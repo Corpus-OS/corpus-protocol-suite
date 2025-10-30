@@ -1,18 +1,18 @@
-# Adapter SDK Protocol Suite Specification (RFC-Style, 10/10 Edition)
+# Corpus Protocol Suite Specification 
 
 ## Abstract
 
-This specification defines the Adapter SDK Protocol Suite: a vendor-neutral set of production-grade interfaces for graph databases, large language models, and vector databases. The suite standardizes contracts for heterogeneous AI infrastructure with built-in observability, error handling, and operational rigor. Protocols are minimal yet expressive, async-first, and extensible via negotiated capabilities. This document includes normative contracts, wire-compatible data shapes, an error taxonomy and mapping, resilience semantics, privacy and security guidance, and compatibility/versioning rules for enterprise-scale deployments.
+This specification defines the Corpus Protocol Suite: a vendor-neutral set of production-grade interfaces for graph databases, large language models, and vector databases. The suite standardizes contracts for heterogeneous AI infrastructure with built-in observability, error handling, and operational rigor. Protocols are minimal yet expressive, async-first, and extensible via negotiated capabilities. This document includes normative contracts, wire-compatible data shapes, an error taxonomy and mapping, resilience semantics, privacy and security guidance, and compatibility/versioning rules for enterprise-scale deployments.
 
 > **Keywords:** Graph Database, Large Language Model, Vector Search, Observability, Multi-Tenancy, Capability Discovery, Semantic Versioning, SIEM-Safe Telemetry, BCP 14
 
 ## Status of This Memo
 
-This document is not an Internet Standards Track specification; it is published for informational/standards-style guidance for the Adapter SDK project. Distribution of this memo is unlimited.
+This document is not an Internet Standards Track specification; it is published for informational/standards-style guidance for the Corpus Protocol Suite project. Distribution of this memo is unlimited.
 
 ## Copyright Notice
 
-Copyright © 2024 Adapter SDK Project.
+Copyright © 2025 Corpus Protocol Suite Project.
 SPDX-License-Identifier: Apache-2.0
 
 ---
@@ -804,13 +804,13 @@ This document has no IANA actions.
 
 ### 19.2. Informative References
 
-* Adapter SDK GitHub Repository — [https://github.com/adapter-sdk](https://github.com/adapter-sdk)
+* Corpus Protocol Suite GitHub Repository — [https://github.com/adapter-sdk](https://github.com/adapter-sdk)
 
 ---
 
 ## 20. Author’s Address
 
-Adapter SDK Working Group
+Corpus Protocol Suite Working Group
 Email: [standards@adaptersdk.org](mailto:standards@adaptersdk.org)
 GitHub: [https://github.com/adapter-sdk/standards](https://github.com/adapter-sdk/standards)
 
