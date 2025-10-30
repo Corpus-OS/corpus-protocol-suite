@@ -11,11 +11,14 @@ import time
 from dataclasses import dataclass
 from typing import (
     Any, Dict, Iterable, List, Mapping, Optional, Protocol, Tuple, 
-    runtime_checkable, AsyncIterator
+    runtime_checkable, AsyncIterator, NewType
 )
 
 GRAPH_PROTOCOL_VERSION = "1.0.0"
 KNOWN_DIALECTS: Tuple[str, ...] = ("cypher", "opencypher", "gremlin", "gql")
+
+# Explicit type for graph identifiers - enhances protocol clarity
+GraphID = NewType('GraphID', str)
 
 class AdapterError(Exception):
     def __init__(
@@ -123,12 +126,12 @@ class GraphProtocolV1(Protocol):
     async def capabilities(self) -> GraphCapabilities: ...
     async def create_vertex(
         self, label: str, props: Mapping[str, Any], *, ctx: Optional[OperationContext] = None
-    ) -> str: ...
+    ) -> GraphID: ...  # Clear return type
     async def create_edge(
-        self, label: str, from_id: str, to_id: str, props: Mapping[str, Any], *, ctx: Optional[OperationContext] = None
-    ) -> str: ...
-    async def delete_vertex(self, vertex_id: str, *, ctx: Optional[OperationContext] = None) -> None: ...
-    async def delete_edge(self, edge_id: str, *, ctx: Optional[OperationContext] = None) -> None: ...
+        self, label: str, from_id: GraphID, to_id: GraphID, props: Mapping[str, Any], *, ctx: Optional[OperationContext] = None
+    ) -> GraphID: ...  # Clear parameter and return types
+    async def delete_vertex(self, vertex_id: GraphID, *, ctx: Optional[OperationContext] = None) -> None: ...
+    async def delete_edge(self, edge_id: GraphID, *, ctx: Optional[OperationContext] = None) -> None: ...
     async def query(
         self,
         *,
@@ -147,7 +150,7 @@ class GraphProtocolV1(Protocol):
     ) -> AsyncIterator[Mapping[str, Any]]: ...
     async def bulk_vertices(
         self, vertices: Iterable[Tuple[str, Mapping[str, Any]]], *, ctx: Optional[OperationContext] = None
-    ) -> List[str]: ...
+    ) -> List[GraphID]: ...  # Clear return type
     async def batch(
         self,
         ops: Iterable[Mapping[str, Any]],
@@ -212,33 +215,33 @@ class BaseGraphAdapter(_Base, GraphProtocolV1):
 
     async def create_vertex(
         self, label: str, props: Mapping[str, Any], *, ctx: Optional[OperationContext] = None
-    ) -> str:
+    ) -> GraphID:
         self._require_non_empty("label", label)
         t0 = time.monotonic()
         try:
             vid = await self._do_create_vertex(label, dict(props), ctx=ctx)
             self._record("create_vertex", t0, True, ctx=ctx)
-            return str(vid)
+            return GraphID(str(vid))  # Explicit type conversion
         except AdapterError as e:
             self._record("create_vertex", t0, False, code=type(e).__name__, ctx=ctx)
             raise
 
     async def create_edge(
-        self, label: str, from_id: str, to_id: str, props: Mapping[str, Any], *, ctx: Optional[OperationContext] = None
-    ) -> str:
+        self, label: str, from_id: GraphID, to_id: GraphID, props: Mapping[str, Any], *, ctx: Optional[OperationContext] = None
+    ) -> GraphID:
         for n, v in (("label", label), ("from_id", from_id), ("to_id", to_id)):
-            self._require_non_empty(n, v)
+            self._require_non_empty(n, str(v))  # Convert GraphID to str for validation
         t0 = time.monotonic()
         try:
             eid = await self._do_create_edge(label, str(from_id), str(to_id), dict(props), ctx=ctx)
             self._record("create_edge", t0, True, ctx=ctx)
-            return str(eid)
+            return GraphID(str(eid))  # Explicit type conversion
         except AdapterError as e:
             self._record("create_edge", t0, False, code=type(e).__name__, ctx=ctx)
             raise
 
-    async def delete_vertex(self, vertex_id: str, *, ctx: Optional[OperationContext] = None) -> None:
-        self._require_non_empty("vertex_id", vertex_id)
+    async def delete_vertex(self, vertex_id: GraphID, *, ctx: Optional[OperationContext] = None) -> None:
+        self._require_non_empty("vertex_id", str(vertex_id))
         t0 = time.monotonic()
         try:
             await self._do_delete_vertex(str(vertex_id), ctx=ctx)
@@ -247,8 +250,8 @@ class BaseGraphAdapter(_Base, GraphProtocolV1):
             self._record("delete_vertex", t0, False, code=type(e).__name__, ctx=ctx)
             raise
 
-    async def delete_edge(self, edge_id: str, *, ctx: Optional[OperationContext] = None) -> None:
-        self._require_non_empty("edge_id", edge_id)
+    async def delete_edge(self, edge_id: GraphID, *, ctx: Optional[OperationContext] = None) -> None:
+        self._require_non_empty("edge_id", str(edge_id))
         t0 = time.monotonic()
         try:
             await self._do_delete_edge(str(edge_id), ctx=ctx)
@@ -299,13 +302,13 @@ class BaseGraphAdapter(_Base, GraphProtocolV1):
 
     async def bulk_vertices(
         self, vertices: Iterable[Tuple[str, Mapping[str, Any]]], *, ctx: Optional[OperationContext] = None
-    ) -> List[str]:
+    ) -> List[GraphID]:
         vertex_list = list(vertices)
         t0 = time.monotonic()
         try:
             ids = await self._do_bulk_vertices(vertex_list, ctx=ctx)
             self._record("bulk_vertices", t0, True, ctx=ctx, count=len(vertex_list))
-            return [str(id) for id in ids]
+            return [GraphID(str(id)) for id in ids]  # Explicit type conversion
         except AdapterError as e:
             self._record("bulk_vertices", t0, False, code=type(e).__name__, ctx=ctx, count=len(vertex_list))
             raise
@@ -352,15 +355,16 @@ class BaseGraphAdapter(_Base, GraphProtocolV1):
             self._record("health", t0, False, code=type(e).__name__, ctx=ctx)
             raise
 
+    # Hooks now use GraphID for clarity in implementation guidance
     async def _do_capabilities(self) -> GraphCapabilities:
         raise NotImplementedError
 
-    async def _do_create_vertex(self, label: str, props: Dict[str, Any], *, ctx: Optional[OperationContext]) -> str:
+    async def _do_create_vertex(self, label: str, props: Dict[str, Any], *, ctx: Optional[OperationContext]) -> GraphID:
         raise NotImplementedError
 
     async def _do_create_edge(
         self, label: str, from_id: str, to_id: str, props: Dict[str, Any], *, ctx: Optional[OperationContext]
-    ) -> str:
+    ) -> GraphID:
         raise NotImplementedError
 
     async def _do_delete_vertex(self, vertex_id: str, *, ctx: Optional[OperationContext]) -> None:
@@ -381,7 +385,7 @@ class BaseGraphAdapter(_Base, GraphProtocolV1):
 
     async def _do_bulk_vertices(
         self, vertices: List[Tuple[str, Mapping[str, Any]]], *, ctx: Optional[OperationContext]
-    ) -> List[str]:
+    ) -> List[GraphID]:
         raise NotImplementedError
 
     async def _do_batch(self, ops: List[Mapping[str, Any]], *, ctx: Optional[OperationContext]) -> List[Mapping[str, Any]]:
@@ -394,7 +398,7 @@ class BaseGraphAdapter(_Base, GraphProtocolV1):
         raise NotImplementedError
 
 __all__ = [
-    "GRAPH_PROTOCOL_VERSION", "KNOWN_DIALECTS", "AdapterError", "BadRequest", "AuthError", 
+    "GRAPH_PROTOCOL_VERSION", "KNOWN_DIALECTS", "GraphID", "AdapterError", "BadRequest", "AuthError", 
     "ResourceExhausted", "TransientNetwork", "Unavailable", "NotSupported", "OperationContext",
     "LogSink", "NoopLogSink", "MetricsSink", "NoopMetrics", "GraphCapabilities", 
     "GraphProtocolV1", "BaseGraphAdapter",
