@@ -38,8 +38,10 @@ Follow SemVer against EMBEDDING_PROTOCOL_VERSION. Minor versions are strictly ad
 """
 
 from __future__ import annotations
+import asyncio
 import time
 import hashlib
+import math
 from dataclasses import dataclass
 from typing import (
     Any, Dict, List, Mapping, Optional, Protocol, Tuple, Iterable,
@@ -148,6 +150,14 @@ class EmbeddingAdapterError(Exception):
             "details": {k: self.details[k] for k in sorted(self.details)},
         }
 
+    def __str__(self) -> str:  # helpful for logs
+        base = self.message or self.__class__.__name__
+        if self.code:
+            base += f" [code={self.code}]"
+        if self.details:
+            base += f" details={self.details}"
+        return base
+
 class BadRequest(EmbeddingAdapterError):
     """Client sent an invalid request (malformed texts, invalid parameters)."""
     pass
@@ -178,6 +188,10 @@ class Unavailable(EmbeddingAdapterError):
 
 class NotSupported(EmbeddingAdapterError):
     """Requested operation or parameter is not supported."""
+    pass
+
+class DeadlineExceeded(EmbeddingAdapterError):
+    """Operation exceeded ctx.deadline_ms budget."""
     pass
 
 # =============================================================================
@@ -271,6 +285,70 @@ class NoopMetrics:
     def counter(self, **_: Any) -> None: ...
 
 # =============================================================================
+# Pluggable policy interfaces (deadlines, truncation, normalization, CB, cache)
+# =============================================================================
+
+class DeadlinePolicy(Protocol):
+    """Strategy to apply time budgets (ctx.deadline_ms) to awaits."""
+    async def wrap(self, coro, ctx: Optional[OperationContext]): ...
+
+class TruncationPolicy(Protocol):
+    """Strategy to deterministically truncate text when allowed."""
+    def apply(self, text: str, max_len: Optional[int], allow: bool) -> Tuple[str, bool]: ...
+
+class NormalizationPolicy(Protocol):
+    """Strategy to normalize vectors when requested."""
+    def normalize(self, vec: List[float]) -> List[float]: ...
+
+class CircuitBreaker(Protocol):
+    """Minimal circuit breaker interface."""
+    def allow(self) -> bool: ...
+    def on_success(self) -> None: ...
+    def on_error(self, err: Exception) -> None: ...
+
+class Cache(Protocol):
+    """Minimal async cache interface."""
+    async def get(self, key: str) -> Optional[Any]: ...
+    async def set(self, key: str, value: Any, ttl_s: int) -> None: ...
+
+class RateLimiter(Protocol):
+    """Minimal rate limiter interface."""
+    async def acquire(self) -> None: ...
+    def release(self) -> None: ...
+
+# ---- No-op / simple policies ----
+
+class NoopDeadline:
+    async def wrap(self, coro, ctx: Optional[OperationContext]):
+        return await coro
+
+class SimpleCharTruncation:
+    def apply(self, text: str, max_len: Optional[int], allow: bool) -> Tuple[str, bool]:
+        if not max_len or len(text) <= max_len:
+            return text, False
+        if not allow:
+            raise TextTooLong(f"text exceeds maximum length of {max_len}")
+        return text[:max_len], True
+
+class L2Normalization:
+    def normalize(self, vec: List[float]) -> List[float]:
+        norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+        return [v / norm for v in vec]
+
+class NoopBreaker:
+    def allow(self) -> bool: return True
+    def on_success(self) -> None: ...
+    def on_error(self, err: Exception) -> None: ...
+
+class NoopCache:
+    async def get(self, key: str) -> Optional[Any]: return None
+    async def set(self, key: str, value: Any, ttl_s: int) -> None: ...
+
+class NoopLimiter:
+    async def acquire(self) -> None: ...
+    def release(self) -> None: ...
+
+# =============================================================================
 # Capabilities (dynamic discovery for routing and planning)
 # =============================================================================
 
@@ -294,6 +372,9 @@ class EmbeddingCapabilities:
         supports_token_counting: Whether token counting is available
         idempotent_operations: Whether operations are idempotent with idempotency_key
         supports_multi_tenant: Whether multi-tenant isolation is supported
+        normalizes_at_source: Whether adapter normalizes vectors at source when requested
+        truncation_mode: "base" or "adapter" to signal where truncation is applied
+        supports_deadline: Whether adapter cooperates with deadline cancellation
     """
     server: str
     version: str
@@ -306,6 +387,9 @@ class EmbeddingCapabilities:
     supports_token_counting: bool = False
     idempotent_operations: bool = False
     supports_multi_tenant: bool = False
+    normalizes_at_source: bool = False
+    truncation_mode: str = "base"
+    supports_deadline: bool = True
 
 # =============================================================================
 # Operation Specifications
@@ -551,14 +635,39 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
 
     _component = "embedding"
 
-    def __init__(self, *, metrics: Optional[MetricsSink] = None) -> None:
+    def __init__(
+        self,
+        *,
+        metrics: Optional[MetricsSink] = None,
+        deadline_policy: Optional[DeadlinePolicy] = None,
+        truncation: Optional[TruncationPolicy] = None,
+        normalization: Optional[NormalizationPolicy] = None,
+        breaker: Optional[CircuitBreaker] = None,
+        cache: Optional[Cache] = None,
+        limiter: Optional[RateLimiter] = None,
+        tag_model_in_metrics: bool = True,
+    ) -> None:
         """
-        Initialize the embedding adapter with metrics instrumentation.
+        Initialize the embedding adapter with metrics instrumentation and optional policies.
         
         Args:
             metrics: Metrics sink for operational monitoring. Uses NoopMetrics if None.
+            deadline_policy: Optional deadline policy to enforce ctx.deadline_ms.
+            truncation: Optional truncation policy; defaults to simple char-based.
+            normalization: Optional normalization policy; defaults to L2.
+            breaker: Optional circuit breaker; defaults to no-op.
+            cache: Optional async cache; defaults to no-op.
+            limiter: Optional rate limiter; defaults to no-op.
+            tag_model_in_metrics: Whether to include 'model' as a metric tag.
         """
         self._metrics: MetricsSink = metrics or NoopMetrics()
+        self._deadline: DeadlinePolicy = deadline_policy or NoopDeadline()
+        self._trunc: TruncationPolicy = truncation or SimpleCharTruncation()
+        self._norm: NormalizationPolicy = normalization or L2Normalization()
+        self._breaker: CircuitBreaker = breaker or NoopBreaker()
+        self._cache: Cache = cache or NoopCache()
+        self._limiter: RateLimiter = limiter or NoopLimiter()
+        self._tag_model_in_metrics: bool = tag_model_in_metrics
 
     # --- internal helpers (validation and instrumentation) ---
 
@@ -637,6 +746,9 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
             x = dict(extra or {})
             if ctx:
                 x["tenant"] = self._tenant_hash(ctx.tenant)
+                if self._tag_model_in_metrics and "model" in extra:
+                    # keep as-is; model is optionally tagged
+                    pass
             self._metrics.observe(
                 component=self._component, 
                 op=op, 
@@ -645,9 +757,21 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
                 code=code, 
                 extra=x or None
             )
+            # advisory counters
+            if not ok:
+                self._metrics.counter(component=self._component, name="errors_total", value=1, extra={"class": code})
         except Exception:
             # Never let metrics recording break the operation
             pass
+
+    async def _apply_deadline(self, coro, ctx: Optional[OperationContext]):
+        """
+        Apply the configured deadline policy to awaitable; map timeouts to DeadlineExceeded.
+        """
+        try:
+            return await self._deadline.wrap(coro, ctx)
+        except asyncio.TimeoutError:
+            raise DeadlineExceeded("operation timed out", code="DEADLINE")
 
     # --- final public APIs (validation + instrumentation) ---
 
@@ -668,23 +792,76 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         """
         self._require_non_empty("text", spec.text)
         self._require_non_empty("model", spec.model)
-        
-        # Get capabilities to validate against limits
-        capabilities = await self._do_capabilities()
-        if spec.model not in capabilities.supported_models:
-            raise ModelNotAvailable(f"Model '{spec.model}' is not supported")
-            
-        if capabilities.max_text_length:
-            self._validate_text(spec.text, capabilities.max_text_length)
+
+        # Breaker gate
+        if not self._breaker.allow():
+            raise Unavailable("circuit open", code="CIRCUIT_OPEN")
+
+        # Rate limit acquire
+        await self._limiter.acquire()
 
         t0 = time.monotonic()
         try:
-            result = await self._do_embed(spec, ctx=ctx)
-            self._record("embed", t0, True, ctx=ctx, model=spec.model, text_length=len(spec.text))
+            # Get capabilities to validate against limits
+            capabilities = await self._do_capabilities()
+            if spec.model not in capabilities.supported_models:
+                raise ModelNotAvailable(f"Model '{spec.model}' is not supported")
+
+            # Determine truncation
+            text = spec.text
+            truncated = False
+            if capabilities.max_text_length:
+                text, truncated = self._trunc.apply(text, capabilities.max_text_length, spec.truncate)
+            # Construct possibly adjusted spec (immutability semantics)
+            eff_spec = EmbedSpec(text=text, model=spec.model, truncate=spec.truncate, normalize=spec.normalize)
+
+            # Optional cache lookup
+            cache_key = f"embed:{eff_spec.model}:{hashlib.sha256(eff_spec.text.encode()).hexdigest()}"
+            cached: Optional[EmbedResult] = await self._cache.get(cache_key)
+            if cached:
+                self._metrics.counter(component=self._component, name="cache_hits", value=1)
+                result = cached
+            else:
+                # Execute with deadline policy
+                result = await self._apply_deadline(self._do_embed(eff_spec, ctx=ctx), ctx)
+
+                # Post-processing: normalization if requested
+                if eff_spec.normalize:
+                    if not capabilities.supports_normalization:
+                        raise NotSupported("normalization not supported for this adapter", code="NORMALIZE")
+                    if not capabilities.normalizes_at_source:
+                        vec = self._norm.normalize(result.embedding.vector)
+                        result.embedding = EmbeddingVector(
+                            vector=vec,
+                            text=result.text,
+                            model=result.model,
+                            dimensions=len(vec),
+                        )
+
+                # Mark truncation result flag
+                result.truncated = bool(truncated)
+
+                # Cache set (best-effort)
+                await self._cache.set(cache_key, result, ttl_s=60)
+
+            # Metrics
+            self._record("embed", t0, True, ctx=ctx, model=eff_spec.model, text_length=len(eff_spec.text))
+            self._metrics.counter(component=self._component, name="texts_embedded", value=1)
+            if result.tokens_used is not None:
+                self._metrics.counter(component=self._component, name="tokens_processed", value=int(result.tokens_used))
+            self._breaker.on_success()
             return result
+
         except EmbeddingAdapterError as e:
             self._record("embed", t0, False, code=type(e).__name__, ctx=ctx, model=spec.model)
+            self._breaker.on_error(e)
             raise
+        except Exception as e:
+            self._record("embed", t0, False, code="UnhandledException", ctx=ctx, model=spec.model)
+            self._breaker.on_error(e)
+            raise
+        finally:
+            self._limiter.release()
 
     async def embed_batch(
         self,
@@ -700,30 +877,74 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         self._require_non_empty("model", spec.model)
         if not spec.texts:
             raise BadRequest("texts must not be empty")
-            
-        # Get capabilities to validate against limits
-        capabilities = await self._do_capabilities()
-        if spec.model not in capabilities.supported_models:
-            raise ModelNotAvailable(f"Model '{spec.model}' is not supported")
-            
-        if capabilities.max_batch_size and len(spec.texts) > capabilities.max_batch_size:
-            raise BadRequest(f"Batch size {len(spec.texts)} exceeds maximum of {capabilities.max_batch_size}")
 
-        # Validate individual texts
-        for text in spec.texts:
-            self._require_non_empty("text", text)
-            if capabilities.max_text_length:
-                self._validate_text(text, capabilities.max_text_length)
+        # Breaker gate
+        if not self._breaker.allow():
+            raise Unavailable("circuit open", code="CIRCUIT_OPEN")
+
+        # Rate limit acquire
+        await self._limiter.acquire()
 
         t0 = time.monotonic()
         try:
-            result = await self._do_embed_batch(spec, ctx=ctx)
-            self._record("embed_batch", t0, True, ctx=ctx, model=spec.model, 
-                        batch_size=len(spec.texts), successful_embeddings=len(result.embeddings))
+            capabilities = await self._do_capabilities()
+            if spec.model not in capabilities.supported_models:
+                raise ModelNotAvailable(f"Model '{spec.model}' is not supported")
+
+            if capabilities.max_batch_size and len(spec.texts) > capabilities.max_batch_size:
+                raise BadRequest(f"Batch size {len(spec.texts)} exceeds maximum of {capabilities.max_batch_size}")
+
+            # Validate and possibly truncate each text deterministically
+            eff_texts: List[str] = []
+            for text in spec.texts:
+                self._require_non_empty("text", text)
+                if capabilities.max_text_length:
+                    new_text, _trunc = self._trunc.apply(text, capabilities.max_text_length, spec.truncate)
+                    eff_texts.append(new_text)
+                else:
+                    eff_texts.append(text)
+
+            eff_spec = BatchEmbedSpec(texts=eff_texts, model=spec.model, truncate=spec.truncate, normalize=spec.normalize)
+
+            # Execute with deadline policy
+            result = await self._apply_deadline(self._do_embed_batch(eff_spec, ctx=ctx), ctx)
+
+            # Post-processing: normalization if requested
+            if eff_spec.normalize:
+                if not capabilities.supports_normalization:
+                    raise NotSupported("normalization not supported for this adapter", code="NORMALIZE")
+                if not capabilities.normalizes_at_source:
+                    # Normalize each embedding vector
+                    for i, ev in enumerate(result.embeddings):
+                        vec = self._norm.normalize(ev.vector)
+                        result.embeddings[i] = EmbeddingVector(
+                            vector=vec,
+                            text=ev.text,
+                            model=ev.model,
+                            dimensions=len(vec),
+                        )
+
+            # Metrics
+            self._record(
+                "embed_batch", t0, True, ctx=ctx, model=eff_spec.model,
+                batch_size=len(eff_spec.texts), successful_embeddings=len(result.embeddings)
+            )
+            self._metrics.counter(component=self._component, name="texts_embedded", value=len(result.embeddings))
+            if result.total_tokens is not None:
+                self._metrics.counter(component=self._component, name="tokens_processed", value=int(result.total_tokens))
+            self._breaker.on_success()
             return result
+
         except EmbeddingAdapterError as e:
             self._record("embed_batch", t0, False, code=type(e).__name__, ctx=ctx, model=spec.model)
+            self._breaker.on_error(e)
             raise
+        except Exception as e:
+            self._record("embed_batch", t0, False, code="UnhandledException", ctx=ctx, model=spec.model)
+            self._breaker.on_error(e)
+            raise
+        finally:
+            self._limiter.release()
 
     async def count_tokens(
         self,
@@ -735,21 +956,32 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         """Count tokens in text with validation and metrics."""
         self._require_non_empty("text", text)
         self._require_non_empty("model", model)
-        
+
         t0 = time.monotonic()
         try:
-            result = await self._do_count_tokens(text, model, ctx=ctx)
+            # Gate by capabilities (align with embed)
+            caps = await self._do_capabilities()
+            if model not in caps.supported_models:
+                raise ModelNotAvailable(f"Model '{model}' is not supported")
+
+            # Execute with deadline policy
+            result = await self._apply_deadline(self._do_count_tokens(text, model, ctx=ctx), ctx)
             self._record("count_tokens", t0, True, ctx=ctx, model=model, text_length=len(text))
+            # Optional counter
+            self._metrics.counter(component=self._component, name="count_tokens_calls", value=1)
             return result
         except EmbeddingAdapterError as e:
             self._record("count_tokens", t0, False, code=type(e).__name__, ctx=ctx, model=model)
+            raise
+        except Exception as e:
+            self._record("count_tokens", t0, False, code="UnhandledException", ctx=ctx, model=model)
             raise
 
     async def health(self, *, ctx: Optional[OperationContext] = None) -> Dict[str, Any]:
         """Check health status with metrics instrumentation."""
         t0 = time.monotonic()
         try:
-            h = await self._do_health(ctx=ctx)
+            h = await self._apply_deadline(self._do_health(ctx=ctx), ctx)
             self._record("health", t0, True, ctx=ctx)
             return {
                 "ok": bool(h.get("ok", True)),
@@ -760,6 +992,10 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         except EmbeddingAdapterError as e:
             self._record("health", t0, False, code=type(e).__name__, ctx=ctx)
             raise
+        except Exception as e:
+            self._record("health", t0, False, code="UnhandledException", ctx=ctx)
+            # Normalize unexpected errors as Unavailable for callers
+            raise Unavailable("health check failed") from e
 
     # --- hooks to implement per backend (override these) ---
 
@@ -814,6 +1050,7 @@ __all__ = [
     "TransientNetwork",
     "Unavailable",
     "NotSupported",
+    "DeadlineExceeded",
     "OperationContext",
     "EmbedSpec",
     "BatchEmbedSpec",
@@ -822,4 +1059,19 @@ __all__ = [
     "EmbeddingCapabilities",
     "EmbeddingProtocolV1",
     "BaseEmbeddingAdapter",
+    # policy & infra extension points
+    "DeadlinePolicy",
+    "TruncationPolicy",
+    "NormalizationPolicy",
+    "CircuitBreaker",
+    "Cache",
+    "RateLimiter",
+    "NoopDeadline",
+    "SimpleCharTruncation",
+    "L2Normalization",
+    "NoopBreaker",
+    "NoopCache",
+    "NoopLimiter",
+    "MetricsSink",
+    "NoopMetrics",
 ]
