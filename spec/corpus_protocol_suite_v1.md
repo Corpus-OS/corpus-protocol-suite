@@ -12,7 +12,7 @@ This document is not an Internet Standards Track specification; it is published 
 
 ## Copyright Notice
 
-Copyright © 2024 Corpus Protocol Suite.
+Copyright © 2025 Corpus Protocol Suite.
 SPDX-License-Identifier: Apache-2.0
 
 ---
