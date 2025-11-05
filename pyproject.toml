@@ -1,26 +1,58 @@
-# pyproject.toml
-
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=68", "wheel>=0.41"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "corpus_sdk"
-version = "1.0.0"
+version = "0.1.0"
+description = "Protocol-first, vendor-neutral SDK for LLM, Embedding, Vector, and Graph backends."
+readme = "README.md"
+license = { text = "Apache-2.0" }
 requires-python = ">=3.9"
+authors = [{ name = "Corpus", email = "standards@adaptersdk.org" }]
+dependencies = []
 
 [project.optional-dependencies]
 test = [
-    "pytest>=7.0.0",
-    "pytest-asyncio>=0.21.0",
+  "pytest>=7.0.0,<9.0.0",
+  "pytest-asyncio>=0.21.0,<0.24.0",
 ]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["corpus_sdk/test"]
 addopts = "-v --strict-markers --strict-config"
-filterwarnings = [
-    "error::DeprecationWarning",
-    "ignore::pytest.PytestUnraisableExceptionWarning",
-]
 
+# --- Formatting/Linting/Typing (recommended, optional) ---
+
+[tool.black]
+line-length = 100
+target-version = ["py39", "py310", "py311"]
+skip-string-normalization = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+select = ["E", "F", "I", "UP"]   # pycodestyle, pyflakes, isort, pyupgrade
+ignore = []
+fix = true
+src = ["corpus_sdk", "corpus_sdk/examples", "corpus_sdk/test"]
+
+[tool.ruff.isort]
+known-first-party = ["corpus_sdk"]
+
+[tool.mypy]
+python_version = "3.9"
+strict = false
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_unused_configs = true
+ignore_missing_imports = true
+namespace_packages = true
+explicit_package_bases = true
+mypy_path = "."
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["corpus_sdk*"]
+exclude = ["corpus_sdk/test*"]
