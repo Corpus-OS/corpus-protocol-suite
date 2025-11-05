@@ -67,7 +67,7 @@ from typing import (
 LOG = logging.getLogger(__name__)
 
 # Minor bump: additive fields in LLMCapabilities and new error type.
-LLM_PROTOCOL_VERSION = "1.2.0"
+LLM_PROTOCOL_VERSION = "1.0.0"
 
 # =============================================================================
 # Normalized Errors (with retry hints and operational guidance)
