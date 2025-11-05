@@ -1,4 +1,4 @@
-# Corpus Protocol Suite Specification
+# Corpus SDK Specification
 
 ## Abstract
 
@@ -61,10 +61,10 @@ The proliferation of AI infrastructure has created a fragmented landscape of pro
 
 This specification defines four complementary protocols:
 
-* **Graph Protocol V1** — Vertex/edge CRUD, traversal, and multi-dialect query execution.
-* **LLM Protocol V1** — Chat-style completion, streaming tokens, usage accounting.
-* **Vector Protocol V1** — Vector upsert/delete, similarity search, and namespace management.
-* **Embedding Protocol V1** — Text embedding generation (single/batch), token counting, capability discovery, and health reporting.
+* **Graph Protocol V1.1** — Vertex/edge CRUD, traversal, and multi-dialect query execution.
+* **LLM Protocol V1.1** — Chat-style completion, streaming tokens, usage accounting.
+* **Vector Protocol V1.1** — Vector upsert/delete, similarity search, and namespace management.
+* **Embedding Protocol V1.1** — Text embedding generation (single/batch), token counting, capability discovery, and health reporting.
 
 All protocols share a **Common Foundation** (context propagation, capability discovery, error taxonomy, observability, resilience).
 
@@ -154,6 +154,13 @@ The key words “MUST”, “MUST NOT”, “REQUIRED”, “SHALL”, “SHALL 
 └─────────────────────────────────────────┘
 ```
 
+### 5.3. Implementation Profiles (Informative)
+
+Two implementation profiles are recognized. Profiles **MUST NOT** alter wire contracts or semantics.
+
+* **Thin (default):** All infra hooks (cache, limiter, breaker) are no-ops; deadlines are propagated to downstream backends.
+* **Standalone:** Optional local enforcement for deadlines, a small circuit breaker, a simple token-bucket limiter, and short-TTL in-memory caches (eligible for Embedding and LLM `complete` only).
+
 ---
 
 ## 6. Common Foundation
@@ -178,9 +185,10 @@ class OperationContext:
 
 * `request_id` (SHOULD) uniquely ties together end-to-end operations.
 * `idempotency_key` (MAY) be supplied on mutating operations; when present, adapters **MUST** guarantee exactly-once external effects or return a consistent prior result.
-* `deadline_ms` (SHOULD) be treated as an absolute deadline; adapters **MUST** propagate remaining budget downstream when possible.
+* `deadline_ms` (SHOULD) be treated as an absolute deadline; adapters **MUST** propagate remaining budget downstream when possible. If the budget is already elapsed at call time, adapters **SHOULD** fail fast with `DeadlineExceeded` (LLM/Embedding) or `Unavailable` (Graph/Vector).
 * `traceparent` (MUST) be forwarded unchanged for distributed tracing.
 * `tenant` (MUST) enforce isolation; telemetry **MUST NOT** log raw tenant values.
+* `attrs` (MUST) be treated as a map; if absent, treat as empty.
 
 ### 6.2. Capability Discovery
 
@@ -195,7 +203,8 @@ class OperationContext:
     "dialects": ["cypher", "opencypher"],
     "supports_txn": true,
     "supports_schema_ops": true,
-    "supports_pagination": false
+    "supports_streaming": false,
+    "supports_deadline": true
   },
   "limits": {
     "max_batch_ops": 5000,
@@ -205,7 +214,8 @@ class OperationContext:
   },
   "extensions": {
     "vendor:neo4j.routing": "cluster",
-    "vendor:read_your_writes": true
+    "vendor:read_your_writes": true,
+    "tag_model_in_metrics": false
   }
 }
 ```
@@ -223,7 +233,8 @@ AdapterError (base)
 ├─ ResourceExhausted       # 429 quotas, rate limits (retry-after)
 ├─ TransientNetwork        # 5xx gateway/timeouts; retryable
 ├─ Unavailable             # 503 backend temporarily unavailable
-└─ NotSupported            # 501/400 operation unsupported
+├─ NotSupported            # 501/400 operation unsupported
+└─ DeadlineExceeded        # 504 budget/deadline exhausted
 ```
 
 LLM, Vector, and Embedding add specific subtypes (see §§8.5, 9.5, 10.3).
@@ -258,8 +269,9 @@ class MetricsSink(Protocol):
 ```
 
 * `component` **MUST** be one of `graph|llm|vector|embedding`.
-* Adapters **MUST** emit at least one `observe` per operation.
+* Adapters **MUST** emit at least one `observe` per operation (streaming ops SHOULD emit a final outcome observe).
 * Telemetry **MUST** be SIEM-safe: no raw tenant IDs, request bodies, prompts, vectors, or source texts.
+* Implementations MAY include low-cardinality fields in `extra`: `tenant_hash`, `deadline_bucket` (`<1s|<5s|<15s|<60s|>=60s`), `cache_hit` (0/1), `rows`, `batch_size`, `model` (when `extensions.tag_model_in_metrics=true`).
 
 ---
 
@@ -272,7 +284,7 @@ Vendor-neutral interface for graph databases (Cypher, OpenCypher, Gremlin, GQL),
 ### 7.2. Data Types
 
 ```python
-from typing import NewType, Tuple, Optional, Mapping, Any, Iterable, List, AsyncIterator
+from typing import NewType, Tuple, Optional
 
 GraphID = NewType('GraphID', str)
 
@@ -284,8 +296,15 @@ class GraphCapabilities:
     supports_txn: bool = True
     supports_schema_ops: bool = True
     max_batch_ops: Optional[int] = None
+    retryable_codes: Tuple[str, ...] = ()
+    rate_limit_unit: str = "requests_per_second"  # or "tokens_per_minute"
+    max_qps: Optional[int] = None
+    idempotent_writes: bool = False
+    supports_multi_tenant: bool = False
+    supports_streaming: bool = False
+    supports_bulk_ops: bool = False
+    # Optional limits/extensions:
     max_query_length: Optional[int] = None
-    read_after_write_consistency: str = "eventual"  # "session" | "strong"
 ```
 
 ### 7.3. Operations
@@ -322,6 +341,7 @@ async def stream_query(*, dialect: str, text: str, params: Optional[Mapping[str,
 * `dialect` **MUST** be one advertised in capabilities.
 * `params` **MUST** be bound safely; adapters **MUST** prevent injection by disallowing string interpolation.
 * `stream_query` yields rows progressively; iterator close **MUST** free resources.
+* Deadline behavior: if budget elapses mid-stream, adapters **SHOULD** terminate promptly with `Unavailable` (Thin) or `DeadlineExceeded` (Standalone).
 
 #### 7.3.3. Batch Operations
 
@@ -354,6 +374,10 @@ async def drop_index(label: str, property: str, *, ctx: Optional[OperationContex
 ```
 
 Index creation events **MUST NOT** log sample property values.
+
+### 7.6. Health
+
+Adapters **SHOULD** normalize unexpected failures in `health()` to `Unavailable("health check failed")` and still report `server`/`version` when known.
 
 ---
 
@@ -419,9 +443,13 @@ async def count_tokens(text: str, *, model: Optional[str]=None,
 ]
 ```
 
-* Roles: `system|user|assistant|tool`. Unknown roles **MUST** yield `BadRequest`.
-* `complete` **MUST** return deterministic `usage` when the provider supplies it; when not, adapters **MUST** estimate and set `usage.total_tokens >= 0` with `extensions.usage_estimated=true`.
-* `stream` **MUST** deliver ordered chunks and set `is_final=true` on the terminal chunk.
+**Validation (Normative):**
+
+* Roles are from `{system,user,assistant,tool}`; unknown roles → `BadRequest`.
+* `temperature ∈ [0,2]`; `top_p ∈ (0,1]`; `frequency_penalty, presence_penalty ∈ [-2,2]`; invalid ranges → `BadRequest`.
+* `count_tokens` is gated by capability `supports_count_tokens`; if `false`, return `NotSupported`.
+
+**Deadline semantics:** If budget is pre-expired or elapses during execution, return `DeadlineExceeded`. Streaming MUST set `is_final=true` on the terminal chunk; if stopping due to deadline, emit a final outcome metric reflecting the error.
 
 ### 8.4. Model Discovery
 
@@ -430,28 +458,28 @@ async def count_tokens(text: str, *, model: Optional[str]=None,
 ```json
 {
   "models": [
-    {"name":"gpt-4.1-mini","family":"gpt","context_window":128000,"supports_tools":true},
-    {"name":"llama3-70b","family":"llama","context_window":8192,"supports_tools":false}
+    {"name":"gpt-4.1-mini","family":"gpt","context_window":128000,"supports_tools":true}
   ],
-  "sampling": {"temperature_range":[0.0,2.0],"top_p_range":[0.0,1.0]}
+  "sampling": {"temperature_range":[0.0,2.0],"top_p_range":[0.0,1.0]},
+  "features": {
+    "supports_streaming": true,
+    "supports_roles": true,
+    "supports_json_output": false,
+    "supports_parallel_tool_calls": false,
+    "supports_deadline": true,
+    "supports_count_tokens": true
+  },
+  "limits": {"max_context_length": 128000}
 }
 ```
+
+Clients **MAY** preflight `prompt_tokens + max_tokens ≤ max_context_length` when token counting is supported.
 
 ### 8.5. LLM-Specific Errors
 
 * `ModelOverloaded` (subtype `Unavailable`): transient capacity pressure.
 * `ContentFiltered` (subtype `BadRequest`): provider content policy triggered.
-* Mitigation metadata MAY include `suggested_token_reduction` and `retry_after_ms`.
-
-### 8.6. Tool Use / Function Calls (Optional)
-
-Adapters MAY support tool calls via structured messages:
-
-```json
-{"role":"assistant","content":"","tool_calls":[{"name":"getWeather","arguments":{"city":"Paris"}}]}
-```
-
-If unsupported, adapters **MUST** return `NotSupported` and advertise `extensions.supports_tools=false`.
+* `DeadlineExceeded`: budget exhausted; retryable only if deadline/size/sampling adjusted.
 
 ---
 
@@ -478,9 +506,9 @@ class Vector:
 
 @dataclass(frozen=True)
 class VectorMatch:
-    id: VectorID
+    vector: Vector
     score: float
-    metadata: Optional[Dict[str, Any]] = None
+    distance: float
 
 @dataclass(frozen=True)
 class QueryResult:
@@ -490,28 +518,27 @@ class QueryResult:
     total_matches: int
 ```
 
-**Spec types:**
+**Spec types (aligned):**
 
 ```python
 @dataclass(frozen=True)
 class QuerySpec:
     vector: List[float]
     top_k: int
-    namespace: str
+    namespace: str = "default"
     filter: Optional[Dict[str, Any]] = None
-    metric: str = "cosine"        # "cosine" | "euclidean" | "dot"
     include_metadata: bool = True
+    include_vectors: bool = False   # if False, VectorMatch.vector.vector MAY be omitted
 
 @dataclass(frozen=True)
 class UpsertSpec:
     vectors: List[Vector]
-    namespace: str
-    create_if_missing: bool = True
+    namespace: str = "default"
 
 @dataclass(frozen=True)
 class DeleteSpec:
-    ids: Optional[List[VectorID]] = None
-    namespace: str = ""
+    ids: List[VectorID]
+    namespace: str = "default"
     filter: Optional[Dict[str, Any]] = None
 ```
 
@@ -530,7 +557,8 @@ async def delete_namespace(namespace: str, *, ctx: Optional[OperationContext]=No
 * Vector dimension **MUST** match the configured index dimension; mismatches **MUST** raise `DimensionMismatch`.
 * `query.top_k` **MUST** be > 0 and bounded by `limits.max_top_k` if present.
 * Metadata filters **MUST** be applied pre-search where supported; otherwise adapters **MUST** document post-filter behavior.
-* Scores **MUST** be consistent with `metric` and the “higher is better” convention unless explicitly documented.
+* Scores **MUST** reflect the “higher is better” convention unless explicitly documented.
+* `include_vectors=false` MAY suppress returning raw vectors in matches; IDs/metadata remain available.
 
 ### 9.4. Distance Metrics
 
@@ -567,6 +595,7 @@ Batch input convenience:
 
 * `TextTooLong` (subtype of `BadRequest`) — input exceeds model maximum when `truncate=false`.
 * `ModelNotAvailable` (subtype of `NotSupported` or `Unavailable`) — requested model not present/disabled.
+* `DeadlineExceeded` — budget exhausted (retryable only if deadline extended or inputs reduced).
 
 **Mitigation hints (SHOULD):** `retry_after_ms`, `resource_scope` (`"model"|"token_limit"|"rate_limit"`), `suggested_batch_reduction` (percentage).
 
@@ -576,7 +605,7 @@ Adapters MUST declare:
 
 * `server`, `version`, `supported_models` (list of strings).
 * Optional limits: `max_batch_size`, `max_text_length`, `max_dimensions`.
-* Flags: `supports_normalization`, `supports_truncation`, `supports_token_counting`, `idempotent_operations`, `supports_multi_tenant`.
+* Flags: `supports_normalization`, `normalizes_at_source`, `supports_truncation`, `supports_token_counting`, `supports_deadline`, `idempotent_operations`, `supports_multi_tenant`.
 
 ### 10.5. Operations (Normative)
 
@@ -599,6 +628,7 @@ Adapters MUST declare:
 * If `normalize=true` and unsupported, return `NotSupported`.
 * `embed_batch` MUST enforce `max_batch_size` and validate each `text`.
 * If `truncate=false` and a text exceeds `max_text_length`, raise `TextTooLong`.
+* Deadline pre-expired or elapsed → `DeadlineExceeded`.
 
 ---
 
@@ -624,6 +654,12 @@ Where `idempotency_key` is accepted, mutations MUST be exactly-once or return th
 
 Graph MAY stream rows; LLM MUST stream with a terminal chunk; Vector pagination is capability-gated; Embedding is request/response (no streaming) in V1.
 
+### 11.6. Caching (Implementation Guidance)
+
+* **Eligible at base:** Embedding (deterministic outputs), LLM `complete` (key includes sampling params).
+* **Typically router/infra:** Vector/Graph result caching due to workload variability.
+* **Keying guidance:** use content hashes; do not include raw content; include model/params.
+
 ---
 
 ## 12. Error Handling and Resilience
@@ -631,6 +667,7 @@ Graph MAY stream rows; LLM MUST stream with a terminal chunk; Vector pagination 
 ### 12.1. Retry Semantics
 
 **Retryable:** `TransientNetwork`, `ResourceExhausted` (respect `retry_after_ms`), `Unavailable`, `IndexNotReady`.
+**Conditionally Retryable:** `DeadlineExceeded` (only if deadline extended or work reduced).
 **Non-Retryable:** `BadRequest`, `AuthError`, `NotSupported`, `DimensionMismatch`, `ContentFiltered`, `TextTooLong` (unless truncation enabled).
 
 ### 12.2. Backoff and Jitter (RECOMMENDED)
@@ -639,23 +676,24 @@ Exponential backoff (100–500 ms base, ×2 factor, 10–30 s cap) with **full j
 
 ### 12.3. Circuit Breaking
 
-Fail fast with `Unavailable` when breaker is open; optionally include `retry_after_ms` to reduce thundering herds.
+Fail fast with `Unavailable("circuit open")` when breaker is open; include `retry_after_ms` where possible to reduce thundering herds. Breakers are an **implementation profile** feature (§5.3).
 
 ### 12.4. Error Mapping Table (Normative)
 
-| Error Class        | HTTP Mapping | Retryable | Client Guidance                                                |
-| ------------------ | ------------ | --------- | -------------------------------------------------------------- |
-| BadRequest         | 400          | No        | Fix parameters; do not retry                                   |
-| AuthError          | 401/403      | No        | Refresh credentials; verify scopes                             |
-| ResourceExhausted  | 429          | Yes       | Back off; **honor** `retry_after_ms`; reduce concurrency/batch |
-| TransientNetwork   | 502/504      | Yes       | Exponential backoff + jitter; consider failover                |
-| Unavailable        | 503          | Yes       | Trip/bias breaker; failover if possible                        |
-| NotSupported       | 501/400      | No        | Probe with `capabilities()`; use alternative feature           |
-| DimensionMismatch* | 400          | No        | Align dimensions to index                                      |
-| IndexNotReady*     | 503          | Yes       | Retry after `retry_after_ms`                                   |
-| ModelOverloaded**  | 503          | Yes       | Reduce rate; try alternate family/model                        |
-| ContentFiltered**  | 400          | No        | Sanitize/adjust prompt                                         |
-| TextTooLong***     | 400          | No        | Enable truncation or split text                                |
+| Error Class        | HTTP Mapping | Retryable    | Client Guidance                                                |
+| ------------------ | ------------ | ------------ | -------------------------------------------------------------- |
+| BadRequest         | 400          | No           | Fix parameters; do not retry                                   |
+| AuthError          | 401/403      | No           | Refresh credentials; verify scopes                             |
+| ResourceExhausted  | 429          | Yes          | Back off; **honor** `retry_after_ms`; reduce concurrency/batch |
+| TransientNetwork   | 502/504      | Yes          | Exponential backoff + jitter; consider failover                |
+| Unavailable        | 503          | Yes          | Trip/bias breaker; failover if possible                        |
+| NotSupported       | 501/400      | No           | Probe with `capabilities()`; use alternative feature           |
+| DimensionMismatch* | 400          | No           | Align dimensions to index                                      |
+| IndexNotReady*     | 503          | Yes          | Retry after `retry_after_ms`                                   |
+| ModelOverloaded**  | 503          | Yes          | Reduce rate; try alternate family/model                        |
+| ContentFiltered**  | 400          | No           | Sanitize/adjust prompt                                         |
+| TextTooLong***     | 400          | No           | Enable truncation or split text                                |
+| DeadlineExceeded   | 504          | *It depends* | Extend deadline or reduce work (max_tokens, batch size, etc.)  |
 
 * Vector-specific. ** LLM-specific. *** Embedding-specific.
 
@@ -714,7 +752,7 @@ SIEM-safe logs (examples):
 
 ### 13.3. Distributed Tracing (SHOULD)
 
-Propagate `traceparent`. Use standard span attributes (`component`, `op`, `tenant_hash`, `model`, counts). For LLM streaming, emit child events per chunk.
+Propagate `traceparent`. Use standard span attributes (`component`, `op`, `tenant_hash`, `model`, counts). For LLM streaming, emit child events per chunk. Record one **final** stream outcome observe after completion/error.
 
 ---
 
@@ -760,10 +798,10 @@ Expose `concurrency`, `rate_limit_qps`, `max_batch_ops/top_k`, and memory consid
 
 ### 16.3. Caching Strategies
 
-* **LLM:** cache keyed by normalized messages + sampling params.
-* **Vector:** cache identical `QuerySpec` results.
-* **Graph:** fingerprint query+params.
-* **Embedding:** content-addressable cache `(model, normalized_text)`; record only hashes in telemetry.
+* **LLM:** cache keyed by normalized messages + sampling params + `system` hash.
+* **Vector:** generally router-layer; if implemented, fingerprint the full `QuerySpec`.
+* **Graph:** fingerprint `dialect + text + params`.
+* **Embedding:** content-addressable `(model, normalize, sha256(text))`; record only hashes in telemetry.
 
 ---
 
@@ -775,13 +813,13 @@ Use base classes to centralize validation, error normalization, and metrics; foc
 
 ### 17.2. Validation (MUST)
 
-Reject empty labels/texts, negative `top_k`, NaN/Inf vectors; enforce JSON-serializable `props/metadata`; validate message roles and `max_tokens` vs. window; enforce embedding `max_text_length` and `max_batch_size`.
+Reject empty labels/texts, negative `top_k`, NaN/Inf vectors; enforce JSON-serializable `props/metadata`; validate message roles and `max_tokens` vs. window; enforce embedding `max_text_length` and `max_batch_size`; enforce sampling parameter ranges.
 
 ### 17.3. Testing
 
 **Unit:** dimension mismatch, role/parameter validation, error mapping, batching limits.
 **Integration:** end-to-end pipelines (Graph → LLM → Vector → Embedding).
-**Chaos:** simulate `Unavailable`, timeouts, and rate-limit storms; verify backoff and breaker behavior; ensure idempotence.
+**Chaos:** simulate `Unavailable`, timeouts, and rate-limit storms; verify backoff and breaker behavior; ensure idempotence and stream resource release.
 
 ---
 
@@ -887,6 +925,9 @@ for attempt in range(5):
     except (TransientNetwork, Unavailable):
         sleep = min(2**attempt * 0.2, 5.0) * random.random()
         await asyncio.sleep(sleep)
+    except DeadlineExceeded:
+        # increase deadline or reduce work before retrying
+        break
 ```
 
 ---
@@ -900,7 +941,13 @@ for attempt in range(5):
   "server": "janusgraph",
   "version": "1.0.0",
   "protocol": "graph/v1",
-  "features": {"dialects":["gremlin"],"supports_txn":true,"supports_schema_ops":false},
+  "features": {
+    "dialects":["gremlin"],
+    "supports_txn":true,
+    "supports_schema_ops":false,
+    "supports_streaming":true,
+    "supports_deadline":true
+  },
   "limits": {"max_batch_ops": 2000, "concurrency": 128},
   "extensions": {"vendor:storage":"cassandra","read_after_write_consistency":"session"}
 }
@@ -913,13 +960,17 @@ for attempt in range(5):
   "server": "chat-gateway",
   "version": "2024-10-01",
   "protocol": "llm/v1",
-  "features": {"supports_tools":true,"supports_streaming":true},
-  "limits": {"max_ctx_window": 128000, "max_rps": 50},
+  "features": {
+    "supports_tools":true,
+    "supports_streaming":true,
+    "supports_deadline":true,
+    "supports_count_tokens":true
+  },
+  "limits": {"max_context_length": 128000},
+  "sampling":{"temperature_range":[0.0,2.0],"top_p_range":[0.0,1.0]},
   "models": [
-    {"name":"gpt-4.1-mini","family":"gpt","context_window":128000,"supports_tools":true},
-    {"name":"mistral-large","family":"mistral","context_window":32000,"supports_tools":false}
-  ],
-  "sampling":{"temperature_range":[0.0,2.0],"top_p_range":[0.0,1.0]}
+    {"name":"gpt-4.1-mini","family":"gpt","context_window":128000,"supports_tools":true}
+  ]
 }
 ```
 
@@ -930,7 +981,7 @@ for attempt in range(5):
   "server": "pinecone",
   "version": "2.2",
   "protocol": "vector/v1",
-  "features": {"supports_pagination":true,"supports_filters":true},
+  "features": {"supports_pagination":true,"supports_filters":true,"supports_deadline":true},
   "limits": {"dimension":1536,"max_top_k":1000,"max_batch":1000},
   "extensions": {"metric_default":"cosine"}
 }
@@ -948,8 +999,10 @@ for attempt in range(5):
   "max_text_length": 16000,
   "max_dimensions": 1536,
   "supports_normalization": true,
+  "normalizes_at_source": false,
   "supports_truncation": true,
   "supports_token_counting": true,
+  "supports_deadline": true,
   "idempotent_operations": true,
   "supports_multi_tenant": true
 }
@@ -985,11 +1038,11 @@ for attempt in range(5):
 ```json
 {
   "ok": false,
-  "code": "TEXT_TOO_LONG",
-  "error": "TextTooLong",
-  "message": "Input exceeds model maximum",
+  "code": "DEADLINE_EXCEEDED",
+  "error": "DeadlineExceeded",
+  "message": "Operation budget exhausted",
   "retry_after_ms": null,
-  "resource_scope": "token_limit"
+  "resource_scope": "time_budget"
 }
 ```
 
@@ -1014,5 +1067,16 @@ for attempt in range(5):
 
 # Appendix F — Change Log / Revision History (Non-Normative)
 
-* **v1.1 — Embedding Added:** Added Embedding Protocol V1 (§10), updated Common Foundation to include `embedding` component, expanded Observability, Security, Privacy, and Error Mapping to cover embeddings.
+* **v1.1 — Alignment & Deadlines:**
+
+  * Added `DeadlineExceeded` error class and mapping (§6.3, §12.4).
+  * Clarified deadline semantics and streaming finalization across protocols.
+  * Extended capability flags: `supports_deadline` (all), `supports_count_tokens` (LLM), expanded Graph fields (`supports_streaming`, `supports_bulk_ops`, `retryable_codes`, `rate_limit_unit`, `max_qps`).
+  * Aligned Vector types: `VectorMatch` carries full `Vector`, plus `score` and `distance`; clarified `include_vectors` behavior.
+  * Added Implementation Profiles (§5.3) and observability enrichments (`deadline_bucket`, final stream outcome).
+* **v1.1 — Embedding Added (from previous RFC note):** Added Embedding Protocol V1, expanded observability/security/privacy coverage.
 * **v1.0 — Initial RFC-Style:** Introduced BCP 14 requirements language, IANA Considerations, split Normative/Informative references, explicit Privacy Considerations, Conventions and Notation, error-mapping table, capability namespacing rules, and appendices for examples, redaction, and wire envelopes.
+
+---
+
+**End of Document**
