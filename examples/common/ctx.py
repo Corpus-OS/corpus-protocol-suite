@@ -9,7 +9,7 @@ and we instantiate it with sensible defaults and deadline plumbing.
 
 Usage:
     from corpus_sdk.llm.llm_base import OperationContext as LLMContext
-    from examples.common.ctx import make_ctx, remaining_budget_ms
+    from corpus_sdk.examples.common.ctx import make_ctx, remaining_budget_ms
 
     ctx = make_ctx(LLMContext, tenant="acme", timeout_ms=30_000)
     print(remaining_budget_ms(ctx))
