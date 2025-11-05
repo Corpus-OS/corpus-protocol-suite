@@ -3,6 +3,13 @@
 
 A protocol-first, vendor-neutral SDK for interoperable AI/data backends — **LLM**, **Embedding**, **Vector**, and **Graph** — with consistent error taxonomies, capability discovery, SIEM-safe metrics, and deadline propagation. Designed to compose cleanly under an external control plane (router, scheduler, rate limiter) while remaining usable in a lightweight **standalone** mode for development and simple services. Forming a complete foundation for AI infrastructure standardization across reasoning (LLM), relationships (Graph), semantic search (Vector), and text representation (Embedding) domains.
 
+The Core Problem Space: AI Infrastructure Chaos
+1) The current AI infrastructure landscape suffers from severe fragmentation that creates massive operational overhead:
+2) Provider Proliferation: Dozens of LLM providers, vector databases, and graph databases with incompatible APIs
+3) Duplicate Integration: Enterprises rewriting the same error handling, observability, and resilience patterns for each provider
+4) Vendor Lock-in: Applications tightly coupled to specific AI infrastructure choices
+5) Operational Complexity: Inconsistent monitoring, logging, and error handling across AI services
+
 > **Note:** The SDK in this repository is **fully open source** (Apache-2.0).  
 > **Corpus Router** and **official production adapters** are **commercial** offerings available as managed cloud or on-prem deployments. The SDK works with any router/control plane; using Corpus Router is optional.
 
