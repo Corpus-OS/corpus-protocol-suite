@@ -18,7 +18,8 @@ from __future__ import annotations
 
 import time
 import uuid
-from typing import Any, Callable, Mapping, Optional, TypeVar, Dict
+import dataclasses
+from typing import Any, Callable, Mapping, Optional, Type, TypeVar, Dict
 
 CtxT = TypeVar("CtxT")
 
@@ -26,6 +27,7 @@ __all__ = [
     "make_ctx",
     "clone_ctx",
     "bump_deadline",
+    "extend_budget_pct",
     "remaining_budget_ms",
     "now_ms",
 ]
@@ -44,7 +46,7 @@ def _default_traceparent() -> str:
     return f"00-{trace_id}-{span_id}-01"
 
 def make_ctx(
-    factory: Callable[..., CtxT],
+    factory: Type[CtxT],
     *,
     request_id: Optional[str] = None,
     idempotency_key: Optional[str] = None,
@@ -63,7 +65,7 @@ def make_ctx(
         idempotency_key: Optional exactly-once token for mutating ops.
         deadline_ms: Absolute epoch ms deadline. Mutually exclusive with timeout_ms.
         timeout_ms: Relative budget in ms from *now* (used if deadline_ms is None).
-        traceparent: W3C trace context; auto if absent.
+        traceparent: W3C trace context; auto-generated if absent.
         tenant: Multi-tenant isolation hint.
         attrs: Extra attributes to propagate.
 
@@ -84,42 +86,60 @@ def make_ctx(
         attrs=payload,
     )
 
-def clone_ctx(factory: Callable[..., CtxT], ctx: Any, **overrides: Any) -> CtxT:
+def clone_ctx(factory: Type[CtxT], ctx: Any, **overrides: Any) -> CtxT:
     """
     Clone an OperationContext with overrides using the same factory.
+    Works with frozen dataclasses (Corpus default).
 
     Example:
         new_ctx = clone_ctx(LLMContext, ctx, deadline_ms=now_ms()+5000)
     """
-    base = {
-        "request_id": getattr(ctx, "request_id", None),
-        "idempotency_key": getattr(ctx, "idempotency_key", None),
-        "deadline_ms": getattr(ctx, "deadline_ms", None),
-        "traceparent": getattr(ctx, "traceparent", None),
-        "tenant": getattr(ctx, "tenant", None),
-        "attrs": dict(getattr(ctx, "attrs", {}) or {}),
-    }
+    if dataclasses.is_dataclass(ctx):
+        base = dataclasses.asdict(ctx)
+    else:
+        base = {
+            "request_id": getattr(ctx, "request_id", None),
+            "idempotency_key": getattr(ctx, "idempotency_key", None),
+            "deadline_ms": getattr(ctx, "deadline_ms", None),
+            "traceparent": getattr(ctx, "traceparent", None),
+            "tenant": getattr(ctx, "tenant", None),
+            "attrs": dict(getattr(ctx, "attrs", {}) or {}),
+        }
     base.update(overrides)
     return factory(**base)
 
-def bump_deadline(factory: Callable[..., CtxT], ctx: Any, *, add_ms: int) -> CtxT:
+def bump_deadline(factory: Type[CtxT], ctx: Any, *, add_ms: int) -> CtxT:
     """
     Return a copy of ctx with deadline extended by add_ms (if present),
     or set a new deadline add_ms from *now* if none exists.
+    Also records the bump in attrs (for observability).
     """
     current = getattr(ctx, "deadline_ms", None)
     new_deadline = (current + int(add_ms)) if current is not None else now_ms() + int(add_ms)
-    return clone_ctx(factory, ctx, deadline_ms=new_deadline)
+    new_attrs = dict(getattr(ctx, "attrs", {}) or {})
+    new_attrs["deadline_bumped_ms"] = int(add_ms)
+    new_ctx = clone_ctx(factory, ctx, deadline_ms=new_deadline, attrs=new_attrs)
+    return new_ctx
+
+def extend_budget_pct(factory: Type[CtxT], ctx: Any, pct: float) -> CtxT:
+    """
+    Extend the remaining time budget by a percentage (e.g., 0.5 to add 50%).
+    If no deadline present, returns the original context unchanged.
+    """
+    remaining = remaining_budget_ms(ctx)
+    if remaining is None:
+        return ctx
+    add_ms = int(remaining * pct)
+    return bump_deadline(factory, ctx, add_ms=add_ms)
 
 def remaining_budget_ms(ctx: Any) -> Optional[int]:
     """
     Compute remaining time budget from ctx.deadline_ms.
 
     Returns:
-        Remaining ms (>=0), or None if no deadline set. Floors at 0.
+        Remaining ms (>= 0), or None if no deadline is set.
     """
     deadline = getattr(ctx, "deadline_ms", None)
     if deadline is None:
         return None
     return max(0, int(deadline - now_ms()))
-
