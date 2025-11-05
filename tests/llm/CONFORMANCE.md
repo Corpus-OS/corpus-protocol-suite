@@ -205,33 +205,33 @@ Validates SIEM-safe observability:
 
 ### All LLM conformance tests
 ```bash
-pytest tests/conformance/llm/ -v
+pytest tests/llm/ -v
 ```
 
 ### By category
 ```bash
 # Core operations
-pytest tests/conformance/llm/test_complete_basic.py \
-       tests/conformance/llm/test_streaming_semantics.py \
-       tests/conformance/llm/test_count_tokens_consistency.py \
-       tests/conformance/llm/test_health_report.py -v
+pytest tests/llm/test_complete_basic.py \
+       tests/llm/test_streaming_semantics.py \
+       tests/llm//test_count_tokens_consistency.py \
+       tests/llm/test_health_report.py -v
 
 # Validation
-pytest tests/conformance/llm/test_message_validation.py \
-       tests/conformance/llm/test_sampling_params_validation.py -v
+pytest tests/llm/test_message_validation.py \
+       tests/llm/test_sampling_params_validation.py -v
 
 # Infrastructure
-pytest tests/conformance/llm/test_capabilities_shape.py \
-       tests/conformance/llm/test_deadline_enforcement.py \
-       tests/conformance/llm/test_context_siem.py -v
+pytest tests/llm/test_capabilities_shape.py \
+       tests/llm/test_deadline_enforcement.py \
+       tests/llm/test_context_siem.py -v
 
 # Error handling
-pytest tests/conformance/llm/test_error_mapping_retryable.py -v
+pytest tests/llm/test_error_mapping_retryable.py -v
 ```
 
 ### With coverage report
 ```bash
-pytest tests/conformance/llm/ --cov=corpus_sdk.llm --cov-report=html
+pytest tests/llm/ --cov=corpus_sdk.llm --cov-report=html
 ```
 
 ## Adapter Compliance Checklist
