@@ -1,33 +1,41 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-Basic completion example using the MockLLMAdapter.
+Example 01 — Basic LLM Completion
 
-Demonstrates a simple complete() call with a context and prints
-the result and token usage.
+Demonstrates a simple completion request using the MockLLMAdapter.
+Shows how to create an OperationContext, run a completion, and
+display the model response and token usage.
 """
 
 import asyncio
+
 from corpus_sdk.examples.llm.mock_llm_adapter import MockLLMAdapter
 from corpus_sdk.examples.common.ctx import make_ctx
+from corpus_sdk.examples.common.printing import box, print_kv
 from corpus_sdk.llm.llm_base import OperationContext
-from corpus_sdk.examples.common.printing import print_kv, box
 
 
 async def main() -> None:
-    adapter = MockLLMAdapter()
-    ctx = make_ctx(OperationContext, request_id="basic-complete")
+    box("Example 01 — Basic LLM Completion")
 
+    # Initialize the mock adapter (no network calls)
+    adapter = MockLLMAdapter()
+
+    # Create a standardized operation context
+    ctx = make_ctx(OperationContext, request_id="example-01", tenant="demo")
+
+    # Run a simple completion call
     result = await adapter.complete(
-        messages=[{"role": "user", "content": "Summarize Corpus SDK"}],
+        messages=[{"role": "user", "content": "Summarize the Corpus SDK"}],
         model="mock-model",
         ctx=ctx,
     )
 
-    box("Basic Completion Example")
+    # Display results
     print_kv({
-        "Response": result.text,
-        "Tokens": result.usage.total_tokens,
         "Model": result.model,
+        "Response": result.text,
+        "Tokens Used": result.usage.total_tokens,
     })
 
 
