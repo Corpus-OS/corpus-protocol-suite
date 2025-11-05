@@ -7,31 +7,33 @@ This document tracks conformance test coverage for the **LLM Protocol V1.0** spe
 **Protocol Version:** LLM Protocol V1.0  
 **Status:** Pre-Release  
 **Last Updated:** 2025-01-XX  
-**Test Location:** `tests/conformance/llm/`
+**Test Location:** `tests/llm/`
 
 ## Conformance Summary
 
-**Overall Coverage: 37/37 tests (100%) ✅**
+**Overall Coverage: 43/43 tests (100%) ✅**
 
 | Category | Tests | Coverage |
 |----------|-------|----------|
-| Core Operations | 6/6 | 100% ✅ |
-| Message Validation | 4/4 | 100% ✅ |
+| Core Operations | 4/4 | 100% ✅ |
+| Message Validation | 3/3 | 100% ✅ |
 | Sampling Parameters | 9/9 | 100% ✅ |
+| Streaming Semantics | 1/1 | 100% ✅ |
 | Error Handling | 2/2 | 100% ✅ |
-| Capabilities | 9/9 | 100% ✅ |
+| Capabilities | 10/10 | 100% ✅ |
 | Observability & Privacy | 4/4 | 100% ✅ |
-| Deadline Semantics | 2/2 | 100% ✅ |
-| Token Counting | 1/1 | 100% ✅ |
-| Health Endpoint | 1/1 | 100% ✅ |
+| Deadline Semantics | 3/3 | 100% ✅ |
+| Token Counting | 3/3 | 100% ✅ |
+| Health Endpoint | 2/2 | 100% ✅ |
 
 ## Test Files
 
 ### test_capabilities_shape.py
 **Specification:** §8.4 - Capabilities Discovery  
-**Status:** ✅ Complete (9 tests)
+**Status:** ✅ Complete (10 tests)
 
 Tests all aspects of capability discovery:
+- `test_capabilities_shape_and_required_fields` - Quick smoke test of essential fields
 - `test_capabilities_returns_correct_type` - Returns LLMCapabilities dataclass instance
 - `test_capabilities_identity_fields` - server/version/model_family are non-empty strings
 - `test_capabilities_resource_limits` - max_context_length positive and reasonable (≤10M)
@@ -54,21 +56,23 @@ Validates basic completion contract:
 **Status:** ✅ Complete (1 test)
 
 Validates streaming contract:
-- `test_stream_has_single_final_chunk_and_progress_usage` - Final chunk semantics, monotonic usage
+- `test_stream_has_single_final_chunk_and_progress_usage` - Multiple chunks (≥2), exactly one final chunk (last), monotonic usage_so_far, non-empty aggregate text
 
 ### test_count_tokens_consistency.py
 **Specification:** §8.3 - Token Counting  
-**Status:** ✅ Complete (1 test)
+**Status:** ✅ Complete (3 tests)
 
 Validates token counting behavior:
-- `test_count_tokens_monotonic` - Non-negative integers, monotonic property
+- `test_count_tokens_monotonic` - Non-negative integers, monotonic property (longer text ≥ shorter text)
+- `test_count_tokens_empty_string` - Empty string returns 0 or minimal overhead
+- `test_count_tokens_unicode_handling` - Unicode characters handled gracefully
 
 ### test_message_validation.py
 **Specification:** §8.3 - Message Format  
 **Status:** ✅ Complete (3 tests) ⭐ Exemplary
 
 Comprehensive message schema validation with parametrized tests:
-- `test_invalid_messages_rejected` - Unknown roles, empty arrays, missing fields (parametrized)
+- `test_invalid_messages_rejected` - Unknown roles, empty arrays, missing fields (parametrized: 4 cases)
 - `test_accepts_standard_roles` - system/user/assistant roles accepted
 - `test_handles_large_message_content` - Large-but-reasonable content (10KB)
 
@@ -77,44 +81,47 @@ Comprehensive message schema validation with parametrized tests:
 **Status:** ✅ Complete (9 tests)
 
 Validates all sampling parameter ranges:
-- `test_invalid_temperature_rejected` - Rejects temperature outside [0.0, 2.0] (parametrized)
-- `test_valid_temperature_accepted` - Accepts temperature in [0.0, 2.0] (parametrized)
-- `test_invalid_top_p_rejected` - Rejects top_p outside (0.0, 1.0] (parametrized)
-- `test_valid_top_p_accepted` - Accepts top_p in (0.0, 1.0] (parametrized)
-- `test_invalid_frequency_penalty_rejected` - Rejects frequency_penalty outside [-2.0, 2.0] (parametrized)
-- `test_valid_frequency_penalty_accepted` - Accepts frequency_penalty in [-2.0, 2.0] (parametrized)
-- `test_invalid_presence_penalty_rejected` - Rejects presence_penalty outside [-2.0, 2.0] (parametrized)
-- `test_valid_presence_penalty_accepted` - Accepts presence_penalty in [-2.0, 2.0] (parametrized)
+- `test_invalid_temperature_rejected` - Rejects temperature outside [0.0, 2.0] (parametrized: 4 invalid values)
+- `test_valid_temperature_accepted` - Accepts temperature in [0.0, 2.0] (parametrized: 5 valid values)
+- `test_invalid_top_p_rejected` - Rejects top_p outside (0.0, 1.0] (parametrized: 5 invalid values)
+- `test_valid_top_p_accepted` - Accepts top_p in (0.0, 1.0] (parametrized: 4 valid values)
+- `test_invalid_frequency_penalty_rejected` - Rejects frequency_penalty outside [-2.0, 2.0] (parametrized: 4 invalid values)
+- `test_valid_frequency_penalty_accepted` - Accepts frequency_penalty in [-2.0, 2.0] (parametrized: 5 valid values)
+- `test_invalid_presence_penalty_rejected` - Rejects presence_penalty outside [-2.0, 2.0] (parametrized: 4 invalid values)
+- `test_valid_presence_penalty_accepted` - Accepts presence_penalty in [-2.0, 2.0] (parametrized: 5 valid values)
 - `test_multiple_invalid_params_error_message` - Error messages are informative
 
 ### test_error_mapping_retryable.py
 **Specification:** §8.5, §12.1, §12.4 - Error Handling  
-**Status:** ✅ Complete (1 test)
+**Status:** ✅ Complete (2 tests)
 
 Validates error classification:
 - `test_retryable_errors_with_hints` - Retryable errors include valid retry_after_ms
+- `test_retryable_errors_have_correct_attributes` - Error taxonomy attributes (code, retryable)
 
 ### test_deadline_enforcement.py
 **Specification:** §8.3, §12.4 - Deadline Semantics  
-**Status:** ✅ Complete (2 tests)
+**Status:** ✅ Complete (3 tests)
 
 Validates deadline behavior:
 - `test_deadline_budget_nonnegative_and_usable` - Budget computation never negative
 - `test_deadline_exceeded_on_expired_budget` - DeadlineExceeded raised on timeout
+- `test_deadline_exceeded_during_stream` - Streaming respects deadlines
 
 ### test_health_report.py
 **Specification:** §8.3 - Health Endpoint  
-**Status:** ✅ Complete (1 test)
+**Status:** ✅ Complete (2 tests)
 
 Validates health endpoint contract:
 - `test_health_has_required_fields` - Returns dict with ok/server/version
+- `test_health_shape_consistent_when_degraded` - Shape consistent regardless of health status
 
 ### test_context_siem.py
 **Specification:** §13.2, §15 - Observability & Privacy  
 **Status:** ✅ Complete (4 tests) ⭐ Critical
 
 Validates SIEM-safe observability:
-- `test_context_propagates_to_metrics_siem_safe` - Tenant hashed, no PII in metrics
+- `test_context_propagates_to_metrics_siem_safe` - Tenant hashed, no PII in metrics, operation metadata emitted
 - `test_metrics_emitted_on_error_path` - Error metrics maintain privacy
 - `test_streaming_metrics_siem_safe` - Streaming maintains SIEM-safe metrics
 - `test_token_counter_metrics_present` - Token usage counters emitted
@@ -142,16 +149,20 @@ Validates SIEM-safe observability:
 | Requirement | Test File | Status |
 |------------|-----------|--------|
 | Yields LLMChunk instances | test_streaming_semantics.py | ✅ |
+| Multiple chunks (≥2) | test_streaming_semantics.py | ✅ |
 | Exactly one final chunk | test_streaming_semantics.py | ✅ |
 | Final chunk is last | test_streaming_semantics.py | ✅ |
 | usage_so_far monotonic | test_streaming_semantics.py | ✅ |
 | Non-empty aggregate text | test_streaming_semantics.py | ✅ |
+| Deadline enforcement | test_deadline_enforcement.py | ✅ |
 
 #### count_tokens()
 | Requirement | Test File | Status |
 |------------|-----------|--------|
 | Returns non-negative int | test_count_tokens_consistency.py | ✅ |
 | Monotonic property | test_count_tokens_consistency.py | ✅ |
+| Empty string handling | test_count_tokens_consistency.py | ✅ |
+| Unicode handling | test_count_tokens_consistency.py | ✅ |
 
 #### health()
 | Requirement | Test File | Status |
@@ -160,6 +171,7 @@ Validates SIEM-safe observability:
 | Contains ok (bool) | test_health_report.py | ✅ |
 | Contains server (str) | test_health_report.py | ✅ |
 | Contains version (str) | test_health_report.py | ✅ |
+| Shape consistent on degraded | test_health_report.py | ✅ |
 
 ### §8.4 Capabilities - Complete Coverage
 
@@ -170,9 +182,10 @@ Validates SIEM-safe observability:
 | Resource limits positive | test_capabilities_shape.py | ✅ |
 | All feature flags boolean | test_capabilities_shape.py | ✅ |
 | supported_models structure | test_capabilities_shape.py | ✅ |
-| Consistency with operations | test_capabilities_shape.py | ✅ |
-| Idempotent calls | test_capabilities_shape.py | ✅ |
+| Consistency with count_tokens | test_capabilities_shape.py | ✅ |
+| Consistency with streaming | test_capabilities_shape.py | ✅ |
 | All fields present | test_capabilities_shape.py | ✅ |
+| Idempotent calls | test_capabilities_shape.py | ✅ |
 
 ### §8.5 Error Handling - Complete Coverage
 
@@ -183,6 +196,7 @@ Validates SIEM-safe observability:
 | Unavailable | test_error_mapping_retryable.py | ✅ |
 | DeadlineExceeded | test_deadline_enforcement.py | ✅ |
 | retry_after_ms hint | test_error_mapping_retryable.py | ✅ |
+| Error attributes | test_error_mapping_retryable.py | ✅ |
 
 ### §13.2 Observability - Complete Coverage
 
@@ -213,7 +227,7 @@ pytest tests/llm/ -v
 # Core operations
 pytest tests/llm/test_complete_basic.py \
        tests/llm/test_streaming_semantics.py \
-       tests/llm//test_count_tokens_consistency.py \
+       tests/llm/test_count_tokens_consistency.py \
        tests/llm/test_health_report.py -v
 
 # Validation
@@ -238,19 +252,19 @@ pytest tests/llm/ --cov=corpus_sdk.llm --cov-report=html
 
 Use this checklist when implementing or validating a new LLM adapter:
 
-### ✅ Phase 1: Core Operations (6/6)
+### ✅ Phase 1: Core Operations (4/4)
 - [x] capabilities() returns valid LLMCapabilities
 - [x] complete() returns LLMCompletion with usage
 - [x] stream() emits chunks with final marker
 - [x] count_tokens() returns non-negative int
 - [x] health() returns {ok, server, version}
-- [x] Deadline enforcement works correctly
 
-### ✅ Phase 2: Message Validation (4/4)
+### ✅ Phase 2: Message Validation (3/3)
 - [x] Rejects empty messages
 - [x] Rejects unknown roles
 - [x] Rejects missing role/content fields
 - [x] Accepts system/user/assistant roles
+- [x] Handles large message content
 
 ### ✅ Phase 3: Parameter Validation (4/4)
 - [x] Temperature range [0.0, 2.0]
@@ -258,11 +272,31 @@ Use this checklist when implementing or validating a new LLM adapter:
 - [x] frequency_penalty range [-2.0, 2.0]
 - [x] presence_penalty range [-2.0, 2.0]
 
-### ✅ Phase 4: Error Handling (2/2)
+### ✅ Phase 4: Streaming Semantics (6/6)
+- [x] Yields LLMChunk instances
+- [x] Multiple chunks (≥2)
+- [x] Exactly one final chunk
+- [x] Final chunk is last
+- [x] usage_so_far monotonic
+- [x] Non-empty aggregate text
+
+### ✅ Phase 5: Token Counting (3/3)
+- [x] Returns non-negative integers
+- [x] Monotonic property (longer ≥ shorter)
+- [x] Empty string handling
+- [x] Unicode handling
+
+### ✅ Phase 6: Error Handling (2/2)
 - [x] Maps errors to taxonomy correctly
 - [x] Includes retry_after_ms on retryable errors
+- [x] Error attributes present (code, retryable)
 
-### ✅ Phase 5: Observability (4/4)
+### ✅ Phase 7: Deadline Enforcement (3/3)
+- [x] Budget computation never negative
+- [x] DeadlineExceeded on expired budget
+- [x] Streaming respects deadlines
+
+### ✅ Phase 8: Observability (4/4)
 - [x] Never logs raw tenant IDs
 - [x] Hashes tenant in metrics
 - [x] No prompt content in metrics
@@ -272,17 +306,18 @@ Use this checklist when implementing or validating a new LLM adapter:
 
 ```
 ✅ LLM Protocol V1.0 - 100% Conformant
-   37/37 tests passing
+   43/43 tests passing
    
-   ✅ Core Operations: 6/6 (100%)
-   ✅ Message Validation: 4/4 (100%)
+   ✅ Core Operations: 4/4 (100%)
+   ✅ Message Validation: 3/3 (100%)
    ✅ Sampling Parameters: 9/9 (100%)
+   ✅ Streaming Semantics: 1/1 (100%)
    ✅ Error Handling: 2/2 (100%)
-   ✅ Capabilities: 9/9 (100%)
+   ✅ Capabilities: 10/10 (100%)
    ✅ Observability: 4/4 (100%)
-   ✅ Deadline: 2/2 (100%)
-   ✅ Token Counting: 1/1 (100%)
-   ✅ Health: 1/1 (100%)
+   ✅ Deadline: 3/3 (100%)
+   ✅ Token Counting: 3/3 (100%)
+   ✅ Health: 2/2 (100%)
    
    Status: Production Ready
 ```
