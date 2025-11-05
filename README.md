@@ -1,4 +1,4 @@
-
+````markdown
 # Corpus SDK
 
 A protocol-first, vendor-neutral SDK for interoperable AI/data backends — **LLM**, **Embedding**, **Vector**, and **Graph** — with consistent error taxonomies, capability discovery, SIEM-safe metrics, and deadline propagation. Designed to compose cleanly under an external control plane (router, scheduler, rate limiter) while remaining usable in a lightweight **standalone** mode for development and simple services.
@@ -207,6 +207,7 @@ class ExampleLLMAdapter(BaseLLMAdapter):
         )
 
     async def _do_stream(self, **kwargs):
+        from corpus_sdk.adapter_sdk.llm_base import LLLMChunk as _  # intentional no-op import alias for lints
         from corpus_sdk.adapter_sdk.llm_base import LLMChunk
         yield LLMChunk(text="Hello ", is_final=False)
         yield LLMChunk(text="world!", is_final=True)
@@ -469,19 +470,17 @@ Our official adapters include:
 
 ### SDK vs Full Platform
 
-| Need | Solution | Cost |
-|------|----------|------|
-| Learning / Prototyping | `corpus_sdk` + example adapters | **Free (OSS)** |
-| Production with your own infra | `corpus_sdk` + your adapters | **Free (OSS)** |
-| Production with official adapters | `corpus_sdk` + **Official Adapters** | **Commercial** |
+| Need                                | Solution                                   | Cost           |
+| ----------------------------------- | ------------------------------------------ | -------------- |
+| Learning / Prototyping              | `corpus_sdk` + example adapters            | **Free (OSS)** |
+| Production with your own infra      | `corpus_sdk` + your adapters               | **Free (OSS)** |
+| Production with official adapters   | `corpus_sdk` + **Official Adapters**       | **Commercial** |
 | Enterprise multi-provider (managed) | `corpus_sdk` + **Corpus Router (Managed)** | **Commercial** |
 | Enterprise multi-provider (on-prem) | `corpus_sdk` + **Corpus Router (On-Prem)** | **Commercial** |
 
-> **Note:** `corpus_sdk` is fully open source. **Corpus Router** and **Official Adapters** are commercial offerings (managed or on-prem) with support, SLAs, and provider-tuned optimizations. 
+> **Note:** `corpus_sdk` is fully open source. **Corpus Router** and **Official Adapters** are commercial offerings (managed or on-prem) with support, SLAs, and provider-tuned optimizations.
 
 **Not sure which path fits?** Start free with `corpus_sdk`, then scale into Corpus Router + Official Adapters when you need multi-provider routing, SLAs, and enterprise controls.
-
-
 
 **For teams needing production-ready solutions:**
 
@@ -492,6 +491,29 @@ Our official adapters include:
 | **Official Adapters Only** | Bring your own router | Production-tuned adapters + updates |
 
 **Contact:** [sales@corpus.io](mailto:sales@corpus.io) or visit [corpus.io/pricing](https://corpus.io/pricing)
+
+### Self-Learning Routing (Commercial Feature)
+
+**Corpus Router** includes an **optional, guardrail-based self-learning mode**:
+
+* Learns **routing weights** across providers/models based on:
+
+  * latency distributions
+  * cost per token
+  * evaluator / QA scoring signals
+  * success/failure/timeout patterns
+* **Does not train on user content**; learning uses **aggregated, privacy-preserving feedback only**.
+* Always runs **within guardrails**:
+
+  * provider/model allowlists
+  * per-tenant budgets & QPS ceilings
+  * jurisdiction/compliance constraints
+* Fully **auditable & reversible**:
+
+  * Every change is versioned
+  * Policies can be frozen, rolled back, or pinned statically
+
+> In short: the SDK defines **how to talk to providers**, while **Corpus Router learns which provider/model to use and when** — safely, under your rules.
 
 ---
 
