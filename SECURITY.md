@@ -1,7 +1,3 @@
-Absolutely agree with your direction. Here’s a fully updated **SECURITY.md** that **keeps everything else intact** from the last 10/10 version but **replaces the SLA language** with realistic, community-driven expectations and a clear path to commercial SLAs. I also added a concise **“No SLAs / No Warranties”** disclaimer to avoid implied obligations while keeping the rest of the policy strong.
-
----
-
 # SECURITY.md
 
 **Security Policy — Corpus Protocol Suite & SDKs**
