@@ -1,8 +1,14 @@
+Absolutely agree with your direction. Here’s a fully updated **SECURITY.md** that **keeps everything else intact** from the last 10/10 version but **replaces the SLA language** with realistic, community-driven expectations and a clear path to commercial SLAs. I also added a concise **“No SLAs / No Warranties”** disclaimer to avoid implied obligations while keeping the rest of the policy strong.
+
+---
+
 # SECURITY.md
 
 **Security Policy — Corpus Protocol Suite & SDKs**
 
 > This document defines how to report vulnerabilities, how we triage and remediate them, and how we coordinate disclosure across the **Corpus Protocol Suite** (Graph, LLM, Vector, Embedding) and the **Corpus SDK** implementations. It complements our privacy/observability rules in the spec (see §13 and §15) and versioning policy in `VERSIONING.md`.
+
+> **Important:** This policy **does not** establish service-level agreements (SLAs). The project is community-driven and security handling is **best-effort** unless you have a commercial support contract.
 
 ---
 
@@ -20,7 +26,7 @@
 
   **PGP fingerprint:** `XXXX XXXX XXXX XXXX XXXX  XXXX XXXX XXXX XXXX XXXX`
 
-We aim to acknowledge every report within **48 hours**.
+We aim to acknowledge every report within **7 business days**.
 
 ### Include in your report (helps us triage fast)
 
@@ -52,18 +58,32 @@ If unsure, send the report—we’ll redirect as needed.
 
 ---
 
-## 3) Triage & Response SLAs
+## 3) Response Process & Expectations (Community-Driven, No SLAs)
 
-We classify severity using **CVSS v3.1** and target these timelines:
+We are a community-driven open-source project. Security reports are handled on a **best-effort** basis by volunteer maintainers and contributors.
 
-| Severity                | Example Impact                          | First Response | Triage Complete | Fix or Mitigation |
-| ----------------------- | --------------------------------------- | -------------: | --------------: | ----------------: |
-| **Critical (9.0–10.0)** | RCE, auth bypass, secret exfiltration   |          ≤ 24h |           ≤ 72h |          ≤ 7 days |
-| **High (7.0–8.9)**      | Privilege escalation, SSRF with privesc |          ≤ 48h |        ≤ 5 days |         ≤ 14 days |
-| **Medium (4.0–6.9)**    | DoS requiring unusual preconditions     |       ≤ 5 days |       ≤ 10 days |         ≤ 30 days |
-| **Low (0.1–3.9)**       | Info leaks with limited risk            |      ≤ 10 days |       ≤ 20 days |       Best effort |
+**Our Commitment (non-binding goals):**
 
-We may update timelines case-by-case if exploitation in the wild is observed.
+* We **aim** to acknowledge your report within **7 business days**.
+* We **prioritize** issues by severity and user impact.
+* We **communicate transparently** about triage and next steps.
+* We **coordinate disclosure** with reporters and **credit** responsible disclosures.
+
+**Typical (non-binding) timelines, for context only:**
+
+* **Critical:** initial assessment within **1–2 weeks** (subject to availability)
+* **High:** triage and remediation planning within **2–4 weeks**
+* **Medium/Low:** addressed as capacity permits
+
+**What we cannot guarantee (unless under a commercial contract):**
+
+* Specific fix timelines or delivery dates
+* 24/7 emergency response
+* Immediate patches for all issues
+
+**Need guaranteed SLAs?** We offer **commercial support** with defined response times and coordination commitments via our enterprise offerings.
+
+> **Legal clarity:** This section sets **expectations**, not contractual obligations. There are **no implied warranties** or SLAs in the open-source project.
 
 ---
 
@@ -162,6 +182,8 @@ Mitigations will be listed in advisories when applicable.
 
 ## 11) Severity Guidance (Quick Reference)
 
+We use **CVSS v3.1** to guide severity. Examples:
+
 | Category     | Examples                                                                       |
 | ------------ | ------------------------------------------------------------------------------ |
 | **Critical** | RCE, auth bypass, arbitrary secret read, tenant escape                         |
@@ -236,8 +258,7 @@ References
 ## 16) Contact
 
 * Security team: **[security@adaptersdk.org](mailto:security@adaptersdk.org)**
-* Emergency (24/7 best effort): prefix subject with **[URGENT]**
+* Emergency (best effort): prefix subject with **[URGENT]**
 * PGP fingerprint: `XXXX XXXX XXXX XXXX XXXX  XXXX XXXX XXXX XXXX XXXX`
 
-Thank you for helping keep the Corpus ecosystem secure.
-
+**Thank you** for helping keep the Corpus ecosystem secure.
