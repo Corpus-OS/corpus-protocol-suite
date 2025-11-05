@@ -2,12 +2,12 @@
 """
 Graph Conformance — Capabilities shape and invariants.
 
-Asserts:
-  • Returns GraphCapabilities instance with identity fields
-  • Dialects is a non-empty tuple[str, ...]
-  • Feature flags are booleans and sane
-  • Batch/Rate-limit fields valid
-  • Repeated calls are idempotent (consistent)
+Asserts (Spec refs):
+  • Returns GraphCapabilities instance with identity fields  (§7.2, §6.2)
+  • Dialects is a non-empty tuple[str, ...]                 (§7.2, §7.4)
+  • Feature flags are booleans and sane                     (§7.2)
+  • Batch/Rate-limit fields valid                           (§7.2, §6.2)
+  • Repeated calls are idempotent (consistent)              (§6.2)
 """
 import pytest
 
@@ -18,9 +18,6 @@ pytestmark = pytest.mark.asyncio
 
 
 async def test_capabilities_returns_correct_type():
-    """
-    SPECIFICATION.md §5.1 — Capabilities discovery
-    """
     caps = await MockGraphAdapter().capabilities()
     assert isinstance(caps, GraphCapabilities)
 
