@@ -17,12 +17,11 @@ from corpus_sdk.graph.graph_base import (
     GraphCapabilities,
     OperationContext as GraphContext,
     GraphID,
-)
-from corpus_sdk.examples.common.errors import (
     BadRequest,
     NotSupported,
     Unavailable,
     ResourceExhausted,
+    HealthStatus,
 )
 from corpus_sdk.examples.common.ctx import make_ctx
 from corpus_sdk.examples.common.printing import box, print_kv, print_json
@@ -39,6 +38,7 @@ class MockGraphAdapter(BaseGraphAdapter):
     # Capabilities & health
     # -----------------------------
     async def _do_capabilities(self) -> GraphCapabilities:
+        # Only use fields defined in GraphCapabilities
         return GraphCapabilities(
             server="mock-graph",
             version="1.0.0",
@@ -46,15 +46,21 @@ class MockGraphAdapter(BaseGraphAdapter):
             supports_txn=True,
             supports_schema_ops=True,
             max_batch_ops=1_000,
-            max_query_length=100_000,
-            read_after_write_consistency="session",
+            retryable_codes=(),            # none for the mock
+            rate_limit_unit="requests_per_second",
+            max_qps=500,
+            idempotent_writes=False,
+            supports_multi_tenant=True,
+            supports_streaming=True,
+            supports_bulk_ops=True,
+            supports_deadline=True,
         )
 
     async def _do_health(self, *, ctx: Optional[GraphContext] = None) -> Dict[str, Any]:
-        # Occasionally report degraded
+        # Occasionally report degraded; use HealthStatus constants to align with base
         if random.random() < 0.20:
-            return {"ok": False, "status": "degraded", "server": "mock-graph", "version": "1.0.0"}
-        return {"ok": True, "status": "healthy", "server": "mock-graph", "version": "1.0.0"}
+            return {"status": HealthStatus.DEGRADED, "server": "mock-graph", "version": "1.0.0"}
+        return {"status": HealthStatus.OK, "server": "mock-graph", "version": "1.0.0"}
 
     # -----------------------------
     # CRUD
@@ -70,9 +76,7 @@ class MockGraphAdapter(BaseGraphAdapter):
         await asyncio.sleep(0.01)
         return GraphID(f"v:{label}:{abs(hash(tuple(sorted(props.items())))) % 10_000}")
 
-    async def _do_delete_vertex(
-        self, vertex_id: GraphID, *, ctx: Optional[GraphContext] = None
-    ) -> None:
+    async def _do_delete_vertex(self, vertex_id: str, *, ctx: Optional[GraphContext] = None) -> None:
         self._maybe_fail("delete_vertex")
         if not vertex_id:
             raise BadRequest("vertex_id must be provided")
@@ -82,8 +86,8 @@ class MockGraphAdapter(BaseGraphAdapter):
     async def _do_create_edge(
         self,
         label: str,
-        from_id: GraphID,
-        to_id: GraphID,
+        from_id: str,
+        to_id: str,
         props: Mapping[str, Any],
         *,
         ctx: Optional[GraphContext] = None,
@@ -91,12 +95,12 @@ class MockGraphAdapter(BaseGraphAdapter):
         self._maybe_fail("create_edge")
         if not all([label, from_id, to_id]):
             raise BadRequest("edge requires label, from_id, to_id")
+        if not isinstance(props, Mapping):
+            raise BadRequest("props must be a mapping")
         await asyncio.sleep(0.01)
         return GraphID(f"e:{label}:{abs(hash((from_id, to_id))) % 10_000}")
 
-    async def _do_delete_edge(
-        self, edge_id: GraphID, *, ctx: Optional[GraphContext] = None
-    ) -> None:
+    async def _do_delete_edge(self, edge_id: str, *, ctx: Optional[GraphContext] = None) -> None:
         self._maybe_fail("delete_edge")
         if not edge_id:
             raise BadRequest("edge_id must be provided")
@@ -111,7 +115,7 @@ class MockGraphAdapter(BaseGraphAdapter):
         *,
         dialect: str,
         text: str,
-        params: Optional[Mapping[str, Any]] = None,
+        params: Mapping[str, Any],
         ctx: Optional[GraphContext] = None,
     ) -> List[Mapping[str, Any]]:
         self._maybe_fail("query")
@@ -128,7 +132,7 @@ class MockGraphAdapter(BaseGraphAdapter):
         *,
         dialect: str,
         text: str,
-        params: Optional[Mapping[str, Any]] = None,
+        params: Mapping[str, Any],
         ctx: Optional[GraphContext] = None,
     ) -> AsyncIterator[Mapping[str, Any]]:
         self._maybe_fail("stream_query")
@@ -147,7 +151,7 @@ class MockGraphAdapter(BaseGraphAdapter):
     # -----------------------------
     async def _do_bulk_vertices(
         self,
-        vertices: Iterable[Tuple[str, Mapping[str, Any]]],
+        vertices: List[Tuple[str, Mapping[str, Any]]],
         *,
         ctx: Optional[GraphContext] = None,
     ) -> List[GraphID]:
@@ -166,7 +170,7 @@ class MockGraphAdapter(BaseGraphAdapter):
 
     async def _do_batch(
         self,
-        ops: Iterable[Mapping[str, Any]],
+        ops: List[Mapping[str, Any]],
         *,
         ctx: Optional[GraphContext] = None,
     ) -> List[Mapping[str, Any]]:
@@ -179,7 +183,11 @@ class MockGraphAdapter(BaseGraphAdapter):
                 results.append({"ok": True, "type": kind, "id": str(vid)})
             elif kind == "create_edge":
                 eid = await self._do_create_edge(
-                    op.get("label", ""), op.get("from_id", ""), op.get("to_id", ""), op.get("props", {}), ctx=ctx
+                    op.get("label", ""),
+                    str(op.get("from_id", "")),
+                    str(op.get("to_id", "")),
+                    op.get("props", {}),
+                    ctx=ctx,
                 )
                 results.append({"ok": True, "type": kind, "id": str(eid)})
             else:
@@ -189,7 +197,7 @@ class MockGraphAdapter(BaseGraphAdapter):
     # -----------------------------
     # Schema (optional in V1)
     # -----------------------------
-    async def _do_get_schema(self, *, ctx: Optional[GraphContext] = None) -> Mapping[str, Any]:
+    async def _do_get_schema(self, *, ctx: Optional[GraphContext] = None) -> Dict[str, Any]:
         self._maybe_fail("get_schema")
         await asyncio.sleep(0.005)
         return {"nodes": ["User", "Doc"], "edges": ["READ", "LINKS"]}
@@ -198,6 +206,7 @@ class MockGraphAdapter(BaseGraphAdapter):
     # Internals
     # -----------------------------
     def _guard_dialect(self, dialect: str) -> None:
+        # Base validates known dialects; this additionally checks our declared support set.
         if dialect not in self.supported_dialects:
             raise NotSupported(f"dialect '{dialect}' not supported; supported={self.supported_dialects}")
 
@@ -237,10 +246,10 @@ if __name__ == "__main__":
         print("\n=== CRUD ===")
         v1 = await adapter.create_vertex("User", {"name": "Ada"}, ctx=ctx)
         v2 = await adapter.create_vertex("User", {"name": "Grace"}, ctx=ctx)
-        e = await adapter.create_edge("FOLLOWS", v1, v2, {"since": 2021}, ctx=ctx)
+        e = await adapter.create_edge("FOLLOWS", str(v1), str(v2), {"since": 2021}, ctx=ctx)
         print_kv({"v1": v1, "v2": v2, "edge": e})
-        await adapter.delete_edge(e, ctx=ctx)
-        await adapter.delete_vertex(v2, ctx=ctx)
+        await adapter.delete_edge(str(e), ctx=ctx)
+        await adapter.delete_vertex(str(v2), ctx=ctx)
 
         # --- Query ---
         print("\n=== QUERY (cypher) ===")
@@ -267,7 +276,13 @@ if __name__ == "__main__":
         results = await adapter.batch(
             [
                 {"type": "create_vertex", "label": "Doc", "props": {"id": "d1"}},
-                {"type": "create_edge", "label": "READ", "from_id": v1, "to_id": GraphID("v:Doc:d1"), "props": {}},
+                {
+                    "type": "create_edge",
+                    "label": "READ",
+                    "from_id": str(v1),
+                    "to_id": "v:Doc:d1",
+                    "props": {},
+                },
                 {"type": "unknown_op"},
             ],
             ctx=ctx,
