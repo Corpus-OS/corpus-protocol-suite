@@ -2,6 +2,7 @@
 
 > Version: **1.0** (Apache-2.0 compliant)
 > Applies to: **Code**, **Specifications (RFC-style docs)**, and **Conformance Tests**
+
 > Scope: **Corpus Protocol Suite** — Graph, LLM, Vector, Embedding adapters and shared infrastructure
 
 ---
