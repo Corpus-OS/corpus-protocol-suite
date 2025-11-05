@@ -1,17 +1,38 @@
+# SPDX-License-Identifier: Apache-2.0
+"""
+Basic completion example using the MockLLMAdapter.
+
+Demonstrates a simple complete() call with a context and prints
+the result and token usage.
+"""
+
 import asyncio
 from corpus_sdk.examples.llm.mock_llm_adapter import MockLLMAdapter
 from corpus_sdk.examples.common.ctx import make_ctx
+from corpus_sdk.llm.llm_base import OperationContext
+from corpus_sdk.examples.common.printing import print_kv, box
+
 
 async def main() -> None:
     adapter = MockLLMAdapter()
-    ctx = make_ctx("basic-complete")
+    ctx = make_ctx(OperationContext, request_id="basic-complete")
+
     result = await adapter.complete(
         messages=[{"role": "user", "content": "Summarize Corpus SDK"}],
-        model="mock-llm-1",
+        model="mock-model",
         ctx=ctx,
     )
-    print(f"Response: {result.text}")
-    print(f"Usage: {result.usage.total_tokens} tokens")
+
+    box("Basic Completion Example")
+    print_kv({
+        "Response": result.text,
+        "Tokens": result.usage.total_tokens,
+        "Model": result.model,
+    })
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
