@@ -42,6 +42,7 @@ import asyncio
 import time
 import hashlib
 import math
+import logging
 from dataclasses import dataclass
 from typing import (
     Any, Dict, List, Mapping, Optional, Protocol, Tuple, Iterable,
@@ -49,6 +50,7 @@ from typing import (
 )
 
 EMBEDDING_PROTOCOL_VERSION = "1.0.0"
+LOG = logging.getLogger(__name__)
 
 # =============================================================================
 # Core Type Definitions
@@ -322,6 +324,20 @@ class NoopDeadline:
     async def wrap(self, coro, ctx: Optional[OperationContext]):
         return await coro
 
+class EnforcingDeadline:
+    """
+    Deadline policy that enforces ctx.deadline_ms using asyncio.wait_for.
+    If deadline is already expired, fail fast with DeadlineExceeded.
+    """
+    async def wrap(self, coro, ctx: Optional[OperationContext]):
+        if ctx and ctx.deadline_ms is not None:
+            now_ms = int(time.time() * 1000)
+            remaining_ms = ctx.deadline_ms - now_ms
+            if remaining_ms <= 0:
+                raise DeadlineExceeded("deadline already exceeded", code="DEADLINE")
+            return await asyncio.wait_for(coro, timeout=max(0.001, remaining_ms / 1000.0))
+        return await coro
+
 class SimpleCharTruncation:
     def apply(self, text: str, max_len: Optional[int], allow: bool) -> Tuple[str, bool]:
         if not max_len or len(text) <= max_len:
@@ -340,13 +356,93 @@ class NoopBreaker:
     def on_success(self) -> None: ...
     def on_error(self, err: Exception) -> None: ...
 
+class SimpleCircuitBreaker:
+    """
+    Extremely small circuit breaker:
+    - opens after `failure_threshold` consecutive errors
+    - half-opens after `cooldown_s`
+    - closes on the first success while half-open
+    """
+    def __init__(self, failure_threshold: int = 5, cooldown_s: float = 5.0) -> None:
+        self._failures = 0
+        self._open_until: float = 0.0
+        self._failure_threshold = max(1, failure_threshold)
+        self._cooldown_s = max(0.1, cooldown_s)
+
+    def allow(self) -> bool:
+        return time.monotonic() >= self._open_until
+
+    def on_success(self) -> None:
+        self._failures = 0
+        self._open_until = 0.0
+
+    def on_error(self, err: Exception) -> None:
+        self._failures += 1
+        if self._failures >= self._failure_threshold:
+            self._open_until = time.monotonic() + self._cooldown_s
+            self._failures = 0  # reset for half-open window
+
 class NoopCache:
     async def get(self, key: str) -> Optional[Any]: return None
     async def set(self, key: str, value: Any, ttl_s: int) -> None: ...
 
+class InMemoryTTLCache:
+    """
+    Tiny in-memory cache with TTL. Suitable for demos/tests only.
+    Not process-safe or distributed.
+    """
+    def __init__(self) -> None:
+        self._store: Dict[str, Tuple[float, Any]] = {}
+
+    async def get(self, key: str) -> Optional[Any]:
+        now = time.monotonic()
+        exp_val = self._store.get(key)
+        if not exp_val:
+            return None
+        exp, val = exp_val
+        if exp < now:
+            self._store.pop(key, None)
+            return None
+        return val
+
+    async def set(self, key: str, value: Any, ttl_s: int) -> None:
+        self._store[key] = (time.monotonic() + max(0, ttl_s), value)
+
 class NoopLimiter:
     async def acquire(self) -> None: ...
     def release(self) -> None: ...
+
+class TokenBucketLimiter:
+    """
+    Very simple token bucket limiter.
+    Args:
+        rate: tokens per second
+        burst: max bucket size
+    """
+    def __init__(self, rate: float = 50.0, burst: int = 50) -> None:
+        self._rate = max(0.1, rate)
+        self._burst = max(1, burst)
+        self._tokens = float(self._burst)
+        self._last = time.monotonic()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        async with self._lock:
+            now = time.monotonic()
+            self._tokens = min(self._burst, self._tokens + (now - self._last) * self._rate)
+            self._last = now
+            if self._tokens < 1.0:
+                # Wait for enough tokens to accumulate
+                need = 1.0 - self._tokens
+                await asyncio.sleep(need / self._rate)
+                now2 = time.monotonic()
+                self._tokens = min(self._burst, self._tokens + (now2 - self._last) * self._rate)
+                self._last = now2
+            self._tokens -= 1.0
+
+    def release(self) -> None:
+        # No-op for token bucket
+        return
 
 # =============================================================================
 # Capabilities (dynamic discovery for routing and planning)
@@ -612,6 +708,15 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
     SIEM-safe observability. Implementers should override the `_do_*` methods
     to provide backend-specific functionality while getting production-ready
     infrastructure for free.
+
+    Mode Strategy
+    -------------
+    mode: "thin" (default) - For composition with external providers. All policies
+          are no-op. Use this when you have your own scheduling/caching/rate limiting.
+          
+          mode: "standalone" - For direct use. Enables basic deadline enforcement,
+          circuit breaking, and in-memory caching. Suitable for development and
+          light production use.
     
     Example:
         class OpenAIEmbeddingAdapter(BaseEmbeddingAdapter):
@@ -638,6 +743,8 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
     def __init__(
         self,
         *,
+        # Composition guard to reduce misconfiguration
+        mode: str = "thin",  # "thin" (default) | "standalone"
         metrics: Optional[MetricsSink] = None,
         deadline_policy: Optional[DeadlinePolicy] = None,
         truncation: Optional[TruncationPolicy] = None,
@@ -645,29 +752,54 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         breaker: Optional[CircuitBreaker] = None,
         cache: Optional[Cache] = None,
         limiter: Optional[RateLimiter] = None,
-        tag_model_in_metrics: bool = True,
+        tag_model_in_metrics: Optional[bool] = None,
     ) -> None:
         """
         Initialize the embedding adapter with metrics instrumentation and optional policies.
         
         Args:
+            mode: "thin" (no-op infra; meant to be wrapped by a provider) or
+                  "standalone" (turn on basic demo policies).
             metrics: Metrics sink for operational monitoring. Uses NoopMetrics if None.
             deadline_policy: Optional deadline policy to enforce ctx.deadline_ms.
-            truncation: Optional truncation policy; defaults to simple char-based.
-            normalization: Optional normalization policy; defaults to L2.
-            breaker: Optional circuit breaker; defaults to no-op.
-            cache: Optional async cache; defaults to no-op.
-            limiter: Optional rate limiter; defaults to no-op.
+            truncation: Optional truncation policy; defaults vary by mode.
+            normalization: Optional normalization policy; defaults vary by mode.
+            breaker: Optional circuit breaker; defaults vary by mode.
+            cache: Optional async cache; defaults vary by mode.
+            limiter: Optional rate limiter; defaults vary by mode.
             tag_model_in_metrics: Whether to include 'model' as a metric tag.
+                                  Defaults to False in "thin", True in "standalone".
         """
+        mode = (mode or "thin").strip().lower()
+        if mode not in {"thin", "standalone"}:
+            mode = "thin"
+
+        # Warn if standalone without metrics sink
+        if mode == "standalone" and metrics is None:
+            LOG.warning("Using standalone mode without metrics - consider providing a metrics sink for production use")
+
+        # Metrics
         self._metrics: MetricsSink = metrics or NoopMetrics()
-        self._deadline: DeadlinePolicy = deadline_policy or NoopDeadline()
-        self._trunc: TruncationPolicy = truncation or SimpleCharTruncation()
-        self._norm: NormalizationPolicy = normalization or L2Normalization()
-        self._breaker: CircuitBreaker = breaker or NoopBreaker()
-        self._cache: Cache = cache or NoopCache()
-        self._limiter: RateLimiter = limiter or NoopLimiter()
-        self._tag_model_in_metrics: bool = tag_model_in_metrics
+
+        # Defaults depend on mode *unless* explicitly provided
+        if mode == "thin":
+            self._deadline: DeadlinePolicy = deadline_policy or NoopDeadline()
+            self._trunc: TruncationPolicy = truncation or SimpleCharTruncation()
+            self._norm: NormalizationPolicy = normalization or L2Normalization()
+            self._breaker: CircuitBreaker = breaker or NoopBreaker()
+            self._cache: Cache = cache or NoopCache()
+            self._limiter: RateLimiter = limiter or NoopLimiter()
+            self._tag_model_in_metrics: bool = bool(tag_model_in_metrics) if tag_model_in_metrics is not None else False
+        else:  # "standalone"
+            self._deadline: DeadlinePolicy = deadline_policy or EnforcingDeadline()
+            self._trunc: TruncationPolicy = truncation or SimpleCharTruncation()
+            self._norm: NormalizationPolicy = normalization or L2Normalization()
+            self._breaker: CircuitBreaker = breaker or SimpleCircuitBreaker()
+            self._cache: Cache = cache or InMemoryTTLCache()
+            self._limiter: RateLimiter = limiter or TokenBucketLimiter()
+            self._tag_model_in_metrics: bool = bool(tag_model_in_metrics) if tag_model_in_metrics is not None else True
+
+        self._mode = mode  # expose for debugging/inspection
 
     # --- internal helpers (validation and instrumentation) ---
 
@@ -816,7 +948,8 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
             eff_spec = EmbedSpec(text=text, model=spec.model, truncate=spec.truncate, normalize=spec.normalize)
 
             # Optional cache lookup
-            cache_key = f"embed:{eff_spec.model}:{hashlib.sha256(eff_spec.text.encode()).hexdigest()}"
+            # Include normalization in cache key to avoid wrong hits
+            cache_key = f"embed:{eff_spec.model}:{eff_spec.normalize}:{hashlib.sha256(eff_spec.text.encode()).hexdigest()}"
             cached: Optional[EmbedResult] = await self._cache.get(cache_key)
             if cached:
                 self._metrics.counter(component=self._component, name="cache_hits", value=1)
@@ -1067,11 +1200,15 @@ __all__ = [
     "Cache",
     "RateLimiter",
     "NoopDeadline",
+    "EnforcingDeadline",
     "SimpleCharTruncation",
     "L2Normalization",
     "NoopBreaker",
+    "SimpleCircuitBreaker",
     "NoopCache",
+    "InMemoryTTLCache",
     "NoopLimiter",
+    "TokenBucketLimiter",
     "MetricsSink",
     "NoopMetrics",
 ]
