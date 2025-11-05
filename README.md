@@ -1,6 +1,10 @@
+````markdown
 # Corpus SDK
 
 A protocol-first, vendor-neutral SDK for interoperable AI/data backends — **LLM**, **Embedding**, **Vector**, and **Graph** — with consistent error taxonomies, capability discovery, SIEM-safe metrics, and deadline propagation. Designed to compose cleanly under an external control plane (router, scheduler, rate limiter) while remaining usable in a lightweight **standalone** mode for development and simple services.
+
+> **Note:** The SDK in this repository is **fully open source** (Apache-2.0).  
+> **Corpus Router** and **official production adapters** are **commercial** offerings available as managed cloud or on-prem deployments. The SDK works with any router/control plane; using Corpus Router is optional.
 
 ---
 
@@ -12,7 +16,6 @@ A protocol-first, vendor-neutral SDK for interoperable AI/data backends — **LL
 4. [Modes: `thin` vs `standalone`](#modes-thin-vs-standalone)
 5. [Core Concepts](#core-concepts)
 6. [Quickstart](#quickstart)
-
    * [Embeddings](#embeddings-quickstart)
    * [LLM](#llm-quickstart)
    * [Vector](#vector-quickstart)
@@ -24,16 +27,19 @@ A protocol-first, vendor-neutral SDK for interoperable AI/data backends — **LL
 11. [Rate Limiting & Circuit Breaking](#rate-limiting--circuit-breaking)
 12. [Capabilities](#capabilities)
 13. [Example Adapters](#example-adapters)
+   * [Adapter Ecosystem](#adapter-ecosystem)
+   * [Why Official Adapters Are Commercial](#why-official-adapters-are-commercial)
 14. [Security & Privacy](#security--privacy)
 15. [Performance Notes](#performance-notes)
 16. [Versioning & Compatibility](#versioning--compatibility)
 17. [Testing](#testing)
 18. [Troubleshooting](#troubleshooting)
 19. [FAQ](#faq)
-20. [Contributing](#contributing)
-21. [License](#license)
-22. [Roadmap](#roadmap)
-23. [Appendix](#appendix)
+20. [Commercial Options](#commercial-options)
+21. [Contributing](#contributing)
+22. [License](#license)
+23. [Roadmap](#roadmap)
+24. [Appendix](#appendix)
 
 ---
 
@@ -44,7 +50,7 @@ Modern AI platforms juggle multiple LLM, embedding, vector, and graph backends. 
 * **Stable, runtime-checkable protocols** across domains.
 * **Normalized errors** with retry hints and scopes.
 * **SIEM-safe metrics** (low-cardinality; tenant hashed).
-* **Deadline propagation** for cancelation & cost control.
+* **Deadline propagation** for cancellation & cost control.
 * **Two modes**: compose under your own router (**thin**) or use lightweight infra (**standalone**).
 
 ---
@@ -64,7 +70,7 @@ Modern AI platforms juggle multiple LLM, embedding, vector, and graph backends. 
 
 ```bash
 pip install corpus_sdk
-```
+````
 
 * Python ≥ 3.9 recommended.
 * No heavy runtime dependencies; bring your own metrics sink or use the provided `NoopMetrics`.
@@ -132,7 +138,6 @@ class ExampleEmbeddingAdapter(BaseEmbeddingAdapter):
         )
 
     async def _do_embed(self, spec: EmbedSpec, *, ctx: OperationContext | None):
-        # Fake embedding for demonstration
         vec = [0.1, 0.2, 0.3]
         return type("EmbedResult", (), {})(
             embedding=EmbeddingVector(vector=vec, text=spec.text, model=spec.model, dimensions=len(vec)),
@@ -202,7 +207,6 @@ class ExampleLLMAdapter(BaseLLMAdapter):
         )
 
     async def _do_stream(self, **kwargs):
-        # Yield two chunks for demonstration
         from corpus_sdk.adapter_sdk.llm_base import LLMChunk
         yield LLMChunk(text="Hello ", is_final=False)
         yield LLMChunk(text="world!", is_final=True)
@@ -373,6 +377,21 @@ Routers can preflight requests (e.g., token counts vs context size; batch sizing
 * Reference adapters show how to override `_do_*` methods to call a vendor API, translate errors into normalized exceptions, and report minimal usage data.
 * You can keep your **production adapters closed-source** while exposing a public example for the community.
 
+### Adapter Ecosystem
+
+* The repository includes **example adapters** for illustration and testing.
+* **Official adapters for major providers (OpenAI, Anthropic, Google, Cohere, Mistral, Pinecone, Qdrant, Weaviate, Neo4j, etc.) are commercial** and distributed with Corpus Router subscriptions (managed or on-prem). They are production-hardened and updated with provider changes.
+
+### Why Official Adapters Are Commercial
+
+Our official adapters include:
+
+* **Provider-specific optimizations** (batching, retry strategies)
+* **Advanced error mapping** (vendor-specific → normalized)
+* **Operational integrations** (health checks, metrics, diagnostics)
+* **Support & SLAs** (response times, bug fixes)
+* **Certification** (tested against provider SLA requirements)
+
 ---
 
 ## Security & Privacy
@@ -429,17 +448,50 @@ Routers can preflight requests (e.g., token counts vs context size; batch sizing
 
 ## FAQ
 
-**Q: Should I use `standalone` in production?**
-A: It’s intended for development and light workloads. For scalable production, use **thin** and delegate resiliency to your control plane.
+**Q: Is the SDK fully open source while the router is commercial?**
+**A:** Yes. The SDK (protocols + bases + example adapters) is **open source** under Apache-2.0. **Corpus Router** and **official adapters** are **commercial** (managed cloud or on-prem).
+
+**Q: Will you maintain official adapters for major providers (OpenAI, Anthropic, Pinecone, etc.)?**
+**A:** Yes. We maintain **closed-source, production-grade adapters** for major providers as part of Corpus Router subscriptions.
+
+**Q: Can Corpus Router run on-premises or is it cloud-only?**
+**A:** Both. Corpus Router is available as a **managed cloud** service and as an **on-prem** deployment for regulated/air-gapped environments.
+
+**Q: Do I have to use Corpus Router?**
+**A:** No. The SDK composes with any router/control plane. Corpus Router is optional.
 
 **Q: Can I split protocols and bases into separate files?**
-A: Yes. We ship them together for convenience. You can refactor the module layout as you see fit.
+**A:** Yes. We ship them together for convenience; you can refactor module layout as you see fit.
 
-**Q: How do I add vendor-specific features?**
-A: Extend your adapter’s `_do_*` implementations; expose additional configuration through your adapter’s constructor. Keep the protocol surface stable.
+---
 
-**Q: How do I avoid PII in logs/metrics?**
-A: Use `OperationContext.tenant` and let the base hash it; avoid logging raw prompts or documents at the adapter layer.
+## Commercial Options
+
+### SDK vs Full Platform
+
+| Need | Solution | Cost |
+|------|----------|------|
+| Learning / Prototyping | `corpus_sdk` + example adapters | **Free (OSS)** |
+| Production with your own infra | `corpus_sdk` + your adapters | **Free (OSS)** |
+| Production with official adapters | `corpus_sdk` + **Official Adapters** | **Commercial** |
+| Enterprise multi-provider (managed) | `corpus_sdk` + **Corpus Router (Managed)** | **Commercial** |
+| Enterprise multi-provider (on-prem) | `corpus_sdk` + **Corpus Router (On-Prem)** | **Commercial** |
+
+> **Note:** `corpus_sdk` is fully open source. **Corpus Router** and **Official Adapters** are commercial offerings (managed or on-prem) with support, SLAs, and provider-tuned optimizations. 
+
+**Not sure which path fits?** Start free with `corpus_sdk`, then scale into Corpus Router + Official Adapters when you need multi-provider routing, SLAs, and enterprise controls.
+
+
+
+**For teams needing production-ready solutions:**
+
+| Offering                   | Best For              | Includes                            |
+| -------------------------- | --------------------- | ----------------------------------- |
+| **Corpus Router Managed**  | Cloud teams           | Router + official adapters + SLAs   |
+| **Corpus Router On-Prem**  | Enterprise/regulated  | Air-gapped deployment + support     |
+| **Official Adapters Only** | Bring your own router | Production-tuned adapters + updates |
+
+**Contact:** [sales@corpus.io](mailto:sales@corpus.io) or visit [corpus.io/pricing](https://corpus.io/pricing)
 
 ---
 
@@ -463,6 +515,9 @@ Apache-2.0. See `LICENSE` file for details. SPDX headers are included at the top
 * Additional optional capability flags (e.g., function/tool calling schemas).
 * Reference metrics exporter examples (Prometheus/OpenTelemetry bridge).
 * More example adapters (public endpoints for demos).
+* **Enterprise policy packs** (content safety, cost ceilings, per-tenant QPS) — **commercial**.
+* **Certified adapter program for partners** — **commercial**.
+* **Advanced analytics and cost attribution** — **commercial**.
 
 ---
 
@@ -477,8 +532,8 @@ Apache-2.0. See `LICENSE` file for details. SPDX headers are included at the top
 
 ### Cache Key Compositions
 
-* **Embedding**: `embed:{model}:{normalize}:{sha256(text)}` (+ tokenizer/version if applicable).
-* **LLM complete**: `llm:complete:{model}:{sha256(system)}:{sha256(messages)}:{temperature}:{top_p}:{freq_pen}:{pres_pen}:{max_tokens}:{sha256(stop_sequences_json)}`.
+* **Embedding**: `embed:{model}:{normalize}:{sha256(text)}`
+* **LLM complete**: `llm:complete:{model}:{sha256(system)}:{sha256(messages)}:{temperature}:{top_p}:{freq_pen}:{pres_pen}:{max_tokens}:{sha256(stop_sequences_json)}`
 
 ### Metrics Field Reference (Common)
 
@@ -489,6 +544,7 @@ Apache-2.0. See `LICENSE` file for details. SPDX headers are included at the top
 * `code`: `"OK"` or error class name
 * `extra`: low-cardinality map; may include `"tenant"`, `"model"`, `"batch_size"`, `"rows"`, `"dialect"`
 
----
+```
 
-**Tip:** Keep adapters simple; put retries, scheduling, multi-tenant rate limits, cost controls, and circuit breaking in your control plane. Use **thin** mode to ensure the SDK composes cleanly without double-stacking resiliency.
+::contentReference[oaicite:0]{index=0}
+```
