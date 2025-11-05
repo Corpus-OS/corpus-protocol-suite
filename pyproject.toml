@@ -20,7 +20,7 @@ test = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-testpaths = ["corpus_sdk/test"]
+testpaths = ["tests"]
 addopts = "-v --strict-markers --strict-config"
 
 # --- Formatting/Linting/Typing (recommended, optional) ---
@@ -36,7 +36,7 @@ target-version = "py39"
 select = ["E", "F", "I", "UP"]   # pycodestyle, pyflakes, isort, pyupgrade
 ignore = []
 fix = true
-src = ["corpus_sdk", "corpus_sdk/examples", "corpus_sdk/test"]
+src = ["corpus_sdk", "tests"]
 
 [tool.ruff.isort]
 known-first-party = ["corpus_sdk"]
@@ -55,4 +55,4 @@ mypy_path = "."
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["corpus_sdk*"]
-exclude = ["corpus_sdk/test*"]
+exclude = ["tests*"]
