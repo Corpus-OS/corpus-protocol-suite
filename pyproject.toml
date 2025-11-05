@@ -1,1 +1,26 @@
+# pyproject.toml
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "corpus_sdk"
+version = "1.0.0"
+requires-python = ">=3.9"
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["corpus_sdk/test"]
+addopts = "-v --strict-markers --strict-config"
+filterwarnings = [
+    "error::DeprecationWarning",
+    "ignore::pytest.PytestUnraisableExceptionWarning",
+]
 
