@@ -1,4 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
+"""
+LLM Conformance — Message validation.
+
+Covers:
+  • Rejection of unknown roles
+  • Rejection of empty message arrays
+  • Rejection of messages missing required fields
+  • Acceptance of standard roles (system/user/assistant)
+  • Handling of large-but-reasonable message content
+"""
+
 import pytest
 
 from corpus_sdk.examples.llm.mock_llm_adapter import MockLLMAdapter
@@ -9,60 +20,37 @@ from corpus_sdk.examples.common.errors import BadRequest
 pytestmark = pytest.mark.asyncio
 
 
-async def test_rejects_unknown_roles():
-    """Verify adapter validates message roles."""
+@pytest.mark.parametrize(
+    "messages, expected_hint",
+    [
+        ([{"role": "alien", "content": "hello from zeta reticuli"}], "role"),
+        ([], "empty"),
+        ([{"content": "hi"}], "role"),        # missing role
+        ([{"role": "user"}], "content"),      # missing content
+    ],
+)
+async def test_invalid_messages_rejected(messages, expected_hint):
+    """
+    Verify that the adapter (or base) enforces basic message schema rules.
+    """
     adapter = MockLLMAdapter(failure_rate=0.0)
-    ctx = make_ctx(OperationContext, request_id="t_msg_role_unknown", tenant="test")
+    ctx = make_ctx(OperationContext, request_id="t_msg_invalid", tenant="test")
 
     with pytest.raises(BadRequest) as exc_info:
-        await adapter.complete(
-            messages=[{"role": "alien", "content": "hello from zeta reticuli"}],
-            model="mock-model",
-            ctx=ctx,
-        )
-    assert "role" in str(exc_info.value.message).lower()
+        await adapter.complete(messages=messages, model="mock-model", ctx=ctx)
 
-
-async def test_requires_nonempty_messages():
-    """Verify adapter rejects empty message lists."""
-    adapter = MockLLMAdapter(failure_rate=0.0)
-    ctx = make_ctx(OperationContext, request_id="t_msg_empty", tenant="test")
-
-    with pytest.raises(BadRequest) as exc_info:
-        await adapter.complete(messages=[], model="mock-model", ctx=ctx)
-    assert "empty" in str(exc_info.value.message).lower()
-
-
-async def test_requires_role_and_content_fields():
-    """Verify adapter validates required message fields."""
-    adapter = MockLLMAdapter(failure_rate=0.0)
-    ctx = make_ctx(OperationContext, request_id="t_msg_fields", tenant="test")
-
-    # Missing 'role'
-    with pytest.raises(BadRequest) as exc_info:
-        await adapter.complete(
-            messages=[{"content": "hi"}], 
-            model="mock-model", 
-            ctx=ctx
-        )
-    assert "role" in str(exc_info.value.message).lower()
-
-    # Missing 'content'  
-    with pytest.raises(BadRequest) as exc_info:
-        await adapter.complete(
-            messages=[{"role": "user"}],
-            model="mock-model",
-            ctx=ctx
-        )
-    assert "content" in str(exc_info.value.message).lower()
+    # Error message should hint at the offending field/condition
+    msg = str(getattr(exc_info.value, "message", exc_info.value)).lower()
+    assert expected_hint in msg
 
 
 async def test_accepts_standard_roles():
-    """Verify adapter accepts standard conversation roles."""
+    """
+    The adapter should accept the canonical conversation roles.
+    """
     adapter = MockLLMAdapter(failure_rate=0.0)
     ctx = make_ctx(OperationContext, request_id="t_msg_roles_ok", tenant="test")
 
-    # Test all standard roles
     res = await adapter.complete(
         messages=[
             {"role": "system", "content": "You are helpful."},
@@ -76,15 +64,17 @@ async def test_accepts_standard_roles():
 
 
 async def test_handles_large_message_content():
-    """Verify adapter handles reasonably sized message content."""
+    """
+    Large-but-reasonable content should be processed without schema failures.
+    (This does NOT test model context limits; just schema-level acceptance.)
+    """
     adapter = MockLLMAdapter(failure_rate=0.0)
     ctx = make_ctx(OperationContext, request_id="t_msg_large", tenant="test")
 
-    # Large but reasonable content
-    large_content = "x" * 10000
+    large_content = "x" * 10_000  # ~10KB payload: reasonable for schema tests
     res = await adapter.complete(
         messages=[{"role": "user", "content": large_content}],
-        model="mock-model", 
+        model="mock-model",
         ctx=ctx,
     )
-    assert isinstance(res.text, str)
+    assert isinstance(res.text, str) and res.text.strip()
