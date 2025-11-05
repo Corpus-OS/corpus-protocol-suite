@@ -19,8 +19,10 @@ from corpus_sdk.llm.llm_base import (
     TokenUsage,
     LLMCapabilities,
     OperationContext as LLMContext,
+    # Use protocol error types from the base (not the examples package)
+    Unavailable,
+    ResourceExhausted,
 )
-from corpus_sdk.examples.common.errors import Unavailable, ResourceExhausted
 from corpus_sdk.examples.common.ctx import make_ctx
 from corpus_sdk.examples.common.printing import print_json, print_kv, box
 
@@ -46,7 +48,7 @@ class MockLLMAdapter(BaseLLMAdapter):
                 raise Unavailable("Mocked service overload", retry_after_ms=2000)
             else:
                 raise ResourceExhausted("Mocked rate limit", retry_after_ms=1000)
-        
+
         joined = " ".join([m["content"] for m in messages])
         await asyncio.sleep(0.05)  # Simulate processing time
         return LLMCompletion(
@@ -67,23 +69,25 @@ class MockLLMAdapter(BaseLLMAdapter):
         """Simulate token streaming with progressive token counts."""
         full_text = f"[streamed:{model or 'mock'}] " + messages[-1]["content"]
         words = full_text.split()
-        
+
         for i, word in enumerate(words):
             await asyncio.sleep(0.02)
             yield LLMChunk(
                 text=word + " ",
                 usage_so_far=TokenUsage(
-                    prompt_tokens=10, 
-                    completion_tokens=i + 1, 
-                    total_tokens=10 + i + 1
-                )
+                    prompt_tokens=10,
+                    completion_tokens=i + 1,
+                    total_tokens=10 + i + 1,
+                ),
             )
-        
+
         yield LLMChunk(
-            text="[end]", 
+            text="[end]",
             is_final=True,
             model=model or "mock-model",
-            usage_so_far=TokenUsage(prompt_tokens=10, completion_tokens=len(words), total_tokens=10 + len(words))
+            usage_so_far=TokenUsage(
+                prompt_tokens=10, completion_tokens=len(words), total_tokens=10 + len(words)
+            ),
         )
 
     async def _do_count_tokens(
@@ -109,7 +113,7 @@ class MockLLMAdapter(BaseLLMAdapter):
             supports_system_message=True,
             supports_deadline=True,
             supports_count_tokens=True,
-            supported_models=("mock-model", "mock-model-pro")
+            supported_models=("mock-model", "mock-model-pro"),
         )
 
     async def _do_health(self, **_: object) -> dict[str, object]:
@@ -125,7 +129,7 @@ class MockLLMAdapter(BaseLLMAdapter):
 
 if __name__ == "__main__":
     """Run this module directly to see mock adapter behavior in action."""
-    
+
     async def _demo() -> None:
         random.seed(42)  # Deterministic for reproducible demos
         box("MockLLMAdapter Demo")
@@ -146,9 +150,9 @@ if __name__ == "__main__":
         print("\n=== COMPLETE ===")
         try:
             result = await adapter.complete(
-                messages=[{"role": "user", "content": "hello world"}], 
+                messages=[{"role": "user", "content": "hello world"}],
                 model="mock-model",
-                ctx=ctx
+                ctx=ctx,
             )
             print_kv({"Output": result.text})
             print_json(result.usage.__dict__)
@@ -159,9 +163,9 @@ if __name__ == "__main__":
         print("\n=== STREAM ===")
         try:
             async for chunk in adapter.stream(
-                messages=[{"role": "user", "content": "stream this message"}], 
+                messages=[{"role": "user", "content": "stream this message"}],
                 model="mock-model-pro",
-                ctx=ctx
+                ctx=ctx,
             ):
                 print(chunk.text, end="", flush=True)
             print("\n[done]")
