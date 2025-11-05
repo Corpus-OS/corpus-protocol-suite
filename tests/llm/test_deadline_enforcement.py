@@ -35,3 +35,21 @@ async def test_deadline_budget_nonnegative_and_usable():
     # Budget helper should never go negative
     rem2 = remaining_budget_ms(ctx)
     assert rem2 is None or rem2 >= 0
+
+async def test_deadline_exceeded_on_expired_budget():
+    """Adapter MUST raise DeadlineExceeded when budget is exhausted."""
+    from corpus_sdk.llm.llm_base import DeadlineExceeded
+    
+    adapter = MockLLMAdapter(failure_rate=0.0)
+    ctx = make_ctx(OperationContext, timeout_ms=1)  # 1ms budget
+    await asyncio.sleep(0.005)  # Burn the budget
+    
+    with pytest.raises(DeadlineExceeded) as exc_info:
+        await adapter.complete(
+            messages=[{"role": "user", "content": "test"}],
+            ctx=ctx
+        )
+    
+    err = exc_info.value
+    assert err.code == "DEADLINE"
+    assert "remaining_ms" in err.details
