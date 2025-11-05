@@ -18,43 +18,98 @@ SPDX-License-Identifier: Apache-2.0
 ⸻
 
 Table of Contents
-	1.	Introduction
-1.1 Motivation • 1.2 Scope • 1.3 Design Philosophy
-	2.	Requirements Language
-	3.	Terminology
-	4.	Conventions and Notation
-	5.	Architecture Overview
-5.1 Protocol Relationships • 5.2 Layered Architecture • 5.3 Implementation Profiles (Informative)
-	6.	Common Foundation
-6.1 Operation Context • 6.2 Capability Discovery • 6.3 Error Taxonomy • 6.4 Observability Interfaces
-	7.	Graph Protocol V1 Specification
-7.1 Overview • 7.2 Data Types • 7.3 Operations • 7.4 Dialects • 7.5 Schema Operations (Optional) • 7.6 Health
-	8.	LLM Protocol V1 Specification
-8.1 Overview • 8.2 Data Types • 8.3 Operations • 8.4 Model Discovery • 8.5 LLM-Specific Errors
-	9.	Vector Protocol V1 Specification
-9.1 Overview • 9.2 Data Types • 9.3 Operations • 9.4 Distance Metrics • 9.5 Vector-Specific Errors
-	10.	Embedding Protocol V1 Specification
-10.1 Overview • 10.2 Data Types (Normative) • 10.3 Operations (Normative) • 10.4 Errors (Embedding-Specific) • 10.5 Capabilities Shape (Normative) • 10.6 Validation & Numerical Requirements (Normative)
-	11.	Cross-Protocol Patterns
-	12.	Error Handling and Resilience
-12.1 Retry Semantics • 12.2 Backoff and Jitter (RECOMMENDED) • 12.3 Circuit Breaking • 12.4 Error Mapping Table (Normative) • 12.5 Partial Failure Contracts • 12.6 Backpressure Integration
-	13.	Observability and Monitoring
-13.1 Metrics Taxonomy (MUST) • 13.2 Structured Logging (MUST) • 13.3 Distributed Tracing (SHOULD)
-	14.	Security Considerations
-14.1 Tenant Isolation (MUST) • 14.2 Authentication and Authorization (MUST) • 14.3 Threat Model (SHOULD)
-	15.	Privacy Considerations
-	16.	Performance Characteristics
-16.1 Latency Targets (Indicative) • 16.2 Concurrency Limits • 16.3 Caching Strategies
-	17.	Implementation Guidelines
-	18.	Versioning and Compatibility
-18.1 Semantic Versioning (MUST) • 18.2 Version Identification and Negotiation • 18.3 Backward Compatibility • 18.4 Deprecation Policy
-	19.	IANA Considerations
-	20.	References
-20.1 Normative References • 20.2 Informative References
-	21.	Author’s Address
-
-Appendices:
-A — End-to-End Example (Normative) • B — Capability Shapes (Illustrative) • C — Wire-Level Envelopes (Optional) • D — Content Redaction Patterns (Normative) • E — Implementation Status (Non-Normative) • F — Change Log / Revision History (Non-Normative)
+	•	1. Introduction
+	•	1.1. Motivation
+	•	1.2. Scope
+	•	1.3. Design Philosophy
+	•	2. Requirements Language
+	•	3. Terminology
+	•	4. Conventions and Notation
+	•	5. Architecture Overview
+	•	5.1. Protocol Relationships
+	•	5.2. Layered Architecture
+	•	5.3. Implementation Profiles (Informative)
+	•	6. Common Foundation
+	•	6.1. Operation Context
+	•	6.2. Capability Discovery
+	•	6.3. Error Taxonomy
+	•	6.4. Observability Interfaces
+	•	7. Graph Protocol V1 Specification
+	•	7.1. Overview
+	•	7.2. Data Types
+	•	7.3. Operations
+	•	7.3.1. Vertex/Edge CRUD
+	•	7.3.2. Queries
+	•	7.3.3. Batch Operations
+	•	7.4. Dialects
+	•	7.5. Schema Operations (Optional)
+	•	7.6. Health
+	•	8. LLM Protocol V1 Specification
+	•	8.1. Overview
+	•	8.2. Data Types
+	•	8.3. Operations
+	•	8.4. Model Discovery
+	•	8.5. LLM-Specific Errors
+	•	9. Vector Protocol V1 Specification
+	•	9.1. Overview
+	•	9.2. Data Types
+	•	9.3. Operations
+	•	9.4. Distance Metrics
+	•	9.5. Vector-Specific Errors
+	•	10. Embedding Protocol V1 Specification
+	•	10.1. Overview
+	•	10.2. Data Types (Formal)
+	•	10.3. Operations (Normative Signatures)
+	•	10.4. Errors (Embedding-Specific)
+	•	10.5. Capabilities
+	•	10.6. Semantics
+	•	11. Cross-Protocol Patterns
+	•	11.1. Unified Error Handling
+	•	11.2. Consistent Observability
+	•	11.3. Context Propagation
+	•	11.4. Idempotency and Exactly-Once
+	•	11.5. Pagination and Streaming
+	•	11.6. Caching (Implementation Guidance)
+	•	12. Error Handling and Resilience
+	•	12.1. Retry Semantics
+	•	12.2. Backoff and Jitter (RECOMMENDED)
+	•	12.3. Circuit Breaking
+	•	12.4. Error Mapping Table (Normative)
+	•	12.5. Partial Failure Contracts
+	•	12.6. Backpressure Integration
+	•	13. Observability and Monitoring
+	•	13.1. Metrics Taxonomy (MUST)
+	•	13.2. Structured Logging (MUST)
+	•	13.3. Distributed Tracing (SHOULD)
+	•	14. Security Considerations
+	•	14.1. Tenant Isolation (MUST)
+	•	14.2. Authentication and Authorization (MUST)
+	•	14.3. Threat Model (SHOULD)
+	•	15. Privacy Considerations
+	•	16. Performance Characteristics
+	•	16.1. Latency Targets (Indicative)
+	•	16.2. Concurrency Limits
+	•	16.3. Caching Strategies
+	•	17. Implementation Guidelines
+	•	17.1. Adapter Pattern
+	•	17.2. Validation (MUST)
+	•	17.3. Testing
+	•	18. Versioning and Compatibility
+	•	18.1. Semantic Versioning (MUST)
+	•	18.2. Version Identification and Negotiation
+	•	18.3. Backward Compatibility
+	•	18.4. Deprecation Policy
+	•	19. IANA Considerations
+	•	20. References
+	•	20.1. Normative References
+	•	20.2. Informative References
+	•	21. Author’s Address
+	•	Appendix A — End-to-End Example (Normative)
+	•	Appendix B — Capability Shapes (Illustrative)
+	•	Appendix C — Wire-Level Envelopes (Optional)
+	•	Appendix D — Content Redaction Patterns (Normative)
+	•	Appendix E — Implementation Status (Non-Normative)
+	•	Appendix F — Change Log / Revision History (Non-Normative)
 
 ⸻
 
@@ -271,8 +326,8 @@ Vendor-neutral interface for graph databases (Cypher, OpenCypher, Gremlin, GQL),
 
 7.2. Data Types
 
-from typing import NewType, Tuple, Optional
 from dataclasses import dataclass
+from typing import NewType, Tuple, Optional, Mapping, Any, Iterable, List, AsyncIterator
 
 GraphID = NewType('GraphID', str)
 
@@ -516,6 +571,8 @@ class DeleteSpec:
 
 9.3. Operations
 
+from typing import Optional
+
 async def query(spec: QuerySpec, *, ctx: Optional[OperationContext]=None) -> QueryResult
 async def upsert(spec: UpsertSpec, *, ctx: Optional[OperationContext]=None) -> dict
 async def delete(spec: DeleteSpec, *, ctx: Optional[OperationContext]=None) -> dict
@@ -550,168 +607,90 @@ Vendor-neutral, production-grade interface for generating text embeddings (singl
 
 Deliberate non-goals (Informative): preprocessing/chunking, fine-tuning, provider-specific vector post-processing; those belong to adjacent layers.
 
-⸻
-
-10.2. Data Types (Normative)
+10.2. Data Types (Formal)
 
 from dataclasses import dataclass
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Mapping, Any
 
 @dataclass(frozen=True)
 class EmbeddingVector:
-    """
-    A single embedding result for an input text.
-    Raw input text MUST NOT be included; text_hash is an optional fingerprint.
-    """
-    vector: List[float]                # length == dimensions, finite, non-NaN
-    dimensions: int                    # > 0
-    model: str                         # non-empty; must match result.model
-    index: int                         # position in the input batch (0-based)
-    text_hash: Optional[str] = None    # deterministic fingerprint of input text
-    metadata: Optional[Dict[str, Any]] = None  # provider-specific, low-cardinality only
-
-@dataclass(frozen=True)
-class ItemFailure:
-    """
-    Per-item failure record for non-atomic batches.
-    """
-    index: int                         # 0-based input position
-    error: str                         # normalized error class (e.g., "BadRequest", "ResourceExhausted")
-    code: Optional[str] = None         # machine-readable code (UPPER_SNAKE_CASE)
-    message: Optional[str] = None      # human-readable explanation
-    retry_after_ms: Optional[int] = None
-    suggested_batch_reduction: Optional[int] = None  # percentage [1..100]
+    vector: List[float]
+    text: Optional[str]            # MAY be omitted/redacted by provider
+    model: str
+    dimensions: int
 
 @dataclass(frozen=True)
 class EmbeddingResult:
-    """
-    Canonical embedding result. For single-item calls, len(embeddings) == 1.
-    For batches, embeddings and failures share the same input index space.
-    """
-    embeddings: List[EmbeddingVector]  # may be empty if all items failed
-    model: str                         # model actually used
-    total_tokens: Optional[int] = None # total over all inputs, if available
+    embeddings: List[EmbeddingVector]
+    model: str
+    total_tokens: Optional[int] = None
     processing_time_ms: Optional[float] = None
-    failures: Optional[List[ItemFailure]] = None    # present only if any failed
+    failures: Optional[List[Mapping[str, Any]]] = None  # per-item failure diagnostics
 
 @dataclass(frozen=True)
 class EmbeddingCapabilities:
-    server: str                        # backend identity
-    version: str                       # backend version
-    supported_models: Tuple[str, ...]  # non-empty list of model identifiers
-    # Limits (MAY be None if unknown)
+    server: str
+    version: str
+    supported_models: List[str]
     max_batch_size: Optional[int] = None
-    max_text_length: Optional[int] = None           # characters or tokens (see flags)
+    max_text_length: Optional[int] = None
     max_dimensions: Optional[int] = None
-    # Features/flags
-    supports_normalization: bool = False            # can return normalized vectors at source
-    normalizes_at_source: bool = False              # if True, vectors are already L2-normalized
+    supports_normalization: bool = False
+    normalizes_at_source: bool = False
     supports_truncation: bool = True
-    length_is_tokens: bool = True                   # True: max_text_length counts tokens; False: characters
     supports_token_counting: bool = True
     supports_deadline: bool = True
     idempotent_operations: bool = True
     supports_multi_tenant: bool = True
-    # Optional extensions (namespaced keys)
-    extensions: Optional[Dict[str, Any]] = None
 
-Type and value constraints (MUST):
-	•	All vector elements MUST be finite floats (no NaN, Inf); dimensions MUST equal len(vector) and be > 0.
-	•	model MUST be a non-empty string and MUST be one of supported_models (unless a documented alias maps to one).
-	•	For batches, EmbeddingVector.index and ItemFailure.index MUST reference the same 0-based input positions with no gaps or duplicates.
-	•	failures MUST be omitted or empty when all items succeed; when present, each failure MUST correspond to an input item not present in embeddings for that index.
-	•	text_hash (if provided) MUST be a deterministic, irreversible fingerprint (e.g., sha256(text)) and MUST NOT reveal the raw text.
+10.3. Operations (Normative Signatures)
 
-⸻
-
-10.3. Operations (Normative)
-
-from dataclasses import dataclass
-from typing import Optional, List, Mapping, Any, Dict
+from typing import Optional, List, AsyncIterator, Mapping, Any
 
 @dataclass(frozen=True)
 class EmbedSpec:
     text: str
     model: str
-    truncate: bool = True              # if False and input exceeds max_text_length => TextTooLong
-    normalize: bool = False            # request L2-normalized output (if supported)
-    attrs: Optional[Mapping[str, Any]] = None       # advisory, non-normative
+    truncate: bool = True
+    normalize: bool = False
 
 @dataclass(frozen=True)
 class BatchEmbedSpec:
-    texts: List[str]                   # length > 0
+    texts: List[str]
     model: str
     truncate: bool = True
     normalize: bool = False
-    attrs: Optional[Mapping[str, Any]] = None
 
-# Interface
-async def capabilities(*, ctx: Optional[OperationContext] = None) -> EmbeddingCapabilities: ...
-async def health(*, ctx: Optional[OperationContext] = None) -> Dict[str, Any]: ...
-async def embed(spec: EmbedSpec, *, ctx: Optional[OperationContext] = None) -> EmbeddingResult: ...
-async def embed_batch(spec: BatchEmbedSpec, *, ctx: Optional[OperationContext] = None) -> EmbeddingResult: ...
-async def count_tokens(text: str, *, model: Optional[str] = None,
-                       ctx: Optional[OperationContext] = None) -> int: ...
+async def capabilities(*, ctx: Optional[OperationContext]=None) -> EmbeddingCapabilities
 
-Semantics (MUST/SHOULD):
-	•	capabilities() MUST return a fully populated EmbeddingCapabilities; unknown extensions MUST be ignored by clients (Common §6.2).
-	•	health() MUST return { ok: bool, server: str, version: str, models?: string[] }. Shape MUST be stable in degraded states (Common §7.6).
-	•	embed() MUST return exactly one EmbeddingVector in embeddings on success; failures MUST be omitted.
-	•	embed_batch() is non-atomic per item: successful items MUST appear in embeddings with their original indices; failed items MUST appear in failures with matching indices. Implementations SHOULD compute suggested_batch_reduction (percentage) on overload or resource errors (Common §12.5).
-	•	count_tokens() MUST return a non-negative integer; if unsupported (supports_token_counting == False), adapters MUST raise NotSupported.
-	•	If normalize=True and supports_normalization == False, adapters MUST raise NotSupported.
-	•	If truncate=False and an input exceeds max_text_length, adapters MUST raise TextTooLong (Embedding-specific).
-	•	If length_is_tokens=True, max_text_length refers to tokens; otherwise characters. Adapters SHOULD document tokenization behavior.
-	•	Deadline semantics follow Common §6.1 and §12.4: pre-expired budgets MUST fail fast with DeadlineExceeded; elapsed budgets during execution SHOULD terminate promptly. No raw content may appear in errors or telemetry.
+async def embed(spec: EmbedSpec, *, ctx: Optional[OperationContext]=None) -> EmbeddingResult
 
-⸻
+async def embed_batch(spec: BatchEmbedSpec, *, ctx: Optional[OperationContext]=None) -> EmbeddingResult
+
+async def count_tokens(text: str, *, model: Optional[str]=None, ctx: Optional[OperationContext]=None) -> int
+
+async def health(*, ctx: Optional[OperationContext]=None) -> dict  # { ok, server, version, models }
 
 10.4. Errors (Embedding-Specific)
-	•	TextTooLong (subtype of BadRequest) — input exceeds model maximum when truncate=False.
-Client guidance: enable truncation or split text.
+	•	TextTooLong (subtype of BadRequest) — input exceeds model maximum when truncate=false.
 	•	ModelNotAvailable (subtype of NotSupported or Unavailable) — requested model not present/disabled.
-Client guidance: select a model from supported_models or retry if transient.
-	•	DeadlineExceeded — budget exhausted; conditionally retryable only if deadline extended or inputs reduced.
+	•	DeadlineExceeded — budget exhausted (retryable only if deadline extended or inputs reduced).
 
-Mitigation hints (SHOULD): retry_after_ms, resource_scope ("model"|"token_limit"|"rate_limit"), suggested_batch_reduction (percentage). Error objects SHOULD include code (string) and informative message (Common §6.3, §12.4).
+Mitigation hints (SHOULD): retry_after_ms, resource_scope ("model"|"token_limit"|"rate_limit"), suggested_batch_reduction (percentage).
 
-⸻
+10.5. Capabilities
 
-10.5. Capabilities Shape (Normative)
+Adapters MUST declare:
+	•	server, version, supported_models (list of strings).
+	•	Optional limits: max_batch_size, max_text_length, max_dimensions.
+	•	Flags: supports_normalization, normalizes_at_source, supports_truncation, supports_token_counting, supports_deadline, idempotent_operations, supports_multi_tenant.
 
-capabilities() MUST serialize to the following JSON-compatible envelope (illustrative fields shown):
-
-{
-  "server": "embed-service",
-  "version": "2025-01-15",
-  "supported_models": ["example-embed-1", "example-embed-2"],
-  "max_batch_size": 512,
-  "max_text_length": 16000,
-  "max_dimensions": 1536,
-  "supports_normalization": true,
-  "normalizes_at_source": false,
-  "supports_truncation": true,
-  "supports_token_counting": true,
-  "supports_deadline": true,
-  "idempotent_operations": true,
-  "supports_multi_tenant": true,
-  "length_is_tokens": true,
-  "extensions": {
-    "vendor:tokenizer": "tiktoken/example-embed-1"
-  }
-}
-
-Client rules (MUST):
-	•	Treat unknown keys as ignorable; treat missing optional keys as None/unsupported.
-	•	Enforce max_batch_size and max_text_length preflight where known.
-	•	When normalizes_at_source == True, clients MUST NOT assume raw (unnormalized) vectors.
-
-⸻
-
-10.6. Validation & Numerical Requirements (Normative)
-	•	All floats in EmbeddingVector.vector MUST satisfy isfinite(x); vectors MUST NOT contain NaN, ±Inf, or subnormal values outside IEEE-754 normal range if the backend documents such constraints.
-	•	If normalize=True, returned vectors MUST be L2-normalized within a tolerance ε ≤ 1e-6.
-	•	Dimensions MUST be consistent for all outputs of a single call; if multiple models are internally used (vendor ensembles), adapters MUST expose a single model string and a single dimensions value to callers.
+10.6. Semantics
+	•	model MUST be present in supported_models.
+	•	If normalize=true and unsupported, return NotSupported.
+	•	embed_batch MUST enforce max_batch_size and validate each text.
+	•	If truncate=false and a text exceeds max_text_length, raise TextTooLong.
+	•	Deadline pre-expired or elapsed → DeadlineExceeded.
 
 ⸻
 
@@ -720,27 +699,39 @@ Client rules (MUST):
 11.1. Unified Error Handling
 
 Centralize error mapping to the normalized taxonomy; use mitigation hints (retry_after_ms, suggested_*) for adaptive clients.
+	•	MUST: Normalize provider-/vendor-specific errors into Common §6.3 classes and populate code (string) + human-readable message.
+	•	SHOULD: Provide retry_after_ms, throttle_scope, and suggested_batch_reduction (when relevant) per §12.4.
+	•	MUST: Preserve original provider error IDs in details.provider_error_id (if available) for audit.
 
 11.2. Consistent Observability
 
 Emit observe and counter across components (graph|llm|vector|embedding) with common labels (op, code, tenant_hash). Never log raw prompts, vectors, source texts, or tenant identifiers.
+	•	MUST: Emit exactly one terminal observe for streaming operations capturing the final outcome (ok=false with code on error).
+	•	MUST: Include deadline_bucket selected from <1s|<5s|<15s|<60s|>=60s (no custom buckets without a major version bump).
+	•	SHOULD: Include cache_hit, rows or matches_returned, and batch_size where applicable.
 
 11.3. Context Propagation
 
 Create one OperationContext at ingress and pass through all protocol calls; update remaining time budget between calls.
+	•	MUST: Forward traceparent verbatim.
+	•	SHOULD: Recompute remaining deadline_ms before chained downstream operations.
 
 11.4. Idempotency and Exactly-Once
 
 Where idempotency_key is accepted, mutations MUST be exactly-once or return the prior committed result.
+	•	MUST: Treat duplicate idempotency_key submissions as safe replays.
+	•	SHOULD: Record minimal, SIEM-safe idempotency audit fields.
 
 11.5. Pagination and Streaming
-
-Graph MAY stream rows; LLM MUST stream with a terminal chunk; Vector pagination is capability-gated; Embedding is request/response (no streaming) in V1.
+	•	Graph: MAY stream rows; iterator close MUST release resources.
+	•	LLM: MUST stream with a single terminal chunk setting is_final=true.
+	•	Vector: Pagination support is capability-gated; if unsupported, MUST document limits.
+	•	Embedding: V1 is request/response (no streaming).
 
 11.6. Caching (Implementation Guidance)
 	•	Eligible at base: Embedding (deterministic outputs), LLM complete (key includes sampling params).
-	•	Typically router/infra: Vector/Graph result caching due to workload variability.
-	•	Keying guidance: use content hashes; do not include raw content; include model/params.
+	•	Router/infra preferred: Vector/Graph results due to variability.
+	•	Keying guidance: Use content hashes; MUST NOT include raw content. Include model and parameters. Include tenant hash for isolation.
 
 ⸻
 
@@ -776,7 +767,7 @@ ContentFiltered**	400	No	Sanitize/adjust prompt
 TextTooLong***	400	No	Enable truncation or split text
 DeadlineExceeded	504	It depends	Extend deadline or reduce work (max_tokens, batch size, etc.)
 
-	•	Vector-specific. ** LLM-specific. *** Embedding-specific.
+* Vector-specific. ** LLM-specific. *** Embedding-specific.
 
 12.5. Partial Failure Contracts
 
@@ -883,10 +874,17 @@ Expose concurrency, rate_limit_qps, max_batch_ops/top_k, and memory consideratio
 17.1. Adapter Pattern
 
 Use base classes to centralize validation, error normalization, and metrics; focus provider code on business logic.
+	•	MUST: Keep protocol validation and taxonomy mapping in base layers.
+	•	SHOULD: Implement provider-specific adapters as thin shims that translate to provider SDKs.
+	•	SHOULD: Expose a capabilities() probe early and cache results with short TTL.
 
 17.2. Validation (MUST)
 
 Reject empty labels/texts, negative top_k, NaN/Inf vectors; enforce JSON-serializable props/metadata; validate message roles and max_tokens vs. window; enforce embedding max_text_length and max_batch_size; enforce sampling parameter ranges.
+	•	Graph: Validate dialect membership and params binding.
+	•	LLM: Validate roles, sampling ranges, and context length (when counting is supported).
+	•	Vector: Enforce exact dimension matching; guard top_k bounds.
+	•	Embedding: Enforce truncate behavior; return TextTooLong when disallowed.
 
 17.3. Testing
 
@@ -1126,7 +1124,7 @@ Appendix F — Change Log / Revision History (Non-Normative)
 	•	Extended capability flags: supports_deadline (all), supports_count_tokens (LLM), expanded Graph fields (supports_streaming, supports_bulk_ops, retryable_codes, rate_limit_unit, max_qps).
 	•	Aligned Vector types: VectorMatch carries full Vector, plus score and distance; clarified include_vectors behavior.
 	•	Added Implementation Profiles (§5.3) and observability enrichments (deadline_bucket, final stream outcome).
-	•	v1.1 — Embedding Added (from previous RFC note): Added Embedding Protocol V1, expanded observability/security/privacy coverage.
+	•	v1.1 — Embedding Added & Formalized: Added Embedding Protocol V1 and upgraded §10 to formal datatypes and normative signatures.
 	•	v1.0 — Initial RFC-Style: Introduced BCP 14 requirements language, IANA Considerations, split Normative/Informative references, explicit Privacy Considerations, Conventions and Notation, error-mapping table, capability namespacing rules, and appendices for examples, redaction, and wire envelopes.
 
 ⸻
