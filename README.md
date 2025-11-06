@@ -576,6 +576,3 @@ Apache-2.0. See `LICENSE` file for details. SPDX headers are included at the top
 * `extra`: low-cardinality map; may include `"tenant"`, `"model"`, `"batch_size"`, `"rows"`, `"dialect"`
 
 ```
-
-::contentReference[oaicite:0]{index=0}
-```
