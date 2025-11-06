@@ -12,7 +12,7 @@ This document is not an Internet Standards Track specification; it is published 
 
 ## Copyright Notice
 
-Copyright © 2025 Corpus Protocol Suite.  
+Copyright © 2025 Corpus Protocol Suite.
 SPDX-License-Identifier: Apache-2.0
 
 ---
@@ -20,44 +20,56 @@ SPDX-License-Identifier: Apache-2.0
 ## Table of Contents
 
 * [1. Introduction](#1-introduction)
+
   * [1.1. Motivation](#11-motivation)
   * [1.2. Scope](#12-scope)
   * [1.3. Design Philosophy](#13-design-philosophy)
 * [2. Requirements Language](#2-requirements-language)
 * [3. Terminology](#3-terminology)
 * [4. Conventions and Notation](#4-conventions-and-notation)
+
+  * [4.1. Wire-First Canonical Form (Normative)](#41-wire-first-canonical-form-normative)
 * [5. Architecture Overview](#5-architecture-overview)
+
   * [5.1. Protocol Relationships](#51-protocol-relationships)
   * [5.2. Layered Architecture](#52-layered-architecture)
   * [5.3. Implementation Profiles (Informative)](#53-implementation-profiles-informative)
 * [6. Common Foundation](#6-common-foundation)
+
   * [6.1. Operation Context](#61-operation-context)
   * [6.2. Capability Discovery](#62-capability-discovery)
   * [6.3. Error Taxonomy](#63-error-taxonomy)
   * [6.4. Observability Interfaces](#64-observability-interfaces)
-* [7. Graph Protocol V1 Specification](#7-graph-protocol-v1-specification)
+* [7. Graph Protocol V1.0 Specification](#7-graph-protocol-v10-specification)
+
   * [7.1. Overview](#71-overview)
   * [7.2. Data Types](#72-data-types)
   * [7.3. Operations](#73-operations)
+
     * [7.3.1. Vertex/Edge CRUD](#731-vertexedge-crud)
     * [7.3.2. Queries](#732-queries)
+
+      * [Streaming Finalization (Normative)](#streaming-finalization-normative)
     * [7.3.3. Batch Operations](#733-batch-operations)
   * [7.4. Dialects](#74-dialects)
   * [7.5. Schema Operations (Optional)](#75-schema-operations-optional)
   * [7.6. Health](#76-health)
-* [8. LLM Protocol V1 Specification](#8-llm-protocol-v1-specification)
+* [8. LLM Protocol V1.0 Specification](#8-llm-protocol-v10-specification)
+
   * [8.1. Overview](#81-overview)
   * [8.2. Data Types](#82-data-types)
   * [8.3. Operations](#83-operations)
   * [8.4. Model Discovery](#84-model-discovery)
   * [8.5. LLM-Specific Errors](#85-llm-specific-errors)
-* [9. Vector Protocol V1 Specification](#9-vector-protocol-v1-specification)
+* [9. Vector Protocol V1.0 Specification](#9-vector-protocol-v10-specification)
+
   * [9.1. Overview](#91-overview)
   * [9.2. Data Types](#92-data-types)
   * [9.3. Operations](#93-operations)
   * [9.4. Distance Metrics](#94-distance-metrics)
   * [9.5. Vector-Specific Errors](#95-vector-specific-errors)
-* [10. Embedding Protocol V1 Specification](#10-embedding-protocol-v1-specification)
+* [10. Embedding Protocol V1.0 Specification](#10-embedding-protocol-v10-specification)
+
   * [10.1. Overview](#101-overview)
   * [10.2. Data Types (Formal)](#102-data-types-formal)
   * [10.3. Operations (Normative Signatures)](#103-operations-normative-signatures)
@@ -65,6 +77,7 @@ SPDX-License-Identifier: Apache-2.0
   * [10.5. Capabilities](#105-capabilities)
   * [10.6. Semantics](#106-semantics)
 * [11. Cross-Protocol Patterns](#11-cross-protocol-patterns)
+
   * [11.1. Unified Error Handling](#111-unified-error-handling)
   * [11.2. Consistent Observability](#112-consistent-observability)
   * [11.3. Context Propagation](#113-context-propagation)
@@ -72,6 +85,7 @@ SPDX-License-Identifier: Apache-2.0
   * [11.5. Pagination and Streaming](#115-pagination-and-streaming)
   * [11.6. Caching (Implementation Guidance)](#116-caching-implementation-guidance)
 * [12. Error Handling and Resilience](#12-error-handling-and-resilience)
+
   * [12.1. Retry Semantics](#121-retry-semantics)
   * [12.2. Backoff and Jitter (RECOMMENDED)](#122-backoff-and-jitter-recommended)
   * [12.3. Circuit Breaking](#123-circuit-breaking)
@@ -79,29 +93,36 @@ SPDX-License-Identifier: Apache-2.0
   * [12.5. Partial Failure Contracts](#125-partial-failure-contracts)
   * [12.6. Backpressure Integration](#126-backpressure-integration)
 * [13. Observability and Monitoring](#13-observability-and-monitoring)
+
   * [13.1. Metrics Taxonomy (MUST)](#131-metrics-taxonomy-must)
   * [13.2. Structured Logging (MUST)](#132-structured-logging-must)
   * [13.3. Distributed Tracing (SHOULD)](#133-distributed-tracing-should)
 * [14. Security Considerations](#14-security-considerations)
+
   * [14.1. Tenant Isolation (MUST)](#141-tenant-isolation-must)
   * [14.2. Authentication and Authorization (MUST)](#142-authentication-and-authorization-must)
   * [14.3. Threat Model (SHOULD)](#143-threat-model-should)
+  * [14.4. Mitigation Matrix (Normative)](#144-mitigation-matrix-normative)
 * [15. Privacy Considerations](#15-privacy-considerations)
 * [16. Performance Characteristics](#16-performance-characteristics)
+
   * [16.1. Latency Targets (Indicative)](#161-latency-targets-indicative)
   * [16.2. Concurrency Limits](#162-concurrency-limits)
   * [16.3. Caching Strategies](#163-caching-strategies)
 * [17. Implementation Guidelines](#17-implementation-guidelines)
+
   * [17.1. Adapter Pattern](#171-adapter-pattern)
   * [17.2. Validation (MUST)](#172-validation-must)
   * [17.3. Testing](#173-testing)
 * [18. Versioning and Compatibility](#18-versioning-and-compatibility)
+
   * [18.1. Semantic Versioning (MUST)](#181-semantic-versioning-must)
   * [18.2. Version Identification and Negotiation](#182-version-identification-and-negotiation)
   * [18.3. Backward Compatibility](#183-backward-compatibility)
   * [18.4. Deprecation Policy](#184-deprecation-policy)
 * [19. IANA Considerations](#19-iana-considerations)
 * [20. References](#20-references)
+
   * [20.1. Normative References](#201-normative-references)
   * [20.2. Informative References](#202-informative-references)
 * [21. Author’s Address](#21-authors-address)
@@ -124,10 +145,10 @@ The proliferation of AI infrastructure has created a fragmented landscape of pro
 
 This specification defines four complementary protocols:
 
-* **Graph Protocol V1.1** — Vertex/edge CRUD, traversal, and multi-dialect query execution.
-* **LLM Protocol V1.1** — Chat-style completion, streaming tokens, usage accounting.
-* **Vector Protocol V1.1** — Vector upsert/delete, similarity search, and namespace management.
-* **Embedding Protocol V1.1** — Text embedding generation (single/batch), token counting, capability discovery, and health reporting.
+* **Graph Protocol V1.0** — Vertex/edge CRUD, traversal, and multi-dialect query execution.
+* **LLM Protocol V1.0** — Chat-style completion, streaming tokens, usage accounting.
+* **Vector Protocol V1.0** — Vector upsert/delete, similarity search, and namespace management.
+* **Embedding Protocol V1.0** — Text embedding generation (single/batch), token counting, capability discovery, and health reporting.
 
 All protocols share a **Common Foundation** (context propagation, capability discovery, error taxonomy, observability, resilience).
 
@@ -150,13 +171,13 @@ The key words “MUST”, “MUST NOT”, “REQUIRED”, “SHALL”, “SHALL 
 
 ## 3. Terminology
 
-**Adapter** — Concrete implementation of a protocol for a specific provider/backend.  
-**Protocol** — Interface contract that adapters MUST implement.  
-**Operation Context** — Metadata container for tracing, deadlines, and tenancy.  
-**Capabilities** — Dynamically discoverable features and limits of an adapter.  
-**SIEM-Safe** — Observability that excludes PII and uses privacy-preserving identifiers.  
-**Idempotency Key** — Client-provided token guaranteeing idempotent semantics.  
-**Tenant Isolation** — Logical separation of data/control plane in multi-tenant deployments.  
+**Adapter** — Concrete implementation of a protocol for a specific provider/backend.
+**Protocol** — Interface contract that adapters MUST implement.
+**Operation Context** — Metadata container for tracing, deadlines, and tenancy.
+**Capabilities** — Dynamically discoverable features and limits of an adapter.
+**SIEM-Safe** — Observability that excludes PII and uses privacy-preserving identifiers.
+**Idempotency Key** — Client-provided token guaranteeing idempotent semantics.
+**Tenant Isolation** — Logical separation of data/control plane in multi-tenant deployments.
 **Backpressure** — Cooperative throttling to keep systems within safe operating limits.
 
 ---
@@ -170,6 +191,103 @@ The key words “MUST”, “MUST NOT”, “REQUIRED”, “SHALL”, “SHALL 
 * Error `code` values use `UPPER_SNAKE_CASE`.
 * `tenant_hash` denotes a deterministic, irreversible hash of the tenant identifier.
 * Unless otherwise stated, scores are **higher is better** (cosine/dot); distance metrics MAY be inverted to scores.
+
+### 4.1. Wire-First Canonical Form (Normative)
+
+This specification is **language-agnostic**. Python snippets are **illustrative only**. The **canonical interface** is the wire contract defined in this section and applied throughout.
+
+#### 4.1.1. Envelopes and Content Types (MUST)
+
+* Requests and responses use UTF-8 JSON.
+* `Content-Type: application/json` (MUST).
+* Top-level envelope shapes:
+
+**Request envelope (MUST):**
+
+```json
+{
+  "op": "<component>.<operation>",
+  "ctx": { },
+  "args": { }
+}
+```
+
+* `op` identifies the component and operation (e.g., `llm.complete`, `graph.stream_query`).
+
+**Response envelope (MUST):**
+
+```json
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 12.3,
+  "result": { }
+}
+```
+
+**Error envelope (MUST):**
+
+```json
+{
+  "ok": false,
+  "code": "DEADLINE_EXCEEDED",
+  "error": "DeadlineExceeded",
+  "message": "Operation budget exhausted",
+  "retry_after_ms": null,
+  "details": {
+    "provider_error_id": "..."
+  }
+}
+```
+
+#### 4.1.2. Version Identification (MUST)
+
+* Protocols identify as `{component}/v1.0` (e.g., `"protocol": "vector/v1.0"` in capabilities; `X-Adapter-Protocol: vector/v1.0` in headers).
+* Breaking changes require `v2.0`. Additive fields remain compatible within the `v1.x` family.
+
+#### 4.1.3. Streaming Frames (MUST where applicable)
+
+For streaming operations (e.g., LLM `stream`, Graph `stream_query`):
+
+* Transport MAY be SSE, WebSocket, HTTP chunked, or gRPC streaming.
+* Each frame is a JSON object with `event` and `data` fields.
+
+**Data frame (MUST):**
+
+```json
+{
+  "event": "data",
+  "data": { }
+}
+```
+
+**Terminal success frame (MUST):**
+
+```json
+{
+  "event": "end",
+  "code": "OK"
+}
+```
+
+**Terminal error frame (MUST):**
+
+```json
+{
+  "event": "error",
+  "code": "UNAVAILABLE",
+  "error": "Unavailable",
+  "message": "..."
+}
+```
+
+Exactly one terminal frame (`event: "end"` or `event: "error"`) **MUST** be emitted per stream.
+
+#### 4.1.4. Compatibility and Unknown Fields (MUST)
+
+* Unknown top-level keys and unknown nested keys **MUST** be ignored.
+* Clients **MUST NOT** assume field ordering.
+* All numbers are IEEE 754 JSON numbers; implementations **SHOULD** validate ranges as defined in normative sections.
 
 ---
 
@@ -194,7 +312,7 @@ The key words “MUST”, “MUST NOT”, “REQUIRED”, “SHALL”, “SHALL 
                     │ • Observability     │
                     │ • Resilience        │
                     └─────────────────────┘
-````
+```
 
 ### 5.2. Layered Architecture
 
@@ -261,7 +379,7 @@ class OperationContext:
 {
   "server": "example-backend",
   "version": "5.17.1",
-  "protocol": "graph/v1",
+  "protocol": "graph/v1.0",
   "features": {
     "dialects": ["cypher", "opencypher"],
     "supports_txn": true,
@@ -338,7 +456,7 @@ class MetricsSink(Protocol):
 
 ---
 
-## 7. Graph Protocol V1 Specification
+## 7. Graph Protocol V1.0 Specification
 
 ### 7.1. Overview
 
@@ -407,6 +525,30 @@ async def stream_query(*, dialect: str, text: str, params: Optional[Mapping[str,
 * `stream_query` yields rows progressively; iterator close **MUST** free resources.
 * Deadline behavior: if budget elapses mid-stream, adapters **SHOULD** terminate promptly with `Unavailable` (Thin) or `DeadlineExceeded` (Standalone).
 
+##### Streaming Finalization (Normative)
+
+When `stream_query` is exposed over a network stream:
+
+* Servers **MUST**:
+
+  1. Emit one or more **data frames** (`event: "data"`) carrying result rows as per §4.1.3.
+  2. Emit exactly one **terminal frame**:
+
+     * `event: "end", code: "OK"` on success, or
+     * `event: "error", ...` containing the normalized error envelope on failure.
+
+When `stream_query` is exposed as an in-process async iterator:
+
+* Completion via `StopAsyncIteration` **MUST** release all resources.
+* Implementations **MUST** emit exactly one terminal `observe` metric per stream (see §11.2).
+* If the deadline elapses mid-stream, implementations **MUST**:
+
+  * terminate promptly,
+  * surface `Unavailable` (Thin) or `DeadlineExceeded` (Standalone),
+  * and still emit the terminal `observe` with `ok=false` and the normalized `code`.
+
+Implementations **MUST NOT** emit multiple terminal frames/outcomes for a single stream.
+
 #### 7.3.3. Batch Operations
 
 ```python
@@ -445,7 +587,7 @@ Adapters **SHOULD** normalize unexpected failures in `health()` to `Unavailable(
 
 ---
 
-## 8. LLM Protocol V1 Specification
+## 8. LLM Protocol V1.0 Specification
 
 ### 8.1. Overview
 
@@ -548,7 +690,8 @@ async def count_tokens(text: str, *, model: Optional[str]=None,
   },
   "limits": {
     "max_context_length": 128000
-  }
+  },
+  "protocol": "llm/v1.0"
 }
 ```
 
@@ -562,7 +705,7 @@ Clients **MAY** preflight `prompt_tokens + max_tokens ≤ max_context_length` wh
 
 ---
 
-## 9. Vector Protocol V1 Specification
+## 9. Vector Protocol V1.0 Specification
 
 ### 9.1. Overview
 
@@ -659,7 +802,7 @@ Adapters **MUST** advertise supported metrics and scoring conventions.
 
 ---
 
-## 10. Embedding Protocol V1 Specification
+## 10. Embedding Protocol V1.0 Specification
 
 ### 10.1. Overview
 
@@ -799,7 +942,7 @@ Where `idempotency_key` is accepted, mutations MUST be exactly-once or return th
 * **Graph:** MAY stream rows; iterator close MUST release resources.
 * **LLM:** MUST stream with a single terminal chunk setting `is_final=true`.
 * **Vector:** Pagination support is capability-gated; if unsupported, MUST document limits.
-* **Embedding:** V1 is request/response (no streaming).
+* **Embedding:** V1.0 is request/response (no streaming).
 
 ### 11.6. Caching (Implementation Guidance)
 
@@ -843,8 +986,8 @@ Fail fast with `Unavailable("circuit open")` when breaker is open; include `retr
 | DeadlineExceeded   | 504          | *It depends* | Extend deadline or reduce work (max_tokens, batch size, etc.)  |
 
 * Vector-specific.
-** LLM-specific.
-*** Embedding-specific.
+  ** LLM-specific.
+  *** Embedding-specific.
 
 ### 12.5. Partial Failure Contracts
 
@@ -922,6 +1065,19 @@ Credentials managed at adapter init; rotate via secret stores; never emit secret
 
 Address idempotency-key spoofing, prompt/graph injection, vector/embedding poisoning, and unbounded traversals via rate limiting, schema constraints, and timeouts.
 
+### 14.4. Mitigation Matrix (Normative)
+
+| Threat Category                | Component         | MUST                                                                                    | SHOULD                                                                                    |
+| ------------------------------ | ----------------- | --------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| Injection (prompt/query)       | LLM, Graph        | Parameterized bindings; reject unknown roles/dialects; validate inputs per §§7.3.2, 8.3 | Static allowlists for dialects/models; strict prompt templates with placeholders          |
+| Data exfiltration via logs     | All               | SIEM-safe telemetry; never log prompts/vectors/raw tenant IDs (§§6.4, 15)               | Field-level redaction lists; log retention ≤30 days                                       |
+| Idempotency-key spoofing       | All mutating ops  | Treat duplicate keys as replay; exactly-once semantics (§11.4)                          | HMAC/nonce-bounded idempotency keys per tenant with expiry                                |
+| Poisoning (vectors/embeddings) | Vector, Embedding | Validate dimensions; reject NaN/Inf; enforce namespace ACLs (§§9.2–9.5, 14.2)           | Outlier detection on norms; quarantine or review suspicious batches                       |
+| Resource exhaustion / DoS      | All               | Enforce deadlines; rate limits per tenant (§§6.1, 12.1–12.3)                            | Adaptive backoff with full jitter; circuit breakers tuned via error codes and utilization |
+| Cross-tenant data leakage      | All               | Strict tenant isolation; cache keys include tenant hash (§§14.1, 11.6)                  | Periodic isolation/segregation tests; policy-as-code checks in CI/CD                      |
+| Tool/model misuse              | LLM               | Enforce sampling parameter ranges; normalize `ContentFiltered`                          | Guardrails and policies for model/family fallback                                         |
+| Unbounded traversals           | Graph             | Limits/timeouts on depth/rows; schema and RBAC constraints                              | Configurable caps for traversal; monitoring alerts on abnormal traversal patterns         |
+
 ---
 
 ## 15. Privacy Considerations
@@ -993,7 +1149,7 @@ Use **MAJOR.MINOR.PATCH**:
 
 ### 18.2. Version Identification and Negotiation
 
-Clients MAY specify `X-Adapter-Protocol: {component}/v{major}`. Adapters MUST reject incompatible majors with `NotSupported` and SHOULD advertise supported versions in `capabilities.protocol`.
+Clients MAY specify `X-Adapter-Protocol: {component}/v{major}.{minor}`. Adapters MUST reject incompatible majors with `NotSupported` and SHOULD advertise supported versions in `capabilities.protocol`.
 
 ### 18.3. Backward Compatibility
 
@@ -1114,7 +1270,7 @@ for attempt in range(5):
 {
   "server": "janusgraph",
   "version": "1.0.0",
-  "protocol": "graph/v1",
+  "protocol": "graph/v1.0",
   "features": {
     "dialects": ["gremlin"],
     "supports_txn": true,
@@ -1139,7 +1295,7 @@ for attempt in range(5):
 {
   "server": "chat-gateway",
   "version": "2024-10-01",
-  "protocol": "llm/v1",
+  "protocol": "llm/v1.0",
   "features": {
     "supports_tools": true,
     "supports_streaming": true,
@@ -1170,7 +1326,7 @@ for attempt in range(5):
 {
   "server": "pinecone",
   "version": "2.2",
-  "protocol": "vector/v1",
+  "protocol": "vector/v1.0",
   "features": {
     "supports_pagination": true,
     "supports_filters": true,
@@ -1193,7 +1349,7 @@ for attempt in range(5):
 {
   "server": "embed-service",
   "version": "2025-01-15",
-  "protocol": "embedding/v1",
+  "protocol": "embedding/v1.0",
   "supported_models": ["example-embed-1", "example-embed-2"],
   "max_batch_size": 512,
   "max_text_length": 16000,
@@ -1211,6 +1367,8 @@ for attempt in range(5):
 ---
 
 ## Appendix C — Wire-Level Envelopes (Optional)
+
+**Note:** The envelopes in this appendix follow the **canonical wire-first** rules in §4.1 and are normative for on-the-wire behavior; code snippets elsewhere are illustrative only.
 
 **Request**
 
@@ -1283,16 +1441,18 @@ for attempt in range(5):
 
 ## Appendix F — Change Log / Revision History (Non-Normative)
 
-* **v1.1 — Alignment & Deadlines:**
+* **v1.0 — Alignment & Deadlines:**
 
   * Added `DeadlineExceeded` error class and mapping (§6.3, §12.4).
   * Clarified deadline semantics and streaming finalization across protocols.
   * Extended capability flags: `supports_deadline` (all), `supports_count_tokens` (LLM); expanded Graph fields (`supports_streaming`, `supports_bulk_ops`, `retryable_codes`, `rate_limit_unit`, `max_qps`).
   * Aligned Vector types: `VectorMatch` carries full `Vector`, plus `score` and `distance`; clarified `include_vectors` behavior.
   * Added Implementation Profiles (§5.3) and observability enrichments (`deadline_bucket`, final stream outcome).
-* **v1.1 — Embedding Added & Formalized:**
 
-  * Added Embedding Protocol V1 and upgraded §10 to formal datatypes and normative signatures.
+* **v1.0 — Embedding Added & Formalized:**
+
+  * Added Embedding Protocol V1.0 and upgraded §10 to formal datatypes and normative signatures.
+
 * **v1.0 — Initial RFC-Style:**
 
   * Introduced BCP 14 requirements language, IANA Considerations, split Normative/Informative references, explicit Privacy Considerations, Conventions and Notation, error-mapping table, capability namespacing rules, and appendices for examples, redaction, and wire envelopes.
@@ -1300,5 +1460,3 @@ for attempt in range(5):
 ---
 
 **End of Document**
-
-```
