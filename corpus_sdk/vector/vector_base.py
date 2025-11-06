@@ -1073,7 +1073,7 @@ class BaseVectorAdapter(VectorProtocolV1):
             self._record(
                 "upsert",
                 t0,
-                False,
+               False,
                 code=e.code or type(e).__name__,
                 ctx=ctx,
                 namespace=spec.namespace,
