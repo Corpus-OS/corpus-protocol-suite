@@ -314,7 +314,7 @@ class MetricsSink(Protocol):
         ok: bool,
         code: str = "OK",
         extra: Optional[Mapping[str, Any]] = None,
-    ) -> None: 
+    ) -> None:
         """
         Record operation timing and status.
 
@@ -327,7 +327,7 @@ class MetricsSink(Protocol):
             extra: Additional low-cardinality dimensions
         """
         ...
-        
+
     def counter(
         self,
         *,
@@ -335,7 +335,7 @@ class MetricsSink(Protocol):
         name: str,
         value: int = 1,
         extra: Optional[Mapping[str, Any]] = None,
-    ) -> None: 
+    ) -> None:
         """
         Increment a counter metric.
 
@@ -487,22 +487,25 @@ class SimpleCircuitBreaker:
     def allow(self) -> bool:
         if self._opened_at is None:
             return True
-        # half-open if recovery window elapsed
+        # Half-open if recovery window elapsed: allow a trial request.
         if (time.monotonic() - self._opened_at) >= self._recovery_after_s:
             return True
         return False
 
     def on_success(self) -> None:
+        # Reset on success (closes breaker if it was open/half-open)
         self._failures = 0
         self._opened_at = None
 
     def on_error(self, _err: Exception) -> None:
+        # Count consecutive failures and open when threshold exceeded.
         self._failures += 1
         if self._failures >= self._failure_threshold:
             self._opened_at = time.monotonic()
 
 
 class NoopCache:
+    """No-op cache used in thin/composed mode."""
     async def get(self, key: str) -> Optional[Any]:
         return None
     async def set(self, key: str, value: Any, ttl_s: int) -> None:
@@ -512,7 +515,9 @@ class NoopCache:
 class InMemoryTTLCache:
     """
     Simple in-memory TTL cache for .complete() responses.
+
     Not multi-process safe; not distributed; suitable for standalone/dev only.
+    Eviction is opportunistic; callers MUST NOT rely on strong cache semantics.
     """
     def __init__(self) -> None:
         self._store: Dict[str, Tuple[float, Any]] = {}
@@ -535,7 +540,7 @@ class InMemoryTTLCache:
     async def set(self, key: str, value: Any, ttl_s: int) -> None:
         exp = time.monotonic() + max(1, int(ttl_s))
         self._store[key] = (exp, value)
-        # opportunistic pruning
+        # Opportunistic pruning to avoid unbounded growth.
         if len(self._store) > 4096:
             try:
                 for k, (e, _) in list(self._store.items())[:2048]:
@@ -546,6 +551,7 @@ class InMemoryTTLCache:
 
 
 class NoopLimiter:
+    """No-op limiter used in thin/composed mode."""
     async def acquire(self) -> None:
         return None
     def release(self) -> None:
@@ -555,6 +561,8 @@ class NoopLimiter:
 class TokenBucketLimiter:
     """
     Simple token bucket limiter (per-process).
+
+    NOTE: This is intentionally simple and only suitable for dev/small scale.
     """
     def __init__(self, *, rate: float = 50.0, capacity: int = 100) -> None:
         self._rate = float(rate)
@@ -569,7 +577,7 @@ class TokenBucketLimiter:
         self._tokens = min(self._capacity, self._tokens + delta * self._rate)
 
     async def acquire(self) -> None:
-        # Busy-wait sleep with small backoff; OK for dev/standalone
+        # Busy-wait with small sleeps; OK for dev/standalone.
         while True:
             self._refill()
             if self._tokens >= 1.0:
@@ -578,7 +586,7 @@ class TokenBucketLimiter:
             await asyncio.sleep(0.01)
 
     def release(self) -> None:
-        # No-op; traditional token bucket subtracts only on acquire
+        # Classic token bucket: charge on acquire only.
         return None
 
 
@@ -690,13 +698,8 @@ class LLMProtocolV1(Protocol):
             LLMCompletion: Complete response with text, metadata, and token usage
 
         Raises:
-            BadRequest: For invalid parameters or malformed messages
-            AuthError: For authentication or authorization failures
-            ResourceExhausted: For quota or rate limit exceeded
-            ModelOverloaded: For model-specific capacity issues
-            TransientNetwork: For retryable network failures
-            Unavailable: For service unavailable errors
-            NotSupported: For unsupported parameters or operations
+            BadRequest, AuthError, ResourceExhausted, ModelOverloaded,
+            TransientNetwork, Unavailable, NotSupported
         """
         ...
 
@@ -725,13 +728,8 @@ class LLMProtocolV1(Protocol):
             LLMChunk: Stream chunks with partial text and optional metadata
 
         Raises:
-            BadRequest: For invalid parameters or malformed messages
-            AuthError: For authentication or authorization failures
-            ResourceExhausted: For quota or rate limit exceeded
-            ModelOverloaded: For model-specific capacity issues
-            TransientNetwork: For retryable network failures
-            Unavailable: For service unavailable errors
-            NotSupported: For unsupported parameters or operations
+            BadRequest, AuthError, ResourceExhausted, ModelOverloaded,
+            TransientNetwork, Unavailable, NotSupported
         """
         ...
 
@@ -791,22 +789,12 @@ class BaseLLMAdapter(LLMProtocolV1):
     SIEM-safe observability. Implementers should override the `_do_*` methods
     to provide backend-specific functionality.
 
-    Example:
-        class OpenAIAdapter(BaseLLMAdapter):
-            async def _do_complete(self, *, messages, max_tokens, temperature, ctx):
-                # OpenAI-specific implementation
-                response = await openai_client.chat.completions.create(
-                    messages=messages,
-                    max_tokens=max_tokens,
-                    temperature=temperature
-                )
-                return LLMCompletion(
-                    text=response.choices[0].message.content,
-                    model=response.model,
-                    model_family="gpt-4",
-                    usage=TokenUsage(...),
-                    finish_reason=response.choices[0].finish_reason
-                )
+    This base:
+      - Normalizes errors into LLMAdapterError subclasses
+      - Enforces simple sampling and message validation
+      - Applies deadline policy if configured
+      - Integrates with pluggable breaker/cache/limiter
+      - Exposes a canonical, testable surface for router/control-plane use
     """
 
     _component = "llm"
@@ -852,14 +840,17 @@ class BaseLLMAdapter(LLMProtocolV1):
         if self._mode == "standalone":
             # Advisory warning if metrics missing
             if metrics is None:
-                LOG.warning("Using standalone mode without metrics - consider providing a metrics sink for production use")
+                LOG.warning(
+                    "Using standalone mode without metrics - "
+                    "consider providing a metrics sink for production use"
+                )
 
             self._deadline: DeadlinePolicy = deadline_policy or SimpleDeadline()
             self._breaker: CircuitBreaker = breaker or SimpleCircuitBreaker()
             self._cache: Cache = cache or InMemoryTTLCache()
             self._limiter: RateLimiter = limiter or TokenBucketLimiter()
         else:
-            # thin
+            # thin/composed: all infra is effectively no-op by default
             self._deadline = deadline_policy or NoopDeadline()
             self._breaker = breaker or NoopBreaker()
             self._cache = cache or NoopCache()
@@ -869,8 +860,17 @@ class BaseLLMAdapter(LLMProtocolV1):
 
     @staticmethod
     def _validate_messages(messages: List[Mapping[str, str]]) -> None:
-        """Validate that messages list conforms to required format."""
-        if not messages or not all(isinstance(m, Mapping) and "role" in m and "content" in m for m in messages):
+        """
+        Validate that messages list conforms to required format.
+
+        Requirements:
+            - Non-empty list
+            - Each item has "role" and "content" keys
+        """
+        if (
+            not messages
+            or not all(isinstance(m, Mapping) and "role" in m and "content" in m for m in messages)
+        ):
             raise BadRequest("messages must be a non-empty list of {role, content} mappings")
 
     @staticmethod
@@ -881,7 +881,11 @@ class BaseLLMAdapter(LLMProtocolV1):
         frequency_penalty: Optional[float],
         presence_penalty: Optional[float],
     ) -> None:
-        """Validate common sampling parameters within safe ranges."""
+        """
+        Validate common sampling parameters within safe ranges.
+
+        This is deliberately conservative to prevent accidental production misconfig.
+        """
         if temperature is not None and not (0.0 <= temperature <= 2.0):
             raise BadRequest("temperature must be within [0.0, 2.0]")
         if top_p is not None and not (0.0 < top_p <= 1.0):
@@ -893,7 +897,11 @@ class BaseLLMAdapter(LLMProtocolV1):
 
     @staticmethod
     def _tenant_hash(t: Optional[str]) -> Optional[str]:
-        """Create privacy-preserving hash of tenant identifier for metrics."""
+        """
+        Create privacy-preserving hash of tenant identifier for metrics.
+
+        Raw tenant identifiers MUST NEVER be emitted to logs/metrics.
+        """
         if not t:
             return None
         return hashlib.sha256(t.encode()).hexdigest()[:12]
@@ -927,11 +935,15 @@ class BaseLLMAdapter(LLMProtocolV1):
                 extra=x or None,
             )
         except Exception:
-            # Never let metrics recording break the operation
+            # Metrics failures MUST NOT impact the main control path.
             pass
 
     def _preflight_deadline(self, ctx: Optional[OperationContext]) -> None:
-        """Fail fast if ctx.deadline_ms already expired."""
+        """
+        Fail fast if ctx.deadline_ms already expired.
+
+        This avoids burning capacity on obviously doomed work.
+        """
         if ctx and ctx.deadline_ms is not None:
             now_ms = int(time.time() * 1000)
             if now_ms >= ctx.deadline_ms:
@@ -942,13 +954,18 @@ class BaseLLMAdapter(LLMProtocolV1):
 
     @staticmethod
     def _hash_str(s: Optional[str]) -> str:
+        """Stable hash helper for cache keys."""
         if s is None:
             return "none"
         return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
     @staticmethod
     def _messages_fingerprint(messages: List[Mapping[str, str]]) -> str:
-        # Stable digest over role/content pairs (order matters)
+        """
+        Compute a stable digest over role/content pairs (order matters).
+
+        Used for cache key construction; MUST NOT leak raw content.
+        """
         h = hashlib.sha256()
         for m in messages:
             role = str(m.get("role", ""))
@@ -973,7 +990,12 @@ class BaseLLMAdapter(LLMProtocolV1):
         stop_sequences: Optional[List[str]],
         caps: LLMCapabilities,
     ) -> str:
-        # Include model, system message, messages, and all sampling params to prevent cross-hit pollution.
+        """
+        Construct a cache key for complete().
+
+        Includes model, system message hash, message fingerprint, and sampling params
+        to avoid cross-polluting responses across materially different requests.
+        """
         parts = {
             "model": str(model or "default"),
             "system_hash": self._hash_str(system_message),
@@ -992,7 +1014,11 @@ class BaseLLMAdapter(LLMProtocolV1):
         return f"llm.complete:{hashlib.sha256(raw.encode('utf-8')).hexdigest()}"
 
     async def _apply_deadline(self, awaitable, ctx: Optional[OperationContext]) -> Any:
-        """Apply the configured deadline policy to awaitable; map timeouts to DeadlineExceeded."""
+        """
+        Apply the configured deadline policy to an awaitable.
+
+        Any asyncio.TimeoutError is normalized into DeadlineExceeded.
+        """
         try:
             return await self._deadline.wrap(awaitable, ctx)
         except asyncio.TimeoutError as e:
@@ -1013,14 +1039,19 @@ class BaseLLMAdapter(LLMProtocolV1):
     ) -> None:
         """
         Optional context-window preflight using count_tokens if supported.
-        This is soft validation; providers may still enforce their own limits.
+
+        This is soft validation:
+          - Uses count_tokens if available.
+          - Prevents obviously invalid (prompt + max_tokens) > max_context_length.
+          - Never blocks the call on transient count_tokens errors.
         """
         if not caps.supports_count_tokens or caps.max_context_length <= 0:
             return
         if max_tokens is not None and max_tokens < 0:
             raise BadRequest("max_tokens must be >= 0")
 
-        # Construct a simple concatenated text for counting; adapters may override behavior in _do_count_tokens.
+        # Construct a simple concatenated text for counting; adapters may override
+        # behavior in _do_count_tokens for more accurate per-message encoding.
         parts: List[str] = []
         if system_message:
             parts.append(f"system:{system_message}")
@@ -1038,7 +1069,6 @@ class BaseLLMAdapter(LLMProtocolV1):
         except LLMAdapterError:
             return  # do not block on preflight failures
 
-        # If max_tokens provided, check sum prompt + max_tokens <= context window
         if max_tokens is not None:
             total_possible = prompt_tokens + max(0, int(max_tokens))
             if total_possible > caps.max_context_length:
@@ -1048,9 +1078,12 @@ class BaseLLMAdapter(LLMProtocolV1):
                 )
 
     def _gate_model_if_listed(self, *, model: Optional[str], caps: LLMCapabilities) -> None:
-        if model and caps.supported_models:
-            if model not in caps.supported_models:
-                raise BadRequest(f"model '{model}' is not supported by this adapter")
+        """
+        If adapter advertises an explicit supported_models list, ensure the requested
+        model is in that list. Otherwise, the adapter is treated as open-set.
+        """
+        if model and caps.supported_models and model not in caps.supported_models:
+            raise BadRequest(f"model '{model}' is not supported by this adapter")
 
     # --- final public APIs (validation + instrumentation) ---
 
@@ -1073,9 +1106,9 @@ class BaseLLMAdapter(LLMProtocolV1):
         ctx: Optional[OperationContext] = None,
     ) -> LLMCompletion:
         """
-        Execute a complete LLM conversation with validation and metrics.
+        Execute a complete LLM conversation with validation, policy hooks, and metrics.
 
-        See LLMProtocolV1.complete for full documentation.
+        See LLMProtocolV1.complete for full contract details.
         """
         self._validate_messages(messages)
         self._validate_sampling_params(
@@ -1086,11 +1119,11 @@ class BaseLLMAdapter(LLMProtocolV1):
         )
         self._preflight_deadline(ctx)
 
-        # Breaker gate
+        # Circuit breaker gate
         if not self._breaker.allow():
             raise Unavailable("circuit open")
 
-        # Rate limit acquire
+        # Rate limit acquire (may block)
         await self._limiter.acquire()
 
         t0 = time.monotonic()
@@ -1108,7 +1141,7 @@ class BaseLLMAdapter(LLMProtocolV1):
                 caps=caps,
             )
 
-            # Optional cache (standalone/dev)
+            # Optional cache (standalone/dev only via InMemoryTTLCache)
             cache_key = None
             cached: Optional[LLMCompletion] = None
             if isinstance(self._cache, InMemoryTTLCache):
@@ -1127,7 +1160,11 @@ class BaseLLMAdapter(LLMProtocolV1):
                 cached = await self._cache.get(cache_key)
 
             if cached:
-                self._metrics.counter(component=self._component, name="cache_hits", value=1)
+                self._metrics.counter(
+                    component=self._component,
+                    name="cache_hits",
+                    value=1,
+                )
                 result: LLMCompletion = cached
             else:
                 # Execute under deadline policy
@@ -1146,7 +1183,7 @@ class BaseLLMAdapter(LLMProtocolV1):
                     ),
                     ctx,
                 )
-                # Best-effort set cache
+                # Best-effort set cache (do not fail request if cache write fails)
                 if cache_key is not None:
                     try:
                         await self._cache.set(cache_key, result, ttl_s=self._cache_ttl_s)
@@ -1158,17 +1195,25 @@ class BaseLLMAdapter(LLMProtocolV1):
             if self._tag_model_in_metrics and result.model:
                 extra["model"] = result.model
             self._record("complete", t0, True, ctx=ctx, **extra)
+
             # Counters
-            self._metrics.counter(component=self._component, name="requests_total", value=1)
+            self._metrics.counter(
+                component=self._component,
+                name="requests_total",
+                value=1,
+            )
             if result.usage and isinstance(result.usage.total_tokens, int):
                 self._metrics.counter(
                     component=self._component,
                     name="tokens_processed",
                     value=int(result.usage.total_tokens),
                 )
+
             self._breaker.on_success()
             return result
+
         except LLMAdapterError as e:
+            # Normalized/known failures
             extra = {"code": type(e).__name__}
             if self._tag_model_in_metrics and model:
                 extra["model"] = model
@@ -1176,6 +1221,7 @@ class BaseLLMAdapter(LLMProtocolV1):
             self._breaker.on_error(e)
             raise
         except Exception as e:
+            # Unexpected failures are surfaced and recorded as UnhandledException
             extra = {}
             if self._tag_model_in_metrics and model:
                 extra["model"] = model
@@ -1196,9 +1242,13 @@ class BaseLLMAdapter(LLMProtocolV1):
         ctx: Optional[OperationContext] = None,
     ) -> AsyncIterator[LLMChunk]:
         """
-        Execute an LLM conversation with streaming and metrics.
+        Execute an LLM conversation with streaming, validation, and metrics.
 
-        See LLMProtocolV1.stream for full documentation.
+        See LLMProtocolV1.stream for full contract details.
+
+        Notes:
+            - Context-window preflight uses max_tokens if available.
+            - Deadline is applied per-chunk via the configured DeadlinePolicy.
         """
         self._validate_messages(messages)
         self._validate_sampling_params(
@@ -1209,7 +1259,7 @@ class BaseLLMAdapter(LLMProtocolV1):
         )
         self._preflight_deadline(ctx)
 
-        # Breaker gate
+        # Circuit breaker gate
         if not self._breaker.allow():
             raise Unavailable("circuit open")
 
@@ -1222,7 +1272,7 @@ class BaseLLMAdapter(LLMProtocolV1):
             caps = await self._do_capabilities()
             self._gate_model_if_listed(model=model, caps=caps)
 
-            # Optional soft preflight for context length if supported (using max_tokens if given)
+            # Optional soft preflight for context length if supported
             await self._preflight_context_window_if_supported(
                 messages=messages,
                 system_message=system_message,
@@ -1249,14 +1299,19 @@ class BaseLLMAdapter(LLMProtocolV1):
                 except StopAsyncIteration:
                     finished_ok = True
                     break
+
                 yield chunk
 
-            # Metrics
+            # Metrics (best-effort)
             extra: Dict[str, Any] = {}
             if self._tag_model_in_metrics and model:
                 extra["model"] = model
             self._record("stream", t0, True, ctx=ctx, **extra)
-            self._metrics.counter(component=self._component, name="stream_requests_total", value=1)
+            self._metrics.counter(
+                component=self._component,
+                name="stream_requests_total",
+                value=1,
+            )
         except LLMAdapterError as e:
             extra = {"code": type(e).__name__}
             if self._tag_model_in_metrics and model:
@@ -1273,8 +1328,8 @@ class BaseLLMAdapter(LLMProtocolV1):
             raise
         finally:
             self._limiter.release()
-            # if finished_ok, breaker success; else already recorded on error path
             if finished_ok:
+                # Only mark success if we drained the stream cleanly.
                 self._breaker.on_success()
 
     async def count_tokens(
@@ -1284,7 +1339,11 @@ class BaseLLMAdapter(LLMProtocolV1):
         model: Optional[str] = None,
         ctx: Optional[OperationContext] = None,
     ) -> int:
-        """Count tokens in text with metrics instrumentation."""
+        """
+        Count tokens in text with metrics instrumentation.
+
+        Delegates to `_do_count_tokens` and wraps it with deadline + metrics.
+        """
         if not isinstance(text, str) or not text:
             raise BadRequest("text must be a non-empty string")
 
@@ -1301,21 +1360,51 @@ class BaseLLMAdapter(LLMProtocolV1):
                 self._do_count_tokens(text=text, model=model, ctx=ctx),
                 ctx,
             )
+
             extra: Dict[str, Any] = {}
             if self._tag_model_in_metrics and model:
                 extra["model"] = model
-            self._record("count_tokens", t0, True, ctx=ctx, text_length=len(text), **extra)
-            self._metrics.counter(component=self._component, name="count_tokens_calls", value=1)
+            self._record(
+                "count_tokens",
+                t0,
+                True,
+                ctx=ctx,
+                text_length=len(text),
+                **extra,
+            )
+            self._metrics.counter(
+                component=self._component,
+                name="count_tokens_calls",
+                value=1,
+            )
             return int(result)
         except LLMAdapterError as e:
-            self._record("count_tokens", t0, False, code=type(e).__name__, ctx=ctx, model=str(model or ""))
+            self._record(
+                "count_tokens",
+                t0,
+                False,
+                code=type(e).__name__,
+                ctx=ctx,
+                model=str(model or ""),
+            )
             raise
         except Exception as e:
-            self._record("count_tokens", t0, False, code="UnhandledException", ctx=ctx, model=str(model or ""))
+            self._record(
+                "count_tokens",
+                t0,
+                False,
+                code="UnhandledException",
+                ctx=ctx,
+                model=str(model or ""),
+            )
             raise
 
     async def health(self, *, ctx: Optional[OperationContext] = None) -> Mapping[str, Any]:
-        """Check health status with metrics instrumentation."""
+        """
+        Check health status with metrics instrumentation.
+
+        This is intentionally small: adapters should return a minimal mapping.
+        """
         t0 = time.monotonic()
         try:
             self._preflight_deadline(ctx)
@@ -1337,7 +1426,11 @@ class BaseLLMAdapter(LLMProtocolV1):
     # --- hooks to implement per backend (override these) ---
 
     async def _do_capabilities(self) -> LLMCapabilities:
-        """Implement to return adapter-specific capabilities."""
+        """
+        Implement to return adapter-specific capabilities.
+
+        Must be cheap and side-effect free; may call remote endpoints if required.
+        """
         raise NotImplementedError
 
     async def _do_complete(
@@ -1354,7 +1447,11 @@ class BaseLLMAdapter(LLMProtocolV1):
         system_message: Optional[str] = None,
         ctx: Optional[OperationContext] = None,
     ) -> LLMCompletion:
-        """Implement complete LLM conversation with validated inputs."""
+        """
+        Implement complete LLM conversation with validated inputs.
+
+        Called only after base has enforced protocol-level validation.
+        """
         raise NotImplementedError
 
     async def _do_stream(
@@ -1367,7 +1464,11 @@ class BaseLLMAdapter(LLMProtocolV1):
         system_message: Optional[str] = None,
         ctx: Optional[OperationContext] = None,
     ) -> AsyncIterator[LLMChunk]:
-        """Implement streaming LLM conversation with validated inputs."""
+        """
+        Implement streaming LLM conversation with validated inputs.
+
+        Implementers should yield LLMChunk instances.
+        """
         raise NotImplementedError
 
     async def _do_count_tokens(
@@ -1377,11 +1478,20 @@ class BaseLLMAdapter(LLMProtocolV1):
         model: Optional[str] = None,
         ctx: Optional[OperationContext] = None,
     ) -> int:
-        """Implement token counting for the specified model."""
+        """
+        Implement token counting for the specified model.
+
+        May use provider tokenizer or an approximate local tokenizer.
+        """
         raise NotImplementedError
 
     async def _do_health(self, *, ctx: Optional[OperationContext] = None) -> Mapping[str, Any]:
-        """Implement health check for the LLM backend."""
+        """
+        Implement health check for the LLM backend.
+
+        Should not raise on minor/transient issues; callers rely on this
+        for coarse readiness.
+        """
         raise NotImplementedError
 
 
@@ -1392,7 +1502,8 @@ class BaseLLMAdapter(LLMProtocolV1):
 def _ctx_from_wire(ctx_dict: Mapping[str, Any]) -> OperationContext:
     """
     Convert a wire-level ctx dict into an OperationContext.
-    Unknown keys are ignored, per protocol rules.
+
+    Unknown keys are ignored per protocol rules to allow forward compatibility.
     """
     if ctx_dict is None:
         return OperationContext()
@@ -1409,6 +1520,8 @@ def _ctx_from_wire(ctx_dict: Mapping[str, Any]) -> OperationContext:
 def _error_to_wire(e: Exception, ms: float) -> Dict[str, Any]:
     """
     Map LLMAdapterError (or unexpected Exception) to canonical error envelope.
+
+    This is the single source of truth for wire-level error normalization.
     """
     if isinstance(e, LLMAdapterError):
         return {
@@ -1435,6 +1548,7 @@ def _error_to_wire(e: Exception, ms: float) -> Dict[str, Any]:
 def _success_to_wire(result: Any, ms: float) -> Dict[str, Any]:
     """
     Map typed result objects to canonical success envelope.
+
     Uses dataclasses.asdict() where applicable, else passes through.
     """
     if hasattr(result, "__dataclass_fields__"):
@@ -1452,6 +1566,8 @@ def _success_to_wire(result: Any, ms: float) -> Dict[str, Any]:
 def _chunk_to_wire(chunk: LLMChunk, ms: float) -> Dict[str, Any]:
     """
     Map an LLMChunk to a canonical streaming envelope.
+
+    This is used only by WireLLMHandler.handle_stream.
     """
     if hasattr(chunk, "__dataclass_fields__"):
         payload = asdict(chunk)
@@ -1490,6 +1606,8 @@ class WireLLMHandler:
             - llm.complete
             - llm.count_tokens
             - llm.health
+
+        Streaming (llm.stream) MUST use handle_stream.
         """
         t0 = time.monotonic()
         try:
@@ -1536,6 +1654,7 @@ class WireLLMHandler:
 
             # llm.stream is handled via handle_stream (streaming), not here.
             raise NotSupported(f"unknown or non-unary operation '{op}'")
+
         except Exception as e:
             ms = (time.monotonic() - t0) * 1000.0
             return _error_to_wire(e, ms)
