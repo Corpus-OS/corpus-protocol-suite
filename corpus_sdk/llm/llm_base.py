@@ -42,6 +42,89 @@ Follow SemVer against LLM_PROTOCOL_VERSION. Minor versions are strictly additive
 - Patch (x.y.Z): Editorial clarifications, non-breaking fixes
 - Minor (x.Y.z): New optional parameters, capabilities, or methods
 - Major (X.y.z): Breaking changes to signatures or behavior
+
+Wire Contract (Canonical Interface)
+-----------------------------------
+The canonical interoperability surface for this protocol is the JSON wire envelope.
+This module defines a code-level interface (LLMProtocolV1 / BaseLLMAdapter) plus a
+thin wire adapter (WireLLMHandler) that maps envelopes ⇄ typed methods.
+
+All requests MUST use the following envelope shape:
+
+    {
+        "op": "llm.<operation>",
+        "ctx": {
+            "request_id": "...",
+            "idempotency_key": "...",
+            "deadline_ms": 1234567890,
+            "traceparent": "...",
+            "tenant": "...",
+            "attrs": { ... }
+        },
+        "args": { ... }  # operation-specific
+    }
+
+Unary Responses (success):
+
+    {
+        "ok": true,
+        "code": "OK",
+        "ms": <float>,          # elapsed milliseconds (best-effort)
+        "result": { ... }       # operation-specific payload
+    }
+
+Unary Responses (error):
+
+    {
+        "ok": false,
+        "code": "<UPPER_SNAKE_CASE>",   # e.g. BAD_REQUEST, AUTH_ERROR, UNAVAILABLE
+        "error": "<ErrorClassName>",    # e.g. BadRequest
+        "message": "<human readable>",
+        "retry_after_ms": <int|null>,
+        "details": { ... } | null,
+        "ms": <float>
+    }
+
+Streaming (llm.stream):
+
+Request:
+
+    {
+        "op": "llm.stream",
+        "ctx": { ... },
+        "args": {
+            "messages": [ ... ],
+            "max_tokens": <int|null>,
+            "temperature": <float|null>,
+            "model": "<model-id>|null",
+            "system_message": "<str>|null"
+        }
+    }
+
+Stream Responses:
+    - Zero or more chunk envelopes:
+
+        {
+            "ok": true,
+            "code": "OK",
+            "ms": <float>,
+            "chunk": {
+                "text": "<partial>",
+                "is_final": false,
+                "model": "<model-id>|null",
+                "usage_so_far": {
+                    "prompt_tokens": <int>,
+                    "completion_tokens": <int>,
+                    "total_tokens": <int>
+                } | null
+            }
+        }
+
+    - On terminal success, last chunk SHOULD have "is_final": true.
+    - On error, a single error envelope (same shape as unary error) terminates the stream.
+
+The WireLLMHandler in this file is the reference adapter for this contract and is
+intentionally transport-agnostic (HTTP, gRPC, WebSocket, etc.).
 """
 
 from __future__ import annotations
@@ -51,7 +134,7 @@ import hashlib
 import logging
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from typing import (
     Any,
     AsyncIterator,
@@ -68,6 +151,7 @@ LOG = logging.getLogger(__name__)
 
 # Minor bump: additive fields in LLMCapabilities and new error type.
 LLM_PROTOCOL_VERSION = "1.0.0"
+LLM_PROTOCOL_ID = "llm/v1.0"
 
 # =============================================================================
 # Normalized Errors (with retry hints and operational guidance)
@@ -123,42 +207,58 @@ class LLMAdapterError(Exception):
 
 class BadRequest(LLMAdapterError):
     """Client sent an invalid request (malformed messages, invalid parameters)."""
-    pass
+    def __init__(self, message: str, **kwargs: Any):
+        kwargs.setdefault("code", "BAD_REQUEST")
+        super().__init__(message, **kwargs)
 
 
 class AuthError(LLMAdapterError):
     """Authentication or authorization failed (invalid credentials, permissions)."""
-    pass
+    def __init__(self, message: str, **kwargs: Any):
+        kwargs.setdefault("code", "AUTH_ERROR")
+        super().__init__(message, **kwargs)
 
 
 class ResourceExhausted(LLMAdapterError):
     """Quota, rate limit, or resource constraints exceeded."""
-    pass
+    def __init__(self, message: str, **kwargs: Any):
+        kwargs.setdefault("code", "RESOURCE_EXHAUSTED")
+        super().__init__(message, **kwargs)
 
 
 class TransientNetwork(LLMAdapterError):
     """Transient network failure that may succeed on retry."""
-    pass
+    def __init__(self, message: str, **kwargs: Any):
+        kwargs.setdefault("code", "TRANSIENT_NETWORK")
+        super().__init__(message, **kwargs)
 
 
 class Unavailable(LLMAdapterError):
     """Service is temporarily unavailable or overloaded."""
-    pass
+    def __init__(self, message: str, **kwargs: Any):
+        kwargs.setdefault("code", "UNAVAILABLE")
+        super().__init__(message, **kwargs)
 
 
 class NotSupported(LLMAdapterError):
     """Requested operation or parameter is not supported by this adapter."""
-    pass
+    def __init__(self, message: str, **kwargs: Any):
+        kwargs.setdefault("code", "NOT_SUPPORTED")
+        super().__init__(message, **kwargs)
 
 
 class ModelOverloaded(LLMAdapterError):
     """Specific model is currently overloaded and cannot handle requests."""
-    pass
+    def __init__(self, message: str, **kwargs: Any):
+        kwargs.setdefault("code", "MODEL_OVERLOADED")
+        super().__init__(message, **kwargs)
 
 
 class DeadlineExceeded(LLMAdapterError):
     """Operation exceeded ctx.deadline_ms budget."""
-    pass
+    def __init__(self, message: str, **kwargs: Any):
+        kwargs.setdefault("code", "DEADLINE_EXCEEDED")
+        super().__init__(message, **kwargs)
 
 
 # =============================================================================
@@ -354,11 +454,17 @@ class SimpleDeadline:
         now_ms = int(time.time() * 1000)
         remaining_ms = max(0, ctx.deadline_ms - now_ms)
         if remaining_ms <= 0:
-            raise DeadlineExceeded("deadline already exceeded", code="DEADLINE", details={"remaining_ms": 0})
+            raise DeadlineExceeded(
+                "deadline already exceeded",
+                details={"remaining_ms": 0},
+            )
         try:
             return await asyncio.wait_for(awaitable, timeout=remaining_ms / 1000.0)
         except asyncio.TimeoutError as e:
-            raise DeadlineExceeded("operation timed out", code="DEADLINE", details={"remaining_ms": 0}) from e
+            raise DeadlineExceeded(
+                "operation timed out",
+                details={"remaining_ms": 0},
+            ) from e
 
 
 class NoopBreaker:
@@ -829,7 +935,10 @@ class BaseLLMAdapter(LLMProtocolV1):
         if ctx and ctx.deadline_ms is not None:
             now_ms = int(time.time() * 1000)
             if now_ms >= ctx.deadline_ms:
-                raise DeadlineExceeded("deadline already exceeded", code="DEADLINE", details={"remaining_ms": 0})
+                raise DeadlineExceeded(
+                    "deadline already exceeded",
+                    details={"remaining_ms": 0},
+                )
 
     @staticmethod
     def _hash_str(s: Optional[str]) -> str:
@@ -887,7 +996,10 @@ class BaseLLMAdapter(LLMProtocolV1):
         try:
             return await self._deadline.wrap(awaitable, ctx)
         except asyncio.TimeoutError as e:
-            raise DeadlineExceeded("operation timed out", code="DEADLINE", details={"remaining_ms": 0}) from e
+            raise DeadlineExceeded(
+                "operation timed out",
+                details={"remaining_ms": 0},
+            ) from e
 
     async def _preflight_context_window_if_supported(
         self,
@@ -976,7 +1088,7 @@ class BaseLLMAdapter(LLMProtocolV1):
 
         # Breaker gate
         if not self._breaker.allow():
-            raise Unavailable("circuit open", code="CIRCUIT_OPEN")
+            raise Unavailable("circuit open")
 
         # Rate limit acquire
         await self._limiter.acquire()
@@ -1099,7 +1211,7 @@ class BaseLLMAdapter(LLMProtocolV1):
 
         # Breaker gate
         if not self._breaker.allow():
-            raise Unavailable("circuit open", code="CIRCUIT_OPEN")
+            raise Unavailable("circuit open")
 
         # Rate limit acquire
         await self._limiter.acquire()
@@ -1273,8 +1385,203 @@ class BaseLLMAdapter(LLMProtocolV1):
         raise NotImplementedError
 
 
+# =============================================================================
+# Wire-Level Helpers (canonical envelopes)
+# =============================================================================
+
+def _ctx_from_wire(ctx_dict: Mapping[str, Any]) -> OperationContext:
+    """
+    Convert a wire-level ctx dict into an OperationContext.
+    Unknown keys are ignored, per protocol rules.
+    """
+    if ctx_dict is None:
+        return OperationContext()
+    return OperationContext(
+        request_id=ctx_dict.get("request_id"),
+        idempotency_key=ctx_dict.get("idempotency_key"),
+        deadline_ms=ctx_dict.get("deadline_ms"),
+        traceparent=ctx_dict.get("traceparent"),
+        tenant=ctx_dict.get("tenant"),
+        attrs=ctx_dict.get("attrs") or {},
+    )
+
+
+def _error_to_wire(e: Exception, ms: float) -> Dict[str, Any]:
+    """
+    Map LLMAdapterError (or unexpected Exception) to canonical error envelope.
+    """
+    if isinstance(e, LLMAdapterError):
+        return {
+            "ok": False,
+            "code": (e.code or type(e).__name__.upper()),
+            "error": type(e).__name__,
+            "message": e.message,
+            "retry_after_ms": e.retry_after_ms,
+            "details": e.details or None,
+            "ms": ms,
+        }
+    # Fallback: treat as UNAVAILABLE/INTERNAL
+    return {
+        "ok": False,
+        "code": "UNAVAILABLE",
+        "error": type(e).__name__,
+        "message": str(e) or "internal error",
+        "retry_after_ms": None,
+        "details": None,
+        "ms": ms,
+    }
+
+
+def _success_to_wire(result: Any, ms: float) -> Dict[str, Any]:
+    """
+    Map typed result objects to canonical success envelope.
+    Uses dataclasses.asdict() where applicable, else passes through.
+    """
+    if hasattr(result, "__dataclass_fields__"):
+        payload = asdict(result)
+    else:
+        payload = result
+    return {
+        "ok": True,
+        "code": "OK",
+        "ms": ms,
+        "result": payload,
+    }
+
+
+def _chunk_to_wire(chunk: LLMChunk, ms: float) -> Dict[str, Any]:
+    """
+    Map an LLMChunk to a canonical streaming envelope.
+    """
+    if hasattr(chunk, "__dataclass_fields__"):
+        payload = asdict(chunk)
+    else:
+        payload = {
+            "text": chunk.text,
+            "is_final": getattr(chunk, "is_final", False),
+            "model": getattr(chunk, "model", None),
+            "usage_so_far": asdict(chunk.usage_so_far) if getattr(chunk, "usage_so_far", None) else None,
+        }
+    return {
+        "ok": True,
+        "code": "OK",
+        "ms": ms,
+        "chunk": payload,
+    }
+
+
+class WireLLMHandler:
+    """
+    Thin wire-level adapter that exposes an LLMProtocolV1 implementation using
+    the canonical JSON envelope contract.
+
+    This handler is transport-agnostic and can be used with HTTP, gRPC, WebSockets, etc.
+    """
+
+    def __init__(self, adapter: LLMProtocolV1):
+        self._adapter = adapter
+
+    async def handle(self, envelope: Mapping[str, Any]) -> Dict[str, Any]:
+        """
+        Handle a single unary request envelope and return a response envelope.
+
+        Supports:
+            - llm.capabilities
+            - llm.complete
+            - llm.count_tokens
+            - llm.health
+        """
+        t0 = time.monotonic()
+        try:
+            op = envelope.get("op")
+            if not isinstance(op, str):
+                raise BadRequest("missing or invalid 'op'")
+
+            ctx = _ctx_from_wire(envelope.get("ctx") or {})
+            args = envelope.get("args") or {}
+
+            if op == "llm.capabilities":
+                res = await self._adapter.capabilities()
+                return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
+
+            if op == "llm.complete":
+                res = await self._adapter.complete(
+                    messages=args.get("messages") or [],
+                    max_tokens=args.get("max_tokens"),
+                    temperature=args.get("temperature"),
+                    top_p=args.get("top_p"),
+                    frequency_penalty=args.get("frequency_penalty"),
+                    presence_penalty=args.get("presence_penalty"),
+                    stop_sequences=args.get("stop_sequences"),
+                    model=args.get("model"),
+                    system_message=args.get("system_message"),
+                    ctx=ctx,
+                )
+                return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
+
+            if op == "llm.count_tokens":
+                text = args.get("text")
+                if not isinstance(text, str):
+                    raise BadRequest("text must be a string")
+                res = await self._adapter.count_tokens(
+                    text=text,
+                    model=args.get("model"),
+                    ctx=ctx,
+                )
+                return _success_to_wire(res, (time.monotonic() - t0) * 1000.0)
+
+            if op == "llm.health":
+                res = await self._adapter.health(ctx=ctx)
+                return _success_to_wire(res, (time.monotonic() - t0) * 1000.0)
+
+            # llm.stream is handled via handle_stream (streaming), not here.
+            raise NotSupported(f"unknown or non-unary operation '{op}'")
+        except Exception as e:
+            ms = (time.monotonic() - t0) * 1000.0
+            return _error_to_wire(e, ms)
+
+    async def handle_stream(self, envelope: Mapping[str, Any]) -> AsyncIterator[Dict[str, Any]]:
+        """
+        Handle a streaming request envelope.
+
+        Expects:
+            op: "llm.stream"
+            ctx: { ... }
+            args: { messages, max_tokens?, temperature?, model?, system_message? }
+
+        Yields:
+            Streaming envelopes containing "chunk" or a terminal error envelope.
+        """
+        t0 = time.monotonic()
+        op = envelope.get("op")
+        if op != "llm.stream":
+            yield _error_to_wire(BadRequest("op must be 'llm.stream' for streaming"), 0.0)
+            return
+
+        ctx = _ctx_from_wire(envelope.get("ctx") or {})
+        args = envelope.get("args") or {}
+
+        try:
+            agen = self._adapter.stream(
+                messages=args.get("messages") or [],
+                max_tokens=args.get("max_tokens"),
+                temperature=args.get("temperature"),
+                model=args.get("model"),
+                system_message=args.get("system_message"),
+                ctx=ctx,
+            )
+
+            async for chunk in agen:
+                ms = (time.monotonic() - t0) * 1000.0
+                yield _chunk_to_wire(chunk, ms)
+        except Exception as e:
+            ms = (time.monotonic() - t0) * 1000.0
+            yield _error_to_wire(e, ms)
+
+
 __all__ = [
     "LLM_PROTOCOL_VERSION",
+    "LLM_PROTOCOL_ID",
     "LLMAdapterError",
     "BadRequest",
     "AuthError",
@@ -1305,4 +1612,10 @@ __all__ = [
     "LLMCapabilities",
     "LLMProtocolV1",
     "BaseLLMAdapter",
+    # wire helpers
+    "WireLLMHandler",
+    "_ctx_from_wire",
+    "_error_to_wire",
+    "_success_to_wire",
+    "_chunk_to_wire",
 ]
