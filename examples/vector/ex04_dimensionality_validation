@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: Apache-2.0
+"""
+Vector ex04 — Dimensionality Validation
+Spec refs: §9.3 (Operations), §12.4 (Error Mapping: DimensionMismatch)
+
+Demonstrates:
+  • Namespace with 3 dimensions
+  • Trigger DimensionMismatch for mismatched query vector
+"""
+
+import asyncio
+from corpus_sdk.examples.vector.mock_vector_adapter import MockVectorAdapter
+from corpus_sdk.vector.vector_base import (
+    Vector, UpsertSpec, QuerySpec, NamespaceSpec, OperationContext, DimensionMismatch
+)
+from corpus_sdk.examples.common.ctx import make_ctx
+from corpus_sdk.examples.common.printing import box, print_kv
+
+async def main():
+    box("Vector ex04 — Dimension Validation")
+    adapter = MockVectorAdapter(failure_rate=0.0)
+    ctx = make_ctx(OperationContext, tenant="ex04-tenant", timeout_ms=10_000)
+    ns = "ex04"
+
+    await adapter.create_namespace(NamespaceSpec(namespace=ns, dimensions=3), ctx=ctx)
+
+    # Upsert with correct dims
+    up = await adapter.upsert(UpsertSpec(vectors=[Vector(id="ok", vector=[1,0,0], namespace=ns)], namespace=ns), ctx=ctx)
+    print_kv({"upserted": up.upserted_count})
+
+    # Query with wrong dims
+    try:
+        await adapter.query(QuerySpec(vector=[0.5, 0.5], top_k=1, namespace=ns), ctx=ctx)
+    except DimensionMismatch as e:
+        print_kv({"caught": type(e).__name__, "message": str(e)})
+
+    print("\n[lesson] ex04: mismatched dimensions -> DimensionMismatch (non-retryable).")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
