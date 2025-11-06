@@ -5,126 +5,154 @@ Adapter SDK — LLM Protocol V1 (public contract + production-grade base)
 
 Purpose
 -------
-A stable, vendor-neutral API for calling Large Language Models — with structured errors,
-streaming support, token usage accounting, deadline propagation, and SIEM-safe metrics.
+A stable, vendor-neutral API for calling Large Language Models — with:
+
+- Structured, normalized error taxonomy (SIEM-safe, machine-actionable)
+- Streaming support for low-latency partial responses
+- Token usage accounting for cost/quota management
+- Deadline propagation and cooperative cancellation
+- Built-in hooks for circuit breaking, rate limiting, and caching
+- Canonical JSON wire envelopes via WireLLMHandler (transport-agnostic)
 
 This protocol enables seamless integration with any LLM provider while maintaining
 production-grade observability, security, and operational rigor.
 
 Design Philosophy
 -----------------
-- Minimal surface area: Core operations only, no vendor-specific extensions
-- Async-first: All operations are non-blocking for high-concurrency environments
-- Production hardened: Built-in metrics, error taxonomy, and context propagation
-- Extensible: Capability discovery allows for provider-specific features
+- Minimal core surface:
+    * capabilities()
+    * complete()
+    * stream()
+    * count_tokens()
+    * health()
+- Async-first: all operations are non-blocking and awaitable.
+- Provider-neutral: no hard-coded vendor specifics; adapters map into this contract.
+- DRY infra:
+    * Shared gate wrappers for breaker / limiter / deadlines / metrics.
+    * Single source of truth for error normalization and wire envelopes.
+- Extensible:
+    * Capabilities advertise feature flags.
+    * Callers can branch on server/version/model_family/supported_models.
 
 Deliberate Non-Goals
 --------------------
-- No retries, hedging, model selection, routing, fallback, or policy enforcement.
-- No tokenizer transforms or tool-calling orchestration.
-- No vendor-specific helpers or SDK wrappers.
-- No client-side auto-stream reassembly.
+- No retries, hedging, routing, model selection, or fallback.
+- No tool-calling orchestration or agent frameworks.
+- No tokenizer transforms or prompt rewriting.
+- No client-side stream reassembly helpers.
 
-Those behaviors live in the **Corpus Router** and upper control-plane layers.
+Those behaviors live in your router / control-plane / orchestration layers.
 
 Mode Strategy (Composition vs. Standalone)
 ------------------------------------------
-mode: "thin" (default) - For composition with external providers/managers. All policies
-      are no-op. Use this when you have your own scheduling/caching/rate limiting/etc.
+mode: "thin" (default)
+    - For composition under an external manager/router.
+    - All policies default to no-op:
+        * No caching
+        * No breaker
+        * No rate limiter
+    - Use when your infra already handles concurrency and resilience.
 
-mode: "standalone" - For direct use. Enables basic deadline enforcement, circuit breaking,
-      and in-memory caching + token-bucket rate limiting. Suitable for development and
-      light production use. Not a replacement for a full external provider.
+mode: "standalone"
+    - For direct use in services.
+    - Enables:
+        * SimpleDeadline (ctx.deadline_ms)
+        * SimpleCircuitBreaker
+        * InMemoryTTLCache for complete()
+        * TokenBucketLimiter
+    - Intended for development / light production; NOT a distributed control plane.
 
 Versioning
 ----------
-Follow SemVer against LLM_PROTOCOL_VERSION. Minor versions are strictly additive.
-- Patch (x.y.Z): Editorial clarifications, non-breaking fixes
-- Minor (x.Y.z): New optional parameters, capabilities, or methods
-- Major (X.y.z): Breaking changes to signatures or behavior
+Follow SemVer against LLM_PROTOCOL_VERSION (wire & type contract).
+
+- Patch (x.y.Z):
+    Editorial/documentation changes and strictly non-breaking code changes.
+- Minor (x.Y.z):
+    Additive fields, capabilities, or methods (must be backward compatible).
+- Major (X.y.z):
+    Breaking changes to signatures or semantics (avoid in base; prefer additive).
 
 Wire Contract (Canonical Interface)
 -----------------------------------
-The canonical interoperability surface for this protocol is the JSON wire envelope.
-This module defines a code-level interface (LLMProtocolV1 / BaseLLMAdapter) plus a
-thin wire adapter (WireLLMHandler) that maps envelopes ⇄ typed methods.
+This module defines the in-process protocol and a reference wire adapter.
 
-All requests MUST use the following envelope shape:
+Canonical JSON envelope:
 
-    {
-        "op": "llm.<operation>",
-        "ctx": {
-            "request_id": "...",
-            "idempotency_key": "...",
-            "deadline_ms": 1234567890,
-            "traceparent": "...",
-            "tenant": "...",
-            "attrs": { ... }
-        },
-        "args": { ... }  # operation-specific
-    }
-
-Unary Responses (success):
-
-    {
-        "ok": true,
-        "code": "OK",
-        "ms": <float>,          # elapsed milliseconds (best-effort)
-        "result": { ... }       # operation-specific payload
-    }
-
-Unary Responses (error):
-
-    {
-        "ok": false,
-        "code": "<UPPER_SNAKE_CASE>",   # e.g. BAD_REQUEST, AUTH_ERROR, UNAVAILABLE
-        "error": "<ErrorClassName>",    # e.g. BadRequest
-        "message": "<human readable>",
-        "retry_after_ms": <int|null>,
-        "details": { ... } | null,
-        "ms": <float>
-    }
-
-Streaming (llm.stream):
-
-Request:
-
-    {
-        "op": "llm.stream",
-        "ctx": { ... },
-        "args": {
-            "messages": [ ... ],
-            "max_tokens": <int|null>,
-            "temperature": <float|null>,
-            "model": "<model-id>|null",
-            "system_message": "<str>|null"
+    Request:
+        {
+            "op": "llm.<operation>",
+            "ctx": {
+                "request_id": "...",
+                "idempotency_key": "...",
+                "deadline_ms": 1234567890,
+                "traceparent": "...",
+                "tenant": "...",
+                "attrs": { ... }
+            },
+            "args": { ... }  # operation-specific
         }
-    }
 
-Stream Responses:
-    - Zero or more chunk envelopes:
-
+    Unary Success:
         {
             "ok": true,
             "code": "OK",
-            "ms": <float>,
-            "chunk": {
-                "text": "<partial>",
-                "is_final": false,
+            "ms": <float>,          # elapsed milliseconds (best-effort)
+            "result": { ... }
+        }
+
+    Unary Error:
+        {
+            "ok": false,
+            "code": "<UPPER_SNAKE_CASE>",   # e.g. BAD_REQUEST, AUTH_ERROR
+            "error": "<ErrorClassName>",    # e.g. BadRequest
+            "message": "<human readable>",
+            "retry_after_ms": <int|null>,
+            "details": { ... } | null,
+            "ms": <float>
+        }
+
+Streaming (llm.stream):
+
+    Request:
+        {
+            "op": "llm.stream",
+            "ctx": { ... },
+            "args": {
+                "messages": [ ... ],
+                "max_tokens": <int|null>,
+                "temperature": <float|null>,
+                "top_p": <float|null>,
+                "frequency_penalty": <float|null>,
+                "presence_penalty": <float|null>,
+                "stop_sequences": [<str>, ...] | null,
                 "model": "<model-id>|null",
-                "usage_so_far": {
-                    "prompt_tokens": <int>,
-                    "completion_tokens": <int>,
-                    "total_tokens": <int>
-                } | null
+                "system_message": "<str>|null"
             }
         }
 
-    - On terminal success, last chunk SHOULD have "is_final": true.
-    - On error, a single error envelope (same shape as unary error) terminates the stream.
+    Stream Responses:
+        - Zero or more chunk envelopes:
+            {
+                "ok": true,
+                "code": "OK",
+                "ms": <float>,
+                "chunk": {
+                    "text": "<partial>",
+                    "is_final": false,
+                    "model": "<model-id>|null",
+                    "usage_so_far": {
+                        "prompt_tokens": <int>,
+                        "completion_tokens": <int>,
+                        "total_tokens": <int>
+                    } | null
+                }
+            }
 
-The WireLLMHandler in this file is the reference adapter for this contract and is
-intentionally transport-agnostic (HTTP, gRPC, WebSocket, etc.).
+        - On terminal success, last chunk SHOULD set "is_final": true.
+        - On error, a single error envelope is sent and terminates the stream.
+
+LLM_PROTOCOL_ID is advertised in capabilities; it is not required per request.
 """
 
 from __future__ import annotations
@@ -132,7 +160,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-import math
+import math  # Intentionally available for adapter implementations if needed.
 import time
 from dataclasses import dataclass, asdict
 from typing import (
@@ -149,28 +177,33 @@ from typing import (
 
 LOG = logging.getLogger(__name__)
 
-# Minor bump: additive fields in LLMCapabilities and new error type.
 LLM_PROTOCOL_VERSION = "1.0.0"
 LLM_PROTOCOL_ID = "llm/v1.0"
 
 # =============================================================================
-# Normalized Errors (with retry hints and operational guidance)
+# Normalized Errors (with retry hints and structured details)
 # =============================================================================
 
 class LLMAdapterError(Exception):
     """
     Base exception for all LLM adapter errors.
 
-    Provides structured error information including retry guidance, throttling context,
-    and operational suggestions for callers to handle failures gracefully.
+    All adapter implementations SHOULD raise subclasses of this error so that callers
+    and the wire handler can make consistent, machine-actionable decisions.
 
     Attributes:
-        message: Human-readable error description
-        code: Machine-readable error code for programmatic handling
-        retry_after_ms: Suggested delay before retry (None if not retryable)
-        throttle_scope: Scope of throttling ("tenant", "model", "global", etc.)
-        suggested_token_reduction: Percentage reduction suggestion for quota errors
-        details: Additional context-specific error details (JSON-serializable)
+        message:
+            Human-readable description (safe for logs and clients).
+        code:
+            Upper-snake-case machine code; when omitted, wire layer derives from class.
+        retry_after_ms:
+            Optional client backoff hint (for 429 / overload / maintenance).
+        throttle_scope:
+            Scope of throttling ("tenant", "model", "cluster", etc.) when applicable.
+        suggested_token_reduction:
+            Optional hint (0-100) to suggest prompt size reduction on quota/limits.
+        details:
+            Additional JSON-safe context (never include secrets/PII).
     """
     def __init__(
         self,
@@ -178,8 +211,8 @@ class LLMAdapterError(Exception):
         *,
         code: Optional[str] = None,
         retry_after_ms: Optional[int] = None,
-        throttle_scope: Optional[str] = None,   # "tenant", "cluster", "model", etc.
-        suggested_token_reduction: Optional[int] = None,  # percent (0–100)
+        throttle_scope: Optional[str] = None,
+        suggested_token_reduction: Optional[int] = None,
         details: Optional[Mapping[str, Any]] = None,
     ):
         super().__init__(message)
@@ -206,90 +239,137 @@ class LLMAdapterError(Exception):
 
 
 class BadRequest(LLMAdapterError):
-    """Client sent an invalid request (malformed messages, invalid parameters)."""
+    """
+    Client error: malformed messages, invalid parameters, or unsupported options.
+
+    Examples:
+        - Empty messages
+        - Invalid temperature/top_p ranges
+        - Unknown model when capabilities.supported_models is authoritative
+    """
     def __init__(self, message: str, **kwargs: Any):
         kwargs.setdefault("code", "BAD_REQUEST")
         super().__init__(message, **kwargs)
 
 
 class AuthError(LLMAdapterError):
-    """Authentication or authorization failed (invalid credentials, permissions)."""
+    """
+    Authentication / authorization failure.
+
+    Examples:
+        - Invalid API key
+        - Missing/invalid credentials
+        - Tenant not allowed to access a given model
+    """
     def __init__(self, message: str, **kwargs: Any):
         kwargs.setdefault("code", "AUTH_ERROR")
         super().__init__(message, **kwargs)
 
 
 class ResourceExhausted(LLMAdapterError):
-    """Quota, rate limit, or resource constraints exceeded."""
+    """
+    Quota, rate limit, or resource exhaustion.
+
+    Callers should use retry_after_ms and/or throttle_scope when present.
+    """
     def __init__(self, message: str, **kwargs: Any):
         kwargs.setdefault("code", "RESOURCE_EXHAUSTED")
         super().__init__(message, **kwargs)
 
 
 class TransientNetwork(LLMAdapterError):
-    """Transient network failure that may succeed on retry."""
+    """
+    Retryable network failure.
+
+    Indicates transport issues between adapter and upstream provider.
+    """
     def __init__(self, message: str, **kwargs: Any):
         kwargs.setdefault("code", "TRANSIENT_NETWORK")
         super().__init__(message, **kwargs)
 
 
 class Unavailable(LLMAdapterError):
-    """Service is temporarily unavailable or overloaded."""
+    """
+    Backend unavailable / overloaded / maintenance.
+
+    Used when the adapter cannot reach the provider or service is degraded.
+    """
     def __init__(self, message: str, **kwargs: Any):
         kwargs.setdefault("code", "UNAVAILABLE")
         super().__init__(message, **kwargs)
 
 
 class NotSupported(LLMAdapterError):
-    """Requested operation or parameter is not supported by this adapter."""
+    """
+    Unsupported operation or parameter.
+
+    Examples:
+        - count_tokens not implemented
+        - streaming not supported by provider
+        - parallel tool calls not supported
+    """
     def __init__(self, message: str, **kwargs: Any):
         kwargs.setdefault("code", "NOT_SUPPORTED")
         super().__init__(message, **kwargs)
 
 
 class ModelOverloaded(LLMAdapterError):
-    """Specific model is currently overloaded and cannot handle requests."""
+    """
+    Specific model is overloaded or hot-partitioned.
+
+    Allows routers to distinguish model-level overload from global failures.
+    """
     def __init__(self, message: str, **kwargs: Any):
         kwargs.setdefault("code", "MODEL_OVERLOADED")
         super().__init__(message, **kwargs)
 
 
 class DeadlineExceeded(LLMAdapterError):
-    """Operation exceeded ctx.deadline_ms budget."""
+    """
+    Operation exceeded the caller's deadline budget (ctx.deadline_ms).
+
+    Emitted when:
+        - Preflight sees an already-expired deadline.
+        - DeadlinePolicy/asyncio.wait_for triggers a timeout.
+    """
     def __init__(self, message: str, **kwargs: Any):
         kwargs.setdefault("code", "DEADLINE_EXCEEDED")
         super().__init__(message, **kwargs)
 
 
 # =============================================================================
-# Context (used for deadlines, identity, SIEM-safe metrics)
+# Operation Context (tracing, deadlines, multi-tenant isolation)
 # =============================================================================
 
 @dataclass(frozen=True)
 class OperationContext:
     """
-    Context for LLM operations providing tracing, deadlines, and multi-tenant isolation.
+    Context for LLM operations.
 
-    All context information is propagated through the call chain and used for
-    observability, security, and operational control without exposing sensitive data.
+    All fields are optional and advisory but SHOULD be propagated by callers.
 
     Attributes:
-        request_id: Unique identifier for the request chain (correlation ID)
-        idempotency_key: Key for ensuring idempotent operations (when supported)
-        deadline_ms: Absolute epoch milliseconds when operation should timeout
-        traceparent: W3C Trace Context header for distributed tracing
-        tenant: Multi-tenant isolation scope (NEVER logged or exposed in metrics)
-        attrs: Additional operation attributes for extensibility and middleware
+        request_id:
+            Correlation ID for tracing across systems.
+        idempotency_key:
+            For idempotent operations (e.g., retried completions).
+        deadline_ms:
+            Absolute epoch ms; used by SimpleDeadline and preflight checks.
+        traceparent:
+            W3C traceparent header for distributed tracing.
+        tenant:
+            Tenant/project identifier; never logged directly (only hashed).
+        attrs:
+            Additional JSON-serializable attributes for routing/middleware.
     """
     request_id: Optional[str] = None
     idempotency_key: Optional[str] = None
-    deadline_ms: Optional[int] = None  # absolute epoch ms
+    deadline_ms: Optional[int] = None
     traceparent: Optional[str] = None
-    tenant: Optional[str] = None       # NEVER log raw - hash only in metrics
+    tenant: Optional[str] = None
     attrs: Mapping[str, Any] = None
 
     def __post_init__(self) -> None:
-        """Ensure attrs is always a valid dictionary."""
         if self.attrs is None:
             object.__setattr__(self, "attrs", {})
 
@@ -300,10 +380,12 @@ class OperationContext:
 
 class MetricsSink(Protocol):
     """
-    Protocol for metrics collection implementations.
+    Metrics collection protocol.
 
-    Used for operational monitoring without exposing sensitive information.
-    All metrics must be low-cardinality and never include PII or tenant identifiers.
+    Implementations MUST:
+        - Avoid PII.
+        - Avoid high-cardinality labels.
+        - Hash tenant identifiers when needed.
     """
     def observe(
         self,
@@ -314,19 +396,7 @@ class MetricsSink(Protocol):
         ok: bool,
         code: str = "OK",
         extra: Optional[Mapping[str, Any]] = None,
-    ) -> None:
-        """
-        Record operation timing and status.
-
-        Args:
-            component: Component name (e.g., "llm")
-            op: Operation name (e.g., "complete", "stream")
-            ms: Operation duration in milliseconds
-            ok: Whether operation succeeded
-            code: Status code (error class name or "OK")
-            extra: Additional low-cardinality dimensions
-        """
-        ...
+    ) -> None: ...
 
     def counter(
         self,
@@ -335,27 +405,17 @@ class MetricsSink(Protocol):
         name: str,
         value: int = 1,
         extra: Optional[Mapping[str, Any]] = None,
-    ) -> None:
-        """
-        Increment a counter metric.
-
-        Args:
-            component: Component name (e.g., "llm")
-            name: Counter name (e.g., "requests", "tokens")
-            value: Increment value
-            extra: Additional low-cardinality dimensions
-        """
-        ...
+    ) -> None: ...
 
 
 class NoopMetrics:
-    """No-operation metrics sink for testing or when metrics are disabled."""
+    """No-op metrics sink for tests or minimal deployments."""
     def observe(self, **_: Any) -> None: ...
     def counter(self, **_: Any) -> None: ...
 
 
 # =============================================================================
-# Result Models (structured, typed responses)
+# Result Models (structured, JSON-safe responses)
 # =============================================================================
 
 @dataclass
@@ -363,10 +423,7 @@ class TokenUsage:
     """
     Token usage accounting for cost tracking and quota management.
 
-    Attributes:
-        prompt_tokens: Number of tokens in the input prompt
-        completion_tokens: Number of tokens in the generated output
-        total_tokens: Sum of prompt and completion tokens
+    All fields are integers and JSON-serializable.
     """
     prompt_tokens: int
     completion_tokens: int
@@ -376,77 +433,90 @@ class TokenUsage:
 @dataclass
 class LLMCompletion:
     """
-    Complete LLM response with metadata and token accounting.
+    Full LLM completion result.
 
     Attributes:
-        text: Generated text content
-        model: Specific model identifier used for generation
-        model_family: Model family for routing and analytics ("gpt-4", "claude-3", etc.)
-        usage: Token usage breakdown for cost tracking
-        finish_reason: Reason for generation stopping ("stop", "length", "error", "tool_call")
+        text:
+            Final response text (router/orchestrator may post-process).
+        model:
+            Concrete model identifier (e.g. "gpt-4.1", "claude-3-opus").
+        model_family:
+            Logical family ("gpt-4", "claude-3", "gemini-pro", etc.).
+        usage:
+            TokenUsage with prompt/completion/total.
+        finish_reason:
+            "stop", "length", "error", "tool_call", etc.
     """
     text: str
     model: str
-    model_family: str  # "gpt-4", "claude-3", "gemini-pro"
+    model_family: str
     usage: TokenUsage
-    finish_reason: str  # "stop", "length", "error", "tool_call"
+    finish_reason: str
 
 
 @dataclass
 class LLMChunk:
     """
-    Streaming response chunk for real-time output.
+    Streaming response chunk.
 
     Attributes:
-        text: Partial generated text content
-        is_final: Whether this is the final chunk in the stream
-        model: Model identifier (may be None until final chunk)
-        usage_so_far: Progressive token usage (may be None until final chunk)
+        text:
+            Partial text delta (MAY be empty for non-text events if extended).
+        is_final:
+            Whether this chunk is the final one in the stream.
+        model:
+            Model identifier; MAY be None until final chunk.
+        usage_so_far:
+            Optional TokenUsage snapshot; typically only on final chunk.
     """
     text: str
     is_final: bool = False
     model: Optional[str] = None
-    usage_so_far: Optional[TokenUsage] = None  # Progressive token counts
+    usage_so_far: Optional[TokenUsage] = None
 
 
 # =============================================================================
-# Pluggable policy & infra interfaces (deadline, breaker, cache, limiter)
+# Policy / Infra Extension Points
 # =============================================================================
 
 class DeadlinePolicy(Protocol):
-    """Strategy to apply time budgets (ctx.deadline_ms) to awaits."""
+    """Strategy interface for applying ctx.deadline_ms to awaitables."""
     async def wrap(self, awaitable, ctx: Optional[OperationContext]) -> Any: ...
 
 
 class CircuitBreaker(Protocol):
-    """Minimal circuit breaker interface."""
+    """Minimal circuit breaker interface for gating upstream calls."""
     def allow(self) -> bool: ...
     def on_success(self) -> None: ...
     def on_error(self, err: Exception) -> None: ...
 
 
 class Cache(Protocol):
-    """Minimal async cache interface (used for non-streaming .complete())."""
+    """Async cache interface used for complete() results."""
     async def get(self, key: str) -> Optional[Any]: ...
     async def set(self, key: str, value: Any, ttl_s: int) -> None: ...
 
 
 class RateLimiter(Protocol):
-    """Minimal rate limiter interface."""
+    """Simple rate limiter interface."""
     async def acquire(self) -> None: ...
     def release(self) -> None: ...
 
 
 class NoopDeadline:
-    """No-op deadline policy (no timing/timeout behavior)."""
+    """No-op deadline policy (used in thin/composed mode by default)."""
     async def wrap(self, awaitable, ctx: Optional[OperationContext]) -> Any:
         return await awaitable
 
 
 class SimpleDeadline:
     """
-    Deadline policy that enforces ctx.deadline_ms using asyncio.wait_for.
-    If ctx.deadline_ms is None, it passes through without timeout.
+    Deadline policy that enforces ctx.deadline_ms via asyncio.wait_for.
+
+    Behavior:
+        - If no deadline: pass-through.
+        - If already expired: raises DeadlineExceeded immediately.
+        - If timed out: raises DeadlineExceeded.
     """
     async def wrap(self, awaitable, ctx: Optional[OperationContext]) -> Any:
         if ctx is None or ctx.deadline_ms is None:
@@ -468,6 +538,7 @@ class SimpleDeadline:
 
 
 class NoopBreaker:
+    """Breaker that never trips; safe default for thin mode."""
     def allow(self) -> bool: return True
     def on_success(self) -> None: ...
     def on_error(self, err: Exception) -> None: ...
@@ -475,8 +546,10 @@ class NoopBreaker:
 
 class SimpleCircuitBreaker:
     """
-    Extremely small circuit breaker (counts consecutive failures).
-    Not distributed; intended for standalone/dev use only.
+    Tiny per-process circuit breaker.
+
+    Not distributed. Intended for standalone/dev usage.
+    Opens after N consecutive failures; half-open after recovery window.
     """
     def __init__(self, *, failure_threshold: int = 5, recovery_after_s: float = 10.0) -> None:
         self._failure_threshold = max(1, int(failure_threshold))
@@ -487,25 +560,23 @@ class SimpleCircuitBreaker:
     def allow(self) -> bool:
         if self._opened_at is None:
             return True
-        # Half-open if recovery window elapsed: allow a trial request.
+        # Half-open probe after recovery interval.
         if (time.monotonic() - self._opened_at) >= self._recovery_after_s:
             return True
         return False
 
     def on_success(self) -> None:
-        # Reset on success (closes breaker if it was open/half-open)
         self._failures = 0
         self._opened_at = None
 
     def on_error(self, _err: Exception) -> None:
-        # Count consecutive failures and open when threshold exceeded.
         self._failures += 1
         if self._failures >= self._failure_threshold:
             self._opened_at = time.monotonic()
 
 
 class NoopCache:
-    """No-op cache used in thin/composed mode."""
+    """No-op cache implementation."""
     async def get(self, key: str) -> Optional[Any]:
         return None
     async def set(self, key: str, value: Any, ttl_s: int) -> None:
@@ -514,10 +585,12 @@ class NoopCache:
 
 class InMemoryTTLCache:
     """
-    Simple in-memory TTL cache for .complete() responses.
+    In-memory TTL cache for complete() results.
 
-    Not multi-process safe; not distributed; suitable for standalone/dev only.
-    Eviction is opportunistic; callers MUST NOT rely on strong cache semantics.
+    Characteristics:
+        - Per-process only; NOT shared/distributed.
+        - Opportunistic pruning; callers must not rely on strong guarantees.
+        - Safe default for standalone/dev mode.
     """
     def __init__(self) -> None:
         self._store: Dict[str, Tuple[float, Any]] = {}
@@ -529,7 +602,6 @@ class InMemoryTTLCache:
             return None
         exp, val = item
         if now >= exp:
-            # expire lazily
             try:
                 del self._store[key]
             except Exception:
@@ -540,7 +612,7 @@ class InMemoryTTLCache:
     async def set(self, key: str, value: Any, ttl_s: int) -> None:
         exp = time.monotonic() + max(1, int(ttl_s))
         self._store[key] = (exp, value)
-        # Opportunistic pruning to avoid unbounded growth.
+        # Basic pruning to avoid unbounded growth.
         if len(self._store) > 4096:
             try:
                 for k, (e, _) in list(self._store.items())[:2048]:
@@ -551,7 +623,7 @@ class InMemoryTTLCache:
 
 
 class NoopLimiter:
-    """No-op limiter used in thin/composed mode."""
+    """No-op rate limiter."""
     async def acquire(self) -> None:
         return None
     def release(self) -> None:
@@ -560,9 +632,11 @@ class NoopLimiter:
 
 class TokenBucketLimiter:
     """
-    Simple token bucket limiter (per-process).
+    Simple token-bucket limiter; per-process only.
 
-    NOTE: This is intentionally simple and only suitable for dev/small scale.
+    Notes:
+        - Charges only on acquire(); release() is a no-op.
+        - Intended for standalone/dev; use a real distributed limiter in production.
     """
     def __init__(self, *, rate: float = 50.0, capacity: int = 100) -> None:
         self._rate = float(rate)
@@ -577,7 +651,6 @@ class TokenBucketLimiter:
         self._tokens = min(self._capacity, self._tokens + delta * self._rate)
 
     async def acquire(self) -> None:
-        # Busy-wait with small sleeps; OK for dev/standalone.
         while True:
             self._refill()
             if self._tokens >= 1.0:
@@ -586,7 +659,6 @@ class TokenBucketLimiter:
             await asyncio.sleep(0.01)
 
     def release(self) -> None:
-        # Classic token bucket: charge on acquire only.
         return None
 
 
@@ -597,28 +669,12 @@ class TokenBucketLimiter:
 @dataclass(frozen=True)
 class LLMCapabilities:
     """
-    Describes the capabilities and limitations of an LLM adapter implementation.
+    Describes the capabilities and limits of an LLM adapter.
 
-    Used by routing layers for intelligent model selection, request planning,
-    and feature compatibility checking.
-
-    Attributes:
-        server: Backend server identifier (e.g., "openai", "anthropic", "local-llm")
-        version: Adapter or backend version string
-        model_family: Primary model family supported ("gpt-4", "claude-3", etc.)
-        max_context_length: Maximum context window in tokens
-        supports_streaming: Whether streaming responses are supported
-        supports_roles: Whether role-based message formatting is supported
-        supports_json_output: Whether JSON-structured output is supported
-        supports_parallel_tool_calls: Whether parallel function/tool calls are supported
-        idempotent_writes: Whether operations are idempotent with idempotency_key
-        supports_multi_tenant: Whether multi-tenant isolation is supported
-        supports_system_message: Whether explicit system messages are supported
-
-        # Additive, optional fields (alignment with Embedding base parity)
-        supports_deadline: Whether adapter cooperates with deadline cancellation
-        supports_count_tokens: Whether count_tokens is supported/accurate
-        supported_models: Optional list of specific models; empty means "adapter-defined"
+    Used by routers/control-plane for:
+        - Model selection and feature routing
+        - Input validation (e.g., context window)
+        - Detecting support for streaming / JSON modes / tools / deadlines
     """
     server: str
     version: str
@@ -633,7 +689,7 @@ class LLMCapabilities:
     supports_system_message: bool = True
     supports_deadline: bool = True
     supports_count_tokens: bool = True
-    supported_models: Tuple[str, ...] = ()  # empty ⇒ not enumerated / open set
+    supported_models: Tuple[str, ...] = ()  # empty ⇒ open/adapter-defined set
 
 
 # =============================================================================
@@ -643,26 +699,15 @@ class LLMCapabilities:
 @runtime_checkable
 class LLMProtocolV1(Protocol):
     """
-    Protocol defining the LLM Protocol V1 interface.
+    Language-level contract for LLM adapters.
 
-    Implement this protocol to create compatible LLM adapters. All methods are async
-    and designed for high-concurrency environments. The protocol is runtime-checkable
-    for dynamic adapter validation.
+    Implementations MUST:
+        - Be async-only.
+        - Raise LLMAdapterError subclasses on failure.
+        - Follow semantics documented here.
     """
 
-    async def capabilities(self) -> LLMCapabilities:
-        """
-        Get the capabilities of this LLM adapter.
-
-        Returns:
-            LLMCapabilities: Description of supported features and limitations
-
-        Note:
-            This method is async to support dynamic capability discovery in
-            distributed systems where capabilities may change or require
-            network calls to determine.
-        """
-        ...
+    async def capabilities(self) -> LLMCapabilities: ...
 
     async def complete(
         self,
@@ -677,31 +722,7 @@ class LLMProtocolV1(Protocol):
         model: Optional[str] = None,
         system_message: Optional[str] = None,
         ctx: Optional[OperationContext] = None,
-    ) -> LLMCompletion:
-        """
-        Execute a complete LLM conversation and return the full response.
-
-        Args:
-            messages: Conversation history as list of role-content mappings.
-                     Each message must have "role" and "content" keys.
-            max_tokens: Maximum tokens to generate (None for model default)
-            temperature: Sampling temperature (0.0 to 2.0, None for default)
-            top_p: Nucleus sampling parameter (None for default)
-            frequency_penalty: Frequency penalty (-2.0 to 2.0, None for default)
-            presence_penalty: Presence penalty (-2.0 to 2.0, None for default)
-            stop_sequences: Sequences that will stop generation (None for default)
-            model: Specific model to use (None for default or adapter-chosen)
-            system_message: Optional system message for conversation context
-            ctx: Operation context for tracing, deadlines, and multi-tenancy
-
-        Returns:
-            LLMCompletion: Complete response with text, metadata, and token usage
-
-        Raises:
-            BadRequest, AuthError, ResourceExhausted, ModelOverloaded,
-            TransientNetwork, Unavailable, NotSupported
-        """
-        ...
+    ) -> LLMCompletion: ...
 
     async def stream(
         self,
@@ -709,29 +730,14 @@ class LLMProtocolV1(Protocol):
         messages: List[Mapping[str, str]],
         max_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        frequency_penalty: Optional[float] = None,
+        presence_penalty: Optional[float] = None,
+        stop_sequences: Optional[List[str]] = None,
         model: Optional[str] = None,
         system_message: Optional[str] = None,
         ctx: Optional[OperationContext] = None,
-    ) -> AsyncIterator[LLMChunk]:
-        """
-        Execute an LLM conversation and stream results as they are generated.
-
-        Args:
-            messages: Conversation history as list of role-content mappings
-            max_tokens: Maximum tokens to generate (None for model default)
-            temperature: Sampling temperature (0.0 to 2.0, None for default)
-            model: Specific model to use (None for default or adapter-chosen)
-            system_message: Optional system message for conversation context
-            ctx: Operation context for tracing, deadlines, and multi-tenancy
-
-        Yields:
-            LLMChunk: Stream chunks with partial text and optional metadata
-
-        Raises:
-            BadRequest, AuthError, ResourceExhausted, ModelOverloaded,
-            TransientNetwork, Unavailable, NotSupported
-        """
-        ...
+    ) -> AsyncIterator[LLMChunk]: ...
 
     async def count_tokens(
         self,
@@ -739,62 +745,29 @@ class LLMProtocolV1(Protocol):
         *,
         model: Optional[str] = None,
         ctx: Optional[OperationContext] = None,
-    ) -> int:
-        """
-        Count the number of tokens in the given text for the specified model.
+    ) -> int: ...
 
-        Args:
-            text: Input text to count tokens for
-            model: Specific model to use for tokenization (None for default)
-            ctx: Operation context for tracing and multi-tenancy
-
-        Returns:
-            int: Number of tokens in the text according to model's tokenizer
-
-        Raises:
-            BadRequest: For invalid text or model
-            NotSupported: If token counting is not supported
-            AuthError: For authentication failures
-        """
-        ...
-
-    async def health(self, *, ctx: Optional[OperationContext] = None) -> Mapping[str, Any]:
-        """
-        Check the health status of the LLM backend.
-
-        Args:
-            ctx: Operation context for tracing and multi-tenancy
-
-        Returns:
-            Mapping with health information including:
-            - ok: Boolean overall health status
-            - server: Backend server identifier
-            - version: Backend version information
-
-        Raises:
-            Unavailable: If the health check fails
-        """
-        ...
+    async def health(self, *, ctx: Optional[OperationContext] = None) -> Mapping[str, Any]: ...
 
 
 # =============================================================================
-# Base Instrumented Adapter (validation, metrics, error handling)
+# Base Instrumented Adapter (validation, metrics, DRY gates)
 # =============================================================================
 
 class BaseLLMAdapter(LLMProtocolV1):
     """
-    Base class for implementing LLM Protocol V1 adapters.
+    Base implementation of LLMProtocolV1.
 
-    Provides common validation, metrics instrumentation, error handling, and
-    SIEM-safe observability. Implementers should override the `_do_*` methods
-    to provide backend-specific functionality.
+    This class:
+        - Validates requests (messages, sampling params).
+        - Ensures JSON-serializability of message payloads (fast-fail).
+        - Applies deadline policies and preflight checks.
+        - Wraps calls with circuit breaker + rate limiter.
+        - Optionally caches complete() results (standalone mode).
+        - Emits SIEM-safe metrics (hashed tenant IDs).
+        - Provides DRY gate helpers for unary and streaming operations.
 
-    This base:
-      - Normalizes errors into LLMAdapterError subclasses
-      - Enforces simple sampling and message validation
-      - Applies deadline policy if configured
-      - Integrates with pluggable breaker/cache/limiter
-      - Exposes a canonical, testable surface for router/control-plane use
+    Backend implementers override only the `_do_*` hooks.
     """
 
     _component = "llm"
@@ -811,67 +784,115 @@ class BaseLLMAdapter(LLMProtocolV1):
         limiter: Optional[RateLimiter] = None,
         tag_model_in_metrics: bool = True,
         cache_ttl_s: int = 60,
+        stream_deadline_check_every_n_chunks: int = 10,
     ) -> None:
         """
-        Initialize the LLM adapter with metrics instrumentation and optional policies.
+        Initialize the LLM adapter with common infra.
 
         Args:
-            metrics: Metrics sink for operational monitoring. Uses NoopMetrics if None.
-            mode: "thin" (default) for composition (all no-op hooks); "standalone" enables
-                  basic deadline enforcement, a small circuit breaker, in-memory caching,
-                  and a token-bucket rate limiter.
-            deadline_policy: Optional deadline policy to enforce ctx.deadline_ms.
-            breaker: Optional circuit breaker; defaults based on mode.
-            cache: Optional async cache (used for complete only); defaults based on mode.
-            limiter: Optional rate limiter; defaults based on mode.
-            tag_model_in_metrics: Whether to include 'model' as a metric tag when available.
-            cache_ttl_s: Default TTL for in-memory cache entries when enabled.
+            metrics:
+                Metrics sink implementation; defaults to NoopMetrics.
+            mode:
+                "thin":
+                    - All hooks are effectively no-op unless explicitly provided.
+                "standalone":
+                    - Enables SimpleDeadline, SimpleCircuitBreaker,
+                      InMemoryTTLCache, TokenBucketLimiter.
+            deadline_policy:
+                Custom DeadlinePolicy; overrides mode defaults when provided.
+            breaker:
+                Custom CircuitBreaker; overrides mode defaults when provided.
+            cache:
+                Custom Cache; used only for complete() responses.
+            limiter:
+                Custom RateLimiter; used for all operations.
+            tag_model_in_metrics:
+                If True, attaches model to metrics where known.
+            cache_ttl_s:
+                TTL for entries in the standalone in-memory cache.
+            stream_deadline_check_every_n_chunks:
+                For streaming, perform deadline checks every N chunks instead
+                of for every single chunk. Reduces overhead for high-volume
+                streams while preserving deadline semantics.
         """
         self._metrics: MetricsSink = metrics or NoopMetrics()
         self._tag_model_in_metrics: bool = bool(tag_model_in_metrics)
         self._cache_ttl_s: int = max(1, int(cache_ttl_s))
+        self._stream_deadline_check_every_n_chunks: int = max(
+            1, int(stream_deadline_check_every_n_chunks)
+        )
 
         m = (mode or "thin").strip().lower()
         if m not in {"thin", "standalone"}:
             m = "thin"
         self._mode = m
 
-        # Instantiate default policies/infra based on mode (explicit args win)
         if self._mode == "standalone":
-            # Advisory warning if metrics missing
             if metrics is None:
                 LOG.warning(
                     "Using standalone mode without metrics - "
                     "consider providing a metrics sink for production use"
                 )
-
             self._deadline: DeadlinePolicy = deadline_policy or SimpleDeadline()
             self._breaker: CircuitBreaker = breaker or SimpleCircuitBreaker()
             self._cache: Cache = cache or InMemoryTTLCache()
             self._limiter: RateLimiter = limiter or TokenBucketLimiter()
         else:
-            # thin/composed: all infra is effectively no-op by default
             self._deadline = deadline_policy or NoopDeadline()
             self._breaker = breaker or NoopBreaker()
-            self._cache = cache or NoopCache()
-            self._limiter = limiter or NoopLimiter()
+            self._cache: Cache = cache or NoopCache()
+            self._limiter: RateLimiter = limiter or NoopLimiter()
 
-    # --- internal helpers (validation and instrumentation) ---
+    # --- async context management (resource cleanup hint) --------------------
+
+    async def __aenter__(self) -> "BaseLLMAdapter":
+        """
+        Support async context manager usage:
+
+            async with MyAdapter(...) as adapter:
+                ...
+
+        Backend implementations may override close() for resource cleanup.
+        """
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        await self.close()
+
+    async def close(self) -> None:
+        """
+        Clean up resources (e.g., HTTP sessions, connection pools).
+
+        Override in concrete adapters as needed. Default is a no-op.
+        """
+        return None
+
+    # --- internal helpers (validation, metrics) ------------------------------
 
     @staticmethod
     def _validate_messages(messages: List[Mapping[str, str]]) -> None:
         """
-        Validate that messages list conforms to required format.
-
-        Requirements:
-            - Non-empty list
-            - Each item has "role" and "content" keys
+        Validate that messages is a non-empty list of {role, content} mappings.
         """
         if (
             not messages
             or not all(isinstance(m, Mapping) and "role" in m and "content" in m for m in messages)
         ):
             raise BadRequest("messages must be a non-empty list of {role, content} mappings")
+
+    @staticmethod
+    def _validate_message_content_serializable(messages: List[Mapping[str, str]]) -> None:
+        """
+        Ensure messages are JSON-serializable.
+
+        Aligns with graph adapter behavior: fail fast before invoking backends
+        when payload contains unserializable types.
+        """
+        import json
+        try:
+            json.dumps(messages)
+        except (TypeError, ValueError) as e:
+            raise BadRequest(f"messages must be JSON-serializable: {e}")
 
     @staticmethod
     def _validate_sampling_params(
@@ -882,9 +903,7 @@ class BaseLLMAdapter(LLMProtocolV1):
         presence_penalty: Optional[float],
     ) -> None:
         """
-        Validate common sampling parameters within safe ranges.
-
-        This is deliberately conservative to prevent accidental production misconfig.
+        Validate core sampling parameters in conservative, production-safe ranges.
         """
         if temperature is not None and not (0.0 <= temperature <= 2.0):
             raise BadRequest("temperature must be within [0.0, 2.0]")
@@ -898,9 +917,9 @@ class BaseLLMAdapter(LLMProtocolV1):
     @staticmethod
     def _tenant_hash(t: Optional[str]) -> Optional[str]:
         """
-        Create privacy-preserving hash of tenant identifier for metrics.
+        Hash tenant for metrics/logging.
 
-        Raw tenant identifiers MUST NEVER be emitted to logs/metrics.
+        Raw tenant identifiers MUST NEVER be emitted.
         """
         if not t:
             return None
@@ -917,9 +936,9 @@ class BaseLLMAdapter(LLMProtocolV1):
         **extra: Any,
     ) -> None:
         """
-        Record operation metrics with context and tenant hashing.
+        Emit a timing metric for an operation.
 
-        Never exposes raw tenant identifiers in metrics. Safe for SIEM systems.
+        Any failures in metrics emission are swallowed.
         """
         try:
             ms = (time.monotonic() - t0) * 1000.0
@@ -935,14 +954,11 @@ class BaseLLMAdapter(LLMProtocolV1):
                 extra=x or None,
             )
         except Exception:
-            # Metrics failures MUST NOT impact the main control path.
             pass
 
     def _preflight_deadline(self, ctx: Optional[OperationContext]) -> None:
         """
-        Fail fast if ctx.deadline_ms already expired.
-
-        This avoids burning capacity on obviously doomed work.
+        Fast-fail if ctx.deadline_ms is already elapsed.
         """
         if ctx and ctx.deadline_ms is not None:
             now_ms = int(time.time() * 1000)
@@ -954,7 +970,6 @@ class BaseLLMAdapter(LLMProtocolV1):
 
     @staticmethod
     def _hash_str(s: Optional[str]) -> str:
-        """Stable hash helper for cache keys."""
         if s is None:
             return "none"
         return hashlib.sha256(s.encode("utf-8")).hexdigest()
@@ -962,9 +977,7 @@ class BaseLLMAdapter(LLMProtocolV1):
     @staticmethod
     def _messages_fingerprint(messages: List[Mapping[str, str]]) -> str:
         """
-        Compute a stable digest over role/content pairs (order matters).
-
-        Used for cache key construction; MUST NOT leak raw content.
+        Stable fingerprint for a messages list without leaking raw content.
         """
         h = hashlib.sha256()
         for m in messages:
@@ -989,14 +1002,19 @@ class BaseLLMAdapter(LLMProtocolV1):
         presence_penalty: Optional[float],
         stop_sequences: Optional[List[str]],
         caps: LLMCapabilities,
+        ctx: Optional[OperationContext],
     ) -> str:
         """
         Construct a cache key for complete().
 
-        Includes model, system message hash, message fingerprint, and sampling params
-        to avoid cross-polluting responses across materially different requests.
+        Includes:
+            - Model & system message hash
+            - Messages fingerprint
+            - Sampling params
+            - Capabilities (family/version/json support)
+            - Tenant hash (when present) for isolation
         """
-        parts = {
+        parts: Dict[str, str] = {
             "model": str(model or "default"),
             "system_hash": self._hash_str(system_message),
             "msgs": self._messages_fingerprint(messages),
@@ -1010,14 +1028,17 @@ class BaseLLMAdapter(LLMProtocolV1):
             "family": caps.model_family,
             "ver": caps.version,
         }
+        if ctx and ctx.tenant:
+            th = self._tenant_hash(ctx.tenant)
+            parts["tenant"] = th or "none"
         raw = "|".join(f"{k}={v}" for k, v in sorted(parts.items()))
         return f"llm.complete:{hashlib.sha256(raw.encode('utf-8')).hexdigest()}"
 
     async def _apply_deadline(self, awaitable, ctx: Optional[OperationContext]) -> Any:
         """
-        Apply the configured deadline policy to an awaitable.
+        Apply DeadlinePolicy and normalize asyncio.TimeoutError.
 
-        Any asyncio.TimeoutError is normalized into DeadlineExceeded.
+        All timeouts become DeadlineExceeded with DEADLINE_EXCEEDED semantics.
         """
         try:
             return await self._deadline.wrap(awaitable, ctx)
@@ -1038,20 +1059,19 @@ class BaseLLMAdapter(LLMProtocolV1):
         caps: LLMCapabilities,
     ) -> None:
         """
-        Optional context-window preflight using count_tokens if supported.
+        Optional context-window preflight using count_tokens() if supported.
 
-        This is soft validation:
-          - Uses count_tokens if available.
-          - Prevents obviously invalid (prompt + max_tokens) > max_context_length.
-          - Never blocks the call on transient count_tokens errors.
+        Behavior:
+            - Uses count_tokens to estimate prompt size.
+            - If max_tokens is provided and sum exceeds max_context_length:
+                  raises BadRequest.
+            - Never blocks the call on count_tokens errors.
         """
         if not caps.supports_count_tokens or caps.max_context_length <= 0:
             return
         if max_tokens is not None and max_tokens < 0:
             raise BadRequest("max_tokens must be >= 0")
 
-        # Construct a simple concatenated text for counting; adapters may override
-        # behavior in _do_count_tokens for more accurate per-message encoding.
         parts: List[str] = []
         if system_message:
             parts.append(f"system:{system_message}")
@@ -1065,9 +1085,9 @@ class BaseLLMAdapter(LLMProtocolV1):
                 ctx,
             )
         except NotSupported:
-            return  # adapter does not support counting precisely
+            return
         except LLMAdapterError:
-            return  # do not block on preflight failures
+            return
 
         if max_tokens is not None:
             total_possible = prompt_tokens + max(0, int(max_tokens))
@@ -1079,16 +1099,152 @@ class BaseLLMAdapter(LLMProtocolV1):
 
     def _gate_model_if_listed(self, *, model: Optional[str], caps: LLMCapabilities) -> None:
         """
-        If adapter advertises an explicit supported_models list, ensure the requested
-        model is in that list. Otherwise, the adapter is treated as open-set.
+        If capabilities enumerate supported_models, enforce membership.
         """
         if model and caps.supported_models and model not in caps.supported_models:
             raise BadRequest(f"model '{model}' is not supported by this adapter")
 
-    # --- final public APIs (validation + instrumentation) ---
+    # --- DRY gate wrappers (unary + streaming) -------------------------------
+
+    async def _with_gates_unary(
+        self,
+        *,
+        op: str,
+        ctx: Optional[OperationContext],
+        call,
+        metric_extra: Mapping[str, Any] = None,
+        after_success=None,
+    ) -> Any:
+        """
+        Shared wrapper for unary operations.
+
+        Applies:
+            - deadline preflight
+            - circuit breaker allow/on_{success,error}
+            - rate limiter acquire/release
+            - metrics recording (timing + status)
+            - optional after_success hook for extra metrics
+        """
+        metric_extra = dict(metric_extra or {})
+        self._preflight_deadline(ctx)
+
+        if not self._breaker.allow():
+            e = Unavailable("circuit open")
+            code = e.code or type(e).__name__
+            t0 = time.monotonic()
+            self._record(op, t0, False, code=code, ctx=ctx, **metric_extra)
+            raise e
+
+        await self._limiter.acquire()
+        t0 = time.monotonic()
+        try:
+            result = await call()
+
+            if after_success is not None:
+                try:
+                    after_success(result, metric_extra)  # type: ignore[arg-type]
+                except Exception:
+                    # Metrics-only; ignore failures.
+                    pass
+
+            self._record(op, t0, True, ctx=ctx, **metric_extra)
+            self._breaker.on_success()
+            return result
+
+        except LLMAdapterError as e:
+            code = e.code or type(e).__name__
+            self._record(op, t0, False, code=code, ctx=ctx, **metric_extra)
+            self._breaker.on_error(e)
+            raise
+
+        except Exception as e:
+            self._record(op, t0, False, code="UnhandledException", ctx=ctx, **metric_extra)
+            self._breaker.on_error(e)
+            raise
+
+        finally:
+            self._limiter.release()
+
+    async def _with_gates_stream(
+        self,
+        *,
+        op: str,
+        ctx: Optional[OperationContext],
+        agen_factory,
+        metric_extra: Mapping[str, Any] = None,
+    ) -> AsyncIterator[LLMChunk]:
+        """
+        Shared wrapper for streaming operations.
+
+        Applies:
+            - deadline preflight
+            - circuit breaker allow/on_{success,error}
+            - rate limiter acquire/release
+            - metrics for overall stream duration and outcome
+
+        Optimization:
+            - Deadline is checked every `stream_deadline_check_every_n_chunks`
+              instead of on every single chunk to reduce overhead on hot paths.
+        """
+        metric_extra = dict(metric_extra or {})
+        self._preflight_deadline(ctx)
+
+        if not self._breaker.allow():
+            e = Unavailable("circuit open")
+            code = e.code or type(e).__name__
+            t0 = time.monotonic()
+            self._record(op, t0, False, code=code, ctx=ctx, **metric_extra)
+            raise e
+
+        await self._limiter.acquire()
+        t0 = time.monotonic()
+
+        async def _gen() -> AsyncIterator[LLMChunk]:
+            chunk_count = 0
+            try:
+                agen = agen_factory()
+                async for chunk in agen:
+                    chunk_count += 1
+                    if (
+                        self._stream_deadline_check_every_n_chunks > 0
+                        and (chunk_count % self._stream_deadline_check_every_n_chunks) == 0
+                    ):
+                        self._preflight_deadline(ctx)
+                    yield chunk
+
+                # Completed successfully
+                self._record(op, t0, True, ctx=ctx, **metric_extra)
+                self._metrics.counter(
+                    component=self._component,
+                    name="stream_requests_total",
+                    value=1,
+                )
+                self._breaker.on_success()
+
+            except LLMAdapterError as e:
+                code = e.code or type(e).__name__
+                self._record(op, t0, False, code=code, ctx=ctx, **metric_extra)
+                self._breaker.on_error(e)
+                raise
+
+            except Exception as e:
+                self._record(op, t0, False, code="UnhandledException", ctx=ctx, **metric_extra)
+                self._breaker.on_error(e)
+                raise
+
+            finally:
+                self._limiter.release()
+
+        return _gen()
+
+    # --- Public API: capabilities / complete / stream / count_tokens / health -
 
     async def capabilities(self) -> LLMCapabilities:
-        """Get the capabilities of this LLM adapter."""
+        """
+        Return adapter capabilities.
+
+        SHOULD be fast and side-effect free; MAY call upstream discovery APIs.
+        """
         return await self._do_capabilities()
 
     async def complete(
@@ -1106,32 +1262,25 @@ class BaseLLMAdapter(LLMProtocolV1):
         ctx: Optional[OperationContext] = None,
     ) -> LLMCompletion:
         """
-        Execute a complete LLM conversation with validation, policy hooks, and metrics.
+        Execute a full LLM completion with validation, policy hooks, and metrics.
 
-        See LLMProtocolV1.complete for full contract details.
+        See LLMProtocolV1.complete for the detailed contract.
         """
         self._validate_messages(messages)
+        self._validate_message_content_serializable(messages)
         self._validate_sampling_params(
             temperature=temperature,
             top_p=top_p,
             frequency_penalty=frequency_penalty,
             presence_penalty=presence_penalty,
         )
-        self._preflight_deadline(ctx)
 
-        # Circuit breaker gate
-        if not self._breaker.allow():
-            raise Unavailable("circuit open")
+        async def _call() -> LLMCompletion:
+            self._preflight_deadline(ctx)
 
-        # Rate limit acquire (may block)
-        await self._limiter.acquire()
-
-        t0 = time.monotonic()
-        try:
             caps = await self._do_capabilities()
             self._gate_model_if_listed(model=model, caps=caps)
 
-            # Optional soft preflight for context length if supported
             await self._preflight_context_window_if_supported(
                 messages=messages,
                 system_message=system_message,
@@ -1141,9 +1290,7 @@ class BaseLLMAdapter(LLMProtocolV1):
                 caps=caps,
             )
 
-            # Optional cache (standalone/dev only via InMemoryTTLCache)
-            cache_key = None
-            cached: Optional[LLMCompletion] = None
+            cache_key: Optional[str] = None
             if isinstance(self._cache, InMemoryTTLCache):
                 cache_key = self._make_complete_cache_key(
                     model=model,
@@ -1156,80 +1303,64 @@ class BaseLLMAdapter(LLMProtocolV1):
                     presence_penalty=presence_penalty,
                     stop_sequences=stop_sequences,
                     caps=caps,
+                    ctx=ctx,
                 )
                 cached = await self._cache.get(cache_key)
+                if cached is not None:
+                    self._metrics.counter(
+                        component=self._component,
+                        name="cache_hits",
+                        value=1,
+                    )
+                    return cached  # type: ignore[return-value]
 
-            if cached:
-                self._metrics.counter(
-                    component=self._component,
-                    name="cache_hits",
-                    value=1,
-                )
-                result: LLMCompletion = cached
-            else:
-                # Execute under deadline policy
-                result = await self._apply_deadline(
-                    self._do_complete(
-                        messages=messages,
-                        max_tokens=max_tokens,
-                        temperature=temperature,
-                        top_p=top_p,
-                        frequency_penalty=frequency_penalty,
-                        presence_penalty=presence_penalty,
-                        stop_sequences=stop_sequences,
-                        model=model,
-                        system_message=system_message,
-                        ctx=ctx,
-                    ),
-                    ctx,
-                )
-                # Best-effort set cache (do not fail request if cache write fails)
-                if cache_key is not None:
-                    try:
-                        await self._cache.set(cache_key, result, ttl_s=self._cache_ttl_s)
-                    except Exception:
-                        pass
+            result = await self._apply_deadline(
+                self._do_complete(
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    frequency_penalty=frequency_penalty,
+                    presence_penalty=presence_penalty,
+                    stop_sequences=stop_sequences,
+                    model=model,
+                    system_message=system_message,
+                    ctx=ctx,
+                ),
+                ctx,
+            )
 
-            # Metrics
-            extra: Dict[str, Any] = {}
-            if self._tag_model_in_metrics and result.model:
-                extra["model"] = result.model
-            self._record("complete", t0, True, ctx=ctx, **extra)
+            if isinstance(self._cache, InMemoryTTLCache) and cache_key is not None:
+                try:
+                    await self._cache.set(cache_key, result, ttl_s=self._cache_ttl_s)
+                except Exception:
+                    pass
 
-            # Counters
+            return result
+
+        def _after_success(result: LLMCompletion, metric_extra: Dict[str, Any]) -> None:
+            if self._tag_model_in_metrics and getattr(result, "model", None):
+                metric_extra.setdefault("model", result.model)
             self._metrics.counter(
                 component=self._component,
                 name="requests_total",
                 value=1,
             )
-            if result.usage and isinstance(result.usage.total_tokens, int):
+            usage = getattr(result, "usage", None)
+            if usage and isinstance(getattr(usage, "total_tokens", None), int):
                 self._metrics.counter(
                     component=self._component,
                     name="tokens_processed",
-                    value=int(result.usage.total_tokens),
+                    value=int(usage.total_tokens),
                 )
 
-            self._breaker.on_success()
-            return result
-
-        except LLMAdapterError as e:
-            # Normalized/known failures
-            extra = {"code": type(e).__name__}
-            if self._tag_model_in_metrics and model:
-                extra["model"] = model
-            self._record("complete", t0, False, code=type(e).__name__, ctx=ctx, **extra)
-            self._breaker.on_error(e)
-            raise
-        except Exception as e:
-            # Unexpected failures are surfaced and recorded as UnhandledException
-            extra = {}
-            if self._tag_model_in_metrics and model:
-                extra["model"] = model
-            self._record("complete", t0, False, code="UnhandledException", ctx=ctx, **extra)
-            self._breaker.on_error(e)
-            raise
-        finally:
-            self._limiter.release()
+        return await self._with_gates_unary(
+            op="complete",
+            ctx=ctx,
+            call=_call,
+            metric_extra={},
+            after_success=_after_success,
+        )
 
     async def stream(
         self,
@@ -1237,42 +1368,42 @@ class BaseLLMAdapter(LLMProtocolV1):
         messages: List[Mapping[str, str]],
         max_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        frequency_penalty: Optional[float] = None,
+        presence_penalty: Optional[float] = None,
+        stop_sequences: Optional[List[str]] = None,
         model: Optional[str] = None,
         system_message: Optional[str] = None,
         ctx: Optional[OperationContext] = None,
     ) -> AsyncIterator[LLMChunk]:
         """
-        Execute an LLM conversation with streaming, validation, and metrics.
+        Streaming completion with full sampling parity.
 
-        See LLMProtocolV1.stream for full contract details.
-
-        Notes:
-            - Context-window preflight uses max_tokens if available.
-            - Deadline is applied per-chunk via the configured DeadlinePolicy.
+        Accepts:
+            - temperature, top_p
+            - frequency_penalty, presence_penalty
+            - stop_sequences
+        and forwards them to _do_stream. This aligns streaming with complete().
         """
         self._validate_messages(messages)
+        self._validate_message_content_serializable(messages)
         self._validate_sampling_params(
             temperature=temperature,
-            top_p=None,  # streaming signature has fewer params; adapters may still use defaults
-            frequency_penalty=None,
-            presence_penalty=None,
+            top_p=top_p,
+            frequency_penalty=frequency_penalty,
+            presence_penalty=presence_penalty,
         )
-        self._preflight_deadline(ctx)
 
-        # Circuit breaker gate
-        if not self._breaker.allow():
-            raise Unavailable("circuit open")
+        metric_extra: Dict[str, Any] = {}
+        if self._tag_model_in_metrics and model:
+            metric_extra["model"] = model
 
-        # Rate limit acquire
-        await self._limiter.acquire()
+        async def agen_factory() -> AsyncIterator[LLMChunk]:
+            self._preflight_deadline(ctx)
 
-        t0 = time.monotonic()
-        finished_ok = False
-        try:
             caps = await self._do_capabilities()
             self._gate_model_if_listed(model=model, caps=caps)
 
-            # Optional soft preflight for context length if supported
             await self._preflight_context_window_if_supported(
                 messages=messages,
                 system_message=system_message,
@@ -1282,55 +1413,28 @@ class BaseLLMAdapter(LLMProtocolV1):
                 caps=caps,
             )
 
-            # Wrap the underlying async generator so we can enforce deadline on each __anext__
             agen = self._do_stream(
                 messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
+                top_p=top_p,
+                frequency_penalty=frequency_penalty,
+                presence_penalty=presence_penalty,
+                stop_sequences=stop_sequences,
                 model=model,
                 system_message=system_message,
                 ctx=ctx,
             )
 
-            while True:
-                try:
-                    # Enforce deadline per chunk fetch
-                    chunk = await self._apply_deadline(agen.__anext__(), ctx)
-                except StopAsyncIteration:
-                    finished_ok = True
-                    break
-
+            async for chunk in agen:
                 yield chunk
 
-            # Metrics (best-effort)
-            extra: Dict[str, Any] = {}
-            if self._tag_model_in_metrics and model:
-                extra["model"] = model
-            self._record("stream", t0, True, ctx=ctx, **extra)
-            self._metrics.counter(
-                component=self._component,
-                name="stream_requests_total",
-                value=1,
-            )
-        except LLMAdapterError as e:
-            extra = {"code": type(e).__name__}
-            if self._tag_model_in_metrics and model:
-                extra["model"] = model
-            self._record("stream", t0, False, code=type(e).__name__, ctx=ctx, **extra)
-            self._breaker.on_error(e)
-            raise
-        except Exception as e:
-            extra = {}
-            if self._tag_model_in_metrics and model:
-                extra["model"] = model
-            self._record("stream", t0, False, code="UnhandledException", ctx=ctx, **extra)
-            self._breaker.on_error(e)
-            raise
-        finally:
-            self._limiter.release()
-            if finished_ok:
-                # Only mark success if we drained the stream cleanly.
-                self._breaker.on_success()
+        return await self._with_gates_stream(
+            op="stream",
+            ctx=ctx,
+            agen_factory=agen_factory,
+            metric_extra=metric_extra,
+        )
 
     async def count_tokens(
         self,
@@ -1340,9 +1444,12 @@ class BaseLLMAdapter(LLMProtocolV1):
         ctx: Optional[OperationContext] = None,
     ) -> int:
         """
-        Count tokens in text with metrics instrumentation.
+        Count tokens for the given text/model pair with full instrumentation.
 
-        Delegates to `_do_count_tokens` and wraps it with deadline + metrics.
+        Honors:
+            - capabilities.supported_models (if enumerated)
+            - capabilities.supports_count_tokens
+            - ctx.deadline_ms via DeadlinePolicy
         """
         if not isinstance(text, str) or not text:
             raise BadRequest("text must be a non-empty string")
@@ -1378,6 +1485,7 @@ class BaseLLMAdapter(LLMProtocolV1):
                 value=1,
             )
             return int(result)
+
         except LLMAdapterError as e:
             self._record(
                 "count_tokens",
@@ -1388,6 +1496,7 @@ class BaseLLMAdapter(LLMProtocolV1):
                 model=str(model or ""),
             )
             raise
+
         except Exception as e:
             self._record(
                 "count_tokens",
@@ -1401,9 +1510,17 @@ class BaseLLMAdapter(LLMProtocolV1):
 
     async def health(self, *, ctx: Optional[OperationContext] = None) -> Mapping[str, Any]:
         """
-        Check health status with metrics instrumentation.
+        Health check endpoint with normalized response shape.
 
-        This is intentionally small: adapters should return a minimal mapping.
+        Returns:
+            {
+                "ok": bool,
+                "server": str,
+                "version": str,
+            }
+
+        Implementations may include additional keys in _do_health; they are
+        normalized down by this wrapper for callers.
         """
         t0 = time.monotonic()
         try:
@@ -1420,16 +1537,15 @@ class BaseLLMAdapter(LLMProtocolV1):
             raise
         except Exception as e:
             self._record("health", t0, False, code="UnhandledException", ctx=ctx)
-            # Normalize unexpected errors as Unavailable for callers
             raise Unavailable("health check failed") from e
 
-    # --- hooks to implement per backend (override these) ---
+    # --- backend hooks -------------------------------------------------------
 
     async def _do_capabilities(self) -> LLMCapabilities:
         """
-        Implement to return adapter-specific capabilities.
+        Return adapter-specific capabilities.
 
-        Must be cheap and side-effect free; may call remote endpoints if required.
+        Must be implemented by concrete adapters.
         """
         raise NotImplementedError
 
@@ -1448,9 +1564,11 @@ class BaseLLMAdapter(LLMProtocolV1):
         ctx: Optional[OperationContext] = None,
     ) -> LLMCompletion:
         """
-        Implement complete LLM conversation with validated inputs.
+        Backend implementation of complete().
 
-        Called only after base has enforced protocol-level validation.
+        Base has already:
+            - validated messages and params
+            - applied preflight checks
         """
         raise NotImplementedError
 
@@ -1460,14 +1578,18 @@ class BaseLLMAdapter(LLMProtocolV1):
         messages: List[Mapping[str, str]],
         max_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        frequency_penalty: Optional[float] = None,
+        presence_penalty: Optional[float] = None,
+        stop_sequences: Optional[List[str]] = None,
         model: Optional[str] = None,
         system_message: Optional[str] = None,
         ctx: Optional[OperationContext] = None,
     ) -> AsyncIterator[LLMChunk]:
         """
-        Implement streaming LLM conversation with validated inputs.
+        Backend implementation of stream().
 
-        Implementers should yield LLMChunk instances.
+        Must yield LLMChunk instances.
         """
         raise NotImplementedError
 
@@ -1479,18 +1601,15 @@ class BaseLLMAdapter(LLMProtocolV1):
         ctx: Optional[OperationContext] = None,
     ) -> int:
         """
-        Implement token counting for the specified model.
-
-        May use provider tokenizer or an approximate local tokenizer.
+        Backend implementation of count_tokens().
         """
         raise NotImplementedError
 
     async def _do_health(self, *, ctx: Optional[OperationContext] = None) -> Mapping[str, Any]:
         """
-        Implement health check for the LLM backend.
+        Backend implementation of health().
 
-        Should not raise on minor/transient issues; callers rely on this
-        for coarse readiness.
+        Should be lightweight and resilient; callers rely on this for readiness.
         """
         raise NotImplementedError
 
@@ -1501,9 +1620,9 @@ class BaseLLMAdapter(LLMProtocolV1):
 
 def _ctx_from_wire(ctx_dict: Mapping[str, Any]) -> OperationContext:
     """
-    Convert a wire-level ctx dict into an OperationContext.
+    Convert wire-level ctx mapping into OperationContext.
 
-    Unknown keys are ignored per protocol rules to allow forward compatibility.
+    Unknown keys are ignored for forward compatibility.
     """
     if ctx_dict is None:
         return OperationContext()
@@ -1519,9 +1638,10 @@ def _ctx_from_wire(ctx_dict: Mapping[str, Any]) -> OperationContext:
 
 def _error_to_wire(e: Exception, ms: float) -> Dict[str, Any]:
     """
-    Map LLMAdapterError (or unexpected Exception) to canonical error envelope.
+    Normalize exceptions into canonical error envelopes.
 
-    This is the single source of truth for wire-level error normalization.
+    LLMAdapterError subclasses preserve their codes and messages; all other
+    exceptions are treated as UNAVAILABLE/internal for callers.
     """
     if isinstance(e, LLMAdapterError):
         return {
@@ -1533,7 +1653,6 @@ def _error_to_wire(e: Exception, ms: float) -> Dict[str, Any]:
             "details": e.details or None,
             "ms": ms,
         }
-    # Fallback: treat as UNAVAILABLE/INTERNAL
     return {
         "ok": False,
         "code": "UNAVAILABLE",
@@ -1547,9 +1666,7 @@ def _error_to_wire(e: Exception, ms: float) -> Dict[str, Any]:
 
 def _success_to_wire(result: Any, ms: float) -> Dict[str, Any]:
     """
-    Map typed result objects to canonical success envelope.
-
-    Uses dataclasses.asdict() where applicable, else passes through.
+    Wrap successful results into canonical success envelope.
     """
     if hasattr(result, "__dataclass_fields__"):
         payload = asdict(result)
@@ -1565,9 +1682,7 @@ def _success_to_wire(result: Any, ms: float) -> Dict[str, Any]:
 
 def _chunk_to_wire(chunk: LLMChunk, ms: float) -> Dict[str, Any]:
     """
-    Map an LLMChunk to a canonical streaming envelope.
-
-    This is used only by WireLLMHandler.handle_stream.
+    Wrap an LLMChunk into the canonical streaming envelope shape.
     """
     if hasattr(chunk, "__dataclass_fields__"):
         payload = asdict(chunk)
@@ -1576,7 +1691,11 @@ def _chunk_to_wire(chunk: LLMChunk, ms: float) -> Dict[str, Any]:
             "text": chunk.text,
             "is_final": getattr(chunk, "is_final", False),
             "model": getattr(chunk, "model", None),
-            "usage_so_far": asdict(chunk.usage_so_far) if getattr(chunk, "usage_so_far", None) else None,
+            "usage_so_far": (
+                asdict(chunk.usage_so_far)
+                if getattr(chunk, "usage_so_far", None)
+                else None
+            ),
         }
     return {
         "ok": True,
@@ -1588,10 +1707,18 @@ def _chunk_to_wire(chunk: LLMChunk, ms: float) -> Dict[str, Any]:
 
 class WireLLMHandler:
     """
-    Thin wire-level adapter that exposes an LLMProtocolV1 implementation using
-    the canonical JSON envelope contract.
+    Reference wire adapter for LLMProtocolV1.
 
-    This handler is transport-agnostic and can be used with HTTP, gRPC, WebSockets, etc.
+    Transport-agnostic: plug into HTTP, gRPC, WebSocket, etc.
+
+    Supported unary ops:
+        - llm.capabilities
+        - llm.complete
+        - llm.count_tokens
+        - llm.health
+
+    Streaming:
+        - llm.stream (via handle_stream)
     """
 
     def __init__(self, adapter: LLMProtocolV1):
@@ -1599,15 +1726,7 @@ class WireLLMHandler:
 
     async def handle(self, envelope: Mapping[str, Any]) -> Dict[str, Any]:
         """
-        Handle a single unary request envelope and return a response envelope.
-
-        Supports:
-            - llm.capabilities
-            - llm.complete
-            - llm.count_tokens
-            - llm.health
-
-        Streaming (llm.stream) MUST use handle_stream.
+        Handle unary LLM operations via JSON envelope.
         """
         t0 = time.monotonic()
         try:
@@ -1652,7 +1771,7 @@ class WireLLMHandler:
                 res = await self._adapter.health(ctx=ctx)
                 return _success_to_wire(res, (time.monotonic() - t0) * 1000.0)
 
-            # llm.stream is handled via handle_stream (streaming), not here.
+            # llm.stream is handled exclusively via handle_stream.
             raise NotSupported(f"unknown or non-unary operation '{op}'")
 
         except Exception as e:
@@ -1661,15 +1780,12 @@ class WireLLMHandler:
 
     async def handle_stream(self, envelope: Mapping[str, Any]) -> AsyncIterator[Dict[str, Any]]:
         """
-        Handle a streaming request envelope.
+        Handle streaming llm.stream requests.
 
         Expects:
             op: "llm.stream"
             ctx: { ... }
-            args: { messages, max_tokens?, temperature?, model?, system_message? }
-
-        Yields:
-            Streaming envelopes containing "chunk" or a terminal error envelope.
+            args: full streaming parameter set (parity with LLMProtocolV1.stream)
         """
         t0 = time.monotonic()
         op = envelope.get("op")
@@ -1685,11 +1801,14 @@ class WireLLMHandler:
                 messages=args.get("messages") or [],
                 max_tokens=args.get("max_tokens"),
                 temperature=args.get("temperature"),
+                top_p=args.get("top_p"),
+                frequency_penalty=args.get("frequency_penalty"),
+                presence_penalty=args.get("presence_penalty"),
+                stop_sequences=args.get("stop_sequences"),
                 model=args.get("model"),
                 system_message=args.get("system_message"),
                 ctx=ctx,
             )
-
             async for chunk in agen:
                 ms = (time.monotonic() - t0) * 1000.0
                 yield _chunk_to_wire(chunk, ms)
@@ -1731,7 +1850,6 @@ __all__ = [
     "LLMCapabilities",
     "LLMProtocolV1",
     "BaseLLMAdapter",
-    # wire helpers
     "WireLLMHandler",
     "_ctx_from_wire",
     "_error_to_wire",
