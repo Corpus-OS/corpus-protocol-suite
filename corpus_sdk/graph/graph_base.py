@@ -59,7 +59,7 @@ from typing import (
 
 LOG = logging.getLogger(__name__)
 
-GRAPH_PROTOCOL_VERSION = "1.1.0"  # minor bump: added capabilities fields & infra hooks
+GRAPH_PROTOCOL_VERSION = "1.0.0"  # minor bump: added capabilities fields & infra hooks
 KNOWN_DIALECTS: Tuple[str, ...] = ("cypher", "opencypher", "gremlin", "gql")
 
 # =============================================================================
