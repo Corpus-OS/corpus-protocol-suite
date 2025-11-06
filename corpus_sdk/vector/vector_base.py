@@ -91,8 +91,18 @@ import hashlib
 import logging
 from dataclasses import dataclass, asdict
 from typing import (
-    Any, Dict, List, Mapping, Optional, Protocol, Tuple, Iterable,
-    runtime_checkable, AsyncIterator, Union, NewType
+    Any,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Protocol,
+    Tuple,
+    Iterable,
+    runtime_checkable,
+    AsyncIterator,
+    Union,
+    NewType,
 )
 
 VECTOR_PROTOCOL_VERSION = "1.0.0"
@@ -110,7 +120,7 @@ VectorID = NewType('VectorID', str)
 class Vector:
     """
     A vector with optional metadata and identifier.
-
+    
     Attributes:
         id: Unique identifier for the vector
         vector: The vector embedding as a list of floats
@@ -126,7 +136,7 @@ class Vector:
 class VectorMatch:
     """
     A single vector match with similarity score.
-
+    
     Attributes:
         vector: The matching vector
         score: Similarity score (higher = more similar)
@@ -140,7 +150,7 @@ class VectorMatch:
 class QueryResult:
     """
     Result from a vector similarity search query.
-
+    
     Attributes:
         matches: List of matching vectors with similarity scores
         query_vector: The original query vector used for search
@@ -159,10 +169,10 @@ class QueryResult:
 class VectorAdapterError(Exception):
     """
     Base exception for all vector adapter errors.
-
+    
     Provides structured error information including retry guidance, resource limits,
     and operational suggestions for callers to handle failures gracefully.
-
+    
     Attributes:
         message: Human-readable error description
         code: Machine-readable error code (UPPER_SNAKE_CASE where possible)
@@ -201,9 +211,7 @@ class VectorAdapterError(Exception):
             "details": {k: self.details[k] for k in sorted(self.details)},
         }
 
-# NOTE:
-# Subclasses set default `code` in UPPER_SNAKE_CASE if not explicitly provided,
-# aligning with the protocol's error code requirements.
+# Subclasses set default `code` in UPPER_SNAKE_CASE where not explicitly provided.
 
 class BadRequest(VectorAdapterError):
     """Client sent an invalid request (malformed vectors, invalid parameters)."""
@@ -267,16 +275,16 @@ class DeadlineExceeded(VectorAdapterError):
 class OperationContext:
     """
     Context for vector operations providing tracing, deadlines, and multi-tenant isolation.
-
+    
     All context information is propagated through the call chain and used for
     observability, security, and operational control without exposing sensitive data.
-
+    
     Attributes:
         request_id: Unique identifier for the request chain (correlation ID)
         idempotency_key: Key for ensuring idempotent operations (when supported)
         deadline_ms: Absolute epoch milliseconds when operation should timeout
         traceparent: W3C Trace Context header for distributed tracing
-        tenant: Multi-tenant isolation scope (NEVER logged raw)
+        tenant: Multi-tenant isolation scope (NEVER logged or exposed in metrics)
         attrs: Additional operation attributes for extensibility and middleware
     """
     request_id: Optional[str] = None
@@ -308,7 +316,7 @@ class OperationContext:
 class MetricsSink(Protocol):
     """
     Protocol for metrics collection implementations.
-
+    
     Used for operational monitoring without exposing sensitive information.
     All metrics must be low-cardinality and never include PII or raw tenant identifiers.
     """
@@ -321,9 +329,12 @@ class MetricsSink(Protocol):
         ok: bool,
         code: str = "OK",
         extra: Optional[Mapping[str, Any]] = None,
-    ) -> None:
+    ) -> None: 
+        """
+        Record operation timing and status.
+        """
         ...
-
+        
     def counter(
         self,
         *,
@@ -331,7 +342,10 @@ class MetricsSink(Protocol):
         name: str,
         value: int = 1,
         extra: Optional[Mapping[str, Any]] = None,
-    ) -> None:
+    ) -> None: 
+        """
+        Increment a counter metric.
+        """
         ...
 
 class NoopMetrics:
@@ -508,10 +522,10 @@ class SimpleTokenBucketLimiter:
 class VectorCapabilities:
     """
     Describes the capabilities and limitations of a vector adapter implementation.
-
-    This mirrors the protocol's capability discovery semantics and is suitable
-    for direct serialization.
-
+    
+    Used by routing layers for intelligent database selection, query planning,
+    and feature compatibility checking across different vector database backends.
+    
     Attributes:
         server: Backend server identifier (e.g., "pinecone", "qdrant", "weaviate")
         version: Backend server version string
@@ -553,7 +567,7 @@ class VectorCapabilities:
 class QuerySpec:
     """
     Specification for vector similarity search queries.
-
+    
     Attributes:
         vector: Query vector for similarity search
         top_k: Number of top results to return
@@ -573,7 +587,7 @@ class QuerySpec:
 class UpsertSpec:
     """
     Specification for vector upsert operations.
-
+    
     Attributes:
         vectors: List of vectors to upsert
         namespace: Target namespace/collection for the operation
@@ -585,7 +599,7 @@ class UpsertSpec:
 class DeleteSpec:
     """
     Specification for vector deletion operations.
-
+    
     Attributes:
         ids: List of vector IDs to delete
         namespace: Target namespace/collection for the operation
@@ -599,7 +613,7 @@ class DeleteSpec:
 class NamespaceSpec:
     """
     Specification for namespace/collection management operations.
-
+    
     Attributes:
         namespace: Namespace/collection name
         dimensions: Vector dimensions for this namespace
@@ -617,7 +631,7 @@ class NamespaceSpec:
 class UpsertResult:
     """
     Result from vector upsert operations.
-
+    
     Attributes:
         upserted_count: Number of vectors successfully upserted
         failed_count: Number of vectors that failed to upsert
@@ -631,7 +645,7 @@ class UpsertResult:
 class DeleteResult:
     """
     Result from vector deletion operations.
-
+    
     Attributes:
         deleted_count: Number of vectors successfully deleted
         failed_count: Number of vectors that failed to delete
@@ -645,7 +659,7 @@ class DeleteResult:
 class NamespaceResult:
     """
     Result from namespace management operations.
-
+    
     Attributes:
         success: Whether the operation completed successfully
         namespace: The namespace that was operated on
@@ -663,7 +677,7 @@ class NamespaceResult:
 class VectorProtocolV1(Protocol):
     """
     Protocol defining the Vector Protocol V1.0 interface.
-
+    
     Implement this protocol to create compatible vector adapters. All methods are async
     and designed for high-concurrency environments. This protocol is language-level,
     while the canonical wire contract is defined by the JSON envelopes.
@@ -715,10 +729,17 @@ class VectorProtocolV1(Protocol):
 class BaseVectorAdapter(VectorProtocolV1):
     """
     Base class for implementing Vector Protocol V1.0 adapters.
-
+    
     Provides common validation, metrics instrumentation, error handling, and
-    SIEM-safe observability. Implementers override `_do_*` methods for backend
-    specifics while inheriting production-grade behavior.
+    SIEM-safe observability. Implementers should override the `_do_*` methods
+    to provide backend-specific functionality while getting production-ready
+    infrastructure for free.
+    
+    Example:
+        class PineconeAdapter(BaseVectorAdapter):
+            async def _do_query(self, spec: QuerySpec, *, ctx: Optional[OperationContext]) -> QueryResult:
+                # Pinecone-specific implementation
+                ...
     """
 
     _component = "vector"
@@ -737,6 +758,9 @@ class BaseVectorAdapter(VectorProtocolV1):
         cache_caps_ttl_s: int = 30,
         warn_on_standalone_no_metrics: bool = True,
     ) -> None:
+        """
+        Initialize the vector adapter with metrics instrumentation and optional policies.
+        """
         self._metrics: MetricsSink = metrics or NoopMetrics()
 
         # Resolve policies by mode; explicit overrides always win.
@@ -767,11 +791,17 @@ class BaseVectorAdapter(VectorProtocolV1):
 
     @staticmethod
     def _require_non_empty(name: str, value: str) -> None:
+        """
+        Validate that a string value is non-empty.
+        """
         if not isinstance(value, str) or not value.strip():
             raise BadRequest(f"{name} must be a non-empty string")
 
     @staticmethod
     def _validate_vector(vector: List[float]) -> None:
+        """
+        Validate that a vector is properly formed.
+        """
         if not vector or not isinstance(vector, list):
             raise BadRequest("vector must be a non-empty list of floats")
         if not all(isinstance(x, (int, float)) for x in vector):
@@ -779,53 +809,56 @@ class BaseVectorAdapter(VectorProtocolV1):
 
     @staticmethod
     def _tenant_hash(tenant: Optional[str]) -> Optional[str]:
-        if not tenant:
+        """
+        Create privacy-preserving hash of tenant identifier for metrics.
+        """
+        if not tenant: 
             return None
         return hashlib.sha256(tenant.encode()).hexdigest()[:12]
 
     def _record(
-        self,
-        op: str,
-        t0: float,
-        ok: bool,
-        *,
-        code: str = "OK",
-        ctx: Optional[OperationContext] = None,
-        **extra: Any,
+        self, 
+        op: str, 
+        t0: float, 
+        ok: bool, 
+        *, 
+        code: str = "OK", 
+        ctx: Optional[OperationContext] = None, 
+        **extra: Any
     ) -> None:
+        """
+        Record operation metrics with context and tenant hashing.
+        """
         try:
             ms = (time.monotonic() - t0) * 1000.0
             x = dict(extra or {})
             if ctx:
                 tenant_h = self._tenant_hash(ctx.tenant)
                 if tenant_h:
-                    # Canonical: tenant_hash (do not log raw tenant)
                     x.setdefault("tenant_hash", tenant_h)
                 rem = ctx.remaining_ms()
                 if rem is not None:
-                    if rem < 1000:
-                        x["deadline_bucket"] = "<1s"
-                    elif rem < 5000:
-                        x["deadline_bucket"] = "<5s"
-                    elif rem < 15000:
-                        x["deadline_bucket"] = "<15s"
-                    elif rem < 60000:
-                        x["deadline_bucket"] = "<60s"
-                    else:
-                        x["deadline_bucket"] = ">=60s"
+                    if rem < 1000: x["deadline_bucket"] = "<1s"
+                    elif rem < 5000: x["deadline_bucket"] = "<5s"
+                    elif rem < 15000: x["deadline_bucket"] = "<15s"
+                    elif rem < 60000: x["deadline_bucket"] = "<60s"
+                    else: x["deadline_bucket"] = ">=60s"
             self._metrics.observe(
-                component=self._component,
-                op=op,
-                ms=ms,
-                ok=ok,
-                code=code,
-                extra=x or None,
+                component=self._component, 
+                op=op, 
+                ms=ms, 
+                ok=ok, 
+                code=code, 
+                extra=x or None
             )
         except Exception:
             # Never let metrics recording break the operation
             pass
 
     async def _apply_deadline(self, coro, ctx: Optional[OperationContext]):
+        """
+        Apply the configured deadline policy to awaitable; map timeouts to DeadlineExceeded.
+        """
         try:
             return await self._deadline.wrap(coro, ctx)
         except DeadlineExceeded:
@@ -834,6 +867,9 @@ class BaseVectorAdapter(VectorProtocolV1):
             raise DeadlineExceeded("operation timed out")
 
     def _fail_if_expired(self, ctx: Optional[OperationContext]) -> None:
+        """
+        Fail fast if ctx.deadline_ms is already expired.
+        """
         if ctx is None or ctx.deadline_ms is None:
             return
         if ctx.remaining_ms() == 0:
@@ -846,12 +882,11 @@ class BaseVectorAdapter(VectorProtocolV1):
         raw = repr(obj).encode("utf-8")
         return hashlib.sha256(raw).hexdigest()
 
-    def _query_cache_key(
-        self,
-        spec: QuerySpec,
-        caps: Optional[VectorCapabilities],
-        ctx: Optional[OperationContext],
-    ) -> str:
+    def _query_cache_key(self, spec: QuerySpec, caps: Optional[VectorCapabilities], ctx: Optional[OperationContext]) -> str:
+        """
+        Compose a cache key for query() that avoids cross-hit pollution.
+        Includes vector hash, namespace, top_k, filter, flags, protocol/backend info, and tenant hash.
+        """
         tenant_h = self._tenant_hash(ctx.tenant) if ctx else None
         caps_part = f"{caps.server}:{caps.version}" if caps else "unknown"
         return (
@@ -872,23 +907,20 @@ class BaseVectorAdapter(VectorProtocolV1):
     # --- final public APIs (validation + instrumentation) ---
 
     async def capabilities(self) -> VectorCapabilities:
+        """Get the capabilities of this vector adapter."""
         t0 = time.monotonic()
         try:
             caps: Optional[VectorCapabilities] = None
+            # standalone: try cache
             if self._mode == "standalone":
                 cached = await self._cache.get(self._caps_cache_key())
                 if cached:
-                    self._metrics.counter(
-                        component=self._component,
-                        name="cache_hits",
-                        value=1,
-                        extra={"op": "capabilities"},
-                    )
+                    self._metrics.counter(component=self._component, name="cache_hits", value=1, extra={"op": "capabilities"})
                     self._record("capabilities", t0, True)
                     return cached
 
             caps = await self._apply_deadline(self._do_capabilities(), ctx=None)
-
+            # standalone: set cache
             if self._mode == "standalone":
                 await self._cache.set(self._caps_cache_key(), caps, ttl_s=self._cache_caps_ttl_s)
 
@@ -899,6 +931,7 @@ class BaseVectorAdapter(VectorProtocolV1):
             raise
         except Exception as e:
             self._record("capabilities", t0, False, code="UNAVAILABLE")
+            # Normalize unexpected exceptions as Unavailable for callers
             raise Unavailable("capabilities fetch failed") from e
 
     async def query(
@@ -907,6 +940,12 @@ class BaseVectorAdapter(VectorProtocolV1):
         *,
         ctx: Optional[OperationContext] = None,
     ) -> QueryResult:
+        """
+        Execute a vector similarity search query with validation and metrics.
+        
+        See VectorProtocolV1.query for full documentation.
+        """
+        # Preflight validation
         self._validate_vector(spec.vector)
         self._require_non_empty("namespace", spec.namespace)
         if not isinstance(spec.top_k, int) or spec.top_k <= 0:
@@ -916,97 +955,65 @@ class BaseVectorAdapter(VectorProtocolV1):
         if not isinstance(spec.include_metadata, bool) or not isinstance(spec.include_vectors, bool):
             raise BadRequest("include_metadata/include_vectors must be booleans")
 
+        # Deadline preflight
         self._fail_if_expired(ctx)
 
+        # Breaker & limiter gates
         if not self._breaker.allow():
             raise Unavailable("circuit open")
         await self._limiter.acquire()
 
         t0 = time.monotonic()
         try:
+            # Capability gating
             caps = await self.capabilities()
             if caps.max_dimensions and len(spec.vector) > int(caps.max_dimensions):
                 raise DimensionMismatch(
                     f"vector dimension {len(spec.vector)} exceeds max {caps.max_dimensions}",
-                    details={"provided": len(spec.vector), "max": int(caps.max_dimensions)},
+                    details={"provided": len(spec.vector), "max": int(caps.max_dimensions)}
                 )
             if caps.max_top_k is not None and spec.top_k > caps.max_top_k:
                 raise BadRequest(
                     f"top_k {spec.top_k} exceeds maximum of {caps.max_top_k}",
-                    details={"max_top_k": caps.max_top_k},
+                    details={"max_top_k": caps.max_top_k}
                 )
             if spec.filter and not caps.supports_metadata_filtering:
                 raise NotSupported("metadata filtering is not supported by this adapter")
 
+            # Read-path cache (standalone only)
             if self._mode == "standalone":
                 ck = self._query_cache_key(spec, caps, ctx)
                 cached = await self._cache.get(ck)
                 if cached:
-                    self._metrics.counter(
-                        component=self._component,
-                        name="cache_hits",
-                        value=1,
-                        extra={"op": "query"},
-                    )
-                    self._record(
-                        "query",
-                        t0,
-                        True,
-                        ctx=ctx,
-                        namespace=spec.namespace,
-                        top_k=spec.top_k,
-                        cached=1,
-                        matches=len(cached.matches),
-                    )
+                    self._metrics.counter(component=self._component, name="cache_hits", value=1, extra={"op": "query"})
+                    self._record("query", t0, True, ctx=ctx, namespace=spec.namespace, top_k=spec.top_k, cached=1, matches=len(cached.matches))
                     self._breaker.on_success()
                     self._limiter.release()
                     return cached
 
+            # Execute with deadline
             result = await self._apply_deadline(self._do_query(spec, ctx=ctx), ctx)
 
+            # Cache the result if eligible
             if self._mode == "standalone":
                 ck = self._query_cache_key(spec, caps, ctx)
                 await self._cache.set(ck, result, ttl_s=self._cache_query_ttl_s)
 
+            # Metrics
             self._record(
-                "query",
-                t0,
-                True,
-                ctx=ctx,
-                namespace=spec.namespace,
-                top_k=spec.top_k,
-                matches=len(result.matches),
+                "query", t0, True, ctx=ctx,
+                namespace=spec.namespace, top_k=spec.top_k, matches=len(result.matches)
             )
-            self._metrics.counter(
-                component=self._component,
-                name="queries",
-                value=1,
-            )
+            self._metrics.counter(component=self._component, name="queries", value=1)
             self._breaker.on_success()
             return result
 
         except VectorAdapterError as e:
-            self._record(
-                "query",
-                t0,
-                False,
-                code=e.code or type(e).__name__,
-                ctx=ctx,
-                namespace=spec.namespace,
-                top_k=spec.top_k,
-            )
+            self._record("query", t0, False, code=e.code or type(e).__name__, ctx=ctx, namespace=spec.namespace, top_k=spec.top_k)
             self._breaker.on_error(e)
             raise
         except Exception as e:
-            self._record(
-                "query",
-                t0,
-                False,
-                code="UNAVAILABLE",
-                ctx=ctx,
-                namespace=spec.namespace,
-                top_k=spec.top_k,
-            )
+            self._record("query", t0, False, code="UNAVAILABLE", ctx=ctx, namespace=spec.namespace, top_k=spec.top_k)
             self._breaker.on_error(e)
             raise
         finally:
@@ -1018,77 +1025,58 @@ class BaseVectorAdapter(VectorProtocolV1):
         *,
         ctx: Optional[OperationContext] = None,
     ) -> UpsertResult:
+        """
+        Upsert vectors into the vector store with validation and metrics.
+        
+        See VectorProtocolV1.upsert for full documentation.
+        """
         self._require_non_empty("namespace", spec.namespace)
         if not spec.vectors:
             raise BadRequest("vectors must not be empty")
         for vector in spec.vectors:
             self._validate_vector(vector.vector)
 
+        # Deadline preflight
         self._fail_if_expired(ctx)
 
+        # Breaker & limiter gates
         if not self._breaker.allow():
             raise Unavailable("circuit open")
         await self._limiter.acquire()
 
         t0 = time.monotonic()
         try:
+            # Capability gating
             caps = await self.capabilities()
             if caps.max_batch_size is not None and len(spec.vectors) > caps.max_batch_size:
                 raise BadRequest(
                     f"batch size {len(spec.vectors)} exceeds maximum of {caps.max_batch_size}",
                     details={"max_batch_size": caps.max_batch_size},
-                    suggested_batch_reduction=int(
-                        100 * (len(spec.vectors) - caps.max_batch_size) / len(spec.vectors)
-                    )
-                    if len(spec.vectors)
-                    else None,
+                    suggested_batch_reduction=int(100 * (len(spec.vectors) - caps.max_batch_size) / len(spec.vectors)) if len(spec.vectors) else None,
                 )
             if caps.max_dimensions:
                 for v in spec.vectors:
                     if len(v.vector) > caps.max_dimensions:
                         raise DimensionMismatch(
                             f"vector dimension {len(v.vector)} exceeds max {caps.max_dimensions}",
-                            details={"provided": len(v.vector), "max": int(caps.max_dimensions)},
+                            details={"provided": len(v.vector), "max": int(caps.max_dimensions)}
                         )
 
+            # Execute with deadline
             result = await self._apply_deadline(self._do_upsert(spec, ctx=ctx), ctx)
 
-            self._record(
-                "upsert",
-                t0,
-                True,
-                ctx=ctx,
-                namespace=spec.namespace,
-                vectors_processed=len(spec.vectors),
-            )
-            self._metrics.counter(
-                component=self._component,
-                name="vectors_upserted",
-                value=int(result.upserted_count),
-            )
+            # Metrics
+            self._record("upsert", t0, True, ctx=ctx, namespace=spec.namespace, vectors_processed=len(spec.vectors))
+            self._metrics.counter(component=self._component, name="vectors_upserted", value=int(result.upserted_count))
             self._breaker.on_success()
             return result
 
         except VectorAdapterError as e:
-            self._record(
-                "upsert",
-                t0,
-               False,
-                code=e.code or type(e).__name__,
-                ctx=ctx,
-                namespace=spec.namespace,
-            )
+            self._record("upsert", t0, False, code=e.code or type(e).__name__, ctx=ctx, namespace=spec.namespace)
             self._breaker.on_error(e)
             raise
         except Exception as e:
-            self._record(
-                "upsert",
-                t0,
-                False,
-                code="UNAVAILABLE",
-                ctx=ctx,
-                namespace=spec.namespace,
-            )
+            self._record("upsert", t0, False, code="UNAVAILABLE", ctx=ctx, namespace=spec.namespace)
             self._breaker.on_error(e)
             raise
         finally:
@@ -1100,70 +1088,54 @@ class BaseVectorAdapter(VectorProtocolV1):
         *,
         ctx: Optional[OperationContext] = None,
     ) -> DeleteResult:
+        """
+        Delete vectors from the vector store with validation and metrics.
+        
+        See VectorProtocolV1.delete for full documentation.
+        """
         self._require_non_empty("namespace", spec.namespace)
         if not spec.ids and not spec.filter:
             raise BadRequest("must provide either ids or filter for deletion")
 
+        # Deadline preflight
         self._fail_if_expired(ctx)
 
+        # Breaker & limiter gates
         if not self._breaker.allow():
             raise Unavailable("circuit open")
         await self._limiter.acquire()
 
         t0 = time.monotonic()
         try:
+            # Capability gating
             caps = await self.capabilities()
             if caps.max_batch_size is not None and spec.ids and len(spec.ids) > caps.max_batch_size:
                 raise BadRequest(
                     f"batch size {len(spec.ids)} exceeds maximum of {caps.max_batch_size}",
                     details={"max_batch_size": caps.max_batch_size},
-                    suggested_batch_reduction=int(
-                        100 * (len(spec.ids) - caps.max_batch_size) / len(spec.ids)
-                    )
-                    if len(spec.ids)
-                    else None,
+                    suggested_batch_reduction=int(100 * (len(spec.ids) - caps.max_batch_size) / len(spec.ids)) if len(spec.ids) else None,
                 )
             if spec.filter and not caps.supports_metadata_filtering:
                 raise NotSupported("metadata filtering is not supported by this adapter")
 
+            # Execute with deadline
             result = await self._apply_deadline(self._do_delete(spec, ctx=ctx), ctx)
 
+            # Metrics
             self._record(
-                "delete",
-                t0,
-                True,
-                ctx=ctx,
-                namespace=spec.namespace,
-                vectors_targeted=len(spec.ids) if spec.ids else 0,
+                "delete", t0, True, ctx=ctx, namespace=spec.namespace,
+                vectors_targeted=len(spec.ids) if spec.ids else 0
             )
-            self._metrics.counter(
-                component=self._component,
-                name="vectors_deleted",
-                value=int(result.deleted_count),
-            )
+            self._metrics.counter(component=self._component, name="vectors_deleted", value=int(result.deleted_count))
             self._breaker.on_success()
             return result
 
         except VectorAdapterError as e:
-            self._record(
-                "delete",
-                t0,
-                False,
-                code=e.code or type(e).__name__,
-                ctx=ctx,
-                namespace=spec.namespace,
-            )
+            self._record("delete", t0, False, code=e.code or type(e).__name__, ctx=ctx, namespace=spec.namespace)
             self._breaker.on_error(e)
             raise
         except Exception as e:
-            self._record(
-                "delete",
-                t0,
-                False,
-                code="UNAVAILABLE",
-                ctx=ctx,
-                namespace=spec.namespace,
-            )
+            self._record("delete", t0, False, code="UNAVAILABLE", ctx=ctx, namespace=spec.namespace)
             self._breaker.on_error(e)
             raise
         finally:
@@ -1175,64 +1147,53 @@ class BaseVectorAdapter(VectorProtocolV1):
         *,
         ctx: Optional[OperationContext] = None,
     ) -> NamespaceResult:
+        """
+        Create a new namespace/collection with validation and metrics.
+        
+        See VectorProtocolV1.create_namespace for full documentation.
+        """
         self._require_non_empty("namespace", spec.namespace)
         if spec.dimensions <= 0:
             raise BadRequest("dimensions must be positive")
         if spec.distance_metric not in ("cosine", "euclidean", "dotproduct"):
             raise BadRequest("distance_metric must be one of: cosine, euclidean, dotproduct")
 
+        # Deadline preflight
         self._fail_if_expired(ctx)
 
+        # Breaker & limiter gates
         if not self._breaker.allow():
             raise Unavailable("circuit open")
         await self._limiter.acquire()
 
         t0 = time.monotonic()
         try:
+            # Capability gating
             caps = await self.capabilities()
             if caps.max_dimensions and spec.dimensions > caps.max_dimensions:
                 raise BadRequest(
                     f"dimensions {spec.dimensions} exceed maximum of {caps.max_dimensions}",
-                    details={"max_dimensions": caps.max_dimensions},
+                    details={"max_dimensions": caps.max_dimensions}
                 )
             if spec.distance_metric not in caps.supported_metrics:
                 raise NotSupported(
                     f"distance_metric '{spec.distance_metric}' not supported",
-                    details={"supported_metrics": caps.supported_metrics},
+                    details={"supported_metrics": caps.supported_metrics}
                 )
 
+            # Execute with deadline
             result = await self._apply_deadline(self._do_create_namespace(spec, ctx=ctx), ctx)
 
-            self._record(
-                "create_namespace",
-                t0,
-                True,
-                ctx=ctx,
-                namespace=spec.namespace,
-            )
+            self._record("create_namespace", t0, True, ctx=ctx, namespace=spec.namespace)
             self._breaker.on_success()
             return result
 
         except VectorAdapterError as e:
-            self._record(
-                "create_namespace",
-                t0,
-                False,
-                code=e.code or type(e).__name__,
-                ctx=ctx,
-                namespace=spec.namespace,
-            )
+            self._record("create_namespace", t0, False, code=e.code or type(e).__name__, ctx=ctx, namespace=spec.namespace)
             self._breaker.on_error(e)
             raise
         except Exception as e:
-            self._record(
-                "create_namespace",
-                t0,
-                False,
-                code="UNAVAILABLE",
-                ctx=ctx,
-                namespace=spec.namespace,
-            )
+            self._record("create_namespace", t0, False, code="UNAVAILABLE", ctx=ctx, namespace=spec.namespace)
             self._breaker.on_error(e)
             raise
         finally:
@@ -1244,55 +1205,42 @@ class BaseVectorAdapter(VectorProtocolV1):
         *,
         ctx: Optional[OperationContext] = None,
     ) -> NamespaceResult:
+        """
+        Delete a namespace/collection with validation and metrics.
+        
+        See VectorProtocolV1.delete_namespace for full documentation.
+        """
         self._require_non_empty("namespace", namespace)
 
+        # Deadline preflight
         self._fail_if_expired(ctx)
 
+        # Breaker & limiter gates
         if not self._breaker.allow():
             raise Unavailable("circuit open")
         await self._limiter.acquire()
 
         t0 = time.monotonic()
         try:
-            result = await self._apply_deadline(
-                self._do_delete_namespace(namespace, ctx=ctx), ctx
-            )
-            self._record(
-                "delete_namespace",
-                t0,
-                True,
-                ctx=ctx,
-                namespace=namespace,
-            )
+            result = await self._apply_deadline(self._do_delete_namespace(namespace, ctx=ctx), ctx)
+            self._record("delete_namespace", t0, True, ctx=ctx, namespace=namespace)
             self._breaker.on_success()
             return result
 
         except VectorAdapterError as e:
-            self._record(
-                "delete_namespace",
-                t0,
-                False,
-                code=e.code or type(e).__name__,
-                ctx=ctx,
-                namespace=namespace,
-            )
+            self._record("delete_namespace", t0, False, code=e.code or type(e).__name__, ctx=ctx, namespace=namespace)
             self._breaker.on_error(e)
             raise
         except Exception as e:
-            self._record(
-                "delete_namespace",
-                t0,
-                False,
-                code="UNAVAILABLE",
-                ctx=ctx,
-                namespace=namespace,
-            )
+            self._record("delete_namespace", t0, False, code="UNAVAILABLE", ctx=ctx, namespace=namespace)
             self._breaker.on_error(e)
             raise
         finally:
             self._limiter.release()
 
     async def health(self, *, ctx: Optional[OperationContext] = None) -> Dict[str, Any]:
+        """Check health status with metrics instrumentation."""
+        # Deadline preflight
         self._fail_if_expired(ctx)
 
         t0 = time.monotonic()
@@ -1306,36 +1254,19 @@ class BaseVectorAdapter(VectorProtocolV1):
                 "namespaces": h.get("namespaces", {}),
             }
         except VectorAdapterError as e:
-            self._record(
-                "health",
-                t0,
-                False,
-                code=e.code or type(e).__name__,
-                ctx=ctx,
-            )
+            self._record("health", t0, False, code=e.code or type(e).__name__, ctx=ctx)
             raise
         except asyncio.TimeoutError:
-            self._record(
-                "health",
-                t0,
-                False,
-                code="DEADLINE_EXCEEDED",
-                ctx=ctx,
-            )
+            self._record("health", t0, False, code="DEADLINE_EXCEEDED", ctx=ctx)
             raise DeadlineExceeded("operation timed out")
         except Exception as e:
-            self._record(
-                "health",
-                t0,
-                False,
-                code="UNAVAILABLE",
-                ctx=ctx,
-            )
+            self._record("health", t0, False, code="UNAVAILABLE", ctx=ctx)
             raise Unavailable("health check failed") from e
 
     # --- hooks to implement per backend (override these) ---
 
     async def _do_capabilities(self) -> VectorCapabilities:
+        """Implement to return adapter-specific capabilities."""
         raise NotImplementedError
 
     async def _do_query(
@@ -1344,6 +1275,7 @@ class BaseVectorAdapter(VectorProtocolV1):
         *,
         ctx: Optional[OperationContext] = None,
     ) -> QueryResult:
+        """Implement vector similarity search with validated inputs."""
         raise NotImplementedError
 
     async def _do_upsert(
@@ -1352,6 +1284,7 @@ class BaseVectorAdapter(VectorProtocolV1):
         *,
         ctx: Optional[OperationContext] = None,
     ) -> UpsertResult:
+        """Implement vector upsert operations with validated inputs."""
         raise NotImplementedError
 
     async def _do_delete(
@@ -1360,6 +1293,7 @@ class BaseVectorAdapter(VectorProtocolV1):
         *,
         ctx: Optional[OperationContext] = None,
     ) -> DeleteResult:
+        """Implement vector deletion operations with validated inputs."""
         raise NotImplementedError
 
     async def _do_create_namespace(
@@ -1368,6 +1302,7 @@ class BaseVectorAdapter(VectorProtocolV1):
         *,
         ctx: Optional[OperationContext] = None,
     ) -> NamespaceResult:
+        """Implement namespace creation with validated inputs."""
         raise NotImplementedError
 
     async def _do_delete_namespace(
@@ -1376,9 +1311,11 @@ class BaseVectorAdapter(VectorProtocolV1):
         *,
         ctx: Optional[OperationContext] = None,
     ) -> NamespaceResult:
+        """Implement namespace deletion."""
         raise NotImplementedError
 
     async def _do_health(self, *, ctx: Optional[OperationContext] = None) -> Dict[str, Any]:
+        """Implement health check for the vector backend."""
         raise NotImplementedError
 
 # =============================================================================
@@ -1527,7 +1464,7 @@ __all__ = [
     "VECTOR_PROTOCOL_ID",
     "VectorID",
     "Vector",
-    "QueryResult",
+    "QueryResult", 
     "VectorMatch",
     "VectorAdapterError",
     "BadRequest",
