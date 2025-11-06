@@ -16,7 +16,7 @@ A stable, vendor-neutral API for graph query and mutation operations, with:
 Design Philosophy
 -----------------
 - Minimal core surface: query, stream_query, upsert/delete nodes & edges, namespaces.
-- Keep existing power-user APIs: streaming, bulk vertices, batch operations.
+- Keep existing power-user APIs: streaming, bulk vertices, batch operations, schema introspection.
 - No vendor- or dialect-specific helpers in the base.
 - Async-only: suitable for servers and routers; sync wrappers live elsewhere.
 - DRY infra: shared gate wrapper for breaker / limiter / deadlines / metrics.
@@ -44,7 +44,8 @@ mode: "standalone"
     - Enables:
         * SimpleDeadline (ctx.deadline_ms)
         * SimpleCircuitBreaker
-        * InMemoryTTLCache for read paths (query / capabilities / bulk_vertices)
+        * InMemoryTTLCache for read paths
+          (query / capabilities / bulk_vertices / get_schema)
         * SimpleTokenBucketLimiter
     - Intended for development / light production; NOT a full distributed control plane.
 
@@ -108,6 +109,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import time
 from dataclasses import dataclass, asdict
@@ -271,14 +273,14 @@ class DeleteEdgesSpec:
     filter: Optional[Mapping[str, Any]] = None
 
 
-# ---- Bulk / Batch specs (restored, additive) --------------------------------
+# ---- Bulk / Batch specs (restored) ------------------------------------------
 
 @dataclass(frozen=True)
 class BulkVerticesSpec:
     """
     Specification for scanning / listing vertices in bulk.
 
-    This is useful for offline sync, backfills, and migrations.
+    Useful for offline sync, backfills, and migrations.
 
     Attributes:
         namespace: Namespace / graph to scan (None = adapter default).
@@ -300,7 +302,7 @@ class BulkVerticesResult:
     Attributes:
         nodes: Nodes in this page.
         next_cursor: Cursor for the next page (None if no more).
-        has_more: Convenience flag; True if more pages are available.
+        has_more: True if additional pages are available.
     """
     nodes: List[Node]
     next_cursor: Optional[str]
@@ -312,12 +314,13 @@ class BatchOperation:
     """
     Opaque batched graph operation.
 
-    This is intentionally generic; routers and adapters agree out-of-band
-    on supported ops. Common patterns:
-        - {"op": "upsert_nodes", "args": {...}}
-        - {"op": "upsert_edges", "args": {...}}
-        - {"op": "delete_nodes", "args": {...}}
-        - {"op": "query", "args": {...}}
+    Intentionally generic; routers and adapters agree out-of-band
+    on supported shapes. Common examples:
+
+        {"op": "upsert_nodes", "args": {...}}
+        {"op": "upsert_edges", "args": {...}}
+        {"op": "delete_nodes", "args": {...}}
+        {"op": "query", "args": {...}}
     """
     op: str
     args: Mapping[str, Any]
@@ -332,6 +335,35 @@ class BatchResult:
         results: Per-operation results (success or error payloads).
     """
     results: List[Any]
+
+
+# ---- Schema Introspection (restored) ----------------------------------------
+
+@dataclass
+class GraphSchema:
+    """
+    Logical graph schema description for introspection and tooling.
+
+    Structure is adapter-defined but MUST be JSON-serializable and stable enough
+    for:
+
+        - Query builders and IDEs
+        - Documentation generators
+        - Router query planning
+        - Migration tools
+        - UI schema explorers
+    """
+    nodes: Mapping[str, Any]
+    edges: Mapping[str, Any]
+    metadata: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        if self.nodes is None:
+            object.__setattr__(self, "nodes", {})
+        if self.edges is None:
+            object.__setattr__(self, "edges", {})
+        if self.metadata is None:
+            object.__setattr__(self, "metadata", {})
 
 
 # =============================================================================
@@ -727,7 +759,7 @@ class SimpleTokenBucketLimiter:
 
 
 # =============================================================================
-# Capabilities (with dialect + streaming + batch flags)
+# Capabilities (with dialect + streaming + batch + schema flags)
 # =============================================================================
 
 @dataclass(frozen=True)
@@ -746,6 +778,7 @@ class GraphCapabilities:
         supports_property_filters: Whether Delete*Spec.filter is honored.
         supports_bulk_vertices: Whether bulk_vertices is supported.
         supports_batch: Whether batch() is supported.
+        supports_schema: Whether get_schema() is supported.
         idempotent_writes: Whether idempotency_key is honored for writes.
         supports_multi_tenant: Whether tenant-aware isolation is supported.
         supports_deadline: Whether ctx.deadline_ms is respected.
@@ -759,6 +792,7 @@ class GraphCapabilities:
     supports_property_filters: bool = True
     supports_bulk_vertices: bool = False
     supports_batch: bool = False
+    supports_schema: bool = False
     idempotent_writes: bool = False
     supports_multi_tenant: bool = False
     supports_deadline: bool = True
@@ -843,6 +877,13 @@ class GraphProtocolV1(Protocol):
     ) -> BatchResult:
         ...
 
+    async def get_schema(
+        self,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> GraphSchema:
+        ...
+
     async def health(
         self,
         *,
@@ -884,6 +925,8 @@ class BaseGraphAdapter(GraphProtocolV1):
         cache_query_ttl_s: int = 30,
         cache_caps_ttl_s: int = 30,
         cache_bulk_vertices_ttl_s: int = 30,
+        cache_schema_ttl_s: int = 60,
+        stream_deadline_check_every_n_chunks: int = 10,
     ) -> None:
         self._metrics: MetricsSink = metrics or NoopMetrics()
 
@@ -908,8 +951,27 @@ class BaseGraphAdapter(GraphProtocolV1):
         self._cache_query_ttl_s = max(1, int(cache_query_ttl_s))
         self._cache_caps_ttl_s = max(1, int(cache_caps_ttl_s))
         self._cache_bulk_vertices_ttl_s = max(1, int(cache_bulk_vertices_ttl_s))
+        self._cache_schema_ttl_s = max(1, int(cache_schema_ttl_s))
+        self._stream_deadline_check_every_n_chunks = max(1, int(stream_deadline_check_every_n_chunks))
 
-    # --- helpers -------------------------------------------------------------
+    # ---- lifecycle helpers --------------------------------------------------
+
+    async def __aenter__(self) -> "BaseGraphAdapter":
+        """Allow use as an async context manager in apps/services."""
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        await self.close()
+
+    async def close(self) -> None:
+        """
+        Clean up underlying resources (connections, pools, clients, etc.)
+
+        Adapters should override when they own external resources.
+        """
+        return None
+
+    # ---- internal helpers ---------------------------------------------------
 
     @staticmethod
     def _tenant_hash(tenant: Optional[str]) -> Optional[str]:
@@ -963,6 +1025,56 @@ class BaseGraphAdapter(GraphProtocolV1):
         except asyncio.TimeoutError as e:
             raise DeadlineExceeded("operation timed out", details={"remaining_ms": 0}) from e
 
+    def _make_cache_key(
+        self,
+        *,
+        op: str,
+        spec: Any,
+        ctx: Optional[OperationContext] = None,
+    ) -> str:
+        """
+        Compose a cache key for read operations.
+
+        Includes:
+            - operation
+            - stable repr of spec/asdict(spec)
+            - tenant hash (if present) to avoid cross-tenant bleed.
+        """
+        if hasattr(spec, "__dataclass_fields__"):
+            raw = asdict(spec)
+        else:
+            raw = spec
+        base = f"graph:{op}:{repr(raw)}"
+        if ctx and ctx.tenant:
+            th = self._tenant_hash(ctx.tenant)
+            if th:
+                base += f":tenant:{th}"
+        return hashlib.sha256(base.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _validate_properties_map(properties: Mapping[str, Any]) -> None:
+        """
+        Validate that a properties mapping is JSON-serializable.
+
+        This is intentionally strict to avoid subtle wire failures later.
+        """
+        try:
+            json.dumps(properties)
+        except (TypeError, ValueError) as e:
+            raise BadRequest(f"properties must be JSON-serializable: {e}")
+
+    def _validate_node(self, node: Node) -> None:
+        if node.properties is not None:
+            self._validate_properties_map(node.properties)
+
+    def _validate_edge(self, edge: Edge) -> None:
+        if not isinstance(edge.label, str) or not edge.label:
+            raise BadRequest("edge.label must be a non-empty string")
+        if edge.properties is not None:
+            self._validate_properties_map(edge.properties)
+
+    # ---- DRY gate wrappers --------------------------------------------------
+
     async def _with_gates_unary(
         self,
         *,
@@ -998,7 +1110,7 @@ class BaseGraphAdapter(GraphProtocolV1):
             self._record(op, t0, False, code=e.code or type(e).__name__, ctx=ctx, **metric_extra)
             self._breaker.on_error(e)
             raise
-        except Exception as e:
+        except Exception:
             self._record(op, t0, False, code="UNAVAILABLE", ctx=ctx, **metric_extra)
             self._breaker.on_error(e)
             raise
@@ -1016,6 +1128,7 @@ class BaseGraphAdapter(GraphProtocolV1):
         """
         DRY wrapper for streaming operations:
         - preflight deadline, breaker, limiter
+        - periodic deadline checks
         - metrics on completion or error
         """
         metric_extra = dict(metric_extra or {})
@@ -1026,12 +1139,16 @@ class BaseGraphAdapter(GraphProtocolV1):
 
         await self._limiter.acquire()
         t0 = time.monotonic()
+        check_n = self._stream_deadline_check_every_n_chunks
 
         async def _gen() -> AsyncIterator[QueryChunk]:
+            chunk_count = 0
             try:
                 agen = agen_factory()
                 async for chunk in agen:
-                    self._fail_if_deadline_expired(ctx)
+                    chunk_count += 1
+                    if chunk_count % check_n == 0:
+                        self._fail_if_deadline_expired(ctx)
                     yield chunk
                 self._record(op, t0, True, ctx=ctx, **metric_extra)
                 self._breaker.on_success()
@@ -1039,7 +1156,7 @@ class BaseGraphAdapter(GraphProtocolV1):
                 self._record(op, t0, False, code=e.code or type(e).__name__, ctx=ctx, **metric_extra)
                 self._breaker.on_error(e)
                 raise
-            except Exception as e:
+            except Exception:
                 self._record(op, t0, False, code="UNAVAILABLE", ctx=ctx, **metric_extra)
                 self._breaker.on_error(e)
                 raise
@@ -1059,7 +1176,8 @@ class BaseGraphAdapter(GraphProtocolV1):
         t0 = time.monotonic()
         try:
             if isinstance(self._cache, InMemoryTTLCache):
-                cached = await self._cache.get("graph:capabilities")
+                key = "graph:capabilities"
+                cached = await self._cache.get(key)
                 if cached:
                     self._metrics.counter(
                         component=self._component,
@@ -1110,10 +1228,9 @@ class BaseGraphAdapter(GraphProtocolV1):
                 )
 
         async def _call() -> QueryResult:
-            # standalone: simple cache on read-only, non-streaming queries
+            # standalone: cache on read-only, non-streaming queries
             if isinstance(self._cache, InMemoryTTLCache) and not spec.stream:
-                key_raw = repr(asdict(spec))
-                key = "graph:query:" + hashlib.sha256(key_raw.encode("utf-8")).hexdigest()
+                key = self._make_cache_key(op="query", spec=spec, ctx=ctx)
                 cached = await self._cache.get(key)
                 if cached:
                     self._metrics.counter(
@@ -1179,6 +1296,8 @@ class BaseGraphAdapter(GraphProtocolV1):
         """Batch upsert nodes with validation and gates."""
         if not spec.nodes:
             raise BadRequest("nodes must not be empty")
+        for n in spec.nodes:
+            self._validate_node(n)
 
         async def _call() -> UpsertResult:
             return await self._do_upsert_nodes(spec, ctx=ctx)
@@ -1199,6 +1318,8 @@ class BaseGraphAdapter(GraphProtocolV1):
         """Batch upsert edges with validation and gates."""
         if not spec.edges:
             raise BadRequest("edges must not be empty")
+        for e in spec.edges:
+            self._validate_edge(e)
 
         async def _call() -> UpsertResult:
             return await self._do_upsert_edges(spec, ctx=ctx)
@@ -1219,6 +1340,8 @@ class BaseGraphAdapter(GraphProtocolV1):
         """Batch delete nodes by IDs and/or filter."""
         if not spec.ids and not spec.filter:
             raise BadRequest("must provide ids or filter for delete_nodes")
+        if spec.filter is not None:
+            self._validate_properties_map(spec.filter)
 
         async def _call() -> DeleteResult:
             return await self._do_delete_nodes(spec, ctx=ctx)
@@ -1239,6 +1362,8 @@ class BaseGraphAdapter(GraphProtocolV1):
         """Batch delete edges by IDs and/or filter."""
         if not spec.ids and not spec.filter:
             raise BadRequest("must provide ids or filter for delete_edges")
+        if spec.filter is not None:
+            self._validate_properties_map(spec.filter)
 
         async def _call() -> DeleteResult:
             return await self._do_delete_edges(spec, ctx=ctx)
@@ -1266,18 +1391,17 @@ class BaseGraphAdapter(GraphProtocolV1):
             raise NotSupported("bulk_vertices is not supported by this adapter")
         if spec.limit <= 0:
             raise BadRequest("limit must be positive")
+        if spec.filter is not None:
+            self._validate_properties_map(spec.filter)
 
         async def _call() -> BulkVerticesResult:
-            # optional cache for purely read-only scans (cursor-less / first page)
+            # optional cache for purely read-only scans (first page, no filter)
             if (
                 isinstance(self._cache, InMemoryTTLCache)
                 and spec.cursor is None
                 and spec.filter is None
             ):
-                key_raw = repr(asdict(spec))
-                key = "graph:bulk_vertices:" + hashlib.sha256(
-                    key_raw.encode("utf-8")
-                ).hexdigest()
+                key = self._make_cache_key(op="bulk_vertices", spec=spec, ctx=ctx)
                 cached = await self._cache.get(key)
                 if cached:
                     self._metrics.counter(
@@ -1327,6 +1451,46 @@ class BaseGraphAdapter(GraphProtocolV1):
             ctx=ctx,
             call=_call,
             metric_extra={"ops": len(ops)},
+        )
+
+    async def get_schema(
+        self,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> GraphSchema:
+        """
+        Return logical graph schema for tooling and routing.
+
+        Behavior:
+            - If capabilities.supports_schema is False -> NotSupported.
+            - In standalone mode, result may be cached briefly.
+        """
+        caps = await self.capabilities()
+        if not caps.supports_schema:
+            raise NotSupported("get_schema is not supported by this adapter")
+
+        async def _call() -> GraphSchema:
+            if isinstance(self._cache, InMemoryTTLCache):
+                key = self._make_cache_key(op="schema", spec="all", ctx=ctx)
+                cached = await self._cache.get(key)
+                if cached:
+                    self._metrics.counter(
+                        component=self._component,
+                        name="cache_hits",
+                        value=1,
+                        extra={"op": "get_schema"},
+                    )
+                    return cached
+            res = await self._do_get_schema(ctx=ctx)
+            if isinstance(self._cache, InMemoryTTLCache):
+                key = self._make_cache_key(op="schema", spec="all", ctx=ctx)
+                await self._cache.set(key, res, ttl_s=self._cache_schema_ttl_s)
+            return res
+
+        return await self._with_gates_unary(
+            op="get_schema",
+            ctx=ctx,
+            call=_call,
         )
 
     async def health(
@@ -1420,6 +1584,13 @@ class BaseGraphAdapter(GraphProtocolV1):
         *,
         ctx: Optional[OperationContext] = None,
     ) -> BatchResult:
+        raise NotImplementedError
+
+    async def _do_get_schema(
+        self,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> GraphSchema:
         raise NotImplementedError
 
     async def _do_health(
@@ -1527,6 +1698,7 @@ class WireGraphHandler:
             - graph.delete_edges
             - graph.bulk_vertices
             - graph.batch
+            - graph.get_schema
             - graph.health
 
         Streaming:
@@ -1592,6 +1764,10 @@ class WireGraphHandler:
                 res = await self._adapter.batch(ops, ctx=ctx)
                 return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
 
+            if op == "graph.get_schema":
+                res = await self._adapter.get_schema(ctx=ctx)
+                return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
+
             if op == "graph.health":
                 res = await self._adapter.health(ctx=ctx)
                 return _success_to_wire(res, (time.monotonic() - t0) * 1000.0)
@@ -1642,6 +1818,7 @@ __all__ = [
     "BulkVerticesResult",
     "BatchOperation",
     "BatchResult",
+    "GraphSchema",
     "QueryResult",
     "QueryChunk",
     "UpsertResult",
