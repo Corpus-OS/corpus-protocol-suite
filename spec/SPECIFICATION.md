@@ -1302,5 +1302,3 @@ for attempt in range(5):
 **End of Document**
 
 ```
-::contentReference[oaicite:0]{index=0}
-```
