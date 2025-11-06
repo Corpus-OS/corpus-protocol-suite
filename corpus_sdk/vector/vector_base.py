@@ -63,7 +63,7 @@ from typing import (
     runtime_checkable, AsyncIterator, Union, NewType
 )
 
-VECTOR_PROTOCOL_VERSION = "1.1.0"  # minor bump for added capabilities & infra hooks
+VECTOR_PROTOCOL_VERSION = "1.0.0"  # minor bump for added capabilities & infra hooks
 LOG = logging.getLogger(__name__)
 
 # =============================================================================
