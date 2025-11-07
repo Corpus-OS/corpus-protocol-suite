@@ -429,9 +429,9 @@ Use this when implementing or validating a new **Embedding adapter** against `Em
 
 ## Related Documentation
 
-* `../../SPECIFICATION.md` — Corpus SDK Specification (§10 Embedding Protocol).
-* `corpus_sdk/embedding/embedding_base.py` — Reference base implementation.
-* `examples/embedding/mock_embedding_adapter.py` — Mock adapter used in tests.
-* `../README.md` — Test harness and contribution guidelines.
+../../SPECIFICATION.md - Full protocol specification (§9 Vector Protocol)
+../../ERRORS.md - Error taxonomy reference
+../../METRICS.md - Observability guidelines
+../README.md - General testing guidelines
 
 ---
