@@ -1174,22 +1174,11 @@ logging.getLogger("corpus_sdk").setLevel(logging.DEBUG)
 
 > **Note:** `corpus_sdk` is fully open source. **Corpus Router** and **Official Adapters** are commercial offerings (managed or on-prem) with support, SLAs, and provider-tuned optimizations.
 
-### Corpus Router: Intelligent AI Infrastructure Orchestration
-
-Corpus Router doesn't just route traffic—it **understands, optimizes, and evolves** with your AI workloads. While the open-source SDK standardizes how you talk to providers, Corpus Router intelligently decides **which providers to use, when, and why** based on your actual workload patterns and business objectives.
-
----
-
 ## 🧠 Intelligent Routing That Learns Your Workloads
 
+Corpus Router doesn't just route traffic—it **understands, optimizes, and evolves** with your AI workloads. While the open-source SDK standardizes how you talk to providers, Corpus Router intelligently decides **which providers to use, when, and why** based on your actual workload patterns and business object
 
-
-
-
-
-# Corpus Router: Intelligent AI Infrastructure 
-
-# Corpus Router: AI Infrastructure, Automated
+### Corpus Router: AI Infrastructure, Automated
 
 **Stop managing AI providers. Start optimizing them automatically.**
 
