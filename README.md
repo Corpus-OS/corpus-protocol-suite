@@ -1071,23 +1071,33 @@ pytest tests/embedding/ -v
 ### Common Issues
 
 **Problem: Double-stacked resiliency (timeouts/limits firing twice)**
+
 *Solution*: Ensure adapters run in thin mode under your router
+
 *Check*: `mode="thin"` in adapter constructor
 
 **Problem: Circuit breaker opens frequently in standalone mode**
+
 *Solution*: Reduce concurrency or switch to thin mode with external circuit breaker
+
 *Check*: `failure_threshold` and `recovery_after_s` settings
 
 **Problem: Cache returns stale results**
+
 *Solution*: Verify all sampling parameters are included in cache key
+
 *Check*: `cache_ttl_s` setting, normalization flag consistency
 
 **Problem: Health check failures**
+
 *Solution*: Inspect adapter-specific `_do_health` implementation
+
 *Check*: Backend reachability, credentials, network configuration
 
 **Problem: `DeadlineExceeded` on fast operations**
+
 *Solution*: Check `deadline_ms` is absolute epoch time, not relative
+
 *Check*: System clock synchronization (NTP)
 
 ### Debug Mode
@@ -1107,35 +1117,45 @@ logging.getLogger("corpus_sdk").setLevel(logging.DEBUG)
 ### General
 
 **Q: Is the SDK fully open source while the router is commercial?**
+
 **A:** Yes. The SDK (protocols + bases + example adapters) is **open source** under Apache-2.0. **Corpus Router** and **official adapters** are **commercial** (managed cloud or on-prem).
 
 **Q: Will you maintain official adapters for major providers (OpenAI, Anthropic, Pinecone, etc.)?**
+
 **A:** Yes. We maintain **closed-source, production-grade adapters** for major providers as part of Corpus Router subscriptions.
 
 **Q: Can Corpus Router run on-premises or is it cloud-only?**
+
 **A:** Both. Corpus Router is available as a **managed cloud** service and as an **on-prem** deployment for regulated/air-gapped environments.
 
 **Q: Do I have to use Corpus Router?**
+
 **A:** No. The SDK composes with any router/control plane. Corpus Router is optional and adheres to the same public protocols.
 
 **Q: Can I split protocols and bases into separate files?**
+
 **A:** Yes. We ship them together for convenience; you can refactor module layout as you see fit.
 
 ### Technical
 
 **Q: Why async-only?**
+
 **A:** Modern AI workloads require high concurrency. Async-first design prevents blocking the event loop. Sync wrappers can be built on top if needed.
 
 **Q: How do I handle streaming with deadlines?**
+
 **A:** Bases check deadlines periodically during streaming. Set `deadline_ms` in `OperationContext` and the base handles enforcement.
 
 **Q: Can I use my own cache/metrics/limiter?**
+
 **A:** Yes. All infrastructure components are pluggable via Protocol interfaces. Provide your implementations to the base constructor.
 
 **Q: What happens if my adapter raises a non-normalized error?**
+
 **A:** Bases catch unexpected exceptions and record them as `UnhandledException` in metrics. Wrap provider errors in normalized exceptions for proper handling.
 
 **Q: How do I test my adapter?**
+
 **A:** Use the protocol as a contract. Verify your adapter satisfies `isinstance(adapter, ProtocolV1)` and test all `_do_*` method implementations.
 
 ---
