@@ -878,22 +878,6 @@ corpus_sdk/
 * **Official adapters** (commercial): Production-hardened, maintained by Corpus team
 * **Community adapters**: Built by ecosystem partners and users — we actively encourage community-maintained, Corpus-Compatible adapters and are happy to highlight stable ones.
 
-### Why Official Adapters Are Commercial
-
-Official adapters include:
-
-* **Provider-specific optimizations** - Batching strategies, retry logic tuned per provider
-* **Advanced error mapping** - Vendor-specific → normalized with operational guidance
-* **Health check integration** - Deep provider health status monitoring
-* **Support & SLAs** - Guaranteed response times and bug fixes
-* **Certification** - Tested against provider SLA requirements
-* **Continuous updates** - Maintained as providers evolve their APIs
-
-**Available with:**
-
-* Corpus Router subscriptions (managed or on-prem)
-* Standalone official adapter licenses
-
 ---
 
 ## Security & Privacy
