@@ -1008,46 +1008,64 @@ Current versions:
 
 ### One-Command Conformance Testing
 
-Run comprehensive protocol conformance tests:
+#### Recommended: Make targets (from repo root)
 
 ```bash
-# Test ALL protocols at once
+# Test ALL protocols at once (LLM + Vector + Graph + Embedding)
 make test-all-conformance
 
 # Test specific protocols
-make test-embedding-conformance
-make test-llm-conformance  
+make test-llm-conformance
 make test-vector-conformance
 make test-graph-conformance
+make test-embedding-conformance
+````
 
-# Alternative methods for each protocol
-python scripts/test_embedding_conformance.py
-python scripts/test_llm_conformance.py
-python scripts/test_vector_conformance.py  
-python scripts/test_graph_conformance.py
+#### Alternative: Corpus SDK CLI
 
-python -m tests.embedding.run_conformance
-python -m tests.llm.run_conformance
-python -m tests.vector.run_conformance
-python -m tests.graph.run_conformance
+> Available when installed with the entrypoint:
+> `[project.scripts] corpus-sdk = "corpus_sdk.cli:main"`
 
-# Run with coverage
-pytest tests/ --cov=corpus_sdk --cov-report=html
+```bash
+# Show help / usage
+corpus-sdk
 
-# Run specific protocol tests
-pytest tests/embedding/ -v
+# Run ALL protocol conformance suites
+corpus-sdk test-all-conformance
+corpus-sdk verify
+
+# Run specific protocol suites
+corpus-sdk test-llm-conformance
+corpus-sdk test-vector-conformance
+corpus-sdk test-graph-conformance
+corpus-sdk test-embedding-conformance
+
+# Filtered verify (run only selected protocols)
+corpus-sdk verify -p llm -p vector
+corpus-sdk verify -p embedding
+```
+
+#### Direct: pytest (no wrappers)
+
+```bash
+# Run everything with coverage
+pytest tests/ -v --cov=corpus_sdk --cov-report=html
+
+# Run specific protocol suites
 pytest tests/llm/ -v
 pytest tests/vector/ -v
 pytest tests/graph/ -v
+pytest tests/embedding/ -v
 ```
-### Corpus Protocol Suite Badge
+
+#### Corpus Protocol Suite Badge
+
 ![LLM Protocol](https://img.shields.io/badge/LLM%20Protocol-100%25%20Conformant-brightgreen)
 ![Vector Protocol](https://img.shields.io/badge/Vector%20Protocol-100%25%20Conformant-brightgreen)
 ![Graph Protocol](https://img.shields.io/badge/Graph%20Protocol-100%25%20Conformant-brightgreen)
 ![Embedding Protocol](https://img.shields.io/badge/Embedding%20Protocol-100%25%20Conformant-brightgreen)
-
----
-
+```
+```
 ## Troubleshooting
 
 ### Common Issues
