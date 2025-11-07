@@ -1190,7 +1190,7 @@ Corpus Router doesn't just route traffic—it understands, optimizes, and evolve
 **All Tiers Include:**
 - Multi-provider failover & circuit breaking
 - Unified observability & cost tracking
-- Multiple routing options - fanout and concurrency
+- Multiple routing options like single, fanout, concurrency,and strategy router
 - 99.9% uptime SLA and 70-90% reduction in cost
 
 **Enterprise Features:**
