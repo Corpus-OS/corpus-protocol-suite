@@ -1008,30 +1008,37 @@ Current versions:
 
 ### One-Command Conformance Testing
 
-Run comprehensive protocol conformance tests with single commands:
+Run comprehensive protocol conformance tests:
 
 ```bash
-# Test ALL protocols
+# Test ALL protocols at once
 make test-all-conformance
 
-# Test specific protocols  
+# Test specific protocols
 make test-embedding-conformance
-make test-llm-conformance
+make test-llm-conformance  
 make test-vector-conformance
 make test-graph-conformance
 
-# Alternative methods
+# Alternative methods for each protocol
 python scripts/test_embedding_conformance.py
-python -m tests.embedding.run_conformance
+python scripts/test_llm_conformance.py
+python scripts/test_vector_conformance.py  
+python scripts/test_graph_conformance.py
 
-# Run specific test files
-pytest tests/test_embedding_base.py -v
+python -m tests.embedding.run_conformance
+python -m tests.llm.run_conformance
+python -m tests.vector.run_conformance
+python -m tests.graph.run_conformance
 
 # Run with coverage
 pytest tests/ --cov=corpus_sdk --cov-report=html
 
 # Run specific protocol tests
 pytest tests/embedding/ -v
+pytest tests/llm/ -v
+pytest tests/vector/ -v
+pytest tests/graph/ -v
 ```
 
 ---
