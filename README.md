@@ -1187,188 +1187,44 @@ Corpus Router doesn't just route traffic—it **understands, optimizes, and evol
 
 
 
-# Corpus Router: Intelligent AI Infrastructure Orchestration
+# Corpus Router: Intelligent AI Infrastructure 
 
-## Stop Managing AI Providers. Start Optimizing Them Automatically.
+# Corpus Router: AI Infrastructure, Automated
 
-While the open-source Corpus SDK standardizes *how* you talk to AI providers, Corpus Router intelligently decides **which providers to use, when, and why**—transforming AI infrastructure from operational overhead into competitive advantage.
+**Stop managing AI providers. Start optimizing them automatically.**
 
----
+Corpus Router intelligently routes across 20+ AI providers to reduce costs by 40-60% while maintaining 99.9% uptime. While our open-source SDK standardizes how you talk to providers, Corpus Router decides **which providers to use and when** based on real-time performance, cost, and quality signals.
 
-### Self-Learning Routing Engine
-Corpus Router continuously optimizes your AI operations using real workload patterns:
+## 🧠 Self-Learning Routing
 
-- **Cost Intelligence**: Automatically routes to most cost-effective providers while maintaining quality
-- **Performance Optimization**: Learns latency distributions and avoids bottlenecks in real-time
-- **Quality-Aware Routing**: Incorporates evaluator and QA scoring signals
-- **Adaptive Failover**: Dynamically adjusts based on success/failure/timeout patterns
+- **Cost Optimization**: Automatically routes to most cost-effective providers
+- **Performance Intelligence**: Learns latency patterns and avoids bottlenecks  
+- **Quality-Aware**: Incorporates evaluator feedback and success patterns
+- **Privacy-First**: No user content analyzed—learning uses aggregated metrics only
 
-### Privacy-Preserving by Design
-- **Zero User Content Analysis**: Learning uses aggregated, privacy-preserving feedback only
-- **No Training on Your Data**: Your prompts and responses never touch our models
-- **Enterprise-Grade Isolation**: Full cryptographic tenant separation
+## 🛡️ Enterprise-Grade Reliability
 
----
-
-## 🚀 From AI Operations to AI Excellence
-
-### Replace Manual Management with Autonomous Optimization
-```python
-# What you replace:
-- Manual cost comparisons across vendor pricing pages
-- Custom failover logic for each provider API
-- Inconsistent error handling across services
-- Budget overruns and performance firefighting
-
-# What you gain:
-- Autonomous cost optimization across providers
-- Intelligent failover that works before users notice
-- Consistent error handling and observability
-- Real-time savings and performance intelligence
-```
-
----
-
-## 🛡️ Enterprise-Grade AI Operations
-
-### Included in All Tiers
-
-**Multi-Provider Intelligence**
-- Smart routing across 20+ AI providers
-- Real-time health checking and circuit breaking
+**All Tiers Include:**
+- Multi-provider failover & circuit breaking
+- Unified observability & cost tracking
 - Request/response validation
+- 99.9% uptime SLA
 
-**Unified Observability**
-- Consistent metrics across all AI infrastructure
-- SIEM-safe logging with automatic PII redaction
-- Cost tracking and attribution
-
-**Production Reliability**
-- Deadline propagation and cancellation
-- Multi-zone and multi-region failover
-- Zero-downtime configuration updates
-
-### Enterprise Exclusive Features
-
-**Self-Learning Optimization**
-- Automatic routing weight adjustments based on performance
-- Privacy-preserving learning from aggregated signals
-- Quality and cost-based provider selection
-
-**Advanced Policy Engine**
-- Budget enforcement per team and project
-- Jurisdiction-aware routing (GDPR, HIPAA compliant)
-- Custom rate limiting and quotas
-
-**Enterprise Governance**
-- Full audit trails with versioned routing changes
-- On-premises deployment options
+**Enterprise Features:**
+- Self-learning optimization engine
+- Policy enforcement (budgets, compliance, rate limits)
+- On-premises deployment
 - 24/7 support with SLAs
 
----
+## 🚀 Get Started
 
-## 🔒 Guardrail-Based Autonomous Operations
+**Free Tier**: 1M requests/month, 3 providers, basic observability
 
-### Safety-First Automation
-Corpus Router's self-learning mode operates within **strict, configurable boundaries**:
+**Production**: Unlimited scale, self-learning optimization, enterprise support
 
-**Provider Safety Controls**
-- Approved provider/model allowlists only
-- Per-tenant budget and QPS ceilings
-- Jurisdiction and compliance constraints
-
-**Full Transparency & Control**
-- Every routing change versioned and auditable
-- Policies can be frozen, rolled back, or pinned statically
-- Human-in-the-loop approval workflows available
-
-**Compliance Ready**
-- Data sovereignty enforcement
-- HIPAA and GDPR compliant routing paths
-- 7-year audit trail retention
-
----
-
-## 💰 Transformative Business Impact
-
-### Typical Production Results
-- **40-60% Reduction** in AI infrastructure costs through intelligent routing
-- **99.9% Uptime** achieved via multi-provider failover strategies
-- **70% Less Operational Overhead** through automated optimization
-- **Zero Vendor Lock-in** while maintaining optimal performance
-
-### ROI That Speaks for Itself
-```python
-# Typical 6-Month Business Impact
-infrastructure_costs = 40-60% reduction
-engineering_time = 15-20 hours/week reclaimed
-reliability_incidents = 90% reduction
-experimentation_velocity = 3x faster
-```
-
----
-
-## 🏗️ Architecture That Scales with You
-
-### Deployment Flexibility
-- **Cloud Managed**: Get started in minutes with fully managed service
-- **Hybrid Deployment**: Control plane in cloud, adapters in your VPC
-- **On-Premises**: Full air-gapped deployment for regulated environments
-
-### Integration Simplicity
 ```bash
-# Start with open-source foundation
 pip install corpus-sdk
-
-# Upgrade to intelligent routing
-# Zero code changes required
-```
-
-The same application code works seamlessly across both open-source and commercial offerings.
-
----
-
-## 🎯 Perfect For Teams Scaling AI
-
-### Platform Engineering Teams
-Building multi-provider AI platforms that need enterprise reliability without operational overhead.
-
-### Product Engineering Teams
-Shipping AI features with consistent SLAs and automatic cost control.
-
-### Infrastructure & FinOps Teams
-Controlling cloud AI spend without limiting innovation or compromising performance.
-
-### Compliance & Security Teams
-Ensuring regulatory requirements are met automatically across all AI operations.
-
----
-
-## 🚀 Start Smart, Scale Smarter
-
-### Free Tier
-- Up to 1M requests/month
-- 3 AI providers
-- Basic observability and cost tracking
-- Community support
-
-### Production Tier
-- Unlimited requests and providers
-- Self-learning optimization engine
-- Advanced policy and governance
-- 99.9% SLA with enterprise support
-
-### Enterprise Tier
-- On-premises deployment options
-- Custom compliance requirements
-- Dedicated infrastructure support
-- Private SLAs and feature development
-
----
-
-**Ready to transform your AI infrastructure from cost center to competitive advantage?**
-
-[Get Started](https://corpus.io) • [Documentation](https://docs.corpus.io) • [Contact Sales](https://corpus.io/contact)
+# Upgrade to Corpus Router with zero code changes
 
 ---
 
