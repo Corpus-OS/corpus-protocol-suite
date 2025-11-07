@@ -13,7 +13,7 @@ This suite constitutes the official Vector Protocol V1.0 Reference Conformance T
 
 ## Conformance Summary
 
-**Overall Coverage: 68/68 tests (100%) ✅**
+**Overall Coverage: 72/72 tests (100%) ✅**
 
 | Category                 | Tests | Coverage |
 | ------------------------ | ----- | -------- |
@@ -30,7 +30,7 @@ This suite constitutes the official Vector Protocol V1.0 Reference Conformance T
 | Health Endpoint          | 4/4   | 100% ✅   |
 | Observability & Privacy  | 6/6   | 100% ✅   |
 | Batch Size Limits        | 4/4   | 100% ✅   |
-| Wire Envelopes & Routing | 6/6   | 100% ✅   |
+| Wire Envelopes & Routing | 10/10 | 100% ✅   |
 
 ---
 
@@ -197,7 +197,7 @@ Validates batch size and partial-failure behavior:
 ### test_wire_handler_envelopes.py
 
 **Specification:** §4.1, §4.1.6, §6.1, §6.3, §9.3, §11.2, §13 - Wire Envelopes & Routing
-**Status:** ✅ Complete (6 tests)
+**Status:** ✅ Complete (10 tests)
 
 Validates wire-level contract and mapping:
 
@@ -205,6 +205,10 @@ Validates wire-level contract and mapping:
 * `vector.query` envelope, ctx → `OperationContext` plumbing, and result mapping
 * `vector.upsert` / `vector.delete` / namespace ops / `vector.health` success envelopes
 * Unknown `op` mapped to `NotSupported` with normalized error envelope
+* Missing or invalid `op` mapped to `BadRequest` with normalized error envelope
+* Adapter-raised `NotSupported` mapped to `NOT_SUPPORTED` wire code
+* Adapter error envelopes include normalized `code`, `error`, and human-readable `message`
+* `vector.query` with missing required fields mapped to `BadRequest`
 * `VectorAdapterError` mapped to canonical error envelope (`code`, `error`, `message`, `details`)
 * Unexpected exceptions mapped to `UNAVAILABLE` per common taxonomy
 
@@ -472,7 +476,7 @@ Use this checklist when implementing or validating a new Vector adapter:
 
 ```text
 ✅ Vector Protocol V1.0 - 100% Conformant
-   68/68 tests passing (13 test files)
+   72/72 tests passing (13 test files)
 
    ✅ Core Operations: 7/7 (100%)
    ✅ Capabilities: 7/7 (100%)
@@ -487,7 +491,7 @@ Use this checklist when implementing or validating a new Vector adapter:
    ✅ Health Endpoint: 4/4 (100%)
    ✅ Observability & Privacy: 6/6 (100%)
    ✅ Batch Size Limits: 4/4 (100%)
-   ✅ Wire Envelopes & Routing: 6/6 (100%)
+   ✅ Wire Envelopes & Routing: 10/10 (100%)
 
    Status: Production Ready
 ```
