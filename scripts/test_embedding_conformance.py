@@ -1,13 +1,10 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 """
 Run all Embedding Protocol V1.0 conformance tests.
 
-Usage (from repo root):
+Usage:
     python scripts/test_embedding_conformance.py
-
-Or:
-    pytest tests/embedding -v
 """
 
 import os
@@ -16,12 +13,13 @@ import sys
 try:
     import pytest
 except ImportError:  # pragma: no cover
-    print("pytest is required to run the embedding conformance suite.", file=sys.stderr)
+    print("pytest is required to run the conformance tests.", file=sys.stderr)
     raise SystemExit(1)
 
 
 def main() -> int:
-    repo_root = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
+    # repo root = parent of this scripts/ directory
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     os.chdir(repo_root)
 
     args = [
