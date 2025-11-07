@@ -1,7 +1,3 @@
-Short answer: we were *close* but not fully on par with Graph; the main missing piece was explicit coverage + mapping for **LLM-specific errors and NotSupported**, the way Graph’s doc calls out its domain-specific errors. Here’s the fully updated version with that fixed and everything else left intact, still at **49/49**.
-
----
-
 # LLM Protocol V1 Conformance Test Coverage
 
 ## Overview
