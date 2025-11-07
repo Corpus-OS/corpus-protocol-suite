@@ -1171,6 +1171,25 @@ logging.getLogger("corpus_sdk").setLevel(logging.DEBUG)
 
 Corpus Router doesn't just route traffic—it understands, optimizes, and evolves with your AI workloads. While our open-source SDK standardizes how you talk to providers, Corpus Router intelligently decides which providers to use, when, and why based on your actual workload patterns and business objectives.
 
+## Three-Brain Architecture
+
+python
+#### Reasoning Brain (WHAT)
+- Understands workload intent and complexity
+- Provides confidence-scored classification
+- Detects degradation and uncertainty
+
+#### Planning Brain (HOW)  
+- Maps intent to execution strategy
+- Optimizes for cost/performance/reliability
+- Adapts based on reasoning confidence
+
+#### Execution Brain (DO)
+- Actually runs the workload
+- Provides real performance feedback
+- Completes the learning loop
+
+
 ## 🧠 Self-Learning Routing
 
 - **Cost Optimization**: Automatically routes to most cost-effective providers
