@@ -408,6 +408,25 @@ async def test_wire_upsert_delete_bulk_batch_schema_health_envelopes():
     assert "version" in hr
 
 
+async def test_wire_get_schema_envelope_success():
+    a = TrackingMockGraphAdapter()
+    h = WireGraphHandler(a)
+
+    res = await h.handle(
+        {
+            "op": "graph.get_schema",
+            "ctx": {"request_id": "schema-only"},
+            "args": {},
+        }
+    )
+
+    assert res["ok"] is True
+    assert res["code"] == "OK"
+    assert isinstance(res["result"], dict)
+    assert "nodes" in res["result"]
+    assert "edges" in res["result"]
+
+
 # ---------------------------------------------------------------------------
 # Streaming via handle_stream
 # ---------------------------------------------------------------------------
@@ -492,6 +511,24 @@ async def test_wire_missing_or_invalid_op_maps_to_bad_request():
     assert "missing or invalid 'op'" in res["message"]
 
 
+async def test_wire_query_missing_required_fields_maps_to_bad_request():
+    a = TrackingMockGraphAdapter()
+    h = WireGraphHandler(a)
+
+    res = await h.handle(
+        {
+            "op": "graph.query",
+            "ctx": {},
+            "args": {},  # missing required 'text'
+        }
+    )
+
+    assert res["ok"] is False
+    assert res["code"] == "BAD_REQUEST"
+    assert res["error"] == "BadRequest"
+    assert "text" in (res.get("message") or "").lower()
+
+
 async def test_wire_maps_graph_adapter_error_to_normalized_envelope():
     exc = BadRequest("bad graph op")
     a = ErrorAdapter(exc)
@@ -514,6 +551,52 @@ async def test_wire_maps_graph_adapter_error_to_normalized_envelope():
     assert res["error"] == "BadRequest"
     assert res["message"] == "bad graph op"
     assert "details" in res  # JSON-safe details present (may be null)
+
+
+async def test_wire_maps_notsupported_adapter_error_to_not_supported_code():
+    exc = NotSupported("nope")
+    a = ErrorAdapter(exc)
+    h = WireGraphHandler(a)
+
+    res = await h.handle(
+        {
+            "op": "graph.query",
+            "ctx": {"request_id": "err-ns"},
+            "args": {
+                "text": "MATCH (n) RETURN n",
+                "dialect": "cypher",
+                "namespace": "demo",
+            },
+        }
+    )
+
+    assert res["ok"] is False
+    assert res["code"] == "NOT_SUPPORTED"
+    assert res["error"] == "NotSupported"
+    assert "nope" in res["message"]
+
+
+async def test_wire_error_envelope_includes_message_and_type():
+    exc = BadRequest("bad things")
+    a = ErrorAdapter(exc)
+    h = WireGraphHandler(a)
+
+    res = await h.handle(
+        {
+            "op": "graph.query",
+            "ctx": {"request_id": "err-msg"},
+            "args": {
+                "text": "MATCH (n) RETURN n",
+                "dialect": "cypher",
+                "namespace": "demo",
+            },
+        }
+    )
+
+    assert res["ok"] is False
+    assert "code" in res and isinstance(res["code"], str) and res["code"]
+    assert "error" in res and isinstance(res["error"], str) and res["error"]
+    assert "message" in res and isinstance(res["message"], str) and res["message"]
 
 
 async def test_wire_maps_unexpected_exception_to_unavailable():
