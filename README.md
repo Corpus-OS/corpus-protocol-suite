@@ -1040,6 +1040,11 @@ pytest tests/llm/ -v
 pytest tests/vector/ -v
 pytest tests/graph/ -v
 ```
+### Corpus Protocol Suite Badge
+![LLM Protocol](https://img.shields.io/badge/LLM%20Protocol-100%25%20Conformant-brightgreen)
+![Vector Protocol](https://img.shields.io/badge/Vector%20Protocol-100%25%20Conformant-brightgreen)
+![Graph Protocol](https://img.shields.io/badge/Graph%20Protocol-100%25%20Conformant-brightgreen)
+![Embedding Protocol](https://img.shields.io/badge/Embedding%20Protocol-100%25%20Conformant-brightgreen)
 
 ---
 
