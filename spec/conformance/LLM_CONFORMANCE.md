@@ -13,20 +13,21 @@ This suite constitutes the official LLM Protocol V1.0 Reference Conformance Test
 
 ## Conformance Summary
 
-**Overall Coverage: 49/49 tests (100%) ✅**
+**Overall Coverage: 57/57 tests (100%) ✅**
 
-| Category                | Tests | Coverage |
-| ----------------------- | ----- | -------- |
-| Core Operations         | 4/4   | 100% ✅   |
-| Message Validation      | 3/3   | 100% ✅   |
-| Sampling Parameters     | 9/9   | 100% ✅   |
-| Streaming Semantics     | 5/5   | 100% ✅   |
-| Error Handling          | 4/4   | 100% ✅   |
-| Capabilities            | 10/10 | 100% ✅   |
-| Observability & Privacy | 4/4   | 100% ✅   |
-| Deadline Semantics      | 3/3   | 100% ✅   |
-| Token Counting          | 3/3   | 100% ✅   |
-| Health Endpoint         | 4/4   | 100% ✅   |
+| Category                 | Tests | Coverage |
+| ------------------------ | ----- | -------- |
+| Core Operations          | 4/4   | 100% ✅   |
+| Message Validation       | 3/3   | 100% ✅   |
+| Sampling Parameters      | 9/9   | 100% ✅   |
+| Streaming Semantics      | 5/5   | 100% ✅   |
+| Error Handling           | 4/4   | 100% ✅   |
+| Capabilities             | 10/10 | 100% ✅   |
+| Observability & Privacy  | 4/4   | 100% ✅   |
+| Deadline Semantics       | 3/3   | 100% ✅   |
+| Token Counting           | 3/3   | 100% ✅   |
+| Health Endpoint          | 4/4   | 100% ✅   |
+| Wire Envelopes & Routing | 8/8   | 100% ✅   |
 
 > Note: Categories are logical groupings. Individual tests may satisfy multiple normative requirements.
 
@@ -171,6 +172,22 @@ Validates SIEM-safe observability:
 * `test_metrics_emitted_on_error_path` - Errors still produce safe metrics
 * `test_streaming_metrics_siem_safe` - Streaming emits final metrics without prompt content
 * `test_token_counter_metrics_present` - Token usage counters emitted, privacy-preserving
+
+### test_llm_wire_handler_envelopes.py
+
+**Specification:** §4.1, §8.3, §8.4, §8.5, §13 - Wire Contract & Envelopes
+**Status:** ✅ Complete (8 tests)
+
+Validates wire-level handler behavior:
+
+* Canonical `llm.<op>` routing (`capabilities`, `complete`, `count_tokens`, `health`)
+* Success envelopes: `{ok, code, ms, result}` shape and JSON-safe payloads
+* Error envelopes: normalized `{ok=false, code, error, message, retry_after_ms?, details?}`
+* `OperationContext` construction from wire `ctx` (ignores unknown keys)
+* Proper mapping of `LLMAdapterError` subclasses to wire errors
+* Fallback of unexpected exceptions to `UNAVAILABLE` per taxonomy
+* `llm.stream` handled exclusively via `handle_stream` (non-unary guard)
+* SIEM/PII-safe behavior at the wire boundary (no raw secrets in envelopes)
 
 ## Specification Mapping
 
@@ -373,7 +390,7 @@ Use this checklist when implementing or validating a new LLM adapter:
 
 ```
 ✅ LLM Protocol V1.0 - 100% Conformant
-   49/49 tests passing
+   57/57 tests passing
 
    ✅ Core Operations: 4/4 (100%)
    ✅ Message Validation: 3/3 (100%)
@@ -385,6 +402,7 @@ Use this checklist when implementing or validating a new LLM adapter:
    ✅ Deadline Semantics: 3/3 (100%)
    ✅ Token Counting: 3/3 (100%)
    ✅ Health Endpoint: 4/4 (100%)
+   ✅ Wire Envelopes & Routing: 8/8 (100%)
 
    Status: Production Ready
 ```
