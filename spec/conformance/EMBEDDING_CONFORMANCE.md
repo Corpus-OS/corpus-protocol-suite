@@ -413,12 +413,10 @@ Use this when implementing or validating a new **Embedding adapter** against `Em
 ## Maintenance
 
 ### Adding New Tests
-
-1. Create file: `tests/embedding/test_<feature>_<aspect>.py`.
-2. Add SPDX header and spec references (`§10.x`, `§12.x`, `§13.x`, etc.).
-3. Use `pytestmark = pytest.mark.asyncio` for async tests.
-4. Update this document’s **Conformance Summary**, **Test Files**, and **Mapping**.
-5. Keep counts accurate; do not repurpose existing tests without updating references.
+* `../../SPECIFICATION.md` - Full protocol specification (§10 Vector Protocol)
+* `../../ERRORS.md` - Error taxonomy reference
+* `../../METRICS.md` - Observability guidelines
+* `../README.md` - General testing guidelines
 
 ### Updating for Specification Changes
 
@@ -426,7 +424,6 @@ Use this when implementing or validating a new **Embedding adapter** against `Em
 2. Add or adjust tests for any new normative behavior.
 3. Bump documented protocol version if required.
 4. Update the conformance badge and checklist to match.
-
 
 ---
 
