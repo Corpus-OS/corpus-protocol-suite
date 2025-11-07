@@ -36,7 +36,7 @@ async def test_upsert_returns_result_with_counts():
     assert isinstance(res.failures, list)
 
 
-async def test_upsert_validates_dimensions_via_caps_or_backend():
+async def test_upsert_validates_dimensions():
     a = MockVectorAdapter()
     caps = await a.capabilities()
     bad_dim = (caps.max_dimensions or 8) + 1
@@ -48,6 +48,30 @@ async def test_upsert_validates_dimensions_via_caps_or_backend():
         await a.upsert(spec)
 
 
+async def test_upsert_validates_namespace_exists_or_behavior_documented():
+    """
+    Spec: adapters MUST either validate unknown namespaces or define clear behavior.
+    This test accepts either:
+      - BadRequest / NotSupported on unknown namespace, OR
+      - A successful UpsertResult with a well-formed shape.
+    """
+    a = MockVectorAdapter()
+    spec = UpsertSpec(
+        namespace="__no_such_namespace__",
+        vectors=[Vector(id=VectorID("v_ns"), vector=[0.1, 0.2])],
+    )
+
+    try:
+        res = await a.upsert(spec)
+    except (BadRequest,):
+        return
+
+    assert isinstance(res, UpsertResult)
+    assert isinstance(res.upserted_count, int)
+    assert isinstance(res.failed_count, int)
+    assert isinstance(res.failures, list)
+
+
 async def test_upsert_requires_non_empty_vectors():
     a = MockVectorAdapter()
     spec = UpsertSpec(namespace="default", vectors=[])
@@ -55,10 +79,10 @@ async def test_upsert_requires_non_empty_vectors():
         await a.upsert(spec)
 
 
-async def test_upsert_result_structure_on_partial_failure():
+async def test_upsert_partial_failure_reporting():
     """
-    Contract: when backend chooses partial success, UpsertResult.failures is populated.
-    This test assumes MockVectorAdapter (or future adapters) may implement such behavior.
+    When partial success is implemented, failures MUST be listed with indices.
+    If adapter chooses atomic failure via DimensionMismatch, that is also valid.
     """
     a = MockVectorAdapter()
     caps = await a.capabilities()
@@ -70,10 +94,9 @@ async def test_upsert_result_structure_on_partial_failure():
     try:
         res = await a.upsert(UpsertSpec(namespace="default", vectors=[good, bad]))
     except DimensionMismatch:
-        # Also acceptable: fail whole op; spec allows atomic failure.
+        # Atomic fail is allowed by spec; this still exercises conformance.
         return
 
-    # If partial implemented: validate shape
     assert isinstance(res, UpsertResult)
     assert res.upserted_count >= 1
     assert res.failed_count >= 1
