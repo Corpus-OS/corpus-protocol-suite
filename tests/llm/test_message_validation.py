@@ -13,9 +13,8 @@ Covers:
 import pytest
 
 from corpus_sdk.examples.llm.mock_llm_adapter import MockLLMAdapter
-from corpus_sdk.llm.llm_base import OperationContext
+from corpus_sdk.llm.llm_base import OperationContext, BadRequest
 from corpus_sdk.examples.common.ctx import make_ctx
-from corpus_sdk.examples.common.errors import BadRequest
 
 pytestmark = pytest.mark.asyncio
 
