@@ -27,7 +27,7 @@ from corpus_sdk.embedding.embedding_base import (
     ModelNotAvailable,
     TextTooLong,
 )
-from corpus_sdk.examples.embedding.mock_embedding_adapter import MockEmbeddingAdapter
+from corpus_sdk.mock_embedding_adapter import MockEmbeddingAdapter
 
 pytestmark = pytest.mark.asyncio
 
