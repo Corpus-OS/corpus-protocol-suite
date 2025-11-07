@@ -400,3 +400,86 @@ async def test_wire_maps_unexpected_exception_to_unavailable():
     assert res["code"] == "UNAVAILABLE"
     assert res["error"] == "RuntimeError"
     assert "boom" in res["message"]
+
+
+# ---------------------------------------------------------------------------
+# Additional wire tests (parity with LLM/Embedding)
+# ---------------------------------------------------------------------------
+
+async def test_wire_missing_or_invalid_op_maps_to_bad_request():
+    a = TrackingMockVectorAdapter()
+    h = WireVectorHandler(a)
+
+    res = await h.handle(
+        {
+            "ctx": {},
+            "args": {},
+        }
+    )
+
+    assert res["ok"] is False
+    assert res["code"] == "BAD_REQUEST"
+    assert res["error"] == "BadRequest"
+    assert "missing or invalid 'op'" in res["message"]
+
+
+async def test_wire_maps_notsupported_adapter_error_to_not_supported_code():
+    exc = NotSupported("nope")
+    a = ErrorAdapter(exc)
+    h = WireVectorHandler(a)
+
+    res = await h.handle(
+        {
+            "op": "vector.query",
+            "ctx": {"request_id": "ns"},
+            "args": {
+                "vector": [0.1],
+                "top_k": 1,
+                "namespace": "default",
+            },
+        }
+    )
+
+    assert res["ok"] is False
+    assert res["code"] in ("NOT_SUPPORTED", "NOTSUPPORTED")
+    assert res["error"] == "NotSupported"
+
+
+async def test_wire_error_envelope_includes_message_and_type():
+    exc = BadRequest("bad things")
+    a = ErrorAdapter(exc)
+    h = WireVectorHandler(a)
+
+    res = await h.handle(
+        {
+            "op": "vector.query",
+            "ctx": {"request_id": "err_shape"},
+            "args": {
+                "vector": [0.1],
+                "top_k": 1,
+                "namespace": "default",
+            },
+        }
+    )
+
+    assert res["ok"] is False
+    assert res["code"] == "BAD_REQUEST"
+    assert res["error"] == "BadRequest"
+    assert "message" in res and isinstance(res["message"], str) and res["message"]
+
+
+async def test_wire_query_missing_required_fields_maps_to_bad_request():
+    a = TrackingMockVectorAdapter()
+    h = WireVectorHandler(a)
+
+    res = await h.handle(
+        {
+            "op": "vector.query",
+            "ctx": {},
+            "args": {},
+        }
+    )
+
+    assert res["ok"] is False
+    assert res["code"] == "BAD_REQUEST"
+    assert res["error"] == "BadRequest"
