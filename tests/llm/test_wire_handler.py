@@ -36,11 +36,12 @@ from corpus_sdk.llm.llm_base import (
     BaseLLMAdapter,
     WireLLMHandler,
 )
+from corpus_sdk.mock_llm_adapter import MockLLMAdapter  # <-- use your mock adapter
 
 pytestmark = pytest.mark.asyncio
 
 
-class FakeLLMAdapter(BaseLLMAdapter):
+class FakeLLMAdapter(MockLLMAdapter):
     """
     Minimal adapter for exercising WireLLMHandler.
 
@@ -51,7 +52,8 @@ class FakeLLMAdapter(BaseLLMAdapter):
     """
 
     def __init__(self) -> None:
-        super().__init__(mode="thin")
+        # Use the real mock adapter base; zero out failures for deterministic tests.
+        super().__init__(failure_rate=0.0)
         self.last_ctx: Optional[OperationContext] = None
         self.last_call: Optional[str] = None
         self.last_args: Dict[str, Any] = {}
@@ -72,6 +74,7 @@ class FakeLLMAdapter(BaseLLMAdapter):
 
     async def _do_capabilities(self) -> LLMCapabilities:
         self._store("capabilities", None)
+        # Return a deterministic fake capability shape for assertions
         return LLMCapabilities(
             server="fake-llm",
             version="1.0.0",
