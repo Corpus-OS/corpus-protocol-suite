@@ -1160,6 +1160,15 @@ logging.getLogger("corpus_sdk").setLevel(logging.DEBUG)
 
 ## 🧠 Intelligent Routing That Learns Your Workloads
 
+# Before your system:
+"We run AI workloads and hope for the best"
+
+# After your system:  
+"We get intelligent workload optimization automatically"
+- Cost optimization: "You route to cheapest viable provider"
+- Performance optimization: "You predict and avoid bottlenecks" 
+- Reliability optimization: "You detect and handle degradation"
+
 Corpus Router doesn't just route traffic—it understands, optimizes, and evolves with your AI workloads. While our open-source SDK standardizes how you talk to providers, Corpus Router intelligently decides which providers to use, when, and why based on your actual workload patterns and business objectives.
 
 ## 🧠 Self-Learning Routing
