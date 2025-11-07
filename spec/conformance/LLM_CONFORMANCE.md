@@ -1,4 +1,4 @@
-# LLM Protocol V1 Conformance Test Coverage
+**LLM Protocol V1 Conformance Test Coverage**
 
 ## Overview
 
@@ -13,7 +13,7 @@ This suite constitutes the official LLM Protocol V1.0 Reference Conformance Test
 
 ## Conformance Summary
 
-**Overall Coverage: 57/57 tests (100%) ✅**
+**Overall Coverage: 61/61 tests (100%) ✅**
 
 | Category                 | Tests | Coverage |
 | ------------------------ | ----- | -------- |
@@ -27,7 +27,7 @@ This suite constitutes the official LLM Protocol V1.0 Reference Conformance Test
 | Deadline Semantics       | 3/3   | 100% ✅   |
 | Token Counting           | 3/3   | 100% ✅   |
 | Health Endpoint          | 4/4   | 100% ✅   |
-| Wire Envelopes & Routing | 8/8   | 100% ✅   |
+| Wire Envelopes & Routing | 12/12 | 100% ✅   |
 
 > Note: Categories are logical groupings. Individual tests may satisfy multiple normative requirements.
 
@@ -176,7 +176,7 @@ Validates SIEM-safe observability:
 ### test_llm_wire_handler_envelopes.py
 
 **Specification:** §4.1, §8.3, §8.4, §8.5, §13 - Wire Contract & Envelopes
-**Status:** ✅ Complete (8 tests)
+**Status:** ✅ Complete (12 tests)
 
 Validates wire-level handler behavior:
 
@@ -188,6 +188,10 @@ Validates wire-level handler behavior:
 * Fallback of unexpected exceptions to `UNAVAILABLE` per taxonomy
 * `llm.stream` handled exclusively via `handle_stream` (non-unary guard)
 * SIEM/PII-safe behavior at the wire boundary (no raw secrets in envelopes)
+* `test_wire_count_tokens_unknown_model_maps_model_not_available` — Unknown model in `count_tokens` mapped to `MODEL_NOT_AVAILABLE` / `NOT_SUPPORTED` per spec.
+* `test_wire_error_envelope_includes_message_and_type` — Verifies error envelopes expose a stable message/type shape for adapter errors.
+* `test_wire_stream_maps_llm_adapter_error_to_normalized_envelope` — Ensures stream-path LLMAdapterError maps to a normalized error envelope.
+* `test_wire_complete_missing_required_fields_maps_to_bad_request` — Missing required args for `llm.complete` yield `BAD_REQUEST`.
 
 ## Specification Mapping
 
@@ -390,7 +394,7 @@ Use this checklist when implementing or validating a new LLM adapter:
 
 ```
 ✅ LLM Protocol V1.0 - 100% Conformant
-   57/57 tests passing
+   61/61 tests passing
 
    ✅ Core Operations: 4/4 (100%)
    ✅ Message Validation: 3/3 (100%)
@@ -402,7 +406,7 @@ Use this checklist when implementing or validating a new LLM adapter:
    ✅ Deadline Semantics: 3/3 (100%)
    ✅ Token Counting: 3/3 (100%)
    ✅ Health Endpoint: 4/4 (100%)
-   ✅ Wire Envelopes & Routing: 8/8 (100%)
+   ✅ Wire Envelopes & Routing: 12/12 (100%)
 
    Status: Production Ready
 ```
