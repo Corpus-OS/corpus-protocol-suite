@@ -36,23 +36,21 @@ from corpus_sdk.llm.llm_base import (
     BaseLLMAdapter,
     WireLLMHandler,
 )
-from corpus_sdk.mock_llm_adapter import MockLLMAdapter  # <-- use your mock adapter
+
+from corpus_sdk.examples.llm.mock_llm_adapter import MockLLMAdapter
 
 pytestmark = pytest.mark.asyncio
 
 
-class FakeLLMAdapter(MockLLMAdapter):
+class TrackingMockLLMAdapter(MockLLMAdapter):
     """
-    Minimal adapter for exercising WireLLMHandler.
+    MockLLMAdapter wrapper for exercising WireLLMHandler.
 
-    Behaviors:
-      - deterministic capabilities
-      - trivial complete/count_tokens/health/stream implementations
-      - records last ctx/call/args for assertions
+    Uses the real mock implementation; only records last ctx/call/args
+    and forces deterministic behavior (failure_rate=0.0, stable health).
     """
 
     def __init__(self) -> None:
-        # Use the real mock adapter base; zero out failures for deterministic tests.
         super().__init__(failure_rate=0.0)
         self.last_ctx: Optional[OperationContext] = None
         self.last_call: Optional[str] = None
@@ -70,27 +68,11 @@ class FakeLLMAdapter(MockLLMAdapter):
         self.last_ctx = ctx
         self.last_args = dict(kwargs)
 
-    # --- backend hooks -------------------------------------------------------
+    # --- backend hooks w/ tracking ------------------------------------------
 
     async def _do_capabilities(self) -> LLMCapabilities:
         self._store("capabilities", None)
-        # Return a deterministic fake capability shape for assertions
-        return LLMCapabilities(
-            server="fake-llm",
-            version="1.0.0",
-            model_family="fake",
-            max_context_length=4096,
-            supports_streaming=True,
-            supports_roles=True,
-            supports_json_output=False,
-            supports_parallel_tool_calls=False,
-            idempotent_writes=False,
-            supports_multi_tenant=True,
-            supports_system_message=True,
-            supports_deadline=True,
-            supports_count_tokens=True,
-            supported_models=("fake-model",),
-        )
+        return await super()._do_capabilities()
 
     async def _do_complete(
         self,
@@ -113,18 +95,17 @@ class FakeLLMAdapter(MockLLMAdapter):
             model=model,
             system_message=system_message,
         )
-        text = "ok:" + (messages[0]["content"] if messages else "")
-        usage = TokenUsage(
-            prompt_tokens=max(1, len(text) // 4),
-            completion_tokens=1,
-            total_tokens=max(1, len(text) // 4) + 1,
-        )
-        return LLMCompletion(
-            text=text,
-            model=model or "fake-model",
-            model_family="fake",
-            usage=usage,
-            finish_reason="stop",
+        return await super()._do_complete(
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            frequency_penalty=frequency_penalty,
+            presence_penalty=presence_penalty,
+            stop_sequences=stop_sequences,
+            model=model,
+            system_message=system_message,
+            ctx=ctx,
         )
 
     async def _do_stream(
@@ -148,26 +129,16 @@ class FakeLLMAdapter(MockLLMAdapter):
             model=model,
             system_message=system_message,
         )
-
-        async def _gen() -> AsyncIterator[LLMChunk]:
-            yield LLMChunk(
-                text="part",
-                is_final=False,
-                model=model or "fake-model",
-                usage_so_far=None,
-            )
-            yield LLMChunk(
-                text="done",
-                is_final=True,
-                model=model or "fake-model",
-                usage_so_far=TokenUsage(
-                    prompt_tokens=1,
-                    completion_tokens=1,
-                    total_tokens=2,
-                ),
-            )
-
-        return _gen()
+        # Delegate to real streaming behavior
+        async for chunk in super()._do_stream(
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            model=model,
+            system_message=system_message,
+            ctx=ctx,
+        ):
+            yield chunk
 
     async def _do_count_tokens(
         self,
@@ -177,22 +148,23 @@ class FakeLLMAdapter(MockLLMAdapter):
         ctx: Optional[OperationContext] = None,
     ) -> int:
         self._store("count_tokens", ctx, text=text, model=model)
-        return max(0, len(text) // 2)
+        return await super()._do_count_tokens(text, model=model, ctx=ctx)
 
     async def _do_health(
         self,
         *,
         ctx: Optional[OperationContext] = None,
     ) -> Mapping[str, Any]:
+        # Make health deterministic for tests
         self._store("health", ctx)
         return {
             "ok": True,
-            "server": "fake-llm",
+            "server": "mock",
             "version": "1.0.0",
         }
 
 
-class ErrorAdapter(FakeLLMAdapter):
+class ErrorAdapter(TrackingMockLLMAdapter):
     """
     Adapter that always raises a specific LLMAdapterError for testing mapping.
     """
@@ -223,7 +195,7 @@ class ErrorAdapter(FakeLLMAdapter):
 # ---------------------------------------------------------------------------
 
 async def test_wire_capabilities_success_envelope():
-    a = FakeLLMAdapter()
+    a = TrackingMockLLMAdapter()
     h = WireLLMHandler(a)
 
     env = {
@@ -238,15 +210,15 @@ async def test_wire_capabilities_success_envelope():
     assert isinstance(res["result"], dict)
 
     out = res["result"]
-    assert out["server"] == "fake-llm"
+    assert out["server"] == "mock"
     assert out["version"] == "1.0.0"
-    assert out["model_family"] == "fake"
+    assert out["model_family"] == "mock"
     assert "supported_models" in out
     assert len(out["supported_models"]) >= 1
 
 
 async def test_wire_complete_roundtrip_and_context_plumbing():
-    a = FakeLLMAdapter()
+    a = TrackingMockLLMAdapter()
     h = WireLLMHandler(a)
 
     ctx_wire = {
@@ -260,7 +232,7 @@ async def test_wire_complete_roundtrip_and_context_plumbing():
     }
     args = {
         "messages": [{"role": "user", "content": "hi"}],
-        "model": "fake-model",
+        "model": "mock-model",
     }
 
     res = await h.handle(
@@ -276,11 +248,11 @@ async def test_wire_complete_roundtrip_and_context_plumbing():
     assert res["code"] == "OK"
     out = res["result"]
     assert isinstance(out["text"], str) and out["text"]
-    assert out["model"] == "fake-model"
-    assert out["model_family"] == "fake"
+    assert out["model"] == "mock-model"
+    assert out["model_family"] == "mock"
     assert "usage" in out
 
-    # Context propagation via BaseLLMAdapter -> FakeLLMAdapter
+    # Context propagation via BaseLLMAdapter -> TrackingMockLLMAdapter
     assert a.last_call == "complete"
     assert isinstance(a.last_ctx, OperationContext)
     assert a.last_ctx.request_id == "req_wire_llm"
@@ -292,14 +264,14 @@ async def test_wire_complete_roundtrip_and_context_plumbing():
 
 
 async def test_wire_count_tokens_and_health_envelopes():
-    a = FakeLLMAdapter()
+    a = TrackingMockLLMAdapter()
     h = WireLLMHandler(a)
 
     # count_tokens
     ct_env = {
         "op": "llm.count_tokens",
         "ctx": {"request_id": "ct1"},
-        "args": {"text": "hello world", "model": "fake-model"},
+        "args": {"text": "hello world", "model": "mock-model"},
     }
     ct_res = await h.handle(ct_env)
     assert ct_res["ok"] is True
@@ -315,7 +287,7 @@ async def test_wire_count_tokens_and_health_envelopes():
     health_res = await h.handle(health_env)
     assert health_res["ok"] is True
     hr = health_res["result"]
-    assert hr["server"] == "fake-llm"
+    assert hr["server"] == "mock"
     assert hr["version"] == "1.0.0"
 
 
@@ -324,7 +296,7 @@ async def test_wire_count_tokens_and_health_envelopes():
 # ---------------------------------------------------------------------------
 
 async def test_wire_stream_success_chunks_and_context():
-    a = FakeLLMAdapter()
+    a = TrackingMockLLMAdapter()
     h = WireLLMHandler(a)
 
     env = {
@@ -335,7 +307,7 @@ async def test_wire_stream_success_chunks_and_context():
         },
         "args": {
             "messages": [{"role": "user", "content": "stream me"}],
-            "model": "fake-model",
+            "model": "mock-model",
         },
     }
 
@@ -367,7 +339,7 @@ async def test_wire_stream_success_chunks_and_context():
 # ---------------------------------------------------------------------------
 
 async def test_wire_unknown_op_maps_to_not_supported():
-    a = FakeLLMAdapter()
+    a = TrackingMockLLMAdapter()
     h = WireLLMHandler(a)
 
     res = await h.handle(
@@ -385,7 +357,7 @@ async def test_wire_unknown_op_maps_to_not_supported():
 
 
 async def test_wire_missing_or_invalid_op_maps_to_bad_request():
-    a = FakeLLMAdapter()
+    a = TrackingMockLLMAdapter()
     h = WireLLMHandler(a)
 
     # No 'op' field
@@ -413,7 +385,7 @@ async def test_wire_maps_llm_adapter_error_to_normalized_envelope():
             "ctx": {"request_id": "err-llm"},
             "args": {
                 "messages": [{"role": "user", "content": "x"}],
-                "model": "fake-model",
+                "model": "mock-model",
             },
         }
     )
@@ -426,7 +398,7 @@ async def test_wire_maps_llm_adapter_error_to_normalized_envelope():
 
 
 async def test_wire_maps_unexpected_exception_to_unavailable():
-    class BoomAdapter(FakeLLMAdapter):
+    class BoomAdapter(TrackingMockLLMAdapter):
         async def _do_complete(
             self,
             *,
@@ -452,7 +424,7 @@ async def test_wire_maps_unexpected_exception_to_unavailable():
             "ctx": {"request_id": "boom"},
             "args": {
                 "messages": [{"role": "user", "content": "hi"}],
-                "model": "fake-model",
+                "model": "mock-model",
             },
         }
     )
