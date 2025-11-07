@@ -10,14 +10,14 @@ Configured via pyproject.toml:
     [project.scripts]
     corpus-sdk = "corpus_sdk.cli:main"
 
-Usage (from repo root or any environment with tests/ available):
+Usage (from repo root or any checkout with tests/):
 
-    # Show help
+    # Help
     corpus-sdk
 
-    # Run ALL protocol conformance suites (LLM + Vector + Graph + Embedding)
+    # Run all conformance tests (LLM + Vector + Graph + Embedding)
     corpus-sdk test-all-conformance
-    corpus-sdk verify
+    corpus-sdk test-conformance
 
     # Run per-protocol suites
     corpus-sdk test-llm-conformance
@@ -25,26 +25,25 @@ Usage (from repo root or any environment with tests/ available):
     corpus-sdk test-graph-conformance
     corpus-sdk test-embedding-conformance
 
-    # Flexible verify mode:
-    corpus-sdk verify --protocol llm --protocol vector
-    corpus-sdk verify -p embedding
+    # Run verify (all or filtered)
+    corpus-sdk verify
+    corpus-sdk verify -p llm -p vector
 
 Notes:
-- Assumes a top-level `tests/` directory with:
+- Assumes a top-level `tests/` directory:
       tests/llm/
       tests/vector/
       tests/graph/
       tests/embedding/
-- Uses pytest directly; requires the "test" extra:
+- Uses pytest directly; install test extras first:
       pip install .[test]
 """
 
 from __future__ import annotations
 
-import argparse
 import os
 import sys
-from typing import Dict, List
+from typing import Dict, Iterable, List
 
 try:
     import pytest
@@ -52,7 +51,6 @@ except ImportError:  # pragma: no cover
     pytest = None  # type: ignore[assignment]
 
 
-# Map protocol names → test directory paths
 PROTOCOL_PATHS: Dict[str, str] = {
     "llm": "tests/llm",
     "vector": "tests/vector",
@@ -60,6 +58,10 @@ PROTOCOL_PATHS: Dict[str, str] = {
     "embedding": "tests/embedding",
 }
 
+
+# --------------------------------------------------------------------------- #
+# Internal helpers
+# --------------------------------------------------------------------------- #
 
 def _ensure_pytest() -> None:
     if pytest is None:  # pragma: no cover
@@ -82,183 +84,238 @@ def _repo_root() -> str:
     return os.path.dirname(here)
 
 
+def _validate_paths(paths: Iterable[str]) -> bool:
+    """
+    Validate that each path we intend pytest to run exists.
+
+    Only checks arguments that look like paths (no leading '-').
+    """
+    ok = True
+    for p in paths:
+        if p.startswith("-"):
+            continue
+        # Allow either directories or files.
+        if not (os.path.isdir(p) or os.path.isfile(p)):
+            print(f"error: test path does not exist: {p}", file=sys.stderr)
+            ok = False
+    return ok
+
+
 def _run_pytest(args: List[str]) -> int:
+    """
+    Run pytest with given args from repo root.
+
+    - Ensures pytest is installed.
+    - Ensures target test paths exist (nice DX).
+    - Prints clean error on unexpected pytest exceptions.
+    """
     _ensure_pytest()
     root = _repo_root()
     os.chdir(root)
-    return pytest.main(args)
+
+    # Validate paths before invoking pytest (only non-flag args).
+    path_like = [a for a in args if not a.startswith("-")]
+    if not _validate_paths(path_like):
+        return 2
+
+    try:
+        return pytest.main(args)
+    except Exception as e:  # pragma: no cover
+        print("error: pytest execution failed unexpectedly:", file=sys.stderr)
+        print(f"  {type(e).__name__}: {e}", file=sys.stderr)
+        return 1
 
 
-# ----- command handlers ------------------------------------------------------
+def _usage() -> int:
+    msg = """Corpus SDK CLI
+
+Usage:
+  corpus-sdk test-all-conformance
+  corpus-sdk test-conformance
+      Run all protocol conformance suites (LLM + Vector + Graph + Embedding).
+
+  corpus-sdk test-llm-conformance
+      Run only LLM Protocol V1 conformance tests (tests/llm).
+
+  corpus-sdk test-vector-conformance
+      Run only Vector Protocol V1 conformance tests (tests/vector).
+
+  corpus-sdk test-graph-conformance
+      Run only Graph Protocol V1 conformance tests (tests/graph).
+
+  corpus-sdk test-embedding-conformance
+      Run only Embedding Protocol V1 conformance tests (tests/embedding).
+
+  corpus-sdk verify [-p llm] [-p vector] [-p graph] [-p embedding]
+      Run conformance tests for all (default) or selected protocols.
+
+Examples:
+  corpus-sdk test-all-conformance
+  corpus-sdk test-embedding-conformance
+  corpus-sdk verify
+  corpus-sdk verify -p llm -p vector
+
+Notes:
+  - Must be run from a checkout (or env) where the `tests/` tree exists.
+  - Install dev/test deps first:
+        pip install .[test]
+"""
+    print(msg.strip())
+    return 0
 
 
-def _cmd_test_all_conformance(_args: argparse.Namespace) -> int:
-    # Full suite across all protocols with coverage over the whole SDK
-    return _run_pytest(
-        [
-            "tests",
-            "-v",
-            "--cov=corpus_sdk",
-            "--cov-report=term",
-            "--cov-report=html:conformance_coverage_report",
-        ]
-    )
+# --------------------------------------------------------------------------- #
+# verify command
+# --------------------------------------------------------------------------- #
 
-
-def _cmd_test_single_protocol(proto: str, cov_pkg: str, report_dir: str) -> int:
-    path = PROTOCOL_PATHS[proto]
-    return _run_pytest(
-        [
-            path,
-            "-v",
-            f"--cov={cov_pkg}",
-            "--cov-report=term",
-            f"--cov-report=html:{report_dir}",
-        ]
-    )
-
-
-def _cmd_test_llm_conformance(_args: argparse.Namespace) -> int:
-    return _cmd_test_single_protocol("llm", "corpus_sdk.llm", "llm_coverage_report")
-
-
-def _cmd_test_vector_conformance(_args: argparse.Namespace) -> int:
-    return _cmd_test_single_protocol("vector", "corpus_sdk.vector", "vector_coverage_report")
-
-
-def _cmd_test_graph_conformance(_args: argparse.Namespace) -> int:
-    return _cmd_test_single_protocol("graph", "corpus_sdk.graph", "graph_coverage_report")
-
-
-def _cmd_test_embedding_conformance(_args: argparse.Namespace) -> int:
-    return _cmd_test_single_protocol(
-        "embedding", "corpus_sdk.embedding", "embedding_coverage_report"
-    )
-
-
-def _cmd_verify(args: argparse.Namespace) -> int:
+def _run_verify(argv: List[str]) -> int:
     """
-    Flexible 'verify' command:
+    Implementation for:
 
-    - No --protocol → run all protocol suites (same as test-all-conformance)
-    - With one or more --protocol → run only those suites.
+        corpus-sdk verify [-p llm] [-p vector] [-p graph] [-p embedding]
 
-    Examples:
-        corpus-sdk verify
-        corpus-sdk verify --protocol llm --protocol vector
-        corpus-sdk verify -p embedding
+    - No flags       -> run all protocol suites.
+    - One/more -p    -> run only those protocol directories.
     """
-    # Determine which protocols to run
-    if args.protocol:
-        invalid = [p for p in args.protocol if p not in PROTOCOL_PATHS]
-        if invalid:
-            print(
-                f"error: unknown protocol(s): {', '.join(invalid)}\n"
-                f"valid choices: {', '.join(PROTOCOL_PATHS.keys())}",
-                file=sys.stderr,
-            )
+    _ensure_pytest()
+    root = _repo_root()
+    os.chdir(root)
+
+    # Tiny manual arg parse (only -p/--protocol).
+    selected: List[str] = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg in ("-p", "--protocol"):
+            i += 1
+            if i >= len(argv):
+                print("error: --protocol requires a value", file=sys.stderr)
+                return 2
+            proto = argv[i]
+            if proto not in PROTOCOL_PATHS:
+                print(f"error: unknown protocol '{proto}'", file=sys.stderr)
+                return 2
+            if proto not in selected:
+                selected.append(proto)
+        else:
+            print(f"error: unknown option '{arg}'", file=sys.stderr)
             return 2
-        protos = args.protocol
-    else:
-        protos = list(PROTOCOL_PATHS.keys())
+        i += 1
 
-    # Build pytest args:
-    # - one or more test paths
-    # - verbose
-    # - coverage over the whole SDK (simpler + stable)
-    pytest_args: List[str] = []
-    for p in protos:
-        pytest_args.append(PROTOCOL_PATHS[p])
+    if not selected:
+        selected = list(PROTOCOL_PATHS.keys())
 
-    pytest_args.extend(
-        [
-            "-v",
-            "--cov=corpus_sdk",
-            "--cov-report=term",
-            "--cov-report=html:conformance_coverage_report",
-        ]
-    )
+    paths = [PROTOCOL_PATHS[p] for p in selected]
+
+    if not _validate_paths(paths):
+        return 2
 
     print("🔍 Running Corpus Protocol Conformance Suite...")
-    print(f"   Protocols: {', '.join(protos)}")
-    rc = _run_pytest(pytest_args)
+    print(f"   Protocols: {', '.join(selected)}")
+    for p in selected:
+        print(f"   • {p}: {PROTOCOL_PATHS[p]}")
+
+    try:
+        rc = pytest.main([*paths, "-v"])
+    except Exception as e:  # pragma: no cover
+        print("error: pytest execution failed unexpectedly:", file=sys.stderr)
+        print(f"  {type(e).__name__}: {e}", file=sys.stderr)
+        return 1
 
     if rc == 0:
         print("\n✅ All selected protocols are 100% conformant.")
     else:
         print("\n❌ Conformance failures detected.")
-        print("   Inspect failed tests above; each one maps to a spec section via the per-protocol CONFORMANCE.md.")
+        print("   Inspect the failed tests above. Each test maps to spec sections via CONFORMANCE.md.")
 
     return rc
 
 
-# ----- main / argument parsing ----------------------------------------------
+# --------------------------------------------------------------------------- #
+# main
+# --------------------------------------------------------------------------- #
 
+def main() -> int:
+    if len(sys.argv) == 1:
+        return _usage()
 
-def main(argv: List[str] | None = None) -> int:
-    if argv is None:
-        argv = sys.argv[1:]
+    cmd = sys.argv[1]
 
-    parser = argparse.ArgumentParser(
-        prog="corpus-sdk",
-        description="Corpus SDK conformance test runner",
-    )
-    sub = parser.add_subparsers(dest="cmd")
+    # Unified “all” / legacy alias
+    if cmd in ("test-all-conformance", "test-conformance"):
+        print("🚀 Running ALL protocol conformance suites (LLM, Vector, Graph, Embedding)...")
+        return _run_pytest(
+            [
+                "tests/llm",
+                "tests/vector",
+                "tests/graph",
+                "tests/embedding",
+                "-v",
+                "--cov=corpus_sdk",
+                "--cov-report=term",
+                "--cov-report=html:conformance_coverage_report",
+            ]
+        )
 
-    # test-all-conformance
-    p_all = sub.add_parser(
-        "test-all-conformance",
-        help="Run ALL protocol conformance suites (LLM, Vector, Graph, Embedding)",
-    )
-    p_all.set_defaults(func=_cmd_test_all_conformance)
+    # Per-protocol wrappers with nice progress messages
+    if cmd == "test-llm-conformance":
+        print("🚀 Running LLM Protocol V1 conformance tests...")
+        return _run_pytest(
+            [
+                "tests/llm",
+                "-v",
+                "--cov=corpus_sdk.llm",
+                "--cov-report=term",
+                "--cov-report=html:llm_coverage_report",
+            ]
+        )
 
-    # Per-protocol commands (simple, explicit)
-    p_llm = sub.add_parser("test-llm-conformance", help="Run LLM Protocol V1 conformance tests")
-    p_llm.set_defaults(func=_cmd_test_llm_conformance)
+    if cmd == "test-vector-conformance":
+        print("🚀 Running Vector Protocol V1 conformance tests...")
+        return _run_pytest(
+            [
+                "tests/vector",
+                "-v",
+                "--cov=corpus_sdk.vector",
+                "--cov-report=term",
+                "--cov-report=html:vector_coverage_report",
+            ]
+        )
 
-    p_vec = sub.add_parser("test-vector-conformance", help="Run Vector Protocol V1 conformance tests")
-    p_vec.set_defaults(func=_cmd_test_vector_conformance)
+    if cmd == "test-graph-conformance":
+        print("🚀 Running Graph Protocol V1 conformance tests...")
+        return _run_pytest(
+            [
+                "tests/graph",
+                "-v",
+                "--cov=corpus_sdk.graph",
+                "--cov-report=term",
+                "--cov-report=html:graph_coverage_report",
+            ]
+        )
 
-    p_graph = sub.add_parser("test-graph-conformance", help="Run Graph Protocol V1 conformance tests")
-    p_graph.set_defaults(func=_cmd_test_graph_conformance)
+    if cmd == "test-embedding-conformance":
+        print("🚀 Running Embedding Protocol V1 conformance tests...")
+        return _run_pytest(
+            [
+                "tests/embedding",
+                "-v",
+                "--cov=corpus_sdk.embedding",
+                "--cov-report=term",
+                "--cov-report=html:embedding_coverage_report",
+            ]
+        )
 
-    p_emb = sub.add_parser(
-        "test-embedding-conformance",
-        help="Run Embedding Protocol V1 conformance tests",
-    )
-    p_emb.set_defaults(func=_cmd_test_embedding_conformance)
+    # verify (all or subset)
+    if cmd == "verify":
+        return _run_verify(sys.argv[2:])
 
-    # verify (nice UX alias, supports filtering)
-    v = sub.add_parser(
-        "verify",
-        help=(
-            "Run protocol conformance suites. "
-            "Use without args for all, or -p/--protocol to filter."
-        ),
-    )
-    v.add_argument(
-        "-p",
-        "--protocol",
-        choices=sorted(PROTOCOL_PATHS.keys()),
-        action="append",
-        help="Limit verification to one or more protocols "
-             "(can be repeated: -p llm -p vector)",
-    )
-    v.set_defaults(func=_cmd_verify)
-
-    # No subcommand → print help
-    if not argv:
-        parser.print_help()
-        return 0
-
-    args = parser.parse_args(argv)
-
-    if not getattr(args, "func", None):
-        parser.print_help()
-        return 1
-
-    return args.func(args)
+    # Unknown command -> usage + non-zero
+    print(f"error: unknown command '{cmd}'\n", file=sys.stderr)
+    _usage()
+    return 1
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
