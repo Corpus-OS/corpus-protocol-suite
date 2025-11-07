@@ -1,4 +1,3 @@
-
 # Embedding Protocol V1 Conformance Test Coverage
 
 ## Overview
@@ -14,7 +13,7 @@ This suite constitutes the **official Embedding Protocol V1.0 Reference Conforma
 
 ## Conformance Summary
 
-**Overall Coverage: 73/73 tests (100%) ✅**
+**Overall Coverage: 75/75 tests (100%) ✅**
 
 | Category                 | Tests | Coverage |
 | ------------------------ | ----- | -------- |
@@ -29,7 +28,7 @@ This suite constitutes the **official Embedding Protocol V1.0 Reference Conforma
 | Health Endpoint          | 4/4   | 100% ✅   |
 | Observability & Privacy  | 6/6   | 100% ✅   |
 | Caching & Idempotency    | 3/3   | 100% ✅   |
-| Wire Contract            | 14/14 | 100% ✅   |
+| Wire Contract            | 16/16 | 100% ✅   |
 
 > Note: Categories are logical groupings. Individual tests may satisfy multiple normative requirements.
 
@@ -209,7 +208,7 @@ Caching & batch fallback behavior:
 ### `test_wire_handler.py`
 
 **Specification:** §4.1, §4.1.6, §10.3, §10.6
-**Status:** ✅ Complete (14 tests)
+**Status:** ✅ Complete (16 tests)
 
 `WireEmbeddingHandler` canonical envelopes:
 
@@ -220,7 +219,15 @@ Caching & batch fallback behavior:
 * `test_health_envelope_success` — `embedding.health` envelope returns `ok:true` with proper `result`.
 * `test_missing_op_rejected_with_bad_request` — Missing `op` yields normalized `BAD_REQUEST`/`NOT_SUPPORTED`.
 * `test_unknown_op_rejected_with_not_supported` — Unknown `op` yields `NOT_SUPPORTED` envelope.
-* (and additional envelope/error mapping assertions in this file bringing total to 14).
+* `test_embed_missing_required_fields_yields_bad_request` — Missing `text` or `model` yields `BAD_REQUEST`.
+* `test_embed_unknown_model_maps_model_not_available` — Unknown model maps to `MODEL_NOT_AVAILABLE`/`NOT_SUPPORTED`.
+* `test_embed_batch_missing_texts_yields_bad_request` — Missing `texts` yields `BAD_REQUEST`.
+* `test_embed_batch_unknown_model_maps_model_not_available` — Unknown model in batch maps correctly.
+* `test_count_tokens_unknown_model_maps_model_not_available` — Unknown model in `count_tokens` maps correctly.
+* `test_error_envelope_includes_message_and_type` — Adapter `BadRequest` surfaces canonical error envelope with message.
+* `test_text_too_long_maps_to_text_too_long_code_when_exposed` — Adapter `TextTooLong` maps to `TEXT_TOO_LONG`/`BAD_REQUEST`.
+* `test_embed_context_roundtrip_and_context_plumbing` — Verifies `OperationContext` fields are correctly constructed and passed into the adapter.
+* `test_unexpected_exception_maps_to_unavailable` — Verifies unexpected exceptions are normalized to `UNAVAILABLE` envelopes.
 
 ---
 
@@ -402,7 +409,7 @@ Use this when implementing or validating a new **Embedding adapter** against `Em
 
 ```text
 ✅ Embedding Protocol V1.0 - 100% Conformant
-   73/73 tests passing (12 test files)
+   75/75 tests passing (12 test files)
 
    ✅ Core Operations: 19/19 (100%)
    ✅ Capabilities: 8/8 (100%)
@@ -415,7 +422,7 @@ Use this when implementing or validating a new **Embedding adapter** against `Em
    ✅ Health: 4/4 (100%)
    ✅ Observability & Privacy: 6/6 (100%)
    ✅ Caching & Idempotency: 3/3 (100%)
-   ✅ Wire Contract: 14/14 (100%)
+   ✅ Wire Contract: 16/16 (100%)
 
    Status: Production Ready
 ```
@@ -443,3 +450,4 @@ Use this when implementing or validating a new **Embedding adapter** against `Em
 **Last Updated:** 2025-01-XX
 **Maintained By:** Corpus SDK Team
 **Status:** 100% V1.0 Conformant - Production Ready
+
