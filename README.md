@@ -1,9 +1,40 @@
 # Corpus SDK
 
-A protocol-first, vendor-neutral SDK for interoperable AI/data backends — **LLM**, **Embedding**, **Vector**, and **Graph** — with consistent error taxonomies, capability discovery, SIEM-safe metrics, and deadline propagation. Designed to compose cleanly under an external control plane (router, scheduler, rate limiter) while remaining usable in a lightweight **standalone** mode for development and simple services. Forming a complete foundation for AI infrastructure standardization across reasoning (LLM), relationships (Graph), semantic search (Vector), and text representation (Embedding) domains.
+Reference implementation of the **Corpus Protocol Suite** — a protocol-first, vendor-neutral SDK for interoperable AI/data backends: **LLM**, **Embedding**, **Vector**, and **Graph**.
 
-> **Note:** The SDK in this repository is **fully open source** (Apache-2.0).  
-> **Corpus Router** and **official production adapters** are **commercial** offerings available as managed cloud or on-prem deployments. The SDK works with any router/control plane; using Corpus Router is optional.
+Corpus defines stable, wire-level contracts (ops, envelopes, errors, capabilities) so that applications, routers, and providers can interoperate without bespoke glue code. This SDK implements those protocols for Python, with:
+
+* Consistent error taxonomies
+* Capability discovery
+* SIEM-safe metrics
+* Deadline & idempotency propagation
+* Async-first, production-ready bases for adapters
+* Canonical JSON envelopes and reserved `op` strings aligned with the public spec
+
+Designed to compose cleanly under any external control plane (router, scheduler, rate limiter) while remaining usable in a lightweight **standalone** mode for development and simple services. Forming a complete foundation for AI infrastructure standardization across reasoning (LLM), relationships (Graph), semantic search (Vector), and text representation (Embedding) domains.
+
+> **Open-Core Model**
+>
+> * The **Corpus Protocol Suite** and this **Corpus SDK** are **fully open source** (Apache-2.0).
+> * **Corpus Router** and **official production adapters** are **commercial** offerings built *on top of* the same public protocols. They are optional; any compatible router/control plane can be used.
+>
+> Using Corpus SDK or implementing the Corpus Protocols does **not** lock you into Corpus Router. The protocols are vendor-neutral by design.
+
+---
+
+## Spec
+
+* **Corpus Protocol Suite v1.0.0** — canonical specification for:
+
+  * Wire-level envelopes (`op`, `ctx`, `args`)
+  * Reserved operation registry
+  * Error taxonomy and mappings
+  * Streaming semantics
+  * Capability discovery
+  * Security, privacy, and observability requirements
+* This SDK tracks the spec and serves as the **reference implementation** for Python.
+* **Latest stable version:** **v1.0.0** (this SDK is aligned with v1.0.0 wire contracts).
+* Full text of the protocol suite is published in this repo under `spec/Corpus-Protocol-Suite-v1.0.0.md` (and may also be tagged in releases for versioned reference).
 
 ---
 
@@ -15,31 +46,35 @@ A protocol-first, vendor-neutral SDK for interoperable AI/data backends — **LL
 4. [Install](#install)
 5. [Modes: `thin` vs `standalone`](#modes-thin-vs-standalone)
 6. [Core Concepts](#core-concepts)
-7. [Quickstart](#quickstart)
+7. [Corpus-Compatible](#corpus-compatible)
+8. [Quickstart](#quickstart)
+
    * [Embeddings](#embeddings-quickstart)
    * [LLM](#llm-quickstart)
    * [Vector](#vector-quickstart)
    * [Graph](#graph-quickstart)
-8. [Error Taxonomy](#error-taxonomy)
-9. [Metrics & Observability](#metrics--observability)
-10. [Deadlines & Timeouts](#deadlines--timeouts)
-11. [Caching](#caching)
-12. [Rate Limiting & Circuit Breaking](#rate-limiting--circuit-breaking)
-13. [Capabilities](#capabilities)
-14. [Example Adapters](#example-adapters)
-   * [Adapter Ecosystem](#adapter-ecosystem)
-   * [Why Official Adapters Are Commercial](#why-official-adapters-are-commercial)
-15. [Security & Privacy](#security--privacy)
-16. [Performance Notes](#performance-notes)
-17. [Versioning & Compatibility](#versioning--compatibility)
-18. [Testing](#testing)
-19. [Troubleshooting](#troubleshooting)
-20. [FAQ](#faq)
-21. [Commercial Options](#commercial-options)
-22. [Contributing](#contributing)
-23. [License](#license)
-24. [Roadmap](#roadmap)
-25. [Appendix](#appendix)
+9. [Error Taxonomy](#error-taxonomy)
+10. [Metrics & Observability](#metrics--observability)
+11. [Deadlines & Timeouts](#deadlines--timeouts)
+12. [Caching](#caching)
+13. [Rate Limiting & Circuit Breaking](#rate-limiting--circuit-breaking)
+14. [Capabilities](#capabilities)
+15. [Example Adapters](#example-adapters)
+
+* [Adapter Ecosystem](#adapter-ecosystem)
+* [Why Official Adapters Are Commercial](#why-official-adapters-are-commercial)
+
+16. [Security & Privacy](#security--privacy)
+17. [Performance Notes](#performance-notes)
+18. [Versioning & Compatibility](#versioning--compatibility)
+19. [Testing](#testing)
+20. [Troubleshooting](#troubleshooting)
+21. [FAQ](#faq)
+22. [Commercial Options](#commercial-options)
+23. [Contributing](#contributing)
+24. [License](#license)
+25. [Roadmap](#roadmap)
+26. [Appendix](#appendix)
 
 ---
 
@@ -72,6 +107,7 @@ Modern AI platforms juggle multiple LLM, embedding, vector, and graph backends. 
 * **Metrics hooks** that never leak PII (tenant hashing)
 * **Optional in-memory cache** (Embedding + LLM complete), rate limiter, and simple circuit breaker in **standalone** mode
 * **Wire-first protocol design** with canonical JSON envelopes for transport-agnostic interoperability
+* **Canonical `op` registry** aligned with the Corpus Protocol Suite for consistent routing and interoperability
 * **Lifecycle management** with async context manager support for clean resource cleanup
 * **Everything ships in single files per domain** (protocols + base) to keep adoption friction low
 
@@ -80,15 +116,19 @@ Modern AI platforms juggle multiple LLM, embedding, vector, and graph backends. 
 ## Who This Is For
 
 ### Platform Engineers
+
 Building multi-tenant AI platforms that need provider flexibility without vendor lock-in.
 
-### ML Engineers  
+### ML Engineers
+
 Prototyping with different models/providers without rewriting integration code.
 
 ### DevOps/SRE
+
 Need consistent observability, error handling, and resilience across AI infrastructure.
 
 ### CTOs/Architects
+
 Evaluating AI infrastructure strategies and avoiding vendor lock-in.
 
 ---
@@ -109,14 +149,17 @@ pip install corpus_sdk
 Corpus SDK can operate in two mutually exclusive modes:
 
 ### **`thin` (default)**
+
 All infra hooks are **no-ops**. Use this when you already have a control plane (router/scheduler/limiter/caching/circuit breaker). Prevents **double-stacking** resiliency.
 
 ### **`standalone`**
+
 Enables a small set of helpers:
-- Deadline enforcement
-- Simple circuit breaker
-- Tiny token-bucket limiter
-- In-memory TTL cache (for deterministic, safe ops)
+
+* Deadline enforcement
+* Simple circuit breaker
+* Tiny token-bucket limiter
+* In-memory TTL cache (for deterministic, safe ops)
 
 Ideal for demos, dev, and light workloads.
 
@@ -128,8 +171,8 @@ Ideal for demos, dev, and light workloads.
 
 ### Protocol vs Base
 
-* **Protocol**: A runtime-checkable interface (e.g., `EmbeddingProtocolV1`) that defines *what* an adapter must implement
-* **Base**: A concrete class (e.g., `BaseEmbeddingAdapter`) that implements validation, deadlines, metrics, caching (where safe), and error normalization. You implement the `_do_*` hooks to talk to your provider
+* **Protocol**: A runtime-checkable interface (e.g., `EmbeddingProtocolV1`) that defines *what* an adapter must implement.
+* **Base**: A concrete class (e.g., `BaseEmbeddingAdapter`) that implements validation, deadlines, metrics, caching (where safe), and error normalization. You implement the `_do_*` hooks to talk to your provider.
 
 ### OperationContext
 
@@ -144,52 +187,86 @@ Each domain exposes a `*Capabilities` object (e.g., `LLMCapabilities`) that desc
 
 ### Wire Protocol
 
-All protocols support canonical JSON envelopes for transport-agnostic interoperability:
+All protocols support canonical JSON envelopes for transport-agnostic interoperability, aligned with the Corpus Protocol Suite:
 
 **Request:**
+
 ```json
 {
-    "op": "<protocol>.<operation>",
-    "ctx": {
-        "request_id": "...",
-        "idempotency_key": "...",
-        "deadline_ms": 1234567890,
-        "traceparent": "...",
-        "tenant": "...",
-        "attrs": {}
-    },
-    "args": {}
+  "op": "<protocol>.<operation>",
+  "ctx": {
+    "request_id": "...",
+    "idempotency_key": "...",
+    "deadline_ms": 1234567890,
+    "traceparent": "...",
+    "tenant": "...",
+    "attrs": {}
+  },
+  "args": {}
 }
 ```
 
 **Success:**
+
 ```json
 {
-    "ok": true,
-    "code": "OK",
-    "ms": 123.45,
-    "result": {}
+  "ok": true,
+  "code": "OK",
+  "ms": 123.45,
+  "result": {}
 }
 ```
 
 **Error:**
+
 ```json
 {
-    "ok": false,
-    "code": "RESOURCE_EXHAUSTED",
-    "error": "ResourceExhausted",
-    "message": "Rate limit exceeded",
-    "retry_after_ms": 5000,
-    "details": {},
-    "ms": 45.67
+  "ok": false,
+  "code": "RESOURCE_EXHAUSTED",
+  "error": "ResourceExhausted",
+  "message": "Rate limit exceeded",
+  "retry_after_ms": 5000,
+  "details": {},
+  "ms": 45.67
 }
 ```
+
+The reserved `op` strings and envelope shapes are defined in the spec and implemented here.
+
+---
+
+## Corpus-Compatible
+
+An implementation (SDK, router, or adapter) MAY claim to be **Corpus-Compatible** if it:
+
+1. Implements the canonical wire envelopes (`op`, `ctx`, `args`) and response shapes from the Corpus Protocol Suite.
+2. Honors the reserved `op` strings (e.g., `llm.complete`, `embedding.embed_batch`, `vector.query`, `graph.query`) without changing their semantics.
+3. Maps provider-specific errors into the normalized error taxonomy defined by the spec.
+4. Preserves streaming semantics (exactly one terminal frame; no `data` after `end`/`error`) where applicable.
+
+We **encourage** forks and independent implementations that remain wire-compatible. Forking while staying compatible strengthens the ecosystem and builds on the same shared standard.
+
+> Note: Names like “Corpus”, “Corpus Protocol”, and “Corpus-Compatible” may be protected marks. You are free to implement the protocols under Apache-2.0, but SHOULD NOT market incompatible variants as “Corpus Protocol” or “Corpus-Compatible”.
 
 ---
 
 ## Quickstart
 
 > **Note**: In all examples, swap `Example*Adapter` with your actual adapter class that inherits the corresponding base and implements `_do_*` hooks.
+
+### 5-Line Hello World
+
+A minimal taste using any `BaseLLMAdapter` implementation:
+
+```python
+from corpus_sdk.adapter_sdk.llm_base import OperationContext
+from my_adapters import MyLLMAdapter
+
+adapter = MyLLMAdapter()
+res = await adapter.complete(messages=[{"role": "user", "content": "Hello Corpus"}],
+                             ctx=OperationContext(request_id="hello"))
+print(res.text)
+```
 
 ### Embeddings Quickstart
 
@@ -217,9 +294,9 @@ class ExampleEmbeddingAdapter(BaseEmbeddingAdapter):
         vec = [0.1, 0.2, 0.3]
         return type("EmbedResult", (), {})(
             embedding=EmbeddingVector(
-                vector=vec, 
-                text=spec.text, 
-                model=spec.model, 
+                vector=vec,
+                text=spec.text,
+                model=spec.model,
                 dimensions=len(vec)
             ),
             model=spec.model,
@@ -233,9 +310,9 @@ class ExampleEmbeddingAdapter(BaseEmbeddingAdapter):
         return BatchEmbedResult(
             embeddings=[
                 EmbeddingVector(
-                    vector=v, 
-                    text=t, 
-                    model=spec.model, 
+                    vector=v,
+                    text=t,
+                    model=spec.model,
                     dimensions=len(v)
                 )
                 for v, t in zip(vecs, spec.texts)
@@ -247,19 +324,19 @@ class ExampleEmbeddingAdapter(BaseEmbeddingAdapter):
         )
 
     async def _do_count_tokens(
-        self, 
-        text: str, 
-        model: str, 
-        *, 
+        self,
+        text: str,
+        model: str,
+        *,
         ctx: OperationContext | None
     ) -> int:
         return len(text.split())
 
     async def _do_health(self, *, ctx: OperationContext | None):
         return {
-            "ok": True, 
-            "server": "example-embeddings", 
-            "version": "1.0.0", 
+            "ok": True,
+            "server": "example-embeddings",
+            "version": "1.0.0",
             "models": {"example-embed-001": "ok"}
         }
 
@@ -267,7 +344,7 @@ class ExampleEmbeddingAdapter(BaseEmbeddingAdapter):
 async with ExampleEmbeddingAdapter() as adapter:
     ctx = OperationContext(request_id="req-1", tenant="acme")
     res = await adapter.embed(
-        EmbedSpec(text="hello world", model="example-embed-001"), 
+        EmbedSpec(text="hello world", model="example-embed-001"),
         ctx=ctx
     )
     print(res.embedding.vector)
@@ -278,7 +355,7 @@ async with ExampleEmbeddingAdapter() as adapter:
 
 ```python
 from corpus_sdk.adapter_sdk.llm_base import (
-    BaseLLMAdapter, OperationContext, LLMCompletion, 
+    BaseLLMAdapter, OperationContext, LLMCompletion,
     TokenUsage, LLMCapabilities, LLMChunk
 )
 
@@ -300,8 +377,8 @@ class ExampleLLMAdapter(BaseLLMAdapter):
 
     async def _do_complete(self, **kwargs):
         usage = TokenUsage(
-            prompt_tokens=5, 
-            completion_tokens=5, 
+            prompt_tokens=5,
+            completion_tokens=5,
             total_tokens=10
         )
         return LLMCompletion(
@@ -317,18 +394,18 @@ class ExampleLLMAdapter(BaseLLMAdapter):
         yield LLMChunk(text="world!", is_final=True)
 
     async def _do_count_tokens(
-        self, 
-        text: str, 
-        *, 
-        model: str | None, 
+        self,
+        text: str,
+        *,
+        model: str | None,
         ctx: OperationContext | None
     ) -> int:
         return len(text.split())
 
     async def _do_health(self, *, ctx: OperationContext | None):
         return {
-            "ok": True, 
-            "server": "example-llm", 
+            "ok": True,
+            "server": "example-llm",
             "version": "1.0.0"
         }
 
@@ -336,7 +413,7 @@ class ExampleLLMAdapter(BaseLLMAdapter):
 async with ExampleLLMAdapter() as adapter:
     ctx = OperationContext(request_id="req-2", tenant="acme")
     resp = await adapter.complete(
-        messages=[{"role": "user", "content": "Say hi"}], 
+        messages=[{"role": "user", "content": "Say hi"}],
         ctx=ctx
     )
     print(resp.text)
@@ -347,91 +424,91 @@ async with ExampleLLMAdapter() as adapter:
 
 ```python
 from corpus_sdk.adapter_sdk.vector_base import (
-    BaseVectorAdapter, VectorCapabilities, QuerySpec, QueryResult, 
-    Vector, VectorMatch, UpsertSpec, UpsertResult, DeleteSpec, 
+    BaseVectorAdapter, VectorCapabilities, QuerySpec, QueryResult,
+    Vector, VectorMatch, UpsertSpec, UpsertResult, DeleteSpec,
     DeleteResult, NamespaceSpec, NamespaceResult, OperationContext, VectorID
 )
 
 class ExampleVectorAdapter(BaseVectorAdapter):
     async def _do_capabilities(self) -> VectorCapabilities:
         return VectorCapabilities(
-            server="example-vector", 
-            version="1.0.0", 
+            server="example-vector",
+            version="1.0.0",
             max_dimensions=3
         )
 
     async def _do_query(
-        self, 
-        spec: QuerySpec, 
-        *, 
+        self,
+        spec: QuerySpec,
+        *,
         ctx: OperationContext | None
     ) -> QueryResult:
         v = Vector(
-            id=VectorID("v1"), 
-            vector=[0.1, 0.2, 0.3], 
-            metadata={"label": "demo"}, 
+            id=VectorID("v1"),
+            vector=[0.1, 0.2, 0.3],
+            metadata={"label": "demo"},
             namespace=spec.namespace
         )
         return QueryResult(
-            matches=[VectorMatch(vector=v, score=0.99, distance=0.01)], 
-            query_vector=spec.vector, 
-            namespace=spec.namespace, 
+            matches=[VectorMatch(vector=v, score=0.99, distance=0.01)],
+            query_vector=spec.vector,
+            namespace=spec.namespace,
             total_matches=1
         )
 
     async def _do_upsert(
-        self, 
-        spec: UpsertSpec, 
-        *, 
+        self,
+        spec: UpsertSpec,
+        *,
         ctx: OperationContext | None
     ) -> UpsertResult:
         return UpsertResult(
-            upserted_count=len(spec.vectors), 
-            failed_count=0, 
+            upserted_count=len(spec.vectors),
+            failed_count=0,
             failures=[]
         )
 
     async def _do_delete(
-        self, 
-        spec: DeleteSpec, 
-        *, 
+        self,
+        spec: DeleteSpec,
+        *,
         ctx: OperationContext | None
     ) -> DeleteResult:
         return DeleteResult(
-            deleted_count=len(spec.ids), 
-            failed_count=0, 
+            deleted_count=len(spec.ids),
+            failed_count=0,
             failures=[]
         )
 
     async def _do_create_namespace(
-        self, 
-        spec: NamespaceSpec, 
-        *, 
+        self,
+        spec: NamespaceSpec,
+        *,
         ctx: OperationContext | None
     ) -> NamespaceResult:
         return NamespaceResult(
-            success=True, 
-            namespace=spec.namespace, 
+            success=True,
+            namespace=spec.namespace,
             details={"created": True}
         )
 
     async def _do_delete_namespace(
-        self, 
-        namespace: str, 
-        *, 
+        self,
+        namespace: str,
+        *,
         ctx: OperationContext | None
     ) -> NamespaceResult:
         return NamespaceResult(
-            success=True, 
-            namespace=namespace, 
+            success=True,
+            namespace=namespace,
             details={"deleted": True}
         )
 
     async def _do_health(self, *, ctx: OperationContext | None) -> dict:
         return {
-            "ok": True, 
-            "server": "example-vector", 
-            "version": "1.0.0", 
+            "ok": True,
+            "server": "example-vector",
+            "version": "1.0.0",
             "namespaces": {"default": "ok"}
         }
 
@@ -440,7 +517,7 @@ adapter = ExampleVectorAdapter()
 ctx = OperationContext(request_id="req-3", tenant="acme")
 
 result = await adapter.query(
-    QuerySpec(vector=[0.1, 0.2, 0.3], top_k=1), 
+    QuerySpec(vector=[0.1, 0.2, 0.3], top_k=1),
     ctx=ctx
 )
 print(result.matches[0].score)
@@ -450,7 +527,7 @@ print(result.matches[0].score)
 
 ```python
 from corpus_sdk.adapter_sdk.graph_base import (
-    BaseGraphAdapter, GraphCapabilities, GraphQuerySpec, 
+    BaseGraphAdapter, GraphCapabilities, GraphQuerySpec,
     UpsertNodesSpec, UpsertEdgesSpec, Node, Edge, GraphID,
     OperationContext
 )
@@ -458,7 +535,7 @@ from corpus_sdk.adapter_sdk.graph_base import (
 class ExampleGraphAdapter(BaseGraphAdapter):
     async def _do_capabilities(self) -> GraphCapabilities:
         return GraphCapabilities(
-            server="example-graph", 
+            server="example-graph",
             version="1.0.0",
             supported_query_dialects=("cypher",),
             supports_stream_query=True,
@@ -468,9 +545,9 @@ class ExampleGraphAdapter(BaseGraphAdapter):
         )
 
     async def _do_query(
-        self, 
-        spec: GraphQuerySpec, 
-        *, 
+        self,
+        spec: GraphQuerySpec,
+        *,
         ctx: OperationContext | None
     ):
         return type("QueryResult", (), {})(
@@ -481,25 +558,25 @@ class ExampleGraphAdapter(BaseGraphAdapter):
         )
 
     async def _do_stream_query(
-        self, 
-        spec: GraphQuerySpec, 
-        *, 
+        self,
+        spec: GraphQuerySpec,
+        *,
         ctx: OperationContext | None
     ):
         yield type("QueryChunk", (), {})(
-            records=[{"id": 1}], 
+            records=[{"id": 1}],
             is_final=False
         )
         yield type("QueryChunk", (), {})(
-            records=[{"id": 2}], 
+            records=[{"id": 2}],
             is_final=True,
             summary={"rows": 2}
         )
 
     async def _do_upsert_nodes(
-        self, 
-        spec: UpsertNodesSpec, 
-        *, 
+        self,
+        spec: UpsertNodesSpec,
+        *,
         ctx: OperationContext | None
     ):
         return type("UpsertResult", (), {})(
@@ -509,9 +586,9 @@ class ExampleGraphAdapter(BaseGraphAdapter):
         )
 
     async def _do_upsert_edges(
-        self, 
-        spec: UpsertEdgesSpec, 
-        *, 
+        self,
+        spec: UpsertEdgesSpec,
+        *,
         ctx: OperationContext | None
     ):
         return type("UpsertResult", (), {})(
@@ -555,21 +632,21 @@ class ExampleGraphAdapter(BaseGraphAdapter):
 
     async def _do_health(self, *, ctx: OperationContext | None):
         return {
-            "ok": True, 
-            "server": "example-graph", 
+            "ok": True,
+            "server": "example-graph",
             "version": "1.0.0"
         }
 
 # Usage with lifecycle management
 async with ExampleGraphAdapter() as adapter:
     ctx = OperationContext(request_id="req-4", tenant="acme")
-    
+
     # Create nodes
     result = await adapter.upsert_nodes(
         UpsertNodesSpec(nodes=[
             Node(
-                id=GraphID("user:1"), 
-                labels=("User",), 
+                id=GraphID("user:1"),
+                labels=("User",),
                 properties={"name": "Ada"}
             )
         ]),
@@ -586,21 +663,24 @@ async with ExampleGraphAdapter() as adapter:
 All domains use normalized, structured exceptions with optional guidance fields:
 
 **Common Errors:**
+
 * `BadRequest` - Invalid request parameters or malformed input
 * `AuthError` - Authentication or authorization failure
 * `ResourceExhausted` - Quota, rate limit, or capacity exceeded
 * `TransientNetwork` - Retryable network failure
 * `Unavailable` - Service temporarily unavailable or overloaded
 * `NotSupported` - Unsupported feature or parameter
-* `DeadlineExceeded` - Operation exceeded ctx.deadline_ms
+* `DeadlineExceeded` - Operation exceeded `ctx.deadline_ms`
 
 **Domain-Specific Errors:**
+
 * Embedding: `TextTooLong`, `ModelNotFound`
 * LLM: `ModelOverloaded`
 * Vector: `DimensionMismatch`, `IndexNotReady`
 * Graph: (Uses common errors with domain-specific details)
 
 **Optional Guidance Fields:**
+
 * `retry_after_ms` - Suggested backoff delay
 * `throttle_scope` / `resource_scope` - Scope of limitation
 * `suggested_*_reduction` - Guidance for quota errors
@@ -679,15 +759,19 @@ class MetricsSink(Protocol):
 ### Cache Key Construction
 
 **Embeddings:**
+
 ```python
 key = f"embed:{model}:{normalize}:{sha256(text)}"
 ```
 
 **LLM:**
+
 ```python
-key = f"llm:complete:{model}:{sha256(system)}:{sha256(messages)}:"
-      f"{temperature}:{top_p}:{freq_pen}:{pres_pen}:{max_tokens}:"
-      f"{sha256(stop_sequences)}:{tenant_hash}"
+key = (
+    f"llm:complete:{model}:{sha256(system)}:{sha256(messages)}:"
+    f"{temperature}:{top_p}:{freq_pen}:{pres_pen}:{max_tokens}:"
+    f"{sha256(stop_sequences)}:{tenant_hash}"
+)
 ```
 
 ### Cache Behavior
@@ -719,10 +803,12 @@ class CircuitBreaker(Protocol):
 ### Built-in Implementations
 
 **Thin mode:**
+
 * `NoopLimiter` - Pass-through
 * `NoopBreaker` - Always allows
 
 **Standalone mode:**
+
 * `TokenBucketLimiter` - Simple per-process token bucket
 * `SimpleCircuitBreaker` - Counter-based breaker with half-open recovery
 
@@ -735,6 +821,7 @@ class CircuitBreaker(Protocol):
 ### Purpose
 
 Capabilities enable:
+
 * **Routing decisions** - Select appropriate provider/model
 * **Request validation** - Preflight checks before backend calls
 * **Feature detection** - Runtime discovery of supported operations
@@ -742,22 +829,26 @@ Capabilities enable:
 ### Capability Fields by Domain
 
 **Embeddings:**
+
 * `supported_models`, `max_batch_size`, `max_text_length`
 * `supports_normalization`, `normalizes_at_source`
 * `supports_token_counting`, `supports_deadline`
 
 **LLM:**
+
 * `model_family`, `max_context_length`, `supported_models`
 * `supports_streaming`, `supports_roles`, `supports_system_message`
 * `supports_json_output`, `supports_parallel_tool_calls`
 * `supports_deadline`, `supports_count_tokens`
 
 **Vector:**
+
 * `max_dimensions`, `supported_distance_metrics`
 * `supports_metadata_filtering`, `supports_namespaces`
 * `max_batch_size`, `supports_deadline`
 
 **Graph:**
+
 * `supported_query_dialects` - e.g., `("cypher", "gremlin", "gql")`
 * `supports_stream_query`, `supports_bulk_vertices`, `supports_batch`
 * `supports_schema`, `supports_namespaces`, `supports_deadline`
@@ -768,13 +859,13 @@ Capabilities enable:
 
 ### Repository Structure
 
-```
+```text
 corpus_sdk/
 ├── adapter_sdk/
 │   ├── embedding_base.py      # Protocol + Base
-│   ├── llm_base.py             # Protocol + Base
-│   ├── vector_base.py          # Protocol + Base
-│   └── graph_base.py           # Protocol + Base
+│   ├── llm_base.py            # Protocol + Base
+│   ├── vector_base.py         # Protocol + Base
+│   └── graph_base.py          # Protocol + Base
 └── examples/
     ├── openai_adapter.py       # Example (reference only)
     ├── anthropic_adapter.py    # Example (reference only)
@@ -785,7 +876,7 @@ corpus_sdk/
 
 * **Example adapters** (in repo): Illustration and testing only
 * **Official adapters** (commercial): Production-hardened, maintained by Corpus team
-* **Community adapters**: Built by ecosystem partners and users
+* **Community adapters**: Built by ecosystem partners and users — we actively encourage community-maintained, Corpus-Compatible adapters and are happy to highlight stable ones.
 
 ### Why Official Adapters Are Commercial
 
@@ -799,6 +890,7 @@ Official adapters include:
 * **Continuous updates** - Maintained as providers evolve their APIs
 
 **Available with:**
+
 * Corpus Router subscriptions (managed or on-prem)
 * Standalone official adapter licenses
 
@@ -817,6 +909,7 @@ Official adapters include:
 * **No secrets in bases** - Adapters accept credentials via constructor or environment
 * **Adapter responsibility** - Backend authentication handled by adapter implementations
 * **Recommended patterns**:
+
   * Environment variables for local dev
   * Secret managers (AWS Secrets Manager, HashiCorp Vault) for production
   * Short-lived credentials with automatic rotation
@@ -848,6 +941,7 @@ Official adapters include:
 ### Benchmarking
 
 Typical overhead per operation:
+
 * Validation: <1ms
 * Metrics recording: <0.1ms (try/except wrapped)
 * Cache lookup (standalone): <0.5ms
@@ -868,6 +962,7 @@ Protocols follow Semantic Versioning:
 ### Protocol Versions
 
 Current versions:
+
 * `EMBEDDING_PROTOCOL_VERSION = "1.0.0"`
 * `LLM_PROTOCOL_VERSION = "1.0.0"`
 * `VECTOR_PROTOCOL_VERSION = "1.0.0"`
@@ -886,6 +981,7 @@ Current versions:
 ### Test Categories
 
 **Unit Tests:**
+
 * Input validation (malformed messages, invalid parameters)
 * Capability gating (unsupported features raise `NotSupported`)
 * Error mapping (vendor errors → normalized exceptions)
@@ -893,16 +989,19 @@ Current versions:
 * Cache key determinism (same inputs → same key)
 
 **Streaming Tests:**
+
 * Partial yields (chunks arrive progressively)
 * Cancellation (stream cleanup on error)
 * Deadline mid-stream (periodic deadline checks)
 
 **Integration Tests:**
+
 * Example adapters in thin mode
 * Example adapters in standalone mode
 * Multi-operation workflows
 
 **Property Tests:**
+
 * Cache key collision resistance
 * Message fingerprinting stability
 * Tenant hash uniqueness
@@ -922,24 +1021,24 @@ pytest tests/ --cov=corpus_sdk --cov-report=html
 ### Common Issues
 
 **Problem: Double-stacked resiliency (timeouts/limits firing twice)**
-* **Solution**: Ensure adapters run in thin mode under your router
-* **Check**: `mode="thin"` in adapter constructor
+*Solution*: Ensure adapters run in thin mode under your router
+*Check*: `mode="thin"` in adapter constructor
 
 **Problem: Circuit breaker opens frequently in standalone mode**
-* **Solution**: Reduce concurrency or switch to thin mode with external circuit breaker
-* **Check**: `failure_threshold` and `recovery_after_s` settings
+*Solution*: Reduce concurrency or switch to thin mode with external circuit breaker
+*Check*: `failure_threshold` and `recovery_after_s` settings
 
 **Problem: Cache returns stale results**
-* **Solution**: Verify all sampling parameters are included in cache key
-* **Check**: `cache_ttl_s` setting, normalization flag consistency
+*Solution*: Verify all sampling parameters are included in cache key
+*Check*: `cache_ttl_s` setting, normalization flag consistency
 
 **Problem: Health check failures**
-* **Solution**: Inspect adapter-specific `_do_health` implementation
-* **Check**: Backend reachability, credentials, network configuration
+*Solution*: Inspect adapter-specific `_do_health` implementation
+*Check*: Backend reachability, credentials, network configuration
 
 **Problem: `DeadlineExceeded` on fast operations**
-* **Solution**: Check `deadline_ms` is absolute epoch time, not relative
-* **Check**: System clock synchronization (NTP)
+*Solution*: Check `deadline_ms` is absolute epoch time, not relative
+*Check*: System clock synchronization (NTP)
 
 ### Debug Mode
 
@@ -958,45 +1057,35 @@ logging.getLogger("corpus_sdk").setLevel(logging.DEBUG)
 ### General
 
 **Q: Is the SDK fully open source while the router is commercial?**
-
 **A:** Yes. The SDK (protocols + bases + example adapters) is **open source** under Apache-2.0. **Corpus Router** and **official adapters** are **commercial** (managed cloud or on-prem).
 
 **Q: Will you maintain official adapters for major providers (OpenAI, Anthropic, Pinecone, etc.)?**
-
 **A:** Yes. We maintain **closed-source, production-grade adapters** for major providers as part of Corpus Router subscriptions.
 
 **Q: Can Corpus Router run on-premises or is it cloud-only?**
-
 **A:** Both. Corpus Router is available as a **managed cloud** service and as an **on-prem** deployment for regulated/air-gapped environments.
 
 **Q: Do I have to use Corpus Router?**
-
-**A:** No. The SDK composes with any router/control plane. Corpus Router is optional.
+**A:** No. The SDK composes with any router/control plane. Corpus Router is optional and adheres to the same public protocols.
 
 **Q: Can I split protocols and bases into separate files?**
-
 **A:** Yes. We ship them together for convenience; you can refactor module layout as you see fit.
 
 ### Technical
 
 **Q: Why async-only?**
-
 **A:** Modern AI workloads require high concurrency. Async-first design prevents blocking the event loop. Sync wrappers can be built on top if needed.
 
 **Q: How do I handle streaming with deadlines?**
-
 **A:** Bases check deadlines periodically during streaming. Set `deadline_ms` in `OperationContext` and the base handles enforcement.
 
 **Q: Can I use my own cache/metrics/limiter?**
-
 **A:** Yes. All infrastructure components are pluggable via Protocol interfaces. Provide your implementations to the base constructor.
 
 **Q: What happens if my adapter raises a non-normalized error?**
-
 **A:** Bases catch unexpected exceptions and record them as `UnhandledException` in metrics. Wrap provider errors in normalized exceptions for proper handling.
 
 **Q: How do I test my adapter?**
-
 **A:** Use the protocol as a contract. Verify your adapter satisfies `isinstance(adapter, ProtocolV1)` and test all `_do_*` method implementations.
 
 ---
@@ -1018,6 +1107,7 @@ logging.getLogger("corpus_sdk").setLevel(logging.DEBUG)
 ### Corpus Router Features
 
 **Included in all tiers:**
+
 * Multi-provider routing and failover
 * Request/response validation
 * Unified observability and logging
@@ -1025,6 +1115,7 @@ logging.getLogger("corpus_sdk").setLevel(logging.DEBUG)
 * Deadline propagation and cancellation
 
 **Additional in Enterprise:**
+
 * Self-learning routing (privacy-preserving)
 * Policy enforcement (budgets, rate limits, jurisdiction)
 * Advanced analytics and reporting
@@ -1037,21 +1128,25 @@ logging.getLogger("corpus_sdk").setLevel(logging.DEBUG)
 **Corpus Router** includes an **optional, guardrail-based self-learning mode**:
 
 * Learns **routing weights** across providers/models based on:
+
   * Latency distributions
   * Cost per token
   * Evaluator / QA scoring signals
   * Success/failure/timeout patterns
 
 * **Does not train on user content**
+
   * Learning uses **aggregated, privacy-preserving feedback only**
   * No content stored or analyzed
 
 * Always runs **within guardrails**:
+
   * Provider/model allowlists
   * Per-tenant budgets & QPS ceilings
   * Jurisdiction/compliance constraints
 
 * Fully **auditable & reversible**:
+
   * Every change is versioned
   * Policies can be frozen, rolled back, or pinned statically
 
@@ -1067,7 +1162,7 @@ logging.getLogger("corpus_sdk").setLevel(logging.DEBUG)
 | **Corpus Router On-Prem**  | Enterprise/regulated  | Air-gapped deployment + support     |
 | **Official Adapters Only** | Bring your own router | Production-tuned adapters + updates |
 
-**Contact:** [sales@corpus.io](mailto:sales@corpus.io) or visit [corpus.io/pricing](https://corpus.io/pricing)
+**Contact:** `sales@corpus.io` or visit the Corpus site for details.
 
 ---
 
@@ -1090,6 +1185,7 @@ pytest
 * **Update README** - Document new capabilities or breaking changes
 * **Maintain low-cardinality metrics** - Never add PII to `extra` fields
 * **Observe SemVer** - Call out any breaking changes in PR description
+* We especially welcome **community adapter contributions** (e.g., new LLM/vector/graph backends implemented against the Corpus Protocol Suite).
 
 ### Pull Request Process
 
@@ -1112,6 +1208,17 @@ pytest
 
 Apache-2.0. See `LICENSE` file for details. SPDX headers are included at the top of source files.
 
+Implementation of the **Corpus Protocol Suite** is free and encouraged. Independent implementations SHOULD preserve wire compatibility if they refer to themselves as **Corpus-Compatible**.
+
+---
+
+## Roadmap
+
+* Additional language SDKs implementing the Corpus Protocol Suite
+* Expanded example adapters for popular providers
+* Deeper validation and conformance tooling for Corpus-Compatible implementations
+* More batteries-included helpers in standalone mode (still spec-aligned)
+
 ---
 
 ## Appendix
@@ -1119,12 +1226,14 @@ Apache-2.0. See `LICENSE` file for details. SPDX headers are included at the top
 ### Error Mapping Cookbook
 
 **HTTP Status Codes:**
+
 * `401/403` → `AuthError` with `details={"endpoint": "...", "hint": "check credential scope"}`
 * `429` → `ResourceExhausted` with `retry_after_ms` from headers; set `throttle_scope`
 * `500/502/503` → `Unavailable` with `details={"http_status": 503}`
 * `504` → `DeadlineExceeded` or `Unavailable` with `details={"kind": "timeout"}`
 
 **Provider-Specific:**
+
 * Context length exceeded → `BadRequest` or `TextTooLong` with suggested reduction
 * Model not found → `BadRequest` with `details={"model": "...", "available": [...]}`
 * Rate limit by key/tenant → `ResourceExhausted` with `throttle_scope="tenant"`
@@ -1132,20 +1241,25 @@ Apache-2.0. See `LICENSE` file for details. SPDX headers are included at the top
 ### Cache Key Compositions
 
 **Embedding:**
+
 ```python
 f"embed:{model}:{normalize}:{tokenizer_version}:{sha256(text)}"
 ```
 
 **LLM complete:**
+
 ```python
-f"llm:complete:{model}:{sha256(system)}:{sha256(messages)}:"
-f"{temperature}:{top_p}:{freq_pen}:{pres_pen}:{max_tokens}:"
-f"{sha256(stop_sequences)}:{tenant_hash}"
+(
+    f"llm:complete:{model}:{sha256(system)}:{sha256(messages)}:"
+    f"{temperature}:{top_p}:{freq_pen}:{pres_pen}:{max_tokens}:"
+    f"{sha256(stop_sequences)}:{tenant_hash}"
+)
 ```
 
 ### Metrics Field Reference
 
 **Common Fields:**
+
 * `component`: `"embedding" | "llm" | "vector" | "graph"`
 * `op`: Operation name (e.g., `"embed"`, `"complete"`, `"query"`)
 * `ms`: Latency in milliseconds
@@ -1154,6 +1268,7 @@ f"{sha256(stop_sequences)}:{tenant_hash}"
 * `extra`: Low-cardinality map (may include `tenant`, `model`, `batch_size`)
 
 **Domain-Specific:**
+
 * Embedding: `{"model": "...", "batch_size": N, "tokens": M}`
 * LLM: `{"model": "...", "tokens": M, "finish_reason": "stop"}`
 * Vector: `{"namespace": "...", "top_k": N, "distance_metric": "cosine"}`
@@ -1162,51 +1277,54 @@ f"{sha256(stop_sequences)}:{tenant_hash}"
 ### Wire Protocol Examples
 
 **Embedding Request:**
+
 ```json
 {
-    "op": "embedding.embed",
-    "ctx": {
-        "request_id": "req-123",
-        "deadline_ms": 1704067200000,
-        "tenant": "acme-corp"
-    },
-    "args": {
-        "text": "hello world",
-        "model": "text-embedding-ada-002",
-        "normalize": true
-    }
+  "op": "embedding.embed",
+  "ctx": {
+    "request_id": "req-123",
+    "deadline_ms": 1704067200000,
+    "tenant": "acme-corp"
+  },
+  "args": {
+    "text": "hello world",
+    "model": "text-embedding-ada-002",
+    "normalize": true
+  }
 }
 ```
 
-**LLM Streaming Response:**
+**LLM Streaming Response (example shape):**
+
 ```json
 {
-    "ok": true,
-    "code": "OK",
-    "ms": 45.67,
-    "chunk": {
-        "text": "Hello ",
-        "is_final": false,
-        "model": "gpt-4",
-        "usage_so_far": null
-    }
+  "ok": true,
+  "code": "OK",
+  "ms": 45.67,
+  "chunk": {
+    "text": "Hello ",
+    "is_final": false,
+    "model": "gpt-4",
+    "usage_so_far": null
+  }
 }
 ```
 
 **Graph Query Error:**
+
 ```json
 {
-    "ok": false,
-    "code": "BAD_REQUEST",
-    "error": "BadRequest",
-    "message": "Invalid Cypher syntax at line 1",
-    "retry_after_ms": null,
-    "details": {
-        "dialect": "cypher",
-        "line": 1,
-        "column": 15
-    },
-    "ms": 12.34
+  "ok": false,
+  "code": "BAD_REQUEST",
+  "error": "BadRequest",
+  "message": "Invalid Cypher syntax at line 1",
+  "retry_after_ms": null,
+  "details": {
+    "dialect": "cypher",
+    "line": 1,
+    "column": 15
+  },
+  "ms": 12.34
 }
 ```
 
