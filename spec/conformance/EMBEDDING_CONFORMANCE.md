@@ -1,6 +1,3 @@
-Here’s the fixed **Embedding Protocol V1** conformance doc — aligned with Graph/LLM/Vector, using your actual base (`adapter_sdk/embedding_base.py`), mock adapter, wire handler, phases, maintenance, and with the correct test count (**54**). No extra fluff.
-
----
 
 # Embedding Protocol V1 Conformance Test Coverage
 
