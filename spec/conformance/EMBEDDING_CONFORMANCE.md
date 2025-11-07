@@ -14,7 +14,7 @@ This suite constitutes the **official Embedding Protocol V1.0 Reference Conforma
 
 ## Conformance Summary
 
-**Overall Coverage: 66/66 tests (100%) ✅**
+**Overall Coverage: 73/73 tests (100%) ✅**
 
 | Category                 | Tests | Coverage |
 | ------------------------ | ----- | -------- |
@@ -29,7 +29,7 @@ This suite constitutes the **official Embedding Protocol V1.0 Reference Conforma
 | Health Endpoint          | 4/4   | 100% ✅   |
 | Observability & Privacy  | 6/6   | 100% ✅   |
 | Caching & Idempotency    | 3/3   | 100% ✅   |
-| Wire Contract            | 7/7   | 100% ✅   |
+| Wire Contract            | 14/14 | 100% ✅   |
 
 > Note: Categories are logical groupings. Individual tests may satisfy multiple normative requirements.
 
@@ -39,7 +39,7 @@ This suite constitutes the **official Embedding Protocol V1.0 Reference Conforma
 
 ### `test_capabilities_shape.py`
 
-**Specification:** §6.2, §10.2, §10.5  
+**Specification:** §6.2, §10.2, §10.5
 **Status:** ✅ Complete (8 tests)
 
 Validates EmbeddingCapabilities contract and alignment with `EmbeddingProtocolV1`:
@@ -57,7 +57,7 @@ Validates EmbeddingCapabilities contract and alignment with `EmbeddingProtocolV1
 
 ### `test_embed_basic.py`
 
-**Specification:** §10.3, §10.6  
+**Specification:** §10.3, §10.6
 **Status:** ✅ Complete (7 tests)
 
 Core unary behavior:
@@ -74,7 +74,7 @@ Core unary behavior:
 
 ### `test_embed_batch_basic.py`
 
-**Specification:** §10.3, §10.6, §12.5  
+**Specification:** §10.3, §10.6, §12.5
 **Status:** ✅ Complete (6 tests)
 
 Batch behavior and partial failures:
@@ -90,7 +90,7 @@ Batch behavior and partial failures:
 
 ### `test_truncation_and_text_length.py`
 
-**Specification:** §10.2, §10.6, §12.1  
+**Specification:** §10.2, §10.6, §12.1
 **Status:** ✅ Complete (5 tests)
 
 Truncation + `max_text_length` semantics:
@@ -105,7 +105,7 @@ Truncation + `max_text_length` semantics:
 
 ### `test_normalization_semantics.py`
 
-**Specification:** §10.2, §10.5, §10.6  
+**Specification:** §10.2, §10.5, §10.6
 **Status:** ✅ Complete (5 tests)
 
 Normalization behavior:
@@ -120,7 +120,7 @@ Normalization behavior:
 
 ### `test_count_tokens_behavior.py`
 
-**Specification:** §10.3, §10.5  
+**Specification:** §10.3, §10.5
 **Status:** ✅ Complete (6 tests)
 
 Token counting behavior:
@@ -136,7 +136,7 @@ Token counting behavior:
 
 ### `test_error_mapping_retryable.py`
 
-**Specification:** §6.3, §10.4, §12.1–§12.5  
+**Specification:** §6.3, §10.4, §12.1–§12.5
 **Status:** ✅ Complete (5 tests)
 
 Embedding-specific error taxonomy:
@@ -151,7 +151,7 @@ Embedding-specific error taxonomy:
 
 ### `test_deadline_enforcement.py`
 
-**Specification:** §6.1, §10.3, §10.6, §12.1  
+**Specification:** §6.1, §10.3, §10.6, §12.1
 **Status:** ✅ Complete (4 tests)
 
 Deadline behavior via `OperationContext`:
@@ -165,7 +165,7 @@ Deadline behavior via `OperationContext`:
 
 ### `test_health_report.py`
 
-**Specification:** §10.3, §6.2  
+**Specification:** §10.3, §6.2
 **Status:** ✅ Complete (4 tests)
 
 Health endpoint contract:
@@ -179,7 +179,7 @@ Health endpoint contract:
 
 ### `test_context_siem.py`
 
-**Specification:** §6.4, §13, §15 (Embedding)  
+**Specification:** §6.4, §13, §15 (Embedding)
 **Status:** ✅ Complete (6 tests)
 
 SIEM-safe metrics and context propagation:
@@ -195,7 +195,7 @@ SIEM-safe metrics and context propagation:
 
 ### `test_cache_and_batch_fallback.py`
 
-**Specification:** §10.3, §10.6, §12.5  
+**Specification:** §10.3, §10.6, §12.5
 **Status:** ✅ Complete (3 tests)
 
 Caching & batch fallback behavior:
@@ -208,8 +208,8 @@ Caching & batch fallback behavior:
 
 ### `test_wire_handler.py`
 
-**Specification:** §4.1, §4.1.6, §10.3, §10.6  
-**Status:** ✅ Complete (7 tests)
+**Specification:** §4.1, §4.1.6, §10.3, §10.6
+**Status:** ✅ Complete (14 tests)
 
 `WireEmbeddingHandler` canonical envelopes:
 
@@ -220,6 +220,7 @@ Caching & batch fallback behavior:
 * `test_health_envelope_success` — `embedding.health` envelope returns `ok:true` with proper `result`.
 * `test_missing_op_rejected_with_bad_request` — Missing `op` yields normalized `BAD_REQUEST`/`NOT_SUPPORTED`.
 * `test_unknown_op_rejected_with_not_supported` — Unknown `op` yields `NOT_SUPPORTED` envelope.
+* (and additional envelope/error mapping assertions in this file bringing total to 14).
 
 ---
 
@@ -238,23 +239,23 @@ Caching & batch fallback behavior:
 
 #### `embed()`
 
-| Requirement                         | Test File                         | Status |
-| ----------------------------------- | --------------------------------- | ------ |
-| Validates non-empty text/model      | test_embed_basic.py               | ✅      |
-| Model must be supported             | test_embed_basic.py               | ✅      |
-| Respects truncate & max_text_length | test_truncation_and_text_length.py| ✅      |
-| Supports optional normalization     | test_normalization_semantics.py   | ✅      |
-| Deadline / context honored          | test_deadline_enforcement.py      | ✅      |
+| Requirement                         | Test File                          | Status |
+| ----------------------------------- | ---------------------------------- | ------ |
+| Validates non-empty text/model      | test_embed_basic.py                | ✅      |
+| Model must be supported             | test_embed_basic.py                | ✅      |
+| Respects truncate & max_text_length | test_truncation_and_text_length.py | ✅      |
+| Supports optional normalization     | test_normalization_semantics.py    | ✅      |
+| Deadline / context honored          | test_deadline_enforcement.py       | ✅      |
 
 #### `embed_batch()`
 
-| Requirement                    | Test File                   | Status |
-| ------------------------------ | --------------------------- | ------ |
-| Validates texts non-empty      | test_embed_batch_basic.py   | ✅      |
-| Enforces max_batch_size        | test_embed_batch_basic.py   | ✅      |
-| Per-item validation & failures | test_embed_batch_basic.py   | ✅      |
-| Truncation semantics           | test_truncation_and_text_length.py | ✅ |
-| Normalization semantics        | test_normalization_semantics.py    | ✅ |
+| Requirement                    | Test File                          | Status |
+| ------------------------------ | ---------------------------------- | ------ |
+| Validates texts non-empty      | test_embed_batch_basic.py          | ✅      |
+| Enforces max_batch_size        | test_embed_batch_basic.py          | ✅      |
+| Per-item validation & failures | test_embed_batch_basic.py          | ✅      |
+| Truncation semantics           | test_truncation_and_text_length.py | ✅      |
+| Normalization semantics        | test_normalization_semantics.py    | ✅      |
 
 #### `count_tokens()`
 
@@ -266,20 +267,20 @@ Caching & batch fallback behavior:
 
 #### `health()`
 
-| Requirement                      | Test File            | Status |
-| -------------------------------- | -------------------- | ------ |
-| Returns ok/server/version/models | test_health_report.py| ✅      |
-| Stable shape even when degraded  | test_health_report.py| ✅      |
+| Requirement                      | Test File             | Status |
+| -------------------------------- | --------------------- | ------ |
+| Returns ok/server/version/models | test_health_report.py | ✅      |
+| Stable shape even when degraded  | test_health_report.py | ✅      |
 
 ### §10.4 Errors — Complete Coverage
 
-| Error Type        | Test File                                                                               | Status |
-| ----------------- | --------------------------------------------------------------------------------------- | ------ |
-| TextTooLong       | test_truncation_and_text_length.py, test_error_mapping_retryable.py                     | ✅      |
-| ModelNotAvailable | test_embed_basic.py, test_count_tokens_behavior.py, test_error_mapping_retryable.py     | ✅      |
-| DeadlineExceeded  | test_deadline_enforcement.py                                                            | ✅      |
-| Retryable vs non- | test_error_mapping_retryable.py                                                         | ✅      |
-| Partial failures  | test_embed_batch_basic.py                                                               | ✅      |
+| Error Type        | Test File                                                                           | Status |
+| ----------------- | ----------------------------------------------------------------------------------- | ------ |
+| TextTooLong       | test_truncation_and_text_length.py, test_error_mapping_retryable.py                 | ✅      |
+| ModelNotAvailable | test_embed_basic.py, test_count_tokens_behavior.py, test_error_mapping_retryable.py | ✅      |
+| DeadlineExceeded  | test_deadline_enforcement.py                                                        | ✅      |
+| Retryable vs non- | test_error_mapping_retryable.py                                                     | ✅      |
+| Partial failures  | test_embed_batch_basic.py                                                           | ✅      |
 
 ### §10.5 Capabilities — Complete Coverage
 
@@ -306,7 +307,7 @@ All required capability fields, normalization/truncation flags, token counting, 
 
 ```bash
 pytest tests/embedding/ -v
-````
+```
 
 ### By category
 
@@ -401,7 +402,7 @@ Use this when implementing or validating a new **Embedding adapter** against `Em
 
 ```text
 ✅ Embedding Protocol V1.0 - 100% Conformant
-   66/66 tests passing (12 test files)
+   73/73 tests passing (12 test files)
 
    ✅ Core Operations: 19/19 (100%)
    ✅ Capabilities: 8/8 (100%)
@@ -414,7 +415,7 @@ Use this when implementing or validating a new **Embedding adapter** against `Em
    ✅ Health: 4/4 (100%)
    ✅ Observability & Privacy: 6/6 (100%)
    ✅ Caching & Idempotency: 3/3 (100%)
-   ✅ Wire Contract: 7/7 (100%)
+   ✅ Wire Contract: 14/14 (100%)
 
    Status: Production Ready
 ```
@@ -442,5 +443,3 @@ Use this when implementing or validating a new **Embedding adapter** against `Em
 **Last Updated:** 2025-01-XX
 **Maintained By:** Corpus SDK Team
 **Status:** 100% V1.0 Conformant - Production Ready
-
-```
