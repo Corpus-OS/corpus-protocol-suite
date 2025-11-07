@@ -1178,8 +1178,6 @@ logging.getLogger("corpus_sdk").setLevel(logging.DEBUG)
 
 Corpus Router doesn't just route traffic—it **understands, optimizes, and evolves** with your AI workloads. While the open-source SDK standardizes how you talk to providers, Corpus Router intelligently decides **which providers to use, when, and why** based on your actual workload patterns and business object
 
-### Corpus Router: AI Infrastructure, Automated
-
 **Stop managing AI providers. Start optimizing them automatically.**
 
 Corpus Router intelligently routes across 20+ AI providers to reduce costs by 40-60% while maintaining 99.9% uptime. While our open-source SDK standardizes how you talk to providers, Corpus Router decides **which providers to use and when** based on real-time performance, cost, and quality signals.
@@ -1205,12 +1203,6 @@ Corpus Router intelligently routes across 20+ AI providers to reduce costs by 40
 - On-premises deployment
 - 24/7 support with SLAs
 
-## 🚀 Get Started
-
-**Free Tier**: 1M requests/month, 3 providers, basic observability
-
-**Production**: Unlimited scale, self-learning optimization, enterprise support
-
 ```bash
 pip install corpus-sdk
 # Upgrade to Corpus Router with zero code changes
@@ -1219,8 +1211,6 @@ pip install corpus-sdk
 
 *Corpus Router: Autonomous optimization for enterprise AI infrastructure.*
 ```
-```
-
 ### Guidelines
 
 * **Follow PEP-8** - Use ruff/black for formatting
