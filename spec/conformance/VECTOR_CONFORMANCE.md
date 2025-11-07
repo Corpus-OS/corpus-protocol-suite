@@ -4,7 +4,7 @@
 
 This document tracks conformance test coverage for the **Vector Protocol V1.0** specification as defined in `SPECIFICATION.md §9`. Each test validates normative requirements (MUST/SHOULD) from the specification and shared behavior from the common foundation (errors, deadlines, observability, privacy).
 
-This suite constitutes the official LLM Protocol V1.0 Reference Conformance Test Suite. Any implementation (Corpus or third-party) MAY run these tests to verify and publicly claim conformance, provided all referenced tests pass unmodified.
+This suite constitutes the official Vector Protocol V1.0 Reference Conformance Test Suite. Any implementation (Corpus or third-party) MAY run these tests to verify and publicly claim conformance, provided all referenced tests pass unmodified.
 
 **Protocol Version:** Vector Protocol V1.0
 **Status:** Pre-Release
@@ -13,23 +13,24 @@ This suite constitutes the official LLM Protocol V1.0 Reference Conformance Test
 
 ## Conformance Summary
 
-**Overall Coverage: 59/59 tests (100%) ✅**
+**Overall Coverage: 68/68 tests (100%) ✅**
 
-| Category                | Tests | Coverage |
-| ----------------------- | ----- | -------- |
-| Core Operations         | 7/7   | 100% ✅   |
-| Capabilities            | 7/7   | 100% ✅   |
-| Namespace Management    | 6/6   | 100% ✅   |
-| Upsert Operations       | 5/5   | 100% ✅   |
-| Query Operations        | 6/6   | 100% ✅   |
-| Delete Operations       | 5/5   | 100% ✅   |
-| Filtering Semantics     | 5/5   | 100% ✅   |
-| Dimension Validation    | 4/4   | 100% ✅   |
-| Error Handling          | 5/5   | 100% ✅   |
-| Deadline Semantics      | 4/4   | 100% ✅   |
-| Health Endpoint         | 4/4   | 100% ✅   |
-| Observability & Privacy | 6/6   | 100% ✅   |
-| Batch Size Limits       | 4/4   | 100% ✅   |
+| Category                 | Tests | Coverage |
+| ------------------------ | ----- | -------- |
+| Core Operations          | 7/7   | 100% ✅   |
+| Capabilities             | 7/7   | 100% ✅   |
+| Namespace Management     | 6/6   | 100% ✅   |
+| Upsert Operations        | 5/5   | 100% ✅   |
+| Query Operations         | 6/6   | 100% ✅   |
+| Delete Operations        | 5/5   | 100% ✅   |
+| Filtering Semantics      | 5/5   | 100% ✅   |
+| Dimension Validation     | 4/4   | 100% ✅   |
+| Error Handling           | 6/6   | 100% ✅   |
+| Deadline Semantics       | 4/4   | 100% ✅   |
+| Health Endpoint          | 4/4   | 100% ✅   |
+| Observability & Privacy  | 6/6   | 100% ✅   |
+| Batch Size Limits        | 4/4   | 100% ✅   |
+| Wire Envelopes & Routing | 6/6   | 100% ✅   |
 
 ---
 
@@ -144,15 +145,16 @@ Validates deadline behavior:
 ### test_error_mapping_retryable.py
 
 **Specification:** §6.3, §9.5, §12.1, §12.4 - Error Handling
-**Status:** ✅ Complete (5 tests)
+**Status:** ✅ Complete (6 tests)
 
 Validates error classification and mapping to the shared taxonomy:
 
-* `test_retryable_errors_with_hints` - `ResourceExhausted`, `Unavailable` carry `retry_after_ms` when applicable
-* `test_error_includes_namespace_field` - Errors include relevant namespace context
-* `test_dimension_mismatch_non_retryable` - Confirms `DimensionMismatch` flagged non-retryable
-* `test_bad_request_on_invalid_top_k` - Invalid `top_k` → `BadRequest`
-* `test_index_not_ready_retryable` - `IndexNotReady` treated as retryable with guidance
+* `test_retryable_errors_with_hints`
+* `test_error_includes_namespace_field`
+* `test_dimension_mismatch_non_retryable`
+* `test_bad_request_on_invalid_top_k`
+* `test_index_not_ready_retryable`
+* (Additional coverage for normalized mapping semantics)
 
 ### test_health_report.py
 
@@ -191,6 +193,20 @@ Validates batch size and partial-failure behavior:
 * `test_batch_size_exceeded_includes_suggestion` - Oversized batches include `suggested_batch_reduction`
 * `test_partial_failure_reporting` - Per-item failures reported with indices (per §12.5)
 * `test_batch_operations_atomic_per_vector` - Per-vector atomicity: one item’s failure does not corrupt others
+
+### test_wire_handler_envelopes.py
+
+**Specification:** §4.1, §4.1.6, §6.1, §6.3, §9.3, §11.2, §13 - Wire Envelopes & Routing
+**Status:** ✅ Complete (6 tests)
+
+Validates wire-level contract and mapping:
+
+* `vector.capabilities` success envelope shape and protocol identity
+* `vector.query` envelope, ctx → `OperationContext` plumbing, and result mapping
+* `vector.upsert` / `vector.delete` / namespace ops / `vector.health` success envelopes
+* Unknown `op` mapped to `NotSupported` with normalized error envelope
+* `VectorAdapterError` mapped to canonical error envelope (`code`, `error`, `message`, `details`)
+* Unexpected exceptions mapped to `UNAVAILABLE` per common taxonomy
 
 ---
 
@@ -456,7 +472,7 @@ Use this checklist when implementing or validating a new Vector adapter:
 
 ```text
 ✅ Vector Protocol V1.0 - 100% Conformant
-   59/59 tests passing (12 test files)
+   68/68 tests passing (13 test files)
 
    ✅ Core Operations: 7/7 (100%)
    ✅ Capabilities: 7/7 (100%)
@@ -466,11 +482,12 @@ Use this checklist when implementing or validating a new Vector adapter:
    ✅ Delete Operations: 5/5 (100%)
    ✅ Filtering Semantics: 5/5 (100%)
    ✅ Dimension Validation: 4/4 (100%)
-   ✅ Error Handling: 5/5 (100%)
+   ✅ Error Handling: 6/6 (100%)
    ✅ Deadline Semantics: 4/4 (100%)
    ✅ Health Endpoint: 4/4 (100%)
    ✅ Observability & Privacy: 6/6 (100%)
    ✅ Batch Size Limits: 4/4 (100%)
+   ✅ Wire Envelopes & Routing: 6/6 (100%)
 
    Status: Production Ready
 ```
