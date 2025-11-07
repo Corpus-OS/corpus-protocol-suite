@@ -1196,8 +1196,8 @@ Corpus Router doesn't just route traffic—it understands, optimizes, and evolve
 **Enterprise Features:**
 - Autonomous optimization from 50+ performance signals
 - Policy engine with workflow planning & reasoning intelligence
-- Proprietary LLM, Vector, and Embedding providers integrations
-- 24/7 support, SLAs, and real-time cost intelligence and adaptive reasoning
+- Proprietary LLM, Vector, and Embedding provider integrations
+- 24/7 support, SLAs, and cost intelligence and adaptive config tuning
 
 ## Guidelines
 
