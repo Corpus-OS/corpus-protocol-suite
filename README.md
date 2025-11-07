@@ -1203,8 +1203,7 @@ Corpus Router intelligently routes across 20+ AI providers to reduce costs by 40
 - On-premises deployment
 - 24/7 support with SLAs
 
-```
-### Guidelines
+## Guidelines
 
 * **Follow PEP-8** - Use ruff/black for formatting
 * **Type hints required** - All public APIs must be fully typed
