@@ -5,9 +5,6 @@
 
 This document tracks conformance test coverage for the **Embedding Protocol V1.0** specification as defined in `SPECIFICATION.md §10`. Each test validates normative requirements (MUST/SHOULD) from the specification and the reference implementation in:
 
-* `adapter_sdk/embedding_base.py`
-* `examples/embedding/mock_embedding_adapter.py`
-
 This suite constitutes the **official Embedding Protocol V1.0 Reference Conformance Test Suite**. Any implementation (Corpus or third-party) MAY run these tests to verify and publicly claim conformance, provided all referenced tests pass unmodified.
 
 **Protocol Version:** Embedding Protocol V1.0  
