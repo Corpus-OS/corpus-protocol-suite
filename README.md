@@ -1,4 +1,4 @@
-# Corpus SDK
+# Corpus Protocols and SDK
 
 Reference implementation of the **Corpus Protocol Suite** — a protocol-first, vendor-neutral SDK for interoperable AI/data backends: **LLM**, **Embedding**, **Vector**, and **Graph**.
 
