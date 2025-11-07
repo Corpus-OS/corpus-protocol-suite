@@ -50,6 +50,24 @@ async def test_embed_cache_respected_in_standalone_mode():
     assert r1.embedding.vector == r2.embedding.vector
 
 
+async def test_embed_cache_respects_tenant_isolation():
+    """
+    Cache keys MUST be tenant-aware to avoid cross-tenant leakage.
+    Same spec under different tenants should not hit the same cache entry.
+    """
+    a = CountingAdapter(mode="standalone", failure_rate=0.0)
+    spec = EmbedSpec(text="cache-me", model=a.supported_models[0], normalize=False)
+
+    ctx1 = make_ctx(OperationContext, request_id="t_cache_t1", tenant="tenant-1")
+    ctx2 = make_ctx(OperationContext, request_id="t_cache_t2", tenant="tenant-2")
+
+    await a.embed(spec, ctx=ctx1)
+    await a.embed(spec, ctx=ctx2)
+
+    # Two distinct tenants ⇒ two backend calls (no cross-tenant cache sharing)
+    assert a.embed_calls == 2
+
+
 class FallbackAdapter(MockEmbeddingAdapter):
     async def _do_embed_batch(self, spec: BatchEmbedSpec, *, ctx: OperationContext = None) -> BatchEmbedResult:
         raise NotSupported("batch not supported")
@@ -65,4 +83,3 @@ async def test_embed_batch_fallback_uses_per_item_and_reports_failures():
     assert isinstance(res, BatchEmbedResult)
     assert len(res.embeddings) >= 2
     assert any(f["index"] == 1 for f in res.failed_texts)
-
