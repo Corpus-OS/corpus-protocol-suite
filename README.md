@@ -1006,12 +1006,32 @@ Current versions:
 * Message fingerprinting stability
 * Tenant hash uniqueness
 
-### Running Tests
+### One-Command Conformance Testing
+
+Run comprehensive protocol conformance tests with single commands:
 
 ```bash
-pytest tests/
+# Test ALL protocols
+make test-all-conformance
+
+# Test specific protocols  
+make test-embedding-conformance
+make test-llm-conformance
+make test-vector-conformance
+make test-graph-conformance
+
+# Alternative methods
+python scripts/test_embedding_conformance.py
+python -m tests.embedding.run_conformance
+
+# Run specific test files
 pytest tests/test_embedding_base.py -v
+
+# Run with coverage
 pytest tests/ --cov=corpus_sdk --cov-report=html
+
+# Run specific protocol tests
+pytest tests/embedding/ -v
 ```
 
 ---
