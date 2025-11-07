@@ -1,0 +1,475 @@
+# SPDX-License-Identifier: Apache-2.0
+"""
+Embedding Conformance — Wire handler canonical envelopes.
+
+Spec refs:
+  • §4 Wire Contract (Embedding) — canonical envelope shapes
+  • §10.3 Embedding Operations (embed, embed_batch, count_tokens, health)
+  • §10.4 Error Mapping — normalized codes and error payloads
+
+Covers:
+  • Successful envelopes for all supported ops
+  • Canonical {ok, code, result, error} shape
+  • Argument validation surfaced as BAD_REQUEST via wire
+  • Unsupported / unknown ops surfaced as NOT_SUPPORTED
+  • Model-not-available mapped to MODEL_NOT_AVAILABLE
+  • Batch semantics & failures preserved through envelope
+  • Context propagation via OperationContext
+  • Unexpected Exception → UNAVAILABLE mapping
+"""
+
+import pytest
+
+from corpus_sdk.embedding.embedding_base import (
+    WireEmbeddingHandler,
+    EmbedSpec,
+    BatchEmbedSpec,
+    BadRequest,
+    NotSupported,
+    ModelNotAvailable,
+    TextTooLong,
+    OperationContext,
+)
+from corpus_sdk.examples.embedding.mock_embedding_adapter import MockEmbeddingAdapter
+
+pytestmark = pytest.mark.asyncio
+
+
+def _assert_ok_envelope(out):
+    assert isinstance(out, dict)
+    assert out.get("ok") is True
+    assert isinstance(out.get("code"), str)
+    assert out["code"] == "OK"
+    assert "error" not in out or out["error"] in (None, {})
+
+
+def _assert_error_envelope(out, *, code: str = None):
+    assert isinstance(out, dict)
+    assert out.get("ok") is False
+    assert "result" not in out or out["result"] in (None, {})
+    assert "code" in out and isinstance(out["code"], str) and out["code"]
+    assert "error" in out and isinstance(out["error"], dict)
+    if code is not None:
+        assert out["code"] == code
+
+
+# ---------------------------------------------------------------------------
+# Tracking adapter for context & call assertions
+# ---------------------------------------------------------------------------
+
+class TrackingMockEmbeddingAdapter(MockEmbeddingAdapter):
+    """
+    MockEmbeddingAdapter wrapper that records last ctx/call/args.
+
+    Uses the real mock implementation; only adds observability and
+    forces deterministic behavior via failure_rate=0.0.
+    """
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("failure_rate", 0.0)
+        super().__init__(*args, **kwargs)
+        self.last_ctx = None
+        self.last_call = None
+        self.last_args = None
+
+    def _store(self, op: str, ctx: OperationContext | None, **kwargs):
+        self.last_call = op
+        self.last_ctx = ctx
+        self.last_args = dict(kwargs)
+
+    async def _do_capabilities(self):
+        self._store("capabilities", None)
+        return await super()._do_capabilities()
+
+    async def _do_embed(
+        self,
+        spec: EmbedSpec,
+        *,
+        ctx: OperationContext | None = None,
+    ):
+        self._store("embed", ctx, spec=spec)
+        return await super()._do_embed(spec, ctx=ctx)
+
+    async def _do_embed_batch(
+        self,
+        spec: BatchEmbedSpec,
+        *,
+        ctx: OperationContext | None = None,
+    ):
+        self._store("embed_batch", ctx, spec=spec)
+        return await super()._do_embed_batch(spec, ctx=ctx)
+
+    async def _do_count_tokens(
+        self,
+        text: str,
+        model: str,
+        *,
+        ctx: OperationContext | None = None,
+    ) -> int:
+        self._store("count_tokens", ctx, text=text, model=model)
+        return await super()._do_count_tokens(text, model, ctx=ctx)
+
+    async def _do_health(
+        self,
+        *,
+        ctx: OperationContext | None = None,
+    ):
+        self._store("health", ctx)
+        # keep health deterministic for tests
+        return {
+            "ok": True,
+            "server": "mock-embedding",
+            "version": "1.0.0",
+            "models": {m: "ok" for m in self.supported_models},
+        }
+
+
+# ---------------------------------------------------------------------------
+# Success-path envelopes
+# ---------------------------------------------------------------------------
+
+async def test_capabilities_envelope_success():
+    a = MockEmbeddingAdapter(failure_rate=0.0)
+    h = WireEmbeddingHandler(a)
+
+    out = await h.handle({"op": "embedding.capabilities", "ctx": {}, "args": {}})
+
+    _assert_ok_envelope(out)
+    assert "result" in out
+    caps = out["result"]
+    assert isinstance(caps, dict)
+    assert "supported_models" in caps
+
+
+async def test_embed_envelope_success():
+    a = MockEmbeddingAdapter(failure_rate=0.0)
+    h = WireEmbeddingHandler(a)
+
+    env = {
+        "op": "embedding.embed",
+        "ctx": {},
+        "args": {
+            "text": "hi",
+            "model": a.supported_models[0],
+            "truncate": True,
+            "normalize": False,
+        },
+    }
+    out = await h.handle(env)
+
+    _assert_ok_envelope(out)
+    assert "result" in out
+
+    res = out["result"]
+    assert isinstance(res, dict)
+    assert res["model"] == a.supported_models[0]
+    assert "embedding" in res
+    ev = res["embedding"]
+    assert isinstance(ev, dict)
+    assert isinstance(ev.get("vector"), list)
+    assert ev.get("text") == "hi"
+
+
+async def test_embed_batch_envelope_success():
+    a = MockEmbeddingAdapter(failure_rate=0.0)
+    h = WireEmbeddingHandler(a)
+
+    env = {
+        "op": "embedding.embed_batch",
+        "ctx": {},
+        "args": {
+            "texts": ["a", "b"],
+            "model": a.supported_models[0],
+        },
+    }
+    out = await h.handle(env)
+
+    _assert_ok_envelope(out)
+    assert "result" in out
+
+    res = out["result"]
+    assert isinstance(res, dict)
+    assert "embeddings" in res
+    assert isinstance(res["embeddings"], list)
+    assert len(res["embeddings"]) == 2
+    for ev in res["embeddings"]:
+        assert isinstance(ev, dict)
+        assert isinstance(ev.get("vector"), list)
+
+
+async def test_count_tokens_envelope_success():
+    a = MockEmbeddingAdapter(failure_rate=0.0)
+    h = WireEmbeddingHandler(a)
+
+    env = {
+        "op": "embedding.count_tokens",
+        "ctx": {},
+        "args": {
+            "text": "hello",
+            "model": a.supported_models[0],
+        },
+    }
+    out = await h.handle(env)
+
+    _assert_ok_envelope(out)
+    assert isinstance(out.get("result"), int)
+    assert out["result"] >= 0
+
+
+async def test_health_envelope_success():
+    a = MockEmbeddingAdapter(failure_rate=0.0)
+    h = WireEmbeddingHandler(a)
+
+    out = await h.handle({"op": "embedding.health", "ctx": {}, "args": {}})
+
+    _assert_ok_envelope(out)
+    assert "result" in out
+    res = out["result"]
+    assert isinstance(res, dict)
+    assert "ok" in res
+    assert "server" in res
+    assert "version" in res
+
+
+# ---------------------------------------------------------------------------
+# Context propagation (OperationContext plumbing)
+# ---------------------------------------------------------------------------
+
+async def test_embed_context_roundtrip_and_context_plumbing():
+    a = TrackingMockEmbeddingAdapter()
+    h = WireEmbeddingHandler(a)
+
+    ctx_wire = {
+        "request_id": "req-embed-ctx",
+        "idempotency_key": "idem-embed",
+        "deadline_ms": 9999999999999,
+        "traceparent": "00-abc-xyz-embed",
+        "tenant": "tenant-embed",
+        "attrs": {"foo": "bar"},
+        "ignore_me": "extra",  # MUST be ignored
+    }
+    args = {
+        "text": "ctx-check",
+        "model": a.supported_models[0],
+        "truncate": True,
+        "normalize": False,
+    }
+
+    out = await h.handle(
+        {
+            "op": "embedding.embed",
+            "ctx": ctx_wire,
+            "args": args,
+        }
+    )
+
+    _assert_ok_envelope(out)
+
+    # Check context propagation into adapter
+    assert a.last_call == "embed"
+    assert isinstance(a.last_ctx, OperationContext)
+    assert a.last_ctx.request_id == "req-embed-ctx"
+    assert a.last_ctx.idempotency_key == "idem-embed"
+    assert a.last_ctx.traceparent == "00-abc-xyz-embed"
+    assert a.last_ctx.tenant == "tenant-embed"
+    # unknown field removed from attrs
+    assert "ignore_me" not in (a.last_ctx.attrs or {})
+
+
+# ---------------------------------------------------------------------------
+# Error mapping semantics
+# ---------------------------------------------------------------------------
+
+async def test_missing_op_rejected_with_bad_request():
+    a = MockEmbeddingAdapter(failure_rate=0.0)
+    h = WireEmbeddingHandler(a)
+
+    out = await h.handle({"ctx": {}, "args": {}})
+
+    _assert_error_envelope(out)
+    assert out["code"] in ("BAD_REQUEST", "NOT_SUPPORTED")
+
+
+async def test_unknown_op_rejected_with_not_supported():
+    a = MockEmbeddingAdapter(failure_rate=0.0)
+    h = WireEmbeddingHandler(a)
+
+    out = await h.handle(
+        {"op": "embedding.unknown_op", "ctx": {}, "args": {}}
+    )
+
+    _assert_error_envelope(out, code="NOT_SUPPORTED")
+
+
+async def test_embed_missing_required_fields_yields_bad_request():
+    a = MockEmbeddingAdapter(failure_rate=0.0)
+    h = WireEmbeddingHandler(a)
+
+    # Missing text
+    out1 = await h.handle(
+        {
+            "op": "embedding.embed",
+            "ctx": {},
+            "args": {"model": a.supported_models[0]},
+        }
+    )
+    _assert_error_envelope(out1)
+    assert out1["code"] == "BAD_REQUEST"
+
+    # Missing model
+    out2 = await h.handle(
+        {
+            "op": "embedding.embed",
+            "ctx": {},
+            "args": {"text": "hi"},
+        }
+    )
+    _assert_error_envelope(out2)
+    assert out2["code"] == "BAD_REQUEST"
+
+
+async def test_embed_unknown_model_maps_model_not_available():
+    a = MockEmbeddingAdapter(failure_rate=0.0)
+    h = WireEmbeddingHandler(a)
+
+    out = await h.handle(
+        {
+            "op": "embedding.embed",
+            "ctx": {},
+            "args": {"text": "hi", "model": "nope-model"},
+        }
+    )
+
+    _assert_error_envelope(out)
+    assert out["code"] in ("MODEL_NOT_AVAILABLE", "NOT_SUPPORTED")
+
+
+async def test_embed_batch_missing_texts_yields_bad_request():
+    a = MockEmbeddingAdapter(failure_rate=0.0)
+    h = WireEmbeddingHandler(a)
+
+    out = await h.handle(
+        {
+            "op": "embedding.embed_batch",
+            "ctx": {},
+            "args": {"model": a.supported_models[0]},
+        }
+    )
+
+    _assert_error_envelope(out)
+    assert out["code"] == "BAD_REQUEST"
+
+
+async def test_embed_batch_unknown_model_maps_model_not_available():
+    a = MockEmbeddingAdapter(failure_rate=0.0)
+    h = WireEmbeddingHandler(a)
+
+    out = await h.handle(
+        {
+            "op": "embedding.embed_batch",
+            "ctx": {},
+            "args": {"texts": ["a"], "model": "nope-model"},
+        }
+    )
+
+    _assert_error_envelope(out)
+    assert out["code"] in ("MODEL_NOT_AVAILABLE", "NOT_SUPPORTED")
+
+
+async def test_count_tokens_unknown_model_maps_model_not_available():
+    a = MockEmbeddingAdapter(failure_rate=0.0)
+    h = WireEmbeddingHandler(a)
+
+    out = await h.handle(
+        {
+            "op": "embedding.count_tokens",
+            "ctx": {},
+            "args": {"text": "hi", "model": "nope-model"},
+        }
+    )
+
+    _assert_error_envelope(out)
+    assert out["code"] in ("MODEL_NOT_AVAILABLE", "NOT_SUPPORTED")
+
+
+async def test_error_envelope_includes_message_and_type():
+    """
+    Force a BadRequest from the adapter and ensure wire handler surfaces a proper error envelope.
+    """
+
+    class BadRequestAdapter(MockEmbeddingAdapter):
+        async def _do_embed(self, spec: EmbedSpec, *, ctx=None):
+            raise BadRequest("bad things")
+
+    a = BadRequestAdapter(failure_rate=0.0)
+    h = WireEmbeddingHandler(a)
+
+    out = await h.handle(
+        {
+            "op": "embedding.embed",
+            "ctx": {},
+            "args": {"text": "x", "model": a.supported_models[0]},
+        }
+    )
+
+    _assert_error_envelope(out, code="BAD_REQUEST")
+    err = out["error"]
+    assert "message" in err and isinstance(err["message"], str) and err["message"]
+
+
+async def test_text_too_long_maps_to_text_too_long_code_when_exposed():
+    """
+    Ensure adapter TextTooLong propagates as TEXT_TOO_LONG in the wire envelope.
+    """
+
+    class TLAdapter(MockEmbeddingAdapter):
+        async def _do_embed(self, spec: EmbedSpec, *, ctx=None):
+            raise TextTooLong("too long")
+
+    a = TLAdapter(failure_rate=0.0)
+    h = WireEmbeddingHandler(a)
+
+    out = await h.handle(
+        {
+            "op": "embedding.embed",
+            "ctx": {},
+            "args": {"text": "x" * 10_000, "model": a.supported_models[0]},
+        }
+    )
+
+    _assert_error_envelope(out)
+    assert out["code"] in ("TEXT_TOO_LONG", "BAD_REQUEST")
+
+
+# ---------------------------------------------------------------------------
+# Unexpected exception → UNAVAILABLE
+# ---------------------------------------------------------------------------
+
+async def test_unexpected_exception_maps_to_unavailable():
+    class BoomAdapter(TrackingMockEmbeddingAdapter):
+        async def _do_embed(
+            self,
+            spec: EmbedSpec,
+            *,
+            ctx: OperationContext | None = None,
+        ):
+            raise RuntimeError("boom")
+
+    a = BoomAdapter()
+    h = WireEmbeddingHandler(a)
+
+    out = await h.handle(
+        {
+            "op": "embedding.embed",
+            "ctx": {"request_id": "boom"},
+            "args": {
+                "text": "hi",
+                "model": a.supported_models[0],
+            },
+        }
+    )
+
+    _assert_error_envelope(out)
+    assert out["code"] == "UNAVAILABLE"
+    assert out["error"].get("type") in ("RuntimeError", "UNAVAILABLE", "Unavailable")
+    assert "boom" in out["error"].get("message", "") or "boom" in out.get("message", "")
