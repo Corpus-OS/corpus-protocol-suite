@@ -1176,8 +1176,6 @@ logging.getLogger("corpus_sdk").setLevel(logging.DEBUG)
 
 ### Corpus Router: Intelligent AI Infrastructure Orchestration
 
-## Transform AI Operations from Cost Center to Competitive Advantage
-
 Corpus Router doesn't just route traffic—it **understands, optimizes, and evolves** with your AI workloads. While the open-source SDK standardizes how you talk to providers, Corpus Router intelligently decides **which providers to use, when, and why** based on your actual workload patterns and business objectives.
 
 ---
