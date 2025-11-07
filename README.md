@@ -1176,11 +1176,7 @@ logging.getLogger("corpus_sdk").setLevel(logging.DEBUG)
 
 ## 🧠 Intelligent Routing That Learns Your Workloads
 
-Corpus Router doesn't just route traffic—it **understands, optimizes, and evolves** with your AI workloads. While the open-source SDK standardizes how you talk to providers, Corpus Router intelligently decides **which providers to use, when, and why** based on your actual workload patterns and business object
-
-**Stop managing AI providers. Start optimizing them automatically.**
-
-Corpus Router intelligently routes across 20+ AI providers to reduce costs by 40-60% while maintaining 99.9% uptime. While our open-source SDK standardizes how you talk to providers, Corpus Router decides **which providers to use and when** based on real-time performance, cost, and quality signals.
+Corpus Router doesn't just route traffic—it understands, optimizes, and evolves with your AI workloads. While our open-source SDK standardizes how you talk to providers, Corpus Router intelligently decides which providers to use, when, and why based on your actual workload patterns and business objectives.
 
 ## 🧠 Self-Learning Routing
 
@@ -1195,11 +1191,11 @@ Corpus Router intelligently routes across 20+ AI providers to reduce costs by 40
 - Multi-provider failover & circuit breaking
 - Unified observability & cost tracking
 - Request/response validation
-- 99.9% uptime SLA
+- 99.9% uptime SLA and 70-90% reduction in cost
 
 **Enterprise Features:**
-- Self-learning optimization engine
-- Policy enforcement (budgets, compliance, rate limits)
+- Self-learning optimization engine learning from 50+ signals
+- Policy enforcement (routing rules, policy tables)
 - On-premises deployment
 - 24/7 support with SLAs
 
