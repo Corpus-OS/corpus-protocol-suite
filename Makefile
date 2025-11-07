@@ -1,12 +1,13 @@
 .PHONY: \
 	test-conformance \
+	test-all-conformance \
 	test-llm-conformance \
 	test-vector-conformance \
 	test-graph-conformance \
 	test-embedding-conformance
 
 # Run ALL protocol conformance suites (LLM + Vector + Graph + Embedding)
-test-conformance:
+test-conformance test-all-conformance:
 	pytest \
 		tests/llm \
 		tests/vector \
