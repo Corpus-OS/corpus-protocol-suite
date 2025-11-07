@@ -1,6 +1,4 @@
-Got you. Here’s the same file with **only** one kind of change: every listed test now has a brief per-test description, matching how the LLM conformance doc is written. Names, counts, categories, and structure are preserved.
 
-````markdown
 # Embedding Protocol V1 Conformance Test Coverage
 
 ## Overview
