@@ -4,6 +4,8 @@
 
 This document tracks conformance test coverage for the **Vector Protocol V1.0** specification as defined in `SPECIFICATION.md §9`. Each test validates normative requirements (MUST/SHOULD) from the specification and shared behavior from the common foundation (errors, deadlines, observability, privacy).
 
+This suite constitutes the official LLM Protocol V1.0 Reference Conformance Test Suite. Any implementation (Corpus or third-party) MAY run these tests to verify and publicly claim conformance, provided all referenced tests pass unmodified.
+
 **Protocol Version:** Vector Protocol V1.0
 **Status:** Pre-Release
 **Last Updated:** 2025-01-XX
