@@ -14,6 +14,8 @@ Covers:
   • Unsupported / unknown ops surfaced as NOT_SUPPORTED
   • Model-not-available mapped to MODEL_NOT_AVAILABLE
   • Batch semantics & failures preserved through envelope
+  • Context propagation via OperationContext
+  • Unexpected Exception → UNAVAILABLE mapping
 """
 
 import pytest
@@ -26,8 +28,9 @@ from corpus_sdk.embedding.embedding_base import (
     NotSupported,
     ModelNotAvailable,
     TextTooLong,
+    OperationContext,
 )
-from corpus_sdk.mock_embedding_adapter import MockEmbeddingAdapter
+from corpus_sdk.examples.embedding.mock_embedding_adapter import MockEmbeddingAdapter
 
 pytestmark = pytest.mark.asyncio
 
@@ -50,6 +53,81 @@ def _assert_error_envelope(out, *, code: str = None):
         assert out["code"] == code
 
 
+# ---------------------------------------------------------------------------
+# Tracking adapter for context & call assertions
+# ---------------------------------------------------------------------------
+
+class TrackingMockEmbeddingAdapter(MockEmbeddingAdapter):
+    """
+    MockEmbeddingAdapter wrapper that records last ctx/call/args.
+
+    Uses the real mock implementation; only adds observability and
+    forces deterministic behavior via failure_rate=0.0.
+    """
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("failure_rate", 0.0)
+        super().__init__(*args, **kwargs)
+        self.last_ctx = None
+        self.last_call = None
+        self.last_args = None
+
+    def _store(self, op: str, ctx: OperationContext | None, **kwargs):
+        self.last_call = op
+        self.last_ctx = ctx
+        self.last_args = dict(kwargs)
+
+    async def _do_capabilities(self):
+        self._store("capabilities", None)
+        return await super()._do_capabilities()
+
+    async def _do_embed(
+        self,
+        spec: EmbedSpec,
+        *,
+        ctx: OperationContext | None = None,
+    ):
+        self._store("embed", ctx, spec=spec)
+        return await super()._do_embed(spec, ctx=ctx)
+
+    async def _do_embed_batch(
+        self,
+        spec: BatchEmbedSpec,
+        *,
+        ctx: OperationContext | None = None,
+    ):
+        self._store("embed_batch", ctx, spec=spec)
+        return await super()._do_embed_batch(spec, ctx=ctx)
+
+    async def _do_count_tokens(
+        self,
+        text: str,
+        model: str,
+        *,
+        ctx: OperationContext | None = None,
+    ) -> int:
+        self._store("count_tokens", ctx, text=text, model=model)
+        return await super()._do_count_tokens(text, model, ctx=ctx)
+
+    async def _do_health(
+        self,
+        *,
+        ctx: OperationContext | None = None,
+    ):
+        self._store("health", ctx)
+        # keep health deterministic for tests
+        return {
+            "ok": True,
+            "server": "mock-embedding",
+            "version": "1.0.0",
+            "models": {m: "ok" for m in self.supported_models},
+        }
+
+
+# ---------------------------------------------------------------------------
+# Success-path envelopes
+# ---------------------------------------------------------------------------
+
 async def test_capabilities_envelope_success():
     a = MockEmbeddingAdapter(failure_rate=0.0)
     h = WireEmbeddingHandler(a)
@@ -58,7 +136,6 @@ async def test_capabilities_envelope_success():
 
     _assert_ok_envelope(out)
     assert "result" in out
-    # Basic shape sanity
     caps = out["result"]
     assert isinstance(caps, dict)
     assert "supported_models" in caps
@@ -154,6 +231,55 @@ async def test_health_envelope_success():
     assert "version" in res
 
 
+# ---------------------------------------------------------------------------
+# Context propagation (OperationContext plumbing)
+# ---------------------------------------------------------------------------
+
+async def test_embed_context_roundtrip_and_context_plumbing():
+    a = TrackingMockEmbeddingAdapter()
+    h = WireEmbeddingHandler(a)
+
+    ctx_wire = {
+        "request_id": "req-embed-ctx",
+        "idempotency_key": "idem-embed",
+        "deadline_ms": 9999999999999,
+        "traceparent": "00-abc-xyz-embed",
+        "tenant": "tenant-embed",
+        "attrs": {"foo": "bar"},
+        "ignore_me": "extra",  # MUST be ignored
+    }
+    args = {
+        "text": "ctx-check",
+        "model": a.supported_models[0],
+        "truncate": True,
+        "normalize": False,
+    }
+
+    out = await h.handle(
+        {
+            "op": "embedding.embed",
+            "ctx": ctx_wire,
+            "args": args,
+        }
+    )
+
+    _assert_ok_envelope(out)
+
+    # Check context propagation into adapter
+    assert a.last_call == "embed"
+    assert isinstance(a.last_ctx, OperationContext)
+    assert a.last_ctx.request_id == "req-embed-ctx"
+    assert a.last_ctx.idempotency_key == "idem-embed"
+    assert a.last_ctx.traceparent == "00-abc-xyz-embed"
+    assert a.last_ctx.tenant == "tenant-embed"
+    # unknown field removed from attrs
+    assert "ignore_me" not in (a.last_ctx.attrs or {})
+
+
+# ---------------------------------------------------------------------------
+# Error mapping semantics
+# ---------------------------------------------------------------------------
+
 async def test_missing_op_rejected_with_bad_request():
     a = MockEmbeddingAdapter(failure_rate=0.0)
     h = WireEmbeddingHandler(a)
@@ -215,8 +341,6 @@ async def test_embed_unknown_model_maps_model_not_available():
     )
 
     _assert_error_envelope(out)
-    # Either normalized to MODEL_NOT_AVAILABLE, or at least not OK.
-    # Prefer strict check if handler maps ModelNotAvailable correctly.
     assert out["code"] in ("MODEL_NOT_AVAILABLE", "NOT_SUPPORTED")
 
 
@@ -290,7 +414,6 @@ async def test_error_envelope_includes_message_and_type():
 
     _assert_error_envelope(out, code="BAD_REQUEST")
     err = out["error"]
-    # Minimal expectations: message string present
     assert "message" in err and isinstance(err["message"], str) and err["message"]
 
 
@@ -315,5 +438,38 @@ async def test_text_too_long_maps_to_text_too_long_code_when_exposed():
     )
 
     _assert_error_envelope(out)
-    # Don't overfit if implementation differs, but prefer canonical code.
     assert out["code"] in ("TEXT_TOO_LONG", "BAD_REQUEST")
+
+
+# ---------------------------------------------------------------------------
+# Unexpected exception → UNAVAILABLE
+# ---------------------------------------------------------------------------
+
+async def test_unexpected_exception_maps_to_unavailable():
+    class BoomAdapter(TrackingMockEmbeddingAdapter):
+        async def _do_embed(
+            self,
+            spec: EmbedSpec,
+            *,
+            ctx: OperationContext | None = None,
+        ):
+            raise RuntimeError("boom")
+
+    a = BoomAdapter()
+    h = WireEmbeddingHandler(a)
+
+    out = await h.handle(
+        {
+            "op": "embedding.embed",
+            "ctx": {"request_id": "boom"},
+            "args": {
+                "text": "hi",
+                "model": a.supported_models[0],
+            },
+        }
+    )
+
+    _assert_error_envelope(out)
+    assert out["code"] == "UNAVAILABLE"
+    assert out["error"].get("type") in ("RuntimeError", "UNAVAILABLE", "Unavailable")
+    assert "boom" in out["error"].get("message", "") or "boom" in out.get("message", "")
