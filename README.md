@@ -1374,32 +1374,6 @@ Ensuring regulatory requirements are met automatically across all AI operations.
 
 *Corpus Router: Autonomous optimization for enterprise AI infrastructure.*
 ```
-
-> In short: the SDK defines **how to talk to providers**, while **Corpus Router learns which provider/model to use and when** — safely, under your rules.
-
-### Pricing
-
-**For teams needing production-ready solutions:**
-
-| Offering                   | Best For              | Includes                            |
-| -------------------------- | --------------------- | ----------------------------------- |
-| **Corpus Router Managed**  | Cloud teams           | Router + official adapters + SLAs   |
-| **Corpus Router On-Prem**  | Enterprise/regulated  | Air-gapped deployment + support     |
-| **Official Adapters Only** | Bring your own router | Production-tuned adapters + updates |
-
-**Contact:** `sales@corpus.io` or visit the Corpus site for details.
-
----
-
-## Contributing
-
-### Development Setup
-
-```bash
-git clone https://github.com/corpus/corpus-sdk.git
-cd corpus-sdk
-pip install -e ".[dev]"
-pytest
 ```
 
 ### Guidelines
