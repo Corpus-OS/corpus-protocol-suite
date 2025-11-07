@@ -1,4 +1,4 @@
-# Corpus SDK Specification
+## Corpus SDK Specification
 
 ## Abstract
 
@@ -29,6 +29,13 @@ SPDX-License-Identifier: Apache-2.0
 * [4. Conventions and Notation](#4-conventions-and-notation)
 
   * [4.1. Wire-First Canonical Form (Normative)](#41-wire-first-canonical-form-normative)
+
+    * [4.1.1. Envelopes and Content Types (MUST)](#411-envelopes-and-content-types-must)
+    * [4.1.2. Version Identification (MUST)](#412-version-identification-must)
+    * [4.1.3. Streaming Frames (MUST where applicable)](#413-streaming-frames-must-where-applicable)
+    * [4.1.4. Transport Bindings for Streaming (Normative)](#414-transport-bindings-for-streaming-normative)
+    * [4.1.5. Compatibility and Unknown Fields (MUST)](#415-compatibility-and-unknown-fields-must)
+    * [4.1.6. Operation Registry (Normative)](#416-operation-registry-normative)
 * [5. Architecture Overview](#5-architecture-overview)
 
   * [5.1. Protocol Relationships](#51-protocol-relationships)
@@ -84,6 +91,7 @@ SPDX-License-Identifier: Apache-2.0
   * [11.4. Idempotency and Exactly-Once](#114-idempotency-and-exactly-once)
   * [11.5. Pagination and Streaming](#115-pagination-and-streaming)
   * [11.6. Caching (Implementation Guidance)](#116-caching-implementation-guidance)
+  * [11.7. Best-Effort Distributed Transactions](#117-best-effort-distributed-transactions)
 * [12. Error Handling and Resilience](#12-error-handling-and-resilience)
 
   * [12.1. Retry Semantics](#121-retry-semantics)
@@ -128,7 +136,7 @@ SPDX-License-Identifier: Apache-2.0
 * [21. Author’s Address](#21-authors-address)
 * [Appendix A — End-to-End Example (Normative)](#appendix-a--end-to-end-example-normative)
 * [Appendix B — Capability Shapes (Illustrative)](#appendix-b--capability-shapes-illustrative)
-* [Appendix C — Wire-Level Envelopes (Optional)](#appendix-c--wire-level-envelopes-optional)
+* [Appendix C — Wire-Level Envelopes](#appendix-c--wire-level-envelopes)
 * [Appendix D — Content Redaction Patterns (Normative)](#appendix-d--content-redaction-patterns-normative)
 * [Appendix E — Implementation Status (Non-Normative)](#appendix-e--implementation-status-non-normative)
 * [Appendix F — Change Log / Revision History (Non-Normative)](#appendix-f--change-log--revision-history-non-normative)
@@ -173,12 +181,14 @@ The key words “MUST”, “MUST NOT”, “REQUIRED”, “SHALL”, “SHALL 
 
 **Adapter** — Concrete implementation of a protocol for a specific provider/backend.
 **Protocol** — Interface contract that adapters MUST implement.
-**Operation Context** — Metadata container for tracing, deadlines, and tenancy.
+**Operation Context** — Metadata container for tracing, deadlines, tenancy, and cache hints.
 **Capabilities** — Dynamically discoverable features and limits of an adapter.
 **SIEM-Safe** — Observability that excludes PII and uses privacy-preserving identifiers.
 **Idempotency Key** — Client-provided token guaranteeing idempotent semantics.
 **Tenant Isolation** — Logical separation of data/control plane in multi-tenant deployments.
 **Backpressure** — Cooperative throttling to keep systems within safe operating limits.
+**Streaming Frame** — Single JSON object carrying a `data`, `end`, or `error` event in a streaming operation.
+**Batch Partial Failure** — Outcome where some batch items succeed and others fail, with per-item status reported.
 
 ---
 
@@ -194,38 +204,39 @@ The key words “MUST”, “MUST NOT”, “REQUIRED”, “SHALL”, “SHALL 
 
 ### 4.1. Wire-First Canonical Form (Normative)
 
-This specification is **language-agnostic**. Python snippets are **illustrative only**. The **canonical interface** is the wire contract defined in this section and applied throughout.
+This specification is **language-agnostic**. Python code is illustrative only. The **canonical interface** is the wire contract defined here and applied throughout.
 
 #### 4.1.1. Envelopes and Content Types (MUST)
 
-* Requests and responses use UTF-8 JSON.
-* `Content-Type: application/json` (MUST).
-* Top-level envelope shapes:
+Non-streaming operations:
 
-**Request envelope (MUST):**
+* `Content-Type: application/json`
+* UTF-8 JSON documents.
+
+**Request envelope:**
 
 ```json
 {
   "op": "<component>.<operation>",
-  "ctx": { },
-  "args": { }
+  "ctx": {},
+  "args": {}
 }
 ```
 
-* `op` identifies the component and operation (e.g., `llm.complete`, `graph.stream_query`).
+* `op` examples: `llm.complete`, `llm.stream`, `graph.query`, `vector.query`, `embedding.embed_batch`.
 
-**Response envelope (MUST):**
+**Success response envelope:**
 
 ```json
 {
   "ok": true,
   "code": "OK",
   "ms": 12.3,
-  "result": { }
+  "result": {}
 }
 ```
 
-**Error envelope (MUST):**
+**Error response envelope:**
 
 ```json
 {
@@ -240,28 +251,34 @@ This specification is **language-agnostic**. Python snippets are **illustrative 
 }
 ```
 
+* `code` MUST be a normalized error/OK code.
+* `error` MUST be the normalized error class name when `ok=false`.
+
 #### 4.1.2. Version Identification (MUST)
 
-* Protocols identify as `{component}/v1.0` (e.g., `"protocol": "vector/v1.0"` in capabilities; `X-Adapter-Protocol: vector/v1.0` in headers).
-* Breaking changes require `v2.0`. Additive fields remain compatible within the `v1.x` family.
+* Each protocol instance declares a protocol identifier: `{component}/v1.0`
+
+  * Example: `"protocol": "vector/v1.0"`.
+* Clients MAY send `X-Adapter-Protocol: {component}/v1.0`.
+* All `v1.x` revisions of this specification are wire-compatible with `{component}/v1.0`.
+* Breaking changes require `{component}/v2.0`.
 
 #### 4.1.3. Streaming Frames (MUST where applicable)
 
-For streaming operations (e.g., LLM `stream`, Graph `stream_query`):
+For streaming operations (`llm.stream`, `graph.stream_query`):
 
-* Transport MAY be SSE, WebSocket, HTTP chunked, or gRPC streaming.
-* Each frame is a JSON object with `event` and `data` fields.
+Each frame is a JSON object:
 
-**Data frame (MUST):**
+**Data frame:**
 
 ```json
 {
   "event": "data",
-  "data": { }
+  "data": {}
 }
 ```
 
-**Terminal success frame (MUST):**
+**Terminal success frame:**
 
 ```json
 {
@@ -270,7 +287,7 @@ For streaming operations (e.g., LLM `stream`, Graph `stream_query`):
 }
 ```
 
-**Terminal error frame (MUST):**
+**Terminal error frame:**
 
 ```json
 {
@@ -281,13 +298,91 @@ For streaming operations (e.g., LLM `stream`, Graph `stream_query`):
 }
 ```
 
-Exactly one terminal frame (`event: "end"` or `event: "error"`) **MUST** be emitted per stream.
+Rules:
 
-#### 4.1.4. Compatibility and Unknown Fields (MUST)
+* Exactly one terminal frame (`event: "end"` or `event: "error"`) per stream.
+* No `data` frames after the terminal frame.
+* Terminal error frame MUST use normalized error codes/classes.
 
-* Unknown top-level keys and unknown nested keys **MUST** be ignored.
-* Clients **MUST NOT** assume field ordering.
-* All numbers are IEEE 754 JSON numbers; implementations **SHOULD** validate ranges as defined in normative sections.
+#### 4.1.4. Transport Bindings for Streaming (Normative)
+
+The logical frame model binds to transports:
+
+**HTTP/1.1 + NDJSON:**
+
+* Headers:
+
+  * `Content-Type: application/x-ndjson`
+  * `Transfer-Encoding: chunked`
+  * `X-Protocol-Streaming: chunked-json`
+* Each line is one JSON frame from §4.1.3.
+
+**Server-Sent Events (SSE):**
+
+* `Content-Type: text/event-stream`
+* For each frame:
+
+  * `event: <event>`
+  * `data: {json}`
+  * blank line.
+
+**WebSocket:**
+
+* Optional header: `X-Protocol-Streaming: websocket-json`
+* Each message is one JSON frame.
+
+**gRPC / HTTP/2 streaming:**
+
+* Each streamed message logically corresponds to a frame from §4.1.3.
+
+Adapters MAY support one or more transports. Supported transports SHOULD be advertised via:
+
+```json
+"extensions": {
+  "streaming_transports": ["ndjson", "sse", "websocket"]
+}
+```
+
+#### 4.1.5. Compatibility and Unknown Fields (MUST)
+
+* Unknown keys (top-level or nested) MUST be ignored.
+* Clients MUST NOT rely on field ordering.
+* Numeric fields MUST respect type/range constraints defined in relevant sections.
+
+#### 4.1.6. Operation Registry (Normative)
+
+The following `op` strings **MUST** be used for the corresponding protocol operations and are reserved for V1.0:
+
+| Section / Operation      | `op` String               |
+| ------------------------ | ------------------------- |
+| 7.3.1 `create_vertex`    | `graph.create_vertex`     |
+| 7.3.1 `delete_vertex`    | `graph.delete_vertex`     |
+| 7.3.1 `create_edge`      | `graph.create_edge`       |
+| 7.3.1 `delete_edge`      | `graph.delete_edge`       |
+| 7.3.2 `query`            | `graph.query`             |
+| 7.3.2 `stream_query`     | `graph.stream_query`      |
+| 7.3.3 `bulk_vertices`    | `graph.bulk_vertices`     |
+| 7.3.3 `batch`            | `graph.batch`             |
+| 7.5   `create_index`     | `graph.create_index`      |
+| 7.5   `drop_index`       | `graph.drop_index`        |
+| 7.6   `health`           | `graph.health`            |
+| 8.3   `complete`         | `llm.complete`            |
+| 8.3   `stream`           | `llm.stream`              |
+| 8.3   `count_tokens`     | `llm.count_tokens`        |
+| 8.4   `capabilities`     | `llm.capabilities`        |
+| 9.3   `query`            | `vector.query`            |
+| 9.3   `upsert`           | `vector.upsert`           |
+| 9.3   `delete`           | `vector.delete`           |
+| 9.3   `create_namespace` | `vector.create_namespace` |
+| 9.3   `delete_namespace` | `vector.delete_namespace` |
+| 9.x   `capabilities`     | `vector.capabilities`     |
+| 10.3  `capabilities`     | `embedding.capabilities`  |
+| 10.3  `embed`            | `embedding.embed`         |
+| 10.3  `embed_batch`      | `embedding.embed_batch`   |
+| 10.3  `count_tokens`     | `embedding.count_tokens`  |
+| 10.3  `health`           | `embedding.health`        |
+
+Adapters MAY expose additional `op` values via namespaced extensions (e.g., `vendorX.llm.complete_raw`), but MUST NOT alter the semantics of the reserved `op` strings above.
 
 ---
 
@@ -337,10 +432,10 @@ Exactly one terminal frame (`event: "end"` or `event: "error"`) **MUST** be emit
 
 ### 5.3. Implementation Profiles (Informative)
 
-Two implementation profiles are recognized. Profiles **MUST NOT** alter wire contracts or semantics.
+Profiles define behavior; they MUST NOT change wire contracts.
 
-* **Thin (default):** All infra hooks (cache, limiter, breaker) are no-ops; deadlines are propagated to downstream backends.
-* **Standalone:** Optional local enforcement for deadlines, a small circuit breaker, a simple token-bucket limiter, and short-TTL in-memory caches (eligible for Embedding and LLM `complete` only).
+* **Thin (default):** No-op caches/limiters/breakers; propagate deadlines downstream.
+* **Standalone:** Local enforcement of deadlines, circuit breaker, token-bucket limiter, short-TTL in-memory caches for Embedding + LLM `complete`.
 
 ---
 
@@ -350,7 +445,7 @@ Two implementation profiles are recognized. Profiles **MUST NOT** alter wire con
 
 ```python
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, List
 
 @dataclass(frozen=True)
 class OperationContext:
@@ -360,20 +455,40 @@ class OperationContext:
     traceparent: Optional[str] = None  # W3C Trace Context
     tenant: Optional[str] = None       # never logged raw
     attrs: Optional[Mapping[str, Any]] = None
+
+    # Cache coordination (advisory; wire-compatible)
+    cache_scope: Optional[str] = None        # "tenant" | "global" | "session"; default "tenant"
+    cache_tags: Optional[List[str]] = None   # tags for cache keying/invalidation
 ```
 
 **Normative behavior:**
 
-* `request_id` (SHOULD) uniquely ties together end-to-end operations.
-* `idempotency_key` (MAY) be supplied on mutating operations; when present, adapters **MUST** guarantee exactly-once external effects or return a consistent prior result.
-* `deadline_ms` (SHOULD) be treated as an absolute deadline; adapters **MUST** propagate remaining budget downstream when possible. If the budget is already elapsed at call time, adapters **SHOULD** fail fast with `DeadlineExceeded` (LLM/Embedding) or `Unavailable` (Graph/Vector).
-* `traceparent` (MUST) be forwarded unchanged for distributed tracing.
-* `tenant` (MUST) enforce isolation; telemetry **MUST NOT** log raw tenant values.
-* `attrs` (MUST) be treated as a map; if absent, treat as empty.
+* `request_id` SHOULD uniquely identify the operation end-to-end.
+* `idempotency_key` MAY be supplied for mutating ops; when present:
+
+  * Adapters MUST provide exactly-once external effects or return the prior committed result.
+* `deadline_ms` SHOULD be treated as an absolute deadline:
+
+  * If elapsed at call time → fail fast (`DeadlineExceeded` or `Unavailable` per component).
+  * Remaining budget SHOULD be propagated downstream.
+* `traceparent` MUST be forwarded unchanged.
+* `tenant` MUST drive isolation; raw tenant MUST NOT be logged.
+* `attrs` treated as a map; if absent, treated as empty.
+* `cache_scope`:
+
+  * If unset, treated as `"tenant"`.
+  * MUST NOT weaken tenant isolation (no cross-tenant sharing unless explicitly configured).
+* `cache_tags`:
+
+  * MUST NOT contain secrets or raw tenant identifiers.
+  * MAY be used when `cache.supports_tags=true`.
+* `cache_scope` and `cache_tags` are **advisory**:
+
+  * Adapters and backends MAY ignore these hints without violating this specification.
 
 ### 6.2. Capability Discovery
 
-`capabilities()` **MUST** return a structured description:
+`capabilities()` MUST return:
 
 ```json
 {
@@ -393,6 +508,11 @@ class OperationContext:
     "concurrency": 256,
     "max_query_length": 100000
   },
+  "cache": {
+    "supports_tags": true,
+    "max_ttl_ms": 3600000,
+    "invalidation_webhook": false
+  },
   "extensions": {
     "vendor:neo4j.routing": "cluster",
     "vendor:read_your_writes": true,
@@ -401,9 +521,12 @@ class OperationContext:
 }
 ```
 
-* Unknown `features`, `limits`, or `extensions` keys **MUST** be ignored by clients.
-* `extensions` keys **MUST** be namespaced (e.g., `vendor:foo.bar`).
-* Semantic changes to published keys **MUST NOT** occur without a **major** protocol version change.
+Rules:
+
+* Unknown `features`, `limits`, `cache`, `extensions` keys MUST be ignored.
+* `extensions` keys MUST be namespaced (`vendor:foo.bar`).
+* `cache.supports_tags=true` signals support for `cache_tags`.
+* Semantic changes to existing keys require a major version bump.
 
 ### 6.3. Error Taxonomy
 
@@ -411,25 +534,32 @@ class OperationContext:
 AdapterError (base)
 ├─ BadRequest              # 400 client errors (validation, schema)
 ├─ AuthError               # 401/403 authentication/authorization
-├─ ResourceExhausted       # 429 quotas, rate limits (retry-after)
+├─ ResourceExhausted       # 429 quotas, rate limits
 ├─ TransientNetwork        # 5xx gateway/timeouts; retryable
 ├─ Unavailable             # 503 backend temporarily unavailable
 ├─ NotSupported            # 501/400 operation unsupported
 └─ DeadlineExceeded        # 504 budget/deadline exhausted
 ```
 
-LLM, Vector, and Embedding add specific subtypes (see §§8.5, 9.5, 10.4).
+Component-specific subtypes:
 
-Errors **MUST** include machine-readable metadata when applicable:
+* LLM: `ModelOverloaded`, `ContentFiltered`.
+* Vector: `DimensionMismatch`, `IndexNotReady`.
+* Embedding: `TextTooLong`, `ModelNotAvailable`.
+
+Errors MUST use normalized `code` and SHOULD include hints:
 
 ```json
 {
+  "ok": false,
+  "code": "RATE_LIMIT",
   "error": "ResourceExhausted",
   "message": "Rate limit exceeded",
-  "code": "RATE_LIMIT",
   "retry_after_ms": 1200,
   "throttle_scope": "tenant:acme:llm",
-  "hint": "Reduce concurrency or increase backoff"
+  "details": {
+    "provider_error_id": "..."
+  }
 }
 ```
 
@@ -449,10 +579,15 @@ class MetricsSink(Protocol):
     ) -> None: ...
 ```
 
-* `component` **MUST** be one of `graph|llm|vector|embedding`.
-* Adapters **MUST** emit at least one `observe` per operation (streaming ops SHOULD emit a final outcome observe).
-* Telemetry **MUST** be SIEM-safe: no raw tenant IDs, request bodies, prompts, vectors, or source texts.
-* Implementations MAY include low-cardinality fields in `extra`: `tenant_hash`, `deadline_bucket` (`<1s|<5s|<15s|<60s|>=60s`), `cache_hit` (0/1), `rows`, `batch_size`, `model` (when `extensions.tag_model_in_metrics=true`).
+Requirements:
+
+* `component` MUST be one of: `graph`, `llm`, `vector`, `embedding`.
+* At least one `observe` per operation.
+* Streaming operations MUST emit exactly one final `observe` for the overall outcome.
+* Telemetry MUST be SIEM-safe:
+
+  * Never log raw tenant IDs, prompts, vectors, or source texts.
+* `extra` SHOULD use low-cardinality keys: `tenant_hash`, `deadline_bucket`, `cache_hit`, `rows`, `matches_returned`, `batch_size`, and optionally `model` when allowed.
 
 ---
 
@@ -460,7 +595,7 @@ class MetricsSink(Protocol):
 
 ### 7.1. Overview
 
-Vendor-neutral interface for graph databases (Cypher, OpenCypher, Gremlin, GQL), standardizing CRUD, queries (sync/streaming), batch operations, and (optionally) schema management.
+Vendor-neutral interface for graph databases (Cypher, OpenCypher, Gremlin, GQL), covering CRUD, queries (sync/streaming), batch operations, and optional schema management.
 
 ### 7.2. Data Types
 
@@ -485,7 +620,6 @@ class GraphCapabilities:
     supports_multi_tenant: bool = False
     supports_streaming: bool = False
     supports_bulk_ops: bool = False
-    # Optional limits/extensions:
     max_query_length: Optional[int] = None
 ```
 
@@ -494,96 +628,141 @@ class GraphCapabilities:
 #### 7.3.1. Vertex/Edge CRUD
 
 ```python
-async def create_vertex(label: str, props: Mapping[str, Any], *, ctx: Optional[OperationContext]=None) -> GraphID
-async def delete_vertex(vertex_id: GraphID, *, ctx: Optional[OperationContext]=None) -> None
+async def create_vertex(
+    label: str,
+    props: Mapping[str, Any],
+    *,
+    ctx: Optional[OperationContext] = None
+) -> GraphID
+
+async def delete_vertex(
+    vertex_id: GraphID,
+    *,
+    ctx: Optional[OperationContext] = None
+) -> None
 
 async def create_edge(
-    label: str, from_id: GraphID, to_id: GraphID, props: Mapping[str, Any], *,
-    ctx: Optional[OperationContext]=None
+    label: str,
+    from_id: GraphID,
+    to_id: GraphID,
+    props: Mapping[str, Any],
+    *,
+    ctx: Optional[OperationContext] = None
 ) -> GraphID
-async def delete_edge(edge_id: GraphID, *, ctx: Optional[OperationContext]=None) -> None
+
+async def delete_edge(
+    edge_id: GraphID,
+    *,
+    ctx: Optional[OperationContext] = None
+) -> None
 ```
 
-**Semantics (Normative):**
+Semantics:
 
-* `props` keys **MUST** be strings; values **MUST** be JSON-serializable.
-* Create operations **SHOULD** accept `idempotency_key` and **MUST** be idempotent when provided.
-* Deletes **MUST** be idempotent: deleting a non-existent ID returns success.
+* `props` keys MUST be strings; values MUST be JSON-serializable.
+* Create ops SHOULD accept `idempotency_key` and MUST be idempotent when provided.
+* Deletes MUST be idempotent: deleting a non-existent ID is success.
 
 #### 7.3.2. Queries
 
 ```python
-async def query(*, dialect: str, text: str, params: Optional[Mapping[str, Any]]=None,
-                ctx: Optional[OperationContext]=None) -> List[Mapping[str, Any]]
+async def query(
+    *,
+    dialect: str,
+    text: str,
+    params: Optional[Mapping[str, Any]] = None,
+    ctx: Optional[OperationContext] = None
+) -> List[Mapping[str, Any]]
 
-async def stream_query(*, dialect: str, text: str, params: Optional[Mapping[str, Any]]=None,
-                       ctx: Optional[OperationContext]=None) -> AsyncIterator[Mapping[str, Any]]
+async def stream_query(
+    *,
+    dialect: str,
+    text: str,
+    params: Optional[Mapping[str, Any]] = None,
+    ctx: Optional[OperationContext] = None
+) -> AsyncIterator[Mapping[str, Any]]
 ```
 
-* `dialect` **MUST** be one advertised in capabilities.
-* `params` **MUST** be bound safely; adapters **MUST** prevent injection by disallowing string interpolation.
-* `stream_query` yields rows progressively; iterator close **MUST** free resources.
-* Deadline behavior: if budget elapses mid-stream, adapters **SHOULD** terminate promptly with `Unavailable` (Thin) or `DeadlineExceeded` (Standalone).
+* `dialect` MUST be from capabilities.
+* `params` MUST be bound safely (no string interpolation).
+* On deadline expiry:
+
+  * Thin profile SHOULD surface `Unavailable`.
+  * Standalone profile SHOULD surface `DeadlineExceeded`.
 
 ##### Streaming Finalization (Normative)
 
-When `stream_query` is exposed over a network stream:
+When exposed over the wire:
 
-* Servers **MUST**:
+1. Emit zero or more `event:"data"` frames with rows.
+2. Emit exactly one terminal frame:
 
-  1. Emit one or more **data frames** (`event: "data"`) carrying result rows as per §4.1.3.
-  2. Emit exactly one **terminal frame**:
+   * `event:"end", code:"OK"` on success; or
+   * `event:"error", ...` with normalized error.
 
-     * `event: "end", code: "OK"` on success, or
-     * `event: "error", ...` containing the normalized error envelope on failure.
+As async iterator:
 
-When `stream_query` is exposed as an in-process async iterator:
-
-* Completion via `StopAsyncIteration` **MUST** release all resources.
-* Implementations **MUST** emit exactly one terminal `observe` metric per stream (see §11.2).
-* If the deadline elapses mid-stream, implementations **MUST**:
-
-  * terminate promptly,
-  * surface `Unavailable` (Thin) or `DeadlineExceeded` (Standalone),
-  * and still emit the terminal `observe` with `ok=false` and the normalized `code`.
-
-Implementations **MUST NOT** emit multiple terminal frames/outcomes for a single stream.
+* `StopAsyncIteration` MUST release resources.
+* Implementation MUST emit one final `observe` with `ok`/`code` reflecting the terminal state.
+* No multiple terminal outcomes.
 
 #### 7.3.3. Batch Operations
 
 ```python
 async def bulk_vertices(
-    vertices: Iterable[Tuple[str, Mapping[str, Any]]], *,
-    ctx: Optional[OperationContext]=None
+    vertices: Iterable[Tuple[str, Mapping[str, Any]]],
+    *,
+    ctx: Optional[OperationContext] = None
 ) -> List[GraphID]
 
 async def batch(
-    ops: Iterable[Mapping[str, Any]], *,
-    ctx: Optional[OperationContext]=None
+    ops: Iterable[Mapping[str, Any]],
+    *,
+    ctx: Optional[OperationContext] = None
 ) -> List[Mapping[str, Any]]
 ```
 
-* Item-level atomicity: partial failures **MUST** be reported per item.
-* `batch` supports vendor-optimized pipelines; supported op codes **MUST** be documented in `capabilities.extensions`.
+* `max_batch_ops` from capabilities MUST be enforced.
+* Partial failures:
+
+  * MUST be reported per item (see §12.5).
+  * MUST NOT fail entire batch solely due to one bad item when others can commit safely.
+* Supported batch op codes MUST be discoverable via `capabilities.extensions`.
 
 ### 7.4. Dialects
 
-Supported (non-exhaustive): **Cypher**, **OpenCypher**, **Gremlin**, **GQL (ISO)**. Unknown dialects **MUST** yield `NotSupported`.
+Supported examples: `cypher`, `opencypher`, `gremlin`, `gql`.
+Unknown dialect → `NotSupported`.
 
 ### 7.5. Schema Operations (Optional)
 
-If `supports_schema_ops=true`, adapters MAY expose:
+If `supports_schema_ops=true`:
 
 ```python
-async def create_index(label: str, property: str, unique: bool=False, *, ctx: Optional[OperationContext]=None) -> None
-async def drop_index(label: str, property: str, *, ctx: Optional[OperationContext]=None) -> None
+async def create_index(
+    label: str,
+    property: str,
+    unique: bool = False,
+    *,
+    ctx: Optional[OperationContext] = None
+) -> None
+
+async def drop_index(
+    label: str,
+    property: str,
+    *,
+    ctx: Optional[OperationContext] = None
+) -> None
 ```
 
-Index creation events **MUST NOT** log sample property values.
+Must not log sample values.
 
 ### 7.6. Health
 
-Adapters **SHOULD** normalize unexpected failures in `health()` to `Unavailable("health check failed")` and still report `server`/`version` when known.
+`health()` SHOULD:
+
+* Return `{ "ok": true, "server": "...", "version": "..." }` on success.
+* On failure, normalize to `Unavailable("health check failed")` while including known `server`/`version` if possible.
 
 ---
 
@@ -591,7 +770,7 @@ Adapters **SHOULD** normalize unexpected failures in `health()` to `Unavailable(
 
 ### 8.1. Overview
 
-Standardized interface for chat-style completions with synchronous and streaming modes, token accounting, and deterministic sampling control. Capability-based model discovery provides portability.
+Standardized interface for chat-style completions, streaming, token accounting, and model discovery with consistent observability and error semantics.
 
 ### 8.2. Data Types
 
@@ -609,9 +788,9 @@ class TokenUsage:
 class LLMCompletion:
     text: str
     model: str
-    model_family: str       # e.g., "gpt", "llama", "mistral"
+    model_family: str        # e.g. "gpt", "llama", "mistral"
     usage: TokenUsage
-    finish_reason: str      # "stop" | "length" | "tool_call" | "content_filter"
+    finish_reason: str       # "stop" | "length" | "tool_call" | "content_filter"
 
 @dataclass
 class LLMChunk:
@@ -624,28 +803,40 @@ class LLMChunk:
 ### 8.3. Operations
 
 ```python
-from typing import Optional, AsyncIterator
+from typing import Optional, AsyncIterator, List, Dict
 
 async def complete(
-    *, messages: list[dict[str, str]],
-    max_tokens: Optional[int]=None, temperature: Optional[float]=None,
-    top_p: Optional[float]=None, model: Optional[str]=None,
-    system_message: Optional[str]=None, frequency_penalty: Optional[float]=None,
-    presence_penalty: Optional[float]=None, ctx: Optional[OperationContext]=None
+    *,
+    messages: List[Dict[str, str]],
+    max_tokens: Optional[int] = None,
+    temperature: Optional[float] = None,
+    top_p: Optional[float] = None,
+    model: Optional[str] = None,
+    system_message: Optional[str] = None,
+    frequency_penalty: Optional[float] = None,
+    presence_penalty: Optional[float] = None,
+    ctx: Optional[OperationContext] = None
 ) -> LLMCompletion
 
 async def stream(
-    *, messages: list[dict[str, str]],
-    max_tokens: Optional[int]=None, temperature: Optional[float]=None,
-    model: Optional[str]=None, system_message: Optional[str]=None,
-    ctx: Optional[OperationContext]=None
+    *,
+    messages: List[Dict[str, str]],
+    max_tokens: Optional[int] = None,
+    temperature: Optional[float] = None,
+    model: Optional[str] = None,
+    system_message: Optional[str] = None,
+    ctx: Optional[OperationContext] = None
 ) -> AsyncIterator[LLMChunk]
 
-async def count_tokens(text: str, *, model: Optional[str]=None,
-                       ctx: Optional[OperationContext]=None) -> int
+async def count_tokens(
+    text: str,
+    *,
+    model: Optional[str] = None,
+    ctx: Optional[OperationContext] = None
+) -> int
 ```
 
-**Message format (MUST):**
+Message format:
 
 ```json
 [
@@ -654,20 +845,37 @@ async def count_tokens(text: str, *, model: Optional[str]=None,
 ]
 ```
 
-**Validation (Normative):**
+Validation:
 
-* Roles are from `{system,user,assistant,tool}`; unknown roles → `BadRequest`.
-* `temperature ∈ [0,2]`; `top_p ∈ (0,1]`; `frequency_penalty, presence_penalty ∈ [-2,2]`; invalid ranges → `BadRequest`.
-* `count_tokens` is gated by capability `supports_count_tokens`; if `false`, return `NotSupported`.
+* `role ∈ {system,user,assistant,tool}`; else `BadRequest`.
+* `temperature ∈ [0,2]`, `top_p ∈ (0,1]`,
+  `frequency_penalty, presence_penalty ∈ [-2,2]`; else `BadRequest`.
+* `count_tokens`:
 
-**Deadline semantics:** If budget is pre-expired or elapses during execution, return `DeadlineExceeded`. Streaming MUST set `is_final=true` on the terminal chunk; if stopping due to deadline, emit a final outcome metric reflecting the error.
+  * If `supports_count_tokens=false`, MUST return `NotSupported`.
+
+Streaming:
+
+* Over wire: use frames in §4.1.3–4.1.4.
+* In-process iterator:
+
+  * Last chunk MUST have `is_final=true`.
+  * One terminal `observe` MUST be emitted.
+
+Deadline:
+
+* If deadline pre-expired or elapsed during generation:
+
+  * Return `DeadlineExceeded`.
+  * For `stream`, terminate with error frame or final chunk indicating error.
 
 ### 8.4. Model Discovery
 
-`capabilities()` **MUST** include:
+`capabilities()` MUST include:
 
 ```json
 {
+  "protocol": "llm/v1.0",
   "models": [
     {
       "name": "gpt-4.1-mini",
@@ -690,18 +898,17 @@ async def count_tokens(text: str, *, model: Optional[str]=None,
   },
   "limits": {
     "max_context_length": 128000
-  },
-  "protocol": "llm/v1.0"
+  }
 }
 ```
 
-Clients **MAY** preflight `prompt_tokens + max_tokens ≤ max_context_length` when token counting is supported.
+Clients MAY preflight `prompt_tokens + max_tokens <= max_context_length`.
 
 ### 8.5. LLM-Specific Errors
 
-* `ModelOverloaded` (subtype `Unavailable`): transient capacity pressure.
-* `ContentFiltered` (subtype `BadRequest`): provider content policy triggered.
-* `DeadlineExceeded`: budget exhausted; retryable only if deadline/size/sampling adjusted.
+* `ModelOverloaded` (`Unavailable`): retry with backoff or alternate model.
+* `ContentFiltered` (`BadRequest`): non-retryable without changing input.
+* `DeadlineExceeded`: conditionally retryable per §12.1 (reduce work/extend deadline).
 
 ---
 
@@ -709,13 +916,13 @@ Clients **MAY** preflight `prompt_tokens + max_tokens ≤ max_context_length` wh
 
 ### 9.1. Overview
 
-Standardized vector storage, search, and namespace isolation across providers with configurable distance metrics and metadata filtering.
+Standardized vector storage, similarity search, and namespace isolation with metadata filtering, distance metrics, and consistent errors.
 
 ### 9.2. Data Types
 
 ```python
-from typing import Any, Optional, NewType, List, Dict
 from dataclasses import dataclass
+from typing import Any, Optional, NewType, List, Dict
 
 VectorID = NewType('VectorID', str)
 
@@ -740,12 +947,9 @@ class QueryResult:
     total_matches: int
 ```
 
-**Spec types (aligned):**
+Spec helpers:
 
 ```python
-from dataclasses import dataclass
-from typing import List, Dict, Any, Optional
-
 @dataclass(frozen=True)
 class QuerySpec:
     vector: List[float]
@@ -753,7 +957,7 @@ class QuerySpec:
     namespace: str = "default"
     filter: Optional[Dict[str, Any]] = None
     include_metadata: bool = True
-    include_vectors: bool = False   # if False, VectorMatch.vector.vector MAY be omitted
+    include_vectors: bool = False  # if False, raw vectors MAY be omitted
 
 @dataclass(frozen=True)
 class UpsertSpec:
@@ -770,35 +974,60 @@ class DeleteSpec:
 ### 9.3. Operations
 
 ```python
-from typing import Optional
+from typing import Optional, Dict, Any
 
-async def query(spec: QuerySpec, *, ctx: Optional[OperationContext]=None) -> QueryResult
-async def upsert(spec: UpsertSpec, *, ctx: Optional[OperationContext]=None) -> dict
-async def delete(spec: DeleteSpec, *, ctx: Optional[OperationContext]=None) -> dict
-async def create_namespace(spec: dict, *, ctx: Optional[OperationContext]=None) -> dict
-async def delete_namespace(namespace: str, *, ctx: Optional[OperationContext]=None) -> dict
+async def query(
+    spec: QuerySpec,
+    *,
+    ctx: Optional[OperationContext] = None
+) -> QueryResult
+
+async def upsert(
+    spec: UpsertSpec,
+    *,
+    ctx: Optional[OperationContext] = None
+) -> Dict[str, Any]
+
+async def delete(
+    spec: DeleteSpec,
+    *,
+    ctx: Optional[OperationContext] = None
+) -> Dict[str, Any]
+
+async def create_namespace(
+    spec: Dict[str, Any],
+    *,
+    ctx: Optional[OperationContext] = None
+) -> Dict[str, Any]
+
+async def delete_namespace(
+    namespace: str,
+    *,
+    ctx: Optional[OperationContext] = None
+) -> Dict[str, Any]
 ```
 
-**Semantics (Normative):**
+Semantics:
 
-* Vector dimension **MUST** match the configured index dimension; mismatches **MUST** raise `DimensionMismatch`.
-* `query.top_k` **MUST** be > 0 and bounded by `limits.max_top_k` if present.
-* Metadata filters **MUST** be applied pre-search where supported; otherwise adapters **MUST** document post-filter behavior.
-* Scores **MUST** reflect the “higher is better” convention unless explicitly documented.
-* `include_vectors=false` MAY suppress returning raw vectors in matches; IDs/metadata remain available.
+* Vector dimensions MUST match index dimension; else `DimensionMismatch`.
+* `top_k > 0` and MUST respect `limits.max_top_k`.
+* Filters MUST be applied pre-search when supported; if post-filtering is used, behavior MUST be documented.
+* Scores adopt “higher is better” unless clearly documented otherwise.
+* `include_vectors=false`:
+
+  * Raw vectors MAY be omitted; IDs/metadata still returned.
 
 ### 9.4. Distance Metrics
 
-* **Cosine** (default)
-* **Euclidean (L2)**
-* **Dot Product**
+Adapters MUST advertise:
 
-Adapters **MUST** advertise supported metrics and scoring conventions.
+* Supported metrics (`cosine`, `euclidean`, `dot`).
+* Whether they return scores, distances, or both; and which direction is “better”.
 
 ### 9.5. Vector-Specific Errors
 
-* `DimensionMismatch` — query/upsert vector dimension incompatible (non-retryable).
-* `IndexNotReady` — background index build incomplete (retryable with `retry_after_ms`).
+* `DimensionMismatch` → HTTP 400, non-retryable.
+* `IndexNotReady` → HTTP 503, retryable with `retry_after_ms`.
 
 ---
 
@@ -806,9 +1035,7 @@ Adapters **MUST** advertise supported metrics and scoring conventions.
 
 ### 10.1. Overview
 
-Vendor-neutral, production-grade interface for generating text embeddings (single/batch), counting tokens, discovering capabilities, and health reporting. Aligns with the Common Foundation and resilience semantics.
-
-**Deliberate non-goals (Informative):** preprocessing/chunking, fine-tuning, provider-specific vector post-processing; those belong to adjacent layers.
+Vendor-neutral interface for generating embeddings (single/batch), counting tokens, and health checking, with deterministic behavior and partial-failure reporting.
 
 ### 10.2. Data Types (Formal)
 
@@ -819,9 +1046,16 @@ from typing import List, Optional, Mapping, Any
 @dataclass(frozen=True)
 class EmbeddingVector:
     vector: List[float]
-    text: Optional[str]            # MAY be omitted/redacted by provider
+    text: Optional[str]      # MAY be omitted or redacted
     model: str
     dimensions: int
+
+@dataclass(frozen=True)
+class EmbeddingFailure:
+    index: int               # index in input list
+    error: str               # normalized code, e.g. "TEXT_TOO_LONG"
+    message: Optional[str] = None
+    details: Optional[Mapping[str, Any]] = None  # SIEM-safe; no full text
 
 @dataclass(frozen=True)
 class EmbeddingResult:
@@ -829,8 +1063,10 @@ class EmbeddingResult:
     model: str
     total_tokens: Optional[int] = None
     processing_time_ms: Optional[float] = None
-    failures: Optional[List[Mapping[str, Any]]] = None  # per-item failure diagnostics
+    failures: Optional[List[EmbeddingFailure]] = None  # REQUIRED if any failures
+```
 
+```python
 @dataclass(frozen=True)
 class EmbeddingCapabilities:
     server: str
@@ -851,7 +1087,8 @@ class EmbeddingCapabilities:
 ### 10.3. Operations (Normative Signatures)
 
 ```python
-from typing import Optional, List
+from dataclasses import dataclass
+from typing import List, Optional
 
 @dataclass(frozen=True)
 class EmbedSpec:
@@ -867,40 +1104,81 @@ class BatchEmbedSpec:
     truncate: bool = True
     normalize: bool = False
 
-async def capabilities(*, ctx: Optional[OperationContext]=None) -> EmbeddingCapabilities
+async def capabilities(
+    *,
+    ctx: Optional[OperationContext] = None
+) -> EmbeddingCapabilities
 
-async def embed(spec: EmbedSpec, *, ctx: Optional[OperationContext]=None) -> EmbeddingResult
+async def embed(
+    spec: EmbedSpec,
+    *,
+    ctx: Optional[OperationContext] = None
+) -> EmbeddingResult
 
-async def embed_batch(spec: BatchEmbedSpec, *, ctx: Optional[OperationContext]=None) -> EmbeddingResult
+async def embed_batch(
+    spec: BatchEmbedSpec,
+    *,
+    ctx: Optional[OperationContext] = None
+) -> EmbeddingResult
 
-async def count_tokens(text: str, *, model: Optional[str]=None,
-                       ctx: Optional[OperationContext]=None) -> int
+async def count_tokens(
+    text: str,
+    *,
+    model: Optional[str] = None,
+    ctx: Optional[OperationContext] = None
+) -> int
 
-async def health(*, ctx: Optional[OperationContext]=None) -> dict  # { ok, server, version, models }
+async def health(
+    *,
+    ctx: Optional[OperationContext] = None
+) -> Mapping[str, Any]  # { "ok": bool, "server": str, "version": str, "models": [...] }
 ```
 
 ### 10.4. Errors (Embedding-Specific)
 
-* `TextTooLong` (subtype of `BadRequest`) — input exceeds model maximum when `truncate=false`.
-* `ModelNotAvailable` (subtype of `NotSupported` or `Unavailable`) — requested model not present/disabled.
-* `DeadlineExceeded` — budget exhausted (retryable only if deadline extended or inputs reduced).
+* `TextTooLong` (`BadRequest`):
 
-**Mitigation hints (SHOULD):** `retry_after_ms`, `resource_scope` (`"model"|"token_limit"|"rate_limit"`), `suggested_batch_reduction` (percentage).
+  * Raised when `truncate=false` and input exceeds `max_text_length`.
+* `ModelNotAvailable` (`NotSupported` or `Unavailable`):
+
+  * Model missing, disabled, or capacity-constrained.
+* `DeadlineExceeded`:
+
+  * Budget exhausted; conditionally retryable per §12.1 only if request is reduced.
+
+Implementations SHOULD include hints:
+
+```json
+{
+  "ok": false,
+  "code": "TEXT_TOO_LONG",
+  "error": "TextTooLong",
+  "message": "Input exceeds 16000 tokens",
+  "details": {
+    "max_text_length": 16000,
+    "suggested_batch_reduction": 0.5
+  }
+}
+```
 
 ### 10.5. Capabilities
 
 Adapters MUST declare:
 
-* `server`, `version`, `supported_models` (list of strings).
-* Optional limits: `max_batch_size`, `max_text_length`, `max_dimensions`.
-* Flags: `supports_normalization`, `normalizes_at_source`, `supports_truncation`, `supports_token_counting`, `supports_deadline`, `idempotent_operations`, `supports_multi_tenant`.
+* `server`, `version`, `supported_models`.
+* Optional: `max_batch_size`, `max_text_length`, `max_dimensions`.
+* Booleans: `supports_normalization`, `normalizes_at_source`, `supports_truncation`, `supports_token_counting`, `supports_deadline`, `idempotent_operations`, `supports_multi_tenant`.
 
 ### 10.6. Semantics
 
-* `model` MUST be present in `supported_models`.
-* If `normalize=true` and unsupported, return `NotSupported`.
-* `embed_batch` MUST enforce `max_batch_size` and validate each `text`.
-* If `truncate=false` and a text exceeds `max_text_length`, raise `TextTooLong`.
+* `model` MUST be in `supported_models`.
+* If `normalize=true` but unsupported → `NotSupported`.
+* `embed_batch`:
+
+  * MUST validate each text.
+  * MUST enforce `max_batch_size` if present.
+  * On per-item failures, MUST populate `failures` with indices; overall response MAY be `ok=true` with `code="PARTIAL_SUCCESS"` at envelope level.
+* If `truncate=false` and text too long → `TextTooLong`.
 * Deadline pre-expired or elapsed → `DeadlineExceeded`.
 
 ---
@@ -909,46 +1187,113 @@ Adapters MUST declare:
 
 ### 11.1. Unified Error Handling
 
-Centralize error mapping to the normalized taxonomy; use mitigation hints (`retry_after_ms`, `suggested_*`) for adaptive clients.
+* ALL adapters MUST map provider-specific errors to common taxonomy (§6.3).
+* Error envelopes MUST include `code` and `message`.
+* SHOULD include:
 
-* **MUST:** Normalize provider-/vendor-specific errors into Common §6.3 classes and populate `code` (string) + human-readable `message`.
-* **SHOULD:** Provide `retry_after_ms`, `throttle_scope`, and `suggested_batch_reduction` (when relevant) per §12.4.
-* **MUST:** Preserve original provider error IDs in `details.provider_error_id` (if available) for audit.
+  * `retry_after_ms` for throttling.
+  * `throttle_scope`.
+  * `suggested_batch_reduction` when relevant.
+  * `details.provider_error_id` when available.
 
 ### 11.2. Consistent Observability
 
-Emit `observe` and `counter` across components (`graph|llm|vector|embedding`) with common labels (`op`, `code`, `tenant_hash`). Never log raw prompts, vectors, source texts, or tenant identifiers.
+* Use `MetricsSink` across `graph|llm|vector|embedding`.
+* MUST:
 
-* **MUST:** Emit exactly one terminal `observe` for streaming operations capturing the final outcome (`ok=false` with `code` on error).
-* **MUST:** Include `deadline_bucket` selected from `<1s|<5s|<15s|<60s|>=60s` (no custom buckets without a major version bump).
-* **SHOULD:** Include `cache_hit`, `rows` or `matches_returned`, and `batch_size` where applicable.
+  * Emit exactly one final `observe` for each operation.
+  * For streams, final `observe` reflects overall success/failure.
+  * Include `deadline_bucket` from `<1s|<5s|<15s|<60s|>=60s`.
+* SHOULD:
+
+  * Include `cache_hit`, `rows`, `matches_returned`, `batch_size`.
+* MUST NOT:
+
+  * Log raw prompts, vectors, graph queries, or raw tenant IDs.
 
 ### 11.3. Context Propagation
 
-Create one `OperationContext` at ingress and pass through all protocol calls; update remaining time budget between calls.
+* Single `OperationContext` flows through:
 
-* **MUST:** Forward `traceparent` verbatim.
-* **SHOULD:** Recompute remaining `deadline_ms` before chained downstream operations.
+  * Graph → LLM → Embedding → Vector, etc.
+* MUST:
+
+  * Forward `traceparent` unchanged.
+* SHOULD:
+
+  * Recompute remaining deadline between calls.
 
 ### 11.4. Idempotency and Exactly-Once
 
-Where `idempotency_key` is accepted, mutations MUST be exactly-once or return the prior committed result.
+* For operations accepting `idempotency_key`:
 
-* **MUST:** Treat duplicate `idempotency_key` submissions as safe replays.
-* **SHOULD:** Record minimal, SIEM-safe idempotency audit fields.
+  * MUST treat duplicate keys as safe replays.
+  * MUST either:
+
+    * Reuse previous result, or
+    * Ensure no duplicate side-effects.
+* SHOULD:
+
+  * Record SIEM-safe idempotency audits.
 
 ### 11.5. Pagination and Streaming
 
-* **Graph:** MAY stream rows; iterator close MUST release resources.
-* **LLM:** MUST stream with a single terminal chunk setting `is_final=true`.
-* **Vector:** Pagination support is capability-gated; if unsupported, MUST document limits.
-* **Embedding:** V1.0 is request/response (no streaming).
+* Graph:
+
+  * MAY stream query results; MUST obey streaming semantics.
+* LLM:
+
+  * `stream` MUST obey frame semantics and final chunk semantics.
+* Vector:
+
+  * Pagination support is capability-gated; if unsupported, MUST publish limits.
+* Embedding:
+
+  * V1.0 is request/response only (no streaming).
 
 ### 11.6. Caching (Implementation Guidance)
 
-* **Eligible at base:** Embedding (deterministic outputs), LLM `complete` (key includes sampling params).
-* **Router/infra preferred:** Vector/Graph results due to variability.
-* **Keying guidance:** Use content hashes; **MUST NOT** include raw content. Include model and parameters. Include tenant hash for isolation.
+* Good candidates: Embedding, deterministic LLM completions.
+* Router-level preferred for: Graph, Vector.
+* Cache key MUST:
+
+  * Use content hashes (e.g., `sha256`), not raw text.
+  * Include `model`, parameters, and `tenant_hash` when `cache_scope="tenant"`.
+* When `cache.supports_tags=true`:
+
+  * Adapters SHOULD use `cache_tags` for grouping entries for invalidation.
+* `cache_scope` and `cache_tags` are hints:
+
+  * Backends MAY ignore them without violating the spec.
+* Caches MUST respect tenant isolation.
+
+### 11.7. Best-Effort Distributed Transactions
+
+To coordinate cross-protocol operations (e.g., embed + upsert + graph edge):
+
+```python
+from typing import Protocol, Callable, List, Any
+
+class TransactionCoordinator(Protocol):
+    async def with_transaction(
+        self,
+        ops: List[Callable[[], Any]],
+        ctx: OperationContext
+    ) -> List[Any]:
+        """
+        Execute operations with best-effort atomicity across providers.
+
+        Requirements:
+        - On full success: return list of results.
+        - On failure:
+          - MUST raise CompositeError containing per-op status.
+          - SHOULD attempt provider-level rollback where supported.
+          - MUST NOT violate tenant isolation.
+          - MUST NOT assume global ACID across vendors.
+        """
+```
+
+This pattern is RECOMMENDED but OPTIONAL. Implementations MUST document which operations support compensation and how.
 
 ---
 
@@ -956,51 +1301,103 @@ Where `idempotency_key` is accepted, mutations MUST be exactly-once or return th
 
 ### 12.1. Retry Semantics
 
-**Retryable:** `TransientNetwork`, `ResourceExhausted` (respect `retry_after_ms`), `Unavailable`, `IndexNotReady`.
-**Conditionally Retryable:** `DeadlineExceeded` (only if deadline extended or work reduced).
-**Non-Retryable:** `BadRequest`, `AuthError`, `NotSupported`, `DimensionMismatch`, `ContentFiltered`, `TextTooLong` (unless truncation enabled).
+**Retryable:**
+
+* `TransientNetwork`
+* `ResourceExhausted` (honor `retry_after_ms`)
+* `Unavailable`
+* `IndexNotReady`
+
+**Conditionally Retryable: `DeadlineExceeded`**
+
+A client MAY retry only if it changes the request:
+
+1. Extend `deadline_ms` in new `OperationContext`.
+2. LLM: reduce `max_tokens`, simplify prompt, or adjust settings to reduce work.
+3. Embedding: reduce `batch_size`, shorten texts, or set `truncate=true`.
+4. Vector: reduce `top_k`, simplify filters.
+5. Graph: reduce traversal depth/complexity or limit result rows.
+
+Without such changes, `DeadlineExceeded` MUST be treated as non-retryable.
+
+**Non-Retryable:**
+
+* `BadRequest`, `AuthError`, `NotSupported`
+* `DimensionMismatch`, `ContentFiltered`, `TextTooLong` (unless enabling truncation or splitting text)
+* Other validation errors.
 
 ### 12.2. Backoff and Jitter (RECOMMENDED)
 
-Exponential backoff (100–500 ms base, ×2 factor, 10–30 s cap) with **full jitter**. Prefer server-provided `retry_after_ms` when present.
+* Exponential backoff:
+
+  * Base: 100–500 ms
+  * Factor: ×2
+  * Cap: 10–30 s
+* Use **full jitter**.
+* Prefer server `retry_after_ms` when present.
 
 ### 12.3. Circuit Breaking
 
-Fail fast with `Unavailable("circuit open")` when breaker is open; include `retry_after_ms` where possible to reduce thundering herds. Breakers are an **implementation profile** feature (§5.3).
+* On repeated `Unavailable`/`TransientNetwork`:
+
+  * MAY open circuit.
+  * While open:
+
+    * Fail fast with normalized `Unavailable("circuit open")`.
+    * SHOULD include indicative `retry_after_ms`.
+* Circuit breakers are per-tenant and per-operation where possible.
 
 ### 12.4. Error Mapping Table (Normative)
 
-| Error Class        | HTTP Mapping | Retryable    | Client Guidance                                                |
-| ------------------ | ------------ | ------------ | -------------------------------------------------------------- |
-| BadRequest         | 400          | No           | Fix parameters; do not retry                                   |
-| AuthError          | 401/403      | No           | Refresh credentials; verify scopes                             |
-| ResourceExhausted  | 429          | Yes          | Back off; **honor** `retry_after_ms`; reduce concurrency/batch |
-| TransientNetwork   | 502/504      | Yes          | Exponential backoff + jitter; consider failover                |
-| Unavailable        | 503          | Yes          | Trip/bias breaker; failover if possible                        |
-| NotSupported       | 501/400      | No           | Probe with `capabilities()`; use alternative feature           |
-| DimensionMismatch* | 400          | No           | Align dimensions to index                                      |
-| IndexNotReady*     | 503          | Yes          | Retry after `retry_after_ms`                                   |
-| ModelOverloaded**  | 503          | Yes          | Reduce rate; try alternate family/model                        |
-| ContentFiltered**  | 400          | No           | Sanitize/adjust prompt                                         |
-| TextTooLong***     | 400          | No           | Enable truncation or split text                                |
-| DeadlineExceeded   | 504          | *It depends* | Extend deadline or reduce work (max_tokens, batch size, etc.)  |
+| Error Class        | HTTP    | Retryable   | Client Guidance                                               |
+| ------------------ | ------- | ----------- | ------------------------------------------------------------- |
+| BadRequest         | 400     | No          | Fix request; do not retry                                     |
+| AuthError          | 401/403 | No          | Refresh credentials; fix scopes                               |
+| ResourceExhausted  | 429     | Yes         | Back off; honor `retry_after_ms`; reduce concurrency/batch    |
+| TransientNetwork   | 502/504 | Yes         | Retry with backoff + jitter; consider failover                |
+| Unavailable        | 503     | Yes         | Retry; use breaker/failover                                   |
+| NotSupported       | 400/501 | No          | Use `capabilities()`; switch feature/model                    |
+| DimensionMismatch* | 400     | No          | Fix vector dimension                                          |
+| IndexNotReady*     | 503     | Yes         | Retry after `retry_after_ms`                                  |
+| ModelOverloaded**  | 503     | Yes         | Retry with backoff; switch model/family                       |
+| ContentFiltered**  | 400     | No          | Sanitize input                                                |
+| TextTooLong***     | 400     | No          | Truncate or chunk inputs                                      |
+| DeadlineExceeded   | 504     | Conditional | Retry only if reducing work or extending deadline (see §12.1) |
 
-* Vector-specific.
-  ** LLM-specific.
-  *** Embedding-specific.
+* Vector-specific
+** LLM-specific
+*** Embedding-specific
 
 ### 12.5. Partial Failure Contracts
 
-Batch APIs MUST report per-item status. Non-atomic batches MUST NOT fail the entire batch due to a single item.
+For non-atomic batch operations (e.g., `embed_batch`, vector `upsert`, graph `batch`):
+
+* Transport-level `ok` may be `true` with `code="PARTIAL_SUCCESS"` when:
+
+  * At least one item succeeded.
+  * At least one item failed.
+* Item-level failures MUST include:
+
+  * `index` (input position),
+  * `code` (normalized),
+  * optional `message`,
+  * optional SIEM-safe `details`.
+* Successful items MUST appear in normal result collections.
+* MUST NOT drop failed items silently.
+
+`EmbeddingResult.failures` is the normative pattern; other batch APIs SHOULD mirror it.
 
 ### 12.6. Backpressure Integration
 
-Expose per-tenant semaphores to bound concurrency:
+Implement cooperative backpressure, e.g.:
 
 ```python
-async with backpressure.acquire(f"{tenant}:{component}:{op}"):
+async with backpressure.acquire(f"{ctx.tenant or 'public'}:{component}:{op}"):
     return await adapter.operation(...)
 ```
+
+* Limits SHOULD be per-tenant where applicable.
+* On saturation, surface `ResourceExhausted` or `Unavailable`.
 
 ---
 
@@ -1008,13 +1405,20 @@ async with backpressure.acquire(f"{tenant}:{component}:{op}"):
 
 ### 13.1. Metrics Taxonomy (MUST)
 
-**Operational:** Latency (p50/p90/p99) by `component+op+code`, error rate by class, concurrency/queue length.
-**Business:** LLM tokens processed, vector upserts/searches, graph ops executed, **texts embedded**.
-**Resource:** Cache hit ratios, rate-limit utilization, breaker state.
+Track:
+
+* Latency (p50/p90/p99) by `component`, `op`, `code`.
+* Error rate by normalized class.
+* Concurrency and queue length.
+* LLM: tokens processed.
+* Vector: upserts, queries.
+* Graph: CRUD/query volume.
+* Embedding: texts/embeddings processed.
+* Cache hit ratios; breaker state.
 
 ### 13.2. Structured Logging (MUST)
 
-SIEM-safe logs (examples):
+Examples:
 
 ```json
 {
@@ -1035,16 +1439,25 @@ SIEM-safe logs (examples):
   "op": "embed_batch",
   "tenant_hash": "7d9f53d2f1ab",
   "trace_id": "def-456",
-  "status": "ok",
+  "status": "partial_success",
   "latency_ms": 37.8,
   "texts": 32,
-  "model": "example-embed-1"
+  "model": "example-embed-1",
+  "failures": 1
 }
 ```
 
+Logs MUST be SIEM-safe per §15.
+
 ### 13.3. Distributed Tracing (SHOULD)
 
-Propagate `traceparent`. Use standard span attributes (`component`, `op`, `tenant_hash`, `model`, counts). For LLM streaming, emit child events per chunk. Record one **final** stream outcome observe after completion/error.
+* Propagate `traceparent`.
+* Use spans with attributes:
+
+  * `component`, `op`, `tenant_hash`, `model`, counts.
+* For streams:
+
+  * Child events per chunk are OPTIONAL; final span status MUST match final stream outcome.
 
 ---
 
@@ -1052,37 +1465,54 @@ Propagate `traceparent`. Use standard span attributes (`component`, `op`, `tenan
 
 ### 14.1. Tenant Isolation (MUST)
 
-* **Graph:** separate DBs/schemas or RBAC-scoped labels.
-* **LLM:** per-tenant keys or dedicated instances.
-* **Vector:** per-tenant namespaces/collections with ACLs.
-* **Embedding:** per-tenant API keys; no cross-tenant caches without isolation keys.
+* Graph: separate schemas/DBs or strong RBAC.
+* LLM: per-tenant credentials; no cross-tenant training without explicit policy.
+* Vector: namespaces/collections scoped per tenant.
+* Embedding: per-tenant API keys; caches keyed by tenant hash.
 
 ### 14.2. Authentication and Authorization (MUST)
 
-Credentials managed at adapter init; rotate via secret stores; never emit secrets in telemetry or errors.
+* Credentials provisioned at adapter initialization.
+* MUST NOT be logged or echoed.
+* Authorization checks MUST align with tenant isolation and operation type.
 
 ### 14.3. Threat Model (SHOULD)
 
-Address idempotency-key spoofing, prompt/graph injection, vector/embedding poisoning, and unbounded traversals via rate limiting, schema constraints, and timeouts.
+Implementations SHOULD address:
+
+* Prompt and query injection.
+* Vector/embedding poisoning.
+* Idempotency-key spoofing.
+* Resource exhaustion / DoS.
+* Cross-tenant leakage.
+* Tool/model misuse.
 
 ### 14.4. Mitigation Matrix (Normative)
 
-| Threat Category                | Component         | MUST                                                                                    | SHOULD                                                                                    |
-| ------------------------------ | ----------------- | --------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
-| Injection (prompt/query)       | LLM, Graph        | Parameterized bindings; reject unknown roles/dialects; validate inputs per §§7.3.2, 8.3 | Static allowlists for dialects/models; strict prompt templates with placeholders          |
-| Data exfiltration via logs     | All               | SIEM-safe telemetry; never log prompts/vectors/raw tenant IDs (§§6.4, 15)               | Field-level redaction lists; log retention ≤30 days                                       |
-| Idempotency-key spoofing       | All mutating ops  | Treat duplicate keys as replay; exactly-once semantics (§11.4)                          | HMAC/nonce-bounded idempotency keys per tenant with expiry                                |
-| Poisoning (vectors/embeddings) | Vector, Embedding | Validate dimensions; reject NaN/Inf; enforce namespace ACLs (§§9.2–9.5, 14.2)           | Outlier detection on norms; quarantine or review suspicious batches                       |
-| Resource exhaustion / DoS      | All               | Enforce deadlines; rate limits per tenant (§§6.1, 12.1–12.3)                            | Adaptive backoff with full jitter; circuit breakers tuned via error codes and utilization |
-| Cross-tenant data leakage      | All               | Strict tenant isolation; cache keys include tenant hash (§§14.1, 11.6)                  | Periodic isolation/segregation tests; policy-as-code checks in CI/CD                      |
-| Tool/model misuse              | LLM               | Enforce sampling parameter ranges; normalize `ContentFiltered`                          | Guardrails and policies for model/family fallback                                         |
-| Unbounded traversals           | Graph             | Limits/timeouts on depth/rows; schema and RBAC constraints                              | Configurable caps for traversal; monitoring alerts on abnormal traversal patterns         |
+| Threat Category                | Component         | MUST                                                   | SHOULD                                                           |
+| ------------------------------ | ----------------- | ------------------------------------------------------ | ---------------------------------------------------------------- |
+| Injection (prompt/query)       | LLM, Graph        | Parameterized bindings; strict role/dialect validation | Allowlist dialects/models; use templates and escape user content |
+| Data exfiltration via logs     | All               | SIEM-safe logs; no prompts/vectors/raw tenants         | Field redaction; retention ≤30 days                              |
+| Idempotency-key spoofing       | All mutating      | Treat duplicates as replays; exactly-once semantics    | Use HMAC/nonce-scoped keys with TTL                              |
+| Poisoning (vectors/embeddings) | Vector, Embedding | Validate dimensions; reject NaN/Inf; enforce ACLs      | Outlier detection; quarantine suspicious batches                 |
+| Resource exhaustion / DoS      | All               | Enforce deadlines; per-tenant rate limits              | Adaptive backoff; tuned circuit breakers                         |
+| Cross-tenant leakage           | All               | Strict tenant isolation; tenant in cache keys          | Periodic isolation tests; policy-as-code in CI/CD                |
+| Tool/model misuse              | LLM               | Enforce param ranges; map filters to `ContentFiltered` | Guardrails and policies for model fallback                       |
+| Unbounded traversals           | Graph             | Depth/row limits; timeouts; schema/RBAC                | Configurable caps; anomaly alerts on traversals                  |
 
 ---
 
 ## 15. Privacy Considerations
 
-Do not log prompts, source texts, vectors, or raw tenant IDs. Hash tenant identifiers, time-bound log retention (≤30 days recommended), and require explicit, access-controlled opt-in for content retention. Provide DSAR-compatible export/delete pathways where applicable.
+* MUST NOT log:
+
+  * Raw prompts, source texts, vectors, or tenant IDs.
+* SHOULD:
+
+  * Hash tenant identifiers.
+  * Limit log retention (≤30 days recommended).
+  * Provide DSAR-aligned mechanisms for deletion/exports where applicable.
+* Content retention for training/analytics MUST be explicit, access-controlled, and policy-governed.
 
 ---
 
@@ -1090,23 +1520,50 @@ Do not log prompts, source texts, vectors, or raw tenant IDs. Hash tenant identi
 
 ### 16.1. Latency Targets (Indicative)
 
-* **Graph:** CRUD 1–10 ms; queries 10–1000 ms; batch 100–5000 ms.
-* **LLM:** token counting 1–5 ms; completion 100–30000 ms; streaming progressive.
-* **Vector:** search 1–100 ms; batch upsert 10–1000 ms; index 1000–60000 ms.
-* **Embedding:** single 5–50 ms; batch 10–1000 ms; token counting 1–5 ms.
+* Graph:
 
-Adapters SHOULD surface p90/p99 per op in `capabilities().limits`.
+  * CRUD: 1–10 ms
+  * Queries: 10–1000 ms
+  * Batch: 100–5000 ms
+* LLM:
+
+  * Token counting: 1–5 ms
+  * Completion: 100–30000 ms (model-dependent)
+* Vector:
+
+  * Search: 1–100 ms
+  * Batch upsert: 10–1000 ms
+* Embedding:
+
+  * Single: 5–50 ms
+  * Batch: 10–1000 ms
+
+Adapters SHOULD expose observed p90/p99 via `capabilities.limits` or metrics.
 
 ### 16.2. Concurrency Limits
 
-Expose `concurrency`, `rate_limit_qps`, `max_batch_ops/top_k`, and memory considerations in capabilities.
+* `capabilities.limits` SHOULD include:
+
+  * `concurrency`
+  * `rate_limit_qps`
+  * `max_batch_ops` / `max_top_k`
+* Clients SHOULD respect published limits.
 
 ### 16.3. Caching Strategies
 
-* **LLM:** cache keyed by normalized messages + sampling params + `system` hash.
-* **Vector:** generally router-layer; if implemented, fingerprint the full `QuerySpec`.
-* **Graph:** fingerprint `dialect + text + params`.
-* **Embedding:** content-addressable `(model, normalize, sha256(text))`; record only hashes in telemetry.
+* Embeddings:
+
+  * Content-addressable by `(model, normalize, sha256(text))`.
+* LLM:
+
+  * Cache deterministic outputs only; keys include sampling params & system hash.
+* Vector:
+
+  * Prefer router-layer caching; key by full query spec hash.
+* Graph:
+
+  * Cache read-only queries keyed by `dialect + text + params` hash.
+* Caches MUST respect tenant isolation.
 
 ---
 
@@ -1114,26 +1571,50 @@ Expose `concurrency`, `rate_limit_qps`, `max_batch_ops/top_k`, and memory consid
 
 ### 17.1. Adapter Pattern
 
-Use base classes to centralize validation, error normalization, and metrics; focus provider code on business logic.
+* Centralize:
 
-* **MUST:** Keep protocol validation and taxonomy mapping in base layers.
-* **SHOULD:** Implement provider-specific adapters as thin shims that translate to provider SDKs.
-* **SHOULD:** Expose a `capabilities()` probe early and cache results with short TTL.
+  * Validation
+  * Error normalization
+  * Metrics/tracing
+* Provider-specific shims:
+
+  * Translate to provider SDK.
+* `capabilities()`:
+
+  * SHOULD be implemented and cached with short TTL.
 
 ### 17.2. Validation (MUST)
 
-Reject empty labels/texts, negative `top_k`, NaN/Inf vectors; enforce JSON-serializable `props/metadata`; validate message roles and `max_tokens` vs. window; enforce embedding `max_text_length` and `max_batch_size`; enforce sampling parameter ranges.
+Adapters MUST:
 
-* **Graph:** Validate dialect membership and params binding.
-* **LLM:** Validate roles, sampling ranges, and context length (when counting is supported).
-* **Vector:** Enforce exact dimension matching; guard `top_k` bounds.
-* **Embedding:** Enforce `truncate` behavior; return `TextTooLong` when disallowed.
+* Reject:
+
+  * Empty labels where disallowed.
+  * Negative `top_k`.
+  * NaN/Inf vectors.
+* Enforce:
+
+  * JSON-serializable `props/metadata`.
+  * Valid message roles & sampling ranges.
+  * Context-length limits where known.
+  * Embedding `max_text_length` / `max_batch_size`.
+  * Vector dimension matching.
+* Apply:
+
+  * `TextTooLong`, `DimensionMismatch`, etc., per contract.
 
 ### 17.3. Testing
 
-**Unit:** dimension mismatch, role/parameter validation, error mapping, batching limits.
-**Integration:** end-to-end pipelines (Graph → LLM → Vector → Embedding).
-**Chaos:** simulate `Unavailable`, timeouts, and rate-limit storms; verify backoff and breaker behavior; ensure idempotence and stream resource release.
+* Unit:
+
+  * Validation, error mapping, idempotency, partial-failure encoding.
+* Integration:
+
+  * Graph → LLM → Embedding → Vector flows.
+* Chaos:
+
+  * Inject `Unavailable`, rate-limits, timeouts.
+  * Verify retries, breakers, and that idempotency + streaming cleanup work.
 
 ---
 
@@ -1141,23 +1622,30 @@ Reject empty labels/texts, negative `top_k`, NaN/Inf vectors; enforce JSON-seria
 
 ### 18.1. Semantic Versioning (MUST)
 
-Use **MAJOR.MINOR.PATCH**:
+Use `MAJOR.MINOR.PATCH`:
 
-* **MAJOR** — breaking changes.
-* **MINOR** — additive, backward-compatible changes.
-* **PATCH** — non-breaking fixes/docs.
+* MAJOR: breaking.
+* MINOR: additive, compatible.
+* PATCH: fixes, clarifications.
 
 ### 18.2. Version Identification and Negotiation
 
-Clients MAY specify `X-Adapter-Protocol: {component}/v{major}.{minor}`. Adapters MUST reject incompatible majors with `NotSupported` and SHOULD advertise supported versions in `capabilities.protocol`.
+* Clients MAY send: `X-Adapter-Protocol: {component}/v1.0`.
+* Adapters MUST:
+
+  * Reject unsupported major versions with `NotSupported`.
+  * Advertise supported versions in `capabilities.protocol`.
 
 ### 18.3. Backward Compatibility
 
-Guaranteed for additive parameters/methods and new capability flags. Not guaranteed for changing required params, removing elements, or altering error semantics outside a major.
+* Additive fields/flags/methods within `v1.x` MUST be backward compatible.
+* Behavior changes requiring clients to change MUST wait for `v2.0`.
 
 ### 18.4. Deprecation Policy
 
-Announce, warn at runtime (where feasible), maintain ≥1 major, then remove in the subsequent major.
+* Announce deprecations.
+* MAY emit runtime warnings (e.g., headers, logs).
+* Maintain deprecated features for at least one minor version before removal in next major.
 
 ---
 
@@ -1179,7 +1667,7 @@ No IANA actions required.
 
 ### 20.2. Informative References
 
-* Corpus GitHub Repository — [https://github.com/adapter-sdk](https://github.com/adapter-sdk)
+* Corpus GitHub Repository — `https://github.com/adapter-sdk`
 
 ---
 
@@ -1187,7 +1675,7 @@ No IANA actions required.
 
 Corpus Working Group
 Email: [standards@adaptersdk.org](mailto:standards@adaptersdk.org)
-GitHub: [https://github.com/adapter-sdk/standards](https://github.com/adapter-sdk/standards)
+GitHub: `https://github.com/adapter-sdk/standards`
 
 ---
 
@@ -1195,13 +1683,19 @@ GitHub: [https://github.com/adapter-sdk/standards](https://github.com/adapter-sd
 
 ```python
 import time, random, asyncio
+from typing import Any, Mapping
+
+# Construct a shared context
+now_ms = int(time.time() * 1000)
 ctx = OperationContext(
     request_id="req_01HZX...",
     idempotency_key="idem_64f0...",
-    deadline_ms=int(time.time()*1000)+30000,
+    deadline_ms=now_ms + 30000,
     traceparent="00-4bf9...-00f0...-01",
     tenant="acme-corp",
-    attrs={"user": "u_12345"}
+    attrs={"user": "u_12345"},
+    cache_scope="tenant",
+    cache_tags=["kb", "user:u_12345"]
 )
 
 # 1) Graph query for related documents
@@ -1215,13 +1709,15 @@ graph_rows = await graph_adapter.query(
     ctx=ctx
 )
 
-# 2) LLM summarization
+doc_ids = [r["doc_id"] for r in graph_rows]
+
+# 2) LLM summarization of those docs
 summary = await llm_adapter.complete(
     messages=[
         {"role": "system", "content": "Summarize tersely."},
         {
             "role": "user",
-            "content": f"Summarize docs: {[r['doc_id'] for r in graph_rows]}"
+            "content": f"Summarize docs: {doc_ids}"
         }
     ],
     max_tokens=256,
@@ -1230,33 +1726,56 @@ summary = await llm_adapter.complete(
     ctx=ctx
 )
 
-# 3) Embedding + Vector search
-embedding = embed(summary.text)  # implementation-specific
-qr = await vector_adapter.query(
-    QuerySpec(
-        vector=embedding,
-        top_k=10,
-        namespace="acme.docs",
-        filter={"doc_type": "kb", "lang": {"$in": ["en"]}}
+# 3) Embedding + Vector search for similar docs
+embed_result = await embedding_adapter.embed(
+    EmbedSpec(
+        text=summary.text,
+        model="example-embed-1",
+        truncate=True,
+        normalize=True
     ),
     ctx=ctx
 )
-```
 
-**Resilience loop (backoff + jitter):**
+embedding_vec = embed_result.embeddings[0].vector
 
-```python
+qr = await vector_adapter.query(
+    QuerySpec(
+        vector=embedding_vec,
+        top_k=10,
+        namespace="acme.docs",
+        filter={"doc_type": "kb", "lang": {"$in": ["en"]}},
+        include_metadata=True,
+        include_vectors=False
+    ),
+    ctx=ctx
+)
+
+# 4) Resilient upsert with backoff (illustrative)
 for attempt in range(5):
     try:
-        res = await vector_adapter.upsert(UpsertSpec(...), ctx=ctx)
+        await vector_adapter.upsert(
+            UpsertSpec(
+                vectors=[
+                    Vector(
+                        id="doc:new",
+                        vector=embedding_vec,
+                        metadata={"source": "summary"},
+                        namespace="acme.docs"
+                    )
+                ]
+            ),
+            ctx=ctx
+        )
         break
     except ResourceExhausted as e:
-        await asyncio.sleep((e.retry_after_ms or 500) / 1000)
+        delay_ms = getattr(e, "retry_after_ms", None) or 500
+        await asyncio.sleep(delay_ms / 1000)
     except (TransientNetwork, Unavailable):
-        sleep = min(2**attempt * 0.2, 5.0) * random.random()
+        sleep = min((2 ** attempt) * 0.2, 5.0) * random.random()
         await asyncio.sleep(sleep)
     except DeadlineExceeded:
-        # increase deadline or reduce work before retrying
+        # Further retries without changing workload/deadline would violate §12.1
         break
 ```
 
@@ -1264,7 +1783,7 @@ for attempt in range(5):
 
 ## Appendix B — Capability Shapes (Illustrative)
 
-**Graph**
+### Graph
 
 ```json
 {
@@ -1282,6 +1801,11 @@ for attempt in range(5):
     "max_batch_ops": 2000,
     "concurrency": 128
   },
+  "cache": {
+    "supports_tags": true,
+    "max_ttl_ms": 600000,
+    "invalidation_webhook": false
+  },
   "extensions": {
     "vendor:storage": "cassandra",
     "read_after_write_consistency": "session"
@@ -1289,7 +1813,7 @@ for attempt in range(5):
 }
 ```
 
-**LLM**
+### LLM
 
 ```json
 {
@@ -1309,6 +1833,11 @@ for attempt in range(5):
     "temperature_range": [0.0, 2.0],
     "top_p_range": [0.0, 1.0]
   },
+  "cache": {
+    "supports_tags": true,
+    "max_ttl_ms": 300000,
+    "invalidation_webhook": true
+  },
   "models": [
     {
       "name": "gpt-4.1-mini",
@@ -1320,7 +1849,7 @@ for attempt in range(5):
 }
 ```
 
-**Vector**
+### Vector
 
 ```json
 {
@@ -1337,20 +1866,26 @@ for attempt in range(5):
     "max_top_k": 1000,
     "max_batch": 1000
   },
+  "cache": {
+    "supports_tags": false
+  },
   "extensions": {
     "metric_default": "cosine"
   }
 }
 ```
 
-**Embedding**
+### Embedding
 
 ```json
 {
   "server": "embed-service",
   "version": "2025-01-15",
   "protocol": "embedding/v1.0",
-  "supported_models": ["example-embed-1", "example-embed-2"],
+  "supported_models": [
+    "example-embed-1",
+    "example-embed-2"
+  ],
   "max_batch_size": 512,
   "max_text_length": 16000,
   "max_dimensions": 1536,
@@ -1360,17 +1895,21 @@ for attempt in range(5):
   "supports_token_counting": true,
   "supports_deadline": true,
   "idempotent_operations": true,
-  "supports_multi_tenant": true
+  "supports_multi_tenant": true,
+  "cache": {
+    "supports_tags": true,
+    "max_ttl_ms": 3600000
+  }
 }
 ```
 
 ---
 
-## Appendix C — Wire-Level Envelopes (Optional)
+## Appendix C — Wire-Level Envelopes
 
-**Note:** The envelopes in this appendix follow the **canonical wire-first** rules in §4.1 and are normative for on-the-wire behavior; code snippets elsewhere are illustrative only.
+These examples apply the canonical rules in §4.1.
 
-**Request**
+**Embedding Batch Request**
 
 ```json
 {
@@ -1378,36 +1917,70 @@ for attempt in range(5):
   "ctx": {
     "request_id": "req_abc",
     "deadline_ms": 1730312345123,
-    "tenant": "acme"
+    "tenant": "acme",
+    "cache_scope": "tenant",
+    "cache_tags": ["kb"]
   },
   "args": {
     "texts": ["a", "b", "c"],
     "model": "example-embed-1",
+    "truncate": true,
     "normalize": true
   }
 }
 ```
 
-**Response**
+**Embedding Batch Partial-Success Response**
 
 ```json
 {
   "ok": true,
-  "code": "OK",
+  "code": "PARTIAL_SUCCESS",
   "ms": 38.4,
   "result": {
+    "model": "example-embed-1",
     "embeddings": [
       {
-        "dimensions": 1536,
-        "model": "example-embed-1"
+        "vector": [0.01, 0.02],
+        "model": "example-embed-1",
+        "dimensions": 2
+      },
+      {
+        "vector": [0.03, 0.04],
+        "model": "example-embed-1",
+        "dimensions": 2
       }
     ],
-    "model": "example-embed-1"
+    "failures": [
+      {
+        "index": 2,
+        "error": "TEXT_TOO_LONG",
+        "message": "Input exceeds max_text_length"
+      }
+    ]
   }
 }
 ```
 
-**Error**
+**Streaming LLM over NDJSON**
+
+HTTP headers:
+
+```text
+Content-Type: application/x-ndjson
+Transfer-Encoding: chunked
+X-Protocol-Streaming: chunked-json
+```
+
+Body (each line = one frame):
+
+```json
+{"event":"data","data":{"text":"Hello","is_final":false}}
+{"event":"data","data":{"text":" world","is_final":false}}
+{"event":"end","code":"OK"}
+```
+
+**Error Envelope Example**
 
 ```json
 {
@@ -1416,7 +1989,9 @@ for attempt in range(5):
   "error": "DeadlineExceeded",
   "message": "Operation budget exhausted",
   "retry_after_ms": null,
-  "resource_scope": "time_budget"
+  "details": {
+    "resource_scope": "time_budget"
+  }
 }
 ```
 
@@ -1425,37 +2000,52 @@ for attempt in range(5):
 ## Appendix D — Content Redaction Patterns (Normative)
 
 * Replace user/tenant identifiers with irreversible hashes before logging.
-* Replace prompts and graph query text with SHA-256 fingerprints; store full content **only** when explicit debug sampling is enabled and access-controlled.
-* For vectors **and embeddings**, log only dimension and norm statistics (mean/std); **never** raw vectors or source texts.
-* Telemetry exporters **MUST** implement field-level redaction lists configurable per deployment.
+* Replace prompts and graph queries with hashes; full content only in tightly controlled debug modes.
+* For vectors and embeddings:
+
+  * Log only dimensions and aggregate stats (e.g., norms).
+  * NEVER log raw vectors or source texts.
+* Telemetry exporters MUST implement configurable redaction rules.
 
 ---
 
 ## Appendix E — Implementation Status (Non-Normative)
 
-* **Reference Adapters:** at least one open-source adapter per protocol family is RECOMMENDED for interoperability testing.
-* **Interop Suite:** a conformance test suite SHOULD validate error mapping, capability negotiation, and streaming semantics.
-* **Release Quality Bar:** adapters SHOULD demonstrate stability under soak tests (24h) and chaos scenarios (network partitions, rate-limit storms).
+* Reference adapters for each protocol family are RECOMMENDED.
+* An interop test suite SHOULD validate:
+
+  * Error normalization
+  * Capability discovery
+  * Streaming semantics
+  * Partial-failure handling.
 
 ---
 
 ## Appendix F — Change Log / Revision History (Non-Normative)
 
-* **v1.0 — Alignment & Deadlines:**
+This appendix is **append-only**. Each entry is immutable once published to avoid ambiguity about the meaning of a given version.
 
-  * Added `DeadlineExceeded` error class and mapping (§6.3, §12.4).
-  * Clarified deadline semantics and streaming finalization across protocols.
-  * Extended capability flags: `supports_deadline` (all), `supports_count_tokens` (LLM); expanded Graph fields (`supports_streaming`, `supports_bulk_ops`, `retryable_codes`, `rate_limit_unit`, `max_qps`).
-  * Aligned Vector types: `VectorMatch` carries full `Vector`, plus `score` and `distance`; clarified `include_vectors` behavior.
-  * Added Implementation Profiles (§5.3) and observability enrichments (`deadline_bucket`, final stream outcome).
+* **v1.0.0-rc1 — 2025-01-10**
 
-* **v1.0 — Embedding Added & Formalized:**
+  * Introduced canonical wire-first envelopes and streaming frame model (§4.1).
+  * Added normative transport bindings for streaming (§4.1.4).
+  * Defined common error taxonomy and initial mappings (§6.3, §12.4).
+  * Established baseline security, privacy, and observability requirements.
 
-  * Added Embedding Protocol V1.0 and upgraded §10 to formal datatypes and normative signatures.
+* **v1.0.0-rc2 — 2025-01-24**
 
-* **v1.0 — Initial RFC-Style:**
+  * Clarified deadline semantics and conditional retry rules (§12.1).
+  * Strengthened streaming finalization guarantees across Graph and LLM (§4.1.3, §7.3.2, §8.3).
+  * Added cache coordination hints to `OperationContext` and `capabilities.cache` (§6.1, §6.2).
+  * Introduced explicit partial-failure patterns for batch operations (§10.2, §12.5).
 
-  * Introduced BCP 14 requirements language, IANA Considerations, split Normative/Informative references, explicit Privacy Considerations, Conventions and Notation, error-mapping table, capability namespacing rules, and appendices for examples, redaction, and wire envelopes.
+* **v1.0.0 — 2025-02-07 (Initial Public Stable Release)**
+
+  * Locked the operation registry mapping protocol sections to `op` strings (§4.1.6).
+  * Confirmed advisory nature of `cache_scope` / `cache_tags` while preserving tenant isolation (§6.1, §11.6).
+  * Finalized Embedding Protocol with `EmbeddingFailure` and `EmbeddingResult.failures` as normative (§10.2).
+  * Documented best-effort `TransactionCoordinator` pattern for cross-protocol workflows (§11.7).
+  * Declared V1.0 wire contracts stable; subsequent 1.0.x releases are limited to non-breaking clarifications.
 
 ---
 
