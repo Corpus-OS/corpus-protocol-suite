@@ -4,6 +4,8 @@
 
 This document tracks conformance test coverage for the **LLM Protocol V1.0** specification as defined in `SPECIFICATION.md §8`. Each test validates normative requirements (MUST/SHOULD) from the specification.
 
+This suite constitutes the official LLM Protocol V1.0 Reference Conformance Test Suite. Any implementation (Corpus or third-party) MAY run these tests to verify and publicly claim conformance, provided all referenced tests pass unmodified.
+
 **Protocol Version:** LLM Protocol V1.0
 **Status:** Pre-Release
 **Last Updated:** 2025-01-XX
