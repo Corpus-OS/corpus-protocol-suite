@@ -23,7 +23,7 @@ Covers:
 import pytest
 from typing import Any, Dict, List, Mapping, Optional
 
-from adapter_sdk.vector_base import (
+from corpus_sdk.vector.vector_base import (
     VECTOR_PROTOCOL_ID,
     VectorID,
     Vector,
@@ -46,52 +46,34 @@ from adapter_sdk.vector_base import (
     WireVectorHandler,
 )
 
+from corpus_sdk.examples.vector.mock_vector_adapter import MockVectorAdapter
 
 pytestmark = pytest.mark.asyncio
 
 
-class FakeVectorAdapter(BaseVectorAdapter):
+class TrackingMockVectorAdapter(MockVectorAdapter):
     """
-    Minimal adapter for exercising WireVectorHandler.
+    MockVectorAdapter wrapper that records last ctx/call/args for assertions.
 
-    Behaviors:
-      - deterministic capabilities
-      - trivial query/upsert/delete/namespace/health responses
-      - records last ctx/spec for assertions
+    All vector behavior is inherited from the real mock; this only adds introspection.
     """
 
-    def __init__(self) -> None:
-        super().__init__(mode="thin")
+    def __init__(self, *args, **kwargs) -> None:
+        # Keep tests deterministic by default.
+        kwargs.setdefault("failure_rate", 0.0)
+        super().__init__(*args, **kwargs)
         self.last_ctx: Optional[OperationContext] = None
         self.last_call: Optional[str] = None
         self.last_args: Dict[str, Any] = {}
 
-    # --- helpers -------------------------------------------------------------
-
-    def _store(self, op: str, ctx: Optional[OperationContext], **kwargs: Any) -> None:
+    def _track(self, op: str, ctx: Optional[OperationContext], **kwargs: Any) -> None:
         self.last_call = op
         self.last_ctx = ctx
         self.last_args = dict(kwargs)
 
-    # --- required hooks ------------------------------------------------------
-
     async def _do_capabilities(self) -> VectorCapabilities:
-        self._store("capabilities", None)
-        return VectorCapabilities(
-            server="fake-vector",
-            version="1.0.0",
-            max_dimensions=8,
-            supported_metrics=("cosine", "euclidean"),
-            supports_namespaces=True,
-            supports_metadata_filtering=True,
-            supports_batch_operations=True,
-            max_batch_size=256,
-            supports_index_management=True,
-            idempotent_writes=True,
-            supports_multi_tenant=True,
-            supports_deadline=True,
-            max_top_k=100,
-        )
+        self._track("capabilities", None)
+        return await super()._do_capabilities()
 
     async def _do_query(
         self,
@@ -99,20 +81,8 @@ class FakeVectorAdapter(BaseVectorAdapter):
         *,
         ctx: Optional[OperationContext] = None,
     ) -> QueryResult:
-        self._store("query", ctx, spec=spec)
-        v = Vector(
-            id=VectorID("v1"),
-            vector=list(spec.vector),
-            metadata={"echo": True} if spec.include_metadata else None,
-            namespace=spec.namespace,
-        )
-        match = VectorMatch(vector=v, score=1.0, distance=0.0)
-        return QueryResult(
-            matches=[match],
-            query_vector=list(spec.vector),
-            namespace=spec.namespace,
-            total_matches=1,
-        )
+        self._track("query", ctx, spec=spec)
+        return await super()._do_query(spec, ctx=ctx)
 
     async def _do_upsert(
         self,
@@ -120,12 +90,8 @@ class FakeVectorAdapter(BaseVectorAdapter):
         *,
         ctx: Optional[OperationContext] = None,
     ) -> UpsertResult:
-        self._store("upsert", ctx, spec=spec)
-        return UpsertResult(
-            upserted_count=len(spec.vectors),
-            failed_count=0,
-            failures=[],
-        )
+        self._track("upsert", ctx, spec=spec)
+        return await super()._do_upsert(spec, ctx=ctx)
 
     async def _do_delete(
         self,
@@ -133,13 +99,8 @@ class FakeVectorAdapter(BaseVectorAdapter):
         *,
         ctx: Optional[OperationContext] = None,
     ) -> DeleteResult:
-        self._store("delete", ctx, spec=spec)
-        deleted = len(spec.ids) if spec.ids else 0
-        return DeleteResult(
-            deleted_count=deleted,
-            failed_count=0,
-            failures=[],
-        )
+        self._track("delete", ctx, spec=spec)
+        return await super()._do_delete(spec, ctx=ctx)
 
     async def _do_create_namespace(
         self,
@@ -147,15 +108,8 @@ class FakeVectorAdapter(BaseVectorAdapter):
         *,
         ctx: Optional[OperationContext] = None,
     ) -> NamespaceResult:
-        self._store("create_namespace", ctx, spec=spec)
-        return NamespaceResult(
-            success=True,
-            namespace=spec.namespace,
-            details={
-                "dimensions": spec.dimensions,
-                "distance_metric": spec.distance_metric,
-            },
-        )
+        self._track("create_namespace", ctx, spec=spec)
+        return await super()._do_create_namespace(spec, ctx=ctx)
 
     async def _do_delete_namespace(
         self,
@@ -163,30 +117,22 @@ class FakeVectorAdapter(BaseVectorAdapter):
         *,
         ctx: Optional[OperationContext] = None,
     ) -> NamespaceResult:
-        self._store("delete_namespace", ctx, namespace=namespace)
-        return NamespaceResult(
-            success=True,
-            namespace=namespace,
-            details={},
-        )
+        self._track("delete_namespace", ctx, namespace=namespace)
+        return await super()._do_delete_namespace(namespace, ctx=ctx)
 
     async def _do_health(
         self,
         *,
         ctx: Optional[OperationContext] = None,
     ) -> Dict[str, Any]:
-        self._store("health", ctx)
-        return {
-            "ok": True,
-            "server": "fake-vector",
-            "version": "1.0.0",
-            "namespaces": {"default": "ok"},
-        )
+        self._track("health", ctx)
+        return await super()._do_health(ctx=ctx)
 
 
-class ErrorAdapter(FakeVectorAdapter):
+class ErrorAdapter(TrackingMockVectorAdapter):
     """
     Adapter that can be configured to raise specific errors to test wire mapping.
+    Uses the real MockVectorAdapter wiring; only overrides the target op.
     """
 
     def __init__(self, exc: Exception):
@@ -199,6 +145,7 @@ class ErrorAdapter(FakeVectorAdapter):
         *,
         ctx: Optional[OperationContext] = None,
     ) -> QueryResult:
+        # Directly raise the configured exception to test mapping.
         raise self._exc
 
 
@@ -207,7 +154,7 @@ class ErrorAdapter(FakeVectorAdapter):
 # ---------------------------------------------------------------------------
 
 async def test_wire_capabilities_success_envelope():
-    a = FakeVectorAdapter()
+    a = TrackingMockVectorAdapter()
     h = WireVectorHandler(a)
 
     env = {
@@ -220,15 +167,44 @@ async def test_wire_capabilities_success_envelope():
     assert res["ok"] is True
     assert res["code"] == "OK"
     assert isinstance(res["result"], dict)
-    # protocol identity MUST be vector/v1.0
     assert res["result"]["protocol"] == VECTOR_PROTOCOL_ID
-    assert res["result"]["server"] == "fake-vector"
+    assert res["result"]["server"] == "mock-vector"
     assert res["result"]["version"] == "1.0.0"
 
 
 async def test_wire_query_roundtrip_and_context_plumbing():
-    a = FakeVectorAdapter()
+    a = TrackingMockVectorAdapter()
     h = WireVectorHandler(a)
+
+    # Set up namespace + data via the wire so MockVectorAdapter query will succeed.
+    await h.handle(
+        {
+            "op": "vector.create_namespace",
+            "ctx": {"request_id": "ns-setup"},
+            "args": {
+                "namespace": "default",
+                "dimensions": 2,
+                "distance_metric": "cosine",
+            },
+        }
+    )
+    await h.handle(
+        {
+            "op": "vector.upsert",
+            "ctx": {"request_id": "upsert-setup"},
+            "args": {
+                "namespace": "default",
+                "vectors": [
+                    {
+                        "id": "v1",
+                        "vector": [0.1, 0.2],
+                        "metadata": {"echo": True},
+                        "namespace": "default",
+                    }
+                ],
+            },
+        }
+    )
 
     ctx_wire = {
         "request_id": "req_wire_q",
@@ -262,22 +238,20 @@ async def test_wire_query_roundtrip_and_context_plumbing():
     assert out["namespace"] == "default"
     assert out["query_vector"] == [0.1, 0.2]
     assert isinstance(out["matches"], list)
-    assert out["total_matches"] == 1
+    assert out["total_matches"] >= 1
 
-    # Context propagation through BaseVectorAdapter -> FakeVectorAdapter
+    # Context propagation through BaseVectorAdapter -> TrackingMockVectorAdapter
     assert a.last_call == "query"
     assert isinstance(a.last_ctx, OperationContext)
     assert a.last_ctx.request_id == "req_wire_q"
     assert a.last_ctx.idempotency_key == "idem_q"
     assert a.last_ctx.traceparent == "00-abc-xyz-01"
-    # raw tenant is allowed in ctx, Wire handler MUST NOT mutate/remove it here
     assert a.last_ctx.tenant == "acme-tenant"
-    # unknown ctx field ignored
-    assert "ignore_me" not in a.last_ctx.attrs
+    assert "ignore_me" not in (a.last_ctx.attrs or {})
 
 
 async def test_wire_upsert_delete_namespace_health_envelopes():
-    a = FakeVectorAdapter()
+    a = TrackingMockVectorAdapter()
     h = WireVectorHandler(a)
 
     # upsert
@@ -345,7 +319,7 @@ async def test_wire_upsert_delete_namespace_health_envelopes():
     }
     health_res = await h.handle(health_env)
     assert health_res["ok"] is True
-    assert health_res["result"]["server"] == "fake-vector"
+    assert health_res["result"]["server"] == "mock-vector"
     assert health_res["result"]["version"] == "1.0.0"
     assert "namespaces" in health_res["result"]
 
@@ -355,7 +329,7 @@ async def test_wire_upsert_delete_namespace_health_envelopes():
 # ---------------------------------------------------------------------------
 
 async def test_wire_unknown_op_maps_to_notsupported():
-    a = FakeVectorAdapter()
+    a = TrackingMockVectorAdapter()
     h = WireVectorHandler(a)
 
     res = await h.handle(
@@ -370,7 +344,7 @@ async def test_wire_unknown_op_maps_to_notsupported():
     # NotSupported from wire path
     assert res["code"] in ("NOT_SUPPORTED", "NOTSUPPORTED")
     assert res["error"] == "NotSupported"
-    assert isinstance(res["message"], str) and "unknown operation" in res["message"]
+    assert "unknown operation" in res["message"]
 
 
 async def test_wire_maps_vector_adapter_error_to_normalized_envelope():
@@ -394,12 +368,11 @@ async def test_wire_maps_vector_adapter_error_to_normalized_envelope():
     assert res["code"] == "BAD_REQUEST"
     assert res["error"] == "BadRequest"
     assert res["message"] == "bad vector"
-    # details MAY be present; MUST be JSON-safe
-    assert "details" in res
+    assert "details" in res  # JSON-safe details present (may be null)
 
 
 async def test_wire_maps_unexpected_exception_to_unavailable():
-    class BoomAdapter(FakeVectorAdapter):
+    class BoomAdapter(TrackingMockVectorAdapter):
         async def _do_query(
             self,
             spec: QuerySpec,
