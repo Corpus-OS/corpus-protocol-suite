@@ -1188,16 +1188,16 @@ Corpus Router doesn't just route traffic—it understands, optimizes, and evolve
 ## 🛡️ Enterprise-Grade Reliability
 
 **All Tiers Include:**
-- Multi-provider failover & circuit breaking
-- Unified observability & cost tracking
-- Multiple routing options like single, fanout, concurrency,and strategy router
-- 99.9% uptime SLA and 70-90% reduction in cost
+- Multi-tenant failover, circuit breaking, backpressure, and rate limiting
+- Real-time analytics & comprehensive observability
+- Multiple routing strategies (single, fanout, concurrent)
+- 70-90% cost reduction via deduplication + 99.9% uptime SLA
 
 **Enterprise Features:**
-- Self-learning optimization engine learning from 50+ signals
-- Policy enforcement (routing rules, planning engine,reasoning engine)
-- Proprietary LLM, Vector, Graph, and Embedding providers
-- 24/7 support with SLAs and real-time metrics and cost tracking
+- Autonomous optimization from 50+ performance signals
+- Policy engine with planning & reasoning intelligence
+- Proprietary LLM, Vector, and Embedding providers
+- 24/7 support, SLAs, and real-time cost intelligence
 
 ## Guidelines
 
