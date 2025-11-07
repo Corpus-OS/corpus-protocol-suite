@@ -428,16 +428,8 @@ Use this when implementing or validating a new **Embedding adapter** against `Em
 4. Update the conformance badge and checklist to match.
 
 
-## Related Documentation
-
-* `../../SPECIFICATION.md` — Full protocol specification (§7 Graph Protocol)
-* `../../ERRORS.md` — Error taxonomy reference
-* `../../METRICS.md` — Observability guidelines
-* `../README.md` — General testing guidelines
-
 ---
 
 **Last Updated:** 2025-01-XX
 **Maintained By:** Corpus SDK Team
 **Status:** 100% V1.0 Conformant - Production Ready
----
