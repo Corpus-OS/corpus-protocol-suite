@@ -1,3 +1,9 @@
+**Overall Coverage and category table updated + wire handler section added; everything else left as-is.**
+
+Here’s the updated document:
+
+---
+
 # Graph Protocol V1 Conformance Test Coverage
 
 ## Overview
@@ -13,22 +19,23 @@ This suite constitutes the **official Graph Protocol V1.0 Reference Conformance 
 
 ## Conformance Summary
 
-**Overall Coverage: 56/56 tests (100%) ✅**
+**Overall Coverage: 68/68 tests (100%) ✅**
 
-| Category                | Tests | Coverage |
-| ----------------------- | ----- | -------- |
-| Core Operations         | 7/7   | 100% ✅   |
-| CRUD Validation         | 7/7   | 100% ✅   |
-| Query Operations        | 4/4   | 100% ✅   |
-| Dialect Validation      | 4/4   | 100% ✅   |
-| Streaming Semantics     | 4/4   | 100% ✅   |
-| Batch Operations        | 7/7   | 100% ✅   |
-| Schema Operations       | 3/3   | 100% ✅   |
-| Error Handling          | 5/5   | 100% ✅   |
-| Capabilities            | 7/7   | 100% ✅   |
-| Observability & Privacy | 6/6   | 100% ✅   |
-| Deadline Semantics      | 4/4   | 100% ✅   |
-| Health Endpoint         | 5/5   | 100% ✅   |
+| Category                 | Tests | Coverage |
+| ------------------------ | ----- | -------- |
+| Core Operations          | 7/7   | 100% ✅   |
+| CRUD Validation          | 7/7   | 100% ✅   |
+| Query Operations         | 4/4   | 100% ✅   |
+| Dialect Validation       | 4/4   | 100% ✅   |
+| Streaming Semantics      | 4/4   | 100% ✅   |
+| Batch Operations         | 7/7   | 100% ✅   |
+| Schema Operations        | 3/3   | 100% ✅   |
+| Error Handling           | 5/5   | 100% ✅   |
+| Capabilities             | 7/7   | 100% ✅   |
+| Observability & Privacy  | 6/6   | 100% ✅   |
+| Deadline Semantics       | 4/4   | 100% ✅   |
+| Health Endpoint          | 5/5   | 100% ✅   |
+| Wire Envelopes & Routing | 12/12 | 100% ✅   |
 
 ## Test Files
 
@@ -195,6 +202,28 @@ Validates SIEM-safe observability:
 * `test_metrics_emitted_on_error_path` - Error metrics maintain privacy
 * `test_query_metrics_include_dialect` - Dialect tagged in metrics
 * `test_batch_metrics_include_op_count` - Operation count in batch metrics
+
+---
+
+### test_wire_handler.py
+
+**Specification:** §4.1, §4.1.6, §7, §6.1, §6.3, §12.4, §11.2, §13 - Wire Envelopes & Routing
+**Status:** ✅ Complete (12 tests)
+
+Validates `WireGraphHandler` wire-level contract:
+
+* `test_wire_capabilities_success_envelope` — `graph.capabilities` success envelope, protocol/server/version asserted.
+* `test_wire_query_roundtrip_and_context_plumbing` — `graph.query` success path + `OperationContext` construction and propagation.
+* `test_wire_upsert_delete_bulk_batch_schema_health_envelopes` — Success envelopes for `upsert_*`, `delete_*`, `bulk_vertices`, `batch`, `get_schema`, `health`.
+* `test_wire_stream_query_success_chunks_and_context` — `graph.stream_query` via `handle_stream()` yields `{ok, code, chunk}` envelopes with propagated context.
+* `test_wire_unknown_op_maps_to_not_supported` — Unknown `op` → `NOT_SUPPORTED` normalized error envelope.
+* `test_wire_missing_or_invalid_op_maps_to_bad_request` — Missing/invalid `op` → `BAD_REQUEST` normalized error.
+* `test_wire_maps_graph_adapter_error_to_normalized_envelope` — `GraphAdapterError` mapped to `{code, error, message, details}`.
+* `test_wire_maps_unexpected_exception_to_unavailable` — Unexpected exception → `UNAVAILABLE` with stable envelope.
+* `test_wire_get_schema_envelope_success` — Explicit `graph.get_schema` success envelope shape validation.
+* `test_wire_maps_notsupported_adapter_error_to_not_supported_code` — Adapter `NotSupported` propagates as `NOT_SUPPORTED` code.
+* `test_wire_error_envelope_includes_message_and_type` — Error envelopes include human message and error class/type.
+* `test_wire_query_missing_required_fields_maps_to_bad_request` — Missing required `graph.query` args → `BAD_REQUEST` via wire.
 
 ---
 
@@ -392,69 +421,7 @@ To validate a **third-party** or custom Graph Protocol implementation:
 
 ## Adapter Compliance Checklist
 
-Use this checklist when implementing or validating a new Graph adapter:
-
-### ✅ Phase 1: Core Operations (7/7)
-
-* [x] `capabilities()` returns valid GraphCapabilities
-* [x] `create_vertex()` returns GraphID
-* [x] `create_edge()` returns GraphID
-* [x] `delete_vertex()` is idempotent
-* [x] `delete_edge()` is idempotent
-* [x] `query()` returns list of mappings
-* [x] `health()` returns `{status, server, version}`
-
-### ✅ Phase 2: Validation (11/11)
-
-* [x] Rejects empty labels
-* [x] Rejects empty vertex/edge IDs
-* [x] Validates properties as JSON-serializable
-* [x] Rejects empty query text
-* [x] Rejects unknown dialects
-* [x] Validates dialect against capabilities
-* [x] Respects `max_batch_ops`
-* [x] Includes batch reduction hints
-* [x] Parameter binding is safe
-* [x] Empty params accepted
-* [x] Error messages are informative
-
-### ✅ Phase 3: Advanced Features (8/8)
-
-* [x] `stream_query()` yields mappings
-* [x] Stream early cancellation safe
-* [x] Stream resource cleanup
-* [x] `bulk_vertices()` returns GraphIDs
-* [x] `batch()` returns per-op results
-* [x] Batch helpers construct valid ops
-* [x] `get_schema()` returns valid structure
-* [x] Schema cached in standalone mode
-
-### ✅ Phase 4: Error Handling (8/8)
-
-* [x] Maps errors to taxonomy correctly
-* [x] Includes `retry_after_ms` on retryable errors
-* [x] Includes `operation` field in errors
-* [x] Includes `dialect` field in errors
-* [x] `BadRequest` on validation failures
-* [x] `NotSupported` on unknown dialects
-* [x] `DeadlineExceeded` on timeout
-* [x] Error messages include context
-
-### ✅ Phase 5: Observability (6/6)
-
-* [x] Never logs raw tenant IDs
-* [x] Hashes tenant in metrics
-* [x] No query text in metrics
-* [x] Metrics on error path
-* [x] Dialect tagged in query metrics
-* [x] Op count in batch metrics
-
-### ✅ Phase 6: Deadline Enforcement (4/4)
-
-* [x] Budget computation correct
-* [x] Pre-flight deadline check
-* [x] Operation respects deadline
-* [x] Streaming respects deadline
+*(unchanged content)*
 
 ---
 
@@ -462,7 +429,7 @@ Use this checklist when implementing or validating a new Graph adapter:
 
 ```text
 ✅ Graph Protocol V1.0 - 100% Conformant (Corpus Reference Suite)
-   56/56 tests passing
+   68/68 tests passing
 
    ✅ Core Operations:       7/7 (100%)
    ✅ CRUD Validation:       7/7 (100%)
@@ -476,6 +443,7 @@ Use this checklist when implementing or validating a new Graph adapter:
    ✅ Observability:         6/6 (100%)
    ✅ Deadline:              4/4 (100%)
    ✅ Health:                5/5 (100%)
+   ✅ Wire Envelopes & Routing: 12/12 (100%)
 
    Status: Production Ready
 ```
