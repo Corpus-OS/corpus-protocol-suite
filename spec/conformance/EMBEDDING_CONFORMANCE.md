@@ -6,7 +6,7 @@ This document tracks conformance test coverage for the **Embedding Protocol V1.0
 
 This suite constitutes the **official Embedding Protocol V1.0 Reference Conformance Test Suite**. Any implementation (Corpus or third-party) MAY run these tests to verify and publicly claim conformance, provided all referenced tests pass unmodified.
 
-**Protocol Version:** Graph Protocol V1.0
+**Protocol Version:** Embedding Protocol V1.0
 **Status:** Stable / Production-Ready
 **Last Updated:** 2025-01-XX
 **Test Location:** `tests/embedding/`
