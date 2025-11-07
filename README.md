@@ -1160,10 +1160,10 @@ logging.getLogger("corpus_sdk").setLevel(logging.DEBUG)
 
 ## 🧠 Intelligent Routing That Learns Your Workloads
 
-### Before your system:
+#### Before Corpus:
 "We run AI workloads and hope for the best"
 
-### After your system:  
+#### After Corpus:  
 "We get intelligent workload optimization automatically"
 - Cost optimization: "You route to cheapest viable provider"
 - Performance optimization: "You predict and avoid bottlenecks" 
