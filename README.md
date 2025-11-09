@@ -24,6 +24,9 @@ Designed to compose cleanly under any external control plane (router, scheduler,
 
 ## 🏗️ Architecture at a Glance
 
+<!--[MOBILE-FRIENDLY DIAGRAMS]-->
+<div class="mermaid-container" style="overflow-x: auto; max-width: 100%;">
+
 ```mermaid
 graph TB
     A[Your Application] --> B[Corpus SDK]
@@ -1877,7 +1880,8 @@ graph TB
     style A fill:#e1f5fe
     style J fill:#e8f5e8
 ```
-
+</div>
+<!--[/MOBILE-FRIENDLY DIAGRAMS]-->
 **Result**: Every request gets an optimal route for its context—within guardrails, fully auditable.
 
 ---
