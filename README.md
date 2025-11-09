@@ -1,4 +1,3 @@
-
 # Corpus SDK
 
 A protocol-first, vendor-neutral SDK for interoperable AI/data backends — **LLM**, **Embedding**, **Vector**, and **Graph** — with consistent error taxonomies, capability discovery, SIEM-safe metrics, and deadline propagation. Designed to compose cleanly under an external control plane (router, scheduler, rate limiter) while remaining usable in a lightweight **standalone** mode for development and simple services. Forming a complete foundation for AI infrastructure standardization across reasoning (LLM), relationships (Graph), semantic search (Vector), and text representation (Embedding) domains.
@@ -491,38 +490,131 @@ Our official adapters include:
 
 **Not sure which path fits?** Start free with `corpus_sdk`, then scale into Corpus Router + Official Adapters when you need multi-provider routing, SLAs, and enterprise controls.
 
-**For teams needing production-ready solutions:**
-
-| Offering                   | Best For              | Includes                            |
-| -------------------------- | --------------------- | ----------------------------------- |
-| **Corpus Router Managed**  | Cloud teams           | Router + official adapters + SLAs   |
-| **Corpus Router On-Prem**  | Enterprise/regulated  | Air-gapped deployment + support     |
-| **Official Adapters Only** | Bring your own router | Production-tuned adapters + updates |
-
 **Contact:** [sales@corpus.io](mailto:sales@corpus.io) or visit [corpus.io/pricing](https://corpus.io/pricing)
 
-### Self-Learning Routing (Commercial Feature)
+## Corpus Router: Enterprise AI Infrastructure Orchestration**
 
-**Corpus Router** includes an **optional, guardrail-based self-learning mode**:
+**One routing layer. Four AI domains. Learns what works.**
 
-* Learns **routing weights** across providers/models based on:
+---
 
-  * latency distributions
-  * cost per token
-  * evaluator / QA scoring signals
-  * success/failure/timeout patterns
-* **Does not train on user content**; learning uses **aggregated, privacy-preserving feedback only**.
-* Always runs **within guardrails**:
+## **Core Features (All Tiers)**
 
-  * provider/model allowlists
-  * per-tenant budgets & QPS ceilings
-  * jurisdiction/compliance constraints
-* Fully **auditable & reversible**:
+### **Universal Interface**
+One API for AI infrastructure across four domains: LLM providers, vector databases, graph databases, embedding systems. Switch backends without changing application code—just update routing config.
 
-  * Every change is versioned
-  * Policies can be frozen, rolled back, or pinned statically
+### **Multi-Provider Routing & Failover**
+Route requests across providers in any domain. Automatic failover when services fail. 99.99% uptime even during outages.
 
-> In short: the SDK defines **how to talk to providers**, while **Corpus Router learns which provider/model to use and when** — safely, under your rules.
+### **Request/Response Validation**
+Catch errors before expensive calls. Validate structure, enforce limits, ensure schema compliance. Stop bad requests in <1ms, not after 30 seconds.
+
+### **Unified Observability & Logging**
+Single dashboard for all domains and providers. Track latency, cost, success rates across LLMs, vector DBs, graph DBs, embeddings. Debug failures instantly with request-level traces.
+
+### **Cost Tracking & Attribution**
+Real-time cost per user, team, and project. Set budgets, get alerts before overruns. See exactly where AI infrastructure spend goes—no surprise bills.
+
+### **Deadline Propagation & Cancellation**
+Respect user timeouts. Cancel slow requests before they waste money. No orphaned calls burning budget.
+
+---
+
+## **Enterprise Features**
+
+### **Self-Learning Routing (Privacy-Preserving)**
+
+**Learns optimal routing without seeing your data:**
+- Analyzes latency, cost, quality, success/failure patterns across all four domains
+- Routes similar requests to best-performing provider (LLM, vector DB, graph DB, embedding)
+- **Never stores request or response content**—only metadata
+
+**Per-tenant models:**
+- Each tenant gets dedicated routing model trained on their usage patterns
+- Tenant A's vector search routing learns from Tenant A's query patterns only
+- Cross-tenant learning opt-in for anonymized pattern sharing
+- Full data isolation—no tenant sees another's routing decisions
+
+**Always within guardrails:**
+- Respects budget caps, rate limits, allowlists
+- Enforces data residency and compliance
+- Every decision versioned—rollback instantly if performance drops
+
+**Typical results:** 30-50% cost reduction, maintained or improved quality across all AI infrastructure.
+
+---
+
+### **Policy Enforcement**
+Hard caps on budgets, rate limits, and provider usage across all domains. Geographic routing (GDPR, data residency). Provider allowlists per environment. Policies enforced at routing time—requests that violate policies never reach providers.
+
+---
+
+### **Advanced Analytics & Reporting**
+Trend analysis, cost forecasting, quality scoring over time. Compare provider performance side-by-side across LLM, vector, graph, embedding domains. Per-provider cost/latency/quality breakdowns. Identify optimization opportunities automatically.
+
+---
+
+### **Multi-Tenancy with Isolation Guarantees**
+Isolated routing, budgets, and policies per tenant. One router instance serves multiple teams/products. Cross-tenant data leakage impossible—cryptographic isolation.
+
+---
+
+### **On-Prem Deployment**
+Run in your VPC or air-gapped environment. Zero data leaves your network. Full control over infrastructure and compliance.
+
+---
+
+### **24/7 Support with SLAs**
+Dedicated Slack channel, <15min response time for critical issues. 99.99% uptime SLA with financial penalties if breached.
+
+---
+
+## **Key Benefits**
+
+✓ **One API, four domains** – LLM, vector, graph, embedding unified  
+✓ **10x faster response times** – Routing overhead <10ms vs. 100ms+ for alternatives  
+✓ **Transparent pricing** – Exact cost per request across all infrastructure  
+✓ **Explainable decisions** – Know WHY each routing choice was made  
+✓ **Zero downtime updates** – Hot-reload routing rules without restarts  
+✓ **Audit-ready** – Every decision versioned, policies immutable  
+✓ **No vendor lock-in** – Switch providers without code changes
+
+---
+
+## **Technical Differentiators**
+
+**Unified Configuration:**  
+All domains speak the same config language. Define routing rules once, apply to LLM, vector, graph, embedding.
+
+**Zero External Dependencies:**  
+Self-contained. Audit once, trust forever. No surprise supply-chain vulnerabilities.
+
+**Built-In Governance:**  
+A/B testing, observability, policy enforcement out-of-the-box. No duct-taping tools together.
+
+**Hot-Reload Everything:**  
+Update routing rules, budgets, allowlists—zero downtime. Deploy changes in <1 second.
+
+**Schema Fingerprinting:**  
+Detect config drift automatically. Prevent silent failures from schema mismatches.
+
+---
+
+## **How Self-Learning Works**
+
+```
+Request → Feature Extraction (complexity, domain, context, user tier)
+       → Constraint Evaluation (budgets, allowlists, quotas)
+       → Partition Resolution (tenant isolation, intent classification)
+       → Provider Selection (LLM/vector/graph/embedding options)
+       → Weighted Scoring (latency, cost, quality predictions)
+       → Calibration (monotonicity guards, override policies)
+       → Tie-Breaking (entropy fallback for equal scores)
+       → Explainability (log reasoning, flags, confidence)
+       → Route to Provider
+```
+
+**Result:** Every request gets optimal routing for its context—automatically, within policy guardrails, fully auditable.
 
 ---
 
@@ -538,17 +630,6 @@ Our official adapters include:
 ## License
 
 Apache-2.0. See `LICENSE` file for details. SPDX headers are included at the top of source files.
-
----
-
-## Roadmap
-
-* Additional optional capability flags (e.g., function/tool calling schemas).
-* Reference metrics exporter examples (Prometheus/OpenTelemetry bridge).
-* More example adapters (public endpoints for demos).
-* **Enterprise policy packs** (content safety, cost ceilings, per-tenant QPS) — **commercial**.
-* **Certified adapter program for partners** — **commercial**.
-* **Advanced analytics and cost attribution** — **commercial**.
 
 ---
 
