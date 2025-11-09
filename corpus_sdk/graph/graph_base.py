@@ -1,106 +1,450 @@
 # adapter_sdk/graph_base.py
 # SPDX-License-Identifier: Apache-2.0
 """
-Adapter SDK — Graph Protocol V1 (public contract + production-grade base)
+Adapter SDK — Graph Protocol V1.0
 
 Purpose
 -------
-A minimal, production-quality surface for building graph adapters that plug into a
-control plane. This protocol enables seamless integration with any graph database
-while maintaining production-grade observability, security, and operational rigor.
+A stable, vendor-neutral API for graph query and mutation operations, with:
+
+- Structured, normalized error taxonomy (SIEM-safe, machine-actionable)
+- Async-first, high-concurrency friendly interface
+- Backpressure: circuit breaker + rate limiting + deadline propagation
+- Optional read-path caching and capability discovery
+- Wire-level handler for canonical JSON envelopes (transport-agnostic)
 
 Design Philosophy
 -----------------
-- Minimal surface area: Core graph operations only, no vendor-specific extensions
-- Async-first: All operations are non-blocking for high-concurrency environments
-- Production hardened: Built-in metrics, error taxonomy, and context propagation
-- Extensible: Capability discovery allows for database-specific features
-- Query agnostic: Supports multiple graph query dialects through unified interface
+- Minimal core surface: query, stream_query, upsert/delete nodes & edges, namespaces.
+- Keep existing power-user APIs: streaming, bulk vertices, batch operations, schema introspection.
+- No vendor- or dialect-specific helpers in the base.
+- Async-only: suitable for servers and routers; sync wrappers live elsewhere.
+- DRY infra: shared gate wrapper for breaker / limiter / deadlines / metrics.
 
 Deliberate Non-Goals
 --------------------
-- No retries, hedging, circuit breakers, failover, pooling, or dynamic config.
-- No secret fetching or policy evaluation.
-- No backend-specific optimizations beyond validated calls and timing.
-- No query planning, optimization, or result post-processing.
+- No routing, retries, hedging, or policy enforcement.
+- No automatic dialect rewriting (Cypher ⇄ Gremlin, etc.).
+- No client-side schema management or migrations.
+- No embedding/LLM integration (belongs in higher layers).
 
-Those behaviors live in the control plane and upper routing layers.
+Those behaviors live in your control-plane / router layers.
 
 Mode Strategy
 -------------
-mode="thin" (default) — Composition mode. All resiliency hooks are no-ops and the
-base performs only validation, timing, and SIEM-safe metrics. Use this when your
-external router/manager provides rate limiting, circuit breaking, scheduling, and caching.
+As with LLM and Vector:
 
-mode="standalone" — Self-contained mode for development and light production. Enables
-basic deadline enforcement (ctx.deadline_ms), a tiny circuit breaker, a simple token
-bucket rate limiter, and in-memory TTL caches for safe read paths (capabilities(),
-get_schema(), query()). This keeps behavior deterministic without duplicating any
-closed-source control-plane logic.
+mode: "thin" (default)
+    - For composition under an external manager/router.
+    - All policies default to no-op: no caching, no breaker, no rate limiter.
+    - Use when your infra already handles concurrency and resilience.
+
+mode: "standalone"
+    - For direct use in services.
+    - Enables:
+        * SimpleDeadline (ctx.deadline_ms)
+        * SimpleCircuitBreaker
+        * InMemoryTTLCache for read paths
+          (query / capabilities / bulk_vertices / get_schema)
+        * SimpleTokenBucketLimiter
+    - Intended for development / light production; NOT a full distributed control plane.
 
 Versioning
 ----------
-Follow SemVer against GRAPH_PROTOCOL_VERSION. Minor versions are strictly additive.
-- Patch (x.y.Z): Editorial clarifications, non-breaking fixes
-- Minor (x.Y.z): New optional parameters, capabilities, or methods
-- Major (X.y.z): Breaking changes to signatures or behavior
+Follow SemVer against GRAPH_PROTOCOL_VERSION (wire & type contract).
+
+- Patch (x.y.Z): Documentation and strictly non-breaking edits.
+- Minor (x.Y.z): Additive fields, methods, or capabilities.
+- Major (X.y.z): Breaking changes only (avoid in base; prefer additive).
+
+Wire Contract (Canonical Interface)
+-----------------------------------
+The canonical interop surface is JSON envelopes; this module provides:
+
+- GraphProtocolV1 / BaseGraphAdapter: typed in-process contract
+- WireGraphHandler: reference transport-agnostic wire adapter
+
+Envelopes:
+
+    Request:
+        {
+            "op": "graph.<operation>",
+            "ctx": {
+                "request_id": "...",
+                "idempotency_key": "...",
+                "deadline_ms": 1234567890,
+                "traceparent": "...",
+                "tenant": "...",
+                "attrs": { ... }
+            },
+            "args": { ... }  # operation-specific
+        }
+
+    Success:
+        {
+            "ok": true,
+            "code": "OK",
+            "ms": <float>,          # elapsed milliseconds (best-effort)
+            "result": { ... }       # operation-specific payload
+        }
+
+    Error:
+        {
+            "ok": false,
+            "code": "<UPPER_SNAKE_CASE>",
+            "error": "<ErrorClassName>",
+            "message": "<human readable>",
+            "retry_after_ms": <int|null>,
+            "details": { ... } | null,
+            "ms": <float>
+        }
+
+Streaming queries (graph.stream_query) follow the same pattern as llm.stream:
+
+    - Request: single envelope with op="graph.stream_query"
+    - Response: stream of { ok, code, ms, chunk: { ... } } or terminal error envelope.
 """
 
 from __future__ import annotations
+
 import asyncio
 import hashlib
+import json
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from typing import (
-    Any, Dict, Iterable, List, Mapping, Optional, Protocol, Tuple,
-    runtime_checkable, AsyncIterator, NewType, Callable
+    Any,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    NewType,
+    Optional,
+    Protocol,
+    Tuple,
+    Union,
+    runtime_checkable,
 )
 
 LOG = logging.getLogger(__name__)
 
-GRAPH_PROTOCOL_VERSION = "1.1.0"  # minor bump: added capabilities fields & infra hooks
-KNOWN_DIALECTS: Tuple[str, ...] = ("cypher", "opencypher", "gremlin", "gql")
+GRAPH_PROTOCOL_VERSION = "1.0.0"
+GRAPH_PROTOCOL_ID = "graph/v1.0"
 
 # =============================================================================
-# Core Type Definitions
+# Core ID / Model Types
 # =============================================================================
 
-GraphID = NewType('GraphID', str)
-"""
-Type alias for graph identifiers providing explicit type safety.
+GraphID = NewType("GraphID", str)
+"""Opaque identifier for nodes/edges (backends may layer structure on top)."""
 
-Using GraphID instead of raw string enhances protocol clarity and enables
-better IDE support and type checking while maintaining string compatibility.
-"""
 
-class HealthStatus:
-    """Standard health status constants for consistent health reporting."""
-    OK = "ok"
-    DEGRADED = "degraded"
-    UNAVAILABLE = "unavailable"
-    READ_ONLY = "read_only"
-
-# =============================================================================
-# Normalized Errors (with retry hints and operational guidance)
-# =============================================================================
-
-class AdapterError(Exception):
+@dataclass(frozen=True)
+class Node:
     """
-    Base exception for all graph adapter errors.
-
-    Provides structured error information including retry guidance, throttling context,
-    and operational suggestions for callers to handle failures gracefully.
+    Graph node representation.
 
     Attributes:
-        message: Human-readable error description
-        code: Machine-readable error code for programmatic handling
-        retry_after_ms: Suggested delay before retry (None if not retryable)
-        throttle_scope: Scope of throttling ("tenant", "cluster", "query_complexity")
-        suggested_batch_reduction: Percentage reduction suggestion for batch size
-        details: Additional context-specific error details
-        operation: Operation that failed (for debugging and metrics)
-        dialect: Query dialect in use during failure (if applicable)
+        id: Stable node identifier (GraphID or backend-native ID)
+        labels: Optional set/list of labels / types / kinds
+        properties: Arbitrary JSON-serializable property map
+        namespace: Optional logical graph / tenant / dataset
+    """
+    id: GraphID
+    labels: Tuple[str, ...] = ()
+    properties: Mapping[str, Any] = None
+    namespace: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.properties is None:
+            object.__setattr__(self, "properties", {})
+
+
+@dataclass(frozen=True)
+class Edge:
+    """
+    Graph edge representation.
+
+    Attributes:
+        id: Stable edge identifier (GraphID or backend-native ID)
+        src: Source node ID
+        dst: Target node ID
+        label: Relationship / predicate / type
+        properties: Arbitrary JSON-serializable property map
+        namespace: Optional logical graph / tenant / dataset
+    """
+    id: GraphID
+    src: GraphID
+    dst: GraphID
+    label: str
+    properties: Mapping[str, Any] = None
+    namespace: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.properties is None:
+            object.__setattr__(self, "properties", {})
+
+
+@dataclass(frozen=True)
+class GraphQuerySpec:
+    """
+    Specification for graph queries.
+
+    Mirrors the wire shape to keep routing trivial.
+
+    Attributes:
+        text: The query text (e.g., Cypher/Gremlin/GQL/SQL/JSON-dsl/etc).
+        dialect: Optional query dialect identifier:
+                 E.g. "cypher", "gremlin", "gql", "sql", "sparql", "native".
+        params: Optional parameter map for bind variables.
+        namespace: Logical graph / dataset / tenant this query targets.
+        timeout_ms: Optional query-level timeout hint (advisory).
+        stream: If True, caller prefers streaming (used by routers and adapters).
+    """
+    text: str
+    dialect: Optional[str] = None
+    params: Mapping[str, Any] = None
+    namespace: Optional[str] = None
+    timeout_ms: Optional[int] = None
+    stream: bool = False
+
+    def __post_init__(self) -> None:
+        if self.params is None:
+            object.__setattr__(self, "params", {})
+
+
+@dataclass(frozen=True)
+class UpsertNodesSpec:
+    """
+    Batch upsert specification for nodes.
+
+    Attributes:
+        nodes: Node objects to upsert
+        namespace: Optional override namespace (per-node namespace wins if set)
+    """
+    nodes: List[Node]
+    namespace: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class UpsertEdgesSpec:
+    """
+    Batch upsert specification for edges.
+
+    Attributes:
+        edges: Edge objects to upsert
+        namespace: Optional override namespace (per-edge namespace wins if set)
+    """
+    edges: List[Edge]
+    namespace: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class DeleteNodesSpec:
+    """
+    Batch delete specification for nodes.
+
+    Attributes:
+        ids: Node IDs to delete
+        namespace: Optional namespace / graph
+        filter: Optional property/label filter for bulk deletes
+    """
+    ids: List[GraphID]
+    namespace: Optional[str] = None
+    filter: Optional[Mapping[str, Any]] = None
+
+
+@dataclass(frozen=True)
+class DeleteEdgesSpec:
+    """
+    Batch delete specification for edges.
+
+    Attributes:
+        ids: Edge IDs to delete
+        namespace: Optional namespace / graph
+        filter: Optional property filter for bulk deletes
+    """
+    ids: List[GraphID]
+    namespace: Optional[str] = None
+    filter: Optional[Mapping[str, Any]] = None
+
+
+# ---- Bulk / Batch specs (restored) ------------------------------------------
+
+@dataclass(frozen=True)
+class BulkVerticesSpec:
+    """
+    Specification for scanning / listing vertices in bulk.
+
+    Useful for offline sync, backfills, and migrations.
+
+    Attributes:
+        namespace: Namespace / graph to scan (None = adapter default).
+        limit: Max number of nodes to return in this page.
+        cursor: Opaque cursor for pagination (adapter-defined).
+        filter: Optional metadata/label filter (adapter-defined semantics).
+    """
+    namespace: Optional[str] = None
+    limit: int = 100
+    cursor: Optional[str] = None
+    filter: Optional[Mapping[str, Any]] = None
+
+
+@dataclass
+class BulkVerticesResult:
+    """
+    Result for bulk_vertices operations.
+
+    Attributes:
+        nodes: Nodes in this page.
+        next_cursor: Cursor for the next page (None if no more).
+        has_more: True if additional pages are available.
+    """
+    nodes: List[Node]
+    next_cursor: Optional[str]
+    has_more: bool
+
+
+@dataclass(frozen=True)
+class BatchOperation:
+    """
+    Opaque batched graph operation.
+
+    Intentionally generic; routers and adapters agree out-of-band
+    on supported shapes. Common examples:
+
+        {"op": "upsert_nodes", "args": {...}}
+        {"op": "upsert_edges", "args": {...}}
+        {"op": "delete_nodes", "args": {...}}
+        {"op": "query", "args": {...}}
+    """
+    op: str
+    args: Mapping[str, Any]
+
+
+@dataclass
+class BatchResult:
+    """
+    Result for batch().
+
+    Attributes:
+        results: Per-operation results (success or error payloads).
+    """
+    results: List[Any]
+
+
+# ---- Schema Introspection (restored) ----------------------------------------
+
+@dataclass
+class GraphSchema:
+    """
+    Logical graph schema description for introspection and tooling.
+
+    Structure is adapter-defined but MUST be JSON-serializable and stable enough
+    for:
+
+        - Query builders and IDEs
+        - Documentation generators
+        - Router query planning
+        - Migration tools
+        - UI schema explorers
+    """
+    nodes: Mapping[str, Any]
+    edges: Mapping[str, Any]
+    metadata: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        if self.nodes is None:
+            object.__setattr__(self, "nodes", {})
+        if self.edges is None:
+            object.__setattr__(self, "edges", {})
+        if self.metadata is None:
+            object.__setattr__(self, "metadata", {})
+
+
+# =============================================================================
+# Results (strongly-typed, JSON-safe)
+# =============================================================================
+
+@dataclass
+class QueryResult:
+    """
+    Result for non-streaming graph queries.
+
+    Attributes:
+        records: Backend-defined rows/tuples/paths; JSON-serializable.
+        summary: Optional metadata, e.g. stats, plan, consumed capacity.
+        dialect: Effective dialect used to run the query.
+        namespace: Target namespace / graph.
+    """
+    records: List[Any]
+    summary: Mapping[str, Any]
+    dialect: Optional[str] = None
+    namespace: Optional[str] = None
+
+
+@dataclass
+class QueryChunk:
+    """
+    Chunk for streaming graph queries.
+
+    Attributes:
+        records: Partial records for this chunk.
+        is_final: True if this is the last chunk in the stream.
+        summary: Optional final summary when is_final is True.
+    """
+    records: List[Any]
+    is_final: bool = False
+    summary: Optional[Mapping[str, Any]] = None
+
+
+@dataclass
+class UpsertResult:
+    """
+    Result for batch upsert operations.
+
+    Attributes:
+        upserted_count: Number of items successfully upserted.
+        failed_count: Number of items that failed.
+        failures: List of per-item failure details (id, message, code).
+    """
+    upserted_count: int
+    failed_count: int
+    failures: List[Mapping[str, Any]]
+
+
+@dataclass
+class DeleteResult:
+    """
+    Result for batch delete operations.
+
+    Attributes:
+        deleted_count: Number of items successfully deleted.
+        failed_count: Number of delete failures.
+        failures: List of per-item failure details.
+    """
+    deleted_count: int
+    failed_count: int
+    failures: List[Mapping[str, Any]]
+
+
+# =============================================================================
+# Normalized Errors
+# =============================================================================
+
+class GraphAdapterError(Exception):
+    """
+    Base exception for graph adapter errors.
+
+    Attributes:
+        message: Human-readable description.
+        code: Machine-readable, UPPER_SNAKE_CASE error code.
+        retry_after_ms: Suggested client backoff (if applicable).
+        details: Additional, SIEM-safe machine context (no PII).
     """
     def __init__(
         self,
@@ -108,85 +452,90 @@ class AdapterError(Exception):
         *,
         code: Optional[str] = None,
         retry_after_ms: Optional[int] = None,
-        throttle_scope: Optional[str] = None,
-        suggested_batch_reduction: Optional[int] = None,
         details: Optional[Mapping[str, Any]] = None,
-        operation: Optional[str] = None,
-        dialect: Optional[str] = None,
-    ) -> None:
+    ):
         super().__init__(message)
         self.message = message
         self.code = code
         self.retry_after_ms = retry_after_ms
-        self.throttle_scope = throttle_scope
-        self.suggested_batch_reduction = suggested_batch_reduction
         self.details = dict(details or {})
-        self.operation = operation
-        self.dialect = dialect
 
-    def asdict(self) -> Dict[str, Any]:
-        """Convert error to dictionary for serialization and logging."""
-        result = {
-            "message": self.message,
-            "code": self.code,
-            "retry_after_ms": self.retry_after_ms,
-            "throttle_scope": self.throttle_scope,
-            "suggested_batch_reduction": self.suggested_batch_reduction,
-            "details": {k: self.details[k] for k in sorted(self.details)},
-        }
-        if self.operation:
-            result["operation"] = self.operation
-        if self.dialect:
-            result["dialect"] = self.dialect
-        return result
+    def __str__(self) -> str:
+        base = self.message or self.__class__.__name__
+        if self.code:
+            base += f" [code={self.code}]"
+        if self.retry_after_ms is not None:
+            base += f" retry_after_ms={self.retry_after_ms}"
+        if self.details:
+            base += f" details={self.details}"
+        return base
 
-class BadRequest(AdapterError):
-    """Client sent an invalid request (malformed parameters, invalid queries)."""
-    pass
 
-class AuthError(AdapterError):
-    """Authentication or authorization failed (invalid credentials, permissions)."""
-    pass
+class BadRequest(GraphAdapterError):
+    """Client error: invalid query/spec/parameters."""
+    def __init__(self, message: str, **kw: Any):
+        kw.setdefault("code", "BAD_REQUEST")
+        super().__init__(message, **kw)
 
-class ResourceExhausted(AdapterError):
-    """Quota, rate limit, or resource constraints exceeded."""
-    pass
 
-class TransientNetwork(AdapterError):
-    """Transient network failure that may succeed on retry."""
-    pass
+class AuthError(GraphAdapterError):
+    """Authentication / authorization failure."""
+    def __init__(self, message: str, **kw: Any):
+        kw.setdefault("code", "AUTH_ERROR")
+        super().__init__(message, **kw)
 
-class Unavailable(AdapterError):
-    """Service is temporarily unavailable or overloaded."""
-    pass
 
-class NotSupported(AdapterError):
-    """Requested operation, dialect, or parameter is not supported."""
-    pass
+class ResourceExhausted(GraphAdapterError):
+    """Quota, rate limit, or capacity exhausted."""
+    def __init__(self, message: str, **kw: Any):
+        kw.setdefault("code", "RESOURCE_EXHAUSTED")
+        super().__init__(message, **kw)
 
-class DeadlineExceeded(AdapterError):
-    """Operation exceeded ctx.deadline_ms budget."""
-    pass
+
+class TransientNetwork(GraphAdapterError):
+    """Retryable network failure."""
+    def __init__(self, message: str, **kw: Any):
+        kw.setdefault("code", "TRANSIENT_NETWORK")
+        super().__init__(message, **kw)
+
+
+class Unavailable(GraphAdapterError):
+    """Backend unavailable / overloaded."""
+    def __init__(self, message: str, **kw: Any):
+        kw.setdefault("code", "UNAVAILABLE")
+        super().__init__(message, **kw)
+
+
+class NotSupported(GraphAdapterError):
+    """Unsupported feature / dialect / parameter."""
+    def __init__(self, message: str, **kw: Any):
+        kw.setdefault("code", "NOT_SUPPORTED")
+        super().__init__(message, **kw)
+
+
+class DeadlineExceeded(GraphAdapterError):
+    """Operation exceeded ctx.deadline_ms."""
+    def __init__(self, message: str, **kw: Any):
+        kw.setdefault("code", "DEADLINE_EXCEEDED")
+        super().__init__(message, **kw)
+
 
 # =============================================================================
-# Context (used for deadlines, identity, SIEM-safe metrics)
+# Context + Metrics
 # =============================================================================
 
 @dataclass(frozen=True)
 class OperationContext:
     """
-    Context for graph operations providing tracing, deadlines, and multi-tenant isolation.
-
-    All context information is propagated through the call chain and used for
-    observability, security, and operational control without exposing sensitive data.
+    Context for graph operations.
 
     Attributes:
-        request_id: Unique identifier for the request chain (correlation ID)
-        idempotency_key: Key for ensuring idempotent operations (when supported)
-        deadline_ms: Absolute epoch milliseconds when operation should timeout
-        traceparent: W3C Trace Context header for distributed tracing
-        tenant: Multi-tenant isolation scope (NEVER logged or exposed in metrics)
-        attrs: Additional operation attributes for extensibility and middleware
+        request_id: Correlation ID for tracing.
+        idempotency_key: For idempotent writes (when supported).
+        deadline_ms: Absolute epoch ms for operation timeout.
+        traceparent: W3C traceparent header.
+        tenant: Tenant / customer / app identifier (never logged raw).
+        attrs: Extra attributes for middleware / routing (SIEM-safe).
     """
     request_id: Optional[str] = None
     idempotency_key: Optional[str] = None
@@ -196,73 +545,20 @@ class OperationContext:
     attrs: Mapping[str, Any] = None
 
     def __post_init__(self) -> None:
-        """Ensure attrs is always a valid dictionary."""
         if self.attrs is None:
             object.__setattr__(self, "attrs", {})
 
-    @property
-    def is_timed_out(self) -> bool:
-        """Check if the context deadline has already elapsed."""
-        if self.deadline_ms is None:
-            return False
-        now_ms = int(time.time() * 1000.0)
-        return now_ms >= int(self.deadline_ms)
-
     def remaining_ms(self) -> Optional[int]:
-        """Return remaining time budget in milliseconds, if any."""
+        """Return non-negative ms remaining until deadline, or None."""
         if self.deadline_ms is None:
             return None
-        now_ms = int(time.time() * 1000.0)
-        return max(0, int(self.deadline_ms) - now_ms)
+        now = int(time.time() * 1000)
+        return max(0, self.deadline_ms - now)
 
-    def with_attrs(self, **new_attrs: Any) -> OperationContext:
-        """
-        Return new context with additional attributes.
-
-        Args:
-            **new_attrs: Additional attributes to merge into existing attrs
-
-        Returns:
-            OperationContext: New context with merged attributes
-        """
-        return OperationContext(
-            request_id=self.request_id,
-            idempotency_key=self.idempotency_key,
-            deadline_ms=self.deadline_ms,
-            traceparent=self.traceparent,
-            tenant=self.tenant,
-            attrs={**self.attrs, **new_attrs}
-        )
-
-# =============================================================================
-# Observability Interfaces (SIEM-safe, low-cardinality)
-# =============================================================================
-
-class LogSink(Protocol):
-    """
-    Protocol for logging implementations.
-
-    Used for structured logging without exposing sensitive information.
-    All log data must avoid PII and use hashed tenant identifiers.
-    """
-    def debug(self, message: str, *, extra: Optional[Mapping[str, Any]] = None) -> None: ...
-    def info(self, message: str, *, extra: Optional[Mapping[str, Any]] = None) -> None: ...
-    def warning(self, message: str, *, extra: Optional[Mapping[str, Any]] = None) -> None: ...
-    def error(self, message: str, *, extra: Optional[Mapping[str, Any]] = None) -> None: ...
-
-class NoopLogSink:
-    """No-operation log sink for testing or when logging is disabled."""
-    def debug(self, message: str, **_: Any) -> None: ...
-    def info(self, message: str, **_: Any) -> None: ...
-    def warning(self, message: str, **_: Any) -> None: ...
-    def error(self, message: str, **_: Any) -> None: ...
 
 class MetricsSink(Protocol):
     """
-    Protocol for metrics collection implementations.
-
-    Used for operational monitoring without exposing sensitive information.
-    All metrics must be low-cardinality and never include PII or tenant identifiers.
+    Metrics collection protocol (low-cardinality; SIEM-safe).
     """
     def observe(
         self,
@@ -273,7 +569,9 @@ class MetricsSink(Protocol):
         ok: bool,
         code: str = "OK",
         extra: Optional[Mapping[str, Any]] = None,
-    ) -> None: ...
+    ) -> None:
+        ...
+
     def counter(
         self,
         *,
@@ -281,706 +579,404 @@ class MetricsSink(Protocol):
         name: str,
         value: int = 1,
         extra: Optional[Mapping[str, Any]] = None,
-    ) -> None: ...
+    ) -> None:
+        ...
+
 
 class NoopMetrics:
-    """No-operation metrics sink for testing or when metrics are disabled."""
-    def observe(self, **_: Any) -> None: ...
-    def counter(self, **_: Any) -> None: ...
+    def observe(self, **_: Any) -> None:
+        ...
+    def counter(self, **_: Any) -> None:
+        ...
+
 
 # =============================================================================
-# Pluggable policies (deadline, breaker, limiter, cache)
+# Policy / Infra Extension Points
 # =============================================================================
 
 class DeadlinePolicy(Protocol):
-    async def wrap(self, coro, ctx: Optional[OperationContext]) -> Any: ...
+    async def wrap(self, awaitable: Awaitable[Any], ctx: Optional[OperationContext]) -> Any:
+        ...
 
-class NoopDeadline(DeadlinePolicy):
-    async def wrap(self, coro, ctx: Optional[OperationContext]) -> Any:
-        return await coro
-
-class CtxDeadline(DeadlinePolicy):
-    """Enforce ctx.deadline_ms via asyncio.wait_for; map timeout to DeadlineExceeded."""
-    async def wrap(self, coro, ctx: Optional[OperationContext]) -> Any:
-        if ctx is None or ctx.deadline_ms is None:
-            return await coro
-        remaining = OperationContext(deadline_ms=ctx.deadline_ms).remaining_ms()
-        if remaining is None:
-            return await coro
-        if remaining <= 0:
-            raise DeadlineExceeded("deadline expired before operation start", code="DEADLINE")
-        try:
-            return await asyncio.wait_for(coro, timeout=float(remaining) / 1000.0)
-        except asyncio.TimeoutError as e:
-            raise DeadlineExceeded("operation timed out", code="DEADLINE") from e
 
 class CircuitBreaker(Protocol):
-    def allow(self) -> bool: ...
-    def on_success(self) -> None: ...
-    def on_error(self, err: Exception) -> None: ...
-
-class NoopBreaker(CircuitBreaker):
-    def allow(self) -> bool: return True
-    def on_success(self) -> None: ...
-    def on_error(self, err: Exception) -> None: ...
-
-class SimpleCircuitBreaker(CircuitBreaker):
-    """
-    Minimal circuit breaker with counts. Not intended to leak closed-source behavior.
-    States: closed -> open after error_threshold within window.
-            open -> half-open once cool_down passes; first success closes, error re-opens.
-    """
-    def __init__(self, *, error_threshold: int = 5, cool_down_s: float = 5.0) -> None:
-        self._error_threshold = max(1, int(error_threshold))
-        self._cool_down_s = max(0.5, float(cool_down_s))
-        self._state = "closed"   # "closed" | "open" | "half"
-        self._errors = 0
-        self._opened_at = 0.0
-
     def allow(self) -> bool:
-        if self._state == "open":
-            if (time.monotonic() - self._opened_at) >= self._cool_down_s:
-                self._state = "half"
-                return True
-            return False
-        return True
-
+        ...
     def on_success(self) -> None:
-        if self._state in ("half", "closed"):
-            self._state = "closed"
-            self._errors = 0
-
+        ...
     def on_error(self, err: Exception) -> None:
-        self._errors += 1
-        if self._errors >= self._error_threshold:
-            self._state = "open"
-            self._opened_at = time.monotonic()
+        ...
+
+
+class Cache(Protocol):
+    async def get(self, key: str) -> Optional[Any]:
+        ...
+    async def set(self, key: str, value: Any, ttl_s: int) -> None:
+        ...
+
 
 class RateLimiter(Protocol):
-    async def acquire(self) -> None: ...
-    def release(self) -> None: ...
+    async def acquire(self) -> None:
+        ...
+    def release(self) -> None:
+        ...
 
-class NoopLimiter(RateLimiter):
-    async def acquire(self) -> None: ...
-    def release(self) -> None: ...
 
-class TokenBucketLimiter(RateLimiter):
+class NoopDeadline:
+    async def wrap(self, awaitable: Awaitable[Any], ctx: Optional[OperationContext]) -> Any:
+        return await awaitable
+
+
+class SimpleDeadline:
+    """Enforce ctx.deadline_ms using asyncio.wait_for."""
+    async def wrap(self, awaitable: Awaitable[Any], ctx: Optional[OperationContext]) -> Any:
+        if ctx is None or ctx.deadline_ms is None:
+            return await awaitable
+        rem = ctx.remaining_ms()
+        if rem is not None and rem <= 0:
+            raise DeadlineExceeded("deadline already exceeded", details={"remaining_ms": 0})
+        try:
+            return await asyncio.wait_for(
+                awaitable, timeout=(rem / 1000.0 if rem is not None else None)
+            )
+        except asyncio.TimeoutError as e:
+            raise DeadlineExceeded("operation timed out", details={"remaining_ms": 0}) from e
+
+
+class NoopBreaker:
+    def allow(self) -> bool:
+        return True
+    def on_success(self) -> None:
+        ...
+    def on_error(self, err: Exception) -> None:
+        ...
+
+
+class SimpleCircuitBreaker:
     """
-    Simple token bucket limiter (coarse-grained). Tokens refill linearly.
-    Designed for safety; failures fail-open to avoid breaking callers.
+    Tiny counter-based breaker; per-process only.
+    Opens after N consecutive failures; half-open after cool-down.
     """
-    def __init__(self, *, rate_per_sec: float = 100.0, burst: int = 100) -> None:
-        self._rate = max(0.1, float(rate_per_sec))
+    def __init__(self, *, failure_threshold: int = 5, recovery_after_s: float = 10.0) -> None:
+        self._threshold = max(1, failure_threshold)
+        self._recovery_after_s = max(0.1, float(recovery_after_s))
+        self._failures = 0
+        self._opened_at: Optional[float] = None
+
+    def allow(self) -> bool:
+        if self._opened_at is None:
+            return True
+        if (time.monotonic() - self._opened_at) >= self._recovery_after_s:
+            # allow one probe (half-open)
+            return True
+        return False
+
+    def on_success(self) -> None:
+        self._failures = 0
+        self._opened_at = None
+
+    def on_error(self, _err: Exception) -> None:
+        self._failures += 1
+        if self._failures >= self._threshold:
+            self._opened_at = time.monotonic()
+
+
+class NoopCache:
+    async def get(self, key: str) -> Optional[Any]:
+        return None
+    async def set(self, key: str, value: Any, ttl_s: int) -> None:
+        ...
+
+
+class InMemoryTTLCache:
+    """
+    Small in-memory TTL cache for read paths (standalone mode only).
+    """
+    def __init__(self) -> None:
+        self._store: Dict[str, Tuple[float, Any]] = {}
+
+    async def get(self, key: str) -> Optional[Any]:
+        now = time.monotonic()
+        item = self._store.get(key)
+        if not item:
+            return None
+        exp, val = item
+        if now >= exp:
+            self._store.pop(key, None)
+            return None
+        return val
+
+    async def set(self, key: str, value: Any, ttl_s: int) -> None:
+        ttl = max(1, int(ttl_s))
+        self._store[key] = (time.monotonic() + ttl, value)
+
+
+class NoopLimiter:
+    async def acquire(self) -> None:
+        ...
+    def release(self) -> None:
+        ...
+
+
+class SimpleTokenBucketLimiter:
+    """
+    Simple token-bucket limiter; per-process; fail-open on internal error.
+    """
+    def __init__(self, rate_per_sec: int = 50, burst: int = 100) -> None:
         self._capacity = max(1, int(burst))
-        self._tokens = float(self._capacity)
+        self._rate = max(1, int(rate_per_sec))
+        self._tokens = self._capacity
         self._last = time.monotonic()
-        self._lock = asyncio.Lock()
 
     def _refill(self) -> None:
         now = time.monotonic()
         delta = now - self._last
-        self._last = now
-        self._tokens = min(self._capacity, self._tokens + delta * self._rate)
+        if delta <= 0:
+            return
+        add = int(delta * self._rate)
+        if add > 0:
+            self._tokens = min(self._capacity, self._tokens + add)
+            self._last = now
 
     async def acquire(self) -> None:
         try:
-            async with self._lock:
-                self._refill()
-                if self._tokens >= 1.0:
-                    self._tokens -= 1.0
-                    return
-            # brief wait loop until a token is available
             while True:
-                await asyncio.sleep(0.01)
-                async with self._lock:
-                    self._refill()
-                    if self._tokens >= 1.0:
-                        self._tokens -= 1.0
-                        return
+                self._refill()
+                if self._tokens > 0:
+                    self._tokens -= 1
+                    return
+                await asyncio.sleep(0.02)
         except Exception:
-            # fail-open
-            return
+            return  # fail-open
 
     def release(self) -> None:
         try:
-            with (self._lock if hasattr(self, "_lock") else None):  # type: ignore
-                self._tokens = min(self._capacity, self._tokens + 0.0)
+            self._refill()
+            if self._tokens < self._capacity:
+                self._tokens += 1
         except Exception:
-            pass
+            return  # fail-open
 
-class Cache(Protocol):
-    async def get(self, key: str) -> Optional[Any]: ...
-    async def set(self, key: str, value: Any, ttl_s: int) -> None: ...
-
-class NoopCache(Cache):
-    async def get(self, key: str) -> Optional[Any]: return None
-    async def set(self, key: str, value: Any, ttl_s: int) -> None: ...
-
-class InMemoryTTLCache(Cache):
-    """Tiny async in-memory TTL cache. Safe for read-path hints."""
-    def __init__(self) -> None:
-        self._store: Dict[str, Tuple[float, Any]] = {}
-        self._lock = asyncio.Lock()
-
-    async def get(self, key: str) -> Optional[Any]:
-        async with self._lock:
-            ent = self._store.get(key)
-            if not ent:
-                return None
-            exp, val = ent
-            if time.monotonic() > exp:
-                self._store.pop(key, None)
-                return None
-            return val
-
-    async def set(self, key: str, value: Any, ttl_s: int) -> None:
-        ttl = max(1, int(ttl_s))
-        async with self._lock:
-            self._store[key] = (time.monotonic() + ttl, value)
 
 # =============================================================================
-# Capabilities (dynamic discovery for routing and planning)
+# Capabilities (with dialect + streaming + batch + schema flags)
 # =============================================================================
 
 @dataclass(frozen=True)
 class GraphCapabilities:
     """
-    Describes the capabilities and limitations of a graph adapter implementation.
-
-    Used by routing layers for intelligent database selection, query planning,
-    and feature compatibility checking across different graph database backends.
+    Describes backend capabilities for routing and validation.
 
     Attributes:
-        server: Backend server identifier (e.g., "neo4j", "janusgraph", "tigergraph")
-        version: Backend server version string
-        dialects: Supported query dialects ("cypher", "gremlin", "gql", etc.)
-        supports_txn: Whether ACID transactions are supported
-        supports_schema_ops: Whether schema operations are supported
-        max_batch_ops: Maximum operations per batch (None for unlimited)
-        retryable_codes: Which error codes are retryable
-        rate_limit_unit: Unit for rate limiting ("requests_per_second", "tokens_per_minute")
-        max_qps: Maximum queries per second (None for unlimited)
-        idempotent_writes: Whether write operations are idempotent with idempotency_key
-        supports_multi_tenant: Whether multi-tenant isolation is supported
-        supports_streaming: Whether streaming queries are supported
-        supports_bulk_ops: Whether bulk operations are supported
-        supports_deadline: Whether adapter cooperates with deadline cancellation
+        server: Backend identifier ("neo4j", "janusgraph", "dgraph", etc.)
+        version: Backend/server version string.
+        protocol: Protocol identifier ("graph/v1.0").
+        supports_stream_query: Whether stream_query is supported.
+        supported_query_dialects: Allowed dialects for GraphQuerySpec.dialect.
+                                  Empty tuple means "adapter-defined" / opaque.
+        supports_namespaces: Whether namespace scoping is supported.
+        supports_property_filters: Whether Delete*Spec.filter is honored.
+        supports_bulk_vertices: Whether bulk_vertices is supported.
+        supports_batch: Whether batch() is supported.
+        supports_schema: Whether get_schema() is supported.
+        idempotent_writes: Whether idempotency_key is honored for writes.
+        supports_multi_tenant: Whether tenant-aware isolation is supported.
+        supports_deadline: Whether ctx.deadline_ms is respected.
     """
     server: str
     version: str
-    dialects: Tuple[str, ...] = ("cypher",)
-    supports_txn: bool = True
-    supports_schema_ops: bool = True
-    max_batch_ops: Optional[int] = None
-    retryable_codes: Tuple[str, ...] = ()
-    rate_limit_unit: str = "requests_per_second"
-    max_qps: Optional[int] = None
+    protocol: str = GRAPH_PROTOCOL_ID
+    supports_stream_query: bool = True
+    supported_query_dialects: Tuple[str, ...] = ()
+    supports_namespaces: bool = True
+    supports_property_filters: bool = True
+    supports_bulk_vertices: bool = False
+    supports_batch: bool = False
+    supports_schema: bool = False
     idempotent_writes: bool = False
     supports_multi_tenant: bool = False
-    supports_streaming: bool = False
-    supports_bulk_ops: bool = False
-    supports_deadline: bool = True  # NEW: parity with embedding/llm
+    supports_deadline: bool = True
+
 
 # =============================================================================
-# Helper Classes (utilities for common operations)
-# =============================================================================
-
-class BatchOperations:
-    """
-    Helper methods for constructing batch operations.
-
-    Provides type-safe utilities for creating batch operation dictionaries
-    that can be passed to the batch() method.
-    """
-
-    @staticmethod
-    def create_vertex_op(label: str, props: Mapping[str, Any]) -> Dict[str, Any]:
-        """
-        Create a vertex creation batch operation.
-
-        Args:
-            label: Vertex type/label
-            props: Vertex properties as key-value pairs
-
-        Returns:
-            Dictionary representing a create_vertex batch operation
-        """
-        return {"type": "create_vertex", "label": label, "props": dict(props)}
-
-    @staticmethod
-    def create_edge_op(label: str, from_id: GraphID, to_id: GraphID, props: Mapping[str, Any]) -> Dict[str, Any]:
-        """
-        Create an edge creation batch operation.
-
-        Args:
-            label: Edge type/label
-            from_id: Source vertex identifier
-            to_id: Target vertex identifier
-            props: Edge properties as key-value pairs
-
-        Returns:
-            Dictionary representing a create_edge batch operation
-        """
-        return {
-            "type": "create_edge",
-            "label": label,
-            "from_id": str(from_id),
-            "to_id": str(to_id),
-            "props": dict(props)
-        }
-
-    @staticmethod
-    def query_op(dialect: str, text: str, params: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
-        """
-        Create a query batch operation.
-
-        Args:
-            dialect: Query dialect ("cypher", "gremlin", etc.)
-            text: Query text
-            params: Query parameters
-
-        Returns:
-            Dictionary representing a query batch operation
-        """
-        return {"type": "query", "dialect": dialect, "text": text, "params": dict(params or {})}
-
-class ProtocolVersion:
-    """
-    Helper for protocol version compatibility checks.
-
-    Provides semantic version parsing and compatibility checking
-    to ensure adapter and caller version alignment.
-    """
-
-    def __init__(self, version_str: str):
-        """
-        Initialize with a semantic version string.
-
-        Args:
-            version_str: Semantic version string (e.g., "1.0.0")
-        """
-        self.major, self.minor, self.patch = map(int, version_str.split('.'))
-
-    def is_compatible_with(self, other: str) -> bool:
-        """
-        Check if this version is compatible with another version.
-
-        Compatibility rules:
-        - Major versions must match exactly
-        - Minor version must be >= the other minor version
-        - Patch versions don't affect compatibility
-
-        Args:
-            other: Other version string to check compatibility with
-
-        Returns:
-            bool: True if versions are compatible
-        """
-        other_ver = ProtocolVersion(other)
-        return self.major == other_ver.major and self.minor >= other_ver.minor
-
-# =============================================================================
-# Stable Protocol Interface (async, versioned contract)
+# Stable Protocol Interface
 # =============================================================================
 
 @runtime_checkable
 class GraphProtocolV1(Protocol):
     """
-    Protocol defining the Graph Protocol V1 interface.
+    Language-level contract for graph adapters.
 
-    Implement this protocol to create compatible graph adapters. All methods are async
-    and designed for high-concurrency environments. The protocol is runtime-checkable
-    for dynamic adapter validation.
+    WireGraphHandler is built strictly on top of this interface.
     """
 
     async def capabilities(self) -> GraphCapabilities:
-        """
-        Get the capabilities of this graph adapter.
-
-        Returns:
-            GraphCapabilities: Description of supported features and limitations
-
-        Note:
-            This method is async to support dynamic capability discovery in
-            distributed systems where capabilities may change or require
-            network calls to determine.
-        """
-        ...
-
-    async def create_vertex(
-        self, label: str, props: Mapping[str, Any], *, ctx: Optional[OperationContext] = None
-    ) -> GraphID:
-        """
-        Create a new vertex with the given label and properties.
-
-        Args:
-            label: The vertex type/label (must be non-empty string)
-            props: Vertex properties as key-value pairs
-            ctx: Operation context for tracing, deadlines, and multi-tenancy
-
-        Returns:
-            GraphID: The unique identifier for the created vertex
-
-        Raises:
-            BadRequest: For invalid arguments or malformed parameters
-            AuthError: For authentication or authorization failures
-            ResourceExhausted: For quota or rate limit exceeded
-            NotSupported: If vertex creation is not supported
-            TransientNetwork: For retryable network failures
-            Unavailable: For service unavailable errors
-        """
-        ...
-
-    async def create_edge(
-        self, label: str, from_id: GraphID, to_id: GraphID, props: Mapping[str, Any], *, ctx: Optional[OperationContext] = None
-    ) -> GraphID:
-        """
-        Create a new edge between two vertices.
-
-        Args:
-            label: The edge type/label (must be non-empty string)
-            from_id: Source vertex identifier (must exist)
-            to_id: Target vertex identifier (must exist)
-            props: Edge properties as key-value pairs
-            ctx: Operation context for tracing, deadlines, and multi-tenancy
-
-        Returns:
-            GraphID: The unique identifier for the created edge
-
-        Raises:
-            BadRequest: For invalid arguments or non-existent vertices
-            AuthError: For authentication or authorization failures
-            ResourceExhausted: For quota or rate limit exceeded
-            NotSupported: If edge creation is not supported
-            TransientNetwork: For retryable network failures
-            Unavailable: For service unavailable errors
-        """
-        ...
-
-    async def delete_vertex(self, vertex_id: GraphID, *, ctx: Optional[OperationContext] = None) -> None:
-        """
-        Delete a vertex by its identifier.
-
-        Args:
-            vertex_id: Vertex identifier to delete
-            ctx: Operation context for tracing and multi-tenancy
-
-        Raises:
-            BadRequest: For invalid vertex identifier
-            AuthError: For authentication or authorization failures
-            ResourceExhausted: For quota or rate limit exceeded
-            NotSupported: If vertex deletion is not supported
-            TransientNetwork: For retryable network failures
-            Unavailable: For service unavailable errors
-        """
-        ...
-
-    async def delete_edge(self, edge_id: GraphID, *, ctx: Optional[OperationContext] = None) -> None:
-        """
-        Delete an edge by its identifier.
-
-        Args:
-            edge_id: Edge identifier to delete
-            ctx: Operation context for tracing and multi-tenancy
-
-        Raises:
-            BadRequest: For invalid edge identifier
-            AuthError: For authentication or authorization failures
-            ResourceExhausted: For quota or rate limit exceeded
-            NotSupported: If edge deletion is not supported
-            TransientNetwork: For retryable network failures
-            Unavailable: For service unavailable errors
-        """
         ...
 
     async def query(
         self,
+        spec: GraphQuerySpec,
         *,
-        dialect: str,
-        text: str,
-        params: Optional[Mapping[str, Any]] = None,
         ctx: Optional[OperationContext] = None,
-    ) -> List[Mapping[str, Any]]:
-        """
-        Execute a query and return all results.
-
-        Args:
-            dialect: Query dialect ("cypher", "gremlin", "gql", etc.)
-            text: Query text in the specified dialect
-            params: Query parameters as key-value pairs
-            ctx: Operation context for tracing, deadlines, and multi-tenancy
-
-        Returns:
-            List of result mappings. Each result is a dictionary representing
-            a node, edge, or projection from the query.
-
-        Raises:
-            BadRequest: For invalid query, dialect, or parameters
-            AuthError: For authentication or authorization failures
-            ResourceExhausted: For quota or rate limit exceeded
-            NotSupported: If the dialect or query type is not supported
-            TransientNetwork: For retryable network failures
-            Unavailable: For service unavailable errors
-        """
+    ) -> QueryResult:
         ...
 
     async def stream_query(
         self,
+        spec: GraphQuerySpec,
         *,
-        dialect: str,
-        text: str,
-        params: Optional[Mapping[str, Any]] = None,
         ctx: Optional[OperationContext] = None,
-    ) -> AsyncIterator[Mapping[str, Any]]:
-        """
-        Execute a query and stream results as they arrive.
+    ) -> AsyncIterator[QueryChunk]:
+        ...
 
-        Args:
-            dialect: Query dialect ("cypher", "gremlin", "gql", etc.)
-            text: Query text in the specified dialect
-            params: Query parameters as key-value pairs
-            ctx: Operation context for tracing, deadlines, and multi-tenancy
+    async def upsert_nodes(
+        self,
+        spec: UpsertNodesSpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> UpsertResult:
+        ...
 
-        Yields:
-            Result mappings as they become available. Each result is a dictionary
-            representing a node, edge, or projection from the query.
+    async def upsert_edges(
+        self,
+        spec: UpsertEdgesSpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> UpsertResult:
+        ...
 
-        Raises:
-            BadRequest: For invalid query, dialect, or parameters
-            AuthError: For authentication or authorization failures
-            ResourceExhausted: For quota or rate limit exceeded
-            NotSupported: If streaming or the dialect is not supported
-            TransientNetwork: For retryable network failures
-            Unavailable: For service unavailable errors
-        """
+    async def delete_nodes(
+        self,
+        spec: DeleteNodesSpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> DeleteResult:
+        ...
+
+    async def delete_edges(
+        self,
+        spec: DeleteEdgesSpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> DeleteResult:
         ...
 
     async def bulk_vertices(
-        self, vertices: Iterable[Tuple[str, Mapping[str, Any]]], *, ctx: Optional[OperationContext] = None
-    ) -> List[GraphID]:
-        """
-        Create multiple vertices in a single operation.
-
-        Args:
-            vertices: Iterable of (label, properties) tuples for vertices to create
-            ctx: Operation context for tracing, deadlines, and multi-tenancy
-
-        Returns:
-            List of GraphIDs for the created vertices in the same order as input
-
-        Raises:
-            BadRequest: For invalid labels or properties
-            AuthError: For authentication or authorization failures
-            ResourceExhausted: For quota or rate limit exceeded
-            NotSupported: If bulk operations are not supported
-            TransientNetwork: For retryable network failures
-            Unavailable: For service unavailable errors
-        """
+        self,
+        spec: BulkVerticesSpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> BulkVerticesResult:
         ...
 
     async def batch(
         self,
-        ops: Iterable[Mapping[str, Any]],
+        ops: List[BatchOperation],
         *,
         ctx: Optional[OperationContext] = None,
-    ) -> List[Mapping[str, Any]]:
-        """
-        Execute multiple operations in a single batch.
-
-        Args:
-            ops: Iterable of operation dictionaries (use BatchOperations helpers)
-            ctx: Operation context for tracing, deadlines, and multi-tenancy
-
-        Returns:
-            List of results corresponding to each operation in the input batch
-
-        Raises:
-            BadRequest: For invalid operations or batch size exceeded
-            AuthError: For authentication or authorization failures
-            ResourceExhausted: For quota or rate limit exceeded
-            NotSupported: If batching is not supported
-            TransientNetwork: For retryable network failures
-            Unavailable: For service unavailable errors
-        """
+    ) -> BatchResult:
         ...
 
-    async def get_schema(self, *, ctx: Optional[OperationContext] = None) -> Dict[str, Any]:
-        """
-        Get the graph schema information.
-
-        Args:
-            ctx: Operation context for tracing, deadlines, and multi-tenancy
-
-        Returns:
-            Dictionary containing schema information (structure varies by backend)
-
-        Raises:
-            AuthError: For authentication or authorization failures
-            NotSupported: If schema operations are not supported
-            TransientNetwork: For retryable network failures
-            Unavailable: For service unavailable errors
-        """
+    async def get_schema(
+        self,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> GraphSchema:
         ...
 
-    async def health(self, *, ctx: Optional[OperationContext] = None) -> Dict[str, Any]:
-        """
-        Check the health status of the graph backend.
-
-        Args:
-            ctx: Operation context for tracing and multi-tenancy
-
-        Returns:
-            Dictionary with health information including:
-            - status: Overall status (HealthStatus constants)
-            - read_only: Whether backend is in read-only mode
-            - degraded: Whether backend is degraded but operational
-            - version: Backend version information
-            - server: Backend server identifier
-            - details: Additional backend-specific health details
-
-        Raises:
-            Unavailable: If the health check fails or backend is unreachable
-        """
+    async def health(
+        self,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> Mapping[str, Any]:
         ...
+
 
 # =============================================================================
-# Base Instrumented Adapter (validation, metrics, error handling)
+# Base Instrumented Adapter (DRY gates via _with_gates)
 # =============================================================================
 
-class _Base:
+class BaseGraphAdapter(GraphProtocolV1):
     """
-    Base functionality shared by graph adapters.
+    Base implementation of GraphProtocolV1.
 
-    Provides common validation, metrics recording, utility methods, and
-    SIEM-safe observability. This class contains all shared infrastructure
-    without implementing the protocol methods.
+    Responsibilities:
+        - Input validation (specs, dialects, namespaces).
+        - Deadline enforcement via DeadlinePolicy.
+        - Circuit breaker + rate limiter gates.
+        - SIEM-safe metrics.
+        - Optional read-path caching in standalone mode.
+        - Wire-agnostic; used by WireGraphHandler.
+
+    Backend implementers override `_do_*` methods only.
     """
+
     _component = "graph"
-    _noop_log_sink = NoopLogSink()
 
     def __init__(
         self,
         *,
         metrics: Optional[MetricsSink] = None,
-        logs: Optional[LogSink] = None,
         mode: str = "thin",
         deadline_policy: Optional[DeadlinePolicy] = None,
         breaker: Optional[CircuitBreaker] = None,
-        limiter: Optional[RateLimiter] = None,
         cache: Optional[Cache] = None,
+        limiter: Optional[RateLimiter] = None,
+        cache_query_ttl_s: int = 30,
+        cache_caps_ttl_s: int = 30,
+        cache_bulk_vertices_ttl_s: int = 30,
+        cache_schema_ttl_s: int = 60,
+        stream_deadline_check_every_n_chunks: int = 10,
     ) -> None:
-        """
-        Initialize the graph adapter with observability instrumentation and optional policies.
-
-        Args:
-            metrics: Metrics sink for operational monitoring. Uses NoopMetrics if None.
-            logs: Log sink for structured logging. Uses NoopLogSink if None.
-            mode: "thin" (default) or "standalone" to toggle infra hooks.
-            deadline_policy: Optional deadline policy to enforce ctx.deadline_ms.
-            breaker: Optional circuit breaker.
-            limiter: Optional rate limiter.
-            cache: Optional async cache for safe read paths.
-        """
         self._metrics: MetricsSink = metrics or NoopMetrics()
-        self._logs: LogSink = logs or self._noop_log_sink
 
-        # Mode wiring with explicit defaults; caller's overrides always win.
-        m = (mode or "thin").lower().strip()
-        self._mode = m if m in {"thin", "standalone"} else "thin"
+        m = (mode or "thin").strip().lower()
+        if m not in {"thin", "standalone"}:
+            m = "thin"
+        self._mode = m
 
-        if self._mode == "thin":
-            self._deadline: DeadlinePolicy = deadline_policy or NoopDeadline()
-            self._breaker: CircuitBreaker = breaker or NoopBreaker()
-            self._limiter: RateLimiter = limiter or NoopLimiter()
-            self._cache: Cache = cache or NoopCache()
-        else:
-            # standalone defaults are conservative, and only for dev/light production
-            self._deadline = deadline_policy or CtxDeadline()
-            self._breaker = breaker or SimpleCircuitBreaker(error_threshold=5, cool_down_s=5.0)
-            self._limiter = limiter or TokenBucketLimiter(rate_per_sec=100.0, burst=100)
+        if self._mode == "standalone":
+            if metrics is None:
+                LOG.warning("Using standalone graph adapter without metrics sink")
+            self._deadline = deadline_policy or SimpleDeadline()
+            self._breaker = breaker or SimpleCircuitBreaker()
             self._cache = cache or InMemoryTTLCache()
-            if isinstance(self._metrics, NoopMetrics):
-                LOG.warning("Using standalone mode without metrics - consider providing a metrics sink for production use")
+            self._limiter = limiter or SimpleTokenBucketLimiter()
+        else:
+            self._deadline = deadline_policy or NoopDeadline()
+            self._breaker = breaker or NoopBreaker()
+            self._cache = cache or NoopCache()
+            self._limiter = limiter or NoopLimiter()
 
-    # ---------------------- validation helpers ----------------------
+        self._cache_query_ttl_s = max(1, int(cache_query_ttl_s))
+        self._cache_caps_ttl_s = max(1, int(cache_caps_ttl_s))
+        self._cache_bulk_vertices_ttl_s = max(1, int(cache_bulk_vertices_ttl_s))
+        self._cache_schema_ttl_s = max(1, int(cache_schema_ttl_s))
+        self._stream_deadline_check_every_n_chunks = max(1, int(stream_deadline_check_every_n_chunks))
 
-    @staticmethod
-    def _require_non_empty(name: str, value: str) -> None:
+    # ---- lifecycle helpers --------------------------------------------------
+
+    async def __aenter__(self) -> "BaseGraphAdapter":
+        """Allow use as an async context manager in apps/services."""
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        await self.close()
+
+    async def close(self) -> None:
         """
-        Validate that a string value is non-empty.
+        Clean up underlying resources (connections, pools, clients, etc.)
 
-        Args:
-            name: Parameter name for error messages
-            value: Value to validate
-
-        Raises:
-            BadRequest: If value is empty or not a string
+        Adapters should override when they own external resources.
         """
-        if not isinstance(value, str) or not value.strip():
-            raise BadRequest(f"{name} must be a non-empty string")
+        return None
 
-    def _validate_dialect(self, dialect: str) -> None:
-        """
-        Validate that a dialect is known and supported.
-
-        Args:
-            dialect: Dialect to validate
-
-        Raises:
-            BadRequest: If dialect is empty
-            NotSupported: If dialect is not in KNOWN_DIALECTS
-        """
-        self._require_non_empty("dialect", dialect)
-        if dialect not in KNOWN_DIALECTS:
-            raise NotSupported(
-                f"Dialect '{dialect}' not supported. Known dialects: {KNOWN_DIALECTS}",
-                dialect=dialect
-            )
-
-    def _validate_properties(self, props: Mapping[str, Any]) -> Dict[str, Any]:
-        """
-        Convert and validate property types for graph compatibility.
-
-        Args:
-            props: Properties to validate and convert
-
-        Returns:
-            Validated properties dictionary with string keys
-        """
-        if props is None:
-            return {}
-        return {str(k): v for k, v in props.items()}
-
-    @staticmethod
-    def _bucket_ms(ms: Optional[int]) -> Optional[str]:
-        """
-        Bucket milliseconds for metrics categorization.
-
-        Args:
-            ms: Milliseconds to bucket
-
-        Returns:
-            Bucketed time range string or None
-        """
-        if ms is None or ms < 0: return None
-        if ms < 1000: return "<1s"
-        if ms < 5000: return "<5s"
-        if ms < 15000: return "<15s"
-        if ms < 60000: return "<60s"
-        return ">=60s"
+    # ---- internal helpers ---------------------------------------------------
 
     @staticmethod
     def _tenant_hash(tenant: Optional[str]) -> Optional[str]:
-        """
-        Create privacy-preserving hash of tenant identifier for metrics.
-
-        Args:
-            tenant: Raw tenant identifier
-
-        Returns:
-            Hashed tenant identifier (first 12 chars of SHA256) or None
-        """
-        if not tenant: return None
+        if not tenant:
+            return None
         return hashlib.sha256(tenant.encode("utf-8")).hexdigest()[:12]
 
     def _record(
@@ -993,616 +989,871 @@ class _Base:
         ctx: Optional[OperationContext] = None,
         **extra: Any,
     ) -> None:
-        """
-        Record operation metrics with context and tenant hashing.
-
-        Never exposes raw tenant identifiers in metrics. Safe for SIEM systems.
-
-        Args:
-            op: Operation name
-            t0: Start time from time.monotonic()
-            ok: Whether operation succeeded
-            code: Status code for metrics
-            ctx: Operation context for tenant and deadline information
-            **extra: Additional metric dimensions
-        """
         try:
-            dt_ms = (time.monotonic() - t0) * 1000.0
+            ms = (time.monotonic() - t0) * 1000.0
             x = dict(extra or {})
             if ctx:
-                x["deadline_bucket"] = self._bucket_ms(ctx.deadline_ms)
-                x["tenant"] = self._tenant_hash(ctx.tenant)
+                th = self._tenant_hash(ctx.tenant)
+                if th:
+                    x.setdefault("tenant", th)
             self._metrics.observe(
-                component=self._component, op=op, ms=dt_ms, ok=ok, code=code, extra=x or None
+                component=self._component,
+                op=op,
+                ms=ms,
+                ok=ok,
+                code=code,
+                extra=x or None,
             )
-            # light counters for visibility
-            name = f"{op}_total" if ok else f"{op}_errors"
-            self._metrics.counter(component=self._component, name=name, value=1)
         except Exception:
-            # Never let metrics recording break the operation
+            # never let metrics break caller
             pass
 
-    # ---------------------- policy helpers ----------------------
+    def _fail_if_deadline_expired(self, ctx: Optional[OperationContext]) -> None:
+        if ctx is None:
+            return
+        rem = ctx.remaining_ms()
+        if rem is not None and rem <= 0:
+            raise DeadlineExceeded("deadline already exceeded", details={"remaining_ms": 0})
 
-    def _preflight_deadline(self, ctx: Optional[OperationContext]) -> None:
-        if ctx is not None and ctx.is_timed_out:
-            raise DeadlineExceeded("deadline expired before operation start", code="DEADLINE")
-
-    async def _apply_deadline(self, coro, ctx: Optional[OperationContext]) -> Any:
+    async def _apply_deadline(
+        self,
+        awaitable: Awaitable[Any],
+        ctx: Optional[OperationContext],
+    ) -> Any:
         try:
-            return await self._deadline.wrap(coro, ctx)
-        except DeadlineExceeded:
-            raise
+            return await self._deadline.wrap(awaitable, ctx)
         except asyncio.TimeoutError as e:
-            raise DeadlineExceeded("operation timed out", code="DEADLINE") from e
+            raise DeadlineExceeded("operation timed out", details={"remaining_ms": 0}) from e
 
-    async def _with_gates(self, op: str, ctx: Optional[OperationContext], fn: Callable[[], Any]) -> Any:
-        """
-        Apply breaker + limiter admission and ensure limiter release & breaker bookkeeping.
-        """
-        self._preflight_deadline(ctx)
-        if not self._breaker.allow():
-            raise Unavailable("circuit open", code="CIRCUIT_OPEN")
-        await self._limiter.acquire()
-        try:
-            return await self._apply_deadline(fn(), ctx)
-        except Exception as e:
-            try:
-                self._breaker.on_error(e)
-            finally:
-                raise
-        finally:
-            try:
-                self._limiter.release()
-            except Exception:
-                pass
-
-    # ---------------------- caching helpers ----------------------
-
-    @staticmethod
-    def _stable_json(obj: Any) -> str:
-        # A stable representation for cache keys without importing json to avoid heavy deps:
-        # We will use a simple deterministic flattener.
-        if obj is None:
-            return "null"
-        if isinstance(obj, (str, int, float, bool)):
-            return repr(obj)
-        if isinstance(obj, Mapping):
-            items = ",".join(f"{repr(str(k))}:{_Base._stable_json(v)}" for k, v in sorted(obj.items(), key=lambda kv: str(kv[0])))
-            return "{" + items + "}"
-        if isinstance(obj, (list, tuple)):
-            return "[" + ",".join(_Base._stable_json(v) for v in obj) + "]"
-        return repr(str(obj))
-
-    def _query_cache_key(
+    def _make_cache_key(
         self,
         *,
-        server: Optional[str],
-        dialect: str,
-        text: str,
-        params: Mapping[str, Any],
-        tenant_hash: Optional[str],
+        op: str,
+        spec: Any,
+        ctx: Optional[OperationContext] = None,
     ) -> str:
-        base = {
-            "server": server or "unknown",
-            "dialect": dialect,
-            "text": text,
-            "params": params,
-            "tenant": tenant_hash or "anon",
-            "version": GRAPH_PROTOCOL_VERSION,
-        }
-        s = self._stable_json(base).encode("utf-8")
-        return "graph:query:" + hashlib.blake2b(s, digest_size=20).hexdigest()
+        """
+        Compose a cache key for read operations.
 
-    def _schema_cache_key(self, server: Optional[str], tenant_hash: Optional[str]) -> str:
-        s = f"{server or 'unknown'}:{tenant_hash or 'anon'}:{GRAPH_PROTOCOL_VERSION}".encode("utf-8")
-        return "graph:schema:" + hashlib.blake2b(s, digest_size=20).hexdigest()
+        Includes:
+            - operation
+            - stable repr of spec/asdict(spec)
+            - tenant hash (if present) to avoid cross-tenant bleed.
+        """
+        if hasattr(spec, "__dataclass_fields__"):
+            raw = asdict(spec)
+        else:
+            raw = spec
+        base = f"graph:{op}:{repr(raw)}"
+        if ctx and ctx.tenant:
+            th = self._tenant_hash(ctx.tenant)
+            if th:
+                base += f":tenant:{th}"
+        return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
-    def _caps_cache_key(self) -> str:
-        return "graph:caps:" + GRAPH_PROTOCOL_VERSION
+    @staticmethod
+    def _validate_properties_map(properties: Mapping[str, Any]) -> None:
+        """
+        Validate that a properties mapping is JSON-serializable.
 
-class BaseGraphAdapter(_Base, GraphProtocolV1):
-    """
-    Base class for implementing Graph Protocol V1 adapters.
+        This is intentionally strict to avoid subtle wire failures later.
+        """
+        try:
+            json.dumps(properties)
+        except (TypeError, ValueError) as e:
+            raise BadRequest(f"properties must be JSON-serializable: {e}")
 
-    Provides common validation, metrics instrumentation, error handling, and
-    SIEM-safe observability. Implementers should override the `_do_*` methods
-    to provide backend-specific functionality while getting production-ready
-    infrastructure for free.
+    def _validate_node(self, node: Node) -> None:
+        if node.properties is not None:
+            self._validate_properties_map(node.properties)
 
-    Example:
-        class Neo4jAdapter(BaseGraphAdapter):
-            async def _do_create_vertex(self, label: str, props: Dict[str, Any], *, ctx: Optional[OperationContext]) -> GraphID:
-                # Neo4j-specific implementation using driver sessions
-                async with self._driver.session() as session:
-                    result = await session.run(
-                        "CREATE (v:$label) SET v = $props RETURN id(v) as id",
-                        label=label, props=props
-                    )
-                    record = await result.single()
-                    return GraphID(str(record["id"]))
-    """
+    def _validate_edge(self, edge: Edge) -> None:
+        if not isinstance(edge.label, str) or not edge.label:
+            raise BadRequest("edge.label must be a non-empty string")
+        if edge.properties is not None:
+            self._validate_properties_map(edge.properties)
 
-    # ---------------------- public API (with hardening) ----------------------
+    # ---- DRY gate wrappers --------------------------------------------------
+
+    async def _with_gates_unary(
+        self,
+        *,
+        op: str,
+        ctx: Optional[OperationContext],
+        call: Callable[[], Awaitable[Any]],
+        metric_extra: Mapping[str, Any] = None,
+    ) -> Any:
+        """
+        DRY wrapper for unary operations:
+        - checks deadline
+        - circuit breaker
+        - rate limiter
+        - maps errors to metrics
+        """
+        metric_extra = dict(metric_extra or {})
+        self._fail_if_deadline_expired(ctx)
+
+        if not self._breaker.allow():
+            e = Unavailable("circuit open")
+            t0 = time.monotonic()
+            self._record(op, t0, False, code=e.code, ctx=ctx, **metric_extra)
+            raise e
+
+        await self._limiter.acquire()
+        t0 = time.monotonic()
+        try:
+            result = await self._apply_deadline(call(), ctx)
+            self._record(op, t0, True, ctx=ctx, **metric_extra)
+            self._breaker.on_success()
+            return result
+        except GraphAdapterError as e:
+            self._record(op, t0, False, code=e.code or type(e).__name__, ctx=ctx, **metric_extra)
+            self._breaker.on_error(e)
+            raise
+        except Exception:
+            self._record(op, t0, False, code="UNAVAILABLE", ctx=ctx, **metric_extra)
+            self._breaker.on_error(e)
+            raise
+        finally:
+            self._limiter.release()
+
+    async def _with_gates_stream(
+        self,
+        *,
+        op: str,
+        ctx: Optional[OperationContext],
+        agen_factory: Callable[[], AsyncIterator[QueryChunk]],
+        metric_extra: Mapping[str, Any] = None,
+    ) -> AsyncIterator[QueryChunk]:
+        """
+        DRY wrapper for streaming operations:
+        - preflight deadline, breaker, limiter
+        - periodic deadline checks
+        - metrics on completion or error
+        """
+        metric_extra = dict(metric_extra or {})
+        self._fail_if_deadline_expired(ctx)
+
+        if not self._breaker.allow():
+            raise Unavailable("circuit open")
+
+        await self._limiter.acquire()
+        t0 = time.monotonic()
+        check_n = self._stream_deadline_check_every_n_chunks
+
+        async def _gen() -> AsyncIterator[QueryChunk]:
+            chunk_count = 0
+            try:
+                agen = agen_factory()
+                async for chunk in agen:
+                    chunk_count += 1
+                    if chunk_count % check_n == 0:
+                        self._fail_if_deadline_expired(ctx)
+                    yield chunk
+                self._record(op, t0, True, ctx=ctx, **metric_extra)
+                self._breaker.on_success()
+            except GraphAdapterError as e:
+                self._record(op, t0, False, code=e.code or type(e).__name__, ctx=ctx, **metric_extra)
+                self._breaker.on_error(e)
+                raise
+            except Exception:
+                self._record(op, t0, False, code="UNAVAILABLE", ctx=ctx, **metric_extra)
+                self._breaker.on_error(e)
+                raise
+            finally:
+                self._limiter.release()
+
+        return _gen()
+
+    # --- public API ----------------------------------------------------------
 
     async def capabilities(self) -> GraphCapabilities:
-        """Get the capabilities of this graph adapter (with optional caching)."""
+        """
+        Return adapter capabilities.
+
+        Standalone mode: may be cached briefly to reduce overhead.
+        """
         t0 = time.monotonic()
         try:
-            async def _call():
-                # Read-path cache only in standalone
-                if self._mode == "standalone":
-                    key = self._caps_cache_key()
-                    cached = await self._cache.get(key)
-                    if cached is not None:
-                        self._metrics.counter(component=self._component, name="cache_hits", value=1)
-                        return cached
-                    caps = await self._do_capabilities()
-                    await self._cache.set(key, caps, ttl_s=30)
-                    return caps
-                # thin: no cache
-                return await self._do_capabilities()
+            if isinstance(self._cache, InMemoryTTLCache):
+                key = "graph:capabilities"
+                cached = await self._cache.get(key)
+                if cached:
+                    self._metrics.counter(
+                        component=self._component,
+                        name="cache_hits",
+                        value=1,
+                        extra={"op": "capabilities"},
+                    )
+                    self._record("capabilities", t0, True)
+                    return cached
 
-            caps = await _call()
-            self._record("capabilities", t0, True, ctx=None)
+            caps = await self._apply_deadline(self._do_capabilities(), ctx=None)
+
+            if isinstance(self._cache, InMemoryTTLCache):
+                await self._cache.set("graph:capabilities", caps, ttl_s=self._cache_caps_ttl_s)
+
+            self._record("capabilities", t0, True)
             return caps
-        except AdapterError as e:
-            self._record("capabilities", t0, False, code=type(e).__name__, ctx=None)
+        except GraphAdapterError as e:
+            self._record("capabilities", t0, False, code=e.code or type(e).__name__)
             raise
-
-    async def create_vertex(
-        self, label: str, props: Mapping[str, Any], *, ctx: Optional[OperationContext] = None
-    ) -> GraphID:
-        """
-        Create a new vertex with the given label and properties.
-
-        See GraphProtocolV1.create_vertex for full documentation.
-        """
-        self._require_non_empty("label", label)
-        validated_props = self._validate_properties(props)
-        t0 = time.monotonic()
-        try:
-            # gates + deadline (no caching for mutations)
-            async def _fn():
-                return await self._do_create_vertex(label, validated_props, ctx=ctx)
-
-            self._preflight_deadline(ctx)
-            if not self._breaker.allow():
-                raise Unavailable("circuit open", code="CIRCUIT_OPEN")
-            await self._limiter.acquire()
-            try:
-                vid = await self._apply_deadline(_fn(), ctx)
-                self._breaker.on_success()
-            except Exception as e:
-                self._breaker.on_error(e)
-                raise
-            finally:
-                self._limiter.release()
-
-            self._record("create_vertex", t0, True, ctx=ctx)
-            return GraphID(str(vid))  # Explicit type conversion
-        except AdapterError as e:
-            self._record("create_vertex", t0, False, code=type(e).__name__, ctx=ctx)
-            raise
-
-    async def create_edge(
-        self, label: str, from_id: GraphID, to_id: GraphID, props: Mapping[str, Any], *, ctx: Optional[OperationContext] = None
-    ) -> GraphID:
-        """
-        Create a new edge between two vertices.
-
-        See GraphProtocolV1.create_edge for full documentation.
-        """
-        for n, v in (("label", label), ("from_id", from_id), ("to_id", to_id)):
-            self._require_non_empty(n, str(v))
-        validated_props = self._validate_properties(props)
-        t0 = time.monotonic()
-        try:
-            async def _fn():
-                return await self._do_create_edge(label, str(from_id), str(to_id), validated_props, ctx=ctx)
-
-            self._preflight_deadline(ctx)
-            if not self._breaker.allow():
-                raise Unavailable("circuit open", code="CIRCUIT_OPEN")
-            await self._limiter.acquire()
-            try:
-                eid = await self._apply_deadline(_fn(), ctx)
-                self._breaker.on_success()
-            except Exception as e:
-                self._breaker.on_error(e)
-                raise
-            finally:
-                self._limiter.release()
-
-            self._record("create_edge", t0, True, ctx=ctx)
-            return GraphID(str(eid))  # Explicit type conversion
-        except AdapterError as e:
-            self._record("create_edge", t0, False, code=type(e).__name__, ctx=ctx)
-            raise
-
-    async def delete_vertex(self, vertex_id: GraphID, *, ctx: Optional[OperationContext] = None) -> None:
-        """Delete a vertex by its identifier."""
-        self._require_non_empty("vertex_id", str(vertex_id))
-        t0 = time.monotonic()
-        try:
-            async def _fn():
-                return await self._do_delete_vertex(str(vertex_id), ctx=ctx)
-
-            self._preflight_deadline(ctx)
-            if not self._breaker.allow():
-                raise Unavailable("circuit open", code="CIRCUIT_OPEN")
-            await self._limiter.acquire()
-            try:
-                await self._apply_deadline(_fn(), ctx)
-                self._breaker.on_success()
-            except Exception as e:
-                self._breaker.on_error(e)
-                raise
-            finally:
-                self._limiter.release()
-
-            self._record("delete_vertex", t0, True, ctx=ctx)
-        except AdapterError as e:
-            self._record("delete_vertex", t0, False, code=type(e).__name__, ctx=ctx)
-            raise
-
-    async def delete_edge(self, edge_id: GraphID, *, ctx: Optional[OperationContext] = None) -> None:
-        """Delete an edge by its identifier."""
-        self._require_non_empty("edge_id", str(edge_id))
-        t0 = time.monotonic()
-        try:
-            async def _fn():
-                return await self._do_delete_edge(str(edge_id), ctx=ctx)
-
-            self._preflight_deadline(ctx)
-            if not self._breaker.allow():
-                raise Unavailable("circuit open", code="CIRCUIT_OPEN")
-            await self._limiter.acquire()
-            try:
-                await self._apply_deadline(_fn(), ctx)
-                self._breaker.on_success()
-            except Exception as e:
-                self._breaker.on_error(e)
-                raise
-            finally:
-                self._limiter.release()
-
-            self._record("delete_edge", t0, True, ctx=ctx)
-        except AdapterError as e:
-            self._record("delete_edge", t0, False, code=type(e).__name__, ctx=ctx)
-            raise
+        except Exception as e:
+            self._record("capabilities", t0, False, code="UNAVAILABLE")
+            raise Unavailable("capabilities fetch failed") from e
 
     async def query(
         self,
+        spec: GraphQuerySpec,
         *,
-        dialect: str,
-        text: str,
-        params: Optional[Mapping[str, Any]] = None,
         ctx: Optional[OperationContext] = None,
-    ) -> List[Mapping[str, Any]]:
-        """Execute a query and return all results."""
-        self._validate_dialect(dialect)
-        self._require_non_empty("text", text)
-        validated_params = self._validate_properties(params or {})
-        t0 = time.monotonic()
-        try:
-            # Capabilities gating (dialect & optional batch limits for internal ops)
-            caps = await self._do_capabilities()
-            if dialect not in caps.dialects:
-                raise NotSupported(f"Dialect '{dialect}' not supported by backend", dialect=dialect)
+    ) -> QueryResult:
+        """
+        Execute a non-streaming graph query.
 
-            tenant_hash = self._tenant_hash(ctx.tenant) if ctx else None
-            server = getattr(caps, "server", None)
-            cache_key = self._query_cache_key(server=server, dialect=dialect, text=text, params=validated_params, tenant_hash=tenant_hash)
+        Dialect rules:
+            - If capabilities.supported_query_dialects is non-empty, and spec.dialect
+              is set, it MUST be a member.
+            - If dialect is None, adapter may treat text as backend-native.
+        """
+        if not isinstance(spec.text, str) or not spec.text.strip():
+            raise BadRequest("query.text must be a non-empty string")
 
-            async def _fn():
-                # Optional cache in standalone
-                if self._mode == "standalone":
-                    cached = await self._cache.get(cache_key)
-                    if cached is not None:
-                        self._metrics.counter(component=self._component, name="cache_hits", value=1)
-                        return cached
-                    res = await self._do_query(dialect=dialect, text=text, params=validated_params, ctx=ctx)
-                    await self._cache.set(cache_key, res, ttl_s=60)
-                    return res
-                return await self._do_query(dialect=dialect, text=text, params=validated_params, ctx=ctx)
+        caps = await self.capabilities()
+        if spec.dialect and caps.supported_query_dialects:
+            if spec.dialect not in caps.supported_query_dialects:
+                raise NotSupported(
+                    f"dialect '{spec.dialect}' not supported",
+                    details={"supported_query_dialects": caps.supported_query_dialects},
+                )
 
-            self._preflight_deadline(ctx)
-            if not self._breaker.allow():
-                raise Unavailable("circuit open", code="CIRCUIT_OPEN")
-            await self._limiter.acquire()
-            try:
-                res = await self._apply_deadline(_fn(), ctx)
-                self._breaker.on_success()
-            except Exception as e:
-                self._breaker.on_error(e)
-                raise
-            finally:
-                self._limiter.release()
+        async def _call() -> QueryResult:
+            # standalone: cache on read-only, non-streaming queries
+            if isinstance(self._cache, InMemoryTTLCache) and not spec.stream:
+                key = self._make_cache_key(op="query", spec=spec, ctx=ctx)
+                cached = await self._cache.get(key)
+                if cached:
+                    self._metrics.counter(
+                        component=self._component,
+                        name="cache_hits",
+                        value=1,
+                        extra={"op": "query"},
+                    )
+                    return cached
+                res = await self._do_query(spec, ctx=ctx)
+                await self._cache.set(key, res, ttl_s=self._cache_query_ttl_s)
+                return res
+            return await self._do_query(spec, ctx=ctx)
 
-            self._record("query", t0, True, ctx=ctx, dialect=dialect, rows=len(res))
-            return res
-        except AdapterError as e:
-            self._record("query", t0, False, code=type(e).__name__, ctx=ctx, dialect=dialect)
-            raise
+        return await self._with_gates_unary(
+            op="query",
+            ctx=ctx,
+            call=_call,
+            metric_extra={"dialect": spec.dialect or "none"},
+        )
 
     async def stream_query(
         self,
+        spec: GraphQuerySpec,
         *,
-        dialect: str,
-        text: str,
-        params: Optional[Mapping[str, Any]] = None,
         ctx: Optional[OperationContext] = None,
-    ) -> AsyncIterator[Mapping[str, Any]]:
-        """Execute a query and stream results as they arrive."""
-        self._validate_dialect(dialect)
-        self._require_non_empty("text", text)
-        validated_params = self._validate_properties(params or {})
-        t0 = time.monotonic()
-        ok = False
-        try:
-            caps = await self._do_capabilities()
-            if dialect not in caps.dialects:
-                raise NotSupported(f"Dialect '{dialect}' not supported by backend", dialect=dialect)
+    ) -> AsyncIterator[QueryChunk]:
+        """
+        Execute a streaming graph query.
 
-            self._preflight_deadline(ctx)
-            if not self._breaker.allow():
-                raise Unavailable("circuit open", code="CIRCUIT_OPEN")
-            await self._limiter.acquire()
+        For large result sets; preferred over `query` when supported.
+        """
+        if not isinstance(spec.text, str) or not spec.text.strip():
+            raise BadRequest("query.text must be a non-empty string")
 
-            # Wrap the underlying async generator with deadline checks.
-            async def _gen():
-                # Note: we intentionally don't cache streams.
-                agen = self._do_stream_query(dialect=dialect, text=text, params=validated_params, ctx=ctx)
-                try:
-                    async for row in agen:
-                        # Per-chunk deadline check:
-                        if ctx and ctx.is_timed_out:
-                            raise DeadlineExceeded("stream exceeded deadline", code="DEADLINE")
-                        yield row
-                finally:
-                    # Ensure underlying generator is closed if caller stops early.
-                    try:
-                        await agen.aclose()  # type: ignore[attr-defined]
-                    except Exception:
-                        pass
+        caps = await self.capabilities()
+        if not caps.supports_stream_query:
+            raise NotSupported("stream_query is not supported by this adapter")
+        if spec.dialect and caps.supported_query_dialects:
+            if spec.dialect not in caps.supported_query_dialects:
+                raise NotSupported(
+                    f"dialect '{spec.dialect}' not supported",
+                    details={"supported_query_dialects": caps.supported_query_dialects},
+                )
 
-            count = 0
-            async for row in self._apply_deadline(_gen(), ctx):  # type: ignore[arg-type]
-                count += 1
-                yield row
-            ok = True
-            self._breaker.on_success()
-            self._record("stream_query", t0, True, ctx=ctx, dialect=dialect, rows=count)
-        except AdapterError as e:
-            self._breaker.on_error(e)
-            self._record("stream_query", t0, False, code=type(e).__name__, ctx=ctx, dialect=dialect)
-            raise
-        except Exception as e:
-            self._breaker.on_error(e)
-            self._record("stream_query", t0, False, code=type(e).__name__, ctx=ctx, dialect=dialect)
-            raise
-        finally:
-            try:
-                self._limiter.release()
-            except Exception:
-                pass
-            if not ok:
-                # no-op, final accounting handled above
-                pass
+        async def agen_factory() -> AsyncIterator[QueryChunk]:
+            async for chunk in self._do_stream_query(spec, ctx=ctx):
+                yield chunk
+
+        return await self._with_gates_stream(
+            op="stream_query",
+            ctx=ctx,
+            agen_factory=lambda: agen_factory(),
+            metric_extra={"dialect": spec.dialect or "none"},
+        )
+
+    async def upsert_nodes(
+        self,
+        spec: UpsertNodesSpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> UpsertResult:
+        """Batch upsert nodes with validation and gates."""
+        if not spec.nodes:
+            raise BadRequest("nodes must not be empty")
+        for n in spec.nodes:
+            self._validate_node(n)
+
+        async def _call() -> UpsertResult:
+            return await self._do_upsert_nodes(spec, ctx=ctx)
+
+        return await self._with_gates_unary(
+            op="upsert_nodes",
+            ctx=ctx,
+            call=_call,
+            metric_extra={"count": len(spec.nodes)},
+        )
+
+    async def upsert_edges(
+        self,
+        spec: UpsertEdgesSpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> UpsertResult:
+        """Batch upsert edges with validation and gates."""
+        if not spec.edges:
+            raise BadRequest("edges must not be empty")
+        for e in spec.edges:
+            self._validate_edge(e)
+
+        async def _call() -> UpsertResult:
+            return await self._do_upsert_edges(spec, ctx=ctx)
+
+        return await self._with_gates_unary(
+            op="upsert_edges",
+            ctx=ctx,
+            call=_call,
+            metric_extra={"count": len(spec.edges)},
+        )
+
+    async def delete_nodes(
+        self,
+        spec: DeleteNodesSpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> DeleteResult:
+        """Batch delete nodes by IDs and/or filter."""
+        if not spec.ids and not spec.filter:
+            raise BadRequest("must provide ids or filter for delete_nodes")
+        if spec.filter is not None:
+            self._validate_properties_map(spec.filter)
+
+        async def _call() -> DeleteResult:
+            return await self._do_delete_nodes(spec, ctx=ctx)
+
+        return await self._with_gates_unary(
+            op="delete_nodes",
+            ctx=ctx,
+            call=_call,
+            metric_extra={"ids": len(spec.ids)},
+        )
+
+    async def delete_edges(
+        self,
+        spec: DeleteEdgesSpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> DeleteResult:
+        """Batch delete edges by IDs and/or filter."""
+        if not spec.ids and not spec.filter:
+            raise BadRequest("must provide ids or filter for delete_edges")
+        if spec.filter is not None:
+            self._validate_properties_map(spec.filter)
+
+        async def _call() -> DeleteResult:
+            return await self._do_delete_edges(spec, ctx=ctx)
+
+        return await self._with_gates_unary(
+            op="delete_edges",
+            ctx=ctx,
+            call=_call,
+            metric_extra={"ids": len(spec.ids)},
+        )
 
     async def bulk_vertices(
-        self, vertices: Iterable[Tuple[str, Mapping[str, Any]]], *, ctx: Optional[OperationContext] = None
-    ) -> List[GraphID]:
-        """Create multiple vertices in a single operation."""
-        vertex_list = list(vertices)
-        for label, props in vertex_list:
-            self._require_non_empty("label", label)
+        self,
+        spec: BulkVerticesSpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> BulkVerticesResult:
+        """
+        Scan/list vertices in bulk with optional pagination.
 
-        # Capabilities gating for batch size if provided
-        caps = await self._do_capabilities()
-        if caps.max_batch_ops is not None and len(vertex_list) > int(caps.max_batch_ops):
-            raise BadRequest(
-                f"batch size {len(vertex_list)} exceeds max_batch_ops {caps.max_batch_ops}",
-                suggested_batch_reduction=100 * (len(vertex_list) - int(caps.max_batch_ops)) // len(vertex_list),
-                details={"max_batch_ops": int(caps.max_batch_ops)},
-                operation="bulk_vertices",
-            )
+        Only available if capabilities.supports_bulk_vertices is True.
+        """
+        caps = await self.capabilities()
+        if not caps.supports_bulk_vertices:
+            raise NotSupported("bulk_vertices is not supported by this adapter")
+        if spec.limit <= 0:
+            raise BadRequest("limit must be positive")
+        if spec.filter is not None:
+            self._validate_properties_map(spec.filter)
 
-        validated_vertices = [(label, self._validate_properties(props)) for label, props in vertex_list]
-        t0 = time.monotonic()
-        try:
-            async def _fn():
-                return await self._do_bulk_vertices(validated_vertices, ctx=ctx)
+        async def _call() -> BulkVerticesResult:
+            # optional cache for purely read-only scans (first page, no filter)
+            if (
+                isinstance(self._cache, InMemoryTTLCache)
+                and spec.cursor is None
+                and spec.filter is None
+            ):
+                key = self._make_cache_key(op="bulk_vertices", spec=spec, ctx=ctx)
+                cached = await self._cache.get(key)
+                if cached:
+                    self._metrics.counter(
+                        component=self._component,
+                        name="cache_hits",
+                        value=1,
+                        extra={"op": "bulk_vertices"},
+                    )
+                    return cached
+                res = await self._do_bulk_vertices(spec, ctx=ctx)
+                await self._cache.set(key, res, ttl_s=self._cache_bulk_vertices_ttl_s)
+                return res
+            return await self._do_bulk_vertices(spec, ctx=ctx)
 
-            self._preflight_deadline(ctx)
-            if not self._breaker.allow():
-                raise Unavailable("circuit open", code="CIRCUIT_OPEN")
-            await self._limiter.acquire()
-            try:
-                ids = await self._apply_deadline(_fn(), ctx)
-                self._breaker.on_success()
-            except Exception as e:
-                self._breaker.on_error(e)
-                raise
-            finally:
-                self._limiter.release()
-
-            self._record("bulk_vertices", t0, True, ctx=ctx, count=len(vertex_list))
-            return [GraphID(str(id)) for id in ids]  # Explicit type conversion
-        except AdapterError as e:
-            self._record("bulk_vertices", t0, False, code=type(e).__name__, ctx=ctx, count=len(vertex_list))
-            raise
+        return await self._with_gates_unary(
+            op="bulk_vertices",
+            ctx=ctx,
+            call=_call,
+            metric_extra={
+                "limit": spec.limit,
+                "cursor": "yes" if spec.cursor else "no",
+            },
+        )
 
     async def batch(
         self,
-        ops: Iterable[Mapping[str, Any]],
+        ops: List[BatchOperation],
         *,
         ctx: Optional[OperationContext] = None,
-    ) -> List[Mapping[str, Any]]:
-        """Execute multiple operations in a single batch."""
-        op_list = list(ops)
+    ) -> BatchResult:
+        """
+        Execute a batch of graph operations.
 
-        caps = await self._do_capabilities()
-        if caps.max_batch_ops is not None and len(op_list) > int(caps.max_batch_ops):
-            raise BadRequest(
-                f"batch size {len(op_list)} exceeds max_batch_ops {caps.max_batch_ops}",
-                suggested_batch_reduction=100 * (len(op_list) - int(caps.max_batch_ops)) // len(op_list),
-                details={"max_batch_ops": int(caps.max_batch_ops)},
-                operation="batch",
-            )
+        Semantics are adapter-defined; intended for reducing round-trips.
+        """
+        caps = await self.capabilities()
+        if not caps.supports_batch:
+            raise NotSupported("batch is not supported by this adapter")
+        if not ops:
+            raise BadRequest("ops must not be empty")
 
-        t0 = time.monotonic()
-        try:
-            async def _fn():
-                return await self._do_batch(op_list, ctx=ctx)
+        async def _call() -> BatchResult:
+            return await self._do_batch(ops, ctx=ctx)
 
-            self._preflight_deadline(ctx)
-            if not self._breaker.allow():
-                raise Unavailable("circuit open", code="CIRCUIT_OPEN")
-            await self._limiter.acquire()
-            try:
-                res = await self._apply_deadline(_fn(), ctx)
-                self._breaker.on_success()
-            except Exception as e:
-                self._breaker.on_error(e)
-                raise
-            finally:
-                self._limiter.release()
+        return await self._with_gates_unary(
+            op="batch",
+            ctx=ctx,
+            call=_call,
+            metric_extra={"ops": len(ops)},
+        )
 
-            self._record("batch", t0, True, ctx=ctx, ops=len(op_list))
+    async def get_schema(
+        self,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> GraphSchema:
+        """
+        Return logical graph schema for tooling and routing.
+
+        Behavior:
+            - If capabilities.supports_schema is False -> NotSupported.
+            - In standalone mode, result may be cached briefly.
+        """
+        caps = await self.capabilities()
+        if not caps.supports_schema:
+            raise NotSupported("get_schema is not supported by this adapter")
+
+        async def _call() -> GraphSchema:
+            if isinstance(self._cache, InMemoryTTLCache):
+                key = self._make_cache_key(op="schema", spec="all", ctx=ctx)
+                cached = await self._cache.get(key)
+                if cached:
+                    self._metrics.counter(
+                        component=self._component,
+                        name="cache_hits",
+                        value=1,
+                        extra={"op": "get_schema"},
+                    )
+                    return cached
+            res = await self._do_get_schema(ctx=ctx)
+            if isinstance(self._cache, InMemoryTTLCache):
+                key = self._make_cache_key(op="schema", spec="all", ctx=ctx)
+                await self._cache.set(key, res, ttl_s=self._cache_schema_ttl_s)
             return res
-        except AdapterError as e:
-            self._record("batch", t0, False, code=type(e).__name__, ctx=ctx, ops=len(op_list))
-            raise
 
-    async def get_schema(self, *, ctx: Optional[OperationContext] = None) -> Dict[str, Any]:
-        """Get the graph schema information."""
+        return await self._with_gates_unary(
+            op="get_schema",
+            ctx=ctx,
+            call=_call,
+        )
+
+    async def health(
+        self,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> Mapping[str, Any]:
+        """Health check with deadline + metrics; no cache."""
+        self._fail_if_deadline_expired(ctx)
         t0 = time.monotonic()
         try:
-            caps = await self._do_capabilities()
-            tenant_hash = self._tenant_hash(ctx.tenant) if ctx else None
-            key = self._schema_cache_key(getattr(caps, "server", None), tenant_hash)
-
-            async def _fn():
-                if self._mode == "standalone":
-                    cached = await self._cache.get(key)
-                    if cached is not None:
-                        self._metrics.counter(component=self._component, name="cache_hits", value=1)
-                        return cached
-                    schema = await self._do_get_schema(ctx=ctx)
-                    schema = dict(schema)
-                    await self._cache.set(key, schema, ttl_s=45)
-                    return schema
-                return dict(await self._do_get_schema(ctx=ctx))
-
-            self._preflight_deadline(ctx)
-            if not self._breaker.allow():
-                raise Unavailable("circuit open", code="CIRCUIT_OPEN")
-            await self._limiter.acquire()
-            try:
-                schema = await self._apply_deadline(_fn(), ctx)
-                self._breaker.on_success()
-            except Exception as e:
-                self._breaker.on_error(e)
-                raise
-            finally:
-                self._limiter.release()
-
-            self._record("get_schema", t0, True, ctx=ctx)
-            return dict(schema)
-        except AdapterError as e:
-            self._record("get_schema", t0, False, code=type(e).__name__, ctx=ctx)
-            raise
-
-    async def health(self, *, ctx: Optional[OperationContext] = None) -> Dict[str, Any]:
-        """Check the health status of the graph backend."""
-        t0 = time.monotonic()
-        try:
-            async def _fn():
-                return await self._do_health(ctx=ctx)
-
-            # health still respects deadlines
-            h = await self._apply_deadline(_fn(), ctx)
+            res = await self._apply_deadline(self._do_health(ctx=ctx), ctx)
             self._record("health", t0, True, ctx=ctx)
             return {
-                "status": h.get("status", HealthStatus.OK),
-                "read_only": bool(h.get("read_only", False)),
-                "degraded": bool(h.get("degraded", False)),
-                "version": str(h.get("version", "")),
-                "server": str(h.get("server", "")),
-                "details": dict(h.get("details", {})),
+                "ok": bool(res.get("ok", True)),
+                "server": str(res.get("server", "")),
+                "version": str(res.get("version", "")),
+                "namespaces": res.get("namespaces", {}),
             }
-        except AdapterError as e:
-            self._record("health", t0, False, code=type(e).__name__, ctx=ctx)
+        except GraphAdapterError as e:
+            self._record("health", t0, False, code=e.code or type(e).__name__, ctx=ctx)
             raise
         except Exception as e:
-            self._record("health", t0, False, code=type(e).__name__, ctx=ctx)
-            # Normalize unexpected exceptions as Unavailable for callers
+            self._record("health", t0, False, code="UNAVAILABLE", ctx=ctx)
             raise Unavailable("health check failed") from e
 
-    # ============ ABSTRACT METHODS TO BE IMPLEMENTED ============
+    # --- backend hooks -------------------------------------------------------
 
     async def _do_capabilities(self) -> GraphCapabilities:
-        """Implement to return adapter-specific capabilities."""
-        raise NotImplementedError
-
-    async def _do_create_vertex(self, label: str, props: Dict[str, Any], *, ctx: Optional[OperationContext]) -> GraphID:
-        """Implement vertex creation with validated inputs."""
-        raise NotImplementedError
-
-    async def _do_create_edge(
-        self, label: str, from_id: str, to_id: str, props: Dict[str, Any], *, ctx: Optional[OperationContext]
-    ) -> GraphID:
-        """Implement edge creation with validated inputs."""
-        raise NotImplementedError
-
-    async def _do_delete_vertex(self, vertex_id: str, *, ctx: Optional[OperationContext]) -> None:
-        """Implement vertex deletion."""
-        raise NotImplementedError
-
-    async def _do_delete_edge(self, edge_id: str, *, ctx: Optional[OperationContext]) -> None:
-        """Implement edge deletion."""
         raise NotImplementedError
 
     async def _do_query(
-        self, *, dialect: str, text: str, params: Mapping[str, Any], ctx: Optional[OperationContext]
-    ) -> List[Mapping[str, Any]]:
-        """Implement query execution."""
+        self,
+        spec: GraphQuerySpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> QueryResult:
         raise NotImplementedError
 
     async def _do_stream_query(
-        self, *, dialect: str, text: str, params: Mapping[str, Any], ctx: Optional[OperationContext]
-    ) -> AsyncIterator[Mapping[str, Any]]:
-        """Implement streaming query execution."""
+        self,
+        spec: GraphQuerySpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> AsyncIterator[QueryChunk]:
+        raise NotImplementedError
+
+    async def _do_upsert_nodes(
+        self,
+        spec: UpsertNodesSpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> UpsertResult:
+        raise NotImplementedError
+
+    async def _do_upsert_edges(
+        self,
+        spec: UpsertEdgesSpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> UpsertResult:
+        raise NotImplementedError
+
+    async def _do_delete_nodes(
+        self,
+        spec: DeleteNodesSpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> DeleteResult:
+        raise NotImplementedError
+
+    async def _do_delete_edges(
+        self,
+        spec: DeleteEdgesSpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> DeleteResult:
         raise NotImplementedError
 
     async def _do_bulk_vertices(
-        self, vertices: List[Tuple[str, Mapping[str, Any]]], *, ctx: Optional[OperationContext]
-    ) -> List[GraphID]:
-        """Implement bulk vertex creation."""
+        self,
+        spec: BulkVerticesSpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> BulkVerticesResult:
         raise NotImplementedError
 
-    async def _do_batch(self, ops: List[Mapping[str, Any]], *, ctx: Optional[OperationContext]) -> List[Mapping[str, Any]]:
-        """Implement batch operation execution."""
+    async def _do_batch(
+        self,
+        ops: List[BatchOperation],
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> BatchResult:
         raise NotImplementedError
 
-    async def _do_get_schema(self, *, ctx: Optional[OperationContext]) -> Dict[str, Any]:
-        """Implement schema retrieval."""
+    async def _do_get_schema(
+        self,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> GraphSchema:
         raise NotImplementedError
 
-    async def _do_health(self, *, ctx: Optional[OperationContext]) -> Dict[str, Any]:
-        """Implement health check."""
+    async def _do_health(
+        self,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> Mapping[str, Any]:
         raise NotImplementedError
+
+
+# =============================================================================
+# Wire-Level Helpers (canonical envelopes)
+# =============================================================================
+
+def _ctx_from_wire(ctx_dict: Mapping[str, Any]) -> OperationContext:
+    """
+    Convert wire-level ctx dict to OperationContext. Unknown keys are ignored.
+    """
+    if ctx_dict is None:
+        return OperationContext()
+    return OperationContext(
+        request_id=ctx_dict.get("request_id"),
+        idempotency_key=ctx_dict.get("idempotency_key"),
+        deadline_ms=ctx_dict.get("deadline_ms"),
+        traceparent=ctx_dict.get("traceparent"),
+        tenant=ctx_dict.get("tenant"),
+        attrs=ctx_dict.get("attrs") or {},
+    )
+
+
+def _error_to_wire(e: Exception, ms: float) -> Dict[str, Any]:
+    """
+    Map GraphAdapterError (or unexpected Exception) to canonical error envelope.
+    """
+    if isinstance(e, GraphAdapterError):
+        return {
+            "ok": False,
+            "code": e.code or type(e).__name__.upper(),
+            "error": type(e).__name__,
+            "message": e.message,
+            "retry_after_ms": e.retry_after_ms,
+            "details": e.details or None,
+            "ms": ms,
+        }
+    return {
+        "ok": False,
+        "code": "UNAVAILABLE",
+        "error": type(e).__name__,
+        "message": str(e) or "internal error",
+        "retry_after_ms": None,
+        "details": None,
+        "ms": ms,
+    }
+
+
+def _success_to_wire(result: Any, ms: float) -> Dict[str, Any]:
+    """
+    Map typed result objects to canonical success envelope.
+    Uses dataclasses.asdict() where applicable, else passes through.
+    """
+    if hasattr(result, "__dataclass_fields__"):
+        payload = asdict(result)
+    else:
+        payload = result
+    return {
+        "ok": True,
+        "code": "OK",
+        "ms": ms,
+        "result": payload,
+    }
+
+
+def _chunk_to_wire(chunk: QueryChunk, ms: float) -> Dict[str, Any]:
+    """
+    Map QueryChunk to streaming envelope.
+    """
+    return {
+        "ok": True,
+        "code": "OK",
+        "ms": ms,
+        "chunk": asdict(chunk),
+    }
+
+
+class WireGraphHandler:
+    """
+    Reference wire adapter for GraphProtocolV1.
+
+    Transport-agnostic: plug into HTTP, gRPC, WebSocket, etc.
+    """
+
+    def __init__(self, adapter: GraphProtocolV1):
+        self._adapter = adapter
+
+    async def handle(self, envelope: Mapping[str, Any]) -> Dict[str, Any]:
+        """
+        Handle unary graph operations via JSON envelope.
+
+        Supported ops:
+            - graph.capabilities
+            - graph.query
+            - graph.upsert_nodes
+            - graph.upsert_edges
+            - graph.delete_nodes
+            - graph.delete_edges
+            - graph.bulk_vertices
+            - graph.batch
+            - graph.get_schema
+            - graph.health
+
+        Streaming:
+            - graph.stream_query via handle_stream(...)
+        """
+        t0 = time.monotonic()
+        try:
+            op = envelope.get("op")
+            if not isinstance(op, str):
+                raise BadRequest("missing or invalid 'op'")
+
+            ctx = _ctx_from_wire(envelope.get("ctx") or {})
+            args = envelope.get("args") or {}
+
+            if op == "graph.capabilities":
+                res = await self._adapter.capabilities()
+                return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
+
+            if op == "graph.query":
+                spec = GraphQuerySpec(**args)
+                res = await self._adapter.query(spec, ctx=ctx)
+                return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
+
+            if op == "graph.upsert_nodes":
+                nodes = [Node(**n) for n in args.get("nodes", [])]
+                spec = UpsertNodesSpec(nodes=nodes, namespace=args.get("namespace"))
+                res = await self._adapter.upsert_nodes(spec, ctx=ctx)
+                return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
+
+            if op == "graph.upsert_edges":
+                edges = [Edge(**e) for e in args.get("edges", [])]
+                spec = UpsertEdgesSpec(edges=edges, namespace=args.get("namespace"))
+                res = await self._adapter.upsert_edges(spec, ctx=ctx)
+                return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
+
+            if op == "graph.delete_nodes":
+                ids = [GraphID(i) for i in args.get("ids", [])]
+                spec = DeleteNodesSpec(
+                    ids=ids,
+                    namespace=args.get("namespace"),
+                    filter=args.get("filter"),
+                )
+                res = await self._adapter.delete_nodes(spec, ctx=ctx)
+                return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
+
+            if op == "graph.delete_edges":
+                ids = [GraphID(i) for i in args.get("ids", [])]
+                spec = DeleteEdgesSpec(
+                    ids=ids,
+                    namespace=args.get("namespace"),
+                    filter=args.get("filter"),
+                )
+                res = await self._adapter.delete_edges(spec, ctx=ctx)
+                return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
+
+            if op == "graph.bulk_vertices":
+                spec = BulkVerticesSpec(**args)
+                res = await self._adapter.bulk_vertices(spec, ctx=ctx)
+                return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
+
+            if op == "graph.batch":
+                ops = [BatchOperation(**o) for o in args.get("ops", [])]
+                res = await self._adapter.batch(ops, ctx=ctx)
+                return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
+
+            if op == "graph.get_schema":
+                res = await self._adapter.get_schema(ctx=ctx)
+                return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
+
+            if op == "graph.health":
+                res = await self._adapter.health(ctx=ctx)
+                return _success_to_wire(res, (time.monotonic() - t0) * 1000.0)
+
+            raise NotSupported(f"unknown or non-unary operation '{op}'")
+        except Exception as e:
+            ms = (time.monotonic() - t0) * 1000.0
+            return _error_to_wire(e, ms)
+
+    async def handle_stream(self, envelope: Mapping[str, Any]) -> AsyncIterator[Dict[str, Any]]:
+        """
+        Handle streaming graph queries:
+
+            op: "graph.stream_query"
+        """
+        t0 = time.monotonic()
+        op = envelope.get("op")
+        if op != "graph.stream_query":
+            yield _error_to_wire(BadRequest("op must be 'graph.stream_query'"), 0.0)
+            return
+
+        ctx = _ctx_from_wire(envelope.get("ctx") or {})
+        args = envelope.get("args") or {}
+        spec = GraphQuerySpec(**args)
+
+        try:
+            agen = self._adapter.stream_query(spec, ctx=ctx)
+            async for chunk in agen:
+                ms = (time.monotonic() - t0) * 1000.0
+                yield _chunk_to_wire(chunk, ms)
+        except Exception as e:
+            ms = (time.monotonic() - t0) * 1000.0
+            yield _error_to_wire(e, ms)
+
 
 __all__ = [
-    "GRAPH_PROTOCOL_VERSION", "KNOWN_DIALECTS", "GraphID", "AdapterError",
-    "BadRequest", "AuthError", "ResourceExhausted", "TransientNetwork",
-    "Unavailable", "NotSupported", "DeadlineExceeded", "OperationContext", "LogSink",
-    "NoopLogSink", "MetricsSink", "NoopMetrics", "GraphCapabilities",
-    "GraphProtocolV1", "BaseGraphAdapter", "BatchOperations", "HealthStatus",
-    "ProtocolVersion", "DeadlinePolicy", "NoopDeadline", "CtxDeadline",
-    "CircuitBreaker", "NoopBreaker", "SimpleCircuitBreaker",
-    "RateLimiter", "NoopLimiter", "TokenBucketLimiter",
-    "Cache", "NoopCache", "InMemoryTTLCache",
+    "GRAPH_PROTOCOL_VERSION",
+    "GRAPH_PROTOCOL_ID",
+    "GraphID",
+    "Node",
+    "Edge",
+    "GraphQuerySpec",
+    "UpsertNodesSpec",
+    "UpsertEdgesSpec",
+    "DeleteNodesSpec",
+    "DeleteEdgesSpec",
+    "BulkVerticesSpec",
+    "BulkVerticesResult",
+    "BatchOperation",
+    "BatchResult",
+    "GraphSchema",
+    "QueryResult",
+    "QueryChunk",
+    "UpsertResult",
+    "DeleteResult",
+    "GraphAdapterError",
+    "BadRequest",
+    "AuthError",
+    "ResourceExhausted",
+    "TransientNetwork",
+    "Unavailable",
+    "NotSupported",
+    "DeadlineExceeded",
+    "OperationContext",
+    "MetricsSink",
+    "NoopMetrics",
+    "GraphCapabilities",
+    "GraphProtocolV1",
+    "BaseGraphAdapter",
+    # infra hooks
+    "DeadlinePolicy",
+    "CircuitBreaker",
+    "Cache",
+    "RateLimiter",
+    "NoopDeadline",
+    "SimpleDeadline",
+    "NoopBreaker",
+    "SimpleCircuitBreaker",
+    "NoopCache",
+    "InMemoryTTLCache",
+    "NoopLimiter",
+    "SimpleTokenBucketLimiter",
+    # wire helpers
+    "WireGraphHandler",
+    "_ctx_from_wire",
+    "_error_to_wire",
+    "_success_to_wire",
+    "_chunk_to_wire",
 ]
