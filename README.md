@@ -1,5 +1,8 @@
 # Corpus SDK
 
+![Version](https://img.shields.io/badge/version-1.0.0-blue)
+![Python](https://img.shields.io/badge/python-3.9+-blue)
+
 Reference implementation of the **Corpus Protocol Suite** — a protocol-first, vendor-neutral SDK for interoperable AI/data backends: **LLM**, **Embedding**, **Vector**, and **Graph**.
 
 Corpus defines stable, wire-level contracts (ops, envelopes, errors, capabilities) so that applications, routers, and providers can interoperate without bespoke glue code. This SDK implements those protocols for Python, with:
@@ -23,9 +26,6 @@ Designed to compose cleanly under any external control plane (router, scheduler,
 ---
 
 ## 🏗️ Architecture at a Glance
-
-<!--[MOBILE-FRIENDLY DIAGRAMS]-->
-<div class="mermaid-container" style="overflow-x: auto; max-width: 100%;">
 
 ```mermaid
 graph TB
@@ -62,43 +62,45 @@ graph TB
 ## Table of Contents
 
 1. [Why Corpus SDK](#why-corpus-sdk)
-2. [When Not to Use Corpus](#when-not-to-use-corpus)
-3. [Features at a Glance](#features-at-a-glance)
-4. [Performance vs Alternatives](#performance-vs-alternatives)
-5. [Install](#install)
-6. [⚡ 5-Minute Quick Start](#-5-minute-quick-start)
-7. [Modes: `thin` vs `standalone`](#modes-thin-vs-standalone)
-8. [Core Concepts](#core-concepts)
-9. [Corpus-Compatible](#corpus-compatible)
-10. [Quickstart](#quickstart)
+2. [How Corpus Compares](#how-corpus-compares)
+3. [When Not to Use Corpus](#when-not-to-use-corpus)
+4. [Features at a Glance](#features-at-a-glance)
+5. [Performance vs Alternatives](#performance-vs-alternatives)
+6. [Install](#install)
+7. [⚡ 5-Minute Quick Start](#-5-minute-quick-start)
+8. [Modes: `thin` vs `standalone`](#modes-thin-vs-standalone)
+9. [Core Concepts](#core-concepts)
+10. [Corpus-Compatible](#corpus-compatible)
+11. [Quickstart](#quickstart)
     * [Embeddings](#embeddings-quickstart)
     * [LLM](#llm-quickstart)
     * [Vector](#vector-quickstart)
     * [Graph](#graph-quickstart)
-11. [💼 Real-World Scenarios](#-real-world-scenarios)
-12. [Error Taxonomy](#error-taxonomy)
-13. [Metrics & Observability](#metrics--observability)
-14. [Deadlines & Timeouts](#deadlines--timeouts)
-15. [Caching](#caching)
-16. [Rate Limiting & Circuit Breaking](#rate-limiting--circuit-breaking)
-17. [Capabilities](#capabilities)
-18. [Example Adapters](#example-adapters)
+12. [💼 Real-World Scenarios](#-real-world-scenarios)
+13. [Error Taxonomy](#error-taxonomy)
+14. [Metrics & Observability](#metrics--observability)
+15. [Deadlines & Timeouts](#deadlines--timeouts)
+16. [Caching](#caching)
+17. [Rate Limiting & Circuit Breaking](#rate-limiting--circuit-breaking)
+18. [Capabilities](#capabilities)
+19. [Example Adapters](#example-adapters)
     * [Adapter Ecosystem](#adapter-ecosystem)
     * [Why Official Adapters Are Commercial](#why-official-adapters-are-commercial)
-19. [Security & Privacy](#security--privacy)
-20. [Performance Notes](#performance-notes)
-21. [🏎️ Performance Benchmarks](#️-performance-benchmarks)
-22. [Versioning & Compatibility](#versioning--compatibility)
-23. [Testing](#testing)
-24. [Troubleshooting](#troubleshooting)
-25. [🚚 Migration Examples](#-migration-examples)
-26. [FAQ](#faq)
-27. [Contributing](#contributing)
-28. [License](#license)
-29. [Roadmap](#roadmap)
-30. [Appendix](#appendix)
-31. [Commercial Options](#commercial-options)
-32. [Corpus Router: Enterprise AI Infrastructure Orchestration](#corpus-router-enterprise-ai-infrastructure-orchestration)
+20. [Security & Privacy](#security--privacy)
+21. [Performance Notes](#performance-notes)
+22. [🏎️ Performance Benchmarks](#️-performance-benchmarks)
+23. [Versioning & Compatibility](#versioning--compatibility)
+24. [Testing](#testing)
+25. [Troubleshooting](#troubleshooting)
+26. [🚚 Migration Examples](#-migration-examples)
+27. [FAQ](#faq)
+28. [Contributing](#contributing)
+29. [License](#license)
+30. [Roadmap](#roadmap)
+31. [Appendix](#appendix)
+32. [Commercial Options](#commercial-options)
+33. [Corpus Router: Enterprise AI Infrastructure Orchestration](#corpus-router-enterprise-ai-infrastructure-orchestration)
+34. [Final Assessment & Launch Readiness](#final-assessment--launch-readiness)
 
 ---
 
@@ -120,6 +122,62 @@ Modern AI platforms juggle multiple LLM, embedding, vector, and graph backends. 
 * **SIEM-safe metrics** (low-cardinality; tenant hashed)
 * **Deadline propagation** for cancellation & cost control
 * **Two modes**: compose under your own router (**thin**) or use lightweight infra (**standalone**)
+
+---
+
+## How Corpus Compares
+
+| Aspect | LangChain/LlamaIndex | OpenRouter | MCP | **Corpus SDK** |
+|--------|---------------------|------------|-----|----------------|
+| **Scope** | Application framework | LLM unification | Tools & data sources | **AI infrastructure protocols** |
+| **Domains Covered** | LLM + Tools | LLM only | Tools + Data | **LLM + Vector + Graph + Embedding** |
+| **Error Standardization** | Partial | Limited | N/A | **Comprehensive taxonomy** |
+| **Multi-Provider Routing** | Basic | Managed service | N/A | **Protocol for any router** |
+| **Observability** | Basic | Limited | N/A | **Built-in metrics + tracing** |
+| **Installation** | Heavy dependencies | Service API | Early stage | **Lightweight, async-first** |
+| **Vendor Neutrality** | High | Service-dependent | High | **Protocol-first, no lock-in** |
+
+**When to use each:**
+- **LangChain/LlamaIndex**: Building complex AI applications with tool orchestration
+- **OpenRouter**: Quick LLM unification without infrastructure changes  
+- **MCP**: Standardizing tools and data sources for AI applications
+- **Corpus SDK**: Standardizing entire AI infrastructure stack with production observability
+
+### **Unified Integration: All Three as Corpus Adapters**
+
+The key advantage of Corpus's protocol-first approach is that **LangChain, OpenRouter, and MCP can all be integrated as adapters within the Corpus ecosystem**:
+
+```python
+# LangChain as a Corpus LLM adapter
+class LangChainLLMAdapter(BaseLLMAdapter):
+    async def _do_complete(self, messages, **kwargs):
+        # Wrap LangChain LLM with Corpus standardization
+        llm = ChatOpenAI(model=kwargs["model"])
+        result = await llm.ainvoke(messages)
+        return self._normalize_langchain_result(result)
+
+# OpenRouter as a Corpus LLM adapter  
+class OpenRouterAdapter(BaseLLMAdapter):
+    async def _do_complete(self, messages, **kwargs):
+        # Standardize OpenRouter API with Corpus error handling
+        response = await self._call_openrouter(messages, kwargs["model"])
+        return self._normalize_openrouter_result(response)
+
+# MCP as a Corpus Tools adapter
+class MCPToolsAdapter(BaseLLMAdapter):
+    async def _do_complete(self, messages, **kwargs):
+        # Use MCP servers as tools within Corpus LLM flow
+        mcp_tools = await self._get_mcp_tools()
+        return await self._complete_with_tools(messages, mcp_tools)
+```
+
+**Benefits of this approach:**
+- **Standardized observability**: All adapters emit the same metrics and error taxonomy
+- **Consistent routing**: Mix and match providers, frameworks, and protocols under one routing layer
+- **Production reliability**: All integrations inherit Corpus's deadline propagation, retry logic, and circuit breaking
+- **Vendor neutrality**: Switch between LangChain, OpenRouter, or direct providers without changing application code
+
+**Instead of choosing one framework, use Corpus as the unifying layer that standardizes them all.**
 
 ---
 
@@ -1511,6 +1569,20 @@ except BadRequest as e:
 
 **A:** Yes. We ship them together for convenience; you can refactor module layout as you see fit.
 
+### **MCP/LangChain/OpenRouter Comparison**
+
+**Q: How does Corpus compare to LangChain/LlamaIndex?**
+
+**A:** LangChain and LlamaIndex are **application-level frameworks** for building AI applications, while Corpus is an **infrastructure protocol** for standardizing backend services. You can use Corpus SDK underneath LangChain/LlamaIndex to get provider-agnostic LLM, embedding, vector, and graph operations with consistent error handling and observability.
+
+**Q: How does Corpus compare to Model Context Protocol (MCP)?**
+
+**A:** MCP focuses on standardizing **tools and data sources** for AI applications, while Corpus standardizes **core AI infrastructure services** (LLM, Vector, Graph, Embedding). They're complementary - you could use MCP for tool integration and Corpus for backend service abstraction.
+
+**Q: How does Corpus compare to OpenRouter?**
+
+**A:** OpenRouter provides a unified API for **LLM providers only**, while Corpus covers **four domains** (LLM, Vector, Graph, Embedding) with standardized error handling, metrics, and capabilities discovery. Corpus is a protocol you can implement anywhere, while OpenRouter is a specific service.
+
 ### Technical
 
 **Q: Why async-only?**
@@ -1880,8 +1952,7 @@ graph TB
     style A fill:#e1f5fe
     style J fill:#e8f5e8
 ```
-</div>
-<!--[/MOBILE-FRIENDLY DIAGRAMS]-->
+
 **Result**: Every request gets an optimal route for its context—within guardrails, fully auditable.
 
 ---
@@ -1909,3 +1980,5 @@ graph TB
 **Built with ❤️ by the Corpus team**
 
 **We're not just building another framework - we're building the foundational layer for reliable, portable AI infrastructure.**
+
+---
