@@ -1199,34 +1199,6 @@ Current versions:
 
 ## Testing
 
-### Test Categories
-
-**Unit Tests:**
-
-* Input validation (malformed messages, invalid parameters)
-* Capability gating (unsupported features raise `NotSupported`)
-* Error mapping (vendor errors → normalized exceptions)
-* Deadline enforcement (timeouts raise `DeadlineExceeded`)
-* Cache key determinism (same inputs → same key)
-
-**Streaming Tests:**
-
-* Partial yields (chunks arrive progressively)
-* Cancellation (stream cleanup on error)
-* Deadline mid-stream (periodic deadline checks)
-
-**Integration Tests:**
-
-* Example adapters in thin mode
-* Example adapters in standalone mode
-* Multi-operation workflows
-
-**Property Tests:**
-
-* Cache key collision resistance
-* Message fingerprinting stability
-* Tenant hash uniqueness
-
 ### One-Command Conformance Testing
 
 #### Recommended: Make targets (from repo root)
