@@ -1482,10 +1482,10 @@ pytest tests/embedding/ -v
 
 #### Corpus Protocol Suite Badge
 
-![LLM Protocol](https://img.shields.io/badge/Corpus LLM%20Protocol-100%25%20Conformant-brightgreen)
-![Vector Protocol](https://img.shields.io/badge/Corpus Vector%20Protocol-100%25%20Conformant-brightgreen)
-![Graph Protocol](https://img.shields.io/badge/Corpus Graph%20Protocol-100%25%20Conformant-brightgreen)
-![Embedding Protocol](https://img.shields.io/badge/Corpus Embedding%20Protocol-100%25%20Conformant-brightgreen)
+![LLM Protocol](https://img.shields.io/badge/CorpusLLM%20Protocol-100%25%20Conformant-brightgreen)
+![Vector Protocol](https://img.shields.io/badge/CorpusVector%20Protocol-100%25%20Conformant-brightgreen)
+![Graph Protocol](https://img.shields.io/badge/CorpusGraph%20Protocol-100%25%20Conformant-brightgreen)
+![Embedding Protocol](https://img.shields.io/badge/CorpusEmbedding%20Protocol-100%25%20Conformant-brightgreen)
 
 ---
 
