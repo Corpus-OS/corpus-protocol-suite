@@ -796,8 +796,6 @@ async with ExampleGraphAdapter() as adapter:
 
 Here's the updated Multi-Cloud AI Strategy section covering all four domains:
 
-## 💼 Real-World Scenarios
-
 ### **Multi-Cloud AI Strategy**
 ```python
 # Route between providers across all four domains based on cost, latency, and quality
