@@ -12,24 +12,62 @@ This suite constitutes the **official Corpus Protocol Suite V1.0 Reference Confo
 **Test Location:** `https://github.com/corpus/protocol-tests`  
 **Normative Requirements:** MUST pass 276/276 conformance tests
 
+## Dual-Level Certification System
+
+This document defines two complementary certification levels:
+
+- **Suite Certification** (Platinum, Silver, Development): High-level certification based on total tests passed across all protocols, representing a vendor's overall investment in the Corpus ecosystem.
+
+- **Protocol Certification** (Gold, Silver, Development): Granular, per-protocol certification based on passing tests for specific protocols, enabling "best-in-breed" vendor specialization.
+
 ## Certification Levels
 
-### 🏆 Platinum Certification
+### 🏆 Suite Platinum Certification
 **Requirements:** 276/276 tests across all protocols + production deployment validation
 ```markdown
 [![Corpus Platinum Certified](https://img.shields.io/badge/Corpus-Platinum_Certified-gold)](https://corpus.io/certification)
 ```
 
-### 🥈 Silver Certification  
+### 🥈 Suite Silver Certification  
 **Requirements:** 200+ tests with major protocol coverage
 ```markdown
 [![Corpus Silver Certified](https://img.shields.io/badge/Corpus-Silver_Certified-silver)](https://corpus.io/certification)
 ```
 
-### 🔬 Development Certification
+### 🔬 Suite Development Certification
 **Requirements:** Protocol implementation in development with 100+ tests passing
 ```markdown
 [![Corpus Development](https://img.shields.io/badge/Corpus-Development_Certified-blue)](https://corpus.io/certification)
+```
+
+### Individual Protocol Certifications
+
+#### Graph Protocol
+```markdown
+🥇 Gold: [![Corpus Graph V1.0 Gold](https://img.shields.io/badge/Corpus-Graph_V1.0_Gold-00aaff)](https://corpus.io/certification/graph)
+🥈 Silver: [![Corpus Graph V1.0 Silver](https://img.shields.io/badge/Corpus-Graph_V1.0_Silver-00aaff)](https://corpus.io/certification/graph)
+🔬 Development: [![Corpus Graph V1.0 Development](https://img.shields.io/badge/Corpus-Graph_V1.0_Development-00aaff)](https://corpus.io/certification/graph)
+```
+
+#### LLM Protocol
+```markdown
+🥇 Gold: [![Corpus LLM V1.0 Gold](https://img.shields.io/badge/Corpus-LLM_V1.0_Gold-ff6b35)](https://corpus.io/certification/llm)
+🥈 Silver: [![Corpus LLM V1.0 Silver](https://img.shields.io/badge/Corpus-LLM_V1.0_Silver-ff6b35)](https://corpus.io/certification/llm)
+🔬 Development: [![Corpus LLM V1.0 Development](https://img.shields.io/badge/Corpus-LLM_V1.0_Development-ff6b35)](https://corpus.io/certification/llm)
+```
+
+#### Vector Protocol
+```markdown
+🥇 Gold: [![Corpus Vector V1.0 Gold](https://img.shields.io/badge/Corpus-Vector_V1.0_Gold-00cc88)](https://corpus.io/certification/vector)
+🥈 Silver: [![Corpus Vector V1.0 Silver](https://img.shields.io/badge/Corpus-Vector_V1.0_Silver-00cc88)](https://corpus.io/certification/vector)
+🔬 Development: [![Corpus Vector V1.0 Development](https://img.shields.io/badge/Corpus-Vector_V1.0_Development-00cc88)](https://corpus.io/certification/vector)
+```
+
+#### Embedding Protocol
+```markdown
+🥇 Gold: [![Corpus Embedding V1.0 Gold](https://img.shields.io/badge/Corpus-Embedding_V1.0_Gold-9966ff)](https://corpus.io/certification/embedding)
+🥈 Silver: [![Corpus Embedding V1.0 Silver](https://img.shields.io/badge/Corpus-Embedding_V1.0_Silver-9966ff)](https://corpus.io/certification/embedding)
+🔬 Development: [![Corpus Embedding V1.0 Development](https://img.shields.io/badge/Corpus-Embedding_V1.0_Development-9966ff)](https://corpus.io/certification/embedding)
 ```
 
 ## Conformance Summary
@@ -37,12 +75,21 @@ This suite constitutes the **official Corpus Protocol Suite V1.0 Reference Confo
 **Overall Coverage: 276/276 tests (100%) ✅**  
 **Certification Level:** 🏆 **PLATINUM**
 
-| Protocol | Tests | Coverage | Status | Badge |
-|----------|--------|-----------|---------|--------|
-| **Graph Protocol V1.0** | 68/68 | 100% ✅ | Production Ready | `graph-v1.0-gold` |
-| **LLM Protocol V1.0** | 61/61 | 100% ✅ | Production Ready | `llm-v1.0-gold` |
-| **Vector Protocol V1.0** | 72/72 | 100% ✅ | Production Ready | `vector-v1.0-gold` |
-| **Embedding Protocol V1.0** | 75/75 | 100% ✅ | Production Ready | `embedding-v1.0-gold` |
+| Protocol | Tests | Coverage | Status | Certification |
+|----------|--------|-----------|---------|---------------|
+| **Graph Protocol V1.0** | 68/68 | 100% ✅ | Production Ready | 🥇 Gold |
+| **LLM Protocol V1.0** | 61/61 | 100% ✅ | Production Ready | 🥇 Gold |
+| **Vector Protocol V1.0** | 72/72 | 100% ✅ | Production Ready | 🥇 Gold |
+| **Embedding Protocol V1.0** | 75/75 | 100% ✅ | Production Ready | 🥇 Gold |
+
+### Individual Protocol Certification Levels
+
+| Protocol | 🥇 Gold | 🥈 Silver | 🔬 Development |
+|----------|---------|-----------|----------------|
+| **Graph** | 68/68 tests | 54+ tests | 34+ tests |
+| **LLM** | 61/61 tests | 49+ tests | 31+ tests |
+| **Vector** | 72/72 tests | 58+ tests | 36+ tests |
+| **Embedding** | 75/75 tests | 60+ tests | 38+ tests |
 
 ### Cross-Protocol Foundation Coverage
 
@@ -60,7 +107,7 @@ This suite constitutes the **official Corpus Protocol Suite V1.0 Reference Confo
 
 ### Specification: §7 Graph Protocol V1.0
 **Status:** ✅ Complete (68 tests)  
-**Badge:** `graph-v1.0-gold`
+**Certification:** 🥇 **Gold**
 
 | Category | Tests | Coverage | Status |
 |----------|--------|-----------|---------|
@@ -87,13 +134,18 @@ This suite constitutes the **official Corpus Protocol Suite V1.0 Reference Confo
 - `tests/graph/test_batch_operations.py` - §7.3.3 Batch & Bulk Operations
 - `tests/graph/test_wire_handler.py` - §4.1.6 Operation Registry
 
+**Individual Certification Levels:**
+- 🥇 **Gold:** 68/68 tests (100%)
+- 🥈 **Silver:** 54+ tests (80%+)
+- 🔬 **Development:** 34+ tests (50%+)
+
 ---
 
 ## LLM Protocol V1.0 Conformance
 
 ### Specification: §8 LLM Protocol V1.0
 **Status:** ✅ Complete (61 tests)  
-**Badge:** `llm-v1.0-gold`
+**Certification:** 🥇 **Gold**
 
 | Category | Tests | Coverage | Status |
 |----------|--------|-----------|---------|
@@ -117,13 +169,18 @@ This suite constitutes the **official Corpus Protocol Suite V1.0 Reference Confo
 - `tests/llm/test_sampling_params_validation.py` - §8.3 Sampling Parameters
 - `tests/llm/test_llm_wire_handler_envelopes.py` - §4.1.6 Operation Registry
 
+**Individual Certification Levels:**
+- 🥇 **Gold:** 61/61 tests (100%)
+- 🥈 **Silver:** 49+ tests (80%+)
+- 🔬 **Development:** 31+ tests (50%+)
+
 ---
 
 ## Vector Protocol V1.0 Conformance
 
 ### Specification: §9 Vector Protocol V1.0
 **Status:** ✅ Complete (72 tests)  
-**Badge:** `vector-v1.0-gold`
+**Certification:** 🥇 **Gold**
 
 | Category | Tests | Coverage | Status |
 |----------|--------|-----------|---------|
@@ -150,13 +207,18 @@ This suite constitutes the **official Corpus Protocol Suite V1.0 Reference Confo
 - `tests/vector/test_dimension_validation.py` - §9.5 Vector-Specific Errors
 - `tests/vector/test_wire_handler_envelopes.py` - §4.1.6 Operation Registry
 
+**Individual Certification Levels:**
+- 🥇 **Gold:** 72/72 tests (100%)
+- 🥈 **Silver:** 58+ tests (80%+)
+- 🔬 **Development:** 36+ tests (50%+)
+
 ---
 
 ## Embedding Protocol V1.0 Conformance
 
 ### Specification: §10 Embedding Protocol V1.0
 **Status:** ✅ Complete (75 tests)  
-**Badge:** `embedding-v1.0-gold`
+**Certification:** 🥇 **Gold**
 
 | Category | Tests | Coverage | Status |
 |----------|--------|-----------|---------|
@@ -181,34 +243,10 @@ This suite constitutes the **official Corpus Protocol Suite V1.0 Reference Confo
 - `tests/embedding/test_normalization_semantics.py` - §10.6 Normalization Behavior
 - `tests/embedding/test_wire_handler.py` - §4.1.6 Operation Registry
 
----
-
-## Common Foundation Conformance
-
-### Specification: §4-§6, §11-§15
-**Status:** ✅ Complete (136 cross-protocol tests)
-
-#### §4 Conventions and Wire Format (50 tests)
-- `tests/foundation/test_wire_envelopes.py` - §4.1.1 Envelopes and Content Types
-- `tests/foundation/test_streaming_frames.py` - §4.1.3 Streaming Frames
-- `tests/foundation/test_transport_bindings.py` - §4.1.4 Transport Bindings
-- `tests/foundation/test_operation_registry.py` - §4.1.6 Operation Registry
-
-#### §6 Common Foundation (46 tests)
-- `tests/foundation/test_operation_context.py` - §6.1 Operation Context
-- `tests/foundation/test_capability_discovery.py` - §6.2 Capability Discovery  
-- `tests/foundation/test_error_taxonomy.py` - §6.3 Error Taxonomy
-- `tests/foundation/test_observability_interfaces.py` - §6.4 Observability Interfaces
-
-#### §12 Error Handling & Resilience (38 tests)
-- `tests/foundation/test_retry_semantics.py` - §12.1 Retry Semantics
-- `tests/foundation/test_error_mapping.py` - §12.4 Error Mapping Table
-- `tests/foundation/test_partial_failures.py` - §12.5 Partial Failure Contracts
-
-#### §13-§15 Security & Observability (42 tests)
-- `tests/foundation/test_siem_safety.py` - §13.2 Structured Logging & §15 Privacy
-- `tests/foundation/test_tenant_isolation.py` - §14.1 Tenant Isolation
-- `tests/foundation/test_security_mitigations.py` - §14.4 Mitigation Matrix
+**Individual Certification Levels:**
+- 🥇 **Gold:** 75/75 tests (100%)
+- 🥈 **Silver:** 60+ tests (80%+)
+- 🔬 **Development:** 38+ tests (50%+)
 
 ---
 
@@ -241,10 +279,10 @@ This suite constitutes the **official Corpus Protocol Suite V1.0 Reference Confo
 
 ```markdown
 # Individual Protocol Certifications
-[![Corpus Graph V1.0](https://img.shields.io/badge/Corpus-Graph_V1.0_Certified-00aaff)](https://corpus.io/certification/graph)
-[![Corpus LLM V1.0](https://img.shields.io/badge/Corpus-LLM_V1.0_Certified-ff6b35)](https://corpus.io/certification/llm)
-[![Corpus Vector V1.0](https://img.shields.io/badge/Corpus-Vector_V1.0_Certified-00cc88)](https://corpus.io/certification/vector)
-[![Corpus Embedding V1.0](https://img.shields.io/badge/Corpus-Embedding_V1.0_Certified-9966ff)](https://corpus.io/certification/embedding)
+[![Corpus Graph V1.0 Gold](https://img.shields.io/badge/Corpus-Graph_V1.0_Gold-00aaff)](https://corpus.io/certification/graph)
+[![Corpus LLM V1.0 Gold](https://img.shields.io/badge/Corpus-LLM_V1.0_Gold-ff6b35)](https://corpus.io/certification/llm)
+[![Corpus Vector V1.0 Gold](https://img.shields.io/badge/Corpus-Vector_V1.0_Gold-00cc88)](https://corpus.io/certification/vector)
+[![Corpus Embedding V1.0 Gold](https://img.shields.io/badge/Corpus-Embedding_V1.0_Gold-9966ff)](https://corpus.io/certification/embedding)
 ```
 
 ### Badge Placement Guidelines
@@ -263,8 +301,8 @@ A Corpus Protocol Suite implementation supporting Graph, LLM, Vector, and Embedd
 title: "Implementation Documentation"
 badges:
   - "Corpus Platinum Certified"
-  - "Graph V1.0 Certified" 
-  - "LLM V1.0 Certified"
+  - "Graph V1.0 Gold Certified" 
+  - "LLM V1.0 Gold Certified"
 ---
 ```
 
@@ -322,9 +360,6 @@ pytest tests/graph/ -v
 pytest tests/llm/ -v
 pytest tests/vector/ -v  
 pytest tests/embedding/ -v
-
-# Foundation testing
-pytest tests/foundation/ -v
 ```
 
 ### Certification Badge Authorization
@@ -402,7 +437,9 @@ Implementations meeting certification requirements MUST:
 | **Platinum** | 276/276 tests across all protocols | `Platinum Certified` |
 | **Silver** | 200+ tests with major protocol coverage | `Silver Certified` |
 | **Development** | 100+ tests in active development | `Development Certified` |
-| **Protocol-Specific** | Individual protocol completion | `{Protocol} V1.0 Certified` |
+| **Protocol Gold** | Individual protocol completion | `{Protocol} V1.0 Gold` |
+| **Protocol Silver** | 80%+ of protocol tests | `{Protocol} V1.0 Silver` |
+| **Protocol Development** | 50%+ of protocol tests | `{Protocol} V1.0 Development` |
 
 ---
 
@@ -412,6 +449,7 @@ Implementations meeting certification requirements MUST:
 - Platinum certifications require annual recertification
 - Silver certifications require biannual review  
 - Development certifications valid for 6 months
+- Protocol certifications follow suite certification timelines
 
 ### Version Compatibility
 - Certification valid for specification major version
@@ -487,3 +525,4 @@ Certification MAY be revoked for:
 **Certification Portal:** https://corpus.io/certification  
 **Brand Guidelines:** https://corpus.io/brand-guidelines  
 **Status:** 🏆 **PLATINUM CERTIFIED** • Valid until 2026-02-07
+```
