@@ -1220,32 +1220,32 @@ Capabilities enable:
 * **Request validation** - Preflight checks before backend calls
 * **Feature detection** - Runtime discovery of supported operations
 
-### Capability Fields by Domain
-
 **Embeddings:**
-
 * `supported_models`, `max_batch_size`, `max_text_length`
 * `supports_normalization`, `normalizes_at_source`
 * `supports_token_counting`, `supports_deadline`
+* **Supported Operations**: `embedding.embed`, `embedding.embed_batch`, `embedding.count_tokens`, `embedding.health`
 
 **LLM:**
-
 * `model_family`, `max_context_length`, `supported_models`
 * `supports_streaming`, `supports_roles`, `supports_system_message`
 * `supports_json_output`, `supports_parallel_tool_calls`
 * `supports_deadline`, `supports_count_tokens`
+* **Supported Operations**: `llm.complete`, `llm.stream`, `llm.count_tokens`, `llm.health`
 
 **Vector:**
-
 * `max_dimensions`, `supported_distance_metrics`
 * `supports_metadata_filtering`, `supports_namespaces`
 * `max_batch_size`, `supports_deadline`
+* **Supported Operations**: `vector.query`, `vector.upsert`, `vector.delete`, `vector.create_namespace`, `vector.delete_namespace`, `vector.health`
 
 **Graph:**
-
 * `supported_query_dialects` - e.g., `("cypher", "gremlin", "gql")`
 * `supports_stream_query`, `supports_bulk_vertices`, `supports_batch`
 * `supports_schema`, `supports_namespaces`, `supports_deadline`
+* **Supported Operations**: `graph.query`, `graph.stream_query`, `graph.upsert_nodes`, `graph.upsert_edges`, `graph.delete_nodes`, `graph.delete_edges`, `graph.bulk_vertices`, `graph.batch`, `graph.get_schema`, `graph.health`
+
+All operations correspond to canonical `op` strings in the Corpus wire protocol for transport-agnostic interoperability.
 
 ---
 
