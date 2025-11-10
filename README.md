@@ -239,7 +239,7 @@ pip install corpus_sdk
 
 ```python
 # Simplest possible working example - get started in under 5 minutes
-from corpus_sdk.llm_base import BaseLLMAdapter, OperationContext
+from corpus_sdk.llm.llm_base import BaseLLMAdapter, OperationContext
 
 class QuickAdapter(BaseLLMAdapter):
     async def _do_complete(self, messages, **kwargs):
@@ -387,7 +387,7 @@ We **encourage** forks and independent implementations that remain wire-compatib
 ### Embeddings Quickstart
 
 ```python
-from corpus_sdk.adapter_sdk.embedding_base import (
+from corpus_sdk.embedding.embedding_base import (
     BaseEmbeddingAdapter, EmbedSpec, OperationContext, EmbeddingVector,
     EmbeddingCapabilities, BatchEmbedSpec, BatchEmbedResult, EmbedResult
 )
@@ -470,7 +470,7 @@ async with ExampleEmbeddingAdapter() as adapter:
 ### LLM Quickstart
 
 ```python
-from corpus_sdk.adapter_sdk.llm_base import (
+from corpus_sdk.llm.llm_base import (
     BaseLLMAdapter, OperationContext, LLMCompletion,
     TokenUsage, LLMCapabilities, LLMChunk, LLMStreamResult
 )
@@ -543,7 +543,7 @@ async with ExampleLLMAdapter() as adapter:
 ### Vector Quickstart
 
 ```python
-from corpus_sdk.adapter_sdk.vector_base import (
+from corpus_sdk.vector.vector_base import (
     BaseVectorAdapter, VectorCapabilities, QuerySpec, QueryResult,
     Vector, VectorMatch, UpsertSpec, UpsertResult, DeleteSpec,
     DeleteResult, NamespaceSpec, NamespaceResult, OperationContext, VectorID
@@ -646,7 +646,7 @@ print(result.matches[0].score)
 ### Graph Quickstart
 
 ```python
-from corpus_sdk.adapter_sdk.graph_base import (
+from corpus_sdk.graph.graph_base import (
     BaseGraphAdapter, GraphCapabilities, GraphQuerySpec,
     UpsertNodesSpec, UpsertEdgesSpec, Node, Edge, GraphID,
     OperationContext, GraphQueryResult, UpsertNodesResult,
@@ -821,7 +821,7 @@ await router.route_workflow({
 ```python
 # Connect AI workflows to business data with consistent error handling
 import asyncio
-from corpus_sdk.llm_base import BaseLLMAdapter, OperationContext
+from corpus_sdk.llm.llm_base import BaseLLMAdapter, OperationContext
 
 class AirtableCorpusAdapter:
     def __init__(self, corpus_llm: BaseLLMAdapter, airtable_base):
@@ -1148,8 +1148,8 @@ Capabilities enable:
 ### Repository Structure
 
 ```text
-corpus_sdk/
-├── adapter_sdk/
+corpus/
+├── corpus_sdk/
 │   ├── embedding_base.py      # Protocol + Base
 │   ├── llm_base.py            # Protocol + Base
 │   ├── vector_base.py         # Protocol + Base
@@ -1378,10 +1378,10 @@ pytest tests/embedding/ -v
 
 #### Corpus Protocol Suite Badge
 
-![LLM Protocol](https://img.shields.io/badge/LLM%20Protocol-100%25%20Conformant-brightgreen)
-![Vector Protocol](https://img.shields.io/badge/Vector%20Protocol-100%25%20Conformant-brightgreen)
-![Graph Protocol](https://img.shields.io/badge/Graph%20Protocol-100%25%20Conformant-brightgreen)
-![Embedding Protocol](https://img.shields.io/badge/Embedding%20Protocol-100%25%20Conformant-brightgreen)
+![LLM Protocol](https://img.shields.io/badge/Corpus LLM%20Protocol-100%25%20Conformant-brightgreen)
+![Vector Protocol](https://img.shields.io/badge/Corpus Vector%20Protocol-100%25%20Conformant-brightgreen)
+![Graph Protocol](https://img.shields.io/badge/Corpus Graph%20Protocol-100%25%20Conformant-brightgreen)
+![Embedding Protocol](https://img.shields.io/badge/Corpus Embedding%20Protocol-100%25%20Conformant-brightgreen)
 
 ---
 
@@ -1469,7 +1469,7 @@ messages = [HumanMessage(content="Hello world")]
 result = llm.invoke(messages)
 
 # After: Protocol-based standardization  
-from corpus_sdk.llm_base import BaseLLMAdapter
+from corpus_sdk.llm.llm_base import BaseLLMAdapter
 
 class OpenAIAdapter(BaseLLMAdapter):
     # Same interface as Anthropic, Cohere, etc.
