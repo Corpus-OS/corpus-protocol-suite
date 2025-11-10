@@ -380,23 +380,9 @@ We **encourage** forks and independent implementations that remain wire-compatib
 
 ---
 
-## Quickstart
+## Quickstart Examples
 
 > **Note**: In all examples, swap `Example*Adapter` with your actual adapter class that inherits the corresponding base and implements `_do_*` hooks.
-
-### 5-Line Hello World
-
-A minimal taste using any `BaseLLMAdapter` implementation:
-
-```python
-from corpus_sdk.adapter_sdk.llm_base import OperationContext
-from my_adapters import MyLLMAdapter
-
-adapter = MyLLMAdapter()
-res = await adapter.complete(messages=[{"role": "user", "content": "Hello Corpus"}],
-                             ctx=OperationContext(request_id="hello"))
-print(res.text)
-```
 
 ### Embeddings Quickstart
 
