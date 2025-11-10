@@ -794,26 +794,132 @@ async with ExampleGraphAdapter() as adapter:
 
 ## 💼 Real-World Scenarios
 
+Here's the updated Multi-Cloud AI Strategy section covering all four domains:
+
+## 💼 Real-World Scenarios
+
 ### **Multi-Cloud AI Strategy**
 ```python
-# Route between providers based on cost, latency, and quality requirements
+# Route between providers across all four domains based on cost, latency, and quality
 strategies = {
-    "cost_optimized": [("anthropic", 0.6), ("openai", 0.3), ("cohere", 0.1)],
-    "low_latency": [("openai", 0.8), ("cohere", 0.2)],
-    "high_quality": [("openai-gpt4", 1.0)]
+    "cost_optimized": {
+        "llm": [("anthropic", 0.6), ("openai", 0.3), ("cohere", 0.1)],
+        "embedding": [("cohere", 0.7), ("openai", 0.3)],
+        "vector": [("qdrant", 0.8), ("pinecone", 0.2)],
+        "graph": [("neo4j", 1.0)]  # Single provider for consistency
+    },
+    "low_latency": {
+        "llm": [("openai", 0.8), ("anthropic", 0.2)],
+        "embedding": [("openai", 1.0)],
+        "vector": [("pinecone", 0.9), ("qdrant", 0.1)],
+        "graph": [("neo4j", 1.0)]
+    },
+    "high_quality": {
+        "llm": [("openai-gpt4", 1.0)],
+        "embedding": [("openai-text-embedding-3-large", 1.0)],
+        "vector": [("weaviate", 0.7), ("pinecone", 0.3)],
+        "graph": [("tigergraph", 0.6), ("neo4j", 0.4)]
+    },
+    "compliance_focused": {
+        "llm": [("azure-openai", 1.0)],  # For HIPAA/GDPR compliance
+        "embedding": [("azure-openai", 1.0)],
+        "vector": [("azure-cognitive-search", 1.0)],
+        "graph": [("azure-cosmosdb", 1.0)]
+    }
 }
 
-# Corpus Router automatically handles fallbacks and load balancing
+# Corpus Router automatically handles cross-domain optimization and fallbacks
+async def execute_rag_pipeline(tenant_id: str, query: str, strategy: str):
+    """Execute a complete RAG pipeline using the specified multi-cloud strategy"""
+    
+    # 1. Generate query embedding
+    embedding_provider = await router.select_provider(
+        domain="embedding", 
+        strategy=strategy,
+        tenant_id=tenant_id
+    )
+    query_embedding = await embedding_provider.embed(
+        EmbedSpec(text=query, model="text-embedding-ada-002")
+    )
+    
+    # 2. Vector search for relevant context
+    vector_provider = await router.select_provider(
+        domain="vector",
+        strategy=strategy, 
+        tenant_id=tenant_id
+    )
+    context_results = await vector_provider.query(
+        QuerySpec(vector=query_embedding.vector, top_k=5, namespace="documents")
+    )
+    
+    # 3. Graph search for related entities
+    graph_provider = await router.select_provider(
+        domain="graph",
+        strategy=strategy,
+        tenant_id=tenant_id
+    )
+    related_entities = await graph_provider.query(
+        GraphQuerySpec(
+            query="MATCH (e:Entity)-[:RELATED_TO]->(c:Context) RETURN e LIMIT 3",
+            dialect="cypher"
+        )
+    )
+    
+    # 4. LLM generation with combined context
+    llm_provider = await router.select_provider(
+        domain="llm",
+        strategy=strategy,
+        tenant_id=tenant_id
+    )
+    
+    augmented_prompt = f"""
+    Context from documents: {[match.vector.metadata for match in context_results.matches]}
+    Related entities: {[record for record in related_entities.records]}
+    
+    User question: {query}
+    """
+    
+    response = await llm_provider.complete(
+        messages=[{"role": "user", "content": augmented_prompt}],
+        model="gpt-4"
+    )
+    
+    return response.text
+
+# Usage examples
+result = await execute_rag_pipeline(
+    tenant_id="startup_alpha", 
+    query="What are our competitive advantages?",
+    strategy="cost_optimized"  # Startup prioritizing cost savings
+)
+
+enterprise_result = await execute_rag_pipeline(
+    tenant_id="enterprise_beta",
+    query="Patient treatment recommendations", 
+    strategy="compliance_focused"  # Healthcare company requiring data residency
+)
 ```
 
 ### **Enterprise Multi-Tenant Isolation**
 ```python
-# Each tenant gets isolated circuit breakers, rate limits, and caches
+# Each tenant gets isolated circuit breakers, rate limits, and caches across all domains
 await router.route_workflow({
     "workflow_type": "rag_pipeline", 
     "tenant_id": "enterprise_customer_123",
     "priority": 8,  # Higher priority tenants get better QoS
-    "budget_ceiling": 1000  # Monthly budget in dollars
+    "budget_ceiling": 1000,  # Monthly budget in dollars
+    "domain_strategies": {
+        "llm": "high_quality",
+        "embedding": "low_latency", 
+        "vector": "cost_optimized",
+        "graph": "compliance_focused"
+    },
+    "isolation_guarantees": {
+        "circuit_breakers": True,  # Separate circuit breakers per tenant
+        "rate_limits": True,      # Isolated rate limiting
+        "caches": True,           # Tenant-specific caching
+        "data_residency": "eu-west-1"  # Geographic isolation
+    }
 })
 ```
 
