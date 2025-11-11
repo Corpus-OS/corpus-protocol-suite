@@ -23,8 +23,8 @@ from corpus_sdk.graph.graph_base import (
     ResourceExhausted,
     HealthStatus,
 )
-from corpus_sdk.examples.common.ctx import make_ctx
-from corpus_sdk.examples.common.printing import box, print_kv, print_json
+from examples.common.ctx import make_ctx
+from examples.common.printing import box, print_kv, print_json
 
 
 @dataclass
