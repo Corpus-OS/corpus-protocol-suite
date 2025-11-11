@@ -11,12 +11,12 @@ Demonstrates:
 """
 
 import asyncio
-from corpus_sdk.examples.vector.mock_vector_adapter import MockVectorAdapter
+from examples.vector.mock_vector_adapter import MockVectorAdapter
 from corpus_sdk.vector.vector_base import (
     Vector, QuerySpec, UpsertSpec, NamespaceSpec, OperationContext
 )
-from corpus_sdk.examples.common.ctx import make_ctx
-from corpus_sdk.examples.common.printing import box, print_kv
+from examples.common.ctx import make_ctx
+from examples.common.printing import box, print_kv
 
 async def main():
     box("Vector ex01 — Basic query")
