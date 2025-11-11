@@ -4,11 +4,11 @@ Demonstrates: multi-tenant isolation in caches & metrics
 Expected: same query under two tenants → distinct cache keys; metrics show hashed tenant tags
 """
 import asyncio, random
-from corpus_sdk.examples.graph.mock_graph_adapter import MockGraphAdapter
-from corpus_sdk.examples.common.metrics_console import ConsoleMetrics
+from examples.graph.mock_graph_adapter import MockGraphAdapter
+from examples.common.metrics_console import ConsoleMetrics
 from corpus_sdk.graph.graph_base import OperationContext as GraphContext
-from corpus_sdk.examples.common.ctx import make_ctx
-from corpus_sdk.examples.common.printing import box, print_kv
+from examples.common.ctx import make_ctx
+from examples.common.printing import box, print_kv
 
 async def main():
     random.seed(110)
