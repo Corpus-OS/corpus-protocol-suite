@@ -21,9 +21,9 @@ from corpus_sdk.llm.llm_base import (
     LLMCapabilities,
     OperationContext as LLMContext,
 )
-from corpus_sdk.examples.common.errors import Unavailable, ResourceExhausted
-from corpus_sdk.examples.common.ctx import make_ctx
-from corpus_sdk.examples.common.printing import print_json, print_kv, box
+from examples.common.errors import Unavailable, ResourceExhausted
+from examples.common.ctx import make_ctx
+from examples.common.printing import print_json, print_kv, box
 
 
 # -----------------------------
