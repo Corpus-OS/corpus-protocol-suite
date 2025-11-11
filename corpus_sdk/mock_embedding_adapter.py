@@ -16,7 +16,7 @@ import random
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-from adapter_sdk.embedding_base import (
+from corpus_sdk.embedding.embedding_base import (
     BaseEmbeddingAdapter,
     EmbeddingCapabilities,
     EmbedSpec,
