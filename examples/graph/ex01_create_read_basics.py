@@ -4,10 +4,10 @@ Demonstrates: CRUD + basic query + capabilities
 Expected: prints created IDs, a small rowset, then clean deletes
 """
 import asyncio, random, argparse
-from corpus_sdk.examples.graph.mock_graph_adapter import MockGraphAdapter
+from examples.graph.mock_graph_adapter import MockGraphAdapter
 from corpus_sdk.graph.graph_base import OperationContext as GraphContext
-from corpus_sdk.examples.common.ctx import make_ctx
-from corpus_sdk.examples.common.printing import box, print_kv, print_json
+from examples.common.ctx import make_ctx
+from examples.common.printing import box, print_kv, print_json
 
 async def main():
     random.seed(101)
