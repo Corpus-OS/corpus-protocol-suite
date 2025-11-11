@@ -4,9 +4,9 @@ Demonstrates: deadline preflight + timeout during op
 Expected: preflight DeadlineExceeded; then timeout during query
 """
 import asyncio, random, time
-from corpus_sdk.examples.graph.mock_graph_adapter import MockGraphAdapter
+from examples.graph.mock_graph_adapter import MockGraphAdapter
 from corpus_sdk.graph.graph_base import OperationContext as GraphContext, DeadlineExceeded
-from corpus_sdk.examples.common.printing import box, print_kv
+from examples.common.printing import box, print_kv
 
 async def main():
     random.seed(107)
