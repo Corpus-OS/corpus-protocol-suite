@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adaptersdk.org/schemas/graph/graph.envelope.error.json",
+  "title": "Graph Error Envelope",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://adaptersdk.org/schemas/common/envelope.error.json" },
+    {
+      "type": "object",
+      "required": ["protocol", "component"],
+      "properties": {
+        "protocol": { "type": "string", "const": "graph/v1.0" },
+        "component": { "type": "string", "const": "graph" }
+      }
+    }
+  ]
+}

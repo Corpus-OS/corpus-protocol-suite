@@ -8,8 +8,8 @@ Demonstrates:
 """
 
 import asyncio
-from corpus_sdk.examples.vector.mock_vector_adapter import MockVectorAdapter
-from corpus_sdk.examples.common.printing import box, print_kv
+from examples.vector.mock_vector_adapter import MockVectorAdapter
+from examples.common.printing import box, print_kv
 
 async def main():
     box("Vector ex03 — Capabilities & Limits")

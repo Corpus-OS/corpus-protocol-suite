@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adaptersdk.org/schemas/graph/graph.types.entity.json",
+  "title": "Graph Entity",
+  "description": "Generic entity shape: vertex or edge. Used for create responses/echo.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["kind", "label", "props"],
+  "properties": {
+    "kind": { "type": "string", "enum": ["vertex", "edge"] },
+    "id": { "$ref": "https://adaptersdk.org/schemas/graph/graph.types.id.json" },
+    "label": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._:-]{1,128}$"
+    },
+    "props": {
+      "type": "object",
+      "description": "JSON-serializable, low-cardinality properties. No secrets/PII.",
+      "maxProperties": 256,
+      "additionalProperties": {
+        "oneOf": [
+          { "type": "string", "maxLength": 1024 },
+          { "type": "number" },
+          { "type": "integer" },
+          { "type": "boolean" },
+          { "type": "null" },
+          { "type": "array", "maxItems": 128, "items": { "type": ["string","number","integer","boolean","null"] } }
+        ]
+      }
+    },
+    "from_id": { "$ref": "https://adaptersdk.org/schemas/graph/graph.types.id.json" },
+    "to_id": { "$ref": "https://adaptersdk.org/schemas/graph/graph.types.id.json" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "kind": { "const": "edge" } }, "required": ["kind"] },
+      "then": { "required": ["from_id", "to_id"] }
+    }
+  ],
+  "patternProperties": {
+    "^(vendor:)[a-z0-9_.:-]+$": {
+      "type": ["string", "number", "boolean", "object", "array", "null"],
+      "description": "Namespaced vendor extensions."
+    }
+  }
+}

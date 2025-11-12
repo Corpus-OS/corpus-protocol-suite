@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adaptersdk.org/schemas/vector/vector.namespace.delete.request.json",
+  "title": "vector.delete_namespace args",
+  "description": "Arguments for op: vector.delete_namespace",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "namespace": {
+      "type": "string",
+      "maxLength": 256,
+      "pattern": "^[A-Za-z0-9._:-]{1,256}$"
+    },
+    "force": { "type": "boolean", "default": false }
+  },
+  "required": ["namespace"]
+}

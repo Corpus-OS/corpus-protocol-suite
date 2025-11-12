@@ -5,7 +5,13 @@
 	test-vector-conformance \
 	test-graph-conformance \
 	test-embedding-conformance \
+	test-fast \
+	test-fast-llm \
+	test-fast-vector \
+	test-fast-graph \
+	test-fast-embedding \
 	check-deps \
+	verify \
 	clean \
 	help
 
@@ -15,14 +21,16 @@ PYTEST_ARGS ?= -v
 PYTEST_JOBS ?= auto
 COV_FAIL_UNDER ?= 80
 
+# Protocols and directories
+PROTOCOLS := llm vector graph embedding
+TEST_DIRS := $(foreach p,$(PROTOCOLS),tests/$(p))
+
 # Derived configuration
 PYTEST_PARALLEL := $(if $(filter-out 1,$(PYTEST_JOBS)),-n $(PYTEST_JOBS),)
 COV_REPORT_TERM := --cov-report=term
-COV_REPORT_HTML := --cov-report=html:$(PROTOCOL)_coverage_report
 COV_THRESHOLD := --cov-fail-under=$(COV_FAIL_UNDER)
 
-# Test directories (validate existence)
-TEST_DIRS := tests/llm tests/vector tests/graph tests/embedding
+# Validate test directories exist
 $(foreach dir,$(TEST_DIRS),$(if $(wildcard $(dir)),,$(error Test directory $(dir) not found)))
 
 # Dependency check
@@ -36,7 +44,7 @@ check-deps:
 # Run ALL protocol conformance suites (LLM + Vector + Graph + Embedding)
 test-conformance test-all-conformance: check-deps
 	@echo "🚀 Running ALL protocol conformance suites..."
-	@echo "   Protocols: LLM, Vector, Graph, Embedding"
+	@echo "   Protocols: $(PROTOCOLS)"
 	@echo "   Parallel jobs: $(PYTEST_JOBS)"
 	@echo "   Coverage threshold: $(COV_FAIL_UNDER)%"
 	$(PYTEST) \
@@ -48,60 +56,60 @@ test-conformance test-all-conformance: check-deps
 		$(COV_REPORT_TERM) \
 		--cov-report=html:conformance_coverage_report
 
-# LLM Protocol V1 conformance
-test-llm-conformance: check-deps
-	@echo "🚀 Running LLM Protocol V1 conformance tests..."
+# --------------------------------------------------------------------------- #
+# Per-Protocol Conformance (Dynamic Targets)
+# --------------------------------------------------------------------------- #
+
+# Single target to handle all protocol conformance tests
+test-%-conformance: check-deps
+	@echo "🚀 Running $(shell echo $* | tr 'a-z' 'A-Z') Protocol V1 conformance tests..."
 	@echo "   Parallel jobs: $(PYTEST_JOBS)"
 	@echo "   Coverage threshold: $(COV_FAIL_UNDER)%"
-	PROTOCOL=llm $(PYTEST) tests/llm $(PYTEST_ARGS) $(PYTEST_PARALLEL) \
-		--cov=corpus_sdk.llm \
+	$(PYTEST) tests/$* $(PYTEST_ARGS) $(PYTEST_PARALLEL) \
+		--cov=corpus_sdk.$* \
 		$(COV_THRESHOLD) \
 		$(COV_REPORT_TERM) \
-		$(COV_REPORT_HTML)
+		--cov-report=html:$*_coverage_report
 
-# Vector Protocol V1 conformance
-test-vector-conformance: check-deps
-	@echo "🚀 Running Vector Protocol V1 conformance tests..."
-	@echo "   Parallel jobs: $(PYTEST_JOBS)"
-	@echo "   Coverage threshold: $(COV_FAIL_UNDER)%"
-	PROTOCOL=vector $(PYTEST) tests/vector $(PYTEST_ARGS) $(PYTEST_PARALLEL) \
-		--cov=corpus_sdk.vector \
-		$(COV_THRESHOLD) \
-		$(COV_REPORT_TERM) \
-		$(COV_REPORT_HTML)
+# --------------------------------------------------------------------------- #
+# Fast Test Runs (No Coverage)
+# --------------------------------------------------------------------------- #
 
-# Graph Protocol V1 conformance
-test-graph-conformance: check-deps
-	@echo "🚀 Running Graph Protocol V1 conformance tests..."
-	@echo "   Parallel jobs: $(PYTEST_JOBS)"
-	@echo "   Coverage threshold: $(COV_FAIL_UNDER)%"
-	PROTOCOL=graph $(PYTEST) tests/graph $(PYTEST_ARGS) $(PYTEST_PARALLEL) \
-		--cov=corpus_sdk.graph \
-		$(COV_THRESHOLD) \
-		$(COV_REPORT_TERM) \
-		$(COV_REPORT_HTML)
-
-# Embedding Protocol V1 conformance
-test-embedding-conformance: check-deps
-	@echo "🚀 Running Embedding Protocol V1 conformance tests..."
-	@echo "   Parallel jobs: $(PYTEST_JOBS)"
-	@echo "   Coverage threshold: $(COV_FAIL_UNDER)%"
-	PROTOCOL=embedding $(PYTEST) tests/embedding $(PYTEST_ARGS) $(PYTEST_PARALLEL) \
-		--cov=corpus_sdk.embedding \
-		$(COV_THRESHOLD) \
-		$(COV_REPORT_TERM) \
-		$(COV_REPORT_HTML)
-
-# Fast test runs (no coverage, parallel)
+# Fast all tests
 test-fast: check-deps
-	@echo "⚡ Running fast tests (no coverage, parallel)..."
-	$(PYTEST) $(TEST_DIRS) $(PYTEST_ARGS) -n auto --no-cov
+	@echo "⚡ Running fast tests (no coverage, skipping slow tests)..."
+	$(PYTEST) $(TEST_DIRS) $(PYTEST_ARGS) $(PYTEST_PARALLEL) -m "not slow" --no-cov
+
+# Fast per-protocol tests
+test-fast-%: check-deps
+	@echo "⚡ Running fast $(shell echo $* | tr 'a-z' 'A-Z') tests (no coverage, skipping slow)..."
+	$(PYTEST) tests/$* $(PYTEST_ARGS) $(PYTEST_PARALLEL) -m "not slow" --no-cov
+
+# --------------------------------------------------------------------------- #
+# Verification & Utilities
+# --------------------------------------------------------------------------- #
+
+# Verify command (alias for test-conformance with better messaging)
+verify: check-deps
+	@echo "🔍 Running Corpus Protocol Conformance Suite..."
+	@echo "   Protocols: $(PROTOCOLS)"
+	@echo "   Parallel jobs: $(PYTEST_JOBS)"
+	@echo "   Coverage threshold: $(COV_FAIL_UNDER)%"
+	$(PYTEST) \
+		$(TEST_DIRS) \
+		$(PYTEST_ARGS) \
+		$(PYTEST_PARALLEL) \
+		--cov=corpus_sdk \
+		$(COV_THRESHOLD) \
+		$(COV_REPORT_TERM) \
+		--cov-report=html:conformance_coverage_report
 
 # Clean up generated files
 clean:
 	@echo "🧹 Cleaning up generated files..."
 	rm -rf \
 		*_coverage_report \
+		conformance_coverage_report \
 		.coverage \
 		.pytest_cache \
 		htmlcov \
@@ -114,13 +122,24 @@ clean:
 help:
 	@echo "Corpus SDK Conformance Test Targets:"
 	@echo ""
-	@echo "  test-conformance       Run ALL protocol suites (LLM + Vector + Graph + Embedding)"
+	@echo "  test-conformance       Run ALL protocol suites ($(PROTOCOLS))"
 	@echo "  test-all-conformance   Alias for test-conformance"
+	@echo "  verify                 Alias for test-conformance with verification messaging"
+	@echo ""
+	@echo "Per-Protocol Conformance:"
 	@echo "  test-llm-conformance   Run only LLM Protocol V1 tests"
 	@echo "  test-vector-conformance Run only Vector Protocol V1 tests"
 	@echo "  test-graph-conformance Run only Graph Protocol V1 tests"
 	@echo "  test-embedding-conformance Run only Embedding Protocol V1 tests"
-	@echo "  test-fast              Run tests quickly (no coverage, parallel)"
+	@echo ""
+	@echo "Fast Testing (No Coverage):"
+	@echo "  test-fast              Run all tests quickly (no coverage, skip slow)"
+	@echo "  test-fast-llm          Run only LLM tests quickly"
+	@echo "  test-fast-vector       Run only Vector tests quickly"
+	@echo "  test-fast-graph        Run only Graph tests quickly"
+	@echo "  test-fast-embedding    Run only Embedding tests quickly"
+	@echo ""
+	@echo "Utilities:"
 	@echo "  check-deps            Verify test dependencies are installed"
 	@echo "  clean                 Remove all generated files and caches"
 	@echo "  help                  Show this help message"
@@ -135,10 +154,10 @@ help:
 	@echo "Examples:"
 	@echo "  make test-conformance                    # Run all tests"
 	@echo "  make test-llm-conformance               # Run only LLM tests"
+	@echo "  make test-fast-vector                   # Run Vector tests quickly"
 	@echo "  make PYTEST_JOBS=4 test-conformance     # Run with 4 parallel jobs"
-	@echo "  make COV_FAIL_UNDER=90 test-conformance # Require 90% coverage"
-	@echo "  make test-fast                         # Fast iteration (no coverage)"
-	@echo "  make clean test-vector-conformance     # Clean then run Vector tests"
+	@echo "  make COV_FAIL_UNDER=90 verify           # Verify with 90% coverage"
+	@echo "  make clean test-vector-conformance      # Clean then run Vector tests"
 	@echo ""
 
 # Default target

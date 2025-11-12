@@ -782,6 +782,7 @@ class GraphCapabilities:
         idempotent_writes: Whether idempotency_key is honored for writes.
         supports_multi_tenant: Whether tenant-aware isolation is supported.
         supports_deadline: Whether ctx.deadline_ms is respected.
+        max_batch_ops: Optional maximum number of ops per batch (adapter-defined).
     """
     server: str
     version: str
@@ -796,6 +797,7 @@ class GraphCapabilities:
     idempotent_writes: bool = False
     supports_multi_tenant: bool = False
     supports_deadline: bool = True
+    max_batch_ops: Optional[int] = None
 
 
 # =============================================================================
@@ -1110,7 +1112,7 @@ class BaseGraphAdapter(GraphProtocolV1):
             self._record(op, t0, False, code=e.code or type(e).__name__, ctx=ctx, **metric_extra)
             self._breaker.on_error(e)
             raise
-        except Exception:
+        except Exception as e:
             self._record(op, t0, False, code="UNAVAILABLE", ctx=ctx, **metric_extra)
             self._breaker.on_error(e)
             raise
@@ -1156,7 +1158,7 @@ class BaseGraphAdapter(GraphProtocolV1):
                 self._record(op, t0, False, code=e.code or type(e).__name__, ctx=ctx, **metric_extra)
                 self._breaker.on_error(e)
                 raise
-            except Exception:
+            except Exception as e:
                 self._record(op, t0, False, code="UNAVAILABLE", ctx=ctx, **metric_extra)
                 self._breaker.on_error(e)
                 raise
@@ -1504,11 +1506,19 @@ class BaseGraphAdapter(GraphProtocolV1):
         try:
             res = await self._apply_deadline(self._do_health(ctx=ctx), ctx)
             self._record("health", t0, True, ctx=ctx)
+            ok = bool(res.get("ok", True))
+            status = res.get("status")
+            if not status:
+                status = "ok" if ok else "degraded"
             return {
-                "ok": bool(res.get("ok", True)),
+                "ok": ok,
+                "status": status,
                 "server": str(res.get("server", "")),
                 "version": str(res.get("version", "")),
                 "namespaces": res.get("namespaces", {}),
+                # pass-through common flags if provided upstream; derive sensible defaults
+                "read_only": bool(res.get("read_only", False)),
+                "degraded": bool(res.get("degraded", status != "ok")),
             }
         except GraphAdapterError as e:
             self._record("health", t0, False, code=e.code or type(e).__name__, ctx=ctx)

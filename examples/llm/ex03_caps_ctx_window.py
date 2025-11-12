@@ -7,8 +7,8 @@ MockLLMAdapter. Prints available models and their context window sizes.
 """
 
 import asyncio
-from corpus_sdk.examples.llm.mock_llm_adapter import MockLLMAdapter
-from corpus_sdk.examples.common.printing import box, print_kv, print_table
+from examples.llm.mock_llm_adapter import MockLLMAdapter
+from examples.common.printing import box, print_kv, print_table
 
 
 async def main() -> None:

@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adaptersdk.org/schemas/llm/llm.types.message.json",
+  "title": "LLM Chat Message",
+  "description": "Canonical chat message for LLM operations. SIEM-safe; no secrets or PII.",
+  "type": "object",
+  "required": ["role", "content"],
+  "additionalProperties": false,
+  "properties": {
+    "role": {
+      "type": "string",
+      "enum": ["system", "user", "assistant", "tool"],
+      "description": "Message role per spec §8.3."
+    },
+    "content": {
+      "type": "string",
+      "minLength": 0,
+      "maxLength": 200000,
+      "description": "Primary message text. Implementations MAY also accept structured content via vendor extensions."
+    },
+    "name": {
+      "type": "string",
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._:-]{1,128}$",
+      "description": "Optional display name for assistant/tool roles."
+    },
+    "tool_call_id": {
+      "type": "string",
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._:-]{1,128}$",
+      "description": "For role=tool, the originating tool_call identifier."
+    }
+  },
+  "patternProperties": {
+    "^(vendor:)[a-z0-9_.:-]+$": {
+      "description": "Vendor/extension namespaced fields for structured content parts.",
+      "type": ["string", "number", "boolean", "object", "array", "null"]
+    }
+  }
+}

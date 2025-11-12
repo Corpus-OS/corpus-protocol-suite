@@ -24,6 +24,8 @@
 
 We aim to acknowledge every report within **7 business days**.
 
+> **Clarification:** “Business days” are counted globally; primary triage timezone is **US Central**. We attempt to reply sooner for high-severity issues.
+
 ### Include in your report (helps us triage fast)
 
 * Affected component(s) and version(s) (commit/tag if possible)
@@ -33,6 +35,8 @@ We aim to acknowledge every report within **7 business days**.
 * Any temporary mitigations you discovered
 
 **Please do not** file security reports in public issues or PRs.
+
+**Large PoCs & sensitive data.** If your PoC is large or contains sensitive material, please share via an **encrypted link** (PGP-encrypted if possible) rather than inline email content. Do **not** email secrets in cleartext.
 
 ---
 
@@ -93,6 +97,8 @@ We are a community-driven open-source project. Security reports are handled on a
   * We may **extend** briefly (≤ 30 additional days) if patches are ready but require synchronized releases across multiple packages.
 * Reporters may share details with affected vendors under the same embargo. Please notify us of cross-vendor coordination so we can align releases.
 
+> **Note:** If we confirm **active exploitation**, we may publish an expedited advisory with mitigations prior to releasing full patches, then follow with patched releases and backports.
+
 ---
 
 ## 5) Safe Harbor for Researchers
@@ -105,6 +111,8 @@ We will not pursue legal action for **good-faith** research that:
 * Follows the **embargo** and coordinated disclosure terms above.
 
 If in doubt, ask us first at [security@adaptersdk.org](mailto:security@adaptersdk.org).
+
+**Load/DoS testing restriction:** Please **do not** perform stress/load testing against production infrastructure without prior written consent.
 
 ---
 
@@ -140,6 +148,8 @@ If in doubt, ask us first at [security@adaptersdk.org](mailto:security@adaptersd
 
 We typically support the **current major** and backport **security-only** patches when feasible.
 
+> **Best-effort backports:** When a new major is released, we generally provide security backports for the previous major for ~12 months.
+
 ---
 
 ## 8) Supply-Chain & Build Integrity
@@ -151,6 +161,15 @@ We typically support the **current major** and backport **security-only** patche
 * **Secrets management**: never commit secrets; rotate credentials on suspicion or leak.
 
 If you find an exposed secret, **email us immediately** and do not test it.
+
+**Example: Sigstore / cosign verification (adjust identity/issuer as appropriate)**
+
+```bash
+cosign verify-blob \
+  --certificate-identity-regexp 'https://github.com/yourorg/yourrepo' \
+  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+  --signature artifact.sig artifact.tar.gz
+```
 
 ---
 
@@ -198,6 +217,19 @@ Final severity may differ after full analysis.
 * Use minimal scopes for provider API keys; rotate regularly.
 * Enable WAF/IDS and alert on unusual token throughput and concurrency.
 * Keep SDKs and adapters up-to-date; subscribe to advisories.
+
+---
+
+### 12a) Advisory Publication & Ecosystem Coordination (Added)
+
+* We publish advisories to **OSV** and **GHSA** (GitHub Security Advisories) when applicable.
+* Where relevant, we may publish **VEX** (Vulnerability Exploitability eXchange) to document non-affected components or non-exploitable paths.
+* For issues originating in **third-party dependencies**, we:
+
+  * Track upstream advisories and fixes,
+  * Assess impact on Corpus SDKs and protocol adapters,
+  * Provide mitigations where feasible,
+  * Reference upstream advisories in our notes.
 
 ---
 
@@ -258,3 +290,20 @@ References
 * PGP fingerprint: `XXXX XXXX XXXX XXXX XXXX  XXXX XXXX XXXX XXXX XXXX`
 
 **Thank you** for helping keep the Corpus ecosystem secure.
+
+---
+
+## Appendix A — `security.txt` Template (Added)
+
+Place at: `https://adaptersdk.org/.well-known/security.txt` (and optionally `/security.txt` in the repo root).
+
+```
+Contact: mailto:security@adaptersdk.org
+Encryption: https://adaptersdk.org/pgp.txt
+Preferred-Languages: en
+Policy: https://github.com/yourorg/yourrepo/blob/main/SECURITY.md
+Canonical: https://adaptersdk.org/.well-known/security.txt
+Expires: 2026-12-31T23:59:59Z
+```
+
+**Bug bounty stance:** We do **not** run a public bounty at this time. Responsible disclosures are acknowledged in our Hall of Fame. If this changes, we will update this policy and the `security.txt`.

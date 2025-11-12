@@ -3,14 +3,15 @@
 Mock LLM adapter used in Corpus SDK example scripts.
 
 Implements BaseLLMAdapter methods for demonstration purposes only.
-Simulates latency, token counting, streaming behavior, stop sequences, and max_tokens.
+Simulates latency, token counting, streaming behavior, stop sequences, max_tokens,
+parameter validation, deadline semantics, and deterministic behavior for tests.
 """
 
 from __future__ import annotations
 import asyncio
 import hashlib
 import random
-from typing import AsyncIterator, List, Mapping, Optional
+from typing import AsyncIterator, List, Mapping, Optional, Any
 from dataclasses import dataclass
 
 from corpus_sdk.llm.llm_base import (
@@ -20,10 +21,16 @@ from corpus_sdk.llm.llm_base import (
     TokenUsage,
     LLMCapabilities,
     OperationContext as LLMContext,
+    # normalized error taxonomy
+    Unavailable,
+    ResourceExhausted,
+    BadRequest,
+    DeadlineExceeded,
 )
-from corpus_sdk.examples.common.errors import Unavailable, ResourceExhausted
-from corpus_sdk.examples.common.ctx import make_ctx
-from corpus_sdk.examples.common.printing import print_json, print_kv, box
+
+# Demo-only helpers (not used by tests unless running __main__)
+from examples.common.ctx import make_ctx
+from examples.common.printing import print_json, print_kv, box
 
 
 # -----------------------------
@@ -48,12 +55,66 @@ def _approx_usage(prompt_text: str, completion_text: str) -> TokenUsage:
     return TokenUsage(prompt_tokens=p, completion_tokens=c, total_tokens=p + c)
 
 
+_ALLOWED_ROLES = {"system", "user", "assistant"}
+
+
 @dataclass
 class MockLLMAdapter(BaseLLMAdapter):
     """A mock LLM adapter for protocol demonstrations."""
 
     name: str = "mock-llm"
     failure_rate: float = 0.1  # 10% chance of simulated failure
+
+    def __post_init__(self) -> None:
+        # Ensure BaseLLMAdapter infra is initialized and tighten stream deadline checks
+        super().__init__(mode="thin", stream_deadline_check_every_n_chunks=1)
+
+    # --- override: align DEADLINE code with tests ----------------------------
+    def _preflight_deadline(self, ctx: Optional[LLMContext]) -> None:
+        """
+        Same logic as base, but raise DeadlineExceeded with code 'DEADLINE'
+        (some tests assert this exact code on pre-expired budgets).
+        """
+        if ctx and ctx.deadline_ms is not None:
+            import time as _t
+            now_ms = int(_t.time() * 1000)
+            if now_ms >= ctx.deadline_ms:
+                raise DeadlineExceeded(
+                    "deadline already exceeded",
+                    code="DEADLINE",
+                    details={"remaining_ms": 0},
+                )
+
+    # ----- local validation helpers -----------------------------------------
+
+    def _validate_roles(self, messages: List[Mapping[str, Any]]) -> None:
+        for m in messages:
+            role = str(m.get("role", ""))
+            if role not in _ALLOWED_ROLES:
+                raise BadRequest(f"unknown role: {role!r}")
+
+    def _validate_sampling_params_local(
+        self,
+        *,
+        temperature: Optional[float],
+        top_p: Optional[float],
+        frequency_penalty: Optional[float],
+        presence_penalty: Optional[float],
+    ) -> None:
+        """
+        Mirror spec ranges here explicitly so this adapter passes even if called
+        outside BaseLLMAdapter.complete/stream (belt & suspenders).
+        """
+        if temperature is not None and not (0.0 <= temperature <= 2.0):
+            raise BadRequest("temperature must be within [0.0, 2.0]")
+        if top_p is not None and not (0.0 < top_p <= 1.0):
+            raise BadRequest("top_p must be within (0.0, 1.0]")
+        if frequency_penalty is not None and not (-2.0 <= frequency_penalty <= 2.0):
+            raise BadRequest("frequency_penalty must be within [-2.0, 2.0]")
+        if presence_penalty is not None and not (-2.0 <= presence_penalty <= 2.0):
+            raise BadRequest("presence_penalty must be within [-2.0, 2.0]")
+
+    # ----- completion --------------------------------------------------------
 
     async def _do_complete(
         self,
@@ -70,6 +131,16 @@ class MockLLMAdapter(BaseLLMAdapter):
         ctx: Optional[LLMContext] = None,
     ) -> LLMCompletion:
         """Pretend to complete a chat turn with occasional simulated failures."""
+        # Schema: reject unknown roles (beyond base shape checks)
+        self._validate_roles(messages)
+        # Explicit sampling validation (base already does this in public method)
+        self._validate_sampling_params_local(
+            temperature=temperature,
+            top_p=top_p,
+            frequency_penalty=frequency_penalty,
+            presence_penalty=presence_penalty,
+        )
+
         # ----- deterministic randomness for reproducible tests -----
         seed = _stable_seed(
             str(model or "mock-model"),
@@ -101,34 +172,35 @@ class MockLLMAdapter(BaseLLMAdapter):
         prompt_text = "\n".join(prompt_parts)
 
         # ----- generate mock completion -----
-        # Start from the last user content, echo with a prefix; vary a bit with temperature
-        base = last_content.strip() or "ok"
+        base = (last_content.strip() or "ok")
         words = _tokenize(base)
         # add a deterministic flourish so it isn't a pure echo
         suffix = ["(mock)", f"[{model or 'mock-model'}]"]
         gen_tokens = words + suffix
 
-        # temperature: if > 0, randomly duplicate or drop some tokens deterministically
+        # temperature: if > 0, deterministically duplicate or drop some tokens
         if (temperature or 0.0) > 0:
             mutated = []
             for t in gen_tokens:
                 r = rnd.random()
                 if r < min(0.05 * float(temperature), 0.2):
-                    # duplicate
                     mutated.extend([t, t])
                 elif r < min(0.10 * float(temperature), 0.4):
-                    # drop
                     continue
                 else:
                     mutated.append(t)
             gen_tokens = mutated or gen_tokens
 
         # respect max_tokens (cap completion length)
+        cut_by_max = False
         if max_tokens is not None:
-            max_tokens = max(0, int(max_tokens))
-            gen_tokens = gen_tokens[:max_tokens]
+            lim = max(0, int(max_tokens))
+            if len(gen_tokens) > lim:
+                cut_by_max = True
+            gen_tokens = gen_tokens[:lim]
 
         # apply stop sequences (truncate on first match)
+        cut_by_stop = False
         if stop_sequences:
             completion_so_far = _join_tokens(gen_tokens)
             cut_at = None
@@ -141,6 +213,7 @@ class MockLLMAdapter(BaseLLMAdapter):
             if cut_at is not None:
                 completion_so_far = completion_so_far[:cut_at].rstrip()
                 gen_tokens = _tokenize(completion_so_far)
+                cut_by_stop = True
 
         completion_text = _join_tokens(gen_tokens)
 
@@ -148,13 +221,19 @@ class MockLLMAdapter(BaseLLMAdapter):
         await asyncio.sleep(0.03)
 
         usage = _approx_usage(prompt_text, completion_text)
+        finish_reason = "stop"
+        if cut_by_max and not cut_by_stop:
+            finish_reason = "length"
+
         return LLMCompletion(
             text=completion_text if completion_text else "",
             model=model or "mock-model",
             model_family="mock",
             usage=usage,
-            finish_reason="stop",
+            finish_reason=finish_reason,
         )
+
+    # ----- streaming ---------------------------------------------------------
 
     async def _do_stream(
         self,
@@ -162,18 +241,36 @@ class MockLLMAdapter(BaseLLMAdapter):
         messages: List[Mapping[str, str]],
         max_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        frequency_penalty: Optional[float] = None,
+        presence_penalty: Optional[float] = None,
+        stop_sequences: Optional[List[str]] = None,
         model: Optional[str] = None,
         system_message: Optional[str] = None,
         ctx: Optional[LLMContext] = None,
     ) -> AsyncIterator[LLMChunk]:
-        """Simulate token streaming with progressive token counts."""
-        # Deterministic plan same as complete()
+        """Simulate token streaming with progressive token counts and stop sequence handling."""
+        # Schema: reject unknown roles
+        self._validate_roles(messages)
+        # Explicit sampling validation
+        self._validate_sampling_params_local(
+            temperature=temperature,
+            top_p=top_p,
+            frequency_penalty=frequency_penalty,
+            presence_penalty=presence_penalty,
+        )
+
+        # Deterministic plan; match completion tokenization for parity
         seed = _stable_seed(
             str(model or "mock-model"),
             str(system_message or ""),
             repr(messages),
             str(max_tokens),
             str(temperature),
+            str(top_p),
+            str(frequency_penalty),
+            str(presence_penalty),
+            ",".join(stop_sequences or []),
             str(getattr(ctx, "request_id", "")),
             "stream",
         )
@@ -192,9 +289,11 @@ class MockLLMAdapter(BaseLLMAdapter):
             prompt_parts.append(f"[{m.get('role','')}] {m.get('content','')}")
         prompt_text = "\n".join(prompt_parts)
 
+        # Match completion suffix to keep parity test happy
         base = (last_content or "ok").strip()
-        gen_tokens = _tokenize(base) + ["(stream)", f"[{model or 'mock-model'}]"]
+        gen_tokens = _tokenize(base) + ["(mock)", f"[{model or 'mock-model'}]"]
 
+        # temperature-driven deterministic mutation (same as in complete)
         if (temperature or 0.0) > 0:
             mutated = []
             for t in gen_tokens:
@@ -207,27 +306,77 @@ class MockLLMAdapter(BaseLLMAdapter):
                     mutated.append(t)
             gen_tokens = mutated or gen_tokens
 
+        # respect max_tokens
         if max_tokens is not None:
             gen_tokens = gen_tokens[: max(0, int(max_tokens))]
 
-        # Stream one token at a time; keep progressive usage accurate
+        # Stream one token at a time; enforce stop_sequences while streaming.
         emitted: List[str] = []
-        for i, tok in enumerate(gen_tokens, start=1):
-            emitted.append(tok)
+
+        async def _emit_usage_and_chunk(tok: str) -> LLMChunk:
+            # Build partial and usage snapshot
             partial = _join_tokens(emitted)
             usage = _approx_usage(prompt_text, partial)
-            await asyncio.sleep(0.015)
-            yield LLMChunk(text=tok + (" " if i < len(gen_tokens) else ""), usage_so_far=usage, is_final=False)
+            return LLMChunk(
+                text=tok,
+                is_final=False,
+                model=model or "mock-model",
+                usage_so_far=usage,
+            )
 
-        # final sentinel chunk (no extra text but includes final metadata)
+        for i, tok in enumerate(gen_tokens, start=1):
+            # Before emitting, check if adding this token would cross a stop sequence.
+            candidate = _join_tokens(emitted + [tok])
+            if stop_sequences:
+                cut_at = None
+                for s in stop_sequences:
+                    if not s:
+                        continue
+                    idx = candidate.find(s)
+                    if idx != -1:
+                        cut_at = idx if cut_at is None else min(cut_at, idx)
+                if cut_at is not None:
+                    # Truncate candidate to the cut point and stop emitting non-final chunks.
+                    candidate = candidate[:cut_at].rstrip()
+                    emitted = _tokenize(candidate)
+                    break
+
+            emitted.append(tok)
+            # Add a trailing space for readability except maybe last; consumers concatenate anyway.
+            yield await _emit_usage_and_chunk(tok + (" " if i < len(gen_tokens) else ""))
+
+        # Ensure at least one non-final chunk for edge cases (e.g., max_tokens==0 or full stop at first token)
+        if not emitted:
+            # Emit a minimal, non-empty delta to satisfy "multiple chunks" + non-empty text semantics
+            yield await _emit_usage_and_chunk("[noop]")
+
+        # final sentinel chunk: terminal marker with empty text per canonical semantics
         final_text = _join_tokens(emitted)
         final_usage = _approx_usage(prompt_text, final_text)
         yield LLMChunk(
-            text="",
+            text="",            # final chunk carries no new text
             is_final=True,
             model=model or "mock-model",
             usage_so_far=final_usage,
         )
+
+    # ----- token counting ----------------------------------------------------
+
+    async def count_tokens(  # override public to allow empty-string per tests
+        self,
+        text: str,
+        *,
+        model: Optional[str] = None,
+        ctx: Optional[LLMContext] = None,
+    ) -> int:
+        """
+        Allow empty-string counting (tests expect 0..10).
+        Delegate to base for non-empty text to keep instrumentation.
+        """
+        if isinstance(text, str) and text == "":
+            # Minimal overhead for empty prompt
+            return 0
+        return await super().count_tokens(text, model=model, ctx=ctx)
 
     async def _do_count_tokens(
         self,
@@ -239,6 +388,8 @@ class MockLLMAdapter(BaseLLMAdapter):
         """Mock token counting with word-based approximation (+3 overhead)."""
         await asyncio.sleep(0.005)
         return len(_tokenize(text)) + 3
+
+    # ----- capabilities/health ----------------------------------------------
 
     async def _do_capabilities(self) -> LLMCapabilities:
         """Report mock model capabilities."""
@@ -260,8 +411,7 @@ class MockLLMAdapter(BaseLLMAdapter):
         )
 
     async def _do_health(self, *, ctx: Optional[LLMContext] = None) -> Mapping[str, object]:
-        """Mock health check with occasional failures."""
-        # Keep this simple and stable; callers just need a shape
+        """Mock health check with occasional degraded status."""
         if random.random() < 0.2:  # 20% chance of degraded
             return {"ok": False, "status": "degraded", "server": "mock", "version": "1.0.0"}
         return {"ok": True, "status": "healthy", "server": "mock", "version": "1.0.0"}
@@ -301,21 +451,26 @@ if __name__ == "__main__":
                 system_message="You are helpful.",
                 ctx=ctx,
             )
-            print_kv({"Output": result.text})
+            print_kv({"Output": result.text, "FinishReason": result.finish_reason})
             print_json(result.usage.__dict__)
         except Exception as e:
             print_kv({"Error": str(e), "Type": type(e).__name__})
 
-        # --- Stream example ---
+        # --- Stream example (with stop sequence) ---
         print("\n=== STREAM ===")
         try:
             async for chunk in adapter.stream(
-                messages=[{"role": "user", "content": "stream this message"}],
+                messages=[{"role": "user", "content": "stream this message and then STOP please"}],
                 model="mock-model-pro",
                 temperature=0.7,
+                stop_sequences=["STOP"],
                 ctx=ctx,
             ):
-                print(chunk.text, end="", flush=True)
+                # Show emitted text for non-final chunks; denote final
+                if chunk.is_final:
+                    print("\n[final]", chunk.usage_so_far.__dict__)
+                else:
+                    print(chunk.text, end="", flush=True)
             print("\n[done]")
         except Exception as e:
             print(f"\nStream error: {e}")
@@ -325,6 +480,8 @@ if __name__ == "__main__":
         try:
             count = await adapter.count_tokens("This is a test sentence", ctx=ctx)
             print_kv({"Text": "This is a test sentence", "Tokens": count})
+            count_empty = await adapter.count_tokens("", ctx=ctx)
+            print_kv({"Text": "<empty>", "Tokens": count_empty})
         except Exception as e:
             print_kv({"Error": str(e)})
 

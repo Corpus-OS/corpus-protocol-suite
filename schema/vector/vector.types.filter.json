@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adaptersdk.org/schemas/vector/vector.types.filter.json",
+  "title": "VectorFilter",
+  "description": "Portable filter DSL (subset) for pre/post-search filtering. Adapters may reject unsupported operators.",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "$and": {
+      "type": "array",
+      "items": { "$ref": "https://adaptersdk.org/schemas/vector/vector.types.filter.json" },
+      "minItems": 1,
+      "maxItems": 32
+    },
+    "$or": {
+      "type": "array",
+      "items": { "$ref": "https://adaptersdk.org/schemas/vector/vector.types.filter.json" },
+      "minItems": 1,
+      "maxItems": 32
+    },
+    "$not": {
+      "$ref": "https://adaptersdk.org/schemas/vector/vector.types.filter.json"
+    }
+  },
+  "$comment": "Field comparisons are expressed as: { \"field\": {\"$op\": value } } where $op ∈ {$eq,$ne,$gt,$gte,$lt,$lte,$in,$nin,$exists}. Values MUST be JSON-serializable and SIEM-safe."
+}

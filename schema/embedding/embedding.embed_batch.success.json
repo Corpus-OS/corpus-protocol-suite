@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adaptersdk.org/schemas/embedding/embedding.embed_batch.success.json",
+  "title": "embedding.embed_batch Result",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://adaptersdk.org/schemas/embedding/embedding.types.result.json" }
+  ],
+  "additionalProperties": false,
+  "$comment": "Client SHOULD verify successes + failures == request.texts.length."
+}

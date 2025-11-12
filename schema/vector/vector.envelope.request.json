@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adaptersdk.org/schemas/vector/vector.envelope.request.json",
+  "title": "Vector Request Envelope",
+  "description": "Wire-first canonical request envelope for vector component operations.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "op": {
+      "type": "string",
+      "enum": [
+        "vector.query",
+        "vector.upsert",
+        "vector.delete",
+        "vector.create_namespace",
+        "vector.delete_namespace",
+        "vector.capabilities",
+        "vector.health"
+      ]
+    },
+    "ctx": {
+      "$ref": "https://adaptersdk.org/schemas/common/operation_context.json"
+    },
+    "args": {
+      "oneOf": [
+        { "$ref": "https://adaptersdk.org/schemas/vector/vector.query.request.json" },
+        { "$ref": "https://adaptersdk.org/schemas/vector/vector.upsert.request.json" },
+        { "$ref": "https://adaptersdk.org/schemas/vector/vector.delete.request.json" },
+        { "$ref": "https://adaptersdk.org/schemas/vector/vector.namespace.create.request.json" },
+        { "$ref": "https://adaptersdk.org/schemas/vector/vector.namespace.delete.request.json" },
+        { "type": "object", "additionalProperties": false, "properties": {}, "description": "capabilities/health take empty args" }
+      ]
+    }
+  },
+  "required": ["op", "ctx", "args"],
+  "$comment": "Follows common envelope.request shape; specialized here for vector operations."
+}

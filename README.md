@@ -1,5 +1,8 @@
 # Corpus SDK
 
+![Version](https://img.shields.io/badge/version-1.0.0-blue)
+![Python](https://img.shields.io/badge/python-3.9+-blue)
+
 Reference implementation of the **Corpus Protocol Suite** — a protocol-first, vendor-neutral SDK for interoperable AI/data backends: **LLM**, **Embedding**, **Vector**, and **Graph**.
 
 Corpus defines stable, wire-level contracts (ops, envelopes, errors, capabilities) so that applications, routers, and providers can interoperate without bespoke glue code. This SDK implements those protocols for Python, with:
@@ -23,9 +26,6 @@ Designed to compose cleanly under any external control plane (router, scheduler,
 ---
 
 ## 🏗️ Architecture at a Glance
-
-<!--[MOBILE-FRIENDLY DIAGRAMS]-->
-<div class="mermaid-container" style="overflow-x: auto; max-width: 100%;">
 
 ```mermaid
 graph TB
@@ -62,43 +62,45 @@ graph TB
 ## Table of Contents
 
 1. [Why Corpus SDK](#why-corpus-sdk)
-2. [When Not to Use Corpus](#when-not-to-use-corpus)
-3. [Features at a Glance](#features-at-a-glance)
-4. [Performance vs Alternatives](#performance-vs-alternatives)
-5. [Install](#install)
-6. [⚡ 5-Minute Quick Start](#-5-minute-quick-start)
-7. [Modes: `thin` vs `standalone`](#modes-thin-vs-standalone)
-8. [Core Concepts](#core-concepts)
-9. [Corpus-Compatible](#corpus-compatible)
-10. [Quickstart](#quickstart)
+2. [How Corpus Compares](#how-corpus-compares)
+3. [When Not to Use Corpus](#when-not-to-use-corpus)
+4. [Features at a Glance](#features-at-a-glance)
+5. [Performance vs Alternatives](#performance-vs-alternatives)
+6. [Install](#install)
+7. [⚡ 5-Minute Quick Start](#-5-minute-quick-start)
+8. [Modes: `thin` vs `standalone`](#modes-thin-vs-standalone)
+9. [Core Concepts](#core-concepts)
+10. [Corpus-Compatible](#corpus-compatible)
+11. [Quickstart](#quickstart)
     * [Embeddings](#embeddings-quickstart)
     * [LLM](#llm-quickstart)
     * [Vector](#vector-quickstart)
     * [Graph](#graph-quickstart)
-11. [💼 Real-World Scenarios](#-real-world-scenarios)
-12. [Error Taxonomy](#error-taxonomy)
-13. [Metrics & Observability](#metrics--observability)
-14. [Deadlines & Timeouts](#deadlines--timeouts)
-15. [Caching](#caching)
-16. [Rate Limiting & Circuit Breaking](#rate-limiting--circuit-breaking)
-17. [Capabilities](#capabilities)
-18. [Example Adapters](#example-adapters)
+12. [💼 Real-World Scenarios](#-real-world-scenarios)
+13. [Error Taxonomy](#error-taxonomy)
+14. [Metrics & Observability](#metrics--observability)
+15. [Deadlines & Timeouts](#deadlines--timeouts)
+16. [Caching](#caching)
+17. [Rate Limiting & Circuit Breaking](#rate-limiting--circuit-breaking)
+18. [Capabilities](#capabilities)
+19. [Example Adapters](#example-adapters)
     * [Adapter Ecosystem](#adapter-ecosystem)
     * [Why Official Adapters Are Commercial](#why-official-adapters-are-commercial)
-19. [Security & Privacy](#security--privacy)
-20. [Performance Notes](#performance-notes)
-21. [🏎️ Performance Benchmarks](#️-performance-benchmarks)
-22. [Versioning & Compatibility](#versioning--compatibility)
-23. [Testing](#testing)
-24. [Troubleshooting](#troubleshooting)
-25. [🚚 Migration Examples](#-migration-examples)
-26. [FAQ](#faq)
-27. [Contributing](#contributing)
-28. [License](#license)
-29. [Roadmap](#roadmap)
-30. [Appendix](#appendix)
-31. [Commercial Options](#commercial-options)
-32. [Corpus Router: Enterprise AI Infrastructure Orchestration](#corpus-router-enterprise-ai-infrastructure-orchestration)
+20. [Security & Privacy](#security--privacy)
+21. [Performance Notes](#performance-notes)
+22. [🏎️ Performance Benchmarks](#️-performance-benchmarks)
+23. [Versioning & Compatibility](#versioning--compatibility)
+24. [Testing](#testing)
+25. [Troubleshooting](#troubleshooting)
+26. [🚚 Migration Examples](#-migration-examples)
+27. [FAQ](#faq)
+28. [Contributing](#contributing)
+29. [License](#license)
+30. [Roadmap](#roadmap)
+31. [Appendix](#appendix)
+32. [Commercial Options](#commercial-options)
+33. [Corpus Router: Enterprise AI Infrastructure Orchestration](#corpus-router-enterprise-ai-infrastructure-orchestration)
+34. [Final Assessment & Launch Readiness](#final-assessment--launch-readiness)
 
 ---
 
@@ -120,6 +122,62 @@ Modern AI platforms juggle multiple LLM, embedding, vector, and graph backends. 
 * **SIEM-safe metrics** (low-cardinality; tenant hashed)
 * **Deadline propagation** for cancellation & cost control
 * **Two modes**: compose under your own router (**thin**) or use lightweight infra (**standalone**)
+
+---
+
+## How Corpus Compares
+
+| Aspect | LangChain/LlamaIndex | OpenRouter | MCP | **Corpus SDK** |
+|--------|---------------------|------------|-----|----------------|
+| **Scope** | Application framework | LLM unification | Tools & data sources | **AI infrastructure protocols** |
+| **Domains Covered** | LLM + Tools | LLM only | Tools + Data | **LLM + Vector + Graph + Embedding** |
+| **Error Standardization** | Partial | Limited | N/A | **Comprehensive taxonomy** |
+| **Multi-Provider Routing** | Basic | Managed service | N/A | **Protocol for any router** |
+| **Observability** | Basic | Limited | N/A | **Built-in metrics + tracing** |
+| **Installation** | Heavy dependencies | Service API | Early stage | **Lightweight, async-first** |
+| **Vendor Neutrality** | High | Service-dependent | High | **Protocol-first, no lock-in** |
+
+**When to use each:**
+- **LangChain/LlamaIndex**: Building complex AI applications with tool orchestration
+- **OpenRouter**: Quick LLM unification without infrastructure changes  
+- **MCP**: Standardizing tools and data sources for AI applications
+- **Corpus SDK**: Standardizing entire AI infrastructure stack with production observability
+
+### **Unified Integration: All Three as Corpus Adapters**
+
+The key advantage of Corpus's protocol-first approach is that **LangChain, OpenRouter, and MCP can all be integrated as adapters within the Corpus ecosystem**:
+
+```python
+# LangChain as a Corpus LLM adapter
+class LangChainLLMAdapter(BaseLLMAdapter):
+    async def _do_complete(self, messages, **kwargs):
+        # Wrap LangChain LLM with Corpus standardization
+        llm = ChatOpenAI(model=kwargs["model"])
+        result = await llm.ainvoke(messages)
+        return self._normalize_langchain_result(result)
+
+# OpenRouter as a Corpus LLM adapter  
+class OpenRouterAdapter(BaseLLMAdapter):
+    async def _do_complete(self, messages, **kwargs):
+        # Standardize OpenRouter API with Corpus error handling
+        response = await self._call_openrouter(messages, kwargs["model"])
+        return self._normalize_openrouter_result(response)
+
+# MCP as a Corpus Tools adapter
+class MCPToolsAdapter(BaseLLMAdapter):
+    async def _do_complete(self, messages, **kwargs):
+        # Use MCP servers as tools within Corpus LLM flow
+        mcp_tools = await self._get_mcp_tools()
+        return await self._complete_with_tools(messages, mcp_tools)
+```
+
+**Benefits of this approach:**
+- **Standardized observability**: All adapters emit the same metrics and error taxonomy
+- **Consistent routing**: Mix and match providers, frameworks, and protocols under one routing layer
+- **Production reliability**: All integrations inherit Corpus's deadline propagation, retry logic, and circuit breaking
+- **Vendor neutrality**: Switch between LangChain, OpenRouter, or direct providers without changing application code
+
+**Instead of choosing one framework, use Corpus as the unifying layer that standardizes them all.**
 
 ---
 
@@ -181,7 +239,7 @@ pip install corpus_sdk
 
 ```python
 # Simplest possible working example - get started in under 5 minutes
-from corpus_sdk.llm_base import BaseLLMAdapter, OperationContext
+from corpus_sdk.llm.llm_base import BaseLLMAdapter, OperationContext
 
 class QuickAdapter(BaseLLMAdapter):
     async def _do_complete(self, messages, **kwargs):
@@ -322,28 +380,14 @@ We **encourage** forks and independent implementations that remain wire-compatib
 
 ---
 
-## Quickstart
+## Quickstart Examples
 
 > **Note**: In all examples, swap `Example*Adapter` with your actual adapter class that inherits the corresponding base and implements `_do_*` hooks.
-
-### 5-Line Hello World
-
-A minimal taste using any `BaseLLMAdapter` implementation:
-
-```python
-from corpus_sdk.adapter_sdk.llm_base import OperationContext
-from my_adapters import MyLLMAdapter
-
-adapter = MyLLMAdapter()
-res = await adapter.complete(messages=[{"role": "user", "content": "Hello Corpus"}],
-                             ctx=OperationContext(request_id="hello"))
-print(res.text)
-```
 
 ### Embeddings Quickstart
 
 ```python
-from corpus_sdk.adapter_sdk.embedding_base import (
+from corpus_sdk.embedding.embedding_base import (
     BaseEmbeddingAdapter, EmbedSpec, OperationContext, EmbeddingVector,
     EmbeddingCapabilities, BatchEmbedSpec, BatchEmbedResult, EmbedResult
 )
@@ -426,7 +470,7 @@ async with ExampleEmbeddingAdapter() as adapter:
 ### LLM Quickstart
 
 ```python
-from corpus_sdk.adapter_sdk.llm_base import (
+from corpus_sdk.llm.llm_base import (
     BaseLLMAdapter, OperationContext, LLMCompletion,
     TokenUsage, LLMCapabilities, LLMChunk, LLMStreamResult
 )
@@ -499,7 +543,7 @@ async with ExampleLLMAdapter() as adapter:
 ### Vector Quickstart
 
 ```python
-from corpus_sdk.adapter_sdk.vector_base import (
+from corpus_sdk.vector.vector_base import (
     BaseVectorAdapter, VectorCapabilities, QuerySpec, QueryResult,
     Vector, VectorMatch, UpsertSpec, UpsertResult, DeleteSpec,
     DeleteResult, NamespaceSpec, NamespaceResult, OperationContext, VectorID
@@ -602,7 +646,7 @@ print(result.matches[0].score)
 ### Graph Quickstart
 
 ```python
-from corpus_sdk.adapter_sdk.graph_base import (
+from corpus_sdk.graph.graph_base import (
     BaseGraphAdapter, GraphCapabilities, GraphQuerySpec,
     UpsertNodesSpec, UpsertEdgesSpec, Node, Edge, GraphID,
     OperationContext, GraphQueryResult, UpsertNodesResult,
@@ -750,26 +794,130 @@ async with ExampleGraphAdapter() as adapter:
 
 ## 💼 Real-World Scenarios
 
+Here's the updated Multi-Cloud AI Strategy section covering all four domains:
+
 ### **Multi-Cloud AI Strategy**
 ```python
-# Route between providers based on cost, latency, and quality requirements
+# Route between providers across all four domains based on cost, latency, and quality
 strategies = {
-    "cost_optimized": [("anthropic", 0.6), ("openai", 0.3), ("cohere", 0.1)],
-    "low_latency": [("openai", 0.8), ("cohere", 0.2)],
-    "high_quality": [("openai-gpt4", 1.0)]
+    "cost_optimized": {
+        "llm": [("anthropic", 0.6), ("openai", 0.3), ("cohere", 0.1)],
+        "embedding": [("cohere", 0.7), ("openai", 0.3)],
+        "vector": [("qdrant", 0.8), ("pinecone", 0.2)],
+        "graph": [("neo4j", 1.0)]  # Single provider for consistency
+    },
+    "low_latency": {
+        "llm": [("openai", 0.8), ("anthropic", 0.2)],
+        "embedding": [("openai", 1.0)],
+        "vector": [("pinecone", 0.9), ("qdrant", 0.1)],
+        "graph": [("neo4j", 1.0)]
+    },
+    "high_quality": {
+        "llm": [("openai-gpt4", 1.0)],
+        "embedding": [("openai-text-embedding-3-large", 1.0)],
+        "vector": [("weaviate", 0.7), ("pinecone", 0.3)],
+        "graph": [("tigergraph", 0.6), ("neo4j", 0.4)]
+    },
+    "compliance_focused": {
+        "llm": [("azure-openai", 1.0)],  # For HIPAA/GDPR compliance
+        "embedding": [("azure-openai", 1.0)],
+        "vector": [("azure-cognitive-search", 1.0)],
+        "graph": [("azure-cosmosdb", 1.0)]
+    }
 }
 
-# Corpus Router automatically handles fallbacks and load balancing
+# Corpus Router automatically handles cross-domain optimization and fallbacks
+async def execute_rag_pipeline(tenant_id: str, query: str, strategy: str):
+    """Execute a complete RAG pipeline using the specified multi-cloud strategy"""
+    
+    # 1. Generate query embedding
+    embedding_provider = await router.select_provider(
+        domain="embedding", 
+        strategy=strategy,
+        tenant_id=tenant_id
+    )
+    query_embedding = await embedding_provider.embed(
+        EmbedSpec(text=query, model="text-embedding-ada-002")
+    )
+    
+    # 2. Vector search for relevant context
+    vector_provider = await router.select_provider(
+        domain="vector",
+        strategy=strategy, 
+        tenant_id=tenant_id
+    )
+    context_results = await vector_provider.query(
+        QuerySpec(vector=query_embedding.vector, top_k=5, namespace="documents")
+    )
+    
+    # 3. Graph search for related entities
+    graph_provider = await router.select_provider(
+        domain="graph",
+        strategy=strategy,
+        tenant_id=tenant_id
+    )
+    related_entities = await graph_provider.query(
+        GraphQuerySpec(
+            query="MATCH (e:Entity)-[:RELATED_TO]->(c:Context) RETURN e LIMIT 3",
+            dialect="cypher"
+        )
+    )
+    
+    # 4. LLM generation with combined context
+    llm_provider = await router.select_provider(
+        domain="llm",
+        strategy=strategy,
+        tenant_id=tenant_id
+    )
+    
+    augmented_prompt = f"""
+    Context from documents: {[match.vector.metadata for match in context_results.matches]}
+    Related entities: {[record for record in related_entities.records]}
+    
+    User question: {query}
+    """
+    
+    response = await llm_provider.complete(
+        messages=[{"role": "user", "content": augmented_prompt}],
+        model="gpt-4"
+    )
+    
+    return response.text
+
+# Usage examples
+result = await execute_rag_pipeline(
+    tenant_id="startup_alpha", 
+    query="What are our competitive advantages?",
+    strategy="cost_optimized"  # Startup prioritizing cost savings
+)
+
+enterprise_result = await execute_rag_pipeline(
+    tenant_id="enterprise_beta",
+    query="Patient treatment recommendations", 
+    strategy="compliance_focused"  # Healthcare company requiring data residency
+)
 ```
 
 ### **Enterprise Multi-Tenant Isolation**
 ```python
-# Each tenant gets isolated circuit breakers, rate limits, and caches
+# Each tenant gets isolated circuit breakers, rate limits, and caches across all domains
 await router.route_workflow({
     "workflow_type": "rag_pipeline", 
     "tenant_id": "enterprise_customer_123",
     "priority": 8,  # Higher priority tenants get better QoS
-    "budget_ceiling": 1000  # Monthly budget in dollars
+    "budget_ceiling": 1000,  # Monthly budget in dollars
+    "domain_strategies": {
+        "llm": "high_quality",
+        "embedding": "low_latency", 
+        "vector": "cost_optimized",
+        "graph": "compliance_focused"
+    },
+    "isolation_guarantees": {
+        "circuit_breakers": True,  # Separate circuit breakers per tenant
+        "rate_limits": True,      # Isolated rate limiting
+        "caches": True,           # Tenant-specific caching
+        "data_residency": "eu-west-1"  # Geographic isolation
+    }
 })
 ```
 
@@ -777,7 +925,7 @@ await router.route_workflow({
 ```python
 # Connect AI workflows to business data with consistent error handling
 import asyncio
-from corpus_sdk.llm_base import BaseLLMAdapter, OperationContext
+from corpus_sdk.llm.llm_base import BaseLLMAdapter, OperationContext
 
 class AirtableCorpusAdapter:
     def __init__(self, corpus_llm: BaseLLMAdapter, airtable_base):
@@ -1070,32 +1218,32 @@ Capabilities enable:
 * **Request validation** - Preflight checks before backend calls
 * **Feature detection** - Runtime discovery of supported operations
 
-### Capability Fields by Domain
-
 **Embeddings:**
-
 * `supported_models`, `max_batch_size`, `max_text_length`
 * `supports_normalization`, `normalizes_at_source`
 * `supports_token_counting`, `supports_deadline`
+* **Supported Operations**: `embedding.embed`, `embedding.embed_batch`, `embedding.count_tokens`, `embedding.health`
 
 **LLM:**
-
 * `model_family`, `max_context_length`, `supported_models`
 * `supports_streaming`, `supports_roles`, `supports_system_message`
 * `supports_json_output`, `supports_parallel_tool_calls`
 * `supports_deadline`, `supports_count_tokens`
+* **Supported Operations**: `llm.complete`, `llm.stream`, `llm.count_tokens`, `llm.health`
 
 **Vector:**
-
 * `max_dimensions`, `supported_distance_metrics`
 * `supports_metadata_filtering`, `supports_namespaces`
 * `max_batch_size`, `supports_deadline`
+* **Supported Operations**: `vector.query`, `vector.upsert`, `vector.delete`, `vector.create_namespace`, `vector.delete_namespace`, `vector.health`
 
 **Graph:**
-
 * `supported_query_dialects` - e.g., `("cypher", "gremlin", "gql")`
 * `supports_stream_query`, `supports_bulk_vertices`, `supports_batch`
 * `supports_schema`, `supports_namespaces`, `supports_deadline`
+* **Supported Operations**: `graph.query`, `graph.stream_query`, `graph.upsert_nodes`, `graph.upsert_edges`, `graph.delete_nodes`, `graph.delete_edges`, `graph.bulk_vertices`, `graph.batch`, `graph.get_schema`, `graph.health`
+
+All operations correspond to canonical `op` strings in the Corpus wire protocol for transport-agnostic interoperability.
 
 ---
 
@@ -1104,8 +1252,8 @@ Capabilities enable:
 ### Repository Structure
 
 ```text
-corpus_sdk/
-├── adapter_sdk/
+corpus/
+├── corpus_sdk/
 │   ├── embedding_base.py      # Protocol + Base
 │   ├── llm_base.py            # Protocol + Base
 │   ├── vector_base.py         # Protocol + Base
@@ -1334,10 +1482,10 @@ pytest tests/embedding/ -v
 
 #### Corpus Protocol Suite Badge
 
-![LLM Protocol](https://img.shields.io/badge/LLM%20Protocol-100%25%20Conformant-brightgreen)
-![Vector Protocol](https://img.shields.io/badge/Vector%20Protocol-100%25%20Conformant-brightgreen)
-![Graph Protocol](https://img.shields.io/badge/Graph%20Protocol-100%25%20Conformant-brightgreen)
-![Embedding Protocol](https://img.shields.io/badge/Embedding%20Protocol-100%25%20Conformant-brightgreen)
+![LLM Protocol](https://img.shields.io/badge/CorpusLLM%20Protocol-100%25%20Conformant-brightgreen)
+![Vector Protocol](https://img.shields.io/badge/CorpusVector%20Protocol-100%25%20Conformant-brightgreen)
+![Graph Protocol](https://img.shields.io/badge/CorpusGraph%20Protocol-100%25%20Conformant-brightgreen)
+![Embedding Protocol](https://img.shields.io/badge/CorpusEmbedding%20Protocol-100%25%20Conformant-brightgreen)
 
 ---
 
@@ -1425,7 +1573,7 @@ messages = [HumanMessage(content="Hello world")]
 result = llm.invoke(messages)
 
 # After: Protocol-based standardization  
-from corpus_sdk.llm_base import BaseLLMAdapter
+from corpus_sdk.llm.llm_base import BaseLLMAdapter
 
 class OpenAIAdapter(BaseLLMAdapter):
     # Same interface as Anthropic, Cohere, etc.
@@ -1510,6 +1658,20 @@ except BadRequest as e:
 **Q: Can I split protocols and bases into separate files?**
 
 **A:** Yes. We ship them together for convenience; you can refactor module layout as you see fit.
+
+### **MCP/LangChain/OpenRouter Comparison**
+
+**Q: How does Corpus compare to LangChain/LlamaIndex?**
+
+**A:** LangChain and LlamaIndex are **application-level frameworks** for building AI applications, while Corpus is an **infrastructure protocol** for standardizing backend services. You can use Corpus SDK underneath LangChain/LlamaIndex to get provider-agnostic LLM, embedding, vector, and graph operations with consistent error handling and observability.
+
+**Q: How does Corpus compare to Model Context Protocol (MCP)?**
+
+**A:** MCP focuses on standardizing **tools and data sources** for AI applications, while Corpus standardizes **core AI infrastructure services** (LLM, Vector, Graph, Embedding). They're complementary - you could use MCP for tool integration and Corpus for backend service abstraction.
+
+**Q: How does Corpus compare to OpenRouter?**
+
+**A:** OpenRouter provides a unified API for **LLM providers only**, while Corpus covers **four domains** (LLM, Vector, Graph, Embedding) with standardized error handling, metrics, and capabilities discovery. Corpus is a protocol you can implement anywhere, while OpenRouter is a specific service.
 
 ### Technical
 
@@ -1880,8 +2042,7 @@ graph TB
     style A fill:#e1f5fe
     style J fill:#e8f5e8
 ```
-</div>
-<!--[/MOBILE-FRIENDLY DIAGRAMS]-->
+
 **Result**: Every request gets an optimal route for its context—within guardrails, fully auditable.
 
 ---
@@ -1909,3 +2070,5 @@ graph TB
 **Built with ❤️ by the Corpus team**
 
 **We're not just building another framework - we're building the foundational layer for reliable, portable AI infrastructure.**
+
+---

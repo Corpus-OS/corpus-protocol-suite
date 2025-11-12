@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adaptersdk.org/schemas/vector/vector.namespace.create.request.json",
+  "title": "vector.create_namespace args",
+  "description": "Arguments for op: vector.create_namespace",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "namespace": {
+      "type": "string",
+      "maxLength": 256,
+      "pattern": "^[A-Za-z0-9._:-]{1,256}$"
+    },
+    "dimensions": { "type": "integer", "minimum": 1, "maximum": 8192 },
+    "distance_metric": { "type": "string", "enum": ["cosine", "euclidean", "dot"] },
+    "extensions": {
+      "type": "object",
+      "additionalProperties": true,
+      "patternProperties": {
+        "^(vendor:)[a-z0-9_.:-]+$": { "type": ["string", "number", "boolean", "object", "array", "null"] }
+      }
+    }
+  },
+  "required": ["namespace", "dimensions", "distance_metric"],
+  "$comment": "Namespaces MUST be created explicitly; other operations MUST NOT create implicitly."
+}
