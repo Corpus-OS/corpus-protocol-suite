@@ -1,5 +1,3 @@
-Here’s the fully updated **schema-only** doc with your new sections added and cleaned up.
-
 ---
 
 # SCHEMA_CONFORMANCE.md
