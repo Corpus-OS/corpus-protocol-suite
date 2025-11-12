@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adaptersdk.org/schemas/vector/vector.delete.request.json",
+  "title": "vector.delete args",
+  "description": "Arguments for op: vector.delete",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "ids": {
+      "type": ["array", "null"],
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 256
+      },
+      "uniqueItems": true,
+      "minItems": 1,
+      "maxItems": 100000
+    },
+    "namespace": {
+      "type": "string",
+      "default": "default",
+      "maxLength": 256,
+      "pattern": "^[A-Za-z0-9._:-]{1,256}$"
+    },
+    "filter": {
+      "type": ["object", "null"],
+      "$ref": "https://adaptersdk.org/schemas/vector/vector.types.filter.json"
+    },
+    "op_extensions": {
+      "type": "object",
+      "additionalProperties": true,
+      "patternProperties": {
+        "^(vendor:)[a-z0-9_.:-]+$": { "type": ["string", "number", "boolean", "object", "array", "null"] }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "anyOf": [
+        { "required": ["ids"] },
+        { "required": ["filter"] }
+      ]
+    },
+    {
+      "not": { "required": ["ids", "filter"] }
+    }
+  ],
+  "$comment": "Delete by IDs XOR filter. Deleting non-existent IDs MUST be treated as success (idempotent). Batch size limits enforced at runtime."
+}
