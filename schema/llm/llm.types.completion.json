@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adaptersdk.org/schemas/llm/llm.types.completion.json",
+  "title": "LLM Completion",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["text", "usage", "finish_reason"],
+  "properties": {
+    "text": { "type": "string", "minLength": 0, "maxLength": 200000 },
+    "model": { "type": "string", "maxLength": 128 },
+    "model_family": { "type": "string", "maxLength": 64 },
+    "usage": { "$ref": "https://adaptersdk.org/schemas/llm/llm.types.token_usage.json" },
+    "finish_reason": { "type": "string", "enum": ["stop", "length", "tool_call", "content_filter"] },
+    "tool_calls": {
+      "type": "array",
+      "maxItems": 16,
+      "items": { "$ref": "https://adaptersdk.org/schemas/llm/llm.types.tool.json#/$defs/toolCall" }
+    },
+    "warnings": {
+      "type": "array",
+      "maxItems": 100,
+      "items": { "$ref": "https://adaptersdk.org/schemas/llm/llm.types.warning.json" }
+    },
+    "logprobs": { "$ref": "https://adaptersdk.org/schemas/llm/llm.types.logprobs.json" },
+    "redactions": {
+      "type": "array",
+      "maxItems": 256,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["start", "end", "reason"],
+        "properties": {
+          "start": { "type": "integer", "minimum": 0 },
+          "end": { "type": "integer", "minimum": 0 },
+          "reason": { "type": "string", "maxLength": 128 }
+        }
+      }
+    },
+    "tokenizer": { "type": "string", "maxLength": 128 }
+  }
+}
