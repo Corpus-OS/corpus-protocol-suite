@@ -20,7 +20,7 @@ import math
 import random
 from typing import Any, Dict, List, Optional, Tuple
 
-from adapter_sdk.embedding_base import (
+from corpus_sdk.embedding_base import (
     BaseEmbeddingAdapter,
     EmbeddingCapabilities,
     EmbedSpec,
@@ -43,6 +43,11 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
     """
     A mock Embedding adapter for protocol demonstrations & conformance.
     Defaults are deterministic and non-flaky. Dials can be toggled for demos.
+
+    NOTE: This adapter overrides `embed_batch()` to ensure per-item validation
+    happens in the **fallback loop** (not preflight), so empty texts become
+    item-level failures when batch is NotSupported — matching the conformance
+    tests that exercise partial-failure semantics on fallback.
     """
 
     # ----- Tunables (safe defaults for conformance) -----
@@ -88,7 +93,6 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
         test_vector_pattern: Optional[str] = None,
         collect_failures_in_native_batch: bool = False,
     ) -> None:
-        # Initialize base instrumentation and policies
         super().__init__(
             mode=mode,
             metrics=metrics,
@@ -102,7 +106,6 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
             cache_embed_ttl_s=cache_embed_ttl_s,
             cache_caps_ttl_s=cache_caps_ttl_s,
         )
-        # Assign mock config
         self.name = name
         self.supported_models = tuple(supported_models)
         self.dimensions_by_model = dict(
@@ -129,11 +132,9 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
             raise ValueError("Invalid latency range (min >= 0 and max >= min)")
         if any(dim <= 0 for dim in self.dimensions_by_model.values()):
             raise ValueError("All dimensions must be positive")
-        # ensure dimensions configured for all supported models
         missing = [m for m in self.supported_models if m not in self.dimensions_by_model]
         if missing:
             raise ValueError(f"Missing dimensions for supported models: {missing}")
-        # vector pattern sanity
         if self.test_vector_pattern not in (None, "zeros", "ones", "unit_x", "gaussian"):
             raise ValueError("test_vector_pattern must be one of None|zeros|ones|unit_x|gaussian")
 
@@ -154,7 +155,7 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
             idempotent_operations=False,
             supports_multi_tenant=True,
             normalizes_at_source=self.normalizes_at_source,
-            truncation_mode="base",  # base applies truncation before _do_* hooks
+            truncation_mode="base",
             supports_deadline=True,
         )
 
@@ -183,7 +184,6 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
         *,
         ctx: Optional[EmbeddingContext] = None,
     ) -> EmbedResult:
-        # Deterministic failure injection (ctx or text sentinels)
         self._maybe_fail(op="embed", ctx=ctx, text=spec.text)
 
         if spec.model not in self.supported_models:
@@ -195,7 +195,6 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
         rng = self._rng_for(spec.model, spec.text)
         vec = self._make_vector(dim, rng)
 
-        # Source-side normalization if requested & advertised
         if self.normalizes_at_source and spec.normalize:
             vec = self._normalize(vec)
 
@@ -211,11 +210,172 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
             model=spec.model,
             text=spec.text,
             tokens_used=tokens,
-            truncated=False,  # base sets this when truncation occurs
+            truncated=False,
         )
 
     # ---------------------------------------------------------------------
-    # Batch embed
+    # Batch embed — public override to ensure fallback-per-item validation
+    # ---------------------------------------------------------------------
+    async def embed_batch(
+        self,
+        spec: BatchEmbedSpec,
+        *,
+        ctx: Optional[EmbeddingContext] = None,
+    ) -> BatchEmbedResult:
+        """
+        Override the base to avoid pre-validating per-item non-emptiness before
+        attempting native batch, so that when native batch is NotSupported the
+        fallback can report **per-item** failures (e.g., empty string) instead
+        of failing the entire request up front — matching conformance tests.
+        """
+        # Reuse base gating/metrics wrapper
+        async def _run() -> BatchEmbedResult:
+            # Core request validation (model & batch size), but **no per-item empty check here**
+            caps = await self._do_capabilities()
+            if spec.model not in caps.supported_models:
+                raise ModelNotAvailable(f"Model '{spec.model}' is not supported")
+
+            if caps.max_batch_size and len(spec.texts) > caps.max_batch_size:
+                raise BadRequest(
+                    f"Batch size {len(spec.texts)} exceeds maximum of {caps.max_batch_size}",
+                    details={"max_batch_size": caps.max_batch_size},
+                )
+
+            # Deterministic truncation per item; allow empty strings to pass through unchanged.
+            eff_texts: List[str] = []
+            for text in spec.texts:
+                if caps.max_text_length:
+                    new_text, _ = self._trunc.apply(
+                        text,
+                        caps.max_text_length,
+                        spec.truncate,
+                    )
+                    eff_texts.append(new_text)
+                else:
+                    eff_texts.append(text)
+
+            eff_spec = BatchEmbedSpec(
+                texts=eff_texts,
+                model=spec.model,
+                truncate=spec.truncate,
+                normalize=spec.normalize,
+            )
+
+            try:
+                # Primary: native batch path (may collect failures itself if configured)
+                if not self.supports_batch:
+                    raise NotSupported("native batch not supported in this mode")
+                result = await self._do_embed_batch(eff_spec, ctx=ctx)
+            except NotSupported:
+                # Fallback: per-item path with **per-item validation** & failure capture
+                embeddings: List[EmbeddingVector] = []
+                failed: List[Dict[str, Any]] = []
+
+                for idx, text in enumerate(eff_spec.texts):
+                    try:
+                        # Validate per item here so empty strings become item failures.
+                        if not isinstance(text, str) or not text.strip():
+                            raise BadRequest("text must be a non-empty string")
+
+                        single_spec = EmbedSpec(
+                            text=text,
+                            model=eff_spec.model,
+                            truncate=eff_spec.truncate,
+                            normalize=False,  # normalize uniformly below
+                        )
+                        single = await self._do_embed(single_spec, ctx=ctx)
+                        ev = single.embedding
+
+                        if eff_spec.normalize:
+                            if not caps.supports_normalization:
+                                raise NotSupported("normalization not supported for this adapter")
+                            if not caps.normalizes_at_source:
+                                vec = self._norm.normalize(ev.vector)
+                                ev = EmbeddingVector(
+                                    vector=vec,
+                                    text=ev.text,
+                                    model=ev.model,
+                                    dimensions=len(vec),
+                                )
+
+                        embeddings.append(ev)
+                    except (BadRequest, ModelNotAvailable, NotSupported,
+                            Unavailable, ResourceExhausted, TransientNetwork) as item_err:
+                        failed.append(
+                            {
+                                "index": idx,
+                                "text": text,
+                                "error": type(item_err).__name__,
+                                "code": getattr(item_err, "code", None)
+                                        or type(item_err).__name__.upper(),
+                                "message": getattr(item_err, "message", None) or str(item_err) or "",
+                            }
+                        )
+                    except Exception as item_err:
+                        failed.append(
+                            {
+                                "index": idx,
+                                "text": text,
+                                "error": type(item_err).__name__,
+                                "code": "UNAVAILABLE",
+                                "message": str(item_err) or "internal error",
+                            }
+                        )
+
+                result = BatchEmbedResult(
+                    embeddings=embeddings,
+                    model=eff_spec.model,
+                    total_texts=len(spec.texts),
+                    total_tokens=None,
+                    failed_texts=failed,
+                )
+
+            # Post-processing: normalization for native-batch result if requested
+            if eff_spec.normalize and not self.normalizes_at_source:
+                if not caps.supports_normalization:
+                    raise NotSupported("normalization not supported for this adapter")
+                for i, ev in enumerate(result.embeddings):
+                    vec = self._norm.normalize(ev.vector)
+                    result.embeddings[i] = EmbeddingVector(
+                        vector=vec,
+                        text=ev.text,
+                        model=ev.model,
+                        dimensions=len(vec),
+                    )
+
+            # Minimal counters (mirror base behavior)
+            self._metrics.counter(
+                component=self._component,
+                name="texts_embedded",
+                value=len(result.embeddings),
+            )
+            if result.total_tokens is not None:
+                self._metrics.counter(
+                    component=self._component,
+                    name="tokens_processed",
+                    value=int(result.total_tokens),
+                )
+
+            return result
+
+        metric_extra: Dict[str, Any] = {"batch_size": len(spec.texts)}
+        error_extra: Dict[str, Any] = {"batch_size": len(spec.texts)}
+        if getattr(self, "_tag_model_in_metrics", False):
+            model_tag = self._safe_model_tag(spec.model)
+            if model_tag:
+                metric_extra["model"] = model_tag
+                error_extra["model"] = model_tag
+
+        return await self._with_gates_unary(
+            op="embed_batch",
+            ctx=ctx,
+            call_coro=_run(),
+            metric_extra=metric_extra,
+            error_extra=error_extra,
+        )
+
+    # ---------------------------------------------------------------------
+    # Native batch hook (used when supports_batch=True)
     # ---------------------------------------------------------------------
     async def _do_embed_batch(
         self,
@@ -223,11 +383,7 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
         *,
         ctx: Optional[EmbeddingContext] = None,
     ) -> BatchEmbedResult:
-        # Allow tests to force base fallback path
-        if not self.supports_batch:
-            raise NotSupported("native batch not supported in this mode")
-
-        # Deterministic failure injection at op level
+        # Allow tests to force base fallback path via `supports_batch=False`
         self._maybe_fail(op="embed_batch", ctx=ctx)
 
         if spec.model not in self.supported_models:
@@ -247,9 +403,11 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
 
         for i, text in enumerate(spec.texts):
             try:
-                # Per-item deterministic failure (only if triggered by sentinel/ctx).
-                # If collect_failures_in_native_batch=True, we capture and continue.
                 self._maybe_fail(op="embed_batch:item", ctx=ctx, text=text, per_item=True)
+
+                # If collecting failures natively, treat empty text as per-item BadRequest here too.
+                if self.collect_failures_in_native_batch and (not isinstance(text, str) or not text.strip()):
+                    raise BadRequest("text must be a non-empty string")
 
                 rng = self._rng_for(spec.model, text)
                 vec = self._make_vector(dim, rng)
@@ -275,9 +433,7 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
                             "message": str(item_err) or "",
                         }
                     )
-                    # skip embedding for this item
                 else:
-                    # re-raise to let caller handle; base fallback covers partials when NotSupported
                     raise
             except Exception as item_err:
                 if self.collect_failures_in_native_batch:
@@ -292,7 +448,6 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
                 else:
                     raise
 
-            # Cooperative yield every N items
             if (i + 1) % 50 == 0:
                 await asyncio.sleep(0)
 
@@ -316,7 +471,6 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
     ) -> int:
         if model not in self.supported_models:
             raise ModelNotAvailable(f"Model '{model}' is not supported")
-        # Small, predictable delay
         await asyncio.sleep(0.005)
         return self._approx_tokens(text)
 
@@ -331,18 +485,6 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
         text: Optional[str] = None,
         per_item: bool = False,
     ) -> None:
-        """
-        Deterministic failure injector for conformance-friendly testing.
-
-        Priority:
-        1) ctx.attrs["simulate_error"] ∈ {"unavailable","rate_limited","transient"}
-        2) Text sentinels: "[UNAVAILABLE]", "[RATE_LIMIT]", "[TRANSIENT]"
-        3) Optional randomness (failure_rate > 0.0) for demos only
-
-        Per-item failures are only thrown when explicitly triggered; they can be
-        collected in native batch if collect_failures_in_native_batch=True.
-        """
-        # 1) ctx-directed failures
         key = (ctx and ctx.attrs.get("simulate_error")) or None
         if key:
             if key == "unavailable":
@@ -352,7 +494,6 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
             if key == "transient":
                 raise TransientNetwork(f"Mocked {op} transient network", retry_after_ms=600)
 
-        # 2) per-text sentinels (only if text provided)
         if text:
             if "[UNAVAILABLE]" in text:
                 raise Unavailable(f"Mocked {op} unavailable (text sentinel)", retry_after_ms=500)
@@ -361,7 +502,6 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
             if "[TRANSIENT]" in text:
                 raise TransientNetwork(f"Mocked {op} transient (text sentinel)", retry_after_ms=600)
 
-        # 3) optional RNG for demos (not used in conformance runs)
         if not per_item and self.failure_rate > 0.0 and random.random() < self.failure_rate:
             if random.random() < 0.5:
                 raise ResourceExhausted(f"Mocked {op} rate-limited", retry_after_ms=800)
@@ -373,7 +513,6 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
         await asyncio.sleep(dur_ms / 1000.0)
 
     def _dimensions_for(self, model: str) -> int:
-        # explicit check to improve error clarity
         if model not in self.dimensions_by_model:
             raise ModelNotAvailable(f"Model '{model}' not found in dimensions mapping")
         dim = int(self.dimensions_by_model[model])
@@ -383,27 +522,23 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
 
     def _rng_for(self, model: str, text: str) -> random.Random:
         h = hashlib.sha256(f"{model}|{text}".encode("utf-8")).hexdigest()
-        # Use a stable integer seed (lower 16 hex chars)
         seed = int(h[-16:], 16)
         return random.Random(seed)
 
     def _make_vector(self, dim: int, rng: random.Random) -> List[float]:
-        # Optional deterministic patterns for specific tests
         if self.test_vector_pattern == "zeros":
             return [0.0] * dim
         if self.test_vector_pattern == "ones":
             return [1.0] * dim
         if self.test_vector_pattern == "unit_x":
-            # 1.0 in the first position, zeros elsewhere
             v = [0.0] * dim
             v[0] = 1.0
             return v
         if self.test_vector_pattern == "gaussian":
-            # Box-Muller-ish using rng.random(); mean 0, unit-ish variance
-            # (still deterministic from rng)
-            return [math.sqrt(-2.0 * math.log(max(1e-12, rng.random()))) *
-                    math.cos(2.0 * math.pi * rng.random()) for _ in range(dim)]
-        # Default: deterministic uniform in [-1, 1)
+            return [
+                math.sqrt(-2.0 * math.log(max(1e-12, rng.random()))) * math.cos(2.0 * math.pi * rng.random())
+                for _ in range(dim)
+            ]
         return [rng.random() * 2.0 - 1.0 for _ in range(dim)]
 
     def _normalize(self, vec: List[float]) -> List[float]:
@@ -411,63 +546,8 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
         return [v / norm for v in vec]
 
     def _approx_tokens(self, text: str) -> int:
-        # Conformance: empty string returns 0; otherwise rough, monotonic heuristic
+        # Empty returns 0 per conformance; otherwise rough, monotonic heuristic
         if not text:
             return 0
-        # Very rough heuristic: words / factor + small overhead
         words = max(1, len(text.split()))
         return int(math.ceil(words / max(0.1, self.token_factor))) + 2
-
-
-# ---------------------------------------------------------------------------
-# Optional: simple self-demo (kept dependency-free)
-# ---------------------------------------------------------------------------
-if __name__ == "__main__":
-    async def _demo() -> None:
-        random.seed(7)  # deterministic demo for vector generation
-        adapter = MockEmbeddingAdapter(
-            mode="standalone",
-            supports_batch=True,
-            normalizes_at_source=False,
-            latency_ms=(5, 5),
-            failure_rate=0.0,
-            test_vector_pattern=None,
-            collect_failures_in_native_batch=True,  # show partials in native batch
-        )
-
-        # Capabilities
-        caps = await adapter.capabilities()
-        print("[CAPABILITIES]", caps)
-
-        # Health (ok)
-        health_ok = await adapter.health()
-        print("[HEALTH OK]", health_ok)
-
-        # Health (degraded)
-        degraded_ctx = EmbeddingContext(attrs={"health": "degraded"})
-        health_bad = await adapter.health(ctx=degraded_ctx)
-        print("[HEALTH DEGRADED]", health_bad)
-
-        # Single embed (normalize at base)
-        spec = EmbedSpec(text="hello world", model="mock-embed-512", truncate=True, normalize=True)
-        res = await adapter.embed(spec)
-        norm = math.sqrt(sum(x * x for x in res.embedding.vector))
-        print("[EMBED] dims=", res.embedding.dimensions, "norm≈", round(norm, 6), "truncated=", res.truncated)
-
-        # Batch embed (native) with per-item failures captured
-        sent = ["ok item", "will [RATE_LIMIT] here", "also ok", "and [UNAVAILABLE] here"]
-        bspec = BatchEmbedSpec(texts=sent, model="mock-embed-1024", normalize=False)
-        bres = await adapter.embed_batch(bspec, ctx=EmbeddingContext(attrs={}))
-        print("[BATCH] ok_embeddings=", len(bres.embeddings), "failures=", bres.failed_texts)
-
-        # Base fallback demo
-        adapter_fallback = MockEmbeddingAdapter(supports_batch=False, latency_ms=(5, 5))
-        bres2 = await adapter_fallback.embed_batch(bspec)
-        print("[BATCH FALLBACK] ok_embeddings=", len(bres2.embeddings), "failures=", bres2.failed_texts)
-
-        # Count tokens
-        tks0 = await adapter.count_tokens("", "mock-embed-512")
-        tks1 = await adapter.count_tokens("token counting example text", "mock-embed-512")
-        print("[COUNT_TOKENS] empty=", tks0, "example=", tks1)
-
-    asyncio.run(_demo())
