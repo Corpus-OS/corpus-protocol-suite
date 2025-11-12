@@ -1,5 +1,3 @@
----
-
 # SCHEMA_CONFORMANCE.md
 
 > ✅ **Corpus Protocol (v1.0) — Schema Conformance (Schema-Only)**
