@@ -1,0 +1,22 @@
+{
+  "op": "llm.complete",
+  "ctx": {
+    "request_id": "req_01HX8KVP5W",
+    "deadline_ms": 253402214400000,
+    "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    "tenant": "acme",
+    "cache_scope": "tenant",
+    "cache_tags": ["kb", "summaries"]
+  },
+  "args": {
+    "messages": [
+      {"role": "system", "content": "You are terse."},
+      {"role": "user", "content": "Summarize: DOC_123, DOC_456"}
+    ],
+    "model": "gpt-4.1-mini",
+    "sampling": {
+      "temperature": 0.2,
+      "max_tokens": 128
+    }
+  }
+}
