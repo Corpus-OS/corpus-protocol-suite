@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adaptersdk.org/schemas/vector/vector.envelope.error.json",
+  "title": "Vector Error Envelope",
+  "description": "Canonical error envelope specialized for the vector component.",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://adaptersdk.org/schemas/common/envelope.error.json" },
+    {
+      "type": "object",
+      "properties": {
+        "protocol": { "const": "vector/v1.0" },
+        "component": { "const": "vector" }
+      }
+    }
+  ]
+}
