@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adaptersdk.org/schemas/graph/graph.query.success.json",
+  "title": "graph.query Result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["rows"],
+  "properties": {
+    "rows": {
+      "type": "array",
+      "maxItems": 100000,
+      "items": { "$ref": "https://adaptersdk.org/schemas/graph/graph.types.row.json" }
+    },
+    "next_page_token": {
+      "type": ["string", "null"],
+      "pattern": "^[A-Za-z0-9+/=_-]{1,4096}$"
+    },
+    "warnings": {
+      "type": "array",
+      "maxItems": 100,
+      "items": { "$ref": "https://adaptersdk.org/schemas/graph/graph.types.warning.json" }
+    }
+  }
+}
