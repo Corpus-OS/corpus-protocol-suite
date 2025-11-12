@@ -1,0 +1,39 @@
+{
+  "ok": true,
+  "code": "PARTIAL_SUCCESS",
+  "ms": 18.2,
+  "result": {
+    "successes": 2,
+    "failures": 1,
+    "items": [
+      {
+        "index": 0,
+        "ok": true,
+        "result": {
+          "vector": [0.01, 0.02],
+          "model": "example-embed-1",
+          "dimensions": 2
+        }
+      },
+      {
+        "index": 1,
+        "ok": true,
+        "result": {
+          "vector": [0.03, 0.04],
+          "model": "example-embed-1",
+          "dimensions": 2
+        }
+      },
+      {
+        "index": 2,
+        "ok": false,
+        "code": "TEXT_TOO_LONG",
+        "message": "Input exceeds max_text_length"
+      }
+    ]
+  },
+  "protocol": "embedding/v1.0",
+  "component": "embedding",
+  "schema_version": "1.0.1",
+  "request_id": "req_emb_01"
+}
