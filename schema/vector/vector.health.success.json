@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adaptersdk.org/schemas/vector/vector.health.success.json",
+  "title": "vector.health result",
+  "description": "Graded health status for vector component.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "ok": { "type": "boolean" },
+    "status": { "type": "string", "enum": ["ok", "degraded", "down"] },
+    "reason": { "type": ["string", "null"], "maxLength": 2000 },
+    "server": { "type": ["string", "null"] },
+    "version": { "type": ["string", "null"] }
+  },
+  "required": ["ok", "status"],
+  "$comment": "Gateways: status ok/degraded → HTTP 200; down → HTTP 503."
+}
