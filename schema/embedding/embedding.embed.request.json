@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adaptersdk.org/schemas/embedding/embedding.embed.request.json",
+  "title": "embedding.embed Args",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["text", "model"],
+  "properties": {
+    "text": { "type": "string", "minLength": 0, "maxLength": 2000000 },
+    "model": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]{1,128}$" },
+    "truncate": { "type": "boolean", "default": true },
+    "normalize": { "type": "boolean", "default": false }
+  },
+  "patternProperties": {
+    "^(vendor:)[a-z0-9_.:-]+$": { "type": ["string", "number", "boolean", "object", "array", "null"] }
+  },
+  "$comment": "If truncate=false and text exceeds capabilities.max_text_length → TextTooLong. If normalize=true but unsupported → NotSupported."
+}
