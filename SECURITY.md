@@ -1,9 +1,3 @@
-what about this one
-
-Here’s the **full file with only additions** (no removals). I’ve preserved every original line and **only appended clarifications, examples, and appendices** as requested.
-
----
-
 # SECURITY.md
 
 **Security Policy — Corpus Protocol Suite & SDKs**
