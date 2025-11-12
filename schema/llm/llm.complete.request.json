@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adaptersdk.org/schemas/llm/llm.complete.request.json",
+  "title": "LLM Complete Request",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["messages"],
+  "properties": {
+    "messages": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 4096,
+      "items": { "$ref": "https://adaptersdk.org/schemas/llm/llm.types.message.json" }
+    },
+    "system_message": { "type": "string", "maxLength": 16000 },
+    "model": { "type": "string", "maxLength": 128 },
+    "max_tokens": { "type": "integer", "minimum": 1, "maximum": 8192 },
+    "temperature": { "type": "number", "minimum": 0, "maximum": 2 },
+    "top_p": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
+    "frequency_penalty": { "type": "number", "minimum": -2, "maximum": 2 },
+    "presence_penalty": { "type": "number", "minimum": -2, "maximum": 2 },
+    "response_format": { "$ref": "https://adaptersdk.org/schemas/llm/llm.response_format.json" },
+    "logprobs": { "type": "boolean", "default": false },
+    "top_logprobs": { "type": "integer", "minimum": 1, "maximum": 5 },
+    "tools": {
+      "type": "array",
+      "maxItems": 128,
+      "items": { "$ref": "https://adaptersdk.org/schemas/llm/llm.tools.schema.json" }
+    },
+    "tool_choice": { "$ref": "https://adaptersdk.org/schemas/llm/llm.types.tool.json#/$defs/toolChoice" },
+    "max_parallel_tool_calls": { "type": "integer", "minimum": 1, "maximum": 128, "default": 1 },
+    "locale": { "type": "string", "maxLength": 64, "pattern": "^[A-Za-z0-9._-]+$" },
+    "timezone": { "type": "string", "maxLength": 128 },
+    "json_stream_mode": { "type": "string", "enum": ["off", "object", "array"], "default": "off" }
+  },
+  "patternProperties": {
+    "^(vendor:)[a-z0-9_.:-]+$": {}
+  }
+}
