@@ -4,10 +4,10 @@ Demonstrates: normalized errors + retry hints
 Expected: shows Unavailable/ResourceExhausted/BadRequest surfaces with retry_after_ms/suggestions
 """
 import asyncio, random
-from corpus_sdk.examples.graph.mock_graph_adapter import MockGraphAdapter
+from examples.graph.mock_graph_adapter import MockGraphAdapter
 from corpus_sdk.graph.graph_base import OperationContext as GraphContext, AdapterError, BadRequest
-from corpus_sdk.examples.common.ctx import make_ctx
-from corpus_sdk.examples.common.printing import box, print_kv
+from examples.common.ctx import make_ctx
+from examples.common.printing import box, print_kv
 
 async def main():
     random.seed(105)  # deterministic failure sequence

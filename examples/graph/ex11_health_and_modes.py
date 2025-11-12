@@ -4,10 +4,10 @@ Demonstrates: health surface & simple readiness logic
 Expected: prints status + readiness decision
 """
 import asyncio, random
-from corpus_sdk.examples.graph.mock_graph_adapter import MockGraphAdapter
+from examples.graph.mock_graph_adapter import MockGraphAdapter
 from corpus_sdk.graph.graph_base import OperationContext as GraphContext, HealthStatus
-from corpus_sdk.examples.common.ctx import make_ctx
-from corpus_sdk.examples.common.printing import box, print_kv
+from examples.common.ctx import make_ctx
+from examples.common.printing import box, print_kv
 
 def readiness(status: str) -> str:
     if status == HealthStatus.OK: return "ready"

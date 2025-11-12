@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adaptersdk.org/schemas/llm/llm.stream.frame.data.json",
+  "title": "LLM Stream Data Frame",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["event", "data", "seq"],
+  "properties": {
+    "event": { "const": "data" },
+    "seq": { "type": "integer", "minimum": 0, "description": "Monotonic sequence per stream." },
+    "emitted_ms": { "type": "number", "minimum": 0, "description": "Server-side elapsed ms at emit time." },
+    "bytes": { "type": "integer", "minimum": 0, "description": "Advisory payload size for this frame." },
+    "data": { "$ref": "https://adaptersdk.org/schemas/llm/llm.types.chunk.json" },
+    "backpressure": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "suggested_sleep_ms": { "type": "integer", "minimum": 0 },
+        "queue_depth": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

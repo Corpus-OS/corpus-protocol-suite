@@ -9,9 +9,9 @@ display the model response and token usage.
 
 import asyncio
 
-from corpus_sdk.examples.llm.mock_llm_adapter import MockLLMAdapter
-from corpus_sdk.examples.common.ctx import make_ctx
-from corpus_sdk.examples.common.printing import box, print_kv
+from examples.llm.mock_llm_adapter import MockLLMAdapter
+from examples.common.ctx import make_ctx
+from examples.common.printing import box, print_kv
 from corpus_sdk.llm.llm_base import OperationContext
 
 

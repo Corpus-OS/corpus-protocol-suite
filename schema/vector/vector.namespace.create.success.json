@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adaptersdk.org/schemas/vector/vector.namespace.create.success.json",
+  "title": "vector.create_namespace result",
+  "description": "Confirmation payload when a namespace is created.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "namespace": { "type": "string", "maxLength": 256 },
+    "dimensions": { "type": "integer", "minimum": 1, "maximum": 8192 },
+    "distance_metric": { "type": "string", "enum": ["cosine", "euclidean", "dot"] },
+    "created_at": { "type": "string", "format": "date-time" }
+  },
+  "required": ["namespace", "dimensions", "distance_metric"]
+}

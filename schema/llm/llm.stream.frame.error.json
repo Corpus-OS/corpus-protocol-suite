@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adaptersdk.org/schemas/llm/llm.stream.frame.error.json",
+  "title": "LLM Stream Frame (error)",
+  "type": "object",
+  "required": ["event", "code", "error", "message"],
+  "additionalProperties": false,
+  "properties": {
+    "event": { "type": "string", "const": "error" },
+    "code": { "type": "string", "pattern": "^[A-Z0-9_]{1,64}$" },
+    "error": {
+      "type": "string",
+      "enum": [
+        "BadRequest",
+        "AuthError",
+        "ResourceExhausted",
+        "TransientNetwork",
+        "Unavailable",
+        "NotSupported",
+        "DeadlineExceeded",
+        "ModelOverloaded",
+        "ContentFiltered"
+      ]
+    },
+    "message": { "type": "string", "minLength": 1, "maxLength": 2000 },
+    "retry_after_ms": { "type": ["integer", "null"], "minimum": 0, "maximum": 86400000 }
+  }
+}

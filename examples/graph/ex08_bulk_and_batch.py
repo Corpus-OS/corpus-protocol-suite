@@ -4,10 +4,10 @@ Demonstrates: bulk_vertices + batch ops + hitting max_batch_ops
 Expected: creates a small bulk set; large bulk raises BadRequest with suggestion; batch mixes results
 """
 import asyncio, random
-from corpus_sdk.examples.graph.mock_graph_adapter import MockGraphAdapter
+from examples.graph.mock_graph_adapter import MockGraphAdapter
 from corpus_sdk.graph.graph_base import OperationContext as GraphContext, BatchOperations, BadRequest
-from corpus_sdk.examples.common.ctx import make_ctx
-from corpus_sdk.examples.common.printing import box, print_kv, print_json
+from examples.common.ctx import make_ctx
+from examples.common.printing import box, print_kv, print_json
 
 async def main():
     random.seed(108)

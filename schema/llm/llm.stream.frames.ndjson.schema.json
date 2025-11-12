@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adaptersdk.org/schemas/llm/llm.stream.frames.ndjson.schema.json",
+  "title": "LLM NDJSON Stream Frames (Union)",
+  "oneOf": [
+    { "$ref": "https://adaptersdk.org/schemas/llm/llm.stream.frame.data.json" },
+    { "$ref": "https://adaptersdk.org/schemas/llm/llm.stream.frame.end.json" },
+    { "$ref": "https://adaptersdk.org/schemas/llm/llm.stream.frame.error.json" }
+  ],
+  "$comment": "Each NDJSON line is one of these frames. Equivalent bindings for SSE/WebSocket supported."
+}

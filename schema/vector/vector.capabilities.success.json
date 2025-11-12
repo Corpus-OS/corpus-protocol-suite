@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adaptersdk.org/schemas/vector/vector.capabilities.success.json",
+  "title": "vector.capabilities result",
+  "description": "Capabilities and limits advertised by the vector adapter.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "server": { "type": "string", "minLength": 1 },
+    "version": { "type": "string", "minLength": 1 },
+    "protocol": { "type": "string", "const": "vector/v1.0" },
+    "features": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "supports_filters": { "type": "boolean" },
+        "supports_pagination": { "type": "boolean" },
+        "supports_deadline": { "type": "boolean" }
+      },
+      "required": ["supports_filters", "supports_pagination", "supports_deadline"]
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "dimension": { "type": "integer", "minimum": 1, "maximum": 8192 },
+        "max_top_k": { "type": "integer", "minimum": 1, "maximum": 100000 },
+        "max_batch": { "type": "integer", "minimum": 1, "maximum": 100000 },
+        "concurrency": { "type": "integer", "minimum": 1 },
+        "rate_limit_qps": { "type": ["integer", "null"], "minimum": 1 }
+      },
+      "required": ["dimension"]
+    },
+    "cache": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "supports_tags": { "type": "boolean" },
+        "max_ttl_ms": { "type": ["integer", "null"], "minimum": 0 }
+      }
+    },
+    "extensions": {
+      "type": "object",
+      "additionalProperties": true,
+      "patternProperties": {
+        "^(vendor:)[a-z0-9_.:-]+$": { "type": ["string", "number", "boolean", "object", "array", "null"] }
+      }
+    }
+  },
+  "required": ["server", "version", "protocol"]
+}

@@ -14,11 +14,11 @@ We share a single ConsoleMetrics sink across two MockLLMAdapter instances:
 from __future__ import annotations
 import asyncio
 
-from corpus_sdk.examples.llm.mock_llm_adapter import MockLLMAdapter
-from corpus_sdk.examples.common.metrics_console import ConsoleMetrics
-from corpus_sdk.examples.common.ctx import make_ctx
+from examples.llm.mock_llm_adapter import MockLLMAdapter
+from examples.common.metrics_console import ConsoleMetrics
+from examples.common.ctx import make_ctx
 from corpus_sdk.llm.llm_base import OperationContext
-from corpus_sdk.examples.common.printing import box, print_kv
+from examples.common.printing import box, print_kv
 
 # Prefer the example taxonomy (clearer for OSS examples).
 try:
