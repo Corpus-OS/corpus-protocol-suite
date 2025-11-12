@@ -1483,7 +1483,9 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         """
         Count tokens in text with validation, gates, and metrics.
         """
-        self._require_non_empty("text", text)
+        # Allow empty string; just ensure it's a string
+        if not isinstance(text, str):
+            raise BadRequest("text must be a string")
         self._require_non_empty("model", model)
 
         async def _run() -> int:
@@ -1604,6 +1606,7 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
     async def _do_health(self, *, ctx: Optional[OperationContext] = None) -> Dict[str, Any]:
         """Implement health check for the embedding backend."""
         raise NotImplementedError
+
 
 
 # =============================================================================
