@@ -1,0 +1,19 @@
+{
+  "ok": false,
+  "error": "DimensionMismatch",
+  "message": "Vector dimension mismatch for namespace",
+  "code": "DIMENSION_MISMATCH",
+  "http_status": 400,
+  "retry_after_ms": null,
+  "retryable": false,
+  "resource_scope": null,
+  "details": {
+    "expected": 1536,
+    "provided": 2,
+    "namespace": "acme.docs"
+  },
+  "protocol": "vector/v1.0",
+  "component": "vector",
+  "schema_version": "1.0.1",
+  "request_id": "req_vec_001"
+}
