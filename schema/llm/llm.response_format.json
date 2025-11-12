@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adaptersdk.org/schemas/llm/llm.response_format.json",
+  "title": "LLM Response Format",
+  "type": "object",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type"],
+      "properties": { "type": { "const": "text" } }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "json_schema"],
+      "properties": {
+        "type": { "const": "json_schema" },
+        "json_schema": { "type": "object", "additionalProperties": true }
+      }
+    }
+  ]
+}
