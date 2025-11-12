@@ -111,7 +111,7 @@ class MockLLMAdapter(BaseLLMAdapter):
             raise BadRequest("top_p must be within (0.0, 1.0]")
         if frequency_penalty is not None and not (-2.0 <= frequency_penalty <= 2.0):
             raise BadRequest("frequency_penalty must be within [-2.0, 2.0]")
-        if presence_penalty is not None and not (-2.0 <= presence_penalty <= 2.0]):
+        if presence_penalty is not None and not (-2.0 <= presence_penalty <= 2.0):
             raise BadRequest("presence_penalty must be within [-2.0, 2.0]")
 
     # ----- completion --------------------------------------------------------
