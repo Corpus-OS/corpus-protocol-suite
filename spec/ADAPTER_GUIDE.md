@@ -1,7 +1,3 @@
-I’m on it—here’s the **updated, full `ADAPTER_GUIDE.md`** you asked for. It’s focused on **implementing the adapter**, aligned with your Makefile, and merges in the concrete error-mapping example, diagnostic flow, precise Adapter API ops/semantics, and all cross-cutting guarantees. No test lists duplicated.
-
----
-
 # ADAPTER_GUIDE.md
 
 > ✅ **Corpus Protocol (v1.0) — Adapter Implementation Guide**
