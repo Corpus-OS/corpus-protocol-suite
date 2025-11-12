@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adaptersdk.org/schemas/embedding/embedding.embed.success.json",
+  "title": "embedding.embed Result",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://adaptersdk.org/schemas/embedding/embedding.types.result.json" }
+  ],
+  "additionalProperties": false,
+  "$comment": "Semantic: embeddings.length MUST equal 1 for single embed."
+}
