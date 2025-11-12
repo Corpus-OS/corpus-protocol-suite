@@ -1,0 +1,2 @@
+{"event":"data","data":{"row":{"n":{"id":"v1","labels":["Node"],"props":{"kind":"demo"}}}}}
+{"event":"error","code":"UNAVAILABLE","error":"Unavailable","message":"backend temporarily unavailable"}
