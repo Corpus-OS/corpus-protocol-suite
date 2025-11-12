@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adaptersdk.org/schemas/llm/llm.tools.schema.json",
+  "title": "Tool Definition",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name", "description", "input_schema"],
+  "properties": {
+    "name": { "type": "string", "maxLength": 64, "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+    "description": { "type": "string", "maxLength": 2000 },
+    "input_schema": {
+      "type": "object",
+      "description": "JSON Schema for validating tool arguments.",
+      "additionalProperties": true
+    }
+  }
+}
