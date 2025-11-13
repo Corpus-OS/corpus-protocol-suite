@@ -62,8 +62,8 @@ It sits next to:
 - **`IMPLEMENTATION.md`**  
   Deep dive on base classes, `_do_*` hooks, and runtime semantics.
 
-- **`QUICK_START.md` / `ADAPTER_RECIPES.md`**  
-  “Do this to get started” guides.
+- **`QUICKSTART_ADAPTERS.md` / `ADAPTER_RECIPES.md`**  
+  “Do this to get started” and “patterns & examples” guides.
 
 ### 1.3 Scope of This Guide
 
@@ -129,40 +129,113 @@ The tests cover four major dimensions:
    - Tenant isolation signals  
    - No PII or raw embeddings in key observability paths
 
-### 2.3 Test Suite Overview
+### 2.3 Test Suite Layout (Actual Tree)
 
-The conformance tests are organized like:
+The conformance tests are organized roughly as:
 
 ```text
 tests/
-  schema/
-  golden/
-  llm/
+  run_conformance.py        # top-level runner (optional)
+  cli.py                    # CLI helpers
+  conftest.py               # shared pytest fixtures
+
   embedding/
-  vector/
+    run_conformance.py
+    test_cache_and_batch_fallback.py
+    test_capabilities_shape.py
+    test_context_siem.py
+    test_count_tokens_behavior.py
+    test_deadline_enforcement.py
+    test_embed_basic.py
+    test_embed_batch_basic.py
+    test_error_mapping_retryable.py
+    test_health_report.py
+    test_normalization_semantics.py
+    test_truncation_and_text_length.py
+    test_wire_handler.py
+
   graph/
-  shared/   # utilities, fixtures
+    run_conformance.py
+    test_batch_operations.py
+    test_capabilities_shape.py
+    test_context_siem.py
+    test_crud_basic.py
+    test_deadline_enforcement.py
+    test_dialect_validation.py
+    test_error_mapping_retryable.py
+    test_health_report.py
+    test_query_basic.py
+    test_schema_operations.py
+    test_streaming_semantics.py
+    test_wire_handler.py
+
+  llm/
+    run_conformance.py
+    test_capabilities_shape.py
+    test_complete_basic.py
+    test_context_siem.py
+    test_count_tokens_consistency.py
+    test_deadline_enforcement.py
+    test_error_mapping_retryable.py
+    test_health_report.py
+    test_message_validation.py
+    test_sampling_params_validation.py
+    test_streaming_semantics.py
+    test_wire_handler.py
+
+  vector/
+    run_conformance.py
+    test_batch_size_limits.py
+    test_capabilities_shape.py
+    test_context_siem.py
+    test_deadline_enforcement.py
+    test_delete_operations.py
+    test_dimension_validation.py
+    test_error_mapping_retryable.py
+    test_filtering_semantics.py
+    test_health_report.py
+    test_namespace_operations.py
+    test_query_basic.py
+    test_upsert_basic.py
+    test_wire_handler.py
+
+  golden/
+    test_golden_samples.py
+    embedding_capabilities_request.json
+    embedding_embed_batch_request.json
+    embedding_embed_request.json
+    embedding_embed_success.j
+    embedding_health_request.json
+    embedding_partial_success_result.json
+    error_envelope_example.json
+    graph_stream.ndjson
+    graph_stream_error.ndjson
+    graph_stream_query_request.json
+    llm_complete_request.json
+    llm_complete_success.json
+    llm_count_tokens_request.json
+    llm_count_tokens_success.json
+    llm_stream.ndjson
+    llm_stream_error.ndjson
+    vector_error_dimension_mismatch.json
+    vector_query_request.json
+    vector_query_success.json
+
+  schema/
+    test_schema_lint.py
+
+  utils/
+    schema_registry.py
+    stream_validator.py
 ````
 
 High-level:
 
-* `tests/schema/`
-  Schema validation for requests / responses.
-
-* `tests/golden/`
-  Golden wire messages. Ensures your implementation can handle “known-good” canonical envelopes.
-
-* `tests/llm/`
-  LLM-specific behavioral + schema tests.
-
-* `tests/embedding/`
-  Embedding-specific behavioral + schema tests.
-
-* `tests/vector/`
-  Vector-specific behavioral + schema tests.
-
-* `tests/graph/`
-  Graph-specific behavioral + schema tests.
+* `embedding/`, `llm/`, `vector/`, `graph/` — protocol-specific behavioral + wire tests.
+* `golden/` — cross-protocol golden messages.
+* `schema/` — schema lint / registry tests.
+* `utils/` — helpers used by tests (`schema_registry`, stream validator).
+* `run_conformance.py` — top-level helper for running the full suite (optional).
 
 ---
 
@@ -171,9 +244,15 @@ High-level:
 ### 3.1 Prerequisites
 
 * Python (exact version in your repo; usually 3.10+)
-* All test dependencies installed (e.g. `pip install -e .[dev,test]`)
+
+* All test dependencies installed, e.g.:
+
+  ```bash
+  pip install -e .[dev,test]
+  ```
+
 * Local or test deployment of your adapter(s) running, or in-process fixtures
-  (Your repo should document which your tests expect.)
+  (your repo should document which the tests expect).
 
 Common env vars:
 
@@ -181,17 +260,16 @@ Common env vars:
 * Adapter endpoint URLs (e.g. `EMBEDDING_ENDPOINT`, `LLM_ENDPOINT`)
 * Test-mode flags (e.g. `CORPUS_TEST_MODE=1`)
 
-Check your repo’s `README` / `Makefile` for specifics.
+### 3.2 Full “All Up” Run
 
-### 3.2 Local “All Up” Run
-
-Most repos expose a single “run it all” command:
+Depending on how you wire things, you can:
 
 ```bash
-# Full suite: schema + behavioral for all protocols you implement
-make test-conformance
-# or
-pytest tests/ -m "conformance" -v
+# Full suite via pytest
+pytest tests/ -v
+
+# Or via the top-level runner (if wired that way)
+python -m tests.run_conformance
 ```
 
 You should see:
@@ -202,26 +280,34 @@ You should see:
 
 ### 3.3 Per-Protocol Runs
 
-To iterate quickly:
+To iterate faster on one component:
 
 ```bash
-# Schema-only
-pytest tests/schema/ tests/golden/ -v
-
 # LLM only
 pytest tests/llm/ -v
+# or
+python -m tests.llm.run_conformance
 
 # Embedding only
 pytest tests/embedding/ -v
+# or
+python -m tests.embedding.run_conformance
 
 # Vector only
 pytest tests/vector/ -v
+# or
+python -m tests.vector.run_conformance
 
 # Graph only
 pytest tests/graph/ -v
+# or
+python -m tests.graph.run_conformance
+
+# Schema + golden wire tests
+pytest tests/schema/ tests/golden/ -v
 ```
 
-You can also use pytest’s `-k` filter for specific subsets:
+Filter down to specific areas with `-k`:
 
 ```bash
 pytest tests/embedding/ -k "truncation" -vv
@@ -232,21 +318,29 @@ pytest tests/llm/ -k "streaming" -vv
 
 Recommended CI layout:
 
-* **Job 1 – Schema:** `pytest tests/schema tests/golden`
-* **Job 2 – LLM:** `pytest tests/llm`
-* **Job 3 – Embedding:** `pytest tests/embedding`
-* **Job 4 – Vector:** `pytest tests/vector`
-* **Job 5 – Graph:** `pytest tests/graph`
+* **Job 1 – Schema + Golden:**
+  `pytest tests/schema tests/golden`
 
-Ideas:
+* **Job 2 – LLM:**
+  `pytest tests/llm`
 
-* Run **per-protocol** suites on PRs that touch that code path.
-* Run the **full suite nightly** (all protocols + schema).
+* **Job 3 – Embedding:**
+  `pytest tests/embedding`
+
+* **Job 4 – Vector:**
+  `pytest tests/vector`
+
+* **Job 5 – Graph:**
+  `pytest tests/graph`
+
+Nice extras:
+
+* Nightly job: `pytest tests/ -v`
 * Publish artifacts:
 
-  * HTML coverage report
-  * JUnit XML (for build dashboards)
-  * A “conformance status” markdown badge or summary
+  * HTML coverage
+  * JUnit XML
+  * A simple “conformance status” markdown or badge
 
 ---
 
@@ -257,57 +351,67 @@ Ideas:
 Schema conformance ensures that:
 
 * Your service accepts **valid Corpus envelopes** and rejects invalid ones.
+
 * Request / response bodies match the **canonical JSON schemas**:
 
   * Required vs optional fields
   * Enum values
-  * Nested structures (e.g. messages, filters, embeddings, matches)
+  * Nested structures (messages, filters, embeddings, matches, errors)
+
 * Golden wire messages continue to round-trip correctly over time.
 
-This is what lets routers and SDKs treat any conformant implementation as “just another Corpus endpoint.”
+This is what lets routers and SDKs treat any conformant implementation as “just another Corpus endpoint”.
 
 ### 4.2 Test Suites and Files
 
-You’ll typically see:
+Schema-level conformance uses:
 
-* `tests/schema/test_schemas_valid.py`
+* `tests/schema/test_schema_lint.py`
 
-  * Ensures that canonical request/response objects match the JSON schema.
+  * Validates schema meta-lint and hygiene via the shared `schema_registry`:
 
-* `tests/schema/test_schemas_invalid.py`
-
-  * Ensures invalid variants are rejected as expected.
+    * No broken refs / missing IDs
+    * Consistent namespaces
+    * Registrations match spec expectations
 
 * `tests/golden/test_golden_samples.py`
 
-  * Sends “golden” envelopes (one for each operation) through your handler and asserts:
+  * Uses the JSON / NDJSON payloads in `tests/golden/`:
 
-    * Success or expected error code
-    * Response shape matches schema
+    * Request/response examples for LLM, Embedding, Vector, Graph
+    * Error envelopes (`error_envelope_example.json`)
+    * Streaming transcripts (`llm_stream.ndjson`, `graph_stream.ndjson`, etc.)
+  * Ensures your wire handlers:
+
+    * Accept canonical request envelopes (e.g. `llm_complete_request.json`)
+    * Produce schema-conformant responses (e.g. `llm_complete_success.json`)
+    * Handle golden error cases like vector dimension mismatches.
+
+Helpers:
+
+* `tests/utils/schema_registry.py` — shared registry that loads schema definitions.
+* `tests/utils/stream_validator.py` — used to validate streaming transcripts in golden tests.
 
 ### 4.3 How to Fix Schema Failures
 
-Common patterns:
+Common issues:
 
 * **Missing fields**
-
-  * e.g. missing `model` or `embedding.dimensions`
-    → Check your serialization: are you omitting fields you think are optional but are actually required?
+  e.g. missing `model` or `embedding.dimensions`.
+  → Check your serialization: are you omitting fields that the schema marks as required?
 
 * **Wrong types**
-
-  * e.g. `dimensions` as string instead of integer
-    → Align your encoder / Pydantic / dataclass definitions with the schema.
+  e.g. `dimensions` as string instead of integer.
+  → Align your DTO / dataclass / Pydantic model with the JSON schema.
 
 * **Unexpected extra fields**
+  Some schemas disallow unknown properties.
+  → Drop unused extra fields or put them into designated `metadata` / `details` fields.
 
-  * Some schemas disallow unknown properties.
-    → Drop unused fields or tuck them into `details` / `metadata` fields where allowed.
+For golden sample failures:
 
-If a test points at the golden suite:
-
-* Compare the failing payload with the corresponding **example in `SCHEMA_CONFORMANCE.md`**.
-* Make sure your wire handler isn’t doing per-adapter quirks (e.g., renaming fields).
+* Compare the failing payload with the corresponding file in `tests/golden/`.
+* Ensure your wire handler is not renaming fields or wrapping/unwrapping in a custom envelope.
 
 ---
 
@@ -319,212 +423,292 @@ Behavioral tests focus on **how** your service behaves, not just the JSON shape:
 
 * **Deadlines & timeouts**
 
-  * Respect `ctx.deadline_ms` and return `DEADLINE_EXCEEDED` appropriately.
+  * Respect `ctx.deadline_ms`, use `ctx.remaining_ms()`, return `DEADLINE_EXCEEDED` correctly.
 
 * **Error taxonomy & mapping**
 
-  * Map provider failures to the canonical error classes & codes.
+  * Map provider failures to canonical error classes and error codes.
 
 * **Streaming semantics**
 
-  * Correct ordering and termination for streaming ops.
+  * Correct ordering and termination rules for streaming ops.
 
 * **Batch behavior & partial failures**
 
-  * Especially for embedding and vector ops.
+  * Especially for embedding and vector operations.
 
 * **Caching and idempotency**
 
   * No surprising nondeterminism where the spec requires stability.
 
-The exact expectations live in `BEHAVIORAL_CONFORMANCE.md`.
+The normative expectations live in `BEHAVIORAL_CONFORMANCE.md`.
 
 ---
 
 ### 5.2 LLM Behavioral Expectations
 
-Key behaviors (examples, not exhaustive):
+Representative tests:
+
+* `tests/llm/test_complete_basic.py`
+* `tests/llm/test_streaming_semantics.py`
+* `tests/llm/test_count_tokens_consistency.py`
+* `tests/llm/test_sampling_params_validation.py`
+* `tests/llm/test_message_validation.py`
+* `tests/llm/test_deadline_enforcement.py`
+* `tests/llm/test_error_mapping_retryable.py`
+* `tests/llm/test_context_siem.py`
+* `tests/llm/test_health_report.py`
+* `tests/llm/test_capabilities_shape.py`
+* `tests/llm/test_wire_handler.py`
+
+Key behaviors (not exhaustive):
 
 * **Context window enforcement**
 
-  * If `supports_count_tokens=True`, the base or your adapter must:
+  * When `supports_count_tokens=True`, you must:
 
     * Count prompt + completion tokens.
-    * Reject requests that exceed `max_context_length` with a canonical error.
+    * Reject over-limit requests with the correct canonical error.
 
 * **Streaming rules**
 
-  * Exactly one final chunk where `is_final=True`.
-  * No chunks after an error or final chunk.
-  * Streaming tests will send prompts that yield:
+  * `llm.stream`:
 
-    * Multiple partial chunks
-    * Terminal chunk
-    * Error mid-stream
+    * Zero or more partial chunks.
+    * Exactly one final chunk where `is_final=True`.
+    * No chunks after an error or the final chunk.
+  * `test_streaming_semantics.py` verifies state machine correctness.
 
-* **Error mapping**
+* **Sampling parameters / validation**
 
-  * Rate limits → `RESOURCE_EXHAUSTED`
-  * Auth failures → `AUTH_ERROR`
-  * Invalid requests → `BAD_REQUEST`
-  * Upstream outages → `UNAVAILABLE`
+  * `test_sampling_params_validation.py` enforces:
 
-Tests to watch:
+    * Ranges for temperature, top_p, top_k, etc.
+    * Rejection of obviously invalid sampling configs.
 
-* `tests/llm/test_streaming_semantics.py`
-* `tests/llm/test_message_validation.py`
-* `tests/llm/test_sampling_params_validation.py`
+* **Error mapping & retryability**
+
+  * `test_error_mapping_retryable.py` checks that you map:
+
+    * Rate limits → `RESOURCE_EXHAUSTED`
+    * Auth issues → `AUTH_ERROR`
+    * Invalid parameters → `BAD_REQUEST`
+    * Provider outages → `UNAVAILABLE`
+  * And that the “retryable vs non-retryable” dimension is consistent.
+
+* **Deadlines & SIEM-safe context**
+
+  * `test_deadline_enforcement.py` ensures you respect `ctx.deadline_ms`.
+  * `test_context_siem.py` ensures you do *not* leak raw tenant IDs or PII into metrics/logs.
 
 ---
 
 ### 5.3 Embedding Behavioral Expectations
 
+Representative tests:
+
+* `tests/embedding/test_embed_basic.py`
+* `tests/embedding/test_embed_batch_basic.py`
+* `tests/embedding/test_truncation_and_text_length.py`
+* `tests/embedding/test_normalization_semantics.py`
+* `tests/embedding/test_cache_and_batch_fallback.py`
+* `tests/embedding/test_count_tokens_behavior.py`
+* `tests/embedding/test_deadline_enforcement.py`
+* `tests/embedding/test_error_mapping_retryable.py`
+* `tests/embedding/test_context_siem.py`
+* `tests/embedding/test_health_report.py`
+* `tests/embedding/test_capabilities_shape.py`
+* `tests/embedding/test_wire_handler.py`
+
 Highlights:
 
-* **Truncation semantics**
+* **Truncation semantics** (`test_truncation_and_text_length.py`)
 
-  * If `max_text_length` set:
+  * If `max_text_length` is set:
 
-    * With `truncate=True`: text is truncated, and `truncated=True` in the result.
-    * With `truncate=False`: raise `TextTooLong` when over the limit.
+    * `truncate=True` → text truncated, `truncated=True` in result.
+    * `truncate=False` → raise `TextTooLong` when text is over limit.
 
-* **Normalization semantics**
+* **Normalization semantics** (`test_normalization_semantics.py`)
 
-  * If `normalize=True`:
+  * With `normalize=True`:
 
     * `supports_normalization` must be `True`.
     * Either:
 
-      * Provider returns normalized vectors; or
+      * Provider returns normalized vectors, or
       * The base normalizes them when `normalizes_at_source=False`.
 
-* **Batch behavior**
+* **Batch + partial failure behavior** (`test_embed_batch_basic.py`, `test_cache_and_batch_fallback.py`)
 
-  * `BatchEmbedResult.failed_texts` must contain:
+  * `BatchEmbedResult.failed_texts` must include:
 
     * `index`, `text`, `code`, `message` for failures.
-  * Tests verify both “all succeed” and “partial failures” cases.
+  * `test_cache_and_batch_fallback.py` also validates:
 
-Look for:
+    * Fallback behavior when `_do_embed_batch` is not supported or partially fails.
+    * That caching and batch fallback remain consistent with spec.
 
-* `tests/embedding/test_truncation_and_text_length.py`
-* `tests/embedding/test_normalization_semantics.py`
-* `tests/embedding/test_embed_batch_basic.py`
+* **Count tokens behavior** (`test_count_tokens_behavior.py`)
+
+  * If `supports_token_counting=True`:
+
+    * Behavior must be consistent across single and batch calls.
+    * Over-limit requests must be rejected correctly.
+
+* **Deadlines, errors, SIEM**
+
+  * `test_deadline_enforcement.py` → deadlines.
+  * `test_error_mapping_retryable.py` → canonical error mapping.
+  * `test_context_siem.py` → metrics/logging hygiene.
 
 ---
 
 ### 5.4 Vector Behavioral Expectations
 
-Core expectations:
-
-* **Dimensions**
-
-  * All vectors must match protocol expectations and respect `max_dimensions`.
-  * Mismatched dimensions → `DimensionMismatch` / canonical error.
-
-* **Query semantics**
-
-  * Deterministic ordering of matches by score.
-  * Correct application of `top_k`.
-  * Respect `include_vectors` and `include_metadata`.
-
-* **Namespace & filters**
-
-  * If `supports_metadata_filtering=False`, using `filter` should produce a canonical error.
-  * Namespace operations (`create_namespace`, `delete_namespace`) should be idempotent.
-
-Tests to inspect:
+Representative tests:
 
 * `tests/vector/test_query_basic.py`
-* `tests/vector/test_namespace_operations.py`
+* `tests/vector/test_upsert_basic.py`
+* `tests/vector/test_delete_operations.py`
+* `tests/vector/test_batch_size_limits.py`
+* `tests/vector/test_filtering_semantics.py`
 * `tests/vector/test_dimension_validation.py`
+* `tests/vector/test_namespace_operations.py`
+* `tests/vector/test_deadline_enforcement.py`
+* `tests/vector/test_error_mapping_retryable.py`
+* `tests/vector/test_context_siem.py`
+* `tests/vector/test_health_report.py`
+* `tests/vector/test_capabilities_shape.py`
+* `tests/vector/test_wire_handler.py`
+
+Core expectations:
+
+* **Dimensions & shapes** (`test_dimension_validation.py`)
+
+  * All vectors must have allowed dimensions ≤ `max_dimensions`.
+  * Mismatches trigger `DimensionMismatch` (or equivalent canonical error).
+
+* **Query semantics** (`test_query_basic.py`)
+
+  * Deterministic ordering by score.
+  * `top_k` honored.
+  * `include_vectors` / `include_metadata` respected.
+
+* **Namespaces + filters**
+
+  * `test_namespace_operations.py`:
+
+    * Creating/deleting namespaces is idempotent.
+  * `test_filtering_semantics.py`:
+
+    * Respects `supports_metadata_filtering`.
+    * Errors clearly if filter is used when not supported.
+
+* **Batch limits & operations** (`test_batch_size_limits.py`, `test_upsert_basic.py`, `test_delete_operations.py`)
+
+  * `max_batch_size` enforced.
+  * Upsert/delete return correct counts and failure information.
+
+* **Deadlines, errors, SIEM**
+
+  * Same pattern: `test_deadline_enforcement.py`, `test_error_mapping_retryable.py`, `test_context_siem.py`, `test_health_report.py`.
 
 ---
 
 ### 5.5 Graph Behavioral Expectations
 
-Graph tests focus on:
-
-* **Query vs streaming query**
-
-  * Unary `query` returns a complete result set.
-  * `stream_query` returns a sequence of events:
-
-    * Row events
-    * Exactly one terminal event (end or error).
-
-* **Batch semantics**
-
-  * Partial successes encoded per operation.
-  * No “everything failed” response when some ops succeeded.
-
-* **Dialect & validation**
-
-  * Unknown / unsupported dialects must produce canonical errors.
-  * Invalid queries surface as `InvalidQuery` (or equivalent) instead of generic `UNAVAILABLE`.
-
-Look for:
+Representative tests:
 
 * `tests/graph/test_query_basic.py`
 * `tests/graph/test_streaming_semantics.py`
 * `tests/graph/test_batch_operations.py`
+* `tests/graph/test_crud_basic.py`
+* `tests/graph/test_schema_operations.py`
+* `tests/graph/test_dialect_validation.py`
+* `tests/graph/test_deadline_enforcement.py`
+* `tests/graph/test_error_mapping_retryable.py`
+* `tests/graph/test_context_siem.py`
+* `tests/graph/test_health_report.py`
+* `tests/graph/test_capabilities_shape.py`
+* `tests/graph/test_wire_handler.py`
+
+Key behaviors:
+
+* **Query vs streaming query** (`test_query_basic.py`, `test_streaming_semantics.py`)
+
+  * Unary `graph.query` returns a complete result.
+  * `graph.stream_query` emits:
+
+    * Zero or more row events.
+    * Exactly one terminal event (end or error).
+    * No events after terminal.
+
+* **Batch semantics** (`test_batch_operations.py`)
+
+  * Partial successes must be explicitly represented.
+  * Only successful operations mutate state.
+  * Input ordering / IDs preserved.
+
+* **Dialect & schema operations** (`test_dialect_validation.py`, `test_schema_operations.py`)
+
+  * Unsupported dialects → canonical “not supported” error.
+  * Schema operations behave predictably and idempotently.
+
+* **CRUD fundamentals** (`test_crud_basic.py`)
+
+  * Basic vertex/edge create/read/update/delete semantics.
+
+* **Deadlines, errors, SIEM**
+
+  * Handled via the same foundational tests: deadline, retryable error mapping, context/metrics hygiene.
 
 ---
 
 ### 5.6 Cross-Protocol Foundations
 
-Shared expectations:
+Cross-cutting behavior is validated via the per-protocol tests plus:
 
-* **OperationContext**
+* `test_context_siem.py` in each protocol:
 
-  * The `ctx` object carries:
+  * Ensures tenant IDs are hashed.
+  * Ensures logs/metrics don’t leak full texts or embeddings where they shouldn’t.
 
-    * `request_id`, `idempotency_key`
-    * `deadline_ms`, `tenant`, `traceparent`
-  * Tests ensure:
+* `test_error_mapping_retryable.py` in each protocol:
 
-    * Deadlines are respected.
-    * Tenant is used consistently when required.
-    * Context is preserved end-to-end.
+  * Ensures canonical error codes and retryability semantics are consistent.
 
-* **Error codes & retryability**
+* `test_health_report.py`:
 
-  * Tests assert specific `code` values and error classes for common failure modes.
+  * Ensures health endpoints expose enough structured info (but not secrets/PII).
 
-* **Observability & security**
-
-  * Some tests indirectly verify that:
-
-    * Tenant IDs are hashed in metrics.
-    * Logs / metrics do not leak raw embeddings or large texts in disallowed places.
-
-If a failure references “common foundation,” look into `BEHAVIORAL_CONFORMANCE.md` §Common Patterns and `IMPLEMENTATION.md`’s OperationContext + metrics sections.
+The details of **OperationContext**, error taxonomy, and observability constraints live in `BEHAVIORAL_CONFORMANCE.md` and `IMPLEMENTATION.md`.
 
 ---
 
 ## 6. Certification Levels and Thresholds
 
-> The exact numbers and thresholds live in `CERTIFICATION.md`.
-> This section is about how **conformance results feed certification**, not the specific math.
+> Exact thresholds (Platinum/Silver/Development, per-protocol Gold/Silver/Dev) live in `CERTIFICATION.md`.
+> This section is about how **conformance results feed certification**, not the raw numbers.
 
 ### 6.1 Suite Levels (Platinum / Silver / Development)
 
-The suite (all protocols + schema) supports:
+Suite-level certification (all protocols + schema) typically offers:
 
 * **Platinum**
 
-  * Pass essentially **all normative tests** for the protocols you claim.
-  * Intended for production-grade, fully conformant implementations.
+  * Pass essentially **all normative tests** for all claimed protocols.
+  * Intended for fully conformant, production-grade implementations.
 
 * **Silver**
 
   * Pass a large majority of tests across major protocols.
-  * Suitable for serious production use with some limited feature gaps.
+  * Suitable for production usage with limited, well-understood gaps.
 
 * **Development**
 
   * Pass a minimum bar of tests per protocol.
-  * Intended for “in active development” adapters.
+  * Intended for adapters in active development.
 
 ### 6.2 Protocol-Level Certifications
 
@@ -538,44 +722,42 @@ You can also certify **per protocol**:
 
 Each has:
 
-* **Gold:** full protocol test completion
-* **Silver:** 80%+ of protocol tests
-* **Development:** 50%+ of protocol tests
+* **Gold:** essentially full protocol completion.
+* **Silver:** ~80%+ of protocol tests.
+* **Development:** ~50%+ of protocol tests.
 
-Exact numbers → see `CERTIFICATION.md`.
+The exact counts → see `CERTIFICATION.md`.
 
 ### 6.3 Mapping Tests → Certification
 
-The mapping is:
+Roughly:
 
-1. Run the full conformance suite (schema + all relevant protocols).
+1. Run the full conformance suite (`pytest tests/` or `python -m tests.run_conformance`).
 2. Count tests passed per:
 
    * Suite
-   * Protocol
-   * Schema
-3. Compare counts to the tables in `CERTIFICATION.md`.
-4. If you meet the thresholds, you can:
+   * Protocol (`llm/`, `embedding/`, `vector/`, `graph/`)
+   * Schema/golden (`schema/`, `golden/`)
+3. Compare those counts to the tables in `CERTIFICATION.md`.
+4. If you meet the thresholds, you can claim:
 
-   * Claim the relevant certification level.
-   * Use the associated badge.
+   * Suite-level certification, and/or
+   * Per-protocol certifications.
 
 ### 6.4 Stable vs Experimental Areas
 
-Tests fall into two buckets:
+Tests fall into buckets:
 
 * **Normative / stable**
 
-  * Tied directly to MUST / MUST NOT sections of the spec.
-  * Will not change behaviorally within a major protocol version without a deprecation path.
+  * Tied directly to MUST / MUST NOT sections of `SPECIFICATION.md`, `SCHEMA_CONFORMANCE.md`, `BEHAVIORAL_CONFORMANCE.md`.
+  * These don’t change behaviorally within a major protocol version.
 
 * **Advisory / experimental**
 
-  * May exercise SHOULD / SHOULD NOT behaviors.
+  * Exercise SHOULD / SHOULD NOT behaviors.
   * May evolve faster across minor versions.
-  * Failing these may not block lower certification levels.
-
-When in doubt: `BEHAVIORAL_CONFORMANCE.md` and `SCHEMA_CONFORMANCE.md` will label tests as “normative” vs “recommended.”
+  * Failing them may limit you to lower certification tiers.
 
 ---
 
@@ -583,17 +765,17 @@ When in doubt: `BEHAVIORAL_CONFORMANCE.md` and `SCHEMA_CONFORMANCE.md` will labe
 
 ### 7.1 Reading Test Output
 
-Pytest output will show something like:
+Pytest output will give you something like:
 
 ```text
 FAILED tests/embedding/test_truncation_and_text_length.py::test_truncate_true_sets_flag
-E   AssertionError: assert response["truncated"] is True
+E   AssertionError: assert result.truncated is True
 ```
 
 Use:
 
-* `-vv` for more detail
-* `-k <pattern>` to re-run a single failing area, e.g.:
+* `-vv` for full assertion diffs.
+* `-k "<pattern>"` to isolate one failure:
 
 ```bash
 pytest tests/embedding/test_truncation_and_text_length.py::test_truncate_true_sets_flag -vv
@@ -603,76 +785,80 @@ pytest tests/embedding/test_truncation_and_text_length.py::test_truncate_true_se
 
 1. **Schema mismatch**
 
-   * Fix your wire shapes (see §4).
+   * Shapes don’t match what `test_golden_samples.py` or `test_schema_lint.py` expect.
+   * Fix your DTO / serializer to align with the schema.
 
-2. **Wrong error code**
+2. **Wrong error code or class**
 
-   * Provider error mapping incorrect (see §5.1, §5.6).
+   * `test_error_mapping_retryable.py` shows you expected `(code, class)` pairs.
+   * Update your provider error mapping.
 
 3. **Streaming violations**
 
-   * Multiple final chunks
-   * Chunks after an error
-   * Missing `is_final` flag
+   * `test_streaming_semantics.py` in LLM/Graph catches:
+
+     * Multiple final events
+     * Data after final/error
+     * Missing `is_final` markers.
 
 4. **Deadline misbehavior**
 
-   * Ignoring `ctx.deadline_ms`
-   * Not timing out when expected
+   * `test_deadline_enforcement.py` ensures `ctx.deadline_ms` is respected and you surface `DEADLINE_EXCEEDED` instead of silent hangs.
 
-5. **Multi-tenant / context issues**
+5. **Context / SIEM issues**
 
-   * Treating `tenant` incorrectly
-   * Ignoring `idempotency_key` or `request_id` where tests expect behavior.
+   * `test_context_siem.py` fails if:
+
+     * Tenant IDs are logged raw.
+     * PII appears in metrics labels.
 
 ### 7.3 Guided Triage Flow
 
-When you hit a failing test:
+When a test fails:
 
 1. **Open the test file.**
-   The test will usually name the exact behavior it expects.
+   Tests are deliberately descriptive (function names, docstrings).
 
 2. **Identify the operation.**
-   e.g., `llm.complete`, `embedding.embed_batch`.
+   e.g., `embedding.embed_batch`, `vector.query`, `llm.stream`.
 
-3. **Check the relevant spec section.**
+3. **Check the spec.**
 
    * `BEHAVIORAL_CONFORMANCE.md` for semantics.
-   * `SCHEMA_CONFORMANCE.md` for shapes.
+   * `SCHEMA_CONFORMANCE.md` for payload shapes.
 
-4. **Check your adapter implementation.**
+4. **Check your implementation.**
 
-   * Does it follow the pattern in `IMPLEMENTATION.md`?
-   * Are you re-implementing something the base already handles?
+   * Is your adapter following the patterns in `IMPLEMENTATION.md`?
+   * Are you re-implementing things the base already handles (e.g., truncation, normalization)?
 
-5. **Instrument and re-run.**
+5. **Log, re-run, iterate.**
 
-   * Add logs (with redaction).
-   * Use request IDs from `ctx` to correlate.
+   * Add limited, redacted logging.
+   * Use `ctx.request_id` to correlate logs and pytest traces.
 
 ### 7.4 Debugging Tools and Techniques
 
-Suggestions:
+Recommendations:
 
 * **Structured logging around `_do_*`**
 
-  * Log:
+  * Log fields like:
 
     * operation
     * model / namespace
     * truncated flags
-    * error classes and codes
-  * Never log raw embeddings or full user texts.
+    * error class / code
+  * Never log full embeddings or full user texts.
 
 * **Trace IDs**
 
-  * Echo `ctx.request_id` into your logs and upstream calls.
-  * Include `traceparent` if you propagate distributed tracing.
+  * Propagate `ctx.request_id` and `ctx.traceparent` into upstream SDKs and logs.
 
-* **Minimal input reproduction**
+* **Minimal reproduction**
 
-  * Take the envelope from the failing test and send it directly via curl or a small script.
-  * Compare logs to pytest output.
+  * Use the request envelopes from failing golden / behavioral tests (or re-create them).
+  * Send manually via curl or a tiny script to verify behavior outside pytest.
 
 ---
 
@@ -680,52 +866,55 @@ Suggestions:
 
 ### 8.1 MUST / MUST NOT Behaviors
 
-Non-negotiable behaviors (examples):
+Non-negotiable patterns (examples):
 
 * Use canonical **error codes + classes** for common failure types.
-* Respect **deadlines**, returning `DEADLINE_EXCEEDED` appropriately.
-* Follow **streaming state machine**:
+* Respect **deadlines** and emit `DEADLINE_EXCEEDED` when appropriate.
+* Follow **streaming state machine** rules:
 
-  * zero or more data events
-  * exactly one terminal event (final chunk or error)
-  * nothing after terminal.
-* Enforce **schema compatibility**:
+  * Zero or more data events
+  * Exactly one terminal event (final chunk or error)
+  * No events after terminal.
+* Maintain **schema compatibility**:
 
-  * Required fields
-  * Types
-  * No incompatible changes.
+  * Required fields present
+  * Types correct
+  * No breaking changes to envelope shape.
 
 Failing these will typically:
 
-* Fail core tests, and
+* Red-light core tests, and
 * Disqualify you from higher certification levels.
 
 ### 8.2 SHOULD / SHOULD NOT Behaviors
 
-These behaviors are strongly recommended but may not be strictly required for lower levels:
+Strongly recommended but more flexible:
 
-* Using **token counting** to enforce context windows when supported.
-* Providing detailed error `details` when safe.
-* Implementing **standalone** mode protections (circuit breaker, rate limiter) if you bypass the base defaults.
-* Returning rich **health** information for observability.
+* Use **token counting** to enforce context windows when supported.
+* Provide structured `details` in errors where safe.
+* Implement robust **standalone** protections if you bypass defaults.
+* Expose richer **health** payloads for observability.
 
-These are still enforced by some tests, but failing them may only affect **Silver/Development** vs **Platinum** standing.
+Some of these are enforced, but may “only” affect Silver/Development vs Platinum.
 
 ### 8.3 Versioning and Compatibility
 
-Conformance is versioned with the protocol:
+Conformance is versioned alongside the protocol and test suite:
 
-* **Major version** (e.g. v1 → v2):
+* **Major version bump** (v1 → v2):
 
-  * May introduce breaking changes and new conformance requirements.
-  * Requires re-certification.
+  * May introduce breaking changes and new tests.
+  * Requires re-conformance and re-certification.
 
-* **Minor version / patch**:
+* **Minor / patch**:
 
-  * Should be backward compatible.
-  * Tests may gain coverage but not change semantics for existing behaviors.
+  * Should remain backward-compatible.
+  * Tests may be added but not change semantics of existing behaviors.
 
-`CERTIFICATION.md` will specify which protocol + test suite version a certification applies to.
+`CERTIFICATION.md` ties each certification level to:
+
+* Protocol version
+* Test suite version
 
 ---
 
@@ -733,161 +922,224 @@ Conformance is versioned with the protocol:
 
 ### 9.1 Local Dev Workflow
 
-Recommended for adapter authors:
+For adapter authors:
 
 * **On feature branches**:
 
-  * Run protocol-specific suites for the component you’re touching:
+  * Run the protocol-specific suite(s) you touched, e.g.:
 
-    * e.g. `pytest tests/embedding/` if you changed an embedding adapter.
+    ```bash
+    pytest tests/embedding/
+    ```
 
 * **Before merging to main**:
 
-  * Run at least:
+  * At minimum:
 
-    * `tests/schema/`
-    * The protocols modified in the PR.
+    ```bash
+    pytest tests/schema/ tests/golden/
+    pytest tests/<protocols-you-changed>/
+    ```
 
 ### 9.2 CI / CD Requirements
 
-Suggested gates:
+Suggested gating:
 
-* **Required** for merge:
+* **Required for merge**:
 
-  * Schema + relevant protocol tests passing.
-* **Required** for release:
+  * Schema + golden tests.
+  * Relevant protocol tests (`llm/`, `embedding/`, `vector/`, `graph/`) for changed code.
 
-  * Full suite passing (all protocols you claim to support).
+* **Required for release**:
+
+  * Full suite:
+
+    ```bash
+    pytest tests/ -v
+    ```
+
 * **Nice-to-have**:
 
-  * A nightly job running the full suites even if not all protocols are currently enabled in production.
+  * Nightly `python -m tests.run_conformance` to catch regressions early.
 
 ### 9.3 Tracking Conformance Over Time
 
 Best practices:
 
-* Store conformance run results for each release:
+* Record conformance runs:
 
   * Test suite version
-  * Git SHA
-  * Date
-  * Pass/fail matrix per protocol
+  * Commit SHA
+  * Date/time
+  * Per-protocol pass/fail summary
 
-* Tie certification claims to specific:
+* Tie certification claims to:
 
   * Adapter versions
   * Test suite versions
   * Protocol major versions
 
-* If a future change causes regressions:
+* When regressions appear:
 
-  * CI should catch it.
-  * You can decide whether to:
+  * CI should fail visibly.
+  * You can decide to:
 
-    * Fix the regression, or
-    * Downgrade certification level.
+    * Fix the behavior, or
+    * Consciously drop from Platinum → Silver / Development.
 
 ---
 
 ## 10. Example Conformance Profiles
 
-### 10.1 Fully Conformant Adapter (Platinum-style)
+### 10.1 Fully Conformant Multi-Protocol Adapter
 
-* Implements: LLM, Embedding, Vector, Graph
-* All schema + behavioral tests pass.
-* Certification:
+* Implements: LLM, Embedding, Vector, Graph.
+* All tests pass in:
 
-  * Suite: Platinum
-  * Protocol: Gold for each component
+  * `schema/`, `golden/`
+  * `llm/`, `embedding/`, `vector/`, `graph/`.
 
-CI snippet:
+Command:
 
 ```bash
 pytest tests/schema tests/golden tests/llm tests/embedding tests/vector tests/graph -v
 ```
 
-### 10.2 Protocol-Specific Adapter (e.g., Embedding Only)
+Certification:
 
-* Implements: Embedding only
+* Suite: Platinum.
+* Protocol: Gold for each protocol.
+
+### 10.2 Single-Protocol Adapter (Embedding Only)
+
+* Implements: Embedding only.
 * Runs:
 
-  * `tests/schema/`
-  * `tests/golden/`
-  * `tests/embedding/`
-* Certification:
+  ```bash
+  pytest tests/schema tests/golden tests/embedding -v
+  ```
 
-  * Suite: may qualify at Development/Silver depending on thresholds
-  * Protocol: Embedding V1.0 Gold/Silver/Development
+Certification:
+
+* Suite: likely Development/Silver depending on thresholds.
+* Protocol: Embedding V1.0 Gold/Silver/Development depending on pass count.
 
 ### 10.3 In-Development Adapter
 
-* New provider integration in progress
+* New provider integration, WIP.
 * Strategy:
 
-  * Start by passing simpler behavioral tests (basic operations, health).
-  * Gradually enable:
+  1. Start with:
 
-    * Deadline tests
-    * Edge-case streaming tests
-    * Partial failure tests
-* Certification:
+     * `test_embed_basic.py`
+     * `test_capabilities_shape.py`
+     * `test_health_report.py`
+  2. Add:
 
-  * Target Development level first, then iterate toward Silver/Platinum.
+     * Deadline + error mapping tests
+     * Truncation / normalization tests
+     * Batch / cache tests
+  3. Aim for Development tier first, then iterate to Silver/Platinum.
 
 ---
 
 ## 11. FAQ and Troubleshooting
 
 **Q: Do I need to pass *all* tests to be “conformant”?**
-A: For **full, Platinum-style conformance**: effectively yes, for the protocols you claim and all normative tests. Lower certification levels allow some gaps; see `CERTIFICATION.md`.
+A: For **full (Platinum-style) conformance** for a protocol: effectively yes, for all normative tests in that protocol and schema/golden. Lower levels (Silver/Development) allow gaps; see `CERTIFICATION.md`.
 
 **Q: Can I skip schema tests if I only use the official SDK?**
-A: No. Schema tests verify your **wire contract**, which remains relevant even if you use the SDK. They also catch misconfigurations and customizations.
+A: No. Schema tests validate the **wire contract**, which still matters even if you’re using the SDK. They also catch configuration/customization mistakes.
 
-**Q: Why are streaming tests so strict?**
-A: Because routers and clients rely on precise streaming semantics to free resources, apply backpressure correctly, and avoid leaks.
+**Q: Why are streaming tests so picky?**
+A: Routers and clients rely on precise streaming semantics for resource cleanup and backpressure. Leaky or mis-ordered streams cause real production issues.
 
 **Q: How do I know if a failure is a test bug vs my bug?**
 A:
 
-1. Read the test file and spec section it references.
-2. If your behavior matches the spec but the test disagrees, open an issue with:
+1. Read the failing test in `tests/<protocol>/...`.
+2. Cross-check the referenced section in `SPECIFICATION.md` / `BEHAVIORAL_CONFORMANCE.md`.
+3. If your behavior clearly matches spec and the test does not, open an issue with:
 
    * Test name
-   * Logs / envelopes
+   * Logs or captured envelopes
    * Your reasoning.
-     Test suites are versioned; genuine issues do get fixed.
 
 **Q: What happens when the test suite changes?**
-A: `CERTIFICATION.md` will identify test suite versions. A new test suite may require re-running conformance and potentially re-certification for new behavior.
+A: `CERTIFICATION.md` ties certifications to test suite versions. A new suite or version may require re-running conformance and refreshing certifications.
 
 ---
 
 ## 12. Appendix
 
-### 12.1 Suggested Test Index (Example)
+### 12.1 Test Index (Aligned with Current Tree)
 
-> The actual index lives next to the tests; this is an example layout.
+> This is a convenience map; the source of truth is the test files themselves.
 
-| Area                    | File / Folder                                        | Protocol  |
-| ----------------------- | ---------------------------------------------------- | --------- |
-| LLM streaming           | `tests/llm/test_streaming_semantics.py`              | LLM       |
-| LLM tokens              | `tests/llm/test_sampling_params_validation.py`       | LLM       |
-| Embedding truncation    | `tests/embedding/test_truncation_and_text_length.py` | Embedding |
-| Embedding normalization | `tests/embedding/test_normalization_semantics.py`    | Embedding |
-| Vector query            | `tests/vector/test_query_basic.py`                   | Vector    |
-| Vector dims             | `tests/vector/test_dimension_validation.py`          | Vector    |
-| Graph streaming         | `tests/graph/test_streaming_semantics.py`            | Graph     |
-| Schema lint             | `tests/schema/test_schema_lint.py`                   | Schema    |
-| Golden samples          | `tests/golden/test_golden_samples.py`                | All       |
+| Area                         | File                                                 | Protocol  |
+| ---------------------------- | ---------------------------------------------------- | --------- |
+| LLM capabilities shape       | `tests/llm/test_capabilities_shape.py`               | LLM       |
+| LLM basic complete           | `tests/llm/test_complete_basic.py`                   | LLM       |
+| LLM streaming semantics      | `tests/llm/test_streaming_semantics.py`              | LLM       |
+| LLM token / sampling checks  | `tests/llm/test_sampling_params_validation.py`       | LLM       |
+| LLM token consistency        | `tests/llm/test_count_tokens_consistency.py`         | LLM       |
+| LLM message validation       | `tests/llm/test_message_validation.py`               | LLM       |
+| LLM deadlines & errors       | `tests/llm/test_deadline_enforcement.py`             | LLM       |
+| LLM retryable errors         | `tests/llm/test_error_mapping_retryable.py`          | LLM       |
+| LLM SIEM / context hygiene   | `tests/llm/test_context_siem.py`                     | LLM       |
+| LLM health reporting         | `tests/llm/test_health_report.py`                    | LLM       |
+| LLM wire handler             | `tests/llm/test_wire_handler.py`                     | LLM       |
+| Embedding basic              | `tests/embedding/test_embed_basic.py`                | Embedding |
+| Embedding batch basics       | `tests/embedding/test_embed_batch_basic.py`          | Embedding |
+| Embedding truncation         | `tests/embedding/test_truncation_and_text_length.py` | Embedding |
+| Embedding normalization      | `tests/embedding/test_normalization_semantics.py`    | Embedding |
+| Embedding cache & fallback   | `tests/embedding/test_cache_and_batch_fallback.py`   | Embedding |
+| Embedding count tokens       | `tests/embedding/test_count_tokens_behavior.py`      | Embedding |
+| Embedding capabilities       | `tests/embedding/test_capabilities_shape.py`         | Embedding |
+| Embedding deadlines & errors | `tests/embedding/test_deadline_enforcement.py`       | Embedding |
+| Embedding retryable errors   | `tests/embedding/test_error_mapping_retryable.py`    | Embedding |
+| Embedding SIEM / context     | `tests/embedding/test_context_siem.py`               | Embedding |
+| Embedding health             | `tests/embedding/test_health_report.py`              | Embedding |
+| Embedding wire handler       | `tests/embedding/test_wire_handler.py`               | Embedding |
+| Vector query basic           | `tests/vector/test_query_basic.py`                   | Vector    |
+| Vector upsert basic          | `tests/vector/test_upsert_basic.py`                  | Vector    |
+| Vector delete operations     | `tests/vector/test_delete_operations.py`             | Vector    |
+| Vector batch limits          | `tests/vector/test_batch_size_limits.py`             | Vector    |
+| Vector filtering semantics   | `tests/vector/test_filtering_semantics.py`           | Vector    |
+| Vector dimension validation  | `tests/vector/test_dimension_validation.py`          | Vector    |
+| Vector namespace ops         | `tests/vector/test_namespace_operations.py`          | Vector    |
+| Vector capabilities          | `tests/vector/test_capabilities_shape.py`            | Vector    |
+| Vector deadlines & errors    | `tests/vector/test_deadline_enforcement.py`          | Vector    |
+| Vector retryable errors      | `tests/vector/test_error_mapping_retryable.py`       | Vector    |
+| Vector SIEM / context        | `tests/vector/test_context_siem.py`                  | Vector    |
+| Vector health                | `tests/vector/test_health_report.py`                 | Vector    |
+| Vector wire handler          | `tests/vector/test_wire_handler.py`                  | Vector    |
+| Graph query basics           | `tests/graph/test_query_basic.py`                    | Graph     |
+| Graph streaming semantics    | `tests/graph/test_streaming_semantics.py`            | Graph     |
+| Graph batch operations       | `tests/graph/test_batch_operations.py`               | Graph     |
+| Graph CRUD basics            | `tests/graph/test_crud_basic.py`                     | Graph     |
+| Graph schema operations      | `tests/graph/test_schema_operations.py`              | Graph     |
+| Graph dialect validation     | `tests/graph/test_dialect_validation.py`             | Graph     |
+| Graph capabilities           | `tests/graph/test_capabilities_shape.py`             | Graph     |
+| Graph deadlines & errors     | `tests/graph/test_deadline_enforcement.py`           | Graph     |
+| Graph retryable errors       | `tests/graph/test_error_mapping_retryable.py`        | Graph     |
+| Graph SIEM / context         | `tests/graph/test_context_siem.py`                   | Graph     |
+| Graph health                 | `tests/graph/test_health_report.py`                  | Graph     |
+| Graph wire handler           | `tests/graph/test_wire_handler.py`                   | Graph     |
+| Schema lint & hygiene        | `tests/schema/test_schema_lint.py`                   | Schema    |
+| Golden wire samples          | `tests/golden/test_golden_samples.py`                | All       |
+| Golden LLM samples           | `tests/golden/llm_*` (JSON + NDJSON)                 | LLM       |
+| Golden Embedding samples     | `tests/golden/embedding_*` (JSON)                    | Embedding |
+| Golden Vector samples        | `tests/golden/vector_*` (JSON)                       | Vector    |
+| Golden Graph samples         | `tests/golden/graph_*` (JSON + NDJSON)               | Graph     |
 
 ### 12.2 Glossary
 
-* **Adapter** — Implementation that plugs a provider (OpenAI, Vertex, in-house) into the Corpus Protocol via the base SDK.
+* **Adapter** — Implementation that plugs a provider (OpenAI, Vertex, in-house) into the Corpus Protocol via the SDK base classes.
 
 * **Wire handler** — Component that takes JSON envelopes, calls adapter methods, and returns canonical envelopes.
 
-* **OperationContext (`ctx`)** — Per-request context; carries deadline, tenant, tracing, etc.
+* **OperationContext (`ctx`)** — Per-request context; carries deadline, tenant, tracing, and attributes.
 
 * **Conformance** — State of passing the normative schema + behavioral test suites for your claimed protocols.
 
@@ -906,6 +1158,6 @@ A: `CERTIFICATION.md` will identify test suite versions. A new test suite may re
 ---
 
 **Maintainers:** Corpus Standards Working Group
-**Status:** Living document; aligned with Corpus Protocol Suite v1.0 conformance tests.
+**Status:** Living document; aligned with Corpus Protocol Suite v1.0 conformance tests and current `tests/` tree.
 
 ```
