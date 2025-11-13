@@ -5,7 +5,7 @@
 
 **Read this *after*:**
 
-- `QUICKSTART_ADAPTERS.md` — hello world Embedding adapter
+- `QUICK_START.md` — hello world Embedding adapter
 - `IMPLEMENTATION.md` — full runtime semantics & base class behavior
 - `BEHAVIORAL_CONFORMANCE.md` — normative behavioral rules
 - `SCHEMA_CONFORMANCE.md` — JSON schemas & wire shapes
