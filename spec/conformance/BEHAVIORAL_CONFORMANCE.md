@@ -9,7 +9,7 @@
 
 ## 1) Overview
 
-This document specifies **runtime semantics** an implementation MUST satisfy beyond schema shape. Passing behavioral conformance means your adapter’s *behavior* matches the protocol across deadlines, streaming lifecycles, error taxonomy mapping, normalization/truncation rules, caching, observability, and limits enforcement.
+This document specifies **runtime semantics** an implementation MUST satisfy beyond schema shape. Passing behavioral conformance means your adapter's *behavior* matches the protocol across deadlines, streaming lifecycles, error taxonomy mapping, normalization/truncation rules, caching, observability, and limits enforcement.
 
 * **Status:** Stable / Production-ready
 * **Applies To:** `llm/v1.0`, `vector/v1.0`, `embedding/v1.0`, `graph/v1.0`
@@ -156,7 +156,7 @@ Explore these directories to understand requirements. Each test file is designed
 | `test_context_siem.py`            | observability/SIEM                 | low        |
 | `test_wire_handler.py`            | canonical envelopes                | low        |
 
-> **How to use this index:** Start from the file tagged with the behavior you’re debugging (e.g., **taxonomy mapping**). Use *flake risk* to prioritize CI investigation.
+> **How to use this index:** Start from the file tagged with the behavior you're debugging (e.g., **taxonomy mapping**). Use *flake risk* to prioritize CI investigation.
 
 ---
 
@@ -170,7 +170,7 @@ Explore these directories to understand requirements. Each test file is designed
 
 | Condition                    | Action         | Required Signals                                     |
 | ---------------------------- | -------------- | ---------------------------------------------------- |
-| `deadline_ms <= now`         | Fail fast      | Error `DEADLINE_EXCEEDED`; no backend span           |
+| `deadline_ms <= now`         | Fail fast      | Error `DEADLINE_EXCEEDED`; no backend RPCs or child spans |
 | `deadline_ms` elapses mid-op | Abort promptly | Canonical error + observation with `deadline_bucket` |
 | No deadline                  | Proceed        | No deadline tags                                     |
 
@@ -181,6 +181,7 @@ Explore these directories to understand requirements. Each test file is designed
 * Exactly **one terminal** (`end` or `error`) per stream.
 * **No data after terminal**; mid-stream **error is terminal**.
 * Keep-alives/heartbeats MUST NOT violate pacing/backpressure.
+* The single terminal frame MUST correspond to exactly one `count_stream_final_outcome` metric emission (see METRICS.md).
 
 ```
 START -> DATA* -> (END | ERROR) -> STOP
@@ -194,6 +195,7 @@ START -> DATA* -> (END | ERROR) -> STOP
 ### 6.3 Error Taxonomy & Retryability
 
 * Deterministic mapping from provider error → **canonical code**.
+* Canonical codes MUST be those defined in ERRORS.md (e.g. `BAD_REQUEST`, `RESOURCE_EXHAUSTED`, `DEADLINE_EXCEEDED`).
 * **Retryable** errors include structured hints (e.g., `retry_after_ms` when available).
 * **Validation** errors are **non-retryable** and include structured `validation_errors` when applicable.
 
@@ -203,7 +205,7 @@ START -> DATA* -> (END | ERROR) -> STOP
 | Resource   | `RESOURCE_EXHAUSTED`                                  | Yes        | Prefer `retry_after_ms`                       |
 | Transport  | `UNAVAILABLE`, `TRANSIENT_NETWORK`                    | Yes        | Backoff expected                              |
 | Deadline   | `DEADLINE_EXCEEDED`                                   | No         | Emitted locally                               |
-| Internal   | `INTERNAL`                                            | No         | Don’t mark retryable unless clearly transient |
+| Internal   | `INTERNAL`                                            | No         | Don't mark retryable unless clearly transient |
 
 ---
 
@@ -217,7 +219,7 @@ START -> DATA* -> (END | ERROR) -> STOP
 
 ### 6.5 Token Counting (LLM/Embedding)
 
-* **Monotonicity:** longer input never yields fewer tokens.
+* **Monotonicity:** For any two inputs A and B where A is a strict prefix of B under the same model, `tokens(B) >= tokens(A)` MUST hold.
 * **Unicode-safe:** combining marks / surrogate pairs handled safely.
 * **Model-gated:** unsupported models return canonical error.
 
@@ -247,6 +249,7 @@ key = hash(tenant_hash, op, model, normalize, params, sha256(text|payload))
 * Exactly **one** observation per op; **stable low-cardinality** tags.
 * Never emit raw text, raw vectors, or plain tenant IDs (hash only).
 * When `deadline_ms` present, emit `deadline_bucket`.
+* Metrics names and required labels are defined in METRICS.md; this section constrains values and SIEM-safety, not metric shapes.
 
 **Required tags (illustrative):** `component`, `op`, `server`, `version`, `tenant_hash`, `deadline_bucket?`, `batch_size?`.
 
