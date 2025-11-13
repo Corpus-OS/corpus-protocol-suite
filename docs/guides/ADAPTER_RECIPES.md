@@ -1,7 +1,7 @@
 # Corpus Protocol (v1.0) — Adapter Recipes
 
 > **Goal:** Give adapter authors copy-pasteable patterns for real-world adapters.  
-> **Audience:** People who finished `Adapter Quickstart` and now want “how do I do X with my provider?”.
+> **Audience:** People who finished `Quickstart` and now want “how do I do X with my provider?”.
 
 **Read this *after*:**
 
