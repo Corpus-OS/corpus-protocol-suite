@@ -10,7 +10,7 @@
 ## 🚀 Hello World Adapter (30-second start)
 
 ```python
-from corpus_sdk.embedding.embedding_base import *
+from corpus_sdk.embedding.embedding_base import BaseEmbeddingAdapter, EmbeddingCapabilities, EmbedSpec, BatchEmbedSpec, EmbedResult, BatchEmbedResult, EmbeddingVector
 
 class HelloEmbeddingAdapter(BaseEmbeddingAdapter):
     async def _do_capabilities(self):
@@ -36,6 +36,7 @@ class HelloEmbeddingAdapter(BaseEmbeddingAdapter):
         return {"ok": True}
 
 # Use it:
+from corpus_sdk.embedding.embedding_base import WireEmbeddingHandler
 adapter = HelloEmbeddingAdapter(mode="standalone")
 handler = WireEmbeddingHandler(adapter)
 # handler.handle(envelope) → full Corpus protocol!
