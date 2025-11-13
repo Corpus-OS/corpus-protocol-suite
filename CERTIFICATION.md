@@ -1,5 +1,3 @@
-You're absolutely right. Let me use the working badges you provided and be more thoughtful about placement:
-
 # Corpus Protocol Suite V1.0 Conformance Test Coverage
 
 ## Overview
@@ -265,9 +263,9 @@ This suite constitutes the **official Corpus Protocol Suite V1.0 Reference Confo
 
 | Level | Requirements | Badge |
 |-------|--------------|--------|
-| **Platinum** | 303/303 tests across all protocols | `![Corpus Protocol Suite](https://img.shields.io/badge/Corpus_Protocol_Suite-Platinum_Certified-gold)` |
-| **Silver** | 212+ tests with major protocol coverage | `![Corpus Protocol Suite](https://img.shields.io/badge/Corpus_Protocol_Suite-Silver_Certified-silver)` |
-| **Development** | 106+ tests in active development | `![Corpus Protocol Suite](https://img.shields.io/badge/Corpus_Protocol_Suite-Development_Certified-blue)` |
+| **Platinum** | 303/303 tests across all protocols | ![Corpus Protocol Suite](https://img.shields.io/badge/Corpus_Protocol_Suite-Platinum_Certified-gold) |
+| **Silver** | 212+ tests with major protocol coverage | ![Corpus Protocol Suite](https://img.shields.io/badge/Corpus_Protocol_Suite-Silver_Certified-silver) |
+| **Development** | 106+ tests in active development | ![Corpus Protocol Suite](https://img.shields.io/badge/Corpus_Protocol_Suite-Development_Certified-blue) |
 
 ---
 
