@@ -1,9 +1,58 @@
+Here's the updated file with a super-short "Hello World Adapter" at the top and improved readability:
+
+```markdown
 # IMPLEMENTATION.md  
 ✅ Corpus Protocol (v1.0) — Adapter Implementation Guide (Runtime Behavior)
 
 > **Scope:** How to implement **real adapters** against the Corpus Protocol base SDKs  
 > **Components:** **LLM • Embedding • Vector • Graph**  
 > **Out of scope:** JSON schema shape (see `SCHEMA_CONFORMANCE.md`)
+
+---
+
+## 🚀 Hello World Adapter (30-second start)
+
+```python
+from corpus_sdk.embedding.embedding_base import *
+
+class HelloEmbeddingAdapter(BaseEmbeddingAdapter):
+    async def _do_capabilities(self):
+        return EmbeddingCapabilities(
+            server="hello", version="1.0.0", supported_models=("hello-1",),
+            max_batch_size=10, max_text_length=100, max_dimensions=8,
+            supports_normalization=False, supports_truncation=True
+        )
+    
+    async def _do_embed(self, spec, *, ctx=None):
+        vec = [float(len(spec.text))] + [0.0] * 7
+        return EmbedResult(
+            embedding=EmbeddingVector(vector=vec, text=spec.text, model=spec.model, dimensions=8),
+            model=spec.model, text=spec.text
+        )
+    
+    async def _do_embed_batch(self, spec, *, ctx=None):
+        embeddings = [await self._do_embed(EmbedSpec(text=t, model=spec.model)) for t in spec.texts]
+        return BatchEmbedResult(embeddings=[e.embedding for e in embeddings], model=spec.model, total_texts=len(spec.texts))
+    
+    async def _do_count_tokens(self, text, model, *, ctx=None):
+        return len(text)
+    
+    async def _do_health(self, *, ctx=None):
+        return {"ok": True}
+
+# Use it:
+adapter = HelloEmbeddingAdapter(mode="standalone")
+handler = WireEmbeddingHandler(adapter)
+# handler.handle(envelope) → full Corpus protocol!
+```
+
+**Quick Recipe:**
+- **Want LLM?** Override `_do_complete`, `_do_stream`, `_do_count_tokens`
+- **Want Embedding?** Override `_do_embed`, `_do_embed_batch`, `_do_count_tokens`  
+- **Want Vector?** Override `_do_query`, `_do_upsert`, `_do_delete`
+- **Check:** Capabilities describe your true limits
+- **Check:** Map provider errors → canonical errors
+- **Check:** Use `ctx.remaining_ms()` for timeouts
 
 ---
 
@@ -35,7 +84,7 @@ If you follow this file, your adapter will:
 
 ### 2.1 Core SDK modules
 
-You get four protocol “bases,” one per component:
+You get four protocol "bases," one per component:
 
 - **LLM**  
   `corpus_sdk.llm.llm_base`  
@@ -251,53 +300,60 @@ async def embedding_endpoint(request: Request):
     envelope = await request.json()
     resp = await handler.handle(envelope)
     return resp
+```
 
-That’s the pattern you repeat for LLM, Vector, and Graph: implement _do_*, drop the adapter into the wire handler, and your service speaks the Corpus protocol.
+That's the pattern you repeat for LLM, Vector, and Graph: implement _do_*, drop the adapter into the wire handler, and your service speaks the Corpus protocol.
 
-⸻
+---
 
-3. Context & Identity (OperationContext)
+## 3. Context & Identity (OperationContext)
 
 All components share the same context pattern:
-	•	request_id: Optional[str]
-	•	idempotency_key: Optional[str]
-	•	deadline_ms: Optional[int] (epoch ms)
-	•	traceparent: Optional[str] (W3C trace context)
-	•	tenant: Optional[str]
-	•	attrs: Mapping[str, Any] (always a dict after __post_init__)
 
-Your _do_* hooks receive ctx: Optional[OperationContext]. You should:
-	•	Use ctx.deadline_ms / ctx.remaining_ms() to set provider timeouts.
-	•	Use ctx.tenant for multi-tenant partitioning (indexes, projects, DBs).
-	•	Propagate tracing metadata (traceparent, request_id) into logs and provider SDKs.
+- `request_id: Optional[str]`
+- `idempotency_key: Optional[str]`
+- `deadline_ms: Optional[int]` (epoch ms)
+- `traceparent: Optional[str]` (W3C trace context)
+- `tenant: Optional[str]`
+- `attrs: Mapping[str, Any]` (always a dict after `__post_init__`)
+
+Your `_do_*` hooks receive `ctx: Optional[OperationContext]`. You should:
+
+- Use `ctx.deadline_ms` / `ctx.remaining_ms()` to set provider timeouts.
+- Use `ctx.tenant` for multi-tenant partitioning (indexes, projects, DBs).
+- Propagate tracing metadata (`traceparent`, `request_id`) into logs and provider SDKs.
 
 The base classes already:
-	•	Hash tenant for metrics (no raw tenant IDs).
-	•	Treat attrs as opaque and pass-through.
 
-⸻
+- Hash tenant for metrics (no raw tenant IDs).
+- Treat `attrs` as opaque and pass-through.
 
-4. Error Taxonomy & Mapping
+---
+
+## 4. Error Taxonomy & Mapping
 
 Each component defines a canonical error tree:
-	•	LLM: LLMAdapterError + BadRequest, AuthError, ResourceExhausted, ModelOverloaded, Unavailable, NotSupported, DeadlineExceeded, etc.
-	•	Embedding: EmbeddingAdapterError + BadRequest, AuthError, ResourceExhausted, TextTooLong, ModelNotAvailable, TransientNetwork, Unavailable, NotSupported, DeadlineExceeded, etc.
-	•	Vector: VectorAdapterError + BadRequest, AuthError, ResourceExhausted, DimensionMismatch, IndexNotReady, TransientNetwork, Unavailable, NotSupported, DeadlineExceeded, etc.
-	•	Graph: GraphAdapterError + graph-specific variants like InvalidQuery, DialectNotSupported, etc.
+
+- **LLM:** `LLMAdapterError` + `BadRequest`, `AuthError`, `ResourceExhausted`, `ModelOverloaded`, `Unavailable`, `NotSupported`, `DeadlineExceeded`, etc.
+- **Embedding:** `EmbeddingAdapterError` + `BadRequest`, `AuthError`, `ResourceExhausted`, `TextTooLong`, `ModelNotAvailable`, `TransientNetwork`, `Unavailable`, `NotSupported`, `DeadlineExceeded`, etc.
+- **Vector:** `VectorAdapterError` + `BadRequest`, `AuthError`, `ResourceExhausted`, `DimensionMismatch`, `IndexNotReady`, `TransientNetwork`, `Unavailable`, `NotSupported`, `DeadlineExceeded`, etc.
+- **Graph:** `GraphAdapterError` + graph-specific variants like `InvalidQuery`, `DialectNotSupported`, etc.
 
 You are expected to:
-	1.	Catch provider/SDK errors inside _do_*.
-	2.	Map them into canonical errors by raising the right subclass with:
-	•	message
-	•	optional code (if overriding default)
-	•	optional retry_after_ms
-	•	optional resource_scope or throttle_scope
-	•	optional suggested_batch_reduction
-	•	optional JSON-safe details
-	3.	Avoid leaking provider internals (full HTTP bodies, stack traces, PII) in message or details.
 
-Wire handlers call _error_to_wire to emit the canonical envelope:
+1. Catch provider/SDK errors inside `_do_*`.
+2. Map them into canonical errors by raising the right subclass with:
+   - `message`
+   - optional `code` (if overriding default)
+   - optional `retry_after_ms`
+   - optional `resource_scope` or `throttle_scope`
+   - optional `suggested_batch_reduction`
+   - optional JSON-safe `details`
+3. Avoid leaking provider internals (full HTTP bodies, stack traces, PII) in `message` or `details`.
 
+Wire handlers call `_error_to_wire` to emit the canonical envelope:
+
+```json
 {
   "ok": false,
   "code": "RESOURCE_EXHAUSTED",
@@ -307,11 +363,13 @@ Wire handlers call _error_to_wire to emit the canonical envelope:
   "details": { "scope": "model" },
   "ms": 12.34
 }
+```
 
 Key rule: the same provider error must always map to the same (code, class, retryability).
 
-4.1 Example: provider → canonical error mapping (Embedding)
+### 4.1 Example: provider → canonical error mapping (Embedding)
 
+```python
 from corpus_sdk.embedding.embedding_base import (
     EmbeddingAdapterError,
     BadRequest,
@@ -353,69 +411,79 @@ def map_provider_error(e: Exception) -> EmbeddingAdapterError:
         return Unavailable("provider unavailable")
     # Last resort fallback
     return Unavailable("unknown provider error")
+```
 
-Then in _do_*:
+Then in `_do_*`:
 
+```python
 try:
     resp = await self._client.embed(...)
 except Exception as e:
     raise map_provider_error(e)
+```
 
+---
 
-⸻
-
-5. Modes: thin vs standalone
+## 5. Modes: thin vs standalone
 
 Every base adapter supports two modes:
-	•	mode="thin" (default)
-	•	For use under an external control plane.
-	•	Deadline policy = no-op
-	•	Circuit breaker = no-op
-	•	Rate limiter = no-op
-	•	Cache = no-op
-	•	mode="standalone"
-	•	For direct use, demos, and light production:
-	•	Enforces deadlines
-	•	Uses a per-process circuit breaker
-	•	Uses a token-bucket rate limiter
-	•	Uses in-memory TTL cache (read-paths + capabilities)
-	•	Logs a warning if running standalone with NoopMetrics
+
+- `mode="thin"` (default)
+  - For use under an external control plane.
+  - Deadline policy = no-op
+  - Circuit breaker = no-op
+  - Rate limiter = no-op
+  - Cache = no-op
+
+- `mode="standalone"`
+  - For direct use, demos, and light production:
+  - Enforces deadlines
+  - Uses a per-process circuit breaker
+  - Uses a token-bucket rate limiter
+  - Uses in-memory TTL cache (read-paths + capabilities)
+  - Logs a warning if running standalone with `NoopMetrics`
 
 You pick the mode when constructing your adapter:
 
+```python
 adapter = MyRealEmbeddingAdapter(
     mode="standalone",
     metrics=my_metrics_sink,
 )
+```
 
 You can also override individual policies explicitly (see §§6–8).
 
-⸻
+---
 
-6. Deadlines & Cancellation
+## 6. Deadlines & Cancellation
 
-Each base uses a DeadlinePolicy to enforce ctx.deadline_ms:
-	•	LLM: NoopDeadline or SimpleDeadline
-	•	Embedding: NoopDeadline or EnforcingDeadline
-	•	Vector: NoopDeadline or SimpleDeadline
-	•	Graph: same pattern
+Each base uses a `DeadlinePolicy` to enforce `ctx.deadline_ms`:
 
-6.1 Preflight
+- **LLM:** `NoopDeadline` or `SimpleDeadline`
+- **Embedding:** `NoopDeadline` or `EnforcingDeadline`
+- **Vector:** `NoopDeadline` or `SimpleDeadline`
+- **Graph:** same pattern
 
-Bases call _fail_if_expired(ctx):
-	•	If ctx.deadline_ms is set and ctx.remaining_ms() <= 0
-→ raise DeadlineExceeded("deadline already exceeded") before hitting the provider.
+### 6.1 Preflight
 
-6.2 Wrapping provider calls
+Bases call `_fail_if_expired(ctx)`:
 
-All provider awaits are wrapped via _apply_deadline() → deadline_policy.wrap(awaitable, ctx):
-	•	If asyncio.wait_for times out, the base raises DeadlineExceeded("operation timed out").
-	•	You generally should not call asyncio.wait_for on your own for the same operation.
+- If `ctx.deadline_ms` is set and `ctx.remaining_ms() <= 0`
+- → raise `DeadlineExceeded("deadline already exceeded")` before hitting the provider.
 
-6.3 Propagating budgets to providers
+### 6.2 Wrapping provider calls
 
-Inside _do_*, you should:
+All provider awaits are wrapped via `_apply_deadline() → deadline_policy.wrap(awaitable, ctx)`:
 
+- If `asyncio.wait_for` times out, the base raises `DeadlineExceeded("operation timed out")`.
+- You generally should not call `asyncio.wait_for` on your own for the same operation.
+
+### 6.3 Propagating budgets to providers
+
+Inside `_do_*`, you should:
+
+```python
 async def _do_embed(self, spec, *, ctx=None) -> EmbedResult:
     timeout_s = None
     if ctx is not None:
@@ -429,37 +497,57 @@ async def _do_embed(self, spec, *, ctx=None) -> EmbedResult:
         timeout=timeout_s,
     )
     ...
+```
 
 Guidelines:
-	•	Never pass a negative or zero timeout to providers.
-	•	If the provider has its own deadline / context object, convert remaining_ms accordingly.
 
-6.4 Metrics & deadlines
+- Never pass a negative or zero timeout to providers.
+- If the provider has its own deadline / context object, convert `remaining_ms` accordingly.
 
-Bases tag metrics with deadline_bucket when a deadline is present:
-	•	<1s, <5s, <15s, <60s, >=60s
+### 6.4 Metrics & deadlines
+
+Bases tag metrics with `deadline_bucket` when a deadline is present:
+
+- `<1s, <5s, <15s, <60s, >=60s`
 
 This gives you a quick view of how tight caller budgets are.
 
-⸻
+---
 
-7. Component Runtime Semantics
+## 7. Component Runtime Semantics
 
 This section explains the runtime behavior for each component and illustrates patterns with code.
 
-⸻
+---
 
-7.1 LLM (BaseLLMAdapter)
+## 7.1 LLM (BaseLLMAdapter)
 
-7.1.1 Core operations
-	•	capabilities() -> LLMCapabilities
-	•	complete(request, ctx) -> LLMCompletion
-	•	stream(request, ctx) -> AsyncIterator[LLMChunk]
-	•	count_tokens(text, model, ctx) -> int
-	•	health(ctx) -> Mapping[str, Any]
+### 7.1.1 Core operations
 
-7.1.2 Example wire payload (unary completion)
+- `capabilities() -> LLMCapabilities`
+- `complete(request, ctx) -> LLMCompletion`
+- `stream(request, ctx) -> AsyncIterator[LLMChunk]`
+- `count_tokens(text, model, ctx) -> int`
+- `health(ctx) -> Mapping[str, Any]`
 
+### 7.1.2 Implementation pattern
+
+**What you override:**
+- `_do_capabilities()` - Describe what you support
+- `_do_complete()` - Single request → response
+- `_do_stream()` - Streaming response chunks
+- `_do_count_tokens()` - Token counting (optional)
+- `_do_health()` - Health checks
+
+**When this will break conformance:**
+- Not respecting `supported_models` from capabilities
+- Streaming: multiple final chunks or data after error
+- Ignoring `ctx.remaining_ms()` for provider timeouts
+- Not mapping provider errors to canonical errors
+
+### 7.1.3 Example wire payload (unary completion)
+
+```json
 {
   "op": "llm.complete",
   "ctx": {
@@ -477,43 +565,48 @@ This section explains the runtime behavior for each component and illustrates pa
     "temperature": 0.7
   }
 }
+```
 
-7.1.3 Validation & context window
+### 7.1.4 Validation & context window
 
 Base-level behavior:
-	•	Validates messages as a non-empty list of {role, content} mappings.
-	•	Validates sampling params ranges.
-	•	If caps.supports_count_tokens is true:
-	•	Builds an internal prompt representation.
-	•	Calls _do_count_tokens with deadlines enforced.
-	•	Enforces prompt_tokens + max_tokens <= caps.max_context_length.
-	•	Raises BadRequest if the request is too big.
 
-7.1.4 Model gating & caching
-	•	If caps.supported_models is non-empty:
-	•	request.model must be in that set.
-	•	If in-memory cache is present (InMemoryTTLCache in standalone mode):
-	•	complete can re-use cached responses based on:
-	•	model
-	•	full messages fingerprint
-	•	sampling params
-	•	stop sequences
-	•	tenant hash
-	•	Cache hits increment cache_hits counter.
+- Validates messages as a non-empty list of `{role, content}` mappings.
+- Validates sampling params ranges.
+- If `caps.supports_count_tokens` is true:
+  - Builds an internal prompt representation.
+  - Calls `_do_count_tokens` with deadlines enforced.
+  - Enforces `prompt_tokens + max_tokens <= caps.max_context_length`.
+  - Raises `BadRequest` if the request is too big.
 
-7.1.5 Streaming semantics
-	•	stream() uses a streaming gate (_with_gates_stream):
-	•	Deadline preflight
-	•	Rate limit acquire/release
-	•	Circuit breaker
-	•	Periodic deadline checks while streaming
-	•	You implement _do_stream(request, ctx) -> AsyncIterator[LLMChunk]:
-	•	Yield chunks with text, is_final, model (and any other fields used in tests).
-	•	Exactly one chunk with is_final=True.
-	•	No chunks after is_final=True or an error.
+### 7.1.5 Model gating & caching
 
-Example: simple LLM adapter
+- If `caps.supported_models` is non-empty:
+  - `request.model` must be in that set.
+- If in-memory cache is present (`InMemoryTTLCache` in standalone mode):
+  - `complete` can re-use cached responses based on:
+    - model
+    - full messages fingerprint
+    - sampling params
+    - stop sequences
+    - tenant hash
+  - Cache hits increment `cache_hits` counter.
 
+### 7.1.6 Streaming semantics
+
+- `stream()` uses a streaming gate (`_with_gates_stream`):
+  - Deadline preflight
+  - Rate limit acquire/release
+  - Circuit breaker
+  - Periodic deadline checks while streaming
+- You implement `_do_stream(request, ctx) -> AsyncIterator[LLMChunk]`:
+  - Yield chunks with `text`, `is_final`, `model` (and any other fields used in tests).
+  - Exactly one chunk with `is_final=True`.
+  - No chunks after `is_final=True` or an error.
+
+**Example: simple LLM adapter**
+
+```python
 from typing import AsyncIterator, Dict, Any
 from corpus_sdk.llm.llm_base import (
     BaseLLMAdapter,
@@ -558,86 +651,108 @@ class MyLLMAdapter(BaseLLMAdapter):
 
     async def _do_health(self, *, ctx=None) -> Dict[str, Any]:
         return {"ok": True, "server": "my-llm-provider", "version": "1.0.0"}
+```
 
+---
 
+## 7.2 Embedding (BaseEmbeddingAdapter)
 
-⸻
+### 7.2.1 Implementation pattern
 
-7.2 Embedding (BaseEmbeddingAdapter)
+**What you override:**
+- `_do_capabilities()` - Describe limits and support
+- `_do_embed()` - Single text → vector
+- `_do_embed_batch()` - Batch texts → vectors (or raise `NotSupported`)
+- `_do_count_tokens()` - Token counting (optional)
+- `_do_health()` - Health checks
+
+**When this will break conformance:**
+- Capabilities don't match actual provider limits
+- Not using base truncation for `max_text_length`
+- Returning normalized vectors but `normalizes_at_source=False`
+- Batch: not reporting partial failures correctly
 
 Base handles truncation, normalization, caching, deadlines, partial batch fallback, and metrics.
-You implement _do_capabilities, _do_embed, _do_embed_batch, _do_count_tokens, _do_health.
 
-7.2.1 Core types & operations
+### 7.2.2 Core types & operations
 
-Types:
-	•	EmbedSpec, BatchEmbedSpec
-	•	EmbedResult, BatchEmbedResult
-	•	EmbeddingVector
-	•	EmbeddingCapabilities
+**Types:**
 
-Operations:
-	•	capabilities() -> EmbeddingCapabilities
-	•	embed(spec, ctx) -> EmbedResult
-	•	embed_batch(spec, ctx) -> BatchEmbedResult
-	•	count_tokens(text, model, ctx) -> int
-	•	health(ctx) -> Dict[str, Any]
+- `EmbedSpec`, `BatchEmbedSpec`
+- `EmbedResult`, `BatchEmbedResult`
+- `EmbeddingVector`
+- `EmbeddingCapabilities`
 
-7.2.2 Capabilities fields
+**Operations:**
 
-Important fields in EmbeddingCapabilities:
-	•	supported_models: Tuple[str, ...>
-	•	max_batch_size: Optional[int]
-	•	max_text_length: Optional[int]
-	•	max_dimensions: Optional[int]
-	•	supports_normalization: bool
-	•	supports_truncation: bool
-	•	supports_token_counting: bool
-	•	normalizes_at_source: bool
-	•	truncation_mode: str ("base" or "adapter")
-	•	supports_deadline: bool
+- `capabilities() -> EmbeddingCapabilities`
+- `embed(spec, ctx) -> EmbedResult`
+- `embed_batch(spec, ctx) -> BatchEmbedResult`
+- `count_tokens(text, model, ctx) -> int`
+- `health(ctx) -> Dict[str, Any]`
 
-7.2.3 Truncation semantics
-	•	If max_text_length is set and len(text) > max_text_length:
-	•	Base uses SimpleCharTruncation.apply(text, max_len, allow=spec.truncate).
-	•	If truncate=True: text is truncated, EmbedResult.truncated=True.
-	•	If truncate=False: raise TextTooLong.
+### 7.2.3 Capabilities fields
 
-You usually do not need to manually truncate inside _do_embed.
+Important fields in `EmbeddingCapabilities`:
 
-7.2.4 Normalization semantics
-	•	If spec.normalize=True:
-	•	If caps.supports_normalization=False: raise NotSupported.
-	•	Else if caps.normalizes_at_source=False:
-	•	Base applies L2 normalization (L2Normalization) to outbound vectors:
-	•	norm = sqrt(sum(v*v)) or 1.0
-	•	v[i] = v[i] / norm
+- `supported_models: Tuple[str, ...]`
+- `max_batch_size: Optional[int]`
+- `max_text_length: Optional[int]`
+- `max_dimensions: Optional[int]`
+- `supports_normalization: bool`
+- `supports_truncation: bool`
+- `supports_token_counting: bool`
+- `normalizes_at_source: bool`
+- `truncation_mode: str` ("base" or "adapter")
+- `supports_deadline: bool`
 
-7.2.5 Batch semantics & partial success
+### 7.2.4 Truncation semantics
 
-embed_batch:
-	•	Validates model and batch size.
-	•	Validates and truncates each text.
-	•	Attempts _do_embed_batch first.
-	•	If _do_embed_batch raises NotSupported:
-	•	Base falls back to per-text _do_embed.
-	•	Successful embeddings go into BatchEmbedResult.embeddings.
-	•	Failures go into BatchEmbedResult.failed_texts with:
-	•	index, text, error, code, message.
+- If `max_text_length` is set and `len(text) > max_text_length`:
+  - Base uses `SimpleCharTruncation.apply(text, max_len, allow=spec.truncate)`.
+  - If `truncate=True`: text is truncated, `EmbedResult.truncated=True`.
+  - If `truncate=False`: raise `TextTooLong`.
 
-7.2.6 Caching & token counting
-	•	embed uses a tenant-aware, content-addressed cache when an InMemoryTTLCache is configured:
+You usually do not need to manually truncate inside `_do_embed`.
 
-embedding:embed:tenant=<hash|global>:model=<model>:norm=<0|1>:text=<sha256(text)>
+### 7.2.5 Normalization semantics
 
+- If `spec.normalize=True`:
+  - If `caps.supports_normalization=False`: raise `NotSupported`.
+  - Else if `caps.normalizes_at_source=False`:
+    - Base applies L2 normalization (`L2Normalization`) to outbound vectors:
+      - `norm = sqrt(sum(v*v))` or `1.0`
+      - `v[i] = v[i] / norm`
 
-	•	count_tokens:
-	•	Requires model in caps.supported_models.
-	•	Requires caps.supports_token_counting=True.
-	•	Otherwise, base raises NotSupported.
+### 7.2.6 Batch semantics & partial success
 
-Example: “real-ish” Embedding adapter
+`embed_batch`:
 
+- Validates model and batch size.
+- Validates and truncates each text.
+- Attempts `_do_embed_batch` first.
+- If `_do_embed_batch` raises `NotSupported`:
+  - Base falls back to per-text `_do_embed`.
+  - Successful embeddings go into `BatchEmbedResult.embeddings`.
+  - Failures go into `BatchEmbedResult.failed_texts` with:
+    - `index`, `text`, `error`, `code`, `message`.
+
+### 7.2.7 Caching & token counting
+
+- `embed` uses a tenant-aware, content-addressed cache when an `InMemoryTTLCache` is configured:
+
+  ```
+  embedding:embed:tenant=<hash|global>:model=<model>:norm=<0|1>:text=<sha256(text)>
+  ```
+
+- `count_tokens`:
+  - Requires model in `caps.supported_models`.
+  - Requires `caps.supports_token_counting=True`.
+  - Otherwise, base raises `NotSupported`.
+
+**Example: "real-ish" Embedding adapter**
+
+```python
 from typing import Dict, Any
 from corpus_sdk.embedding.embedding_base import (
     BaseEmbeddingAdapter,
@@ -777,51 +892,54 @@ class MyRealEmbeddingAdapter(BaseEmbeddingAdapter):
             "version": "2025-01-01",
             "models": {"embed-large": {"status": "ready"}},
         }
+```
 
+---
 
+## 7.3 Vector (BaseVectorAdapter)
 
-⸻
+### 7.3.1 Core types & operations
 
-7.3 Vector (BaseVectorAdapter)
+**Types:**
 
-7.3.1 Core types & operations
+- `VectorID`, `Vector`, `VectorMatch`
+- `QuerySpec`, `UpsertSpec`, `DeleteSpec`, `NamespaceSpec`
+- `QueryResult`, `UpsertResult`, `DeleteResult`, `NamespaceResult`
+- `VectorCapabilities`
 
-Types:
-	•	VectorID, Vector, VectorMatch
-	•	QuerySpec, UpsertSpec, DeleteSpec, NamespaceSpec
-	•	QueryResult, UpsertResult, DeleteResult, NamespaceResult
-	•	VectorCapabilities
+**Operations:**
 
-Operations:
-	•	capabilities() -> VectorCapabilities
-	•	query(spec, ctx) -> QueryResult
-	•	upsert(spec, ctx) -> UpsertResult
-	•	delete(spec, ctx) -> DeleteResult
-	•	create_namespace(spec, ctx) -> NamespaceResult
-	•	delete_namespace(namespace, ctx) -> NamespaceResult
-	•	health(ctx) -> Dict[str, Any]
+- `capabilities() -> VectorCapabilities`
+- `query(spec, ctx) -> QueryResult`
+- `upsert(spec, ctx) -> UpsertResult`
+- `delete(spec, ctx) -> DeleteResult`
+- `create_namespace(spec, ctx) -> NamespaceResult`
+- `delete_namespace(namespace, ctx) -> NamespaceResult`
+- `health(ctx) -> Dict[str, Any]`
 
-7.3.2 Semantics
+### 7.3.2 Semantics
 
 Base behavior:
-	•	Validates:
-	•	Vectors as non-empty lists of numeric values.
-	•	Filters as mappings that are JSON-serializable.
-	•	Enforces capabilities:
-	•	max_dimensions: any vector dimension must be ≤ this value.
-	•	max_top_k: top_k must be ≤ this value.
-	•	max_batch_size: enforced for upsert/delete.
-	•	supports_metadata_filtering: required to use filter.
-	•	Caching:
-	•	Standalone mode with InMemoryTTLCache:
-	•	Query cache key includes:
-	•	vector hash, filter hash
-	•	namespace, top_k, include_metadata, include_vectors
-	•	backend identity (server:version)
-	•	tenant hash
 
-7.3.3 Wire example
+- Validates:
+  - Vectors as non-empty lists of numeric values.
+  - Filters as mappings that are JSON-serializable.
+- Enforces capabilities:
+  - `max_dimensions`: any vector dimension must be ≤ this value.
+  - `max_top_k`: `top_k` must be ≤ this value.
+  - `max_batch_size`: enforced for upsert/delete.
+  - `supports_metadata_filtering`: required to use filter.
+- Caching:
+  - Standalone mode with `InMemoryTTLCache`:
+  - Query cache key includes:
+    - vector hash, filter hash
+    - namespace, top_k, include_metadata, include_vectors
+    - backend identity (server:version)
+    - tenant hash
 
+### 7.3.3 Wire example
+
+```json
 {
   "op": "vector.query",
   "ctx": { "request_id": "r-1", "tenant": "tenant-a" },
@@ -834,9 +952,11 @@ Base behavior:
     "include_vectors": false
   }
 }
+```
 
-Example: in-memory Vector adapter
+**Example: in-memory Vector adapter**
 
+```python
 from typing import Dict, Any, List
 from corpus_sdk.vector.vector_base import (
     BaseVectorAdapter,
@@ -937,34 +1057,36 @@ class InMemoryVectorAdapter(BaseVectorAdapter):
 
     async def _do_health(self, *, ctx=None) -> Dict[str, Any]:
         return {"ok": True, "server": "vector-in-memory", "version": "1.0.0"}
+```
 
+---
 
-
-⸻
-
-7.4 Graph (BaseGraphAdapter)
+## 7.4 Graph (BaseGraphAdapter)
 
 The Graph base mirrors the same design:
-	•	Async-first, canonical envelopes, _do_* hooks.
-	•	Supports:
-	•	query (unary)
-	•	stream_query (streaming)
-	•	batch (mixed vertex/edge operations)
-	•	Vertex/edge CRUD as needed
-	•	capabilities, health
 
-7.4.1 Expectations
-	•	Streaming:
-	•	Exactly one terminal event (end or error).
-	•	No rows/events after terminal.
-	•	Heartbeats allowed but must respect pacing/backpressure.
-	•	Batch semantics:
-	•	Partial success is explicitly represented.
-	•	Only successful operations mutate state.
-	•	Input ordering and IDs are preserved.
+- Async-first, canonical envelopes, `_do_*` hooks.
+- Supports:
+  - `query` (unary)
+  - `stream_query` (streaming)
+  - `batch` (mixed vertex/edge operations)
+  - Vertex/edge CRUD as needed
+  - `capabilities`, `health`
 
-Example: Graph streaming skeleton
+### 7.4.1 Expectations
 
+- **Streaming:**
+  - Exactly one terminal event (end or error).
+  - No rows/events after terminal.
+  - Heartbeats allowed but must respect pacing/backpressure.
+- **Batch semantics:**
+  - Partial success is explicitly represented.
+  - Only successful operations mutate state.
+  - Input ordering and IDs are preserved.
+
+**Example: Graph streaming skeleton**
+
+```python
 from typing import AsyncIterator, Dict, Any
 from corpus_sdk.graph.graph_base import (
     BaseGraphAdapter,
@@ -1008,39 +1130,42 @@ class MyGraphAdapter(BaseGraphAdapter):
 
     async def _do_health(self, *, ctx=None) -> Dict[str, Any]:
         return {"ok": True, "server": "my-graph", "version": "1.0.0"}
+```
 
+---
 
-
-⸻
-
-8. Caching & Key Design
+## 8. Caching & Key Design
 
 The base classes implement per-process caches for:
-	•	LLM complete
-	•	Embedding embed
-	•	Vector query
-	•	Capabilities for all components
 
-Properties:
-	•	Content-addressed:
-	•	Use hashes of content; no raw text or vectors in keys.
-	•	Tenant-aware:
-	•	Include tenant hash when ctx.tenant is present.
-	•	Param-sensitive:
-	•	Include model, flags, and relevant parameters (normalization, top_k, etc.).
-	•	TTL-based:
-	•	Configurable TTLs (cache_ttl_s, cache_embed_ttl_s, cache_query_ttl_s, cache_caps_ttl_s).
+- LLM complete
+- Embedding embed
+- Vector query
+- Capabilities for all components
+
+**Properties:**
+
+- **Content-addressed:**
+  - Use hashes of content; no raw text or vectors in keys.
+- **Tenant-aware:**
+  - Include tenant hash when `ctx.tenant` is present.
+- **Param-sensitive:**
+  - Include model, flags, and relevant parameters (normalization, top_k, etc.).
+- **TTL-based:**
+  - Configurable TTLs (`cache_ttl_s`, `cache_embed_ttl_s`, `cache_query_ttl_s`, `cache_caps_ttl_s`).
 
 If you need additional caching:
-	•	Prefer wrapping adapters or higher-level caches.
-	•	Avoid adding conflicting caches inside _do_*.
 
-⸻
+- Prefer wrapping adapters or higher-level caches.
+- Avoid adding conflicting caches inside `_do_*`.
 
-9. Metrics & Observability
+---
 
-All base classes use a MetricsSink with:
+## 9. Metrics & Observability
 
+All base classes use a `MetricsSink` with:
+
+```python
 def observe(
     *,
     component: str,
@@ -1058,18 +1183,21 @@ def counter(
     value: int = 1,
     extra: Optional[Mapping[str, Any]] = None,
 ) -> None: ...
+```
 
-Behavior:
-	•	Exactly one timing observation per op.
-	•	Additional counters for:
-	•	queries, vectors_upserted, vectors_deleted
-	•	texts_embedded, tokens_processed, count_tokens_calls
-	•	cache_hits, errors_total, etc.
-	•	Tenant IDs are hashed (tenant_hash).
-	•	Deadlines reported as deadline_bucket when present.
+**Behavior:**
 
-Example: simple Prometheus sink
+- Exactly one timing observation per op.
+- Additional counters for:
+  - queries, vectors_upserted, vectors_deleted
+  - texts_embedded, tokens_processed, count_tokens_calls
+  - cache_hits, errors_total, etc.
+- Tenant IDs are hashed (`tenant_hash`).
+- Deadlines reported as `deadline_bucket` when present.
 
+**Example: simple Prometheus sink**
+
+```python
 class PromMetricsSink:
     def __init__(self, registry):
         self._latency = ...
@@ -1091,40 +1219,45 @@ class PromMetricsSink:
     def counter(self, *, component, name, value=1, extra=None):
         labels = {"component": component, "name": name}
         self._counter.labels(**labels).inc(value)
+```
 
+---
 
-
-⸻
-
-10. Wire Handlers & Canonical Envelopes
+## 10. Wire Handlers & Canonical Envelopes
 
 Each component exposes a wire handler:
-	•	WireLLMHandler
-	•	WireEmbeddingHandler
-	•	WireVectorHandler
-	•	WireGraphHandler
 
-10.1 Envelopes
+- `WireLLMHandler`
+- `WireEmbeddingHandler`
+- `WireVectorHandler`
+- `WireGraphHandler`
 
-Input:
+### 10.1 Envelopes
 
+**Input:**
+
+```json
 {
   "op": "<prefix>.<operation>",
   "ctx": { ... },
   "args": { ... }
 }
+```
 
-Success output:
+**Success output:**
 
+```json
 {
   "ok": true,
   "code": "OK",
   "ms": 12.3,
   "result": { ... }
 }
+```
 
-Error output:
+**Error output:**
 
+```json
 {
   "ok": false,
   "code": "BAD_REQUEST",
@@ -1134,17 +1267,20 @@ Error output:
   "details": { ... } | null,
   "ms": 1.2
 }
+```
 
 Wire handlers:
-	•	Parse ctx into OperationContext via _ctx_from_wire.
-	•	Construct typed specs (EmbedSpec, QuerySpec, etc.) from args.
-	•	Call your adapter methods.
-	•	Normalize results with _success_to_wire.
-	•	Normalize errors with _error_to_wire.
-	•	For unknown op, raise NotSupported("unknown operation '<op>'").
 
-Example: embedding wire endpoint
+- Parse `ctx` into `OperationContext` via `_ctx_from_wire`.
+- Construct typed specs (`EmbedSpec`, `QuerySpec`, etc.) from `args`.
+- Call your adapter methods.
+- Normalize results with `_success_to_wire`.
+- Normalize errors with `_error_to_wire`.
+- For unknown op, raise `NotSupported("unknown operation '<op>'")`.
 
+**Example: embedding wire endpoint**
+
+```python
 from fastapi import FastAPI, Request
 from corpus_sdk.embedding.embedding_base import WireEmbeddingHandler
 from my_embedding_adapter import MyRealEmbeddingAdapter
@@ -1158,71 +1294,77 @@ async def embedding_endpoint(request: Request):
     envelope = await request.json()
     resp = await handler.handle(envelope)
     return resp
+```
 
+---
 
+## 11. Streaming Rules (LLM & Graph)
 
-⸻
+Streaming operations (`llm.stream`, `graph.stream_query`) must obey:
 
-11. Streaming Rules (LLM & Graph)
-
-Streaming operations (llm.stream, graph.stream_query) must obey:
-	•	Exactly one terminal envelope:
-	•	Final chunk with is_final=True (LLM), or
-	•	Terminal end event (Graph), or
-	•	Single error envelope.
-	•	No data after terminal.
-	•	Mid-stream error is terminal.
-	•	Heartbeats are allowed but must not flood or ignore backpressure.
+- Exactly one terminal envelope:
+  - Final chunk with `is_final=True` (LLM), or
+  - Terminal end event (Graph), or
+  - Single error envelope.
+- No data after terminal.
+- Mid-stream error is terminal.
+- Heartbeats are allowed but must not flood or ignore backpressure.
 
 The base enforces:
-	•	Deadline preflight.
-	•	Rate limiting.
-	•	Circuit breaker integration.
-	•	Deadline checks across long-running streams.
 
-You implement _do_stream / _do_stream_query to produce chunks/events that the wire handler wraps.
+- Deadline preflight.
+- Rate limiting.
+- Circuit breaker integration.
+- Deadline checks across long-running streams.
 
-⸻
+You implement `_do_stream` / `_do_stream_query` to produce chunks/events that the wire handler wraps.
 
-12. Conformance Tests & Mocks (High-Level)
+---
+
+## 12. Conformance Tests & Mocks (High-Level)
 
 Three main conformance pillars:
-	•	SPECIFICATION.md — normative protocol description.
-	•	SCHEMA_CONFORMANCE.md — JSON schemas & wire shapes.
-	•	BEHAVIORAL_CONFORMANCE.md — semantic behavior & edge cases.
+
+- `SPECIFICATION.md` — normative protocol description.
+- `SCHEMA_CONFORMANCE.md` — JSON schemas & wire shapes.
+- `BEHAVIORAL_CONFORMANCE.md` — semantic behavior & edge cases.
 
 Plus:
-	•	Mock adapters for LLM, Embedding, Vector, Graph.
-	•	Conformance test suites for:
-	•	Schema conformance.
-	•	Behavioral conformance.
 
-Adapter author workflow:
-	1.	Implement your adapter on top of the base class.
-	2.	Run schema verify targets (make verify-schema).
-	3.	Run behavioral suites (make test-llm-conformance, make test-embedding-conformance, etc.).
-	4.	Iterate until your adapter passes all suites unmodified.
+- Mock adapters for LLM, Embedding, Vector, Graph.
+- Conformance test suites for:
+  - Schema conformance.
+  - Behavioral conformance.
 
-⸻
+**Adapter author workflow:**
 
-13. Environment, Configuration, and Modes
+1. Implement your adapter on top of the base class.
+2. Run schema verify targets (`make verify-schema`).
+3. Run behavioral suites (`make test-llm-conformance`, `make test-embedding-conformance`, etc.).
+4. Iterate until your adapter passes all suites unmodified.
+
+---
+
+## 13. Environment, Configuration, and Modes
 
 Typical knobs:
-	•	mode: "thin" or "standalone".
-	•	metrics: your MetricsSink implementation.
-	•	Policy overrides:
-	•	deadline_policy
-	•	breaker
-	•	cache
-	•	limiter
-	•	Embedding-specific: truncation, normalization.
-	•	Cache TTLs:
-	•	LLM: cache_ttl_s
-	•	Embedding: cache_embed_ttl_s, cache_caps_ttl_s
-	•	Vector: cache_query_ttl_s, cache_caps_ttl_s
 
-Example: wiring from env
+- `mode`: "thin" or "standalone".
+- `metrics`: your MetricsSink implementation.
+- Policy overrides:
+  - `deadline_policy`
+  - `breaker`
+  - `cache`
+  - `limiter`
+- Embedding-specific: truncation, normalization.
+- Cache TTLs:
+  - LLM: `cache_ttl_s`
+  - Embedding: `cache_embed_ttl_s`, `cache_caps_ttl_s`
+  - Vector: `cache_query_ttl_s`, `cache_caps_ttl_s`
 
+**Example: wiring from env**
+
+```python
 import os
 from corpus_sdk.embedding.embedding_base import InMemoryTTLCache, TokenBucketLimiter
 
@@ -1236,192 +1378,204 @@ adapter = MyRealEmbeddingAdapter(
     limiter=TokenBucketLimiter(rate=rate, burst=100),
     cache_embed_ttl_s=cache_ttl,
 )
+```
 
+---
 
-
-⸻
-
-14. Partial Failures & Batch Behavior
+## 14. Partial Failures & Batch Behavior
 
 The system prefers explicit partial success over all-or-nothing semantics.
-	•	Embedding:
-	•	BatchEmbedResult.failed_texts carries:
-	•	index, text, error, code, message.
-	•	Vector:
-	•	UpsertResult, DeleteResult include:
-	•	upserted_count / deleted_count
-	•	failed_count
-	•	failures: List[Dict[str, Any]]
-	•	Graph:
-	•	Batch ops encode per-op success/failure as required by BEHAVIORAL_CONFORMANCE.md.
 
-Rules:
-	•	Never silently drop failed items.
-	•	Counts must match actual successes and failures.
-	•	Input order and indices must be preserved.
+- **Embedding:**
+  - `BatchEmbedResult.failed_texts` carries:
+    - `index`, `text`, `error`, `code`, `message`.
+- **Vector:**
+  - `UpsertResult`, `DeleteResult` include:
+    - `upserted_count` / `deleted_count`
+    - `failed_count`
+    - `failures: List[Dict[str, Any]]`
+- **Graph:**
+  - Batch ops encode per-op success/failure as required by `BEHAVIORAL_CONFORMANCE.md`.
 
-⸻
+**Rules:**
 
-15. Extending Adapters Safely & Common Pitfalls
+- Never silently drop failed items.
+- Counts must match actual successes and failures.
+- Input order and indices must be preserved.
+
+---
+
+## 15. Extending Adapters Safely & Common Pitfalls
 
 You can extend adapters:
-	•	Inside _do_*: add provider features and advanced options.
-	•	Outside the base: wrap adapters with higher-level routing, logging, or policy layers.
+
+- **Inside `_do_*`:** add provider features and advanced options.
+- **Outside the base:** wrap adapters with higher-level routing, logging, or policy layers.
 
 The canonical contract is defined by:
-	•	Base classes
-	•	Wire handlers
-	•	Conformance tests
+
+- Base classes
+- Wire handlers
+- Conformance tests
 
 As long as those pass unchanged, you are within spec.
 
-15.1 Common Pitfalls
+### 15.1 Common Pitfalls
 
-LLM
-	•	Forgetting to enforce supported_models → requests for unknown models slip through.
-	•	Violating streaming rules (is_final multiple times or trailing chunks).
-	•	Ignoring deadlines, causing upstream provider timeouts that never surface as DeadlineExceeded.
+**LLM**
 
-Embedding
-	•	Re-implementing truncation inside _do_embed instead of relying on base behavior.
-	•	Returning already-normalized vectors but incorrectly setting normalizes_at_source=False.
-	•	Forgetting to set supports_token_counting and implementing _do_count_tokens anyway (base may never call it).
-	•	Not including model in supported_models, causing ModelNotAvailable to fire unexpectedly.
+- Forgetting to enforce `supported_models` → requests for unknown models slip through.
+- Violating streaming rules (`is_final` multiple times or trailing chunks).
+- Ignoring deadlines, causing upstream provider timeouts that never surface as `DeadlineExceeded`.
 
-Vector
-	•	Returning vectors with mismatched dimensions relative to capabilities.
-	•	Using filters when supports_metadata_filtering=False.
-	•	Ignoring max_batch_size and relying on provider failures instead of raising BadRequest.
-	•	Using raw vector contents in cache keys or logs.
+**Embedding**
 
-Graph
-	•	Emitting extra data after an end event or error in streaming.
-	•	Not preserving row order or IDs in batch responses.
-	•	Collapsing partial failures into a single global error instead of per-op details.
+- Re-implementing truncation inside `_do_embed` instead of relying on base behavior.
+- Returning already-normalized vectors but incorrectly setting `normalizes_at_source=False`.
+- Forgetting to set `supports_token_counting` and implementing `_do_count_tokens` anyway (base may never call it).
+- Not including model in `supported_models`, causing `ModelNotAvailable` to fire unexpectedly.
 
-Wire / Metrics / Security
-	•	Forking wire handlers instead of using the provided ones.
-	•	Logging entire envelopes (including text/embeddings) without redaction.
-	•	Exposing raw tenant IDs in metrics or logs instead of hashed identifiers.
+**Vector**
+
+- Returning vectors with mismatched dimensions relative to capabilities.
+- Using filters when `supports_metadata_filtering=False`.
+- Ignoring `max_batch_size` and relying on provider failures instead of raising `BadRequest`.
+- Using raw vector contents in cache keys or logs.
+
+**Graph**
+
+- Emitting extra data after an end event or error in streaming.
+- Not preserving row order or IDs in batch responses.
+- Collapsing partial failures into a single global error instead of per-op details.
+
+**Wire / Metrics / Security**
+
+- Forking wire handlers instead of using the provided ones.
+- Logging entire envelopes (including text/embeddings) without redaction.
+- Exposing raw tenant IDs in metrics or logs instead of hashed identifiers.
 
 If conformance tests are failing in confusing ways, check this section first.
 
-⸻
+---
 
-16. Security & Multi-Tenancy
+## 16. Security & Multi-Tenancy
 
-Base-level guarantees:
-	•	No raw tenant ID in caches or metrics.
-	•	No raw text in cache keys (only digests).
-	•	OperationContext.attrs is treated as opaque and not logged by default.
+**Base-level guarantees:**
 
-Adapter responsibilities:
-	•	Use ctx.tenant to:
-	•	Select tenant-specific indices, namespaces, or projects.
-	•	Enforce access control for the underlying provider.
-	•	Keep details in errors SIEM-safe and low-cardinality.
-	•	Avoid logging full prompts/text/vectors unless you have clear policies and redaction in place.
+- No raw tenant ID in caches or metrics.
+- No raw text in cache keys (only digests).
+- `OperationContext.attrs` is treated as opaque and not logged by default.
 
-⸻
+**Adapter responsibilities:**
 
-17. Implementation Checklists
+- Use `ctx.tenant` to:
+  - Select tenant-specific indices, namespaces, or projects.
+  - Enforce access control for the underlying provider.
+- Keep details in errors SIEM-safe and low-cardinality.
+- Avoid logging full prompts/text/vectors unless you have clear policies and redaction in place.
 
-Use these as the “ready for conformance” gates for each adapter.
+---
 
-⸻
+## 17. Implementation Checklists
 
-17.1 LLM Adapter Checklist
-	•	Implements:
-	•	_do_capabilities() -> LLMCapabilities
-	•	_do_complete(...) -> LLMCompletion
-	•	_do_stream(...) -> AsyncIterator[LLMChunk]
-	•	_do_count_tokens(text, model, ctx) -> int
-	•	_do_health(ctx) -> Mapping[str, Any]
-	•	Honors:
-	•	supported_models gating.
-	•	max_context_length via token counting preflight when supported.
-	•	Flags like supports_streaming, supports_count_tokens.
-	•	Deadlines:
-	•	Uses ctx.remaining_ms() for provider timeouts.
-	•	Does not call upstream if deadline already exceeded.
-	•	Streaming:
-	•	Exactly one terminal chunk with is_final=True.
-	•	No chunks after final or error.
-	•	Error mapping:
-	•	Provider errors map to LLMAdapterError subclasses.
-	•	Retryability matches your mapping table.
-	•	Metrics:
-	•	One observe per op.
-	•	Token counters wired via usage.total_tokens.
-	•	Conformance:
-	•	Passes all LLM schema + behavioral suites unmodified.
+Use these as the "ready for conformance" gates for each adapter.
 
-⸻
+---
 
-17.2 Vector Adapter Checklist
-	•	Implements:
-	•	_do_capabilities() -> VectorCapabilities
-	•	_do_query(spec, ctx) -> QueryResult
-	•	_do_upsert(spec, ctx) -> UpsertResult
-	•	_do_delete(spec, ctx) -> DeleteResult
-	•	_do_create_namespace(spec, ctx) -> NamespaceResult
-	•	_do_delete_namespace(namespace, ctx) -> NamespaceResult
-	•	_do_health(ctx) -> Dict[str, Any]
-	•	Enforces:
-	•	Vector shape (non-empty, numeric).
-	•	max_dimensions, max_top_k, max_batch_size.
-	•	supports_metadata_filtering before using filter.
-	•	Caching:
-	•	Query cache keys include tenant hash, namespace, params.
-	•	No raw vectors in cache keys.
-	•	Deadlines & breaker:
-	•	Uses ctx.remaining_ms() with providers.
-	•	Uses circuit breaker hooks consistently (allow, on_success, on_error).
-	•	Partial behavior:
-	•	Upsert/delete results report per-item failures when applicable.
-	•	Conformance:
-	•	Passes vector schema + behavioral suites unmodified.
+## 17.1 LLM Adapter Checklist
 
-⸻
+- [ ] **Implements:**
+  - `_do_capabilities() -> LLMCapabilities`
+  - `_do_complete(...) -> LLMCompletion`
+  - `_do_stream(...) -> AsyncIterator[LLMChunk]`
+  - `_do_count_tokens(text, model, ctx) -> int`
+  - `_do_health(ctx) -> Mapping[str, Any]`
+- [ ] **Honors:**
+  - `supported_models` gating.
+  - `max_context_length` via token counting preflight when supported.
+  - Flags like `supports_streaming`, `supports_count_tokens`.
+- [ ] **Deadlines:**
+  - Uses `ctx.remaining_ms()` for provider timeouts.
+  - Does not call upstream if deadline already exceeded.
+- [ ] **Streaming:**
+  - Exactly one terminal chunk with `is_final=True`.
+  - No chunks after final or error.
+- [ ] **Error mapping:**
+  - Provider errors map to `LLMAdapterError` subclasses.
+  - Retryability matches your mapping table.
+- [ ] **Metrics:**
+  - One observe per op.
+  - Token counters wired via `usage.total_tokens`.
+- [ ] **Conformance:**
+  - Passes all LLM schema + behavioral suites unmodified.
 
-17.3 Embedding Adapter Checklist
-	•	Implements:
-	•	_do_capabilities() -> EmbeddingCapabilities
-	•	_do_embed(spec: EmbedSpec, ctx) -> EmbedResult
-	•	_do_embed_batch(spec: BatchEmbedSpec, ctx) -> BatchEmbedResult
-(or raises NotSupported to use base fallback)
-	•	_do_count_tokens(text, model, ctx) -> int
-	•	_do_health(ctx) -> Dict[str, Any]
-	•	Capabilities:
-	•	supported_models matches provider reality.
-	•	max_text_length, max_batch_size, max_dimensions set truthfully.
-	•	supports_normalization, normalizes_at_source, supports_token_counting correct.
-	•	Truncation:
-	•	max_text_length enforced via base truncation.
-	•	truncate=True → truncated text + EmbedResult.truncated=True.
-	•	truncate=False → TextTooLong when over limit.
-	•	Normalization:
-	•	normalize=True and supports_normalization=False → NotSupported.
-	•	If vectors are not normalized at source, base L2-normalization is sufficient.
-	•	Batch behavior:
-	•	max_batch_size enforced.
-	•	On _do_embed_batch NotSupported, base per-item fallback:
-	•	Embeddings in embeddings.
-	•	Failures in failed_texts with index, code, message.
-	•	Caching:
-	•	Uses base embed cache (tenant-scoped, content-addressed).
-	•	No raw text or tenant IDs in any cache key you add.
-	•	Deadlines & metrics:
-	•	Provider timeouts use ctx.remaining_ms().
-	•	Metrics are SIEM-safe; tenant hash only.
-	•	Conformance:
-	•	Passes all embedding schema + behavioral suites unmodified.
+---
 
-⸻
+## 17.2 Vector Adapter Checklist
 
+- [ ] **Implements:**
+  - `_do_capabilities() -> VectorCapabilities`
+  - `_do_query(spec, ctx) -> QueryResult`
+  - `_do_upsert(spec, ctx) -> UpsertResult`
+  - `_do_delete(spec, ctx) -> DeleteResult`
+  - `_do_create_namespace(spec, ctx) -> NamespaceResult`
+  - `_do_delete_namespace(namespace, ctx) -> NamespaceResult`
+  - `_do_health(ctx) -> Dict[str, Any]`
+- [ ] **Enforces:**
+  - Vector shape (non-empty, numeric).
+  - `max_dimensions`, `max_top_k`, `max_batch_size`.
+  - `supports_metadata_filtering` before using filter.
+- [ ] **Caching:**
+  - Query cache keys include tenant hash, namespace, params.
+  - No raw vectors in cache keys.
+- [ ] **Deadlines & breaker:**
+  - Uses `ctx.remaining_ms()` with providers.
+  - Uses circuit breaker hooks consistently (`allow`, `on_success`, `on_error`).
+- [ ] **Partial behavior:**
+  - Upsert/delete results report per-item failures when applicable.
+- [ ] **Conformance:**
+  - Passes vector schema + behavioral suites unmodified.
 
-✅ Adapter Ready — Corpus Protocol (v1.0)
+---
 
+## 17.3 Embedding Adapter Checklist
+
+- [ ] **Implements:**
+  - `_do_capabilities() -> EmbeddingCapabilities`
+  - `_do_embed(spec: EmbedSpec, ctx) -> EmbedResult`
+  - `_do_embed_batch(spec: BatchEmbedSpec, ctx) -> BatchEmbedResult` (or raises `NotSupported` to use base fallback)
+  - `_do_count_tokens(text, model, ctx) -> int`
+  - `_do_health(ctx) -> Dict[str, Any]`
+- [ ] **Capabilities:**
+  - `supported_models` matches provider reality.
+  - `max_text_length`, `max_batch_size`, `max_dimensions` set truthfully.
+  - `supports_normalization`, `normalizes_at_source`, `supports_token_counting` correct.
+- [ ] **Truncation:**
+  - `max_text_length` enforced via base truncation.
+  - `truncate=True` → truncated text + `EmbedResult.truncated=True`.
+  - `truncate=False` → `TextTooLong` when over limit.
+- [ ] **Normalization:**
+  - `normalize=True` and `supports_normalization=False` → `NotSupported`.
+  - If vectors are not normalized at source, base L2-normalization is sufficient.
+- [ ] **Batch behavior:**
+  - `max_batch_size` enforced.
+  - On `_do_embed_batch` `NotSupported`, base per-item fallback:
+    - Embeddings in `embeddings`.
+    - Failures in `failed_texts` with `index`, `code`, `message`.
+- [ ] **Caching:**
+  - Uses base embed cache (tenant-scoped, content-addressed).
+  - No raw text or tenant IDs in any cache key you add.
+- [ ] **Deadlines & metrics:**
+  - Provider timeouts use `ctx.remaining_ms()`.
+  - Metrics are SIEM-safe; tenant hash only.
+- [ ] **Conformance:**
+  - Passes all embedding schema + behavioral suites unmodified.
+
+---
+
+## ✅ Adapter Ready — Corpus Protocol (v1.0)
+
+```
 Components: <LLM|Embedding|Vector|Graph>
 Adapter:    <YourAdapterName>
 Mode(s):    ["thin", "standalone"]
@@ -1432,8 +1586,9 @@ Status:
   - SCHEMA_CONFORMANCE:    PASS
   - BEHAVIORAL_CONFORMANCE: PASS
   - COV_FAIL_UNDER:        <N>% or higher
+```
 
-Maintainers: Corpus SDK Team
-Last Updated: 2025-11-12
-Scope: Adapter runtime behavior; see SCHEMA_CONFORMANCE.md and BEHAVIORAL_CONFORMANCE.md for normative contracts.
-
+**Maintainers:** Corpus SDK Team  
+**Last Updated:** 2025-11-12  
+**Scope:** Adapter runtime behavior; see `SCHEMA_CONFORMANCE.md` and `BEHAVIORAL_CONFORMANCE.md` for normative contracts.
+```
