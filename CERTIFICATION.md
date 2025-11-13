@@ -20,7 +20,7 @@ This suite constitutes the **official Corpus Protocol Suite V1.0 Reference Confo
 
 ## Certification Status
 
-![Corpus Protocol Suite](https://img.shields.io/badge/Corpus_Protocol_Suite-Platinum_Certified-gold)
+![Corpus Protocol Suite](https://img.shields.io/badge/CorpusProtocol%20Suite-Platinum%20Certified-gold)
 
 ## Conformance Summary
 
@@ -263,9 +263,9 @@ This suite constitutes the **official Corpus Protocol Suite V1.0 Reference Confo
 
 | Level | Requirements | Badge |
 |-------|--------------|--------|
-| **Platinum** | 303/303 tests across all protocols | ![Corpus Protocol Suite](https://img.shields.io/badge/Corpus_Protocol_Suite-Platinum_Certified-gold) |
-| **Silver** | 212+ tests with major protocol coverage | ![Corpus Protocol Suite](https://img.shields.io/badge/Corpus_Protocol_Suite-Silver_Certified-silver) |
-| **Development** | 106+ tests in active development | ![Corpus Protocol Suite](https://img.shields.io/badge/Corpus_Protocol_Suite-Development_Certified-blue) |
+| **Platinum** | 303/303 tests across all protocols | ![Corpus Protocol Suite](https://img.shields.io/badge/CorpusProtocol%20Suite-Platinum%20Certified-gold) |
+| **Silver** | 212+ tests with major protocol coverage | ![Corpus Protocol Suite](https://img.shields.io/badge/CorpusProtocol%20Suite-Silver%20Certified-silver) |
+| **Development** | 106+ tests in active development | ![Corpus Protocol Suite](https://img.shields.io/badge/CorpusProtocol%20Suite-Development%20Certified-blue) |
 
 ---
 
@@ -275,19 +275,19 @@ This suite constitutes the **official Corpus Protocol Suite V1.0 Reference Confo
 
 #### 🏆 Platinum Certification
 ```markdown
-![Corpus Protocol Suite](https://img.shields.io/badge/Corpus_Protocol_Suite-Platinum_Certified-gold)
+![Corpus Protocol Suite](https://img.shields.io/badge/CorpusProtocol%20Suite-Platinum%20Certified-gold)
 ```
 **Usage:** Production systems with full protocol suite compliance
 
 #### 🥈 Silver Certification  
 ```markdown
-![Corpus Protocol Suite](https://img.shields.io/badge/Corpus_Protocol_Suite-Silver_Certified-silver)
+![Corpus Protocol Suite](https://img.shields.io/badge/CorpusProtocol%20Suite-Silver%20Certified-silver)
 ```
 **Usage:** Major protocol implementations in production
 
 #### 🔬 Development Certification
 ```markdown
-![Corpus Protocol Suite](https://img.shields.io/badge/Corpus_Protocol_Suite-Development_Certified-blue)
+![Corpus Protocol Suite](https://img.shields.io/badge/CorpusProtocol%20Suite-Development%20Certified-blue)
 ```
 **Usage:** Active development and testing phases
 
@@ -306,7 +306,7 @@ This suite constitutes the **official Corpus Protocol Suite V1.0 Reference Confo
 **README.md (Primary)**
 ```markdown
 # Project Name
-![Corpus Protocol Suite](https://img.shields.io/badge/Corpus_Protocol_Suite-Platinum_Certified-gold)
+![Corpus Protocol Suite](https://img.shields.io/badge/CorpusProtocol%20Suite-Platinum%20Certified-gold)
 
 A Corpus Protocol Suite implementation supporting Graph, LLM, Vector, and Embedding protocols.
 ```
