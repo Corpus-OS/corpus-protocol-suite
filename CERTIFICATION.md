@@ -7,6 +7,7 @@ This document provides authoritative conformance test coverage for the **Corpus 
 This suite constitutes the **official Corpus Protocol Suite V1.0 Reference Conformance Test Suite**. Any implementation (Corpus or third-party) MAY run these tests to verify and publicly claim conformance, provided all referenced tests pass unmodified.
 
 **Audience:** SDK/adapter implementers, vendor integrators, standards/compliance reviewers  
+
 **How to use this document:** 
 - **Vendors**: Start with Conformance Summary → Normative Test Requirements → Implementation Verification
 - **Implementers**: Review protocol-specific sections and test files
