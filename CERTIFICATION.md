@@ -2,15 +2,21 @@
 
 ## Overview
 
-This document provides authoritative conformance test coverage for the **Corpus Protocol Suite V1.0** as defined in `SPECIFICATION.md`. Each test validates normative requirements (MUST/SHOULD) from the complete specification across all four protocols.
+This document provides authoritative conformance test coverage for the **Corpus Protocol Suite V1.0** as defined in `SPECIFICATION.md`. Each test validates normative requirements (MUST/SHOULD) from the complete specification across all four runtime protocols (Graph, LLM, Vector, Embedding) and the Schema Conformance suite.
 
 This suite constitutes the **official Corpus Protocol Suite V1.0 Reference Conformance Test Suite**. Any implementation (Corpus or third-party) MAY run these tests to verify and publicly claim conformance, provided all referenced tests pass unmodified.
+
+**Audience:** SDK/adapter implementers, vendor integrators, standards/compliance reviewers  
+**How to use this document:** 
+- **Vendors**: Start with Conformance Summary → Normative Test Requirements → Implementation Verification
+- **Implementers**: Review protocol-specific sections and test files
+- **Compliance reviewers**: Use Specification Mapping for audit trails
 
 **Protocol Version:** Corpus Protocol Suite V1.0  
 **Status:** Stable / Production-Ready  
 **Last Updated:** 2025-02-07  
 **Test Location:** `https://github.com/corpus/protocol-tests`  
-**Normative Requirements:** MUST pass 276/276 conformance tests
+**Full Conformance (Platinum):** MUST pass 312/312 tests
 
 ## Dual-Level Certification System
 
@@ -22,57 +28,29 @@ This document defines two complementary certification levels:
 
 ## Certification Levels
 
+*See "Conformance Certification Levels" table below for detailed requirements.*
+
 ### 🏆 Suite Platinum Certification
-**Requirements:** 276/276 tests across all protocols + production deployment validation
+**Requirements:** 312/312 tests across all protocols + production deployment validation
 ```markdown
 [![Corpus Platinum Certified](https://img.shields.io/badge/Corpus-Platinum_Certified-gold)](https://corpus.io/certification)
 ```
 
 ### 🥈 Suite Silver Certification  
-**Requirements:** 200+ tests with major protocol coverage
+**Requirements:** 220+ tests with major protocol coverage
 ```markdown
 [![Corpus Silver Certified](https://img.shields.io/badge/Corpus-Silver_Certified-silver)](https://corpus.io/certification)
 ```
 
 ### 🔬 Suite Development Certification
-**Requirements:** Protocol implementation in development with 100+ tests passing
+**Requirements:** Protocol implementation in development with 110+ tests passing
 ```markdown
 [![Corpus Development](https://img.shields.io/badge/Corpus-Development_Certified-blue)](https://corpus.io/certification)
 ```
 
-### Individual Protocol Certifications
-
-#### Graph Protocol
-```markdown
-🥇 Gold: [![Corpus Graph V1.0 Gold](https://img.shields.io/badge/Corpus-Graph_V1.0_Gold-00aaff)](https://corpus.io/certification/graph)
-🥈 Silver: [![Corpus Graph V1.0 Silver](https://img.shields.io/badge/Corpus-Graph_V1.0_Silver-00aaff)](https://corpus.io/certification/graph)
-🔬 Development: [![Corpus Graph V1.0 Development](https://img.shields.io/badge/Corpus-Graph_V1.0_Development-00aaff)](https://corpus.io/certification/graph)
-```
-
-#### LLM Protocol
-```markdown
-🥇 Gold: [![Corpus LLM V1.0 Gold](https://img.shields.io/badge/Corpus-LLM_V1.0_Gold-ff6b35)](https://corpus.io/certification/llm)
-🥈 Silver: [![Corpus LLM V1.0 Silver](https://img.shields.io/badge/Corpus-LLM_V1.0_Silver-ff6b35)](https://corpus.io/certification/llm)
-🔬 Development: [![Corpus LLM V1.0 Development](https://img.shields.io/badge/Corpus-LLM_V1.0_Development-ff6b35)](https://corpus.io/certification/llm)
-```
-
-#### Vector Protocol
-```markdown
-🥇 Gold: [![Corpus Vector V1.0 Gold](https://img.shields.io/badge/Corpus-Vector_V1.0_Gold-00cc88)](https://corpus.io/certification/vector)
-🥈 Silver: [![Corpus Vector V1.0 Silver](https://img.shields.io/badge/Corpus-Vector_V1.0_Silver-00cc88)](https://corpus.io/certification/vector)
-🔬 Development: [![Corpus Vector V1.0 Development](https://img.shields.io/badge/Corpus-Vector_V1.0_Development-00cc88)](https://corpus.io/certification/vector)
-```
-
-#### Embedding Protocol
-```markdown
-🥇 Gold: [![Corpus Embedding V1.0 Gold](https://img.shields.io/badge/Corpus-Embedding_V1.0_Gold-9966ff)](https://corpus.io/certification/embedding)
-🥈 Silver: [![Corpus Embedding V1.0 Silver](https://img.shields.io/badge/Corpus-Embedding_V1.0_Silver-9966ff)](https://corpus.io/certification/embedding)
-🔬 Development: [![Corpus Embedding V1.0 Development](https://img.shields.io/badge/Corpus-Embedding_V1.0_Development-9966ff)](https://corpus.io/certification/embedding)
-```
-
 ## Conformance Summary
 
-**Overall Coverage: 276/276 tests (100%) ✅**  
+**Overall Coverage: 312/312 tests (100%) ✅**  
 **Certification Level:** 🏆 **PLATINUM**
 
 | Protocol | Tests | Coverage | Status | Certification |
@@ -81,6 +59,7 @@ This document defines two complementary certification levels:
 | **LLM Protocol V1.0** | 61/61 | 100% ✅ | Production Ready | 🥇 Gold |
 | **Vector Protocol V1.0** | 72/72 | 100% ✅ | Production Ready | 🥇 Gold |
 | **Embedding Protocol V1.0** | 75/75 | 100% ✅ | Production Ready | 🥇 Gold |
+| **Schema Conformance** | 36/36 | 100% ✅ | Production Ready | 🥇 Gold |
 
 ### Individual Protocol Certification Levels
 
@@ -90,6 +69,7 @@ This document defines two complementary certification levels:
 | **LLM** | 61/61 tests | 49+ tests | 31+ tests |
 | **Vector** | 72/72 tests | 58+ tests | 36+ tests |
 | **Embedding** | 75/75 tests | 60+ tests | 38+ tests |
+| **Schema** | 36/36 tests | 29+ tests | 18+ tests |
 
 ### Cross-Protocol Foundation Coverage
 
@@ -100,6 +80,33 @@ This document defines two complementary certification levels:
 | Observability & Privacy | 22/22 | 100% ✅ | Production Ready |
 | Wire Contracts & Envelopes | 50/50 | 100% ✅ | Production Ready |
 | Security & Tenant Isolation | 20/20 | 100% ✅ | Production Ready |
+| Schema Validation & Hygiene | 36/36 | 100% ✅ | Production Ready |
+
+---
+
+## Schema Conformance Testing
+
+### Specification: §5 Schema Validation & Wire Contracts
+**Status:** ✅ Complete (36 tests)  
+**Certification:** 🥇 **Gold**
+
+| Category | Tests | Coverage | Status |
+|----------|--------|-----------|---------|
+| Schema Meta-Lint | 12/12 | 100% ✅ | Production Ready |
+| Golden Wire Messages | 12/12 | 100% ✅ | Production Ready |
+| JSON Schema Draft 2020-12 Compliance | 6/6 | 100% ✅ | Production Ready |
+| Cross-Protocol Validation | 6/6 | 100% ✅ | Production Ready |
+
+#### Key Test Files
+- `tests/schema/test_schema_lint.py` - §5.1 Schema Meta-Lint & Hygiene
+- `tests/golden/test_golden_samples.py` - §5.2 Golden Wire Message Validation
+- `tests/schema/test_json_schema_compliance.py` - §5.3 Draft 2020-12 Compliance
+- `tests/schema/test_cross_protocol_validation.py` - §5.4 Cross-Protocol Contracts
+
+**Individual Certification Levels:**
+- 🥇 **Gold:** 36/36 tests (100%)
+- 🥈 **Silver:** 29+ tests (80%+)
+- 🔬 **Development:** 18+ tests (50%+)
 
 ---
 
@@ -250,94 +257,54 @@ This document defines two complementary certification levels:
 
 ---
 
-## Badge Usage & Brand Guidelines
+## Implementation Verification
 
-### Certified Implementation Badges
+### Adapter Compliance Checklist
 
-#### 🏆 Platinum Certification
-**Requirements:** 276/276 tests + production deployment validation
-```markdown
-[![Corpus Platinum Certified](https://img.shields.io/badge/Corpus-Platinum_Certified-gold)](https://corpus.io/certification)
-```
-**Usage:** Production systems with full protocol suite compliance
+**Phase 1: Core Protocol Implementation**
+- [ ] Implement all normative operations for claimed protocols
+- [ ] Pass protocol-specific test suites (68+61+72+75 tests)
+- [ ] Validate wire envelope compatibility
 
-#### 🥈 Silver Certification  
-**Requirements:** 200+ tests with major protocol coverage
-```markdown
-[![Corpus Silver Certified](https://img.shields.io/badge/Corpus-Silver_Certified-silver)](https://corpus.io/certification)
-```
-**Usage:** Major protocol implementations in production
+**Phase 2: Schema Compliance**
+- [ ] Pass all 36 schema conformance tests
+- [ ] Validate JSON Schema Draft 2020-12 compliance
+- [ ] Pass golden wire message validation
+- [ ] Ensure cross-protocol schema consistency
 
-#### 🔬 Development Certification
-**Requirements:** Protocol implementation in development with 100+ tests passing
-```markdown
-[![Corpus Development](https://img.shields.io/badge/Corpus-Development_Certified-blue)](https://corpus.io/certification)
-```
-**Usage:** Active development and testing phases
+**Phase 3: Common Foundation**
+- [ ] Implement OperationContext propagation
+- [ ] Support capability discovery
+- [ ] Map errors to normalized taxonomy
+- [ ] Integrate observability interfaces
 
-### Protocol-Specific Badges
+**Phase 4: Production Hardening**
+- [ ] Enforce SIEM-safe logging and metrics
+- [ ] Maintain tenant isolation boundaries
+- [ ] Implement retry semantics and circuit breaking
+- [ ] Support partial failure reporting
 
-```markdown
-# Individual Protocol Certifications
-[![Corpus Graph V1.0 Gold](https://img.shields.io/badge/Corpus-Graph_V1.0_Gold-00aaff)](https://corpus.io/certification/graph)
-[![Corpus LLM V1.0 Gold](https://img.shields.io/badge/Corpus-LLM_V1.0_Gold-ff6b35)](https://corpus.io/certification/llm)
-[![Corpus Vector V1.0 Gold](https://img.shields.io/badge/Corpus-Vector_V1.0_Gold-00cc88)](https://corpus.io/certification/vector)
-[![Corpus Embedding V1.0 Gold](https://img.shields.io/badge/Corpus-Embedding_V1.0_Gold-9966ff)](https://corpus.io/certification/embedding)
-```
+**Phase 5: Certification**
+- [ ] Pass all 312/312 tests unmodified
+- [ ] Document implementation coverage
+- [ ] Publish conformance badge with results link
 
-### Badge Placement Guidelines
+### Conformance Certification Levels
 
-**README.md (Primary)**
-```markdown
-# Project Name
-[![Corpus Platinum Certified](https://img.shields.io/badge/Corpus-Platinum_Certified-gold)](https://corpus.io/certification)
-
-A Corpus Protocol Suite implementation supporting Graph, LLM, Vector, and Embedding protocols.
-```
-
-**Documentation Header**
-```markdown
----
-title: "Implementation Documentation"
-badges:
-  - "Corpus Platinum Certified"
-  - "Graph V1.0 Gold Certified" 
-  - "LLM V1.0 Gold Certified"
----
-```
-
-**API Documentation**
-```markdown
-> **Certification Level**: Platinum  
-> **Protocol Coverage**: Graph • LLM • Vector • Embedding  
-> **Test Suite**: protocol-tests@v1.0.0
-```
+| Level | Requirements | Badge |
+|-------|--------------|--------|
+| **Platinum** | 312/312 tests across all protocols | `Platinum Certified` |
+| **Silver** | 220+ tests with major protocol coverage | `Silver Certified` |
+| **Development** | 110+ tests in active development | `Development Certified` |
+| **Protocol Gold** | Individual protocol completion | `{Protocol} V1.0 Gold` |
+| **Protocol Silver** | 80%+ of protocol tests | `{Protocol} V1.0 Silver` |
+| **Protocol Development** | 50%+ of protocol tests | `{Protocol} V1.0 Development` |
 
 ---
 
 ## Normative Test Requirements
 
-### Implementation Compliance
-
-To claim **Corpus Protocol Suite Certification**, implementations MUST:
-
-#### Platinum Level (276/276 tests)
-- [ ] Pass all protocol test suites without modification
-- [ ] Implement all MUST requirements from relevant sections
-- [ ] Maintain production deployment for 30+ days
-- [ ] Pass security and performance audits
-- [ ] Provide public test results and certification ID
-
-#### Silver Level (200+ tests)  
-- [ ] Pass 200+ tests across major protocols
-- [ ] Implement core MUST requirements
-- [ ] Demonstrate production readiness
-- [ ] Provide test results documentation
-
-#### Development Level (100+ tests)
-- [ ] Pass 100+ tests in active development
-- [ ] Implement foundational protocol operations
-- [ ] Provide development roadmap to full compliance
+*Refer to "Conformance Certification Levels" table above for detailed requirements.*
 
 ### Test Execution
 
@@ -346,20 +313,18 @@ To claim **Corpus Protocol Suite Certification**, implementations MUST:
 git clone https://github.com/corpus/protocol-tests
 cd protocol-tests
 
-# Platinum certification validation
+# Platinum certification validation (312 tests)
 pytest tests/ --cov=corpus_sdk --cov-report=html -v
 
-# Silver certification validation  
-pytest tests/ --cov=corpus_sdk -v
-
-# Development certification
-pytest tests/ --cov=corpus_sdk -v
+# Schema-specific validation (36 tests)
+pytest tests/schema/ -v
+pytest tests/golden/ -v
 
 # Individual protocol validation
-pytest tests/graph/ -v
-pytest tests/llm/ -v
-pytest tests/vector/ -v  
-pytest tests/embedding/ -v
+pytest tests/graph/ -v    # 68 tests
+pytest tests/llm/ -v      # 61 tests
+pytest tests/vector/ -v   # 72 tests
+pytest tests/embedding/ -v # 75 tests
 ```
 
 ### Certification Badge Authorization
@@ -385,6 +350,12 @@ Implementations meeting certification requirements MUST:
 - ✅ Transport binding compliance (8 tests)
 - ✅ Operation registry validation (14 tests)
 
+### Schema Compliance (§5)
+- ✅ Schema meta-lint and hygiene (12 tests)
+- ✅ Golden wire message validation (12 tests)
+- ✅ JSON Schema Draft 2020-12 compliance (6 tests)
+- ✅ Cross-protocol validation (6 tests)
+
 ### Common Foundation Compliance (§6)
 - ✅ OperationContext propagation (12 tests)
 - ✅ Capability discovery negotiation (10 tests)
@@ -404,42 +375,69 @@ Implementations meeting certification requirements MUST:
 
 ---
 
-## Implementation Verification
+## Badge Usage & Brand Guidelines
 
-### Adapter Compliance Checklist
+### Certified Implementation Badges
 
-**Phase 1: Core Protocol Implementation**
-- [ ] Implement all normative operations for claimed protocols
-- [ ] Pass protocol-specific test suites (68+61+72+75 tests)
-- [ ] Validate wire envelope compatibility
+*Refer to "Certification Levels" section above for detailed requirements.*
 
-**Phase 2: Common Foundation**
-- [ ] Implement OperationContext propagation
-- [ ] Support capability discovery
-- [ ] Map errors to normalized taxonomy
-- [ ] Integrate observability interfaces
+#### 🏆 Platinum Certification
+```markdown
+[![Corpus Platinum Certified](https://img.shields.io/badge/Corpus-Platinum_Certified-gold)](https://corpus.io/certification)
+```
+**Usage:** Production systems with full protocol suite compliance
 
-**Phase 3: Production Hardening**
-- [ ] Enforce SIEM-safe logging and metrics
-- [ ] Maintain tenant isolation boundaries
-- [ ] Implement retry semantics and circuit breaking
-- [ ] Support partial failure reporting
+#### 🥈 Silver Certification  
+```markdown
+[![Corpus Silver Certified](https://img.shields.io/badge/Corpus-Silver_Certified-silver)](https://corpus.io/certification)
+```
+**Usage:** Major protocol implementations in production
 
-**Phase 4: Certification**
-- [ ] Pass all 276/276 tests unmodified
-- [ ] Document implementation coverage
-- [ ] Publish conformance badge with results link
+#### 🔬 Development Certification
+```markdown
+[![Corpus Development](https://img.shields.io/badge/Corpus-Development_Certified-blue)](https://corpus.io/certification)
+```
+**Usage:** Active development and testing phases
 
-### Conformance Certification Levels
+### Protocol-Specific Badges
 
-| Level | Requirements | Badge |
-|-------|--------------|--------|
-| **Platinum** | 276/276 tests across all protocols | `Platinum Certified` |
-| **Silver** | 200+ tests with major protocol coverage | `Silver Certified` |
-| **Development** | 100+ tests in active development | `Development Certified` |
-| **Protocol Gold** | Individual protocol completion | `{Protocol} V1.0 Gold` |
-| **Protocol Silver** | 80%+ of protocol tests | `{Protocol} V1.0 Silver` |
-| **Protocol Development** | 50%+ of protocol tests | `{Protocol} V1.0 Development` |
+```markdown
+# Individual Protocol Certifications
+[![Corpus Graph V1.0 Gold](https://img.shields.io/badge/Corpus-Graph_V1.0_Gold-00aaff)](https://corpus.io/certification/graph)
+[![Corpus LLM V1.0 Gold](https://img.shields.io/badge/Corpus-LLM_V1.0_Gold-ff6b35)](https://corpus.io/certification/llm)
+[![Corpus Vector V1.0 Gold](https://img.shields.io/badge/Corpus-Vector_V1.0_Gold-00cc88)](https://corpus.io/certification/vector)
+[![Corpus Embedding V1.0 Gold](https://img.shields.io/badge/Corpus-Embedding_V1.0_Gold-9966ff)](https://corpus.io/certification/embedding)
+[![Corpus Schema V1.0 Gold](https://img.shields.io/badge/Corpus-Schema_V1.0_Gold-ffd700)](https://corpus.io/certification/schema)
+```
+
+### Badge Placement Guidelines
+
+**README.md (Primary)**
+```markdown
+# Project Name
+[![Corpus Platinum Certified](https://img.shields.io/badge/Corpus-Platinum_Certified-gold)](https://corpus.io/certification)
+
+A Corpus Protocol Suite implementation supporting Graph, LLM, Vector, and Embedding protocols.
+```
+
+**Documentation Header**
+```markdown
+---
+title: "Implementation Documentation"
+badges:
+  - "Corpus Platinum Certified"
+  - "Graph V1.0 Gold Certified" 
+  - "LLM V1.0 Gold Certified"
+  - "Schema V1.0 Gold Certified"
+---
+```
+
+**API Documentation**
+```markdown
+> **Certification Level**: Platinum  
+> **Protocol Coverage**: Graph • LLM • Vector • Embedding • Schema  
+> **Test Suite**: protocol-tests@v1.0.0
+```
 
 ---
 
@@ -465,64 +463,8 @@ Certification MAY be revoked for:
 
 ---
 
-## Official Certification Badges
-
-### Platinum Certification
-```text
-🏆 CORPUS PLATINUM CERTIFIED • SUITE V1.0
-   276/276 tests • Production Validated
-
-   PROTOCOLS:
-   ✅ Graph V1.0: 68/68 • 🥇 Gold
-   ✅ LLM V1.0: 61/61 • 🥇 Gold  
-   ✅ Vector V1.0: 72/72 • 🥇 Gold
-   ✅ Embedding V1.0: 75/75 • 🥇 Gold
-
-   FOUNDATION:
-   ✅ Wire Format: 50/50 • 🥇 Gold
-   ✅ Common Foundation: 46/46 • 🥇 Gold
-   ✅ Error Handling: 38/38 • 🥇 Gold
-   ✅ Security & Observability: 42/42 • 🥇 Gold
-
-   CERTIFICATION ID: CPT-2025-001
-   VALID UNTIL: 2026-02-07
-```
-
-### Silver Certification
-```text
-🥈 CORPUS SILVER CERTIFIED • SUITE V1.0
-   200+/276 tests • Production Ready
-
-   PROTOCOLS:
-   ✅ Graph V1.0: 68/68 • 🥇 Gold
-   ✅ LLM V1.0: 45/61 • 🥈 Silver
-   ✅ Vector V1.0: 72/72 • 🥇 Gold
-   ⏳ Embedding V1.0: 15/75 • Development
-
-   CERTIFICATION ID: CSV-2025-001
-   VALID UNTIL: 2025-08-07
-```
-
-### Development Certification
-```text
-🔬 CORPUS DEVELOPMENT • SUITE V1.0
-   100+/276 tests • Active Development
-
-   PROTOCOLS:
-   ✅ Graph V1.0: 68/68 • 🥇 Gold
-   ⏳ LLM V1.0: 25/61 • Development
-   ⏳ Vector V1.0: 0/72 • Planned
-   ⏳ Embedding V1.0: 15/75 • Development
-
-   CERTIFICATION ID: CDV-2025-001
-   VALID UNTIL: 2025-08-07
-```
-
----
-
 **Certification Authority:** Corpus Standards Working Group  
 **Test Suite:** https://github.com/corpus/protocol-tests  
 **Certification Portal:** https://corpus.io/certification  
 **Brand Guidelines:** https://corpus.io/brand-guidelines  
 **Status:** 🏆 **PLATINUM CERTIFIED** • Valid until 2026-02-07
-```
