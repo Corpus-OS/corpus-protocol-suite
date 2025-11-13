@@ -8,7 +8,7 @@
 - Implement a minimal Embedding adapter
 - Expose it over HTTP  
 - Call it with a real Corpus envelope
-- See where to go for LLM / Vector / Graph /Embedding
+- See where to go for LLM / Vector / Graph / Embedding
 
 ---
 
