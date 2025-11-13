@@ -1,6 +1,3 @@
-Here's the updated file with a super-short "Hello World Adapter" at the top and improved readability:
-
-```markdown
 # IMPLEMENTATION.md  
 ✅ Corpus Protocol (v1.0) — Adapter Implementation Guide (Runtime Behavior)
 
