@@ -59,7 +59,7 @@ This document explains how to implement **production-grade adapters** on top of 
 - `corpus_sdk.llm.llm_base.BaseLLMAdapter`
 - `corpus_sdk.embedding.embedding_base.BaseEmbeddingAdapter`
 - `corpus_sdk.vector.vector_base.BaseVectorAdapter`
-- `corpus_sdk.graph.graph_base.BaseGraphAdapter` (when present)
+- `corpus_sdk.graph.graph_base.BaseGraphAdapter` 
 
 It ties together:
 
