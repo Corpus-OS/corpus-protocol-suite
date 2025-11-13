@@ -39,7 +39,20 @@ from corpus_sdk.vector.vector_base import (
     Unavailable,
 )
 
+# ------------------------------- constants --------------------------------- #
+
+METRIC_COSINE = "cosine"
+METRIC_EUCLIDEAN = "euclidean"
+METRIC_DOTPRODUCT = "dotproduct"
+
+SUPPORTED_DISTANCE_METRICS: Tuple[str, ...] = (
+    METRIC_COSINE,
+    METRIC_EUCLIDEAN,
+    METRIC_DOTPRODUCT,
+)
+
 # ------------------------------- utilities --------------------------------- #
+
 
 def _cosine_sim(a: List[float], b: List[float]) -> float:
     num = sum(x * y for x, y in zip(a, b))
@@ -57,11 +70,18 @@ def _dot(a: List[float], b: List[float]) -> float:
 
 
 def _filter_match(meta: Optional[Dict[str, Any]], flt: Optional[Dict[str, Any]]) -> bool:
+    """
+    Very simple equality-only filter.
+
+    This is intentionally minimal for a mock adapter; it exists to prove:
+      - filters can be applied pre-search
+      - filters work consistently for query + delete
+    Real adapters are expected to support richer filter dialects.
+    """
     if not flt:
         return True
     if not meta:
         return False
-    # simple equality-only filter for demo purposes
     for k, v in flt.items():
         if meta.get(k) != v:
             return False
@@ -70,10 +90,11 @@ def _filter_match(meta: Optional[Dict[str, Any]], flt: Optional[Dict[str, Any]])
 
 # ------------------------------- mock state -------------------------------- #
 
+
 @dataclass
 class _NamespaceInfo:
     dimensions: int
-    distance_metric: str = "cosine"  # "cosine" | "euclidean" | "dotproduct"
+    distance_metric: str = METRIC_COSINE  # one of SUPPORTED_DISTANCE_METRICS
 
 
 @dataclass
@@ -81,6 +102,7 @@ class _MemoryStore:
     """
     Very small in-memory store keyed by namespace.
     """
+
     namespaces: Dict[str, _NamespaceInfo] = field(default_factory=dict)
     # ns -> id -> Vector
     data: Dict[str, Dict[str, Vector]] = field(default_factory=dict)
@@ -88,20 +110,23 @@ class _MemoryStore:
     def ensure_namespace(self, spec: NamespaceSpec) -> None:
         if spec.namespace not in self.namespaces:
             self.namespaces[spec.namespace] = _NamespaceInfo(
-                dimensions=spec.dimensions, distance_metric=spec.distance_metric
+                dimensions=spec.dimensions,
+                distance_metric=spec.distance_metric,
             )
             self.data.setdefault(spec.namespace, {})
 
 
 # ----------------------------- adapter class ------------------------------- #
 
+
 @dataclass
 class MockVectorAdapter(BaseVectorAdapter):
     """
-    A mock Vector adapter for protocol demonstrations.
+    A mock Vector adapter for protocol demonstrations & conformance tests.
     """
+
     name: str = "mock-vector"
-    # Deterministic for conformance runs (no random transient failures)
+    # Deterministic for conformance runs (no random transient failures by default)
     failure_rate: float = 0.0
     _store: _MemoryStore = field(default_factory=_MemoryStore)
 
@@ -109,17 +134,32 @@ class MockVectorAdapter(BaseVectorAdapter):
         """
         Optional seeding of a 'default' namespace for demos. Disabled by default to
         avoid masking IndexNotReady or isolation tests. Enable by setting:
+
             VECTOR_SEED_DEFAULT=1
         """
         if os.getenv("VECTOR_SEED_DEFAULT", "0") == "1":
             if "default" not in self._store.namespaces:
                 self._store.ensure_namespace(
-                    NamespaceSpec(namespace="default", dimensions=2, distance_metric="cosine")
+                    NamespaceSpec(
+                        namespace="default",
+                        dimensions=2,
+                        distance_metric=METRIC_COSINE,
+                    )
                 )
             if not self._store.data.get("default"):
                 self._store.data["default"] = {
-                    "seed1": Vector(id="seed1", vector=[1.0, 0.0], metadata={"label": "alpha"}, namespace="default"),
-                    "seed2": Vector(id="seed2", vector=[0.0, 1.0], metadata={"label": "beta"}, namespace="default"),
+                    "seed1": Vector(
+                        id="seed1",
+                        vector=[1.0, 0.0],
+                        metadata={"label": "alpha"},
+                        namespace="default",
+                    ),
+                    "seed2": Vector(
+                        id="seed2",
+                        vector=[0.0, 1.0],
+                        metadata={"label": "beta"},
+                        namespace="default",
+                    ),
                 }
 
     # --------------------------- capability probe --------------------------- #
@@ -128,10 +168,10 @@ class MockVectorAdapter(BaseVectorAdapter):
         # tiny simulated network delay
         await asyncio.sleep(0.01)
         return VectorCapabilities(
-            server="mock-vector",
+            server=self.name,
             version="1.0.0",
             max_dimensions=2048,
-            supported_metrics=("cosine", "euclidean", "dotproduct"),
+            supported_metrics=SUPPORTED_DISTANCE_METRICS,
             supports_namespaces=True,
             supports_metadata_filtering=True,
             supports_batch_operations=True,
@@ -146,8 +186,13 @@ class MockVectorAdapter(BaseVectorAdapter):
 
     # ------------------------------ query ---------------------------------- #
 
-    async def _do_query(self, spec: QuerySpec, *, ctx: Optional[OperationContext] = None) -> QueryResult:
-        if random.random() < self.failure_rate:
+    async def _do_query(
+        self,
+        spec: QuerySpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> QueryResult:
+        if self.failure_rate > 0.0 and random.random() < self.failure_rate:
             raise Unavailable("mock backend overloaded", code="OVERLOADED")
 
         # Require namespace to exist (no implicit creation)
@@ -178,7 +223,11 @@ class MockVectorAdapter(BaseVectorAdapter):
         if len(spec.vector) != ns_info.dimensions:
             raise DimensionMismatch(
                 f"query vector dimension {len(spec.vector)} does not match namespace {ns_info.dimensions}",
-                details={"expected": ns_info.dimensions, "actual": len(spec.vector), "namespace": spec.namespace},
+                details={
+                    "expected": ns_info.dimensions,
+                    "actual": len(spec.vector),
+                    "namespace": spec.namespace,
+                },
             )
 
         # If namespace exists but has no data, surface retryable "index not ready"
@@ -196,17 +245,24 @@ class MockVectorAdapter(BaseVectorAdapter):
         # Score with chosen metric
         scored: List[Tuple[float, float, Vector]] = []
         for v in candidates:
-            if ns_info.distance_metric == "cosine":
+            if ns_info.distance_metric == METRIC_COSINE:
                 sim = _cosine_sim(spec.vector, v.vector)
                 distance = 1.0 - sim
                 score = sim
-            elif ns_info.distance_metric == "euclidean":
+            elif ns_info.distance_metric == METRIC_EUCLIDEAN:
                 distance = _euclidean(spec.vector, v.vector)
                 score = 1.0 / (1.0 + distance)
-            else:  # "dotproduct"
+            elif ns_info.distance_metric == METRIC_DOTPRODUCT:
                 dp = _dot(spec.vector, v.vector)
                 distance = -dp  # lower is better
                 score = dp
+            else:
+                # Should never happen given create_namespace validation, but guard anyway
+                raise NotSupported(
+                    f"distance_metric '{ns_info.distance_metric}' not supported",
+                    details={"namespace": spec.namespace},
+                )
+
             scored.append((score, distance, v))
 
         # Top-K by score (descending)
@@ -220,7 +276,12 @@ class MockVectorAdapter(BaseVectorAdapter):
             out_meta = v.metadata if spec.include_metadata else None
             matches.append(
                 VectorMatch(
-                    vector=Vector(id=v.id, vector=out_vec, metadata=out_meta, namespace=v.namespace),
+                    vector=Vector(
+                        id=v.id,
+                        vector=out_vec,
+                        metadata=out_meta,
+                        namespace=v.namespace,
+                    ),
                     score=float(score),
                     distance=float(distance),
                 )
@@ -237,8 +298,13 @@ class MockVectorAdapter(BaseVectorAdapter):
 
     # ------------------------------ upsert --------------------------------- #
 
-    async def _do_upsert(self, spec: UpsertSpec, *, ctx: Optional[OperationContext] = None) -> UpsertResult:
-        if random.random() < self.failure_rate:
+    async def _do_upsert(
+        self,
+        spec: UpsertSpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> UpsertResult:
+        if self.failure_rate > 0.0 and random.random() < self.failure_rate:
             raise ResourceExhausted("mock rate limit", retry_after_ms=500)
 
         ns = spec.namespace
@@ -249,11 +315,13 @@ class MockVectorAdapter(BaseVectorAdapter):
 
         caps = await self.capabilities()
         if caps.max_batch_size and len(spec.vectors) > caps.max_batch_size:
-            suggested = int(100 * (len(spec.vectors) - caps.max_batch_size) / len(spec.vectors))
+            # suggested_batch_reduction: how many items to remove to meet the limit
+            reduction = len(spec.vectors) - caps.max_batch_size
+            reduction = max(1, reduction)
             raise BadRequest(
                 f"batch size {len(spec.vectors)} exceeds maximum of {caps.max_batch_size}",
                 details={"max_batch_size": caps.max_batch_size, "namespace": ns},
-                suggested_batch_reduction=suggested,
+                suggested_batch_reduction=reduction,
             )
 
         dims = self._store.namespaces[ns].dimensions
@@ -271,7 +339,11 @@ class MockVectorAdapter(BaseVectorAdapter):
                         "index": i,
                         "code": "DIMENSION_MISMATCH",
                         "message": f"expected {dims}, got {len(v.vector)}",
-                        "details": {"expected": dims, "actual": len(v.vector), "namespace": ns},
+                        "details": {
+                            "expected": dims,
+                            "actual": len(v.vector),
+                            "namespace": ns,
+                        },
                     }
                 )
                 continue
@@ -304,7 +376,12 @@ class MockVectorAdapter(BaseVectorAdapter):
 
     # ------------------------------ delete --------------------------------- #
 
-    async def _do_delete(self, spec: DeleteSpec, *, ctx: Optional[OperationContext] = None) -> DeleteResult:
+    async def _do_delete(
+        self,
+        spec: DeleteSpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> DeleteResult:
         ns = spec.namespace
         if ns not in self._store.namespaces:
             # Explicit namespace validation (tests expect BAD_REQUEST here)
@@ -312,17 +389,22 @@ class MockVectorAdapter(BaseVectorAdapter):
 
         caps = await self.capabilities()
         if spec.ids and caps.max_batch_size and len(spec.ids) > caps.max_batch_size:
-            suggested = int(100 * (len(spec.ids) - caps.max_batch_size) / len(spec.ids))
+            reduction = len(spec.ids) - caps.max_batch_size
+            reduction = max(1, reduction)
             raise BadRequest(
                 f"batch size {len(spec.ids)} exceeds maximum of {caps.max_batch_size}",
                 details={"max_batch_size": caps.max_batch_size, "namespace": ns},
-                suggested_batch_reduction=suggested,
+                suggested_batch_reduction=reduction,
             )
 
         if spec.filter and caps.max_filter_terms and len(spec.filter) > caps.max_filter_terms:
             raise BadRequest(
                 f"filter too complex: {len(spec.filter)} terms exceeds {caps.max_filter_terms}",
-                details={"provided_terms": len(spec.filter), "max_terms": caps.max_filter_terms, "namespace": ns},
+                details={
+                    "provided_terms": len(spec.filter),
+                    "max_terms": caps.max_filter_terms,
+                    "namespace": ns,
+                },
             )
 
         bucket = self._store.data.get(ns, {})
@@ -330,22 +412,12 @@ class MockVectorAdapter(BaseVectorAdapter):
         failures: List[Dict[str, Any]] = []
 
         if spec.ids:
-            for i, vid in enumerate(spec.ids):
+            # Idempotent: deleting unknown IDs is a no-op, not a failure
+            for vid in spec.ids:
                 key = str(vid)
                 if key in bucket:
                     del bucket[key]
                     deleted += 1
-                else:
-                    # Idempotent: normalized failure record (consistent shape)
-                    failures.append(
-                        {
-                            "id": key,
-                            "index": i,
-                            "code": "NOT_FOUND",
-                            "message": "id not found",
-                            "details": {"namespace": ns},
-                        }
-                    )
         elif spec.filter:
             # Delete by simple equality filter
             to_delete = [vid for vid, v in list(bucket.items()) if _filter_match(v.metadata, spec.filter)]
@@ -357,40 +429,78 @@ class MockVectorAdapter(BaseVectorAdapter):
             raise BadRequest("must provide either ids or filter for deletion")
 
         await asyncio.sleep(0.002)
-        return DeleteResult(deleted_count=deleted, failed_count=len(failures), failures=failures)
+        return DeleteResult(
+            deleted_count=deleted,
+            failed_count=len(failures),
+            failures=failures,
+        )
 
     # ------------------------- namespace management ------------------------ #
 
-    async def _do_create_namespace(self, spec: NamespaceSpec, *, ctx: Optional[OperationContext] = None) -> NamespaceResult:
+    async def _do_create_namespace(
+        self,
+        spec: NamespaceSpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> NamespaceResult:
         metric = spec.distance_metric
-        if metric not in ("cosine", "euclidean", "dotproduct"):
-            raise NotSupported("distance_metric must be one of: cosine, euclidean, dotproduct")
+        if metric not in SUPPORTED_DISTANCE_METRICS:
+            raise NotSupported(
+                "distance_metric must be one of: "
+                + ", ".join(SUPPORTED_DISTANCE_METRICS)
+            )
 
         self._store.ensure_namespace(spec)
         await asyncio.sleep(0.001)
-        return NamespaceResult(success=True, namespace=spec.namespace, details={"created": True})
+        return NamespaceResult(
+            success=True,
+            namespace=spec.namespace,
+            details={"created": True},
+        )
 
-    async def _do_delete_namespace(self, namespace: str, *, ctx: Optional[OperationContext] = None) -> NamespaceResult:
+    async def _do_delete_namespace(
+        self,
+        namespace: str,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> NamespaceResult:
         existed = namespace in self._store.namespaces
         self._store.namespaces.pop(namespace, None)
         self._store.data.pop(namespace, None)
         await asyncio.sleep(0.001)
-        return NamespaceResult(success=True, namespace=namespace, details={"existed": existed})
+        return NamespaceResult(
+            success=True,
+            namespace=namespace,
+            details={"existed": existed},
+        )
 
     # -------------------------------- health ------------------------------- #
 
-    async def _do_health(self, *, ctx: Optional[OperationContext] = None) -> Dict[str, Any]:
-        # Simulate quick health probe with namespace summary, stable shape
+    async def _do_health(
+        self,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> Dict[str, Any]:
+        """
+        Simulate quick health probe with namespace summary.
+
+        ctx.attrs["health"] == "degraded" forces a degraded state while preserving
+        the response shape for conformance and observability tests.
+        """
+        degraded = bool(ctx and ctx.attrs.get("health") == "degraded")
+        ns_status = "degraded" if degraded else "ok"
+
         await asyncio.sleep(0.001)
         return {
-            "ok": True,
-            "server": "mock-vector",
+            "ok": not degraded,
+            "server": self.name,
             "version": "1.0.0",
             "namespaces": {
                 ns: {
                     "dimensions": info.dimensions,
                     "metric": info.distance_metric,
                     "count": len(self._store.data.get(ns, {})),
+                    "status": ns_status,
                 }
                 for ns, info in self._store.namespaces.items()
             },
@@ -400,23 +510,48 @@ class MockVectorAdapter(BaseVectorAdapter):
 # ------------------------------ demo (optional) ---------------------------- #
 
 if __name__ == "__main__":
+
     async def _demo() -> None:
         adapter = MockVectorAdapter()
         # Create a namespace
-        await adapter.create_namespace(NamespaceSpec(namespace="demo", dimensions=3, distance_metric="cosine"))
+        await adapter.create_namespace(
+            NamespaceSpec(namespace="demo", dimensions=3, distance_metric=METRIC_COSINE)
+        )
 
         # Upsert a few vectors
         vecs = [
-            Vector(id="a", vector=[1.0, 0.0, 0.0], metadata={"label": "alpha"}, namespace="demo"),
-            Vector(id="b", vector=[0.0, 1.0, 0.0], metadata={"label": "beta"}, namespace="demo"),
-            Vector(id="c", vector=[0.7, 0.7, 0.0], metadata={"label": "gamma"}, namespace="demo"),
+            Vector(
+                id="a",
+                vector=[1.0, 0.0, 0.0],
+                metadata={"label": "alpha"},
+                namespace="demo",
+            ),
+            Vector(
+                id="b",
+                vector=[0.0, 1.0, 0.0],
+                metadata={"label": "beta"},
+                namespace="demo",
+            ),
+            Vector(
+                id="c",
+                vector=[0.7, 0.7, 0.0],
+                metadata={"label": "gamma"},
+                namespace="demo",
+            ),
         ]
         await adapter.upsert(UpsertSpec(vectors=vecs, namespace="demo"))
 
         # Query
-        res = await adapter.query(QuerySpec(vector=[0.8, 0.6, 0.0], top_k=2, namespace="demo"))
+        res = await adapter.query(
+            QuerySpec(vector=[0.8, 0.6, 0.0], top_k=2, namespace="demo")
+        )
         print("Top matches:")
         for m in res.matches:
-            print(f"- id={m.vector.id} score={m.score:.3f} distance={m.distance:.3f} meta={m.vector.metadata}")
+            print(
+                f"- id={m.vector.id} "
+                f"score={m.score:.3f} "
+                f"distance={m.distance:.3f} "
+                f"meta={m.vector.metadata}"
+            )
 
     asyncio.run(_demo())
