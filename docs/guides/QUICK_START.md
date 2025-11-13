@@ -4,6 +4,12 @@
 > **Audience:** SDK / adapter authors (LLM, Embedding, Vector, Graph).  
 > **You'll build:** A tiny Embedding adapter + wire handler you can swap for LLM / Vector / Graph.
 
+**In this guide you will:**
+- Implement a minimal Embedding adapter
+- Expose it over HTTP  
+- Call it with a real Corpus envelope
+- See where to go for LLM / Vector / Graph
+
 ---
 
 ## 0. Mental Model (What You're Actually Building)
@@ -195,6 +201,8 @@ Run it:
 ```bash
 uvicorn services.embedding_service:app --reload
 ```
+
+*If your app layout differs, just update the uvicorn import path accordingly.*
 
 Send a minimal Corpus envelope:
 
@@ -422,10 +430,6 @@ Once the quickstart is working, deepen the adapter:
 * **Wire shapes & schemas**
   `spec/SCHEMA_CONFORMANCE.md`
   → Canonical envelopes and JSON schemas for all operations.
-
-* **Certification & coverage**
-  `conformance/CERTIFICATION.md` (or similar)
-  → How many tests you must pass to claim Corpus Protocol Suite certification.
 
 ---
 
