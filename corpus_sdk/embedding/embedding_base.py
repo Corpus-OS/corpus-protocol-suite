@@ -1,4 +1,4 @@
-# adapter_sdk/embedding_base.py
+# corpus_sdk/embedding_base.py
 # SPDX-License-Identifier: Apache-2.0
 """
 Adapter SDK — Embedding Protocol V1 (public contract + production-grade base)
