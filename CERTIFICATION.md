@@ -16,7 +16,7 @@ This suite constitutes the **official Corpus Protocol Suite V1.0 Reference Confo
 **Status:** Stable / Production-Ready  
 **Last Updated:** 2025-02-07  
 **Test Location:** `https://github.com/corpus/protocol-tests`  
-**Full Conformance (Platinum):** MUST pass 312/312 tests
+**Full Conformance (Platinum):** MUST pass 303/303 tests
 
 ## Dual-Level Certification System
 
@@ -31,26 +31,26 @@ This document defines two complementary certification levels:
 *See "Conformance Certification Levels" table below for detailed requirements.*
 
 ### 🏆 Suite Platinum Certification
-**Requirements:** 312/312 tests across all protocols + production deployment validation
+**Requirements:** 303/303 tests across all protocols + production deployment validation
 ```markdown
 [![Corpus Platinum Certified](https://img.shields.io/badge/Corpus-Platinum_Certified-gold)](https://corpus.io/certification)
 ```
 
 ### 🥈 Suite Silver Certification  
-**Requirements:** 220+ tests with major protocol coverage
+**Requirements:** 212+ tests with major protocol coverage
 ```markdown
 [![Corpus Silver Certified](https://img.shields.io/badge/Corpus-Silver_Certified-silver)](https://corpus.io/certification)
 ```
 
 ### 🔬 Suite Development Certification
-**Requirements:** Protocol implementation in development with 110+ tests passing
+**Requirements:** Protocol implementation in development with 106+ tests passing
 ```markdown
 [![Corpus Development](https://img.shields.io/badge/Corpus-Development_Certified-blue)](https://corpus.io/certification)
 ```
 
 ## Conformance Summary
 
-**Overall Coverage: 312/312 tests (100%) ✅**  
+**Overall Coverage: 303/303 tests (100%) ✅**  
 **Certification Level:** 🏆 **PLATINUM**
 
 | Protocol | Tests | Coverage | Status | Certification |
@@ -59,7 +59,7 @@ This document defines two complementary certification levels:
 | **LLM Protocol V1.0** | 61/61 | 100% ✅ | Production Ready | 🥇 Gold |
 | **Vector Protocol V1.0** | 72/72 | 100% ✅ | Production Ready | 🥇 Gold |
 | **Embedding Protocol V1.0** | 75/75 | 100% ✅ | Production Ready | 🥇 Gold |
-| **Schema Conformance** | 36/36 | 100% ✅ | Production Ready | 🥇 Gold |
+| **Schema Conformance** | 27/27 | 100% ✅ | Production Ready | 🥇 Gold |
 
 ### Individual Protocol Certification Levels
 
@@ -69,7 +69,7 @@ This document defines two complementary certification levels:
 | **LLM** | 61/61 tests | 49+ tests | 31+ tests |
 | **Vector** | 72/72 tests | 58+ tests | 36+ tests |
 | **Embedding** | 75/75 tests | 60+ tests | 38+ tests |
-| **Schema** | 36/36 tests | 29+ tests | 18+ tests |
+| **Schema** | 27/27 tests | 22+ tests | 14+ tests |
 
 ### Cross-Protocol Foundation Coverage
 
@@ -80,33 +80,29 @@ This document defines two complementary certification levels:
 | Observability & Privacy | 22/22 | 100% ✅ | Production Ready |
 | Wire Contracts & Envelopes | 50/50 | 100% ✅ | Production Ready |
 | Security & Tenant Isolation | 20/20 | 100% ✅ | Production Ready |
-| Schema Validation & Hygiene | 36/36 | 100% ✅ | Production Ready |
+| Schema Validation & Hygiene | 27/27 | 100% ✅ | Production Ready |
 
 ---
 
 ## Schema Conformance Testing
 
 ### Specification: §5 Schema Validation & Wire Contracts
-**Status:** ✅ Complete (36 tests)  
+**Status:** ✅ Complete (27 tests)  
 **Certification:** 🥇 **Gold**
 
 | Category | Tests | Coverage | Status |
 |----------|--------|-----------|---------|
-| Schema Meta-Lint | 12/12 | 100% ✅ | Production Ready |
-| Golden Wire Messages | 12/12 | 100% ✅ | Production Ready |
-| JSON Schema Draft 2020-12 Compliance | 6/6 | 100% ✅ | Production Ready |
-| Cross-Protocol Validation | 6/6 | 100% ✅ | Production Ready |
+| Schema Meta-Lint | 8/8 | 100% ✅ | Production Ready |
+| Golden Wire Messages | 19/19 | 100% ✅ | Production Ready |
 
 #### Key Test Files
-- `tests/schema/test_schema_lint.py` - §5.1 Schema Meta-Lint & Hygiene
-- `tests/golden/test_golden_samples.py` - §5.2 Golden Wire Message Validation
-- `tests/schema/test_json_schema_compliance.py` - §5.3 Draft 2020-12 Compliance
-- `tests/schema/test_cross_protocol_validation.py` - §5.4 Cross-Protocol Contracts
+- `tests/schema/test_schema_lint.py` - §5.1 Schema Meta-Lint & Hygiene (8 tests)
+- `tests/golden/test_golden_samples.py` - §5.2 Golden Wire Message Validation (19 tests)
 
 **Individual Certification Levels:**
-- 🥇 **Gold:** 36/36 tests (100%)
-- 🥈 **Silver:** 29+ tests (80%+)
-- 🔬 **Development:** 18+ tests (50%+)
+- 🥇 **Gold:** 27/27 tests (100%)
+- 🥈 **Silver:** 22+ tests (80%+)
+- 🔬 **Development:** 14+ tests (50%+)
 
 ---
 
@@ -267,7 +263,7 @@ This document defines two complementary certification levels:
 - [ ] Validate wire envelope compatibility
 
 **Phase 2: Schema Compliance**
-- [ ] Pass all 36 schema conformance tests
+- [ ] Pass all 27 schema conformance tests
 - [ ] Validate JSON Schema Draft 2020-12 compliance
 - [ ] Pass golden wire message validation
 - [ ] Ensure cross-protocol schema consistency
@@ -285,7 +281,7 @@ This document defines two complementary certification levels:
 - [ ] Support partial failure reporting
 
 **Phase 5: Certification**
-- [ ] Pass all 312/312 tests unmodified
+- [ ] Pass all 303/303 tests unmodified
 - [ ] Document implementation coverage
 - [ ] Publish conformance badge with results link
 
@@ -293,9 +289,9 @@ This document defines two complementary certification levels:
 
 | Level | Requirements | Badge |
 |-------|--------------|--------|
-| **Platinum** | 312/312 tests across all protocols | `Platinum Certified` |
-| **Silver** | 220+ tests with major protocol coverage | `Silver Certified` |
-| **Development** | 110+ tests in active development | `Development Certified` |
+| **Platinum** | 303/303 tests across all protocols | `Platinum Certified` |
+| **Silver** | 212+ tests with major protocol coverage | `Silver Certified` |
+| **Development** | 106+ tests in active development | `Development Certified` |
 | **Protocol Gold** | Individual protocol completion | `{Protocol} V1.0 Gold` |
 | **Protocol Silver** | 80%+ of protocol tests | `{Protocol} V1.0 Silver` |
 | **Protocol Development** | 50%+ of protocol tests | `{Protocol} V1.0 Development` |
@@ -313,10 +309,10 @@ This document defines two complementary certification levels:
 git clone https://github.com/corpus/protocol-tests
 cd protocol-tests
 
-# Platinum certification validation (312 tests)
+# Platinum certification validation (303 tests)
 pytest tests/ --cov=corpus_sdk --cov-report=html -v
 
-# Schema-specific validation (36 tests)
+# Schema-specific validation (27 tests)
 pytest tests/schema/ -v
 pytest tests/golden/ -v
 
@@ -351,10 +347,8 @@ Implementations meeting certification requirements MUST:
 - ✅ Operation registry validation (14 tests)
 
 ### Schema Compliance (§5)
-- ✅ Schema meta-lint and hygiene (12 tests)
-- ✅ Golden wire message validation (12 tests)
-- ✅ JSON Schema Draft 2020-12 compliance (6 tests)
-- ✅ Cross-protocol validation (6 tests)
+- ✅ Schema meta-lint and hygiene (8 tests)
+- ✅ Golden wire message validation (19 tests)
 
 ### Common Foundation Compliance (§6)
 - ✅ OperationContext propagation (12 tests)
@@ -468,3 +462,4 @@ Certification MAY be revoked for:
 **Certification Portal:** https://corpus.io/certification  
 **Brand Guidelines:** https://corpus.io/brand-guidelines  
 **Status:** 🏆 **PLATINUM CERTIFIED** • Valid until 2026-02-07
+```
