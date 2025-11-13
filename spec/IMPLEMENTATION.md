@@ -10,7 +10,7 @@
 ## 🚀 Hello World Adapter (30-second start)
 
 ```python
-from corpus_sdk.embedding.embedding_base import BaseEmbeddingAdapter, EmbeddingCapabilities, EmbedSpec, BatchEmbedSpec, EmbedResult, BatchEmbedResult
+from corpus_sdk.embedding.embedding_base import BaseEmbeddingAdapter, EmbeddingCapabilities, EmbedSpec, BatchEmbedSpec, EmbedResult, BatchEmbedResult, EmbeddingVector
 
 class HelloEmbeddingAdapter(BaseEmbeddingAdapter):
     async def _do_capabilities(self):
