@@ -17,7 +17,8 @@ class HelloEmbeddingAdapter(BaseEmbeddingAdapter):
         return EmbeddingCapabilities(
             server="hello", version="1.0.0", supported_models=("hello-1",),
             max_batch_size=10, max_text_length=100, max_dimensions=8,
-            supports_normalization=False, supports_truncation=True
+            supports_normalization=False, supports_truncation=True,
+            supports_token_counting=False,  # No token counting support
         )
     
     async def _do_embed(self, spec, *, ctx=None):
@@ -31,9 +32,6 @@ class HelloEmbeddingAdapter(BaseEmbeddingAdapter):
         embeddings = [await self._do_embed(EmbedSpec(text=t, model=spec.model)) for t in spec.texts]
         return BatchEmbedResult(embeddings=[e.embedding for e in embeddings], model=spec.model, total_texts=len(spec.texts))
     
-    async def _do_count_tokens(self, text, model, *, ctx=None):
-        return len(text)
-    
     async def _do_health(self, *, ctx=None):
         return {"ok": True}
 
@@ -45,7 +43,7 @@ handler = WireEmbeddingHandler(adapter)
 
 **Quick Recipe:**
 - **Want LLM?** Override `_do_complete`, `_do_stream`, `_do_count_tokens`
-- **Want Embedding?** Override `_do_embed`, `_do_embed_batch`, `_do_count_tokens`  
+- **Want Embedding?** Override `_do_embed`, `_do_embed_batch` (and `_do_count_tokens` if `supports_token_counting=True`)
 - **Want Vector?** Override `_do_query`, `_do_upsert`, `_do_delete`
 - **Check:** Capabilities describe your true limits
 - **Check:** Map provider errors → canonical errors
@@ -145,7 +143,7 @@ For each provider, you typically:
 - `_do_capabilities`
 - `_do_embed`
 - `_do_embed_batch`
-- `_do_count_tokens`
+- `_do_count_tokens` (if `supports_token_counting=True`)
 - `_do_health`
 
 **Vector**
@@ -660,7 +658,7 @@ class MyLLMAdapter(BaseLLMAdapter):
 - `_do_capabilities()` - Describe limits and support
 - `_do_embed()` - Single text → vector
 - `_do_embed_batch()` - Batch texts → vectors (or raise `NotSupported`)
-- `_do_count_tokens()` - Token counting (optional)
+- `_do_count_tokens()` - Token counting (if `supports_token_counting=True`)
 - `_do_health()` - Health checks
 
 **When this will break conformance:**
@@ -1307,6 +1305,14 @@ Streaming operations (`llm.stream`, `graph.stream_query`) must obey:
 - Mid-stream error is terminal.
 - Heartbeats are allowed but must not flood or ignore backpressure.
 
+**Streaming State Machine:**
+```
+START -> DATA* -> (END | ERROR) -> STOP
+            ^           |
+            |-----------|
+(No DATA after END/ERROR; ERROR is terminal)
+```
+
 The base enforces:
 
 - Deadline preflight.
@@ -1337,7 +1343,11 @@ Plus:
 
 1. Implement your adapter on top of the base class.
 2. Run schema verify targets (`make verify-schema`).
-3. Run behavioral suites (`make test-llm-conformance`, `make test-embedding-conformance`, etc.).
+3. Run behavioral suites:
+   - `make test-llm-conformance`
+   - `make test-embedding-conformance`
+   - `make test-vector-conformance`
+   - `make test-graph-conformance`
 4. Iterate until your adapter passes all suites unmodified.
 
 ---
@@ -1455,21 +1465,24 @@ If conformance tests are failing in confusing ways, check this section first.
 
 ---
 
-## 16. Security & Multi-Tenancy
+## 16. Debugging Conformance Failures
 
-**Base-level guarantees:**
+**Diagnostic Flow:**
+- **Schema failures?** → Run `make verify-schema`
+- **Behavioral failures?** → Check the specific test file from `BEHAVIORAL_CONFORMANCE.md §5`
+- **Streaming issues?** → Review **Streaming State Machine** above
+- **Error mapping wrong?** → Review **Error Taxonomy & Mapping** (§4)
 
-- No raw tenant ID in caches or metrics.
-- No raw text in cache keys (only digests).
-- `OperationContext.attrs` is treated as opaque and not logged by default.
+**Testing Best Practices:**
+- Seed randomness and log the seed on failure
+- Log adapter version + capabilities snapshot at test start  
+- Isolate or clear caches between tests
+- Use `PYTEST_JOBS=auto` for CI parallelism
 
-**Adapter responsibilities:**
-
-- Use `ctx.tenant` to:
-  - Select tenant-specific indices, namespaces, or projects.
-  - Enforce access control for the underlying provider.
-- Keep details in errors SIEM-safe and low-cardinality.
-- Avoid logging full prompts/text/vectors unless you have clear policies and redaction in place.
+**Environment Profiles:**
+- **Local dev:** generous timeouts, low parallelism
+- **CI:** explicit budgets, no external dependencies  
+- **Stress (opt-in):** short deadlines, forced backoffs (`@slow` tests)
 
 ---
 
@@ -1541,7 +1554,7 @@ Use these as the "ready for conformance" gates for each adapter.
   - `_do_capabilities() -> EmbeddingCapabilities`
   - `_do_embed(spec: EmbedSpec, ctx) -> EmbedResult`
   - `_do_embed_batch(spec: BatchEmbedSpec, ctx) -> BatchEmbedResult` (or raises `NotSupported` to use base fallback)
-  - `_do_count_tokens(text, model, ctx) -> int`
+  - `_do_count_tokens(text, model, ctx) -> int` (if `supports_token_counting=True`)
   - `_do_health(ctx) -> Dict[str, Any]`
 - [ ] **Capabilities:**
   - `supported_models` matches provider reality.
@@ -1588,4 +1601,3 @@ Status:
 **Maintainers:** Corpus SDK Team  
 **Last Updated:** 2025-11-12  
 **Scope:** Adapter runtime behavior; see `SCHEMA_CONFORMANCE.md` and `BEHAVIORAL_CONFORMANCE.md` for normative contracts.
-```
