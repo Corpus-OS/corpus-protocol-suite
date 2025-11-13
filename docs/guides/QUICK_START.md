@@ -2,7 +2,7 @@
 
 > **Goal:** Get a real adapter speaking the Corpus Protocol in minutes.  
 > **Audience:** SDK / adapter authors (LLM, Embedding, Vector, Graph).  
-> **You'll build:** A tiny Embedding adapter + wire handler you can swap for LLM / Vector / Graph /Embedding
+> **You'll build:** A tiny Embedding adapter + wire handler you can swap for LLM / Vector / Graph / Embedding
 
 **In this guide you will:**
 - Implement a minimal Embedding adapter
