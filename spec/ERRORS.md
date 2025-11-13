@@ -1,33 +1,3 @@
-# ERRORS.md
-
-**Corpus Protocol Suite & SDKs — Normalized Error Taxonomy**  
-**errors_version:** `1.0`
-
-> This document defines the **normalized error model** used across **Graph**, **LLM**, **Vector**, and **Embedding** adapters. It aligns with the Specification’s Common Foundation (§6.3), Error Handling & Resilience (§12), and protocol-specific sections (§7.6 Graph health, §8.5 LLM, §9.5 Vector, §10.3 Embedding).  
-> It is **implementation-agnostic** and compatible with any transport (HTTP, gRPC, queues) and any observability backend.
-
----
-
-## 0) Goals & Non-Goals
-
-### Goals
-
-- One **cross-protocol taxonomy** with consistent semantics.
-- Deterministic, machine-readable **retryability** and **hints**.
-- Privacy-preserving, SIEM-safe payloads.
-- Predictable transport mappings for HTTP/gRPC.
-- Stable naming and documented **versioning** rules.
-
-### Non-Goals
-
-- Exhaustive backend-specific error catalogs.
-- Mandating specific transports or frameworks.
-
----
-
-## 1) Normalized Error Classes (Canonical)
-
-```text
 AdapterError (base)
 ├─ BadRequest               # 400 client errors (validation, schema, ranges)
 ├─ AuthError                # 401/403 credentials/permissions
@@ -39,7 +9,7 @@ AdapterError (base)
 
 1.1 Protocol-Specific Subtypes (Full Expansion)
 
-All subtypes MUST inherit from one of the canonical classes above and MUST NOT contradict the parent’s retry semantics.
+All subtypes MUST inherit from one of the canonical classes above and MUST NOT contradict the parent's retry semantics.
 
 Note: Some subtypes are shared across protocols (e.g., ProviderQuotaExceeded).
 
@@ -188,7 +158,7 @@ LLM adapters MUST map common failures into the taxonomy as follows:
 
 Validation / Request Errors (BadRequest)
 	•	PromptTooLong
-	•	When: combined messages + system prompt exceed model’s max context.
+	•	When: combined messages + system prompt exceed model's max context.
 	•	details SHOULD include:
 {"max_context_length": <int>, "provided_tokens": <int>, "model": "<name>"}
 	•	ContentFiltered / SafetyPolicyViolation
@@ -534,5 +504,3 @@ A: Typically no. Clients should adjust deadlines or workload size instead.
 ⸻
 
 End of ERRORS.md (errors_version 1.0)
-
-
