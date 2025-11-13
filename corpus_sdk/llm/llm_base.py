@@ -1,4 +1,4 @@
-# adapter_sdk/llm_base.py
+# corpus_sdk/llm/llm_base.py
 # SPDX-License-Identifier: Apache-2.0
 """
 Adapter SDK — LLM Protocol V1 (public contract + production-grade base)
