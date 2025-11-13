@@ -62,7 +62,7 @@ It sits next to:
 - **`IMPLEMENTATION.md`**  
   Deep dive on base classes, `_do_*` hooks, and runtime semantics.
 
-- **`QUICKSTART_ADAPTERS.md` / `ADAPTER_RECIPES.md`**  
+- **`QUICK_START.md` / `ADAPTER_RECIPES.md`**  
   “Do this to get started” guides.
 
 ### 1.3 Scope of This Guide
