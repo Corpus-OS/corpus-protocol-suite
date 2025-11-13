@@ -3,7 +3,7 @@
 > **Goal:** Give adapter authors copy-pasteable patterns for real-world adapters.  
 > **Audience:** People who finished `Quickstart` and now want “how do I do X with my provider?”.
 
-**Read this *also*:**
+**Read these *also*:**
 
 - `QUICK_START.md` — hello world Embedding adapter
 - `IMPLEMENTATION.md` — full runtime semantics & base class behavior
