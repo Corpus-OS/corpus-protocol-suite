@@ -34,7 +34,7 @@ The base classes + wire handlers already do that.
 ## 1. Prerequisites
 
 - Python 3.10+ (async-friendly)
-- `corpus-sdk` installed (placeholder name; adjust for your actual package):
+- `corpus-sdk` installed:
 
 ```bash
 pip install corpus-sdk
