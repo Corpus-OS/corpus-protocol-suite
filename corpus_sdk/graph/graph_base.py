@@ -1,4 +1,4 @@
-# adapter_sdk/graph_base.py
+# corpus_sdk/graph/graph_base.py
 # SPDX-License-Identifier: Apache-2.0
 """
 Adapter SDK — Graph Protocol V1.0
