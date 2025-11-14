@@ -13,7 +13,7 @@ import time
 from typing import Dict, List, Optional, Tuple, Any
 
 
-# Protocol configuration with certification levels
+# Protocol configuration with certification levels - ALIGNED WITH SCHEMA_CONFORMANCE.md
 PROTOCOLS = ["llm", "vector", "graph", "embedding", "schema", "golden"]
 
 PROTOCOL_DISPLAY_NAMES = {
@@ -25,13 +25,14 @@ PROTOCOL_DISPLAY_NAMES = {
     "golden": "Golden Wire Validation"
 }
 
+# ALIGNED WITH SCHEMA_CONFORMANCE.md TEST COUNTS
 CONFORMANCE_LEVELS = {
     "llm": {"gold": 61, "silver": 49, "development": 31},
     "vector": {"gold": 72, "silver": 58, "development": 36},
     "graph": {"gold": 68, "silver": 54, "development": 34},
     "embedding": {"gold": 75, "silver": 60, "development": 38},
-    "schema": {"gold": 86, "silver": 69, "development": 43},
-    "golden": {"gold": 73, "silver": 58, "development": 37},
+    "schema": {"gold": 13, "silver": 10, "development": 7},    # 13 schema meta-lint tests
+    "golden": {"gold": 73, "silver": 58, "development": 37},   # 73 golden sample tests
 }
 
 TEST_CATEGORIES = {
@@ -93,31 +94,238 @@ TEST_CATEGORIES = {
         "caching": "Caching & Idempotency", 
         "wire_contract": "Wire Contract"
     },
+    # ALIGNED WITH SCHEMA_CONFORMANCE.md TEST CATEGORIES
     "schema": {
-        "meta_lint": "Schema Meta-Lint",
-        "golden_validation": "Golden Wire Validation"
+        "schema_loading": "Schema Loading & IDs",
+        "file_organization": "File Organization", 
+        "metaschema_hygiene": "Metaschema & Hygiene",
+        "cross_references": "Cross-References",
+        "definitions": "Definitions",
+        "envelopes_constants": "Envelopes & Constants",
+        "examples_validation": "Examples Validation",
+        "stream_frames": "Stream Frames",
+        "performance_metrics": "Performance & Metrics"
     },
     "golden": {
-        "wire_messages": "Golden Wire Messages",
-        "envelope_validation": "Envelope Validation"
+        "core_validation": "Core Schema Validation",
+        "ndjson_stream": "NDJSON Stream Validation",
+        "cross_invariants": "Cross-Schema Invariants",
+        "version_format": "Schema Version & Format",
+        "drift_detection": "Drift Detection",
+        "performance_reliability": "Performance & Reliability",
+        "component_coverage": "Component Coverage"
     }
 }
 
 SPEC_SECTION_MAPPING = {
     "llm": {
-        "core_ops": "§8.3 Complete Operation",
-        "streaming": "§8.3 Stream Operation", 
-        "message_validation": "§8.3 Message Format",
-        "sampling_params": "§8.3 Sampling Parameters",
-        "capabilities": "§8.4 Model Discovery"
+        "core_ops": "§8.3 Operations",
+        "message_validation": "§8.3 Operations",
+        "sampling_params": "§8.3 Operations", 
+        "streaming": "§8.3 Operations & §4.1.3 Streaming Frames",
+        "error_handling": "§8.5 LLM-Specific Errors",
+        "capabilities": "§8.4 Model Discovery",
+        "observability": "§6.4 Observability Interfaces & §13 Observability and Monitoring",
+        "deadline": "§4.3 Deadline Propagation & §6.1 Operation Context",
+        "token_counting": "§8.3 Operations",
+        "health": "§8.3 Operations",
+        "wire_envelopes": "§4.1 Wire-First Canonical Form"
     },
     "vector": {
-        "namespace": "§9.3 Namespace Management",
-        "upsert": "§9.3 Upsert Operations", 
-        "query": "§9.3 Query Operations",
-        "capabilities": "§9.2 Capabilities Discovery"
+        "core_ops": "§9.3 Operations",
+        "capabilities": "§9.3 Operations",
+        "namespace": "§9.3 Operations",
+        "upsert": "§9.3 Operations",
+        "query": "§9.3 Operations",
+        "delete": "§9.3 Operations",
+        "filtering": "§9.3 Operations",
+        "dimension_validation": "§9.5 Vector-Specific Errors",
+        "error_handling": "§9.5 Vector-Specific Errors & §12.4 Error Mapping Table",
+        "deadline": "§4.3 Deadline Propagation & §6.1 Operation Context",
+        "health": "§9.3 Operations",
+        "observability": "§6.4 Observability Interfaces & §13 Observability and Monitoring",
+        "batch_limits": "§9.3 Operations & §12.5 Partial Failure Contracts",
+        "wire_envelopes": "§4.1 Wire-First Canonical Form"
     },
-    # ... similar mappings for other protocols
+    "graph": {
+        "core_ops": "§7.3 Operations",
+        "crud_validation": "§7.3.1 Vertex/Edge CRUD",
+        "query_ops": "§7.3.2 Queries",
+        "dialect_validation": "§7.4 Dialects",
+        "streaming": "§7.3.2 Streaming Finalization & §4.1.3 Streaming Frames",
+        "batch_ops": "§7.3.3 Batch Operations",
+        "schema_ops": "§7.5 Schema Operations (Optional)",
+        "error_handling": "§7.3 Operations & §12.4 Error Mapping Table",
+        "capabilities": "§7.3 Operations & §6.2 Capability Discovery",
+        "observability": "§6.4 Observability Interfaces & §13 Observability and Monitoring",
+        "deadline": "§4.3 Deadline Propagation & §6.1 Operation Context",
+        "health": "§7.6 Health",
+        "wire_envelopes": "§4.1 Wire-First Canonical Form"
+    },
+    "embedding": {
+        "core_ops": "§10.3 Operations (Normative Signatures)",
+        "capabilities": "§10.5 Capabilities",
+        "batch_partial": "§10.3 Operations & §12.5 Partial Failure Contracts",
+        "truncation": "§10.6 Semantics",
+        "normalization": "§10.6 Semantics",
+        "token_counting": "§10.3 Operations",
+        "error_handling": "§10.4 Errors (Embedding-Specific) & §12.4 Error Mapping Table",
+        "deadline": "§4.3 Deadline Propagation & §6.1 Operation Context",
+        "health": "§10.3 Operations",
+        "observability": "§6.4 Observability Interfaces & §13 Observability and Monitoring",
+        "caching": "§11.6 Caching (Implementation Guidance)",
+        "wire_contract": "§4.1 Wire-First Canonical Form"
+    },
+    # ALIGNED WITH SCHEMA_CONFORMANCE.md TEST STRUCTURE
+    "schema": {
+        "schema_loading": "Schema Meta-Lint Suite - Schema Loading & IDs",
+        "file_organization": "Schema Meta-Lint Suite - File Organization", 
+        "metaschema_hygiene": "Schema Meta-Lint Suite - Metaschema & Hygiene",
+        "cross_references": "Schema Meta-Lint Suite - Cross-References",
+        "definitions": "Schema Meta-Lint Suite - Definitions",
+        "envelopes_constants": "Schema Meta-Lint Suite - Envelopes & Constants",
+        "examples_validation": "Schema Meta-Lint Suite - Examples Validation",
+        "stream_frames": "Schema Meta-Lint Suite - Stream Frames",
+        "performance_metrics": "Schema Meta-Lint Suite - Performance & Metrics"
+    },
+    "golden": {
+        "core_validation": "Golden Samples Suite - Core Schema Validation",
+        "ndjson_stream": "Golden Samples Suite - NDJSON Stream Validation",
+        "cross_invariants": "Golden Samples Suite - Cross-Schema Invariants",
+        "version_format": "Golden Samples Suite - Schema Version & Format",
+        "drift_detection": "Golden Samples Suite - Drift Detection",
+        "performance_reliability": "Golden Samples Suite - Performance & Reliability",
+        "component_coverage": "Golden Samples Suite - Component Coverage"
+    }
+}
+
+# ALIGNED WITH ACTUAL TEST NAMES FROM SCHEMA_CONFORMANCE.md
+ERROR_GUIDANCE_MAPPING = {
+    "schema": {
+        "schema_loading": {
+            "test_schema_loading": {
+                "error_patterns": {
+                    "invalid_schema": "Schema file failed to load or parse",
+                    "missing_schema": "Required $schema field missing or invalid"
+                },
+                "quick_fix": "Ensure all schema files are valid JSON and include $schema: 'https://json-schema.org/draft/2020-12/schema'",
+                "examples": "See SCHEMA_CONFORMANCE.md - Schema Loading & IDs section"
+            },
+            "test_unique_ids": {
+                "error_patterns": {
+                    "duplicate_id": "Duplicate $id found across schema files",
+                    "invalid_id_format": "$id does not follow https://adaptersdk.org/schemas/ format"
+                },
+                "quick_fix": "Ensure each schema has unique $id following convention: https://adaptersdk.org/schemas/<component>/<file>.json",
+                "examples": "See SCHEMA_CONFORMANCE.md - $id hygiene requirements"
+            }
+        },
+        "metaschema_hygiene": {
+            "test_metaschema_compliance": {
+                "error_patterns": {
+                    "draft_2020_12_violation": "Schema violates JSON Schema Draft 2020-12",
+                    "invalid_keywords": "Unknown or invalid JSON Schema keywords used"
+                },
+                "quick_fix": "Validate schema against Draft 2020-12 metaschema and remove unsupported keywords",
+                "examples": "See SCHEMA_CONFORMANCE.md - Metaschema & Hygiene section"
+            },
+            "test_regex_patterns": {
+                "error_patterns": {
+                    "invalid_regex": "Regular expression pattern does not compile",
+                    "unsupported_regex_flags": "Regex uses unsupported flags"
+                },
+                "quick_fix": "Fix regex patterns to use supported ECMA 262 syntax without flags",
+                "examples": "See SCHEMA_CONFORMANCE.md - Pattern hygiene requirements"
+            }
+        },
+        "cross_references": {
+            "test_ref_resolution": {
+                "error_patterns": {
+                    "unresolved_ref": "$ref cannot be resolved to known schema $id",
+                    "invalid_fragment": "Fragment (#/definitions/...) points to non-existent definition"
+                },
+                "quick_fix": "Ensure all $ref values point to valid $ids or internal fragments",
+                "examples": "See SCHEMA_CONFORMANCE.md - Cross-References section"
+            }
+        }
+    },
+    "golden": {
+        "core_validation": {
+            "test_golden_validation": {
+                "error_patterns": {
+                    "schema_validation_failed": "Golden sample does not validate against its declared schema",
+                    "missing_schema_reference": "Golden file missing $schema reference"
+                },
+                "quick_fix": "Update golden sample to match schema or fix schema definition",
+                "examples": "See SCHEMA_CONFORMANCE.md - Golden Samples Suite section"
+            }
+        },
+        "ndjson_stream": {
+            "test_llm_stream_validation": {
+                "error_patterns": {
+                    "invalid_frame_sequence": "Stream frames violate terminal frame rules",
+                    "missing_terminal_frame": "Stream missing required end or error frame"
+                },
+                "quick_fix": "Ensure streams have exactly one terminal frame (end/error) after data frames",
+                "examples": "See SCHEMA_CONFORMANCE.md - NDJSON Stream Validation"
+            }
+        },
+        "cross_invariants": {
+            "test_partial_success_math": {
+                "error_patterns": {
+                    "count_mismatch": "successes + failures ≠ total items in partial success",
+                    "invalid_indexing": "Failure indices out of bounds"
+                },
+                "quick_fix": "Ensure partial success counts are mathematically consistent",
+                "examples": "See SCHEMA_CONFORMANCE.md - Cross-Schema Invariants"
+            }
+        }
+    },
+    "llm": {
+        "streaming": {
+            "test_stream_finalization": {
+                "error_patterns": {
+                    "missing_final_chunk": "Ensure stream ends with terminal frame per §4.1.3",
+                    "premature_close": "Connection must remain open until terminal frame per §7.3.2 Streaming Finalization",
+                    "chunk_format": "Each frame must follow §4.1.3 Streaming Frames format"
+                },
+                "quick_fix": "Add terminal frame (event: 'end' or event: 'error') after all data frames",
+                "examples": "See §4.1.3 for frame format and §7.3.2 for streaming finalization rules"
+            }
+        },
+        "sampling_params": {
+            "test_temperature_validation": {
+                "error_patterns": {
+                    "invalid_range": "Temperature must be between 0.0 and 2.0 per §8.3",
+                    "type_error": "Temperature must be float, not string per §4.1 Numeric Types"
+                },
+                "quick_fix": "Clamp temperature values to valid range [0.0, 2.0] and ensure numeric types",
+                "examples": "See §8.3 for parameter validation and §4.1 for numeric type rules"
+            }
+        }
+    },
+    "vector": {
+        "namespace": {
+            "test_namespace_isolation": {
+                "error_patterns": {
+                    "cross_namespace_leak": "Data must be strictly isolated per §14.1 Tenant Isolation",
+                    "invalid_namespace": "Namespace must follow §9.3 Operations requirements"
+                },
+                "quick_fix": "Validate namespace format and enforce isolation at storage layer",
+                "examples": "See §9.3 for namespace operations and §14.1 for tenant isolation requirements"
+            }
+        },
+        "dimension_validation": {
+            "test_dimension_mismatch": {
+                "error_patterns": {
+                    "dimension_mismatch": "Vector dimensions must match index dimensions per §9.5",
+                    "invalid_dimension": "Dimensions must be positive integers per §4.1 Numeric Types"
+                },
+                "quick_fix": "Validate vector dimensions before upsert operations",
+                "examples": "See §9.5 for dimension handling and §4.1 for numeric validation"
+            }
+        }
+    }
 }
 
 
@@ -177,8 +385,8 @@ class CorpusProtocolPlugin:
                 
         return "other", "unknown"
     
-    def _categorize_failures(self, failed_reports: List) -> Dict[str, Dict[str, int]]:
-        """Categorize failed tests by protocol and category."""
+    def _categorize_failures(self, failed_reports: List) -> Dict[str, Dict[str, List[Any]]]:
+        """Categorize failed tests by protocol and category - FIXED ARCHITECTURE."""
         by_protocol = {proto: {} for proto in PROTOCOLS}
         by_protocol["other"] = {}
         
@@ -188,11 +396,10 @@ class CorpusProtocolPlugin:
             
             if proto not in by_protocol:
                 by_protocol[proto] = {}
-                
             if category not in by_protocol[proto]:
-                by_protocol[proto][category] = 0
+                by_protocol[proto][category] = []  # Store actual reports, not counts
                 
-            by_protocol[proto][category] += 1
+            by_protocol[proto][category].append(rep)  # Add the full report
                 
         return by_protocol
     
@@ -203,15 +410,12 @@ class CorpusProtocolPlugin:
         if passed_count >= levels.get("gold", 0):
             return "🥇 Gold", 0
         elif passed_count >= levels.get("silver", 0):
-            next_level = "Gold"
             needed = levels.get("gold", 0) - passed_count
             return "🥈 Silver", needed
         elif passed_count >= levels.get("development", 0):
-            next_level = "Silver" 
             needed = levels.get("silver", 0) - passed_count
             return "🔬 Development", needed
         else:
-            next_level = "Development"
             needed = levels.get("development", 0) - passed_count
             return "❌ Below Development", needed
     
@@ -219,6 +423,24 @@ class CorpusProtocolPlugin:
         """Get specification section for a test category."""
         protocol_map = SPEC_SECTION_MAPPING.get(protocol, {})
         return protocol_map.get(category, "See protocol specification")
+    
+    def _get_error_guidance(self, protocol: str, category: str, test_name: str) -> Dict[str, str]:
+        """Get specific error guidance for a test failure."""
+        protocol_guidance = ERROR_GUIDANCE_MAPPING.get(protocol, {})
+        category_guidance = protocol_guidance.get(category, {})
+        test_guidance = category_guidance.get(test_name, {})
+        
+        return {
+            "error_patterns": test_guidance.get("error_patterns", {}),
+            "quick_fix": test_guidance.get("quick_fix", "Review specification section above"),
+            "examples": test_guidance.get("examples", "See specification for implementation details")
+        }
+    
+    def _extract_test_name(self, nodeid: str) -> str:
+        """Extract the test function name from nodeid."""
+        # nodeid format: "tests/llm/test_streaming.py::test_stream_finalization"
+        parts = nodeid.split("::")
+        return parts[-1] if len(parts) > 1 else "unknown_test"
     
     def _print_platinum_certification(self, terminalreporter, counts: Dict[str, int], duration: float):
         """Print Platinum certification summary."""
@@ -240,6 +462,7 @@ class CorpusProtocolPlugin:
         terminalreporter.write_line("")
         terminalreporter.write_line(f"⏱️  Completed in {duration:.2f}s")
         terminalreporter.write_line("🎯 Status: Ready for production deployment")
+        terminalreporter.write_line("📚 Specification: All requirements met per Corpus Protocol Suite V1.0")
     
     def _print_gold_certification(self, terminalreporter, protocol_results: Dict[str, int], duration: float):
         """Print Gold certification summary with progress to Platinum."""
@@ -266,20 +489,21 @@ class CorpusProtocolPlugin:
             terminalreporter.write_line("🎯 Focus on protocols below Gold level for Platinum certification")
         
         terminalreporter.write_line(f"⏱️  Completed in {duration:.2f}s")
+        terminalreporter.write_line("📚 Review CONFORMANCE.md for detailed test-to-spec mapping")
     
-    def _print_failure_analysis(self, terminalreporter, by_protocol: Dict[str, Dict[str, int]], duration: float):
-        """Print detailed failure analysis with actionable guidance."""
+    def _print_failure_analysis(self, terminalreporter, by_protocol: Dict[str, Dict[str, List[Any]]], duration: float):
+        """Print detailed failure analysis with actionable guidance - FIXED ARCHITECTURE."""
         terminalreporter.write_sep("=", "❌ CORPUS PROTOCOL CONFORMANCE ANALYSIS")
         
         total_failures = 0
         for proto_failures in by_protocol.values():
-            for category_count in proto_failures.values():
-                total_failures += category_count
+            for reports_list in proto_failures.values():
+                total_failures += len(reports_list)  # Count from actual reports
         
         terminalreporter.write_line(f"Found {total_failures} conformance issue(s) across protocols:")
         terminalreporter.write_line("")
         
-        # Show failures by protocol and category
+        # Show failures by protocol and category with specific guidance
         for proto, categories in by_protocol.items():
             if not categories:
                 continue
@@ -287,12 +511,33 @@ class CorpusProtocolPlugin:
             display_name = PROTOCOL_DISPLAY_NAMES.get(proto, proto.upper())
             terminalreporter.write_line(f"{display_name}:")
             
-            for category, count in categories.items():
+            for category, reports_list in categories.items():
+                count = len(reports_list)
                 category_name = TEST_CATEGORIES.get(proto, {}).get(category, category.replace('_', ' ').title())
                 spec_section = self._get_spec_section(proto, category)
                 
                 terminalreporter.write_line(f"  ❌ {category_name}: {count} failure(s)")
                 terminalreporter.write_line(f"      Specification: {spec_section}")
+                
+                # Show specific guidance for each failed test - FIXED LOGIC
+                for rep in reports_list:
+                    test_name = self._extract_test_name(rep.nodeid)
+                    guidance = self._get_error_guidance(proto, category, test_name)
+                    
+                    # Only show guidance if we have specific advice
+                    if guidance["quick_fix"] != "Review specification section above":
+                        terminalreporter.write_line(f"      Test: {test_name}")
+                        terminalreporter.write_line(f"      Quick fix: {guidance['quick_fix']}")
+                        
+                        # Show error patterns if available
+                        error_patterns = guidance.get("error_patterns", {})
+                        if error_patterns:
+                            # Try to extract actual error message for pattern matching
+                            error_msg = getattr(rep, 'longrepr', str(rep))
+                            for pattern_key, pattern_desc in error_patterns.items():
+                                if pattern_key.lower() in str(error_msg).lower():
+                                    terminalreporter.write_line(f"      Detected: {pattern_desc}")
+                                    break
             
             terminalreporter.write_line("")
         
@@ -310,9 +555,10 @@ class CorpusProtocolPlugin:
         
         terminalreporter.write_line("")
         terminalreporter.write_line("Next Steps:")
-        terminalreporter.write_line("  1. Review failing tests above")
-        terminalreporter.write_line("  2. Check CONFORMANCE.md for test-to-spec mapping") 
+        terminalreporter.write_line("  1. Review failing tests above with spec section references")
+        terminalreporter.write_line("  2. Check SPECIFICATION.md for detailed requirements") 
         terminalreporter.write_line("  3. Run individual protocol tests: make test-{protocol}-conformance")
+        terminalreporter.write_line("  4. Review error guidance in test output for specific fixes")
         terminalreporter.write_line(f"⏱️  Completed in {duration:.2f}s")
     
     def _collect_protocol_results(self, terminalreporter) -> Dict[str, int]:
@@ -349,8 +595,6 @@ class CorpusProtocolPlugin:
         
         # Collect protocol-specific results
         protocol_results = self._collect_protocol_results(terminalreporter)
-        
-        # --- CORRECTED LOGIC ---
         
         # Check if any tests actually failed
         if not failed_reports:
