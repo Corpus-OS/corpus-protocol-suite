@@ -20,7 +20,6 @@ Covers (normative + robustness):
 
 import pytest
 from corpus_sdk.llm.llm_base import OperationContext, LLMChunk, DeadlineExceeded
-from examples.common.ctx import make_ctx
 
 pytestmark = pytest.mark.asyncio
 
@@ -34,7 +33,7 @@ async def test_streaming_stream_has_single_final_chunk_and_progress_usage(adapte
     if not caps.supports_streaming:
         pytest.skip("Adapter does not support streaming")
 
-    ctx = make_ctx(OperationContext, request_id="t_stream_semantics", tenant="test")
+    ctx = OperationContext(request_id="t_stream_semantics", tenant="test")
 
     chunks: list[LLMChunk] = []
     async for ch in adapter.stream(
@@ -74,7 +73,7 @@ async def test_streaming_stream_model_consistent_when_present(adapter):
     if not caps.supports_streaming:
         pytest.skip("Adapter does not support streaming")
 
-    ctx = make_ctx(OperationContext, request_id="t_stream_model", tenant="test")
+    ctx = OperationContext(request_id="t_stream_model", tenant="test")
     models = []
 
     async for ch in adapter.stream(
@@ -97,7 +96,7 @@ async def test_streaming_stream_early_cancel_then_new_stream_ok(adapter):
     if not caps.supports_streaming:
         pytest.skip("Adapter does not support streaming")
 
-    ctx = make_ctx(OperationContext, request_id="t_stream_cancel", tenant="test")
+    ctx = OperationContext(request_id="t_stream_cancel", tenant="test")
 
     # Start and cancel early
     it = adapter.stream(
@@ -160,7 +159,7 @@ async def test_streaming_stream_content_progress_and_terminal_rules(adapter):
     if not caps.supports_streaming:
         pytest.skip("Adapter does not support streaming")
 
-    ctx = make_ctx(OperationContext, request_id="t_stream_progress", tenant="test")
+    ctx = OperationContext(request_id="t_stream_progress", tenant="test")
 
     chunks: list[LLMChunk] = []
     async for ch in adapter.stream(
@@ -198,7 +197,7 @@ async def test_streaming_stream_body_matches_complete_result(adapter):
     if not caps.supports_streaming:
         pytest.skip("Adapter does not support streaming")
 
-    ctx = make_ctx(OperationContext, request_id="t_stream_vs_complete", tenant="test")
+    ctx = OperationContext(request_id="t_stream_vs_complete", tenant="test")
 
     # Stream
     chunks: list[LLMChunk] = []
