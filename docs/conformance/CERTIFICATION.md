@@ -1,5 +1,25 @@
 # Corpus Protocol Suite V1.0 Conformance Test Coverage
 
+## Table of Contents
+
+- [Overview](#overview)
+- [Certification Status](#certification-status)
+- [Conformance Summary](#conformance-summary)
+  - [Individual Protocol Certification Levels](#individual-protocol-certification-levels)
+  - [Cross-Protocol Foundation Coverage](#cross-protocol-foundation-coverage)
+- [Schema Conformance Testing](#schema-conformance-testing)
+- [Graph Protocol V1.0 Conformance](#graph-protocol-v10-conformance)
+- [LLM Protocol V1.0 Conformance](#llm-protocol-v10-conformance)
+- [Vector Protocol V1.0 Conformance](#vector-protocol-v10-conformance)
+- [Embedding Protocol V1.0 Conformance](#embedding-protocol-v10-conformance)
+- [Implementation Verification](#implementation-verification)
+  - [Adapter Compliance Checklist](#adapter-compliance-checklist)
+  - [Conformance Certification Levels](#conformance-certification-levels)
+- [Badge Usage & Brand Guidelines](#badge-usage--brand-guidelines)
+  - [Certified Implementation Badges](#certified-implementation-badges)
+  - [Protocol-Specific Badges](#protocol-specific-badges)
+  - [Badge Placement Guidelines](#badge-placement-guidelines)
+
 ## Overview
 
 This document provides authoritative conformance test coverage for the **Corpus Protocol Suite V1.0** as defined in `SPECIFICATION.md`. Each test validates normative requirements (MUST/SHOULD) from the complete specification across all four runtime protocols (Graph, LLM, Vector, Embedding) and the Schema Conformance suite.
@@ -14,9 +34,9 @@ This suite constitutes the **official Corpus Protocol Suite V1.0 Reference Confo
 
 **Protocol Version:** Corpus Protocol Suite V1.0  
 **Status:** Stable / Production-Ready  
-**Last Updated:** 2025-02-07  
+**Last Updated:** 2025-11-12  
 **Test Location:** `https://github.com/corpus/protocol-tests`  
-**Full Conformance (Platinum):** MUST pass 303/303 tests
+**Full Conformance (Platinum):** MUST pass 362/362 tests
 
 ## Certification Status
 
@@ -24,7 +44,7 @@ This suite constitutes the **official Corpus Protocol Suite V1.0 Reference Confo
 
 ## Conformance Summary
 
-**Overall Coverage: 303/303 tests (100%) ✅**  
+**Overall Coverage: 362/362 tests (100%) ✅**  
 **Certification Level:** 🏆 **PLATINUM**
 
 | Protocol | Tests | Coverage | Status | Certification |
@@ -33,7 +53,7 @@ This suite constitutes the **official Corpus Protocol Suite V1.0 Reference Confo
 | **LLM Protocol V1.0** | 61/61 | 100% ✅ | Production Ready | ![LLM Protocol](https://img.shields.io/badge/CorpusLLM%20Protocol-100%25%20Conformant-brightgreen) |
 | **Vector Protocol V1.0** | 72/72 | 100% ✅ | Production Ready | ![Vector Protocol](https://img.shields.io/badge/CorpusVector%20Protocol-100%25%20Conformant-brightgreen) |
 | **Embedding Protocol V1.0** | 75/75 | 100% ✅ | Production Ready | ![Embedding Protocol](https://img.shields.io/badge/CorpusEmbedding%20Protocol-100%25%20Conformant-brightgreen) |
-| **Schema Conformance** | 27/27 | 100% ✅ | Production Ready | ![Schema Conformance](https://img.shields.io/badge/CorpusSchema-100%25%20Conformant-blue) |
+| **Schema Conformance** | 86/86 | 100% ✅ | Production Ready | ![Schema Conformance](https://img.shields.io/badge/CorpusSchema-100%25%20Conformant-blue) |
 
 ### Individual Protocol Certification Levels
 
@@ -43,7 +63,7 @@ This suite constitutes the **official Corpus Protocol Suite V1.0 Reference Confo
 | **LLM** | 61/61 tests | 49+ tests | 31+ tests |
 | **Vector** | 72/72 tests | 58+ tests | 36+ tests |
 | **Embedding** | 75/75 tests | 60+ tests | 38+ tests |
-| **Schema** | 27/27 tests | 22+ tests | 14+ tests |
+| **Schema** | 86/86 tests | 69+ tests | 43+ tests |
 
 ### Cross-Protocol Foundation Coverage
 
@@ -54,29 +74,29 @@ This suite constitutes the **official Corpus Protocol Suite V1.0 Reference Confo
 | Observability & Privacy | 22/22 | 100% ✅ | Production Ready |
 | Wire Contracts & Envelopes | 50/50 | 100% ✅ | Production Ready |
 | Security & Tenant Isolation | 20/20 | 100% ✅ | Production Ready |
-| Schema Validation & Hygiene | 27/27 | 100% ✅ | Production Ready |
+| Schema Validation & Hygiene | 86/86 | 100% ✅ | Production Ready |
 
 ---
 
 ## Schema Conformance Testing
 
 ### Specification: §5 Schema Validation & Wire Contracts
-**Status:** ✅ Complete (27 tests)  
+**Status:** ✅ Complete (86 tests)  
 **Certification:** ![Schema Conformance](https://img.shields.io/badge/CorpusSchema-100%25%20Conformant-blue)
 
 | Category | Tests | Coverage | Status |
 |----------|--------|-----------|---------|
-| Schema Meta-Lint | 8/8 | 100% ✅ | Production Ready |
-| Golden Wire Messages | 19/19 | 100% ✅ | Production Ready |
+| Schema Meta-Lint | 13/13 | 100% ✅ | Production Ready |
+| Golden Wire Messages | 73/73 | 100% ✅ | Production Ready |
 
 #### Key Test Files
-- `tests/schema/test_schema_lint.py` - §5.1 Schema Meta-Lint & Hygiene (8 tests)
-- `tests/golden/test_golden_samples.py` - §5.2 Golden Wire Message Validation (19 tests)
+- `tests/schema/test_schema_lint.py` - §5.1 Schema Meta-Lint & Hygiene (13 comprehensive tests)
+- `tests/golden/test_golden_samples.py` - §5.2 Golden Wire Message Validation (73 individual test cases)
 
 **Individual Certification Levels:**
-- 🥇 **Gold:** 27/27 tests (100%)
-- 🥈 **Silver:** 22+ tests (80%+)
-- 🔬 **Development:** 14+ tests (50%+)
+- 🥇 **Gold:** 86/86 tests (100%)
+- 🥈 **Silver:** 69+ tests (80%+)
+- 🔬 **Development:** 43+ tests (50%+)
 
 ---
 
@@ -237,7 +257,7 @@ This suite constitutes the **official Corpus Protocol Suite V1.0 Reference Confo
 - [ ] Validate wire envelope compatibility
 
 **Phase 2: Schema Compliance**
-- [ ] Pass all 27 schema conformance tests
+- [ ] Pass all 86 schema conformance tests
 - [ ] Validate JSON Schema Draft 2020-12 compliance
 - [ ] Pass golden wire message validation
 - [ ] Ensure cross-protocol schema consistency
@@ -255,7 +275,7 @@ This suite constitutes the **official Corpus Protocol Suite V1.0 Reference Confo
 - [ ] Support partial failure reporting
 
 **Phase 5: Certification**
-- [ ] Pass all 303/303 tests unmodified
+- [ ] Pass all 362/362 tests unmodified
 - [ ] Document implementation coverage
 - [ ] Publish conformance badge with results link
 
@@ -263,9 +283,9 @@ This suite constitutes the **official Corpus Protocol Suite V1.0 Reference Confo
 
 | Level | Requirements | Badge |
 |-------|--------------|--------|
-| **Platinum** | 303/303 tests across all protocols | ![Corpus Protocol Suite](https://img.shields.io/badge/CorpusProtocol%20Suite-Platinum%20Certified-gold) |
-| **Silver** | 212+ tests with major protocol coverage | ![Corpus Protocol Suite](https://img.shields.io/badge/CorpusProtocol%20Suite-Silver%20Certified-silver) |
-| **Development** | 106+ tests in active development | ![Corpus Protocol Suite](https://img.shields.io/badge/CorpusProtocol%20Suite-Development%20Certified-blue) |
+| **Platinum** | 362/362 tests across all protocols | ![Corpus Protocol Suite](https://img.shields.io/badge/CorpusProtocol%20Suite-Platinum%20Certified-gold) |
+| **Silver** | 290+ tests with major protocol coverage | ![Corpus Protocol Suite](https://img.shields.io/badge/CorpusProtocol%20Suite-Silver%20Certified-silver) |
+| **Development** | 181+ tests in active development | ![Corpus Protocol Suite](https://img.shields.io/badge/CorpusProtocol%20Suite-Development%20Certified-blue) |
 
 ---
 
@@ -323,4 +343,5 @@ A Corpus Protocol Suite implementation supporting Graph, LLM, Vector, and Embedd
 **Certification Authority:** Corpus Standards Working Group  
 **Test Suite:** https://github.com/corpus/protocol-tests  
 **Certification Portal:** https://corpus.io/certification  
-**Status:** 🏆 **PLATINUM CERTIFIED** • Valid until 2026-02-07
+**Status:** 🏆 **PLATINUM CERTIFIED** • Valid until 2026-11-12
+```
