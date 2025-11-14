@@ -8,9 +8,7 @@ Spec refs:
 """
 
 import pytest
-
-from corpus_sdk.examples.vector.mock_vector_adapter import MockVectorAdapter
-from adapter_sdk.vector_base import (
+from corpus_sdk.vector.vector_base import (
     Vector,
     VectorID,
     UpsertSpec,
@@ -22,46 +20,59 @@ from adapter_sdk.vector_base import (
 pytestmark = pytest.mark.asyncio
 
 
-async def test_delete_by_ids_returns_counts():
-    a = MockVectorAdapter()
-    v = Vector(id=VectorID("d1"), vector=[0.1, 0.2])
-    await a.upsert(UpsertSpec(namespace="default", vectors=[v]))
+async def test_delete_delete_by_ids_returns_counts(adapter):
+    """Verify delete by IDs returns proper counts and result structure."""
+    # First upsert a vector to delete
+    vector = Vector(id=VectorID("d1"), vector=[0.1, 0.2])
+    await adapter.upsert(UpsertSpec(namespace="default", vectors=[vector]))
 
-    res = await a.delete(DeleteSpec(namespace="default", ids=[VectorID("d1")]))
-    assert isinstance(res, DeleteResult)
-    assert res.deleted_count >= 1
-    assert isinstance(res.failures, list)
+    # Then delete it
+    result = await adapter.delete(DeleteSpec(namespace="default", ids=[VectorID("d1")]))
+    
+    assert isinstance(result, DeleteResult)
+    assert result.deleted_count >= 1
+    assert isinstance(result.failures, list)
 
 
-async def test_delete_by_filter_returns_counts():
-    a = MockVectorAdapter()
-    # Rely on mock semantics; at minimum, no crash + valid shape.
+async def test_delete_delete_by_filter_returns_counts(adapter):
+    """Verify delete by filter returns proper result structure."""
     spec = DeleteSpec(namespace="default", ids=[], filter={"foo": "bar"})
-    res = await a.delete(spec)
-    assert isinstance(res, DeleteResult)
-    assert res.deleted_count >= 0
+    result = await adapter.delete(spec)
+    
+    assert isinstance(result, DeleteResult)
+    assert result.deleted_count >= 0
+    assert isinstance(result.failures, list)
 
 
-async def test_delete_requires_ids_or_filter():
-    a = MockVectorAdapter()
+async def test_delete_requires_ids_or_filter(adapter):
+    """Verify delete requires either IDs or filter parameter."""
     spec = DeleteSpec(namespace="default", ids=[], filter=None)
-    with pytest.raises(BadRequest):
-        await a.delete(spec)
+    
+    with pytest.raises(BadRequest) as exc_info:
+        await adapter.delete(spec)
+    
+    err = exc_info.value
+    assert "ids" in str(err).lower() or "filter" in str(err).lower()
 
 
-async def test_delete_idempotent_for_missing_ids():
-    a = MockVectorAdapter()
-    spec = DeleteSpec(namespace="default", ids=[VectorID("missing")])
-    res1 = await a.delete(spec)
-    res2 = await a.delete(spec)
-    assert res1.deleted_count >= 0
-    assert res2.deleted_count >= 0
+async def test_delete_idempotent_for_missing_ids(adapter):
+    """Verify delete operations are idempotent for non-existent IDs."""
+    spec = DeleteSpec(namespace="default", ids=[VectorID("non-existent-id")])
+    
+    result1 = await adapter.delete(spec)
+    result2 = await adapter.delete(spec)
+    
+    assert result1.deleted_count >= 0
+    assert result2.deleted_count >= 0
+    # Idempotent means subsequent calls should behave the same
+    assert result1.deleted_count == result2.deleted_count
 
 
-async def test_delete_result_structure():
-    a = MockVectorAdapter()
-    spec = DeleteSpec(namespace="default", ids=[VectorID("x")])
-    res = await a.delete(spec)
-    assert hasattr(res, "deleted_count")
-    assert hasattr(res, "failed_count")
-    assert isinstance(res.failures, list)
+async def test_delete_delete_result_structure(adapter):
+    """Verify DeleteResult has all required fields with proper types."""
+    spec = DeleteSpec(namespace="default", ids=[VectorID("test-vector")])
+    result = await adapter.delete(spec)
+    
+    assert hasattr(result, "deleted_count") and isinstance(result.deleted_count, int)
+    assert hasattr(result, "failed_count") and isinstance(result.failed_count, int)
+    assert hasattr(result, "failures") and isinstance(result.failures, list)
