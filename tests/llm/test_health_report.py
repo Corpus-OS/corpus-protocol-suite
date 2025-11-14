@@ -15,19 +15,16 @@ Covers:
 """
 
 import pytest
-
-from corpus_sdk.examples.llm.mock_llm_adapter import MockLLMAdapter
 from corpus_sdk.llm.llm_base import OperationContext, DeadlineExceeded
-from corpus_sdk.examples.common.ctx import make_ctx
+from examples.common.ctx import make_ctx
 
 pytestmark = pytest.mark.asyncio
 
 
-async def test_health_has_required_fields():
+async def test_health_health_has_required_fields(adapter):
     """
     §7.6 — Health MUST provide stable shape; §6.2 — identity fields present.
     """
-    adapter = MockLLMAdapter(failure_rate=0.0)
     ctx = make_ctx(OperationContext, request_id="t_health", tenant="test")
 
     h = await adapter.health(ctx=ctx)
@@ -48,14 +45,13 @@ async def test_health_has_required_fields():
     assert isinstance(h["version"], str) and h["version"].strip(), "'version' must be a non-empty string"
 
 
-async def test_health_shape_consistent_when_degraded():
+async def test_health_health_shape_consistent_when_degraded(adapter):
     """
     §7.6 — Shape MUST be consistent even when degraded/unavailable.
     """
-    adapter = MockLLMAdapter(failure_rate=0.0)
     ctx = make_ctx(OperationContext, tenant="test")
 
-    # Probe several times; mock may occasionally report degraded
+    # Probe several times; implementation may occasionally report degraded
     for _ in range(20):
         h = await adapter.health(ctx=ctx)
 
@@ -70,11 +66,10 @@ async def test_health_shape_consistent_when_degraded():
             assert isinstance(h["status"], str)
 
 
-async def test_health_identity_fields_are_stable_across_calls():
+async def test_health_health_identity_fields_are_stable_across_calls(adapter):
     """
     §7.6 / §6.2 — Identity information (server/version) SHOULD be stable across health probes.
     """
-    adapter = MockLLMAdapter(failure_rate=0.0)
     ctx = make_ctx(OperationContext, request_id="t_health_stability", tenant="test")
 
     h1 = await adapter.health(ctx=ctx)
@@ -84,12 +79,10 @@ async def test_health_identity_fields_are_stable_across_calls():
     assert h1["version"] == h2["version"], "version should be stable"
 
 
-async def test_health_deadline_preexpired_raises_deadline_exceeded():
+async def test_health_health_deadline_preexpired_raises_deadline_exceeded(adapter):
     """
     §6.1 — Pre-expired budgets MUST fail fast with DeadlineExceeded.
     """
-    adapter = MockLLMAdapter(failure_rate=0.0)
-
     # Absolute epoch 0 guarantees elapsed deadline
     ctx = OperationContext(deadline_ms=0, tenant="test")
 
