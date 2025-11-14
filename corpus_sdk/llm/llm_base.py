@@ -1,4 +1,4 @@
-# adapter_sdk/llm_base.py
+# corpus_sdk/llm/llm_base.py
 # SPDX-License-Identifier: Apache-2.0
 """
 Adapter SDK — LLM Protocol V1 (public contract + production-grade base)
@@ -911,7 +911,7 @@ class BaseLLMAdapter(LLMProtocolV1):
             raise BadRequest("top_p must be within (0.0, 1.0]")
         if frequency_penalty is not None and not (-2.0 <= frequency_penalty <= 2.0):
             raise BadRequest("frequency_penalty must be within [-2.0, 2.0]")
-        if presence_penalty is not None and not (-2.0 <= presence_penalty <= 2.0):
+        if presence_penalty is not None and not (-2.0 <= presence_penalty <= 2.0]):
             raise BadRequest("presence_penalty must be within [-2.0, 2.0]")
 
     @staticmethod
@@ -1245,7 +1245,35 @@ class BaseLLMAdapter(LLMProtocolV1):
 
         SHOULD be fast and side-effect free; MAY call upstream discovery APIs.
         """
-        return await self._do_capabilities()
+        t0 = time.monotonic()
+        try:
+            if isinstance(self._cache, InMemoryTTLCache):
+                key = "llm:capabilities"
+                cached = await self._cache.get(key)
+                if cached:
+                    self._metrics.counter(
+                        component=self._component,
+                        name="cache_hits",
+                        value=1,
+                        extra={"op": "capabilities"},
+                    )
+                    self._record("capabilities", t0, True)
+                    return cached
+            caps = await self._do_capabilities()
+            if isinstance(self._cache, InMemoryTTLCache):
+                try:
+                    await self._cache.set("llm:capabilities", caps, ttl_s=self._cache_ttl_s)
+                except Exception:
+                    pass
+            self._record("capabilities", t0, True)
+            return caps
+        except LLMAdapterError as e:
+            code = e.code or type(e).__name__
+            self._record("capabilities", t0, False, code=code)
+            raise
+        except Exception as e:
+            self._record("capabilities", t0, False, code="UNAVAILABLE")
+            raise Unavailable("capabilities fetch failed") from e
 
     async def complete(
         self,
@@ -1276,8 +1304,6 @@ class BaseLLMAdapter(LLMProtocolV1):
         )
 
         async def _call() -> LLMCompletion:
-            self._preflight_deadline(ctx)
-
             caps = await self._do_capabilities()
             self._gate_model_if_listed(model=model, caps=caps)
 
@@ -1399,10 +1425,11 @@ class BaseLLMAdapter(LLMProtocolV1):
             metric_extra["model"] = model
 
         async def agen_factory() -> AsyncIterator[LLMChunk]:
-            self._preflight_deadline(ctx)
-
             caps = await self._do_capabilities()
             self._gate_model_if_listed(model=model, caps=caps)
+
+            if not caps.supports_streaming:
+                raise NotSupported("stream is not supported by this adapter")
 
             await self._preflight_context_window_if_supported(
                 messages=messages,
@@ -1451,8 +1478,8 @@ class BaseLLMAdapter(LLMProtocolV1):
             - capabilities.supports_count_tokens
             - ctx.deadline_ms via DeadlinePolicy
         """
-        if not isinstance(text, str) or not text:
-            raise BadRequest("text must be a non-empty string")
+        if not isinstance(text, str):
+            raise BadRequest("text must be a string")
 
         t0 = time.monotonic()
         try:

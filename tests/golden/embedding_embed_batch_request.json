@@ -1,0 +1,14 @@
+{
+  "op": "embedding.embed_batch",
+  "ctx": {
+    "request_id": "req_emb_01",
+    "deadline_ms": 253402214400000,
+    "tenant": "acme"
+  },
+  "args": {
+    "texts": ["alpha", "beta", "gamma-too-long"],
+    "model": "example-embed-1",
+    "truncate": true,
+    "normalize": true
+  }
+}

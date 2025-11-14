@@ -1,9 +1,3 @@
-**Overall Coverage and category table updated + wire handler section added; everything else left as-is.**
-
-Here’s the updated document:
-
----
-
 # Graph Protocol V1 Conformance Test Coverage
 
 ## Overview

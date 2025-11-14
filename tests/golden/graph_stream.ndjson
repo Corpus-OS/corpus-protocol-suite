@@ -1,0 +1,3 @@
+{"event":"data","data":{"row":{"n":{"id":"v1","labels":["Node"],"props":{"kind":"demo"}}}}}
+{"event":"data","data":{"row":{"n":{"id":"v2","labels":["Node"],"props":{"kind":"demo"}}}}}
+{"event":"end","code":"OK"}

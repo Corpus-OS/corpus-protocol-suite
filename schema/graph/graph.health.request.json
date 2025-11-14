@@ -1,0 +1,9 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adaptersdk.org/schemas/graph/graph.health.request.json",
+  "title": "graph.health Args",
+  "description": "Explicit empty-args schema for graph.health().",
+  "type": "object",
+  "additionalProperties": false,
+  "maxProperties": 0
+}
