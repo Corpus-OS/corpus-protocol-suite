@@ -11,10 +11,8 @@ Covers:
 """
 
 import pytest
-
-from corpus_sdk.examples.llm.mock_llm_adapter import MockLLMAdapter
 from corpus_sdk.llm.llm_base import OperationContext, BadRequest
-from corpus_sdk.examples.common.ctx import make_ctx
+from examples.common.ctx import make_ctx
 
 pytestmark = pytest.mark.asyncio
 
@@ -28,26 +26,26 @@ pytestmark = pytest.mark.asyncio
         ([{"role": "user"}], "content"),      # missing content
     ],
 )
-async def test_invalid_messages_rejected(messages, expected_hint):
+async def test_message_validation_invalid_messages_rejected(adapter, messages, expected_hint):
     """
     Verify that the adapter (or base) enforces basic message schema rules.
     """
-    adapter = MockLLMAdapter(failure_rate=0.0)
+    caps = await adapter.capabilities()
     ctx = make_ctx(OperationContext, request_id="t_msg_invalid", tenant="test")
 
     with pytest.raises(BadRequest) as exc_info:
-        await adapter.complete(messages=messages, model="mock-model", ctx=ctx)
+        await adapter.complete(messages=messages, model=caps.supported_models[0], ctx=ctx)
 
     # Error message should hint at the offending field/condition
     msg = str(getattr(exc_info.value, "message", exc_info.value)).lower()
     assert expected_hint in msg
 
 
-async def test_accepts_standard_roles():
+async def test_message_validation_accepts_standard_roles(adapter):
     """
     The adapter should accept the canonical conversation roles.
     """
-    adapter = MockLLMAdapter(failure_rate=0.0)
+    caps = await adapter.capabilities()
     ctx = make_ctx(OperationContext, request_id="t_msg_roles_ok", tenant="test")
 
     res = await adapter.complete(
@@ -56,24 +54,24 @@ async def test_accepts_standard_roles():
             {"role": "user", "content": "Question"},
             {"role": "assistant", "content": "Previous response"},
         ],
-        model="mock-model",
+        model=caps.supported_models[0],
         ctx=ctx,
     )
     assert isinstance(res.text, str) and len(res.text) > 0
 
 
-async def test_handles_large_message_content():
+async def test_message_validation_handles_large_message_content(adapter):
     """
     Large-but-reasonable content should be processed without schema failures.
     (This does NOT test model context limits; just schema-level acceptance.)
     """
-    adapter = MockLLMAdapter(failure_rate=0.0)
+    caps = await adapter.capabilities()
     ctx = make_ctx(OperationContext, request_id="t_msg_large", tenant="test")
 
     large_content = "x" * 10_000  # ~10KB payload: reasonable for schema tests
     res = await adapter.complete(
         messages=[{"role": "user", "content": large_content}],
-        model="mock-model",
+        model=caps.supported_models[0],
         ctx=ctx,
     )
     assert isinstance(res.text, str) and res.text.strip()
