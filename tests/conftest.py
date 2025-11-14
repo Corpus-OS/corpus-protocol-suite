@@ -9,18 +9,171 @@ failure analysis, and actionable guidance.
 
 from __future__ import annotations
 
+import os
 import time
+import importlib
 from typing import Dict, List, Optional, Tuple, Any
 
+import pytest
+
+
+# ---------------------------------------------------------------------------
+# Pluggable adapter fixture (SDK-agnostic, no hard dependencies)
+# ---------------------------------------------------------------------------
+
+# Environment variable for fully-qualified adapter class:
+#   CORPUS_ADAPTER="package.module:ClassName"
+#
+# This allows vendors (or you) to plug in ANY adapter implementation that
+# satisfies the expected protocol interface, without this file knowing
+# anything about corpus_sdk or concrete adapter types.
+ADAPTER_ENV = "CORPUS_ADAPTER"
+
+# Default adapter used when CORPUS_ADAPTER is not set.
+# This assumes a local mock implementation lives in the tests repo at:
+#   tests/mocks/mock_llm_adapter.py
+# with a class named:
+#   MockLLMAdapter
+DEFAULT_ADAPTER = "tests.mocks.mock_llm_adapter:MockLLMAdapter"
+
+# Optional endpoint for network-backed adapters. If set, we will attempt to
+# pass it to the adapter's constructor as one of:
+#   endpoint=, base_url=, or url=
+# The adapter is free to ignore it or not accept these parameters.
+ENDPOINT_ENV = "CORPUS_ENDPOINT"
+
+# Cached adapter class to avoid repeated import and attribute lookups.
+_ADAPTER_CLASS: Optional[type] = None
+_ADAPTER_SPEC_USED: Optional[str] = None
+
+
+def _load_class_from_spec(spec: str) -> type:
+    """
+    Load a class from a 'package.module:ClassName' string.
+
+    This function performs no assumptions about the underlying SDK or
+    type hierarchy; it simply loads a Python object by module and name.
+    """
+    module_name, _, class_name = spec.partition(":")
+    if not module_name or not class_name:
+        raise RuntimeError(
+            f"Invalid adapter spec '{spec}'. Expected 'package.module:ClassName'."
+        )
+
+    try:
+        module = importlib.import_module(module_name)
+    except ImportError as exc:
+        raise RuntimeError(
+            f"Failed to import adapter module '{module_name}' for spec '{spec}'."
+        ) from exc
+
+    try:
+        cls = getattr(module, class_name)
+    except AttributeError as exc:
+        raise RuntimeError(
+            f"Adapter class '{class_name}' not found in module '{module_name}' "
+            f"for spec '{spec}'."
+        ) from exc
+
+    if not callable(cls):
+        raise RuntimeError(
+            f"Resolved adapter '{spec}' is not callable. "
+            f"Expected a class or factory function."
+        )
+
+    return cls  # type: ignore[return-value]
+
+
+def _get_adapter_class() -> type:
+    """
+    Resolve and cache the adapter class based on environment configuration.
+
+    Resolution order:
+      1. If CORPUS_ADAPTER is set, use that spec.
+      2. Otherwise, fall back to DEFAULT_ADAPTER.
+
+    The resolved class is cached for the duration of the test session to
+    avoid repeated dynamic imports and attribute lookups.
+    """
+    global _ADAPTER_CLASS, _ADAPTER_SPEC_USED
+
+    if _ADAPTER_CLASS is not None:
+        return _ADAPTER_CLASS
+
+    spec = os.getenv(ADAPTER_ENV, DEFAULT_ADAPTER)
+    _ADAPTER_SPEC_USED = spec
+    _ADAPTER_CLASS = _load_class_from_spec(spec)
+    return _ADAPTER_CLASS
+
+
+@pytest.fixture
+def adapter():
+    """
+    Generic, pluggable adapter fixture.
+
+    This fixture is intentionally SDK-agnostic: it does not import or
+    reference corpus_sdk, LLMAdapter, or any concrete adapter types.
+
+    Behavior:
+      - Reads CORPUS_ADAPTER (if set) as 'package.module:ClassName'.
+      - Otherwise uses DEFAULT_ADAPTER (tests.mocks.mock_llm_adapter:MockLLMAdapter).
+      - If CORPUS_ENDPOINT is set, it will *attempt* to pass it to the
+        adapter's constructor using common parameter names: endpoint=,
+        base_url=, or url=. If none of these match the adapter's signature,
+        it falls back to calling the adapter with no arguments.
+
+    This keeps the tests flexible: any implementation can be swapped in
+    via environment configuration, as long as it matches the expected
+    protocol interface at runtime.
+    """
+    Adapter = _get_adapter_class()
+    endpoint = os.getenv(ENDPOINT_ENV)
+
+    if endpoint:
+        # Best-effort injection of endpoint-style parameter. We deliberately
+        # do not inspect signatures to avoid extra overhead and complexity;
+        # instead we try a few common names and gracefully fall back.
+        for kw in ("endpoint", "base_url", "url"):
+            try:
+                return Adapter(**{kw: endpoint})  # type: ignore[arg-type]
+            except TypeError:
+                # The adapter's __init__ does not accept this keyword;
+                # try the next one.
+                continue
+
+        # As a final fallback, instantiate without arguments. This allows
+        # adapters that obtain configuration from other sources (e.g. env).
+        try:
+            return Adapter()  # type: ignore[call-arg]
+        except TypeError as exc:
+            raise RuntimeError(
+                f"Failed to instantiate adapter '{_ADAPTER_SPEC_USED or Adapter}' "
+                f"with or without endpoint from {ENDPOINT_ENV}."
+            ) from exc
+
+    # Local/mock mode (no endpoint configured)
+    try:
+        return Adapter()  # type: ignore[call-arg]
+    except TypeError as exc:
+        raise RuntimeError(
+            f"Failed to instantiate adapter '{_ADAPTER_SPEC_USED or Adapter}' "
+            f"without arguments. Ensure your mock/adapter has a no-arg "
+            f"constructor or configure {ENDPOINT_ENV} appropriately."
+        ) from exc
+
+
+# ---------------------------------------------------------------------------
+# Existing Corpus Protocol conformance reporting plugin
+# ---------------------------------------------------------------------------
 
 # Protocol configuration with certification levels - CORRECTED FOR 78 GOLDEN TESTS
 PROTOCOLS = ["llm", "vector", "graph", "embedding", "schema", "golden"]
 
 PROTOCOL_DISPLAY_NAMES = {
     "llm": "LLM Protocol V1.0",
-    "vector": "Vector Protocol V1.0", 
+    "vector": "Vector Protocol V1.0",
     "graph": "Graph Protocol V1.0",
-    "embedding": "Embedding Protocol V1.0", 
+    "embedding": "Embedding Protocol V1.0",
     "schema": "Schema Conformance",
     "golden": "Golden Wire Validation"
 }
@@ -38,13 +191,13 @@ CONFORMANCE_LEVELS = {
 TEST_CATEGORIES = {
     "llm": {
         "core_ops": "Core Operations",
-        "message_validation": "Message Validation", 
+        "message_validation": "Message Validation",
         "sampling_params": "Sampling Parameters",
         "streaming": "Streaming Semantics",
         "error_handling": "Error Handling",
         "capabilities": "Capabilities Discovery",
         "observability": "Observability & Privacy",
-        "deadline": "Deadline Semantics", 
+        "deadline": "Deadline Semantics",
         "token_counting": "Token Counting",
         "health": "Health Endpoint",
         "wire_envelopes": "Wire Envelopes & Routing"
@@ -52,7 +205,7 @@ TEST_CATEGORIES = {
     "vector": {
         "core_ops": "Core Operations",
         "capabilities": "Capabilities Discovery",
-        "namespace": "Namespace Management", 
+        "namespace": "Namespace Management",
         "upsert": "Upsert Operations",
         "query": "Query Operations",
         "delete": "Delete Operations",
@@ -60,18 +213,18 @@ TEST_CATEGORIES = {
         "dimension_validation": "Dimension Validation",
         "error_handling": "Error Handling",
         "deadline": "Deadline Semantics",
-        "health": "Health Endpoint", 
+        "health": "Health Endpoint",
         "observability": "Observability & Privacy",
         "batch_limits": "Batch Size Limits",
         "wire_envelopes": "Wire Envelopes & Routing"
     },
     "graph": {
-        "core_ops": "Core Operations", 
+        "core_ops": "Core Operations",
         "crud_validation": "CRUD Validation",
         "query_ops": "Query Operations",
         "dialect_validation": "Dialect Validation",
         "streaming": "Streaming Semantics",
-        "batch_ops": "Batch Operations", 
+        "batch_ops": "Batch Operations",
         "schema_ops": "Schema Operations",
         "error_handling": "Error Handling",
         "capabilities": "Capabilities Discovery",
@@ -82,22 +235,22 @@ TEST_CATEGORIES = {
     },
     "embedding": {
         "core_ops": "Core Operations",
-        "capabilities": "Capabilities Discovery", 
+        "capabilities": "Capabilities Discovery",
         "batch_partial": "Batch & Partial Failures",
         "truncation": "Truncation & Length",
         "normalization": "Normalization Semantics",
         "token_counting": "Token Counting",
         "error_handling": "Error Handling",
-        "deadline": "Deadline Semantics", 
+        "deadline": "Deadline Semantics",
         "health": "Health Endpoint",
         "observability": "Observability & Privacy",
-        "caching": "Caching & Idempotency", 
+        "caching": "Caching & Idempotency",
         "wire_contract": "Wire Contract"
     },
     # ALIGNED WITH SCHEMA_CONFORMANCE.md TEST CATEGORIES
     "schema": {
         "schema_loading": "Schema Loading & IDs",
-        "file_organization": "File Organization", 
+        "file_organization": "File Organization",
         "metaschema_hygiene": "Metaschema & Hygiene",
         "cross_references": "Cross-References",
         "definitions": "Definitions",
@@ -121,7 +274,7 @@ SPEC_SECTION_MAPPING = {
     "llm": {
         "core_ops": "§8.3 Operations",
         "message_validation": "§8.3 Operations",
-        "sampling_params": "§8.3 Operations", 
+        "sampling_params": "§8.3 Operations",
         "streaming": "§8.3 Operations & §4.1.3 Streaming Frames",
         "error_handling": "§8.5 LLM-Specific Errors",
         "capabilities": "§8.4 Model Discovery",
@@ -179,7 +332,7 @@ SPEC_SECTION_MAPPING = {
     # ALIGNED WITH SCHEMA_CONFORMANCE.md TEST STRUCTURE
     "schema": {
         "schema_loading": "Schema Meta-Lint Suite - Schema Loading & IDs",
-        "file_organization": "Schema Meta-Lint Suite - File Organization", 
+        "file_organization": "Schema Meta-Lint Suite - File Organization",
         "metaschema_hygiene": "Schema Meta-Lint Suite - Metaschema & Hygiene",
         "cross_references": "Schema Meta-Lint Suite - Cross-References",
         "definitions": "Schema Meta-Lint Suite - Definitions",
@@ -192,7 +345,7 @@ SPEC_SECTION_MAPPING = {
         "core_validation": "Golden Samples Suite - Core Schema Validation",
         "ndjson_stream": "Golden Samples Suite - NDJSON Stream Validation",
         "cross_invariants": "Golden Samples Suite - Cross-Schema Invariants",
-        "version_format": "Golden Samples Suite - Schema Version & Format",
+        "version_format": "Schema Version & Format",
         "drift_detection": "Golden Samples Suite - Drift Detection",
         "performance_reliability": "Golden Samples Suite - Performance & Reliability",
         "component_coverage": "Golden Samples Suite - Component Coverage"
@@ -331,19 +484,19 @@ ERROR_GUIDANCE_MAPPING = {
 
 class CorpusProtocolPlugin:
     """Pytest plugin for comprehensive Corpus Protocol conformance reporting."""
-    
+
     def __init__(self):
         self.start_time: Optional[float] = None
         self.test_reports: Dict[str, List[Any]] = {}
         self.protocol_counts: Dict[str, Dict[str, int]] = {}
-        
+
     def pytest_sessionstart(self, session):
         """Record session start time and initialize tracking."""
         self.start_time = time.time()
         self.test_reports = {proto: [] for proto in PROTOCOLS}
         self.test_reports["other"] = []
         self.protocol_counts = {proto: {} for proto in PROTOCOLS}
-        
+
     def _get_test_counts(self, terminalreporter) -> Dict[str, int]:
         """Get counts of passed, failed, skipped tests."""
         return {
@@ -354,59 +507,59 @@ class CorpusProtocolPlugin:
             "xfailed": len(terminalreporter.stats.get("xfailed", [])),
             "xpassed": len(terminalreporter.stats.get("xpassed", [])),
         }
-    
+
     def _get_total_tests(self, counts: Dict[str, int]) -> int:
         """Calculate total number of tests run."""
         return sum(counts.values())
-    
+
     def _get_duration(self) -> float:
         """Calculate test session duration."""
         if self.start_time is None:
             return 0.0
         return time.time() - self.start_time
-    
+
     def _categorize_test_by_protocol(self, nodeid: str) -> Tuple[str, str]:
         """Categorize test by protocol and test category."""
         # Handle both POSIX and Windows paths
         nodeid_lower = nodeid.lower()
-        
+
         for proto in PROTOCOLS:
             if f"tests/{proto}/" in nodeid_lower or f"tests\\{proto}\\" in nodeid_lower:
                 # Further categorize by test type
                 test_name = nodeid_lower
                 category = "unknown"
-                
+
                 for cat_key, cat_name in TEST_CATEGORIES.get(proto, {}).items():
                     if cat_key in test_name or cat_name.lower() in test_name:
                         category = cat_key
                         break
-                        
+
                 return proto, category
-                
+
         return "other", "unknown"
-    
+
     def _categorize_failures(self, failed_reports: List) -> Dict[str, Dict[str, List[Any]]]:
         """Categorize failed tests by protocol and category - FIXED ARCHITECTURE."""
         by_protocol = {proto: {} for proto in PROTOCOLS}
         by_protocol["other"] = {}
-        
+
         for rep in failed_reports:
             nodeid = getattr(rep, "nodeid", "") or ""
             proto, category = self._categorize_test_by_protocol(nodeid)
-            
+
             if proto not in by_protocol:
                 by_protocol[proto] = {}
             if category not in by_protocol[proto]:
                 by_protocol[proto][category] = []  # Store actual reports, not counts
-                
+
             by_protocol[proto][category].append(rep)  # Add the full report
-                
+
         return by_protocol
-    
+
     def _calculate_conformance_level(self, protocol: str, passed_count: int) -> Tuple[str, int]:
         """Calculate conformance level and progress to next level."""
         levels = CONFORMANCE_LEVELS.get(protocol, {})
-        
+
         if passed_count >= levels.get("gold", 0):
             return "🥇 Gold", 0
         elif passed_count >= levels.get("silver", 0):
@@ -418,117 +571,117 @@ class CorpusProtocolPlugin:
         else:
             needed = levels.get("development", 0) - passed_count
             return "❌ Below Development", needed
-    
+
     def _get_spec_section(self, protocol: str, category: str) -> str:
         """Get specification section for a test category."""
         protocol_map = SPEC_SECTION_MAPPING.get(protocol, {})
         return protocol_map.get(category, "See protocol specification")
-    
+
     def _get_error_guidance(self, protocol: str, category: str, test_name: str) -> Dict[str, str]:
         """Get specific error guidance for a test failure."""
         protocol_guidance = ERROR_GUIDANCE_MAPPING.get(protocol, {})
         category_guidance = protocol_guidance.get(category, {})
         test_guidance = category_guidance.get(test_name, {})
-        
+
         return {
             "error_patterns": test_guidance.get("error_patterns", {}),
             "quick_fix": test_guidance.get("quick_fix", "Review specification section above"),
             "examples": test_guidance.get("examples", "See specification for implementation details")
         }
-    
+
     def _extract_test_name(self, nodeid: str) -> str:
         """Extract the test function name from nodeid."""
         # nodeid format: "tests/llm/test_streaming.py::test_stream_finalization"
         parts = nodeid.split("::")
         return parts[-1] if len(parts) > 1 else "unknown_test"
-    
+
     def _print_platinum_certification(self, terminalreporter, counts: Dict[str, int], duration: float):
         """Print Platinum certification summary."""
         total_tests = self._get_total_tests(counts)
-        
+
         terminalreporter.write_sep("=", "🏆 CORPUS PROTOCOL SUITE - PLATINUM CERTIFIED")
         terminalreporter.write_line(
             f"All {total_tests} conformance tests passed across 6 test suites"
         )
         terminalreporter.write_line("")
-        
+
         # Show protocol breakdown
         terminalreporter.write_line("Protocol Conformance Status:")
         for proto in PROTOCOLS:
             display_name = PROTOCOL_DISPLAY_NAMES.get(proto, proto.upper())
             level, _ = self._calculate_conformance_level(proto, CONFORMANCE_LEVELS[proto]["gold"])
             terminalreporter.write_line(f"  ✅ {display_name}: {level}")
-        
+
         terminalreporter.write_line("")
         terminalreporter.write_line(f"⏱️  Completed in {duration:.2f}s")
         terminalreporter.write_line("🎯 Status: Ready for production deployment")
         terminalreporter.write_line("📚 Specification: All requirements met per Corpus Protocol Suite V1.0")
-    
+
     def _print_gold_certification(self, terminalreporter, protocol_results: Dict[str, int], duration: float):
         """Print Gold certification summary with progress to Platinum."""
         terminalreporter.write_sep("=", "🥇 CORPUS PROTOCOL SUITE - GOLD CERTIFIED")
-        
+
         terminalreporter.write_line("Protocol Conformance Status:")
         platinum_ready = True
-        
+
         for proto in PROTOCOLS:
             display_name = PROTOCOL_DISPLAY_NAMES.get(proto, proto.upper())
             passed = protocol_results.get(proto, 0)
             level, needed = self._calculate_conformance_level(proto, passed)
-            
+
             if "Gold" in level:
                 terminalreporter.write_line(f"  ✅ {display_name}: {level}")
             else:
                 platinum_ready = False
                 terminalreporter.write_line(f"  ⚠️  {display_name}: {level} ({needed} tests to Gold)")
-        
+
         terminalreporter.write_line("")
         if platinum_ready:
             terminalreporter.write_line("🎯 All protocols at Gold level - Platinum certification available!")
         else:
             terminalreporter.write_line("🎯 Focus on protocols below Gold level for Platinum certification")
-        
+
         terminalreporter.write_line(f"⏱️  Completed in {duration:.2f}s")
         terminalreporter.write_line("📚 Review CONFORMANCE.md for detailed test-to-spec mapping")
-    
+
     def _print_failure_analysis(self, terminalreporter, by_protocol: Dict[str, Dict[str, List[Any]]], duration: float):
         """Print detailed failure analysis with actionable guidance - FIXED ARCHITECTURE."""
         terminalreporter.write_sep("=", "❌ CORPUS PROTOCOL CONFORMANCE ANALYSIS")
-        
+
         total_failures = 0
         for proto_failures in by_protocol.values():
             for reports_list in proto_failures.values():
                 total_failures += len(reports_list)  # Count from actual reports
-        
+
         terminalreporter.write_line(f"Found {total_failures} conformance issue(s) across protocols:")
         terminalreporter.write_line("")
-        
+
         # Show failures by protocol and category with specific guidance
         for proto, categories in by_protocol.items():
             if not categories:
                 continue
-                
+
             display_name = PROTOCOL_DISPLAY_NAMES.get(proto, proto.upper())
             terminalreporter.write_line(f"{display_name}:")
-            
+
             for category, reports_list in categories.items():
                 count = len(reports_list)
                 category_name = TEST_CATEGORIES.get(proto, {}).get(category, category.replace('_', ' ').title())
                 spec_section = self._get_spec_section(proto, category)
-                
+
                 terminalreporter.write_line(f"  ❌ {category_name}: {count} failure(s)")
                 terminalreporter.write_line(f"      Specification: {spec_section}")
-                
+
                 # Show specific guidance for each failed test - FIXED LOGIC
                 for rep in reports_list:
                     test_name = self._extract_test_name(rep.nodeid)
                     guidance = self._get_error_guidance(proto, category, test_name)
-                    
+
                     # Only show guidance if we have specific advice
                     if guidance["quick_fix"] != "Review specification section above":
                         terminalreporter.write_line(f"      Test: {test_name}")
                         terminalreporter.write_line(f"      Quick fix: {guidance['quick_fix']}")
-                        
+
                         # Show error patterns if available
                         error_patterns = guidance.get("error_patterns", {})
                         if error_patterns:
@@ -538,13 +691,13 @@ class CorpusProtocolPlugin:
                                 if pattern_key.lower() in str(error_msg).lower():
                                     terminalreporter.write_line(f"      Detected: {pattern_desc}")
                                     break
-            
+
             terminalreporter.write_line("")
-        
+
         # Certification impact
         terminalreporter.write_line("Certification Impact:")
         failing_protocols = [p for p, cats in by_protocol.items() if cats and p != "other"]
-        
+
         if failing_protocols:
             terminalreporter.write_line("  ⚠️  Platinum certification blocked by failures in:")
             for proto in failing_protocols:
@@ -552,28 +705,28 @@ class CorpusProtocolPlugin:
                 terminalreporter.write_line(f"      - {display_name}")
         else:
             terminalreporter.write_line("  ✅ No protocol conformance failures - review 'other' category tests")
-        
+
         terminalreporter.write_line("")
         terminalreporter.write_line("Next Steps:")
         terminalreporter.write_line("  1. Review failing tests above with spec section references")
-        terminalreporter.write_line("  2. Check SPECIFICATION.md for detailed requirements") 
+        terminalreporter.write_line("  2. Check SPECIFICATION.md for detailed requirements")
         terminalreporter.write_line("  3. Run individual protocol tests: make test-{protocol}-conformance")
         terminalreporter.write_line("  4. Review error guidance in test output for specific fixes")
         terminalreporter.write_line(f"⏱️  Completed in {duration:.2f}s")
-    
+
     def _collect_protocol_results(self, terminalreporter) -> Dict[str, int]:
         """Collect passed test counts per protocol."""
         protocol_results = {proto: 0 for proto in PROTOCOLS}
-        
+
         # Count passed tests per protocol
         for test_report in terminalreporter.stats.get("passed", []):
             nodeid = getattr(test_report, "nodeid", "") or ""
             proto, _ = self._categorize_test_by_protocol(nodeid)
             if proto in protocol_results:
                 protocol_results[proto] += 1
-        
+
         return protocol_results
-    
+
     def _is_platinum_certified(self, protocol_results: Dict[str, int]) -> bool:
         """Check if all protocols meet Platinum certification requirements."""
         for proto in PROTOCOLS:
@@ -588,18 +741,18 @@ class CorpusProtocolPlugin:
         failed_reports = []
         for key in ("failed", "error"):
             failed_reports.extend(terminalreporter.stats.get(key, []))
-        
+
         # Get test counts and duration
         counts = self._get_test_counts(terminalreporter)
         duration = self._get_duration()
-        
+
         # Collect protocol-specific results
         protocol_results = self._collect_protocol_results(terminalreporter)
-        
+
         # Check if any tests actually failed
         if not failed_reports:
             # All tests that ran have passed.
-            
+
             if self._is_platinum_certified(protocol_results):
                 # Best case: All protocols ran and hit Gold.
                 self._print_platinum_certification(terminalreporter, counts, duration)
@@ -608,11 +761,11 @@ class CorpusProtocolPlugin:
                 # Show the mixed-level "Gold" summary.
                 self._print_gold_certification(terminalreporter, protocol_results, duration)
             return
-        
+
         # We have actual failures. Show the analysis.
         by_protocol = self._categorize_failures(failed_reports)
         self._print_failure_analysis(terminalreporter, by_protocol, duration)
-    
+
     def pytest_runtest_logstart(self, nodeid, location):
         """Show protocol being tested for better progress visibility."""
         proto, category = self._categorize_test_by_protocol(nodeid)
@@ -624,22 +777,26 @@ class CorpusProtocolPlugin:
 # Instantiate the plugin
 corpus_protocol_plugin = CorpusProtocolPlugin()
 
+
 # Pytest hook functions (delegate to plugin instance)
 def pytest_sessionstart(session):
     corpus_protocol_plugin.pytest_sessionstart(session)
 
+
 def pytest_terminal_summary(terminalreporter, exitstatus, config):
     corpus_protocol_plugin.pytest_terminal_summary(terminalreporter, exitstatus, config)
 
+
 def pytest_runtest_logstart(nodeid, location):
     corpus_protocol_plugin.pytest_runtest_logstart(nodeid, location)
+
 
 # Optional: Add custom markers for better test organization
 def pytest_configure(config):
     """Register custom markers for protocol tests."""
     markers = [
         "llm: LLM Protocol V1.0 conformance tests",
-        "vector: Vector Protocol V1.0 conformance tests", 
+        "vector: Vector Protocol V1.0 conformance tests",
         "graph: Graph Protocol V1.0 conformance tests",
         "embedding: Embedding Protocol V1.0 conformance tests",
         "schema: Schema conformance validation tests",
@@ -647,6 +804,6 @@ def pytest_configure(config):
         "slow: Tests that take longer to run (skip with -m 'not slow')",
         "conformance: All protocol conformance tests",
     ]
-    
+
     for marker in markers:
         config.addinivalue_line("markers", marker)
