@@ -8,9 +8,7 @@ Spec refs:
 """
 
 import pytest
-
-from corpus_sdk.examples.vector.mock_vector_adapter import MockVectorAdapter
-from adapter_sdk.vector_base import (
+from corpus_sdk.vector.vector_base import (
     QuerySpec,
     VectorMatch,
     QueryResult,
@@ -21,58 +19,72 @@ from adapter_sdk.vector_base import (
 pytestmark = pytest.mark.asyncio
 
 
-async def test_query_returns_vector_matches():
-    a = MockVectorAdapter()
+async def test_query_query_returns_vector_matches(adapter):
+    """Verify query operations return properly structured results."""
     spec = QuerySpec(vector=[0.1, 0.2], top_k=5, namespace="default")
-    res = await a.query(spec)
-    assert isinstance(res, QueryResult)
-    assert isinstance(res.matches, list)
-    if res.matches:
-        assert isinstance(res.matches[0], VectorMatch)
+    result = await adapter.query(spec)
+    
+    assert isinstance(result, QueryResult)
+    assert isinstance(result.matches, list)
+    if result.matches:  # If there are matches, verify their structure
+        assert isinstance(result.matches[0], VectorMatch)
 
 
-async def test_query_validates_dimensions():
-    a = MockVectorAdapter()
-    caps = await a.capabilities()
-    bad_dim = (caps.max_dimensions or 8) + 1
-    spec = QuerySpec(vector=[0.0] * bad_dim, top_k=5, namespace="default")
-    with pytest.raises(DimensionMismatch):
-        await a.query(spec)
+async def test_query_validates_dimensions(adapter):
+    """Verify query validates vector dimensions."""
+    caps = await adapter.capabilities()
+    bad_dimension = (caps.max_dimensions or 8) + 1
+    
+    spec = QuerySpec(vector=[0.0] * bad_dimension, top_k=5, namespace="default")
+    
+    with pytest.raises(DimensionMismatch) as exc_info:
+        await adapter.query(spec)
+    
+    err = exc_info.value
+    assert err.code == "DIMENSION_MISMATCH"
 
 
-async def test_query_top_k_must_be_positive():
-    a = MockVectorAdapter()
-    with pytest.raises(BadRequest):
-        await a.query(QuerySpec(vector=[0.1], top_k=0, namespace="default"))
+async def test_query_top_k_must_be_positive(adapter):
+    """Verify top_k must be a positive integer."""
+    with pytest.raises(BadRequest) as exc_info:
+        await adapter.query(QuerySpec(vector=[0.1], top_k=0, namespace="default"))
+    
+    err = exc_info.value
+    assert "top_k" in str(err).lower() or "positive" in str(err).lower()
 
 
-async def test_query_respects_max_top_k():
-    a = MockVectorAdapter()
-    caps = await a.capabilities()
+async def test_query_respects_max_top_k(adapter):
+    """Verify query respects adapter's maximum top_k limit."""
+    caps = await adapter.capabilities()
     if caps.max_top_k is None:
         pytest.skip("Adapter does not publish max_top_k")
 
-    with pytest.raises(BadRequest):
-        await a.query(
+    with pytest.raises(BadRequest) as exc_info:
+        await adapter.query(
             QuerySpec(
                 vector=[0.1],
                 top_k=caps.max_top_k + 1,
                 namespace="default",
             )
         )
+    
+    err = exc_info.value
+    assert "top_k" in str(err).lower() or "max" in str(err).lower()
 
 
-async def test_query_results_sorted_by_score_desc():
-    a = MockVectorAdapter()
+async def test_query_results_sorted_by_score_desc(adapter):
+    """Verify query results are sorted by score in descending order."""
     spec = QuerySpec(vector=[0.1, 0.2], top_k=10, namespace="default")
-    res = await a.query(spec)
-    scores = [m.score for m in res.matches]
+    result = await adapter.query(spec)
+    
+    scores = [match.score for match in result.matches]
+    # Verify scores are in descending order (highest first)
     assert scores == sorted(scores, reverse=True)
 
 
-async def test_query_include_flags_respected():
-    a = MockVectorAdapter()
-    # include metadata only
+async def test_query_include_flags_respected(adapter):
+    """Verify query include flags control returned data."""
+    # Query with metadata only, no vectors
     spec = QuerySpec(
         vector=[0.1, 0.2],
         top_k=3,
@@ -80,8 +92,12 @@ async def test_query_include_flags_respected():
         include_metadata=True,
         include_vectors=False,
     )
-    res = await a.query(spec)
-    for m in res.matches:
-        # metadata MAY be present; but when present must be mapping
-        if m.vector.metadata is not None:
-            assert isinstance(m.vector.metadata, dict)
+    result = await adapter.query(spec)
+    
+    for match in result.matches:
+        # When metadata is present, it must be a dictionary
+        if match.vector.metadata is not None:
+            assert isinstance(match.vector.metadata, dict)
+        
+        # When vectors are excluded, they may be None or empty
+        # The spec allows either behavior for performance
