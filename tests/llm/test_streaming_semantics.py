@@ -19,26 +19,27 @@ Covers (normative + robustness):
 """
 
 import pytest
-
-from corpus_sdk.examples.llm.mock_llm_adapter import MockLLMAdapter
 from corpus_sdk.llm.llm_base import OperationContext, LLMChunk, DeadlineExceeded
-from corpus_sdk.examples.common.ctx import make_ctx
+from examples.common.ctx import make_ctx
 
 pytestmark = pytest.mark.asyncio
 
 
-async def test_stream_has_single_final_chunk_and_progress_usage():
+async def test_streaming_stream_has_single_final_chunk_and_progress_usage(adapter):
     """
     §8.3 — stream() MUST produce progressive chunks and exactly one terminal chunk.
     §12.4 — usage_so_far (when present) should progress monotonically.
     """
-    adapter = MockLLMAdapter(failure_rate=0.0)
+    caps = await adapter.capabilities()
+    if not caps.supports_streaming:
+        pytest.skip("Adapter does not support streaming")
+
     ctx = make_ctx(OperationContext, request_id="t_stream_semantics", tenant="test")
 
     chunks: list[LLMChunk] = []
     async for ch in adapter.stream(
         messages=[{"role": "user", "content": "stream me"}],
-        model="mock-model",
+        model=caps.supported_models[0],
         ctx=ctx,
     ):
         assert isinstance(ch, LLMChunk), "stream must yield LLMChunk instances"
@@ -51,7 +52,6 @@ async def test_stream_has_single_final_chunk_and_progress_usage():
     finals = [c for c in chunks if getattr(c, "is_final", False)]
     assert len(finals) == 1, "expected exactly one final chunk"
     assert chunks[-1].is_final, "final chunk must be last"
-    assert chunks[-1].text.strip() == "[end]", "mock adapter ends with '[end]' token"
 
     # usage_so_far should be non-decreasing across chunks when provided
     prev_total = 0
@@ -66,17 +66,20 @@ async def test_stream_has_single_final_chunk_and_progress_usage():
     assert body_text, "non-final streamed text should be non-empty"
 
 
-async def test_stream_model_consistent_when_present():
+async def test_streaming_stream_model_consistent_when_present(adapter):
     """
     §8.3 — If chunk.model is present, it SHOULD remain consistent across the stream.
     """
-    adapter = MockLLMAdapter(failure_rate=0.0)
+    caps = await adapter.capabilities()
+    if not caps.supports_streaming:
+        pytest.skip("Adapter does not support streaming")
+
     ctx = make_ctx(OperationContext, request_id="t_stream_model", tenant="test")
     models = []
 
     async for ch in adapter.stream(
         messages=[{"role": "user", "content": "stream me"}],
-        model="mock-model",
+        model=caps.supported_models[0],
         ctx=ctx,
     ):
         if ch.model:
@@ -86,17 +89,20 @@ async def test_stream_model_consistent_when_present():
         assert all(m == models[0] for m in models), "model must be consistent across all chunks"
 
 
-async def test_stream_early_cancel_then_new_stream_ok():
+async def test_streaming_stream_early_cancel_then_new_stream_ok(adapter):
     """
     §8.3 — Iterator close MUST free resources; subsequent streams operate normally.
     """
-    adapter = MockLLMAdapter(failure_rate=0.0)
+    caps = await adapter.capabilities()
+    if not caps.supports_streaming:
+        pytest.skip("Adapter does not support streaming")
+
     ctx = make_ctx(OperationContext, request_id="t_stream_cancel", tenant="test")
 
     # Start and cancel early
     it = adapter.stream(
         messages=[{"role": "user", "content": "partial"}],
-        model="mock-model",
+        model=caps.supported_models[0],
         ctx=ctx,
     )
 
@@ -111,19 +117,21 @@ async def test_stream_early_cancel_then_new_stream_ok():
     chunks = []
     async for ch in adapter.stream(
         messages=[{"role": "user", "content": "fresh run"}],
-        model="mock-model",
+        model=caps.supported_models[0],
         ctx=ctx,
     ):
         chunks.append(ch)
     assert chunks and chunks[-1].is_final, "post-cancel stream must still complete with a final chunk"
-    assert chunks[-1].text.strip() == "[end]", "terminal marker must be present on the last chunk"
 
 
-async def test_stream_deadline_preexpired_yields_no_chunks():
+async def test_streaming_stream_deadline_preexpired_yields_no_chunks(adapter):
     """
     §6.1 + §12.4 — Pre-expired deadline MUST fail fast with DeadlineExceeded; no partial emission.
     """
-    adapter = MockLLMAdapter(failure_rate=0.0)
+    caps = await adapter.capabilities()
+    if not caps.supports_streaming:
+        pytest.skip("Adapter does not support streaming")
+
     # Pre-expired deadline: 0 (epoch) guarantees elapsed budget
     ctx = OperationContext(deadline_ms=0, tenant="test")
 
@@ -131,7 +139,7 @@ async def test_stream_deadline_preexpired_yields_no_chunks():
         items = []
         async for ch in adapter.stream(
             messages=[{"role": "user", "content": "late"}],
-            model="mock-model",
+            model=caps.supported_models[0],
             ctx=ctx,
         ):
             items.append(ch)
@@ -141,20 +149,23 @@ async def test_stream_deadline_preexpired_yields_no_chunks():
         await _collect()
 
 
-async def test_stream_content_progress_and_terminal_rules():
+async def test_streaming_stream_content_progress_and_terminal_rules(adapter):
     """
     §8.3 — Progressive content and single terminal semantics:
       • Non-final chunks have non-empty text
       • Final chunk is terminal-only ('[end]' in mock)
       • Cumulative body grows as chunks arrive
     """
-    adapter = MockLLMAdapter(failure_rate=0.0)
+    caps = await adapter.capabilities()
+    if not caps.supports_streaming:
+        pytest.skip("Adapter does not support streaming")
+
     ctx = make_ctx(OperationContext, request_id="t_stream_progress", tenant="test")
 
     chunks: list[LLMChunk] = []
     async for ch in adapter.stream(
         messages=[{"role": "user", "content": "stream me"}],
-        model="mock-model",
+        model=caps.supported_models[0],
         ctx=ctx,
     ):
         chunks.append(ch)
@@ -165,10 +176,9 @@ async def test_stream_content_progress_and_terminal_rules():
     for c in chunks[:-1]:
         assert c.text.strip(), "non-final chunk text must be non-empty"
 
-    # Final chunk is terminal marker only for this mock
+    # Final chunk is terminal marker
     final = chunks[-1]
     assert final.is_final, "last chunk must be final"
-    assert final.text.strip() == "[end]", "final chunk carries only the terminal sentinel"
 
     # Progress: cumulative text across non-finals should grow
     cumulative = ""
@@ -179,19 +189,22 @@ async def test_stream_content_progress_and_terminal_rules():
     assert cumulative.strip(), "aggregate non-final text must be non-empty"
 
 
-async def test_stream_body_matches_complete_result():
+async def test_streaming_stream_body_matches_complete_result(adapter):
     """
     (Informative) Cross-path parity: streamed body ≈ completion text for same prompt.
     Useful to detect drift between streaming and non-streaming implementations.
     """
-    adapter = MockLLMAdapter(failure_rate=0.0)
+    caps = await adapter.capabilities()
+    if not caps.supports_streaming:
+        pytest.skip("Adapter does not support streaming")
+
     ctx = make_ctx(OperationContext, request_id="t_stream_vs_complete", tenant="test")
 
     # Stream
     chunks: list[LLMChunk] = []
     async for ch in adapter.stream(
         messages=[{"role": "user", "content": "stream parity"}],
-        model="mock-model",
+        model=caps.supported_models[0],
         ctx=ctx,
     ):
         chunks.append(ch)
@@ -200,7 +213,7 @@ async def test_stream_body_matches_complete_result():
     # Complete
     comp = await adapter.complete(
         messages=[{"role": "user", "content": "stream parity"}],
-        model="mock-model",
+        model=caps.supported_models[0],
         ctx=ctx,
     )
 
