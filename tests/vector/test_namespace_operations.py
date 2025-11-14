@@ -8,76 +8,89 @@ Spec refs:
 """
 
 import pytest
-
-from corpus_sdk.examples.vector.mock_vector_adapter import MockVectorAdapter
-from adapter_sdk.vector_base import (
+from corpus_sdk.vector.vector_base import (
     NamespaceSpec,
     BadRequest,
     NotSupported,
+    Vector,
+    VectorID,
+    UpsertSpec,
+    QuerySpec,
 )
 
 pytestmark = pytest.mark.asyncio
 
 
-async def test_create_namespace_returns_success():
-    a = MockVectorAdapter()
-    spec = NamespaceSpec(namespace="ns1", dimensions=8, distance_metric="cosine")
-    res = await a.create_namespace(spec)
-    assert res.success is True
-    assert res.namespace == "ns1"
+async def test_namespace_create_namespace_returns_success(adapter):
+    """Verify namespace creation returns success result."""
+    spec = NamespaceSpec(namespace="test-namespace-1", dimensions=8, distance_metric="cosine")
+    result = await adapter.create_namespace(spec)
+    
+    assert result.success is True
+    assert result.namespace == "test-namespace-1"
 
 
-async def test_namespace_requires_positive_dimensions():
-    a = MockVectorAdapter()
-    spec = NamespaceSpec(namespace="bad", dimensions=0, distance_metric="cosine")
-    with pytest.raises(BadRequest):
-        await a.create_namespace(spec)
+async def test_namespace_namespace_requires_positive_dimensions(adapter):
+    """Verify namespace creation requires positive dimensions."""
+    spec = NamespaceSpec(namespace="invalid-namespace", dimensions=0, distance_metric="cosine")
+    
+    with pytest.raises(BadRequest) as exc_info:
+        await adapter.create_namespace(spec)
+    
+    err = exc_info.value
+    assert "dimension" in str(err).lower() or "positive" in str(err).lower()
 
 
-async def test_namespace_requires_valid_distance_metric():
-    a = MockVectorAdapter()
-    spec = NamespaceSpec(namespace="ns2", dimensions=8, distance_metric="weird")
-    with pytest.raises(NotSupported):
-        await a.create_namespace(spec)
+async def test_namespace_namespace_requires_valid_distance_metric(adapter):
+    """Verify namespace creation requires valid distance metrics."""
+    spec = NamespaceSpec(namespace="invalid-metric", dimensions=8, distance_metric="invalid-metric")
+    
+    with pytest.raises(NotSupported) as exc_info:
+        await adapter.create_namespace(spec)
+    
+    err = exc_info.value
+    assert "metric" in str(err).lower() or "distance" in str(err).lower()
 
 
-async def test_health_exposes_namespaces_dict():
-    a = MockVectorAdapter()
-    h = await a.health()
-    # Shape: { "ok": bool, "server": str, "version": str, "namespaces": {...} }
-    assert isinstance(h, dict)
-    assert "namespaces" in h
-    assert isinstance(h["namespaces"], dict)
+async def test_namespace_health_exposes_namespaces_dict(adapter):
+    """Verify health response includes namespace dictionary."""
+    health = await adapter.health()
+    
+    assert isinstance(health, dict)
+    assert "namespaces" in health
+    assert isinstance(health["namespaces"], dict)
 
 
-async def test_delete_namespace_idempotent():
-    a = MockVectorAdapter()
-    spec = NamespaceSpec(namespace="gone", dimensions=8, distance_metric="cosine")
-    await a.create_namespace(spec)
+async def test_namespace_delete_namespace_idempotent(adapter):
+    """Verify namespace deletion is idempotent."""
+    # First create a namespace
+    spec = NamespaceSpec(namespace="temporary-namespace", dimensions=8, distance_metric="cosine")
+    await adapter.create_namespace(spec)
 
-    res1 = await a.delete_namespace("gone")
-    res2 = await a.delete_namespace("gone")
+    # Delete it twice - both should succeed
+    result1 = await adapter.delete_namespace("temporary-namespace")
+    result2 = await adapter.delete_namespace("temporary-namespace")
 
-    assert res1.success is True
-    assert res2.success is True
+    assert result1.success is True
+    assert result2.success is True
 
 
-async def test_namespace_isolation():
-    a = MockVectorAdapter()
+async def test_namespace_namespace_isolation(adapter):
+    """Verify namespace isolation prevents cross-namespace data leakage."""
+    # Create vectors in different namespaces
+    vector_a = Vector(id=VectorID("vector-a"), vector=[0.1, 0.2], namespace="namespace-a")
+    vector_b = Vector(id=VectorID("vector-b"), vector=[0.9, 0.8], namespace="namespace-b")
 
-    # Two namespaces get distinct vectors / isolation behavior
-    from adapter_sdk.vector_base import Vector, VectorID, UpsertSpec
+    await adapter.upsert(UpsertSpec(vectors=[vector_a], namespace="namespace-a"))
+    await adapter.upsert(UpsertSpec(vectors=[vector_b], namespace="namespace-b"))
 
-    v1 = Vector(id=VectorID("a"), vector=[0.1, 0.2], namespace="ns_a")
-    v2 = Vector(id=VectorID("b"), vector=[0.9, 0.8], namespace="ns_b")
+    # Query each namespace - should only find vectors from that namespace
+    result_a = await adapter.query(QuerySpec(vector=[0.1, 0.2], top_k=5, namespace="namespace-a"))
+    result_b = await adapter.query(QuerySpec(vector=[0.9, 0.8], top_k=5, namespace="namespace-b"))
 
-    await a.upsert(UpsertSpec(vectors=[v1], namespace="ns_a"))
-    await a.upsert(UpsertSpec(vectors=[v2], namespace="ns_b"))
-
-    from adapter_sdk.vector_base import QuerySpec
-
-    r_a = await a.query(QuerySpec(vector=[0.1, 0.2], top_k=5, namespace="ns_a"))
-    r_b = await a.query(QuerySpec(vector=[0.9, 0.8], top_k=5, namespace="ns_b"))
-
-    assert all(m.vector.namespace == "ns_a" for m in r_a.matches)
-    assert all(m.vector.namespace == "ns_b" for m in r_b.matches)
+    # Verify namespace isolation
+    for match in result_a.matches:
+        assert match.vector.namespace == "namespace-a"
+    
+    for match in result_b.matches:
+        assert match.vector.namespace == "namespace-b"
