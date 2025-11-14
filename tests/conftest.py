@@ -13,7 +13,7 @@ import time
 from typing import Dict, List, Optional, Tuple, Any
 
 
-# Protocol configuration with certification levels - ALIGNED WITH SCHEMA_CONFORMANCE.md
+# Protocol configuration with certification levels - CORRECTED FOR 78 GOLDEN TESTS
 PROTOCOLS = ["llm", "vector", "graph", "embedding", "schema", "golden"]
 
 PROTOCOL_DISPLAY_NAMES = {
@@ -25,14 +25,14 @@ PROTOCOL_DISPLAY_NAMES = {
     "golden": "Golden Wire Validation"
 }
 
-# ALIGNED WITH SCHEMA_CONFORMANCE.md TEST COUNTS
+# CORRECTED: Updated golden tests from 73 to 78 to match actual test_golden_samples.py
 CONFORMANCE_LEVELS = {
     "llm": {"gold": 61, "silver": 49, "development": 31},
     "vector": {"gold": 72, "silver": 58, "development": 36},
     "graph": {"gold": 68, "silver": 54, "development": 34},
     "embedding": {"gold": 75, "silver": 60, "development": 38},
     "schema": {"gold": 13, "silver": 10, "development": 7},    # 13 schema meta-lint tests
-    "golden": {"gold": 73, "silver": 58, "development": 37},   # 73 golden sample tests
+    "golden": {"gold": 78, "silver": 62, "development": 39},   # CORRECTED: 78 golden tests (55 parametrized + 23 standalone)
 }
 
 TEST_CATEGORIES = {
@@ -251,7 +251,7 @@ ERROR_GUIDANCE_MAPPING = {
     },
     "golden": {
         "core_validation": {
-            "test_golden_validation": {
+            "test_golden_validates": {
                 "error_patterns": {
                     "schema_validation_failed": "Golden sample does not validate against its declared schema",
                     "missing_schema_reference": "Golden file missing $schema reference"
@@ -261,7 +261,7 @@ ERROR_GUIDANCE_MAPPING = {
             }
         },
         "ndjson_stream": {
-            "test_llm_stream_validation": {
+            "test_llm_stream_ndjson_union_validates": {
                 "error_patterns": {
                     "invalid_frame_sequence": "Stream frames violate terminal frame rules",
                     "missing_terminal_frame": "Stream missing required end or error frame"
