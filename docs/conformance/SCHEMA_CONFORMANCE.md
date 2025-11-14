@@ -1,6 +1,3 @@
-Here's the full updated SCHEMA_CONFORMANCE.md with exact test counts:
-
-```markdown
 # SCHEMA_CONFORMANCE.md
 
 **Corpus Protocol (v1.0) — Schema Conformance (Schema-Only)**  
