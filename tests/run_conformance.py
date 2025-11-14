@@ -66,13 +66,14 @@ PROTOCOL_DISPLAY_NAMES = {
     "golden": "Golden Wire Validation"
 }
 
+# CORRECTED: Aligned with conftest.py and SCHEMA_CONFORMANCE.md
 CONFORMANCE_LEVELS = {
     "llm": {"gold": 61, "silver": 49, "development": 31},
     "vector": {"gold": 72, "silver": 58, "development": 36},
     "graph": {"gold": 68, "silver": 54, "development": 34},
     "embedding": {"gold": 75, "silver": 60, "development": 38},
-    "schema": {"gold": 86, "silver": 69, "development": 43},
-    "golden": {"gold": 73, "silver": 58, "development": 37},
+    "schema": {"gold": 13, "silver": 10, "development": 7},    # 13 schema meta-lint tests
+    "golden": {"gold": 73, "silver": 58, "development": 37},   # 73 golden sample tests
 }
 
 
