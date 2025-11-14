@@ -305,6 +305,7 @@ PROTOCOLS_CONFIG = {
         display_name="Embedding Protocol V1.0",
         conformance_levels={"gold": 75, "silver": 60, "development": 38},
         test_categories={
+            "wire_contract": "Wire Contract",
             "core_ops": "Core Operations",
             "capabilities": "Capabilities Discovery",
             "batch_partial": "Batch & Partial Failures",
@@ -316,7 +317,6 @@ PROTOCOLS_CONFIG = {
             "health": "Health Endpoint",
             "observability": "Observability & Privacy",
             "caching": "Caching & Idempotency",
-            "wire_contract": "Wire Contract"
         },
         spec_sections={
             "core_ops": "§10.3 Operations (Normative Signatures)",
