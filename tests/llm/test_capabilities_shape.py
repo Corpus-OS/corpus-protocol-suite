@@ -10,47 +10,43 @@ Covers:
   • Logical consistency between capabilities and adapter behavior
 """
 import pytest
-from corpus_sdk.examples.llm.mock_llm_adapter import MockLLMAdapter
 from corpus_sdk.llm.llm_base import (
     LLMCapabilities,
     OperationContext,
     NotSupported,
 )
-from corpus_sdk.examples.common.ctx import make_ctx
+from examples.common.ctx import make_ctx
 
 pytestmark = pytest.mark.asyncio
 
 
-async def test_capabilities_shape_and_required_fields():
+async def test_capabilities_capabilities_shape_and_required_fields(adapter):
     """Quick smoke test of essential capabilities fields."""
-    adapter = MockLLMAdapter(failure_rate=0.0)
     caps = await adapter.capabilities()
     assert isinstance(caps, LLMCapabilities)
-    assert caps.server == "mock"
-    assert caps.model_family == "mock"
+    assert caps.server
+    assert caps.model_family
     assert caps.max_context_length > 0
-    assert caps.supports_streaming is True
+    assert isinstance(caps.supports_streaming, bool)
     assert isinstance(caps.supported_models, tuple)
     assert len(caps.supported_models) >= 1
 
 
-async def test_capabilities_returns_correct_type():
+async def test_capabilities_returns_correct_type(adapter):
     """
     SPECIFICATION.md §8.4 — Capabilities Discovery
 
     Capabilities MUST return an LLMCapabilities dataclass instance.
     """
-    adapter = MockLLMAdapter(failure_rate=0.0)
     caps = await adapter.capabilities()
     assert isinstance(caps, LLMCapabilities), \
         "capabilities() must return LLMCapabilities instance"
 
 
-async def test_capabilities_identity_fields():
+async def test_capabilities_identity_fields(adapter):
     """
     Identity fields (server, version, model_family) MUST be non-empty strings.
     """
-    adapter = MockLLMAdapter(failure_rate=0.0)
     caps = await adapter.capabilities()
 
     assert isinstance(caps.server, str) and len(caps.server) > 0, \
@@ -61,11 +57,10 @@ async def test_capabilities_identity_fields():
         "model_family must be a non-empty string"
 
 
-async def test_capabilities_resource_limits():
+async def test_capabilities_resource_limits(adapter):
     """
     Resource limits MUST be positive integers within reasonable bounds.
     """
-    adapter = MockLLMAdapter(failure_rate=0.0)
     caps = await adapter.capabilities()
 
     assert isinstance(caps.max_context_length, int), \
@@ -76,11 +71,10 @@ async def test_capabilities_resource_limits():
         "max_context_length should be reasonable (≤10M tokens)"
 
 
-async def test_capabilities_feature_flags_are_boolean():
+async def test_capabilities_feature_flags_are_boolean(adapter):
     """
     All feature flags MUST be boolean values (not truthy/falsy objects).
     """
-    adapter = MockLLMAdapter(failure_rate=0.0)
     caps = await adapter.capabilities()
 
     flags = {
@@ -100,11 +94,10 @@ async def test_capabilities_feature_flags_are_boolean():
             f"{name} must be a boolean, got {type(value).__name__}"
 
 
-async def test_capabilities_supported_models_structure():
+async def test_capabilities_supported_models_structure(adapter):
     """
     supported_models MUST be a non-empty tuple of non-empty strings.
     """
-    adapter = MockLLMAdapter(failure_rate=0.0)
     caps = await adapter.capabilities()
 
     assert isinstance(caps.supported_models, tuple), \
@@ -119,12 +112,11 @@ async def test_capabilities_supported_models_structure():
             f"Model at index {i} must be non-empty"
 
 
-async def test_capabilities_consistency_with_count_tokens():
+async def test_capabilities_consistency_with_count_tokens(adapter):
     """
     If supports_count_tokens is False, count_tokens() SHOULD raise NotSupported.
     If True, count_tokens() MUST work.
     """
-    adapter = MockLLMAdapter(failure_rate=0.0)
     caps = await adapter.capabilities()
     ctx = make_ctx(OperationContext, tenant="test", request_id="test-caps-001")
 
@@ -134,16 +126,15 @@ async def test_capabilities_consistency_with_count_tokens():
             "count_tokens should return non-negative integer"
     else:
         # If not supported, real adapters SHOULD raise NotSupported.
-        # MockLLMAdapter always supports it.
+        # We don't enforce that here; conformance harness may test separately.
         pass
 
 
-async def test_capabilities_consistency_with_streaming():
+async def test_capabilities_consistency_with_streaming(adapter):
     """
     If supports_streaming is False, stream() SHOULD raise NotSupported.
     If True, stream() MUST work.
     """
-    adapter = MockLLMAdapter(failure_rate=0.0)
     caps = await adapter.capabilities()
     ctx = make_ctx(OperationContext, tenant="test", request_id="test-caps-002")
 
@@ -151,6 +142,7 @@ async def test_capabilities_consistency_with_streaming():
         chunks = []
         async for chunk in adapter.stream(
             messages=[{"role": "user", "content": "test"}],
+            model=caps.supported_models[0],
             ctx=ctx,
         ):
             chunks.append(chunk)
@@ -159,15 +151,13 @@ async def test_capabilities_consistency_with_streaming():
         assert len(chunks) > 0, "stream() should yield at least one chunk"
     else:
         # Real adapters SHOULD raise NotSupported in this branch.
-        # MockLLMAdapter supports streaming.
         pass
 
 
-async def test_capabilities_all_fields_present():
+async def test_capabilities_all_fields_present(adapter):
     """
     Comprehensive check that all expected fields are present and valid.
     """
-    adapter = MockLLMAdapter(failure_rate=0.0)
     caps = await adapter.capabilities()
 
     # Identity
@@ -202,12 +192,10 @@ async def test_capabilities_all_fields_present():
     assert len(caps.supported_models) > 0
 
 
-async def test_capabilities_idempotency():
+async def test_capabilities_idempotency(adapter):
     """
     Multiple calls to capabilities() SHOULD return consistent results.
     """
-    adapter = MockLLMAdapter(failure_rate=0.0)
-
     caps1 = await adapter.capabilities()
     caps2 = await adapter.capabilities()
 
