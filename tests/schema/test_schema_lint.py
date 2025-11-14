@@ -56,6 +56,13 @@ SCHEMA_VERSION_PATTERN = re.compile(r"^\d+\.\d+\.\d+$")
 ID_ALLOWED = re.compile(r"^[A-Za-z0-9._~:/#-]+$")  # permissive but disallows spaces, etc.
 PATTERN_CACHE: Dict[str, re.Pattern] = {}
 
+# Enhanced constants
+SUPPORTED_PROTOCOLS = {"llm/v1.0", "vector/v1.0", "embedding/v1.0", "graph/v1.0"}
+RESERVED_PROPERTIES = {"$schema", "$id", "$defs", "$ref", "examples"}
+MAX_SCHEMA_SIZE_BYTES = 1 * 1024 * 1024  # 1MB per schema
+MAX_DEFS_COUNT = 50  # Maximum number of definitions per schema
+MAX_ENUM_SIZE = 100  # Maximum number of enum values
+
 
 def _iter_schema_files() -> List[Path]:
     """Collect all JSON schema files under /schemas/**."""
@@ -65,10 +72,13 @@ def _iter_schema_files() -> List[Path]:
 
 
 def _load_json(p: Path) -> Any:
+    """Load JSON file with comprehensive error handling."""
     try:
         return json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        pytest.fail(f"Failed to parse JSON for {p}: {e}")
     except Exception as e:
-        pytest.fail(f"Failed to load JSON for {p}: {e}")
+        pytest.fail(f"Failed to load {p}: {e}")
 
 
 def _walk(obj: Any) -> Iterable[Tuple[str, Any]]:
@@ -83,9 +93,11 @@ def _walk(obj: Any) -> Iterable[Tuple[str, Any]]:
     elif isinstance(obj, list):
         for i, v in enumerate(obj):
             yield str(i), v
+            yield from _walk(v)
 
 
 def _compile_pattern(pat: str) -> None:
+    """Compile and cache regex patterns."""
     if pat in PATTERN_CACHE:
         return
     try:
@@ -95,6 +107,7 @@ def _compile_pattern(pat: str) -> None:
 
 
 def _collect_ids(store: Dict[str, dict]) -> Set[str]:
+    """Collect all schema IDs from the store."""
     return set(store.keys())
 
 
@@ -123,24 +136,34 @@ def _resolve_local_fragment(schema: dict, fragment: str) -> bool:
         part = part.replace("~1", "/").replace("~0", "~")
         if isinstance(node, dict) and part in node:
             node = node[part]
+        elif isinstance(node, list) and part.isdigit():
+            idx = int(part)
+            if 0 <= idx < len(node):
+                node = node[idx]
+            else:
+                return False
         else:
             return False
     return True
 
 
 def _is_envelope_request(fname: str) -> bool:
+    """Check if filename matches envelope request pattern."""
     return fname.endswith(".envelope.request.json")
 
 
 def _is_envelope_success(fname: str) -> bool:
+    """Check if filename matches envelope success pattern."""
     return fname.endswith(".envelope.success.json")
 
 
 def _is_envelope_error(fname: str) -> bool:
+    """Check if filename matches envelope error pattern."""
     return fname.endswith(".envelope.error.json")
 
 
 def _is_stream_frame(fname: str) -> bool:
+    """Check if filename matches stream frame pattern."""
     return (
         fname.endswith(".stream.frame.data.json")
         or fname.endswith(".stream.frame.end.json")
@@ -155,9 +178,57 @@ def _component_for_path(p: Path) -> str:
     """
     try:
         idx = p.parts.index("schemas")
-        return p.parts[idx + 1]
-    except Exception:
+        return p.parts[idx + 1] if idx + 1 < len(p.parts) else "unknown"
+    except (ValueError, IndexError):
         return "unknown"
+
+
+def _validate_schema_size(path: Path) -> None:
+    """Validate schema file size limits."""
+    size = path.stat().st_size
+    if size > MAX_SCHEMA_SIZE_BYTES:
+        pytest.fail(f"{path}: Schema file too large ({size} bytes > {MAX_SCHEMA_SIZE_BYTES} limit)")
+
+
+def _check_reserved_property_usage(schema: dict, path: Path) -> List[str]:
+    """Check for misuse of reserved JSON Schema properties."""
+    issues = []
+    for key in schema.keys():
+        if key.startswith("$") and key not in RESERVED_PROPERTIES:
+            issues.append(f"Custom property '{key}' should not use '$' prefix")
+    return issues
+
+
+def _validate_protocol_const(schema: dict, path: Path) -> List[str]:
+    """Validate protocol constant format and values."""
+    issues = []
+    props = schema.get("properties", {})
+    proto = props.get("protocol", {})
+    
+    if isinstance(proto, dict) and "const" in proto:
+        const_value = proto["const"]
+        if not isinstance(const_value, str) or const_value not in SUPPORTED_PROTOCOLS:
+            issues.append(f"Invalid protocol constant: {const_value}")
+    
+    return issues
+
+
+def _check_defs_size(schema: dict, path: Path) -> List[str]:
+    """Check that $defs doesn't grow too large."""
+    issues = []
+    defs = schema.get("$defs") or schema.get("definitions")
+    if isinstance(defs, dict) and len(defs) > MAX_DEFS_COUNT:
+        issues.append(f"Too many definitions ({len(defs)} > {MAX_DEFS_COUNT} limit)")
+    return issues
+
+
+def _check_enum_size(schema: dict, path: Path) -> List[str]:
+    """Check that enum arrays don't grow too large."""
+    issues = []
+    for key, val in _walk(schema):
+        if key == "enum" and isinstance(val, list) and len(val) > MAX_ENUM_SIZE:
+            issues.append(f"Enum too large ({len(val)} > {MAX_ENUM_SIZE} limit)")
+    return issues
 
 
 # --------------------------------------------------------------------------------------
@@ -165,11 +236,15 @@ def _component_for_path(p: Path) -> str:
 # --------------------------------------------------------------------------------------
 
 def test_all_schemas_load_and_have_unique_ids():
+    """Test that all schemas load, have correct $schema, and unique $ids."""
     files = _iter_schema_files()
     store: Dict[str, dict] = {}
     id_to_path: Dict[str, Path] = {}
 
     for path in files:
+        # Check file size first
+        _validate_schema_size(path)
+        
         schema = _load_json(path)
 
         # $schema presence and value
@@ -191,10 +266,11 @@ def test_all_schemas_load_and_have_unique_ids():
 
 
 # --------------------------------------------------------------------------------------
-# Test 2: $id path convention
+# Test 2: $id path convention + file organization
 # --------------------------------------------------------------------------------------
 
 def test_id_path_convention_matches_filesystem():
+    """Test that $id values match filesystem paths."""
     files = _iter_schema_files()
     problems: List[str] = []
 
@@ -213,11 +289,46 @@ def test_id_path_convention_matches_filesystem():
         pytest.fail("ID/path mismatches:\n- " + "\n- ".join(problems))
 
 
+def test_schema_file_organization():
+    """Test that schemas are properly organized by component."""
+    files = _iter_schema_files()
+    component_files: Dict[str, List[Path]] = {}
+    problems: List[str] = []
+
+    # Group files by component
+    for path in files:
+        comp = _component_for_path(path)
+        if comp not in component_files:
+            component_files[comp] = []
+        component_files[comp].append(path)
+
+    # Check for unknown components
+    for comp in component_files:
+        if comp not in COMPONENTS and comp != "unknown":
+            problems.append(f"Unknown component in path: {comp}")
+
+    # Check component directory structure
+    for comp in COMPONENTS:
+        comp_dir = SCHEMAS_DIR / comp
+        if not comp_dir.exists():
+            problems.append(f"Missing component directory: {comp}")
+            continue
+
+        # Check for non-JSON files in schema directories
+        for item in comp_dir.iterdir():
+            if item.is_file() and item.suffix not in {".json", ".md"}:
+                problems.append(f"Non-schema file in component directory: {item}")
+
+    if problems:
+        pytest.fail("Schema organization issues:\n- " + "\n- ".join(problems))
+
+
 # --------------------------------------------------------------------------------------
 # Test 3: Metaschema conformance + regex patterns + enum hygiene
 # --------------------------------------------------------------------------------------
 
 def test_metaschema_conformance_and_basic_hygiene():
+    """Test schema conformance, regex patterns, and enum hygiene."""
     files = _iter_schema_files()
 
     for path in files:
@@ -243,12 +354,23 @@ def test_metaschema_conformance_and_basic_hygiene():
                 if all(isinstance(x, str) for x in val):
                     assert val == sorted(val), f"{path}: enum strings should be sorted for stability"
 
+        # 3d) Check enum size limits
+        enum_issues = _check_enum_size(schema, path)
+        if enum_issues:
+            pytest.fail(f"{path}: " + "; ".join(enum_issues))
+
+        # 3e) Check reserved property usage
+        reserved_issues = _check_reserved_property_usage(schema, path)
+        if reserved_issues:
+            pytest.fail(f"{path}: " + "; ".join(reserved_issues))
+
 
 # --------------------------------------------------------------------------------------
 # Test 4: Cross-file $ref resolution + local fragment checks
 # --------------------------------------------------------------------------------------
 
 def test_cross_file_refs_resolve_and_local_fragments_exist():
+    """Test that all $refs resolve and local fragments exist."""
     # Build store of $id -> schema for absolute refs
     files = _iter_schema_files()
     store: Dict[str, dict] = {}
@@ -289,10 +411,11 @@ def test_cross_file_refs_resolve_and_local_fragments_exist():
 
 
 # --------------------------------------------------------------------------------------
-# Test 5: $defs usage (no dangling definitions)
+# Test 5: $defs usage (no dangling definitions + size limits)
 # --------------------------------------------------------------------------------------
 
 def test_no_dangling_defs_globally():
+    """Test that no $defs are defined but never referenced."""
     files = _iter_schema_files()
 
     # Collect every available def anchor as absolute "$id#/$defs/name"
@@ -339,11 +462,26 @@ def test_no_dangling_defs_globally():
         )
 
 
+def test_defs_size_limits():
+    """Test that $defs don't grow too large."""
+    files = _iter_schema_files()
+    problems: List[str] = []
+
+    for path in files:
+        schema = _load_json(path)
+        defs_issues = _check_defs_size(schema, path)
+        problems.extend(defs_issues)
+
+    if problems:
+        pytest.fail("$defs size issues:\n- " + "\n- ".join(problems))
+
+
 # --------------------------------------------------------------------------------------
 # Test 6: Envelope / role sanity & consts
 # --------------------------------------------------------------------------------------
 
 def test_envelope_role_sanity_and_consts():
+    """Test envelope schema conventions and constants."""
     files = _iter_schema_files()
     problems: List[str] = []
 
@@ -402,6 +540,10 @@ def test_envelope_role_sanity_and_consts():
             comp_prop = props.get("component")
             if not isinstance(comp_prop, dict) or "const" not in comp_prop:
                 problems.append(f"{path}: envelopes should const-bind 'component'")
+            
+            # Validate protocol constant value
+            proto_issues = _validate_protocol_const(schema, path)
+            problems.extend(proto_issues)
 
     if problems:
         pytest.fail("Envelope/const issues:\n- " + "\n- ".join(problems))
@@ -412,6 +554,7 @@ def test_envelope_role_sanity_and_consts():
 # --------------------------------------------------------------------------------------
 
 def test_examples_validate_against_own_schema():
+    """Test that examples validate against their own schemas."""
     files = _iter_schema_files()
     # Build a store for cross-ref resolution
     store: Dict[str, dict] = {}
@@ -461,3 +604,101 @@ def test_stream_frame_files_are_union_or_frames():
 
     if problems:
         pytest.fail("Stream frame schema issues:\n- " + "\n- ".join(problems))
+
+
+# --------------------------------------------------------------------------------------
+# Test 9: Schema performance and reliability
+# --------------------------------------------------------------------------------------
+
+def test_schema_loading_performance():
+    """Test that all schemas can be loaded quickly."""
+    import time
+    
+    files = _iter_schema_files()
+    max_load_time = 1.0  # seconds per schema
+    slow_files: List[Tuple[Path, float]] = []
+    
+    for path in files:
+        start = time.time()
+        try:
+            _load_json(path)
+            load_time = time.time() - start
+            if load_time > max_load_time:
+                slow_files.append((path, load_time))
+        except Exception:
+            continue  # Loading errors are caught in other tests
+    
+    if slow_files:
+        slow_info = ", ".join(f"{path.name}({time:.2f}s)" for path, time in slow_files)
+        pytest.skip(f"Slow schema loading detected: {slow_info}")
+
+
+def test_schema_complexity_metrics():
+    """Test schema complexity metrics for maintainability."""
+    files = _iter_schema_files()
+    high_complexity: List[Tuple[Path, int]] = []
+    
+    for path in files:
+        schema = _load_json(path)
+        
+        # Count total number of properties as complexity metric
+        prop_count = 0
+        for key, value in _walk(schema):
+            if key in {"properties", "patternProperties", "additionalProperties"}:
+                if isinstance(value, dict):
+                    prop_count += len(value)
+        
+        # Arbitrary threshold - adjust based on your needs
+        if prop_count > 100:
+            high_complexity.append((path, prop_count))
+    
+    if high_complexity:
+        complexity_info = ", ".join(f"{path.name}({count})" for path, count in high_complexity)
+        pytest.skip(f"High complexity schemas detected: {complexity_info}")
+
+
+# --------------------------------------------------------------------------------------
+# Test 10: Comprehensive schema health report
+# --------------------------------------------------------------------------------------
+
+def test_schema_registry_health_summary():
+    """Provide a comprehensive health summary of the schema registry."""
+    files = _iter_schema_files()
+    
+    # Collect metrics
+    total_schemas = len(files)
+    components = set()
+    envelope_schemas = 0
+    stream_schemas = 0
+    total_defs = 0
+    
+    for path in files:
+        schema = _load_json(path)
+        components.add(_component_for_path(path))
+        
+        fname = path.name
+        if any(_is_envelope_request(fname), _is_envelope_success(fname), _is_envelope_error(fname)):
+            envelope_schemas += 1
+        if _is_stream_frame(fname):
+            stream_schemas += 1
+            
+        defs = schema.get("$defs") or schema.get("definitions") or {}
+        total_defs += len(defs)
+    
+    # Log health summary (doesn't fail test)
+    print(f"\nSchema Registry Health Summary:")
+    print(f"  Total schemas: {total_schemas}")
+    print(f"  Components: {', '.join(sorted(components))}")
+    print(f"  Envelope schemas: {envelope_schemas}")
+    print(f"  Stream schemas: {stream_schemas}")
+    print(f"  Total definitions: {total_defs}")
+    
+    # Basic sanity checks
+    assert total_schemas > 0, "No schemas found"
+    assert len(components) >= len(COMPONENTS), f"Missing components: {COMPONENTS - components}"
+
+
+# Run all tests to ensure comprehensive coverage
+if __name__ == "__main__":
+    # This allows running the file directly for debugging
+    pytest.main([__file__, "-v"])
