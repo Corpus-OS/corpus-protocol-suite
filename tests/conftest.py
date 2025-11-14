@@ -104,6 +104,7 @@ PROTOCOLS_CONFIG = {
         display_name="LLM Protocol V1.0",
         conformance_levels={"gold": 61, "silver": 49, "development": 31},
         test_categories={
+            "wire_contract": "Wire Contract & Routing",
             "core_ops": "Core Operations",
             "message_validation": "Message Validation",
             "sampling_params": "Sampling Parameters",
@@ -113,10 +114,10 @@ PROTOCOLS_CONFIG = {
             "observability": "Observability & Privacy",
             "deadline": "Deadline Semantics",
             "token_counting": "Token Counting",
-            "health": "Health Endpoint",
-            "wire_envelopes": "Wire Envelopes & Routing"
+            "health": "Health Endpoint"
         },
         spec_sections={
+            "wire_contract": "§4.1 Wire-First Canonical Form",
             "core_ops": "§8.3 Operations",
             "message_validation": "§8.3 Operations",
             "sampling_params": "§8.3 Operations",
@@ -126,10 +127,19 @@ PROTOCOLS_CONFIG = {
             "observability": "§6.4 Observability Interfaces & §13 Observability and Monitoring",
             "deadline": "§4.3 Deadline Propagation & §6.1 Operation Context",
             "token_counting": "§8.3 Operations",
-            "health": "§8.3 Operations",
-            "wire_envelopes": "§4.1 Wire-First Canonical Form"
+            "health": "§8.3 Operations"
         },
         error_guidance={
+            "wire_contract": {
+                "test_wire_envelope_validation": {
+                    "error_patterns": {
+                        "missing_required_fields": "Wire envelope missing required fields per §4.1",
+                        "invalid_field_types": "Field types don't match canonical form requirements"
+                    },
+                    "quick_fix": "Ensure all wire envelopes include required fields with correct types",
+                    "examples": "See §4.1 for wire envelope format and field requirements"
+                }
+            },
             "streaming": {
                 "test_stream_finalization": {
                     "error_patterns": {
@@ -177,6 +187,7 @@ PROTOCOLS_CONFIG = {
         display_name="Vector Protocol V1.0",
         conformance_levels={"gold": 72, "silver": 58, "development": 36},
         test_categories={
+            "wire_contract": "Wire Contract & Routing",
             "core_ops": "Core Operations",
             "capabilities": "Capabilities Discovery",
             "namespace": "Namespace Management",
@@ -189,10 +200,10 @@ PROTOCOLS_CONFIG = {
             "deadline": "Deadline Semantics",
             "health": "Health Endpoint",
             "observability": "Observability & Privacy",
-            "batch_limits": "Batch Size Limits",
-            "wire_envelopes": "Wire Envelopes & Routing"
+            "batch_limits": "Batch Size Limits"
         },
         spec_sections={
+            "wire_contract": "§4.1 Wire-First Canonical Form",
             "core_ops": "§9.3 Operations",
             "capabilities": "§9.3 Operations",
             "namespace": "§9.3 Operations",
@@ -205,10 +216,19 @@ PROTOCOLS_CONFIG = {
             "deadline": "§4.3 Deadline Propagation & §6.1 Operation Context",
             "health": "§9.3 Operations",
             "observability": "§6.4 Observability Interfaces & §13 Observability and Monitoring",
-            "batch_limits": "§9.3 Operations & §12.5 Partial Failure Contracts",
-            "wire_envelopes": "§4.1 Wire-First Canonical Form"
+            "batch_limits": "§9.3 Operations & §12.5 Partial Failure Contracts"
         },
         error_guidance={
+            "wire_contract": {
+                "test_wire_envelope_validation": {
+                    "error_patterns": {
+                        "missing_required_fields": "Wire envelope missing required fields per §4.1",
+                        "invalid_field_types": "Field types don't match canonical form requirements"
+                    },
+                    "quick_fix": "Ensure all wire envelopes include required fields with correct types",
+                    "examples": "See §4.1 for wire envelope format and field requirements"
+                }
+            },
             "namespace": {
                 "test_namespace_isolation": {
                     "error_patterns": {
@@ -247,6 +267,7 @@ PROTOCOLS_CONFIG = {
         display_name="Graph Protocol V1.0",
         conformance_levels={"gold": 68, "silver": 54, "development": 34},
         test_categories={
+            "wire_contract": "Wire Contract & Routing",
             "core_ops": "Core Operations",
             "crud_validation": "CRUD Validation",
             "query_ops": "Query Operations",
@@ -258,10 +279,10 @@ PROTOCOLS_CONFIG = {
             "capabilities": "Capabilities Discovery",
             "observability": "Observability & Privacy",
             "deadline": "Deadline Semantics",
-            "health": "Health Endpoint",
-            "wire_envelopes": "Wire Envelopes & Routing"
+            "health": "Health Endpoint"
         },
         spec_sections={
+            "wire_contract": "§4.1 Wire-First Canonical Form",
             "core_ops": "§7.3 Operations",
             "crud_validation": "§7.3.1 Vertex/Edge CRUD",
             "query_ops": "§7.3.2 Queries",
@@ -273,10 +294,19 @@ PROTOCOLS_CONFIG = {
             "capabilities": "§7.3 Operations & §6.2 Capability Discovery",
             "observability": "§6.4 Observability Interfaces & §13 Observability and Monitoring",
             "deadline": "§4.3 Deadline Propagation & §6.1 Operation Context",
-            "health": "§7.6 Health",
-            "wire_envelopes": "§4.1 Wire-First Canonical Form"
+            "health": "§7.6 Health"
         },
         error_guidance={
+            "wire_contract": {
+                "test_wire_envelope_validation": {
+                    "error_patterns": {
+                        "missing_required_fields": "Wire envelope missing required fields per §4.1",
+                        "invalid_field_types": "Field types don't match canonical form requirements"
+                    },
+                    "quick_fix": "Ensure all wire envelopes include required fields with correct types",
+                    "examples": "See §4.1 for wire envelope format and field requirements"
+                }
+            },
             "query_ops": {
                 "test_cypher_query_validation": {
                     "error_patterns": {
@@ -305,7 +335,7 @@ PROTOCOLS_CONFIG = {
         display_name="Embedding Protocol V1.0",
         conformance_levels={"gold": 75, "silver": 60, "development": 38},
         test_categories={
-            "wire_contract": "Wire Contract",
+            "wire_contract": "Wire Contract & Routing",
             "core_ops": "Core Operations",
             "capabilities": "Capabilities Discovery",
             "batch_partial": "Batch & Partial Failures",
@@ -316,9 +346,10 @@ PROTOCOLS_CONFIG = {
             "deadline": "Deadline Semantics",
             "health": "Health Endpoint",
             "observability": "Observability & Privacy",
-            "caching": "Caching & Idempotency",
+            "caching": "Caching & Idempotency"
         },
         spec_sections={
+            "wire_contract": "§4.1 Wire-First Canonical Form",
             "core_ops": "§10.3 Operations (Normative Signatures)",
             "capabilities": "§10.5 Capabilities",
             "batch_partial": "§10.3 Operations & §12.5 Partial Failure Contracts",
@@ -329,10 +360,19 @@ PROTOCOLS_CONFIG = {
             "deadline": "§4.3 Deadline Propagation & §6.1 Operation Context",
             "health": "§10.3 Operations",
             "observability": "§6.4 Observability Interfaces & §13 Observability and Monitoring",
-            "caching": "§11.6 Caching (Implementation Guidance)",
-            "wire_contract": "§4.1 Wire-First Canonical Form"
+            "caching": "§11.6 Caching (Implementation Guidance)"
         },
         error_guidance={
+            "wire_contract": {
+                "test_wire_envelope_validation": {
+                    "error_patterns": {
+                        "missing_required_fields": "Wire envelope missing required fields per §4.1",
+                        "invalid_field_types": "Field types don't match canonical form requirements"
+                    },
+                    "quick_fix": "Ensure all wire envelopes include required fields with correct types",
+                    "examples": "See §4.1 for wire envelope format and field requirements"
+                }
+            },
             "batch_partial": {
                 "test_partial_batch_failures": {
                     "error_patterns": {
@@ -366,7 +406,7 @@ PROTOCOLS_CONFIG = {
             "metaschema_hygiene": "Metaschema & Hygiene",
             "cross_references": "Cross-References",
             "definitions": "Definitions",
-            "envelopes_constants": "Envelopes & Constants",
+            "contract_constants": "Contract & Constants",
             "examples_validation": "Examples Validation",
             "stream_frames": "Stream Frames",
             "performance_metrics": "Performance & Metrics"
@@ -377,7 +417,7 @@ PROTOCOLS_CONFIG = {
             "metaschema_hygiene": "Schema Meta-Lint Suite - Metaschema & Hygiene",
             "cross_references": "Schema Meta-Lint Suite - Cross-References",
             "definitions": "Schema Meta-Lint Suite - Definitions",
-            "envelopes_constants": "Schema Meta-Lint Suite - Envelopes & Constants",
+            "contract_constants": "Schema Meta-Lint Suite - Contract & Constants",
             "examples_validation": "Schema Meta-Lint Suite - Examples Validation",
             "stream_frames": "Schema Meta-Lint Suite - Stream Frames",
             "performance_metrics": "Schema Meta-Lint Suite - Performance & Metrics"
