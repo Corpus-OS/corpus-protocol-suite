@@ -9,9 +9,7 @@ Spec refs:
 """
 
 import pytest
-
-from corpus_sdk.examples.vector.mock_vector_adapter import MockVectorAdapter
-from adapter_sdk.vector_base import (
+from corpus_sdk.vector.vector_base import (
     Vector,
     VectorID,
     UpsertSpec,
@@ -23,81 +21,89 @@ from adapter_sdk.vector_base import (
 pytestmark = pytest.mark.asyncio
 
 
-async def test_upsert_returns_result_with_counts():
-    a = MockVectorAdapter()
+async def test_upsert_upsert_returns_result_with_counts(adapter):
+    """Verify upsert returns proper result structure with counts."""
     spec = UpsertSpec(
         namespace="default",
-        vectors=[Vector(id=VectorID("v1"), vector=[0.1, 0.2])],
+        vectors=[Vector(id=VectorID("test-vector-1"), vector=[0.1, 0.2])],
     )
-    res = await a.upsert(spec)
-    assert isinstance(res, UpsertResult)
-    assert res.upserted_count == 1
-    assert res.failed_count == 0
-    assert isinstance(res.failures, list)
+    result = await adapter.upsert(spec)
+    
+    assert isinstance(result, UpsertResult)
+    assert result.upserted_count == 1
+    assert result.failed_count == 0
+    assert isinstance(result.failures, list)
 
 
-async def test_upsert_validates_dimensions():
-    a = MockVectorAdapter()
-    caps = await a.capabilities()
-    bad_dim = (caps.max_dimensions or 8) + 1
+async def test_upsert_validates_dimensions(adapter):
+    """Verify upsert validates vector dimensions."""
+    caps = await adapter.capabilities()
+    bad_dimension = (caps.max_dimensions or 8) + 1
 
-    bad_vec = Vector(id=VectorID("bad"), vector=[0.0] * bad_dim)
-    spec = UpsertSpec(namespace="default", vectors=[bad_vec])
+    bad_vector = Vector(id=VectorID("bad-dimension"), vector=[0.0] * bad_dimension)
+    spec = UpsertSpec(namespace="default", vectors=[bad_vector])
 
-    with pytest.raises(DimensionMismatch):
-        await a.upsert(spec)
+    with pytest.raises(DimensionMismatch) as exc_info:
+        await adapter.upsert(spec)
+    
+    err = exc_info.value
+    assert err.code == "DIMENSION_MISMATCH"
 
 
-async def test_upsert_validates_namespace_exists_or_behavior_documented():
+async def test_upsert_validates_namespace_exists_or_behavior_documented(adapter):
     """
     Spec: adapters MUST either validate unknown namespaces or define clear behavior.
     This test accepts either:
       - BadRequest / NotSupported on unknown namespace, OR
       - A successful UpsertResult with a well-formed shape.
     """
-    a = MockVectorAdapter()
     spec = UpsertSpec(
-        namespace="__no_such_namespace__",
-        vectors=[Vector(id=VectorID("v_ns"), vector=[0.1, 0.2])],
+        namespace="__completely_unknown_namespace_123__",
+        vectors=[Vector(id=VectorID("test-vector"), vector=[0.1, 0.2])],
     )
 
     try:
-        res = await a.upsert(spec)
-    except (BadRequest,):
-        return
+        result = await adapter.upsert(spec)
+    except (BadRequest, NotSupported):
+        return  # Validation behavior is acceptable
 
-    assert isinstance(res, UpsertResult)
-    assert isinstance(res.upserted_count, int)
-    assert isinstance(res.failed_count, int)
-    assert isinstance(res.failures, list)
+    # If no exception, result must be well-formed
+    assert isinstance(result, UpsertResult)
+    assert isinstance(result.upserted_count, int)
+    assert isinstance(result.failed_count, int)
+    assert isinstance(result.failures, list)
 
 
-async def test_upsert_requires_non_empty_vectors():
-    a = MockVectorAdapter()
+async def test_upsert_requires_non_empty_vectors(adapter):
+    """Verify upsert requires non-empty vectors list."""
     spec = UpsertSpec(namespace="default", vectors=[])
-    with pytest.raises(BadRequest):
-        await a.upsert(spec)
+    
+    with pytest.raises(BadRequest) as exc_info:
+        await adapter.upsert(spec)
+    
+    err = exc_info.value
+    assert "vector" in str(err).lower() or "empty" in str(err).lower()
 
 
-async def test_upsert_partial_failure_reporting():
+async def test_upsert_partial_failure_reporting(adapter):
     """
     When partial success is implemented, failures MUST be listed with indices.
     If adapter chooses atomic failure via DimensionMismatch, that is also valid.
     """
-    a = MockVectorAdapter()
-    caps = await a.capabilities()
+    caps = await adapter.capabilities()
     dim = caps.max_dimensions or 8
 
-    good = Vector(id=VectorID("ok"), vector=[0.1] * dim)
-    bad = Vector(id=VectorID("too_long"), vector=[0.1] * (dim + 1))
+    good_vector = Vector(id=VectorID("good-vector"), vector=[0.1] * dim)
+    bad_vector = Vector(id=VectorID("bad-dimension"), vector=[0.1] * (dim + 1))
 
     try:
-        res = await a.upsert(UpsertSpec(namespace="default", vectors=[good, bad]))
+        result = await adapter.upsert(UpsertSpec(namespace="default", vectors=[good_vector, bad_vector]))
     except DimensionMismatch:
-        # Atomic fail is allowed by spec; this still exercises conformance.
+        # Atomic failure is allowed by spec
         return
 
-    assert isinstance(res, UpsertResult)
-    assert res.upserted_count >= 1
-    assert res.failed_count >= 1
-    assert len(res.failures) == res.failed_count
+    # If partial success is implemented, verify proper reporting
+    assert isinstance(result, UpsertResult)
+    assert result.upserted_count >= 1
+    assert result.failed_count >= 1
+    assert len(result.failures) == result.failed_count
