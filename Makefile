@@ -19,6 +19,10 @@
 	quick-check \
 	conformance-report \
 	test-docker \
+	test-ci \
+	test-ci-fast \
+	setup-test-env \
+	upload-results \
 	safety-check \
 	check-deps \
 	check-versions \
@@ -78,13 +82,37 @@ for m in ('pytest','jsonschema','rfc3339_validator'):
 PY
 
 # --------------------------------------------------------------------------- #
-# Environment Validation
+# Environment Validation & Setup
 # --------------------------------------------------------------------------- #
 
 # Validate critical environment variables
 validate-env:
+	@echo "🔧 Validating test environment..."
 	@if [ -z "$${CORPUS_TEST_ENV}" ]; then \
 		echo "⚠️  CORPUS_TEST_ENV not set, using default"; \
+	fi
+	@if [ -z "$${CORPUS_ENDPOINT}" ]; then \
+		echo "⚠️  CORPUS_ENDPOINT not set, using default test endpoint"; \
+	fi
+	@echo "✅ Environment validation complete"
+
+# Interactive test environment setup
+setup-test-env:
+	@echo "🎯 Setting up test environment..."
+	@if command -v read > /dev/null 2>&1; then \
+		read -p "Test endpoint [http://localhost:8080]: " endpoint; \
+		endpoint=$${endpoint:-http://localhost:8080}; \
+		read -p "API key [test-key]: " key; \
+		key=$${key:-test-key}; \
+		echo "CORPUS_ENDPOINT=$$endpoint" > .testenv; \
+		echo "CORPUS_API_KEY=$$key" >> .testenv; \
+		echo "✅ Test environment saved to .testenv"; \
+		echo "   Load with: export \$$(cat .testenv | xargs)"; \
+	else \
+		echo "❌ 'read' command not available - manual setup required"; \
+		echo "   Create .testenv with:"; \
+		echo "   CORPUS_ENDPOINT=http://your-endpoint"; \
+		echo "   CORPUS_API_KEY=your-api-key"; \
 	fi
 
 # Safety check for production environments
@@ -98,11 +126,12 @@ safety-check: validate-env
 # --------------------------------------------------------------------------- #
 # Run ALL protocol conformance suites (LLM + Vector + Graph + Embedding)
 # --------------------------------------------------------------------------- #
-test-conformance test-all-conformance: check-deps
+test-conformance test-all-conformance: check-deps safety-check
 	@echo "🚀 Running ALL protocol conformance suites..."
 	@echo "   Protocols: $(PROTOCOLS)"
 	@echo "   Parallel jobs: $(PYTEST_JOBS)"
 	@echo "   Coverage threshold: $(COV_FAIL_UNDER)%"
+	@echo "   Environment: $${CORPUS_TEST_ENV:-default}"
 	$(PYTEST) \
 		$(TEST_DIRS) \
 		$(PYTEST_ARGS) \
@@ -110,7 +139,9 @@ test-conformance test-all-conformance: check-deps
 		--cov=corpus_sdk \
 		$(COV_THRESHOLD) \
 		$(COV_REPORT_TERM) \
-		--cov-report=html:conformance_coverage_report
+		--cov-report=html:conformance_coverage_report \
+		--cov-report=xml:conformance_coverage.xml \
+		--junitxml=conformance_results.xml
 
 # --------------------------------------------------------------------------- #
 # Per-Protocol Conformance (Dynamic Targets)
@@ -121,11 +152,13 @@ test-%-conformance: check-deps
 	@echo "🚀 Running $(shell echo $* | tr 'a-z' 'A-Z') Protocol V1 conformance tests..."
 	@echo "   Parallel jobs: $(PYTEST_JOBS)"
 	@echo "   Coverage threshold: $(COV_FAIL_UNDER)%"
+	@echo "   Environment: $${CORPUS_TEST_ENV:-default}"
 	$(PYTEST) tests/$* $(PYTEST_ARGS) $(PYTEST_PARALLEL) \
 		--cov=corpus_sdk.$* \
 		$(COV_THRESHOLD) \
 		$(COV_REPORT_TERM) \
-		--cov-report=html:$*_coverage_report
+		--cov-report=html:$*_coverage_report \
+		--junitxml=$*_results.xml
 
 # --------------------------------------------------------------------------- #
 # Schema / Golden Conformance (Additive Targets)
@@ -134,7 +167,7 @@ test-%-conformance: check-deps
 # Schema meta-lint only (no coverage—schema validation isn't code coverage)
 test-schema: check-deps
 	@echo "🧩 Running Schema Meta-Lint (JSON Schema Draft 2020-12)..."
-	$(PYTEST) $(SCHEMA_TEST_DIR) $(PYTEST_ARGS) $(PYTEST_PARALLEL) --no-cov
+	$(PYTEST) $(SCHEMA_TEST_DIR) $(PYTEST_ARGS) $(PYTEST_PARALLEL) --no-cov --junitxml=schema_results.xml
 
 # Faster schema run (skip @slow)
 test-schema-fast: check-deps
@@ -144,7 +177,7 @@ test-schema-fast: check-deps
 # Golden wire-message validation (envelopes, frames, invariants). No coverage by default.
 test-golden: check-deps
 	@echo "🧪 Running Golden Wire-Message Validation..."
-	$(PYTEST) $(GOLDEN_TEST_DIR) $(PYTEST_ARGS) $(PYTEST_PARALLEL) --no-cov
+	$(PYTEST) $(GOLDEN_TEST_DIR) $(PYTEST_ARGS) $(PYTEST_PARALLEL) --no-cov --junitxml=golden_results.xml
 
 # Fast golden run (skips tests marked 'slow')
 test-golden-fast: check-deps
@@ -167,7 +200,7 @@ quick-check: check-deps
 	$(PYTEST) tests/ -k "test_golden_validates or test_schema_meta" -v --no-cov -x
 
 # --------------------------------------------------------------------------- #
-# Reports
+# Reports & CI Integration
 # --------------------------------------------------------------------------- #
 
 # Generate conformance report (with error handling and duration aggregation if JUnit XML is present)
@@ -175,42 +208,86 @@ conformance-report: test-conformance
 	@echo "📊 Generating detailed conformance report..."
 	@python - <<'PY'
 try:
-    import json, datetime, os
-    # Try to aggregate duration from any JUnit XML in repo (best-effort, optional)
-    try:
-        # Shell-style aggregation via os.popen to avoid platform-specific tools
-        # Looks for attributes like time="X.Y" or duration="X.Y"
-        import re, glob
-        total = 0.0
-        for path in glob.glob("**/*.xml", recursive=True):
-            try:
-                txt = open(path, "r", encoding="utf-8", errors="ignore").read()
-            except Exception:
-                continue
-            for m in re.finditer(r'(?:time|duration)="([0-9]*\.?[0-9]+)"', txt):
-                try:
-                    total += float(m.group(1))
-                except Exception:
-                    pass
-        duration_seconds = round(total, 3)
-    except Exception:
-        duration_seconds = 0.0
-
+    import json, datetime, os, glob, re
+    from xml.etree import ElementTree
+    
+    # Aggregate results from JUnit XML files
+    total_tests = 0
+    total_failures = 0
+    total_errors = 0
+    total_time = 0.0
+    
+    for xml_file in glob.glob("*_results.xml"):
+        try:
+            tree = ElementTree.parse(xml_file)
+            root = tree.getroot()
+            total_tests += int(root.get("tests", 0))
+            total_failures += int(root.get("failures", 0))
+            total_errors += int(root.get("errors", 0))
+            total_time += float(root.get("time", 0))
+        except Exception as e:
+            print(f"⚠️  Could not parse {xml_file}: {e}")
+    
+    status = "PASS" if total_failures == 0 and total_errors == 0 else "FAIL"
+    
     results = {
         "protocols": "$(PROTOCOLS)",
-        "status": "PASS",
+        "status": status,
         "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "summary": {
+            "total_tests": total_tests,
+            "failures": total_failures,
+            "errors": total_errors,
+            "duration_seconds": round(total_time, 3)
+        },
         "coverage_threshold": $(COV_FAIL_UNDER),
         "test_suites": ["schema", "golden", "llm", "vector", "graph", "embedding"],
-        "duration_seconds": duration_seconds
+        "environment": os.getenv("CORPUS_TEST_ENV", "default")
     }
+    
     with open("conformance_report.json", "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)
+    
     print("✅ Conformance report: conformance_report.json")
+    print(f"📈 Summary: {total_tests} tests, {total_failures} failures, {total_errors} errors")
+    print(f"⏱️  Duration: {round(total_time, 3)}s")
+    print(f"🎯 Status: {status}")
+    
 except Exception as e:
     print(f"❌ Failed to generate report: {e}")
     raise SystemExit(1)
 PY
+
+# Upload results to conformance service
+upload-results:
+	@if [ -f conformance_report.json ]; then \
+		echo "📤 Uploading conformance results..."; \
+		curl -f -X POST https://api.corpus.io/conformance \
+			-H "Content-Type: application/json" \
+			-H "Authorization: Bearer $${CORPUS_API_KEY}" \
+			-d @conformance_report.json > /dev/null 2>&1 && \
+		echo "✅ Results uploaded successfully" || \
+		echo "⚠️  Upload failed (service may be unavailable)"; \
+	else \
+		echo "❌ No conformance report found - run 'make conformance-report' first"; \
+	fi
+
+# --------------------------------------------------------------------------- #
+# CI-Optimized Targets
+# --------------------------------------------------------------------------- #
+
+# Full CI pipeline
+test-ci: check-deps validate-env
+	@echo "🏗️  Running CI-optimized conformance suite..."
+	@make test-conformance
+	@make conformance-report
+	@echo "✅ CI conformance suite complete"
+
+# Fast CI pipeline (for PR validation)
+test-ci-fast: check-deps
+	@echo "⚡ Running fast CI validation..."
+	@make test-fast
+	@echo "✅ Fast CI validation complete"
 
 # --------------------------------------------------------------------------- #
 # Docker Support
@@ -220,7 +297,11 @@ PY
 test-docker:
 	@echo "🐳 Running tests in Docker..."
 	docker build -t corpus-conformance .
-	docker run --rm corpus-conformance make test-conformance
+	docker run --rm \
+		-e CORPUS_TEST_ENV=$${CORPUS_TEST_ENV} \
+		-e CORPUS_ENDPOINT=$${CORPUS_ENDPOINT} \
+		-e CORPUS_API_KEY=$${CORPUS_API_KEY} \
+		corpus-conformance make test-ci
 
 # --------------------------------------------------------------------------- #
 # Fast Test Runs (No Coverage)
@@ -241,11 +322,12 @@ test-fast-%: check-deps
 # --------------------------------------------------------------------------- #
 
 # Verify command (alias for test-conformance with better messaging)
-verify: check-deps
+verify: check-deps safety-check
 	@echo "🔍 Running Corpus Protocol Conformance Suite..."
 	@echo "   Protocols: $(PROTOCOLS)"
 	@echo "   Parallel jobs: $(PYTEST_JOBS)"
 	@echo "   Coverage threshold: $(COV_FAIL_UNDER)%"
+	@echo "   Environment: $${CORPUS_TEST_ENV:-default}"
 	$(PYTEST) \
 		$(TEST_DIRS) \
 		$(PYTEST_ARGS) \
@@ -253,7 +335,9 @@ verify: check-deps
 		--cov=corpus_sdk \
 		$(COV_THRESHOLD) \
 		$(COV_REPORT_TERM) \
-		--cov-report=html:conformance_coverage_report
+		--cov-report=html:conformance_coverage_report \
+		--cov-report=xml:conformance_coverage.xml \
+		--junitxml=conformance_results.xml
 
 # Clean up generated files
 clean:
@@ -267,7 +351,10 @@ clean:
 		.mypy_cache \
 		__pycache__ \
 		*/__pycache__ \
-		*/*/__pycache__
+		*/*/__pycache__ \
+		*.xml \
+		*.json \
+		.testenv
 
 # Help target
 help:
@@ -290,9 +377,15 @@ help:
 	@echo "  test-schema-fast           Fast schema meta-lint (no coverage, skip slow)"
 	@echo "  test-golden-fast           Fast golden validation (no coverage, skip slow)"
 	@echo ""
-	@echo "Quick / Reports / Docker / Env:"
+	@echo "CI & Automation:"
+	@echo "  test-ci                    Full CI pipeline (deps+env+test+report)"
+	@echo "  test-ci-fast               Fast CI pipeline for PR validation"
+	@echo "  conformance-report         Generate JSON summary with JUnit XML parsing"
+	@echo "  upload-results             Upload results to conformance service"
+	@echo "  setup-test-env             Interactive environment configuration"
+	@echo ""
+	@echo "Quick / Docker / Environment:"
 	@echo "  quick-check                Smoke test subset (schema+golden)"
-	@echo "  conformance-report         Emit JSON summary after full run (timestamped, error-handled)"
 	@echo "  test-docker                Build and run tests inside Docker"
 	@echo "  validate-env               Validate required environment variables"
 	@echo "  safety-check               Block full runs in production envs (use quick-check)"
@@ -320,14 +413,14 @@ help:
 	@echo "Examples:"
 	@echo "  make test-conformance                      # Run all tests"
 	@echo "  make test-llm-conformance                 # Run only LLM tests"
-	@echo "  make test-schema                           # Run schema meta-lint only"
-	@echo "  make test-golden                           # Run golden validation only"
-	@echo "  make quick-check                           # Smoke test subset"
-	@echo "  make conformance-report                    # Emit JSON summary after full run"
-	@echo "  make test-docker                           # Run in Docker"
-	@echo "  make PYTEST_JOBS=4 test-conformance        # Run with 4 parallel jobs"
-	@echo "  make COV_FAIL_UNDER=90 verify              # Verify with 90% coverage"
-	@echo "  make clean test-vector-conformance         # Clean then run Vector tests"
+	@echo "  make test-ci                              # Full CI pipeline"
+	@echo "  make setup-test-env                       # Configure test environment"
+	@echo "  make test-ci-fast                         # Fast CI for PRs"
+	@echo "  make conformance-report upload-results    # Generate and upload report"
+	@echo "  make test-docker                          # Run in Docker"
+	@echo "  make PYTEST_JOBS=4 test-conformance       # Run with 4 parallel jobs"
+	@echo "  make COV_FAIL_UNDER=90 verify             # Verify with 90% coverage"
+	@echo "  make clean test-vector-conformance        # Clean then run Vector tests"
 
 # Default target
 .DEFAULT_GOAL := help
