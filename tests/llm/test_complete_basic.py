@@ -10,19 +10,17 @@ Asserts:
 """
 
 import pytest
-
-from corpus_sdk.examples.llm.mock_llm_adapter import MockLLMAdapter
 from corpus_sdk.llm.llm_base import (
     OperationContext,
     LLMCompletion,
     TokenUsage,
 )
-from corpus_sdk.examples.common.ctx import make_ctx
+from examples.common.ctx import make_ctx
 
 pytestmark = pytest.mark.asyncio
 
 
-async def test_complete_basic_text_and_usage():
+async def test_core_ops_complete_basic_text_and_usage(adapter):
     """
     SPECIFICATION.md §8.3 — complete()
 
@@ -33,14 +31,14 @@ async def test_complete_basic_text_and_usage():
       - Model/model_family consistent with capabilities
       - finish_reason is a valid enum value
     """
-    adapter = MockLLMAdapter(failure_rate=0.0)
     ctx = make_ctx(OperationContext, request_id="t_complete_basic", tenant="test")
 
     caps = await adapter.capabilities()
+    model = caps.supported_models[0]
 
     res = await adapter.complete(
         messages=[{"role": "user", "content": "hello"}],
-        model="mock-model",
+        model=model,
         ctx=ctx,
     )
 
