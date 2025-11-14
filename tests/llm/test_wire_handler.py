@@ -37,24 +37,35 @@ from corpus_sdk.llm.llm_base import (
     WireLLMHandler,
 )
 
-from corpus_sdk.examples.llm.mock_llm_adapter import MockLLMAdapter
-
 pytestmark = pytest.mark.asyncio
 
 
-class TrackingMockLLMAdapter(MockLLMAdapter):
+class TrackingMockLLMAdapter(BaseLLMAdapter):
     """
-    MockLLMAdapter wrapper for exercising WireLLMHandler.
-
-    Uses the real mock implementation; only records last ctx/call/args
-    and forces deterministic behavior (failure_rate=0.0, stable health).
+    Test adapter for exercising WireLLMHandler with tracking capabilities.
     """
 
     def __init__(self) -> None:
-        super().__init__(failure_rate=0.0)
+        super().__init__()
         self.last_ctx: Optional[OperationContext] = None
         self.last_call: Optional[str] = None
         self.last_args: Dict[str, Any] = {}
+        self._caps = LLMCapabilities(
+            server="mock",
+            version="1.0.0", 
+            model_family="mock",
+            max_context_length=4096,
+            supports_streaming=True,
+            supports_roles=True,
+            supports_json_output=False,
+            supports_parallel_tool_calls=False,
+            idempotent_writes=True,
+            supports_multi_tenant=True,
+            supports_system_message=True,
+            supports_deadline=True,
+            supports_count_tokens=True,
+            supported_models=("mock-model", "mock-model-2")
+        )
 
     # --- helpers -------------------------------------------------------------
 
@@ -70,11 +81,11 @@ class TrackingMockLLMAdapter(MockLLMAdapter):
 
     # --- backend hooks w/ tracking ------------------------------------------
 
-    async def _do_capabilities(self) -> LLMCapabilities:
+    async def capabilities(self) -> LLMCapabilities:
         self._store("capabilities", None)
-        return await super()._do_capabilities()
+        return self._caps
 
-    async def _do_complete(
+    async def complete(
         self,
         *,
         messages,
@@ -95,20 +106,19 @@ class TrackingMockLLMAdapter(MockLLMAdapter):
             model=model,
             system_message=system_message,
         )
-        return await super()._do_complete(
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            frequency_penalty=frequency_penalty,
-            presence_penalty=presence_penalty,
-            stop_sequences=stop_sequences,
-            model=model,
-            system_message=system_message,
-            ctx=ctx,
+        return LLMCompletion(
+            text="Mock completion response",
+            model=model or "mock-model",
+            model_family="mock",
+            usage=TokenUsage(
+                prompt_tokens=10,
+                completion_tokens=5,
+                total_tokens=15
+            ),
+            finish_reason="stop"
         )
 
-    async def _do_stream(
+    async def stream(
         self,
         *,
         messages,
@@ -129,18 +139,14 @@ class TrackingMockLLMAdapter(MockLLMAdapter):
             model=model,
             system_message=system_message,
         )
-        # Delegate to real streaming behavior
-        async for chunk in super()._do_stream(
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            model=model,
-            system_message=system_message,
-            ctx=ctx,
-        ):
-            yield chunk
+        
+        # Yield multiple chunks including final
+        yield LLMChunk(text="First ", is_final=False)
+        yield LLMChunk(text="chunk ", is_final=False) 
+        yield LLMChunk(text="content", is_final=False)
+        yield LLMChunk(text="[end]", is_final=True)
 
-    async def _do_count_tokens(
+    async def count_tokens(
         self,
         text: str,
         *,
@@ -148,14 +154,13 @@ class TrackingMockLLMAdapter(MockLLMAdapter):
         ctx: Optional[OperationContext] = None,
     ) -> int:
         self._store("count_tokens", ctx, text=text, model=model)
-        return await super()._do_count_tokens(text, model=model, ctx=ctx)
+        return len(text.split())  # Simple token approximation
 
-    async def _do_health(
+    async def health(
         self,
         *,
         ctx: Optional[OperationContext] = None,
     ) -> Mapping[str, Any]:
-        # Make health deterministic for tests
         self._store("health", ctx)
         return {
             "ok": True,
@@ -173,7 +178,7 @@ class ErrorAdapter(TrackingMockLLMAdapter):
         super().__init__()
         self._exc = exc
 
-    async def _do_complete(
+    async def complete(
         self,
         *,
         messages,
@@ -190,11 +195,33 @@ class ErrorAdapter(TrackingMockLLMAdapter):
         raise self._exc
 
 
+class BoomAdapter(TrackingMockLLMAdapter):
+    """
+    Adapter that raises unexpected exceptions for testing error mapping.
+    """
+    
+    async def complete(
+        self,
+        *,
+        messages,
+        max_tokens=None,
+        temperature=None,
+        top_p=None,
+        frequency_penalty=None,
+        presence_penalty=None,
+        stop_sequences=None,
+        model=None,
+        system_message=None,
+        ctx: Optional[OperationContext] = None,
+    ) -> LLMCompletion:
+        raise RuntimeError("boom")
+
+
 # ---------------------------------------------------------------------------
 # Success-path envelopes
 # ---------------------------------------------------------------------------
 
-async def test_wire_capabilities_success_envelope():
+async def test_wire_contract_capabilities_success_envelope():
     a = TrackingMockLLMAdapter()
     h = WireLLMHandler(a)
 
@@ -217,7 +244,7 @@ async def test_wire_capabilities_success_envelope():
     assert len(out["supported_models"]) >= 1
 
 
-async def test_wire_complete_roundtrip_and_context_plumbing():
+async def test_wire_contract_complete_roundtrip_and_context_plumbing():
     a = TrackingMockLLMAdapter()
     h = WireLLMHandler(a)
 
@@ -263,7 +290,7 @@ async def test_wire_complete_roundtrip_and_context_plumbing():
     assert "ignore_me" not in a.last_ctx.attrs
 
 
-async def test_wire_count_tokens_and_health_envelopes():
+async def test_wire_contract_count_tokens_and_health_envelopes():
     a = TrackingMockLLMAdapter()
     h = WireLLMHandler(a)
 
@@ -295,7 +322,7 @@ async def test_wire_count_tokens_and_health_envelopes():
 # Streaming via handle_stream
 # ---------------------------------------------------------------------------
 
-async def test_wire_stream_success_chunks_and_context():
+async def test_wire_contract_stream_success_chunks_and_context():
     a = TrackingMockLLMAdapter()
     h = WireLLMHandler(a)
 
@@ -338,7 +365,7 @@ async def test_wire_stream_success_chunks_and_context():
 # Error mapping semantics
 # ---------------------------------------------------------------------------
 
-async def test_wire_unknown_op_maps_to_not_supported():
+async def test_wire_contract_unknown_op_maps_to_not_supported():
     a = TrackingMockLLMAdapter()
     h = WireLLMHandler(a)
 
@@ -356,7 +383,7 @@ async def test_wire_unknown_op_maps_to_not_supported():
     assert "unknown or non-unary operation" in res["message"]
 
 
-async def test_wire_missing_or_invalid_op_maps_to_bad_request():
+async def test_wire_contract_missing_or_invalid_op_maps_to_bad_request():
     a = TrackingMockLLMAdapter()
     h = WireLLMHandler(a)
 
@@ -374,7 +401,7 @@ async def test_wire_missing_or_invalid_op_maps_to_bad_request():
     assert "missing or invalid 'op'" in res["message"]
 
 
-async def test_wire_maps_llm_adapter_error_to_normalized_envelope():
+async def test_wire_contract_maps_llm_adapter_error_to_normalized_envelope():
     exc = BadRequest("bad llm call")
     a = ErrorAdapter(exc)
     h = WireLLMHandler(a)
@@ -397,24 +424,7 @@ async def test_wire_maps_llm_adapter_error_to_normalized_envelope():
     assert "details" in res  # JSON-safe details present (may be null)
 
 
-async def test_wire_maps_unexpected_exception_to_unavailable():
-    class BoomAdapter(TrackingMockLLMAdapter):
-        async def _do_complete(
-            self,
-            *,
-            messages,
-            max_tokens=None,
-            temperature=None,
-            top_p=None,
-            frequency_penalty=None,
-            presence_penalty=None,
-            stop_sequences=None,
-            model=None,
-            system_message=None,
-            ctx: Optional[OperationContext] = None,
-        ) -> LLMCompletion:
-            raise RuntimeError("boom")
-
+async def test_wire_contract_maps_unexpected_exception_to_unavailable():
     a = BoomAdapter()
     h = WireLLMHandler(a)
 
