@@ -3,7 +3,7 @@
 Schema Registry (Draft 2020-12)
 
 - Recursively loads all JSON Schemas under ./schemas
-- Indexes by $id and by relative file path
+- Indexes by $id and by relative file path  
 - Exposes:
     get_validator(schema_id: str) -> jsonschema.Validator
     validate_json(schema_id: str, obj: Any) -> None (raises ValidationError)
@@ -17,7 +17,7 @@ import json
 import os
 import threading
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, NoReturn
 
 import jsonschema
 from jsonschema import Draft202012Validator
@@ -27,25 +27,34 @@ from jsonschema.exceptions import RefResolutionError, ValidationError
 _SCHEMAS_ROOT_ENV = "CORPUS_SCHEMAS_ROOT"
 _DEFAULT_SCHEMAS_DIR = Path(__file__).resolve().parents[2] / "schemas"
 
-# Global, thread-safe singletons
+# Global, thread-safe singletons with loaded state tracking
 _STORE_LOCK = threading.RLock()
 _SCHEMA_STORE: Dict[str, dict] = {}
 _VALIDATOR_CACHE: Dict[str, Draft202012Validator] = {}
 _SCHEMA_PATHS: Dict[str, str] = {}
+_LOADED = False  # Track loading state explicitly
 
 
 def _schemas_root() -> Path:
     """Get schemas root directory with environment variable override support."""
     root = os.environ.get(_SCHEMAS_ROOT_ENV)
-    return Path(root).resolve() if root else _DEFAULT_SCHEMAS_DIR
+    if root:
+        path = Path(root).resolve()
+        if not path.exists():
+            raise RuntimeError(f"Schema root from {_SCHEMAS_ROOT_ENV} not found: {path}")
+        return path
+    return _DEFAULT_SCHEMAS_DIR
 
 
 def _iter_schema_files(root: Path) -> List[Path]:
     """Find all JSON schema files, skipping obvious non-schema files."""
     schema_files = []
     for p in root.rglob("*.json"):
-        # Skip package.json, tsconfig.json, etc. if they exist
-        if p.name in {"package.json", "tsconfig.json", "package-lock.json"}:
+        # Skip common non-schema files and build directories
+        if p.name in {"package.json", "tsconfig.json", "package-lock.json", "composer.json"}:
+            continue
+        # Skip common exclusion directories
+        if any(part in p.parts for part in {"node_modules", ".git", "dist", "build", "__pycache__"}):
             continue
         schema_files.append(p)
     return sorted(schema_files)  # Deterministic order for testing
@@ -56,22 +65,37 @@ def _validate_schema_metadata(schema: dict, file_path: Path) -> None:
     if not isinstance(schema, dict):
         raise ValueError(f"Schema must be a JSON object: {file_path}")
     
+    # Skip if not a JSON Schema (no $schema)
+    if "$schema" not in schema:
+        return
+    
     # Check for Draft 2020-12 compliance
-    if schema.get("$schema") != "https://json-schema.org/draft/2020-12/schema":
-        raise ValueError(f"Schema must declare $schema as Draft 2020-12: {file_path}")
+    schema_version = schema.get("$schema")
+    if schema_version != "https://json-schema.org/draft/2020-12/schema":
+        raise ValueError(
+            f"Schema must declare $schema as Draft 2020-12: {file_path} (got {schema_version})"
+        )
     
     if "$id" not in schema:
         raise ValueError(f"Schema must declare $id: {file_path}")
     
     schema_id = schema["$id"]
-    if not isinstance(schema_id, str) or not schema_id.startswith(("http://", "https://")):
-        raise ValueError(f"Schema $id must be a valid URI: {file_path} -> {schema_id}")
+    if not isinstance(schema_id, str):
+        raise ValueError(f"Schema $id must be a string: {file_path}")
+    
+    # Validate URI format more thoroughly
+    if not (schema_id.startswith(("http://", "https://", "urn:", "tag:"))):
+        raise ValueError(
+            f"Schema $id must be a valid URI (http/https/urn/tag): {file_path} -> {schema_id}"
+        )
 
 
 def _load_all_schemas() -> None:
     """Load all schemas into the global store with comprehensive validation."""
+    global _LOADED
+    
     with _STORE_LOCK:
-        if _SCHEMA_STORE:
+        if _LOADED:
             return
 
         root = _schemas_root()
@@ -80,13 +104,18 @@ def _load_all_schemas() -> None:
 
         loaded_files = []
         duplicate_ids = []
+        schema_count = 0
         
         for file_path in _iter_schema_files(root):
             try:
                 with file_path.open("r", encoding="utf-8") as f:
                     schema = json.load(f)
             except json.JSONDecodeError as e:
-                raise RuntimeError(f"Invalid JSON in schema: {file_path}: {e}") from e
+                raise RuntimeError(f"Invalid JSON in schema {file_path}: {e}") from e
+
+            # Skip if not a JSON Schema
+            if "$schema" not in schema:
+                continue
 
             # Validate schema structure
             try:
@@ -107,11 +136,17 @@ def _load_all_schemas() -> None:
             _SCHEMA_STORE[schema_id] = schema
             _SCHEMA_PATHS[schema_id] = str(file_path)
             loaded_files.append(file_path.name)
+            schema_count += 1
 
         if duplicate_ids:
             raise RuntimeError("Duplicate schema $id detected:\n" + "\n".join(duplicate_ids))
         
-        print(f"✅ Loaded {len(loaded_files)} schemas: {', '.join(sorted(loaded_files))}")
+        if schema_count > 0:
+            print(f"✅ Loaded {schema_count} schemas: {', '.join(sorted(loaded_files))}")
+        else:
+            print("⚠️  No JSON schemas found - check CORPUS_SCHEMAS_ROOT environment variable")
+            
+        _LOADED = True
 
 
 def _build_resolver() -> jsonschema.RefResolver:
@@ -129,28 +164,45 @@ def _build_resolver() -> jsonschema.RefResolver:
 def _make_validator(schema_id: str) -> Draft202012Validator:
     """Create a validator for the given schema ID with comprehensive error handling."""
     with _STORE_LOCK:
-        if not _SCHEMA_STORE:
+        if not _LOADED:
             _load_all_schemas()
 
         if schema_id not in _SCHEMA_STORE:
             # Provide helpful suggestions for unknown schema IDs
             available_ids = list(_SCHEMA_STORE.keys())
+            
+            if not available_ids:
+                raise KeyError(
+                    f"Schema not found: {schema_id}\nNo schemas loaded. "
+                    f"Check {_SCHEMAS_ROOT_ENV} environment variable."
+                )
+
+            # Try various matching strategies
             suggestions = []
             
-            # Try suffix matching
+            # Exact suffix matching
             for available_id in available_ids:
                 if available_id.endswith(schema_id):
                     suggestions.append(available_id)
                 elif schema_id in available_id:
                     suggestions.append(available_id)
             
+            # Also try filename matching
+            schema_filename = Path(schema_id).name
+            for available_id in available_ids:
+                if Path(_SCHEMA_PATHS[available_id]).name == schema_filename:
+                    if available_id not in suggestions:
+                        suggestions.append(available_id)
+            
             error_msg = f"Schema not found: {schema_id}"
             if suggestions:
-                error_msg += f"\nDid you mean one of:\n  " + "\n  ".join(suggestions[:5])  # Limit to 5 suggestions
+                error_msg += f"\nDid you mean one of:\n  " + "\n  ".join(sorted(suggestions)[:5])
             else:
                 error_msg += f"\nAvailable schemas ({len(available_ids)}):\n  " + "\n  ".join(
-                    sorted(available_ids)[:10]  # Show first 10
+                    sorted(available_ids)[:8]  # Show first 8
                 )
+                if len(available_ids) > 8:
+                    error_msg += f"\n  ... and {len(available_ids) - 8} more"
             
             raise KeyError(error_msg)
 
@@ -168,12 +220,14 @@ def _make_validator(schema_id: str) -> Draft202012Validator:
                 format_checker=jsonschema.draft202012_format_checker
             )
         except RefResolutionError as e:
+            file_path = schema.get("__file__", "unknown")
             raise RuntimeError(
-                f"Failed to resolve $refs for schema '{schema_id}' ({schema.get('__file__')}): {e}"
+                f"Failed to resolve $refs for schema '{schema_id}' ({file_path}): {e}"
             ) from e
         except Exception as e:
+            file_path = schema.get("__file__", "unknown")
             raise RuntimeError(
-                f"Failed to create validator for schema '{schema_id}' ({schema.get('__file__')}): {e}"
+                f"Failed to create validator for schema '{schema_id}' ({file_path}): {e}"
             ) from e
 
         return validator
@@ -190,7 +244,7 @@ def get_validator(schema_id: str) -> Draft202012Validator:
         Draft202012Validator: Cached validator instance
         
     Raises:
-        KeyError: If schema_id is not found
+        KeyError: If schema_id is not found with helpful suggestions
         RuntimeError: If schema validation fails
     """
     with _STORE_LOCK:
@@ -219,6 +273,14 @@ def validate_json(schema_id: str, obj: Any) -> None:
     validator.validate(obj)
 
 
+def _format_value(value: Any, max_length: int = 200) -> str:
+    """Format value for error messages with length limiting."""
+    formatted = repr(value)
+    if len(formatted) > max_length:
+        return formatted[:max_length] + "..."
+    return formatted
+
+
 def assert_valid(schema_id: str, obj: Any, *, context: Optional[str] = None) -> None:
     """
     Pytest-friendly validation with rich error messages.
@@ -239,7 +301,7 @@ def assert_valid(schema_id: str, obj: Any, *, context: Optional[str] = None) -> 
             f"JSON validation failed against {schema_id}",
             f"Schema file: {_SCHEMA_PATHS.get(schema_id, 'unknown')}",
             f"Error: {e.message}",
-            f"Failing value: {repr(e.instance)}" if e.instance is not None else "Failing value: <none>",
+            f"Failing value: {_format_value(e.instance)}" if e.instance is not None else "Failing value: <none>",
             f"JSON path: {'.'.join(str(p) for p in e.path) if e.path else '<root>'}", 
             f"Schema path: {'.'.join(str(p) for p in e.schema_path) if e.schema_path else '<root>'}"
         ]
@@ -260,7 +322,8 @@ def preload_all_schemas() -> None:
             try:
                 get_validator(schema_id)
             except Exception as e:
-                raise RuntimeError(f"Failed to create validator for {schema_id}: {e}") from e
+                file_path = _SCHEMA_STORE[schema_id].get("__file__", "unknown")
+                raise RuntimeError(f"Failed to create validator for {schema_id} ({file_path}): {e}") from e
 
 
 def list_schemas() -> Dict[str, str]:
@@ -282,7 +345,7 @@ def get_schema(schema_id: str) -> dict:
         schema_id: The $id of the schema to retrieve
         
     Returns:
-        dict: The schema document
+        dict: The schema document (copy to prevent mutation)
         
     Raises:
         KeyError: If schema_id is not found
@@ -291,15 +354,17 @@ def get_schema(schema_id: str) -> dict:
     with _STORE_LOCK:
         if schema_id not in _SCHEMA_STORE:
             raise KeyError(f"Schema not found: {schema_id}")
-        return _SCHEMA_STORE[schema_id].copy()  # Return copy to prevent mutation
+        return _SCHEMA_STORE[schema_id].copy()
 
 
 def clear_cache() -> None:
     """Clear all caches (primarily for testing)."""
+    global _LOADED
     with _STORE_LOCK:
         _SCHEMA_STORE.clear()
         _VALIDATOR_CACHE.clear()
         _SCHEMA_PATHS.clear()
+        _LOADED = False
 
 
 # Command-line interface for validation and debugging
@@ -319,10 +384,11 @@ Environment:
   CORPUS_SCHEMAS_ROOT    Override the default schemas directory
         """
     )
-    parser.add_argument("schema_id", help="Schema $id (exact) or file name suffix")
-    parser.add_argument("json_file", help="Path to JSON document to validate")
+    parser.add_argument("schema_id", nargs="?", help="Schema $id (exact) or file name suffix")
+    parser.add_argument("json_file", nargs="?", help="Path to JSON document to validate")
     parser.add_argument("--list", action="store_true", help="List all available schemas")
     parser.add_argument("--preload", action="store_true", help="Preload and validate all schemas")
+    parser.add_argument("--stats", action="store_true", help="Show schema registry statistics")
     
     args = parser.parse_args()
 
@@ -332,7 +398,8 @@ Environment:
             schemas = list_schemas()
             print(f"Available schemas ({len(schemas)}):")
             for schema_id, file_path in sorted(schemas.items()):
-                print(f"  {schema_id} -> {file_path}")
+                rel_path = Path(file_path).relative_to(_schemas_root()) if Path(file_path).is_relative_to(_schemas_root()) else file_path
+                print(f"  {schema_id} -> {rel_path}")
             sys.exit(0)
             
         if args.preload:
@@ -340,24 +407,42 @@ Environment:
             print("✅ All schemas loaded and validated successfully")
             sys.exit(0)
 
+        if args.stats:
+            preload_all_schemas()
+            print(f"Schema Registry Statistics:")
+            print(f"  Schemas loaded: {len(_SCHEMA_STORE)}")
+            print(f"  Validators cached: {len(_VALIDATOR_CACHE)}")
+            print(f"  Schema root: {_schemas_root()}")
+            sys.exit(0)
+
         # Normal validation mode
+        if not args.schema_id or not args.json_file:
+            parser.print_help()
+            sys.exit(1)
+            
         preload_all_schemas()
         
         # Find matching schema ID
         target_id = args.schema_id
         if target_id not in _SCHEMA_STORE:
-            # Try suffix matching for convenience
+            # Try various matching strategies
             matches = [sid for sid in _SCHEMA_STORE.keys() if sid.endswith(target_id)]
+            if not matches:
+                # Try filename matching
+                schema_filename = Path(target_id).name
+                matches = [sid for sid, path in _SCHEMA_PATHS.items() if Path(path).name == schema_filename]
+            
             if len(matches) == 1:
                 target_id = matches[0]
                 print(f"🔍 Using schema: {target_id}")
             elif len(matches) > 1:
                 print(f"❌ Multiple schemas match '{args.schema_id}':")
-                for match in matches:
+                for match in sorted(matches):
                     print(f"   {match}")
                 sys.exit(1)
             else:
                 print(f"❌ Schema not found: {args.schema_id}")
+                print(f"   Use --list to see available schemas")
                 sys.exit(1)
 
         with open(args.json_file, "r", encoding="utf-8") as f:
