@@ -10,7 +10,6 @@ Covers:
 """
 import pytest
 from corpus_sdk.llm.llm_base import OperationContext, BadRequest
-from examples.common.ctx import make_ctx
 
 pytestmark = pytest.mark.asyncio
 
@@ -24,7 +23,7 @@ async def test_sampling_params_invalid_temperature_rejected(adapter, temperature
     MUST raise BadRequest.
     """
     caps = await adapter.capabilities()
-    ctx = make_ctx(OperationContext, request_id="t_temp_invalid", tenant="test")
+    ctx = OperationContext(request_id="t_temp_invalid", tenant="test")
 
     with pytest.raises(BadRequest) as exc_info:
         await adapter.complete(
@@ -45,7 +44,7 @@ async def test_sampling_params_valid_temperature_accepted(adapter, temperature):
     Temperature values within [0.0, 2.0] MUST be accepted.
     """
     caps = await adapter.capabilities()
-    ctx = make_ctx(OperationContext, tenant="test")
+    ctx = OperationContext(tenant="test")
 
     res = await adapter.complete(
         messages=[{"role": "user", "content": "test"}],
@@ -66,7 +65,7 @@ async def test_sampling_params_invalid_top_p_rejected(adapter, top_p):
     MUST raise BadRequest.
     """
     caps = await adapter.capabilities()
-    ctx = make_ctx(OperationContext, request_id="t_top_p_invalid", tenant="test")
+    ctx = OperationContext(request_id="t_top_p_invalid", tenant="test")
 
     with pytest.raises(BadRequest) as exc_info:
         await adapter.complete(
@@ -87,7 +86,7 @@ async def test_sampling_params_valid_top_p_accepted(adapter, top_p):
     top_p values within (0.0, 1.0] MUST be accepted.
     """
     caps = await adapter.capabilities()
-    ctx = make_ctx(OperationContext, tenant="test")
+    ctx = OperationContext(tenant="test")
 
     res = await adapter.complete(
         messages=[{"role": "user", "content": "test"}],
@@ -108,7 +107,7 @@ async def test_sampling_params_invalid_frequency_penalty_rejected(adapter, frequ
     MUST raise BadRequest.
     """
     caps = await adapter.capabilities()
-    ctx = make_ctx(OperationContext, request_id="t_freq_pen_invalid", tenant="test")
+    ctx = OperationContext(request_id="t_freq_pen_invalid", tenant="test")
 
     with pytest.raises(BadRequest) as exc_info:
         await adapter.complete(
@@ -129,7 +128,7 @@ async def test_sampling_params_valid_frequency_penalty_accepted(adapter, frequen
     frequency_penalty values within [-2.0, 2.0] MUST be accepted.
     """
     caps = await adapter.capabilities()
-    ctx = make_ctx(OperationContext, tenant="test")
+    ctx = OperationContext(tenant="test")
 
     res = await adapter.complete(
         messages=[{"role": "user", "content": "test"}],
@@ -150,7 +149,7 @@ async def test_sampling_params_invalid_presence_penalty_rejected(adapter, presen
     MUST raise BadRequest.
     """
     caps = await adapter.capabilities()
-    ctx = make_ctx(OperationContext, request_id="t_pres_pen_invalid", tenant="test")
+    ctx = OperationContext(request_id="t_pres_pen_invalid", tenant="test")
 
     with pytest.raises(BadRequest) as exc_info:
         await adapter.complete(
@@ -171,7 +170,7 @@ async def test_sampling_params_valid_presence_penalty_accepted(adapter, presence
     presence_penalty values within [-2.0, 2.0] MUST be accepted.
     """
     caps = await adapter.capabilities()
-    ctx = make_ctx(OperationContext, tenant="test")
+    ctx = OperationContext(tenant="test")
 
     res = await adapter.complete(
         messages=[{"role": "user", "content": "test"}],
@@ -188,7 +187,7 @@ async def test_sampling_params_multiple_invalid_params_error_message(adapter):
     When multiple parameters are invalid, error should be informative.
     """
     caps = await adapter.capabilities()
-    ctx = make_ctx(OperationContext, tenant="test")
+    ctx = OperationContext(tenant="test")
 
     with pytest.raises(BadRequest) as exc_info:
         await adapter.complete(
