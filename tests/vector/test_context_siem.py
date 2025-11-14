@@ -11,6 +11,7 @@ Spec refs:
 import pytest
 from typing import Any, Mapping, Optional, List, Dict
 from corpus_sdk.vector.vector_base import (
+    OperationContext,
     QuerySpec,
     UpsertSpec,
     Vector,
@@ -18,7 +19,6 @@ from corpus_sdk.vector.vector_base import (
     MetricsSink,
     BadRequest,
 )
-from examples.common.ctx import make_ctx
 
 pytestmark = pytest.mark.asyncio
 
@@ -74,7 +74,7 @@ async def test_observability_context_propagates_to_metrics_siem_safe(adapter):
     original_metrics = getattr(adapter, "_metrics", None)
     adapter._metrics = metrics  # type: ignore[attr-defined]
 
-    ctx = make_ctx(None, request_id="v_ctx", tenant="acme")
+    ctx = OperationContext(request_id="v_ctx", tenant="acme")
     await adapter.query(QuerySpec(vector=[0.1], top_k=1, namespace="default"), ctx=ctx)
 
     # Restore original metrics
@@ -91,7 +91,7 @@ async def test_observability_tenant_hashed_never_raw(adapter):
     adapter._metrics = metrics  # type: ignore[attr-defined]
 
     secret_tenant = "super-secret-tenant-12345"
-    ctx = make_ctx(None, request_id="v_hash", tenant=secret_tenant)
+    ctx = OperationContext(request_id="v_hash", tenant=secret_tenant)
     await adapter.query(QuerySpec(vector=[0.1], top_k=1, namespace="default"), ctx=ctx)
 
     # Restore original metrics
@@ -109,7 +109,7 @@ async def test_observability_no_vector_data_in_metrics(adapter):
     original_metrics = getattr(adapter, "_metrics", None)
     adapter._metrics = metrics  # type: ignore[attr-defined]
 
-    ctx = make_ctx(None, request_id="v_no_vec", tenant="test-tenant")
+    ctx = OperationContext(request_id="v_no_vec", tenant="test-tenant")
     await adapter.query(QuerySpec(vector=[0.9, 0.8], top_k=1, namespace="default"), ctx=ctx)
 
     # Restore original metrics
@@ -129,7 +129,7 @@ async def test_observability_metrics_emitted_on_error_path(adapter):
     original_metrics = getattr(adapter, "_metrics", None)
     adapter._metrics = metrics  # type: ignore[attr-defined]
 
-    ctx = make_ctx(None, request_id="v_err", tenant="test-tenant")
+    ctx = OperationContext(request_id="v_err", tenant="test-tenant")
 
     with pytest.raises(BadRequest):
         await adapter.query(QuerySpec(vector=[0.1], top_k=0, namespace="default"), ctx=ctx)
@@ -148,7 +148,7 @@ async def test_observability_query_metrics_include_namespace(adapter):
     original_metrics = getattr(adapter, "_metrics", None)
     adapter._metrics = metrics  # type: ignore[attr-defined]
 
-    ctx = make_ctx(None, request_id="v_ns", tenant="test-tenant")
+    ctx = OperationContext(request_id="v_ns", tenant="test-tenant")
     await adapter.query(QuerySpec(vector=[0.2], top_k=1, namespace="test-namespace"), ctx=ctx)
 
     # Restore original metrics
@@ -168,7 +168,7 @@ async def test_observability_upsert_metrics_include_vector_count(adapter):
     original_metrics = getattr(adapter, "_metrics", None)
     adapter._metrics = metrics  # type: ignore[attr-defined]
 
-    ctx = make_ctx(None, request_id="v_up", tenant="test-tenant")
+    ctx = OperationContext(request_id="v_up", tenant="test-tenant")
     spec = UpsertSpec(
         namespace="default",
         vectors=[Vector(id=VectorID("m1"), vector=[0.1])],
