@@ -1,5 +1,5 @@
 # SCHEMA CONFORMANCE
----
+
 ## Table of Contents
 
 - [Overview](#overview)
