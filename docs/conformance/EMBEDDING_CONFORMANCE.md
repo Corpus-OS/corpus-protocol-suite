@@ -1,5 +1,17 @@
 # Embedding Protocol Conformance Test Coverage
 
+**Table of Contents**
+- [Overview](#overview)
+- [Conformance Summary](#conformance-summary)
+- [Test Files](#test-files)
+- [Specification Mapping](#specification-mapping)
+- [Running Tests](#running-tests)
+- [Adapter Compliance Checklist](#adapter-compliance-checklist)
+- [Conformance Badge](#conformance-badge)
+- [Maintenance](#maintenance)
+
+---
+
 ## Overview
 
 This document tracks conformance test coverage for the **Embedding Protocol V1.0** specification as defined in `SPECIFICATION.md §10`. Each test validates normative requirements (MUST/SHOULD) from the specification and the reference implementation in:
@@ -450,4 +462,3 @@ Use this when implementing or validating a new **Embedding adapter** against `Em
 **Last Updated:** 2025-01-XX
 **Maintained By:** Corpus SDK Team
 **Status:** 100% V1.0 Conformant - Production Ready
-
