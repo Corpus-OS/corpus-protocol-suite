@@ -1,11 +1,48 @@
-# PROTOCOLS.md
+# PROTOCOLS
+
+**Table of Contents**
+- [0. Document Metadata](#0-document-metadata)
+- [1. Introduction](#1-introduction)
+- [2. Common Foundation (All Adapters)](#2-common-foundation-all-adapters)
+- [3. Shared Types](#3-shared-types)
+- [4. Protocol Overview](#4-protocol-overview)
+- [PART I — GRAPH PROTOCOL (v1.0)](#part-i--graph-protocol-v10)
+- [5. Graph Capabilities](#5-graph-capabilities)
+- [6. Graph Types](#6-graph-types)
+- [7. Graph Operations](#7-graph-operations)
+- [8. Graph Semantics (Normative)](#8-graph-semantics-normative)
+- [PART II — LLM PROTOCOL (v1.0)](#part-ii--llm-protocol-v10)
+- [9. LLM Capabilities](#9-llm-capabilities)
+- [10. LLM Types](#10-llm-types)
+- [11. LLM Operations](#11-llm-operations)
+- [12. LLM Semantics (Normative)](#12-llm-semantics-normative)
+- [PART III — VECTOR PROTOCOL (v1.0)](#part-iii--vector-protocol-v10)
+- [13. Vector Capabilities](#13-vector-capabilities)
+- [14. Vector Types](#14-vector-types)
+- [15. Vector Operations](#15-vector-operations)
+- [16. Vector Semantics (Normative)](#16-vector-semantics-normative)
+- [PART IV — EMBEDDING PROTOCOL (v1.0)](#part-iv--embedding-protocol-v10)
+- [17. Embedding Capabilities](#17-embedding-capabilities)
+- [18. Embedding Types](#18-embedding-types)
+- [19. Embedding Operations](#19-embedding-operations)
+- [20. Embedding Semantics (Normative)](#20-embedding-semantics-normative)
+- [PART V — CROSS-PROTOCOL SECTIONS](#part-v--cross-protocol-sections)
+- [21. Observability Integration](#21-observability-integration)
+- [22. Normalized Error Integration](#22-normalized-error-integration)
+- [23. Testing & Conformance](#23-testing--conformance)
+- [24. Security Requirements](#24-security-requirements)
+- [25. Versioning, Deprecation & Evolution](#25-versioning-deprecation--evolution)
+- [26. Compliance Matrices](#26-compliance-matrices)
+- [27. Cross-Protocol Standardization Tables](#27-cross-protocol-standardization-tables)
+- [28. Glossary](#28-glossary)
+- [29. Appendix](#29-appendix)
+
+---
 
 **Corpus Protocol Suite — Unified Specification for Graph, LLM, Vector, and Embedding Adapters**  
 **protocols_version:** `1.0`
 
 > This document defines the unified protocol specification for all Corpus adapters. It establishes the normative behavior, types, and semantics for Graph, LLM, Vector, and Embedding protocols while maintaining cross-protocol consistency.
-
----
 
 ## 0. Document Metadata
 
@@ -37,8 +74,6 @@
 - **MUST/SHOULD/MAY:** RFC 2119 normative language
 - **Tenant:** Logical isolation boundary for multi-tenant deployments
 - **Namespace:** Protocol-specific isolation scope (Vector collections, Graph databases, etc.)
-
----
 
 ## 1. Introduction
 
@@ -74,8 +109,6 @@ Corpus Protocol → Adapter → Provider API
 - Deadline propagation and enforcement
 - Tenant isolation and security
 - Metrics emission and observability
-
----
 
 ## 2. Common Foundation (All Adapters)
 
@@ -242,8 +275,6 @@ interface ResponseHeaders {
 {"type": "end"}\n
 ```
 
----
-
 ## 3. Shared Types
 
 ### 3.1 Numeric Types
@@ -304,8 +335,6 @@ interface TokenUsage {
   total_tokens: number;
 }
 ```
-
----
 
 ## 4. Protocol Overview
 
@@ -385,8 +414,6 @@ supports_explain?: boolean;         // Query explanation
 - **Adapter fallback:** Adapters MAY translate between dialects if supported
 - **Error on unsupported:** `NotSupported` error for unknown dialects
 - **Parameter binding:** All dialects MUST support named parameter binding
-
----
 
 ## 6. Graph Types
 
@@ -504,8 +531,6 @@ interface BatchFailure {
   detail: string;                 // Failure details
 }
 ```
-
----
 
 ## 7. Graph Operations
 
@@ -645,8 +670,6 @@ interface HealthStatus {
 }
 ```
 
----
-
 ## 8. Graph Semantics (Normative)
 
 ### 8.1 Consistency Requirements
@@ -747,8 +770,6 @@ supports_function_calling?: boolean;
 supported_sampling_parameters?: string[];
 ```
 
----
-
 ## 10. LLM Types
 
 ### 10.1 Message Schema
@@ -815,8 +836,6 @@ interface StreamChunk {
 }
 ```
 
----
-
 ## 11. LLM Operations
 
 ### 11.1 complete
@@ -880,8 +899,6 @@ interface LLMHealthStatus {
   };
 }
 ```
-
----
 
 ## 12. LLM Semantics (Normative)
 
@@ -967,8 +984,6 @@ supports_vector_compression?: boolean;
 supported_index_types?: string[];
 approximate_search_accuracy?: number; // 0.0 to 1.0
 ```
-
----
 
 ## 14. Vector Types
 
@@ -1076,8 +1091,6 @@ interface NamespaceResult {
 }
 ```
 
----
-
 ## 15. Vector Operations
 
 ### 15.1 query
@@ -1112,7 +1125,7 @@ interface NamespaceResult {
 ### 15.3 delete
 **Purpose:** Remove vectors by ID or metadata filter
 
-**Input:** `DeleteSpec`
+**Input:`DeleteSpec`
 
 **Output:** `DeleteResult`
 
@@ -1166,8 +1179,6 @@ interface VectorHealthStatus {
   };
 }
 ```
-
----
 
 ## 16. Vector Semantics (Normative)
 
@@ -1244,8 +1255,6 @@ supports_async_embedding?: boolean;
 max_requests_per_minute?: number;
 ```
 
----
-
 ## 18. Embedding Types
 
 ### 18.1 EmbedSpec
@@ -1301,8 +1310,6 @@ interface EmbedBatchResult {
   }>;
 }
 ```
-
----
 
 ## 19. Embedding Operations
 
@@ -1369,8 +1376,6 @@ interface EmbeddingHealthStatus {
   };
 }
 ```
-
----
 
 ## 20. Embedding Semantics (Normative)
 
