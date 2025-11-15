@@ -1,5 +1,3 @@
-Here's the fully updated PROTOCOLS.md file with all the improvements you requested:
-
 # CORPUS PROTOCOLS
 
 **Table of Contents**
