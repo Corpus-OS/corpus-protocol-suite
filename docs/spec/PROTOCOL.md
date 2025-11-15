@@ -122,10 +122,6 @@ interface OperationContext {
   traceparent?: string;          // W3C trace context
   tenant?: string;               // Tenant identifier (hashed in metrics)
   attrs: Map<string, any>;       // Opaque extension attributes
-  
-  // Derived methods
-  remaining_ms(): number | null; // Time until deadline
-  is_expired(): boolean;         // Deadline check
 }
 ```
 
@@ -137,32 +133,56 @@ interface OperationContext {
 ### 2.3 Deadlines & Budgets
 - **Propagation:** Adapters MUST propagate `deadline_ms` to provider APIs
 - **Safety buffer:** Subtract 50-100ms from remaining time for network overhead
-- **Expiration:** Reject operations where `ctx.is_expired()` returns true
+- **Expiration:** Reject operations where context deadline has expired
 
 ### 2.4 Stream Semantics
 - **Single terminal:** Exactly one terminal event (success or error)
 - **No content after terminal:** Stream MUST end after final event
 - **Heartbeats:** Optional keep-alive messages allowed but not required
-- **Backpressure:** Clients control consumption rate; adapters respect flow control
+- **Backpressure:** Clients control consumption rate; adapters MUST implement bounded buffering and flow control
 
-### 2.5 Normalized Error Model
+### 2.5 Thread Safety & In-Memory Infrastructure
+- **Adapter instances are not thread-safe** by default
+- **In-memory implementations are not distributed** - state is local to process
+- **Concurrent access** requires external synchronization by callers
+- **Standalone mode** assumes single-process deployment constraints
+
+### 2.6 Configuration Management
+- **Thin mode:** Adapters rely on external configuration for policies, limits, and routing
+- **Standalone mode:** Limited built-in configuration for development/testing
+- **Policy configuration** (rate limits, quotas, etc.) is outside wire protocol scope
+- **Adapter initialization** accepts configuration but runtime changes require restart
+
+### 2.7 Cache Serialization Constraints
+- **All cached data MUST be JSON-serializable**
+- **Metadata maps** MUST contain only JSON-serializable values
+- **Filter expressions** MUST be serializable for cache key composition
+- **Vector data** may require custom serialization for performance
+
+### 2.8 Cache Key Composition
+- **Cache keys MUST include:** tenant, namespace, operation, and critical parameters
+- **Filter expressions** MUST be normalized for consistent key generation
+- **Vector queries** SHOULD use fingerprinting for high-dimensional data
+- **Collision risk:** Adapters MUST ensure key uniqueness across tenants and namespaces
+
+### 2.9 Normalized Error Model
 See **ERRORS.md** for complete error taxonomy and mapping requirements.
 
-### 2.6 Observability & Metrics
+### 2.10 Observability & Metrics
 See **METRICS.md** for complete metrics specification and emission rules.
 
-### 2.7 Capability Probing
+### 2.11 Capability Probing
 - **Dynamic discovery:** Clients probe `capabilities()` to determine supported features
 - **Truthful reporting:** Adapters MUST accurately report actual capabilities
 - **Caching:** Capabilities may be cached with appropriate TTL (typically 5-60 minutes)
 
-### 2.8 SIEM-Safe Requirements
+### 2.12 SIEM-Safe Requirements
 - **No raw content** in logs, metrics, or errors (prompts, vectors, embeddings)
 - **Structured data only** in telemetry fields
 - **Tenant hashing** as described in §2.2
 - **Cardinality control** in labels and dimensions
 
-### 2.9 Idempotency Expectations
+### 2.13 Idempotency Expectations
 | Operation Type | Idempotent? | Notes |
 |---------------|-------------|--------|
 | Read operations | Yes | Same inputs → same outputs |
@@ -171,7 +191,7 @@ See **METRICS.md** for complete metrics specification and emission rules.
 | Update | Yes | Last write wins |
 | Delete | Yes | Multiple deletes return success |
 
-### 2.10 Global Invariants (MUST/MUST NOT)
+### 2.14 Global Invariants (MUST/MUST NOT)
 
 **All adapters MUST:**
 - Emit `observe_operation` and `count_operation` for every operation
@@ -188,7 +208,7 @@ See **METRICS.md** for complete metrics specification and emission rules.
 - Cache capabilities beyond reasonable TTL (max 1 hour)
 - Process requests after context deadline expiration
 
-### 2.11 Wire-Level Envelope Standardization
+### 2.15 Wire-Level Envelope Standardization
 
 **Success Response Envelope:**
 ```json
@@ -207,7 +227,6 @@ See **METRICS.md** for complete metrics specification and emission rules.
   "error": "ResourceExhausted",
   "message": "Rate limit exceeded",
   "code": "RATE_LIMIT",
-  "http_status": 429,
   "retry_after_ms": 5000,
   "details": { ... }
 }
@@ -222,7 +241,7 @@ See **METRICS.md** for complete metrics specification and emission rules.
 }
 ```
 
-### 2.12 Transport Envelope Specification
+### 2.16 Transport Envelope Specification
 
 **HTTP/REST Transport Binding:**
 ```typescript
@@ -275,6 +294,19 @@ interface ResponseHeaders {
 {"type": "data", "data": { ... }}\n
 {"type": "end"}\n
 ```
+
+### 2.17 Type Serialization and Wire Format
+
+**Field Name Stability:**
+- Protocol type definitions use exact field names from reference implementations
+- WireHandlers perform serialization using `dataclasses.asdict()` or equivalent
+- Field names in JSON wire format match Python dataclass field names exactly
+- No field name translation is performed at the wire layer
+
+**Type Name Conventions:**
+- LLM chunks use `LLMChunk` (not `StreamChunk`)
+- Graph query results use `QueryResult` with `records` field
+- All protocols use consistent naming patterns for similar concepts
 
 ## 3. Shared Types
 
@@ -341,7 +373,7 @@ interface TokenUsage {
 
 ### 4.1 Graph Protocol
 - **Purpose:** Property graph storage and querying
-- **Key operations:** CRUD on vertices/edges, graph queries, batch operations
+- **Key operations:** CRUD on nodes/edges, graph queries, batch operations
 - **Primary use cases:** Knowledge graphs, recommendation systems, fraud detection
 
 ### 4.2 LLM Protocol
@@ -380,8 +412,9 @@ interface TokenUsage {
 ### 5.1 Required Fields
 ```typescript
 interface GraphCapabilities {
-  server: string;                   // Adapter identifier
-  version: string;                  // Protocol version
+  protocol: string;               // "graph"
+  server: string;                 // Adapter identifier
+  version: string;                // Protocol version
   supported_query_dialects: string[]; // e.g., ["cypher", "gremlin"]
   supports_stream_query: boolean;
   supports_bulk_vertices: boolean;
@@ -389,6 +422,10 @@ interface GraphCapabilities {
   supports_schema: boolean;
   idempotent_writes: boolean;
   supports_deadline: boolean;
+  supports_namespaces: boolean;
+  supports_property_filters: boolean;
+  supports_multi_tenant: boolean;
+  max_batch_ops?: number;
 }
 ```
 
@@ -418,102 +455,85 @@ supports_explain?: boolean;         // Query explanation
 
 ## 6. Graph Types
 
-### 6.1 Vertex
+### 6.1 Node
 ```typescript
-interface Vertex {
+interface Node {
   id: string;
-  label: string;
+  labels: string[];               // Multiple labels supported
   properties: Metadata;
-  created_at?: string;    // ISO 8601 timestamp
-  updated_at?: string;    // ISO 8601 timestamp
+  namespace?: string;             // Optional namespace isolation
 }
 ```
+
+**Note on Timestamps:**
+The `created_at` and `updated_at` fields shown in operation response examples 
+are added by backend implementations and are not part of the protocol's base 
+Node/Edge type contracts. Adapters MAY include these fields in responses, but 
+clients MUST NOT depend on their presence.
 
 ### 6.2 Edge
 ```typescript
 interface Edge {
   id: string;
+  src: string;                    // Source node ID
+  dst: string;                    // Target node ID  
   label: string;
-  from_vertex: string;    // Source vertex ID
-  to_vertex: string;      // Target vertex ID  
   properties: Metadata;
-  created_at?: string;
-  updated_at?: string;
+  namespace?: string;             // Optional namespace isolation
 }
 ```
+
+**Note on Timestamps:**
+The `created_at` and `updated_at` fields shown in operation response examples 
+are added by backend implementations and are not part of the protocol's base 
+Node/Edge type contracts. Adapters MAY include these fields in responses, but 
+clients MUST NOT depend on their presence.
 
 ### 6.3 QuerySpec
 ```typescript
 interface QuerySpec {
-  query: string;                   // Query in supported dialect
-  parameters?: Metadata;          // Named parameters for query
+  text: string;                   // Query in supported dialect
+  params?: Metadata;              // Named parameters for query
   timeout_ms?: number;            // Query-specific timeout
-  include_metadata?: boolean;     // Return vertex/edge properties
-  limit?: number;                 // Maximum results to return
   dialect?: string;               // Preferred query dialect
-  explain?: boolean;              // Return query execution plan
 }
 ```
 
 ### 6.4 QueryResult
 ```typescript
 interface QueryResult {
-  rows: any[];                    // Query result rows
-  columns?: string[];             // Column names for tabular results
-  schema?: ResultSchema;          // Optional result schema
+  records: any[];                 // Query result data
   summary: {                      // Execution summary (REQUIRED)
     query_time_ms: number;
     results_count: number;
     has_more: boolean;
     dialect_used: string;         // Actual dialect used
-    plan?: QueryPlan;             // Execution plan if explain=true
   };
-}
-
-interface ResultSchema {
-  columns: Array<{
-    name: string;
-    type: 'string' | 'number' | 'boolean' | 'vertex' | 'edge' | 'path';
-    nullable: boolean;
-  }>;
-}
-
-interface QueryPlan {
-  steps: Array<{
-    operation: string;
-    estimated_rows?: number;
-    cost?: number;
-  }>;
+  dialect?: string;               // Optional dialect used
+  namespace?: string;             // Optional namespace context
 }
 ```
 
-### 6.5 StreamQueryResult
+### 6.5 QueryChunk
 ```typescript
-// Async iterator yielding stream events
-type StreamQueryResult = AsyncIterable<StreamEvent>;
-
-interface StreamEvent {
-  type: 'row' | 'summary' | 'error' | 'end' | 'schema';
-  data?: any;
-  schema?: ResultSchema;
-  error?: NormalizedError;
+interface QueryChunk {
+  records: any[];                 // Incremental result data
+  is_final: boolean;              // True for final chunk
+  summary?: {                     // Final execution summary
+    query_time_ms: number;
+    results_count: number;
+    has_more: boolean;
+    dialect_used: string;
+  };
 }
 ```
 
 ### 6.6 BatchSpec
 ```typescript
 interface BatchSpec {
-  operations: BatchOperation[];
+  operations: any[];              // Opaque operation objects
   atomic?: boolean;               // All-or-nothing execution
 }
-
-type BatchOperation = 
-  | { type: 'create_vertex'; vertex: Vertex }
-  | { type: 'delete_vertex'; id: string }
-  | { type: 'create_edge'; edge: Edge }
-  | { type: 'delete_edge'; id: string }
-  | { type: 'update_vertex'; vertex: Vertex }
-  | { type: 'update_edge'; edge: Edge };
 ```
 
 ### 6.7 BatchResult
@@ -522,7 +542,7 @@ interface BatchResult {
   processed_count: number;
   failed_count: number;
   failures: BatchFailure[];
-  results?: BatchOperationResult[]; // For successful operations
+  results?: any[];                // Opaque operation results
 }
 
 interface BatchFailure {
@@ -535,217 +555,312 @@ interface BatchFailure {
 
 ## 7. Graph Operations
 
-### 7.1 create_vertex
-**Purpose:** Create a new vertex in the graph
+### 7.1 capabilities
+**Purpose:** Discover supported graph features and limits
+
+**Input:** None (uses OperationContext)
+
+**Request Body:**
+```json
+{
+  "op": "graph.capabilities",
+  "ctx": {
+    "request_id": "req-graph-cap-001",
+    "tenant": "acme-corp"
+  },
+  "args": {}
+}
+```
+
+**Output:** `GraphCapabilities`
+
+**Response Body:**
+```json
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 1.2,
+  "result": {
+    "protocol": "graph",
+    "server": "neo4j-adapter",
+    "version": "1.0.0",
+    "supported_query_dialects": ["cypher"],
+    "supports_stream_query": true,
+    "supports_bulk_vertices": true,
+    "supports_batch": true,
+    "supports_schema": true,
+    "idempotent_writes": true,
+    "supports_deadline": true,
+    "supports_namespaces": true,
+    "supports_property_filters": true,
+    "supports_multi_tenant": true,
+    "max_batch_ops": 1000
+  }
+}
+```
+
+### 7.2 upsert_nodes
+**Purpose:** Create or update multiple nodes
 
 **Input:**
 ```typescript
-interface CreateVertexSpec {
-  vertex: Vertex;
-  if_not_exists?: boolean;        // Skip if vertex already exists
+interface UpsertNodesSpec {
+  nodes: Node[];
+  namespace?: string;
 }
 ```
 
 **Request Body:**
 ```json
 {
-  "op": "graph.create_vertex",
+  "op": "graph.upsert_nodes",
   "ctx": {
-    "request_id": "req-123",
-    "tenant": "acme"
+    "request_id": "req-graph-upsert-nodes-001",
+    "tenant": "acme-corp",
+    "idempotency_key": "batch-user-import-20250115"
   },
   "args": {
-    "vertex": {
-      "id": "user-123",
-      "label": "User",
-      "properties": {
-        "name": "Alice",
-        "email": "alice@example.com",
-        "age": 30
+    "nodes": [
+      {
+        "id": "user-alice-123",
+        "labels": ["User", "Premium"],
+        "properties": {
+          "name": "Alice Smith",
+          "email": "alice@example.com",
+          "age": 30,
+          "department": "Engineering"
+        },
+        "namespace": "production"
+      },
+      {
+        "id": "user-bob-456",
+        "labels": ["User", "Standard"],
+        "properties": {
+          "name": "Bob Johnson",
+          "email": "bob@example.com",
+          "age": 25,
+          "department": "Sales"
+        },
+        "namespace": "production"
       }
-    },
-    "if_not_exists": true
+    ],
+    "namespace": "production"
   }
 }
 ```
 
-**Output:** `Vertex` (created vertex with server-generated timestamps)
+**Output:** `BatchResult<Node>`
 
 **Response Body:**
 ```json
 {
   "ok": true,
   "code": "OK",
-  "ms": 12.5,
+  "ms": 45.7,
   "result": {
-    "id": "user-123",
-    "label": "User",
-    "properties": {
-      "name": "Alice",
-      "email": "alice@example.com",
-      "age": 30
-    },
-    "created_at": "2025-01-15T10:30:00Z",
-    "updated_at": "2025-01-15T10:30:00Z"
-  }
-}
-```
-
-**Errors:**
-- `BadRequest`: Invalid vertex data, missing required fields
-- `AuthError`: Insufficient permissions
-- `SchemaValidationError`: Vertex violates schema constraints
-
-### 7.2 delete_vertex
-**Purpose:** Remove a vertex and its edges from the graph
-
-**Input:**
-```typescript
-interface DeleteVertexSpec {
-  id: string;
-  cascade?: boolean;              // Also delete connected edges
-}
-```
-
-**Request Body:**
-```json
-{
-  "op": "graph.delete_vertex",
-  "ctx": {
-    "request_id": "req-124",
-    "tenant": "acme"
-  },
-  "args": {
-    "id": "user-123",
-    "cascade": true
-  }
-}
-```
-
-**Output:** `{ deleted: boolean }` (true if vertex existed and was deleted)
-
-**Response Body:**
-```json
-{
-  "ok": true,
-  "code": "OK",
-  "ms": 8.2,
-  "result": {
-    "deleted": true
-  }
-}
-```
-
-**Errors:**
-- `BadRequest`: Invalid ID format
-- `VertexNotFound`: Vertex does not exist
-
-### 7.3 create_edge
-**Purpose:** Create a new relationship between vertices
-
-**Input:**
-```typescript
-interface CreateEdgeSpec {
-  edge: Edge;
-  if_not_exists?: boolean;
-}
-```
-
-**Request Body:**
-```json
-{
-  "op": "graph.create_edge",
-  "ctx": {
-    "request_id": "req-125",
-    "tenant": "acme"
-  },
-  "args": {
-    "edge": {
-      "id": "follows-1",
-      "label": "FOLLOWS",
-      "from_vertex": "user-123",
-      "to_vertex": "user-456",
-      "properties": {
-        "since": "2025-01-15",
-        "strength": 0.8
+    "processed_count": 2,
+    "failed_count": 0,
+    "failures": [],
+    "results": [
+      {
+        "id": "user-alice-123",
+        "labels": ["User", "Premium"],
+        "properties": {
+          "name": "Alice Smith",
+          "email": "alice@example.com",
+          "age": 30,
+          "department": "Engineering"
+        },
+        "namespace": "production"
+      },
+      {
+        "id": "user-bob-456",
+        "labels": ["User", "Standard"],
+        "properties": {
+          "name": "Bob Johnson",
+          "email": "bob@example.com",
+          "age": 25,
+          "department": "Sales"
+        },
+        "namespace": "production"
       }
-    },
-    "if_not_exists": true
+    ]
   }
 }
 ```
 
-**Output:** `Edge` (created edge with server-generated timestamps)
-
-**Response Body:**
-```json
-{
-  "ok": true,
-  "code": "OK",
-  "ms": 9.8,
-  "result": {
-    "id": "follows-1",
-    "label": "FOLLOWS",
-    "from_vertex": "user-123",
-    "to_vertex": "user-456",
-    "properties": {
-      "since": "2025-01-15",
-      "strength": 0.8
-    },
-    "created_at": "2025-01-15T10:31:00Z",
-    "updated_at": "2025-01-15T10:31:00Z"
-  }
-}
-```
-
-**Errors:**
-- `BadRequest`: Invalid edge data, missing vertices
-- `VertexNotFound`: Source or target vertex does not exist
-- `SchemaValidationError`: Edge violates schema constraints
-
-### 7.4 delete_edge
-**Purpose:** Remove an edge from the graph
+### 7.3 upsert_edges
+**Purpose:** Create or update multiple edges
 
 **Input:**
 ```typescript
-interface DeleteEdgeSpec {
-  id: string;
+interface UpsertEdgesSpec {
+  edges: Edge[];
+  namespace?: string;
 }
 ```
 
 **Request Body:**
 ```json
 {
-  "op": "graph.delete_edge",
+  "op": "graph.upsert_edges",
   "ctx": {
-    "request_id": "req-126",
-    "tenant": "acme"
+    "request_id": "req-graph-upsert-edges-001",
+    "tenant": "acme-corp"
   },
   "args": {
-    "id": "follows-1"
+    "edges": [
+      {
+        "id": "works-with-001",
+        "src": "user-alice-123",
+        "dst": "user-bob-456",
+        "label": "WORKS_WITH",
+        "properties": {
+          "since": "2024-06-01",
+          "project": "Phoenix"
+        },
+        "namespace": "production"
+      },
+      {
+        "id": "reports-to-001",
+        "src": "user-bob-456",
+        "dst": "user-alice-123",
+        "label": "REPORTS_TO",
+        "properties": {
+          "since": "2024-01-15",
+          "role": "Team Lead"
+        },
+        "namespace": "production"
+      }
+    ],
+    "namespace": "production"
   }
 }
 ```
 
-**Output:** `{ deleted: boolean }` (true if edge existed and was deleted)
+**Output:** `BatchResult<Edge>`
 
 **Response Body:**
 ```json
 {
   "ok": true,
   "code": "OK",
-  "ms": 7.5,
+  "ms": 32.1,
   "result": {
-    "deleted": true
+    "processed_count": 2,
+    "failed_count": 0,
+    "failures": [],
+    "results": [
+      {
+        "id": "works-with-001",
+        "src": "user-alice-123",
+        "dst": "user-bob-456",
+        "label": "WORKS_WITH",
+        "properties": {
+          "since": "2024-06-01",
+          "project": "Phoenix"
+        },
+        "namespace": "production"
+      },
+      {
+        "id": "reports-to-001",
+        "src": "user-bob-456",
+        "dst": "user-alice-123",
+        "label": "REPORTS_TO",
+        "properties": {
+          "since": "2024-01-15",
+          "role": "Team Lead"
+        },
+        "namespace": "production"
+      }
+    ]
   }
 }
 ```
 
-**Errors:**
-- `BadRequest`: Invalid ID format
-- `EdgeNotFound`: Edge does not exist
+### 7.4 delete_nodes
+**Purpose:** Remove nodes by ID or filter
 
-### 7.5 query
+**Input:**
+```typescript
+interface DeleteNodesSpec {
+  ids: string[];
+  namespace?: string;
+  filter?: Metadata;
+}
+```
+
+**Request Body:**
+```json
+{
+  "op": "graph.delete_nodes",
+  "ctx": {
+    "request_id": "req-graph-delete-nodes-001",
+    "tenant": "acme-corp"
+  },
+  "args": {
+    "ids": ["user-alice-123", "user-bob-456"],
+    "namespace": "production"
+  }
+}
+```
+
+**Output:** `{ deleted_count: number }`
+
+**Response Body:**
+```json
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 18.3,
+  "result": {
+    "deleted_count": 2
+  }
+}
+```
+
+### 7.5 delete_edges
+**Purpose:** Remove edges by ID or filter
+
+**Input:**
+```typescript
+interface DeleteEdgesSpec {
+  ids: string[];
+  namespace?: string;
+  filter?: Metadata;
+}
+```
+
+**Request Body:**
+```json
+{
+  "op": "graph.delete_edges",
+  "ctx": {
+    "request_id": "req-graph-delete-edges-001",
+    "tenant": "acme-corp"
+  },
+  "args": {
+    "ids": ["works-with-001", "reports-to-001"],
+    "namespace": "production"
+  }
+}
+```
+
+**Output:** `{ deleted_count: number }`
+
+**Response Body:**
+```json
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 15.7,
+  "result": {
+    "deleted_count": 2
+  }
+}
+```
+
+### 7.6 query
 **Purpose:** Execute a graph query and return results
 
 **Input:** `QuerySpec`
@@ -755,18 +870,16 @@ interface DeleteEdgeSpec {
 {
   "op": "graph.query",
   "ctx": {
-    "request_id": "req-127",
-    "tenant": "acme",
+    "request_id": "req-graph-query-001",
+    "tenant": "acme-corp",
     "deadline_ms": 1736929200000
   },
   "args": {
-    "query": "MATCH (u:User {id: $user_id})-[:FOLLOWS]->(f:User) RETURN f.id, f.name LIMIT 10",
-    "parameters": {
-      "user_id": "user-123"
+    "text": "MATCH (u:User)-[r:WORKS_WITH]->(c:User) WHERE u.department = $dept RETURN u.name, c.name, r.project",
+    "params": {
+      "dept": "Engineering"
     },
     "dialect": "cypher",
-    "include_metadata": true,
-    "limit": 10,
     "timeout_ms": 5000
   }
 }
@@ -781,34 +894,26 @@ interface DeleteEdgeSpec {
   "code": "OK",
   "ms": 45.2,
   "result": {
-    "rows": [
+    "records": [
       {
-        "f.id": "user-456",
-        "f.name": "Bob"
-      },
-      {
-        "f.id": "user-789", 
-        "f.name": "Charlie"
+        "u.name": "Alice Smith",
+        "c.name": "Bob Johnson",
+        "r.project": "Phoenix"
       }
     ],
-    "columns": ["f.id", "f.name"],
     "summary": {
       "query_time_ms": 42.1,
-      "results_count": 2,
+      "results_count": 1,
       "has_more": false,
       "dialect_used": "cypher"
-    }
+    },
+    "dialect": "cypher",
+    "namespace": "production"
   }
 }
 ```
 
-**Errors:**
-- `BadRequest`: Invalid query syntax, missing parameters
-- `QueryParseError`: Query cannot be parsed
-- `NotSupported`: Query dialect or feature not supported
-- `ResourceExhausted`: Query too complex or timeout
-
-### 7.6 stream_query
+### 7.7 stream_query
 **Purpose:** Execute a graph query with streaming results
 
 **Input:** `QuerySpec`
@@ -818,126 +923,150 @@ interface DeleteEdgeSpec {
 {
   "op": "graph.stream_query",
   "ctx": {
-    "request_id": "req-128",
-    "tenant": "acme"
+    "request_id": "req-graph-stream-001",
+    "tenant": "acme-corp"
   },
   "args": {
-    "query": "MATCH (u:User) RETURN u.id, u.name",
-    "dialect": "cypher",
-    "limit": 1000
+    "text": "MATCH (u:User) RETURN u.id, u.name, u.department ORDER BY u.name",
+    "dialect": "cypher"
   }
 }
 ```
 
-**Output:** `StreamQueryResult` (async iterator)
+**Output:** `AsyncIterable<QueryChunk>`
 
 **Stream Response Frames:**
 ```json
-{"type": "schema", "schema": {"columns": [{"name": "u.id", "type": "string"}, {"name": "u.name", "type": "string"}]}}
-{"type": "row", "data": {"u.id": "user-123", "u.name": "Alice"}}
-{"type": "row", "data": {"u.id": "user-456", "u.name": "Bob"}}
-{"type": "summary", "data": {"query_time_ms": 125.4, "results_count": 2, "dialect_used": "cypher"}}
-{"type": "end"}
+{"type": "data", "data": {"records": {"u.id": "user-alice-123", "u.name": "Alice Smith", "u.department": "Engineering"}, "is_final": false}}
+{"type": "data", "data": {"records": {"u.id": "user-bob-456", "u.name": "Bob Johnson", "u.department": "Sales"}, "is_final": false}}
+{"type": "data", "data": {"summary": {"query_time_ms": 125.4, "results_count": 2, "dialect_used": "cypher", "has_more": false}, "is_final": true}}
 ```
 
-**Stream Semantics:**
-- Optional `schema` event with result structure
-- Zero or more `row` events with result data
-- Exactly one `summary` event with query statistics
-- Exactly one `end` event to terminate stream
-- Or one `error` event if query fails
+### 7.8 bulk_vertices
+**Purpose:** Bulk operations on vertices (import/export)
 
-**Errors:**
-- Same as `query` but delivered via stream error event
-
-### 7.7 batch
-**Purpose:** Execute multiple graph operations in a single request
-
-**Input:** `BatchSpec`
+**Input:** 
+```typescript
+interface BulkVerticesSpec {
+  operation: 'import' | 'export';
+  nodes?: Node[];
+  format?: string;
+  namespace?: string;
+}
+```
 
 **Request Body:**
 ```json
 {
-  "op": "graph.batch",
+  "op": "graph.bulk_vertices",
   "ctx": {
-    "request_id": "req-129",
-    "tenant": "acme",
-    "idempotency_key": "batch-001"
+    "request_id": "req-graph-bulk-001",
+    "tenant": "acme-corp"
   },
   "args": {
-    "operations": [
-      {
-        "type": "create_vertex",
-        "vertex": {
-          "id": "user-999",
-          "label": "User",
-          "properties": {"name": "David"}
-        }
-      },
-      {
-        "type": "create_edge", 
-        "edge": {
-          "id": "follows-999",
-          "label": "FOLLOWS",
-          "from_vertex": "user-123",
-          "to_vertex": "user-999",
-          "properties": {"since": "2025-01-15"}
-        }
-      }
-    ],
-    "atomic": true
+    "operation": "export",
+    "format": "json",
+    "namespace": "production"
   }
 }
 ```
 
-**Output:** `BatchResult`
+**Output:** `{ nodes: Node[] }`
 
 **Response Body:**
 ```json
 {
   "ok": true,
   "code": "OK",
-  "ms": 25.7,
+  "ms": 89.5,
   "result": {
-    "processed_count": 2,
-    "failed_count": 0,
-    "failures": [],
-    "results": [
+    "nodes": [
       {
-        "operation_index": 0,
-        "result": {
-          "id": "user-999",
-          "label": "User",
-          "properties": {"name": "David"},
-          "created_at": "2025-01-15T10:32:00Z"
-        }
+        "id": "user-alice-123",
+        "labels": ["User", "Premium"],
+        "properties": {
+          "name": "Alice Smith",
+          "email": "alice@example.com",
+          "age": 30,
+          "department": "Engineering"
+        },
+        "namespace": "production"
       },
       {
-        "operation_index": 1,
-        "result": {
-          "id": "follows-999",
-          "label": "FOLLOWS", 
-          "from_vertex": "user-123",
-          "to_vertex": "user-999",
-          "properties": {"since": "2025-01-15"},
-          "created_at": "2025-01-15T10:32:00Z"
-        }
+        "id": "user-bob-456",
+        "labels": ["User", "Standard"],
+        "properties": {
+          "name": "Bob Johnson",
+          "email": "bob@example.com",
+          "age": 25,
+          "department": "Sales"
+        },
+        "namespace": "production"
       }
     ]
   }
 }
 ```
 
-**Partial Failure:**
-- Individual operation failures reported in `failures[]`
-- Successful operations executed and reported in `results[]`
-- If `atomic=true`, entire batch fails on first error
+### 7.9 get_schema
+**Purpose:** Retrieve graph schema information
 
-**Errors:**
-- `BadRequest`: Invalid batch specification
-- `ResourceExhausted`: Batch too large
+**Input:** `{ namespace?: string }`
 
-### 7.8 health
+**Request Body:**
+```json
+{
+  "op": "graph.get_schema",
+  "ctx": {
+    "request_id": "req-graph-schema-001",
+    "tenant": "acme-corp"
+  },
+  "args": {
+    "namespace": "production"
+  }
+}
+```
+
+**Output:** 
+```typescript
+interface GraphSchema {
+  node_labels: string[];
+  edge_types: string[];
+  property_keys: string[];
+  constraints: any[];
+  indexes: any[];
+}
+```
+
+**Response Body:**
+```json
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 12.3,
+  "result": {
+    "node_labels": ["User", "Premium", "Standard"],
+    "edge_types": ["WORKS_WITH", "REPORTS_TO"],
+    "property_keys": ["name", "email", "age", "department", "since", "project", "role"],
+    "constraints": [
+      {
+        "type": "UNIQUE",
+        "label": "User",
+        "property": "email"
+      }
+    ],
+    "indexes": [
+      {
+        "type": "BTREE",
+        "label": "User",
+        "property": "department"
+      }
+    ]
+  }
+}
+```
+
+### 7.10 health
 **Purpose:** Check adapter and provider health status
 
 **Input:** None (uses OperationContext)
@@ -947,8 +1076,8 @@ interface DeleteEdgeSpec {
 {
   "op": "graph.health",
   "ctx": {
-    "request_id": "req-130",
-    "tenant": "acme"
+    "request_id": "req-graph-health-001",
+    "tenant": "acme-corp"
   },
   "args": {}
 }
@@ -1002,57 +1131,49 @@ interface HealthStatus {
 - **Cross-tenant isolation:** No data leakage between tenants
 
 ### 8.2 Referential Integrity Rules
-- **Vertex deletion:** With `cascade=true`, connected edges automatically deleted
-- **Edge validation:** Source and target vertices must exist
-- **ID uniqueness:** Vertex/edge IDs unique within their namespace
+- **Node deletion:** Connected edges automatically deleted when nodes are deleted
+- **Edge validation:** Source and target nodes must exist
+- **ID uniqueness:** Node/edge IDs unique within their namespace
 
 ### 8.3 Streaming Guarantees
 - **Exactly-once delivery:** Each row delivered exactly once
 - **Order preservation:** Results delivered in query result order
-- **Terminal event:** Stream always ends with `end` or `error` event
+- **Terminal event:** Stream always ends with final chunk (`is_final: true`)
 - **Cardinality bounds:** Streams SHOULD support at least 1M rows
-- **Schema early delivery:** Schema events SHOULD precede row events when available
 
 ### 8.4 Query Dialect Semantics
-- **Parameter binding:** All dialects MUST support `$param` or `{param}` syntax
+- **Parameter binding:** All dialects MUST support `$param` syntax
 - **Query planning:** Adapters MAY optimize queries but MUST preserve semantics
 - **Cost limits:** Queries exceeding `max_query_complexity` return `ResourceExhausted`
-- **Explain output:** When `explain=true`, return execution plan in summary
 
-### 8.5 Result Schema Semantics
-- **Optional schema:** Adapters MAY provide result schemas for structured queries
-- **Type consistency:** Schema types SHOULD match actual result types
-- **Nullability:** Schema indicates which columns may contain null values
-- **Dynamic schemas:** Schemas MAY vary based on query parameters
-
-### 8.6 Batch Operation Semantics
+### 8.5 Batch Operation Semantics
 - **Order preservation:** Operations executed in specified order
 - **Atomic batches:** When `atomic=true`, all operations succeed or fail together
 - **Partial visibility:** Non-atomic batch results visible as they complete
 - **Failure isolation:** Individual operation failures don't affect others in non-atomic mode
 
-### 8.7 Error Mappings
+### 8.6 Error Mappings
 | Provider Error | Normalized Error | Details |
 |----------------|------------------|---------|
 | Syntax error | `QueryParseError` | `{"dialect": "cypher", "position": 45}` |
-| Unknown vertex | `VertexNotFound` | `{"vertex_id": "v123"}` |
+| Unknown node | `VertexNotFound` | `{"node_id": "v123"}` |
 | Unknown edge | `EdgeNotFound` | `{"edge_id": "e456"}` |
 | Schema violation | `SchemaValidationError` | `{"constraint": "label_missing"}` |
 | Constraint violation | `BadRequest` | `{"constraint": "unique_property"}` |
 | Timeout | `DeadlineExceeded` | `{"query_time_ms": 5000}` |
 
-### 8.8 Deadlines
+### 8.7 Deadlines
 - **Query timeout:** `timeout_ms` in QuerySpec overrides context deadline
 - **Stream duration:** Deadline applies to entire stream execution
 - **Batch operations:** Deadline applies to entire batch execution
 
-### 8.9 Idempotency Table
+### 8.8 Idempotency Table
 | Operation | Idempotent | Conditions |
 |-----------|------------|------------|
-| create_vertex | Yes | With `if_not_exists=true` or same ID |
-| delete_vertex | Yes | Always |
-| create_edge | Yes | With `if_not_exists=true` or same ID |
-| delete_edge | Yes | Always |
+| upsert_nodes | Yes | With same ID |
+| delete_nodes | Yes | Always |
+| upsert_edges | Yes | With same ID |
+| delete_edges | Yes | Always |
 | query | Yes | Always |
 | batch | Conditional | Depends on individual operations |
 
@@ -1065,8 +1186,10 @@ interface HealthStatus {
 ### 9.1 Required Flags
 ```typescript
 interface LLMCapabilities {
+  protocol: string;               // "llm"
   server: string;
   version: string;
+  model_family: string;           // e.g., "openai", "anthropic", "cohere"
   supported_models: string[];
   max_context_length: number;
   supports_streaming: boolean;
@@ -1076,6 +1199,8 @@ interface LLMCapabilities {
   supports_parallel_tool_calls: boolean;
   supports_deadline: boolean;
   supports_count_tokens: boolean;
+  idempotent_writes: boolean;
+  supports_multi_tenant: boolean;
 }
 ```
 
@@ -1132,37 +1257,75 @@ interface CompletionSpec {
 }
 ```
 
-### 10.3 CompletionResult
+### 10.3 LLMCompletion
 ```typescript
-interface CompletionResult {
-  id: string;                    // Provider-generated completion ID
+interface LLMCompletion {
+  text: string;                  // Generated completion text
   model: string;
-  choices: Array<{
-    index: number;
-    message: Message;
-    finish_reason: 'stop' | 'length' | 'tool_calls' | 'content_filter';
-  }>;
+  model_family: string;          // Model family identifier
   usage: TokenUsage;
+  finish_reason: string;         // Reason generation stopped
 }
 ```
 
-### 10.4 StreamChunk
+### 10.4 LLMChunk
 ```typescript
-interface StreamChunk {
-  id: string;
-  model: string;
-  choices: Array<{
-    index: number;
-    delta: Partial<Message>;     // Incremental message content
-    finish_reason?: string;
-  }>;
-  usage?: TokenUsage;
+interface LLMChunk {
+  text: string;                  // Incremental text content
+  is_final: boolean;             // True for final chunk
+  model?: string;                // Optional model identifier
+  usage_so_far?: TokenUsage;     // Cumulative token usage
 }
 ```
 
 ## 11. LLM Operations
 
-### 11.1 complete
+### 11.1 capabilities
+**Purpose:** Discover supported LLM features and models
+
+**Input:** None (uses OperationContext)
+
+**Request Body:**
+```json
+{
+  "op": "llm.capabilities",
+  "ctx": {
+    "request_id": "req-llm-cap-001",
+    "tenant": "acme-corp"
+  },
+  "args": {}
+}
+```
+
+**Output:** `LLMCapabilities`
+
+**Response Body:**
+```json
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 1.5,
+  "result": {
+    "protocol": "llm",
+    "server": "openai-adapter",
+    "version": "1.0.0",
+    "model_family": "openai",
+    "supported_models": ["gpt-4.1-mini", "gpt-4.1-max"],
+    "max_context_length": 128000,
+    "supports_streaming": true,
+    "supports_roles": true,
+    "supports_system_message": true,
+    "supports_json_output": true,
+    "supports_parallel_tool_calls": true,
+    "supports_deadline": true,
+    "supports_count_tokens": true,
+    "idempotent_writes": true,
+    "supports_multi_tenant": true
+  }
+}
+```
+
+### 11.2 complete
 **Purpose:** Generate LLM completion for given messages
 
 **Input:** `CompletionSpec`
@@ -1172,8 +1335,8 @@ interface StreamChunk {
 {
   "op": "llm.complete",
   "ctx": {
-    "request_id": "req-201",
-    "tenant": "acme",
+    "request_id": "req-llm-comp-001",
+    "tenant": "acme-corp",
     "deadline_ms": 1736929300000
   },
   "args": {
@@ -1181,21 +1344,21 @@ interface StreamChunk {
     "messages": [
       {
         "role": "system",
-        "content": "You are a helpful assistant."
+        "content": "You are a helpful assistant that provides concise answers."
       },
       {
         "role": "user", 
-        "content": "What is the capital of France?"
+        "content": "What are the main benefits of renewable energy?"
       }
     ],
-    "max_tokens": 100,
+    "max_tokens": 150,
     "temperature": 0.7,
     "top_p": 0.9
   }
 }
 ```
 
-**Output:** `CompletionResult`
+**Output:** `LLMCompletion`
 
 **Response Body:**
 ```json
@@ -1204,34 +1367,20 @@ interface StreamChunk {
   "code": "OK",
   "ms": 1250.8,
   "result": {
-    "id": "chatcmpl-123",
+    "text": "Renewable energy offers several key benefits:\n\n1. Environmental sustainability - Reduces greenhouse gas emissions and air pollution\n2. Energy security - Decreases dependence on fossil fuel imports\n3. Cost stability - Renewable sources have predictable long-term costs\n4. Job creation - Growing industry creates new employment opportunities\n5. Public health - Cleaner air leads to better health outcomes",
     "model": "gpt-4.1-mini",
-    "choices": [
-      {
-        "index": 0,
-        "message": {
-          "role": "assistant",
-          "content": "The capital of France is Paris."
-        },
-        "finish_reason": "stop"
-      }
-    ],
+    "model_family": "openai",
     "usage": {
-      "prompt_tokens": 15,
-      "completion_tokens": 7,
-      "total_tokens": 22
-    }
+      "prompt_tokens": 28,
+      "completion_tokens": 87,
+      "total_tokens": 115
+    },
+    "finish_reason": "stop"
   }
 }
 ```
 
-**Errors:**
-- `BadRequest`: Invalid messages, unsupported parameters
-- `ModelNotFound`: Requested model not available
-- `PromptTooLong`: Input exceeds context window
-- `ContentFiltered`: Content violates safety policies
-
-### 11.2 stream
+### 11.3 stream
 **Purpose:** Stream LLM completion incrementally
 
 **Input:** `CompletionSpec`
@@ -1241,15 +1390,15 @@ interface StreamChunk {
 {
   "op": "llm.stream",
   "ctx": {
-    "request_id": "req-202",
-    "tenant": "acme"
+    "request_id": "req-llm-stream-001",
+    "tenant": "acme-corp"
   },
   "args": {
     "model": "gpt-4.1-mini",
     "messages": [
       {
         "role": "user",
-        "content": "Tell me a short story about AI"
+        "content": "Explain quantum computing in simple terms."
       }
     ],
     "max_tokens": 200,
@@ -1258,26 +1407,31 @@ interface StreamChunk {
 }
 ```
 
-**Output:** `AsyncIterable<StreamChunk>`
+**Output:** `AsyncIterable<LLMChunk>`
 
 **Stream Response Frames:**
 ```json
-{"type": "data", "data": {"id": "chatcmpl-124", "model": "gpt-4.1-mini", "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]}}
-{"type": "data", "data": {"id": "chatcmpl-124", "model": "gpt-4.1-mini", "choices": [{"index": 0, "delta": {"content": "Once"}, "finish_reason": null}]}}
-{"type": "data", "data": {"id": "chatcmpl-124", "model": "gpt-4.1-mini", "choices": [{"index": 0, "delta": {"content": " upon"}, "finish_reason": null}]}}
-{"type": "data", "data": {"id": "chatcmpl-124", "model": "gpt-4.1-mini", "choices": [{"index": 0, "delta": {"content": " a time"}, "finish_reason": null}]}}
-{"type": "data", "data": {"id": "chatcmpl-124", "model": "gpt-4.1-mini", "choices": [{"index": 0, "delta": {"content": "..."}, "finish_reason": "stop"}]}}
+{"type": "data", "data": {"text": "Quantum", "is_final": false, "model": "gpt-4.1-mini"}}
+{"type": "data", "data": {"text": " computing", "is_final": false, "model": "gpt-4.1-mini"}}
+{"type": "data", "data": {"text": " is", "is_final": false, "model": "gpt-4.1-mini"}}
+{"type": "data", "data": {"text": " a", "is_final": false, "model": "gpt-4.1-mini"}}
+{"type": "data", "data": {"text": " new", "is_final": false, "model": "gpt-4.1-mini"}}
+{"type": "data", "data": {"text": " type", "is_final": false, "model": "gpt-4.1-mini"}}
+{"type": "data", "data": {"text": " of", "is_final": false, "model": "gpt-4.1-mini"}}
+{"type": "data", "data": {"text": " computing", "is_final": false, "model": "gpt-4.1-mini"}}
+{"type": "data", "data": {"text": " that", "is_final": false, "model": "gpt-4.1-mini"}}
+{"type": "data", "data": {"text": " uses", "is_final": false, "model": "gpt-4.1-mini"}}
+{"type": "data", "data": {"text": " quantum", "is_final": false, "model": "gpt-4.1-mini"}}
+{"type": "data", "data": {"text": " bits", "is_final": false, "model": "gpt-4.1-mini"}}
+{"type": "data", "data": {"text": " (qubits)", "is_final": false, "model": "gpt-4.1-mini"}}
+{"type": "data", "data": {"text": " instead", "is_final": false, "model": "gpt-4.1-mini"}}
+{"type": "data", "data": {"text": " of", "is_final": false, "model": "gpt-4.1-mini"}}
+{"type": "data", "data": {"text": " classical", "is_final": false, "model": "gpt-4.1-mini"}}
+{"type": "data", "data": {"text": " bits.", "is_final": true, "model": "gpt-4.1-mini", "usage_so_far": {"prompt_tokens": 12, "completion_tokens": 18, "total_tokens": 30}}}
 {"type": "end"}
 ```
 
-**Stream Semantics:**
-- Multiple chunks with incremental content
-- Exactly one chunk with `finish_reason` set
-- Final chunk may include token usage
-
-**Errors:** Same as `complete`, delivered as final error chunk
-
-### 11.3 count_tokens
+### 11.4 count_tokens
 **Purpose:** Count tokens in text for a specific model
 
 **Input:** 
@@ -1293,8 +1447,8 @@ interface CountTokensSpec {
 {
   "op": "llm.count_tokens",
   "ctx": {
-    "request_id": "req-203",
-    "tenant": "acme"
+    "request_id": "req-llm-tokens-001",
+    "tenant": "acme-corp"
   },
   "args": {
     "text": "The quick brown fox jumps over the lazy dog",
@@ -1303,7 +1457,7 @@ interface CountTokensSpec {
 }
 ```
 
-**Output:** `{ tokens: number }`
+**Output:** `number` (bare integer)
 
 **Response Body:**
 ```json
@@ -1311,17 +1465,11 @@ interface CountTokensSpec {
   "ok": true,
   "code": "OK",
   "ms": 3.2,
-  "result": {
-    "tokens": 9
-  }
+  "result": 9
 }
 ```
 
-**Errors:**
-- `NotSupported`: Token counting not available for model
-- `ModelNotFound`: Model not available
-
-### 11.4 health
+### 11.5 health
 **Purpose:** Check LLM provider health and model availability
 
 **Request Body:**
@@ -1329,8 +1477,8 @@ interface CountTokensSpec {
 {
   "op": "llm.health",
   "ctx": {
-    "request_id": "req-204",
-    "tenant": "acme"
+    "request_id": "req-llm-health-001",
+    "tenant": "acme-corp"
   },
   "args": {}
 }
@@ -1412,7 +1560,7 @@ interface LLMHealthStatus {
 ### 12.7 Streaming Guarantees
 - **Chunk integrity:** Complete tokens delivered in each chunk
 - **Order preservation:** Chunks delivered in correct sequence
-- **Final indication:** Clear termination with finish reason
+- **Final indication:** Clear termination with `is_final: true`
 
 ### 12.8 Error Mappings
 See **ERRORS.md** §6.1 for complete LLM error mapping specifications.
@@ -1431,6 +1579,7 @@ See **ERRORS.md** §6.1 for complete LLM error mapping specifications.
 ### 13.1 Required Fields
 ```typescript
 interface VectorCapabilities {
+  protocol: string;               // "vector"
   server: string;
   version: string;
   max_dimensions: number;
@@ -1438,9 +1587,13 @@ interface VectorCapabilities {
   supports_namespaces: boolean;
   supports_metadata_filtering: boolean;
   supports_batch_operations: boolean;
-  max_batch_size: number;
+  max_batch_size?: number;
   supports_index_management: boolean;
   supports_deadline: boolean;
+  idempotent_writes: boolean;
+  supports_multi_tenant: boolean;
+  max_top_k?: number;
+  max_filter_terms?: number;
 }
 ```
 
@@ -1452,8 +1605,6 @@ interface VectorCapabilities {
 
 ### 13.3 Optional Extensions
 ```typescript
-max_top_k?: number;
-max_filter_terms?: number;
 supports_hybrid_search?: boolean;
 supports_vector_compression?: boolean;
 supported_index_types?: string[];
@@ -1477,7 +1628,7 @@ interface Vector {
 interface VectorMatch {
   vector: Vector;
   score: number;                  // Similarity score (higher = more similar)
-  distance?: number;              // Raw distance metric (lower = more similar)
+  distance: number;               // Raw distance metric (lower = more similar) - REQUIRED
 }
 ```
 
@@ -1485,12 +1636,11 @@ interface VectorMatch {
 ```typescript
 interface QuerySpec {
   vector: number[];
-  top_k: number;
-  namespace?: string;
+  top_k: number;                  // Default: 10
+  namespace?: string;             // Default: "default"
   filter?: Metadata;              // Metadata filter conditions
-  include_metadata?: boolean;
-  include_vectors?: boolean;
-  hybrid_alpha?: number;          // 0.0 = pure vector, 1.0 = pure keyword
+  include_metadata?: boolean;     // Default: true
+  include_vectors?: boolean;      // Default: false
 }
 ```
 
@@ -1500,7 +1650,7 @@ interface QueryResult {
   matches: VectorMatch[];
   query_vector: number[];         // May be normalized
   namespace: string;
-  total_matches?: number;         // Total matches before top_k
+  total_matches: number;          // Total matches before top_k - REQUIRED
 }
 ```
 
@@ -1552,8 +1702,7 @@ interface DeleteResult {
 interface NamespaceSpec {
   namespace: string;
   dimensions: number;
-  metric: string;                 // e.g., "cosine", "euclidean"
-  config?: Metadata;              // Provider-specific configuration
+  distance_metric: string;        // e.g., "cosine", "euclidean"
 }
 ```
 
@@ -1568,7 +1717,52 @@ interface NamespaceResult {
 
 ## 15. Vector Operations
 
-### 15.1 query
+### 15.1 capabilities
+**Purpose:** Discover supported vector features and limits
+
+**Input:** None (uses OperationContext)
+
+**Request Body:**
+```json
+{
+  "op": "vector.capabilities",
+  "ctx": {
+    "request_id": "req-vector-cap-001",
+    "tenant": "acme-corp"
+  },
+  "args": {}
+}
+```
+
+**Output:** `VectorCapabilities`
+
+**Response Body:**
+```json
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 1.8,
+  "result": {
+    "protocol": "vector",
+    "server": "pinecone-adapter",
+    "version": "1.0.0",
+    "max_dimensions": 2000,
+    "supported_metrics": ["cosine", "euclidean", "dotproduct"],
+    "supports_namespaces": true,
+    "supports_metadata_filtering": true,
+    "supports_batch_operations": true,
+    "max_batch_size": 100,
+    "supports_index_management": true,
+    "supports_deadline": true,
+    "idempotent_writes": true,
+    "supports_multi_tenant": true,
+    "max_top_k": 10000,
+    "max_filter_terms": 10
+  }
+}
+```
+
+### 15.2 query
 **Purpose:** Find similar vectors using approximate nearest neighbor search
 
 **Input:** `QuerySpec`
@@ -1578,17 +1772,17 @@ interface NamespaceResult {
 {
   "op": "vector.query",
   "ctx": {
-    "request_id": "req-301",
-    "tenant": "acme",
+    "request_id": "req-vector-query-001",
+    "tenant": "acme-corp",
     "deadline_ms": 1736929400000
   },
   "args": {
-    "vector": [0.1, 0.2, 0.3, 0.4, 0.5],
-    "top_k": 10,
+    "vector": [0.1, 0.2, 0.3, 0.4, 0.5, 0.1, 0.2, 0.3, 0.4, 0.5],
+    "top_k": 5,
     "namespace": "documents",
     "filter": {
       "category": "technology",
-      "language": {"$in": ["en", "es"]}
+      "language": "en"
     },
     "include_metadata": true,
     "include_vectors": false
@@ -1609,7 +1803,7 @@ interface NamespaceResult {
       {
         "vector": {
           "id": "doc-123",
-          "vector": [0.12, 0.22, 0.32, 0.42, 0.52],
+          "vector": [0.12, 0.22, 0.32, 0.42, 0.52, 0.12, 0.22, 0.32, 0.42, 0.52],
           "metadata": {
             "title": "AI Research Paper",
             "category": "technology",
@@ -1623,7 +1817,7 @@ interface NamespaceResult {
       {
         "vector": {
           "id": "doc-456",
-          "vector": [0.08, 0.18, 0.28, 0.38, 0.48],
+          "vector": [0.08, 0.18, 0.28, 0.38, 0.48, 0.08, 0.18, 0.28, 0.38, 0.48],
           "metadata": {
             "title": "Machine Learning Guide",
             "category": "technology", 
@@ -1635,20 +1829,14 @@ interface NamespaceResult {
         "distance": 0.08
       }
     ],
-    "query_vector": [0.1, 0.2, 0.3, 0.4, 0.5],
+    "query_vector": [0.1, 0.2, 0.3, 0.4, 0.5, 0.1, 0.2, 0.3, 0.4, 0.5],
     "namespace": "documents",
     "total_matches": 2
   }
 }
 ```
 
-**Errors:**
-- `BadRequest`: Invalid vector dimensions, unsupported metric
-- `DimensionMismatch`: Query vector dimensions don't match namespace
-- `NamespaceNotFound`: Specified namespace doesn't exist
-- `IndexNotReady`: Namespace exists but index not ready
-
-### 15.2 upsert
+### 15.3 upsert
 **Purpose:** Insert or update vectors in a namespace
 
 **Input:** `UpsertSpec`
@@ -1658,26 +1846,27 @@ interface NamespaceResult {
 {
   "op": "vector.upsert",
   "ctx": {
-    "request_id": "req-302",
-    "tenant": "acme",
-    "idempotency_key": "upsert-001"
+    "request_id": "req-vector-upsert-001",
+    "tenant": "acme-corp",
+    "idempotency_key": "vector-import-20250115"
   },
   "args": {
     "vectors": [
       {
         "id": "doc-789",
-        "vector": [0.15, 0.25, 0.35, 0.45, 0.55],
+        "vector": [0.15, 0.25, 0.35, 0.45, 0.55, 0.15, 0.25, 0.35, 0.45, 0.55],
         "metadata": {
-          "title": "New Research",
-          "category": "science"
+          "title": "New Research on Neural Networks",
+          "category": "science",
+          "language": "en"
         },
         "namespace": "documents"
       },
       {
         "id": "doc-999",
-        "vector": [0.09, 0.19, 0.29, 0.39, 0.49],
+        "vector": [0.09, 0.19, 0.29, 0.39, 0.49, 0.09, 0.19, 0.29, 0.39, 0.49],
         "metadata": {
-          "title": "Updated Guide",
+          "title": "Updated Programming Guide",
           "category": "technology"
         },
         "namespace": "documents"
@@ -1704,16 +1893,7 @@ interface NamespaceResult {
 }
 ```
 
-**Partial Failure:**
-- Individual vector failures reported in `failures[]`
-- Successful vectors upserted and counted in `upserted_count`
-
-**Errors:**
-- `BadRequest`: Invalid vectors, batch too large
-- `DimensionMismatch`: Vector dimensions don't match namespace
-- `NamespaceNotFound`: Namespace doesn't exist
-
-### 15.3 delete
+### 15.4 delete
 **Purpose:** Remove vectors by ID or metadata filter
 
 **Input:** `DeleteSpec`
@@ -1723,8 +1903,8 @@ interface NamespaceResult {
 {
   "op": "vector.delete",
   "ctx": {
-    "request_id": "req-303",
-    "tenant": "acme"
+    "request_id": "req-vector-delete-001",
+    "tenant": "acme-corp"
   },
   "args": {
     "ids": ["doc-123", "doc-456"],
@@ -1749,15 +1929,7 @@ interface NamespaceResult {
 }
 ```
 
-**Partial Failure:**
-- Individual deletion failures reported in `failures[]`
-- `deleted_count` reflects successful deletions
-
-**Errors:**
-- `BadRequest`: Invalid filter syntax
-- `NamespaceNotFound`: Namespace doesn't exist
-
-### 15.4 create_namespace
+### 15.5 create_namespace
 **Purpose:** Create a new vector namespace/collection
 
 **Input:** `NamespaceSpec`
@@ -1767,17 +1939,13 @@ interface NamespaceResult {
 {
   "op": "vector.create_namespace",
   "ctx": {
-    "request_id": "req-304",
-    "tenant": "acme"
+    "request_id": "req-vector-create-ns-001",
+    "tenant": "acme-corp"
   },
   "args": {
     "namespace": "images",
     "dimensions": 512,
-    "metric": "cosine",
-    "config": {
-      "replication_factor": 3,
-      "segment_size": 10000
-    }
+    "distance_metric": "cosine"
   }
 }
 ```
@@ -1801,12 +1969,7 @@ interface NamespaceResult {
 }
 ```
 
-**Errors:**
-- `BadRequest`: Invalid namespace configuration
-- `NotSupported`: Namespace management not supported
-- `ResourceExhausted`: Too many namespaces
-
-### 15.5 delete_namespace
+### 15.6 delete_namespace
 **Purpose:** Remove a vector namespace and all its vectors
 
 **Input:** `{ namespace: string }`
@@ -1816,8 +1979,8 @@ interface NamespaceResult {
 {
   "op": "vector.delete_namespace",
   "ctx": {
-    "request_id": "req-305",
-    "tenant": "acme"
+    "request_id": "req-vector-delete-ns-001",
+    "tenant": "acme-corp"
   },
   "args": {
     "namespace": "old-data"
@@ -1843,12 +2006,7 @@ interface NamespaceResult {
 }
 ```
 
-**Errors:**
-- `BadRequest`: Invalid namespace name
-- `NamespaceNotFound`: Namespace doesn't exist
-- `NotSupported`: Namespace management not supported
-
-### 15.6 health
+### 15.7 health
 **Purpose:** Check vector store health and namespace status
 
 **Request Body:**
@@ -1856,8 +2014,8 @@ interface NamespaceResult {
 {
   "op": "vector.health",
   "ctx": {
-    "request_id": "req-306",
-    "tenant": "acme"
+    "request_id": "req-vector-health-001",
+    "tenant": "acme-corp"
   },
   "args": {}
 }
@@ -1874,6 +2032,7 @@ interface VectorHealthStatus {
       ready: boolean;
       vector_count: number;
       dimensions: number;
+      [key: string]: any;  // Provider-specific metadata
     };
   };
 }
@@ -1893,12 +2052,14 @@ interface VectorHealthStatus {
       "documents": {
         "ready": true,
         "vector_count": 15000,
-        "dimensions": 1536
+        "dimensions": 1536,
+        "index_size_mb": 245
       },
       "images": {
         "ready": false,
         "vector_count": 0,
-        "dimensions": 512
+        "dimensions": 512,
+        "index_status": "initializing"
       }
     }
   }
@@ -1927,13 +2088,14 @@ interface VectorHealthStatus {
 
 ### 16.4 Search Behavior
 - **Approximate vs exact:** Adapters SHOULD document search accuracy guarantees
-- **Hybrid search:** When `hybrid_alpha` provided, balance vector and keyword search
+- **Hybrid search:** When supported, balance vector and keyword search
 - **Result ordering:** Matches ordered by descending score (highest similarity first)
 
 ### 16.5 Batch Semantics
 - **Partial success:** Batch operations continue despite individual failures
 - **Order preservation:** Results maintain input order where applicable
 - **Size limits:** Batch size constrained by provider capabilities
+- **Empty batch validation:** Reject empty batches with `BadRequest`
 
 ### 16.6 Error Mappings
 See **ERRORS.md** §6.3 for complete Vector error mapping specifications.
@@ -1952,18 +2114,20 @@ See **ERRORS.md** §6.3 for complete Vector error mapping specifications.
 ### 17.1 Required Flags
 ```typescript
 interface EmbeddingCapabilities {
+  protocol: string;               // "embedding"
   server: string;
   version: string;
   supported_models: string[];
-  max_batch_size: number;
-  max_text_length: number;
-  max_dimensions: number;
+  max_batch_size?: number;
+  max_text_length?: number;
+  max_dimensions?: number;
   supports_normalization: boolean;
   supports_truncation: boolean;
   supports_token_counting: boolean;
   supports_multi_tenant: boolean;
   supports_deadline: boolean;
   normalizes_at_source: boolean;
+  idempotent_operations: boolean;
 }
 ```
 
@@ -2038,7 +2202,51 @@ interface EmbedBatchResult {
 
 ## 19. Embedding Operations
 
-### 19.1 embed
+### 19.1 capabilities
+**Purpose:** Discover supported embedding features and models
+
+**Input:** None (uses OperationContext)
+
+**Request Body:**
+```json
+{
+  "op": "embedding.capabilities",
+  "ctx": {
+    "request_id": "req-embed-cap-001",
+    "tenant": "acme-corp"
+  },
+  "args": {}
+}
+```
+
+**Output:** `EmbeddingCapabilities`
+
+**Response Body:**
+```json
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 1.3,
+  "result": {
+    "protocol": "embedding",
+    "server": "openai-embedding-adapter",
+    "version": "1.0.0",
+    "supported_models": ["text-embedding-3-large", "text-embedding-3-small"],
+    "max_batch_size": 2048,
+    "max_text_length": 8192,
+    "max_dimensions": 3072,
+    "supports_normalization": true,
+    "supports_truncation": true,
+    "supports_token_counting": true,
+    "supports_multi_tenant": true,
+    "supports_deadline": true,
+    "normalizes_at_source": true,
+    "idempotent_operations": true
+  }
+}
+```
+
+### 19.2 embed
 **Purpose:** Generate embedding vector for a single text
 
 **Input:** `EmbedSpec`
@@ -2048,8 +2256,8 @@ interface EmbedBatchResult {
 {
   "op": "embedding.embed",
   "ctx": {
-    "request_id": "req-401",
-    "tenant": "acme",
+    "request_id": "req-embed-single-001",
+    "tenant": "acme-corp",
     "deadline_ms": 1736929500000
   },
   "args": {
@@ -2071,10 +2279,10 @@ interface EmbedBatchResult {
   "ms": 45.2,
   "result": {
     "embedding": {
-      "vector": [0.1, 0.2, 0.3, 0.4, 0.5],
+      "vector": [0.1, 0.2, 0.3, 0.4, 0.5, 0.1, 0.2, 0.3, 0.4, 0.5],
       "text": "The quick brown fox jumps over the lazy dog",
       "model": "text-embedding-3-large",
-      "dimensions": 1536
+      "dimensions": 3072
     },
     "model": "text-embedding-3-large",
     "text": "The quick brown fox jumps over the lazy dog",
@@ -2084,13 +2292,7 @@ interface EmbedBatchResult {
 }
 ```
 
-**Errors:**
-- `BadRequest`: Invalid text, unsupported model
-- `TextTooLong`: Text exceeds limits and truncation disabled
-- `ModelNotFound`: Requested model not available
-- `ContentFiltered`: Text violates content policies
-
-### 19.2 embed_batch
+### 19.3 embed_batch
 **Purpose:** Generate embeddings for multiple texts in batch
 
 **Input:** `EmbedBatchSpec`
@@ -2100,8 +2302,8 @@ interface EmbedBatchResult {
 {
   "op": "embedding.embed_batch",
   "ctx": {
-    "request_id": "req-402",
-    "tenant": "acme"
+    "request_id": "req-embed-batch-001",
+    "tenant": "acme-corp"
   },
   "args": {
     "texts": [
@@ -2127,22 +2329,22 @@ interface EmbedBatchResult {
   "result": {
     "embeddings": [
       {
-        "vector": [0.1, 0.2, 0.3, 0.4, 0.5],
+        "vector": [0.1, 0.2, 0.3, 0.4, 0.5, 0.1, 0.2, 0.3, 0.4, 0.5],
         "text": "Machine learning is a subset of artificial intelligence.",
         "model": "text-embedding-3-large",
-        "dimensions": 1536
+        "dimensions": 3072
       },
       {
-        "vector": [0.15, 0.25, 0.35, 0.45, 0.55],
+        "vector": [0.15, 0.25, 0.35, 0.45, 0.55, 0.15, 0.25, 0.35, 0.45, 0.55],
         "text": "Deep learning uses neural networks with multiple layers.",
         "model": "text-embedding-3-large",
-        "dimensions": 1536
+        "dimensions": 3072
       },
       {
-        "vector": [0.12, 0.22, 0.32, 0.42, 0.52],
+        "vector": [0.12, 0.22, 0.32, 0.42, 0.52, 0.12, 0.22, 0.32, 0.42, 0.52],
         "text": "Natural language processing helps computers understand human language.",
         "model": "text-embedding-3-large",
-        "dimensions": 1536
+        "dimensions": 3072
       }
     ],
     "model": "text-embedding-3-large",
@@ -2153,15 +2355,7 @@ interface EmbedBatchResult {
 }
 ```
 
-**Partial Failure:**
-- Individual text failures reported in `failed_texts[]`
-- Successful embeddings returned in `embeddings[]`
-
-**Errors:**
-- `BadRequest`: Batch too large, invalid texts
-- `NotSupported`: Batch embedding not available (fallback to single)
-
-### 19.3 count_tokens
+### 19.4 count_tokens
 **Purpose:** Count tokens in text for embedding model
 
 **Input:** 
@@ -2177,8 +2371,8 @@ interface CountTokensSpec {
 {
   "op": "embedding.count_tokens",
   "ctx": {
-    "request_id": "req-403",
-    "tenant": "acme"
+    "request_id": "req-embed-tokens-001",
+    "tenant": "acme-corp"
   },
   "args": {
     "text": "The quick brown fox jumps over the lazy dog",
@@ -2187,7 +2381,7 @@ interface CountTokensSpec {
 }
 ```
 
-**Output:** `{ tokens: number }`
+**Output:** `number` (bare integer)
 
 **Response Body:**
 ```json
@@ -2195,17 +2389,11 @@ interface CountTokensSpec {
   "ok": true,
   "code": "OK",
   "ms": 2.8,
-  "result": {
-    "tokens": 9
-  }
+  "result": 9
 }
 ```
 
-**Errors:**
-- `NotSupported`: Token counting not available
-- `ModelNotFound`: Model not available
-
-### 19.4 health
+### 19.5 health
 **Purpose:** Check embedding provider health and model status
 
 **Request Body:**
@@ -2213,8 +2401,8 @@ interface CountTokensSpec {
 {
   "op": "embedding.health",
   "ctx": {
-    "request_id": "req-404",
-    "tenant": "acme"
+    "request_id": "req-embed-health-001",
+    "tenant": "acme-corp"
   },
   "args": {}
 }
@@ -2276,14 +2464,14 @@ interface EmbeddingHealthStatus {
 - **Determinism:** Same text + normalization settings → identical vector
 
 ### 20.3 Dimension Consistency
-- **Model adherence:** Embedding dimensions MUST match `capabilities.max_dimensions` for model
+- **Model adherence:** Embedding dimensions MUST match model specifications
 - **Batch consistency:** All embeddings in batch have same dimensions
-- **Error on mismatch:** `EmbeddingDimensionMismatch` if dimensions don't match expectations
+- **Error on mismatch:** Return error if dimensions don't match expectations
 
 ### 20.4 Empty Input Handling
-- **Zero-length texts:** Return zero vector or error based on provider capability
+- **Zero-length texts:** Reject empty inputs with `BadRequest` error
 - **Whitespace-only:** Treat as normal text, not empty
-- **Error preference:** Prefer zero vector over error for empty inputs
+- **Error preference:** Prefer error over zero vector for empty inputs
 
 ### 20.5 Batch Semantics
 - **Order preservation:** Embeddings maintain input text order
@@ -2531,7 +2719,7 @@ All batch operations use consistent partial failure reporting:
 - **OperationContext:** Request-scoped context for deadlines, tracing, etc.
 
 ### 28.2 Protocol-Specific Terms
-- **Graph:** Property graph with vertices, edges, and graph queries
+- **Graph:** Property graph with nodes, edges, and graph queries
 - **LLM:** Large language model for text generation and completion
 - **Vector:** High-dimensional vectors for similarity search
 - **Embedding:** Text-to-vector transformation models
@@ -2543,8 +2731,10 @@ All batch operations use consistent partial failure reporting:
 ```json
 {
   "LLM": {
+    "protocol": "llm",
     "server": "openai-adapter",
     "version": "1.0.0",
+    "model_family": "openai",
     "supported_models": ["gpt-4", "gpt-3.5-turbo"],
     "max_context_length": 8192,
     "supports_streaming": true,
@@ -2560,7 +2750,6 @@ All batch operations use consistent partial failure reporting:
   "error": "ResourceExhausted",
   "message": "Rate limit exceeded for model gpt-4",
   "code": "RATE_LIMIT",
-  "http_status": 429,
   "retry_after_ms": 5000,
   "resource_scope": "model"
 }
@@ -2584,11 +2773,16 @@ All batch operations use consistent partial failure reporting:
 ### 29.4 Example Streaming Traces
 **Graph Stream:**
 ```json
-{"type": "schema", "schema": {"columns": [{"name": "user", "type": "vertex"}]}}
-{"type": "row", "data": {"user": {"id": "u1", "label": "User", "properties": {"name": "Alice"}}}}
-{"type": "row", "data": {"user": {"id": "u2", "label": "User", "properties": {"name": "Bob"}}}}
-{"type": "summary", "data": {"query_time_ms": 45, "results_count": 2, "dialect_used": "cypher"}}
-{"type": "end"}
+{"type": "data", "data": {"records": {"user": {"id": "u1", "labels": ["User"], "properties": {"name": "Alice"}}}, "is_final": false}}
+{"type": "data", "data": {"records": {"user": {"id": "u2", "labels": ["User"], "properties": {"name": "Bob"}}}, "is_final": false}}
+{"type": "data", "data": {"summary": {"query_time_ms": 45, "results_count": 2, "dialect_used": "cypher", "has_more": false}, "is_final": true}}
+```
+
+**LLM Stream:**
+```json
+{"type": "data", "data": {"text": "Hello", "is_final": false, "model": "gpt-4"}}
+{"type": "data", "data": {"text": " world", "is_final": false, "model": "gpt-4"}}
+{"type": "data", "data": {"text": "!", "is_final": true, "model": "gpt-4", "usage_so_far": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}}}
 ```
 
 **Vector Batch Failure:**
