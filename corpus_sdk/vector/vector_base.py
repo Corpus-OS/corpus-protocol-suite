@@ -52,6 +52,13 @@ offering a safe "batteries included" option for direct use:
     Suitable for development and light production. Not a replacement for a
     full-blown distributed control plane.
 
+Threading & Processes
+---------------------
+- In-memory components (cache, breaker, limiter) are **per-process only**.
+- They are **not thread-safe** and are intended for a single-threaded async
+  event loop. For multi-threaded or multi-process deployments, use external,
+  distributed implementations of cache / limiter / breaker instead.
+
 Versioning
 ----------
 Follow SemVer against VECTOR_PROTOCOL_VERSION. Minor versions are strictly additive.
@@ -407,7 +414,14 @@ class CircuitBreaker(Protocol):
 
 
 class Cache(Protocol):
-    """Minimal async cache interface."""
+    """
+    Minimal async cache interface.
+
+    Implementations MAY store arbitrary Python objects. The in-memory default
+    simply holds references and does not serialize. If you plug in a distributed
+    cache (e.g., Redis), you are responsible for serializing/deserializing values
+    (JSON, msgpack, etc.) safely.
+    """
     async def get(self, key: str) -> Optional[Any]: ...
     async def set(self, key: str, value: Any, ttl_s: int) -> None: ...
 
@@ -501,7 +515,12 @@ class InMemoryTTLCache:
     """
     Very small, in-memory TTL cache (not for large workloads).
 
-    Not multi-process safe; not distributed; suitable for standalone/dev only.
+    Characteristics:
+        - Per-process only; NOT multi-process or distributed.
+        - Not thread-safe; intended for use in a single-threaded async event loop.
+        - Stores Python objects by reference; no serialization is performed.
+          If you need cross-process or cross-host caching, use a different Cache
+          implementation with explicit serialization.
     """
     def __init__(self) -> None:
         self._store: Dict[str, Tuple[float, Any]] = {}
@@ -532,8 +551,13 @@ class SimpleTokenBucketLimiter:
     """
     Simple token-bucket limiter with second-level refill.
 
-    Fail-open on internal errors to avoid deadlocks in critical paths.
-    Intended for standalone/dev.
+    Characteristics:
+        - Per-process only; not distributed.
+        - Not thread-safe; intended for a single-threaded async event loop.
+        - Fail-open on internal errors to avoid deadlocks in critical paths.
+
+    Intended for standalone/dev use. For production backpressure across
+    multiple workers, use a distributed rate limiter.
     """
     def __init__(self, rate_per_sec: int = 50, burst: int = 100) -> None:
         self._capacity = max(1, int(burst))
@@ -806,6 +830,32 @@ class VectorProtocolV1(Protocol):
 
 
 # =============================================================================
+# Structured Configuration
+# =============================================================================
+
+@dataclass(frozen=True)
+class VectorAdapterConfig:
+    """
+    Structured configuration for BaseVectorAdapter policies.
+
+    This allows callers to configure core behavior (breaker, limiter, cache TTLs)
+    in a single place, instead of ad-hoc kwargs.
+
+    Notes:
+        - `cache_*_ttl_s` are used as defaults when explicit constructor args
+          are not provided.
+        - `limiter_*` and `breaker_*` are used only when BaseVectorAdapter is
+          constructing its own SimpleTokenBucketLimiter / SimpleCircuitBreaker.
+    """
+    cache_query_ttl_s: int = 60
+    cache_caps_ttl_s: int = 30
+    breaker_failure_threshold: int = 5
+    breaker_reset_timeout_s: float = 10.0
+    limiter_rate_per_sec: int = 50
+    limiter_burst: int = 100
+
+
+# =============================================================================
 # Base Instrumented Adapter (validation, metrics, error handling)
 # =============================================================================
 
@@ -823,6 +873,16 @@ class BaseVectorAdapter(VectorProtocolV1):
       - Read-path caching for queries (standalone mode)
       - Rate limiting via token bucket (standalone mode)
       - Canonical metrics emission for ops & latency
+
+    Threading:
+        - In-memory infra (cache, breaker, limiter) is not thread-safe.
+        - Intended for single-threaded async event loops. Use external distributed
+          infra for multi-threaded or multi-process deployments.
+
+    Backpressure:
+        - The SimpleTokenBucketLimiter provides per-process QPS-style backpressure.
+        - For high-volume or large-batch workloads, callers should also respect
+          capabilities.max_batch_size and manually chunk work into smaller requests.
     """
 
     _component = "vector"
@@ -840,6 +900,7 @@ class BaseVectorAdapter(VectorProtocolV1):
         cache_query_ttl_s: int = 60,
         cache_caps_ttl_s: int = 30,
         warn_on_standalone_no_metrics: bool = True,
+        config: Optional[VectorAdapterConfig] = None,
     ) -> None:
         """
         Initialize the vector adapter with metrics instrumentation and optional policies.
@@ -853,8 +914,18 @@ class BaseVectorAdapter(VectorProtocolV1):
             limiter: Optional rate limiter override.
             cache_query_ttl_s: TTL for query cache entries in standalone mode.
             cache_caps_ttl_s: TTL for capabilities cache entries in standalone mode.
+            warn_on_standalone_no_metrics: Warn if standalone is used without metrics.
+            config: Optional VectorAdapterConfig to centralize policy configuration.
+                    Explicit constructor args take precedence over config fields.
         """
         self._metrics: MetricsSink = metrics or NoopMetrics()
+
+        # Structured config defaults
+        cfg = config or VectorAdapterConfig()
+
+        # Effective TTLs: explicit args win, config is fallback.
+        self._cache_query_ttl_s = int(max(1, cache_query_ttl_s or cfg.cache_query_ttl_s))
+        self._cache_caps_ttl_s = int(max(1, cache_caps_ttl_s or cfg.cache_caps_ttl_s))
 
         m = (mode or "thin").strip().lower()
         if m not in {"thin", "standalone"}:
@@ -868,16 +939,19 @@ class BaseVectorAdapter(VectorProtocolV1):
             self._limiter: RateLimiter = limiter or NoopLimiter()
         else:
             self._deadline = deadline_policy or SimpleDeadline()
-            self._breaker = breaker or SimpleCircuitBreaker()
+            self._breaker = breaker or SimpleCircuitBreaker(
+                consecutive_failure_threshold=cfg.breaker_failure_threshold,
+                reset_timeout_s=cfg.breaker_reset_timeout_s,
+            )
             self._cache = cache or InMemoryTTLCache()
-            self._limiter = limiter or SimpleTokenBucketLimiter()
+            self._limiter = limiter or SimpleTokenBucketLimiter(
+                rate_per_sec=cfg.limiter_rate_per_sec,
+                burst=cfg.limiter_burst,
+            )
             if warn_on_standalone_no_metrics and isinstance(self._metrics, NoopMetrics):
                 LOG.warning(
                     "Using standalone mode without metrics — provide a MetricsSink for production use"
                 )
-
-        self._cache_query_ttl_s = int(max(1, cache_query_ttl_s))
-        self._cache_caps_ttl_s = int(max(1, cache_caps_ttl_s))
 
     # --- async context management & cleanup hooks ----------------------------
 
@@ -1030,7 +1104,17 @@ class BaseVectorAdapter(VectorProtocolV1):
 
     @staticmethod
     def _hash_obj(obj: Any) -> str:
-        raw = repr(obj).encode("utf-8")
+        """
+        Stable hash for JSON-serializable objects.
+
+        Uses json.dumps(..., sort_keys=True) to avoid ordering issues for dicts
+        and reduce cache-key collisions. Falls back to repr() only if JSON
+        serialization fails (which should be rare because we validate).
+        """
+        try:
+            raw = json.dumps(obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        except TypeError:
+            raw = repr(obj).encode("utf-8")
         return hashlib.sha256(raw).hexdigest()
 
     def _query_cache_key(
@@ -1194,6 +1278,11 @@ class BaseVectorAdapter(VectorProtocolV1):
         Execute a vector similarity search query with validation and metrics.
 
         See VectorProtocolV1.query for full documentation.
+
+        Backpressure note:
+            - For high top_k values or very hot namespaces, consider using a
+              distributed rate limiter in addition to the built-in per-process
+              token bucket to avoid overload in large clusters.
         """
         # Structural validation
         self._validate_vector(spec.vector)
@@ -1243,6 +1332,13 @@ class BaseVectorAdapter(VectorProtocolV1):
                     except Exception:
                         pass
                     return cached
+                else:
+                    self._metrics.counter(
+                        component=self._component,
+                        name="cache_misses",
+                        value=1,
+                        extra={"op": "query"},
+                    )
 
             # Execute backend query
             result = await self._do_query(spec, ctx=ctx)
@@ -1296,13 +1392,18 @@ class BaseVectorAdapter(VectorProtocolV1):
         Upsert vectors into the vector store with validation and metrics.
 
         See VectorProtocolV1.upsert for full documentation.
+
+        Guidance:
+            - For very large batches, respect capabilities.max_batch_size and
+              chunk requests accordingly to avoid memory pressure.
         """
         self._require_non_empty("namespace", spec.namespace)
         if not spec.vectors:
             raise BadRequest("vectors must not be empty")
 
-        # Validate each vector and its metadata
+        # Validate each vector, id, and its metadata
         for v in spec.vectors:
+            self._require_non_empty("vector.id", str(v.id))
             self._validate_vector(v.vector)
             if v.metadata is not None and not isinstance(v.metadata, Mapping):
                 raise BadRequest("metadata must be a mapping (dict) when provided")
@@ -1336,6 +1437,7 @@ class BaseVectorAdapter(VectorProtocolV1):
             return {
                 "namespace": spec.namespace,
                 "vectors_processed": len(spec.vectors),
+                "upserted_count": res.upserted_count,
             }
 
         result = await self._with_gates_unary(
@@ -1350,6 +1452,11 @@ class BaseVectorAdapter(VectorProtocolV1):
             component=self._component,
             name="vectors_upserted",
             value=int(result.upserted_count),
+        )
+        self._metrics.counter(
+            component=self._component,
+            name="upsert_batches",
+            value=1,
         )
 
         return result
@@ -1372,6 +1479,9 @@ class BaseVectorAdapter(VectorProtocolV1):
             raise BadRequest("filter must be a mapping (dict) when provided")
         if spec.filter is not None:
             self._ensure_json_serializable(spec.filter, "filter")
+        if spec.ids:
+            for vid in spec.ids:
+                self._require_non_empty("id", str(vid))
 
         async def _call() -> DeleteResult:
             caps = await self.capabilities()
@@ -1396,6 +1506,7 @@ class BaseVectorAdapter(VectorProtocolV1):
             return {
                 "namespace": spec.namespace,
                 "vectors_targeted": targeted,
+                "deleted_count": res.deleted_count,
             }
 
         result = await self._with_gates_unary(
@@ -1409,6 +1520,11 @@ class BaseVectorAdapter(VectorProtocolV1):
             component=self._component,
             name="vectors_deleted",
             value=int(result.deleted_count),
+        )
+        self._metrics.counter(
+            component=self._component,
+            name="delete_batches",
+            value=1,
         )
 
         return result
@@ -1750,6 +1866,7 @@ __all__ = [
     "NamespaceResult",
     "VectorCapabilities",
     "VectorProtocolV1",
+    "VectorAdapterConfig",
     "BaseVectorAdapter",
     # policy & infra extension points
     "DeadlinePolicy",
