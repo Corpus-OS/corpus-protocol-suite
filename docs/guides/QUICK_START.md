@@ -453,4 +453,5 @@ If all those are true, you're ready to plug into a production Corpus routing sta
 
 ---
 **Maintainers:** Corpus SDK Team
+
 **Scope:** Adapter author quickstart — see `spec/IMPLEMENTATION.md`, `spec/BEHAVIORAL_CONFORMANCE.md`, and `spec/SCHEMA_CONFORMANCE.md` for full details.
