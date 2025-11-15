@@ -1,5 +1,16 @@
-# LLM Protocol V1 Conformance Test Coverage
+# LLM Protocol Conformance Test Coverage
 
+**Table of Contents**
+- [Overview](#overview)
+- [Conformance Summary](#conformance-summary)
+- [Test Files](#test-files)
+- [Specification Mapping](#specification-mapping)
+- [Running Tests](#running-tests)
+- [Adapter Compliance Checklist](#adapter-compliance-checklist)
+- [Conformance Badge](#conformance-badge)
+- [Maintenance](#maintenance)
+
+---
 
 ## Overview
 
@@ -329,67 +340,79 @@ Use this checklist when implementing or validating a new LLM adapter:
 
 ### ✅ Phase 1: Core Operations
 
-* [x] `capabilities()` returns valid `LLMCapabilities`
-* [x] `complete()` returns `LLMCompletion` with usage + finish_reason
-* [x] `stream()` emits chunks with exactly one final marker
-* [x] `count_tokens()` returns non-negative int
-* [x] `health()` returns `{ok, server, version}`
+* [ ] `capabilities()` returns valid `LLMCapabilities`
+* [ ] `complete()` returns `LLMCompletion` with usage + finish_reason
+* [ ] `stream()` emits chunks with exactly one final marker
+* [ ] `count_tokens()` returns non-negative int
+* [ ] `health()` returns `{ok, server, version}`
 
 ### ✅ Phase 2: Message Validation
 
-* [x] Rejects empty messages
-* [x] Rejects unknown roles
-* [x] Rejects missing required fields
-* [x] Accepts `system` / `user` / `assistant`
-* [x] Handles large (reasonable) content
+* [ ] Rejects empty messages
+* [ ] Rejects unknown roles
+* [ ] Rejects missing required fields
+* [ ] Accepts `system` / `user` / `assistant`
+* [ ] Handles large (reasonable) content
 
 ### ✅ Phase 3: Parameter Validation
 
-* [x] Enforces `temperature` in [0.0, 2.0]
-* [x] Enforces `top_p` in (0.0, 1.0]
-* [x] Enforces `frequency_penalty` in [-2.0, 2.0]
-* [x] Enforces `presence_penalty` in [-2.0, 2.0]
+* [ ] Enforces `temperature` in [0.0, 2.0]
+* [ ] Enforces `top_p` in (0.0, 1.0]
+* [ ] Enforces `frequency_penalty` in [-2.0, 2.0]
+* [ ] Enforces `presence_penalty` in [-2.0, 2.0]
 
 ### ✅ Phase 4: Streaming Semantics
 
-* [x] Yields `LLMChunk` objects
-* [x] Multiple chunks where applicable
-* [x] Exactly one final chunk
-* [x] Final chunk is last
-* [x] `usage_so_far` monotonic and consistent
+* [ ] Yields `LLMChunk` objects
+* [ ] Multiple chunks where applicable
+* [ ] Exactly one final chunk
+* [ ] Final chunk is last
+* [ ] `usage_so_far` monotonic and consistent
 
 ### ✅ Phase 5: Token Counting
 
-* [x] Non-negative integers
-* [x] Monotonic vs input length
-* [x] Correct empty-string handling
-* [x] Robust Unicode handling
+* [ ] Non-negative integers
+* [ ] Monotonic vs input length
+* [ ] Correct empty-string handling
+* [ ] Robust Unicode handling
 
 ### ✅ Phase 6: Error Handling
 
-* [x] Maps validation issues → `BadRequest`
-* [x] Maps quotas/limits → `ResourceExhausted` (+ `retry_after_ms`)
-* [x] Maps transient issues → `Unavailable` / retryable
-* [x] Maps timeouts → `DeadlineExceeded`
-* [x] Maps unsupported → `NotSupported`
-* [x] Maps `ModelOverloaded` as retryable
-* [x] Maps `ContentFiltered` as non-retryable
-* [x] Emits normalized `code` and attributes
+* [ ] Maps validation issues → `BadRequest`
+* [ ] Maps quotas/limits → `ResourceExhausted` (+ `retry_after_ms`)
+* [ ] Maps transient issues → `Unavailable` / retryable
+* [ ] Maps timeouts → `DeadlineExceeded`
+* [ ] Maps unsupported → `NotSupported`
+* [ ] Maps `ModelOverloaded` as retryable
+* [ ] Maps `ContentFiltered` as non-retryable
+* [ ] Emits normalized `code` and attributes
 
 ### ✅ Phase 7: Deadline Enforcement
 
-* [x] Correct budget computation
-* [x] Preflight deadline checks where applicable
-* [x] Honors deadlines in unary calls
-* [x] Honors deadlines mid-stream
+* [ ] Correct budget computation
+* [ ] Preflight deadline checks where applicable
+* [ ] Honors deadlines in unary calls
+* [ ] Honors deadlines mid-stream
 
 ### ✅ Phase 8: Observability & Privacy
 
-* [x] Never logs raw tenant IDs
-* [x] Uses tenant hash in metrics
-* [x] Excludes prompt content from metrics
-* [x] Emits token usage metrics
-* [x] Emits metrics on both success and error paths
+* [ ] Never logs raw tenant IDs
+* [ ] Uses tenant hash in metrics
+* [ ] Excludes prompt content from metrics
+* [ ] Emits token usage metrics
+* [ ] Emits metrics on both success and error paths
+
+### ✅ Phase 9: Wire Contract & Envelopes
+
+* [ ] `WireLLMHandler` implements all `llm.*` operations
+* [ ] Success envelopes have correct `{ok, code, ms, result}` shape
+* [ ] Error envelopes normalize to `{ok=false, code, error, message, ...}`
+* [ ] `OperationContext` properly constructed from wire `ctx`
+* [ ] Unknown fields ignored in requests
+* [ ] Unknown operations map to `NotSupported`
+* [ ] Unexpected exceptions map to `Unavailable`
+* [ ] `llm.stream` handled via `handle_stream` only
+* [ ] No PII/secrets in wire envelopes
 
 ## Conformance Badge
 
