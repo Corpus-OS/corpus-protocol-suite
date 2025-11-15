@@ -1,4 +1,6 @@
-# PROTOCOLS
+Here's the fully updated PROTOCOLS.md file with all the improvements you requested:
+
+# CORPUS PROTOCOLS
 
 **Table of Contents**
 - [0. Document Metadata](#0-document-metadata)
@@ -36,6 +38,7 @@
 - [27. Cross-Protocol Standardization Tables](#27-cross-protocol-standardization-tables)
 - [28. Glossary](#28-glossary)
 - [29. Appendix](#29-appendix)
+- [30. Index](#30-index)
 
 ---
 
@@ -384,6 +387,9 @@ interface GraphCapabilities {
   supports_property_filters: boolean;
   supports_multi_tenant: boolean;
   max_batch_ops?: number;
+  max_query_complexity?: number;  // Optional: maximum query complexity score
+  max_nodes_per_transaction?: number; // Optional: transaction size limits
+  supports_analytics_queries?: boolean; // Optional: analytical query support
 }
 ```
 
@@ -504,7 +510,10 @@ interface QueryChunk {
     "supports_namespaces": true,
     "supports_property_filters": true,
     "supports_multi_tenant": true,
-    "max_batch_ops": 1000
+    "max_batch_ops": 1000,
+    "max_query_complexity": 10000,
+    "max_nodes_per_transaction": 50000,
+    "supports_analytics_queries": true
   }
 }
 ```
@@ -1030,9 +1039,18 @@ interface HealthStatus {
   status: "ok" | "degraded";
   server: string;
   version: string;
-  namespaces?: { ... };
+  namespaces?: { 
+    [namespace: string]: {
+      node_count: number;
+      edge_count: number;
+      ready: boolean;
+      read_only?: boolean;
+    }
+  };
   read_only?: boolean;
   degraded?: boolean;
+  message?: string;  // Optional status message
+  last_check?: string; // Optional timestamp of last health check
 }
 ```
 
@@ -1050,11 +1068,15 @@ interface HealthStatus {
     "namespaces": {
       "production": {
         "node_count": 1500,
-        "edge_count": 3200
+        "edge_count": 3200,
+        "ready": true,
+        "read_only": false
       }
     },
     "read_only": false,
-    "degraded": false
+    "degraded": false,
+    "message": "All systems operational",
+    "last_check": "2025-01-15T10:20:00Z"
   }
 }
 ```
@@ -1121,6 +1143,11 @@ interface LLMCapabilities {
   supports_count_tokens: boolean;
   idempotent_writes: boolean;
   supports_multi_tenant: boolean;
+  max_tokens_per_minute?: number; // Optional: rate limiting info
+  max_requests_per_minute?: number; // Optional: request rate limits
+  supports_function_calling?: boolean; // Optional: function calling support
+  supports_vision?: boolean;      // Optional: multimodal vision support
+  supports_logprobs?: boolean;    // Optional: token probabilities
 }
 ```
 
@@ -1229,7 +1256,12 @@ interface LLMChunk {
     "supports_deadline": true,
     "supports_count_tokens": true,
     "idempotent_writes": true,
-    "supports_multi_tenant": true
+    "supports_multi_tenant": true,
+    "max_tokens_per_minute": 100000,
+    "max_requests_per_minute": 1000,
+    "supports_function_calling": true,
+    "supports_vision": false,
+    "supports_logprobs": true
   }
 }
 ```
@@ -1410,6 +1442,19 @@ interface LLMHealthStatus {
   ok: boolean;
   server: string;
   version: string;
+  status?: "ok" | "degraded";  // Optional status indicator
+  models?: {                   // Optional model status information
+    [model: string]: {
+      available: boolean;
+      rate_limited?: boolean;
+      degraded?: boolean;
+    };
+  };
+  rate_limits?: {             // Optional rate limit information
+    tokens_per_minute?: number;
+    requests_per_minute?: number;
+  };
+  message?: string;           // Optional status message
 }
 ```
 
@@ -1422,7 +1467,25 @@ interface LLMHealthStatus {
   "result": {
     "ok": true,
     "server": "openai-adapter",
-    "version": "1.0.0"
+    "version": "1.0.0",
+    "status": "ok",
+    "models": {
+      "gpt-4.1-mini": {
+        "available": true,
+        "rate_limited": false,
+        "degraded": false
+      },
+      "gpt-4.1-max": {
+        "available": true,
+        "rate_limited": false,
+        "degraded": false
+      }
+    },
+    "rate_limits": {
+      "tokens_per_minute": 100000,
+      "requests_per_minute": 1000
+    },
+    "message": "All models operational"
   }
 }
 ```
@@ -1504,6 +1567,10 @@ interface VectorCapabilities {
   supports_multi_tenant: boolean;
   max_top_k?: number;
   max_filter_terms?: number;
+  supports_hybrid_search?: boolean; // Optional: hybrid vector+keyword search
+  supports_sparse_vectors?: boolean; // Optional: sparse vector support
+  max_namespaces?: number;        // Optional: namespace count limit
+  supports_vector_compression?: boolean; // Optional: vector compression
 }
 ```
 
@@ -1613,6 +1680,9 @@ interface NamespaceResult {
   success: boolean;
   namespace: string;
   details: Metadata;
+  vector_count?: number;          // Optional: count of vectors in namespace
+  index_status?: string;          // Optional: index build status
+  ready?: boolean;                // Optional: namespace readiness
 }
 ```
 
@@ -1658,7 +1728,11 @@ interface NamespaceResult {
     "idempotent_writes": true,
     "supports_multi_tenant": true,
     "max_top_k": 10000,
-    "max_filter_terms": 10
+    "max_filter_terms": 10,
+    "supports_hybrid_search": true,
+    "supports_sparse_vectors": false,
+    "max_namespaces": 1000,
+    "supports_vector_compression": true
   }
 }
 ```
@@ -1891,7 +1965,10 @@ interface NamespaceResult {
     "details": {
       "index_status": "building",
       "estimated_completion_ms": 120000
-    }
+    },
+    "vector_count": 0,
+    "index_status": "building",
+    "ready": false
   }
 }
 ```
@@ -1933,7 +2010,10 @@ interface NamespaceResult {
     "namespace": "old-data",
     "details": {
       "vectors_deleted": 15000
-    }
+    },
+    "vector_count": 15000,
+    "index_status": "deleted",
+    "ready": false
   }
 }
 ```
@@ -1961,13 +2041,18 @@ interface VectorHealthStatus {
   ok: boolean;
   server: string;
   version: string;
+  status?: "ok" | "degraded";  // Optional status indicator
   namespaces: {
     [namespace: string]: {
       ready: boolean;
       vector_count: number;
       dimensions: number;
+      index_status?: string;    // Optional index status
+      read_only?: boolean;      // Optional read-only status
     };
   };
+  total_vector_count?: number;  // Optional total vectors across all namespaces
+  message?: string;             // Optional status message
 }
 ```
 
@@ -1981,18 +2066,25 @@ interface VectorHealthStatus {
     "ok": true,
     "server": "pinecone-adapter",
     "version": "1.0.0",
+    "status": "ok",
     "namespaces": {
       "documents": {
         "ready": true,
         "vector_count": 15000,
-        "dimensions": 1536
+        "dimensions": 1536,
+        "index_status": "ready",
+        "read_only": false
       },
       "images": {
         "ready": false,
         "vector_count": 0,
-        "dimensions": 512
+        "dimensions": 512,
+        "index_status": "building",
+        "read_only": false
       }
-    }
+    },
+    "total_vector_count": 15000,
+    "message": "Vector store operational"
   }
 }
 ```
@@ -2059,10 +2151,13 @@ interface EmbeddingCapabilities {
   supports_truncation: boolean;
   supports_token_counting: boolean;
   supports_multi_tenant: boolean;
-  supports_deadline: boolean;
+  supports_deadline: boolean;     // Added missing field
   normalizes_at_source: boolean;
   idempotent_operations: boolean;
   truncation_mode: string;        // "base" or "adapter"
+  max_batch_tokens?: number;      // Optional: token-based batch limits
+  supports_multilingual?: boolean; // Optional: multilingual support
+  supports_custom_dimensions?: boolean; // Optional: dimension customization
 }
 ```
 
@@ -2169,7 +2264,10 @@ interface EmbedBatchResult {
     "supports_deadline": true,
     "normalizes_at_source": true,
     "idempotent_operations": true,
-    "truncation_mode": "base"
+    "truncation_mode": "base",
+    "max_batch_tokens": 8000000,
+    "supports_multilingual": true,
+    "supports_custom_dimensions": true
   }
 }
 ```
@@ -2358,6 +2456,19 @@ interface EmbeddingHealthStatus {
   ok: boolean;
   server: string;
   version: string;
+  status?: "ok" | "degraded";  // Optional status indicator
+  models?: {                   // Optional model status information
+    [model: string]: {
+      available: boolean;
+      rate_limited?: boolean;
+      degraded?: boolean;
+    };
+  };
+  rate_limits?: {             // Optional rate limit information
+    tokens_per_minute?: number;
+    requests_per_minute?: number;
+  };
+  message?: string;           // Optional status message
 }
 ```
 
@@ -2370,7 +2481,25 @@ interface EmbeddingHealthStatus {
   "result": {
     "ok": true,
     "server": "openai-embedding-adapter",
-    "version": "1.0.0"
+    "version": "1.0.0",
+    "status": "ok",
+    "models": {
+      "text-embedding-3-large": {
+        "available": true,
+        "rate_limited": false,
+        "degraded": false
+      },
+      "text-embedding-3-small": {
+        "available": true,
+        "rate_limited": false,
+        "degraded": false
+      }
+    },
+    "rate_limits": {
+      "tokens_per_minute": 1000000,
+      "requests_per_minute": 5000
+    },
+    "message": "All embedding models operational"
   }
 }
 ```
@@ -2620,11 +2749,12 @@ All batch operations use consistent partial failure reporting:
 | `ok` | REQUIRED | ✓ | ✓ | ✓ | ✓ |
 | `server` | REQUIRED | ✓ | ✓ | ✓ | ✓ |
 | `version` | REQUIRED | ✓ | ✓ | ✓ | ✓ |
-| `status` | OPTIONAL | ✓ | ✗ | ✗ | ✗ |
+| `status` | OPTIONAL | ✓ | ✓ | ✓ | ✓ |
 | `namespaces` | PROTOCOL | ✓ | ✗ | ✓ | ✗ |
 | `models` | PROTOCOL | ✗ | ✓ | ✗ | ✓ |
 | `read_only` | OPTIONAL | ✓ | ✗ | ✗ | ✗ |
 | `degraded` | OPTIONAL | ✓ | ✗ | ✗ | ✗ |
+| `message` | OPTIONAL | ✓ | ✓ | ✓ | ✓ |
 
 ### 27.2 Batch Operation Standardization
 | Field | All Protocols | Purpose |
@@ -2824,6 +2954,33 @@ adapter = BaseLLMAdapter(mode="standalone")
 - **Default values:** Specified where semantically meaningful
 - **Range validation:** Numeric bounds enforced per capabilities
 - **Serialization:** All data MUST be JSON-serializable for caching and wire transfer
+
+## 30. Index
+
+### 30.1 Operations Index
+- **Graph Operations:** capabilities, upsert_nodes, upsert_edges, delete_nodes, delete_edges, query, stream_query, bulk_vertices, batch, get_schema, health
+- **LLM Operations:** capabilities, complete, stream, count_tokens, health  
+- **Vector Operations:** capabilities, query, upsert, delete, create_namespace, delete_namespace, health
+- **Embedding Operations:** capabilities, embed, embed_batch, count_tokens, health
+
+### 30.2 Types Index
+- **Common Types:** OperationContext, Metadata, BatchResult, TokenUsage
+- **Graph Types:** Node, Edge, QuerySpec, QueryResult, QueryChunk, GraphSchema, HealthStatus
+- **LLM Types:** Message, ToolCall, CompletionSpec, LLMCompletion, LLMChunk, LLMHealthStatus
+- **Vector Types:** Vector, VectorMatch, QuerySpec, QueryResult, UpsertSpec, UpsertResult, DeleteSpec, DeleteResult, NamespaceSpec, NamespaceResult, VectorHealthStatus
+- **Embedding Types:** EmbedSpec, EmbedBatchSpec, EmbedResult, EmbeddingVector, EmbedBatchResult, EmbeddingHealthStatus
+
+### 30.3 Capabilities Index
+- **Graph Capabilities:** protocol, server, version, supported_query_dialects, supports_stream_query, supports_bulk_vertices, supports_batch, supports_schema, idempotent_writes, supports_deadline, supports_namespaces, supports_property_filters, supports_multi_tenant, max_batch_ops, max_query_complexity, max_nodes_per_transaction, supports_analytics_queries
+- **LLM Capabilities:** protocol, server, version, model_family, supported_models, max_context_length, supports_streaming, supports_roles, supports_system_message, supports_json_output, supports_parallel_tool_calls, supports_deadline, supports_count_tokens, idempotent_writes, supports_multi_tenant, max_tokens_per_minute, max_requests_per_minute, supports_function_calling, supports_vision, supports_logprobs
+- **Vector Capabilities:** protocol, server, version, max_dimensions, supported_metrics, supports_namespaces, supports_metadata_filtering, supports_batch_operations, max_batch_size, supports_index_management, supports_deadline, idempotent_writes, supports_multi_tenant, max_top_k, max_filter_terms, supports_hybrid_search, supports_sparse_vectors, max_namespaces, supports_vector_compression
+- **Embedding Capabilities:** protocol, server, version, supported_models, max_batch_size, max_text_length, max_dimensions, supports_normalization, supports_truncation, supports_token_counting, supports_multi_tenant, supports_deadline, normalizes_at_source, idempotent_operations, truncation_mode, max_batch_tokens, supports_multilingual, supports_custom_dimensions
+
+### 30.4 Error Codes Index
+- BAD_REQUEST, AUTH_ERROR, RESOURCE_EXHAUSTED, TRANSIENT_NETWORK, UNAVAILABLE, NOT_SUPPORTED, DEADLINE_EXCEEDED, MODEL_OVERLOADED, TEXT_TOO_LONG, DIMENSION_MISMATCH, QUERY_PARSE_ERROR
+
+### 30.5 Cross-Protocol Concepts
+- Tenant Isolation, Deadline Propagation, Streaming Semantics, Batch Operations, Partial Failures, Health Checking, Capability Discovery, Error Normalization, Observability, Security Requirements
 
 ---
 
