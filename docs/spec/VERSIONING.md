@@ -1,4 +1,4 @@
-# VERSIONING.md
+# VERSIONING
 
 **Corpus Protocol Suite — Versioning & Compatibility Policy**
 
