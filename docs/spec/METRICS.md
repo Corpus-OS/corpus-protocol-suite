@@ -18,8 +18,8 @@
 
 ---
 
-**Corpus Protocol Suite & SDKs — Cross-Protocol Observability (Agnostic)**  
-**metrics_version:** `1.0`
+**Cross-Protocol Observability (Agnostic)**  
+**Metrics Version:** `1.0`
 
 > This document defines an *implementation-agnostic* metrics contract for **Graph**, **LLM**, **Vector**, and **Embedding** adapters. It aligns with the specification's Observability sections (see §13.1–§13.3) and the Common Foundation. Providers, stacks, and exporters are **not** mandated; the shapes below are semantic contracts that any telemetry pipeline can map to.
 
