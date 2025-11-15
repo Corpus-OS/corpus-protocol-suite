@@ -1,5 +1,22 @@
 # BEHAVIORAL CONFORMANCE
 
+**Table of Contents**
+- [1) Overview](#1-overview)
+- [2) Runbook (Makefile-Aligned)](#2-runbook-makefile-aligned)
+- [3) Scope & Non-Goals](#3-scope--non-goals)
+- [4) Test Authority](#4-test-authority)
+- [5) Annotated Test Suite Index (Gold Standard)](#5-annotated-test-suite-index-gold-standard)
+- [6) Behavioral Requirements (Normative)](#6-behavioral-requirements-normative)
+- [7) Adapter Readiness Checklist](#7-adapter-readiness-checklist)
+- [8) Environment Profiles (for stable CI)](#8-environment-profiles-for-stable-ci)
+- [9) Reproducibility](#9-reproducibility)
+- [10) Deviations & Extensions](#10-deviations--extensions)
+- [11) Pass/Fail Policy](#11-passfail-policy)
+- [12) Conformance Attestation (Template)](#12-conformance-attestation-template)
+- [13) Maintenance](#13-maintenance)
+
+---
+
 > **Corpus Protocol (v1.0) — Behavioral Conformance (Runtime Semantics)**
 > Components: **LLM** • **Vector** • **Embedding** • **Graph**
 > Scope: **adapter logic**, **deadlines**, **errors & retryability**, **streaming semantics**, **observability/SIEM**, **caching/idempotency**, **limits enforcement**
