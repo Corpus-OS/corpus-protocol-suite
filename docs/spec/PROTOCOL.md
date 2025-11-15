@@ -39,8 +39,8 @@
 
 ---
 
-**Detailed Protocol Specification for Graph, LLM, Vector, and Embedding Adapters**  
-**Protocol Version:** `1.0`
+**Corpus Protocol Suite — Unified Specification for Graph, LLM, Vector, and Embedding Adapters**  
+**protocols_version:** `1.0`
 
 > This document defines the unified protocol specification for all Corpus adapters. It establishes the normative behavior, types, and semantics for Graph, LLM, Vector, and Embedding protocols while maintaining cross-protocol consistency.
 
@@ -52,6 +52,7 @@
 - **Replaces:** None (initial version)
 
 ### 0.2 Relationship to Companion Documents
+- **SPECIFICATION.md:** Defines high-level architecture, design philosophy, and normative requirements referenced throughout this document
 - **METRICS.md:** Defines observability requirements referenced in §21
 - **ERRORS.md:** Defines error taxonomy referenced in §22
 - **IMPLEMENTATION.md:** Provides implementation guidance and patterns
@@ -545,7 +546,50 @@ interface CreateVertexSpec {
 }
 ```
 
+**Request Body:**
+```json
+{
+  "op": "graph.create_vertex",
+  "ctx": {
+    "request_id": "req-123",
+    "tenant": "acme"
+  },
+  "args": {
+    "vertex": {
+      "id": "user-123",
+      "label": "User",
+      "properties": {
+        "name": "Alice",
+        "email": "alice@example.com",
+        "age": 30
+      }
+    },
+    "if_not_exists": true
+  }
+}
+```
+
 **Output:** `Vertex` (created vertex with server-generated timestamps)
+
+**Response Body:**
+```json
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 12.5,
+  "result": {
+    "id": "user-123",
+    "label": "User",
+    "properties": {
+      "name": "Alice",
+      "email": "alice@example.com",
+      "age": 30
+    },
+    "created_at": "2025-01-15T10:30:00Z",
+    "updated_at": "2025-01-15T10:30:00Z"
+  }
+}
+```
 
 **Errors:**
 - `BadRequest`: Invalid vertex data, missing required fields
@@ -563,7 +607,34 @@ interface DeleteVertexSpec {
 }
 ```
 
+**Request Body:**
+```json
+{
+  "op": "graph.delete_vertex",
+  "ctx": {
+    "request_id": "req-124",
+    "tenant": "acme"
+  },
+  "args": {
+    "id": "user-123",
+    "cascade": true
+  }
+}
+```
+
 **Output:** `{ deleted: boolean }` (true if vertex existed and was deleted)
+
+**Response Body:**
+```json
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 8.2,
+  "result": {
+    "deleted": true
+  }
+}
+```
 
 **Errors:**
 - `BadRequest`: Invalid ID format
@@ -580,7 +651,52 @@ interface CreateEdgeSpec {
 }
 ```
 
+**Request Body:**
+```json
+{
+  "op": "graph.create_edge",
+  "ctx": {
+    "request_id": "req-125",
+    "tenant": "acme"
+  },
+  "args": {
+    "edge": {
+      "id": "follows-1",
+      "label": "FOLLOWS",
+      "from_vertex": "user-123",
+      "to_vertex": "user-456",
+      "properties": {
+        "since": "2025-01-15",
+        "strength": 0.8
+      }
+    },
+    "if_not_exists": true
+  }
+}
+```
+
 **Output:** `Edge` (created edge with server-generated timestamps)
+
+**Response Body:**
+```json
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 9.8,
+  "result": {
+    "id": "follows-1",
+    "label": "FOLLOWS",
+    "from_vertex": "user-123",
+    "to_vertex": "user-456",
+    "properties": {
+      "since": "2025-01-15",
+      "strength": 0.8
+    },
+    "created_at": "2025-01-15T10:31:00Z",
+    "updated_at": "2025-01-15T10:31:00Z"
+  }
+}
+```
 
 **Errors:**
 - `BadRequest`: Invalid edge data, missing vertices
@@ -597,7 +713,33 @@ interface DeleteEdgeSpec {
 }
 ```
 
+**Request Body:**
+```json
+{
+  "op": "graph.delete_edge",
+  "ctx": {
+    "request_id": "req-126",
+    "tenant": "acme"
+  },
+  "args": {
+    "id": "follows-1"
+  }
+}
+```
+
 **Output:** `{ deleted: boolean }` (true if edge existed and was deleted)
+
+**Response Body:**
+```json
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 7.5,
+  "result": {
+    "deleted": true
+  }
+}
+```
 
 **Errors:**
 - `BadRequest`: Invalid ID format
@@ -608,7 +750,57 @@ interface DeleteEdgeSpec {
 
 **Input:** `QuerySpec`
 
+**Request Body:**
+```json
+{
+  "op": "graph.query",
+  "ctx": {
+    "request_id": "req-127",
+    "tenant": "acme",
+    "deadline_ms": 1736929200000
+  },
+  "args": {
+    "query": "MATCH (u:User {id: $user_id})-[:FOLLOWS]->(f:User) RETURN f.id, f.name LIMIT 10",
+    "parameters": {
+      "user_id": "user-123"
+    },
+    "dialect": "cypher",
+    "include_metadata": true,
+    "limit": 10,
+    "timeout_ms": 5000
+  }
+}
+```
+
 **Output:** `QueryResult`
+
+**Response Body:**
+```json
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 45.2,
+  "result": {
+    "rows": [
+      {
+        "f.id": "user-456",
+        "f.name": "Bob"
+      },
+      {
+        "f.id": "user-789", 
+        "f.name": "Charlie"
+      }
+    ],
+    "columns": ["f.id", "f.name"],
+    "summary": {
+      "query_time_ms": 42.1,
+      "results_count": 2,
+      "has_more": false,
+      "dialect_used": "cypher"
+    }
+  }
+}
+```
 
 **Errors:**
 - `BadRequest`: Invalid query syntax, missing parameters
@@ -621,7 +813,32 @@ interface DeleteEdgeSpec {
 
 **Input:** `QuerySpec`
 
+**Request Body:**
+```json
+{
+  "op": "graph.stream_query",
+  "ctx": {
+    "request_id": "req-128",
+    "tenant": "acme"
+  },
+  "args": {
+    "query": "MATCH (u:User) RETURN u.id, u.name",
+    "dialect": "cypher",
+    "limit": 1000
+  }
+}
+```
+
 **Output:** `StreamQueryResult` (async iterator)
+
+**Stream Response Frames:**
+```json
+{"type": "schema", "schema": {"columns": [{"name": "u.id", "type": "string"}, {"name": "u.name", "type": "string"}]}}
+{"type": "row", "data": {"u.id": "user-123", "u.name": "Alice"}}
+{"type": "row", "data": {"u.id": "user-456", "u.name": "Bob"}}
+{"type": "summary", "data": {"query_time_ms": 125.4, "results_count": 2, "dialect_used": "cypher"}}
+{"type": "end"}
+```
 
 **Stream Semantics:**
 - Optional `schema` event with result structure
@@ -638,7 +855,78 @@ interface DeleteEdgeSpec {
 
 **Input:** `BatchSpec`
 
+**Request Body:**
+```json
+{
+  "op": "graph.batch",
+  "ctx": {
+    "request_id": "req-129",
+    "tenant": "acme",
+    "idempotency_key": "batch-001"
+  },
+  "args": {
+    "operations": [
+      {
+        "type": "create_vertex",
+        "vertex": {
+          "id": "user-999",
+          "label": "User",
+          "properties": {"name": "David"}
+        }
+      },
+      {
+        "type": "create_edge", 
+        "edge": {
+          "id": "follows-999",
+          "label": "FOLLOWS",
+          "from_vertex": "user-123",
+          "to_vertex": "user-999",
+          "properties": {"since": "2025-01-15"}
+        }
+      }
+    ],
+    "atomic": true
+  }
+}
+```
+
 **Output:** `BatchResult`
+
+**Response Body:**
+```json
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 25.7,
+  "result": {
+    "processed_count": 2,
+    "failed_count": 0,
+    "failures": [],
+    "results": [
+      {
+        "operation_index": 0,
+        "result": {
+          "id": "user-999",
+          "label": "User",
+          "properties": {"name": "David"},
+          "created_at": "2025-01-15T10:32:00Z"
+        }
+      },
+      {
+        "operation_index": 1,
+        "result": {
+          "id": "follows-999",
+          "label": "FOLLOWS", 
+          "from_vertex": "user-123",
+          "to_vertex": "user-999",
+          "properties": {"since": "2025-01-15"},
+          "created_at": "2025-01-15T10:32:00Z"
+        }
+      }
+    ]
+  }
+}
+```
 
 **Partial Failure:**
 - Individual operation failures reported in `failures[]`
@@ -654,6 +942,18 @@ interface DeleteEdgeSpec {
 
 **Input:** None (uses OperationContext)
 
+**Request Body:**
+```json
+{
+  "op": "graph.health",
+  "ctx": {
+    "request_id": "req-130",
+    "tenant": "acme"
+  },
+  "args": {}
+}
+```
+
 **Output:** 
 ```typescript
 interface HealthStatus {
@@ -667,6 +967,30 @@ interface HealthStatus {
       details?: Metadata;
     };
   };
+}
+```
+
+**Response Body:**
+```json
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 2.1,
+  "result": {
+    "ok": true,
+    "server": "neo4j-adapter",
+    "version": "1.0.0",
+    "checks": {
+      "database_connectivity": {
+        "ok": true,
+        "message": "Connected to Neo4j cluster"
+      },
+      "query_execution": {
+        "ok": true,
+        "message": "Test query executed successfully"
+      }
+    }
+  }
 }
 ```
 
@@ -843,7 +1167,63 @@ interface StreamChunk {
 
 **Input:** `CompletionSpec`
 
+**Request Body:**
+```json
+{
+  "op": "llm.complete",
+  "ctx": {
+    "request_id": "req-201",
+    "tenant": "acme",
+    "deadline_ms": 1736929300000
+  },
+  "args": {
+    "model": "gpt-4.1-mini",
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are a helpful assistant."
+      },
+      {
+        "role": "user", 
+        "content": "What is the capital of France?"
+      }
+    ],
+    "max_tokens": 100,
+    "temperature": 0.7,
+    "top_p": 0.9
+  }
+}
+```
+
 **Output:** `CompletionResult`
+
+**Response Body:**
+```json
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 1250.8,
+  "result": {
+    "id": "chatcmpl-123",
+    "model": "gpt-4.1-mini",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "The capital of France is Paris."
+        },
+        "finish_reason": "stop"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 15,
+      "completion_tokens": 7,
+      "total_tokens": 22
+    }
+  }
+}
+```
 
 **Errors:**
 - `BadRequest`: Invalid messages, unsupported parameters
@@ -856,7 +1236,39 @@ interface StreamChunk {
 
 **Input:** `CompletionSpec`
 
+**Request Body:**
+```json
+{
+  "op": "llm.stream",
+  "ctx": {
+    "request_id": "req-202",
+    "tenant": "acme"
+  },
+  "args": {
+    "model": "gpt-4.1-mini",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Tell me a short story about AI"
+      }
+    ],
+    "max_tokens": 200,
+    "temperature": 0.8
+  }
+}
+```
+
 **Output:** `AsyncIterable<StreamChunk>`
+
+**Stream Response Frames:**
+```json
+{"type": "data", "data": {"id": "chatcmpl-124", "model": "gpt-4.1-mini", "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]}}
+{"type": "data", "data": {"id": "chatcmpl-124", "model": "gpt-4.1-mini", "choices": [{"index": 0, "delta": {"content": "Once"}, "finish_reason": null}]}}
+{"type": "data", "data": {"id": "chatcmpl-124", "model": "gpt-4.1-mini", "choices": [{"index": 0, "delta": {"content": " upon"}, "finish_reason": null}]}}
+{"type": "data", "data": {"id": "chatcmpl-124", "model": "gpt-4.1-mini", "choices": [{"index": 0, "delta": {"content": " a time"}, "finish_reason": null}]}}
+{"type": "data", "data": {"id": "chatcmpl-124", "model": "gpt-4.1-mini", "choices": [{"index": 0, "delta": {"content": "..."}, "finish_reason": "stop"}]}}
+{"type": "end"}
+```
 
 **Stream Semantics:**
 - Multiple chunks with incremental content
@@ -876,7 +1288,34 @@ interface CountTokensSpec {
 }
 ```
 
+**Request Body:**
+```json
+{
+  "op": "llm.count_tokens",
+  "ctx": {
+    "request_id": "req-203",
+    "tenant": "acme"
+  },
+  "args": {
+    "text": "The quick brown fox jumps over the lazy dog",
+    "model": "gpt-4.1-mini"
+  }
+}
+```
+
 **Output:** `{ tokens: number }`
+
+**Response Body:**
+```json
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 3.2,
+  "result": {
+    "tokens": 9
+  }
+}
+```
 
 **Errors:**
 - `NotSupported`: Token counting not available for model
@@ -884,6 +1323,18 @@ interface CountTokensSpec {
 
 ### 11.4 health
 **Purpose:** Check LLM provider health and model availability
+
+**Request Body:**
+```json
+{
+  "op": "llm.health",
+  "ctx": {
+    "request_id": "req-204",
+    "tenant": "acme"
+  },
+  "args": {}
+}
+```
 
 **Output:**
 ```typescript
@@ -897,6 +1348,30 @@ interface LLMHealthStatus {
       message?: string;
     };
   };
+}
+```
+
+**Response Body:**
+```json
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 5.1,
+  "result": {
+    "ok": true,
+    "server": "openai-adapter",
+    "version": "1.0.0",
+    "models": {
+      "gpt-4.1-mini": {
+        "status": "ready",
+        "message": "Model available"
+      },
+      "gpt-4.1-max": {
+        "status": "loading", 
+        "message": "Model initializing"
+      }
+    }
+  }
 }
 ```
 
@@ -1098,7 +1573,74 @@ interface NamespaceResult {
 
 **Input:** `QuerySpec`
 
+**Request Body:**
+```json
+{
+  "op": "vector.query",
+  "ctx": {
+    "request_id": "req-301",
+    "tenant": "acme",
+    "deadline_ms": 1736929400000
+  },
+  "args": {
+    "vector": [0.1, 0.2, 0.3, 0.4, 0.5],
+    "top_k": 10,
+    "namespace": "documents",
+    "filter": {
+      "category": "technology",
+      "language": {"$in": ["en", "es"]}
+    },
+    "include_metadata": true,
+    "include_vectors": false
+  }
+}
+```
+
 **Output:** `QueryResult`
+
+**Response Body:**
+```json
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 23.4,
+  "result": {
+    "matches": [
+      {
+        "vector": {
+          "id": "doc-123",
+          "vector": [0.12, 0.22, 0.32, 0.42, 0.52],
+          "metadata": {
+            "title": "AI Research Paper",
+            "category": "technology",
+            "language": "en"
+          },
+          "namespace": "documents"
+        },
+        "score": 0.95,
+        "distance": 0.05
+      },
+      {
+        "vector": {
+          "id": "doc-456",
+          "vector": [0.08, 0.18, 0.28, 0.38, 0.48],
+          "metadata": {
+            "title": "Machine Learning Guide",
+            "category": "technology", 
+            "language": "en"
+          },
+          "namespace": "documents"
+        },
+        "score": 0.92,
+        "distance": 0.08
+      }
+    ],
+    "query_vector": [0.1, 0.2, 0.3, 0.4, 0.5],
+    "namespace": "documents",
+    "total_matches": 2
+  }
+}
+```
 
 **Errors:**
 - `BadRequest`: Invalid vector dimensions, unsupported metric
@@ -1111,7 +1653,56 @@ interface NamespaceResult {
 
 **Input:** `UpsertSpec`
 
+**Request Body:**
+```json
+{
+  "op": "vector.upsert",
+  "ctx": {
+    "request_id": "req-302",
+    "tenant": "acme",
+    "idempotency_key": "upsert-001"
+  },
+  "args": {
+    "vectors": [
+      {
+        "id": "doc-789",
+        "vector": [0.15, 0.25, 0.35, 0.45, 0.55],
+        "metadata": {
+          "title": "New Research",
+          "category": "science"
+        },
+        "namespace": "documents"
+      },
+      {
+        "id": "doc-999",
+        "vector": [0.09, 0.19, 0.29, 0.39, 0.49],
+        "metadata": {
+          "title": "Updated Guide",
+          "category": "technology"
+        },
+        "namespace": "documents"
+      }
+    ],
+    "namespace": "documents"
+  }
+}
+```
+
 **Output:** `UpsertResult`
+
+**Response Body:**
+```json
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 15.8,
+  "result": {
+    "upserted_count": 2,
+    "failed_count": 0,
+    "failures": []
+  }
+}
+```
 
 **Partial Failure:**
 - Individual vector failures reported in `failures[]`
@@ -1125,9 +1716,38 @@ interface NamespaceResult {
 ### 15.3 delete
 **Purpose:** Remove vectors by ID or metadata filter
 
-**Input:`DeleteSpec`
+**Input:** `DeleteSpec`
+
+**Request Body:**
+```json
+{
+  "op": "vector.delete",
+  "ctx": {
+    "request_id": "req-303",
+    "tenant": "acme"
+  },
+  "args": {
+    "ids": ["doc-123", "doc-456"],
+    "namespace": "documents"
+  }
+}
+```
 
 **Output:** `DeleteResult`
+
+**Response Body:**
+```json
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 12.3,
+  "result": {
+    "deleted_count": 2,
+    "failed_count": 0,
+    "failures": []
+  }
+}
+```
 
 **Partial Failure:**
 - Individual deletion failures reported in `failures[]`
@@ -1142,7 +1762,44 @@ interface NamespaceResult {
 
 **Input:** `NamespaceSpec`
 
+**Request Body:**
+```json
+{
+  "op": "vector.create_namespace",
+  "ctx": {
+    "request_id": "req-304",
+    "tenant": "acme"
+  },
+  "args": {
+    "namespace": "images",
+    "dimensions": 512,
+    "metric": "cosine",
+    "config": {
+      "replication_factor": 3,
+      "segment_size": 10000
+    }
+  }
+}
+```
+
 **Output:** `NamespaceResult`
+
+**Response Body:**
+```json
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 45.2,
+  "result": {
+    "success": true,
+    "namespace": "images",
+    "details": {
+      "index_status": "building",
+      "estimated_completion_ms": 120000
+    }
+  }
+}
+```
 
 **Errors:**
 - `BadRequest`: Invalid namespace configuration
@@ -1154,7 +1811,37 @@ interface NamespaceResult {
 
 **Input:** `{ namespace: string }`
 
+**Request Body:**
+```json
+{
+  "op": "vector.delete_namespace",
+  "ctx": {
+    "request_id": "req-305",
+    "tenant": "acme"
+  },
+  "args": {
+    "namespace": "old-data"
+  }
+}
+```
+
 **Output:** `NamespaceResult`
+
+**Response Body:**
+```json
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 28.7,
+  "result": {
+    "success": true,
+    "namespace": "old-data",
+    "details": {
+      "vectors_deleted": 15000
+    }
+  }
+}
+```
 
 **Errors:**
 - `BadRequest`: Invalid namespace name
@@ -1163,6 +1850,18 @@ interface NamespaceResult {
 
 ### 15.6 health
 **Purpose:** Check vector store health and namespace status
+
+**Request Body:**
+```json
+{
+  "op": "vector.health",
+  "ctx": {
+    "request_id": "req-306",
+    "tenant": "acme"
+  },
+  "args": {}
+}
+```
 
 **Output:**
 ```typescript
@@ -1177,6 +1876,32 @@ interface VectorHealthStatus {
       dimensions: number;
     };
   };
+}
+```
+
+**Response Body:**
+```json
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 3.8,
+  "result": {
+    "ok": true,
+    "server": "pinecone-adapter",
+    "version": "1.0.0",
+    "namespaces": {
+      "documents": {
+        "ready": true,
+        "vector_count": 15000,
+        "dimensions": 1536
+      },
+      "images": {
+        "ready": false,
+        "vector_count": 0,
+        "dimensions": 512
+      }
+    }
+  }
 }
 ```
 
@@ -1318,7 +2043,46 @@ interface EmbedBatchResult {
 
 **Input:** `EmbedSpec`
 
+**Request Body:**
+```json
+{
+  "op": "embedding.embed",
+  "ctx": {
+    "request_id": "req-401",
+    "tenant": "acme",
+    "deadline_ms": 1736929500000
+  },
+  "args": {
+    "text": "The quick brown fox jumps over the lazy dog",
+    "model": "text-embedding-3-large",
+    "truncate": true,
+    "normalize": true
+  }
+}
+```
+
 **Output:** `EmbedResult`
+
+**Response Body:**
+```json
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 45.2,
+  "result": {
+    "embedding": {
+      "vector": [0.1, 0.2, 0.3, 0.4, 0.5],
+      "text": "The quick brown fox jumps over the lazy dog",
+      "model": "text-embedding-3-large",
+      "dimensions": 1536
+    },
+    "model": "text-embedding-3-large",
+    "text": "The quick brown fox jumps over the lazy dog",
+    "tokens_used": 9,
+    "truncated": false
+  }
+}
+```
 
 **Errors:**
 - `BadRequest`: Invalid text, unsupported model
@@ -1331,7 +2095,63 @@ interface EmbedBatchResult {
 
 **Input:** `EmbedBatchSpec`
 
+**Request Body:**
+```json
+{
+  "op": "embedding.embed_batch",
+  "ctx": {
+    "request_id": "req-402",
+    "tenant": "acme"
+  },
+  "args": {
+    "texts": [
+      "Machine learning is a subset of artificial intelligence.",
+      "Deep learning uses neural networks with multiple layers.",
+      "Natural language processing helps computers understand human language."
+    ],
+    "model": "text-embedding-3-large",
+    "truncate": true,
+    "normalize": false
+  }
+}
+```
+
 **Output:** `EmbedBatchResult`
+
+**Response Body:**
+```json
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 89.7,
+  "result": {
+    "embeddings": [
+      {
+        "vector": [0.1, 0.2, 0.3, 0.4, 0.5],
+        "text": "Machine learning is a subset of artificial intelligence.",
+        "model": "text-embedding-3-large",
+        "dimensions": 1536
+      },
+      {
+        "vector": [0.15, 0.25, 0.35, 0.45, 0.55],
+        "text": "Deep learning uses neural networks with multiple layers.",
+        "model": "text-embedding-3-large",
+        "dimensions": 1536
+      },
+      {
+        "vector": [0.12, 0.22, 0.32, 0.42, 0.52],
+        "text": "Natural language processing helps computers understand human language.",
+        "model": "text-embedding-3-large",
+        "dimensions": 1536
+      }
+    ],
+    "model": "text-embedding-3-large",
+    "total_texts": 3,
+    "total_tokens": 42,
+    "failed_texts": []
+  }
+}
+```
 
 **Partial Failure:**
 - Individual text failures reported in `failed_texts[]`
@@ -1352,7 +2172,34 @@ interface CountTokensSpec {
 }
 ```
 
+**Request Body:**
+```json
+{
+  "op": "embedding.count_tokens",
+  "ctx": {
+    "request_id": "req-403",
+    "tenant": "acme"
+  },
+  "args": {
+    "text": "The quick brown fox jumps over the lazy dog",
+    "model": "text-embedding-3-large"
+  }
+}
+```
+
 **Output:** `{ tokens: number }`
+
+**Response Body:**
+```json
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 2.8,
+  "result": {
+    "tokens": 9
+  }
+}
+```
 
 **Errors:**
 - `NotSupported`: Token counting not available
@@ -1360,6 +2207,18 @@ interface CountTokensSpec {
 
 ### 19.4 health
 **Purpose:** Check embedding provider health and model status
+
+**Request Body:**
+```json
+{
+  "op": "embedding.health",
+  "ctx": {
+    "request_id": "req-404",
+    "tenant": "acme"
+  },
+  "args": {}
+}
+```
 
 **Output:**
 ```typescript
@@ -1374,6 +2233,32 @@ interface EmbeddingHealthStatus {
       max_text_length: number;
     };
   };
+}
+```
+
+**Response Body:**
+```json
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 4.2,
+  "result": {
+    "ok": true,
+    "server": "openai-embedding-adapter",
+    "version": "1.0.0",
+    "models": {
+      "text-embedding-3-large": {
+        "status": "ready",
+        "dimensions": 3072,
+        "max_text_length": 8192
+      },
+      "text-embedding-3-small": {
+        "status": "ready",
+        "dimensions": 1536,
+        "max_text_length": 8192
+      }
+    }
+  }
 }
 ```
 
