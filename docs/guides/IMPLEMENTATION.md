@@ -1,7 +1,3 @@
-Of course. Here is the exact file with a Table of Contents added at the beginning.
-
-***
-
 # IMPLEMENTATION
 
 **Table of Contents**
