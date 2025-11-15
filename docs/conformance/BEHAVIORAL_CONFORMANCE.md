@@ -1,6 +1,6 @@
-# BEHAVIORAL_CONFORMANCE
+# BEHAVIORAL CONFORMANCE
 
-> ✅ **Corpus Protocol (v1.0) — Behavioral Conformance (Runtime Semantics)**
+> **Corpus Protocol (v1.0) — Behavioral Conformance (Runtime Semantics)**
 > Components: **LLM** • **Vector** • **Embedding** • **Graph**
 > Scope: **adapter logic**, **deadlines**, **errors & retryability**, **streaming semantics**, **observability/SIEM**, **caching/idempotency**, **limits enforcement**
 > Out of scope: **schema shape** (see `SCHEMA_CONFORMANCE.md`)
