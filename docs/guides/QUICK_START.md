@@ -1,6 +1,6 @@
-# Corpus Protocol (v1.0) — Adapter Quickstart
+# Adapter Quickstart
 
-> **Goal:** Get a real adapter speaking the Corpus Protocol in minutes.  
+> **Goal:** Get a real adapter speaking the Corpus Protocol v1.0 in minutes.  
 > **Audience:** SDK / adapter authors (LLM, Embedding, Vector, Graph).  
 > **You'll build:** A tiny Embedding adapter + wire handler you can swap for LLM / Vector / Graph / Embedding
 
