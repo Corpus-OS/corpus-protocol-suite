@@ -1,5 +1,18 @@
 # Adapter Quickstart
 
+**Table of Contents**
+- [0. Mental Model (What You're Actually Building)](#0-mental-model-what-youre-actually-building)
+- [1. Prerequisites](#1-prerequisites)
+- [2. Hello World Embedding Adapter (Single File)](#2-hello-world-embedding-adapter-single-file)
+- [3. Expose It Over HTTP (Wire Handler)](#3-expose-it-over-http-wire-handler)
+- [4. "I Want LLM / Vector / Graph Instead"](#4-i-want-llm--vector--graph-instead)
+- [5. Timeouts, Tenants, and Errors (60-Second Version)](#5-timeouts-tenants-and-errors-60-second-version)
+- [6. Run the Conformance Tests](#6-run-the-conformance-tests)
+- [7. What to Read Next](#7-what-to-read-next)
+- [8. Adapter Launch Checklist (TL;DR)](#8-adapter-launch-checklist-tldr)
+
+---
+
 > **Goal:** Get a real adapter speaking the Corpus Protocol v1.0 in minutes.  
 > **Audience:** SDK / adapter authors (LLM, Embedding, Vector, Graph).  
 > **You'll build:** A tiny Embedding adapter + wire handler you can swap for LLM / Vector / Graph / Embedding
@@ -132,18 +145,18 @@ class HelloEmbeddingAdapter(BaseEmbeddingAdapter):
         *,
         ctx=None,
     ) -> BatchEmbedResult:
+        # Process all texts in batch for optimal performance
         embeddings = []
-        for t in spec.texts:
-            single = await self._do_embed(
-                EmbedSpec(
-                    text=t,
-                    model=spec.model,
-                    truncate=spec.truncate,
-                    normalize=False,
-                ),
-                ctx=ctx,
+        for text in spec.texts:
+            # Create vector directly without calling _do_embed
+            vec = [float(len(text))] + [0.0] * 7
+            embedding = EmbeddingVector(
+                vector=vec,
+                text=text,
+                model=spec.model,
+                dimensions=len(vec),
             )
-            embeddings.append(single.embedding)
+            embeddings.append(embedding)
 
         return BatchEmbedResult(
             embeddings=embeddings,
@@ -447,11 +460,7 @@ Before you ship:
 If all those are true, you're ready to plug into a production Corpus routing stack.
 
 ---
-## 9. What's Next?
-- **Deep dive**: See `IMPLEMENTATION.md` for production patterns, error handling, and advanced features
-- **Validation**: Run `make test-conformance` to verify your adapter
 
----
 **Maintainers:** Corpus SDK Team
 
 **Scope:** Adapter author quickstart — see `spec/IMPLEMENTATION.md`, `spec/BEHAVIORAL_CONFORMANCE.md`, and `spec/SCHEMA_CONFORMANCE.md` for full details.
