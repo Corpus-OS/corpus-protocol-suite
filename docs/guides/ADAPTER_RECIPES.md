@@ -1,7 +1,20 @@
-# Corpus Protocol (v1.0) — Adapter Recipes
+# Adapter Recipes
+
+**Table of Contents**
+- [0. How to Use This File](#0-how-to-use-this-file)
+- [1. LLM Adapter Recipes](#1-llm-adapter-recipes)
+- [2. Embedding Adapter Recipes](#2-embedding-adapter-recipes)
+- [3. Vector Adapter Recipes](#3-vector-adapter-recipes)
+- [4. Graph Adapter Recipes](#4-graph-adapter-recipes)
+- [5. Cross-Cutting Recipes](#5-cross-cutting-recipes)
+- [6. "Real-ish" Provider: Multiple Adapters, Shared Pieces](#6-real-ish-provider-multiple-adapters-shared-pieces)
+- [7. Choosing the Right Recipe](#7-choosing-the-right-recipe)
+- [8. Next Steps](#8-next-steps)
+
+---
 
 > **Goal:** Give adapter authors copy-pasteable patterns for real-world adapters.  
-> **Audience:** People who finished `Quickstart` and now want “how do I do X with my provider?”.
+> **Audience:** People who finished `Quickstart` and now want "how do I do X with my provider?".
 
 **Read these *also*:**
 
@@ -38,7 +51,7 @@ Conventions:
 ### 1.1 Minimal Non-Toy LLM Adapter
 
 **Scenario:** Wrap a single upstream LLM with basic completion + streaming.  
-**Good for:** “I just want this thing to talk Corpus ASAP.”
+**Good for:** "I just want this thing to talk Corpus ASAP."
 
 ```python
 # adapters/my_llm_adapter.py
@@ -251,7 +264,7 @@ class MyStreamingLLMAdapter(BaseLLMAdapter):
         )
 
     async def _do_complete(self, request, *, ctx=None) -> LLMCompletion:
-        # Simple “gather from streaming” implementation.
+        # Simple "gather from streaming" implementation.
         text_parts = []
         async for chunk in self._do_stream(request, ctx=ctx):
             text_parts.append(chunk.text)
@@ -857,13 +870,13 @@ class InMemoryVectorAdapter(BaseVectorAdapter):
         return {"ok": True, "server": "vector-in-memory", "version": "1.0.0"}
 ```
 
-Great for unit tests and CI; don’t use for serious workloads.
+Great for unit tests and CI; don't use for serious workloads.
 
 ---
 
 ### 3.2 Hosted Vector DB Wrapper (Shape)
 
-**Scenario:** You’re wrapping a real vector DB (Pinecone/Weaviate/pgvector-like).
+**Scenario:** You're wrapping a real vector DB (Pinecone/Weaviate/pgvector-like).
 **Pattern:** Namespace + capabilities enforcement.
 
 ```python
@@ -1311,7 +1324,7 @@ async def _do_embed(self, spec, *, ctx=None):
 
 ---
 
-## 6. “Real-ish” Provider: Multiple Adapters, Shared Pieces
+## 6. "Real-ish" Provider: Multiple Adapters, Shared Pieces
 
 **Suggested layout:**
 
@@ -1332,7 +1345,7 @@ adapters/
 
 Shared pieces:
 
-* `client.py` — base “AcmeClient” used by all adapters.
+* `client.py` — base "AcmeClient" used by all adapters.
 * `errors.py` — `map_error_llm`, `map_error_embedding`, etc.
 * `utils_time.py` — `timeout_from_ctx`.
 * `utils_retry.py` — safe retry wrapper.
@@ -1350,7 +1363,7 @@ Everything else (deadlines, metrics, circuit breaking, caching, envelopes) comes
 
 ## 7. Choosing the Right Recipe
 
-Quick “what do I start from?” table:
+Quick "what do I start from?" table:
 
 | Use case                            | Start with section             |
 | ----------------------------------- | ------------------------------ |
@@ -1369,7 +1382,7 @@ Quick “what do I start from?” table:
 
 ## 8. Next Steps
 
-Once you’ve cloned a recipe:
+Once you've cloned a recipe:
 
 1. Swap out the **provider client** and **error types** for your real ones.
 2. Make sure `capabilities()` truly matches what the provider can do.
@@ -1387,4 +1400,3 @@ Once you’ve cloned a recipe:
 **Scope:** Practical patterns for implementing adapters; see `IMPLEMENTATION.md`, `BEHAVIORAL_CONFORMANCE.md`, and `SCHEMA_CONFORMANCE.md` for normative details.
 
 ```
-
