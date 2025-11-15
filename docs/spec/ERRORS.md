@@ -19,8 +19,7 @@
 
 ---
 
-**Corpus Protocol Suite & SDKs — Normalized Error Taxonomy**  
-**errors_version:** `1.0`
+**Errors Version:** `1.0`
 
 > This document defines the **normalized error model** used across **Graph**, **LLM**, **Vector**, and **Embedding** adapters. It aligns with the Specification's Common Foundation (§6.3), Error Handling & Resilience (§12), and protocol-specific sections (§7.6 Graph health, §8.5 LLM, §9.5 Vector, §10.3 Embedding).  
 > It is **implementation-agnostic** and compatible with any transport (HTTP, gRPC, queues) and any observability backend.
