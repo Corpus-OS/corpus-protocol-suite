@@ -1,10 +1,4 @@
-# SCHEMA_CONFORMANCE.md
-
-**Corpus Protocol (v1.0) — Schema Conformance (Schema-Only)**  
-**Components:** LLM / Vector / Embedding / Graph  
-**JSON Schema Draft 2020-12**  
-**Test suites:** Schema Meta-Lint (tests/schema/) & Golden Wire Messages (tests/golden/)
-
+# SCHEMA CONFORMANCE
 ---
 
 ## Table of Contents
@@ -31,6 +25,11 @@
 - [Compliance Badge (Schema-Only)](#compliance-badge-schema-only)
 - [Maintenance](#maintenance)
 
+---
+**Corpus Protocol (v1.0) — Schema Conformance (Schema-Only)**  
+**Components:** LLM / Vector / Embedding / Graph  
+**JSON Schema Draft 2020-12**  
+**Test suites:** Schema Meta-Lint (tests/schema/) & Golden Wire Messages (tests/golden/)
 ---
 
 ## Overview
