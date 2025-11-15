@@ -1,4 +1,4 @@
-Conformance Guide
+# Conformance Guide
 
 > **Goal:** Help you get from “my adapter sort of works” to  
 > “this thing *provably* conforms to the Corpus Protocol v1.0 and is certifiable.”
