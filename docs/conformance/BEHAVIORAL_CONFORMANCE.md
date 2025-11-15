@@ -1,4 +1,4 @@
-# BEHAVIORAL_CONFORMANCE.md
+# BEHAVIORAL_CONFORMANCE
 
 > ✅ **Corpus Protocol (v1.0) — Behavioral Conformance (Runtime Semantics)**
 > Components: **LLM** • **Vector** • **Embedding** • **Graph**
