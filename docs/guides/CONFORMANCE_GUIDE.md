@@ -1,5 +1,21 @@
 # Conformance Guide
 
+**Table of Contents**
+- [1. What "Conformance" Means](#1-what-conformance-means)
+- [2. Conformance Surfaces at a Glance](#2-conformance-surfaces-at-a-glance)
+- [3. Running the Test Suites](#3-running-the-test-suites)
+- [4. Schema Conformance](#4-schema-conformance)
+- [5. Behavioral Conformance](#5-behavioral-conformance)
+- [6. Certification Levels and Thresholds](#6-certification-levels-and-thresholds)
+- [7. Debugging Failing Tests](#7-debugging-failing-tests)
+- [8. Hard Requirements vs. Flexibility](#8-hard-requirements-vs-flexibility)
+- [9. Integrating Conformance into Your Release Process](#9-integrating-conformance-into-your-release-process)
+- [10. Example Conformance Profiles](#10-example-conformance-profiles)
+- [11. FAQ and Troubleshooting](#11-faq-and-troubleshooting)
+- [12. Appendix](#12-appendix)
+
+---
+
 > **Goal:** Help you get from “my adapter sort of works” to  
 > “this thing *provably* conforms to the Corpus Protocol v1.0 and is certifiable.”
 
@@ -494,7 +510,7 @@ Key behaviors (not exhaustive):
     * Auth issues → `AUTH_ERROR`
     * Invalid parameters → `BAD_REQUEST`
     * Provider outages → `UNAVAILABLE`
-  * And that the “retryable vs non-retryable” dimension is consistent.
+  * And that the "retryable vs non-retryable" dimension is consistent.
 
 * **Deadlines & SIEM-safe context**
 
@@ -652,7 +668,7 @@ Key behaviors:
 
 * **Dialect & schema operations** (`test_dialect_validation.py`, `test_schema_operations.py`)
 
-  * Unsupported dialects → canonical “not supported” error.
+  * Unsupported dialects → canonical "not supported" error.
   * Schema operations behave predictably and idempotently.
 
 * **CRUD fundamentals** (`test_crud_basic.py`)
@@ -672,7 +688,7 @@ Cross-cutting behavior is validated via the per-protocol tests plus:
 * `test_context_siem.py` in each protocol:
 
   * Ensures tenant IDs are hashed.
-  * Ensures logs/metrics don’t leak full texts or embeddings where they shouldn’t.
+  * Ensures logs/metrics don't leak full texts or embeddings where they shouldn't.
 
 * `test_error_mapping_retryable.py` in each protocol:
 
@@ -751,7 +767,7 @@ Tests fall into buckets:
 * **Normative / stable**
 
   * Tied directly to MUST / MUST NOT sections of `SPECIFICATION.md`, `SCHEMA_CONFORMANCE.md`, `BEHAVIORAL_CONFORMANCE.md`.
-  * These don’t change behaviorally within a major protocol version.
+  * These don't change behaviorally within a major protocol version.
 
 * **Advisory / experimental**
 
@@ -785,7 +801,7 @@ pytest tests/embedding/test_truncation_and_text_length.py::test_truncate_true_se
 
 1. **Schema mismatch**
 
-   * Shapes don’t match what `test_golden_samples.py` or `test_schema_lint.py` expect.
+   * Shapes don't match what `test_golden_samples.py` or `test_schema_lint.py` expect.
    * Fix your DTO / serializer to align with the schema.
 
 2. **Wrong error code or class**
@@ -895,7 +911,7 @@ Strongly recommended but more flexible:
 * Implement robust **standalone** protections if you bypass defaults.
 * Expose richer **health** payloads for observability.
 
-Some of these are enforced, but may “only” affect Silver/Development vs Platinum.
+Some of these are enforced, but may "only" affect Silver/Development vs Platinum.
 
 ### 8.3 Versioning and Compatibility
 
@@ -1045,11 +1061,11 @@ Certification:
 
 ## 11. FAQ and Troubleshooting
 
-**Q: Do I need to pass *all* tests to be “conformant”?**
+**Q: Do I need to pass *all* tests to be "conformant"?**
 A: For **full (Platinum-style) conformance** for a protocol: effectively yes, for all normative tests in that protocol and schema/golden. Lower levels (Silver/Development) allow gaps; see `CERTIFICATION.md`.
 
 **Q: Can I skip schema tests if I only use the official SDK?**
-A: No. Schema tests validate the **wire contract**, which still matters even if you’re using the SDK. They also catch configuration/customization mistakes.
+A: No. Schema tests validate the **wire contract**, which still matters even if you're using the SDK. They also catch configuration/customization mistakes.
 
 **Q: Why are streaming tests so picky?**
 A: Routers and clients rely on precise streaming semantics for resource cleanup and backpressure. Leaky or mis-ordered streams cause real production issues.
