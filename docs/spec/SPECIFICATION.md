@@ -367,34 +367,34 @@ Adapters MAY support one or more transports and SHOULD advertise:
 
 The following values of `op` are reserved for V1.0:
 
-| Section / Operation      | `op` String               |
-| ------------------------ | ------------------------- |
-| 7.3.1 `create_vertex`    | `graph.create_vertex`     |
-| 7.3.1 `delete_vertex`    | `graph.delete_vertex`     |
-| 7.3.1 `create_edge`      | `graph.create_edge`       |
-| 7.3.1 `delete_edge`      | `graph.delete_edge`       |
-| 7.3.2 `query`            | `graph.query`             |
-| 7.3.2 `stream_query`     | `graph.stream_query`      |
-| 7.3.3 `bulk_vertices`    | `graph.bulk_vertices`     |
-| 7.3.3 `batch`            | `graph.batch`             |
-| 7.5   `create_index`     | `graph.create_index`      |
-| 7.5   `drop_index`       | `graph.drop_index`        |
-| 7.6   `health`           | `graph.health`            |
-| 8.3   `complete`         | `llm.complete`            |
-| 8.3   `stream`           | `llm.stream`              |
-| 8.3   `count_tokens`     | `llm.count_tokens`        |
-| 8.4   `capabilities`     | `llm.capabilities`        |
-| 9.3   `query`            | `vector.query`            |
-| 9.3   `upsert`           | `vector.upsert`           |
-| 9.3   `delete`           | `vector.delete`           |
-| 9.3   `create_namespace` | `vector.create_namespace` |
-| 9.3   `delete_namespace` | `vector.delete_namespace` |
-| 9.3   `capabilities`     | `vector.capabilities`     |
-| 10.3  `capabilities`     | `embedding.capabilities`  |
-| 10.3  `embed`            | `embedding.embed`         |
-| 10.3  `embed_batch`      | `embedding.embed_batch`   |
-| 10.3  `count_tokens`     | `embedding.count_tokens`  |
-| 10.3  `health`           | `embedding.health`        |
+| Section Number | Operation Name (from 1st table) | op String (from 2nd table) | Protocol |
+|---|---|---|---|
+| 7.3.1 | upsert_nodes | graph.upsert_nodes | Graph |
+| 7.3.1 | delete_nodes | graph.delete_nodes | Graph |
+| 7.3.1 | upsert_edges | graph.upsert_edges | Graph |
+| 7.3.1 | delete_edges | graph.delete_edges | Graph |
+| 7.3.2 | query | graph.query | Graph |
+| 7.3.2 | stream_query | graph.stream_query | Graph |
+| 7.3.3 | bulk_vertices | graph.bulk_vertices | Graph |
+| 7.3.3 | batch | graph.batch | Graph |
+| 7.5 | get_schema | graph.get_schema | Graph |
+| 7.5 | capabilities | graph.capabilities | Graph |
+| 7.6 | health | graph.health | Graph |
+| 8.3 | complete | llm.complete | LLM |
+| 8.3 | stream | llm.stream | LLM |
+| 8.3 | count_tokens | llm.count_tokens | LLM |
+| 8.4 | capabilities | llm.capabilities | LLM |
+| 9.3 | query | vector.query | Vector |
+| 9.3 | upsert | vector.upsert | Vector |
+| 9.3 | delete | vector.delete | Vector |
+| 9.3 | create_namespace | vector.create_namespace | Vector |
+| 9.3 | delete_namespace | vector.delete_namespace | Vector |
+| 9.3 | capabilities | vector.capabilities | Vector |
+| 10.3 | capabilities | embedding.capabilities | Embedding |
+| 10.3 | embed | embedding.embed | Embedding |
+| 10.3 | embed_batch | embedding.embed_batch | Embedding |
+| 10.3 | count_tokens | embedding.count_tokens | Embedding |
+| 10.3 | health | embedding.health | Embedding |
 
 Adapters MAY expose additional `op` values via namespaced extensions (e.g. `vendorX.llm.complete_raw`) but MUST NOT alter semantics of reserved `op` strings.
 
