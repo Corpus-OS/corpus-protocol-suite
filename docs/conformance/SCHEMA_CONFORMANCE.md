@@ -25,7 +25,7 @@
 - [Maintenance](#maintenance)
 ---
 
-**Corpus Protocol:(v1.0)** — Schema Conformance **  
+**Corpus Protocol(v1.0)** — Schema Conformance **  
 **Components:** LLM / Vector / Embedding / Graph  
 **JSON Schema Draft 2020-12**  
 **Test suites:** Schema Meta-Lint (tests/schema/) & Golden Wire Messages (tests/golden/)
