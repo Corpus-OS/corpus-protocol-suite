@@ -1,4 +1,4 @@
-# Corpus SDK Specification
+# Corpus Protocol Suite Specification
 
 ## Abstract
 
@@ -53,7 +53,7 @@ SPDX-License-Identifier: Apache-2.0
   * [7.2. Data Types](#72-data-types)
   * [7.3. Operations](#73-operations)
 
-    * [7.3.1. Vertex/Edge CRUD](#731-vertexedge-crud)
+    * [7.3.1. Node/Edge CRUD](#731-nodeedge-crud)
     * [7.3.2. Queries](#732-queries)
 
       * [Streaming Finalization (Normative)](#streaming-finalization-normative)
@@ -133,7 +133,7 @@ SPDX-License-Identifier: Apache-2.0
 
   * [20.1. Normative References](#201-normative-references)
   * [20.2. Informative References](#202-informative-references)
-* [21. Author’s Address](#21-authors-address)
+* [21. Author's Address](#21-authors-address)
 * [Appendix A — End-to-End Example (Normative)](#appendix-a--end-to-end-example-normative)
 * [Appendix B — Capability Shapes (Illustrative)](#appendix-b--capability-shapes-illustrative)
 * [Appendix C — Wire-Level Envelopes](#appendix-c--wire-level-envelopes)
@@ -154,7 +154,7 @@ The proliferation of AI infrastructure has created a fragmented landscape of pro
 
 This specification defines four complementary protocols:
 
-* **Graph Protocol V1.0** — Vertex/edge CRUD, traversal, and multi-dialect query execution.
+* **Graph Protocol V1.0** — Node/edge CRUD, traversal, and multi-dialect query execution.
 * **LLM Protocol V1.0** — Chat-style completion, streaming tokens, usage accounting.
 * **Vector Protocol V1.0** — Vector upsert/delete, similarity search, and namespace management.
 * **Embedding Protocol V1.0** — Text embedding generation (single/batch), token counting, capability discovery, and health reporting.
@@ -174,7 +174,7 @@ All protocols share a **Common Foundation** for context propagation, capability 
 
 ## 2. Requirements Language
 
-The key words “MUST”, “MUST NOT”, “REQUIRED”, “SHALL”, “SHALL NOT”, “SHOULD”, “SHOULD NOT”, “RECOMMENDED”, “NOT RECOMMENDED”, “MAY”, and “OPTIONAL” in this document are to be interpreted as described in BCP 14 [RFC2119] [RFC8174] when, and only when, they appear in all capitals.
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC2119] [RFC8174] when, and only when, they appear in all capitals.
 
 ---
 
@@ -656,33 +656,29 @@ class GraphCapabilities:
 
 ### 7.3. Operations
 
-#### 7.3.1. Vertex/Edge CRUD
+#### 7.3.1. Node/Edge CRUD
 
 ```python
-async def create_vertex(
-    label: str,
-    props: Mapping[str, Any],
+async def upsert_nodes(
+    nodes: Iterable[Tuple[str, Mapping[str, Any]]],
     *,
     ctx: Optional[OperationContext] = None
-) -> GraphID
+) -> List[GraphID]
 
-async def delete_vertex(
-    vertex_id: GraphID,
+async def delete_nodes(
+    node_ids: List[GraphID],
     *,
     ctx: Optional[OperationContext] = None
 ) -> None
 
-async def create_edge(
-    label: str,
-    from_id: GraphID,
-    to_id: GraphID,
-    props: Mapping[str, Any],
+async def upsert_edges(
+    edges: Iterable[Tuple[str, GraphID, GraphID, Mapping[str, Any]]],
     *,
     ctx: Optional[OperationContext] = None
-) -> GraphID
+) -> List[GraphID]
 
-async def delete_edge(
-    edge_id: GraphID,
+async def delete_edges(
+    edge_ids: List[GraphID],
     *,
     ctx: Optional[OperationContext] = None
 ) -> None
@@ -1378,7 +1374,7 @@ Requirements:
 
 ### 12.6. Backpressure Integration
 
-Implementations SHOULD integrate cooperative backpressure. On saturation, surface `ResourceExhausted` or `Unavailable` following this spec’s hints.
+Implementations SHOULD integrate cooperative backpressure. On saturation, surface `ResourceExhausted` or `Unavailable` following this spec's hints.
 
 ---
 
@@ -1617,7 +1613,7 @@ No IANA actions are required.
 
 ---
 
-## 21. Author’s Address
+## 21. Author's Address
 
 Corpus Working Group
 Email: [standards@adaptersdk.org](mailto:standards@adaptersdk.org)
