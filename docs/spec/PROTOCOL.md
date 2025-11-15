@@ -40,7 +40,7 @@
 ---
 
 **Detailed Protocol Specification for Graph, LLM, Vector, and Embedding Adapters**  
-**protocols_version:** `1.0`
+**Protocol Version:** `1.0`
 
 > This document defines the unified protocol specification for all Corpus adapters. It establishes the normative behavior, types, and semantics for Graph, LLM, Vector, and Embedding protocols while maintaining cross-protocol consistency.
 
