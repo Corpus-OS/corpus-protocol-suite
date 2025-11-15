@@ -109,6 +109,7 @@ import time
 import hashlib
 import math
 import logging
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, asdict
 from typing import (
     Any,
@@ -336,10 +337,10 @@ class OperationContext:
     deadline_ms: Optional[int] = None
     traceparent: Optional[str] = None
     tenant: Optional[str] = None
-    attrs: Mapping[str, Any] = None
+    attrs: Optional[Mapping[str, Any]] = None
 
     def __post_init__(self) -> None:
-        """Ensure attrs is always a valid dictionary."""
+        """Ensure attrs is always a valid dictionary at runtime."""
         if self.attrs is None:
             object.__setattr__(self, "attrs", {})
 
@@ -573,7 +574,8 @@ class InMemoryTTLCache:
     """
     Tiny in-memory cache with TTL. Suitable for demos/tests only.
 
-    Not process-safe or distributed.
+    Not thread-safe, process-safe, or distributed. Intended only for
+    single-process, single-threaded development and test usage.
     """
     def __init__(self) -> None:
         self._store: Dict[str, Tuple[float, Any]] = {}
@@ -1048,9 +1050,17 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
             raise DeadlineExceeded("deadline already exceeded")
 
     @staticmethod
+    def _format_cache_key(prefix: str, *parts: str) -> str:
+        """
+        Helper to build cache keys in a consistent way while preserving
+        existing key formats.
+        """
+        return prefix + "".join(parts)
+
+    @staticmethod
     def _caps_cache_key() -> str:
         """Cache key for capabilities() when cached."""
-        return "embedding:capabilities"
+        return BaseEmbeddingAdapter._format_cache_key("embedding:capabilities")
 
     def _embed_cache_key(
         self,
@@ -1067,13 +1077,27 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         """
         digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
         tenant_hash = self._tenant_hash(ctx.tenant) if ctx and ctx.tenant else "global"
-        return (
-            f"embedding:embed:"
-            f"tenant={tenant_hash}:"
-            f"model={model}:"
-            f"norm={int(normalize)}:"
-            f"text={digest}"
+        return self._format_cache_key(
+            "embedding:embed:",
+            f"tenant={tenant_hash}:",
+            f"model={model}:",
+            f"norm={int(normalize)}:",
+            f"text={digest}",
         )
+
+    @asynccontextmanager
+    async def _rate_limited(self):
+        """
+        Async context manager to wrap an operation with rate limiting.
+
+        Ensures that acquire/release semantics remain correct even in the
+        presence of exceptions, while keeping the main call site readable.
+        """
+        await self._limiter.acquire()
+        try:
+            yield
+        finally:
+            self._limiter.release()
 
     async def _with_gates_unary(
         self,
@@ -1100,48 +1124,44 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         if not self._breaker.allow():
             raise Unavailable("circuit open")
 
-        # Rate limit acquire
-        await self._limiter.acquire()
-
-        t0 = time.monotonic()
-        try:
-            result = await self._apply_deadline(call_coro, ctx)
-            self._record(
-                op,
-                t0,
-                True,
-                ctx=ctx,
-                **(metric_extra or {}),
-            )
-            self._breaker.on_success()
-            return result
-        except EmbeddingAdapterError as e:
-            code = e.code or type(e).__name__
-            extra = dict(error_extra or {})
-            self._record(
-                op,
-                t0,
-                False,
-                code=code,
-                ctx=ctx,
-                **extra,
-            )
-            self._breaker.on_error(e)
-            raise
-        except Exception as e:
-            extra = dict(error_extra or {})
-            self._record(
-                op,
-                t0,
-                False,
-                code="UnhandledException",
-                ctx=ctx,
-                **extra,
-            )
-            self._breaker.on_error(e)
-            raise
-        finally:
-            self._limiter.release()
+        async with self._rate_limited():
+            t0 = time.monotonic()
+            try:
+                result = await self._apply_deadline(call_coro, ctx)
+                self._record(
+                    op,
+                    t0,
+                    True,
+                    ctx=ctx,
+                    **(metric_extra or {}),
+                )
+                self._breaker.on_success()
+                return result
+            except EmbeddingAdapterError as e:
+                code = e.code or type(e).__name__
+                extra = dict(error_extra or {})
+                self._record(
+                    op,
+                    t0,
+                    False,
+                    code=code,
+                    ctx=ctx,
+                    **extra,
+                )
+                self._breaker.on_error(e)
+                raise
+            except Exception as e:
+                extra = dict(error_extra or {})
+                self._record(
+                    op,
+                    t0,
+                    False,
+                    code="UnhandledException",
+                    ctx=ctx,
+                    **extra,
+                )
+                self._breaker.on_error(e)
+                raise
 
     # --- public APIs (use helpers + backend hooks) ---
 
@@ -1189,6 +1209,103 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
             self._record("capabilities", t0, False, code="UNAVAILABLE")
             raise Unavailable("capabilities fetch failed") from e
 
+    async def _embed_core(
+        self,
+        spec: EmbedSpec,
+        ctx: Optional[OperationContext],
+    ) -> EmbedResult:
+        """
+        Core implementation of embed() separated for easier testing and
+        reuse from the gated public method.
+        """
+        # Capabilities for validation and limits.
+        caps = await self._do_capabilities()
+        if spec.model not in caps.supported_models:
+            raise ModelNotAvailable(f"Model '{spec.model}' is not supported")
+
+        # Deterministic truncation if needed.
+        text = spec.text
+        truncated = False
+        if caps.max_text_length:
+            text, truncated = self._trunc.apply(
+                text,
+                caps.max_text_length,
+                spec.truncate,
+            )
+
+        eff_spec = EmbedSpec(
+            text=text,
+            model=spec.model,
+            truncate=spec.truncate,
+            normalize=spec.normalize,
+        )
+
+        # Optional cache: isolated per tenant via _embed_cache_key.
+        result: Optional[EmbedResult] = None
+        cache_key: Optional[str] = None
+        if isinstance(self._cache, InMemoryTTLCache):
+            cache_key = self._embed_cache_key(
+                eff_spec.model,
+                eff_spec.normalize,
+                eff_spec.text,
+                ctx,
+            )
+            cached = await self._cache.get(cache_key)
+            if cached:
+                self._metrics.counter(
+                    component=self._component,
+                    name="cache_hits",
+                    value=1,
+                    extra={"op": "embed"},
+                )
+                result = cached
+
+        if result is None:
+            # Provider-specific embed.
+            result = await self._do_embed(eff_spec, ctx=ctx)
+
+            # Post-processing: normalization if requested and not handled at source.
+            if eff_spec.normalize:
+                if not caps.supports_normalization:
+                    raise NotSupported("normalization not supported for this adapter")
+                if not caps.normalizes_at_source:
+                    vec = self._norm.normalize(result.embedding.vector)
+                    result.embedding = EmbeddingVector(
+                        vector=vec,
+                        text=result.text,
+                        model=result.model,
+                        dimensions=len(vec),
+                    )
+
+            # Mark truncation result flag.
+            result.truncated = bool(truncated)
+
+            # Cache set (best-effort).
+            if cache_key is not None:
+                try:
+                    await self._cache.set(
+                        cache_key,
+                        result,
+                        ttl_s=self._cache_embed_ttl_s,
+                    )
+                except Exception:
+                    pass
+
+        # Per-op counters.
+        self._metrics.counter(
+            component=self._component,
+            name="texts_embedded",
+            value=1,
+        )
+        if result.tokens_used is not None:
+            self._metrics.counter(
+                component=self._component,
+                name="tokens_processed",
+                value=int(result.tokens_used),
+            )
+
+        return result
+
     async def embed(
         self,
         spec: EmbedSpec,
@@ -1203,95 +1320,6 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         self._require_non_empty("text", spec.text)
         self._require_non_empty("model", spec.model)
 
-        async def _run() -> EmbedResult:
-            # Capabilities for validation and limits.
-            caps = await self._do_capabilities()
-            if spec.model not in caps.supported_models:
-                raise ModelNotAvailable(f"Model '{spec.model}' is not supported")
-
-            # Deterministic truncation if needed.
-            text = spec.text
-            truncated = False
-            if caps.max_text_length:
-                text, truncated = self._trunc.apply(
-                    text,
-                    caps.max_text_length,
-                    spec.truncate,
-                )
-
-            eff_spec = EmbedSpec(
-                text=text,
-                model=spec.model,
-                truncate=spec.truncate,
-                normalize=spec.normalize,
-            )
-
-            # Optional cache: isolated per tenant via _embed_cache_key.
-            result: Optional[EmbedResult] = None
-            cache_key: Optional[str] = None
-            if isinstance(self._cache, InMemoryTTLCache):
-                cache_key = self._embed_cache_key(
-                    eff_spec.model,
-                    eff_spec.normalize,
-                    eff_spec.text,
-                    ctx,
-                )
-                cached = await self._cache.get(cache_key)
-                if cached:
-                    self._metrics.counter(
-                        component=self._component,
-                        name="cache_hits",
-                        value=1,
-                        extra={"op": "embed"},
-                    )
-                    result = cached
-
-            if result is None:
-                # Provider-specific embed.
-                result = await self._do_embed(eff_spec, ctx=ctx)
-
-                # Post-processing: normalization if requested and not handled at source.
-                if eff_spec.normalize:
-                    if not caps.supports_normalization:
-                        raise NotSupported("normalization not supported for this adapter")
-                    if not caps.normalizes_at_source:
-                        vec = self._norm.normalize(result.embedding.vector)
-                        result.embedding = EmbeddingVector(
-                            vector=vec,
-                            text=result.text,
-                            model=result.model,
-                            dimensions=len(vec),
-                        )
-
-                # Mark truncation result flag.
-                result.truncated = bool(truncated)
-
-                # Cache set (best-effort).
-                if cache_key is not None:
-                    try:
-                        await self._cache.set(
-                            cache_key,
-                            result,
-                            ttl_s=self._cache_embed_ttl_s,
-                        )
-                    except Exception:
-                        pass
-
-            # Per-op counters.
-            self._metrics.counter(
-                component=self._component,
-                name="texts_embedded",
-                value=1,
-            )
-            if result.tokens_used is not None:
-                self._metrics.counter(
-                    component=self._component,
-                    name="tokens_processed",
-                    value=int(result.tokens_used),
-                )
-
-            return result
-
         metric_extra: Dict[str, Any] = {}
         error_extra: Dict[str, Any] = {}
 
@@ -1304,10 +1332,184 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         return await self._with_gates_unary(
             op="embed",
             ctx=ctx,
-            call_coro=_run(),
+            call_coro=self._embed_core(spec, ctx),
             metric_extra=metric_extra,
             error_extra=error_extra,
         )
+
+    def _validate_and_prepare_batch_spec(
+        self,
+        spec: BatchEmbedSpec,
+        caps: EmbeddingCapabilities,
+    ) -> BatchEmbedSpec:
+        """
+        Validate the incoming BatchEmbedSpec against capabilities and apply
+        deterministic truncation, returning an effective spec for execution.
+        """
+        if spec.model not in caps.supported_models:
+            raise ModelNotAvailable(f"Model '{spec.model}' is not supported")
+
+        if caps.max_batch_size and len(spec.texts) > caps.max_batch_size:
+            raise BadRequest(
+                f"Batch size {len(spec.texts)} exceeds maximum of {caps.max_batch_size}",
+                details={"max_batch_size": caps.max_batch_size},
+            )
+
+        eff_texts: List[str] = []
+        for text in spec.texts:
+            self._require_non_empty("text", text)
+            if caps.max_text_length:
+                new_text, _ = self._trunc.apply(
+                    text,
+                    caps.max_text_length,
+                    spec.truncate,
+                )
+                eff_texts.append(new_text)
+            else:
+                eff_texts.append(text)
+
+        return BatchEmbedSpec(
+            texts=eff_texts,
+            model=spec.model,
+            truncate=spec.truncate,
+            normalize=spec.normalize,
+        )
+
+    async def _fallback_embed_batch_per_item(
+        self,
+        eff_spec: BatchEmbedSpec,
+        caps: EmbeddingCapabilities,
+        ctx: Optional[OperationContext],
+        total_texts: int,
+    ) -> BatchEmbedResult:
+        """
+        Fallback implementation for batch embedding when provider-level
+        batching is not supported. Preserves partial success semantics.
+
+        Uses asyncio.gather() to run per-text embeddings concurrently while
+        still returning results in input order and maintaining the same
+        failure structure as the sequential implementation.
+        """
+
+        async def _embed_one(idx: int, text: str):
+            try:
+                single_spec = EmbedSpec(
+                    text=text,
+                    model=eff_spec.model,
+                    truncate=eff_spec.truncate,
+                    normalize=False,  # normalization applied uniformly below
+                )
+                single = await self._do_embed(single_spec, ctx=ctx)
+                ev = single.embedding
+
+                if eff_spec.normalize:
+                    if not caps.supports_normalization:
+                        raise NotSupported(
+                            "normalization not supported for this adapter"
+                        )
+                    if not caps.normalizes_at_source:
+                        vec = self._norm.normalize(ev.vector)
+                        ev = EmbeddingVector(
+                            vector=vec,
+                            text=ev.text,
+                            model=ev.model,
+                            dimensions=len(vec),
+                        )
+
+                return idx, ev, None
+            except EmbeddingAdapterError as item_err:
+                return idx, None, {
+                    "index": idx,
+                    "text": text,
+                    "error": type(item_err).__name__,
+                    "code": item_err.code or type(item_err).__name__,
+                    "message": item_err.message,
+                }
+            except Exception as item_err:
+                return idx, None, {
+                    "index": idx,
+                    "text": text,
+                    "error": type(item_err).__name__,
+                    "code": "UNAVAILABLE",
+                    "message": str(item_err) or "internal error",
+                }
+
+        tasks = [
+            _embed_one(idx, text) for idx, text in enumerate(eff_spec.texts)
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=False)
+
+        embeddings: List[EmbeddingVector] = []
+        failed: List[Dict[str, Any]] = []
+
+        # Results are in the same order as the tasks list (input order).
+        for idx, ev, error_info in results:
+            if error_info is None:
+                embeddings.append(ev)
+            else:
+                failed.append(error_info)
+
+        return BatchEmbedResult(
+            embeddings=embeddings,
+            model=eff_spec.model,
+            total_texts=total_texts,
+            total_tokens=None,
+            failed_texts=failed,
+        )
+
+    async def _embed_batch_core(
+        self,
+        spec: BatchEmbedSpec,
+        ctx: Optional[OperationContext],
+    ) -> BatchEmbedResult:
+        """
+        Core implementation of embed_batch() separated for easier testing and
+        reuse from the gated public method.
+        """
+        caps = await self._do_capabilities()
+        eff_spec = self._validate_and_prepare_batch_spec(spec, caps)
+
+        try:
+            # Primary path: provider-specific batch implementation.
+            result = await self._do_embed_batch(eff_spec, ctx=ctx)
+        except NotSupported:
+            # Fallback path: partial-success aware per-item embedding.
+            result = await self._fallback_embed_batch_per_item(
+                eff_spec,
+                caps,
+                ctx,
+                total_texts=len(spec.texts),
+            )
+
+        # Post-processing: normalization if requested and not handled at source,
+        # for providers that implement _do_embed_batch directly.
+        if eff_spec.normalize:
+            if not caps.supports_normalization:
+                raise NotSupported("normalization not supported for this adapter")
+            if not caps.normalizes_at_source:
+                for i, ev in enumerate(result.embeddings):
+                    vec = self._norm.normalize(ev.vector)
+                    result.embeddings[i] = EmbeddingVector(
+                        vector=vec,
+                        text=ev.text,
+                        model=ev.model,
+                        dimensions=len(vec),
+                    )
+
+        # Per-op counters.
+        self._metrics.counter(
+            component=self._component,
+            name="texts_embedded",
+            value=len(result.embeddings),
+        )
+        if result.total_tokens is not None:
+            self._metrics.counter(
+                component=self._component,
+                name="tokens_processed",
+                value=int(result.total_tokens),
+            )
+
+        return result
 
     async def embed_batch(
         self,
@@ -1327,131 +1529,6 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         if not spec.texts:
             raise BadRequest("texts must not be empty")
 
-        async def _run() -> BatchEmbedResult:
-            caps = await self._do_capabilities()
-            if spec.model not in caps.supported_models:
-                raise ModelNotAvailable(f"Model '{spec.model}' is not supported")
-
-            if caps.max_batch_size and len(spec.texts) > caps.max_batch_size:
-                raise BadRequest(
-                    f"Batch size {len(spec.texts)} exceeds maximum of {caps.max_batch_size}",
-                    details={"max_batch_size": caps.max_batch_size},
-                )
-
-            # Validate and possibly truncate each text deterministically.
-            eff_texts: List[str] = []
-            for text in spec.texts:
-                self._require_non_empty("text", text)
-                if caps.max_text_length:
-                    new_text, _ = self._trunc.apply(
-                        text,
-                        caps.max_text_length,
-                        spec.truncate,
-                    )
-                    eff_texts.append(new_text)
-                else:
-                    eff_texts.append(text)
-
-            eff_spec = BatchEmbedSpec(
-                texts=eff_texts,
-                model=spec.model,
-                truncate=spec.truncate,
-                normalize=spec.normalize,
-            )
-
-            try:
-                # Primary path: provider-specific batch implementation.
-                result = await self._do_embed_batch(eff_spec, ctx=ctx)
-            except NotSupported:
-                # Fallback path: partial-success aware per-item embedding.
-                embeddings: List[EmbeddingVector] = []
-                failed: List[Dict[str, Any]] = []
-
-                for idx, text in enumerate(eff_spec.texts):
-                    try:
-                        single_spec = EmbedSpec(
-                            text=text,
-                            model=eff_spec.model,
-                            truncate=eff_spec.truncate,
-                            normalize=False,  # normalization applied uniformly below
-                        )
-                        single = await self._do_embed(single_spec, ctx=ctx)
-                        ev = single.embedding
-
-                        if eff_spec.normalize:
-                            if not caps.supports_normalization:
-                                raise NotSupported(
-                                    "normalization not supported for this adapter"
-                                )
-                            if not caps.normalizes_at_source:
-                                vec = self._norm.normalize(ev.vector)
-                                ev = EmbeddingVector(
-                                    vector=vec,
-                                    text=ev.text,
-                                    model=ev.model,
-                                    dimensions=len(vec),
-                                )
-
-                        embeddings.append(ev)
-                    except EmbeddingAdapterError as item_err:
-                        failed.append(
-                            {
-                                "index": idx,
-                                "text": text,
-                                "error": type(item_err).__name__,
-                                "code": item_err.code or type(item_err).__name__,
-                                "message": item_err.message,
-                            }
-                        )
-                    except Exception as item_err:
-                        failed.append(
-                            {
-                                "index": idx,
-                                "text": text,
-                                "error": type(item_err).__name__,
-                                "code": "UNAVAILABLE",
-                                "message": str(item_err) or "internal error",
-                            }
-                        )
-
-                result = BatchEmbedResult(
-                    embeddings=embeddings,
-                    model=eff_spec.model,
-                    total_texts=len(spec.texts),
-                    total_tokens=None,
-                    failed_texts=failed,
-                )
-
-            # Post-processing: normalization if requested and not handled at source,
-            # for providers that implement _do_embed_batch directly.
-            if eff_spec.normalize:
-                if not caps.supports_normalization:
-                    raise NotSupported("normalization not supported for this adapter")
-                if not caps.normalizes_at_source:
-                    for i, ev in enumerate(result.embeddings):
-                        vec = self._norm.normalize(ev.vector)
-                        result.embeddings[i] = EmbeddingVector(
-                            vector=vec,
-                            text=ev.text,
-                            model=ev.model,
-                            dimensions=len(vec),
-                        )
-
-            # Per-op counters.
-            self._metrics.counter(
-                component=self._component,
-                name="texts_embedded",
-                value=len(result.embeddings),
-            )
-            if result.total_tokens is not None:
-                self._metrics.counter(
-                    component=self._component,
-                    name="tokens_processed",
-                    value=int(result.total_tokens),
-                )
-
-            return result
-
         metric_extra: Dict[str, Any] = {
             "batch_size": len(spec.texts),
         }
@@ -1468,10 +1545,26 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         return await self._with_gates_unary(
             op="embed_batch",
             ctx=ctx,
-            call_coro=_run(),
+            call_coro=self._embed_batch_core(spec, ctx),
             metric_extra=metric_extra,
             error_extra=error_extra,
         )
+
+    async def _count_tokens_core(
+        self,
+        text: str,
+        model: str,
+        ctx: Optional[OperationContext],
+    ) -> int:
+        """
+        Core implementation of count_tokens() separated for easier testing.
+        """
+        caps = await self._do_capabilities()
+        if model not in caps.supported_models:
+            raise ModelNotAvailable(f"Model '{model}' is not supported")
+        if not caps.supports_token_counting:
+            raise NotSupported("count_tokens is not supported by this adapter")
+        return await self._do_count_tokens(text, model, ctx=ctx)
 
     async def count_tokens(
         self,
@@ -1488,14 +1581,6 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
             raise BadRequest("text must be a string")
         self._require_non_empty("model", model)
 
-        async def _run() -> int:
-            caps = await self._do_capabilities()
-            if model not in caps.supported_models:
-                raise ModelNotAvailable(f"Model '{model}' is not supported")
-            if not caps.supports_token_counting:
-                raise NotSupported("count_tokens is not supported by this adapter")
-            return await self._do_count_tokens(text, model, ctx=ctx)
-
         metric_extra: Dict[str, Any] = {
             "text_length": len(text),
         }
@@ -1510,7 +1595,7 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         result = await self._with_gates_unary(
             op="count_tokens",
             ctx=ctx,
-            call_coro=_run(),
+            call_coro=self._count_tokens_core(text, model, ctx),
             metric_extra=metric_extra,
             error_extra=error_extra,
         )
@@ -1523,26 +1608,31 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         )
         return int(result)
 
+    async def _health_core(
+        self,
+        ctx: Optional[OperationContext],
+    ) -> Dict[str, Any]:
+        """
+        Core implementation of health() separated for easier testing.
+        """
+        h = await self._do_health(ctx=ctx)
+        return {
+            "ok": bool(h.get("ok", True)),
+            "server": str(h.get("server", "")),
+            "version": str(h.get("version", "")),
+            "models": h.get("models", {}),
+        }
+
     async def health(self, *, ctx: Optional[OperationContext] = None) -> Dict[str, Any]:
         """
         Check health status with metrics instrumentation.
 
         Returns a small mapping; unknown keys from backends are informational only.
         """
-
-        async def _run() -> Dict[str, Any]:
-            h = await self._do_health(ctx=ctx)
-            return {
-                "ok": bool(h.get("ok", True)),
-                "server": str(h.get("server", "")),
-                "version": str(h.get("version", "")),
-                "models": h.get("models", {}),
-            }
-
         return await self._with_gates_unary(
             op="health",
             ctx=ctx,
-            call_coro=_run(),
+            call_coro=self._health_core(ctx),
         )
 
     # --- async context manager (resource cleanup hook) ---
