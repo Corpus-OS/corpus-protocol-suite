@@ -447,6 +447,10 @@ Before you ship:
 If all those are true, you're ready to plug into a production Corpus routing stack.
 
 ---
+## 9. What's Next?
+- **Deep dive**: See `IMPLEMENTATION.md` for production patterns, error handling, and advanced features
+- **Validation**: Run `make test-conformance` to verify your adapter
 
+---
 **Maintainers:** Corpus SDK Team
 **Scope:** Adapter author quickstart — see `spec/IMPLEMENTATION.md`, `spec/BEHAVIORAL_CONFORMANCE.md`, and `spec/SCHEMA_CONFORMANCE.md` for full details.
