@@ -1,12 +1,29 @@
 # ERRORS.md
 
+**Table of Contents**
+- [0) Goals & Non-Goals](#0-goals--non-goals)
+- [1) Normalized Error Classes (Canonical)](#1-normalized-error-classes-canonical)
+- [2) Programmatic Error Envelope (Wire-Level)](#2-programmatic-error-envelope-wire-level)
+- [3) Transport Mappings](#3-transport-mappings)
+- [4) Retry Semantics (Normative)](#4-retry-semantics-normative)
+- [5) Observability & Privacy (SIEM-Safe)](#5-observability--privacy-siem-safe)
+- [6) Protocol-Specific Supplements (Full Detail)](#6-protocol-specific-supplements-full-detail)
+- [7) Error Hints (Machine-Readable Mitigations)](#7-error-hints-machine-readable-mitigations)
+- [8) Normalization Rules (Adapter Implementations)](#8-normalization-rules-adapter-implementations)
+- [9) Client Backoff & Breaker Guidance](#9-client-backoff--breaker-guidance)
+- [10) Partial Failure (Batches)](#10-partial-failure-batches)
+- [11) Examples (Per Protocol)](#11-examples-per-protocol)
+- [12) Versioning & Deprecation (Errors)](#12-versioning--deprecation-errors)
+- [13) Compliance Checklist](#13-compliance-checklist)
+- [14) FAQ](#14-faq)
+
+---
+
 **Corpus Protocol Suite & SDKs — Normalized Error Taxonomy**  
 **errors_version:** `1.0`
 
 > This document defines the **normalized error model** used across **Graph**, **LLM**, **Vector**, and **Embedding** adapters. It aligns with the Specification's Common Foundation (§6.3), Error Handling & Resilience (§12), and protocol-specific sections (§7.6 Graph health, §8.5 LLM, §9.5 Vector, §10.3 Embedding).  
 > It is **implementation-agnostic** and compatible with any transport (HTTP, gRPC, queues) and any observability backend.
-
----
 
 ## 0) Goals & Non-Goals
 
@@ -22,8 +39,6 @@
 
 - Exhaustive backend-specific error catalogs.
 - Mandating specific transports or frameworks.
-
----
 
 ## 1) Normalized Error Classes (Canonical)
 
@@ -72,8 +87,6 @@ All subtypes MUST inherit from one of the canonical classes above and MUST NOT c
 
 **Stability:** Canonical classes and the above subtype names + meanings are frozen for `errors_version=1.0`. New subtypes MAY be added only if they refine an existing parent class and preserve retry semantics.
 
----
-
 ## 2) Programmatic Error Envelope (Wire-Level)
 
 Adapters SHOULD surface errors using the following machine-readable envelope:
@@ -104,8 +117,6 @@ Adapters SHOULD surface errors using the following machine-readable envelope:
 - `details` MUST be JSON-serializable and SIEM-safe.
 - Subtypes MUST set `error` equal to the subtype name (e.g. `"TextTooLong"`).
 
----
-
 ## 3) Transport Mappings
 
 ### 3.1 HTTP (Recommended)
@@ -131,8 +142,6 @@ Adapters SHOULD surface errors using the following machine-readable envelope:
 | TransientNetwork | UNAVAILABLE / DEADLINE_EXCEEDED |
 | Unavailable | UNAVAILABLE |
 | DeadlineExceeded | DEADLINE_EXCEEDED |
-
----
 
 ## 4) Retry Semantics (Normative)
 
@@ -176,16 +185,12 @@ Adapters SHOULD surface errors using the following machine-readable envelope:
 | VertexNotFound | No | Fix vertex ids or query |
 | EdgeNotFound | No | Fix edge ids or query |
 
----
-
 ## 5) Observability & Privacy (SIEM-Safe)
 
 - For metrics (see METRICS.md), the canonical class name or subtype name (e.g., `"Unavailable"`, `"IndexNotReady"`) MUST be used as the metrics code label — not the adapter-level envelope code string.
 - Never emit raw prompts, vectors, embeddings, tenant IDs, doc IDs, or arbitrary free-text fields.
 - Use tenant hashing where tenant participates in labels or details.
 - `details` MUST be low-cardinality and JSON-safe.
-
----
 
 ## 6) Protocol-Specific Supplements (Full Detail)
 
@@ -336,8 +341,6 @@ Graph adapters MUST mirror Vector/LLM level of detail:
   - Use the same normalization rules as `query`.
   - Emit a single final error if the stream fails, plus one `count_stream_final_outcome` metric with the normalized error/code.
 
----
-
 ## 7) Error Hints (Machine-Readable Mitigations)
 
 Adapters SHOULD attach structured hints:
@@ -355,8 +358,6 @@ new_size = ceil(old_size * (100 - suggested_batch_reduction) / 100)
 ```
 
 `details` SHOULD be used for low-cardinality, structured context (e.g. `"max_batch_size"`, `"max_top_k"`, `"max_text_length"`, `"max_context_length"`).
-
----
 
 ## 8) Normalization Rules (Adapter Implementations)
 
@@ -396,8 +397,6 @@ def normalize(provider_exc) -> NormalizedError:
     return Unavailable(message="Service unavailable", code="UNKNOWN_UPSTREAM")
 ```
 
----
-
 ## 9) Client Backoff & Breaker Guidance
 
 **Exponential Backoff (Recommended)**
@@ -417,8 +416,6 @@ def normalize(provider_exc) -> NormalizedError:
 - Return `Unavailable("circuit open")` while breaker is open.
 - Use `retry_after_ms` to dampen traffic when closing.
 
----
-
 ## 10) Partial Failure (Batches)
 
 Batch APIs MUST surface per-item status, not just aggregate failure:
@@ -437,8 +434,6 @@ Batch APIs MUST surface per-item status, not just aggregate failure:
 
 - Per-item failures use a reduced shape (`error`, `detail`, optional `item-code`) — they are not full envelopes.
 - If an entire batch is rejected (e.g., too large, rate-limited), the top-level error SHOULD include `suggested_batch_reduction`.
-
----
 
 ## 11) Examples (Per Protocol)
 
@@ -502,8 +497,6 @@ Batch APIs MUST surface per-item status, not just aggregate failure:
 }
 ```
 
----
-
 ## 12) Versioning & Deprecation (Errors)
 
 - **errors_version:** `1.0`
@@ -515,8 +508,6 @@ Batch APIs MUST surface per-item status, not just aggregate failure:
 - **Deprecation:**
   - Mark old subtype as deprecated for ≥1 minor release.
   - Do not reuse names with different semantics.
-
----
 
 ## 13) Compliance Checklist
 
@@ -530,8 +521,6 @@ Batch APIs MUST surface per-item status, not just aggregate failure:
 - [ ] Transport mapping conforms to §3.
 - [ ] Metrics emitted with canonical class/subtype as code label.
 - [ ] Tenant hashing used in telemetry contexts.
-
----
 
 ## 14) FAQ
 
