@@ -1,4 +1,16 @@
-# Graph Protocol V1 Conformance Test Coverage
+# Graph Protocol Conformance Test Coverage
+
+**Table of Contents**
+- [Overview](#overview)
+- [Conformance Summary](#conformance-summary)
+- [Test Files](#test-files)
+- [Specification Mapping](#specification-mapping)
+- [Running Tests](#running-tests)
+- [Adapter Compliance Checklist](#adapter-compliance-checklist)
+- [Conformance Badge](#conformance-badge)
+- [Maintenance](#maintenance)
+
+---
 
 ## Overview
 
@@ -409,13 +421,67 @@ To validate a **third-party** or custom Graph Protocol implementation:
 2. Provide a small adapter/fixture that binds these tests to your implementation (e.g., via a factory or configuration).
 3. Run the full `tests/graph/` suite.
 4. If all tests pass unmodified, you can accurately claim:
-   **“Graph Protocol V1.0 - 100% Conformant (Corpus Reference Suite)”**.
+   **"Graph Protocol V1.0 - 100% Conformant (Corpus Reference Suite)"**.
 
 ---
 
 ## Adapter Compliance Checklist
 
-*(unchanged content)*
+Use this when implementing or validating a new **Graph adapter** against `GraphProtocolV1` + `BaseGraphAdapter`.
+
+### ✅ Phase 1: Core Operations (8/8)
+
+* [ ] `capabilities()` returns `GraphCapabilities` with required fields
+* [ ] `create_vertex()` returns valid `GraphID` with proper format
+* [ ] `create_edge()` returns valid `GraphID` with proper format  
+* [ ] `delete_vertex()` and `delete_edge()` are idempotent
+* [ ] `query()` returns list of mappings with dialect validation
+* [ ] `stream_query()` yields dict instances with proper streaming semantics
+* [ ] `bulk_vertices()` respects `max_batch_ops` limits
+* [ ] `batch()` returns per-operation results
+
+### ✅ Phase 2: Validation & Dialect Handling (9/9)
+
+* [ ] Reject empty labels in vertex/edge creation
+* [ ] Validate required `from`/`to` fields for edges
+* [ ] Ensure properties are JSON-serializable
+* [ ] Reject unknown dialects with clear error messages
+* [ ] Validate dialects against capabilities
+* [ ] Require non-empty query text
+* [ ] Support empty parameters in queries
+* [ ] Safe parameter binding to prevent injection
+* [ ] Enforce `max_batch_ops` with helpful error hints
+
+### ✅ Phase 3: Error Handling & Semantics (8/8)
+
+* [ ] Map provider errors to canonical codes (`BadRequest`, `NotSupported`, etc.)
+* [ ] Include `retry_after_ms` for retryable errors when available
+* [ ] Include operation and dialect context in errors
+* [ ] Do not treat validation errors as retryable
+* [ ] Provide `suggested_batch_reduction` for batch size errors
+* [ ] Use `DeadlineExceeded` on expired budgets
+* [ ] Honor `NotSupported` for unsupported dialects/features
+* [ ] Follow §12.5 partial-failure semantics for batch operations
+
+### ✅ Phase 4: Observability & Privacy (6/6)
+
+* [ ] Use `component="graph"` in metrics
+* [ ] Emit exactly one `observe` per operation
+* [ ] Never log raw query text, tenant IDs, or sensitive properties
+* [ ] Use `tenant_hash`, `dialect`, `op_count` as low-cardinality tags
+* [ ] Emit error counters on failure paths
+* [ ] Ensure wire+logs SIEM-safe per §13 requirements
+
+### ✅ Phase 5: Deadlines, Caching & Wire Contract (8/8)
+
+* [ ] Respect `OperationContext.deadline_ms` with preflight checks
+* [ ] Use `DeadlineExceeded` when time budget elapses mid-operation
+* [ ] Support early cancellation of streaming queries
+* [ ] Ensure resource cleanup on stream cancellation
+* [ ] Cache schema in standalone mode when appropriate
+* [ ] `WireGraphHandler` implements all `graph.*` ops with canonical envelopes
+* [ ] Unknown fields ignored; unknown ops → `NotSupported`
+* [ ] Error envelopes use normalized `code`/`error` structure
 
 ---
 
