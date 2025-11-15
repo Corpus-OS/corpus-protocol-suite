@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adaptersdk.org/schemas/graph/graph.types.id.json",
+  "title": "GraphID",
+  "type": ["string", "integer"],
+  "description": "Canonical identifier for vertices/edges. Strings are recommended; integers allowed for legacy stores.",
+  "anyOf": [
+    {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[A-Za-z0-9._~:@\\-]{1,256}$"
+    },
+    {
+      "type": "integer",
+      "minimum": -9007199254740991,
+      "maximum": 9007199254740991
+    }
+  ]
+}

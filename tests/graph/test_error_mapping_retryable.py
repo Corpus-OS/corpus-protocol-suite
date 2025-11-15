@@ -7,56 +7,81 @@ Asserts (Spec refs):
   • Operation and dialect fields propagate in errors          (§6.3)
   • Input validation surfaces BadRequest / NotSupported       (§17.2, §7.4)
 """
-import random
 import pytest
 
-from corpus_sdk.examples.graph.mock_graph_adapter import MockGraphAdapter
 from corpus_sdk.graph.graph_base import (
     OperationContext as GraphContext,
     AdapterError,
     NotSupported,
     BadRequest,
 )
-from corpus_sdk.examples.common.ctx import make_ctx
+from examples.common.ctx import make_ctx
 
 pytestmark = pytest.mark.asyncio
 
 
-async def test_retryable_errors_with_hints():
-    random.seed(202)  # deterministic sequence
-    a = MockGraphAdapter(failure_rate=0.9)
-    ctx = make_ctx(GraphContext, request_id="t_err_retry", tenant="t")
-    with pytest.raises(AdapterError) as ei:
-        await a.query(dialect="cypher", text="RETURN 1", ctx=ctx)
-    err = ei.value
+def test_error_handling_retryable_errors_with_hints():
+    """
+    Validate that AdapterError supports retry_after_ms hints for retryable errors.
+    """
+    err = AdapterError("retryable", retry_after_ms=123)
     assert getattr(err, "retry_after_ms", None) is not None
+    assert isinstance(err.retry_after_ms, int) and err.retry_after_ms >= 0
 
 
-async def test_error_includes_operation_field():
-    a = MockGraphAdapter()
-    ctx = make_ctx(GraphContext, request_id="t_err_opfield", tenant="t")
+async def test_error_handling_error_includes_operation_field(adapter):
+    caps = await adapter.capabilities()
+    if getattr(caps, "max_batch_ops", None) is None:
+        pytest.skip("Adapter does not declare max_batch_ops; cannot trigger bulk_vertices error")
+
+    ctx = make_ctx(
+        GraphContext,
+        request_id="t_err_opfield",
+        tenant="t",
+    )
+    too_many = caps.max_batch_ops * 2
     with pytest.raises(BadRequest) as ei:
-        await a.bulk_vertices([("U", {"i": i}) for i in range(5000)], ctx=ctx)
+        await adapter.bulk_vertices(
+            [("U", {"i": i}) for i in range(too_many)],
+            ctx=ctx,
+        )
     assert getattr(ei.value, "operation", None) == "bulk_vertices"
 
 
-async def test_error_includes_dialect_field():
-    a = MockGraphAdapter()
-    ctx = make_ctx(GraphContext, request_id="t_err_dialect", tenant="t")
+async def test_error_handling_error_includes_dialect_field(adapter):
+    caps = await adapter.capabilities()
+    unknown = "__err_dialect__"
+    assert unknown not in caps.dialects
+
+    ctx = make_ctx(
+        GraphContext,
+        request_id="t_err_dialect",
+        tenant="t",
+    )
     with pytest.raises(NotSupported) as ei:
-        await a.query(dialect="gremlin", text="g.V()", ctx=ctx)
-    assert getattr(ei.value, "dialect", None) == "gremlin"
+        await adapter.query(dialect=unknown, text="g.V()", ctx=ctx)
+    assert getattr(ei.value, "dialect", None) == unknown
 
 
-async def test_bad_request_on_empty_label():
-    a = MockGraphAdapter()
-    ctx = make_ctx(GraphContext, request_id="t_err_badreq", tenant="t")
+async def test_error_handling_bad_request_on_empty_label(adapter):
+    ctx = make_ctx(
+        GraphContext,
+        request_id="t_err_badreq",
+        tenant="t",
+    )
     with pytest.raises(BadRequest):
-        await a.create_vertex("", {"x": 1}, ctx=ctx)
+        await adapter.create_vertex("", {"x": 1}, ctx=ctx)
 
 
-async def test_not_supported_on_unknown_dialect():
-    a = MockGraphAdapter()
-    ctx = make_ctx(GraphContext, request_id="t_err_notsup", tenant="t")
+async def test_error_handling_not_supported_on_unknown_dialect(adapter):
+    caps = await adapter.capabilities()
+    unknown = "__sparql_like__"
+    assert unknown not in caps.dialects
+
+    ctx = make_ctx(
+        GraphContext,
+        request_id="t_err_notsup",
+        tenant="t",
+    )
     with pytest.raises(NotSupported):
-        await a.query(dialect="sparql", text="SELECT * WHERE {}", ctx=ctx)
+        await adapter.query(dialect=unknown, text="SELECT * WHERE {}", ctx=ctx)

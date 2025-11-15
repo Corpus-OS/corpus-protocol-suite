@@ -1,4 +1,4 @@
-# adapter_sdk/graph_base.py
+# corpus_sdk/graph/graph_base.py
 # SPDX-License-Identifier: Apache-2.0
 """
 Adapter SDK — Graph Protocol V1.0
@@ -542,7 +542,7 @@ class OperationContext:
     deadline_ms: Optional[int] = None
     traceparent: Optional[str] = None
     tenant: Optional[str] = None
-    attrs: Mapping[str, Any] = None
+    attrs: Optional[Mapping[str, Any]] = None
 
     def __post_init__(self) -> None:
         if self.attrs is None:
@@ -691,6 +691,10 @@ class NoopCache:
 class InMemoryTTLCache:
     """
     Small in-memory TTL cache for read paths (standalone mode only).
+
+    Not thread-safe, not process-safe, and not distributed. Intended for
+    single-process, best-effort development and test use only. Do NOT
+    share instances across multiple processes or threads in production.
     """
     def __init__(self) -> None:
         self._store: Dict[str, Tuple[float, Any]] = {}
@@ -721,6 +725,9 @@ class NoopLimiter:
 class SimpleTokenBucketLimiter:
     """
     Simple token-bucket limiter; per-process; fail-open on internal error.
+
+    Not concurrency-safe across threads or processes; intended for
+    best-effort throttling in development and light production only.
     """
     def __init__(self, rate_per_sec: int = 50, burst: int = 100) -> None:
         self._capacity = max(1, int(burst))
@@ -782,6 +789,7 @@ class GraphCapabilities:
         idempotent_writes: Whether idempotency_key is honored for writes.
         supports_multi_tenant: Whether tenant-aware isolation is supported.
         supports_deadline: Whether ctx.deadline_ms is respected.
+        max_batch_ops: Optional maximum number of ops per batch (adapter-defined).
     """
     server: str
     version: str
@@ -796,6 +804,7 @@ class GraphCapabilities:
     idempotent_writes: bool = False
     supports_multi_tenant: bool = False
     supports_deadline: bool = True
+    max_batch_ops: Optional[int] = None
 
 
 # =============================================================================
@@ -908,7 +917,11 @@ class BaseGraphAdapter(GraphProtocolV1):
         - Optional read-path caching in standalone mode.
         - Wire-agnostic; used by WireGraphHandler.
 
-    Backend implementers override `_do_*` methods only.
+    Standalone mode wires in lightweight, in-process helpers
+    (SimpleCircuitBreaker, InMemoryTTLCache, SimpleTokenBucketLimiter)
+    which are *not* thread-safe, process-safe, or distributed. For
+    serious production deployments, supply hardened implementations
+    via the constructor instead of relying on these defaults.
     """
 
     _component = "graph"
@@ -995,7 +1008,7 @@ class BaseGraphAdapter(GraphProtocolV1):
             if ctx:
                 th = self._tenant_hash(ctx.tenant)
                 if th:
-                    x.setdefault("tenant", th)
+                    x.setdefault("tenant_hash", th)
             self._metrics.observe(
                 component=self._component,
                 op=op,
@@ -1037,19 +1050,29 @@ class BaseGraphAdapter(GraphProtocolV1):
 
         Includes:
             - operation
-            - stable repr of spec/asdict(spec)
+            - stable JSON-serialized representation of spec/asdict(spec)
             - tenant hash (if present) to avoid cross-tenant bleed.
+
+        Falls back to repr() only if JSON serialization fails, to keep
+        key collisions unlikely but avoid raising on surprising types.
         """
         if hasattr(spec, "__dataclass_fields__"):
             raw = asdict(spec)
         else:
             raw = spec
-        base = f"graph:{op}:{repr(raw)}"
+
+        payload: Dict[str, Any] = {"op": op, "spec": raw}
         if ctx and ctx.tenant:
             th = self._tenant_hash(ctx.tenant)
             if th:
-                base += f":tenant:{th}"
-        return hashlib.sha256(base.encode("utf-8")).hexdigest()
+                payload["tenant"] = th
+
+        try:
+            serialized = json.dumps(payload, sort_keys=True, default=str)
+        except TypeError:
+            serialized = repr(payload)
+
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
     @staticmethod
     def _validate_properties_map(properties: Mapping[str, Any]) -> None:
@@ -1110,7 +1133,7 @@ class BaseGraphAdapter(GraphProtocolV1):
             self._record(op, t0, False, code=e.code or type(e).__name__, ctx=ctx, **metric_extra)
             self._breaker.on_error(e)
             raise
-        except Exception:
+        except Exception as e:
             self._record(op, t0, False, code="UNAVAILABLE", ctx=ctx, **metric_extra)
             self._breaker.on_error(e)
             raise
@@ -1130,6 +1153,7 @@ class BaseGraphAdapter(GraphProtocolV1):
         - preflight deadline, breaker, limiter
         - periodic deadline checks
         - metrics on completion or error
+        - chunk-level throughput metrics (chunks and records)
         """
         metric_extra = dict(metric_extra or {})
         self._fail_if_deadline_expired(ctx)
@@ -1147,6 +1171,23 @@ class BaseGraphAdapter(GraphProtocolV1):
                 agen = agen_factory()
                 async for chunk in agen:
                     chunk_count += 1
+                    # chunk-level throughput metrics (best-effort, non-fatal)
+                    try:
+                        self._metrics.counter(
+                            component=self._component,
+                            name="stream_chunks_total",
+                            value=1,
+                            extra={"op": op},
+                        )
+                        self._metrics.counter(
+                            component=self._component,
+                            name="stream_records_total",
+                            value=len(chunk.records),
+                            extra={"op": op},
+                        )
+                    except Exception:
+                        pass
+
                     if chunk_count % check_n == 0:
                         self._fail_if_deadline_expired(ctx)
                     yield chunk
@@ -1156,7 +1197,7 @@ class BaseGraphAdapter(GraphProtocolV1):
                 self._record(op, t0, False, code=e.code or type(e).__name__, ctx=ctx, **metric_extra)
                 self._breaker.on_error(e)
                 raise
-            except Exception:
+            except Exception as e:
                 self._record(op, t0, False, code="UNAVAILABLE", ctx=ctx, **metric_extra)
                 self._breaker.on_error(e)
                 raise
@@ -1443,6 +1484,25 @@ class BaseGraphAdapter(GraphProtocolV1):
         if not ops:
             raise BadRequest("ops must not be empty")
 
+        if caps.max_batch_ops is not None and len(ops) > caps.max_batch_ops:
+            raise BadRequest(
+                f"batch ops count {len(ops)} exceeds maximum of {caps.max_batch_ops}",
+                details={"max_batch_ops": caps.max_batch_ops},
+            )
+
+        # Basic schema validation for opaque BatchOperation shapes.
+        for idx, op_spec in enumerate(ops):
+            if not isinstance(op_spec.op, str) or not op_spec.op:
+                raise BadRequest(
+                    "each BatchOperation.op must be a non-empty string",
+                    details={"index": idx},
+                )
+            if not isinstance(op_spec.args, Mapping):
+                raise BadRequest(
+                    "each BatchOperation.args must be a mapping",
+                    details={"index": idx, "type": type(op_spec.args).__name__},
+                )
+
         async def _call() -> BatchResult:
             return await self._do_batch(ops, ctx=ctx)
 
@@ -1498,17 +1558,31 @@ class BaseGraphAdapter(GraphProtocolV1):
         *,
         ctx: Optional[OperationContext] = None,
     ) -> Mapping[str, Any]:
-        """Health check with deadline + metrics; no cache."""
+        """
+        Health check with deadline + metrics; no cache.
+
+        Returns a normalized, SIEM-safe summary view derived from the
+        backend's raw health mapping; backends may expose additional
+        fields but they are not surfaced here.
+        """
         self._fail_if_deadline_expired(ctx)
         t0 = time.monotonic()
         try:
             res = await self._apply_deadline(self._do_health(ctx=ctx), ctx)
             self._record("health", t0, True, ctx=ctx)
+            ok = bool(res.get("ok", True))
+            status = res.get("status")
+            if not status:
+                status = "ok" if ok else "degraded"
             return {
-                "ok": bool(res.get("ok", True)),
+                "ok": ok,
+                "status": status,
                 "server": str(res.get("server", "")),
                 "version": str(res.get("version", "")),
                 "namespaces": res.get("namespaces", {}),
+                # pass-through common flags if provided upstream; derive sensible defaults
+                "read_only": bool(res.get("read_only", False)),
+                "degraded": bool(res.get("degraded", status != "ok")),
             }
         except GraphAdapterError as e:
             self._record("health", t0, False, code=e.code or type(e).__name__, ctx=ctx)

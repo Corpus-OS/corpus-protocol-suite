@@ -7,11 +7,11 @@ to transient errors (e.g., Unavailable or ResourceExhausted) from the mock adapt
 """
 
 import asyncio
-from corpus_sdk.examples.llm.mock_llm_adapter import MockLLMAdapter
-from corpus_sdk.examples.common.ctx import make_ctx
-from corpus_sdk.examples.common.retry import retry_async, RetryPolicy
+from examples.llm.mock_llm_adapter import MockLLMAdapter
+from examples.common.ctx import make_ctx
+from examples.common.retry import retry_async, RetryPolicy
 from corpus_sdk.llm.llm_base import OperationContext
-from corpus_sdk.examples.common.printing import box, print_kv
+from examples.common.printing import box, print_kv
 
 
 async def main() -> None:

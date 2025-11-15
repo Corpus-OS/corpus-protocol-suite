@@ -10,21 +10,22 @@ Spec refs:
 
 import pytest
 from typing import Any, Mapping, Optional, List, Dict
-
-from corpus_sdk.examples.vector.mock_vector_adapter import MockVectorAdapter
-from adapter_sdk.vector_base import (
+from corpus_sdk.vector.vector_base import (
+    OperationContext,
     QuerySpec,
     UpsertSpec,
     Vector,
     VectorID,
     MetricsSink,
+    BadRequest,
 )
-from corpus_sdk.examples.common.ctx import make_ctx
 
 pytestmark = pytest.mark.asyncio
 
 
 class CaptureMetrics(MetricsSink):
+    """Metrics sink that captures all observations and counters for testing."""
+    
     def __init__(self) -> None:
         self.observations: List[Dict[str, Any]] = []
         self.counters: List[Dict[str, Any]] = []
@@ -67,79 +68,117 @@ class CaptureMetrics(MetricsSink):
         )
 
 
-async def test_context_propagates_to_metrics_siem_safe():
-    m = CaptureMetrics()
-    a = MockVectorAdapter(metrics=m)
-    ctx = make_ctx(
-        # using vector OperationContext via make_ctx helper
-        type(a)._component_context if hasattr(type(a), "_component_context") else None,  # fallback no-op
-        request_id="v_ctx",
-        tenant="acme",
-    )
-    # if make_ctx signature differs, just construct QuerySpec with ctx below
-    await a.query(QuerySpec(vector=[0.1], top_k=1, namespace="default"), ctx=ctx)
+async def test_observability_context_propagates_to_metrics_siem_safe(adapter):
+    """Verify operation context propagates to metrics while maintaining SIEM safety."""
+    metrics = CaptureMetrics()
+    original_metrics = getattr(adapter, "_metrics", None)
+    adapter._metrics = metrics  # type: ignore[attr-defined]
 
-    assert any(o["op"] == "query" for o in m.observations)
+    ctx = OperationContext(request_id="v_ctx", tenant="acme")
+    await adapter.query(QuerySpec(vector=[0.1], top_k=1, namespace="default"), ctx=ctx)
 
+    # Restore original metrics
+    if original_metrics is not None:
+        adapter._metrics = original_metrics  # type: ignore[attr-defined]
 
-async def test_tenant_hashed_never_raw():
-    m = CaptureMetrics()
-    a = MockVectorAdapter(metrics=m)
-    tenant = "super-secret-tenant"
-    ctx = make_ctx(None, request_id="v_hash", tenant=tenant)
-    await a.query(QuerySpec(vector=[0.1], top_k=1, namespace="default"), ctx=ctx)
-
-    extras = [o["extra"] for o in m.observations if o["op"] == "query"]
-    assert extras
-    blob = str(extras[-1])
-    assert tenant not in blob  # no raw tenant
+    assert any(obs["op"] == "query" for obs in metrics.observations)
 
 
-async def test_no_vector_data_in_metrics():
-    m = CaptureMetrics()
-    a = MockVectorAdapter(metrics=m)
-    ctx = make_ctx(None, request_id="v_no_vec", tenant="t")
-    await a.query(QuerySpec(vector=[0.9, 0.8], top_k=1, namespace="default"), ctx=ctx)
+async def test_observability_tenant_hashed_never_raw(adapter):
+    """Verify tenant identifiers are never logged in raw form."""
+    metrics = CaptureMetrics()
+    original_metrics = getattr(adapter, "_metrics", None)
+    adapter._metrics = metrics  # type: ignore[attr-defined]
 
-    extras = [o["extra"] for o in m.observations if o["op"] == "query"]
-    assert extras
-    s = str(extras[-1])
-    assert "[0.9, 0.8]" not in s  # heuristic: no raw vector literal
+    secret_tenant = "super-secret-tenant-12345"
+    ctx = OperationContext(request_id="v_hash", tenant=secret_tenant)
+    await adapter.query(QuerySpec(vector=[0.1], top_k=1, namespace="default"), ctx=ctx)
+
+    # Restore original metrics
+    if original_metrics is not None:
+        adapter._metrics = original_metrics  # type: ignore[attr-defined]
+
+    # Verify no raw tenant appears in any metrics output
+    all_metrics_output = str(metrics.observations) + str(metrics.counters)
+    assert secret_tenant not in all_metrics_output, "Raw tenant ID leaked in metrics"
 
 
-async def test_metrics_emitted_on_error_path():
-    from adapter_sdk.vector_base import BadRequest
+async def test_observability_no_vector_data_in_metrics(adapter):
+    """Verify vector data never appears in metrics output."""
+    metrics = CaptureMetrics()
+    original_metrics = getattr(adapter, "_metrics", None)
+    adapter._metrics = metrics  # type: ignore[attr-defined]
 
-    m = CaptureMetrics()
-    a = MockVectorAdapter(metrics=m)
-    ctx = make_ctx(None, request_id="v_err", tenant="t")
+    ctx = OperationContext(request_id="v_no_vec", tenant="test-tenant")
+    await adapter.query(QuerySpec(vector=[0.9, 0.8], top_k=1, namespace="default"), ctx=ctx)
+
+    # Restore original metrics
+    if original_metrics is not None:
+        adapter._metrics = original_metrics  # type: ignore[attr-defined]
+
+    # Verify no vector data appears in metrics
+    all_metrics_output = str(metrics.observations) + str(metrics.counters)
+    vector_indicators = ["[0.9, 0.8]", "0.9", "0.8", "vector_data", "embedding"]
+    for indicator in vector_indicators:
+        assert indicator not in all_metrics_output, f"Vector data leaked: {indicator}"
+
+
+async def test_observability_metrics_emitted_on_error_path(adapter):
+    """Verify metrics are emitted even when operations fail."""
+    metrics = CaptureMetrics()
+    original_metrics = getattr(adapter, "_metrics", None)
+    adapter._metrics = metrics  # type: ignore[attr-defined]
+
+    ctx = OperationContext(request_id="v_err", tenant="test-tenant")
 
     with pytest.raises(BadRequest):
-        await a.query(QuerySpec(vector=[0.1], top_k=0, namespace="default"), ctx=ctx)
+        await adapter.query(QuerySpec(vector=[0.1], top_k=0, namespace="default"), ctx=ctx)
 
-    assert any(o for o in m.observations if o["op"] == "query" and o["ok"] is False)
+    # Restore original metrics
+    if original_metrics is not None:
+        adapter._metrics = original_metrics  # type: ignore[attr-defined]
 
-
-async def test_query_metrics_include_namespace():
-    m = CaptureMetrics()
-    a = MockVectorAdapter(metrics=m)
-    ctx = make_ctx(None, request_id="v_ns", tenant="t")
-    await a.query(QuerySpec(vector=[0.2], top_k=1, namespace="ns_x"), ctx=ctx)
-
-    extra = [o["extra"] for o in m.observations if o["op"] == "query"][-1]
-    assert extra.get("namespace") == "ns_x"
+    error_observations = [obs for obs in metrics.observations if obs["op"] == "query" and not obs["ok"]]
+    assert error_observations, "No metrics emitted for error path"
 
 
-async def test_upsert_metrics_include_vector_count():
-    m = CaptureMetrics()
-    a = MockVectorAdapter(metrics=m)
-    ctx = make_ctx(None, request_id="v_up", tenant="t")
+async def test_observability_query_metrics_include_namespace(adapter):
+    """Verify query metrics include namespace information."""
+    metrics = CaptureMetrics()
+    original_metrics = getattr(adapter, "_metrics", None)
+    adapter._metrics = metrics  # type: ignore[attr-defined]
+
+    ctx = OperationContext(request_id="v_ns", tenant="test-tenant")
+    await adapter.query(QuerySpec(vector=[0.2], top_k=1, namespace="test-namespace"), ctx=ctx)
+
+    # Restore original metrics
+    if original_metrics is not None:
+        adapter._metrics = original_metrics  # type: ignore[attr-defined]
+
+    query_observations = [obs for obs in metrics.observations if obs["op"] == "query"]
+    assert query_observations, "No query observations found"
+    
+    last_query_extra = query_observations[-1].get("extra", {})
+    assert last_query_extra.get("namespace") == "test-namespace"
+
+
+async def test_observability_upsert_metrics_include_vector_count(adapter):
+    """Verify upsert operations emit vector count metrics."""
+    metrics = CaptureMetrics()
+    original_metrics = getattr(adapter, "_metrics", None)
+    adapter._metrics = metrics  # type: ignore[attr-defined]
+
+    ctx = OperationContext(request_id="v_up", tenant="test-tenant")
     spec = UpsertSpec(
         namespace="default",
         vectors=[Vector(id=VectorID("m1"), vector=[0.1])],
     )
-    await a.upsert(spec, ctx=ctx)
+    await adapter.upsert(spec, ctx=ctx)
 
-    counters = [c for c in m.counters if c["name"] == "vectors_upserted"]
-    assert counters
-    assert counters[-1]["value"] >= 1
+    # Restore original metrics
+    if original_metrics is not None:
+        adapter._metrics = original_metrics  # type: ignore[attr-defined]
+
+    vector_counters = [counter for counter in metrics.counters if "vectors_upserted" in counter["name"]]
+    assert vector_counters, "No vector count metrics emitted"
+    assert vector_counters[-1]["value"] >= 1

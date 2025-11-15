@@ -7,10 +7,10 @@ Each chunk simulates partial tokens being emitted from a model.
 """
 
 import asyncio
-from corpus_sdk.examples.llm.mock_llm_adapter import MockLLMAdapter
-from corpus_sdk.examples.common.ctx import make_ctx
+from examples.llm.mock_llm_adapter import MockLLMAdapter
+from examples.common.ctx import make_ctx
 from corpus_sdk.llm.llm_base import OperationContext
-from corpus_sdk.examples.common.printing import box
+from examples.common.printing import box
 
 
 async def main() -> None:

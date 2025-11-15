@@ -10,10 +10,10 @@ Demonstrates CORRECT use of the SDK's deadline mechanism:
 from __future__ import annotations
 import asyncio
 
-from corpus_sdk.examples.llm.mock_llm_adapter import MockLLMAdapter
+from examples.llm.mock_llm_adapter import MockLLMAdapter
 from corpus_sdk.llm.llm_base import OperationContext
-from corpus_sdk.examples.common.ctx import make_ctx, remaining_budget_ms
-from corpus_sdk.examples.common.printing import box, print_kv
+from examples.common.ctx import make_ctx, remaining_budget_ms
+from examples.common.printing import box, print_kv
 
 # Prefer the example taxonomy for clarity; falls back to SDK if needed.
 try:

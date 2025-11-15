@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adaptersdk.org/schemas/vector/vector.query.request.json",
+  "title": "vector.query args",
+  "description": "Arguments for op: vector.query",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "vector": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8192,
+      "items": { "type": "number" }
+    },
+    "top_k": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100000,
+      "description": "MUST be ≤ capabilities.limits.max_top_k. Adapters enforce exact cap at runtime."
+    },
+    "namespace": {
+      "type": "string",
+      "default": "default",
+      "maxLength": 256,
+      "pattern": "^[A-Za-z0-9._:-]{1,256}$"
+    },
+    "filter": {
+      "type": ["object", "null"],
+      "$ref": "https://adaptersdk.org/schemas/vector/vector.types.filter.json"
+    },
+    "include_metadata": { "type": "boolean", "default": true },
+    "include_vectors": { "type": "boolean", "default": false },
+    "page_token": {
+      "type": ["string", "null"],
+      "maxLength": 4096,
+      "pattern": "^[A-Za-z0-9+/=_-]{1,4096}$",
+      "description": "Opaque page token from previous response; mutually exclusive with vector? (adapter-defined)."
+    },
+    "op_extensions": {
+      "type": "object",
+      "additionalProperties": true,
+      "patternProperties": {
+        "^(vendor:)[a-z0-9_.:-]+$": { "type": ["string", "number", "boolean", "object", "array", "null"] }
+      }
+    }
+  },
+  "required": ["vector", "top_k"],
+  "$comment": "Adapters MUST validate namespace exists (no implicit creation). Empty namespace with no data SHOULD return IndexNotReady (retryable) with retry_after_ms."
+}

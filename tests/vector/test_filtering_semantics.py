@@ -7,9 +7,7 @@ Spec refs:
 """
 
 import pytest
-
-from corpus_sdk.examples.vector.mock_vector_adapter import MockVectorAdapter
-from adapter_sdk.vector_base import (
+from corpus_sdk.vector.vector_base import (
     Vector,
     VectorID,
     UpsertSpec,
@@ -22,17 +20,19 @@ from adapter_sdk.vector_base import (
 pytestmark = pytest.mark.asyncio
 
 
-async def test_query_filter_equality():
-    a = MockVectorAdapter()
-    v = Vector(
-        id=VectorID("f1"),
+async def test_filtering_query_filter_equality(adapter):
+    """Verify equality filters work correctly on query operations."""
+    # Create a vector with metadata
+    vector = Vector(
+        id=VectorID("filter-test-1"),
         vector=[0.1, 0.2],
-        metadata={"tag": "keep"},
+        metadata={"tag": "keep", "category": "test"},
         namespace="default",
     )
-    await a.upsert(UpsertSpec(namespace="default", vectors=[v]))
+    await adapter.upsert(UpsertSpec(namespace="default", vectors=[vector]))
 
-    res = await a.query(
+    # Query with filter
+    result = await adapter.query(
         QuerySpec(
             vector=[0.1, 0.2],
             top_k=5,
@@ -40,53 +40,65 @@ async def test_query_filter_equality():
             filter={"tag": "keep"},
         )
     )
-    # At least shape correctness: no crash, list matches.
-    assert isinstance(res.matches, list)
+    
+    # At minimum, should return valid result structure
+    assert isinstance(result.matches, list)
 
 
-async def test_delete_filter_equality():
-    a = MockVectorAdapter()
-    spec = DeleteSpec(namespace="default", ids=[], filter={"tag": "keep"})
-    res = await a.delete(spec)
-    assert res.deleted_count >= 0
+async def test_filtering_delete_filter_equality(adapter):
+    """Verify equality filters work correctly on delete operations."""
+    spec = DeleteSpec(namespace="default", ids=[], filter={"status": "obsolete"})
+    result = await adapter.delete(spec)
+    
+    assert isinstance(result, DeleteResult)
+    assert result.deleted_count >= 0
 
 
-async def test_filter_requires_mapping_type():
-    a = MockVectorAdapter()
-    with pytest.raises(BadRequest):
-        await a.query(
+async def test_filtering_filter_requires_mapping_type(adapter):
+    """Verify filters must be mapping types (dict-like)."""
+    with pytest.raises(BadRequest) as exc_info:
+        await adapter.query(
             QuerySpec(
                 vector=[0.1],
                 top_k=1,
                 namespace="default",
-                filter=["not-a-mapping"],  # type: ignore[arg-type]
+                filter="not-a-dict",  # Wrong type
             )
         )
+    
+    err = exc_info.value
+    assert "filter" in str(err).lower() or "mapping" in str(err).lower()
 
 
-async def test_filter_respects_capabilities_support():
-    a = MockVectorAdapter()
-    caps = await a.capabilities()
+async def test_filtering_filter_respects_capabilities_support(adapter):
+    """Verify filtering respects adapter capability flags."""
+    caps = await adapter.capabilities()
+    
     if not caps.supports_metadata_filtering:
-        with pytest.raises(NotSupported):
-            await a.query(
+        with pytest.raises(NotSupported) as exc_info:
+            await adapter.query(
                 QuerySpec(
                     vector=[0.1],
                     top_k=1,
                     namespace="default",
-                    filter={"x": 1},
+                    filter={"field": "value"},
                 )
             )
+        
+        err = exc_info.value
+        assert err.code == "NOT_SUPPORTED"
 
 
-async def test_filter_empty_results_ok():
-    a = MockVectorAdapter()
-    res = await a.query(
+async def test_filtering_filter_empty_results_ok(adapter):
+    """Verify filters that match no vectors return empty results properly."""
+    result = await adapter.query(
         QuerySpec(
             vector=[0.9, 0.9],
             top_k=3,
             namespace="default",
-            filter={"tag": "__unlikely__"},
+            filter={"tag": "completely-unlikely-value-12345"},
         )
     )
-    assert isinstance(res.matches, list)
+    
+    assert isinstance(result.matches, list)
+    # Empty results are valid - the important thing is no crash

@@ -128,7 +128,7 @@ class TrackingMockEmbeddingAdapter(MockEmbeddingAdapter):
 # Success-path envelopes
 # ---------------------------------------------------------------------------
 
-async def test_capabilities_envelope_success():
+async def test_wire_contract_capabilities_envelope_success():
     a = MockEmbeddingAdapter(failure_rate=0.0)
     h = WireEmbeddingHandler(a)
 
@@ -141,7 +141,7 @@ async def test_capabilities_envelope_success():
     assert "supported_models" in caps
 
 
-async def test_embed_envelope_success():
+async def test_wire_contract_embed_envelope_success():
     a = MockEmbeddingAdapter(failure_rate=0.0)
     h = WireEmbeddingHandler(a)
 
@@ -170,7 +170,7 @@ async def test_embed_envelope_success():
     assert ev.get("text") == "hi"
 
 
-async def test_embed_batch_envelope_success():
+async def test_wire_contract_embed_batch_envelope_success():
     a = MockEmbeddingAdapter(failure_rate=0.0)
     h = WireEmbeddingHandler(a)
 
@@ -197,7 +197,7 @@ async def test_embed_batch_envelope_success():
         assert isinstance(ev.get("vector"), list)
 
 
-async def test_count_tokens_envelope_success():
+async def test_wire_contract_count_tokens_envelope_success():
     a = MockEmbeddingAdapter(failure_rate=0.0)
     h = WireEmbeddingHandler(a)
 
@@ -216,7 +216,7 @@ async def test_count_tokens_envelope_success():
     assert out["result"] >= 0
 
 
-async def test_health_envelope_success():
+async def test_wire_contract_health_envelope_success():
     a = MockEmbeddingAdapter(failure_rate=0.0)
     h = WireEmbeddingHandler(a)
 
@@ -235,7 +235,7 @@ async def test_health_envelope_success():
 # Context propagation (OperationContext plumbing)
 # ---------------------------------------------------------------------------
 
-async def test_embed_context_roundtrip_and_context_plumbing():
+async def test_wire_contract_embed_context_roundtrip_and_context_plumbing():
     a = TrackingMockEmbeddingAdapter()
     h = WireEmbeddingHandler(a)
 
@@ -280,7 +280,7 @@ async def test_embed_context_roundtrip_and_context_plumbing():
 # Error mapping semantics
 # ---------------------------------------------------------------------------
 
-async def test_missing_op_rejected_with_bad_request():
+async def test_wire_contract_missing_op_rejected_with_bad_request():
     a = MockEmbeddingAdapter(failure_rate=0.0)
     h = WireEmbeddingHandler(a)
 
@@ -290,7 +290,7 @@ async def test_missing_op_rejected_with_bad_request():
     assert out["code"] in ("BAD_REQUEST", "NOT_SUPPORTED")
 
 
-async def test_unknown_op_rejected_with_not_supported():
+async def test_wire_contract_unknown_op_rejected_with_not_supported():
     a = MockEmbeddingAdapter(failure_rate=0.0)
     h = WireEmbeddingHandler(a)
 
@@ -301,7 +301,7 @@ async def test_unknown_op_rejected_with_not_supported():
     _assert_error_envelope(out, code="NOT_SUPPORTED")
 
 
-async def test_embed_missing_required_fields_yields_bad_request():
+async def test_wire_contract_embed_missing_required_fields_yields_bad_request():
     a = MockEmbeddingAdapter(failure_rate=0.0)
     h = WireEmbeddingHandler(a)
 
@@ -328,7 +328,7 @@ async def test_embed_missing_required_fields_yields_bad_request():
     assert out2["code"] == "BAD_REQUEST"
 
 
-async def test_embed_unknown_model_maps_model_not_available():
+async def test_wire_contract_embed_unknown_model_maps_model_not_available():
     a = MockEmbeddingAdapter(failure_rate=0.0)
     h = WireEmbeddingHandler(a)
 
@@ -344,7 +344,7 @@ async def test_embed_unknown_model_maps_model_not_available():
     assert out["code"] in ("MODEL_NOT_AVAILABLE", "NOT_SUPPORTED")
 
 
-async def test_embed_batch_missing_texts_yields_bad_request():
+async def test_wire_contract_embed_batch_missing_texts_yields_bad_request():
     a = MockEmbeddingAdapter(failure_rate=0.0)
     h = WireEmbeddingHandler(a)
 
@@ -360,7 +360,7 @@ async def test_embed_batch_missing_texts_yields_bad_request():
     assert out["code"] == "BAD_REQUEST"
 
 
-async def test_embed_batch_unknown_model_maps_model_not_available():
+async def test_wire_contract_embed_batch_unknown_model_maps_model_not_available():
     a = MockEmbeddingAdapter(failure_rate=0.0)
     h = WireEmbeddingHandler(a)
 
@@ -376,7 +376,7 @@ async def test_embed_batch_unknown_model_maps_model_not_available():
     assert out["code"] in ("MODEL_NOT_AVAILABLE", "NOT_SUPPORTED")
 
 
-async def test_count_tokens_unknown_model_maps_model_not_available():
+async def test_wire_contract_count_tokens_unknown_model_maps_model_not_available():
     a = MockEmbeddingAdapter(failure_rate=0.0)
     h = WireEmbeddingHandler(a)
 
@@ -392,7 +392,7 @@ async def test_count_tokens_unknown_model_maps_model_not_available():
     assert out["code"] in ("MODEL_NOT_AVAILABLE", "NOT_SUPPORTED")
 
 
-async def test_error_envelope_includes_message_and_type():
+async def test_wire_contract_error_envelope_includes_message_and_type():
     """
     Force a BadRequest from the adapter and ensure wire handler surfaces a proper error envelope.
     """
@@ -417,7 +417,7 @@ async def test_error_envelope_includes_message_and_type():
     assert "message" in err and isinstance(err["message"], str) and err["message"]
 
 
-async def test_text_too_long_maps_to_text_too_long_code_when_exposed():
+async def test_wire_contract_text_too_long_maps_to_text_too_long_code_when_exposed():
     """
     Ensure adapter TextTooLong propagates as TEXT_TOO_LONG in the wire envelope.
     """
@@ -445,7 +445,7 @@ async def test_text_too_long_maps_to_text_too_long_code_when_exposed():
 # Unexpected exception → UNAVAILABLE
 # ---------------------------------------------------------------------------
 
-async def test_unexpected_exception_maps_to_unavailable():
+async def test_wire_contract_unexpected_exception_maps_to_unavailable():
     class BoomAdapter(TrackingMockEmbeddingAdapter):
         async def _do_embed(
             self,

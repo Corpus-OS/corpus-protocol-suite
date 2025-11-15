@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adaptersdk.org/schemas/embedding/embedding.types.result.json",
+  "title": "Embedding Result (Shared)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["embeddings", "model"],
+  "properties": {
+    "embeddings": {
+      "type": "array",
+      "minItems": 0,
+      "maxItems": 100000,
+      "items": { "$ref": "https://adaptersdk.org/schemas/embedding/embedding.types.vector.json" }
+    },
+    "model": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "total_tokens": { "type": "integer", "minimum": 0 },
+    "processing_time_ms": { "type": "number", "minimum": 0, "maximum": 86400000 },
+    "failures": {
+      "type": "array",
+      "maxItems": 100000,
+      "items": { "$ref": "https://adaptersdk.org/schemas/embedding/embedding.types.failure.json" }
+    },
+    "warnings": {
+      "type": "array",
+      "maxItems": 100,
+      "items": { "$ref": "https://adaptersdk.org/schemas/embedding/embedding.types.warning.json" }
+    }
+  },
+  "patternProperties": {
+    "^(vendor:)[a-z0-9_.:-]+$": { "type": ["string", "number", "boolean", "object", "array", "null"] }
+  },
+  "$comment": "Semantic invariants (not enforceable in JSON Schema): for batch—successes + failures == request.texts.length; successes>=1 and failures>=1 for PARTIAL_SUCCESS."
+}

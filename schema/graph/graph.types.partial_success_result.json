@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adaptersdk.org/schemas/graph/graph.types.partial_success_result.json",
+  "title": "Graph Partial Success Result",
+  "description": "Canonical transport-level partial-success payload for non-atomic Graph batch operations. Used with success envelopes that set code=\"PARTIAL_SUCCESS\".",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["successes", "failures", "items"],
+  "properties": {
+    "successes": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of successful items."
+    },
+    "failures": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of failed items."
+    },
+    "items": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 10000,
+      "description": "Per-item result entries in the same order as input.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["index", "ok"],
+        "properties": {
+          "index": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Zero-based index of the input item."
+          },
+          "ok": {
+            "type": "boolean",
+            "description": "True if the item succeeded, false if it failed."
+          },
+          "result": {
+            "description": "Item-specific success payload (e.g., created IDs, rows). Shape depends on the batch op.",
+            "oneOf": [
+              { "$ref": "https://adaptersdk.org/schemas/graph/graph.types.batch_op.json" },
+              { "$ref": "https://adaptersdk.org/schemas/graph/graph.types.row.json" },
+              { "$ref": "https://adaptersdk.org/schemas/graph/graph.id.success.json" },
+              { "type": "object", "additionalProperties": true }
+            ]
+          },
+          "code": {
+            "type": "string",
+            "pattern": "^[A-Z0-9_]{1,64}$",
+            "description": "Normalized error code for failed items (e.g., BAD_REQUEST, NOT_SUPPORTED)."
+          },
+          "message": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2000,
+            "description": "Human-readable, SIEM-safe message for failed items."
+          },
+          "details": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "Low-cardinality, SIEM-safe context for failed items (no PII/prompts/queries)."
+          }
+        },
+        "allOf": [
+          {
+            "if": { "properties": { "ok": { "const": true } }, "required": ["ok"] },
+            "then": { "required": ["result"], "properties": { "code": { "not": {} }, "message": { "not": {} } } }
+          },
+          {
+            "if": { "properties": { "ok": { "const": false } }, "required": ["ok"] },
+            "then": { "required": ["code", "message"], "properties": { "result": { "not": {} } } }
+          }
+        ],
+        "patternProperties": {
+          "^(vendor:)[a-z0-9_.:-]+$": {
+            "type": ["string", "number", "boolean", "object", "array", "null"],
+            "description": "Namespaced vendor extension fields."
+          }
+        }
+      }
+    }
+  },
+  "$comment": "Invariants (enforced in tests/logic, not JSON Schema): (1) successes + failures == items.length; (2) successes >= 1 AND failures >= 1 for PARTIAL_SUCCESS; (3) Items preserve input order; (4) No silent drops of failed items."
+}
