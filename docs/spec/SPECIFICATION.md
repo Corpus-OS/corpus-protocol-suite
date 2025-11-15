@@ -367,7 +367,7 @@ Adapters MAY support one or more transports and SHOULD advertise:
 
 The following values of `op` are reserved for V1.0:
 
-| Section Number | Operation Name (from 1st table) | op String (from 2nd table) | Protocol |
+| Section Number | Operation Name | op String | Protocol |
 |---|---|---|---|
 | 7.3.1 | upsert_nodes | graph.upsert_nodes | Graph |
 | 7.3.1 | delete_nodes | graph.delete_nodes | Graph |
