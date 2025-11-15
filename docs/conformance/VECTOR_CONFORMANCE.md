@@ -1,10 +1,22 @@
-# Vector Protocol V1 Conformance Test Coverage
+# Vector Protocol Conformance Test Coverage
+
+**Table of Contents**
+- [Overview](#overview)
+- [Conformance Summary](#conformance-summary)
+- [Test Files](#test-files)
+- [Specification Mapping](#specification-mapping)
+- [Running Tests](#running-tests)
+- [Adapter Compliance Checklist](#adapter-compliance-checklist)
+- [Conformance Badge](#conformance-badge)
+- [Maintenance](#maintenance)
+
+---
 
 ## Overview
 
 This document tracks conformance test coverage for the **Vector Protocol V1.0** specification as defined in `SPECIFICATION.md §9`. Each test validates normative requirements (MUST/SHOULD) from the specification and shared behavior from the common foundation (errors, deadlines, observability, privacy).
 
-This suite constitutes the official Vector Protocol V1.0 Reference Conformance Test Suite. Any implementation (Corpus or third-party) MAY run these tests to verify and publicly claim conformance, provided all referenced tests pass unmodified.
+This suite constitutes the **official Vector Protocol V1.0 Reference Conformance Test Suite**. Any implementation (Corpus or third-party) MAY run these tests to verify and publicly claim conformance, provided all referenced tests pass unmodified.
 
 **Protocol Version:** Vector Protocol V1.0
 **Status:** Pre-Release
@@ -36,7 +48,7 @@ This suite constitutes the official Vector Protocol V1.0 Reference Conformance T
 
 ## Test Files
 
-### test_capabilities_shape.py
+### `test_capabilities_shape.py`
 
 **Specification:** §9.2, §6.2 - Capabilities Discovery
 **Status:** ✅ Complete (7 tests)
@@ -51,7 +63,7 @@ Tests all aspects of capability discovery:
 * `test_capabilities_idempotency` - Multiple calls return consistent results
 * `test_capabilities_all_fields_present` - All required fields present and valid
 
-### test_namespace_operations.py
+### `test_namespace_operations.py`
 
 **Specification:** §9.3, §9.4 - Namespace Management
 **Status:** ✅ Complete (6 tests)
@@ -65,7 +77,7 @@ Validates namespace lifecycle:
 * `test_delete_namespace_idempotent` - Deleting a non-existent namespace succeeds (idempotent)
 * `test_namespace_isolation` - Vectors in different namespaces are isolated
 
-### test_upsert_basic.py
+### `test_upsert_basic.py`
 
 **Specification:** §9.3, §9.5, §12.5 - Upsert Operations & Partial Failures
 **Status:** ✅ Complete (5 tests)
@@ -78,7 +90,7 @@ Validates upsert contract and partial-failure semantics:
 * `test_upsert_result_structure` - Result shape includes failures list when applicable
 * `test_upsert_partial_failure_reporting` - Partial failures follow §12.5: successful items committed; failed items reported per-index
 
-### test_query_basic.py
+### `test_query_basic.py`
 
 **Specification:** §9.3, §9.2 - Query Operations
 **Status:** ✅ Complete (6 tests)
@@ -92,7 +104,7 @@ Validates query contract:
 * `test_query_returns_sorted_by_score` - Results sorted descending by score
 * `test_query_include_flags_work` - `include_vectors` / `include_metadata` respected
 
-### test_delete_operations.py
+### `test_delete_operations.py`
 
 **Specification:** §9.3, §12.5 - Delete Operations
 **Status:** ✅ Complete (5 tests)
@@ -105,7 +117,7 @@ Validates delete contract:
 * `test_delete_idempotent` - Deleting non-existent IDs succeeds (idempotent)
 * `test_delete_result_structure` - Result includes `deleted_count`, `failed_count`, `failures`
 
-### test_filtering_semantics.py
+### `test_filtering_semantics.py`
 
 **Specification:** §9.3 - Metadata Filtering
 **Status:** ✅ Complete (5 tests)
@@ -118,7 +130,7 @@ Validates filtering behavior:
 * `test_filter_requires_metadata_support` - Enforces `supports_metadata_filtering` from capabilities
 * `test_filter_empty_results_ok` - Empty results are valid and correctly encoded
 
-### test_dimension_validation.py
+### `test_dimension_validation.py`
 
 **Specification:** §9.5, §12.4 - Vector-Specific Errors
 **Status:** ✅ Complete (4 tests)
@@ -130,7 +142,7 @@ Validates dimension checking and error semantics:
 * `test_dimension_mismatch_error_attributes` - Error includes expected/actual dimensions
 * `test_dimension_mismatch_non_retryable` - `DimensionMismatch` is non-retryable (no `retry_after_ms`)
 
-### test_deadline_enforcement.py
+### `test_deadline_enforcement.py`
 
 **Specification:** §6.1, §12.1, §12.4 - Deadline Semantics
 **Status:** ✅ Complete (4 tests)
@@ -142,7 +154,7 @@ Validates deadline behavior:
 * `test_preflight_deadline_check` - Pre-flight validation of `deadline_ms`
 * `test_query_respects_deadline` - Query checks and enforces deadline during execution
 
-### test_error_mapping_retryable.py
+### `test_error_mapping_retryable.py`
 
 **Specification:** §6.3, §9.5, §12.1, §12.4 - Error Handling
 **Status:** ✅ Complete (6 tests)
@@ -156,7 +168,7 @@ Validates error classification and mapping to the shared taxonomy:
 * `test_index_not_ready_retryable`
 * (Additional coverage for normalized mapping semantics)
 
-### test_health_report.py
+### `test_health_report.py`
 
 **Specification:** §9.3, §6.4 - Health Endpoint
 **Status:** ✅ Complete (4 tests)
@@ -168,7 +180,7 @@ Validates health endpoint contract:
 * `test_health_status_is_valid_enum` - Status/flags use valid and documented forms
 * `test_health_consistent_on_error` - Shape remains consistent on degraded/error states
 
-### test_context_siem.py
+### `test_context_siem.py`
 
 **Specification:** §13.1-§13.3, §15, §6.1 - Observability & Privacy
 **Status:** ✅ Complete (6 tests) ⭐ Critical
@@ -182,7 +194,7 @@ Validates SIEM-safe observability:
 * `test_query_metrics_include_namespace` - Namespace attached as low-cardinality tag
 * `test_upsert_metrics_include_vector_count` - Upsert metrics include aggregate counts only
 
-### test_batch_size_limits.py
+### `test_batch_size_limits.py`
 
 **Specification:** §9.3, §12.5 - Batch Size & Partial Failures
 **Status:** ✅ Complete (4 tests)
@@ -194,7 +206,7 @@ Validates batch size and partial-failure behavior:
 * `test_partial_failure_reporting` - Per-item failures reported with indices (per §12.5)
 * `test_batch_operations_atomic_per_vector` - Per-vector atomicity: one item’s failure does not corrupt others
 
-### test_wire_handler_envelopes.py
+### `test_wire_handler_envelopes.py`
 
 **Specification:** §4.1, §4.1.6, §6.1, §6.3, §9.3, §11.2, §13 - Wire Envelopes & Routing
 **Status:** ✅ Complete (10 tests)
@@ -278,8 +290,6 @@ Validates wire-level contract and mapping:
 | Contains version (str)     | test_health_report.py | ✅      |
 | Contains namespaces (dict) | test_health_report.py | ✅      |
 
----
-
 ### §9.2 Capabilities - Complete Coverage
 
 | Requirement                  | Test File                  | Status |
@@ -292,8 +302,6 @@ Validates wire-level contract and mapping:
 | Idempotent calls             | test_capabilities_shape.py | ✅      |
 | All fields present           | test_capabilities_shape.py | ✅      |
 
----
-
 ### §9.4 Distance Metrics - Complete Coverage
 
 | Requirement              | Test File                    | Status |
@@ -301,16 +309,12 @@ Validates wire-level contract and mapping:
 | Known metrics advertised | test_capabilities_shape.py   | ✅      |
 | Unknown metrics rejected | test_namespace_operations.py | ✅      |
 
----
-
 ### §9.5 Vector-Specific Errors - Complete Coverage
 
 | Error Type        | Semantics                                                            | Test File                                                     | Status |
 | ----------------- | -------------------------------------------------------------------- | ------------------------------------------------------------- | ------ |
 | DimensionMismatch | Raised on dimension mismatch; **non-retryable**; no `retry_after_ms` | test_dimension_validation.py, test_error_mapping_retryable.py | ✅      |
 | IndexNotReady     | Retryable; may include `retry_after_ms` hint                         | test_error_mapping_retryable.py                               | ✅      |
-
----
 
 ### §12 Error Handling & Partial Failures - Complete Coverage
 
@@ -325,8 +329,6 @@ Validates wire-level contract and mapping:
 | `IndexNotReady` (retryable)                | test_error_mapping_retryable.py                                                    | ✅      |
 | Partial failures per §12.5                 | test_upsert_basic.py, test_batch_size_limits.py                                    | ✅      |
 
----
-
 ### §13 Observability - Complete Coverage
 
 | Requirement                            | Test File            | Status |
@@ -338,8 +340,6 @@ Validates wire-level contract and mapping:
 | Namespace tagged in metrics            | test_context_siem.py | ✅      |
 | Vector counts as low-cardinality stats | test_context_siem.py | ✅      |
 
----
-
 ### §15 Privacy - Complete Coverage
 
 | Requirement             | Test File            | Status |
@@ -347,8 +347,6 @@ Validates wire-level contract and mapping:
 | No PII in telemetry     | test_context_siem.py | ✅      |
 | Hash tenant identifiers | test_context_siem.py | ✅      |
 | No raw vectors in logs  | test_context_siem.py | ✅      |
-
----
 
 ### §6.1 Context & Deadlines - Complete Coverage
 
@@ -527,4 +525,4 @@ Use this checklist when implementing or validating a new Vector adapter:
 
 **Last Updated:** 2025-01-XX
 **Maintained By:** Corpus SDK Team
-**Status:** 100% V1.0 Conformant - Production Ready**
+**Status:** 100% V1.0 Conformant - Production Ready
