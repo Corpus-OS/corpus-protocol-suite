@@ -1,4 +1,4 @@
-# Embedding Protocol V1 Conformance Test Coverage
+# Embedding Protocol Conformance Test Coverage
 
 ## Overview
 
