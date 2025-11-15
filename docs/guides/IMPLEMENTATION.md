@@ -1,5 +1,6 @@
-# IMPLEMENTATION.md  
-✅ Corpus Protocol (v1.0) — Adapter Implementation Guide (Runtime Behavior)
+# IMPLEMENTATION
+
+Corpus Protocol (v1.0) — Adapter Implementation Guide (Runtime Behavior)
 
 > **Scope:** How to implement **real adapters** against the Corpus Protocol base SDKs  
 > **Components:** **LLM • Embedding • Vector • Graph**  
