@@ -1,0 +1,23 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 23.4,
+  "chunk": {
+    "records": [
+      {
+        "user": {
+          "id": "user-alice-123",
+          "name": "Alice Smith",
+          "department": "Engineering"
+        }
+      }
+    ],
+    "is_final": true,
+    "summary": {
+      "query_time_ms": 125.4,
+      "results_count": 1,
+      "has_more": false,
+      "dialect_used": "cypher"
+    }
+  }
+}
