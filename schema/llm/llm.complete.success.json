@@ -1,10 +1,10 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/llm/llm.complete.success.json",
+  "$id": "https://corpusos.com/schemas/llm/llm.complete.success.json",
   "title": "LLM Complete Success Result",
   "type": "object",
   "additionalProperties": false,
   "allOf": [
-    { "$ref": "https://adaptersdk.org/schemas/llm/llm.types.completion.json" }
+    { "$ref": "https://corpusos.com/schemas/llm/llm.types.completion.json" }
   ]
 }
