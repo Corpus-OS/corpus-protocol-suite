@@ -1,20 +1,15 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/vector/vector.types.failure_item.json",
+  "$id": "https://corpusos.com/schemas/vector/vector.types.failure_item.json",
   "title": "FailureItem",
-  "description": "Per-item failure record used in partial successes for upsert/delete.",
+  "description": "Per-item failure record for batch operations per protocol §14.8.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
-    "index": { "type": "integer", "minimum": 0 },
-    "id": {
-      "type": ["string", "null"],
-      "maxLength": 256,
-      "description": "Vector ID (if applicable for delete/upsert item). May be null when not applicable."
-    },
-    "code": { "type": "string", "pattern": "^[A-Z0-9_]{2,64}$" },
-    "message": { "type": ["string", "null"], "maxLength": 2000 },
-    "details": { "type": ["object", "null"], "additionalProperties": true }
+    "id": { "type": ["string", "null"] },
+    "index": { "type": ["integer", "null"] },
+    "error": { "type": "string" },
+    "detail": { "type": "string" }
   },
-  "required": ["index", "code"]
+  "required": ["error", "detail"]
 }
