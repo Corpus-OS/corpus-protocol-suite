@@ -1,0 +1,17 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 23.4,
+  "result": {
+    "processed_count": 3,
+    "failed_count": 1,
+    "failures": [
+      {
+        "id": "user-charlie-789",
+        "index": 2,
+        "error": "SchemaValidationError",
+        "detail": "Node label 'InvalidLabel' not found in schema"
+      }
+    ]
+  }
+}
