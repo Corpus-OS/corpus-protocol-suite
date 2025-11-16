@@ -1,32 +1,22 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/vector/vector.upsert.request.json",
+  "$id": "https://corpusos.com/schemas/vector/vector.upsert.request.json",
   "title": "vector.upsert args",
-  "description": "Arguments for op: vector.upsert",
+  "description": "Arguments for op: vector.upsert per protocol §15.3.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
     "vectors": {
       "type": "array",
       "minItems": 1,
-      "maxItems": 100000,
-      "items": { "$ref": "https://adaptersdk.org/schemas/vector/vector.types.vector.json" }
+      "items": { "$ref": "https://corpusos.com/schemas/vector/vector.types.vector.json" }
     },
     "namespace": {
       "type": "string",
       "default": "default",
       "maxLength": 256,
       "pattern": "^[A-Za-z0-9._:-]{1,256}$"
-    },
-    "idempotent": { "type": "boolean", "default": true },
-    "op_extensions": {
-      "type": "object",
-      "additionalProperties": true,
-      "patternProperties": {
-        "^(vendor:)[a-z0-9_.:-]+$": { "type": ["string", "number", "boolean", "object", "array", "null"] }
-      }
     }
   },
-  "required": ["vectors"],
-  "$comment": "Adapters MUST enforce max_batch_size against capabilities.limits.max_batch (return BadRequest w/ suggested_batch_reduction). Per-item namespace (if set) MUST equal request namespace."
+  "required": ["vectors"]
 }
