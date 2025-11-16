@@ -1,15 +1,18 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/vector/vector.namespace.delete.success.json",
-  "title": "vector.delete_namespace result",
-  "description": "Confirmation & stats when a namespace is deleted.",
+  "$id": "https://corpusos.com/schemas/vector/vector.namespace.delete.success.json",
+  "title": "vector.delete_namespace result", 
+  "description": "Namespace deletion result per protocol §14.10.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
+    "success": { "type": "boolean" },
     "namespace": { "type": "string", "maxLength": 256 },
-    "deleted": { "type": "boolean" },
-    "vectors_removed": { "type": "integer", "minimum": 0 },
-    "purged": { "type": "boolean", "description": "True if data was purged with force=true." }
+    "details": {
+      "type": "object", 
+      "additionalProperties": true
+    },
+    "vector_count": { "type": "integer", "minimum": 0 }
   },
-  "required": ["namespace", "deleted"]
+  "required": ["success", "namespace", "details"]
 }
