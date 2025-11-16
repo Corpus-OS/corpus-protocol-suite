@@ -1,81 +1,51 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/llm/llm.capabilities.success.json",
+  "$id": "https://corpusos.com/schemas/llm/llm.capabilities.success.json",
   "title": "LLM Capabilities",
+  "description": "LLM capabilities per protocol §9.1",
   "type": "object",
   "additionalProperties": false,
-  "required": ["protocol", "server", "version", "features", "limits", "models", "sampling"],
   "properties": {
     "protocol": { "type": "string", "const": "llm/v1.0" },
-    "server": { "type": "string", "minLength": 1, "maxLength": 128 },
-    "version": { "type": "string", "minLength": 1, "maxLength": 64 },
-    "features": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["supports_streaming", "supports_roles", "supports_deadline", "supports_count_tokens"],
-      "properties": {
-        "supports_streaming": { "type": "boolean" },
-        "supports_roles": { "type": "boolean" },
-        "supports_json_output": { "type": "boolean", "default": false },
-        "supports_parallel_tool_calls": { "type": "boolean", "default": false },
-        "supports_deadline": { "type": "boolean" },
-        "supports_count_tokens": { "type": "boolean" }
-      }
-    },
-    "limits": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "max_context_length": { "type": "integer", "minimum": 1 }
-      }
-    },
-    "sampling": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["temperature_range", "top_p_range"],
-      "properties": {
-        "temperature_range": {
-          "type": "array",
-          "items": { "type": "number" },
-          "minItems": 2,
-          "maxItems": 2
-        },
-        "top_p_range": {
-          "type": "array",
-          "items": { "type": "number" },
-          "minItems": 2,
-          "maxItems": 2
-        }
-      }
-    },
-    "models": {
+    "server": { "type": "string", "minLength": 1 },
+    "version": { "type": "string", "minLength": 1 },
+    "model_family": { "type": "string" },
+    "supported_models": {
       "type": "array",
-      "minItems": 1,
-      "maxItems": 4096,
-      "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["name", "family", "context_window", "supports_tools"],
-        "properties": {
-          "name": { "type": "string", "maxLength": 128 },
-          "family": { "type": "string", "maxLength": 64 },
-          "context_window": { "type": "integer", "minimum": 1 },
-          "supports_tools": { "type": "boolean" }
-        },
-        "patternProperties": {
-          "^(vendor:)[a-z0-9_.:-]+$": { "type": ["string", "number", "boolean", "object", "array", "null"] }
-        }
-      }
+      "items": { "type": "string" },
+      "minItems": 1
     },
-    "cache": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "supports_tags": { "type": "boolean" },
-        "max_ttl_ms": { "type": "integer", "minimum": 0 },
-        "invalidation_webhook": { "type": "boolean" }
-      }
-    },
-    "extensions": { "type": "object", "additionalProperties": true }
-  }
+    "max_context_length": { "type": "integer", "minimum": 1 },
+    "supports_streaming": { "type": "boolean" },
+    "supports_roles": { "type": "boolean" },
+    "supports_system_message": { "type": "boolean" },
+    "supports_json_output": { "type": "boolean" },
+    "supports_parallel_tool_calls": { "type": "boolean" },
+    "supports_deadline": { "type": "boolean" },
+    "supports_count_tokens": { "type": "boolean" },
+    "idempotent_writes": { "type": "boolean" },
+    "supports_multi_tenant": { "type": "boolean" },
+    "max_tokens_per_minute": { "type": ["integer", "null"], "minimum": 1 },
+    "max_requests_per_minute": { "type": ["integer", "null"], "minimum": 1 },
+    "supports_function_calling": { "type": "boolean" },
+    "supports_vision": { "type": "boolean" },
+    "supports_logprobs": { "type": "boolean" }
+  },
+  "required": [
+    "protocol",
+    "server",
+    "version",
+    "model_family",
+    "supported_models",
+    "max_context_length",
+    "supports_streaming",
+    "supports_roles",
+    "supports_system_message",
+    "supports_json_output",
+    "supports_parallel_tool_calls",
+    "supports_deadline",
+    "supports_count_tokens",
+    "idempotent_writes",
+    "supports_multi_tenant"
+  ]
 }
