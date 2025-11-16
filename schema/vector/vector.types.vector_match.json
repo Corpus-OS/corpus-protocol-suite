@@ -1,23 +1,22 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/vector/vector.types.vector_match.json",
+  "$id": "https://corpusos.com/schemas/vector/vector.types.vector_match.json",
   "title": "VectorMatch",
-  "description": "A single match entry returned from vector.query.",
+  "description": "A single match entry returned from vector.query per protocol §14.2.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
     "vector": {
-      "$ref": "https://adaptersdk.org/schemas/vector/vector.types.vector.json"
+      "$ref": "https://corpusos.com/schemas/vector/vector.types.vector.json"
     },
     "score": {
       "type": "number",
-      "description": "Normalized score where higher is better. For euclidean backends, adapters normalize if needed."
+      "description": "Similarity score (higher = more similar)."
     },
     "distance": {
-      "type": ["number", "null"],
-      "description": "Optional raw distance if backend returns it (lower is better for euclidean)."
+      "type": "number",
+      "description": "Raw distance metric (lower = more similar)."
     }
   },
-  "required": ["vector"],
-  "$comment": "For cosine/dot, prefer score; for euclidean, adapters may provide both a normalized score and raw distance."
+  "required": ["vector", "score", "distance"]
 }
