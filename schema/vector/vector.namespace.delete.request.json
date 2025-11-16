@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/vector/vector.namespace.delete.request.json",
+  "$id": "https://corpusos.com/schemas/vector/vector.namespace.delete.request.json",
   "title": "vector.delete_namespace args",
   "description": "Arguments for op: vector.delete_namespace",
   "type": "object",
