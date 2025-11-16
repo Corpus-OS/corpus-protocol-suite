@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/vector/vector.types.vector.json",
+  "$id": "https://corpusos.com/schemas/vector/vector.types.vector.json",
   "title": "Vector",
   "description": "Canonical Vector representation used by Vector Protocol operations.",
   "type": "object",
@@ -16,7 +16,6 @@
     "vector": {
       "type": "array",
       "minItems": 1,
-      "maxItems": 8192,
       "items": {
         "type": "number"
       },
@@ -35,5 +34,5 @@
     }
   },
   "required": ["id", "vector"],
-  "$comment": "Dimension conformity is enforced against capabilities.limits.dimension at runtime."
+  "$comment": "Dimension conformity is enforced against capabilities.max_dimensions at runtime."
 }
