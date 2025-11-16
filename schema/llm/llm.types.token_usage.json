@@ -1,14 +1,14 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/llm/llm.types.token_usage.json",
+  "$id": "https://corpusos.com/schemas/llm/llm.types.token_usage.json",
   "title": "Token Usage",
+  "description": "Token usage per protocol §3.7",
   "type": "object",
   "additionalProperties": false,
-  "required": ["prompt_tokens", "completion_tokens", "total_tokens"],
+  "required": ["prompt_tokens", "total_tokens"],
   "properties": {
-    "prompt_tokens": { "type": "integer", "minimum": 0, "maximum": 10000000 },
-    "completion_tokens": { "type": "integer", "minimum": 0, "maximum": 10000000 },
-    "total_tokens": { "type": "integer", "minimum": 0, "maximum": 10000000 }
-  },
-  "$comment": "Implementations MUST ensure total_tokens = prompt_tokens + completion_tokens."
+    "prompt_tokens": { "type": "integer", "minimum": 0 },
+    "completion_tokens": { "type": "integer", "minimum": 0 },
+    "total_tokens": { "type": "integer", "minimum": 0 }
+  }
 }
