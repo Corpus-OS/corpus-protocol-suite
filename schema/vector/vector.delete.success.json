@@ -1,49 +1,29 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/vector/vector.delete.success.json",
+  "$id": "https://corpusos.com/schemas/vector/vector.delete.success.json",
   "title": "vector.delete result",
-  "description": "Result payload for vector.delete, supports OK and PARTIAL_SUCCESS.",
+  "description": "Result payload for vector.delete following protocol §14.8 BatchResult pattern.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
-    "code": { "type": "string", "enum": ["OK", "PARTIAL_SUCCESS"] },
-    "successes": { "type": "integer", "minimum": 0 },
-    "failures": { "type": "integer", "minimum": 0 },
-    "items": {
+    "deleted_count": { "type": "integer", "minimum": 0 },
+    "failed_count": { "type": "integer", "minimum": 0 },
+    "filter_applied_count": { "type": ["integer", "null"], "minimum": 0 },
+    "failures": {
       "type": "array",
-      "minItems": 1,
-      "maxItems": 100000,
-      "items": {
-        "oneOf": [
-          {
-            "title": "SuccessItem",
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-              "index": { "type": "integer", "minimum": 0 },
-              "ok": { "type": "boolean", "const": true },
-              "id": { "type": ["string", "null"], "maxLength": 256 }
-            },
-            "required": ["index", "ok"]
-          },
-          { "$ref": "https://adaptersdk.org/schemas/vector/vector.types.failure_item.json" }
-        ]
-      }
-    },
-    "warnings": {
-      "type": "array",
-      "maxItems": 100,
       "items": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "code": { "type": "string", "pattern": "^[A-Z0-9_]{2,64}$" },
-          "message": { "type": "string", "maxLength": 1000 }
+          "id": { "type": ["string", "null"] },
+          "index": { "type": ["integer", "null"] },
+          "error": { "type": "string" },
+          "detail": { "type": "string" }
         },
-        "required": ["code", "message"]
+        "required": ["error", "detail"]
       }
     }
   },
-  "required": ["code", "successes", "failures", "items"],
-  "$comment": "For filter deletes, items MAY summarize (e.g., one element) if per-item IDs are unknown. Maintain index mapping when request provided ids."
+  "required": ["deleted_count", "failed_count", "failures"],
+  "$comment": "For filter deletes where individual IDs are unknown, failures array may be empty if failed_count is 0. filter_applied_count indicates how many vectors matched filter criteria."
 }
