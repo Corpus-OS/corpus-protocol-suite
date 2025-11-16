@@ -1,1 +1,24 @@
-delete
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/llm/llm.types.logprobs.json",
+  "title": "LLM Logprobs",
+  "description": "Token probabilities - used when capabilities.supports_logprobs = true",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "tokens": { "type": "array", "items": { "type": "string" } },
+    "token_logprobs": { "type": "array", "items": { "type": "number" } },
+    "top_logprobs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "token": { "type": "string" },
+          "logprob": { "type": "number" }
+        },
+        "required": ["token", "logprob"]
+      }
+    }
+  }
+}
