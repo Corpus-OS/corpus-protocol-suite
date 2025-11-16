@@ -1,23 +1,12 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/llm/llm.response_format.json",
+  "$id": "https://corpusos.com/schemas/llm/llm.response_format.json",
   "title": "LLM Response Format",
+  "description": "Response format per protocol §12.5",
   "type": "object",
-  "oneOf": [
-    {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["type"],
-      "properties": { "type": { "const": "text" } }
-    },
-    {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["type", "json_schema"],
-      "properties": {
-        "type": { "const": "json_schema" },
-        "json_schema": { "type": "object", "additionalProperties": true }
-      }
-    }
-  ]
+  "additionalProperties": false,
+  "properties": {
+    "type": { "type": "string", "enum": ["json_object"] }
+  },
+  "required": ["type"]
 }
