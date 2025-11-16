@@ -1,15 +1,35 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/llm/llm.health.success.json",
+  "$id": "https://corpusos.com/schemas/llm/llm.health.success.json",
   "title": "LLM Health",
+  "description": "Health status per protocol §11.5",
   "type": "object",
   "additionalProperties": false,
-  "required": ["ok", "status"],
   "properties": {
     "ok": { "type": "boolean" },
-    "status": { "type": "string", "enum": ["ok", "degraded", "down"] },
-    "reason": { "type": "string", "maxLength": 512 },
-    "server": { "type": "string", "maxLength": 128 },
-    "version": { "type": "string", "maxLength": 64 }
-  }
+    "server": { "type": "string" },
+    "version": { "type": "string" },
+    "status": { "type": "string", "enum": ["ok", "degraded"] },
+    "models": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "available": { "type": "boolean" },
+          "rate_limited": { "type": "boolean" },
+          "degraded": { "type": "boolean" }
+        },
+        "required": ["available"]
+      }
+    },
+    "rate_limits": {
+      "type": "object",
+      "properties": {
+        "tokens_per_minute": { "type": "number" },
+        "requests_per_minute": { "type": "number" }
+      }
+    },
+    "message": { "type": "string" }
+  },
+  "required": ["ok", "server", "version"]
 }
