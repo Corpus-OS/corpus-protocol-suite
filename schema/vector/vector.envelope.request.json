@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/vector/vector.envelope.request.json",
+  "$id": "https://corpusos.com/schemas/vector/vector.envelope.request.json",
   "title": "Vector Request Envelope",
   "description": "Wire-first canonical request envelope for vector component operations.",
   "type": "object",
@@ -19,19 +19,12 @@
       ]
     },
     "ctx": {
-      "$ref": "https://adaptersdk.org/schemas/common/operation_context.json"
+      "$ref": "https://corpusos.com/schemas/common/operation_context.json"
     },
     "args": {
-      "oneOf": [
-        { "$ref": "https://adaptersdk.org/schemas/vector/vector.query.request.json" },
-        { "$ref": "https://adaptersdk.org/schemas/vector/vector.upsert.request.json" },
-        { "$ref": "https://adaptersdk.org/schemas/vector/vector.delete.request.json" },
-        { "$ref": "https://adaptersdk.org/schemas/vector/vector.namespace.create.request.json" },
-        { "$ref": "https://adaptersdk.org/schemas/vector/vector.namespace.delete.request.json" },
-        { "type": "object", "additionalProperties": false, "properties": {}, "description": "capabilities/health take empty args" }
-      ]
+      "type": "object"
     }
   },
   "required": ["op", "ctx", "args"],
-  "$comment": "Follows common envelope.request shape; specialized here for vector operations."
+  "$comment": "Follows common envelope.request shape; specialized here for vector operations. Args validation determined by operation type."
 }
