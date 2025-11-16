@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/vector/vector.namespace.create.request.json",
+  "$id": "https://corpusos.com/schemas/vector/vector.namespace.create.request.json",
   "title": "vector.create_namespace args",
-  "description": "Arguments for op: vector.create_namespace",
+  "description": "Arguments for op: vector.create_namespace per protocol §15.5.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -11,15 +11,8 @@
       "maxLength": 256,
       "pattern": "^[A-Za-z0-9._:-]{1,256}$"
     },
-    "dimensions": { "type": "integer", "minimum": 1, "maximum": 8192 },
-    "distance_metric": { "type": "string", "enum": ["cosine", "euclidean", "dot"] },
-    "extensions": {
-      "type": "object",
-      "additionalProperties": true,
-      "patternProperties": {
-        "^(vendor:)[a-z0-9_.:-]+$": { "type": ["string", "number", "boolean", "object", "array", "null"] }
-      }
-    }
+    "dimensions": { "type": "integer", "minimum": 1 },
+    "distance_metric": { "type": "string", "enum": ["cosine", "euclidean", "dotproduct"] }
   },
   "required": ["namespace", "dimensions", "distance_metric"],
   "$comment": "Namespaces MUST be created explicitly; other operations MUST NOT create implicitly."
