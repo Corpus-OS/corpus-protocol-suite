@@ -1,45 +1,10 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/vector/vector.query.success.json",
+  "$id": "https://corpusos.com/schemas/vector/vector.query.success.json",
   "title": "vector.query result",
-  "description": "Result payload for a successful vector.query (non-streaming).",
+  "description": "Result payload for vector.query per protocol §14.4.",
   "type": "object",
-  "additionalProperties": false,
-  "properties": {
-    "matches": {
-      "type": "array",
-      "items": { "$ref": "https://adaptersdk.org/schemas/vector/vector.types.vector_match.json" }
-    },
-    "query_vector": {
-      "type": ["array", "null"],
-      "items": { "type": "number" },
-      "minItems": 1,
-      "maxItems": 8192
-    },
-    "namespace": {
-      "type": "string",
-      "maxLength": 256,
-      "pattern": "^[A-Za-z0-9._:-]{1,256}$"
-    },
-    "total_matches": { "type": "integer", "minimum": 0 },
-    "next_page_token": {
-      "type": ["string", "null"],
-      "maxLength": 4096,
-      "pattern": "^[A-Za-z0-9+/=_-]{1,4096}$"
-    },
-    "warnings": {
-      "type": "array",
-      "maxItems": 100,
-      "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "code": { "type": "string", "pattern": "^[A-Z0-9_]{2,64}$" },
-          "message": { "type": "string", "maxLength": 1000 }
-        },
-        "required": ["code", "message"]
-      }
-    }
-  },
-  "required": ["matches", "namespace", "total_matches"]
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/vector/vector.types.query_result.json" }
+  ]
 }
