@@ -4,8 +4,8 @@ Golden sample + schema meta-validation for Corpus Protocol (Draft 2020-12).
 
 This suite validates:
 - Golden messages against component envelopes (requests/success/error)
-- NDJSON stream rules for LLM + Graph (data/end/error; exactly-one terminal)
-- Cross-schema invariants (partial-success math, token totals, vector dims)
+- Protocol envelope standardization (§2.4) for all operations
+- Cross-schema invariants (token totals, vector dims, batch results)
 - Drift detection (listed vs on-disk goldens)
 - Schema meta-lint: every JSON Schema under schemas/** is valid and resolvable
 - Heuristics: timestamp/id patterns, fixture size guardrails, large string checks
@@ -36,29 +36,23 @@ GOLDEN = Path(__file__).resolve().parent    # tests/golden/
 # ------------------------------------------------------------------------------
 MAX_VECTOR_DIMENSIONS = 10_000
 MAX_FIXTURE_SIZE_BYTES = 10 * 1024 * 1024  # 10MB
-LARGE_STRING_FIELDS = {"text", "content", "data", "vector"}  # allow larger but bounded
+LARGE_STRING_FIELDS = {"text", "content"}  # allow larger but bounded
 SUPPORTING_FILES = {"README.md", ".gitkeep", "config.json"}
 SUPPORTED_COMPONENTS = {"llm", "vector", "embedding", "graph"}
-STREAM_TERMINAL_EVENTS = {"end", "error"}
 
 # Field-specific size limits (bytes)
 MAX_STRING_FIELD_SIZES = {
     "text": 5_000_000,      # 5MB for text content
     "content": 5_000_000,   # 5MB for content  
-    "data": 2_000_000,      # 2MB for generic data
-    "vector": 100_000,      # 100KB for vector data (encoded)
 }
 
 # Validation patterns
 TIMESTAMP_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
 ID_PATTERN = re.compile(r"^[A-Za-z0-9._~:-]{1,256}$")
-SCHEMA_VERSION_PATTERN = re.compile(r"^\d+\.\d+\.\d+$")
 
 # Golden file naming patterns
 GOLDEN_NAMING_PATTERNS = [
-    r"^[a-z_]+_(request|success|error|partial_success_result)\.json$",
-    r"^[a-z_]+_stream(?:|_error)\.ndjson$", 
-    r"^[a-z_]+_stream_frame_(data|end|error)\.json$",
+    r"^[a-z_]+_(request|success|error)\.json$",
     r"^error_envelope_example\.json$"
 ]
 
@@ -140,72 +134,66 @@ def _validate_string_field_size(obj: Any, path: str = "", issues: List[str] | No
 # ------------------------------------------------------------------------------
 CASES: List[Tuple[str, str]] = [
     # ---------------------- LLM ----------------------
-    ("llm_complete_request.json",         "https://adaptersdk.org/schemas/llm/llm.envelope.request.json"),
-    ("llm_complete_success.json",         "https://adaptersdk.org/schemas/llm/llm.envelope.success.json"),
-    ("llm_count_tokens_request.json",     "https://adaptersdk.org/schemas/llm/llm.envelope.request.json"),
-    ("llm_count_tokens_success.json",     "https://adaptersdk.org/schemas/llm/llm.envelope.success.json"),
-    ("llm_capabilities_success.json",     "https://adaptersdk.org/schemas/llm/llm.envelope.success.json"),
-    ("llm_health_success.json",           "https://adaptersdk.org/schemas/llm/llm.envelope.success.json"),
+    ("llm_complete_request.json",         "https://corpusos.com/schemas/llm/llm.envelope.request.json"),
+    ("llm_complete_success.json",         "https://corpusos.com/schemas/llm/llm.envelope.success.json"),
+    ("llm_count_tokens_request.json",     "https://corpusos.com/schemas/llm/llm.envelope.request.json"),
+    ("llm_count_tokens_success.json",     "https://corpusos.com/schemas/llm/llm.envelope.success.json"),
+    ("llm_capabilities_success.json",     "https://corpusos.com/schemas/llm/llm.envelope.success.json"),
+    ("llm_health_success.json",           "https://corpusos.com/schemas/llm/llm.envelope.success.json"),
     # Optional request variants
-    ("llm_complete_request_with_tools.json",            "https://adaptersdk.org/schemas/llm/llm.envelope.request.json"),
-    ("llm_complete_request_with_response_format.json",  "https://adaptersdk.org/schemas/llm/llm.envelope.request.json"),
-    # Optional per-frame samples (single frames as JSON, not NDJSON)
-    ("llm_stream_frame_data.json",        "https://adaptersdk.org/schemas/llm/llm.stream.frame.data.json"),
-    ("llm_stream_frame_end.json",         "https://adaptersdk.org/schemas/llm/llm.stream.frame.end.json"),
-    ("llm_stream_frame_error.json",       "https://adaptersdk.org/schemas/llm/llm.stream.frame.error.json"),
+    ("llm_complete_request_with_tools.json",            "https://corpusos.com/schemas/llm/llm.envelope.request.json"),
+    ("llm_complete_request_with_response_format.json",  "https://corpusos.com/schemas/llm/llm.envelope.request.json"),
+    # Streaming chunks (protocol envelope format)
+    ("llm_stream_chunk.json",             "https://corpusos.com/schemas/llm/llm.envelope.success.json"),
 
     # -------------------- VECTOR ---------------------
-    ("vector_query_request.json",         "https://adaptersdk.org/schemas/vector/vector.envelope.request.json"),
-    ("vector_query_success.json",         "https://adaptersdk.org/schemas/vector/vector.envelope.success.json"),
-    ("vector_upsert_request.json",        "https://adaptersdk.org/schemas/vector/vector.envelope.request.json"),
-    ("vector_upsert_success.json",        "https://adaptersdk.org/schemas/vector/vector.envelope.success.json"),
-    ("vector_delete_request.json",        "https://adaptersdk.org/schemas/vector/vector.envelope.request.json"),
-    ("vector_delete_success.json",        "https://adaptersdk.org/schemas/vector/vector.envelope.success.json"),
-    ("vector_namespace_create_request.json", "https://adaptersdk.org/schemas/vector/vector.envelope.request.json"),
-    ("vector_namespace_create_success.json", "https://adaptersdk.org/schemas/vector/vector.envelope.success.json"),
-    ("vector_namespace_delete_request.json", "https://adaptersdk.org/schemas/vector/vector.envelope.request.json"),
-    ("vector_namespace_delete_success.json", "https://adaptersdk.org/schemas/vector/vector.envelope.success.json"),
-    ("vector_capabilities_success.json",  "https://adaptersdk.org/schemas/vector/vector.envelope.success.json"),
-    ("vector_health_success.json",        "https://adaptersdk.org/schemas/vector/vector.envelope.success.json"),
-    ("vector_error_dimension_mismatch.json", "https://adaptersdk.org/schemas/vector/vector.envelope.error.json"),
-    ("vector_partial_success_result.json","https://adaptersdk.org/schemas/vector/vector.envelope.success.json"),
+    ("vector_query_request.json",         "https://corpusos.com/schemas/vector/vector.envelope.request.json"),
+    ("vector_query_success.json",         "https://corpusos.com/schemas/vector/vector.envelope.success.json"),
+    ("vector_upsert_request.json",        "https://corpusos.com/schemas/vector/vector.envelope.request.json"),
+    ("vector_upsert_success.json",        "https://corpusos.com/schemas/vector/vector.envelope.success.json"),
+    ("vector_delete_request.json",        "https://corpusos.com/schemas/vector/vector.envelope.request.json"),
+    ("vector_delete_success.json",        "https://corpusos.com/schemas/vector/vector.envelope.success.json"),
+    ("vector_namespace_create_request.json", "https://corpusos.com/schemas/vector/vector.envelope.request.json"),
+    ("vector_namespace_create_success.json", "https://corpusos.com/schemas/vector/vector.envelope.success.json"),
+    ("vector_namespace_delete_request.json", "https://corpusos.com/schemas/vector/vector.envelope.request.json"),
+    ("vector_namespace_delete_success.json", "https://corpusos.com/schemas/vector/vector.envelope.success.json"),
+    ("vector_capabilities_success.json",  "https://corpusos.com/schemas/vector/vector.envelope.success.json"),
+    ("vector_health_success.json",        "https://corpusos.com/schemas/vector/vector.envelope.success.json"),
+    ("vector_error_dimension_mismatch.json", "https://corpusos.com/schemas/vector/vector.envelope.error.json"),
 
     # ------------------- EMBEDDING -------------------
-    ("embedding_embed_request.json",          "https://adaptersdk.org/schemas/embedding/embedding.envelope.request.json"),
-    ("embedding_embed_success.json",          "https://adaptersdk.org/schemas/embedding/embedding.envelope.success.json"),
-    ("embedding_embed_batch_request.json",    "https://adaptersdk.org/schemas/embedding/embedding.envelope.request.json"),
-    ("embedding_embed_batch_success.json",    "https://adaptersdk.org/schemas/embedding/embedding.envelope.success.json"),
-    ("embedding_count_tokens_request.json",   "https://adaptersdk.org/schemas/embedding/embedding.envelope.request.json"),
-    ("embedding_count_tokens_success.json",   "https://adaptersdk.org/schemas/embedding/embedding.envelope.success.json"),
-    ("embedding_capabilities_request.json",   "https://adaptersdk.org/schemas/embedding/embedding.envelope.request.json"),
-    ("embedding_capabilities_success.json",   "https://adaptersdk.org/schemas/embedding/embedding.envelope.success.json"),
-    ("embedding_health_request.json",         "https://adaptersdk.org/schemas/embedding/embedding.envelope.request.json"),
-    ("embedding_health_success.json",         "https://adaptersdk.org/schemas/embedding/embedding.envelope.success.json"),
-    ("embedding_partial_success_result.json", "https://adaptersdk.org/schemas/embedding/embedding.envelope.success.json"),
-    ("embedding_error_text_too_long.json",    "https://adaptersdk.org/schemas/embedding/embedding.envelope.error.json"),
+    ("embedding_embed_request.json",          "https://corpusos.com/schemas/embedding/embedding.envelope.request.json"),
+    ("embedding_embed_success.json",          "https://corpusos.com/schemas/embedding/embedding.envelope.success.json"),
+    ("embedding_embed_batch_request.json",    "https://corpusos.com/schemas/embedding/embedding.envelope.request.json"),
+    ("embedding_embed_batch_success.json",    "https://corpusos.com/schemas/embedding/embedding.envelope.success.json"),
+    ("embedding_count_tokens_request.json",   "https://corpusos.com/schemas/embedding/embedding.envelope.request.json"),
+    ("embedding_count_tokens_success.json",   "https://corpusos.com/schemas/embedding/embedding.envelope.success.json"),
+    ("embedding_capabilities_request.json",   "https://corpusos.com/schemas/embedding/embedding.envelope.request.json"),
+    ("embedding_capabilities_success.json",   "https://corpusos.com/schemas/embedding/embedding.envelope.success.json"),
+    ("embedding_health_request.json",         "https://corpusos.com/schemas/embedding/embedding.envelope.request.json"),
+    ("embedding_health_success.json",         "https://corpusos.com/schemas/embedding/embedding.envelope.success.json"),
+    ("embedding_error_text_too_long.json",    "https://corpusos.com/schemas/embedding/embedding.envelope.error.json"),
 
     # ---------------------- GRAPH --------------------
-    ("graph_query_request.json",          "https://adaptersdk.org/schemas/graph/graph.envelope.request.json"),
-    ("graph_query_success.json",          "https://adaptersdk.org/schemas/graph/graph.envelope.success.json"),
-    ("graph_stream_query_request.json",   "https://adaptersdk.org/schemas/graph/graph.envelope.request.json"),
-    ("graph_capabilities_request.json",   "https://adaptersdk.org/schemas/graph/graph.envelope.request.json"),
-    ("graph_capabilities_success.json",   "https://adaptersdk.org/schemas/graph/graph.envelope.success.json"),
-    ("graph_health_request.json",         "https://adaptersdk.org/schemas/graph/graph.envelope.request.json"),
-    ("graph_health_success.json",         "https://adaptersdk.org/schemas/graph/graph.envelope.success.json"),
-    ("graph_vertex_create_request.json",  "https://adaptersdk.org/schemas/graph/graph.envelope.request.json"),
-    ("graph_vertex_delete_request.json",  "https://adaptersdk.org/schemas/graph/graph.envelope.request.json"),
-    ("graph_edge_create_request.json",    "https://adaptersdk.org/schemas/graph/graph.envelope.request.json"),
-    ("graph_batch_request.json",          "https://adaptersdk.org/schemas/graph/graph.envelope.request.json"),
-    ("graph_batch_partial_success.json",  "https://adaptersdk.org/schemas/graph/graph.envelope.success.json"),
-    ("graph_id_success.json",             "https://adaptersdk.org/schemas/graph/graph.envelope.success.json"),
-    ("graph_ack_success.json",            "https://adaptersdk.org/schemas/graph/graph.envelope.success.json"),
-    # Optional per-frame samples (single frames as JSON)
-    ("graph_stream_frame_data.json",      "https://adaptersdk.org/schemas/graph/graph.stream.frame.data.json"),
-    ("graph_stream_frame_end.json",       "https://adaptersdk.org/schemas/graph/graph.stream.frame.end.json"),
-    ("graph_stream_frame_error.json",     "https://adaptersdk.org/schemas/graph/graph.stream.frame.error.json"),
+    ("graph_query_request.json",          "https://corpusos.com/schemas/graph/graph.envelope.request.json"),
+    ("graph_query_success.json",          "https://corpusos.com/schemas/graph/graph.envelope.success.json"),
+    ("graph_stream_query_request.json",   "https://corpusos.com/schemas/graph/graph.envelope.request.json"),
+    ("graph_capabilities_request.json",   "https://corpusos.com/schemas/graph/graph.envelope.request.json"),
+    ("graph_capabilities_success.json",   "https://corpusos.com/schemas/graph/graph.envelope.success.json"),
+    ("graph_health_request.json",         "https://corpusos.com/schemas/graph/graph.envelope.request.json"),
+    ("graph_health_success.json",         "https://corpusos.com/schemas/graph/graph.envelope.success.json"),
+    ("graph_vertex_create_request.json",  "https://corpusos.com/schemas/graph/graph.envelope.request.json"),
+    ("graph_vertex_delete_request.json",  "https://corpusos.com/schemas/graph/graph.envelope.request.json"),
+    ("graph_edge_create_request.json",    "https://corpusos.com/schemas/graph/graph.envelope.request.json"),
+    ("graph_batch_request.json",          "https://corpusos.com/schemas/graph/graph.envelope.request.json"),
+    ("graph_batch_success.json",          "https://corpusos.com/schemas/graph/graph.envelope.success.json"),
+    ("graph_id_success.json",             "https://corpusos.com/schemas/graph/graph.envelope.success.json"),
+    ("graph_ack_success.json",            "https://corpusos.com/schemas/graph/graph.envelope.success.json"),
+    # Streaming chunks (protocol envelope format)
+    ("graph_stream_chunk.json",           "https://corpusos.com/schemas/graph/graph.envelope.success.json"),
 
     # ------------- Generic error example -------------
-    ("error_envelope_example.json",       "https://adaptersdk.org/schemas/llm/llm.envelope.error.json"),
+    ("error_envelope_example.json",       "https://corpusos.com/schemas/llm/llm.envelope.error.json"),
 ]
 
 # ------------------------------------------------------------------------------
@@ -230,124 +218,184 @@ def test_golden_validates(fname: str, schema_id: str):
     assert_valid(schema_id, doc, context=fname)
 
 # ------------------------------------------------------------------------------
-# NDJSON stream validations (LLM + Graph)
+# Protocol Envelope Compliance Tests
 # ------------------------------------------------------------------------------
-def test_llm_stream_ndjson_union_validates():
-    """Test LLM NDJSON stream validates against union schema."""
-    ndj = _read_text_if_exists("llm_stream.ndjson")
-    if ndj is None:
-        pytest.skip("llm_stream.ndjson fixture not present")
+def test_all_success_envelopes_follow_protocol_format():
+    """Test ALL success envelopes use {ok, code, ms, result} exactly per §2.4."""
+    for fname, schema_id in CASES:
+        if "envelope.success" not in schema_id:
+            continue
+            
+        p = GOLDEN / fname
+        if not p.exists():
+            continue
+            
+        doc = json.loads(p.read_text(encoding="utf-8"))
+        
+        # Protocol §2.4 REQUIRED fields
+        assert "ok" in doc, f"{fname}: missing 'ok' field"
+        assert "code" in doc, f"{fname}: missing 'code' field" 
+        assert "ms" in doc, f"{fname}: missing 'ms' field"
+        assert "result" in doc, f"{fname}: missing 'result' field"
+        
+        # Protocol §2.4 EXACT field constraints
+        assert doc["ok"] is True, f"{fname}: 'ok' must be true"
+        assert doc["code"] == "OK", f"{fname}: 'code' must be 'OK'"
+        assert isinstance(doc["ms"], (int, float)) and doc["ms"] >= 0, f"{fname}: 'ms' must be non-negative number"
+        
+        # Protocol §2.4 NO extra fields
+        allowed_fields = {"ok", "code", "ms", "result"}
+        extra_fields = set(doc.keys()) - allowed_fields
+        assert not extra_fields, f"{fname}: contains non-protocol fields: {extra_fields}"
+
+def test_all_error_envelopes_follow_protocol_format():
+    """Test ALL error envelopes use protocol error format exactly per §2.4."""
+    for fname, schema_id in CASES:
+        if "envelope.error" not in schema_id:
+            continue
+            
+        p = GOLDEN / fname
+        if not p.exists():
+            continue
+            
+        doc = json.loads(p.read_text(encoding="utf-8"))
+        
+        # Protocol §2.4 REQUIRED fields
+        required_fields = {"ok", "code", "error", "message", "ms"}
+        for field in required_fields:
+            assert field in doc, f"{fname}: missing required field '{field}'"
+        
+        # Protocol §2.4 field constraints
+        assert doc["ok"] is False, f"{fname}: 'ok' must be false"
+        assert isinstance(doc["ms"], (int, float)) and doc["ms"] >= 0
+        
+        # Protocol §2.4 OPTIONAL fields
+        allowed_fields = {"ok", "code", "error", "message", "retry_after_ms", "details", "ms"}
+        extra_fields = set(doc.keys()) - allowed_fields
+        assert not extra_fields, f"{fname}: contains non-protocol fields: {extra_fields}"
+
+def test_all_batch_operations_use_protocol_batchresult_pattern():
+    """Test batch operations use {processed_count, failed_count, failures[]} pattern per §3.4."""
+    batch_files = [
+        "vector_upsert_success.json",
+        "vector_delete_success.json", 
+        "graph_batch_success.json",
+        "embedding_embed_batch_success.json"
+    ]
     
-    validate_ndjson_stream(
-        ndj,
-        union_schema_id="https://adaptersdk.org/schemas/llm/llm.stream.frames.ndjson.schema.json",
-        component="llm",
-    )
+    for fname in batch_files:
+        p = GOLDEN / fname
+        if not p.exists():
+            continue
+            
+        doc = json.loads(p.read_text(encoding="utf-8"))
+        result = doc.get("result", {})
+        
+        # Protocol §3.4 BatchResult pattern
+        assert "processed_count" in result, f"{fname}: missing 'processed_count'"
+        assert "failed_count" in result, f"{fname}: missing 'failed_count'"
+        assert "failures" in result, f"{fname}: missing 'failures' array"
+        
+        # Validate failures array structure
+        for failure in result.get("failures", []):
+            assert "error" in failure, f"{fname}: failure missing 'error' field"
+            assert "detail" in failure, f"{fname}: failure missing 'detail' field"
+            # id and index are optional per protocol
 
-def test_llm_stream_error_ndjson_validates():
-    """Test LLM error NDJSON stream validates protocol rules."""
-    ndj = _read_text_if_exists("llm_stream_error.ndjson")
-    if ndj is None:
-        pytest.skip("llm_stream_error.ndjson fixture not present")
+def test_batch_operations_track_failures_in_result():
+    """Test batch operations track failures via failed_count > 0, not envelope codes per §3.4."""
+    batch_files = [
+        "vector_upsert_success.json",
+        "vector_delete_success.json", 
+        "graph_batch_success.json",
+        "embedding_embed_batch_success.json"
+    ]
     
-    validate_ndjson_stream(
-        ndj,
-        union_schema_id="https://adaptersdk.org/schemas/llm/llm.stream.frames.ndjson.schema.json",
-        component="llm",
-    )
+    for fname in batch_files:
+        p = GOLDEN / fname
+        if not p.exists():
+            continue
+            
+        doc = json.loads(p.read_text(encoding="utf-8"))
+        
+        # Protocol §2.4: envelope code must always be "OK" for successful operations
+        assert doc["code"] == "OK", f"{fname}: batch operation must use 'OK' code, not partial success codes"
+        
+        # Protocol §3.4: failures tracked in result, not envelope
+        result = doc.get("result", {})
+        failed_count = result.get("failed_count", 0)
+        failures = result.get("failures", [])
+        
+        # If there are failures, they must be properly tracked
+        if failed_count > 0:
+            assert len(failures) > 0, f"{fname}: failed_count > 0 but failures array is empty"
+            assert failed_count == len(failures), f"{fname}: failed_count doesn't match failures array length"
 
-def test_graph_stream_ndjson_validates_frames_and_terminal_rules():
-    """Test Graph NDJSON stream validates protocol rules."""
-    ndj = _read_text_if_exists("graph_stream.ndjson")
-    if ndj is None:
-        pytest.skip("graph_stream.ndjson fixture not present")
+def test_capabilities_use_flat_structure():
+    """Test capabilities use flat structure per protocol §9.1, §13.1, §17.1."""
+    capabilities_files = [
+        "llm_capabilities_success.json",
+        "vector_capabilities_success.json", 
+        "embedding_capabilities_success.json",
+        "graph_capabilities_success.json"
+    ]
     
-    validate_ndjson_stream(
-        ndj,
-        union_schema_id=None,  # Protocol-only validation if no union schema
-        component="graph",
-    )
+    for fname in capabilities_files:
+        p = GOLDEN / fname
+        if not p.exists():
+            continue
+            
+        doc = json.loads(p.read_text(encoding="utf-8"))
+        result = doc.get("result", {})
+        
+        # Protocol requires flat structure, not nested features/limits
+        # Check for nested structures that violate protocol
+        nested_structures = {"features", "limits", "sampling", "models", "cache", "extensions"}
+        found_nested = nested_structures.intersection(result.keys())
+        assert not found_nested, f"{fname}: uses nested structure {found_nested} instead of flat protocol fields"
+        
+        # Check for required protocol fields
+        assert "protocol" in result, f"{fname}: missing 'protocol' field"
+        assert "server" in result, f"{fname}: missing 'server' field"
+        assert "version" in result, f"{fname}: missing 'version' field"
 
-def test_graph_stream_error_ndjson_validates():
-    """Test Graph error NDJSON stream validates protocol rules."""
-    ndj = _read_text_if_exists("graph_stream_error.ndjson")
-    if ndj is None:
-        pytest.skip("graph_stream_error.ndjson fixture not present")
+def test_streaming_uses_protocol_envelope():
+    """Test streaming operations use protocol envelope with chunk field per §2.4."""
+    streaming_files = [
+        "llm_stream_chunk.json",
+        "graph_stream_chunk.json"
+    ]
     
-    validate_ndjson_stream(
-        ndj,
-        union_schema_id=None,
-        component="graph",
-    )
-
-def test_stream_validation_edge_cases():
-    """Test stream validator edge cases and error conditions."""
-    # Empty stream
-    with pytest.raises(ValueError):
-        validate_ndjson_stream("", component="llm")
-
-    # Terminal-only stream (valid)
-    terminal_only = '{"event":"end","code":"OK"}\n'
-    validate_ndjson_stream(terminal_only, component="llm")
-
-    # Multiple terminals (invalid)
-    multiple_terminals = (
-        '{"event":"data","data":{"text":"x","is_final":false}}\n'
-        '{"event":"end","code":"OK"}\n'
-        '{"event":"end","code":"OK"}\n'
-    )
-    with pytest.raises(ValueError):
-        validate_ndjson_stream(multiple_terminals, component="llm")
+    for fname in streaming_files:
+        p = GOLDEN / fname
+        if not p.exists():
+            continue
+            
+        doc = json.loads(p.read_text(encoding="utf-8"))
+        
+        # Must use protocol envelope format
+        assert "ok" in doc, f"{fname}: missing 'ok' field"
+        assert "code" in doc, f"{fname}: missing 'code' field"
+        assert "ms" in doc, f"{fname}: missing 'ms' field"
+        assert "chunk" in doc, f"{fname}: missing 'chunk' field"
+        
+        assert doc["ok"] is True, f"{fname}: 'ok' must be true"
+        assert doc["code"] == "OK", f"{fname}: 'code' must be 'OK'"
+        
+        # Chunk must follow protocol chunk format
+        chunk = doc["chunk"]
+        if "llm" in fname:
+            assert "text" in chunk, f"{fname}: LLM chunk missing 'text' field"
+            assert "is_final" in chunk, f"{fname}: LLM chunk missing 'is_final' field"
+        elif "graph" in fname:
+            assert "records" in chunk, f"{fname}: Graph chunk missing 'records' field"
+            assert "is_final" in chunk, f"{fname}: Graph chunk missing 'is_final' field"
 
 # ------------------------------------------------------------------------------
 # Cross-schema invariants & heuristics
 # ------------------------------------------------------------------------------
-def test_llm_success_result_hash_matches():
-    """Test that LLM success result_hash matches computed SHA-256."""
-    p = GOLDEN / "llm_complete_success.json"
-    if not p.exists():
-        pytest.skip("llm_complete_success.json fixture not present")
-    
-    doc = json.loads(p.read_text(encoding="utf-8"))
-    result = doc.get("result")
-    rh = doc.get("result_hash")
-    
-    if not rh or result is None:
-        pytest.skip("no result_hash/result in sample")
-    
-    digest = hashlib.sha256(_canon_json(result)).hexdigest()
-    assert rh.lower() == digest, "result_hash must be SHA-256 of canonical JSON of result"
-
-def test_embedding_partial_success_invariants():
-    """Test embedding partial success mathematical invariants."""
-    p = GOLDEN / "embedding_partial_success_result.json"
-    if not p.exists():
-        pytest.skip("embedding_partial_success_result.json fixture not present")
-    
-    doc = json.loads(p.read_text(encoding="utf-8"))
-    assert doc["code"] == "PARTIAL_SUCCESS"
-    
-    res = doc["result"]
-    succ, fail, items = res["successes"], res["failures"], res["items"]
-    assert succ + fail == len(items), "successes + failures must equal len(items)"
-    assert succ >= 1 and fail >= 1, "PARTIAL_SUCCESS requires ≥1 success and ≥1 failure"
-
-def test_graph_batch_partial_success_invariants():
-    """Test graph batch partial success mathematical invariants."""
-    p = GOLDEN / "graph_batch_partial_success.json"
-    if not p.exists():
-        pytest.skip("graph_batch_partial_success.json fixture not present")
-    
-    doc = json.loads(p.read_text(encoding="utf-8"))
-    assert doc["code"] == "PARTIAL_SUCCESS"
-    
-    res = doc["result"]
-    succ, fail, items = res["successes"], res["failures"], res["items"]
-    assert succ + fail == len(items), "successes + failures must equal len(items)"
-    assert succ >= 1 and fail >= 1, "PARTIAL_SUCCESS requires ≥1 success and ≥1 failure"
-
 def test_llm_token_totals_invariant():
-    """Test LLM token usage mathematical invariant."""
+    """Test LLM token usage mathematical invariant per §3.7."""
     p = GOLDEN / "llm_complete_success.json"
     if not p.exists():
         pytest.skip("llm_complete_success.json fixture not present")
@@ -358,10 +406,11 @@ def test_llm_token_totals_invariant():
     if not usage:
         pytest.skip("no usage in sample")
     
-    assert usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"]
+    assert usage["total_tokens"] == usage["prompt_tokens"] + usage.get("completion_tokens", 0), \
+        "total_tokens must equal prompt_tokens + completion_tokens"
 
 def test_vector_dimension_invariants():
-    """Test that all vectors in a response have consistent dimensions."""
+    """Test that all vectors in a response have consistent dimensions per §16.1."""
     p = GOLDEN / "vector_query_success.json"
     if not p.exists():
         pytest.skip("vector_query_success.json fixture not present")
@@ -430,26 +479,6 @@ def test_vector_dimension_limits():
             assert len(v) <= MAX_VECTOR_DIMENSIONS, (
                 f"{vf} vector #{i} has {len(v)} dims; exceeds {MAX_VECTOR_DIMENSIONS}"
             )
-
-def test_schema_version_present_on_success_envelopes():
-    """Test that success envelopes include valid schema_version."""
-    missing = []
-    for fname, schema_id in CASES:
-        if "envelope.success" not in schema_id:
-            continue
-            
-        p = GOLDEN / fname
-        if not p.exists():
-            continue
-            
-        doc = json.loads(p.read_text(encoding="utf-8"))
-        sv = doc.get("schema_version")
-        
-        if not (isinstance(sv, str) and SCHEMA_VERSION_PATTERN.match(sv)):
-            missing.append(fname)
-    
-    if missing:
-        pytest.fail("Missing/invalid schema_version in success envelopes: " + ", ".join(missing))
 
 def test_timestamp_and_id_validation():
     """Test timestamp and ID field formatting across all golden files."""
@@ -615,4 +644,5 @@ def test_golden_file_unique_checksums():
     # Report duplicates but don't fail (some duplication might be intentional)
     duplicates = {checksum: files for checksum, files in checksums.items() if len(files) > 1}
     if duplicates:
-        duplicate_info = "; ".join(f"{files}
+        duplicate_info = "; ".join(f"{files}" for files in duplicates.values())
+        pytest.skip(f"Duplicate golden file content: {duplicate_info}")
