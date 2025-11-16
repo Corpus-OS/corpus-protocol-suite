@@ -1,21 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-Advanced Streaming Frames Validator
+Protocol-Compliant Stream Validator for Corpus Protocol Suite.
 
-Validates NDJSON / SSE / WebSocket-like JSON frames against a union frame schema ($id),
-and enforces protocol-level invariants with production-grade performance and reliability.
+Validates that streaming operations follow protocol §2.4 envelope format and §2.7 streaming semantics.
+This validator ensures ALL stream frames use the canonical {ok, code, ms, result/chunk} envelope structure.
 
 Features:
-- Exactly one terminal frame (event=end OR event=error)
-- No data frames after terminal
-- Configurable max frame size enforcement
-- Performance-optimized sampling for large streams
-- Comprehensive validation reporting with metrics
-- Streaming-friendly memory efficiency
-- Async support for high-throughput applications
-- True streaming parse for unbounded streams
-- Telemetry hooks for observability integration
-- Error collection mode for comprehensive validation
+- Validates protocol envelope structure on every frame
+- Enforces streaming termination semantics
+- Performance-optimized for production use
+- Transport-agnostic (works with NDJSON, SSE, WebSocket)
+- Comprehensive validation reporting
 """
 
 from __future__ import annotations
@@ -46,13 +41,6 @@ class ValidationMode(Enum):
     SAMPLED = "sampled"  # Validate sample of frames
     LAZY = "lazy"  # Validate only protocol rules, skip schema validation
     COLLECT_ERRORS = "collect_errors"  # Collect all errors instead of failing fast
-
-
-class TerminalType(Enum):
-    """Terminal frame types."""
-    END = "end"
-    ERROR = "error"
-    NONE = "none"
 
 
 @dataclass(frozen=True)
@@ -128,7 +116,7 @@ class StreamValidationReport:
 @dataclass(frozen=True)
 class ValidationConfig:
     """Configuration for stream validation."""
-    union_schema_id: str
+    envelope_schema_id: str  # Schema for protocol envelope (e.g., llm.envelope.success.json)
     component: str
     max_frame_bytes: Optional[int] = 1_048_576  # 1 MiB
     mode: ValidationMode = ValidationMode.STRICT
@@ -149,11 +137,6 @@ class StreamProtocolError(AssertionError):
     pass
 
 
-class StreamPerformanceWarning(UserWarning):
-    """Warning for performance-related stream issues."""
-    pass
-
-
 class FrameSizeExceededError(StreamProtocolError):
     """Raised when frame exceeds size limits."""
     pass
@@ -164,12 +147,12 @@ class StreamParser(ABC):
     
     @abstractmethod
     def parse(self, content: str) -> list[dict[str, Any]]:
-        """Parse content into frames."""
+        """Parse content into protocol envelope frames."""
         pass
     
     @abstractmethod
     async def parse_async(self, content: str) -> list[dict[str, Any]]:
-        """Parse content asynchronously into frames."""
+        """Parse content asynchronously into protocol envelope frames."""
         pass
     
     @abstractmethod
@@ -179,7 +162,7 @@ class StreamParser(ABC):
 
 
 class NDJSONParser(StreamParser):
-    """NDJSON stream parser."""
+    """NDJSON stream parser that extracts protocol envelopes."""
     
     def parse(self, content: str) -> list[dict[str, Any]]:
         frames: list[dict[str, Any]] = []
@@ -191,10 +174,30 @@ class NDJSONParser(StreamParser):
                 frame = json.loads(line)
                 if not isinstance(frame, dict):
                     raise StreamProtocolError(f"Frame #{i} must be a JSON object, got {type(frame).__name__}")
-                frames.append(frame)
+                
+                # Extract protocol envelope - ignore transport-specific fields
+                envelope = self._extract_protocol_envelope(frame, i)
+                frames.append(envelope)
             except json.JSONDecodeError as e:
                 raise StreamProtocolError(f"Invalid NDJSON at line #{i}: {e}") from e
         return frames
+    
+    def _extract_protocol_envelope(self, frame: dict[str, Any], frame_num: int) -> dict[str, Any]:
+        """Extract protocol envelope from transport frame."""
+        # For NDJSON, the frame should already be the protocol envelope
+        # But handle cases where transport adds wrapper fields
+        protocol_fields = {"ok", "code", "ms", "result", "chunk", "error", "message", "retry_after_ms", "details"}
+        
+        # If frame contains only protocol fields, return as-is
+        if set(frame.keys()).issubset(protocol_fields):
+            return frame
+        
+        # If frame has extra fields, extract protocol envelope
+        envelope = {k: v for k, v in frame.items() if k in protocol_fields}
+        if not envelope:
+            raise StreamProtocolError(f"Frame #{frame_num} contains no protocol envelope fields")
+        
+        return envelope
     
     async def parse_async(self, content: str) -> list[dict[str, Any]]:
         """Async implementation that uses thread pool for CPU-bound work."""
@@ -202,14 +205,7 @@ class NDJSONParser(StreamParser):
         return await loop.run_in_executor(None, self.parse, content)
     
     async def parse_streaming(self, lines: AsyncIterable[str]) -> AsyncIterator[dict[str, Any]]:
-        """
-        True streaming parse for unbounded NDJSON streams.
-        
-        Example:
-            async for line in websocket_stream:
-                # Lines are processed as they arrive
-                pass
-        """
+        """True streaming parse for unbounded NDJSON streams."""
         line_num = 0
         async for line in lines:
             line_num += 1
@@ -220,52 +216,37 @@ class NDJSONParser(StreamParser):
                 frame = json.loads(line)
                 if not isinstance(frame, dict):
                     raise StreamProtocolError(f"Frame #{line_num} must be a JSON object, got {type(frame).__name__}")
-                yield frame
+                
+                envelope = self._extract_protocol_envelope(frame, line_num)
+                yield envelope
             except json.JSONDecodeError as e:
                 raise StreamProtocolError(f"Invalid NDJSON at line #{line_num}: {e}") from e
 
 
 class SSEParser(StreamParser):
-    """Server-Sent Events (SSE) stream parser."""
+    """Server-Sent Events (SSE) parser that extracts protocol envelopes."""
     
     def parse(self, sse_text: str) -> list[dict[str, Any]]:
         frames: list[dict[str, Any]] = []
-        current_event: Optional[str] = None
         current_data_lines: list[str] = []
-        current_id: Optional[str] = None
 
         def flush() -> None:
-            nonlocal current_event, current_data_lines, current_id
-            if current_event is None:
+            nonlocal current_data_lines
+            if not current_data_lines:
                 return
                 
             try:
                 data_content = "\n".join(current_data_lines).strip()
-                payload: dict[str, Any] = {}
-                
-                # Parse data as JSON if present
                 if data_content:
-                    try:
-                        payload = json.loads(data_content)
-                    except json.JSONDecodeError:
-                        # If not valid JSON, treat as plain text
-                        payload = {"message": data_content}
-                
-                # Construct frame according to SSE semantics
-                frame: dict[str, Any] = {"event": current_event}
-                if current_event == "data":
-                    frame["data"] = payload
-                else:
-                    frame.update(payload)
-                    
-                if current_id:
-                    frame["id"] = current_id
-                    
-                frames.append(frame)
-            except Exception as e:
-                raise StreamProtocolError(f"Invalid SSE data for event '{current_event}': {e}") from e
+                    # Parse the protocol envelope from SSE data
+                    envelope = json.loads(data_content)
+                    if not isinstance(envelope, dict):
+                        raise StreamProtocolError(f"SSE data must contain JSON object, got {type(envelope).__name__}")
+                    frames.append(envelope)
+            except json.JSONDecodeError as e:
+                raise StreamProtocolError(f"Invalid JSON in SSE data: {e}") from e
             finally:
-                current_event, current_data_lines, current_id = None, [], None
+                current_data_lines = []
 
         for line_num, raw_line in enumerate(sse_text.splitlines(), 1):
             line = raw_line.rstrip('\n\r')
@@ -274,20 +255,13 @@ class SSEParser(StreamParser):
                 flush()
                 continue
 
-            if line.startswith("event:"):
-                flush()
-                event_value = line[6:].strip()
-                # SSE spec: empty event defaults to "message"
-                current_event = event_value if event_value else "message"
-            elif line.startswith("data:"):
+            if line.startswith("data:"):
                 current_data_lines.append(line[5:].lstrip())
-            elif line.startswith("id:"):
-                current_id = line[3:].strip()
-            elif line.startswith("retry:") or line.startswith(":"):
-                # Ignore retry and comment lines
+            elif line.startswith("event:") or line.startswith("id:") or line.startswith("retry:") or line.startswith(":"):
+                # Ignore event, id, retry, and comment lines - we only care about data
                 continue
             else:
-                # Unknown line format - append to data
+                # Treat unknown lines as data (per SSE spec)
                 current_data_lines.append(line)
 
         flush()
@@ -298,47 +272,25 @@ class SSEParser(StreamParser):
         return await loop.run_in_executor(None, self.parse, content)
     
     async def parse_streaming(self, lines: AsyncIterable[str]) -> AsyncIterator[dict[str, Any]]:
-        """
-        True streaming parse for unbounded SSE streams.
-        
-        Example:
-            async for line in sse_stream:
-                # SSE events are parsed and yielded as they complete
-                pass
-        """
-        current_event: Optional[str] = None
+        """True streaming parse for unbounded SSE streams."""
         current_data_lines: list[str] = []
-        current_id: Optional[str] = None
 
         async def flush() -> AsyncIterator[dict[str, Any]]:
-            nonlocal current_event, current_data_lines, current_id
-            if current_event is None:
+            nonlocal current_data_lines
+            if not current_data_lines:
                 return
                 
             try:
                 data_content = "\n".join(current_data_lines).strip()
-                payload: dict[str, Any] = {}
-                
                 if data_content:
-                    try:
-                        payload = json.loads(data_content)
-                    except json.JSONDecodeError:
-                        payload = {"message": data_content}
-                
-                frame: dict[str, Any] = {"event": current_event}
-                if current_event == "data":
-                    frame["data"] = payload
-                else:
-                    frame.update(payload)
-                    
-                if current_id:
-                    frame["id"] = current_id
-                    
-                yield frame
-            except Exception as e:
-                raise StreamProtocolError(f"Invalid SSE data for event '{current_event}': {e}") from e
+                    envelope = json.loads(data_content)
+                    if not isinstance(envelope, dict):
+                        raise StreamProtocolError(f"SSE data must contain JSON object, got {type(envelope).__name__}")
+                    yield envelope
+            except json.JSONDecodeError as e:
+                raise StreamProtocolError(f"Invalid JSON in SSE data: {e}") from e
             finally:
-                current_event, current_data_lines, current_id = None, [], None
+                current_data_lines = []
 
         async for raw_line in lines:
             line = raw_line.rstrip('\n\r')
@@ -348,16 +300,9 @@ class SSEParser(StreamParser):
                     yield frame
                 continue
 
-            if line.startswith("event:"):
-                async for frame in flush():
-                    yield frame
-                event_value = line[6:].strip()
-                current_event = event_value if event_value else "message"
-            elif line.startswith("data:"):
+            if line.startswith("data:"):
                 current_data_lines.append(line[5:].lstrip())
-            elif line.startswith("id:"):
-                current_id = line[3:].strip()
-            elif line.startswith("retry:") or line.startswith(":"):
+            elif line.startswith("event:") or line.startswith("id:") or line.startswith("retry:") or line.startswith(":"):
                 continue
             else:
                 current_data_lines.append(line)
@@ -367,7 +312,7 @@ class SSEParser(StreamParser):
 
 
 class FrameValidator:
-    """Core frame validation logic."""
+    """Protocol envelope validation logic."""
     
     @staticmethod
     def estimate_frame_size(frame: dict[str, Any]) -> int:
@@ -388,20 +333,33 @@ class FrameValidator:
             )
     
     @staticmethod
-    def check_content_warnings(frame: dict[str, Any], frame_num: int) -> None:
-        """Check for potentially problematic frame content."""
-        if frame.get("event") == "data" and "data" in frame:
-            data = frame["data"]
-            if isinstance(data, str) and len(data) > 10_000:
-                warnings.warn(
-                    f"Large data frame #{frame_num}: {len(data)} characters",
-                    StreamPerformanceWarning
-                )
-            elif isinstance(data, (dict, list)) and len(str(data)) > 50_000:
-                warnings.warn(
-                    f"Large structured data frame #{frame_num}: {len(str(data))} characters",
-                    StreamPerformanceWarning
-                )
+    def validate_protocol_envelope(frame: dict[str, Any], frame_num: int) -> None:
+        """Validate protocol §2.4 envelope structure."""
+        # Check required success envelope fields
+        if frame.get("ok") is True:
+            if "code" not in frame:
+                raise StreamProtocolError(f"Frame #{frame_num}: missing 'code' field")
+            if frame.get("code") != "OK":
+                raise StreamProtocolError(f"Frame #{frame_num}: code must be 'OK', got '{frame.get('code')}'")
+            if "ms" not in frame:
+                raise StreamProtocolError(f"Frame #{frame_num}: missing 'ms' field")
+            if not (isinstance(frame.get("ms"), (int, float)) and frame["ms"] >= 0):
+                raise StreamProtocolError(f"Frame #{frame_num}: 'ms' must be non-negative number")
+            
+            # Must have either result or chunk, not both
+            has_result = "result" in frame
+            has_chunk = "chunk" in frame
+            if not (has_result or has_chunk):
+                raise StreamProtocolError(f"Frame #{frame_num}: must have either 'result' or 'chunk' field")
+            if has_result and has_chunk:
+                raise StreamProtocolError(f"Frame #{frame_num}: cannot have both 'result' and 'chunk' fields")
+        
+        # Check error envelope fields
+        elif frame.get("ok") is False:
+            required_fields = {"code", "error", "message", "ms"}
+            for field in required_fields:
+                if field not in frame:
+                    raise StreamProtocolError(f"Frame #{frame_num}: error envelope missing '{field}' field")
     
     @staticmethod
     def should_validate_frame(frame_num: int, mode: ValidationMode, sample_rate: float) -> bool:
@@ -419,7 +377,7 @@ class FrameValidator:
 
 
 class StreamValidationEngine:
-    """Main stream validation engine with sync and async support."""
+    """Protocol-compliant stream validation engine."""
     
     def __init__(self, config: ValidationConfig):
         self.config = config
@@ -433,7 +391,7 @@ class StreamValidationEngine:
         if self.config.on_performance_warning:
             self.config.on_performance_warning(message)
         else:
-            warnings.warn(message, StreamPerformanceWarning)
+            warnings.warn(message, UserWarning)
     
     def _emit_validation_error(self, error: ValidationError) -> None:
         """Emit validation error through hook."""
@@ -467,7 +425,7 @@ class StreamValidationEngine:
         frames: Iterable[dict[str, Any]],
         format: StreamFormat = StreamFormat.RAW_JSON
     ) -> StreamValidationReport:
-        """Validate frames synchronously."""
+        """Validate protocol envelope frames synchronously."""
         start_time = time.time()
         
         total = 0
@@ -492,16 +450,22 @@ class StreamValidationEngine:
                 total_bytes += frame_size
                 max_frame_size = max(max_frame_size, frame_size)
                 FrameValidator.check_frame_size(frame, frame_num, self.config.max_frame_bytes)
-            except FrameSizeExceededError as e:
+            except (FrameSizeExceededError, StreamProtocolError) as e:
                 self._handle_validation_error(e, frame_num, "size_exceeded", collect_errors, validation_errors)
                 if collect_errors:
                     continue
                 else:
                     raise
 
-            # Content warnings
-            if self.config.enable_content_warnings:
-                FrameValidator.check_content_warnings(frame, frame_num)
+            # Protocol envelope validation (always performed)
+            try:
+                FrameValidator.validate_protocol_envelope(frame, frame_num)
+            except StreamProtocolError as e:
+                self._handle_validation_error(e, frame_num, "protocol_envelope", collect_errors, validation_errors)
+                if collect_errors:
+                    continue
+                else:
+                    raise
 
             # Schema validation (conditional)
             should_validate = FrameValidator.should_validate_frame(
@@ -512,7 +476,7 @@ class StreamValidationEngine:
                 frames_validated += 1
                 try:
                     assert_valid(
-                        self.config.union_schema_id, 
+                        self.config.envelope_schema_id, 
                         frame, 
                         context=f"{self.config.component}.stream frame #{frame_num}",
                         registry=self.config.schema_registry
@@ -527,28 +491,31 @@ class StreamValidationEngine:
             else:
                 frames_skipped += 1
 
-            # Protocol validation (always performed)
-            event = frame.get("event")
-            
+            # Protocol streaming semantics validation (always performed)
             try:
                 if terminal_seen:
                     raise StreamProtocolError(
-                        f"Data after terminal frame: saw '{event}' at frame #{frame_num} "
+                        f"Data after terminal frame at frame #{frame_num} "
                         f"(terminal was at frame #{terminal_frame_position})"
                     )
 
-                if event == "data":
+                # Check if this is a data frame
+                if frame.get("ok") is True and "chunk" in frame:
                     data_count += 1
-                elif event == "end":
-                    terminal_seen = True
-                    ended_ok = True
-                    terminal_frame_position = frame_num
-                elif event == "error":
+                    
+                    # Check if this is a terminal success frame
+                    chunk = frame["chunk"]
+                    if chunk.get("is_final") is True:
+                        terminal_seen = True
+                        ended_ok = True
+                        terminal_frame_position = frame_num
+                
+                # Check if this is a terminal error frame
+                elif frame.get("ok") is False:
                     terminal_seen = True
                     errored = True
                     terminal_frame_position = frame_num
-                else:
-                    raise StreamProtocolError(f"Unknown event type '{event}' at frame #{frame_num}")
+                    
             except StreamProtocolError as e:
                 self._handle_validation_error(e, frame_num, "protocol_violation", collect_errors, validation_errors)
                 if collect_errors:
@@ -564,9 +531,6 @@ class StreamValidationEngine:
                 raise StreamProtocolError(
                     f"Stream completed without terminal frame. Processed {total} frames."
                 )
-
-            if ended_ok and errored:
-                raise StreamProtocolError("Stream contained both 'end' and 'error' terminal frames")
         except StreamProtocolError as e:
             self._handle_validation_error(e, total, "stream_integrity", collect_errors, validation_errors)
 
@@ -600,7 +564,7 @@ class StreamValidationEngine:
         frames: AsyncIterable[dict[str, Any]],
         format: StreamFormat = StreamFormat.RAW_JSON
     ) -> StreamValidationReport:
-        """Validate frames asynchronously."""
+        """Validate protocol envelope frames asynchronously."""
         start_time = time.time()
         
         total = 0
@@ -626,16 +590,22 @@ class StreamValidationEngine:
                 total_bytes += frame_size
                 max_frame_size = max(max_frame_size, frame_size)
                 FrameValidator.check_frame_size(frame, frame_num, self.config.max_frame_bytes)
-            except FrameSizeExceededError as e:
+            except (FrameSizeExceededError, StreamProtocolError) as e:
                 self._handle_validation_error(e, frame_num, "size_exceeded", collect_errors, validation_errors)
                 if collect_errors:
                     continue
                 else:
                     raise
 
-            # Content warnings
-            if self.config.enable_content_warnings:
-                FrameValidator.check_content_warnings(frame, frame_num)
+            # Protocol envelope validation
+            try:
+                FrameValidator.validate_protocol_envelope(frame, frame_num)
+            except StreamProtocolError as e:
+                self._handle_validation_error(e, frame_num, "protocol_envelope", collect_errors, validation_errors)
+                if collect_errors:
+                    continue
+                else:
+                    raise
 
             # Schema validation
             should_validate = FrameValidator.should_validate_frame(
@@ -650,7 +620,7 @@ class StreamValidationEngine:
                     await loop.run_in_executor(
                         None, 
                         lambda f=frame, n=frame_num: assert_valid(
-                            self.config.union_schema_id,
+                            self.config.envelope_schema_id,
                             f,
                             context=f"{self.config.component}.stream frame #{n}",
                             registry=self.config.schema_registry
@@ -666,28 +636,28 @@ class StreamValidationEngine:
             else:
                 frames_skipped += 1
 
-            # Protocol validation
-            event = frame.get("event")
-            
+            # Protocol streaming semantics validation
             try:
                 if terminal_seen:
                     raise StreamProtocolError(
-                        f"Data after terminal frame: saw '{event}' at frame #{frame_num} "
+                        f"Data after terminal frame at frame #{frame_num} "
                         f"(terminal was at frame #{terminal_frame_position})"
                     )
 
-                if event == "data":
+                if frame.get("ok") is True and "chunk" in frame:
                     data_count += 1
-                elif event == "end":
-                    terminal_seen = True
-                    ended_ok = True
-                    terminal_frame_position = frame_num
-                elif event == "error":
+                    
+                    chunk = frame["chunk"]
+                    if chunk.get("is_final") is True:
+                        terminal_seen = True
+                        ended_ok = True
+                        terminal_frame_position = frame_num
+                
+                elif frame.get("ok") is False:
                     terminal_seen = True
                     errored = True
                     terminal_frame_position = frame_num
-                else:
-                    raise StreamProtocolError(f"Unknown event type '{event}' at frame #{frame_num}")
+                    
             except StreamProtocolError as e:
                 self._handle_validation_error(e, frame_num, "protocol_violation", collect_errors, validation_errors)
                 if collect_errors:
@@ -701,9 +671,6 @@ class StreamValidationEngine:
         try:
             if not terminal_seen:
                 raise StreamProtocolError(f"Stream completed without terminal frame. Processed {total} frames.")
-
-            if ended_ok and errored:
-                raise StreamProtocolError("Stream contained both 'end' and 'error' terminal frames")
         except StreamProtocolError as e:
             self._handle_validation_error(e, total, "stream_integrity", collect_errors, validation_errors)
 
@@ -733,13 +700,13 @@ class StreamValidationEngine:
         )
     
     def validate_ndjson(self, ndjson_text: str) -> StreamValidationReport:
-        """Validate NDJSON text."""
+        """Validate NDJSON text containing protocol envelopes."""
         parser = self._parsers[StreamFormat.NDJSON]
         frames = parser.parse(ndjson_text)
         return self.validate_frames(frames, StreamFormat.NDJSON)
     
     def validate_sse(self, sse_text: str) -> StreamValidationReport:
-        """Validate SSE text."""
+        """Validate SSE text containing protocol envelopes."""
         parser = self._parsers[StreamFormat.SSE]
         frames = parser.parse(sse_text)
         return self.validate_frames(frames, StreamFormat.SSE)
@@ -760,23 +727,7 @@ class StreamValidationEngine:
         self, 
         lines: AsyncIterable[str]
     ) -> StreamValidationReport:
-        """
-        Validate NDJSON in true streaming fashion for unbounded streams.
-        
-        Args:
-            lines: Async iterable of NDJSON lines
-            
-        Returns:
-            StreamValidationReport: Validation results
-            
-        Example:
-            async def read_from_websocket():
-                async with websockets.connect(...) as websocket:
-                    async for message in websocket:
-                        yield message
-            
-            report = await engine.validate_ndjson_streaming(read_from_websocket())
-        """
+        """Validate NDJSON in true streaming fashion for unbounded streams."""
         parser = self._parsers[StreamFormat.NDJSON]
         frames = parser.parse_streaming(lines)
         return await self.validate_frames_async(frames, StreamFormat.NDJSON)
@@ -785,24 +736,7 @@ class StreamValidationEngine:
         self, 
         lines: AsyncIterable[str]
     ) -> StreamValidationReport:
-        """
-        Validate SSE in true streaming fashion for unbounded streams.
-        
-        Args:
-            lines: Async iterable of SSE lines
-            
-        Returns:
-            StreamValidationReport: Validation results
-            
-        Example:
-            async def read_sse_stream():
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(...) as response:
-                        async for line in response.content:
-                            yield line.decode()
-            
-            report = await engine.validate_sse_streaming(read_sse_stream())
-        """
+        """Validate SSE in true streaming fashion for unbounded streams."""
         parser = self._parsers[StreamFormat.SSE]
         frames = parser.parse_streaming(lines)
         return await self.validate_frames_async(frames, StreamFormat.SSE)
@@ -814,147 +748,51 @@ class StreamValidationEngine:
             yield frame
 
 
-# Factory functions for common use cases
-
-def create_strict_validator(
-    union_schema_id: str,
-    component: str,
-    max_frame_bytes: Optional[int] = None,
-    **kwargs: Any
-) -> StreamValidationEngine:
-    """Create a strict validator for maximum reliability."""
-    config = ValidationConfig(
-        union_schema_id=union_schema_id,
-        component=component,
-        max_frame_bytes=max_frame_bytes,
-        mode=ValidationMode.STRICT,
-        enable_content_warnings=True,
-        **kwargs
-    )
-    return StreamValidationEngine(config)
-
-
-def create_performance_validator(
-    union_schema_id: str,
-    component: str,
-    sample_rate: float = 0.1,
-    **kwargs: Any
-) -> StreamValidationEngine:
-    """Create a performance-optimized validator for high-throughput scenarios."""
-    config = ValidationConfig(
-        union_schema_id=union_schema_id,
-        component=component,
-        max_frame_bytes=10_485_760,  # 10MB for large streams
-        mode=ValidationMode.SAMPLED,
-        sample_rate=sample_rate,
-        enable_content_warnings=False,
-        performance_warning_threshold_ms=5000,
-        **kwargs
-    )
-    return StreamValidationEngine(config)
-
-
-def create_lazy_validator(
-    union_schema_id: str,
-    component: str,
-    **kwargs: Any
-) -> StreamValidationEngine:
-    """Create a lazy validator for protocol-only validation."""
-    config = ValidationConfig(
-        union_schema_id=union_schema_id,
-        component=component,
-        mode=ValidationMode.LAZY,
-        enable_content_warnings=False,
-        **kwargs
-    )
-    return StreamValidationEngine(config)
-
-
-def create_error_collecting_validator(
-    union_schema_id: str,
-    component: str,
-    **kwargs: Any
-) -> StreamValidationEngine:
-    """Create a validator that collects all errors instead of failing fast."""
-    config = ValidationConfig(
-        union_schema_id=union_schema_id,
-        component=component,
-        mode=ValidationMode.COLLECT_ERRORS,
-        enable_content_warnings=True,
-        **kwargs
-    )
-    return StreamValidationEngine(config)
-
-
 # Convenience functions for simple use cases
 
 def validate_ndjson_stream(
     ndjson_text: str,
-    union_schema_id: str,
+    envelope_schema_id: str,
     component: str,
     **kwargs: Any
 ) -> StreamValidationReport:
     """Convenience function for simple NDJSON validation."""
-    config = ValidationConfig(union_schema_id=union_schema_id, component=component, **kwargs)
+    config = ValidationConfig(envelope_schema_id=envelope_schema_id, component=component, **kwargs)
     engine = StreamValidationEngine(config)
     return engine.validate_ndjson(ndjson_text)
 
 
 def validate_sse_stream(
     sse_text: str,
-    union_schema_id: str,
+    envelope_schema_id: str,
     component: str,
     **kwargs: Any
 ) -> StreamValidationReport:
     """Convenience function for simple SSE validation."""
-    config = ValidationConfig(union_schema_id=union_schema_id, component=component, **kwargs)
+    config = ValidationConfig(envelope_schema_id=envelope_schema_id, component=component, **kwargs)
     engine = StreamValidationEngine(config)
     return engine.validate_sse(sse_text)
 
 
 async def validate_ndjson_stream_async(
     ndjson_text: str,
-    union_schema_id: str,
+    envelope_schema_id: str,
     component: str,
     **kwargs: Any
 ) -> StreamValidationReport:
     """Convenience function for simple async NDJSON validation."""
-    config = ValidationConfig(union_schema_id=union_schema_id, component=component, **kwargs)
+    config = ValidationConfig(envelope_schema_id=envelope_schema_id, component=component, **kwargs)
     engine = StreamValidationEngine(config)
     return await engine.validate_ndjson_async(ndjson_text)
 
 
 async def validate_sse_stream_async(
     sse_text: str,
-    union_schema_id: str,
+    envelope_schema_id: str,
     component: str,
     **kwargs: Any
 ) -> StreamValidationReport:
     """Convenience function for simple async SSE validation."""
-    config = ValidationConfig(union_schema_id=union_schema_id, component=component, **kwargs)
+    config = ValidationConfig(envelope_schema_id=envelope_schema_id, component=component, **kwargs)
     engine = StreamValidationEngine(config)
     return await engine.validate_sse_async(sse_text)
-
-
-async def validate_ndjson_stream_streaming(
-    lines: AsyncIterable[str],
-    union_schema_id: str,
-    component: str,
-    **kwargs: Any
-) -> StreamValidationReport:
-    """Convenience function for true streaming NDJSON validation."""
-    config = ValidationConfig(union_schema_id=union_schema_id, component=component, **kwargs)
-    engine = StreamValidationEngine(config)
-    return await engine.validate_ndjson_streaming(lines)
-
-
-async def validate_sse_stream_streaming(
-    lines: AsyncIterable[str],
-    union_schema_id: str,
-    component: str,
-    **kwargs: Any
-) -> StreamValidationReport:
-    """Convenience function for true streaming SSE validation."""
-    config = ValidationConfig(union_schema_id=union_schema_id, component=component, **kwargs)
-    engine = StreamValidationEngine(config)
-    return await engine.validate_sse_streaming(lines)
