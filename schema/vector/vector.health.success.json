@@ -1,17 +1,31 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/vector/vector.health.success.json",
+  "$id": "https://corpusos.com/schemas/vector/vector.health.success.json",
   "title": "vector.health result",
-  "description": "Graded health status for vector component.",
+  "description": "Health status for vector component per protocol §15.7.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
     "ok": { "type": "boolean" },
-    "status": { "type": "string", "enum": ["ok", "degraded", "down"] },
-    "reason": { "type": ["string", "null"], "maxLength": 2000 },
-    "server": { "type": ["string", "null"] },
-    "version": { "type": ["string", "null"] }
+    "status": { "type": "string", "enum": ["ok", "degraded"] },
+    "server": { "type": "string" },
+    "version": { "type": "string" },
+    "namespaces": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "ready": { "type": "boolean" },
+          "vector_count": { "type": "integer", "minimum": 0 },
+          "dimensions": { "type": "integer", "minimum": 1 },
+          "index_status": { "type": "string" },
+          "read_only": { "type": "boolean" }
+        },
+        "required": ["ready", "vector_count", "dimensions"]
+      }
+    },
+    "total_vector_count": { "type": "integer", "minimum": 0 },
+    "message": { "type": "string" }
   },
-  "required": ["ok", "status"],
-  "$comment": "Gateways: status ok/degraded → HTTP 200; down → HTTP 503."
+  "required": ["ok", "server", "version", "namespaces"]
 }
