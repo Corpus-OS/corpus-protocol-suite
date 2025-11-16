@@ -1,40 +1,43 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/llm/llm.types.message.json",
+  "$id": "https://corpusos.com/schemas/llm/llm.types.message.json",
   "title": "LLM Chat Message",
-  "description": "Canonical chat message for LLM operations. SIEM-safe; no secrets or PII.",
+  "description": "Chat message per protocol §10.1",
   "type": "object",
   "required": ["role", "content"],
   "additionalProperties": false,
   "properties": {
     "role": {
       "type": "string",
-      "enum": ["system", "user", "assistant", "tool"],
-      "description": "Message role per spec §8.3."
+      "enum": ["system", "user", "assistant", "tool"]
     },
     "content": {
-      "type": "string",
-      "minLength": 0,
-      "maxLength": 200000,
-      "description": "Primary message text. Implementations MAY also accept structured content via vendor extensions."
+      "type": "string"
     },
     "name": {
-      "type": "string",
-      "maxLength": 128,
-      "pattern": "^[A-Za-z0-9._:-]{1,128}$",
-      "description": "Optional display name for assistant/tool roles."
+      "type": "string"
     },
     "tool_call_id": {
-      "type": "string",
-      "maxLength": 128,
-      "pattern": "^[A-Za-z0-9._:-]{1,128}$",
-      "description": "For role=tool, the originating tool_call identifier."
-    }
-  },
-  "patternProperties": {
-    "^(vendor:)[a-z0-9_.:-]+$": {
-      "description": "Vendor/extension namespaced fields for structured content parts.",
-      "type": ["string", "number", "boolean", "object", "array", "null"]
+      "type": "string"
+    },
+    "tool_calls": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "type": { "type": "string", "const": "function" },
+          "function": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "string" },
+              "arguments": { "type": "string" }
+            },
+            "required": ["name", "arguments"]
+          }
+        },
+        "required": ["id", "type", "function"]
+      }
     }
   }
 }
