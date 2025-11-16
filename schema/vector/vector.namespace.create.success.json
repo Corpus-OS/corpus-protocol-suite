@@ -1,15 +1,20 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/vector/vector.namespace.create.success.json",
+  "$id": "https://corpusos.com/schemas/vector/vector.namespace.create.success.json",
   "title": "vector.create_namespace result",
-  "description": "Confirmation payload when a namespace is created.",
+  "description": "Namespace creation result per protocol §14.10.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
+    "success": { "type": "boolean" },
     "namespace": { "type": "string", "maxLength": 256 },
-    "dimensions": { "type": "integer", "minimum": 1, "maximum": 8192 },
-    "distance_metric": { "type": "string", "enum": ["cosine", "euclidean", "dot"] },
-    "created_at": { "type": "string", "format": "date-time" }
+    "details": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "vector_count": { "type": "integer", "minimum": 0 },
+    "index_status": { "type": "string" },
+    "ready": { "type": "boolean" }
   },
-  "required": ["namespace", "dimensions", "distance_metric"]
+  "required": ["success", "namespace", "details"]
 }
