@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/vector/vector.delete.request.json",
+  "$id": "https://corpusos.com/schemas/vector/vector.delete.request.json",
   "title": "vector.delete args",
   "description": "Arguments for op: vector.delete",
   "type": "object",
@@ -14,8 +14,7 @@
         "maxLength": 256
       },
       "uniqueItems": true,
-      "minItems": 1,
-      "maxItems": 100000
+      "minItems": 1
     },
     "namespace": {
       "type": "string",
@@ -25,26 +24,21 @@
     },
     "filter": {
       "type": ["object", "null"],
-      "$ref": "https://adaptersdk.org/schemas/vector/vector.types.filter.json"
-    },
-    "op_extensions": {
-      "type": "object",
-      "additionalProperties": true,
-      "patternProperties": {
-        "^(vendor:)[a-z0-9_.:-]+$": { "type": ["string", "number", "boolean", "object", "array", "null"] }
-      }
+      "$ref": "https://corpusos.com/schemas/vector/vector.types.filter.json"
     }
   },
   "allOf": [
     {
       "anyOf": [
-        { "required": ["ids"] },
+        { 
+          "required": ["ids"],
+          "properties": {
+            "ids": { "minItems": 1 }
+          }
+        },
         { "required": ["filter"] }
       ]
-    },
-    {
-      "not": { "required": ["ids", "filter"] }
     }
   ],
-  "$comment": "Delete by IDs XOR filter. Deleting non-existent IDs MUST be treated as success (idempotent). Batch size limits enforced at runtime."
+  "$comment": "Delete by IDs OR filter. At least one must be provided. Deleting non-existent IDs MUST be treated as success (idempotent). Batch size limits enforced via capabilities.max_batch_size."
 }
