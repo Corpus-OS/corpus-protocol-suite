@@ -27,6 +27,8 @@
 	check-deps \
 	check-versions \
 	verify \
+	test-cli \
+	test-root-conformance \
 	clean \
 	help
 
@@ -39,6 +41,9 @@ COV_FAIL_UNDER ?= 80
 # Protocols and directories
 PROTOCOLS := llm vector graph embedding
 TEST_DIRS := $(foreach p,$(PROTOCOLS),tests/$(p))
+
+# Extra non-protocol conformance/CLI tests
+EXTRA_TEST_FILES := tests/cli.py tests/run_conformance.py
 
 # Schema / Golden directories
 SCHEMA_TEST_DIR := tests/schema
@@ -125,17 +130,18 @@ safety-check: validate-env
 
 # --------------------------------------------------------------------------- #
 # Run ALL protocol conformance suites (LLM + Vector + Graph + Embedding)
+# + top-level orchestration/CLI tests
 # --------------------------------------------------------------------------- #
 test-conformance test-all-conformance: check-deps safety-check
 	@echo "🚀 Running ALL protocol conformance suites..."
 	@echo "   Protocols: $(PROTOCOLS)"
+	@echo "   Extra test files: $(EXTRA_TEST_FILES)"
 	@echo "   Parallel jobs: $(PYTEST_JOBS)"
 	@echo "   Coverage threshold: $(COV_FAIL_UNDER)%"
 	@echo "   Environment: $${CORPUS_TEST_ENV:-default}"
 	$(PYTEST) \
 		$(TEST_DIRS) \
-		tests/cli.py \
-		tests/run_conformance.py \
+		$(EXTRA_TEST_FILES) \
 		$(PYTEST_ARGS) \
 		$(PYTEST_PARALLEL) \
 		--cov=corpus_sdk \
@@ -202,6 +208,18 @@ quick-check: check-deps
 	$(PYTEST) tests/ -k "test_golden_validates or test_schema_meta" -v --no-cov -x
 
 # --------------------------------------------------------------------------- #
+# Additional dedicated targets for extra test files
+# --------------------------------------------------------------------------- #
+
+test-cli: check-deps
+	@echo "🧪 Running CLI tests (tests/cli.py)..."
+	$(PYTEST) tests/cli.py $(PYTEST_ARGS) $(PYTEST_PARALLEL) --no-cov
+
+test-root-conformance: check-deps
+	@echo "🧪 Running top-level conformance runner tests (tests/run_conformance.py)..."
+	$(PYTEST) tests/run_conformance.py $(PYTEST_ARGS) $(PYTEST_PARALLEL) --no-cov
+
+# --------------------------------------------------------------------------- #
 # Reports & CI Integration
 # --------------------------------------------------------------------------- #
 
@@ -243,7 +261,7 @@ try:
             "duration_seconds": round(total_time, 3)
         },
         "coverage_threshold": $(COV_FAIL_UNDER),
-        "test_suites": ["schema", "golden", "llm", "vector", "graph", "embedding"],
+        "test_suites": ["schema", "golden", "llm", "vector", "graph", "embedding", "cli", "root_conformance"],
         "environment": os.getenv("CORPUS_TEST_ENV", "default")
     }
     
@@ -309,10 +327,10 @@ test-docker:
 # Fast Test Runs (No Coverage)
 # --------------------------------------------------------------------------- #
 
-# Fast all tests
+# Fast all tests (protocol suites + extra test files)
 test-fast: check-deps
 	@echo "⚡ Running fast tests (no coverage, skipping slow tests)..."
-	$(PYTEST) $(TEST_DIRS) $(PYTEST_ARGS) $(PYTEST_PARALLEL) -m "not slow" --no-cov
+	$(PYTEST) $(TEST_DIRS) $(EXTRA_TEST_FILES) $(PYTEST_ARGS) $(PYTEST_PARALLEL) -m "not slow" --no-cov
 
 # Fast per-protocol tests
 test-fast-%: check-deps
@@ -327,13 +345,13 @@ test-fast-%: check-deps
 verify: check-deps safety-check
 	@echo "🔍 Running Corpus Protocol Conformance Suite..."
 	@echo "   Protocols: $(PROTOCOLS)"
+	@echo "   Extra test files: $(EXTRA_TEST_FILES)"
 	@echo "   Parallel jobs: $(PYTEST_JOBS)"
 	@echo "   Coverage threshold: $(COV_FAIL_UNDER)%"
 	@echo "   Environment: $${CORPUS_TEST_ENV:-default}"
 	$(PYTEST) \
 		$(TEST_DIRS) \
-		tests/cli.py \
-		tests/run_conformance.py \
+		$(EXTRA_TEST_FILES) \
 		$(PYTEST_ARGS) \
 		$(PYTEST_PARALLEL) \
 		--cov=corpus_sdk \
@@ -364,15 +382,15 @@ clean:
 help:
 	@echo "Corpus SDK Conformance Test Targets:"
 	@echo ""
-	@echo "  test-conformance           Run ALL protocol suites ($(PROTOCOLS))"
+	@echo "  test-conformance           Run ALL protocol suites ($(PROTOCOLS)) plus extra tests ($(EXTRA_TEST_FILES))"
 	@echo "  test-all-conformance       Alias for test-conformance"
 	@echo "  verify                     Alias for test-conformance with verification messaging"
 	@echo ""
 	@echo "Per-Protocol Conformance:"
-	@echo "  test-llm-conformance       Run only LLM Protocol V1 tests"
-	@echo "  test-vector-conformance    Run only Vector Protocol V1 tests"
-	@echo "  test-graph-conformance     Run only Graph Protocol V1 tests"
-	@echo "  test-embedding-conformance Run only Embedding Protocol V1 tests"
+	@echo "  test-llm-conformance       Run only LLM Protocol V1 tests (tests/llm)"
+	@echo "  test-vector-conformance    Run only Vector Protocol V1 tests (tests/vector)"
+	@echo "  test-graph-conformance     Run only Graph Protocol V1 tests (tests/graph)"
+	@echo "  test-embedding-conformance Run only Embedding Protocol V1 tests (tests/embedding)"
 	@echo ""
 	@echo "Schema & Golden Conformance:"
 	@echo "  test-schema                Run schema meta-lint (Draft 2020-12, \$id/\$ref checks)"
@@ -380,6 +398,10 @@ help:
 	@echo "  verify-schema              Run schema meta-lint + golden validation"
 	@echo "  test-schema-fast           Fast schema meta-lint (no coverage, skip slow)"
 	@echo "  test-golden-fast           Fast golden validation (no coverage, skip slow)"
+	@echo ""
+	@echo "Extra Top-Level Tests:"
+	@echo "  test-cli                   Run CLI wrapper tests (tests/cli.py)"
+	@echo "  test-root-conformance      Run top-level conformance runner tests (tests/run_conformance.py)"
 	@echo ""
 	@echo "CI & Automation:"
 	@echo "  test-ci                    Full CI pipeline (deps+env+test+report)"
@@ -396,7 +418,7 @@ help:
 	@echo "  check-versions             Print key dependency versions"
 	@echo ""
 	@echo "Fast Testing (No Coverage):"
-	@echo "  test-fast                  Run all tests quickly (no coverage, skip slow)"
+	@echo "  test-fast                  Run all tests quickly (protocol + extra, no coverage, skip slow)"
 	@echo "  test-fast-llm              Run only LLM tests quickly"
 	@echo "  test-fast-vector           Run Vector tests quickly"
 	@echo "  test-fast-graph            Run Graph tests quickly"
@@ -415,7 +437,7 @@ help:
 	@echo "  COV_FAIL_UNDER=90          Require 90% coverage"
 	@echo ""
 	@echo "Examples:"
-	@echo "  make test-conformance                      # Run all tests"
+	@echo "  make test-conformance                      # Run all protocol + extra tests"
 	@echo "  make test-llm-conformance                 # Run only LLM tests"
 	@echo "  make test-ci                              # Full CI pipeline"
 	@echo "  make setup-test-env                       # Configure test environment"
