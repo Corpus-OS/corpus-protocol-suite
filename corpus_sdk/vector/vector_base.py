@@ -219,7 +219,14 @@ class QueryResult:
 
 @dataclass(frozen=True)
 class Document:
-    """Document with text content and metadata"""
+    """Document with text content and metadata.
+
+    Note:
+        Metadata stored here is usually a *copy* of vector metadata and may
+        diverge over time. The vector backend remains the source of truth for
+        vector-level metadata; the docstore metadata is primarily for
+        doc-centric access patterns or convenience.
+    """
     id: str
     text: str
     metadata: Dict[str, Any]
@@ -252,6 +259,8 @@ class DocStore(Protocol):
     async def delete(self, doc_id: str) -> None:
         """Delete document"""
         ...
+    # batch_delete is intentionally not required by the protocol;
+    # BaseVectorAdapter will use it opportunistically via getattr() if present.
 
 
 class InMemoryDocStore:
@@ -276,9 +285,19 @@ class InMemoryDocStore:
     async def delete(self, doc_id: str) -> None:
         self._store.pop(doc_id, None)
 
+    async def batch_delete(self, doc_ids: List[str]) -> None:
+        """Optional batch delete helper used opportunistically by BaseVectorAdapter."""
+        for doc_id in doc_ids:
+            self._store.pop(doc_id, None)
+
 
 class RedisDocStore:
-    """Redis-backed document store for production"""
+    """Redis-backed document store for production.
+    
+    Note:
+        Metadata stored here mirrors vector metadata at write time but is not
+        automatically kept in sync with later vector metadata changes.
+    """
     
     def __init__(self, redis_client, key_prefix: str = "corpus:doc:"):
         self._redis = redis_client
@@ -337,6 +356,13 @@ class RedisDocStore:
     
     async def delete(self, doc_id: str) -> None:
         await self._redis.delete(self._key(doc_id))
+
+    async def batch_delete(self, doc_ids: List[str]) -> None:
+        """Optional batch delete helper used opportunistically by BaseVectorAdapter."""
+        if not doc_ids:
+            return
+        keys = [self._key(doc_id) for doc_id in doc_ids]
+        await self._redis.delete(*keys)
 
 
 # =============================================================================
@@ -481,7 +507,7 @@ class OperationContext:
     deadline_ms: Optional[int] = None
     traceparent: Optional[str] = None
     tenant: Optional[str] = None
-    attrs: Mapping[str, Any] = None
+    attrs: Optional[Mapping[str, Any]] = None
 
     def __post_init__(self) -> None:
         """Ensure attrs is always a valid dictionary."""
@@ -598,11 +624,21 @@ class SimpleDeadline:
         tmp = OperationContext(deadline_ms=ctx.deadline_ms)
         rem = tmp.remaining_ms()
         if rem is not None and rem <= 0:
-            raise DeadlineExceeded("operation timed out (preflight)", details={"preflight": True})
+            # Align with LLM adapter semantics: explicit "deadline already exceeded"
+            raise DeadlineExceeded(
+                "deadline already exceeded",
+                details={"remaining_ms": 0, "preflight": True},
+            )
         try:
-            return await asyncio.wait_for(awaitable, timeout=(rem / 1000.0 if rem is not None else None))
+            return await asyncio.wait_for(
+                awaitable,
+                timeout=(rem / 1000.0 if rem is not None else None),
+            )
         except asyncio.TimeoutError:
-            raise DeadlineExceeded("operation timed out")
+            raise DeadlineExceeded(
+                "operation timed out",
+                details={"remaining_ms": 0},
+            )
 
 
 class NoopBreaker:
@@ -1181,6 +1217,12 @@ class BaseVectorAdapter(VectorProtocolV1):
         # Document store for text storage
         self._docstore = docstore
 
+        # Capabilities cache key is namespaced per adapter instance (module/class/id)
+        self._caps_cache_key = (
+            f"vector:capabilities:"
+            f"{self.__class__.__module__}.{self.__class__.__qualname__}:{id(self)}"
+        )
+
     # --- async context management & cleanup hooks ----------------------------
 
     async def __aenter__(self) -> "BaseVectorAdapter":
@@ -1316,7 +1358,7 @@ class BaseVectorAdapter(VectorProtocolV1):
             # Propagate adapter-specific deadline errors
             raise
         except asyncio.TimeoutError:
-            raise DeadlineExceeded("operation timed out")
+            raise DeadlineExceeded("operation timed out", details={"remaining_ms": 0})
 
     def _fail_if_expired(self, ctx: Optional[OperationContext]) -> None:
         """
@@ -1327,7 +1369,10 @@ class BaseVectorAdapter(VectorProtocolV1):
         if ctx is None or ctx.deadline_ms is None:
             return
         if ctx.remaining_ms() == 0:
-            raise DeadlineExceeded("operation timed out (preflight)", details={"preflight": True})
+            raise DeadlineExceeded(
+                "operation timed out (preflight)",
+                details={"preflight": True, "remaining_ms": 0},
+            )
 
     # --- cache keys (read paths only) ----------------------------------------
 
@@ -1411,11 +1456,6 @@ class BaseVectorAdapter(VectorProtocolV1):
             f"tenant={tenant_h}:"
             f"text={text_strategy}"
         )
-
-    @staticmethod
-    def _caps_cache_key() -> str:
-        """Cache key for capabilities() in standalone mode."""
-        return "v1:capabilities"
 
     def _namespace_cache_pattern(self, namespace: str) -> str:
         """
@@ -1542,7 +1582,7 @@ class BaseVectorAdapter(VectorProtocolV1):
         try:
             # Check cache if TTL is non-zero
             if self._mode == "standalone" and self._cache_caps_ttl_s > 0:
-                cached = await self._cache.get(self._caps_cache_key())
+                cached = await self._cache.get(self._caps_cache_key)
                 if cached:
                     self._metrics.counter(
                         component=self._component,
@@ -1558,7 +1598,7 @@ class BaseVectorAdapter(VectorProtocolV1):
             # Cache if TTL is non-zero
             if self._mode == "standalone" and self._cache_caps_ttl_s > 0:
                 try:
-                    await self._cache.set(self._caps_cache_key(), caps, ttl_s=self._cache_caps_ttl_s)
+                    await self._cache.set(self._caps_cache_key, caps, ttl_s=self._cache_caps_ttl_s)
                 except Exception:
                     pass
 
@@ -1725,11 +1765,17 @@ class BaseVectorAdapter(VectorProtocolV1):
             on_result=_on_result,
         )
 
-        # Request counter (unchanged semantics)
+        # Request counters (keep legacy name and add cross-component-friendly name)
         self._metrics.counter(
             component=self._component,
             name="queries",
             value=1,
+        )
+        self._metrics.counter(
+            component=self._component,
+            name="requests_total",
+            value=1,
+            extra={"op": "query"},
         )
 
         return result
@@ -1898,6 +1944,12 @@ class BaseVectorAdapter(VectorProtocolV1):
             name="queries_in_batch",
             value=len(spec.queries),
         )
+        self._metrics.counter(
+            component=self._component,
+            name="requests_total",
+            value=1,
+            extra={"op": "batch_query"},
+        )
 
         return results
 
@@ -2038,7 +2090,7 @@ class BaseVectorAdapter(VectorProtocolV1):
             on_result=_on_result,
         )
 
-        # Token-style counter for upserted vectors
+        # Token-style counters for upserted vectors and requests
         self._metrics.counter(
             component=self._component,
             name="vectors_upserted",
@@ -2048,6 +2100,12 @@ class BaseVectorAdapter(VectorProtocolV1):
             component=self._component,
             name="upsert_batches",
             value=1,
+        )
+        self._metrics.counter(
+            component=self._component,
+            name="requests_total",
+            value=1,
+            extra={"op": "upsert"},
         )
 
         return result
@@ -2101,11 +2159,16 @@ class BaseVectorAdapter(VectorProtocolV1):
 
             # Clean up docstore entries and cache on successful delete
             if result.deleted_count > 0:
-                # Clean up docstore entries (best effort)
+                # Clean up docstore entries (best effort, with optional batch_delete)
                 if self._docstore is not None and spec.ids:
                     try:
-                        for doc_id in spec.ids:
-                            await self._docstore.delete(str(doc_id))
+                        doc_ids = [str(doc_id) for doc_id in spec.ids]
+                        batch_delete = getattr(self._docstore, "batch_delete", None)
+                        if callable(batch_delete):
+                            await batch_delete(doc_ids)
+                        else:
+                            for doc_id in doc_ids:
+                                await self._docstore.delete(doc_id)
                     except Exception:
                         # Log but don't fail the operation
                         LOG.debug("Failed to clean up docstore entries after delete")
@@ -2142,6 +2205,12 @@ class BaseVectorAdapter(VectorProtocolV1):
             component=self._component,
             name="delete_batches",
             value=1,
+        )
+        self._metrics.counter(
+            component=self._component,
+            name="requests_total",
+            value=1,
+            extra={"op": "delete"},
         )
 
         return result
@@ -2182,12 +2251,21 @@ class BaseVectorAdapter(VectorProtocolV1):
         def _on_result(_: NamespaceResult) -> Mapping[str, Any]:
             return {"namespace": spec.namespace}
 
-        return await self._with_gates_unary(
+        result = await self._with_gates_unary(
             op="create_namespace",
             ctx=ctx,
             call=_call,
             on_result=_on_result,
         )
+
+        self._metrics.counter(
+            component=self._component,
+            name="requests_total",
+            value=1,
+            extra={"op": "create_namespace"},
+        )
+
+        return result
 
     async def delete_namespace(
         self,
@@ -2217,12 +2295,21 @@ class BaseVectorAdapter(VectorProtocolV1):
         def _on_result(_: NamespaceResult) -> Mapping[str, Any]:
             return {"namespace": namespace}
 
-        return await self._with_gates_unary(
+        result = await self._with_gates_unary(
             op="delete_namespace",
             ctx=ctx,
             call=_call,
             on_result=_on_result,
         )
+
+        self._metrics.counter(
+            component=self._component,
+            name="requests_total",
+            value=1,
+            extra={"op": "delete_namespace"},
+        )
+
+        return result
 
     async def health(self, *, ctx: Optional[OperationContext] = None) -> Dict[str, Any]:
         """
