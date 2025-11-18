@@ -635,12 +635,18 @@ class SimpleCircuitBreaker:
 
 
 class NoopCache:
-    """No-op cache implementation."""
+    """
+    No-op cache implementation.
+
+    This implementation never stores values. The ttl_s parameter on set() is
+    accepted for interface compatibility but ignored.
+    """
 
     async def get(self, key: str) -> Optional[Any]:
         return None
 
     async def set(self, key: str, value: Any, ttl_s: int) -> None:
+        """Accepts ttl_s for interface compatibility but ignores it."""
         return None
 
 
@@ -1006,7 +1012,7 @@ class BaseLLMAdapter(LLMProtocolV1):
             raise BadRequest("top_p must be within (0.0, 1.0]")
         if frequency_penalty is not None and not (-2.0 <= frequency_penalty <= 2.0):
             raise BadRequest("frequency_penalty must be within [-2.0, 2.0]")
-        if presence_penalty is not None and not (-2.0 <= presence_penalty <= 2.0]):
+        if presence_penalty is not None and not (-2.0 <= presence_penalty <= 2.0):
             raise BadRequest("presence_penalty must be within [-2.0, 2.0]")
 
     @staticmethod
@@ -1019,6 +1025,38 @@ class BaseLLMAdapter(LLMProtocolV1):
         if not t:
             return None
         return hashlib.sha256(t.encode("utf-8")).hexdigest()[:12]
+
+    @staticmethod
+    def _hash_str(s: Optional[str]) -> str:
+        """
+        Hash a string into a stable, non-reversible identifier.
+
+        Intended for metrics/logging and cache keys to reduce PII exposure.
+        Hash collisions are possible in theory but extremely unlikely for our
+        usage and are acceptable for this purpose.
+        """
+        if s is None:
+            return "none"
+        return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _messages_fingerprint(messages: List[Mapping[str, str]]) -> str:
+        """
+        Stable fingerprint for a messages list without leaking raw content.
+
+        Uses a SHA-256 hash over role/content pairs. This deliberately trades
+        away reversibility to minimize PII exposure. Callers MUST NOT rely on
+        this as a cryptographic signature or for strict uniqueness guarantees.
+        """
+        h = hashlib.sha256()
+        for m in messages:
+            role = str(m.get("role", ""))
+            content = str(m.get("content", ""))
+            h.update(role.encode("utf-8"))
+            h.update(b"\x1f")
+            h.update(content.encode("utf-8"))
+            h.update(b"\x1e")
+        return h.hexdigest()
 
     def _record(
         self,
@@ -1065,27 +1103,6 @@ class BaseLLMAdapter(LLMProtocolV1):
                     details={"remaining_ms": 0},
                 )
 
-    @staticmethod
-    def _hash_str(s: Optional[str]) -> str:
-        if s is None:
-            return "none"
-        return hashlib.sha256(s.encode("utf-8")).hexdigest()
-
-    @staticmethod
-    def _messages_fingerprint(messages: List[Mapping[str, str]]) -> str:
-        """
-        Stable fingerprint for a messages list without leaking raw content.
-        """
-        h = hashlib.sha256()
-        for m in messages:
-            role = str(m.get("role", ""))
-            content = str(m.get("content", ""))
-            h.update(role.encode("utf-8"))
-            h.update(b"\x1f")
-            h.update(content.encode("utf-8"))
-            h.update(b"\x1e")
-        return h.hexdigest()
-
     def _make_complete_cache_key(
         self,
         *,
@@ -1108,9 +1125,33 @@ class BaseLLMAdapter(LLMProtocolV1):
             - Model & system message hash
             - Messages fingerprint
             - Sampling params (represented via repr() to minimize FP collisions)
-            - Capabilities (family/version/json support)
+            - Capabilities fingerprint (server/version/family/feature flags)
             - Tenant hash (when present) for isolation
+
+        The capabilities are fully represented via a hashed fingerprint so that
+        dynamic changes (e.g., feature flags, context window size) naturally
+        invalidate old cache entries.
         """
+        caps_fingerprint_payload = {
+            "server": caps.server,
+            "version": caps.version,
+            "model_family": caps.model_family,
+            "max_context_length": caps.max_context_length,
+            "supports_streaming": caps.supports_streaming,
+            "supports_roles": caps.supports_roles,
+            "supports_json_output": caps.supports_json_output,
+            "supports_parallel_tool_calls": caps.supports_parallel_tool_calls,
+            "idempotent_writes": caps.idempotent_writes,
+            "supports_multi_tenant": caps.supports_multi_tenant,
+            "supports_system_message": caps.supports_system_message,
+            "supports_deadline": caps.supports_deadline,
+            "supports_count_tokens": caps.supports_count_tokens,
+            "supported_models": caps.supported_models,
+        }
+        caps_hash = hashlib.sha256(
+            json.dumps(caps_fingerprint_payload, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()
+
         parts: Dict[str, str] = {
             "model": str(model or "default"),
             "system_hash": self._hash_str(system_message),
@@ -1121,9 +1162,8 @@ class BaseLLMAdapter(LLMProtocolV1):
             "freq_pen": repr(frequency_penalty) if frequency_penalty is not None else "none",
             "pres_pen": repr(presence_penalty) if presence_penalty is not None else "none",
             "stops": ",".join(stop_sequences) if stop_sequences else "none",
-            "json": "1" if caps.supports_json_output else "0",
-            "family": caps.model_family,
-            "ver": caps.version,
+            # Capabilities hash ensures cache is isolated across capability changes.
+            "caps": caps_hash,
         }
         if ctx and ctx.tenant:
             th = self._tenant_hash(ctx.tenant)
@@ -1877,6 +1917,13 @@ class WireLLMHandler:
 
     Streaming:
         - llm.stream (via handle_stream)
+
+    Error propagation:
+        For streaming, this handler represents adapter exceptions as a final
+        JSON envelope on the stream. For transports with a native error channel
+        (e.g., gRPC status codes), callers may wish to translate that final
+        envelope into transport-specific errors instead of forwarding it as
+        data.
     """
 
     def __init__(self, adapter: LLMProtocolV1):
