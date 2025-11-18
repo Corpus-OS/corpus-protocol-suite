@@ -113,6 +113,8 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, asdict
 from typing import (
     Any,
+    Awaitable,
+    Callable,
     Dict,
     List,
     Mapping,
@@ -130,6 +132,7 @@ LOG = logging.getLogger(__name__)
 # Core Type Definitions
 # =============================================================================
 
+
 @dataclass(frozen=True)
 class EmbeddingVector:
     """
@@ -140,11 +143,14 @@ class EmbeddingVector:
         text: The source text that was embedded
         model: Model used to generate the embedding
         dimensions: Vector dimensions
+        metadata: Optional metadata associated with this embedding
+                  (e.g., document/chunk identifiers).
     """
     vector: List[float]
     text: str
     model: str
     dimensions: int
+    metadata: Optional[Dict[str, Any]] = None
 
 
 @dataclass(frozen=True)
@@ -185,6 +191,7 @@ class EmbeddingBatch:
 # Normalized Errors (with retry hints and operational guidance)
 # =============================================================================
 
+
 class EmbeddingAdapterError(Exception):
     """
     Base exception for all embedding adapter errors.
@@ -200,6 +207,7 @@ class EmbeddingAdapterError(Exception):
         suggested_batch_reduction: Percentage reduction suggestion for batch size
         details: Additional context-specific error details (SIEM-safe, JSON-serializable)
     """
+
     def __init__(
         self,
         message: str = "",
@@ -251,6 +259,7 @@ class EmbeddingAdapterError(Exception):
 
 class BadRequest(EmbeddingAdapterError):
     """Client sent an invalid request (malformed texts, invalid parameters)."""
+
     def __init__(self, message: str, **kwargs: Any):
         kwargs.setdefault("code", "BAD_REQUEST")
         super().__init__(message, **kwargs)
@@ -258,6 +267,7 @@ class BadRequest(EmbeddingAdapterError):
 
 class AuthError(EmbeddingAdapterError):
     """Authentication or authorization failed (invalid credentials, permissions)."""
+
     def __init__(self, message: str, **kwargs: Any):
         kwargs.setdefault("code", "AUTH_ERROR")
         super().__init__(message, **kwargs)
@@ -265,6 +275,7 @@ class AuthError(EmbeddingAdapterError):
 
 class ResourceExhausted(EmbeddingAdapterError):
     """Quota, rate limit, or resource constraints exceeded."""
+
     def __init__(self, message: str, **kwargs: Any):
         kwargs.setdefault("code", "RESOURCE_EXHAUSTED")
         super().__init__(message, **kwargs)
@@ -272,6 +283,7 @@ class ResourceExhausted(EmbeddingAdapterError):
 
 class TextTooLong(EmbeddingAdapterError):
     """Input text exceeds model's maximum context length."""
+
     def __init__(self, message: str, **kwargs: Any):
         kwargs.setdefault("code", "TEXT_TOO_LONG")
         super().__init__(message, **kwargs)
@@ -279,6 +291,7 @@ class TextTooLong(EmbeddingAdapterError):
 
 class ModelNotAvailable(EmbeddingAdapterError):
     """Requested embedding model is not available."""
+
     def __init__(self, message: str, **kwargs: Any):
         kwargs.setdefault("code", "MODEL_NOT_AVAILABLE")
         super().__init__(message, **kwargs)
@@ -286,6 +299,7 @@ class ModelNotAvailable(EmbeddingAdapterError):
 
 class TransientNetwork(EmbeddingAdapterError):
     """Transient network failure that may succeed on retry."""
+
     def __init__(self, message: str, **kwargs: Any):
         kwargs.setdefault("code", "TRANSIENT_NETWORK")
         super().__init__(message, **kwargs)
@@ -293,6 +307,7 @@ class TransientNetwork(EmbeddingAdapterError):
 
 class Unavailable(EmbeddingAdapterError):
     """Service is temporarily unavailable or overloaded."""
+
     def __init__(self, message: str, **kwargs: Any):
         kwargs.setdefault("code", "UNAVAILABLE")
         super().__init__(message, **kwargs)
@@ -300,6 +315,7 @@ class Unavailable(EmbeddingAdapterError):
 
 class NotSupported(EmbeddingAdapterError):
     """Requested operation or parameter is not supported."""
+
     def __init__(self, message: str, **kwargs: Any):
         kwargs.setdefault("code", "NOT_SUPPORTED")
         super().__init__(message, **kwargs)
@@ -307,6 +323,7 @@ class NotSupported(EmbeddingAdapterError):
 
 class DeadlineExceeded(EmbeddingAdapterError):
     """Operation exceeded ctx.deadline_ms budget."""
+
     def __init__(self, message: str, **kwargs: Any):
         kwargs.setdefault("code", "DEADLINE_EXCEEDED")
         super().__init__(message, **kwargs)
@@ -315,6 +332,7 @@ class DeadlineExceeded(EmbeddingAdapterError):
 # =============================================================================
 # Context (used for deadlines, identity, SIEM-safe metrics)
 # =============================================================================
+
 
 @dataclass(frozen=True)
 class OperationContext:
@@ -360,6 +378,7 @@ class OperationContext:
 # Metrics Interface (SIEM-safe, low-cardinality)
 # =============================================================================
 
+
 class MetricsSink(Protocol):
     """
     Protocol for metrics collection implementations.
@@ -367,6 +386,7 @@ class MetricsSink(Protocol):
     Used for operational monitoring without exposing sensitive information.
     All metrics must be low-cardinality and never include PII or tenant identifiers.
     """
+
     def observe(
         self,
         *,
@@ -412,8 +432,10 @@ class MetricsSink(Protocol):
 
 class NoopMetrics:
     """No-operation metrics sink for testing or when metrics are disabled."""
+
     def observe(self, **_: Any) -> None:
         ...
+
     def counter(self, **_: Any) -> None:
         ...
 
@@ -422,55 +444,83 @@ class NoopMetrics:
 # Pluggable policy interfaces (deadlines, truncation, normalization, CB, cache)
 # =============================================================================
 
+
 class DeadlinePolicy(Protocol):
     """Strategy to apply time budgets (ctx.deadline_ms) to awaits."""
-    async def wrap(self, awaitable, ctx: Optional[OperationContext]) -> Any:
+
+    async def wrap(self, awaitable: Awaitable[Any], ctx: Optional[OperationContext]) -> Any:
         ...
 
 
 class TruncationPolicy(Protocol):
     """Strategy to deterministically truncate text when allowed."""
+
     def apply(self, text: str, max_len: Optional[int], allow: bool) -> Tuple[str, bool]:
         ...
 
 
 class NormalizationPolicy(Protocol):
     """Strategy to normalize vectors when requested."""
+
     def normalize(self, vec: List[float]) -> List[float]:
         ...
 
 
 class CircuitBreaker(Protocol):
     """Minimal circuit breaker interface."""
+
     def allow(self) -> bool:
         ...
+
     def on_success(self) -> None:
         ...
+
     def on_error(self, err: Exception) -> None:
         ...
 
 
 class Cache(Protocol):
-    """Minimal async cache interface."""
+    """
+    Minimal async cache interface.
+
+    Implementations should define whether they support TTL-based caching via
+    the `supports_ttl` property. This lets the adapter avoid type checks on
+    specific cache implementations.
+    """
+
     async def get(self, key: str) -> Optional[Any]:
         ...
+
     async def set(self, key: str, value: Any, ttl_s: int) -> None:
+        ...
+
+    @property
+    def supports_ttl(self) -> bool:
+        """
+        Whether this cache implementation supports TTL semantics on `set`.
+
+        Used by BaseEmbeddingAdapter to decide if it can safely rely on TTL.
+        """
         ...
 
 
 class RateLimiter(Protocol):
     """Minimal rate limiter interface."""
+
     async def acquire(self) -> None:
         ...
+
     def release(self) -> None:
         ...
 
 
 # ---- No-op / simple policies ----
 
+
 class NoopDeadline:
     """No-op deadline policy (no timing/timeout behavior)."""
-    async def wrap(self, awaitable, ctx: Optional[OperationContext]) -> Any:
+
+    async def wrap(self, awaitable: Awaitable[Any], ctx: Optional[OperationContext]) -> Any:
         return await awaitable
 
 
@@ -480,7 +530,8 @@ class EnforcingDeadline:
 
     If deadline is already expired, fail fast with DeadlineExceeded.
     """
-    async def wrap(self, awaitable, ctx: Optional[OperationContext]) -> Any:
+
+    async def wrap(self, awaitable: Awaitable[Any], ctx: Optional[OperationContext]) -> Any:
         if ctx is None or ctx.deadline_ms is None:
             return await awaitable
         remaining = ctx.remaining_ms()
@@ -497,6 +548,7 @@ class EnforcingDeadline:
 
 class SimpleCharTruncation:
     """Deterministic truncation policy based on max character length."""
+
     def apply(self, text: str, max_len: Optional[int], allow: bool) -> Tuple[str, bool]:
         if not max_len or len(text) <= max_len:
             return text, False
@@ -507,6 +559,7 @@ class SimpleCharTruncation:
 
 class L2Normalization:
     """L2-normalize embedding vectors when requested."""
+
     def normalize(self, vec: List[float]) -> List[float]:
         norm = math.sqrt(sum(v * v for v in vec)) or 1.0
         return [v / norm for v in vec]
@@ -515,8 +568,10 @@ class L2Normalization:
 class NoopBreaker:
     def allow(self) -> bool:
         return True
+
     def on_success(self) -> None:
         ...
+
     def on_error(self, err: Exception) -> None:
         ...
 
@@ -530,6 +585,7 @@ class SimpleCircuitBreaker:
 
     Intended for standalone/dev use only (not distributed).
     """
+
     def __init__(self, failure_threshold: int = 5, cooldown_s: float = 5.0) -> None:
         self._failure_threshold = max(1, int(failure_threshold))
         self._cooldown_s = max(0.1, float(cooldown_s))
@@ -564,10 +620,16 @@ class SimpleCircuitBreaker:
 
 class NoopCache:
     """No-op cache used in thin/composed mode."""
+
     async def get(self, key: str) -> Optional[Any]:
         return None
+
     async def set(self, key: str, value: Any, ttl_s: int) -> None:
         return None
+
+    @property
+    def supports_ttl(self) -> bool:
+        return False
 
 
 class InMemoryTTLCache:
@@ -577,8 +639,10 @@ class InMemoryTTLCache:
     Not thread-safe, process-safe, or distributed. Intended only for
     single-process, single-threaded development and test usage.
     """
-    def __init__(self) -> None:
+
+    def __init__(self, max_entries: Optional[int] = None) -> None:
         self._store: Dict[str, Tuple[float, Any]] = {}
+        self._max_entries = max_entries
 
     async def get(self, key: str) -> Optional[Any]:
         now = time.monotonic()
@@ -593,13 +657,28 @@ class InMemoryTTLCache:
 
     async def set(self, key: str, value: Any, ttl_s: int) -> None:
         ttl = max(0, int(ttl_s))
+        if ttl == 0:
+            # Treat TTL=0 as "do not cache"
+            return
+        # Simple eviction policy: drop arbitrary item if over max_entries.
+        if self._max_entries is not None and len(self._store) >= self._max_entries:
+            try:
+                self._store.pop(next(iter(self._store)))
+            except StopIteration:
+                pass
         self._store[key] = (time.monotonic() + ttl, value)
+
+    @property
+    def supports_ttl(self) -> bool:
+        return True
 
 
 class NoopLimiter:
     """No-op limiter used in thin/composed mode."""
+
     async def acquire(self) -> None:
         return None
+
     def release(self) -> None:
         return None
 
@@ -614,6 +693,7 @@ class TokenBucketLimiter:
 
     Intended for standalone/dev; avoids impacting main path on internal errors.
     """
+
     def __init__(self, rate: float = 50.0, burst: int = 50) -> None:
         self._rate = max(0.1, float(rate))
         self._burst = max(1, int(burst))
@@ -622,8 +702,15 @@ class TokenBucketLimiter:
         self._lock = asyncio.Lock()
 
     async def acquire(self) -> None:
-        async with self._lock:
-            while True:
+        """
+        Acquire one token from the bucket, waiting if necessary.
+
+        This implementation avoids holding the lock while sleeping to prevent
+        head-of-line blocking under contention.
+        """
+        while True:
+            needed: float
+            async with self._lock:
                 now = time.monotonic()
                 elapsed = now - self._last
                 if elapsed > 0:
@@ -636,7 +723,8 @@ class TokenBucketLimiter:
                     self._tokens -= 1.0
                     return
                 needed = (1.0 - self._tokens) / self._rate
-                await asyncio.sleep(max(needed, 0.001))
+            # Sleep outside the lock so other coroutines can make progress.
+            await asyncio.sleep(max(needed, 0.001))
 
     def release(self) -> None:
         # Classic token bucket: only charge on acquire.
@@ -646,6 +734,7 @@ class TokenBucketLimiter:
 # =============================================================================
 # Capabilities (dynamic discovery for routing and planning)
 # =============================================================================
+
 
 @dataclass(frozen=True)
 class EmbeddingCapabilities:
@@ -691,6 +780,7 @@ class EmbeddingCapabilities:
 # Operation Specifications
 # =============================================================================
 
+
 @dataclass(frozen=True)
 class EmbedSpec:
     """
@@ -701,11 +791,14 @@ class EmbedSpec:
         model: Target model for embedding generation
         truncate: Whether to truncate long texts (True) or error (False)
         normalize: Whether to normalize output vector to unit length
+        metadata: Optional metadata to associate with the resulting embedding
+                  (not sent on the wire; used locally).
     """
     text: str
     model: str
     truncate: bool = True
     normalize: bool = False
+    metadata: Optional[Dict[str, Any]] = None
 
 
 @dataclass(frozen=True)
@@ -718,16 +811,20 @@ class BatchEmbedSpec:
         model: Target model for embedding generation
         truncate: Whether to truncate long texts (True) or error (False)
         normalize: Whether to normalize output vectors to unit length
+        metadatas: Optional list of per-text metadata dicts. Length must match
+                   texts when provided. Not part of the wire contract.
     """
     texts: List[str]
     model: str
     truncate: bool = True
     normalize: bool = False
+    metadatas: Optional[List[Dict[str, Any]]] = None
 
 
 # =============================================================================
 # Operation Results
 # =============================================================================
+
 
 @dataclass
 class EmbedResult:
@@ -764,6 +861,13 @@ class BatchEmbedResult:
             - error: error class name
             - code: stable error code (if available)
             - message: human-readable error
+            - metadata: optional metadata associated with this text (if provided)
+
+    Contract for provider-native implementations:
+        - Unless otherwise documented, `embeddings[i]` is assumed to correspond
+          to `texts[i]` from the input BatchEmbedSpec (i.e., same length and order).
+        - Partial success may also be expressed via `failed_texts`, but any
+          deviation from 1:1 alignment MUST be documented by the implementation.
     """
     embeddings: List[EmbeddingVector]
     model: str
@@ -779,6 +883,7 @@ class BatchEmbedResult:
 # =============================================================================
 # Stable Protocol Interface (async, versioned contract)
 # =============================================================================
+
 
 @runtime_checkable
 class EmbeddingProtocolV1(Protocol):
@@ -835,6 +940,7 @@ class EmbeddingProtocolV1(Protocol):
 # =============================================================================
 # Base Instrumented Adapter (validation, metrics, error handling)
 # =============================================================================
+
 
 class BaseEmbeddingAdapter(EmbeddingProtocolV1):
     """
@@ -895,8 +1001,10 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
             cache: Optional async cache; defaults vary by mode.
             limiter: Optional rate limiter; defaults vary by mode.
             tag_model_in_metrics: Whether to include 'model' as a metric tag.
-            cache_embed_ttl_s: TTL for embed() cache entries when using in-memory cache.
+            cache_embed_ttl_s: TTL for embed() cache entries when using a TTL cache.
+                               Use 0 to disable embed caching.
             cache_caps_ttl_s: TTL for capabilities() cache entries in standalone mode.
+                              Use 0 to disable capabilities caching.
         """
         m = (mode or "thin").strip().lower()
         if m not in {"thin", "standalone"}:
@@ -934,8 +1042,9 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
                 bool(tag_model_in_metrics) if tag_model_in_metrics is not None else True
             )
 
-        self._cache_embed_ttl_s: int = max(1, int(cache_embed_ttl_s))
-        self._cache_caps_ttl_s: int = max(1, int(cache_caps_ttl_s))
+        # Allow 0 to mean "no caching".
+        self._cache_embed_ttl_s: int = max(0, int(cache_embed_ttl_s))
+        self._cache_caps_ttl_s: int = max(0, int(cache_caps_ttl_s))
 
     # --- internal helpers (validation, hashing, metrics, deadlines) ---
 
@@ -1024,7 +1133,11 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
             # Metrics failures MUST NOT affect request path.
             pass
 
-    async def _apply_deadline(self, awaitable, ctx: Optional[OperationContext]) -> Any:
+    async def _apply_deadline(
+        self,
+        awaitable: Awaitable[Any],
+        ctx: Optional[OperationContext],
+    ) -> Any:
         """
         Apply the configured deadline policy to an awaitable.
 
@@ -1104,7 +1217,7 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         *,
         op: str,
         ctx: Optional[OperationContext],
-        call_coro,
+        call: Callable[[], Awaitable[Any]],
         metric_extra: Optional[Mapping[str, Any]] = None,
         error_extra: Optional[Mapping[str, Any]] = None,
     ) -> Any:
@@ -1127,7 +1240,7 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         async with self._rate_limited():
             t0 = time.monotonic()
             try:
-                result = await self._apply_deadline(call_coro, ctx)
+                result = await self._apply_deadline(call(), ctx)
                 self._record(
                     op,
                     t0,
@@ -1163,18 +1276,102 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
                 self._breaker.on_error(e)
                 raise
 
+    # --- metadata helpers ----------------------------------------------------
+
+    @staticmethod
+    def _attach_single_metadata(
+        base: EmbedResult,
+        metadata: Optional[Dict[str, Any]],
+    ) -> EmbedResult:
+        """
+        Attach caller-supplied metadata to a single EmbedResult without
+        mutating the original (important for cache safety).
+        """
+        if metadata is None:
+            return base
+
+        emb = base.embedding
+        new_emb = EmbeddingVector(
+            vector=emb.vector,
+            text=emb.text,
+            model=emb.model,
+            dimensions=emb.dimensions,
+            metadata=metadata,
+        )
+        return EmbedResult(
+            embedding=new_emb,
+            model=base.model,
+            text=base.text,
+            tokens_used=base.tokens_used,
+            truncated=base.truncated,
+        )
+
+    @staticmethod
+    def _attach_batch_metadata_to_embeddings(
+        embeddings: List[EmbeddingVector],
+        metadatas: Optional[List[Dict[str, Any]]],
+    ) -> List[EmbeddingVector]:
+        """
+        Attach per-embedding metadata, preserving order. Does not mutate
+        the original list or vectors.
+
+        Assumes that `embeddings[i]` corresponds to the same input item
+        as `metadatas[i]`.
+        """
+        if not metadatas:
+            return embeddings
+
+        out: List[EmbeddingVector] = []
+        for idx, ev in enumerate(embeddings):
+            md = metadatas[idx] if idx < len(metadatas) else None
+            if md is None:
+                out.append(ev)
+            else:
+                out.append(
+                    EmbeddingVector(
+                        vector=ev.vector,
+                        text=ev.text,
+                        model=ev.model,
+                        dimensions=ev.dimensions,
+                        metadata=md,
+                    )
+                )
+        return out
+
+    @staticmethod
+    def _attach_batch_metadata_to_failures(
+        failures: List[Dict[str, Any]],
+        metadatas: Optional[List[Dict[str, Any]]],
+    ) -> List[Dict[str, Any]]:
+        """
+        Attach metadata to per-item failure records based on index
+        (if available). Mutates the failure dicts in-place for simplicity.
+        """
+        if not metadatas:
+            return failures
+        for f in failures:
+            idx = f.get("index")
+            if isinstance(idx, int) and 0 <= idx < len(metadatas):
+                f.setdefault("metadata", metadatas[idx])
+        return failures
+
     # --- public APIs (use helpers + backend hooks) ---
 
     async def capabilities(self) -> EmbeddingCapabilities:
         """
         Get the capabilities of this embedding adapter (with optional caching).
 
-        In standalone mode with an in-memory TTL cache, caches capabilities
-        using the configured cache_caps_ttl_s.
+        In standalone mode with a TTL-supporting cache, caches capabilities
+        using the configured cache_caps_ttl_s. TTL=0 disables capabilities caching.
         """
         t0 = time.monotonic()
         try:
-            if self._mode == "standalone" and isinstance(self._cache, InMemoryTTLCache):
+            use_cache = (
+                self._mode == "standalone"
+                and getattr(self._cache, "supports_ttl", False)
+                and self._cache_caps_ttl_s > 0
+            )
+            if use_cache:
                 cached = await self._cache.get(self._caps_cache_key())
                 if cached:
                     self._metrics.counter(
@@ -1188,7 +1385,7 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
 
             caps = await self._apply_deadline(self._do_capabilities(), ctx=None)
 
-            if self._mode == "standalone" and isinstance(self._cache, InMemoryTTLCache):
+            if use_cache:
                 try:
                     await self._cache.set(
                         self._caps_cache_key(),
@@ -1217,6 +1414,9 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         """
         Core implementation of embed() separated for easier testing and
         reuse from the gated public method.
+
+        NOTE: Cache stores base results without caller-supplied metadata.
+        Metadata is attached per call on top of the cached base.
         """
         # Capabilities for validation and limits.
         caps = await self._do_capabilities()
@@ -1238,12 +1438,19 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
             model=spec.model,
             truncate=spec.truncate,
             normalize=spec.normalize,
+            metadata=None,  # provider does not see caller metadata by default
         )
 
         # Optional cache: isolated per tenant via _embed_cache_key.
-        result: Optional[EmbedResult] = None
+        base_result: Optional[EmbedResult] = None
         cache_key: Optional[str] = None
-        if isinstance(self._cache, InMemoryTTLCache):
+
+        use_cache = (
+            getattr(self._cache, "supports_ttl", False)
+            and self._cache_embed_ttl_s > 0
+        )
+
+        if use_cache:
             cache_key = self._embed_cache_key(
                 eff_spec.model,
                 eff_spec.normalize,
@@ -1258,38 +1465,42 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
                     value=1,
                     extra={"op": "embed"},
                 )
-                result = cached
+                base_result = cached
 
-        if result is None:
+        if base_result is None:
             # Provider-specific embed.
-            result = await self._do_embed(eff_spec, ctx=ctx)
+            base_result = await self._do_embed(eff_spec, ctx=ctx)
 
             # Post-processing: normalization if requested and not handled at source.
             if eff_spec.normalize:
                 if not caps.supports_normalization:
                     raise NotSupported("normalization not supported for this adapter")
                 if not caps.normalizes_at_source:
-                    vec = self._norm.normalize(result.embedding.vector)
-                    result.embedding = EmbeddingVector(
+                    vec = self._norm.normalize(base_result.embedding.vector)
+                    base_result.embedding = EmbeddingVector(
                         vector=vec,
-                        text=result.text,
-                        model=result.model,
+                        text=base_result.embedding.text,
+                        model=base_result.embedding.model,
                         dimensions=len(vec),
+                        metadata=base_result.embedding.metadata,
                     )
 
             # Mark truncation result flag.
-            result.truncated = bool(truncated)
+            base_result.truncated = bool(truncated)
 
-            # Cache set (best-effort).
-            if cache_key is not None:
+            # Cache set (best-effort) without caller-provided metadata.
+            if use_cache and cache_key is not None:
                 try:
                     await self._cache.set(
                         cache_key,
-                        result,
+                        base_result,
                         ttl_s=self._cache_embed_ttl_s,
                     )
                 except Exception:
                     pass
+
+        # Attach metadata for this specific call (does not affect cached value).
+        result = self._attach_single_metadata(base_result, spec.metadata)
 
         # Per-op counters.
         self._metrics.counter(
@@ -1332,7 +1543,7 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         return await self._with_gates_unary(
             op="embed",
             ctx=ctx,
-            call_coro=self._embed_core(spec, ctx),
+            call=lambda: self._embed_core(spec, ctx),
             metric_extra=metric_extra,
             error_extra=error_extra,
         )
@@ -1355,6 +1566,15 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
                 details={"max_batch_size": caps.max_batch_size},
             )
 
+        if spec.metadatas is not None and len(spec.metadatas) != len(spec.texts):
+            raise BadRequest(
+                "metadatas length must match texts length when provided",
+                details={
+                    "texts": len(spec.texts),
+                    "metadatas": len(spec.metadatas),
+                },
+            )
+
         eff_texts: List[str] = []
         for text in spec.texts:
             self._require_non_empty("text", text)
@@ -1373,6 +1593,7 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
             model=spec.model,
             truncate=spec.truncate,
             normalize=spec.normalize,
+            metadatas=spec.metadatas,
         )
 
     async def _fallback_embed_batch_per_item(
@@ -1392,12 +1613,18 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         """
 
         async def _embed_one(idx: int, text: str):
+            cur_metadata = (
+                eff_spec.metadatas[idx]
+                if eff_spec.metadatas is not None and idx < len(eff_spec.metadatas)
+                else None
+            )
             try:
                 single_spec = EmbedSpec(
                     text=text,
                     model=eff_spec.model,
                     truncate=eff_spec.truncate,
                     normalize=False,  # normalization applied uniformly below
+                    metadata=None,    # provider does not see caller metadata
                 )
                 single = await self._do_embed(single_spec, ctx=ctx)
                 ev = single.embedding
@@ -1414,25 +1641,42 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
                             text=ev.text,
                             model=ev.model,
                             dimensions=len(vec),
+                            metadata=ev.metadata,
                         )
+
+                # Attach metadata for this item (does not affect other callers).
+                if cur_metadata is not None:
+                    ev = EmbeddingVector(
+                        vector=ev.vector,
+                        text=ev.text,
+                        model=ev.model,
+                        dimensions=ev.dimensions,
+                        metadata=cur_metadata,
+                    )
 
                 return idx, ev, None
             except EmbeddingAdapterError as item_err:
-                return idx, None, {
+                info: Dict[str, Any] = {
                     "index": idx,
                     "text": text,
                     "error": type(item_err).__name__,
                     "code": item_err.code or type(item_err).__name__,
                     "message": item_err.message,
                 }
+                if cur_metadata is not None:
+                    info["metadata"] = cur_metadata
+                return idx, None, info
             except Exception as item_err:
-                return idx, None, {
+                info = {
                     "index": idx,
                     "text": text,
                     "error": type(item_err).__name__,
                     "code": "UNAVAILABLE",
                     "message": str(item_err) or "internal error",
                 }
+                if cur_metadata is not None:
+                    info["metadata"] = cur_metadata
+                return idx, None, info
 
         tasks = [
             _embed_one(idx, text) for idx, text in enumerate(eff_spec.texts)
@@ -1480,21 +1724,37 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
                 ctx,
                 total_texts=len(spec.texts),
             )
+        else:
+            # Post-processing of provider-native batch results.
+            # Attach metadata to embeddings/failures if provided.
+            result.embeddings = self._attach_batch_metadata_to_embeddings(
+                result.embeddings,
+                eff_spec.metadatas,
+            )
+            result.failed_texts = self._attach_batch_metadata_to_failures(
+                result.failed_texts,
+                eff_spec.metadatas,
+            )
 
-        # Post-processing: normalization if requested and not handled at source,
-        # for providers that implement _do_embed_batch directly.
-        if eff_spec.normalize:
-            if not caps.supports_normalization:
-                raise NotSupported("normalization not supported for this adapter")
-            if not caps.normalizes_at_source:
-                for i, ev in enumerate(result.embeddings):
-                    vec = self._norm.normalize(ev.vector)
-                    result.embeddings[i] = EmbeddingVector(
-                        vector=vec,
-                        text=ev.text,
-                        model=ev.model,
-                        dimensions=len(vec),
-                    )
+            # Post-processing: normalization if requested and not handled at source,
+            # for providers that implement _do_embed_batch directly.
+            if eff_spec.normalize:
+                if not caps.supports_normalization:
+                    raise NotSupported("normalization not supported for this adapter")
+                if not caps.normalizes_at_source:
+                    normed: List[EmbeddingVector] = []
+                    for ev in result.embeddings:
+                        vec = self._norm.normalize(ev.vector)
+                        normed.append(
+                            EmbeddingVector(
+                                vector=vec,
+                                text=ev.text,
+                                model=ev.model,
+                                dimensions=len(vec),
+                                metadata=ev.metadata,
+                            )
+                        )
+                    result.embeddings = normed
 
         # Per-op counters.
         self._metrics.counter(
@@ -1524,6 +1784,10 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
           - Provider-native batch behavior via _do_embed_batch.
           - Optional partial-success fallback when batch is not supported:
             falls back to per-item _do_embed calls and populates failed_texts.
+
+        Note:
+            metadatas are not part of the wire contract; they are a local
+            convenience for frameworks to track per-text context.
         """
         self._require_non_empty("model", spec.model)
         if not spec.texts:
@@ -1545,7 +1809,7 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         return await self._with_gates_unary(
             op="embed_batch",
             ctx=ctx,
-            call_coro=self._embed_batch_core(spec, ctx),
+            call=lambda: self._embed_batch_core(spec, ctx),
             metric_extra=metric_extra,
             error_extra=error_extra,
         )
@@ -1595,7 +1859,7 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         result = await self._with_gates_unary(
             op="count_tokens",
             ctx=ctx,
-            call_coro=self._count_tokens_core(text, model, ctx),
+            call=lambda: self._count_tokens_core(text, model, ctx),
             metric_extra=metric_extra,
             error_extra=error_extra,
         )
@@ -1632,7 +1896,7 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         return await self._with_gates_unary(
             op="health",
             ctx=ctx,
-            call_coro=self._health_core(ctx),
+            call=lambda: self._health_core(ctx),
         )
 
     # --- async context manager (resource cleanup hook) ---
@@ -1678,8 +1942,13 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         Implement batch text embedding with validated inputs.
 
         Implementers MAY populate failed_texts for partial success semantics.
-        If this method raises NotSupported, BaseEmbeddingAdapter falls back to
-        a per-item _do_embed()-based implementation with partial results.
+
+        Contract:
+            - By default, `embeddings[i]` is assumed to correspond to
+              `spec.texts[i]` (1:1 alignment, same length & order).
+            - If you return a different structure (e.g., only successes),
+              you MUST document this behavior clearly for callers that rely
+              on positional alignment (such as metadata propagation).
         """
         raise NotImplementedError
 
@@ -1698,10 +1967,10 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         raise NotImplementedError
 
 
-
 # =============================================================================
 # Wire-Level Helpers (canonical envelopes)
 # =============================================================================
+
 
 def _ctx_from_wire(ctx_dict: Mapping[str, Any]) -> OperationContext:
     """
@@ -1776,6 +2045,9 @@ class WireEmbeddingHandler:
         { "op": "embedding.embed", "ctx": {...}, "args": {...} } -> { ... }
 
     Transport-agnostic: can be wrapped by HTTP, gRPC, WebSockets, etc.
+
+    Note: The wire contract currently does NOT carry metadata/metadatas. Those
+    fields are local-only conveniences and must be populated by in-process callers.
     """
 
     def __init__(self, adapter: EmbeddingProtocolV1):
@@ -1811,6 +2083,7 @@ class WireEmbeddingHandler:
                     model=args.get("model", ""),
                     truncate=bool(args.get("truncate", True)),
                     normalize=bool(args.get("normalize", False)),
+                    metadata=None,  # metadata not in wire contract
                 )
                 res = await self._adapter.embed(spec, ctx=ctx)
                 return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
@@ -1824,6 +2097,7 @@ class WireEmbeddingHandler:
                     model=args.get("model", ""),
                     truncate=bool(args.get("truncate", True)),
                     normalize=bool(args.get("normalize", False)),
+                    metadatas=None,  # metadatas not in wire contract
                 )
                 res = await self._adapter.embed_batch(spec, ctx=ctx)
                 return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
