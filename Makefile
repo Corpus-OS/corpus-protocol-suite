@@ -134,6 +134,8 @@ test-conformance test-all-conformance: check-deps safety-check
 	@echo "   Environment: $${CORPUS_TEST_ENV:-default}"
 	$(PYTEST) \
 		$(TEST_DIRS) \
+		tests/cli.py \
+		tests/run_conformance.py \
 		$(PYTEST_ARGS) \
 		$(PYTEST_PARALLEL) \
 		--cov=corpus_sdk \
@@ -330,6 +332,8 @@ verify: check-deps safety-check
 	@echo "   Environment: $${CORPUS_TEST_ENV:-default}"
 	$(PYTEST) \
 		$(TEST_DIRS) \
+		tests/cli.py \
+		tests/run_conformance.py \
 		$(PYTEST_ARGS) \
 		$(PYTEST_PARALLEL) \
 		--cov=corpus_sdk \
