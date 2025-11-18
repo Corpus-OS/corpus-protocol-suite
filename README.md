@@ -123,6 +123,25 @@ Modern AI platforms juggle multiple LLM, embedding, vector, and graph backends. 
 * **Deadline propagation** for cancellation & cost control
 * **Two modes**: compose under your own router (**thin**) or use lightweight infra (**standalone**)
 
+## Who is this for?
+
+- **For app developers** – Build on LangChain, LlamaIndex, Semantic Kernel, AutoGen, CrewAI, or MCP and still talk to your backends through the *same* Corpus protocols. Swap frameworks or providers without rewriting business logic or error handling.
+
+- **For framework maintainers** – Implement **one** Corpus adapter per protocol (LLM / Vector / Graph / Embedding) and instantly support any backend that passes the Corpus conformance tests. Fewer bespoke integrations, fewer “this provider behaves differently” bugs.
+
+- **For backend vendors** – Implement `llm/v1`, `embedding/v1`, `vector/v1`, or `graph/v1` once, run the open test suite, and your service “just works” with multiple frameworks and MCP tools. Golden samples + conformance tests give you a clear definition of correctness.
+
+- **For platform / infra teams** – Get **unified observability**: normalized error codes, deadlines, and metrics across all frameworks and providers. One set of dashboards, alerts, and SLOs that cover LLM, vector, and graph traffic end-to-end.
+
+- **For MCP users** – The Corpus MCP server exposes your protocols as standard MCP tools (LLM, vector search, graph query, etc.). Any MCP client (including ChatGPT) can call into your existing infra with consistent behavior and safety guarantees.
+
+- **For security & compliance** – A shared, SIEM-safe error taxonomy and context model (tenant hashing, attrs) makes it easier to audit, trace, and reason about behavior across multiple services without leaking sensitive identifiers.
+
+- **For OSS contributors** – The repo includes schemas, golden wire messages, and per-protocol test suites (`tests/llm`, `tests/vector`, `tests/graph`, `tests/embedding`) so new backends and frameworks can validate behavior and evolve the standards in the open.
+
+- **For everyone tired of glue code** – Instead of N×M custom integrations between frameworks and providers, you get **one stable protocol layer** in the middle. Integrate once, interoperate everywhere.
+
+
 ---
 
 ## How Corpus Compares
