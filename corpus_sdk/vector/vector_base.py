@@ -138,6 +138,7 @@ import time
 from dataclasses import dataclass, asdict
 from typing import (
     Any,
+    Awaitable,
     Callable,
     Dict,
     List,
@@ -546,7 +547,7 @@ class NoopMetrics:
 
 class DeadlinePolicy(Protocol):
     """Strategy to apply time budgets (ctx.deadline_ms) to awaits."""
-    async def wrap(self, coro, ctx: Optional[OperationContext]) -> Any: ...
+    async def wrap(self, awaitable: Awaitable[Any], ctx: Optional[OperationContext]) -> Any: ...
 
 
 class CircuitBreaker(Protocol):
@@ -564,6 +565,10 @@ class Cache(Protocol):
     simply holds references and does not serialize. If you plug in a distributed
     cache (e.g., Redis), you are responsible for serializing/deserializing values
     (JSON, msgpack, etc.) safely.
+
+    Note: cache implementations MAY optionally expose an async
+    `invalidate_namespace(namespace: str)` method. If present, BaseVectorAdapter
+    will call it for namespace-scoped invalidation instead of relying on TTL.
     """
     async def get(self, key: str) -> Optional[Any]: ...
     async def set(self, key: str, value: Any, ttl_s: int) -> None: ...
@@ -577,8 +582,8 @@ class RateLimiter(Protocol):
 
 class NoopDeadline:
     """No-op deadline policy (no timing/timeout behavior)."""
-    async def wrap(self, coro, ctx: Optional[OperationContext]) -> Any:
-        return await coro
+    async def wrap(self, awaitable: Awaitable[Any], ctx: Optional[OperationContext]) -> Any:
+        return await awaitable
 
 
 class SimpleDeadline:
@@ -587,15 +592,15 @@ class SimpleDeadline:
 
     Maps asyncio.TimeoutError → DeadlineExceeded.
     """
-    async def wrap(self, coro, ctx: Optional[OperationContext]) -> Any:
+    async def wrap(self, awaitable: Awaitable[Any], ctx: Optional[OperationContext]) -> Any:
         if ctx is None or ctx.deadline_ms is None:
-            return await coro
+            return await awaitable
         tmp = OperationContext(deadline_ms=ctx.deadline_ms)
         rem = tmp.remaining_ms()
         if rem is not None and rem <= 0:
             raise DeadlineExceeded("operation timed out (preflight)", details={"preflight": True})
         try:
-            return await asyncio.wait_for(coro, timeout=(rem / 1000.0 if rem is not None else None))
+            return await asyncio.wait_for(awaitable, timeout=(rem / 1000.0 if rem is not None else None))
         except asyncio.TimeoutError:
             raise DeadlineExceeded("operation timed out")
 
@@ -673,6 +678,9 @@ class InMemoryTTLCache:
         - Stores Python objects by reference; no serialization is performed.
           If you need cross-process or cross-host caching, use a different Cache
           implementation with explicit serialization.
+
+    This implementation also exposes an optional `invalidate_namespace(namespace: str)`
+    method used by BaseVectorAdapter for namespace-scoped invalidation.
     """
     def __init__(self) -> None:
         self._store: Dict[str, Tuple[float, Any]] = {}
@@ -691,6 +699,18 @@ class InMemoryTTLCache:
     async def set(self, key: str, value: Any, ttl_s: int) -> None:
         ttl_s = max(0, int(ttl_s))
         self._store[key] = (time.monotonic() + ttl_s, value)
+
+    async def invalidate_namespace(self, namespace: str) -> None:
+        """
+        Best-effort namespace invalidation based on the standard cache key
+        pattern used by BaseVectorAdapter (`ns=<namespace>:`).
+        """
+        if not namespace:
+            return
+        pattern = f"ns={namespace}:"
+        keys_to_remove = [k for k in list(self._store.keys()) if pattern in k]
+        for k in keys_to_remove:
+            self._store.pop(k, None)
 
 
 class NoopLimiter:
@@ -1284,14 +1304,14 @@ class BaseVectorAdapter(VectorProtocolV1):
         except Exception:
             pass
 
-    async def _apply_deadline(self, coro, ctx: Optional[OperationContext]) -> Any:
+    async def _apply_deadline(self, awaitable: Awaitable[Any], ctx: Optional[OperationContext]) -> Any:
         """
         Apply the configured deadline policy to an awaitable.
 
         Any asyncio.TimeoutError is normalized into DeadlineExceeded.
         """
         try:
-            return await self._deadline.wrap(coro, ctx)
+            return await self._deadline.wrap(awaitable, ctx)
         except DeadlineExceeded:
             # Propagate adapter-specific deadline errors
             raise
@@ -1403,36 +1423,30 @@ class BaseVectorAdapter(VectorProtocolV1):
         Used for cache invalidation on write operations.
         
         Note: This uses simple substring matching for in-memory cache.
-        For distributed caches, use provider-specific pattern matching.
+        For distributed caches, cache implementations can provide their own
+        `invalidate_namespace(namespace: str)` hook.
         """
         return f"ns={namespace}:"
 
     async def _invalidate_namespace_cache(self, namespace: str) -> None:
         """
-        Invalidate all cache entries for a specific namespace.
-        
-        This is a best-effort operation and should not block write operations.
-        For in-memory cache, we use substring matching. For distributed caches,
-        this would need provider-specific implementation.
+        Best-effort namespace cache invalidation.
+
+        Behavior:
+            - If the underlying cache exposes an async `invalidate_namespace(namespace)`
+              method, it is called directly.
+            - Otherwise, this is a no-op and TTL-based expiry is relied upon.
+
+        This avoids reaching into cache internals (e.g., _store) and allows
+        distributed caches to provide their own invalidation semantics.
         """
         if isinstance(self._cache, NoopCache):
             return
-            
+
         try:
-            # For InMemoryTTLCache, we can iterate and remove matching keys
-            if isinstance(self._cache, InMemoryTTLCache):
-                pattern = self._namespace_cache_pattern(namespace)
-                # Simple substring matching for in-memory cache
-                keys_to_remove = []
-                for key in self._cache._store.keys():
-                    if pattern in key:
-                        keys_to_remove.append(key)
-                for key in keys_to_remove:
-                    self._cache._store.pop(key, None)
-            
-            # For distributed caches, this would need provider-specific implementation
-            # For now, we rely on TTL for distributed caches
-            
+            invalidate = getattr(self._cache, "invalidate_namespace", None)
+            if callable(invalidate):
+                await invalidate(namespace)
         except Exception:
             # Never let cache invalidation break the main operation
             LOG.debug("Cache invalidation failed for namespace %s", namespace)
@@ -1444,7 +1458,7 @@ class BaseVectorAdapter(VectorProtocolV1):
         *,
         op: str,
         ctx: Optional[OperationContext],
-        call: Callable[[], Any],
+        call: Callable[[], Awaitable[Any]],
         metric_extra: Optional[Mapping[str, Any]] = None,
         on_result: Optional[Callable[[Any], Mapping[str, Any]]] = None,
     ) -> Any:
@@ -1670,7 +1684,17 @@ class BaseVectorAdapter(VectorProtocolV1):
                     )
                 except Exception as e:
                     # Graceful degradation: log but don't fail the query
-                    LOG.debug("Docstore hydration failed for query: %s", e)
+                    LOG.debug(
+                        "Docstore hydration failed for query in namespace %s: %r",
+                        result.namespace,
+                        e,
+                    )
+                    self._metrics.counter(
+                        component=self._component,
+                        name="docstore_hydration_errors",
+                        value=1,
+                        extra={"op": "query"},
+                    )
                     # Continue with original result (text will be None)
 
             # Populate cache if eligible (non-zero TTL and not already cached)
@@ -1830,7 +1854,13 @@ class BaseVectorAdapter(VectorProtocolV1):
                         results = hydrated_results
                 except Exception as e:
                     # Graceful degradation: log but don't fail the batch query
-                    LOG.debug("Docstore hydration failed for batch query: %s", e)
+                    LOG.debug("Docstore hydration failed for batch query in namespace %s: %r", spec.namespace, e)
+                    self._metrics.counter(
+                        component=self._component,
+                        name="docstore_hydration_errors",
+                        value=1,
+                        extra={"op": "batch_query"},
+                    )
                     # Continue with original results (text will be None)
 
             # Populate cache if eligible
@@ -1905,6 +1935,13 @@ class BaseVectorAdapter(VectorProtocolV1):
 
         async def _call() -> UpsertResult:
             caps = await self.capabilities()
+
+            # Enforce batch operation support
+            if not caps.supports_batch_operations and len(spec.vectors) > 1:
+                raise NotSupported(
+                    "batch upsert is not supported by this adapter",
+                    details={"requested": len(spec.vectors)},
+                )
 
             # Validate text storage capabilities
             texts_present = any(v.text for v in spec.vectors)
@@ -2039,6 +2076,13 @@ class BaseVectorAdapter(VectorProtocolV1):
 
         async def _call() -> DeleteResult:
             caps = await self.capabilities()
+
+            # Enforce batch operation support for multi-id deletes
+            if not caps.supports_batch_operations and spec.ids and len(spec.ids) > 1:
+                raise NotSupported(
+                    "batch delete is not supported by this adapter",
+                    details={"requested": len(spec.ids)},
+                )
 
             if caps.max_batch_size is not None and spec.ids and len(spec.ids) > caps.max_batch_size:
                 suggested = (
