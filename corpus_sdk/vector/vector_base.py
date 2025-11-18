@@ -11,9 +11,11 @@ structured errors, caching strategies, rate limiting, and production observabili
 This module serves as the reference implementation and SDK mapping for the
 Vector Protocol V1.0. It defines:
 
-- Typed Python contracts mirroring the protocol data shapes
+- Typed Python contracts mirroring the protocol data shapes  
 - A production-ready BaseVectorAdapter with validation, metrics, and backpressure
 - A thin WireVectorHandler that converts wire envelopes ⇄ typed API
+- First-class text storage support via DocStore integration
+- Optional batch query operations for performance optimization
 
 Design Philosophy
 -----------------
@@ -23,15 +25,29 @@ Design Philosophy
 - Extensible: Capability discovery allows for database-specific vector features
 - Performance-optimized: Read-path caching for similarity queries (standalone mode)
 - Wire-first: Types and helpers exist to faithfully implement the canonical JSON contract
+- Text-aware: First-class support for source text storage and retrieval
+- Batch-friendly: Optional batch operations for efficiency where supported
 
 Deliberate Non-Goals
 --------------------
 - No embedding model management or text-to-vector transformations
-- No vector index tuning or optimization strategies
+- No vector index tuning or optimization strategies  
 - No provider-specific algorithms beyond capabilities
 - No client-side result re-ranking or post-processing
 
 Those behaviors live in embedding services and upper application layers.
+
+Text Storage Strategy
+---------------------
+The protocol supports three text storage strategies:
+
+1. "metadata" (default): Store text in vector metadata (simple but expensive for large texts)
+2. "docstore": Store text in separate document store (cost-optimized for production)
+3. "none": Text storage not supported
+
+When using docstore, text is automatically stored/retrieved during upsert/query operations.
+Docstore failures during upsert cause the entire operation to fail (atomicity).
+Docstore failures during query cause text to be missing but don't fail the query (graceful degradation).
 
 Mode Strategy
 -------------
@@ -75,10 +91,10 @@ plus a thin wire adapter (WireVectorHandler) that maps envelopes ⇄ typed metho
 All requests MUST use the following envelope shape:
 
     {
-        "op": "vector.<operation>",
+        "op": "vector.<operation>", 
         "ctx": {
             "request_id": "...",
-            "idempotency_key": "...",
+            "idempotency_key": "...", 
             "deadline_ms": 1234567890,
             "traceparent": "...",
             "tenant": "...",
@@ -91,7 +107,7 @@ Unary Responses (success):
 
     {
         "ok": true,
-        "code": "OK",
+        "code": "OK", 
         "ms": <float>,          # elapsed milliseconds (best-effort)
         "result": { ... }       # operation-specific payload
     }
@@ -122,7 +138,6 @@ import time
 from dataclasses import dataclass, asdict
 from typing import (
     Any,
-    AsyncIterator,
     Callable,
     Dict,
     List,
@@ -134,12 +149,12 @@ from typing import (
     runtime_checkable,
 )
 
-VECTOR_PROTOCOL_VERSION = "1.0.0"
-VECTOR_PROTOCOL_ID = "vector/v1.0"
+VECTOR_PROTOCOL_VERSION = "1.1.0"
+VECTOR_PROTOCOL_ID = "vector/v1.1"
 LOG = logging.getLogger(__name__)
 
 # =============================================================================
-# Core Type Definitions
+# Core Type Definitions  
 # =============================================================================
 
 VectorID = NewType("VectorID", str)
@@ -149,18 +164,20 @@ VectorID = NewType("VectorID", str)
 @dataclass(frozen=True)
 class Vector:
     """
-    A vector with optional metadata and identifier.
+    A vector with optional metadata, identifier, and source text.
 
     Attributes:
         id: Unique identifier for the vector
         vector: The vector embedding as a list of floats
         metadata: Optional key-value pairs for filtering and retrieval
         namespace: Optional namespace/collection for multi-tenant isolation
+        text: Optional source text that generated this vector
     """
     id: VectorID
     vector: List[float]
     metadata: Optional[Dict[str, Any]] = None
     namespace: Optional[str] = None
+    text: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -178,7 +195,7 @@ class VectorMatch:
     distance: float
 
 
-@dataclass(frozen=True)
+@dataclass
 class QueryResult:
     """
     Result from a vector similarity search query.
@@ -193,6 +210,132 @@ class QueryResult:
     query_vector: List[float]
     namespace: str
     total_matches: int
+
+
+# =============================================================================
+# Document Storage (for text associated with vectors)
+# =============================================================================
+
+@dataclass(frozen=True)
+class Document:
+    """Document with text content and metadata"""
+    id: str
+    text: str
+    metadata: Dict[str, Any]
+
+
+class DocStore(Protocol):
+    """
+    Document storage interface for vector source text.
+    
+    Used when vectors have associated text that should not be stored
+    in vector database metadata (for cost/performance reasons).
+    """
+    
+    async def get(self, doc_id: str) -> Optional[Document]:
+        """Retrieve document by ID"""
+        ...
+    
+    async def put(self, doc: Document) -> None:
+        """Store document"""
+        ...
+    
+    async def batch_get(self, doc_ids: List[str]) -> Dict[str, Document]:
+        """Retrieve multiple documents (default: calls get() in loop)"""
+        ...
+    
+    async def batch_put(self, docs: List[Document]) -> None:
+        """Store multiple documents (default: calls put() in loop)"""
+        ...
+    
+    async def delete(self, doc_id: str) -> None:
+        """Delete document"""
+        ...
+
+
+class InMemoryDocStore:
+    """In-memory document store for testing and development"""
+    
+    def __init__(self):
+        self._store: Dict[str, Document] = {}
+    
+    async def get(self, doc_id: str) -> Optional[Document]:
+        return self._store.get(doc_id)
+    
+    async def put(self, doc: Document) -> None:
+        self._store[doc.id] = doc
+    
+    async def batch_get(self, doc_ids: List[str]) -> Dict[str, Document]:
+        return {doc_id: doc for doc_id in doc_ids if (doc := self._store.get(doc_id))}
+    
+    async def batch_put(self, docs: List[Document]) -> None:
+        for doc in docs:
+            self._store[doc.id] = doc
+    
+    async def delete(self, doc_id: str) -> None:
+        self._store.pop(doc_id, None)
+
+
+class RedisDocStore:
+    """Redis-backed document store for production"""
+    
+    def __init__(self, redis_client, key_prefix: str = "corpus:doc:"):
+        self._redis = redis_client
+        self._prefix = key_prefix
+    
+    def _key(self, doc_id: str) -> str:
+        return f"{self._prefix}{doc_id}"
+    
+    async def get(self, doc_id: str) -> Optional[Document]:
+        import msgpack
+        raw = await self._redis.get(self._key(doc_id))
+        if raw is None:
+            return None
+        data = msgpack.unpackb(raw, raw=False)
+        return Document(
+            id=data["id"],
+            text=data["text"],
+            metadata=data.get("metadata", {})
+        )
+    
+    async def put(self, doc: Document) -> None:
+        import msgpack
+        data = {"id": doc.id, "text": doc.text, "metadata": doc.metadata}
+        await self._redis.set(
+            self._key(doc.id),
+            msgpack.packb(data),
+            ex=86400 * 30  # 30 day TTL
+        )
+    
+    async def batch_get(self, doc_ids: List[str]) -> Dict[str, Document]:
+        import msgpack
+        if not doc_ids:
+            return {}
+        keys = [self._key(doc_id) for doc_id in doc_ids]
+        values = await self._redis.mget(keys)
+        results = {}
+        for doc_id, raw in zip(doc_ids, values):
+            if raw is not None:
+                data = msgpack.unpackb(raw, raw=False)
+                results[doc_id] = Document(
+                    id=data["id"],
+                    text=data["text"],
+                    metadata=data.get("metadata", {})
+                )
+        return results
+    
+    async def batch_put(self, docs: List[Document]) -> None:
+        import msgpack
+        if not docs:
+            return
+        pipe = self._redis.pipeline()
+        for doc in docs:
+            data = {"id": doc.id, "text": doc.text, "metadata": doc.metadata}
+            pipe.set(self._key(doc.id), msgpack.packb(data), ex=86400 * 30)
+        await pipe.execute()
+    
+    async def delete(self, doc_id: str) -> None:
+        await self._redis.delete(self._key(doc_id))
 
 
 # =============================================================================
@@ -458,9 +601,15 @@ class SimpleDeadline:
 
 
 class NoopBreaker:
-    def allow(self) -> bool: return True
-    def on_success(self) -> None: ...
-    def on_error(self, err: Exception) -> None: ...
+    """No-op circuit breaker that always allows operations."""
+    def allow(self) -> bool: 
+        return True
+    
+    def on_success(self) -> None: 
+        pass
+    
+    def on_error(self, err: Exception) -> None: 
+        pass
 
 
 class SimpleCircuitBreaker:
@@ -507,8 +656,11 @@ class SimpleCircuitBreaker:
 
 class NoopCache:
     """No-op cache used in thin/composed mode."""
-    async def get(self, key: str) -> Optional[Any]: return None
-    async def set(self, key: str, value: Any, ttl_s: int) -> None: ...
+    async def get(self, key: str) -> Optional[Any]: 
+        return None
+    
+    async def set(self, key: str, value: Any, ttl_s: int) -> None: 
+        pass
 
 
 class InMemoryTTLCache:
@@ -543,8 +695,11 @@ class InMemoryTTLCache:
 
 class NoopLimiter:
     """No-op limiter used in thin/composed mode."""
-    async def acquire(self) -> None: ...
-    def release(self) -> None: ...
+    async def acquire(self) -> None: 
+        pass
+    
+    def release(self) -> None: 
+        pass
 
 
 class SimpleTokenBucketLimiter:
@@ -613,7 +768,7 @@ class VectorCapabilities:
     Attributes:
         server: Backend server identifier (e.g., "pinecone", "qdrant", "weaviate")
         version: Backend server version string
-        protocol: Protocol identifier (e.g., "vector/v1.0")
+        protocol: Protocol identifier (e.g., "vector/v1.1")
         max_dimensions: Maximum vector dimensions supported
         supported_metrics: Supported distance metrics ("cosine", "euclidean", "dotproduct")
         supports_namespaces: Whether namespaces/collections are supported
@@ -626,6 +781,9 @@ class VectorCapabilities:
         supports_deadline: Whether adapter cooperates with deadline cancellation
         max_top_k: Optional upper bound on top_k per query (None means unspecified)
         max_filter_terms: Optional guideline for filter complexity
+        text_storage_strategy: How text is stored ("metadata", "docstore", "none")
+        max_text_length: Maximum text length supported (None means unlimited)
+        supports_batch_queries: Whether batch query operations are supported
     """
     server: str
     version: str
@@ -642,6 +800,9 @@ class VectorCapabilities:
     supports_deadline: bool = True
     max_top_k: Optional[int] = None
     max_filter_terms: Optional[int] = None
+    text_storage_strategy: str = "metadata"  # "metadata", "docstore", "none"
+    max_text_length: Optional[int] = None
+    supports_batch_queries: bool = False
 
 
 # =============================================================================
@@ -667,6 +828,19 @@ class QuerySpec:
     filter: Optional[Dict[str, Any]] = None
     include_metadata: bool = True
     include_vectors: bool = False
+
+
+@dataclass(frozen=True)
+class BatchQuerySpec:
+    """
+    Specification for batch vector similarity search queries.
+
+    Attributes:
+        queries: List of individual query specifications
+        namespace: Target namespace/collection for all queries
+    """
+    queries: List[QuerySpec]
+    namespace: str = "default"
 
 
 @dataclass(frozen=True)
@@ -739,7 +913,7 @@ class DeleteResult:
     Attributes:
         deleted_count: Number of vectors successfully deleted
         failed_count: Number of vectors that failed to delete
-        failures: List[Dict[str, Any]] with individual failure details
+        failures: List of individual failure details
     """
     deleted_count: int
     failed_count: int
@@ -768,11 +942,14 @@ class NamespaceResult:
 @runtime_checkable
 class VectorProtocolV1(Protocol):
     """
-    Protocol defining the Vector Protocol V1.0 interface.
+    Protocol defining the Vector Protocol V1.1 interface.
 
     Implement this protocol to create compatible vector adapters. All methods are async
     and designed for high-concurrency environments. This protocol is language-level;
     the canonical wire contract is defined by the JSON envelopes.
+
+    Note: batch_query is a V1.1 addition. Adapters that don't support batch queries
+    should raise NotSupported when this method is called.
     """
 
     async def capabilities(self) -> VectorCapabilities:
@@ -786,6 +963,20 @@ class VectorProtocolV1(Protocol):
         ctx: Optional[OperationContext] = None,
     ) -> QueryResult:
         """Execute a vector similarity search query."""
+        ...
+
+    async def batch_query(
+        self,
+        spec: BatchQuerySpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> List[QueryResult]:
+        """
+        Execute multiple vector similarity search queries in batch.
+        
+        This is a V1.1 addition. Adapters that don't support batch queries
+        should raise NotSupported.
+        """
         ...
 
     async def upsert(
@@ -843,7 +1034,7 @@ class VectorAdapterConfig:
 
     Notes:
         - `cache_*_ttl_s` are used as defaults when explicit constructor args
-          are not provided.
+          are not provided. Use 0 to disable caching for that operation.
         - `limiter_*` and `breaker_*` are used only when BaseVectorAdapter is
           constructing its own SimpleTokenBucketLimiter / SimpleCircuitBreaker.
     """
@@ -861,7 +1052,7 @@ class VectorAdapterConfig:
 
 class BaseVectorAdapter(VectorProtocolV1):
     """
-    Base class for implementing Vector Protocol V1.0 adapters.
+    Base class for implementing Vector Protocol V1.1 adapters.
 
     Provides common validation, metrics instrumentation, error handling, and
     SIEM-safe observability. Implementers override the `_do_*` methods to plug in
@@ -873,6 +1064,12 @@ class BaseVectorAdapter(VectorProtocolV1):
       - Read-path caching for queries (standalone mode)
       - Rate limiting via token bucket (standalone mode)
       - Canonical metrics emission for ops & latency
+      - Automatic text storage/retrieval via DocStore
+      - Cache invalidation on write operations
+
+    Text Storage Behavior:
+      - Upsert: Docstore failures cause the entire operation to fail (atomicity)
+      - Query: Docstore failures cause missing text but don't fail the query (graceful degradation)
 
     Threading:
         - In-memory infra (cache, breaker, limiter) is not thread-safe.
@@ -897,8 +1094,9 @@ class BaseVectorAdapter(VectorProtocolV1):
         breaker: Optional[CircuitBreaker] = None,
         cache: Optional[Cache] = None,
         limiter: Optional[RateLimiter] = None,
-        cache_query_ttl_s: int = 60,
-        cache_caps_ttl_s: int = 30,
+        docstore: Optional[DocStore] = None,
+        cache_query_ttl_s: Optional[int] = None,
+        cache_caps_ttl_s: Optional[int] = None,
         warn_on_standalone_no_metrics: bool = True,
         config: Optional[VectorAdapterConfig] = None,
     ) -> None:
@@ -912,8 +1110,9 @@ class BaseVectorAdapter(VectorProtocolV1):
             breaker: Optional circuit breaker override.
             cache: Optional cache override (read paths).
             limiter: Optional rate limiter override.
-            cache_query_ttl_s: TTL for query cache entries in standalone mode.
-            cache_caps_ttl_s: TTL for capabilities cache entries in standalone mode.
+            docstore: Optional document store for text storage.
+            cache_query_ttl_s: TTL for query cache entries in standalone mode. Use 0 to disable.
+            cache_caps_ttl_s: TTL for capabilities cache entries in standalone mode. Use 0 to disable.
             warn_on_standalone_no_metrics: Warn if standalone is used without metrics.
             config: Optional VectorAdapterConfig to centralize policy configuration.
                     Explicit constructor args take precedence over config fields.
@@ -923,9 +1122,15 @@ class BaseVectorAdapter(VectorProtocolV1):
         # Structured config defaults
         cfg = config or VectorAdapterConfig()
 
-        # Effective TTLs: explicit args win, config is fallback.
-        self._cache_query_ttl_s = int(max(1, cache_query_ttl_s or cfg.cache_query_ttl_s))
-        self._cache_caps_ttl_s = int(max(1, cache_caps_ttl_s or cfg.cache_caps_ttl_s))
+        # Effective TTLs: explicit args win, config is fallback. Allow 0 to disable.
+        self._cache_query_ttl_s = (
+            cache_query_ttl_s if cache_query_ttl_s is not None 
+            else cfg.cache_query_ttl_s
+        )
+        self._cache_caps_ttl_s = (
+            cache_caps_ttl_s if cache_caps_ttl_s is not None 
+            else cfg.cache_caps_ttl_s
+        )
 
         m = (mode or "thin").strip().lower()
         if m not in {"thin", "standalone"}:
@@ -952,6 +1157,9 @@ class BaseVectorAdapter(VectorProtocolV1):
                 LOG.warning(
                     "Using standalone mode without metrics — provide a MetricsSink for production use"
                 )
+
+        # Document store for text storage
+        self._docstore = docstore
 
     # --- async context management & cleanup hooks ----------------------------
 
@@ -1025,6 +1233,7 @@ class BaseVectorAdapter(VectorProtocolV1):
         Create privacy-preserving hash of tenant identifier for metrics.
 
         Raw tenant IDs MUST NOT appear directly in metrics.
+        Uses a 12-character prefix of SHA256 for low-cardinality labeling.
         """
         if not tenant:
             return None
@@ -1107,15 +1316,16 @@ class BaseVectorAdapter(VectorProtocolV1):
         """
         Stable hash for JSON-serializable objects.
 
-        Uses json.dumps(..., sort_keys=True) to avoid ordering issues for dicts
-        and reduce cache-key collisions. Falls back to repr() only if JSON
-        serialization fails (which should be rare because we validate).
+        Uses json.dumps(..., sort_keys=True) with type prefix to avoid collisions
+        for different types that serialize to identical JSON.
         """
-        try:
-            raw = json.dumps(obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        except TypeError:
-            raw = repr(obj).encode("utf-8")
-        return hashlib.sha256(raw).hexdigest()
+        if isinstance(obj, (list, dict)):
+            # Stable JSON with type prefix
+            payload = json.dumps(obj, sort_keys=True, separators=(",", ":"))
+            return hashlib.sha256(f"j:{payload}".encode()).hexdigest()
+        else:
+            # Use repr for non-JSON types with prefix
+            return hashlib.sha256(f"p:{repr(obj)}".encode()).hexdigest()
 
     def _query_cache_key(
         self,
@@ -1131,9 +1341,11 @@ class BaseVectorAdapter(VectorProtocolV1):
             - namespace, top_k, filter, include_* flags
             - backend identity (server/version)
             - tenant hash (if present)
+            - text storage strategy
         """
         tenant_h = self._tenant_hash(ctx.tenant) if ctx else None
         caps_part = f"{caps.server}:{caps.version}" if caps else "unknown"
+        text_strategy = caps.text_storage_strategy if caps else "unknown"
         return (
             f"v1:query:"
             f"{caps_part}:"
@@ -1142,13 +1354,88 @@ class BaseVectorAdapter(VectorProtocolV1):
             f"im={int(bool(spec.include_metadata))}:iv={int(bool(spec.include_vectors))}:"
             f"vec={self._hash_obj(spec.vector)}:"
             f"flt={self._hash_obj(spec.filter)}:"
-            f"tenant={tenant_h}"
+            f"tenant={tenant_h}:"
+            f"text={text_strategy}"
+        )
+
+    def _batch_query_cache_key(
+        self,
+        spec: BatchQuerySpec,
+        caps: Optional[VectorCapabilities],
+        ctx: Optional[OperationContext],
+    ) -> str:
+        """
+        Compose a cache key for batch_query().
+        """
+        tenant_h = self._tenant_hash(ctx.tenant) if ctx else None
+        caps_part = f"{caps.server}:{caps.version}" if caps else "unknown"
+        text_strategy = caps.text_storage_strategy if caps else "unknown"
+        
+        # Hash all queries for the cache key
+        queries_hash = self._hash_obj([
+            {
+                "vector": q.vector,
+                "top_k": q.top_k,
+                "filter": q.filter,
+                "include_metadata": q.include_metadata,
+                "include_vectors": q.include_vectors
+            }
+            for q in spec.queries
+        ])
+        
+        return (
+            f"v1:batch_query:"
+            f"{caps_part}:"
+            f"ns={spec.namespace}:"
+            f"queries={queries_hash}:"
+            f"tenant={tenant_h}:"
+            f"text={text_strategy}"
         )
 
     @staticmethod
     def _caps_cache_key() -> str:
         """Cache key for capabilities() in standalone mode."""
         return "v1:capabilities"
+
+    def _namespace_cache_pattern(self, namespace: str) -> str:
+        """
+        Return a string pattern for cache keys belonging to a specific namespace.
+        Used for cache invalidation on write operations.
+        
+        Note: This uses simple substring matching for in-memory cache.
+        For distributed caches, use provider-specific pattern matching.
+        """
+        return f"ns={namespace}:"
+
+    async def _invalidate_namespace_cache(self, namespace: str) -> None:
+        """
+        Invalidate all cache entries for a specific namespace.
+        
+        This is a best-effort operation and should not block write operations.
+        For in-memory cache, we use substring matching. For distributed caches,
+        this would need provider-specific implementation.
+        """
+        if isinstance(self._cache, NoopCache):
+            return
+            
+        try:
+            # For InMemoryTTLCache, we can iterate and remove matching keys
+            if isinstance(self._cache, InMemoryTTLCache):
+                pattern = self._namespace_cache_pattern(namespace)
+                # Simple substring matching for in-memory cache
+                keys_to_remove = []
+                for key in self._cache._store.keys():
+                    if pattern in key:
+                        keys_to_remove.append(key)
+                for key in keys_to_remove:
+                    self._cache._store.pop(key, None)
+            
+            # For distributed caches, this would need provider-specific implementation
+            # For now, we rely on TTL for distributed caches
+            
+        except Exception:
+            # Never let cache invalidation break the main operation
+            LOG.debug("Cache invalidation failed for namespace %s", namespace)
 
     # --- unified unary gate wrapper (for data-path ops) ----------------------
 
@@ -1239,7 +1526,8 @@ class BaseVectorAdapter(VectorProtocolV1):
         """
         t0 = time.monotonic()
         try:
-            if self._mode == "standalone":
+            # Check cache if TTL is non-zero
+            if self._mode == "standalone" and self._cache_caps_ttl_s > 0:
                 cached = await self._cache.get(self._caps_cache_key())
                 if cached:
                     self._metrics.counter(
@@ -1253,7 +1541,8 @@ class BaseVectorAdapter(VectorProtocolV1):
 
             caps = await self._apply_deadline(self._do_capabilities(), ctx=None)
 
-            if self._mode == "standalone":
+            # Cache if TTL is non-zero
+            if self._mode == "standalone" and self._cache_caps_ttl_s > 0:
                 try:
                     await self._cache.set(self._caps_cache_key(), caps, ttl_s=self._cache_caps_ttl_s)
                 except Exception:
@@ -1278,6 +1567,10 @@ class BaseVectorAdapter(VectorProtocolV1):
         Execute a vector similarity search query with validation and metrics.
 
         See VectorProtocolV1.query for full documentation.
+
+        Docstore Behavior:
+            - If docstore is configured and text hydration fails, the query continues
+              but vectors will have text=None (graceful degradation).
 
         Backpressure note:
             - For high top_k values or very hot namespaces, consider using a
@@ -1315,22 +1608,19 @@ class BaseVectorAdapter(VectorProtocolV1):
             if spec.filter and not caps.supports_metadata_filtering:
                 raise NotSupported("metadata filtering is not supported by this adapter")
 
-            # Read-path cache (standalone only)
-            if self._mode == "standalone":
+            # Read-path cache (standalone only with non-zero TTL)
+            cache_hit = False
+            if self._mode == "standalone" and self._cache_query_ttl_s > 0:
                 ck = self._query_cache_key(spec, caps, ctx)
                 cached = await self._cache.get(ck)
                 if cached:
-                    # Count cache hit; result-level metrics are derived in on_result.
+                    cache_hit = True
                     self._metrics.counter(
                         component=self._component,
                         name="cache_hits",
                         value=1,
                         extra={"op": "query"},
                     )
-                    try:
-                        setattr(cached, "_vector_cache_hit", True)
-                    except Exception:
-                        pass
                     return cached
                 else:
                     self._metrics.counter(
@@ -1343,8 +1633,48 @@ class BaseVectorAdapter(VectorProtocolV1):
             # Execute backend query
             result = await self._do_query(spec, ctx=ctx)
 
-            # Populate cache if eligible
-            if self._mode == "standalone":
+            # Hydrate text from docstore if configured (graceful degradation on failure)
+            if self._docstore is not None and result.matches:
+                try:
+                    doc_ids = [str(match.vector.id) for match in result.matches]
+                    docs = await self._docstore.batch_get(doc_ids)
+                    
+                    # Rebuild matches with hydrated text
+                    hydrated_matches = []
+                    for match in result.matches:
+                        doc = docs.get(str(match.vector.id))
+                        if doc is not None:
+                            # Create new vector with text populated
+                            hydrated_vector = Vector(
+                                id=match.vector.id,
+                                vector=match.vector.vector,
+                                metadata=match.vector.metadata,
+                                namespace=match.vector.namespace,
+                                text=doc.text  # Hydrated from docstore
+                            )
+                            hydrated_matches.append(VectorMatch(
+                                vector=hydrated_vector,
+                                score=match.score,
+                                distance=match.distance
+                            ))
+                        else:
+                            # No text found, pass through as-is
+                            hydrated_matches.append(match)
+                    
+                    # Replace matches with hydrated version
+                    result = QueryResult(
+                        matches=hydrated_matches,
+                        query_vector=result.query_vector,
+                        namespace=result.namespace,
+                        total_matches=result.total_matches
+                    )
+                except Exception as e:
+                    # Graceful degradation: log but don't fail the query
+                    LOG.debug("Docstore hydration failed for query: %s", e)
+                    # Continue with original result (text will be None)
+
+            # Populate cache if eligible (non-zero TTL and not already cached)
+            if self._mode == "standalone" and self._cache_query_ttl_s > 0 and not cache_hit:
                 try:
                     ck = self._query_cache_key(spec, caps, ctx)
                     await self._cache.set(ck, result, ttl_s=self._cache_query_ttl_s)
@@ -1362,8 +1692,6 @@ class BaseVectorAdapter(VectorProtocolV1):
                 extra["matches"] = len(res.matches)
             except Exception:
                 pass
-            if getattr(res, "_vector_cache_hit", False):
-                extra["cached"] = 1
             return extra
 
         result = await self._with_gates_unary(
@@ -1382,6 +1710,167 @@ class BaseVectorAdapter(VectorProtocolV1):
 
         return result
 
+    async def batch_query(
+        self,
+        spec: BatchQuerySpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> List[QueryResult]:
+        """
+        Execute multiple vector similarity search queries in batch.
+
+        This can be more efficient than individual queries for some backends.
+        Adapters that don't support batch queries should raise NotSupported.
+
+        Docstore Behavior:
+            - If docstore is configured and text hydration fails, the batch query continues
+              but vectors will have text=None (graceful degradation).
+        """
+        self._require_non_empty("namespace", spec.namespace)
+        if not spec.queries:
+            raise BadRequest("queries must not be empty")
+        
+        # Validate each query
+        for i, query in enumerate(spec.queries):
+            self._validate_vector(query.vector)
+            if not isinstance(query.top_k, int) or query.top_k <= 0:
+                raise BadRequest(f"query[{i}].top_k must be a positive integer")
+            if query.filter is not None and not isinstance(query.filter, Mapping):
+                raise BadRequest(f"query[{i}].filter must be a mapping (dict) when provided")
+            if query.filter is not None:
+                self._ensure_json_serializable(query.filter, f"query[{i}].filter")
+
+        async def _call() -> List[QueryResult]:
+            caps = await self.capabilities()
+
+            if not caps.supports_batch_queries:
+                raise NotSupported("batch queries are not supported by this adapter")
+
+            # Validate capabilities for all queries
+            for i, query in enumerate(spec.queries):
+                if caps.max_dimensions and len(query.vector) > int(caps.max_dimensions):
+                    raise DimensionMismatch(
+                        f"query[{i}] vector dimension {len(query.vector)} exceeds max {caps.max_dimensions}",
+                        details={"provided": len(query.vector), "max": int(caps.max_dimensions)},
+                    )
+                if caps.max_top_k is not None and query.top_k > caps.max_top_k:
+                    raise BadRequest(
+                        f"query[{i}] top_k {query.top_k} exceeds maximum of {caps.max_top_k}",
+                        details={"max_top_k": caps.max_top_k},
+                    )
+                if query.filter and not caps.supports_metadata_filtering:
+                    raise NotSupported(f"query[{i}] metadata filtering is not supported by this adapter")
+
+            # Read-path cache (standalone only with non-zero TTL)
+            cache_hit = False
+            if self._mode == "standalone" and self._cache_query_ttl_s > 0:
+                ck = self._batch_query_cache_key(spec, caps, ctx)
+                cached = await self._cache.get(ck)
+                if cached:
+                    cache_hit = True
+                    self._metrics.counter(
+                        component=self._component,
+                        name="cache_hits",
+                        value=1,
+                        extra={"op": "batch_query"},
+                    )
+                    return cached
+                else:
+                    self._metrics.counter(
+                        component=self._component,
+                        name="cache_misses",
+                        value=1,
+                        extra={"op": "batch_query"},
+                    )
+
+            # Execute backend batch query
+            results = await self._do_batch_query(spec, ctx=ctx)
+
+            # Hydrate text from docstore if configured (graceful degradation on failure)
+            if self._docstore is not None:
+                try:
+                    # Collect all document IDs from all results
+                    all_doc_ids = []
+                    for result in results:
+                        for match in result.matches:
+                            all_doc_ids.append(str(match.vector.id))
+                    
+                    if all_doc_ids:
+                        docs = await self._docstore.batch_get(all_doc_ids)
+                        
+                        # Rebuild all results with hydrated text
+                        hydrated_results = []
+                        for result in results:
+                            hydrated_matches = []
+                            for match in result.matches:
+                                doc = docs.get(str(match.vector.id))
+                                if doc is not None:
+                                    hydrated_vector = Vector(
+                                        id=match.vector.id,
+                                        vector=match.vector.vector,
+                                        metadata=match.vector.metadata,
+                                        namespace=match.vector.namespace,
+                                        text=doc.text
+                                    )
+                                    hydrated_matches.append(VectorMatch(
+                                        vector=hydrated_vector,
+                                        score=match.score,
+                                        distance=match.distance
+                                    ))
+                                else:
+                                    hydrated_matches.append(match)
+                            
+                            hydrated_results.append(QueryResult(
+                                matches=hydrated_matches,
+                                query_vector=result.query_vector,
+                                namespace=result.namespace,
+                                total_matches=result.total_matches
+                            ))
+                        
+                        results = hydrated_results
+                except Exception as e:
+                    # Graceful degradation: log but don't fail the batch query
+                    LOG.debug("Docstore hydration failed for batch query: %s", e)
+                    # Continue with original results (text will be None)
+
+            # Populate cache if eligible
+            if self._mode == "standalone" and self._cache_query_ttl_s > 0 and not cache_hit:
+                try:
+                    ck = self._batch_query_cache_key(spec, caps, ctx)
+                    await self._cache.set(ck, results, ttl_s=self._cache_query_ttl_s)
+                except Exception:
+                    pass
+
+            return results
+
+        def _on_result(results: List[QueryResult]) -> Mapping[str, Any]:
+            total_matches = sum(len(result.matches) for result in results)
+            return {
+                "namespace": spec.namespace,
+                "query_count": len(spec.queries),
+                "total_matches": total_matches,
+            }
+
+        results = await self._with_gates_unary(
+            op="batch_query",
+            ctx=ctx,
+            call=_call,
+            on_result=_on_result,
+        )
+
+        self._metrics.counter(
+            component=self._component,
+            name="batch_queries",
+            value=1,
+        )
+        self._metrics.counter(
+            component=self._component,
+            name="queries_in_batch",
+            value=len(spec.queries),
+        )
+
+        return results
+
     async def upsert(
         self,
         spec: UpsertSpec,
@@ -1392,6 +1881,10 @@ class BaseVectorAdapter(VectorProtocolV1):
         Upsert vectors into the vector store with validation and metrics.
 
         See VectorProtocolV1.upsert for full documentation.
+
+        Docstore Behavior:
+            - If docstore is configured and text storage fails, the entire upsert
+              operation fails (atomicity).
 
         Guidance:
             - For very large batches, respect capabilities.max_batch_size and
@@ -1413,6 +1906,19 @@ class BaseVectorAdapter(VectorProtocolV1):
         async def _call() -> UpsertResult:
             caps = await self.capabilities()
 
+            # Validate text storage capabilities
+            texts_present = any(v.text for v in spec.vectors)
+            if texts_present:
+                if caps.text_storage_strategy == "none":
+                    raise NotSupported("Text storage is not supported by this adapter")
+                if caps.max_text_length:
+                    for v in spec.vectors:
+                        if v.text and len(v.text) > caps.max_text_length:
+                            raise BadRequest(
+                                f"Text length {len(v.text)} exceeds maximum {caps.max_text_length}",
+                                details={"max_text_length": caps.max_text_length}
+                            )
+
             if caps.max_batch_size is not None and len(spec.vectors) > caps.max_batch_size:
                 suggested = (
                     int(100 * (len(spec.vectors) - caps.max_batch_size) / len(spec.vectors))
@@ -1431,7 +1937,55 @@ class BaseVectorAdapter(VectorProtocolV1):
                             details={"provided": len(v.vector), "max": int(caps.max_dimensions)},
                         )
 
-            return await self._do_upsert(spec, ctx=ctx)
+            # Handle text storage if docstore is configured (atomic operation)
+            backend_vectors = spec.vectors
+            if self._docstore is not None and texts_present:
+                # Store texts in docstore and create cleaned vectors for backend
+                texts_to_store = []
+                cleaned_vectors = []
+                
+                for v in spec.vectors:
+                    if v.text is not None:
+                        # Store in docstore
+                        texts_to_store.append(Document(
+                            id=str(v.id),
+                            text=v.text,
+                            metadata=v.metadata or {}
+                        ))
+                        
+                        # Create cleaned vector without text
+                        cleaned_vectors.append(Vector(
+                            id=v.id,
+                            vector=v.vector,
+                            metadata=v.metadata,
+                            namespace=v.namespace,
+                            text=None  # Removed
+                        ))
+                    else:
+                        # No text, pass through as-is
+                        cleaned_vectors.append(v)
+                
+                # Batch store texts (failure here fails the entire upsert)
+                if texts_to_store:
+                    await self._docstore.batch_put(texts_to_store)
+                
+                backend_vectors = cleaned_vectors
+
+            # Call backend with cleaned vectors (no text in metadata/vector)
+            result = await self._do_upsert(
+                UpsertSpec(vectors=backend_vectors, namespace=spec.namespace),
+                ctx=ctx
+            )
+
+            # Invalidate cache for this namespace on successful upsert
+            if result.upserted_count > 0:
+                try:
+                    await self._invalidate_namespace_cache(spec.namespace)
+                except Exception:
+                    # Never let cache invalidation break the operation
+                    pass
+
+            return result
 
         def _on_result(res: UpsertResult) -> Mapping[str, Any]:
             return {
@@ -1499,7 +2053,26 @@ class BaseVectorAdapter(VectorProtocolV1):
             if spec.filter and not caps.supports_metadata_filtering:
                 raise NotSupported("metadata filtering is not supported by this adapter")
 
-            return await self._do_delete(spec, ctx=ctx)
+            result = await self._do_delete(spec, ctx=ctx)
+
+            # Clean up docstore entries and cache on successful delete
+            if result.deleted_count > 0:
+                # Clean up docstore entries (best effort)
+                if self._docstore is not None and spec.ids:
+                    try:
+                        for doc_id in spec.ids:
+                            await self._docstore.delete(str(doc_id))
+                    except Exception:
+                        # Log but don't fail the operation
+                        LOG.debug("Failed to clean up docstore entries after delete")
+                
+                # Invalidate cache for this namespace
+                try:
+                    await self._invalidate_namespace_cache(spec.namespace)
+                except Exception:
+                    pass
+
+            return result
 
         def _on_result(res: DeleteResult) -> Mapping[str, Any]:
             targeted = len(spec.ids) if spec.ids else 0
@@ -1586,7 +2159,16 @@ class BaseVectorAdapter(VectorProtocolV1):
         self._require_non_empty("namespace", namespace)
 
         async def _call() -> NamespaceResult:
-            return await self._do_delete_namespace(namespace, ctx=ctx)
+            result = await self._do_delete_namespace(namespace, ctx=ctx)
+
+            # Invalidate all cache entries for this namespace
+            if result.success:
+                try:
+                    await self._invalidate_namespace_cache(namespace)
+                except Exception:
+                    pass
+
+            return result
 
         def _on_result(_: NamespaceResult) -> Mapping[str, Any]:
             return {"namespace": namespace}
@@ -1637,6 +2219,15 @@ class BaseVectorAdapter(VectorProtocolV1):
         ctx: Optional[OperationContext] = None,
     ) -> QueryResult:
         """Implement vector similarity search with validated inputs."""
+        raise NotImplementedError
+
+    async def _do_batch_query(
+        self,
+        spec: BatchQuerySpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> List[QueryResult]:
+        """Implement batch vector similarity search with validated inputs."""
         raise NotImplementedError
 
     async def _do_upsert(
@@ -1769,6 +2360,7 @@ class WireVectorHandler:
         Supports:
             - vector.capabilities
             - vector.query
+            - vector.batch_query (V1.1+)
             - vector.upsert
             - vector.delete
             - vector.create_namespace
@@ -1792,6 +2384,15 @@ class WireVectorHandler:
                 spec = QuerySpec(**args)
                 res = await self._adapter.query(spec, ctx=ctx)
                 return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
+
+            if op == "vector.batch_query":
+                queries = [QuerySpec(**q) for q in args.get("queries", [])]
+                spec = BatchQuerySpec(
+                    queries=queries,
+                    namespace=args.get("namespace", "default"),
+                )
+                res = await self._adapter.batch_query(spec, ctx=ctx)
+                return _success_to_wire([asdict(r) for r in res], (time.monotonic() - t0) * 1000.0)
 
             if op == "vector.upsert":
                 vectors = [Vector(**v) for v in args.get("vectors", [])]
@@ -1858,6 +2459,7 @@ __all__ = [
     "DeadlineExceeded",
     "OperationContext",
     "QuerySpec",
+    "BatchQuerySpec",
     "UpsertSpec",
     "DeleteSpec",
     "NamespaceSpec",
@@ -1868,6 +2470,11 @@ __all__ = [
     "VectorProtocolV1",
     "VectorAdapterConfig",
     "BaseVectorAdapter",
+    # document storage
+    "Document",
+    "DocStore",
+    "InMemoryDocStore", 
+    "RedisDocStore",
     # policy & infra extension points
     "DeadlinePolicy",
     "CircuitBreaker",
