@@ -153,15 +153,27 @@ class Node:
         labels: Optional set/list of labels / types / kinds
         properties: Arbitrary JSON-serializable property map
         namespace: Optional logical graph / tenant / dataset
+        created_at: Optional creation timestamp (epoch milliseconds)
+        updated_at: Optional last update timestamp (epoch milliseconds)
     """
     id: GraphID
     labels: Tuple[str, ...] = ()
     properties: Mapping[str, Any] = None
     namespace: Optional[str] = None
+    created_at: Optional[int] = None
+    updated_at: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.properties is None:
             object.__setattr__(self, "properties", {})
+        # Validate labels are all strings
+        if self.labels:
+            for i, label in enumerate(self.labels):
+                if not isinstance(label, str):
+                    # Map to normalized client error rather than generic ValueError
+                    raise BadRequest(
+                        f"labels[{i}] must be a string, got {type(label).__name__}"
+                    )
 
 
 @dataclass(frozen=True)
@@ -176,6 +188,8 @@ class Edge:
         label: Relationship / predicate / type
         properties: Arbitrary JSON-serializable property map
         namespace: Optional logical graph / tenant / dataset
+        created_at: Optional creation timestamp (epoch milliseconds)
+        updated_at: Optional last update timestamp (epoch milliseconds)
     """
     id: GraphID
     src: GraphID
@@ -183,6 +197,8 @@ class Edge:
     label: str
     properties: Mapping[str, Any] = None
     namespace: Optional[str] = None
+    created_at: Optional[int] = None
+    updated_at: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.properties is None:
@@ -613,6 +629,14 @@ class Cache(Protocol):
         ...
     async def set(self, key: str, value: Any, ttl_s: int) -> None:
         ...
+    async def invalidate_pattern(self, pattern: str) -> None:
+        """
+        Invalidate cached entries whose cache keys match the given pattern.
+
+        The pattern semantics (substring match, glob, prefix, etc.) are
+        implementation-defined, but should be documented per Cache impl.
+        """
+        ...
 
 
 class RateLimiter(Protocol):
@@ -684,8 +708,13 @@ class SimpleCircuitBreaker:
 class NoopCache:
     async def get(self, key: str) -> Optional[Any]:
         return None
+
     async def set(self, key: str, value: Any, ttl_s: int) -> None:
         ...
+
+    async def invalidate_pattern(self, pattern: str) -> None:
+        # No-op by design
+        return None
 
 
 class InMemoryTTLCache:
@@ -714,6 +743,18 @@ class InMemoryTTLCache:
         ttl = max(1, int(ttl_s))
         self._store[key] = (time.monotonic() + ttl, value)
 
+    async def invalidate_pattern(self, pattern: str) -> None:
+        """
+        Simple substring-based invalidation for in-memory cache.
+        """
+        try:
+            keys_to_remove = [k for k in list(self._store.keys()) if pattern in k]
+            for key in keys_to_remove:
+                self._store.pop(key, None)
+        except Exception:
+            # Invalidating cache must never break callers
+            LOG.debug("InMemoryTTLCache.invalidate_pattern failed for pattern %s", pattern)
+
 
 class NoopLimiter:
     async def acquire(self) -> None:
@@ -728,6 +769,9 @@ class SimpleTokenBucketLimiter:
 
     Not concurrency-safe across threads or processes; intended for
     best-effort throttling in development and light production only.
+
+    Note: release() is a no-op to maintain consistency with LLM-side
+    TokenBucketLimiter semantics.
     """
     def __init__(self, rate_per_sec: int = 50, burst: int = 100) -> None:
         self._capacity = max(1, int(burst))
@@ -757,12 +801,8 @@ class SimpleTokenBucketLimiter:
             return  # fail-open
 
     def release(self) -> None:
-        try:
-            self._refill()
-            if self._tokens < self._capacity:
-                self._tokens += 1
-        except Exception:
-            return  # fail-open
+        # No-op to maintain consistency with LLM-side TokenBucketLimiter
+        return
 
 
 # =============================================================================
@@ -940,6 +980,9 @@ class BaseGraphAdapter(GraphProtocolV1):
         cache_bulk_vertices_ttl_s: int = 30,
         cache_schema_ttl_s: int = 60,
         stream_deadline_check_every_n_chunks: int = 10,
+        auto_timestamp_writes: bool = False,
+        strict_batch_validation: bool = False,
+        batch_supported_ops: Optional[Iterable[str]] = None,
     ) -> None:
         self._metrics: MetricsSink = metrics or NoopMetrics()
 
@@ -965,7 +1008,28 @@ class BaseGraphAdapter(GraphProtocolV1):
         self._cache_caps_ttl_s = max(1, int(cache_caps_ttl_s))
         self._cache_bulk_vertices_ttl_s = max(1, int(cache_bulk_vertices_ttl_s))
         self._cache_schema_ttl_s = max(1, int(cache_schema_ttl_s))
-        self._stream_deadline_check_every_n_chunks = max(1, int(stream_deadline_check_every_n_chunks))
+        self._stream_deadline_check_every_n_chunks = max(
+            1, int(stream_deadline_check_every_n_chunks)
+        )
+
+        # Behavior flags
+        self._auto_timestamp_writes = bool(auto_timestamp_writes)
+        self._strict_batch_validation = bool(strict_batch_validation)
+        default_supported_ops = {
+            "query",
+            "upsert_nodes",
+            "upsert_edges",
+            "delete_nodes",
+            "delete_edges",
+            "bulk_vertices",
+            "get_schema",
+            "health",
+            "batch",
+        }
+        if batch_supported_ops is not None:
+            self._batch_supported_ops = set(batch_supported_ops)
+        else:
+            self._batch_supported_ops = default_supported_ops
 
     # ---- lifecycle helpers --------------------------------------------------
 
@@ -1038,6 +1102,17 @@ class BaseGraphAdapter(GraphProtocolV1):
         except asyncio.TimeoutError as e:
             raise DeadlineExceeded("operation timed out", details={"remaining_ms": 0}) from e
 
+    def _extract_namespace_from_spec(self, spec: Any) -> Optional[str]:
+        """
+        Extract namespace from various spec types.
+
+        Returns None for operations that don't target a specific namespace
+        to avoid unnecessary cache invalidation.
+        """
+        if hasattr(spec, "namespace"):
+            return getattr(spec, "namespace")
+        return None
+
     def _make_cache_key(
         self,
         *,
@@ -1051,10 +1126,11 @@ class BaseGraphAdapter(GraphProtocolV1):
         Includes:
             - operation
             - stable JSON-serialized representation of spec/asdict(spec)
-            - tenant hash (if present) to avoid cross-tenant bleed.
+            - tenant hash (if present) to avoid cross-tenant bleed
+            - namespace tag (if present) to support targeted invalidation
 
-        Falls back to repr() only if JSON serialization fails, to keep
-        key collisions unlikely but avoid raising on surprising types.
+        Uses type-prefixed hashing (j:/p:) to prevent collisions between
+        different types that serialize to identical JSON.
         """
         if hasattr(spec, "__dataclass_fields__"):
             raw = asdict(spec)
@@ -1062,17 +1138,25 @@ class BaseGraphAdapter(GraphProtocolV1):
             raw = spec
 
         payload: Dict[str, Any] = {"op": op, "spec": raw}
+
+        tenant_hash = None
         if ctx and ctx.tenant:
-            th = self._tenant_hash(ctx.tenant)
-            if th:
-                payload["tenant"] = th
+            tenant_hash = self._tenant_hash(ctx.tenant)
+            if tenant_hash:
+                payload["tenant"] = tenant_hash
+
+        namespace = self._extract_namespace_from_spec(spec)
+        ns_tag = namespace or "none"
 
         try:
-            serialized = json.dumps(payload, sort_keys=True, default=str)
+            serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+            base_hash = hashlib.sha256(f"j:{serialized}".encode()).hexdigest()
         except TypeError:
-            serialized = repr(payload)
+            base_hash = hashlib.sha256(f"p:{repr(payload)}".encode()).hexdigest()
 
-        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+        t_tag = tenant_hash or "none"
+        # Human-readable prefix to allow pattern-based invalidation
+        return f"ns={ns_tag}|t={t_tag}|{base_hash}"
 
     @staticmethod
     def _validate_properties_map(properties: Mapping[str, Any]) -> None:
@@ -1095,6 +1179,56 @@ class BaseGraphAdapter(GraphProtocolV1):
             raise BadRequest("edge.label must be a non-empty string")
         if edge.properties is not None:
             self._validate_properties_map(edge.properties)
+
+    async def _invalidate_namespace_cache(self, namespace: Optional[str]) -> None:
+        """
+        Invalidate cache entries for a namespace (best-effort).
+
+        If namespace is None, no invalidation is performed to avoid
+        unnecessarily clearing caches for non-namespaced operations.
+        """
+        if namespace is None or isinstance(self._cache, NoopCache):
+            return
+
+        try:
+            pattern = f"ns={namespace}|"
+            await self._cache.invalidate_pattern(pattern)
+        except Exception:
+            # Never let cache invalidation break the main operation
+            LOG.debug("Cache invalidation failed for namespace %s", namespace)
+
+    def _batch_op_succeeded(self, op: BatchOperation, batch_result: BatchResult, idx: int) -> bool:
+        """
+        Determine if a specific batch operation succeeded.
+
+        This inspects the batch result to see if the operation at the given
+        index actually modified data, allowing for smarter cache invalidation.
+        """
+        if idx >= len(batch_result.results):
+            return False
+
+        result = batch_result.results[idx]
+
+        # For write operations, check if they actually succeeded
+        if op.op in {"upsert_nodes", "upsert_edges"}:
+            if isinstance(result, UpsertResult):
+                return result.upserted_count > 0
+        elif op.op in {"delete_nodes", "delete_edges"}:
+            if isinstance(result, DeleteResult):
+                return result.deleted_count > 0
+
+        # For query operations or unknown result types, assume no cache invalidation needed
+        return False
+
+    def _extract_namespace_from_batch_op(self, op: BatchOperation) -> Optional[str]:
+        """
+        Extract namespace from a batch operation.
+
+        Returns None if no namespace is specified to avoid unnecessary
+        cache invalidation for non-namespaced operations.
+        """
+        args = op.args or {}
+        return args.get("namespace")
 
     # ---- DRY gate wrappers --------------------------------------------------
 
@@ -1134,7 +1268,8 @@ class BaseGraphAdapter(GraphProtocolV1):
             self._breaker.on_error(e)
             raise
         except Exception as e:
-            self._record(op, t0, False, code="UNAVAILABLE", ctx=ctx, **metric_extra)
+            # Standardize on "UnhandledException" for cross-SDK metrics alignment
+            self._record(op, t0, False, code="UnhandledException", ctx=ctx, **metric_extra)
             self._breaker.on_error(e)
             raise
         finally:
@@ -1154,6 +1289,7 @@ class BaseGraphAdapter(GraphProtocolV1):
         - periodic deadline checks
         - metrics on completion or error
         - chunk-level throughput metrics (chunks and records)
+        - proper resource cleanup for abandoned streams
         """
         metric_extra = dict(metric_extra or {})
         self._fail_if_deadline_expired(ctx)
@@ -1167,6 +1303,7 @@ class BaseGraphAdapter(GraphProtocolV1):
 
         async def _gen() -> AsyncIterator[QueryChunk]:
             chunk_count = 0
+            agen: Optional[AsyncIterator[QueryChunk]] = None
             try:
                 agen = agen_factory()
                 async for chunk in agen:
@@ -1198,11 +1335,18 @@ class BaseGraphAdapter(GraphProtocolV1):
                 self._breaker.on_error(e)
                 raise
             except Exception as e:
-                self._record(op, t0, False, code="UNAVAILABLE", ctx=ctx, **metric_extra)
+                # Standardize on "UnhandledException" for cross-SDK metrics alignment
+                self._record(op, t0, False, code="UnhandledException", ctx=ctx, **metric_extra)
                 self._breaker.on_error(e)
                 raise
             finally:
                 self._limiter.release()
+                # Ensure underlying stream resources are cleaned up
+                if agen is not None:
+                    try:
+                        await agen.aclose()  # If the async generator supports it
+                    except (AttributeError, RuntimeError):
+                        pass  # Not all async generators have aclose()
 
         return _gen()
 
@@ -1213,11 +1357,13 @@ class BaseGraphAdapter(GraphProtocolV1):
         Return adapter capabilities.
 
         Standalone mode: may be cached briefly to reduce overhead.
+        Uses pluggable cache interface (not tied to InMemoryTTLCache).
         """
         t0 = time.monotonic()
         try:
-            if isinstance(self._cache, InMemoryTTLCache):
-                key = "graph:capabilities"
+            # Use pluggable cache interface
+            if not isinstance(self._cache, NoopCache):
+                key = self._make_cache_key(op="capabilities", spec="all", ctx=None)
                 cached = await self._cache.get(key)
                 if cached:
                     self._metrics.counter(
@@ -1231,8 +1377,9 @@ class BaseGraphAdapter(GraphProtocolV1):
 
             caps = await self._apply_deadline(self._do_capabilities(), ctx=None)
 
-            if isinstance(self._cache, InMemoryTTLCache):
-                await self._cache.set("graph:capabilities", caps, ttl_s=self._cache_caps_ttl_s)
+            if not isinstance(self._cache, NoopCache):
+                key = self._make_cache_key(op="capabilities", spec="all", ctx=None)
+                await self._cache.set(key, caps, ttl_s=self._cache_caps_ttl_s)
 
             self._record("capabilities", t0, True)
             return caps
@@ -1240,7 +1387,7 @@ class BaseGraphAdapter(GraphProtocolV1):
             self._record("capabilities", t0, False, code=e.code or type(e).__name__)
             raise
         except Exception as e:
-            self._record("capabilities", t0, False, code="UNAVAILABLE")
+            self._record("capabilities", t0, False, code="UnhandledException")
             raise Unavailable("capabilities fetch failed") from e
 
     async def query(
@@ -1269,8 +1416,8 @@ class BaseGraphAdapter(GraphProtocolV1):
                 )
 
         async def _call() -> QueryResult:
-            # standalone: cache on read-only, non-streaming queries
-            if isinstance(self._cache, InMemoryTTLCache) and not spec.stream:
+            # Use pluggable cache interface for read-only, non-streaming queries
+            if not isinstance(self._cache, NoopCache) and not spec.stream:
                 key = self._make_cache_key(op="query", spec=spec, ctx=ctx)
                 cached = await self._cache.get(key)
                 if cached:
@@ -1334,14 +1481,48 @@ class BaseGraphAdapter(GraphProtocolV1):
         *,
         ctx: Optional[OperationContext] = None,
     ) -> UpsertResult:
-        """Batch upsert nodes with validation and gates."""
+        """Batch upsert nodes with validation, gates, and optional timestamp management."""
         if not spec.nodes:
             raise BadRequest("nodes must not be empty")
         for n in spec.nodes:
             self._validate_node(n)
 
         async def _call() -> UpsertResult:
-            return await self._do_upsert_nodes(spec, ctx=ctx)
+            if self._auto_timestamp_writes:
+                now_ms = int(time.time() * 1000)
+                nodes_with_timestamps: List[Node] = []
+
+                for node in spec.nodes:
+                    if node.created_at is None or node.updated_at is None:
+                        nodes_with_timestamps.append(
+                            Node(
+                                id=node.id,
+                                labels=node.labels,
+                                properties=node.properties,
+                                namespace=node.namespace,
+                                created_at=node.created_at or now_ms,
+                                updated_at=now_ms,  # Always update
+                            )
+                        )
+                    else:
+                        nodes_with_timestamps.append(node)
+
+                result = await self._do_upsert_nodes(
+                    UpsertNodesSpec(
+                        nodes=nodes_with_timestamps,
+                        namespace=spec.namespace,
+                    ),
+                    ctx=ctx,
+                )
+            else:
+                result = await self._do_upsert_nodes(spec, ctx=ctx)
+
+            # Invalidate relevant caches only if writes succeeded and we have a namespace
+            if result.upserted_count > 0:
+                namespace = self._extract_namespace_from_spec(spec)
+                await self._invalidate_namespace_cache(namespace)
+
+            return result
 
         return await self._with_gates_unary(
             op="upsert_nodes",
@@ -1356,14 +1537,50 @@ class BaseGraphAdapter(GraphProtocolV1):
         *,
         ctx: Optional[OperationContext] = None,
     ) -> UpsertResult:
-        """Batch upsert edges with validation and gates."""
+        """Batch upsert edges with validation, gates, and optional timestamp management."""
         if not spec.edges:
             raise BadRequest("edges must not be empty")
         for e in spec.edges:
             self._validate_edge(e)
 
         async def _call() -> UpsertResult:
-            return await self._do_upsert_edges(spec, ctx=ctx)
+            if self._auto_timestamp_writes:
+                now_ms = int(time.time() * 1000)
+                edges_with_timestamps: List[Edge] = []
+
+                for edge in spec.edges:
+                    if edge.created_at is None or edge.updated_at is None:
+                        edges_with_timestamps.append(
+                            Edge(
+                                id=edge.id,
+                                src=edge.src,
+                                dst=edge.dst,
+                                label=edge.label,
+                                properties=edge.properties,
+                                namespace=edge.namespace,
+                                created_at=edge.created_at or now_ms,
+                                updated_at=now_ms,  # Always update
+                            )
+                        )
+                    else:
+                        edges_with_timestamps.append(edge)
+
+                result = await self._do_upsert_edges(
+                    UpsertEdgesSpec(
+                        edges=edges_with_timestamps,
+                        namespace=spec.namespace,
+                    ),
+                    ctx=ctx,
+                )
+            else:
+                result = await self._do_upsert_edges(spec, ctx=ctx)
+
+            # Invalidate relevant caches only if writes succeeded and we have a namespace
+            if result.upserted_count > 0:
+                namespace = self._extract_namespace_from_spec(spec)
+                await self._invalidate_namespace_cache(namespace)
+
+            return result
 
         return await self._with_gates_unary(
             op="upsert_edges",
@@ -1385,7 +1602,14 @@ class BaseGraphAdapter(GraphProtocolV1):
             self._validate_properties_map(spec.filter)
 
         async def _call() -> DeleteResult:
-            return await self._do_delete_nodes(spec, ctx=ctx)
+            result = await self._do_delete_nodes(spec, ctx=ctx)
+
+            # Invalidate relevant caches only if deletes succeeded and we have a namespace
+            if result.deleted_count > 0:
+                namespace = self._extract_namespace_from_spec(spec)
+                await self._invalidate_namespace_cache(namespace)
+
+            return result
 
         return await self._with_gates_unary(
             op="delete_nodes",
@@ -1407,7 +1631,14 @@ class BaseGraphAdapter(GraphProtocolV1):
             self._validate_properties_map(spec.filter)
 
         async def _call() -> DeleteResult:
-            return await self._do_delete_edges(spec, ctx=ctx)
+            result = await self._do_delete_edges(spec, ctx=ctx)
+
+            # Invalidate relevant caches only if deletes succeeded and we have a namespace
+            if result.deleted_count > 0:
+                namespace = self._extract_namespace_from_spec(spec)
+                await self._invalidate_namespace_cache(namespace)
+
+            return result
 
         return await self._with_gates_unary(
             op="delete_edges",
@@ -1426,6 +1657,7 @@ class BaseGraphAdapter(GraphProtocolV1):
         Scan/list vertices in bulk with optional pagination.
 
         Only available if capabilities.supports_bulk_vertices is True.
+        Uses pluggable cache interface.
         """
         caps = await self.capabilities()
         if not caps.supports_bulk_vertices:
@@ -1436,9 +1668,9 @@ class BaseGraphAdapter(GraphProtocolV1):
             self._validate_properties_map(spec.filter)
 
         async def _call() -> BulkVerticesResult:
-            # optional cache for purely read-only scans (first page, no filter)
+            # Use pluggable cache interface for read-only scans
             if (
-                isinstance(self._cache, InMemoryTTLCache)
+                not isinstance(self._cache, NoopCache)
                 and spec.cursor is None
                 and spec.filter is None
             ):
@@ -1477,6 +1709,7 @@ class BaseGraphAdapter(GraphProtocolV1):
         Execute a batch of graph operations.
 
         Semantics are adapter-defined; intended for reducing round-trips.
+        Includes optional strict operation-specific validation and smart cache invalidation.
         """
         caps = await self.capabilities()
         if not caps.supports_batch:
@@ -1490,7 +1723,9 @@ class BaseGraphAdapter(GraphProtocolV1):
                 details={"max_batch_ops": caps.max_batch_ops},
             )
 
-        # Basic schema validation for opaque BatchOperation shapes.
+        supported_ops = self._batch_supported_ops
+
+        # Enhanced operation-specific validation (opt-in strictness)
         for idx, op_spec in enumerate(ops):
             if not isinstance(op_spec.op, str) or not op_spec.op:
                 raise BadRequest(
@@ -1503,8 +1738,47 @@ class BaseGraphAdapter(GraphProtocolV1):
                     details={"index": idx, "type": type(op_spec.args).__name__},
                 )
 
+            if self._strict_batch_validation:
+                if op_spec.op not in supported_ops:
+                    raise BadRequest(
+                        f"unsupported batch operation '{op_spec.op}'",
+                        details={"index": idx, "supported_ops": list(supported_ops)},
+                    )
+
+                # Operation-specific schema validation (only for known ops)
+                if op_spec.op == "upsert_nodes" and "nodes" not in op_spec.args:
+                    raise BadRequest(
+                        "upsert_nodes requires 'nodes' array",
+                        details={"index": idx},
+                    )
+                if op_spec.op == "upsert_edges" and "edges" not in op_spec.args:
+                    raise BadRequest(
+                        "upsert_edges requires 'edges' array",
+                        details={"index": idx},
+                    )
+                if op_spec.op in {"delete_nodes", "delete_edges"} and "ids" not in op_spec.args:
+                    raise BadRequest(
+                        f"{op_spec.op} requires 'ids' array",
+                        details={"index": idx},
+                    )
+
         async def _call() -> BatchResult:
-            return await self._do_batch(ops, ctx=ctx)
+            result = await self._do_batch(ops, ctx=ctx)
+
+            # Smart cache invalidation: only invalidate namespaces where writes actually succeeded
+            namespaces_to_invalidate = set()
+            for idx, op in enumerate(ops):
+                if op.op in {"upsert_nodes", "upsert_edges", "delete_nodes", "delete_edges"}:
+                    if self._batch_op_succeeded(op, result, idx):
+                        namespace = self._extract_namespace_from_batch_op(op)
+                        if namespace is not None:
+                            namespaces_to_invalidate.add(namespace)
+
+            # Invalidate each affected namespace
+            for namespace in namespaces_to_invalidate:
+                await self._invalidate_namespace_cache(namespace)
+
+            return result
 
         return await self._with_gates_unary(
             op="batch",
@@ -1523,14 +1797,15 @@ class BaseGraphAdapter(GraphProtocolV1):
 
         Behavior:
             - If capabilities.supports_schema is False -> NotSupported.
-            - In standalone mode, result may be cached briefly.
+            - Uses pluggable cache interface.
         """
         caps = await self.capabilities()
         if not caps.supports_schema:
             raise NotSupported("get_schema is not supported by this adapter")
 
         async def _call() -> GraphSchema:
-            if isinstance(self._cache, InMemoryTTLCache):
+            # Use pluggable cache interface
+            if not isinstance(self._cache, NoopCache):
                 key = self._make_cache_key(op="schema", spec="all", ctx=ctx)
                 cached = await self._cache.get(key)
                 if cached:
@@ -1542,7 +1817,7 @@ class BaseGraphAdapter(GraphProtocolV1):
                     )
                     return cached
             res = await self._do_get_schema(ctx=ctx)
-            if isinstance(self._cache, InMemoryTTLCache):
+            if not isinstance(self._cache, NoopCache):
                 key = self._make_cache_key(op="schema", spec="all", ctx=ctx)
                 await self._cache.set(key, res, ttl_s=self._cache_schema_ttl_s)
             return res
@@ -1588,7 +1863,7 @@ class BaseGraphAdapter(GraphProtocolV1):
             self._record("health", t0, False, code=e.code or type(e).__name__, ctx=ctx)
             raise
         except Exception as e:
-            self._record("health", t0, False, code="UNAVAILABLE", ctx=ctx)
+            self._record("health", t0, False, code="UnhandledException", ctx=ctx)
             raise Unavailable("health check failed") from e
 
     # --- backend hooks -------------------------------------------------------
@@ -1711,7 +1986,7 @@ def _error_to_wire(e: Exception, ms: float) -> Dict[str, Any]:
         }
     return {
         "ok": False,
-        "code": "UNAVAILABLE",
+        "code": "UNAVAILABLE",  # Wire-level code remains UNAVAILABLE
         "error": type(e).__name__,
         "message": str(e) or "internal error",
         "retry_after_ms": None,
