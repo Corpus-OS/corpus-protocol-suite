@@ -600,7 +600,13 @@ class SimpleCircuitBreaker:
     Tiny per-process circuit breaker.
 
     Not distributed. Intended for standalone/dev usage.
-    Opens after N consecutive failures; half-open after recovery window.
+
+    Semantics:
+        - Opens after N consecutive failures.
+        - Once the recovery window has elapsed, allow() simply returns True
+          again on subsequent calls; there is no distinct half-open state
+          that restricts to a single probe call. This is intentionally
+          simpler than a full half-open implementation.
     """
 
     def __init__(self, *, failure_threshold: int = 5, recovery_after_s: float = 10.0) -> None:
@@ -612,7 +618,8 @@ class SimpleCircuitBreaker:
     def allow(self) -> bool:
         if self._opened_at is None:
             return True
-        # Half-open probe after recovery interval.
+        # Allow calls again once the recovery window has passed. There is no
+        # explicit half-open state; the next successful call will fully reset.
         if (time.monotonic() - self._opened_at) >= self._recovery_after_s:
             return True
         return False
@@ -912,6 +919,13 @@ class BaseLLMAdapter(LLMProtocolV1):
             self._cache = cache or NoopCache()
             self._limiter = limiter or NoopLimiter()
 
+        # Capabilities cache key is namespaced per adapter instance to avoid
+        # accidental collisions when sharing a cache across multiple adapters.
+        self._caps_cache_key = (
+            f"llm:capabilities:"
+            f"{self.__class__.__module__}.{self.__class__.__qualname__}:{id(self)}"
+        )
+
     # --- async context management (resource cleanup hint) --------------------
 
     async def __aenter__(self) -> "BaseLLMAdapter":
@@ -941,13 +955,26 @@ class BaseLLMAdapter(LLMProtocolV1):
     @staticmethod
     def _validate_messages(messages: List[Mapping[str, str]]) -> None:
         """
-        Validate that messages is a non-empty list of {role, content} mappings.
+        Validate that messages is a non-empty list of {role, content} mappings
+        with string values.
         """
-        if (
-            not messages
-            or not all(isinstance(m, Mapping) and "role" in m and "content" in m for m in messages)
-        ):
-            raise BadRequest("messages must be a non-empty list of {role, content} mappings")
+        if not messages:
+            raise BadRequest(
+                "messages must be a non-empty list of mappings with string 'role' and 'content'"
+            )
+        for m in messages:
+            if not isinstance(m, Mapping):
+                raise BadRequest(
+                    "each message must be a mapping with string 'role' and 'content'"
+                )
+            if "role" not in m or "content" not in m:
+                raise BadRequest(
+                    "each message must include 'role' and 'content' keys"
+                )
+            if not isinstance(m["role"], str) or not isinstance(m["content"], str):
+                raise BadRequest(
+                    "each message must have string 'role' and 'content' fields"
+                )
 
     @staticmethod
     def _validate_message_content_serializable(messages: List[Mapping[str, str]]) -> None:
@@ -979,7 +1006,7 @@ class BaseLLMAdapter(LLMProtocolV1):
             raise BadRequest("top_p must be within (0.0, 1.0]")
         if frequency_penalty is not None and not (-2.0 <= frequency_penalty <= 2.0):
             raise BadRequest("frequency_penalty must be within [-2.0, 2.0]")
-        if presence_penalty is not None and not (-2.0 <= presence_penalty <= 2.0):
+        if presence_penalty is not None and not (-2.0 <= presence_penalty <= 2.0]):
             raise BadRequest("presence_penalty must be within [-2.0, 2.0]")
 
     @staticmethod
@@ -1350,24 +1377,21 @@ class BaseLLMAdapter(LLMProtocolV1):
         """
         t0 = time.monotonic()
         try:
-            if isinstance(self._cache, InMemoryTTLCache):
-                key = "llm:capabilities"
-                cached = await self._cache.get(key)
-                if cached:
-                    self._metrics.counter(
-                        component=self._component,
-                        name="cache_hits",
-                        value=1,
-                        extra={"op": "capabilities"},
-                    )
-                    self._record("capabilities", t0, True)
-                    return cached
+            cached = await self._cache.get(self._caps_cache_key)
+            if cached:
+                self._metrics.counter(
+                    component=self._component,
+                    name="cache_hits",
+                    value=1,
+                    extra={"op": "capabilities"},
+                )
+                self._record("capabilities", t0, True)
+                return cached
             caps = await self._do_capabilities()
-            if isinstance(self._cache, InMemoryTTLCache):
-                try:
-                    await self._cache.set("llm:capabilities", caps, ttl_s=self._cache_ttl_s)
-                except Exception:
-                    pass
+            try:
+                await self._cache.set(self._caps_cache_key, caps, ttl_s=self._cache_ttl_s)
+            except Exception:
+                pass
             self._record("capabilities", t0, True)
             return caps
         except LLMAdapterError as e:
@@ -1420,28 +1444,27 @@ class BaseLLMAdapter(LLMProtocolV1):
             )
 
             cache_key: Optional[str] = None
-            if isinstance(self._cache, InMemoryTTLCache):
-                cache_key = self._make_complete_cache_key(
-                    model=model,
-                    system_message=system_message,
-                    messages=messages,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    frequency_penalty=frequency_penalty,
-                    presence_penalty=presence_penalty,
-                    stop_sequences=stop_sequences,
-                    caps=caps,
-                    ctx=ctx,
+            cache_key = self._make_complete_cache_key(
+                model=model,
+                system_message=system_message,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                frequency_penalty=frequency_penalty,
+                presence_penalty=presence_penalty,
+                stop_sequences=stop_sequences,
+                caps=caps,
+                ctx=ctx,
+            )
+            cached = await self._cache.get(cache_key)
+            if cached is not None:
+                self._metrics.counter(
+                    component=self._component,
+                    name="cache_hits",
+                    value=1,
                 )
-                cached = await self._cache.get(cache_key)
-                if cached is not None:
-                    self._metrics.counter(
-                        component=self._component,
-                        name="cache_hits",
-                        value=1,
-                    )
-                    return cached  # type: ignore[return-value]
+                return cached  # type: ignore[return-value]
 
             result = await self._apply_deadline(
                 self._do_complete(
@@ -1459,7 +1482,7 @@ class BaseLLMAdapter(LLMProtocolV1):
                 ctx,
             )
 
-            if isinstance(self._cache, InMemoryTTLCache) and cache_key is not None:
+            if cache_key is not None:
                 try:
                     await self._cache.set(cache_key, result, ttl_s=self._cache_ttl_s)
                 except Exception:
@@ -1585,6 +1608,9 @@ class BaseLLMAdapter(LLMProtocolV1):
             raise BadRequest("text must be a string")
 
         t0 = time.monotonic()
+        extra: Dict[str, Any] = {"text_length": len(text)}
+        if self._tag_model_in_metrics and model:
+            extra["model"] = model
         try:
             caps = await self.capabilities()
             if model and caps.supported_models and model not in caps.supported_models:
@@ -1598,9 +1624,6 @@ class BaseLLMAdapter(LLMProtocolV1):
                 ctx,
             )
 
-            extra: Dict[str, Any] = {"text_length": len(text)}
-            if self._tag_model_in_metrics and model:
-                extra["model"] = model
             self._record(
                 "count_tokens",
                 t0,
@@ -1622,7 +1645,7 @@ class BaseLLMAdapter(LLMProtocolV1):
                 False,
                 code=type(e).__name__,
                 ctx=ctx,
-                model=str(model or ""),
+                **extra,
             )
             raise
 
@@ -1633,7 +1656,7 @@ class BaseLLMAdapter(LLMProtocolV1):
                 False,
                 code="UnhandledException",
                 ctx=ctx,
-                model=str(model or ""),
+                **extra,
             )
             raise
 
@@ -1921,6 +1944,12 @@ class WireLLMHandler:
             op: "llm.stream"
             ctx: { ... }
             args: full streaming parameter set (parity with LLMProtocolV1.stream)
+
+        Note:
+            This method forwards chunks as they are produced by the adapter.
+            For JSON-envelope style transports, an error is emitted as a final
+            envelope on the stream. Other transports (e.g. raw gRPC streams)
+            may choose to map this to a terminal stream error instead.
         """
         t0 = time.monotonic()
         op = envelope.get("op")
@@ -1949,6 +1978,7 @@ class WireLLMHandler:
                 yield _chunk_to_wire(chunk, ms)
         except Exception as e:
             ms = (time.monotonic() - t0) * 1000.0
+            # Emit a final error envelope on the stream channel.
             yield _error_to_wire(e, ms)
 
 
