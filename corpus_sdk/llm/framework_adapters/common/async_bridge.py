@@ -409,3 +409,14 @@ def sync_method(
     Module-level convenience wrapper around AsyncBridge.sync_method.
     """
     return AsyncBridge.sync_method(async_func)
+
+
+__all__ = [
+    "AsyncBridge",
+    "AsyncBridgeTimeoutError",
+    "DEFAULT_MAX_WORKERS",
+    "DEFAULT_RUN_TIMEOUT",
+    "run_async",
+    "sync_wrapper",
+    "sync_method",
+]
