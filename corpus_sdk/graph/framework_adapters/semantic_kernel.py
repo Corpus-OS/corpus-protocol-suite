@@ -110,7 +110,7 @@ from corpus_sdk.graph.graph_base import (
     UpsertResult,
 )
 from corpus_sdk.graph.graph_translation import GraphTranslator
-from corpus_sdk.llm.framework_adapters.common.async_bridge import AsyncBridge
+from corpus_sdk.core.async_bridge import AsyncBridge
 
 logger = logging.getLogger(__name__)
 
