@@ -1,4 +1,4 @@
-# Corpus SDK
+# Corpus (Core Orchestration Runtime for Polyglot Unified Systems) Protocol and SDK
 
 ![Version](https://img.shields.io/badge/version-1.0.0-blue)
 ![Python](https://img.shields.io/badge/python-3.9+-blue)
