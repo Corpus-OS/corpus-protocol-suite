@@ -2,32 +2,53 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Message translation for Corpus framework adapters.
+Message translation for Corpus chat framework adapters.
 
-This module normalizes framework-specific message objects into Corpus
-protocol messages so that:
+This module normalizes *chat-style* message objects from various upstream
+frameworks into Corpus protocol messages so that:
 
-- Role names are canonicalized (e.g., "human" → "user")
+- Role names are canonicalized into the Corpus chat role set
+  ("system", "user", "assistant", "tool", "function")
 - Content is stringified while preserving structured data
-- Metadata is captured without loss
-- Round-trip translation is possible
+- Framework-specific metadata is captured without loss
+- Round-trip translation is possible when going back to the source framework
+
+Scope
+-----
+- This module is **LLM/chat-specific**: it is meant for chat messages only.
+- It is **framework-agnostic**: implementations for LangChain, LlamaIndex,
+  Semantic Kernel, AutoGen, CrewAI, etc. are optional adapters on top of a
+  protocol-first core.
+- Non-chat products (vector, graph, embedding) should use their own protocol
+  types rather than `NormalizedMessage`.
 
 Design goals
 ------------
-- Protocol-first: wire format is the source of truth
-- Non-destructive: preserve original objects in metadata
-- Framework-agnostic: no hard runtime dependencies
-- Configurable: strict vs. lenient role validation
+- Protocol-first:
+    The Corpus chat wire format ({role, content}) is the source of truth.
+- Non-destructive:
+    Preserve original framework objects and structured content in metadata.
+- Framework-agnostic:
+    No hard runtime dependency on any single framework; imports live inside
+    adapter functions and are optional.
+- Configurable:
+    Strict vs. lenient role validation, configurable fallback role.
 
 Primary entry points
 --------------------
-For each framework:
-- from_<framework>: framework message → NormalizedMessage
-- to_<framework>: NormalizedMessage → framework message
-
-Wire format:
+Core / protocol:
+- NormalizedMessage
 - to_corpus: [NormalizedMessage] → [{"role": str, "content": str}]
-- from_corpus: {"role": str, "content": str} → NormalizedMessage
+- from_corpus: {"role": str, "content": Any} → NormalizedMessage
+- from_corpus_many
+- from_generic_dict / to_generic_dict
+
+Framework adapters:
+- from_langchain / to_langchain
+- from_llamaindex / to_llamaindex
+- from_semantic_kernel / to_semantic_kernel
+- from_autogen / to_autogen
+- from_crewai / to_crewai
 """
 
 from __future__ import annotations
@@ -46,12 +67,14 @@ if TYPE_CHECKING:  # pragma: no cover
 # ---------------------------------------------------------------------------
 
 STRICT_ROLE_VALIDATION: bool = os.getenv("CORPUS_STRICT_ROLES", "0") in {
-    "1", "true", "TRUE"
+    "1",
+    "true",
+    "TRUE",
 }
 
-_UNKNOWN_ROLE_FALLBACK: str = os.getenv(
-    "CORPUS_UNKNOWN_ROLE", "assistant"
-).strip().lower()
+# Default fallback role when encountering unknown roles in lenient mode.
+# This is a Corpus chat protocol role, not a framework-specific label.
+_UNKNOWN_ROLE_FALLBACK: str = os.getenv("CORPUS_UNKNOWN_ROLE", "assistant").strip().lower()
 
 
 def set_strict_role_validation(enabled: bool) -> None:
@@ -87,21 +110,33 @@ class NormalizedMessage:
     """
     Protocol-centric representation of a single chat message.
 
+    This is the "narrow waist" across frameworks: all upstream chat messages
+    (LangChain, LlamaIndex, SK, AutoGen, CrewAI, or custom) should be mapped
+    into this structure before being sent over the Corpus chat protocol.
+
     Attributes
     ----------
     role:
-        Canonical role string: "system", "user", "assistant", "tool", "function".
-        Non-standard roles are remapped and original preserved in metadata.
+        Canonical Corpus chat role string:
+            "system", "user", "assistant", "tool", "function".
+        Non-standard roles from upstream frameworks are remapped into this
+        set, with the original value preserved in metadata["corpus_original_role"].
 
     content:
-        String form of the message. Structured content is stringified and
-        preserved in metadata["corpus_raw_content"].
+        String form of the message body, suitable for wire transport.
+        Structured or rich content (dict, list-of-parts, etc.) is stringified
+        and the original preserved in metadata["corpus_raw_content"].
 
     metadata:
-        Arbitrary metadata. Reserved keys:
-        - "corpus_raw": original framework message object
-        - "corpus_raw_content": original structured content
-        - "corpus_original_role": non-canonical role when remapped
+        Arbitrary metadata from upstream frameworks or callers.
+
+        Reserved Corpus keys:
+            - "corpus_raw": the original framework message object or payload
+            - "corpus_raw_content": original structured content before stringifying
+            - "corpus_original_role": non-canonical role when remapped
+
+        All other keys are considered integration-specific and are preserved
+        for round-tripping or debugging.
     """
 
     role: str
@@ -109,7 +144,7 @@ class NormalizedMessage:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def copy_with_content(self, content: str) -> "NormalizedMessage":
-        """Create a copy with new content."""
+        """Create a shallow copy with new content."""
         return NormalizedMessage(
             role=self.role,
             content=content,
@@ -123,7 +158,7 @@ class NormalizedMessage:
 
     @property
     def original_role(self) -> Optional[str]:
-        """Original framework role before normalization."""
+        """Original framework role before normalization, if remapped."""
         val = self.metadata.get("corpus_original_role")
         return str(val) if val is not None else None
 
@@ -132,6 +167,10 @@ class NormalizedMessage:
 # Role normalization
 # ---------------------------------------------------------------------------
 
+# Corpus chat protocol canonical roles:
+#   "system", "user", "assistant", "tool", "function"
+#
+# All framework-specific / upstream role labels are mapped into this set.
 _ROLE_MAP: Dict[str, str] = {
     # System
     "system": "system",
@@ -154,7 +193,7 @@ _ROLE_MAP: Dict[str, str] = {
 
 def _normalize_role(raw_role: Optional[str]) -> Tuple[str, Optional[str]]:
     """
-    Map framework role to canonical protocol role.
+    Map upstream/framework role to canonical Corpus chat role.
 
     Returns:
         (canonical_role, original_role_if_changed)
@@ -173,7 +212,7 @@ def _normalize_role(raw_role: Optional[str]) -> Tuple[str, Optional[str]]:
     if STRICT_ROLE_VALIDATION:
         raise ValueError(f"Unknown message role: {original!r}")
 
-    # Fallback
+    # Lenient fallback
     fallback = _UNKNOWN_ROLE_FALLBACK
     if fallback not in {"system", "user", "assistant", "tool", "function"}:
         fallback = "assistant"
@@ -196,7 +235,8 @@ def _stringify_content(content: Any) -> Tuple[str, Optional[Any]]:
     - str → pass through
     - Mapping → JSON + preserve original
     - list[Mapping] → JSON + preserve original (OpenAI-style parts)
-    - other → str() conversion
+    - other iterables → str(list(...)) + preserve original list
+    - fallthrough → str() conversion
     """
     if isinstance(content, str):
         return content, None
@@ -210,7 +250,7 @@ def _stringify_content(content: Any) -> Tuple[str, Optional[Any]]:
 
     # Try iterable (but not string)
     try:
-        as_list = list(content)  # type: ignore
+        as_list = list(content)  # type: ignore[arg-type]
     except (TypeError, RecursionError):
         return str(content), None
 
@@ -232,7 +272,7 @@ def _stringify_content(content: Any) -> Tuple[str, Optional[Any]]:
 
 def to_corpus(messages: Iterable[NormalizedMessage]) -> List[Dict[str, Any]]:
     """
-    Convert normalized messages to Corpus protocol wire format.
+    Convert normalized messages to Corpus chat protocol wire format.
 
     Returns:
         [{"role": str, "content": str}, ...]
@@ -245,7 +285,7 @@ def from_corpus(payload: Mapping[str, Any]) -> NormalizedMessage:
     Convert a Corpus wire message to NormalizedMessage.
 
     Args:
-        payload: {"role": str, "content": str, ...}
+        payload: {"role": str, "content": Any, ...}
 
     Returns:
         NormalizedMessage
@@ -263,8 +303,85 @@ def from_corpus(payload: Mapping[str, Any]) -> NormalizedMessage:
 
 
 def from_corpus_many(payloads: Iterable[Mapping[str, Any]]) -> List[NormalizedMessage]:
-    """Convert multiple Corpus wire messages to NormalizedMessage list."""
+    """Convert multiple Corpus wire messages to a list of NormalizedMessage."""
     return [from_corpus(p) for p in payloads]
+
+
+# ---------------------------------------------------------------------------
+# Generic dict helpers (framework-agnostic)
+# ---------------------------------------------------------------------------
+
+
+def from_generic_dict(msg: Mapping[str, Any]) -> NormalizedMessage:
+    """
+    Generic dict → NormalizedMessage.
+
+    This is a framework-agnostic adapter for callers that already operate on
+    simple dicts and don't want to depend on a specific framework's types.
+
+    Expected (but not strictly required) shape:
+        {
+            "role": str,
+            "content": Any,
+            "metadata": { ... }  # optional
+            ... other keys ...
+        }
+
+    Behavior:
+    - Uses `msg["role"]` and `msg["content"]` if present, with defaults.
+    - Copies any `msg["metadata"]` (if a mapping) into `metadata`.
+    - Preserves the original dict as metadata["corpus_raw"].
+    """
+    raw_role = msg.get("role", "user")
+    raw_content = msg.get("content", "")
+
+    role, original_role = _normalize_role(raw_role)
+    content, structured = _stringify_content(raw_content)
+
+    metadata: Dict[str, Any] = {"corpus_raw": msg}
+
+    # Merge user metadata if present
+    user_meta = msg.get("metadata")
+    if isinstance(user_meta, Mapping):
+        metadata.update(dict(user_meta))
+
+    if original_role is not None:
+        metadata["corpus_original_role"] = original_role
+    if structured is not None:
+        metadata["corpus_raw_content"] = structured
+
+    return NormalizedMessage(role=role, content=content, metadata=metadata)
+
+
+def to_generic_dict(msg: NormalizedMessage) -> Dict[str, Any]:
+    """
+    NormalizedMessage → generic dict.
+
+    Returns:
+        {
+            "role": str,
+            "content": Any,
+            "metadata": { ... non-corpus metadata ... }
+        }
+
+    This is useful for custom or internal frameworks that want a neutral,
+    non-framework-branded representation of a chat message.
+    """
+    # Reconstruct content from structured form if available
+    content = msg.raw_content if msg.raw_content is not None else msg.content
+
+    # Build metadata (exclude reserved corpus_* keys)
+    metadata: Dict[str, Any] = {
+        k: v
+        for k, v in msg.metadata.items()
+        if not k.startswith("corpus_")
+    }
+
+    return {
+        "role": msg.role,
+        "content": content,
+        "metadata": metadata,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -276,7 +393,7 @@ def from_langchain(msg: "BaseMessage") -> NormalizedMessage:
     """
     LangChain BaseMessage → NormalizedMessage.
 
-    Supports:
+    Supports typical LangChain message types:
     - SystemMessage, HumanMessage, AIMessage
     - FunctionMessage, ToolMessage
 
@@ -311,7 +428,7 @@ def to_langchain(msg: NormalizedMessage) -> Any:
     NormalizedMessage → LangChain BaseMessage.
 
     Raises:
-        RuntimeError: If LangChain is not installed
+        RuntimeError: If LangChain is not installed.
     """
     try:
         from langchain_core.messages import (  # type: ignore
@@ -320,7 +437,7 @@ def to_langchain(msg: NormalizedMessage) -> Any:
             AIMessage,
             ToolMessage,
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         raise RuntimeError(
             "LangChain is not installed, cannot create LangChain messages"
         ) from exc
@@ -328,25 +445,39 @@ def to_langchain(msg: NormalizedMessage) -> Any:
     # Reconstruct content
     content = msg.raw_content if msg.raw_content is not None else msg.content
 
-    # Build additional_kwargs from metadata
-    additional_kwargs = {
+    # Build additional_kwargs from metadata (excluding reserved corpus_* keys)
+    additional_kwargs: Dict[str, Any] = {
         k: v
         for k, v in msg.metadata.items()
         if not k.startswith("corpus_")
     }
 
-    # Select message class
+    # Select message class based on canonical role
     if msg.role == "system":
         return SystemMessage(content=content, additional_kwargs=additional_kwargs)
-    elif msg.role == "user":
+    if msg.role == "user":
         return HumanMessage(content=content, additional_kwargs=additional_kwargs)
-    elif msg.role == "assistant":
+    if msg.role == "assistant":
         return AIMessage(content=content, additional_kwargs=additional_kwargs)
-    elif msg.role in {"function", "tool"}:
-        return ToolMessage(content=content, additional_kwargs=additional_kwargs)
-    else:
-        # Fallback for unknown roles
-        return HumanMessage(content=content, additional_kwargs=additional_kwargs)
+    if msg.role in {"function", "tool"}:
+        # LangChain's ToolMessage in many versions expects a `tool_call_id`.
+        # We try to recover it from metadata if present; callers that need
+        # strict round-tripping for tool messages should ensure they store
+        # `tool_call_id` (or compatible) in message.metadata.
+        tool_call_id = (
+            additional_kwargs.get("tool_call_id")
+            or additional_kwargs.get("id")
+            or additional_kwargs.get("call_id")
+        )
+
+        return ToolMessage(
+            content=content,
+            tool_call_id=tool_call_id,
+            additional_kwargs=additional_kwargs,
+        )
+
+    # Fallback for unknown roles: treat as user
+    return HumanMessage(content=content, additional_kwargs=additional_kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -392,16 +523,16 @@ def to_llamaindex(msg: NormalizedMessage) -> Any:
     NormalizedMessage → LlamaIndex ChatMessage.
 
     Raises:
-        RuntimeError: If llama-index is not installed
+        RuntimeError: If llama-index is not installed.
     """
     try:
         from llama_index.core.llms import ChatMessage, MessageRole  # type: ignore
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         raise RuntimeError(
             "llama-index is not installed, cannot create ChatMessage"
         ) from exc
 
-    # Map role to MessageRole enum
+    # Map canonical role to MessageRole enum
     role_map = {
         "system": MessageRole.SYSTEM,
         "user": MessageRole.USER,
@@ -414,7 +545,7 @@ def to_llamaindex(msg: NormalizedMessage) -> Any:
     # Reconstruct content
     content = msg.raw_content if msg.raw_content is not None else msg.content
 
-    # Build additional_kwargs
+    # Build additional_kwargs (excluding reserved corpus_* keys)
     additional_kwargs = {
         k: v
         for k, v in msg.metadata.items()
@@ -435,10 +566,10 @@ def to_llamaindex(msg: NormalizedMessage) -> Any:
 
 def from_semantic_kernel(msg: Mapping[str, Any]) -> NormalizedMessage:
     """
-    Semantic Kernel dict → NormalizedMessage.
+    Semantic Kernel message dict → NormalizedMessage.
 
     Expected shape:
-        {"role": str, "content": str, "metadata": {...}}
+        {"role": str, "content": Any, "metadata": {...}}
 
     Args:
         msg: SK message dict
@@ -468,15 +599,15 @@ def from_semantic_kernel(msg: Mapping[str, Any]) -> NormalizedMessage:
 
 def to_semantic_kernel(msg: NormalizedMessage) -> Dict[str, Any]:
     """
-    NormalizedMessage → Semantic Kernel dict.
+    NormalizedMessage → Semantic Kernel message dict.
 
     Returns:
-        {"role": str, "content": str, "metadata": {...}}
+        {"role": str, "content": Any, "metadata": {...}}
     """
     # Reconstruct content
     content = msg.raw_content if msg.raw_content is not None else msg.content
 
-    # Build metadata (exclude corpus_ keys)
+    # Build metadata (exclude corpus_* keys)
     sk_metadata = {
         k: v
         for k, v in msg.metadata.items()
@@ -542,7 +673,7 @@ def to_autogen(msg: NormalizedMessage) -> Dict[str, Any]:
     NormalizedMessage → AutoGen-style dict.
 
     Returns:
-        {"role": str, "content": str, ...}
+        {"role": str, "content": Any, ...}
     """
     # Reconstruct content
     content = msg.raw_content if msg.raw_content is not None else msg.content
@@ -613,7 +744,7 @@ def to_crewai(msg: NormalizedMessage) -> Dict[str, Any]:
     NormalizedMessage → CrewAI-compatible dict.
 
     Returns:
-        {"role": str, "content": str, ...}
+        {"role": str, "content": Any, ...}
     """
     # Reconstruct content
     content = msg.raw_content if msg.raw_content is not None else msg.content
@@ -635,16 +766,16 @@ def to_crewai(msg: NormalizedMessage) -> Dict[str, Any]:
 __all__ = [
     # Core type
     "NormalizedMessage",
-    
     # Configuration
     "set_strict_role_validation",
     "set_unknown_role_fallback",
-    
     # Corpus wire format
     "to_corpus",
     "from_corpus",
     "from_corpus_many",
-    
+    # Generic dict helpers
+    "from_generic_dict",
+    "to_generic_dict",
     # Framework adapters
     "from_langchain",
     "to_langchain",
@@ -657,3 +788,4 @@ __all__ = [
     "from_crewai",
     "to_crewai",
 ]
+
