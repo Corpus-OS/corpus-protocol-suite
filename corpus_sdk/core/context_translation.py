@@ -5,8 +5,8 @@
 Context translation utilities for Corpus framework adapters.
 
 This module normalizes framework-specific "context" objects into a
-canonical dictionary shape that can be fed into any Corpus
-`OperationContext`-like type (LLM, vector, embedding, graph), so that:
+canonical `OperationContext` that can be used by any Corpus protocol
+layer (LLM, vector, embedding, graph), so that:
 
 - Request IDs / trace IDs are preserved
 - Deadlines / timeouts propagate correctly
@@ -23,19 +23,18 @@ Design goals
 
 Primary entry points
 --------------------
-The `from_*` functions all return a normalized dict of the form:
+Each `from_*` function returns a *core* `OperationContext` instance with:
 
-    {
-        "request_id": str | None,
-        "tenant": str | None,
-        "deadline_ms": int | None,
-        "traceparent": str | None,
-        "attrs": dict,
-    }
+    OperationContext(
+        request_id: str | None,
+        tenant: str | None,
+        deadline_ms: int | None,
+        traceparent: str | None,
+        attrs: dict,
+    )
 
-They do *not* construct any specific `OperationContext` class. Each
-protocol layer (LLM, vector, embedding, graph) is responsible for
-taking that dict and building its own OperationContext object.
+The `OperationContext` type itself is protocol-agnostic and can be used
+by LLM, vector, embedding, graph, or any other Corpus adapter.
 
 - from_langchain
 - from_llamaindex
@@ -47,7 +46,8 @@ taking that dict and building its own OperationContext object.
 
 Registry-based entry points
 ---------------------------
-For custom frameworks or overrides, you can register a translator:
+For custom frameworks or overrides, you can register a translator that
+produces a normalized dict, which is then wrapped into an OperationContext:
 
     def my_framework_translator(raw_ctx) -> NormalizedContext:
         ...
@@ -58,9 +58,8 @@ For custom frameworks or overrides, you can register a translator:
 
 Round-trip helpers
 ------------------
-These helpers take an OperationContext-like object (anything with
-`request_id`, `tenant`, `deadline_ms`, `traceparent`, and `attrs`
-attributes) and convert it back into framework-specific metadata:
+These helpers take an OperationContext (core type) and convert it back
+into framework-specific metadata:
 
 - to_langchain
 - to_llamaindex
@@ -71,6 +70,8 @@ from __future__ import annotations
 
 import logging
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Union
+
+from corpus_sdk.core.operation_context import OperationContext
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +98,7 @@ KEY_TRACE_ID = "trace_id"
 KEY_CORRELATION_ID = "correlation_id"
 
 
-# Normalized context shape:
+# Internal normalized context shape used before constructing OperationContext:
 # {
 #   "request_id": str | None,
 #   "tenant": str | None,
@@ -125,7 +126,8 @@ def register_framework_translator(name: str, translator: FrameworkTranslator) ->
     """
     Register or override a framework translator.
 
-    The translator must return a `NormalizedContext` dict. This is useful for:
+    The translator must return a *normalized* context dict; this module will
+    validate it and wrap it into an OperationContext. This is useful for:
     - Custom frameworks not covered by built-in `from_*` helpers.
     - Overriding default behavior for existing frameworks.
 
@@ -142,6 +144,8 @@ def register_framework_translator(name: str, translator: FrameworkTranslator) ->
             }
 
         register_framework_translator("my_framework", my_translator)
+
+        ctx = translate_framework("my_framework", raw_ctx)
     """
     if not name or not isinstance(name, str):
         raise ContextTranslationError("Translator name must be a non-empty string")
@@ -156,9 +160,10 @@ def get_framework_translator(name: str) -> Optional[FrameworkTranslator]:
     return _framework_translators.get(name)
 
 
-def translate_framework(name: str, *args: Any, **kwargs: Any) -> NormalizedContext:
+def translate_framework(name: str, *args: Any, **kwargs: Any) -> OperationContext:
     """
-    Dispatch translation to a registered framework translator.
+    Dispatch translation to a registered framework translator and wrap
+    the result into an OperationContext.
 
     Raises:
         ContextTranslationError if no translator is registered or if the
@@ -168,9 +173,9 @@ def translate_framework(name: str, *args: Any, **kwargs: Any) -> NormalizedConte
     if translator is None:
         raise ContextTranslationError(f"No framework translator registered for: {name!r}")
 
-    ctx = translator(*args, **kwargs)
-    _validate_normalized_context(ctx, source=f"registry:{name}")
-    return ctx
+    ctx_dict = translator(*args, **kwargs)
+    _validate_normalized_context(ctx_dict, source=f"registry:{name}")
+    return OperationContext(**ctx_dict)
 
 
 # ---------------------------------------------------------------------------
@@ -182,9 +187,9 @@ def from_langchain(
     config: Optional[Mapping[str, Any]],
     *,
     framework_version: Optional[str] = None,
-) -> NormalizedContext:
+) -> OperationContext:
     """
-    LangChain RunnableConfig → normalized context dict.
+    LangChain RunnableConfig → OperationContext.
 
     Expected shape:
         {
@@ -203,12 +208,12 @@ def from_langchain(
         framework_version: Optional version string
 
     Returns:
-        NormalizedContext dict
+        OperationContext
     """
     if not config:
-        ctx = _empty_context()
-        _validate_normalized_context(ctx, source="langchain")
-        return ctx
+        ctx_dict = _empty_context()
+        _validate_normalized_context(ctx_dict, source="langchain")
+        return OperationContext(**ctx_dict)
 
     metadata = _get_dict(config, "metadata")
 
@@ -237,21 +242,21 @@ def from_langchain(
 
     common = _extract_common_fields(config, metadata)
 
-    ctx: NormalizedContext = {
+    ctx_dict: NormalizedContext = {
         **common,
         "attrs": attrs,
     }
-    _validate_normalized_context(ctx, source="langchain")
-    return ctx
+    _validate_normalized_context(ctx_dict, source="langchain")
+    return OperationContext(**ctx_dict)
 
 
 def from_llamaindex(
     callback_manager: Optional[Any],
     *,
     framework_version: Optional[str] = None,
-) -> NormalizedContext:
+) -> OperationContext:
     """
-    LlamaIndex CallbackManager → normalized context dict.
+    LlamaIndex CallbackManager → OperationContext.
 
     Extracts:
     - trace_id / span_id
@@ -263,12 +268,12 @@ def from_llamaindex(
         framework_version: Optional version string
 
     Returns:
-        NormalizedContext dict
+        OperationContext
     """
     if callback_manager is None:
-        ctx = _empty_context()
-        _validate_normalized_context(ctx, source="llamaindex")
-        return ctx
+        ctx_dict = _empty_context()
+        _validate_normalized_context(ctx_dict, source="llamaindex")
+        return OperationContext(**ctx_dict)
 
     # Try common attributes
     trace_id = getattr(callback_manager, "trace_id", None)
@@ -308,12 +313,12 @@ def from_llamaindex(
     # Prefer explicit IDs from callback manager when available
     common["request_id"] = request_id or trace_id or common["request_id"]
 
-    ctx: NormalizedContext = {
+    ctx_dict: NormalizedContext = {
         **common,
         "attrs": attrs,
     }
-    _validate_normalized_context(ctx, source="llamaindex")
-    return ctx
+    _validate_normalized_context(ctx_dict, source="llamaindex")
+    return OperationContext(**ctx_dict)
 
 
 def from_semantic_kernel(
@@ -321,9 +326,9 @@ def from_semantic_kernel(
     *,
     settings: Optional[Any] = None,
     framework_version: Optional[str] = None,
-) -> NormalizedContext:
+) -> OperationContext:
     """
-    Semantic Kernel context → normalized context dict.
+    Semantic Kernel context → OperationContext.
 
     Extracts from context.variables and optional settings.
 
@@ -333,12 +338,12 @@ def from_semantic_kernel(
         framework_version: Optional version string
 
     Returns:
-        NormalizedContext dict
+        OperationContext
     """
     if context is None and settings is None:
-        ctx = _empty_context()
-        _validate_normalized_context(ctx, source="semantic_kernel")
-        return ctx
+        ctx_dict = _empty_context()
+        _validate_normalized_context(ctx_dict, source="semantic_kernel")
+        return OperationContext(**ctx_dict)
 
     # SK often has "variables" or "context_variables"
     metadata = (
@@ -380,12 +385,12 @@ def from_semantic_kernel(
         if settings_timeout is not None:
             common["deadline_ms"] = _coerce_deadline_ms(settings_timeout)
 
-    ctx: NormalizedContext = {
+    ctx_dict: NormalizedContext = {
         **common,
         "attrs": attrs,
     }
-    _validate_normalized_context(ctx, source="semantic_kernel")
-    return ctx
+    _validate_normalized_context(ctx_dict, source="semantic_kernel")
+    return OperationContext(**ctx_dict)
 
 
 def from_autogen(
@@ -393,9 +398,9 @@ def from_autogen(
     *,
     framework_version: Optional[str] = None,
     **extra: Any,
-) -> NormalizedContext:
+) -> OperationContext:
     """
-    AutoGen conversation → normalized context dict.
+    AutoGen conversation → OperationContext.
 
     Extracts:
     - conversation_id / id
@@ -408,12 +413,12 @@ def from_autogen(
         **extra: Additional context fields
 
     Returns:
-        NormalizedContext dict
+        OperationContext
     """
     if conversation is None and not extra:
-        ctx = _empty_context()
-        _validate_normalized_context(ctx, source="autogen")
-        return ctx
+        ctx_dict = _empty_context()
+        _validate_normalized_context(ctx_dict, source="autogen")
+        return OperationContext(**ctx_dict)
 
     # Extract IDs
     conversation_id = (
@@ -454,12 +459,12 @@ def from_autogen(
     common = _extract_common_fields({}, merged)
     common["request_id"] = request_id or run_id or common["request_id"]
 
-    ctx: NormalizedContext = {
+    ctx_dict: NormalizedContext = {
         **common,
         "attrs": attrs,
     }
-    _validate_normalized_context(ctx, source="autogen")
-    return ctx
+    _validate_normalized_context(ctx_dict, source="autogen")
+    return OperationContext(**ctx_dict)
 
 
 def from_crewai(
@@ -467,9 +472,9 @@ def from_crewai(
     *,
     framework_version: Optional[str] = None,
     **extra: Any,
-) -> NormalizedContext:
+) -> OperationContext:
     """
-    CrewAI task → normalized context dict.
+    CrewAI task → OperationContext.
 
     Extracts:
     - task.id / task.task_id
@@ -482,12 +487,12 @@ def from_crewai(
         **extra: Additional context fields
 
     Returns:
-        NormalizedContext dict
+        OperationContext
     """
     if task is None and not extra:
-        ctx = _empty_context()
-        _validate_normalized_context(ctx, source="crewai")
-        return ctx
+        ctx_dict = _empty_context()
+        _validate_normalized_context(ctx_dict, source="crewai")
+        return OperationContext(**ctx_dict)
 
     # Extract IDs
     task_id = getattr(task, "id", None) or getattr(task, "task_id", None)
@@ -528,21 +533,21 @@ def from_crewai(
     common = _extract_common_fields({}, merged)
     common["request_id"] = request_id or run_id or common["request_id"]
 
-    ctx: NormalizedContext = {
+    ctx_dict: NormalizedContext = {
         **common,
         "attrs": attrs,
     }
-    _validate_normalized_context(ctx, source="crewai")
-    return ctx
+    _validate_normalized_context(ctx_dict, source="crewai")
+    return OperationContext(**ctx_dict)
 
 
 def from_mcp(
     request: Mapping[str, Any],
     *,
     connection_metadata: Optional[Mapping[str, Any]] = None,
-) -> NormalizedContext:
+) -> OperationContext:
     """
-    MCP JSON-RPC request → normalized context dict.
+    MCP JSON-RPC request → OperationContext.
 
     Expected shape:
         {
@@ -562,7 +567,7 @@ def from_mcp(
         connection_metadata: Optional connection-level metadata
 
     Returns:
-        NormalizedContext dict
+        OperationContext
     """
     params = request.get("params") or {}
     context = params.get("context") or {}
@@ -596,17 +601,17 @@ def from_mcp(
     if request_id is not None:
         common["request_id"] = str(request_id)
 
-    ctx: NormalizedContext = {
+    ctx_dict: NormalizedContext = {
         **common,
         "attrs": attrs,
     }
-    _validate_normalized_context(ctx, source="mcp")
-    return ctx
+    _validate_normalized_context(ctx_dict, source="mcp")
+    return OperationContext(**ctx_dict)
 
 
-def from_dict(ctx: Optional[Mapping[str, Any]]) -> NormalizedContext:
+def from_dict(ctx: Optional[Mapping[str, Any]]) -> OperationContext:
     """
-    Generic dict → normalized context dict.
+    Generic dict → OperationContext.
 
     Expected keys (all optional):
         {
@@ -621,23 +626,22 @@ def from_dict(ctx: Optional[Mapping[str, Any]]) -> NormalizedContext:
         ctx: Dictionary with context fields
 
     Returns:
-        NormalizedContext dict
+        OperationContext
     """
     if not ctx:
-        ctx_out = _empty_context()
-        _validate_normalized_context(ctx_out, source="dict")
-        return ctx_out
+        ctx_dict = _empty_context()
+        _validate_normalized_context(ctx_dict, source="dict")
+        return OperationContext(**ctx_dict)
 
     attrs = dict(ctx.get("attrs") or {})
-
     common = _extract_common_fields(ctx, {})
 
-    ctx_out: NormalizedContext = {
+    ctx_dict: NormalizedContext = {
         **common,
         "attrs": attrs,
     }
-    _validate_normalized_context(ctx_out, source="dict")
-    return ctx_out
+    _validate_normalized_context(ctx_dict, source="dict")
+    return OperationContext(**ctx_dict)
 
 
 # ---------------------------------------------------------------------------
@@ -645,15 +649,14 @@ def from_dict(ctx: Optional[Mapping[str, Any]]) -> NormalizedContext:
 # ---------------------------------------------------------------------------
 
 
-def to_langchain(ctx: Any) -> Dict[str, Any]:
+def to_langchain(ctx: OperationContext) -> Dict[str, Any]:
     """
-    OperationContext-like → LangChain RunnableConfig-like dict.
+    OperationContext → LangChain RunnableConfig-like dict.
 
     Preserves key Corpus context fields in metadata + tags.
 
     Args:
-        ctx: OperationContext-like object to convert
-             (must expose request_id, tenant, deadline_ms, traceparent, attrs)
+        ctx: OperationContext to convert
 
     Returns:
         Dict suitable for LangChain RunnableConfig
@@ -661,11 +664,11 @@ def to_langchain(ctx: Any) -> Dict[str, Any]:
     config: Dict[str, Any] = {}
     metadata: Dict[str, Any] = {}
 
-    tenant = getattr(ctx, "tenant", None)
-    deadline_ms = getattr(ctx, "deadline_ms", None)
-    traceparent = getattr(ctx, "traceparent", None)
-    request_id = getattr(ctx, "request_id", None)
-    attrs = getattr(ctx, "attrs", None) or {}
+    tenant = ctx.tenant
+    deadline_ms = ctx.deadline_ms
+    traceparent = ctx.traceparent
+    request_id = ctx.request_id
+    attrs = ctx.attrs or {}
 
     if tenant is not None:
         metadata[KEY_TENANT] = tenant
@@ -691,23 +694,23 @@ def to_langchain(ctx: Any) -> Dict[str, Any]:
     return config
 
 
-def to_llamaindex(ctx: Any) -> Dict[str, Any]:
+def to_llamaindex(ctx: OperationContext) -> Dict[str, Any]:
     """
-    OperationContext-like → metadata dict for LlamaIndex.
+    OperationContext → metadata dict for LlamaIndex.
 
     Args:
-        ctx: OperationContext-like object to convert
+        ctx: OperationContext to convert
 
     Returns:
         Dict suitable for LlamaIndex metadata
     """
     metadata: Dict[str, Any] = {}
 
-    request_id = getattr(ctx, "request_id", None)
-    tenant = getattr(ctx, "tenant", None)
-    deadline_ms = getattr(ctx, "deadline_ms", None)
-    traceparent = getattr(ctx, "traceparent", None)
-    attrs = getattr(ctx, "attrs", None) or {}
+    request_id = ctx.request_id
+    tenant = ctx.tenant
+    deadline_ms = ctx.deadline_ms
+    traceparent = ctx.traceparent
+    attrs = ctx.attrs or {}
 
     if request_id is not None:
         metadata[KEY_REQUEST_ID] = request_id
@@ -724,23 +727,23 @@ def to_llamaindex(ctx: Any) -> Dict[str, Any]:
     return metadata
 
 
-def to_semantic_kernel(ctx: Any) -> Dict[str, Any]:
+def to_semantic_kernel(ctx: OperationContext) -> Dict[str, Any]:
     """
-    OperationContext-like → SK-style variables dict.
+    OperationContext → SK-style variables dict.
 
     Args:
-        ctx: OperationContext-like object to convert
+        ctx: OperationContext to convert
 
     Returns:
         Dict suitable for SK context variables
     """
     variables: Dict[str, Any] = {}
 
-    request_id = getattr(ctx, "request_id", None)
-    tenant = getattr(ctx, "tenant", None)
-    deadline_ms = getattr(ctx, "deadline_ms", None)
-    traceparent = getattr(ctx, "traceparent", None)
-    attrs = getattr(ctx, "attrs", None) or {}
+    request_id = ctx.request_id
+    tenant = ctx.tenant
+    deadline_ms = ctx.deadline_ms
+    traceparent = ctx.traceparent
+    attrs = ctx.attrs or {}
 
     if request_id is not None:
         variables[KEY_REQUEST_ID] = request_id
@@ -792,11 +795,10 @@ def _validate_normalized_context(
     source: str = "unknown",
 ) -> None:
     """
-    Validate normalized context structure.
+    Validate normalized context structure before wrapping into OperationContext.
 
-    Ensures the required keys are present. Does not validate types
-    strictly, since different protocol layers may coerce or extend
-    values differently.
+    Ensures the required keys are present. Does not validate types strictly,
+    since different protocol layers may coerce or extend values differently.
     """
     required_keys = {"request_id", "tenant", "deadline_ms", "traceparent", "attrs"}
     missing = [key for key in required_keys if key not in ctx]
@@ -814,7 +816,7 @@ def _validate_normalized_context(
 
 
 def _empty_context() -> NormalizedContext:
-    """Create a well-formed empty normalized context."""
+    """Create a well-formed empty normalized context dict."""
     return {
         "request_id": None,
         "tenant": None,
@@ -934,7 +936,6 @@ def _get_dict(obj: Any, key: str) -> Dict[str, Any]:
 
 
 __all__ = [
-    "NormalizedContext",
     "ContextTranslationError",
     "register_framework_translator",
     "get_framework_translator",
