@@ -63,7 +63,7 @@ import logging
 import os
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from .vector_base import (
+from corpus_sdk.vector.vector_base import (
     BaseVectorAdapter,
     Vector,
     VectorMatch,
