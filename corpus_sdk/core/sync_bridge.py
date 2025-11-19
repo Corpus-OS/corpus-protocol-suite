@@ -46,6 +46,7 @@ import contextvars
 import logging
 import queue
 import threading
+import time
 from typing import (
     Any,
     AsyncIterator,
@@ -197,6 +198,7 @@ class SyncStreamBridge:
         self._thread: Optional[threading.Thread] = None
         self._error: Optional[BaseException] = None
         self._sentinel: object = object()
+        self._sentinel_enqueued = False
         # Capture contextvars so tracing/logging context propagates into the worker.
         self._parent_context = contextvars.copy_context()
 
@@ -230,23 +232,35 @@ class SyncStreamBridge:
 
         try:
             while True:
-                # Early exit if canceled and nothing is left to consume.
-                if self._cancel_event.is_set() and self._queue.empty():
+                # Check cancellation with proper queue state handling
+                if self._cancel_event.is_set():
+                    # Drain any remaining items before exiting
+                    try:
+                        while True:
+                            item = self._queue.get_nowait()
+                            if item is self._sentinel:
+                                break
+                            yield item  # type: ignore[misc]
+                    except queue.Empty:
+                        pass
                     break
 
                 try:
                     item = self._queue.get(timeout=self._poll_timeout_s)
                 except queue.Empty:
-                    # If worker is dead and queue is empty, we are done.
+                    # Check if worker is dead and queue is definitively empty
                     with self._lock:
                         thread = self._thread
-                    if thread is not None and not thread.is_alive():
-                        if self._queue.empty():
-                            break
+                        # Worker is dead and we've seen sentinel or queue is empty
+                        if thread is not None and not thread.is_alive():
+                            if self._sentinel_enqueued or self._queue.empty():
+                                break
                     continue
 
                 if item is self._sentinel:
-                    # Worker signaled completion.
+                    # Worker signaled completion
+                    with self._lock:
+                        self._sentinel_enqueued = True
                     break
 
                 # Normal item
@@ -265,8 +279,15 @@ class SyncStreamBridge:
     def _ensure_worker_started(self) -> None:
         """Start the worker thread if it is not already running."""
         with self._lock:
-            if self._thread is not None and self._thread.is_alive():
-                return
+            # Double-check pattern: another thread might have started it
+            if self._thread is not None:
+                if self._thread.is_alive():
+                    return
+                # Thread died - allow restart
+                logger.debug(
+                    "SyncStreamBridge: previous worker thread for framework=%s died, restarting",
+                    self._framework,
+                )
 
             def _thread_target() -> None:
                 # Run worker logic under the captured contextvars.
@@ -274,10 +295,11 @@ class SyncStreamBridge:
                     self._parent_context.run(self._worker_main)
                 except BaseException as exc:  # noqa: BLE001
                     # Last-resort: if something blows up at top-level, capture it.
-                    logger.debug(
+                    logger.error(
                         "SyncStreamBridge worker crashed in framework=%s: %s",
                         self._framework,
                         exc,
+                        exc_info=True,
                     )
                     self._push_error(exc)
 
@@ -287,24 +309,31 @@ class SyncStreamBridge:
                 daemon=True,
             )
             self._thread.start()
+            logger.debug(
+                "SyncStreamBridge: started worker thread %s for framework=%s",
+                self._thread.name,
+                self._framework,
+            )
 
     def _shutdown_worker(self) -> None:
         """Signal cancellation and join the worker thread (best-effort)."""
+        # Signal cancellation first
+        self._cancel_event.set()
+
         with self._lock:
             thread = self._thread
-
-        # Signal cancellation
-        self._cancel_event.set()
 
         if thread is None:
             return
 
+        # Give worker time to clean up
         thread.join(self._join_timeout_s)
         if thread.is_alive():
-            logger.debug(
-                "SyncStreamBridge worker thread %s did not exit within %.3fs",
+            logger.warning(
+                "SyncStreamBridge worker thread %s did not exit within %.3fs (framework=%s)",
                 thread.name,
                 self._join_timeout_s,
+                self._framework,
             )
 
     # ------------------------------------------------------------------ #
@@ -317,8 +346,16 @@ class SyncStreamBridge:
             asyncio.run(self._worker_coro())
         except BaseException as exc:  # noqa: BLE001
             # If the async runner itself fails, propagate error.
+            logger.error(
+                "SyncStreamBridge asyncio.run failed in framework=%s: %s",
+                self._framework,
+                exc,
+                exc_info=True,
+            )
             self._push_error(exc)
-            self._safe_enqueue_sentinel()
+        finally:
+            # Always ensure sentinel is enqueued
+            self._ensure_sentinel_enqueued()
 
     async def _worker_coro(self) -> None:
         """
@@ -328,6 +365,8 @@ class SyncStreamBridge:
         items into the queue.
         """
         attempt = 0
+        items_yielded = False
+        
         while True:
             if self._cancel_event.is_set():
                 return
@@ -336,14 +375,26 @@ class SyncStreamBridge:
                 stream = await self._coro_factory()
                 async for item in stream:
                     if self._cancel_event.is_set():
-                        break
+                        return
                     self._put_queue_item(item)
+                    items_yielded = True
 
-                # Normal completion
-                self._put_queue_item(self._sentinel)
+                # Normal completion - stream exhausted
                 return
 
             except BaseException as exc:  # noqa: BLE001
+                # Once we've successfully yielded items, treat all errors as terminal
+                if items_yielded:
+                    logger.error(
+                        "SyncStreamBridge error after yielding items in framework=%s: %s",
+                        self._framework,
+                        exc,
+                        exc_info=True,
+                    )
+                    self._push_error(exc)
+                    return
+
+                # Check if error is transient and we have retries left
                 is_transient = (
                     bool(self._transient_error_types)
                     and isinstance(exc, self._transient_error_types)
@@ -372,8 +423,13 @@ class SyncStreamBridge:
                     continue
 
                 # Non-transient or out-of-retries: surface error.
+                logger.error(
+                    "SyncStreamBridge terminal error in framework=%s: %s",
+                    self._framework,
+                    exc,
+                    exc_info=True,
+                )
                 self._push_error(exc)
-                self._put_queue_item(self._sentinel)
                 return
 
     # ------------------------------------------------------------------ #
@@ -385,8 +441,7 @@ class SyncStreamBridge:
         Put an item into the queue with bounded retry when full.
 
         If the queue remains full after `max_queue_full_retries` attempts,
-        records a `SyncStreamBridgeError`, enqueues a sentinel (best-effort),
-        and returns without enqueuing the item.
+        records a `SyncStreamBridgeError` and returns without enqueuing.
         """
         retries = 0
         while True:
@@ -398,36 +453,107 @@ class SyncStreamBridge:
                 return
             except queue.Full:
                 retries += 1
-                logger.debug(
-                    "SyncStreamBridge queue full for framework=%s; "
-                    "retry=%d (max=%s)",
-                    self._framework,
-                    retries,
-                    self._max_queue_full_retries,
-                )
-
+                
                 if (
                     self._max_queue_full_retries is not None
                     and retries >= self._max_queue_full_retries
                 ):
+                    logger.error(
+                        "SyncStreamBridge queue remained full after %d attempts (framework=%s); "
+                        "consumer may be blocked or too slow",
+                        retries,
+                        self._framework,
+                    )
                     err = SyncStreamBridgeError(
                         f"SyncStreamBridge queue remained full after "
-                        f"{retries} attempts (framework={self._framework})"
+                        f"{retries} attempts (framework={self._framework}). "
+                        f"Consumer is not keeping up with producer."
                     )
                     self._push_error(err)
-                    self._safe_enqueue_sentinel()
                     return
+                
+                if retries % 10 == 0:  # Log every 10th retry to avoid spam
+                    logger.warning(
+                        "SyncStreamBridge queue full for framework=%s; "
+                        "retry=%d (max=%s)",
+                        self._framework,
+                        retries,
+                        self._max_queue_full_retries,
+                    )
 
-    def _safe_enqueue_sentinel(self) -> None:
-        """Best-effort enqueue of the sentinel without blocking."""
-        try:
-            self._queue.put_nowait(self._sentinel)
-        except queue.Full:
-            logger.debug(
-                "SyncStreamBridge: queue full when enqueuing sentinel "
-                "for framework=%s",
-                self._framework,
-            )
+    def _ensure_sentinel_enqueued(self) -> None:
+        """
+        Ensure sentinel is enqueued with aggressive retry.
+        
+        This is critical for consumer to exit properly. Uses multiple
+        strategies to ensure sentinel delivery:
+        1. Try non-blocking put
+        2. If full, drain one item and retry
+        3. If still failing after max attempts, set cancel event
+        """
+        with self._lock:
+            if self._sentinel_enqueued:
+                return
+            self._sentinel_enqueued = True
+
+        max_attempts = 100
+        for attempt in range(max_attempts):
+            if self._cancel_event.is_set():
+                return
+
+            try:
+                self._queue.put_nowait(self._sentinel)
+                logger.debug(
+                    "SyncStreamBridge: sentinel enqueued for framework=%s",
+                    self._framework,
+                )
+                return
+            except queue.Full:
+                # Strategy: Aggressively drain one item to make space
+                if attempt < max_attempts - 1:
+                    try:
+                        discarded = self._queue.get_nowait()
+                        logger.debug(
+                            "SyncStreamBridge: drained item to make space for sentinel "
+                            "(framework=%s, attempt=%d/%d)",
+                            self._framework,
+                            attempt + 1,
+                            max_attempts,
+                        )
+                        # Try to put back the item we just removed if it wasn't sentinel
+                        if discarded is not self._sentinel:
+                            try:
+                                self._queue.put_nowait(discarded)
+                            except queue.Full:
+                                logger.warning(
+                                    "SyncStreamBridge: lost item during sentinel insertion "
+                                    "(framework=%s)",
+                                    self._framework,
+                                )
+                    except queue.Empty:
+                        # Queue became empty between check and get - retry put
+                        pass
+                
+                if attempt % 10 == 0 and attempt > 0:
+                    logger.warning(
+                        "SyncStreamBridge: struggling to enqueue sentinel "
+                        "(attempt %d/%d) for framework=%s",
+                        attempt + 1,
+                        max_attempts,
+                        self._framework,
+                    )
+                
+                # Small sleep to let consumer catch up
+                time.sleep(0.001)
+
+        # Last resort: set cancel event to unblock consumer
+        logger.error(
+            "SyncStreamBridge: failed to enqueue sentinel after %d attempts "
+            "for framework=%s; setting cancel event as fallback",
+            max_attempts,
+            self._framework,
+        )
+        self._cancel_event.set()
 
     # ------------------------------------------------------------------ #
     # Error handling
@@ -438,12 +564,17 @@ class SyncStreamBridge:
         Record an error for later propagation and attach debug context.
 
         - Only the first error is recorded; subsequent errors are ignored.
-        - Error context attachment failures are logged and swallowed, but
-          do not override or replace the original exception.
+        - Error context attachment failures are logged and swallowed.
+        - Ensures sentinel is enqueued exactly once per error.
         """
+        sentinel_needed = False
+        
         with self._lock:
             if self._error is None:
                 self._error = exc
+                sentinel_needed = True
+                
+                # Attach error context if available
                 if self._error_context:
                     try:
                         attach_context(
@@ -462,8 +593,10 @@ class SyncStreamBridge:
                             ctx_exc,
                         )
 
-            # Ensure the consumer unblocks and exits.
-            self._safe_enqueue_sentinel()
+        # Enqueue sentinel only if we were the first to record an error
+        # This prevents multiple sentinels from being enqueued
+        if sentinel_needed:
+            self._ensure_sentinel_enqueued()
 
 
 __all__ = [
