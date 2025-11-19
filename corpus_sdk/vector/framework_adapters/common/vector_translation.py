@@ -116,7 +116,7 @@ from corpus_sdk.vector.vector_base import (
 from corpus_sdk.core.context_translation import from_dict as ctx_from_dict
 from corpus_sdk.core.sync_stream_bridge import SyncStreamBridge
 from corpus_sdk.core.async_bridge import AsyncBridge
-from corpus_sdk.llm.framework_adapters.common.error_context import attach_context
+from corpus_sdk.core.error_context import attach_context
 
 LOG = logging.getLogger(__name__)
 
