@@ -49,6 +49,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Coroutine, Optional, TypeVar, ParamSpec, ClassVar, Set
 from time import perf_counter
 import os
+import sys
 
 T = TypeVar("T")
 P = ParamSpec("P")
@@ -389,7 +390,8 @@ class AsyncBridge:
         threaded: bool,
         timed_out: bool = False,
         errored: bool = False,
-        resource_error: bool = False
+        resource_error: bool = False,
+        circuit_trip: bool = False
     ) -> None:
         """Update performance and health metrics."""
         with cls._metrics_lock:
@@ -402,12 +404,12 @@ class AsyncBridge:
                 cls._metrics.errors += 1
             if resource_error:
                 cls._metrics.resource_errors += 1
+            if circuit_trip:
+                cls._metrics.circuit_breaker_trips += 1
             
-            # Update duration statistics
-            cls._metrics.avg_duration = (
-                (cls._metrics.avg_duration * (cls._metrics.calls_total - 1) + duration) 
-                / cls._metrics.calls_total
-            )
+            # Update duration statistics using Welford's method for numerical stability
+            new_avg = cls._metrics.avg_duration + (duration - cls._metrics.avg_duration) / cls._metrics.calls_total
+            cls._metrics.avg_duration = new_avg
             cls._metrics.max_duration = max(cls._metrics.max_duration, duration)
             cls._metrics.min_duration = min(cls._metrics.min_duration, duration)
             cls._metrics.last_call_time = time.time()
@@ -454,9 +456,11 @@ class AsyncBridge:
         start_time = perf_counter()
         effective_timeout = timeout if timeout is not None else DEFAULT_RUN_TIMEOUT
         threaded_execution = False
+        circuit_tripped = False
 
         # Check circuit breaker first
         if not cls._circuit_breaker.should_try():
+            circuit_tripped = True
             exc = AsyncBridgeCircuitOpenError(
                 "AsyncBridge circuit breaker is open due to repeated failures"
             )
@@ -464,7 +468,8 @@ class AsyncBridge:
             cls._update_metrics(
                 duration=perf_counter() - start_time,
                 threaded=False,
-                errored=True
+                errored=True,
+                circuit_trip=True
             )
             raise exc
 
@@ -495,10 +500,15 @@ class AsyncBridge:
 
                 future = executor.submit(cls._run_in_context, coro, effective_timeout, ctx)
                 
-                # Track pending future for resource management
+                # Track pending future for resource management with guaranteed cleanup
                 with cls._lock:
                     cls._pending_futures.add(future)
-                    future.add_done_callback(cls._pending_futures.discard)
+                
+                def cleanup_future(f: Future) -> None:
+                    with cls._lock:
+                        cls._pending_futures.discard(f)
+                
+                future.add_done_callback(cleanup_future)
 
                 # Let exceptions from the coroutine surface naturally.
                 try:
@@ -527,8 +537,9 @@ class AsyncBridge:
 
         except AsyncBridgeTimeoutError:
             # Re-raise timeout errors with metrics
+            duration = perf_counter() - start_time
             cls._update_metrics(
-                duration=perf_counter() - start_time,
+                duration=duration,
                 threaded=threaded_execution,
                 timed_out=True,
                 errored=True
@@ -536,28 +547,30 @@ class AsyncBridge:
             raise
         except AsyncBridgeResourceError:
             # Resource errors are not circuit breaker failures
+            duration = perf_counter() - start_time
             cls._update_metrics(
-                duration=perf_counter() - start_time,
+                duration=duration,
                 threaded=threaded_execution,
                 resource_error=True,
                 errored=True
             )
             raise
-        except Exception as exc:
+        except Exception:
             # Update metrics for other errors
+            duration = perf_counter() - start_time
             cls._update_metrics(
-                duration=perf_counter() - start_time,
+                duration=duration,
                 threaded=threaded_execution,
                 errored=True
             )
             raise
-        finally:
-            # Always update successful call metrics
-            if not any([isinstance(sys.exc_info()[1], (AsyncBridgeTimeoutError, AsyncBridgeResourceError, Exception)]) if sys.exc_info()[0] else True:
-                cls._update_metrics(
-                    duration=perf_counter() - start_time,
-                    threaded=threaded_execution
-                )
+        else:
+            # Success case - no exception occurred
+            duration = perf_counter() - start_time
+            cls._update_metrics(
+                duration=duration,
+                threaded=threaded_execution
+            )
 
     @classmethod
     def sync_wrapper(
@@ -603,6 +616,7 @@ class AsyncBridge:
     def get_metrics(cls) -> BridgeMetrics:
         """Get current bridge metrics for monitoring."""
         with cls._metrics_lock:
+            # Return a copy to prevent external modification
             return BridgeMetrics(**cls._metrics.__dict__)
 
     @classmethod
