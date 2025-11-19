@@ -65,15 +65,15 @@ from corpus_sdk.llm.llm_base import (
     TransientNetwork,
     Unavailable,
 )
-from corpus_sdk.llm.framework_adapters.common.async_bridge import AsyncBridge
-from corpus_sdk.llm.framework_adapters.common.context_translation import ContextTranslator
-from corpus_sdk.llm.framework_adapters.common.error_context import attach_context
+from corpus_sdk.core.async_bridge import AsyncBridge
+from corpus_sdk.core.context_translation import ContextTranslator
+from corpus_sdk.core.error_context import attach_context
 from corpus_sdk.llm.framework_adapters.common.message_translation import (
     NormalizedMessage,
     from_autogen,
     to_corpus,
 )
-from corpus_sdk.llm.framework_adapters.common.sync_stream_bridge import SyncStreamBridge
+from corpus_sdk.core.sync_bridge import SyncStreamBridge
 
 logger = logging.getLogger(__name__)
 
