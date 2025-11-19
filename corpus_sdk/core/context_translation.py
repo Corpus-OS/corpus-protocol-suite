@@ -23,7 +23,7 @@ Design goals
 
 Primary entry points
 --------------------
-Each `from_*` function returns a *core* `OperationContext` instance with:
+Each `from_*` function returns a core `OperationContext` instance with:
 
     OperationContext(
         request_id: str | None,
