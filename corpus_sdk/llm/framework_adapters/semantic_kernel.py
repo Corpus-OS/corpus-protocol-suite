@@ -11,6 +11,8 @@ This module exposes a Corpus `BaseLLMAdapter` as a Semantic Kernel
 - Async + streaming flows remain async-first (no background threads).
 - Context / deadlines / tenant hints are propagated via `OperationContext`.
 - Sampling parameters are bridged from `PromptExecutionSettings` to Corpus.
+- Optional transient error retry with exponential backoff.
+- Rich error context for enhanced observability and debugging.
 
 Design goals
 ------------
@@ -36,6 +38,11 @@ Design goals
     - Cancellation works via normal asyncio task cancellation semantics
       plus ctx.deadline_ms at the Corpus adapter layer.
 
+* Production resilience:
+    - Configurable retry for transient errors
+    - Rich error context attachment for debugging
+    - Comprehensive logging and observability
+
 Typical usage
 -------------
 
@@ -50,6 +57,9 @@ Typical usage
     sk_llm = CorpusSemanticKernelChatCompletion(
         corpus_adapter=corpus_adapter,
         model="gpt-4o",
+        # Optional: enable retry for transient errors
+        max_transient_retries=2,
+        transient_backoff_s=0.5,
     )
 
     agent = ChatCompletionAgent(
@@ -61,16 +71,31 @@ Typical usage
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from typing import Any, AsyncIterator, Dict, List, Mapping, Optional, Tuple
+import time
+from typing import (
+    Any,
+    AsyncIterator,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Tuple,
+    Type,
+    Union,
+)
 
 from corpus_sdk.llm.llm_base import (
     BaseLLMAdapter,
     LLMChunk,
     LLMCompletion,
     OperationContext,
+    TransientNetwork,
+    Unavailable,
 )
 from corpus_sdk.llm.framework_adapters.common.context_translation import ContextTranslator
+from corpus_sdk.llm.framework_adapters.common.error_context import attach_context
 from corpus_sdk.llm.framework_adapters.common.message_translation import (
     MessageTranslator,
     NormalizedMessage,
@@ -353,6 +378,73 @@ def _chunk_to_streaming_chat_message(
     )
 
 
+async def _with_transient_retry(
+    coro_func: Callable[[], Awaitable[T]],
+    *,
+    max_retries: int,
+    backoff_s: float,
+    error_types: Tuple[Type[BaseException], ...],
+    error_context: Dict[str, Any],
+) -> T:
+    """
+    Execute an async function with transient error retry.
+
+    Only retries for specified error types and only up to max_retries.
+    Uses exponential backoff between attempts.
+    """
+    attempt = 0
+    last_exc: Optional[BaseException] = None
+
+    while True:
+        try:
+            return await coro_func()
+        except error_types as exc:
+            last_exc = exc
+            if attempt >= max_retries:
+                break
+
+            attempt += 1
+            delay = backoff_s * (2.0 ** (attempt - 1))
+            
+            attach_context(
+                exc,
+                framework="semantic_kernel",
+                operation="transient_retry",
+                attempt=attempt,
+                max_retries=max_retries,
+                delay_s=delay,
+                **error_context,
+            )
+
+            logger.warning(
+                "Transient error in Semantic Kernel adapter (attempt %d/%d), "
+                "retrying after %.2fs: %s",
+                attempt,
+                max_retries,
+                delay,
+                exc,
+            )
+            
+            await asyncio.sleep(delay)
+        except BaseException as exc:
+            last_exc = exc
+            break
+
+    if last_exc is not None:
+        attach_context(
+            last_exc,
+            framework="semantic_kernel",
+            operation="final_attempt",
+            attempt=attempt,
+            max_retries=max_retries,
+            **error_context,
+        )
+        raise last_exc
+    
+    # This should never happen, but for type safety
+    raise RuntimeError("Unexpected error in _with_transient_retry")
+
+
 # ---------------------------------------------------------------------------
 # Public adapter
 # ---------------------------------------------------------------------------
@@ -379,6 +471,33 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
         Optional Semantic Kernel version string for context attribution.
     service_id:
         Optional SK service identifier used by the Kernel's service registry.
+
+    max_transient_retries:
+        Number of retry attempts for transient errors. Default: 0 (no retry).
+    transient_backoff_s:
+        Initial backoff delay (seconds) for retry. Uses exponential backoff.
+        Default: 0.25.
+    transient_error_types:
+        Tuple of exception types to consider transient and eligible for retry.
+        Default: (TransientNetwork, Unavailable).
+
+    Examples
+    --------
+    Basic usage:
+
+        sk_llm = CorpusSemanticKernelChatCompletion(
+            corpus_adapter=OpenAIAdapter(api_key="..."),
+            model="gpt-4",
+        )
+
+    With retry enabled:
+
+        sk_llm = CorpusSemanticKernelChatCompletion(
+            corpus_adapter=OpenAIAdapter(api_key="..."),
+            model="gpt-4",
+            max_transient_retries=3,
+            transient_backoff_s=0.5,
+        )
     """
 
     def __init__(
@@ -390,6 +509,13 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
         max_tokens: Optional[int] = None,
         framework_version: Optional[str] = None,
         service_id: Optional[str] = None,
+        # Retry configuration
+        max_transient_retries: int = 0,
+        transient_backoff_s: float = 0.25,
+        transient_error_types: Tuple[Type[BaseException], ...] = (
+            TransientNetwork,
+            Unavailable,
+        ),
     ) -> None:
         if _SEMANTIC_KERNEL_IMPORT_ERROR is not None:
             # Give a very direct, one-hop error for misconfiguration.
@@ -406,6 +532,54 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
         self._default_temperature = float(temperature)
         self._default_max_tokens = max_tokens
         self._framework_version = framework_version
+
+        # Retry configuration
+        self._max_transient_retries = max(0, int(max_transient_retries))
+        self._transient_backoff_s = float(transient_backoff_s)
+        self._transient_error_types = transient_error_types
+
+    async def _execute_with_retry(
+        self,
+        operation: str,
+        coro_func: Callable[[], Awaitable[T]],
+        context: Dict[str, Any],
+    ) -> T:
+        """
+        Execute an async operation with optional transient error retry.
+
+        Parameters
+        ----------
+        operation:
+            Name of the operation for error context.
+        coro_func:
+            Async function to execute.
+        context:
+            Additional context for error reporting.
+
+        Returns
+        -------
+        T
+            Result of the async operation.
+        """
+        error_context = {
+            "operation": operation,
+            **context,
+        }
+
+        if self._max_transient_retries > 0:
+            return await _with_transient_retry(
+                coro_func,
+                max_retries=self._max_transient_retries,
+                backoff_s=self._transient_backoff_s,
+                error_types=self._transient_error_types,
+                error_context=error_context,
+            )
+        else:
+            try:
+                return await coro_func()
+            except BaseException as exc:
+                attach_context(exc, framework="semantic_kernel", **error_context)
+                raise
 
     # ------------------------------------------------------------------ #
     # Core async API expected by ChatCompletionClientBase
@@ -427,43 +601,86 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
         settings:
             Provider-specific or generic prompt execution settings.
         **kwargs:
-            Additional provider-specific settings; we only look at `model`.
+            Additional provider-specific settings; we look at `model` and
+            retry overrides: `max_transient_retries`, `transient_backoff_s`,
+            `transient_error_types`.
+
+        Returns
+        -------
+        ChatMessageContent
+            SK chat message content with assistant response.
         """
-        try:
-            normalized = _history_to_normalized_messages(chat_history)
-            corpus_messages = _normalized_to_corpus_messages(normalized)
+        # Extract per-call retry overrides
+        max_retries_override = kwargs.pop("max_transient_retries", None)
+        backoff_override = kwargs.pop("transient_backoff_s", None)
+        error_types_override = kwargs.pop("transient_error_types", None)
 
-            ctx, params = _build_ctx_and_sampling_params(
-                settings=settings,
-                framework_version=self._framework_version,
-                model_override=kwargs.get("model"),
-                default_model=self._default_model,
-                default_temperature=self._default_temperature,
-                default_max_tokens=self._default_max_tokens,
-            )
+        normalized = _history_to_normalized_messages(chat_history)
+        corpus_messages = _normalized_to_corpus_messages(normalized)
 
+        ctx, params = _build_ctx_and_sampling_params(
+            settings=settings,
+            framework_version=self._framework_version,
+            model_override=kwargs.get("model"),
+            default_model=self._default_model,
+            default_temperature=self._default_temperature,
+            default_max_tokens=self._default_max_tokens,
+        )
+
+        async def _complete() -> ChatMessageContent:
             completion = await self._corpus_adapter.complete(
                 messages=corpus_messages,
                 ctx=ctx,
                 **params,
             )
-
             return _completion_to_chat_message(completion)
 
-        except (TimeoutError, OSError) as exc:
-            # Network-ish or timeout-ish failures get logged with a clearer tag.
-            logger.warning(
-                "CorpusSemanticKernelChatCompletion.get_chat_message_content network/timeout "
-                "failure: %s",
-                exc,
+        # Use overrides if provided, otherwise instance defaults
+        max_retries = (
+            max_retries_override if max_retries_override is not None 
+            else self._max_transient_retries
+        )
+        backoff_s = (
+            backoff_override if backoff_override is not None 
+            else self._transient_backoff_s
+        )
+        error_types = (
+            error_types_override if error_types_override is not None 
+            else self._transient_error_types
+        )
+
+        context = {
+            "messages_count": len(corpus_messages),
+            "model": params.get("model", self._default_model),
+            "temperature": params.get("temperature"),
+            "max_tokens": params.get("max_tokens"),
+            "top_p": params.get("top_p"),
+            "frequency_penalty": params.get("frequency_penalty"),
+            "presence_penalty": params.get("presence_penalty"),
+            "request_id": getattr(ctx, "request_id", None),
+            "tenant": getattr(ctx, "tenant", None),
+            "stream": False,
+            "max_transient_retries": max_retries,
+            "transient_backoff_s": backoff_s,
+        }
+
+        if error_types:
+            context["transient_error_types"] = [t.__name__ for t in error_types]
+
+        if max_retries > 0:
+            return await _with_transient_retry(
+                _complete,
+                max_retries=max_retries,
+                backoff_s=backoff_s,
+                error_types=error_types,
+                error_context=context,
             )
-            raise
-        except Exception as exc:
-            logger.exception(
-                "CorpusSemanticKernelChatCompletion.get_chat_message_content failed: %s",
-                exc,
-            )
-            raise
+        else:
+            try:
+                return await _complete()
+            except BaseException as exc:
+                attach_context(exc, framework="semantic_kernel", **context)
+                raise
 
     async def get_chat_message_contents(
         self,
@@ -489,7 +706,26 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
 
         Yields Semantic Kernel `StreamingChatMessageContent` objects for each
         chunk produced by the Corpus adapter.
+
+        Parameters
+        ----------
+        chat_history:
+            Semantic Kernel chat history.
+        settings:
+            Prompt execution settings.
+        **kwargs:
+            Additional settings including retry overrides.
+
+        Yields
+        ------
+        StreamingChatMessageContent
+            Streaming chat message content chunks.
         """
+        # Extract per-call retry overrides (for the initial stream creation)
+        max_retries_override = kwargs.pop("max_transient_retries", None)
+        backoff_override = kwargs.pop("transient_backoff_s", None)
+        error_types_override = kwargs.pop("transient_error_types", None)
+
         normalized = _history_to_normalized_messages(chat_history)
         corpus_messages = _normalized_to_corpus_messages(normalized)
 
@@ -502,28 +738,70 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
             default_max_tokens=self._default_max_tokens,
         )
 
-        stream = await self._corpus_adapter.stream(
-            messages=corpus_messages,
-            ctx=ctx,
-            **params,
+        context = {
+            "operation": "get_streaming_chat_message_content",
+            "messages_count": len(corpus_messages),
+            "model": params.get("model", self._default_model),
+            "temperature": params.get("temperature"),
+            "max_tokens": params.get("max_tokens"),
+            "top_p": params.get("top_p"),
+            "frequency_penalty": params.get("frequency_penalty"),
+            "presence_penalty": params.get("presence_penalty"),
+            "request_id": getattr(ctx, "request_id", None),
+            "tenant": getattr(ctx, "tenant", None),
+            "stream": True,
+        }
+
+        # Use overrides if provided, otherwise instance defaults
+        max_retries = (
+            max_retries_override if max_retries_override is not None 
+            else self._max_transient_retries
         )
+        backoff_s = (
+            backoff_override if backoff_override is not None 
+            else self._transient_backoff_s
+        )
+        error_types = (
+            error_types_override if error_types_override is not None 
+            else self._transient_error_types
+        )
+
+        async def _create_stream() -> AsyncIterator[LLMChunk]:
+            return await self._corpus_adapter.stream(
+                messages=corpus_messages,
+                ctx=ctx,
+                **params,
+            )
+
+        # Retry only the stream creation, not individual chunks
+        if max_retries > 0:
+            stream_context = context.copy()
+            stream_context.update({
+                "max_transient_retries": max_retries,
+                "transient_backoff_s": backoff_s,
+            })
+            if error_types:
+                stream_context["transient_error_types"] = [t.__name__ for t in error_types]
+
+            stream = await _with_transient_retry(
+                _create_stream,
+                max_retries=max_retries,
+                backoff_s=backoff_s,
+                error_types=error_types,
+                error_context=stream_context,
+            )
+        else:
+            try:
+                stream = await _create_stream()
+            except BaseException as exc:
+                attach_context(exc, framework="semantic_kernel", **context)
+                raise
 
         try:
             async for chunk in stream:
                 yield _chunk_to_streaming_chat_message(chunk)
-        except (TimeoutError, OSError) as exc:
-            logger.warning(
-                "CorpusSemanticKernelChatCompletion.get_streaming_chat_message_content "
-                "network/timeout failure: %s",
-                exc,
-            )
-            raise
-        except Exception as exc:
-            logger.exception(
-                "CorpusSemanticKernelChatCompletion.get_streaming_chat_message_content "
-                "failed: %s",
-                exc,
-            )
+        except BaseException as exc:
+            attach_context(exc, framework="semantic_kernel", **context)
             raise
         finally:
             # Best-effort cleanup for adapters that implement aclose() on streams.
