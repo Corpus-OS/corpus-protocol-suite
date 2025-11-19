@@ -122,10 +122,10 @@ from corpus_sdk.vector.vector_base import (
     VectorAdapterError,
 )
 
-from corpus_sdk.core.async_bridge import AsyncBridge
+from corpus_sdk.llm.framework_adapters.common.async_bridge import AsyncBridge
 from corpus_sdk.core.context_translation import from_llamaindex as context_from_llamaindex
 from corpus_sdk.core.error_context import attach_context
-from corpus_sdk.core.sync_bridge import sync_stream
+from corpus_sdk.core.sync_stream_bridge import sync_stream
 
 logger = logging.getLogger(__name__)
 
@@ -1240,4 +1240,3 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
 __all__ = [
     "CorpusLlamaIndexVectorStore",
 ]
-
