@@ -495,20 +495,19 @@ class AsyncBridge:
                 # is preserved when we hop to the worker thread.
                 ctx = contextvars.copy_context()
 
+                # CRITICAL FIX #1: All operations under lock to prevent race condition
+                # between future creation, tracking, and callback registration
                 with cls._lock:
                     executor = cls._get_or_create_executor()
-
-                future = executor.submit(cls._run_in_context, coro, effective_timeout, ctx)
-                
-                # Track pending future for resource management with guaranteed cleanup
-                with cls._lock:
+                    future = executor.submit(cls._run_in_context, coro, effective_timeout, ctx)
                     cls._pending_futures.add(future)
-                
-                def cleanup_future(f: Future) -> None:
-                    with cls._lock:
-                        cls._pending_futures.discard(f)
-                
-                future.add_done_callback(cleanup_future)
+                    
+                    # Callback registration while holding lock ensures no race
+                    def cleanup_future(f: Future) -> None:
+                        with cls._lock:
+                            cls._pending_futures.discard(f)
+                    
+                    future.add_done_callback(cleanup_future)
 
                 # Let exceptions from the coroutine surface naturally.
                 try:
@@ -666,20 +665,36 @@ class AsyncBridge:
         It is safe to call multiple times.
         """
         with cls._lock:
-            if cls._executor is not None:
+            # CRITICAL FIX #2: Make shutdown idempotent and exception-safe
+            # Clear executor reference first, before shutdown() which might raise
+            executor = cls._executor
+            cls._executor = None
+            
+            if executor is None:
+                # Already shut down or never created
+                return
+            
+            try:
                 if cancel_futures:
                     # Cancel pending futures
                     for future in cls._pending_futures.copy():
                         future.cancel()
                     cls._pending_futures.clear()
                 
-                cls._executor.shutdown(wait=wait)
-                cls._executor = None
+                executor.shutdown(wait=wait)
                 logger.debug(
                     "AsyncBridge: executor shutdown (wait=%s, cancel_futures=%s)",
                     wait,
                     cancel_futures,
                 )
+            except Exception as e:
+                logger.error(
+                    "AsyncBridge: error during executor shutdown: %s",
+                    e,
+                    exc_info=True
+                )
+                # Don't re-raise - we've already cleared the executor reference
+                # Subsequent shutdown calls will be no-ops
 
 
 # ---------------------------------------------------------------------------
