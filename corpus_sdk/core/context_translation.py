@@ -1,4 +1,4 @@
-# corpus_sdk/llm/framework_adapters/common/context_translation.py
+# corpus_sdk/core/context_translation.py
 # SPDX-License-Identifier: Apache-2.0
 
 """
