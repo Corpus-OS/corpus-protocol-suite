@@ -91,9 +91,9 @@ from corpus_sdk.llm.llm_base import (
     TransientNetwork,
     Unavailable,
 )
-from corpus_sdk.llm.framework_adapters.common.async_bridge import AsyncBridge
-from corpus_sdk.llm.framework_adapters.common.error_context import attach_context
-from corpus_sdk.llm.framework_adapters.common.sync_stream_bridge import SyncStreamBridge
+from corpus_sdk.core.common.async_bridge import AsyncBridge
+from corpus_sdk.core.error_context import attach_context
+from corpus_sdk.core.sync_bridge import SyncStreamBridge
 from corpus_sdk.llm.framework_adapters.common.message_translation import (
     from_crewai,
     to_corpus,
