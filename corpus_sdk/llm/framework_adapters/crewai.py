@@ -94,6 +94,11 @@ from corpus_sdk.llm.llm_base import (
 from corpus_sdk.llm.framework_adapters.common.async_bridge import AsyncBridge
 from corpus_sdk.llm.framework_adapters.common.error_context import attach_context
 from corpus_sdk.llm.framework_adapters.common.sync_stream_bridge import SyncStreamBridge
+from corpus_sdk.llm.framework_adapters.common.message_translation import (
+    from_crewai,
+    to_corpus,
+    NormalizedMessage,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -107,23 +112,9 @@ class CrewAIMessage(Protocol):
     role: str
     content: str
 
-@runtime_checkable
-class CrewAIAgent(Protocol):
-    """Protocol for CrewAI agent context."""
-    role: Optional[str]
-    goal: Optional[str]
-    backstory: Optional[str]
-
-@runtime_checkable
-class CrewAITask(Protocol):
-    """Protocol for CrewAI task context."""
-    description: Optional[str]
-    expected_output: Optional[str]
-
 # Type aliases for better readability
 CrewAIMessageInput = Union[str, Mapping[str, Any], CrewAIMessage]
 CrewAIMessageSequence = Sequence[CrewAIMessageInput]
-CrewAIStreamOutput = Union[str, Dict[str, Any]]
 
 # ---------------------------------------------------------------------------
 # Optional CrewAI import (for dependency checks only)
@@ -162,54 +153,19 @@ def _normalize_messages(
     """
     Normalize various CrewAI-friendly inputs into Corpus wire messages.
 
-    Supported shapes:
-        - str: treated as a single user message.
-        - {"role": "...", "content": "..."} or CrewAIMessage protocol
-        - Sequence[str]
-        - Sequence[{"role": "...", "content": "..."}]
-        - Mixed sequences (str + dict), where str is treated as "user".
+    Uses the shared message translation infrastructure.
     """
-    def _to_msg(obj: CrewAIMessageInput) -> Mapping[str, str]:
-        if isinstance(obj, str):
-            return {"role": "user", "content": obj}
-        if isinstance(obj, Mapping):
-            role = str(obj.get("role", "user"))
-            content = str(obj.get("content", ""))
-            return {"role": role, "content": content}
-        if hasattr(obj, 'role') and hasattr(obj, 'content'):
-            # CrewAIMessage protocol
-            return {"role": str(obj.role), "content": str(obj.content)}
-        # Fallback: treat as string
-        return {"role": "user", "content": str(obj)}
-
     if isinstance(input_messages, (str, Mapping)) or hasattr(input_messages, 'role'):
-        return [_to_msg(input_messages)]
+        messages_list: Sequence[CrewAIMessageInput] = [input_messages]
+    elif isinstance(input_messages, Sequence):
+        messages_list = input_messages
+    else:
+        # Extreme fallback: stringify
+        messages_list = [str(input_messages)]
 
-    if isinstance(input_messages, Sequence):
-        return [_to_msg(m) for m in input_messages]
-
-    # Extreme fallback: stringify
-    return [{"role": "user", "content": str(input_messages)}]
-
-
-def _extract_sampling_params(kwargs: Mapping[str, Any]) -> Dict[str, Any]:
-    """
-    Extract comprehensive sampling parameters from kwargs.
-    
-    Supports all common LLM parameters plus CrewAI-specific context.
-    """
-    params = {
-        "model": kwargs.get("model"),
-        "temperature": kwargs.get("temperature"),
-        "max_tokens": kwargs.get("max_tokens"),
-        "top_p": kwargs.get("top_p"),
-        "frequency_penalty": kwargs.get("frequency_penalty"),
-        "presence_penalty": kwargs.get("presence_penalty"),
-        "stop_sequences": _extract_stop_sequences(kwargs),
-        "seed": kwargs.get("seed"),
-        "top_k": kwargs.get("top_k"),
-    }
-    return {k: v for k, v in params.items() if v is not None}
+    # Use shared message translation
+    normalized: List[NormalizedMessage] = [from_crewai(m) for m in messages_list]
+    return [dict(m) for m in to_corpus(normalized)]
 
 
 def _extract_stop_sequences(kwargs: Mapping[str, Any]) -> Optional[List[str]]:
@@ -282,6 +238,38 @@ def _build_operation_context_from_kwargs(kwargs: Mapping[str, Any]) -> Operation
     )
 
 
+def _build_sampling_params(
+    *,
+    default_model: str,
+    default_temperature: float,
+    default_max_tokens: Optional[int],
+    kwargs: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """
+    Build complete sampling parameters from kwargs and defaults.
+    
+    Single unified function that handles all parameter extraction and precedence.
+    """
+    stop_sequences = _extract_stop_sequences(kwargs)
+    
+    # Build complete parameter set with proper precedence
+    params = {
+        # Sampling parameters
+        "model": kwargs.get("model", default_model),
+        "temperature": kwargs.get("temperature", default_temperature),
+        "max_tokens": kwargs.get("max_tokens", default_max_tokens),
+        "top_p": kwargs.get("top_p"),
+        "frequency_penalty": kwargs.get("frequency_penalty"),
+        "presence_penalty": kwargs.get("presence_penalty"),
+        "stop_sequences": stop_sequences,
+        "seed": kwargs.get("seed"),
+        "top_k": kwargs.get("top_k"),
+    }
+    
+    # Remove None values to keep the parameter set clean
+    return {k: v for k, v in params.items() if v is not None}
+
+
 def _build_error_context(
     operation: str,
     messages_count: int,
@@ -316,31 +304,6 @@ def _build_error_context(
     
     error_ctx.update(additional)
     return {k: v for k, v in error_ctx.items() if v is not None}
-
-
-def _sampling_params_from_kwargs(
-    *,
-    default_model: str,
-    default_temperature: float,
-    default_max_tokens: Optional[int],
-    stop_sequences: Optional[List[str]],
-    kwargs: Mapping[str, Any],
-) -> Dict[str, Any]:
-    """
-    Map generic sampling kwargs into Corpus adapter params.
-    """
-    base_params = {
-        "model": kwargs.get("model", default_model),
-        "max_tokens": kwargs.get("max_tokens", default_max_tokens),
-        "temperature": kwargs.get("temperature", default_temperature),
-        "top_p": kwargs.get("top_p"),
-        "frequency_penalty": kwargs.get("frequency_penalty"),
-        "presence_penalty": kwargs.get("presence_penalty"),
-        "stop_sequences": stop_sequences,
-        "seed": kwargs.get("seed"),
-        "top_k": kwargs.get("top_k"),
-    }
-    return {k: v for k, v in base_params.items() if v is not None}
 
 
 def _compose_text_from_chunks(chunks: Sequence[LLMChunk]) -> str:
@@ -571,11 +534,6 @@ class CorpusCrewAILLM:
 
         self.stream_bridge_factory = stream_bridge_factory
 
-    @classmethod
-    def from_config(cls, config: CorpusCrewAILLMConfig) -> CorpusCrewAILLM:
-        """Alternative constructor from configuration builder."""
-        return config.build()
-
     # ------------------------------------------------------------------ #
     # Internal: stream bridge creation
     # ------------------------------------------------------------------ #
@@ -636,95 +594,22 @@ class CorpusCrewAILLM:
     # Core async API
     # ------------------------------------------------------------------ #
 
-    async def acomplete(
+    async def _astream_from_corpus_messages(
         self,
-        messages: Union[CrewAIMessageInput, CrewAIMessageSequence],
-        **kwargs: Any,
-    ) -> str:
-        """
-        Async completion.
-
-        Parameters
-        ----------
-        messages:
-            Prompt or chat messages:
-                - str
-                - {"role": "...", "content": "..."}
-                - Sequence[str | mapping]
-
-        kwargs:
-            Sampling parameters and optional context hints:
-                - model, temperature, max_tokens, top_p, frequency_penalty, 
-                  presence_penalty, stop/stop_sequences, seed, top_k
-                - ctx: Optional OperationContext
-                - request_id, traceparent, tenant, attrs
-                - CrewAI context: agent, task, crew_id, etc.
-
-        Returns
-        -------
-        str
-            Final response text from the underlying Corpus adapter.
-        """
-        corpus_messages = _normalize_messages(messages)
-        sampling_params = _extract_sampling_params(kwargs)
-        ctx = _build_operation_context_from_kwargs(kwargs)
-        
-        # Merge with defaults
-        params = _sampling_params_from_kwargs(
-            default_model=self.model,
-            default_temperature=self.temperature,
-            default_max_tokens=self.max_tokens,
-            stop_sequences=sampling_params.get("stop_sequences"),
-            kwargs={**sampling_params, **kwargs},  # kwargs takes precedence
-        )
-
-        model_for_context = params.get("model", self.model)
-
-        try:
-            result: LLMCompletion = await self.corpus_adapter.complete(
-                messages=corpus_messages,
-                ctx=ctx,
-                **params,
-            )
-
-            return result.text
-        except BaseException as exc:  # noqa: BLE001
-            error_ctx = _build_error_context(
-                operation="acomplete",
-                messages_count=len(corpus_messages),
-                model=model_for_context,
-                ctx=ctx,
-                stream=False,
-                temperature=params.get("temperature"),
-                max_tokens=params.get("max_tokens"),
-                top_p=params.get("top_p"),
-                frequency_penalty=params.get("frequency_penalty"),
-                presence_penalty=params.get("presence_penalty"),
-            )
-            attach_context(exc, **error_ctx)
-            raise
-
-    async def astream(
-        self,
-        messages: Union[CrewAIMessageInput, CrewAIMessageSequence],
+        corpus_messages: List[Mapping[str, str]],
         **kwargs: Any,
     ) -> AsyncIterator[str]:
         """
-        Async streaming completion.
-
-        Yields partial text chunks as they arrive from the Corpus adapter.
-        """
-        corpus_messages = _normalize_messages(messages)
-        sampling_params = _extract_sampling_params(kwargs)
-        ctx = _build_operation_context_from_kwargs(kwargs)
+        Internal async streaming from pre-normalized Corpus messages.
         
-        # Merge with defaults
-        params = _sampling_params_from_kwargs(
+        Avoids double normalization when called from sync streaming.
+        """
+        ctx = _build_operation_context_from_kwargs(kwargs)
+        params = _build_sampling_params(
             default_model=self.model,
             default_temperature=self.temperature,
             default_max_tokens=self.max_tokens,
-            stop_sequences=sampling_params.get("stop_sequences"),
-            kwargs={**sampling_params, **kwargs},
+            kwargs=kwargs,
         )
 
         model_for_context = params.get("model", self.model)
@@ -769,6 +654,84 @@ class CorpusCrewAILLM:
             )
             attach_context(exc, **error_ctx)
             raise
+
+    async def acomplete(
+        self,
+        messages: Union[CrewAIMessageInput, CrewAIMessageSequence],
+        **kwargs: Any,
+    ) -> str:
+        """
+        Async completion.
+
+        Parameters
+        ----------
+        messages:
+            Prompt or chat messages:
+                - str
+                - {"role": "...", "content": "..."}
+                - Sequence[str | mapping]
+
+        kwargs:
+            Sampling parameters and optional context hints:
+                - model, temperature, max_tokens, top_p, frequency_penalty, 
+                  presence_penalty, stop/stop_sequences, seed, top_k
+                - ctx: Optional OperationContext
+                - request_id, traceparent, tenant, attrs
+                - CrewAI context: agent, task, crew_id, etc.
+
+        Returns
+        -------
+        str
+            Final response text from the underlying Corpus adapter.
+        """
+        corpus_messages = _normalize_messages(messages)
+        ctx = _build_operation_context_from_kwargs(kwargs)
+        params = _build_sampling_params(
+            default_model=self.model,
+            default_temperature=self.temperature,
+            default_max_tokens=self.max_tokens,
+            kwargs=kwargs,
+        )
+
+        model_for_context = params.get("model", self.model)
+
+        try:
+            result: LLMCompletion = await self.corpus_adapter.complete(
+                messages=corpus_messages,
+                ctx=ctx,
+                **params,
+            )
+
+            return result.text
+        except BaseException as exc:  # noqa: BLE001
+            error_ctx = _build_error_context(
+                operation="acomplete",
+                messages_count=len(corpus_messages),
+                model=model_for_context,
+                ctx=ctx,
+                stream=False,
+                temperature=params.get("temperature"),
+                max_tokens=params.get("max_tokens"),
+                top_p=params.get("top_p"),
+                frequency_penalty=params.get("frequency_penalty"),
+                presence_penalty=params.get("presence_penalty"),
+            )
+            attach_context(exc, **error_ctx)
+            raise
+
+    async def astream(
+        self,
+        messages: Union[CrewAIMessageInput, CrewAIMessageSequence],
+        **kwargs: Any,
+    ) -> AsyncIterator[str]:
+        """
+        Async streaming completion.
+
+        Yields partial text chunks as they arrive from the Corpus adapter.
+        """
+        corpus_messages = _normalize_messages(messages)
+        async for chunk in self._astream_from_corpus_messages(corpus_messages, **kwargs):
+            yield chunk
 
     # ------------------------------------------------------------------ #
     # Sync API (for typical CrewAI usage)
@@ -873,8 +836,8 @@ class CorpusCrewAILLM:
         ctx = _build_operation_context_from_kwargs(kwargs)
 
         async def _coro_factory() -> AsyncIterator[str]:
-            # Note: we return the async iterator; SyncStreamBridge will iterate it
-            return await self.astream(corpus_messages, **kwargs)
+            # Use internal method to avoid double normalization
+            return await self._astream_from_corpus_messages(corpus_messages, **kwargs)
 
         error_context = _build_error_context(
             operation="stream",
