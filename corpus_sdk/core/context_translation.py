@@ -4,8 +4,9 @@
 """
 Context translation utilities for Corpus framework adapters.
 
-This module normalizes framework-specific "context" objects into Corpus
-`OperationContext` instances so that:
+This module normalizes framework-specific "context" objects into a
+canonical dictionary shape that can be fed into any Corpus
+`OperationContext`-like type (LLM, vector, embedding, graph), so that:
 
 - Request IDs / trace IDs are preserved
 - Deadlines / timeouts propagate correctly
@@ -15,12 +16,27 @@ This module normalizes framework-specific "context" objects into Corpus
 Design goals
 ------------
 - Protocol-first: this is SDK infrastructure, not business logic.
-- Framework-agnostic: no hard runtime dependency on any single framework.
+- Framework-agnostic: no hard runtime dependency on any single protocol.
 - Non-destructive: never drop context fields unless clearly unsafe.
 - Debuggable: provide helpers to snapshot/serialize context for logs/metrics.
+- Extensible: support custom frameworks via a pluggable registry.
 
 Primary entry points
 --------------------
+The `from_*` functions all return a normalized dict of the form:
+
+    {
+        "request_id": str | None,
+        "tenant": str | None,
+        "deadline_ms": int | None,
+        "traceparent": str | None,
+        "attrs": dict,
+    }
+
+They do *not* construct any specific `OperationContext` class. Each
+protocol layer (LLM, vector, embedding, graph) is responsible for
+taking that dict and building its own OperationContext object.
+
 - from_langchain
 - from_llamaindex
 - from_semantic_kernel
@@ -29,8 +45,23 @@ Primary entry points
 - from_mcp
 - from_dict
 
+Registry-based entry points
+---------------------------
+For custom frameworks or overrides, you can register a translator:
+
+    def my_framework_translator(raw_ctx) -> NormalizedContext:
+        ...
+
+    register_framework_translator("my_framework", my_framework_translator)
+
+    ctx = translate_framework("my_framework", raw_ctx)
+
 Round-trip helpers
 ------------------
+These helpers take an OperationContext-like object (anything with
+`request_id`, `tenant`, `deadline_ms`, `traceparent`, and `attrs`
+attributes) and convert it back into framework-specific metadata:
+
 - to_langchain
 - to_llamaindex
 - to_semantic_kernel
@@ -39,10 +70,7 @@ Round-trip helpers
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Mapping, Optional, Sequence, Union, TYPE_CHECKING
-
-if TYPE_CHECKING:  # pragma: no cover
-    from corpus_sdk.llm.llm_base import OperationContext
+from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Union
 
 logger = logging.getLogger(__name__)
 
@@ -69,8 +97,84 @@ KEY_TRACE_ID = "trace_id"
 KEY_CORRELATION_ID = "correlation_id"
 
 
+# Normalized context shape:
+# {
+#   "request_id": str | None,
+#   "tenant": str | None,
+#   "deadline_ms": int | None,
+#   "traceparent": str | None,
+#   "attrs": Dict[str, Any],
+# }
+NormalizedContext = Dict[str, Any]
+
+
+class ContextTranslationError(ValueError):
+    """Raised when context translation or validation fails."""
+
+
 # ---------------------------------------------------------------------------
-# Core translation functions
+# Registry for custom / override translators
+# ---------------------------------------------------------------------------
+
+FrameworkTranslator = Callable[..., NormalizedContext]
+
+_framework_translators: Dict[str, FrameworkTranslator] = {}
+
+
+def register_framework_translator(name: str, translator: FrameworkTranslator) -> None:
+    """
+    Register or override a framework translator.
+
+    The translator must return a `NormalizedContext` dict. This is useful for:
+    - Custom frameworks not covered by built-in `from_*` helpers.
+    - Overriding default behavior for existing frameworks.
+
+    Example
+    -------
+        def my_translator(raw_ctx) -> NormalizedContext:
+            # ...extract fields...
+            return {
+                "request_id": "...",
+                "tenant": "...",
+                "deadline_ms": 1234,
+                "traceparent": "...",
+                "attrs": {...},
+            }
+
+        register_framework_translator("my_framework", my_translator)
+    """
+    if not name or not isinstance(name, str):
+        raise ContextTranslationError("Translator name must be a non-empty string")
+    if not callable(translator):
+        raise ContextTranslationError("Translator must be callable")
+    _framework_translators[name] = translator
+    logger.debug("Registered framework translator: %s", name)
+
+
+def get_framework_translator(name: str) -> Optional[FrameworkTranslator]:
+    """Return a previously registered framework translator, if any."""
+    return _framework_translators.get(name)
+
+
+def translate_framework(name: str, *args: Any, **kwargs: Any) -> NormalizedContext:
+    """
+    Dispatch translation to a registered framework translator.
+
+    Raises:
+        ContextTranslationError if no translator is registered or if the
+        returned context is invalid.
+    """
+    translator = get_framework_translator(name)
+    if translator is None:
+        raise ContextTranslationError(f"No framework translator registered for: {name!r}")
+
+    ctx = translator(*args, **kwargs)
+    _validate_normalized_context(ctx, source=f"registry:{name}")
+    return ctx
+
+
+# ---------------------------------------------------------------------------
+# Core translation functions for built-in frameworks
 # ---------------------------------------------------------------------------
 
 
@@ -78,9 +182,9 @@ def from_langchain(
     config: Optional[Mapping[str, Any]],
     *,
     framework_version: Optional[str] = None,
-) -> "OperationContext":
+) -> NormalizedContext:
     """
-    LangChain RunnableConfig → OperationContext.
+    LangChain RunnableConfig → normalized context dict.
 
     Expected shape:
         {
@@ -99,54 +203,55 @@ def from_langchain(
         framework_version: Optional version string
 
     Returns:
-        OperationContext with extracted fields
+        NormalizedContext dict
     """
-    from corpus_sdk.llm.llm_base import OperationContext
-
     if not config:
-        return OperationContext()
+        ctx = _empty_context()
+        _validate_normalized_context(ctx, source="langchain")
+        return ctx
 
     metadata = _get_dict(config, "metadata")
-    
+
     attrs: Dict[str, Any] = {ATTR_FRAMEWORK: "langchain"}
     if framework_version:
         attrs[ATTR_FRAMEWORK_VERSION] = framework_version
-    
+
     # Extract tags
     tags = config.get("tags")
     if tags:
         attrs["tags"] = list(tags)
-    
+
     # Extract recursion_limit
     recursion_limit = config.get("recursion_limit")
     if recursion_limit is not None:
         attrs["langchain_recursion_limit"] = recursion_limit
-    
+
     # Extract run_name
     run_name = config.get("run_name")
     if run_name:
         attrs["run_name"] = run_name
-    
+
     # Merge user attrs from metadata
     user_attrs = _get_dict(metadata, "attrs")
     attrs.update(user_attrs)
 
-    return OperationContext(
-        request_id=_extract_request_id(config, metadata),
-        tenant=_extract_tenant(metadata),
-        deadline_ms=_extract_deadline_ms(metadata),
-        traceparent=_extract_traceparent(metadata),
-        attrs=attrs,
-    )
+    common = _extract_common_fields(config, metadata)
+
+    ctx: NormalizedContext = {
+        **common,
+        "attrs": attrs,
+    }
+    _validate_normalized_context(ctx, source="langchain")
+    return ctx
 
 
 def from_llamaindex(
     callback_manager: Optional[Any],
     *,
     framework_version: Optional[str] = None,
-) -> "OperationContext":
+) -> NormalizedContext:
     """
-    LlamaIndex CallbackManager → OperationContext.
+    LlamaIndex CallbackManager → normalized context dict.
 
     Extracts:
     - trace_id / span_id
@@ -158,16 +263,16 @@ def from_llamaindex(
         framework_version: Optional version string
 
     Returns:
-        OperationContext with extracted fields
+        NormalizedContext dict
     """
-    from corpus_sdk.llm.llm_base import OperationContext
-
     if callback_manager is None:
-        return OperationContext()
+        ctx = _empty_context()
+        _validate_normalized_context(ctx, source="llamaindex")
+        return ctx
 
     # Try common attributes
     trace_id = getattr(callback_manager, "trace_id", None)
-    span_id = getattr(callback_manager, "span_id", None)
+    span_id = getattr(callback_manager, "span_id", None)  # noqa: F841  # reserved for future use
     request_id = (
         getattr(callback_manager, "request_id", None)
         or getattr(callback_manager, "run_id", None)
@@ -180,28 +285,35 @@ def from_llamaindex(
         or {}
     )
     if not isinstance(metadata, Mapping):
+        logger.debug(
+            "LlamaIndex callback_manager.metadata/context is not a Mapping; got %r",
+            type(metadata),
+        )
         metadata = {}
 
     attrs: Dict[str, Any] = {ATTR_FRAMEWORK: "llamaindex"}
     if framework_version:
         attrs[ATTR_FRAMEWORK_VERSION] = framework_version
-    
+
     # Extract tags
     tags = getattr(callback_manager, "tags", None)
     if tags:
         attrs["tags"] = list(tags)
-    
+
     # Merge user attrs from metadata
     user_attrs = _get_dict(metadata, "attrs")
     attrs.update(user_attrs)
 
-    return OperationContext(
-        request_id=request_id or trace_id or _extract_request_id({}, metadata),
-        tenant=_extract_tenant(metadata),
-        deadline_ms=_extract_deadline_ms(metadata),
-        traceparent=_extract_traceparent(metadata),
-        attrs=attrs,
-    )
+    common = _extract_common_fields({}, metadata)
+    # Prefer explicit IDs from callback manager when available
+    common["request_id"] = request_id or trace_id or common["request_id"]
+
+    ctx: NormalizedContext = {
+        **common,
+        "attrs": attrs,
+    }
+    _validate_normalized_context(ctx, source="llamaindex")
+    return ctx
 
 
 def from_semantic_kernel(
@@ -209,9 +321,9 @@ def from_semantic_kernel(
     *,
     settings: Optional[Any] = None,
     framework_version: Optional[str] = None,
-) -> "OperationContext":
+) -> NormalizedContext:
     """
-    Semantic Kernel context → OperationContext.
+    Semantic Kernel context → normalized context dict.
 
     Extracts from context.variables and optional settings.
 
@@ -221,12 +333,12 @@ def from_semantic_kernel(
         framework_version: Optional version string
 
     Returns:
-        OperationContext with extracted fields
+        NormalizedContext dict
     """
-    from corpus_sdk.llm.llm_base import OperationContext
-
     if context is None and settings is None:
-        return OperationContext()
+        ctx = _empty_context()
+        _validate_normalized_context(ctx, source="semantic_kernel")
+        return ctx
 
     # SK often has "variables" or "context_variables"
     metadata = (
@@ -235,12 +347,16 @@ def from_semantic_kernel(
         or {}
     )
     if not isinstance(metadata, Mapping):
+        logger.debug(
+            "Semantic Kernel context.variables/context_variables is not a Mapping; got %r",
+            type(metadata),
+        )
         metadata = {}
 
     attrs: Dict[str, Any] = {ATTR_FRAMEWORK: "semantic_kernel"}
     if framework_version:
         attrs[ATTR_FRAMEWORK_VERSION] = framework_version
-    
+
     # Extract function/plugin info
     function_name = _safe_get(context, ["function", "name"])
     plugin_name = _safe_get(context, ["plugin", "name"])
@@ -248,28 +364,28 @@ def from_semantic_kernel(
         attrs["function_name"] = function_name
     if plugin_name:
         attrs["plugin_name"] = plugin_name
-    
+
     # Merge user attrs from metadata
     user_attrs = _get_dict(metadata, "attrs")
     attrs.update(user_attrs)
 
-    # Extract deadline from settings if present
-    deadline_ms = _extract_deadline_ms(metadata)
+    common = _extract_common_fields({}, metadata)
+
+    # Extract deadline from settings if present, overriding metadata-based value
     if settings is not None:
         settings_timeout = (
             getattr(settings, "timeout_ms", None)
             or getattr(settings, "timeout", None)
         )
         if settings_timeout is not None:
-            deadline_ms = _coerce_deadline_ms(settings_timeout)
+            common["deadline_ms"] = _coerce_deadline_ms(settings_timeout)
 
-    return OperationContext(
-        request_id=_extract_request_id({}, metadata),
-        tenant=_extract_tenant(metadata),
-        deadline_ms=deadline_ms,
-        traceparent=_extract_traceparent(metadata),
-        attrs=attrs,
-    )
+    ctx: NormalizedContext = {
+        **common,
+        "attrs": attrs,
+    }
+    _validate_normalized_context(ctx, source="semantic_kernel")
+    return ctx
 
 
 def from_autogen(
@@ -277,9 +393,9 @@ def from_autogen(
     *,
     framework_version: Optional[str] = None,
     **extra: Any,
-) -> "OperationContext":
+) -> NormalizedContext:
     """
-    AutoGen conversation → OperationContext.
+    AutoGen conversation → normalized context dict.
 
     Extracts:
     - conversation_id / id
@@ -292,12 +408,12 @@ def from_autogen(
         **extra: Additional context fields
 
     Returns:
-        OperationContext with extracted fields
+        NormalizedContext dict
     """
-    from corpus_sdk.llm.llm_base import OperationContext
-
     if conversation is None and not extra:
-        return OperationContext()
+        ctx = _empty_context()
+        _validate_normalized_context(ctx, source="autogen")
+        return ctx
 
     # Extract IDs
     conversation_id = (
@@ -315,8 +431,12 @@ def from_autogen(
         or {}
     )
     if not isinstance(metadata, Mapping):
+        logger.debug(
+            "AutoGen conversation.metadata/config/context is not a Mapping; got %r",
+            type(metadata),
+        )
         metadata = {}
-    
+
     # Merge extra kwargs
     merged = dict(metadata)
     merged.update(extra)
@@ -326,18 +446,20 @@ def from_autogen(
         attrs[ATTR_FRAMEWORK_VERSION] = framework_version
     if conversation_id is not None:
         attrs["conversation_id"] = str(conversation_id)
-    
+
     # Merge user attrs
     user_attrs = _get_dict(merged, "attrs")
     attrs.update(user_attrs)
 
-    return OperationContext(
-        request_id=request_id or run_id or _extract_request_id({}, merged),
-        tenant=_extract_tenant(merged),
-        deadline_ms=_extract_deadline_ms(merged),
-        traceparent=_extract_traceparent(merged),
-        attrs=attrs,
-    )
+    common = _extract_common_fields({}, merged)
+    common["request_id"] = request_id or run_id or common["request_id"]
+
+    ctx: NormalizedContext = {
+        **common,
+        "attrs": attrs,
+    }
+    _validate_normalized_context(ctx, source="autogen")
+    return ctx
 
 
 def from_crewai(
@@ -345,9 +467,9 @@ def from_crewai(
     *,
     framework_version: Optional[str] = None,
     **extra: Any,
-) -> "OperationContext":
+) -> NormalizedContext:
     """
-    CrewAI task → OperationContext.
+    CrewAI task → normalized context dict.
 
     Extracts:
     - task.id / task.task_id
@@ -360,12 +482,12 @@ def from_crewai(
         **extra: Additional context fields
 
     Returns:
-        OperationContext with extracted fields
+        NormalizedContext dict
     """
-    from corpus_sdk.llm.llm_base import OperationContext
-
     if task is None and not extra:
-        return OperationContext()
+        ctx = _empty_context()
+        _validate_normalized_context(ctx, source="crewai")
+        return ctx
 
     # Extract IDs
     task_id = getattr(task, "id", None) or getattr(task, "task_id", None)
@@ -379,8 +501,12 @@ def from_crewai(
     # Extract metadata
     metadata = getattr(task, "metadata", None) or {}
     if not isinstance(metadata, Mapping):
+        logger.debug(
+            "CrewAI task.metadata is not a Mapping; got %r",
+            type(metadata),
+        )
         metadata = {}
-    
+
     # Merge extra kwargs
     merged = dict(metadata)
     merged.update(extra)
@@ -394,27 +520,29 @@ def from_crewai(
         attrs["crew_name"] = crew_name
     if agent_name:
         attrs["agent_name"] = agent_name
-    
+
     # Merge user attrs
     user_attrs = _get_dict(merged, "attrs")
     attrs.update(user_attrs)
 
-    return OperationContext(
-        request_id=request_id or run_id or _extract_request_id({}, merged),
-        tenant=_extract_tenant(merged),
-        deadline_ms=_extract_deadline_ms(merged),
-        traceparent=_extract_traceparent(merged),
-        attrs=attrs,
-    )
+    common = _extract_common_fields({}, merged)
+    common["request_id"] = request_id or run_id or common["request_id"]
+
+    ctx: NormalizedContext = {
+        **common,
+        "attrs": attrs,
+    }
+    _validate_normalized_context(ctx, source="crewai")
+    return ctx
 
 
 def from_mcp(
     request: Mapping[str, Any],
     *,
     connection_metadata: Optional[Mapping[str, Any]] = None,
-) -> "OperationContext":
+) -> NormalizedContext:
     """
-    MCP JSON-RPC request → OperationContext.
+    MCP JSON-RPC request → normalized context dict.
 
     Expected shape:
         {
@@ -434,13 +562,15 @@ def from_mcp(
         connection_metadata: Optional connection-level metadata
 
     Returns:
-        OperationContext with extracted fields
+        NormalizedContext dict
     """
-    from corpus_sdk.llm.llm_base import OperationContext
-
     params = request.get("params") or {}
     context = params.get("context") or {}
     if not isinstance(context, Mapping):
+        logger.debug(
+            "MCP request.params.context is not a Mapping; got %r",
+            type(context),
+        )
         context = {}
 
     # Merge connection metadata
@@ -456,24 +586,27 @@ def from_mcp(
         attrs["mcp_method"] = str(method)
     if tool_name:
         attrs["mcp_tool_name"] = str(tool_name)
-    
+
     # Merge user attrs
     user_attrs = _get_dict(merged, "attrs")
     attrs.update(user_attrs)
 
+    common = _extract_common_fields({}, merged)
     request_id = request.get("id")
-    return OperationContext(
-        request_id=str(request_id) if request_id is not None else _extract_request_id({}, merged),
-        tenant=_extract_tenant(merged),
-        deadline_ms=_extract_deadline_ms(merged),
-        traceparent=_extract_traceparent(merged),
-        attrs=attrs,
-    )
+    if request_id is not None:
+        common["request_id"] = str(request_id)
+
+    ctx: NormalizedContext = {
+        **common,
+        "attrs": attrs,
+    }
+    _validate_normalized_context(ctx, source="mcp")
+    return ctx
 
 
-def from_dict(ctx: Optional[Mapping[str, Any]]) -> "OperationContext":
+def from_dict(ctx: Optional[Mapping[str, Any]]) -> NormalizedContext:
     """
-    Generic dict → OperationContext.
+    Generic dict → normalized context dict.
 
     Expected keys (all optional):
         {
@@ -488,22 +621,23 @@ def from_dict(ctx: Optional[Mapping[str, Any]]) -> "OperationContext":
         ctx: Dictionary with context fields
 
     Returns:
-        OperationContext with extracted fields
+        NormalizedContext dict
     """
-    from corpus_sdk.llm.llm_base import OperationContext
-
     if not ctx:
-        return OperationContext()
+        ctx_out = _empty_context()
+        _validate_normalized_context(ctx_out, source="dict")
+        return ctx_out
 
     attrs = dict(ctx.get("attrs") or {})
 
-    return OperationContext(
-        request_id=_extract_request_id(ctx, {}),
-        tenant=_extract_tenant(ctx),
-        deadline_ms=_extract_deadline_ms(ctx),
-        traceparent=_extract_traceparent(ctx),
-        attrs=attrs,
-    )
+    common = _extract_common_fields(ctx, {})
+
+    ctx_out: NormalizedContext = {
+        **common,
+        "attrs": attrs,
+    }
+    _validate_normalized_context(ctx_out, source="dict")
+    return ctx_out
 
 
 # ---------------------------------------------------------------------------
@@ -511,14 +645,15 @@ def from_dict(ctx: Optional[Mapping[str, Any]]) -> "OperationContext":
 # ---------------------------------------------------------------------------
 
 
-def to_langchain(ctx: "OperationContext") -> Dict[str, Any]:
+def to_langchain(ctx: Any) -> Dict[str, Any]:
     """
-    OperationContext → LangChain RunnableConfig-like dict.
+    OperationContext-like → LangChain RunnableConfig-like dict.
 
     Preserves key Corpus context fields in metadata + tags.
 
     Args:
-        ctx: OperationContext to convert
+        ctx: OperationContext-like object to convert
+             (must expose request_id, tenant, deadline_ms, traceparent, attrs)
 
     Returns:
         Dict suitable for LangChain RunnableConfig
@@ -526,23 +661,29 @@ def to_langchain(ctx: "OperationContext") -> Dict[str, Any]:
     config: Dict[str, Any] = {}
     metadata: Dict[str, Any] = {}
 
-    if ctx.tenant is not None:
-        metadata[KEY_TENANT] = ctx.tenant
-    if ctx.deadline_ms is not None:
-        metadata[KEY_DEADLINE_MS] = ctx.deadline_ms
-    if ctx.traceparent is not None:
-        metadata[KEY_TRACEPARENT] = ctx.traceparent
-    if ctx.request_id is not None:
-        metadata[KEY_REQUEST_ID] = ctx.request_id
-        config["run_id"] = ctx.request_id
+    tenant = getattr(ctx, "tenant", None)
+    deadline_ms = getattr(ctx, "deadline_ms", None)
+    traceparent = getattr(ctx, "traceparent", None)
+    request_id = getattr(ctx, "request_id", None)
+    attrs = getattr(ctx, "attrs", None) or {}
+
+    if tenant is not None:
+        metadata[KEY_TENANT] = tenant
+    if deadline_ms is not None:
+        metadata[KEY_DEADLINE_MS] = deadline_ms
+    if traceparent is not None:
+        metadata[KEY_TRACEPARENT] = traceparent
+    if request_id is not None:
+        metadata[KEY_REQUEST_ID] = request_id
+        config["run_id"] = request_id
 
     # Preserve attrs in metadata["attrs"]
-    if ctx.attrs:
-        attrs = dict(ctx.attrs)
-        tags = attrs.pop("tags", None)
+    if attrs:
+        attrs_copy = dict(attrs)
+        tags = attrs_copy.pop("tags", None)
         if tags and isinstance(tags, (list, tuple)):
             config["tags"] = list(tags)
-        metadata["attrs"] = attrs
+        metadata["attrs"] = attrs_copy
 
     if metadata:
         config["metadata"] = metadata
@@ -550,64 +691,137 @@ def to_langchain(ctx: "OperationContext") -> Dict[str, Any]:
     return config
 
 
-def to_llamaindex(ctx: "OperationContext") -> Dict[str, Any]:
+def to_llamaindex(ctx: Any) -> Dict[str, Any]:
     """
-    OperationContext → metadata dict for LlamaIndex.
+    OperationContext-like → metadata dict for LlamaIndex.
 
     Args:
-        ctx: OperationContext to convert
+        ctx: OperationContext-like object to convert
 
     Returns:
         Dict suitable for LlamaIndex metadata
     """
     metadata: Dict[str, Any] = {}
 
-    if ctx.request_id is not None:
-        metadata[KEY_REQUEST_ID] = ctx.request_id
-    if ctx.tenant is not None:
-        metadata[KEY_TENANT] = ctx.tenant
-    if ctx.deadline_ms is not None:
-        metadata[KEY_DEADLINE_MS] = ctx.deadline_ms
-    if ctx.traceparent is not None:
-        metadata[KEY_TRACEPARENT] = ctx.traceparent
+    request_id = getattr(ctx, "request_id", None)
+    tenant = getattr(ctx, "tenant", None)
+    deadline_ms = getattr(ctx, "deadline_ms", None)
+    traceparent = getattr(ctx, "traceparent", None)
+    attrs = getattr(ctx, "attrs", None) or {}
 
-    if ctx.attrs:
-        metadata["attrs"] = dict(ctx.attrs)
+    if request_id is not None:
+        metadata[KEY_REQUEST_ID] = request_id
+    if tenant is not None:
+        metadata[KEY_TENANT] = tenant
+    if deadline_ms is not None:
+        metadata[KEY_DEADLINE_MS] = deadline_ms
+    if traceparent is not None:
+        metadata[KEY_TRACEPARENT] = traceparent
+
+    if attrs:
+        metadata["attrs"] = dict(attrs)
 
     return metadata
 
 
-def to_semantic_kernel(ctx: "OperationContext") -> Dict[str, Any]:
+def to_semantic_kernel(ctx: Any) -> Dict[str, Any]:
     """
-    OperationContext → SK-style variables dict.
+    OperationContext-like → SK-style variables dict.
 
     Args:
-        ctx: OperationContext to convert
+        ctx: OperationContext-like object to convert
 
     Returns:
         Dict suitable for SK context variables
     """
     variables: Dict[str, Any] = {}
 
-    if ctx.request_id is not None:
-        variables[KEY_REQUEST_ID] = ctx.request_id
-    if ctx.tenant is not None:
-        variables[KEY_TENANT] = ctx.tenant
-    if ctx.deadline_ms is not None:
-        variables[KEY_DEADLINE_MS] = ctx.deadline_ms
-    if ctx.traceparent is not None:
-        variables[KEY_TRACEPARENT] = ctx.traceparent
+    request_id = getattr(ctx, "request_id", None)
+    tenant = getattr(ctx, "tenant", None)
+    deadline_ms = getattr(ctx, "deadline_ms", None)
+    traceparent = getattr(ctx, "traceparent", None)
+    attrs = getattr(ctx, "attrs", None) or {}
 
-    if ctx.attrs:
-        for key, value in ctx.attrs.items():
+    if request_id is not None:
+        variables[KEY_REQUEST_ID] = request_id
+    if tenant is not None:
+        variables[KEY_TENANT] = tenant
+    if deadline_ms is not None:
+        variables[KEY_DEADLINE_MS] = deadline_ms
+    if traceparent is not None:
+        variables[KEY_TRACEPARENT] = traceparent
+
+    if attrs:
+        for key, value in attrs.items():
             variables.setdefault(key, value)
 
     return variables
 
 
 # ---------------------------------------------------------------------------
-# Internal extraction helpers
+# Internal extraction / validation helpers
 # ---------------------------------------------------------------------------
+
+
+def _extract_common_fields(
+    config: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """
+    Extract all common fields in one pass.
+
+    Returns:
+        {
+            "request_id": str | None,
+            "tenant": str | None,
+            "deadline_ms": int | None,
+            "traceparent": str | None,
+        }
+    """
+    return {
+        "request_id": _extract_request_id(config, metadata),
+        "tenant": _extract_tenant(metadata),
+        "deadline_ms": _extract_deadline_ms(metadata),
+        "traceparent": _extract_traceparent(metadata),
+    }
+
+
+def _validate_normalized_context(
+    ctx: NormalizedContext,
+    *,
+    source: str = "unknown",
+) -> None:
+    """
+    Validate normalized context structure.
+
+    Ensures the required keys are present. Does not validate types
+    strictly, since different protocol layers may coerce or extend
+    values differently.
+    """
+    required_keys = {"request_id", "tenant", "deadline_ms", "traceparent", "attrs"}
+    missing = [key for key in required_keys if key not in ctx]
+    if missing:
+        logger.error(
+            "Normalized context validation failed for source=%s; "
+            "missing keys=%s; ctx=%r",
+            source,
+            missing,
+            ctx,
+        )
+        raise ContextTranslationError(
+            f"Missing required keys in normalized context: {missing}"
+        )
+
+
+def _empty_context() -> NormalizedContext:
+    """Create a well-formed empty normalized context."""
+    return {
+        "request_id": None,
+        "tenant": None,
+        "deadline_ms": None,
+        "traceparent": None,
+        "attrs": {},
+    }
 
 
 def _extract_request_id(
@@ -655,10 +869,11 @@ def _coerce_deadline_ms(value: Any) -> Optional[int]:
     """
     Coerce various deadline/timeout representations into milliseconds.
 
-    Accepts:
+    Convention:
     - None → None
-    - int/float (assumed seconds if < 100M, otherwise ms)
-    - timedelta-like objects (with total_seconds())
+    - int/float < ~1e8 are treated as seconds and converted to ms
+    - int/float >= ~1e8 are assumed to already be milliseconds
+    - timedelta-like objects use total_seconds()
     """
     if value is None:
         return None
@@ -669,15 +884,17 @@ def _coerce_deadline_ms(value: Any) -> Optional[int]:
             seconds = float(value.total_seconds())
             return int(seconds * 1000)
         except Exception:
+            logger.debug("Failed to coerce deadline from timedelta-like: %r", value)
             return None
 
     # numeric
     if isinstance(value, (int, float)):
-        # Heuristic: if > 100M, assume ms
+        # Heuristic: if > 100M, assume ms (≈ 3 years)
         if float(value) > 1e8:
             return int(value)
         return int(float(value) * 1000.0)
 
+    logger.debug("Unsupported deadline/timeout type for coercion: %r", type(value))
     return None
 
 
@@ -705,10 +922,23 @@ def _get_dict(obj: Any, key: str) -> Dict[str, Any]:
         value = obj.get(key, {})
     else:
         value = getattr(obj, key, {})
-    return dict(value) if isinstance(value, Mapping) else {}
+    if not isinstance(value, Mapping):
+        if value:
+            logger.debug(
+                "_get_dict expected Mapping for key=%r, got %r; value ignored",
+                key,
+                type(value),
+            )
+        return {}
+    return dict(value)
 
 
 __all__ = [
+    "NormalizedContext",
+    "ContextTranslationError",
+    "register_framework_translator",
+    "get_framework_translator",
+    "translate_framework",
     "from_langchain",
     "from_llamaindex",
     "from_semantic_kernel",
