@@ -11,6 +11,8 @@ This module exposes Corpus `BaseLLMAdapter` implementations as
 - Async + sync streaming (true incremental streaming)
 - Proper callback integration (on_llm_end, on_llm_new_token)
 - Protocol-first design: LangChain is a thin skin over Corpus
+- Optional transient error retry with exponential backoff
+- Configurable streaming bridge for testing and customization
 
 Example
 -------
@@ -22,6 +24,9 @@ Example
     lc_llm = CorpusLangChainLLM(
         corpus_adapter=corpus_llm,
         model="gpt-4.1",
+        # Optional: enable retry for transient errors
+        enable_streaming_retry=True,
+        max_streaming_retries=2,
     )
 
     # Sync call
@@ -43,9 +48,17 @@ Example
 from __future__ import annotations
 
 import logging
-import threading
-from queue import Queue
-from typing import Any, AsyncIterator, Dict, Iterator, List, Optional
+from typing import (
+    Any,
+    AsyncIterator,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Tuple,
+    Type,
+)
 
 from langchain_core.callbacks import (
     AsyncCallbackManagerForLLMRun,
@@ -60,6 +73,8 @@ from corpus_sdk.llm.llm_base import (
     LLMChunk,
     LLMCompletion,
     OperationContext,
+    TransientNetwork,
+    Unavailable,
 )
 from corpus_sdk.llm.framework_adapters.common.message_translation import (
     from_langchain,
@@ -70,6 +85,8 @@ from corpus_sdk.llm.framework_adapters.common.context_translation import (
     from_langchain as context_from_langchain,
 )
 from corpus_sdk.llm.framework_adapters.common.async_bridge import AsyncBridge
+from corpus_sdk.llm.framework_adapters.common.error_context import attach_context
+from corpus_sdk.llm.framework_adapters.common.sync_stream_bridge import SyncStreamBridge
 
 logger = logging.getLogger(__name__)
 
@@ -102,19 +119,97 @@ class CorpusLangChainLLM(BaseChatModel):
     stream_queue_maxsize:
         Max queue size for sync streaming bridge. `<= 0` means unbounded.
         This is a backpressure knob between the background async worker and
-        the sync consumer.
+        the sync consumer. Default: 16.
+
+    stream_poll_timeout_s:
+        Timeout (seconds) for polling the queue during sync streaming.
+        Lower values provide more responsive cancellation but increase CPU usage.
+        Default: 0.1 (100ms).
 
     stream_thread_join_timeout:
         Timeout (seconds) for waiting on the background streaming thread
-        during cleanup. Prevents hangs in pathological cases.
+        during cleanup. Prevents hangs in pathological cases. Default: 5.0.
+
+    enable_streaming_retry:
+        If True, enables retry logic for transient errors that occur before
+        the first chunk is emitted during sync streaming. Once streaming begins,
+        errors propagate immediately. Default: False.
+
+    max_streaming_retries:
+        Number of retry attempts for transient errors during sync streaming.
+        Only applies when enable_streaming_retry=True. Default: 1.
+
+    streaming_retry_backoff_s:
+        Initial backoff delay (seconds) for streaming retry. Uses exponential
+        backoff: attempt N sleeps for `backoff * (2 ** (N - 1))` seconds.
+        Only applies when enable_streaming_retry=True. Default: 0.25.
+
+    streaming_retry_error_types:
+        Tuple of exception types to consider transient and eligible for retry
+        during sync streaming. Only applies when enable_streaming_retry=True.
+        Default: (TransientNetwork, Unavailable).
+
+    stream_bridge_factory:
+        Optional factory function for creating SyncStreamBridge instances.
+        Primarily used for testing/mocking. If None, uses default factory.
+        Default: None.
+
+        Signature:
+            (coro_factory, queue_maxsize, poll_timeout_s, join_timeout_s,
+             cancel_event, framework, error_context, max_transient_retries,
+             transient_backoff_s, transient_error_types) -> SyncStreamBridge
+
+    Examples
+    --------
+    Basic usage:
+
+        lc_llm = CorpusLangChainLLM(
+            corpus_adapter=OpenAIAdapter(api_key="..."),
+            model="gpt-4",
+        )
+
+    With retry enabled:
+
+        lc_llm = CorpusLangChainLLM(
+            corpus_adapter=OpenAIAdapter(api_key="..."),
+            model="gpt-4",
+            enable_streaming_retry=True,
+            max_streaming_retries=3,
+            streaming_retry_backoff_s=0.5,
+        )
+
+    With custom bridge factory (testing):
+
+        def mock_bridge_factory(**kwargs):
+            return MockSyncStreamBridge(**kwargs)
+
+        lc_llm = CorpusLangChainLLM(
+            corpus_adapter=mock_adapter,
+            stream_bridge_factory=mock_bridge_factory,
+        )
     """
 
     corpus_adapter: BaseLLMAdapter
     model: str = "default"
     temperature: float = 0.7
     max_tokens: Optional[int] = None
+
+    # Sync streaming configuration
     stream_queue_maxsize: int = 16
+    stream_poll_timeout_s: float = 0.1
     stream_thread_join_timeout: float = 5.0
+
+    # Retry configuration
+    enable_streaming_retry: bool = False
+    max_streaming_retries: int = 1
+    streaming_retry_backoff_s: float = 0.25
+    streaming_retry_error_types: Tuple[Type[BaseException], ...] = (
+        TransientNetwork,
+        Unavailable,
+    )
+
+    # Dependency injection for testing
+    stream_bridge_factory: Optional[Callable[..., SyncStreamBridge]] = None
 
     # Pydantic v2-style config: allow arbitrary types like BaseLLMAdapter.
     model_config = {"arbitrary_types_allowed": True}
@@ -250,6 +345,67 @@ class CorpusLangChainLLM(BaseChatModel):
             generation_info=gen_info,
         )
 
+    def _create_stream_bridge(
+        self,
+        *,
+        coro_factory: Callable[[], Any],
+        error_context: Dict[str, Any],
+    ) -> SyncStreamBridge:
+        """
+        Create a SyncStreamBridge instance with current configuration.
+
+        This method centralizes bridge creation and allows for dependency
+        injection via stream_bridge_factory.
+
+        Parameters
+        ----------
+        coro_factory:
+            Factory function that produces an awaitable that returns an
+            async iterator of ChatGenerationChunk.
+
+        error_context:
+            Additional context to attach to any errors raised during streaming.
+
+        Returns
+        -------
+        SyncStreamBridge
+            Configured bridge instance ready to run.
+        """
+        # Determine retry configuration
+        max_retries = self.max_streaming_retries if self.enable_streaming_retry else 0
+        backoff = self.streaming_retry_backoff_s if self.enable_streaming_retry else 0.25
+        error_types = (
+            self.streaming_retry_error_types if self.enable_streaming_retry else ()
+        )
+
+        # Use custom factory if provided (for testing), otherwise use default
+        if self.stream_bridge_factory is not None:
+            return self.stream_bridge_factory(
+                coro_factory=coro_factory,
+                queue_maxsize=self.stream_queue_maxsize,
+                poll_timeout_s=self.stream_poll_timeout_s,
+                join_timeout_s=self.stream_thread_join_timeout,
+                cancel_event=None,
+                framework="langchain",
+                error_context=error_context,
+                max_transient_retries=max_retries,
+                transient_backoff_s=backoff,
+                transient_error_types=error_types,
+            )
+
+        return SyncStreamBridge(
+            coro_factory=coro_factory,
+            queue_maxsize=self.stream_queue_maxsize,
+            poll_timeout_s=self.stream_poll_timeout_s,
+            join_timeout_s=self.stream_thread_join_timeout,
+            cancel_event=None,  # Could expose this in future if LangChain needs it
+            framework="langchain",
+            error_context=error_context,
+            max_transient_retries=max_retries,
+            transient_backoff_s=backoff,
+            transient_error_types=error_types,
+        )
+
     # ------------------------------------------------------------------ #
     # Core async → Corpus calls
     # ------------------------------------------------------------------ #
@@ -315,6 +471,12 @@ class CorpusLangChainLLM(BaseChatModel):
                 await run_manager.on_llm_end(result)
             return result
         except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework="langchain",
+                operation="complete",
+                messages_count=len(messages),
+            )
             if run_manager is not None:
                 await run_manager.on_llm_error(exc)
             raise
@@ -353,6 +515,12 @@ class CorpusLangChainLLM(BaseChatModel):
                 await run_manager.on_llm_end(empty_result)
 
         except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework="langchain",
+                operation="stream",
+                messages_count=len(messages),
+            )
             if run_manager is not None:
                 await run_manager.on_llm_error(exc)
             raise
@@ -381,6 +549,12 @@ class CorpusLangChainLLM(BaseChatModel):
                 run_manager.on_llm_end(result)
             return result
         except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework="langchain",
+                operation="complete",
+                messages_count=len(messages),
+            )
             if run_manager is not None:
                 run_manager.on_llm_error(exc)
             raise
@@ -395,100 +569,41 @@ class CorpusLangChainLLM(BaseChatModel):
         """
         Sync streaming entrypoint used by LangChain.
 
-        Bridges the async streaming iterator via a background thread and a Queue,
-        yielding `ChatGenerationChunk` objects as they arrive without buffering the
+        Bridges the async streaming iterator via SyncStreamBridge, yielding
+        `ChatGenerationChunk` objects as they arrive without buffering the
         entire response.
 
-        Best-effort cancellation:
-            - If the caller stops consuming early (breaks the iterator),
-              we signal the worker thread via a `cancel_event`.
-            - The worker checks this flag and attempts to close the underlying
-              async generator (if it exposes `aclose()`).
+        The bridge handles:
+        - Background thread management
+        - Bounded queue for backpressure
+        - Proper cleanup and error propagation
+        - Optional transient retry (controlled by enable_streaming_retry)
+
+        Retry behavior (when enable_streaming_retry=True):
+        - Only retries errors before the first chunk is emitted
+        - Uses exponential backoff with configured parameters
+        - Only retries error types in streaming_retry_error_types
+        - Logs retry attempts at WARNING level
         """
-        # Queue between worker and main thread. maxsize <= 0 ⇒ unbounded.
-        maxsize = self.stream_queue_maxsize if self.stream_queue_maxsize > 0 else 0
-        queue: "Queue[Optional[ChatGenerationChunk]]" = Queue(maxsize=maxsize)
 
-        error_holder: List[BaseException] = []
-        done_event = threading.Event()
-        cancel_event = threading.Event()
-        finished_normally = False
+        async def _coro_factory():
+            """Factory that produces the async streaming iterator."""
+            return self._acall_corpus_stream(messages, stop=stop, **kwargs)
 
-        def worker() -> None:
-            """
-            Background thread that runs the async Corpus stream and enqueues chunks.
-            """
-
-            async def run_stream() -> None:
-                corpus_messages = self._translate_messages(messages)
-                ctx, params = self._build_context_and_params(stop=stop, **kwargs)
-
-                agen = await self.corpus_adapter.stream(
-                    messages=corpus_messages,
-                    ctx=ctx,
-                    **params,
-                )
-
-                try:
-                    async for chunk in agen:
-                        if cancel_event.is_set():
-                            # Best-effort shutdown: ask the async generator to close
-                            # itself so the adapter can tear down any upstream stream.
-                            close = getattr(agen, "aclose", None)
-                            if callable(close):
-                                try:
-                                    await close()
-                                except Exception as close_exc:  # noqa: BLE001
-                                    logger.debug(
-                                        "Error closing Corpus stream after cancellation: %s",
-                                        close_exc,
-                                    )
-                            break
-
-                        queue.put(CorpusLangChainLLM._chunk_to_generation_chunk(chunk))
-                finally:
-                    # Always signal completion to the consumer.
-                    queue.put(None)
-
-            try:
-                AsyncBridge.run_async(run_stream())
-            except BaseException as exc:  # noqa: BLE001
-                error_holder.append(exc)
-                # Ensure sentinel is in the queue even on error.
-                queue.put(None)
-            finally:
-                done_event.set()
-
-        thread = threading.Thread(target=worker, daemon=True)
-        thread.start()
+        bridge = self._create_stream_bridge(
+            coro_factory=_coro_factory,
+            error_context={"messages_count": len(messages), "operation": "stream"},
+        )
 
         try:
-            while True:
-                chunk = queue.get()
-                if chunk is None:
-                    finished_normally = True
-                    break
+            for gen_chunk in bridge.run():
+                # Forward tokens to LangChain callbacks
+                if run_manager is not None and gen_chunk.message.content:
+                    run_manager.on_llm_new_token(gen_chunk.message.content)
 
-                if run_manager is not None and chunk.message.content:
-                    run_manager.on_llm_new_token(chunk.message.content)
+                yield gen_chunk
 
-                yield chunk
-
-            # Wait a bit for the worker thread to finish cleanup.
-            thread.join(timeout=self.stream_thread_join_timeout)
-            if thread.is_alive():
-                logger.warning(
-                    "CorpusLangChainLLM streaming worker thread did not exit "
-                    "within %.2fs; continuing anyway",
-                    self.stream_thread_join_timeout,
-                )
-
-            if error_holder:
-                exc = error_holder[0]
-                if run_manager is not None:
-                    run_manager.on_llm_error(exc)
-                raise exc
-
+            # Signal completion to LangChain callbacks
             if run_manager is not None:
                 empty_result = ChatResult(
                     generations=[
@@ -501,12 +616,13 @@ class CorpusLangChainLLM(BaseChatModel):
                 run_manager.on_llm_end(empty_result)
 
         except Exception as exc:  # noqa: BLE001
-            # Caller stopped early or error occurred on the main thread.
-            if not finished_normally:
-                cancel_event.set()
-                # Give worker a short window to react to cancellation.
-                done_event.wait(timeout=self.stream_thread_join_timeout)
-
+            # Error context already attached by bridge, but we add operation detail
+            attach_context(
+                exc,
+                framework="langchain",
+                operation="stream_sync",
+                messages_count=len(messages),
+            )
             if run_manager is not None:
                 run_manager.on_llm_error(exc)
             raise
