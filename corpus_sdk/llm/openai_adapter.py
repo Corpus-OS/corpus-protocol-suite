@@ -12,7 +12,7 @@ Goals
 - Map Corpus protocol → OpenAI Chat Completions.
 - Preserve async/streaming semantics.
 - Normalize provider errors into Corpus' error taxonomy.
-- Provide basic token counting for cost/quota tracking.
+- Provide token usage accounting for cost/quota tracking.
 - Play nicely with higher-level framework adapters
   (LangChain, LlamaIndex, Semantic Kernel, etc.).
 
@@ -56,6 +56,12 @@ from corpus_sdk.llm.llm_base import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Optional tiktoken support for accurate token counting.
+try:  # pragma: no cover - optional dependency
+    import tiktoken  # type: ignore
+except Exception:  # pragma: no cover
+    tiktoken = None  # type: ignore[assignment]
 
 # Try to use the modern async client if available.
 try:  # pragma: no cover - import surface only
@@ -108,10 +114,10 @@ class OpenAIAdapter(BaseLLMAdapter):
     -----
     - Requires `openai` Python library v1+ (for `AsyncOpenAI`). If that
       is not available, instantiation will raise `RuntimeError`.
-    - Streaming returns token deltas as `LLMChunk.text`; `usage_so_far`
-      is currently omitted (None) because OpenAI's streaming API only
-      surfaces final usage. Callers that need precise usage can call
-      `complete()` instead.
+    - Uses `tiktoken` for token counting when available, with a safe
+      whitespace fallback otherwise.
+    - Streaming uses `stream_options={"include_usage": True}` so the
+      final chunk carries accurate token usage.
     """
 
     def __init__(
@@ -323,8 +329,8 @@ class OpenAIAdapter(BaseLLMAdapter):
             supports_multi_tenant=True,
             supports_system_message=True,
             supports_deadline=True,
-            # We implement a *rough* token counter (whitespace-based) for
-            # planning and observability only.
+            # We implement token counting using tiktoken when available,
+            # with a safe heuristic fallback when it isn't.
             supports_count_tokens=True,
             supported_models=(),  # open set; let callers choose.
         )
@@ -412,11 +418,11 @@ class OpenAIAdapter(BaseLLMAdapter):
 
         We emit:
             - One `LLMChunk` per non-empty delta text (is_final=False).
-            - A terminal sentinel chunk with is_final=True and no new text.
+            - A terminal sentinel chunk with is_final=True.
 
-        `usage_so_far` is not populated because OpenAI only exposes final
-        usage at the end of the stream; callers requiring exact usage
-        should prefer `complete()`.
+        With `stream_options={"include_usage": True}`, the final event
+        contains exact token usage; this is surfaced on the final chunk
+        via `usage_so_far`.
         """
         resolved_model = self._resolve_model(model)
         oai_messages = self._build_messages(
@@ -435,6 +441,8 @@ class OpenAIAdapter(BaseLLMAdapter):
                 presence_penalty=presence_penalty,
                 stop=stop_sequences,
                 stream=True,
+                # Key improvement: ask OpenAI to include usage in the stream.
+                stream_options={"include_usage": True},
             )
         except Exception as exc:  # noqa: BLE001
             raise self._translate_openai_error(exc) from exc
@@ -460,7 +468,8 @@ class OpenAIAdapter(BaseLLMAdapter):
             if not text and hasattr(choice, "text"):
                 text = getattr(choice, "text", "") or ""
 
-            # Collect final usage if present on this chunk.
+            # Collect final usage if present on this chunk (thanks to
+            # stream_options={"include_usage": True}).
             usage = getattr(event, "usage", None)
             if usage is not None:
                 final_usage = TokenUsage(
@@ -478,7 +487,7 @@ class OpenAIAdapter(BaseLLMAdapter):
                     usage_so_far=None,  # not tracked per-chunk
                 )
 
-        # Emit a final sentinel chunk marking end-of-stream.
+        # Emit a final sentinel chunk marking end-of-stream (with usage if available).
         yield LLMChunk(
             text="",
             is_final=True,
@@ -494,22 +503,37 @@ class OpenAIAdapter(BaseLLMAdapter):
         ctx: Optional[OperationContext] = None,
     ) -> int:
         """
-        Approximate token counting.
+        Token counting for OpenAI models.
 
-        For simplicity and to avoid coupling to provider-specific
-        tokenizers, we use a whitespace-based heuristic similar to the
-        mock adapter. This is good enough for:
-            - relative size comparisons
-            - basic context-window planning
-            - high-level quota tracking
+        Strategy:
+        - If `tiktoken` is available, use model-aware tokenization via
+          `encoding_for_model` (falling back to `cl100k_base`).
+        - Otherwise, use a whitespace heuristic similar to MockLLMAdapter,
+          which is good enough for rough planning but less precise.
 
-        If you need exact tokenization for billing-critical paths,
-        consider extending this adapter with `tiktoken` or the OpenAI
-        tokenizer APIs.
+        This function is used by BaseLLMAdapter for:
+            - context-window preflight checks
+            - coarse quota tracking
         """
         if not text:
             return 0
-        # +3 overhead for system metadata / biases (same as MockLLMAdapter).
+
+        resolved_model = self._resolve_model(model)
+
+        # Prefer tiktoken when available.
+        if tiktoken is not None:
+            try:
+                try:
+                    enc = tiktoken.encoding_for_model(resolved_model)  # type: ignore[attr-defined]
+                except Exception:
+                    # Fallback encoding used by most modern OpenAI chat models.
+                    enc = tiktoken.get_encoding("cl100k_base")  # type: ignore[attr-defined]
+                return len(enc.encode(text))
+            except Exception:  # noqa: BLE001
+                # If tiktoken explodes for any reason, fall back to heuristic.
+                logger.debug("tiktoken token counting failed; falling back to heuristic", exc_info=True)
+
+        # Heuristic fallback: whitespace-based + small overhead.
         return len(text.split()) + 3
 
     async def _do_health(
