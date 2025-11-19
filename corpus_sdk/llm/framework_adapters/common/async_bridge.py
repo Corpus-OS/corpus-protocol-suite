@@ -1,17 +1,22 @@
+# corpus_sdk/llm/framework_adapters/common/async_bridge.py
+# SPDX-License-Identifier: Apache-2.0
+
 """
-Bridges async-first Corpus SDK APIs to sync-centric frameworks
-(LangChain, LlamaIndex, etc.) safely and predictably.
+Async bridge utilities for Corpus LLM adapters.
+
+This module bridges async-first Corpus SDK APIs to sync-centric frameworks
+(e.g., LangChain, LlamaIndex) in a safe and predictable way.
 
 Key concerns handled here:
 
-- Nested event loops (e.g., Jupyter, asyncio-based apps)
+- Nested event loops (Jupyter, asyncio-based apps)
 - Threaded execution when a loop is already running
 - Timeouts and cancellation
 - Clean shutdown / resource reuse
 
-This module is *protocol infrastructure*, not business logic. It provides
-a small set of primitives that adapters can use to expose both async and
-sync entry points on top of async Corpus APIs.
+This is *protocol infrastructure*, not business logic. Adapters should use
+these helpers to expose both async and sync entry points on top of async
+Corpus APIs.
 """
 
 from __future__ import annotations
@@ -20,7 +25,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import functools
 import threading
-from typing import Any, Callable, Coroutine, Optional, TypeVar, Generic
+from typing import Any, Callable, Coroutine, Optional, TypeVar
 
 T = TypeVar("T")
 
@@ -51,7 +56,7 @@ class AsyncBridgeTimeoutError(TimeoutError):
 # ---------------------------------------------------------------------------
 
 
-class AsyncBridge(Generic[T]):
+class AsyncBridge:
     """
     Helper for safely running async code from sync contexts.
 
@@ -194,12 +199,11 @@ class AsyncBridge(Generic[T]):
         """
         effective_timeout = timeout if timeout is not None else DEFAULT_RUN_TIMEOUT
 
-        loop = None
+        loop: Optional[asyncio.AbstractEventLoop]
         try:
             loop = asyncio.get_event_loop()
         except RuntimeError:
-            # No current loop in this thread; we'll use get_loop() below.
-            pass
+            loop = None
 
         # ------------------------------------------------------------------
         # Case 1: Loop is already running (nested-loop environment).
@@ -230,7 +234,6 @@ class AsyncBridge(Generic[T]):
             return loop.run_until_complete(_inner())
         except KeyboardInterrupt:
             # Best-effort cancellation: cancel all pending tasks on this loop.
-            # This avoids leaving dangling tasks when a user interrupts.
             pending = asyncio.all_tasks(loop=loop)
             for task in pending:
                 task.cancel()
@@ -273,22 +276,22 @@ class AsyncBridge(Generic[T]):
         """
         Decorator variant for instance methods.
 
-        This is essentially the same as sync_wrapper, but exists as a
-        semantic hint that the wrapped function is likely a method
-        (i.e., first argument is `self`). Usage is identical.
-
-        Example
-        -------
+        Usage
+        -----
             class Adapter:
                 @AsyncBridge.sync_method
                 async def acomplete(self, prompt: str) -> str:
                     ...
 
-                # complete is a sync twin of acomplete
+                # Now you can define a sync twin that internally uses the async one:
                 def complete(self, prompt: str) -> str:
-                    return self.acomplete_sync(prompt)
+                    return AsyncBridge.run_async(self.acomplete(prompt))
 
-                # or directly:
+            # Or assign a sync alias directly:
+            class Adapter2:
+                async def acomplete(self, prompt: str) -> str:
+                    ...
+
                 complete = AsyncBridge.sync_method(acomplete)
         """
 
@@ -312,24 +315,22 @@ class AsyncBridge(Generic[T]):
             asyncio.Future associated with the scheduled task.
 
         Notes:
-            - This is primarily for background side-effects (metrics,
+            - This method requires that the managed loop is already
+              running in the current thread. If no loop is running,
+              a RuntimeError is raised.
+            - Intended primarily for background side-effects (metrics,
               logging, etc.).
             - Exceptions will be stored on the Future and need to be
               observed somewhere to avoid "unobserved exception" logs.
         """
         loop = cls.get_loop()
-        # If loop is running in this thread, schedule directly.
-        if loop.is_running():
-            return loop.create_task(coro)
-
-        # If loop is not running, start the task by running once around it.
-        # Caller is responsible for ensuring this makes sense in their
-        # environment; often this is used only when the server is already
-        # managing the loop.
-        def _start_task() -> asyncio.Future:
-            return loop.create_task(coro)
-
-        return _start_task()
+        if not loop.is_running():
+            raise RuntimeError(
+                "AsyncBridge.spawn() requires the managed event loop to be "
+                "already running. Start and manage the loop at a higher "
+                "level before using spawn()."
+            )
+        return loop.create_task(coro)
 
     @classmethod
     def run_in_thread(cls, func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
@@ -351,8 +352,15 @@ class AsyncBridge(Generic[T]):
         Gracefully shut down the executor and (if owned) the managed loop.
 
         Intended primarily for tests or short-lived scripts. In long-lived
-        processes (servers, notebooks) you usually don't want to call this
-        unless you're explicitly tearing down all async infrastructure.
+        processes (servers, notebooks) you usually do *not* want to call
+        this unless you're explicitly tearing down all async infrastructure.
+
+        Behavior:
+        - Shuts down the shared ThreadPoolExecutor, waiting for all
+          submitted tasks to complete.
+        - If the managed loop was created by AsyncBridge (`_loop_owned`
+          is True), closes it. Any tasks still pending on that loop will
+          be cancelled when the loop is closed.
         """
         with cls._lock:
             if cls._executor is not None:
@@ -360,8 +368,12 @@ class AsyncBridge(Generic[T]):
                 cls._executor = None
 
             if cls._loop is not None and cls._loop_owned and not cls._loop.is_closed():
-                cls._loop.call_soon_threadsafe(cls._loop.stop)
+                # If the loop is running elsewhere, caller should ensure
+                # it is stopped before invoking shutdown().
+                if cls._loop.is_running():
+                    cls._loop.call_soon_threadsafe(cls._loop.stop)
                 cls._loop.close()
+
             cls._loop = None
             cls._loop_owned = False
 
@@ -369,6 +381,7 @@ class AsyncBridge(Generic[T]):
 # ---------------------------------------------------------------------------
 # Module-level convenience aliases
 # ---------------------------------------------------------------------------
+
 
 def run_async(
     coro: Coroutine[Any, Any, T],
