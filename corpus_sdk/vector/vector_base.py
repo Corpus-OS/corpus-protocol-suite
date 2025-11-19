@@ -150,8 +150,8 @@ from typing import (
     runtime_checkable,
 )
 
-VECTOR_PROTOCOL_VERSION = "1.1.0"
-VECTOR_PROTOCOL_ID = "vector/v1.1"
+VECTOR_PROTOCOL_VERSION = "1.0.0"
+VECTOR_PROTOCOL_ID = "vector/v1.0"
 LOG = logging.getLogger(__name__)
 
 # =============================================================================
@@ -824,7 +824,7 @@ class VectorCapabilities:
     Attributes:
         server: Backend server identifier (e.g., "pinecone", "qdrant", "weaviate")
         version: Backend server version string
-        protocol: Protocol identifier (e.g., "vector/v1.1")
+        protocol: Protocol identifier (e.g., "vector/v1.0")
         max_dimensions: Maximum vector dimensions supported
         supported_metrics: Supported distance metrics ("cosine", "euclidean", "dotproduct")
         supports_namespaces: Whether namespaces/collections are supported
@@ -998,13 +998,13 @@ class NamespaceResult:
 @runtime_checkable
 class VectorProtocolV1(Protocol):
     """
-    Protocol defining the Vector Protocol V1.1 interface.
+    Protocol defining the Vector Protocol V1.0 interface.
 
     Implement this protocol to create compatible vector adapters. All methods are async
     and designed for high-concurrency environments. This protocol is language-level;
     the canonical wire contract is defined by the JSON envelopes.
 
-    Note: batch_query is a V1.1 addition. Adapters that don't support batch queries
+    Note: batch_query is a V1.0 addition. Adapters that don't support batch queries
     should raise NotSupported when this method is called.
     """
 
@@ -1030,7 +1030,7 @@ class VectorProtocolV1(Protocol):
         """
         Execute multiple vector similarity search queries in batch.
         
-        This is a V1.1 addition. Adapters that don't support batch queries
+        This is a V1.0 addition. Adapters that don't support batch queries
         should raise NotSupported.
         """
         ...
@@ -1108,7 +1108,7 @@ class VectorAdapterConfig:
 
 class BaseVectorAdapter(VectorProtocolV1):
     """
-    Base class for implementing Vector Protocol V1.1 adapters.
+    Base class for implementing Vector Protocol V1.0 adapters.
 
     Provides common validation, metrics instrumentation, error handling, and
     SIEM-safe observability. Implementers override the `_do_*` methods to plug in
@@ -2491,7 +2491,7 @@ class WireVectorHandler:
         Supports:
             - vector.capabilities
             - vector.query
-            - vector.batch_query (V1.1+)
+            - vector.batch_query (V1.0+)
             - vector.upsert
             - vector.delete
             - vector.create_namespace
