@@ -306,16 +306,6 @@ def _build_error_context(
     return {k: v for k, v in error_ctx.items() if v is not None}
 
 
-def _compose_text_from_chunks(chunks: Sequence[LLMChunk]) -> str:
-    """
-    Utility to combine chunk texts into a single string.
-
-    This is used only in rare cases (e.g., if we ever need to buffer),
-    but is provided for completeness and potential future hooks.
-    """
-    return "".join(getattr(c, "text", "") or "" for c in chunks)
-
-
 # ---------------------------------------------------------------------------
 # Configuration Builder
 # ---------------------------------------------------------------------------
@@ -602,7 +592,10 @@ class CorpusCrewAILLM:
         """
         Internal async streaming from pre-normalized Corpus messages.
         
-        Avoids double normalization when called from sync streaming.
+        This exists so stream() can avoid double normalization and share
+        error-context logic with astream.
+        
+        Yields partial text chunks as they arrive from the Corpus adapter.
         """
         ctx = _build_operation_context_from_kwargs(kwargs)
         params = _build_sampling_params(
@@ -621,23 +614,20 @@ class CorpusCrewAILLM:
                 **params,
             )
 
-            async def _gen() -> AsyncIterator[str]:
-                try:
-                    async for chunk in stream:
-                        yield getattr(chunk, "text", "") or ""
-                finally:
-                    aclose = getattr(stream, "aclose", None)
-                    if callable(aclose):
-                        try:
-                            await aclose()
-                        except Exception as cleanup_error:  # noqa: BLE001
-                            logger.debug(
-                                "CrewAI stream cleanup failed: %s",
-                                cleanup_error,
-                                extra={"framework": "crewai"},
-                            )
-
-            return _gen()
+            try:
+                async for chunk in stream:
+                    yield getattr(chunk, "text", "") or ""
+            finally:
+                aclose = getattr(stream, "aclose", None)
+                if callable(aclose):
+                    try:
+                        await aclose()
+                    except Exception as cleanup_error:  # noqa: BLE001
+                        logger.debug(
+                            "CrewAI stream cleanup failed: %s",
+                            cleanup_error,
+                            extra={"framework": "crewai"},
+                        )
 
         except BaseException as exc:  # noqa: BLE001
             error_ctx = _build_error_context(
@@ -836,8 +826,8 @@ class CorpusCrewAILLM:
         ctx = _build_operation_context_from_kwargs(kwargs)
 
         async def _coro_factory() -> AsyncIterator[str]:
-            # Use internal method to avoid double normalization
-            return await self._astream_from_corpus_messages(corpus_messages, **kwargs)
+            # Use internal async generator directly (no await needed)
+            return self._astream_from_corpus_messages(corpus_messages, **kwargs)
 
         error_context = _build_error_context(
             operation="stream",
