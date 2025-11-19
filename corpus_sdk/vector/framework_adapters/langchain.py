@@ -76,6 +76,7 @@ import math
 import uuid
 from typing import (
     Any,
+    Callable,
     Dict,
     Iterable,
     Iterator,
@@ -191,7 +192,7 @@ class CorpusLangChainVectorStore(VectorStore):
     default_top_k: int = 4
 
     # Optional embedding integration
-    embedding_function: Optional[Any] = None  # Callable[[List[str]], Embeddings]
+    embedding_function: Optional[Callable[[List[str]], Embeddings]] = None
 
     # Cached capabilities
     _caps: Optional[VectorCapabilities] = None
@@ -284,32 +285,64 @@ class CorpusLangChainVectorStore(VectorStore):
         """
         if embeddings is not None:
             if len(embeddings) != len(texts):
-                raise BadRequest(
+                err = BadRequest(
                     f"embeddings length {len(embeddings)} does not match texts length {len(texts)}",
                     code="BAD_EMBEDDINGS",
                     details={"texts": len(texts), "embeddings": len(embeddings)},
                 )
+                attach_context(
+                    err,
+                    framework="langchain",
+                    operation="ensure_embeddings",
+                    texts_count=len(texts),
+                    embeddings_count=len(embeddings),
+                )
+                raise err
             return embeddings
 
         if self.embedding_function is None:
-            raise NotSupported(
+            err = NotSupported(
                 "No embedding_function configured; caller must supply embeddings",
                 code="NO_EMBEDDING_FUNCTION",
                 details={"texts": len(texts)},
             )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="ensure_embeddings",
+                texts_count=len(texts),
+            )
+            raise err
 
         try:
             computed = self.embedding_function(texts)
         except Exception as exc:  # noqa: BLE001
-            raise BadRequest(
+            err = BadRequest(
                 f"embedding_function failed: {exc}",
                 code="EMBEDDING_ERROR",
+                details={"texts": len(texts)},
             )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="ensure_embeddings",
+                texts_count=len(texts),
+            )
+            raise err
         if len(computed) != len(texts):
-            raise BadRequest(
+            err = BadRequest(
                 f"embedding_function returned {len(computed)} embeddings for {len(texts)} texts",
                 code="BAD_EMBEDDINGS",
+                details={"texts": len(texts), "embeddings": len(computed)},
             )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="ensure_embeddings",
+                texts_count=len(texts),
+                embeddings_count=len(computed),
+            )
+            raise err
         return computed
 
     def _normalize_metadatas(
@@ -336,11 +369,19 @@ class CorpusLangChainVectorStore(VectorStore):
             base = dict(metadatas[0] or {})
             return [dict(base) for _ in range(n)]
 
-        raise BadRequest(
+        err = BadRequest(
             f"metadatas length {len(metadatas)} does not match texts length {n}",
             code="BAD_METADATA",
             details={"texts": n, "metadatas": len(metadatas)},
         )
+        attach_context(
+            err,
+            framework="langchain",
+            operation="normalize_metadatas",
+            texts_count=n,
+            metadatas_count=len(metadatas),
+        )
+        raise err
 
     def _normalize_ids(
         self,
@@ -358,11 +399,19 @@ class CorpusLangChainVectorStore(VectorStore):
         if ids is None:
             return [uuid.uuid4().hex for _ in range(n)]
         if len(ids) != n:
-            raise BadRequest(
+            err = BadRequest(
                 f"ids length {len(ids)} does not match texts length {n}",
                 code="BAD_IDS",
                 details={"texts": n, "ids": len(ids)},
             )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="normalize_ids",
+                texts_count=n,
+                ids_count=len(ids),
+            )
+            raise err
         return [str(i) for i in ids]
 
     def _to_corpus_vectors(
@@ -515,18 +564,34 @@ class CorpusLangChainVectorStore(VectorStore):
         ns = self._effective_namespace(namespace)
 
         if caps.max_top_k is not None and k > caps.max_top_k:
-            raise BadRequest(
+            err = BadRequest(
                 f"top_k {k} exceeds maximum of {caps.max_top_k}",
                 code="BAD_TOP_K",
                 details={"max_top_k": caps.max_top_k, "namespace": ns},
             )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="query",
+                namespace=ns,
+                top_k=k,
+            )
+            raise err
 
         if filter and not caps.supports_metadata_filtering:
-            raise NotSupported(
+            err = NotSupported(
                 "metadata filtering is not supported by the underlying vector adapter",
                 code="FILTER_NOT_SUPPORTED",
                 details={"namespace": ns},
             )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="query",
+                namespace=ns,
+                top_k=k,
+            )
+            raise err
 
         spec = QuerySpec(
             vector=[float(x) for x in embedding],
@@ -572,17 +637,33 @@ class CorpusLangChainVectorStore(VectorStore):
         ns = self._effective_namespace(namespace)
 
         if filter and not caps.supports_metadata_filtering:
-            raise NotSupported(
+            err = NotSupported(
                 "delete by metadata filter is not supported by the underlying vector adapter",
                 code="FILTER_NOT_SUPPORTED",
                 details={"namespace": ns},
             )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="delete",
+                namespace=ns,
+                ids_count=len(ids or []),
+            )
+            raise err
 
         if not ids and not filter:
-            raise BadRequest(
+            err = BadRequest(
                 "must provide ids or filter for delete",
                 code="BAD_DELETE",
             )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="delete",
+                namespace=ns,
+                ids_count=0,
+            )
+            raise err
 
         spec = DeleteSpec(
             namespace=ns,
@@ -735,23 +816,42 @@ class CorpusLangChainVectorStore(VectorStore):
             return [float(x) for x in embedding]
 
         if self.embedding_function is None:
-            raise NotSupported(
+            err = NotSupported(
                 "No embedding_function configured; caller must supply query embedding",
                 code="NO_EMBEDDING_FUNCTION",
             )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="embed_query",
+            )
+            raise err
 
         try:
             embs = self.embedding_function([query])
         except Exception as exc:  # noqa: BLE001
-            raise BadRequest(
+            err = BadRequest(
                 f"embedding_function failed for query: {exc}",
                 code="EMBEDDING_ERROR",
             )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="embed_query",
+            )
+            raise err
         if not embs or len(embs) != 1:
-            raise BadRequest(
+            err = BadRequest(
                 "embedding_function must return exactly one embedding for a single query",
                 code="BAD_EMBEDDINGS",
+                details={"returned": len(embs) if embs is not None else 0},
             )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="embed_query",
+            )
+            raise err
         return [float(x) for x in embs[0]]
 
     def similarity_search(
@@ -796,9 +896,9 @@ class CorpusLangChainVectorStore(VectorStore):
         """
         Streaming similarity search (sync), yielding Documents one by one.
 
-        This uses SyncStreamBridge under the hood via `sync_stream` to bridge
-        the async query into a synchronous iterator. The backend query itself
-        is still a single async call; this just exposes results incrementally.
+        Note: this does not change the backend query semantics; the underlying
+        adapter still executes a single async similarity query and returns all
+        matches, which are then yielded incrementally to the caller.
         """
         embedding: Optional[Sequence[float]] = kwargs.get("embedding")
         namespace: Optional[str] = kwargs.get("namespace")
@@ -808,6 +908,13 @@ class CorpusLangChainVectorStore(VectorStore):
         top_k = k or self.default_top_k
 
         async def _stream_coro():
+            """
+            Async factory returning an async iterator over VectorMatch items.
+
+            This avoids nested async generators with `yield` while still
+            matching the SyncStreamBridge contract of:
+                Callable[[], Awaitable[AsyncIterator[T]]].
+            """
             matches = await self._aquery_embedding(
                 query_emb,
                 k=top_k,
@@ -816,8 +923,23 @@ class CorpusLangChainVectorStore(VectorStore):
                 include_vectors=False,
                 ctx=ctx,
             )
-            for m in matches:
-                yield m
+
+            class _MatchAsyncIterator:
+                def __init__(self, items: List[VectorMatch]) -> None:
+                    self._items = items
+                    self._idx = 0
+
+                def __aiter__(self) -> "_MatchAsyncIterator":
+                    return self
+
+                async def __anext__(self) -> VectorMatch:
+                    if self._idx >= len(self._items):
+                        raise StopAsyncIteration
+                    item = self._items[self._idx]
+                    self._idx += 1
+                    return item
+
+            return _MatchAsyncIterator(matches)
 
         for match in sync_stream(
             _stream_coro,
@@ -954,39 +1076,61 @@ class CorpusLangChainVectorStore(VectorStore):
         if k == 0:
             return []
 
+        # If lambda_mult is 1.0, MMR reduces to simple relevance ranking:
+        # we can skip all diversity computation for a performance win.
+        if lambda_mult >= 1.0:
+            scores = [float(match.score) for match in candidate_matches]
+            sorted_indices = sorted(
+                range(len(candidate_matches)),
+                key=lambda i: scores[i],
+                reverse=True,
+            )
+            return sorted_indices[:k]
+
         # Use original scores from database as relevance measure
         original_scores = [float(match.score) for match in candidate_matches]
-        candidate_vecs = [match.vector.vector or [] for match in candidate_matches]
-        
+
+        # Build candidate vector list, handling missing or mismatched dimensions
+        candidate_vecs: List[List[float]] = []
+        dim = len(query_vec)
+        for match in candidate_matches:
+            vec = match.vector.vector or []
+            if not vec or (dim > 0 and len(vec) != dim):
+                # Treat missing or dimensionally inconsistent vectors as zero vectors,
+                # so MMR gracefully falls back toward original scores.
+                candidate_vecs.append([])
+            else:
+                candidate_vecs.append([float(x) for x in vec])
+
         # Normalize original scores to 0-1 range for consistency
         max_orig_score = max(original_scores) if original_scores else 1.0
         if max_orig_score <= 0.0:
             normalized_scores = [0.0] * len(original_scores)
         else:
             normalized_scores = [score / max_orig_score for score in original_scores]
-        
+
         # Precompute all pairwise similarities with caching
         similarity_cache: Dict[Tuple[int, int], float] = {}
-        
+
         def get_similarity(i: int, j: int) -> float:
             if (i, j) in similarity_cache:
                 return similarity_cache[(i, j)]
             if (j, i) in similarity_cache:
                 return similarity_cache[(j, i)]
-            
+
             vec_i = candidate_vecs[i]
             vec_j = candidate_vecs[j]
             if not vec_i or not vec_j or len(vec_i) != len(vec_j):
                 sim = 0.0
             else:
                 sim = self._cosine_sim(vec_i, vec_j)
-            
+
             similarity_cache[(i, j)] = sim
             return sim
 
         selected: List[int] = []
         candidates = list(range(len(candidate_matches)))
-        
+
         # Start with the most relevant document based on original score
         if candidates:
             first_idx = max(candidates, key=lambda i: normalized_scores[i])
@@ -1000,16 +1144,16 @@ class CorpusLangChainVectorStore(VectorStore):
             for idx in candidates:
                 # Relevance term using original database score
                 relevance = normalized_scores[idx]
-                
+
                 # Diversity term: max similarity to already selected items
                 max_similarity = 0.0
                 for sel_idx in selected:
                     similarity = get_similarity(idx, sel_idx)
                     max_similarity = max(max_similarity, similarity)
-                
+
                 # MMR score balancing relevance and diversity
                 mmr_score = lambda_mult * relevance - (1.0 - lambda_mult) * max_similarity
-                
+
                 if mmr_score > best_score:
                     best_score = mmr_score
                     best_idx = idx
@@ -1050,6 +1194,22 @@ class CorpusLangChainVectorStore(VectorStore):
         Returns:
             List of Documents selected via MMR
         """
+        if k <= 0:
+            return []
+
+        if not (0.0 <= lambda_mult <= 1.0):
+            err = BadRequest(
+                f"lambda_mult must be in [0, 1], got {lambda_mult}",
+                code="BAD_MMR_LAMBDA",
+            )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="mmr_search",
+                lambda_mult=lambda_mult,
+            )
+            raise err
+
         fetch_k: int = kwargs.get("fetch_k") or max(k * 4, k + 5)
         embedding: Optional[Sequence[float]] = kwargs.get("embedding")
         namespace: Optional[str] = kwargs.get("namespace")
@@ -1072,7 +1232,6 @@ class CorpusLangChainVectorStore(VectorStore):
         if not matches:
             return []
 
-        # Use improved MMR that respects original scores
         indices = self._mmr_select_indices(
             query_vec=query_emb,
             candidate_matches=matches,
@@ -1094,6 +1253,22 @@ class CorpusLangChainVectorStore(VectorStore):
         """
         Perform Maximal Marginal Relevance (MMR) search (async).
         """
+        if k <= 0:
+            return []
+
+        if not (0.0 <= lambda_mult <= 1.0):
+            err = BadRequest(
+                f"lambda_mult must be in [0, 1], got {lambda_mult}",
+                code="BAD_MMR_LAMBDA",
+            )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="mmr_search_async",
+                lambda_mult=lambda_mult,
+            )
+            raise err
+
         fetch_k: int = kwargs.get("fetch_k") or max(k * 4, k + 5)
         embedding: Optional[Sequence[float]] = kwargs.get("embedding")
         namespace: Optional[str] = kwargs.get("namespace")
