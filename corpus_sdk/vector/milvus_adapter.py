@@ -1,7 +1,7 @@
 # corpus_sdk/vector/milvus_adapter.py
 # SPDX-License-Identifier: Apache-2.0
 """
-Milvus Vector adapter for the Vector Protocol V1.1.
+Milvus Vector adapter for the Vector Protocol V1.0.
 
 This module implements a production-grade adapter on top of the
 `BaseVectorAdapter` / `VectorProtocolV1` contract, backed by Milvus.
@@ -148,7 +148,7 @@ class MilvusVectorAdapter(BaseVectorAdapter):
         # Soft limits / planning hints
         max_batch_size: int = 100,
         max_top_k: int = 100,
-        max_filter_terms: Optional[int] = None,
+        max_filter_terms: Optional[int] = None,  # accepted for API symmetry; ignored (no filtering support)
         text_storage_strategy: str = "metadata",  # "metadata", "docstore", or "none"
         batch_query_max_concurrency: Optional[int] = None,
         # BaseVectorAdapter infra
@@ -228,8 +228,7 @@ class MilvusVectorAdapter(BaseVectorAdapter):
         self._dimensions = int(dimensions) if dimensions is not None else 0
         self._max_batch_size = int(max_batch_size)
         self._max_top_k = int(max_top_k)
-        # Filters are not supported; this is kept for signature symmetry but unused in capabilities.
-        self._max_filter_terms = max_filter_terms
+        # max_filter_terms is intentionally not stored; filtering is not supported.
         self._text_storage_strategy = text_storage_strategy
         self._batch_query_max_concurrency = (
             int(batch_query_max_concurrency)
@@ -813,13 +812,20 @@ class MilvusVectorAdapter(BaseVectorAdapter):
             partitions = await self._run_in_thread(
                 client.list_partitions, self._collection_name
             )
-            existing_names = {p["partition_name"] for p in partitions} if isinstance(
-                partitions, list
-            ) else set()
         except Exception as exc:  # noqa: BLE001
             # If we fail to list partitions, we still attempt creation and rely on errors.
             logger.debug("list_partitions failed during create_namespace: %s", exc)
-            existing_names = set()
+            partitions = []
+
+        existing_names: set[str] = set()
+        if isinstance(partitions, list):
+            for p in partitions:
+                if isinstance(p, Mapping):
+                    pname = p.get("partition_name")
+                else:
+                    pname = getattr(p, "partition_name", None)
+                if pname:
+                    existing_names.add(str(pname))
 
         created = False
         if spec.namespace not in existing_names:
