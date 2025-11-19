@@ -1,12 +1,12 @@
 # corpus_sdk/vector/weaviate_adapter.py
 # SPDX-License-Identifier: Apache-2.0
 """
-Weaviate Vector adapter for the Vector Protocol V1.1.
+Weaviate Vector adapter for the Vector Protocol V1.0.
 
 # corpus_sdk/vector/weaviate_adapter.py
 # SPDX-License-Identifier: Apache-2.0
 """
-Weaviate Vector adapter for the Vector Protocol V1.1.
+Weaviate Vector adapter for the Vector Protocol V1.0.
 
 This module implements a production-grade adapter on top of the
 `BaseVectorAdapter` / `VectorProtocolV1` contract, backed by Weaviate.
