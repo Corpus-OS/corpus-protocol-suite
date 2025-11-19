@@ -175,6 +175,10 @@ class CorpusLangChainVectorStore(VectorStore):
         Signature:
             embedding_function(texts: List[str]) -> List[List[float]]
 
+    mmr_similarity_fn:
+        Optional custom similarity function for the MMR diversity term.
+        If not provided, cosine similarity is used.
+
     model_config:
         Pydantic v2-style config: allow arbitrary types like BaseVectorAdapter.
     """
@@ -193,6 +197,11 @@ class CorpusLangChainVectorStore(VectorStore):
 
     # Optional embedding integration
     embedding_function: Optional[Callable[[List[str]], Embeddings]] = None
+
+    # Optional custom similarity function for MMR diversity term
+    mmr_similarity_fn: Optional[
+        Callable[[Sequence[float], Sequence[float]], float]
+    ] = None
 
     # Cached capabilities
     _caps: Optional[VectorCapabilities] = None
@@ -896,9 +905,9 @@ class CorpusLangChainVectorStore(VectorStore):
         """
         Streaming similarity search (sync), yielding Documents one by one.
 
-        Note: this does not change the backend query semantics; the underlying
-        adapter still executes a single async similarity query and returns all
-        matches, which are then yielded incrementally to the caller.
+        This uses `sync_stream` under the hood to bridge an async generator into
+        a synchronous iterator, while keeping the backend query semantics
+        identical to `similarity_search`.
         """
         embedding: Optional[Sequence[float]] = kwargs.get("embedding")
         namespace: Optional[str] = kwargs.get("namespace")
@@ -909,11 +918,10 @@ class CorpusLangChainVectorStore(VectorStore):
 
         async def _stream_coro():
             """
-            Async factory returning an async iterator over VectorMatch items.
+            Async generator that yields VectorMatch items for streaming.
 
-            This avoids nested async generators with `yield` while still
-            matching the SyncStreamBridge contract of:
-                Callable[[], Awaitable[AsyncIterator[T]]].
+            This is a simple, readable pattern compatible with `sync_stream`,
+            exposing VectorMatch items one by one.
             """
             matches = await self._aquery_embedding(
                 query_emb,
@@ -923,23 +931,8 @@ class CorpusLangChainVectorStore(VectorStore):
                 include_vectors=False,
                 ctx=ctx,
             )
-
-            class _MatchAsyncIterator:
-                def __init__(self, items: List[VectorMatch]) -> None:
-                    self._items = items
-                    self._idx = 0
-
-                def __aiter__(self) -> "_MatchAsyncIterator":
-                    return self
-
-                async def __anext__(self) -> VectorMatch:
-                    if self._idx >= len(self._items):
-                        raise StopAsyncIteration
-                    item = self._items[self._idx]
-                    self._idx += 1
-                    return item
-
-            return _MatchAsyncIterator(matches)
+            for match in matches:
+                yield match
 
         for match in sync_stream(
             _stream_coro,
@@ -1033,7 +1026,7 @@ class CorpusLangChainVectorStore(VectorStore):
         return self._from_corpus_matches(matches)
 
     # ------------------------------------------------------------------ #
-    # MMR search (improved implementation)
+    # MMR search (improved + configurable similarity)
     # ------------------------------------------------------------------ #
 
     @staticmethod
@@ -1050,6 +1043,34 @@ class CorpusLangChainVectorStore(VectorStore):
             return 0.0
         return float(dot / (math.sqrt(na) * math.sqrt(nb)))
 
+    def _similarity_for_mmr(
+        self,
+        a: Sequence[float],
+        b: Sequence[float],
+    ) -> float:
+        """
+        Compute similarity between two vectors for MMR.
+
+        Uses `mmr_similarity_fn` if provided; otherwise falls back to cosine
+        similarity. Any error or non-numeric return from the custom function
+        is logged and treated as a signal to fall back to cosine.
+        """
+        if self.mmr_similarity_fn is not None:
+            try:
+                value = self.mmr_similarity_fn(a, b)
+                if isinstance(value, (int, float)):
+                    return float(value)
+                logger.debug(
+                    "mmr_similarity_fn returned non-numeric value %r; falling back to cosine",
+                    value,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "mmr_similarity_fn raised %r; falling back to cosine similarity",
+                    exc,
+                )
+        return self._cosine_sim(a, b)
+
     def _mmr_select_indices(
         self,
         query_vec: Sequence[float],
@@ -1058,7 +1079,8 @@ class CorpusLangChainVectorStore(VectorStore):
         lambda_mult: float,
     ) -> List[int]:
         """
-        Improved MMR selector that respects original database scores and caches similarities.
+        Improved MMR selector that respects original database scores and allows
+        a configurable similarity metric for the diversity term.
 
         Args:
             query_vec: The query embedding vector
@@ -1076,8 +1098,8 @@ class CorpusLangChainVectorStore(VectorStore):
         if k == 0:
             return []
 
-        # If lambda_mult is 1.0, MMR reduces to simple relevance ranking:
-        # we can skip all diversity computation for a performance win.
+        # If lambda_mult is 1.0, MMR reduces to pure relevance ranking:
+        # skip diversity computation for better performance.
         if lambda_mult >= 1.0:
             scores = [float(match.score) for match in candidate_matches]
             sorted_indices = sorted(
@@ -1123,7 +1145,7 @@ class CorpusLangChainVectorStore(VectorStore):
             if not vec_i or not vec_j or len(vec_i) != len(vec_j):
                 sim = 0.0
             else:
-                sim = self._cosine_sim(vec_i, vec_j)
+                sim = self._similarity_for_mmr(vec_i, vec_j)
 
             similarity_cache[(i, j)] = sim
             return sim
