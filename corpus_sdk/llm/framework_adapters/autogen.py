@@ -124,27 +124,36 @@ class CorpusAutoGenChatClient:
         model: str = "default",
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
-        # Streaming tuning knobs for sync streaming
+        # Streaming tuning knobs for sync streaming (defaults)
         stream_queue_maxsize: int = 16,
         stream_poll_timeout_s: float = 0.1,
         stream_join_timeout_s: float = 2.0,
         # Transient retry knobs for sync streaming
         max_transient_retries: int = 0,
         transient_backoff_s: float = 0.25,
+        stream_transient_error_types: Optional[Tuple[Type[BaseException], ...]] = None,
     ) -> None:
         self._adapter = corpus_adapter
         self.model = model
         self.temperature = float(temperature)
         self.max_tokens = max_tokens
 
-        # Sync streaming configuration
+        # Default sync streaming configuration
         self.stream_queue_maxsize = int(stream_queue_maxsize)
         self.stream_poll_timeout_s = float(stream_poll_timeout_s)
         self.stream_join_timeout_s = float(stream_join_timeout_s)
 
-        # Transient retry for sync streaming (before first item)
+        # Default transient retry for sync streaming (before first item)
         self.max_transient_retries = int(max_transient_retries)
         self.transient_backoff_s = float(transient_backoff_s)
+
+        if stream_transient_error_types is None:
+            self.stream_transient_error_types: Tuple[Type[BaseException], ...] = (
+                TransientNetwork,
+                Unavailable,
+            )
+        else:
+            self.stream_transient_error_types = stream_transient_error_types
 
     # ------------------------------------------------------------------ #
     # Core translation helpers
@@ -362,6 +371,14 @@ class CorpusAutoGenChatClient:
                 operation="complete",
                 messages_count=len(messages),
                 model=params.get("model", self.model),
+                temperature=params.get("temperature"),
+                max_tokens=params.get("max_tokens"),
+                top_p=params.get("top_p"),
+                frequency_penalty=params.get("frequency_penalty"),
+                presence_penalty=params.get("presence_penalty"),
+                request_id=ctx.request_id,
+                tenant=ctx.tenant,
+                stream=False,
             )
             raise
 
@@ -427,6 +444,14 @@ class CorpusAutoGenChatClient:
                 operation="stream",
                 messages_count=len(messages),
                 model=model_for_context,
+                temperature=params.get("temperature"),
+                max_tokens=params.get("max_tokens"),
+                top_p=params.get("top_p"),
+                frequency_penalty=params.get("frequency_penalty"),
+                presence_penalty=params.get("presence_penalty"),
+                request_id=ctx.request_id,
+                tenant=ctx.tenant,
+                stream=True,
             )
             raise
 
@@ -493,6 +518,13 @@ class CorpusAutoGenChatClient:
         kwargs:
             - stream: bool (default False)
             - cancel_event: Optional[threading.Event] for early cancellation
+            - Per-call streaming overrides:
+                * stream_queue_maxsize
+                * stream_poll_timeout_s
+                * stream_join_timeout_s
+                * stream_max_transient_retries
+                * stream_transient_backoff_s
+                * stream_transient_error_types
             - All other parameters as in `acreate`.
 
         Returns
@@ -504,17 +536,37 @@ class CorpusAutoGenChatClient:
         if cancel_event is not None and not isinstance(cancel_event, threading.Event):
             raise TypeError("cancel_event must be a threading.Event if provided")
 
+        # Per-call streaming overrides (fall back to instance defaults)
+        stream_queue_maxsize = int(kwargs.pop("stream_queue_maxsize", self.stream_queue_maxsize))
+        stream_poll_timeout_s = float(kwargs.pop("stream_poll_timeout_s", self.stream_poll_timeout_s))
+        stream_join_timeout_s = float(kwargs.pop("stream_join_timeout_s", self.stream_join_timeout_s))
+        stream_max_transient_retries = int(
+            kwargs.pop("stream_max_transient_retries", self.max_transient_retries)
+        )
+        stream_transient_backoff_s = float(
+            kwargs.pop("stream_transient_backoff_s", self.transient_backoff_s)
+        )
+        stream_transient_error_types = kwargs.pop("stream_transient_error_types", None)
+
+        if stream_transient_error_types is not None and not isinstance(
+            stream_transient_error_types, tuple
+        ):
+            raise TypeError("stream_transient_error_types must be a tuple of exception types")
+
         if not stream:
             # Non-streaming: simple AsyncBridge wrapper.
             try:
                 return AsyncBridge.run_async(self._acreate_openai(messages, **kwargs))
             except BaseException as exc:  # noqa: BLE001
+                # We may not know ctx/params here, but we can still enrich with
+                # basic context; _acreate_openai also attaches its own context.
                 attach_context(
                     exc,
                     framework="autogen",
-                    operation="complete",
+                    operation="complete_sync_wrapper",
                     messages_count=len(messages),
                     model=kwargs.get("model", self.model),
+                    stream=False,
                 )
                 raise
 
@@ -525,24 +577,40 @@ class CorpusAutoGenChatClient:
             # Note: we return the async iterator, not iterate here.
             return self._astream_openai(messages, **kwargs)
 
+        # Decide which transient error types to use for this call.
+        effective_transient_types: Tuple[Type[BaseException], ...]
+        if stream_transient_error_types is not None:
+            effective_transient_types = stream_transient_error_types
+        else:
+            effective_transient_types = self.stream_transient_error_types
+
+        error_context: Dict[str, Any] = {
+            "operation": "stream",
+            "messages_count": len(messages),
+            "model": model_for_context,
+            "stream_queue_maxsize": stream_queue_maxsize,
+            "stream_poll_timeout_s": stream_poll_timeout_s,
+            "stream_join_timeout_s": stream_join_timeout_s,
+            "stream_max_transient_retries": stream_max_transient_retries,
+            "stream_transient_backoff_s": stream_transient_backoff_s,
+            "stream": True,
+        }
+        if effective_transient_types:
+            error_context["stream_transient_error_types"] = [
+                t.__name__ for t in effective_transient_types
+            ]
+
         bridge = SyncStreamBridge(
             coro_factory=_factory,
-            queue_maxsize=self.stream_queue_maxsize,
-            poll_timeout_s=self.stream_poll_timeout_s,
-            join_timeout_s=self.stream_join_timeout_s,
+            queue_maxsize=stream_queue_maxsize,
+            poll_timeout_s=stream_poll_timeout_s,
+            join_timeout_s=stream_join_timeout_s,
             cancel_event=cancel_event,
             framework="autogen",
-            error_context={
-                "operation": "stream",
-                "messages_count": len(messages),
-                "model": model_for_context,
-            },
-            max_transient_retries=self.max_transient_retries,
-            transient_backoff_s=self.transient_backoff_s,
-            transient_error_types=(
-                TransientNetwork,
-                Unavailable,
-            ),
+            error_context=error_context,
+            max_transient_retries=stream_max_transient_retries,
+            transient_backoff_s=stream_transient_backoff_s,
+            transient_error_types=effective_transient_types,
         )
 
         return bridge.run()
