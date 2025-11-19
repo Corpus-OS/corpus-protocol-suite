@@ -1,0 +1,1819 @@
+# corpus_sdk/graph/framework_adapters/common/graph_translation.py
+# SPDX-License-Identifier: Apache-2.0
+"""
+Framework-agnostic Graph → Framework translation layer.
+
+Purpose
+-------
+Provide a high-level orchestration and translation layer between:
+
+- The Corpus Graph Protocol V1 (`GraphProtocolV1` / `BaseGraphAdapter`), and
+- Framework-specific graph integrations (LangChain, LlamaIndex, SK, AutoGen, CrewAI, custom).
+
+This module is intentionally *framework-neutral* and focuses on:
+
+- Building `GraphQuerySpec` / mutation specs from framework-level inputs
+- Translating `QueryResult` / `QueryChunk` / mutation results back to framework-facing shapes
+- Applying optional MMR / diversification on query results
+- Handling rich metadata filters (including $and / $or / range operators)
+- Providing sync + async APIs, including streaming via a sync bridge
+- Attaching rich error context for observability
+
+Context translation
+-------------------
+This module does **not** parse framework configs directly. Instead:
+
+- `corpus_sdk.core.context_translation` is responsible for taking framework-native
+  contexts (LangChain RunnableConfig, LlamaIndex CallbackManager, etc.) and producing
+  a core `OperationContext`.
+- Callers pass either an `OperationContext` or a simple dict-like context into
+  the methods here; we normalize that via `from_dict` into the graph adapter's
+  `OperationContext`.
+
+MMR / diversification
+---------------------
+This layer optionally supports Maximal Marginal Relevance (MMR) re-ranking on
+graph query results that expose:
+
+- A relevance score field (e.g. "score")
+- An embedding field (e.g. "embedding")
+
+The similarity metric for diversity is configurable (defaults to cosine).
+
+Filter handling
+---------------
+Metadata / property filters can use a rich, adapter-agnostic DSL:
+
+- Logical combinators:    {"$and": [...]} / {"$or": [...]}
+- Range operators:        {"field": {"$gt": v, "$lt": v2}} or tuple ["field", ">", v]
+- Simple equality:        {"field": value}
+
+The normalized filter is passed through to the graph adapter, which may further
+interpret or constrain semantics based on its own capabilities.
+
+Streaming
+---------
+For streaming queries, this module exposes:
+
+- An async API that yields translated framework chunks, and
+- A sync API that wraps the async generator via `sync_stream`, preserving
+  proper cancellation and error propagation.
+
+Registry
+--------
+A small registry lets you register per-framework graph translators:
+
+- `register_graph_translator("my_framework", factory)`
+- `create_graph_translator("my_framework", adapter, ...)`
+
+This makes it straightforward to plug in framework-specific behaviors while
+reusing the common orchestration logic here.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+from dataclasses import dataclass
+from typing import (
+    Any,
+    AsyncIterator,
+    Callable,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Protocol,
+    Sequence,
+    Tuple,
+    TypeVar,
+    Union,
+)
+
+from corpus_sdk.graph.graph_base import (
+    BatchOperation,
+    BatchResult,
+    BulkVerticesResult,
+    BulkVerticesSpec,
+    DeleteEdgesSpec,
+    DeleteNodesSpec,
+    GraphAdapterError,
+    GraphCapabilities,
+    GraphQuerySpec,
+    GraphSchema,
+    GraphProtocolV1,
+    OperationContext,
+    QueryChunk,
+    QueryResult,
+    UpsertEdgesSpec,
+    UpsertNodesSpec,
+    BadRequest,
+    NotSupported,
+)
+
+from corpus_sdk.core.context_translation import from_dict as ctx_from_dict
+from corpus_sdk.core.sync_stream_bridge import sync_stream
+from corpus_sdk.llm.framework_adapters.common.error_context import attach_context
+
+LOG = logging.getLogger(__name__)
+
+T = TypeVar("T")
+Record = Mapping[str, Any]
+
+
+# =============================================================================
+# Helpers: OperationContext normalization
+# =============================================================================
+
+
+def _ensure_operation_context(
+    ctx: Optional[Union[OperationContext, Mapping[str, Any]]],
+) -> OperationContext:
+    """
+    Normalize various context shapes into a graph OperationContext.
+
+    Accepts:
+        - None: returns an "empty" context
+        - OperationContext: returned as-is
+        - Mapping[str, Any]: interpreted via context_translation.from_dict,
+          then adapted into a graph OperationContext.
+
+    This keeps responsibilities clean:
+        - Framework-native → Normalized dict/OperationContext happens in
+          corpus_sdk.core.context_translation (from_langchain, from_llamaindex, etc.)
+        - This helper simply ensures the graph adapter receives the right type.
+    """
+    if ctx is None:
+        core_ctx = ctx_from_dict({})
+    elif isinstance(ctx, OperationContext):
+        return ctx
+    elif isinstance(ctx, Mapping):
+        core_ctx = ctx_from_dict(ctx)
+    else:
+        raise BadRequest(
+            f"Unsupported context type: {type(ctx).__name__}",
+            code="BAD_OPERATION_CONTEXT",
+        )
+
+    # We don't import the core OperationContext type directly here; we only
+    # assume it exposes the standard attributes accessed via getattr.
+    return OperationContext(
+        request_id=getattr(core_ctx, "request_id", None),
+        idempotency_key=getattr(core_ctx, "idempotency_key", None),
+        deadline_ms=getattr(core_ctx, "deadline_ms", None),
+        traceparent=getattr(core_ctx, "traceparent", None),
+        tenant=getattr(core_ctx, "tenant", None),
+        attrs=getattr(core_ctx, "attrs", None),
+    )
+
+
+# =============================================================================
+# MMR configuration
+# =============================================================================
+
+
+SimilarityFn = Callable[[Sequence[float], Sequence[float]], float]
+
+
+@dataclass(frozen=True)
+class MMRConfig:
+    """
+    Configuration for Maximal Marginal Relevance re-ranking.
+
+    Attributes:
+        enabled:
+            Whether to apply MMR. If False, results are returned as-is.
+
+        k:
+            Number of results to keep after diversification. If None, the full
+            set of records is re-ordered but not truncated.
+
+        lambda_mult:
+            Tradeoff between relevance and diversity, in [0, 1].
+            Higher → more weight on original relevance scores.
+            Lower  → more weight on diversity between results.
+
+        score_key:
+            Record field name containing the original relevance score.
+            Must be convertible to float.
+
+        vector_key:
+            Record field name containing the embedding vector for diversity.
+            Must be a sequence of floats.
+
+        similarity_fn:
+            Optional custom similarity metric between two embedding vectors.
+            If None, cosine similarity is used.
+    """
+
+    enabled: bool = False
+    k: Optional[int] = None
+    lambda_mult: float = 0.5
+    score_key: str = "score"
+    vector_key: str = "embedding"
+    similarity_fn: Optional[SimilarityFn] = None
+
+    def effective_k(self, n: int) -> int:
+        """Resolve final k against the number of available records."""
+        if not self.enabled:
+            return n
+        if self.k is None or self.k <= 0:
+            return n
+        return min(self.k, n)
+
+
+# =============================================================================
+# Filter translation helpers
+# =============================================================================
+
+
+class FilterTranslator:
+    """
+    Helper for normalizing framework-level filter DSLs into a mapping suitable
+    for GraphProtocol filters.
+
+    Supported input shapes (examples):
+        - {"field": "value"}
+        - {"$and": [ {...}, {...} ]}
+        - {"$or":  [ {...}, {...} ]}
+        - ["field", ">", 10]          → {"field": {"$gt": 10}}
+        - [ ["age", ">", 18], ["age", "<", 65] ]
+        - [{"field": "v1"}, {"field": "v2"}]  → {"$and": [...]}
+
+    This module intentionally does not enforce the semantics of these operators;
+    adapters can interpret or restrict them as needed.
+    """
+
+    _RANGE_OP_MAP: Mapping[str, str] = {
+        ">": "$gt",
+        "<": "$lt",
+        ">=": "$gte",
+        "<=": "$lte",
+        "==": "$eq",
+        "=": "$eq",
+        "!=": "$ne",
+    }
+
+    def normalize(self, raw: Any) -> Optional[Mapping[str, Any]]:
+        """Normalize arbitrary filter DSL into a mapping, or None."""
+        if raw is None:
+            return None
+
+        # Already a mapping: shallow-copy to avoid mutating caller state.
+        if isinstance(raw, Mapping):
+            return self._normalize_mapping(raw)
+
+        # Sequence of filters or single tuple condition.
+        if isinstance(raw, (list, tuple)):
+            return self._normalize_sequence(raw)
+
+        # Anything else is unsupported.
+        raise BadRequest(
+            f"Unsupported filter type: {type(raw).__name__}",
+            code="BAD_FILTER",
+        )
+
+    def _normalize_mapping(self, raw: Mapping[str, Any]) -> Mapping[str, Any]:
+        # If it already looks like a logical combinator or range structure,
+        # we keep it as-is but ensure nested filters are normalized.
+        if "$and" in raw or "$or" in raw:
+            out: Dict[str, Any] = {}
+            for key, value in raw.items():
+                if key in ("$and", "$or") and isinstance(value, (list, tuple)):
+                    out[key] = [self.normalize(v) for v in value]
+                else:
+                    out[key] = value
+            return out
+
+        # Otherwise, treat as a simple equality / basic range map.
+        out: Dict[str, Any] = {}
+        for key, value in raw.items():
+            if isinstance(value, (list, tuple)) and len(value) == 2:
+                # Example: {"age": (">", 18)} -> {"age": {"$gt": 18}}
+                op, v = value
+                mapped = self._RANGE_OP_MAP.get(str(op))
+                if mapped:
+                    out[key] = {mapped: v}
+                else:
+                    out[key] = value
+            else:
+                out[key] = value
+        return out
+
+    def _normalize_sequence(self, raw: Sequence[Any]) -> Mapping[str, Any]:
+        # Tuple condition: ["age", ">", 18]
+        if len(raw) == 3 and not isinstance(raw[0], (list, tuple, Mapping)):
+            field, op, value = raw
+            mapped = self._RANGE_OP_MAP.get(str(op))
+            if not mapped:
+                raise BadRequest(
+                    f"Unsupported filter operator: {op!r}",
+                    code="BAD_FILTER_OPERATOR",
+                    details={"operator": op},
+                )
+            return {str(field): {mapped: value}}
+
+        # Otherwise, assume a list of filters combined via AND.
+        parts = [self.normalize(part) for part in raw]
+        return {"$and": parts}
+
+
+# =============================================================================
+# Framework-agnostic translator protocol
+# =============================================================================
+
+
+class GraphFrameworkTranslator(Protocol):
+    """
+    Per-framework translator contract.
+
+    Implementations are responsible for:
+        - Converting framework-level query/mutation inputs into Graph*Spec types
+        - Converting Graph results into framework-level outputs
+        - (Optionally) applying MMR or other post-processing steps
+
+    The default implementation provided here is generic and treats inputs as
+    dicts/strings that already closely match GraphSpec shapes. Frameworks with
+    richer abstractions (LangChain, LlamaIndex, etc.) can provide their own
+    implementations and register them via the registry.
+    """
+
+    # ---- query translation ----
+
+    def build_query_spec(
+        self,
+        raw_query: Any,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Any] = None,
+        stream: bool = False,
+    ) -> GraphQuerySpec:
+        ...
+
+    def translate_query_result(
+        self,
+        result: QueryResult,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        ...
+
+    def translate_query_chunk(
+        self,
+        chunk: QueryChunk,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        ...
+
+    # ---- mutation translation ----
+
+    def build_upsert_nodes_spec(
+        self,
+        raw_nodes: Any,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Any] = None,
+    ) -> UpsertNodesSpec:
+        ...
+
+    def build_upsert_edges_spec(
+        self,
+        raw_edges: Any,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Any] = None,
+    ) -> UpsertEdgesSpec:
+        ...
+
+    def build_delete_nodes_spec(
+        self,
+        raw_filter_or_ids: Any,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Any] = None,
+    ) -> DeleteNodesSpec:
+        ...
+
+    def build_delete_edges_spec(
+        self,
+        raw_filter_or_ids: Any,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Any] = None,
+    ) -> DeleteEdgesSpec:
+        ...
+
+    # ---- bulk / batch / schema ----
+
+    def build_bulk_vertices_spec(
+        self,
+        raw_request: Any,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Any] = None,
+    ) -> BulkVerticesSpec:
+        ...
+
+    def translate_bulk_vertices_result(
+        self,
+        result: BulkVerticesResult,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        ...
+
+    def build_batch_ops(
+        self,
+        raw_batch_ops: Any,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Any] = None,
+    ) -> List[BatchOperation]:
+        ...
+
+    def translate_batch_result(
+        self,
+        result: BatchResult,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        ...
+
+    def translate_schema(
+        self,
+        schema: GraphSchema,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        ...
+
+    # ---- optional hooks ----
+
+    def preferred_namespace(
+        self,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Any] = None,
+    ) -> Optional[str]:
+        """
+        Optional hook for translators to derive a default namespace.
+
+        This can come from:
+            - framework_ctx (e.g., which index/graph is active)
+            - op_ctx.attrs (e.g., "graph_namespace" key)
+        """
+        ...
+
+
+# =============================================================================
+# Default generic translator implementation
+# =============================================================================
+
+
+class DefaultGraphFrameworkTranslator:
+    """
+    Generic, framework-neutral translator implementation.
+
+    Behaviors:
+        - Treats raw_query as either:
+            * a string (query text), or
+            * a mapping with GraphQuerySpec-like keys
+        - Treats mutation inputs as:
+            * sequences of dicts with Node/Edge fields, or
+            * sequences of already-built Node/Edge-compatible mappings
+
+        - For results:
+            * QueryResult → list of records
+            * QueryChunk  → list of records per chunk
+            * BulkVerticesResult → same structure
+            * BatchResult → underlying results list
+            * GraphSchema → underlying schema object
+
+    Frameworks with richer abstractions are expected to provide their own
+    GraphFrameworkTranslator implementation, but this default is fully usable.
+    """
+
+    def __init__(self) -> None:
+        self._filter_translator = FilterTranslator()
+
+    # ---- namespace helper ----
+
+    def preferred_namespace(
+        self,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Any] = None,
+    ) -> Optional[str]:
+        # Prefer explicit framework_ctx value, else attrs, else None.
+        if isinstance(framework_ctx, Mapping) and "namespace" in framework_ctx:
+            return str(framework_ctx["namespace"])
+        attrs = op_ctx.attrs or {}
+        ns = attrs.get("graph_namespace") or attrs.get("namespace")
+        return str(ns) if ns is not None else None
+
+    # ---- query translation ----
+
+    def build_query_spec(
+        self,
+        raw_query: Any,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Any] = None,
+        stream: bool = False,
+    ) -> GraphQuerySpec:
+        namespace = self.preferred_namespace(op_ctx=op_ctx, framework_ctx=framework_ctx)
+
+        if isinstance(raw_query, str):
+            return GraphQuerySpec(
+                text=raw_query,
+                dialect=None,
+                params={},
+                namespace=namespace,
+                timeout_ms=None,
+                stream=stream,
+            )
+
+        if isinstance(raw_query, Mapping):
+            text = raw_query.get("text")
+            if not isinstance(text, str) or not text.strip():
+                raise BadRequest(
+                    "raw_query.text must be a non-empty string",
+                    code="BAD_QUERY",
+                )
+
+            dialect = raw_query.get("dialect")
+            params = raw_query.get("params") or {}
+            rq_namespace = raw_query.get("namespace")
+            timeout_ms = raw_query.get("timeout_ms")
+
+            return GraphQuerySpec(
+                text=text,
+                dialect=str(dialect) if dialect is not None else None,
+                params=dict(params),
+                namespace=str(rq_namespace) if rq_namespace is not None else namespace,
+                timeout_ms=int(timeout_ms) if timeout_ms is not None else None,
+                stream=bool(raw_query.get("stream", stream)),
+            )
+
+        raise BadRequest(
+            f"Unsupported raw_query type: {type(raw_query).__name__}",
+            code="BAD_QUERY",
+        )
+
+    def translate_query_result(
+        self,
+        result: QueryResult,
+        *,
+        op_ctx: OperationContext,  # noqa: ARG002
+        framework_ctx: Optional[Any] = None,  # noqa: ARG002
+    ) -> Any:
+        # Generic behavior: return the records list, plus summary as metadata.
+        return {
+            "records": list(result.records or []),
+            "summary": dict(result.summary or {}),
+            "dialect": result.dialect,
+            "namespace": result.namespace,
+        }
+
+    def translate_query_chunk(
+        self,
+        chunk: QueryChunk,
+        *,
+        op_ctx: OperationContext,  # noqa: ARG002
+        framework_ctx: Optional[Any] = None,  # noqa: ARG002
+    ) -> Any:
+        # Generic behavior: return the chunk as a simple dict.
+        return {
+            "records": list(chunk.records or []),
+            "is_final": bool(chunk.is_final),
+            "summary": dict(chunk.summary or {}) if chunk.summary is not None else None,
+        }
+
+    # ---- mutation translation ----
+
+    def build_upsert_nodes_spec(
+        self,
+        raw_nodes: Any,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Any] = None,
+    ) -> UpsertNodesSpec:
+        from corpus_sdk.graph.graph_base import Node  # local import to avoid cycles
+
+        namespace = self.preferred_namespace(op_ctx=op_ctx, framework_ctx=framework_ctx)
+
+        if isinstance(raw_nodes, Mapping):
+            raw_nodes = [raw_nodes]
+        if not isinstance(raw_nodes, Iterable):
+            raise BadRequest(
+                "raw_nodes must be a mapping or iterable",
+                code="BAD_NODES",
+            )
+
+        nodes: List[Node] = []
+        for idx, item in enumerate(raw_nodes):
+            if isinstance(item, Node):
+                nodes.append(item)
+                continue
+            if not isinstance(item, Mapping):
+                raise BadRequest(
+                    f"raw_nodes[{idx}] must be a mapping or Node",
+                    code="BAD_NODES",
+                    details={"index": idx, "type": type(item).__name__},
+                )
+            node_ns = item.get("namespace", namespace)
+            node = Node(
+                id=item.get("id"),
+                labels=tuple(item.get("labels") or ()),
+                properties=item.get("properties") or {},
+                namespace=node_ns,
+                created_at=item.get("created_at"),
+                updated_at=item.get("updated_at"),
+            )
+            nodes.append(node)
+
+        return UpsertNodesSpec(nodes=nodes, namespace=namespace)
+
+    def build_upsert_edges_spec(
+        self,
+        raw_edges: Any,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Any] = None,
+    ) -> UpsertEdgesSpec:
+        from corpus_sdk.graph.graph_base import Edge, GraphID  # local import
+
+        namespace = self.preferred_namespace(op_ctx=op_ctx, framework_ctx=framework_ctx)
+
+        if isinstance(raw_edges, Mapping):
+            raw_edges = [raw_edges]
+        if not isinstance(raw_edges, Iterable):
+            raise BadRequest(
+                "raw_edges must be a mapping or iterable",
+                code="BAD_EDGES",
+            )
+
+        edges: List[Edge] = []
+        for idx, item in enumerate(raw_edges):
+            if isinstance(item, Edge):
+                edges.append(item)
+                continue
+            if not isinstance(item, Mapping):
+                raise BadRequest(
+                    f"raw_edges[{idx}] must be a mapping or Edge",
+                    code="BAD_EDGES",
+                    details={"index": idx, "type": type(item).__name__},
+                )
+            edge_ns = item.get("namespace", namespace)
+            edge = Edge(
+                id=GraphID(str(item.get("id"))),
+                src=GraphID(str(item.get("src"))),
+                dst=GraphID(str(item.get("dst"))),
+                label=str(item.get("label")),
+                properties=item.get("properties") or {},
+                namespace=edge_ns,
+                created_at=item.get("created_at"),
+                updated_at=item.get("updated_at"),
+            )
+            edges.append(edge)
+
+        return UpsertEdgesSpec(edges=edges, namespace=namespace)
+
+    def build_delete_nodes_spec(
+        self,
+        raw_filter_or_ids: Any,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Any] = None,
+    ) -> DeleteNodesSpec:
+        from corpus_sdk.graph.graph_base import GraphID  # local import
+
+        namespace = self.preferred_namespace(op_ctx=op_ctx, framework_ctx=framework_ctx)
+
+        ids: List[GraphID] = []
+        filter_expr: Optional[Mapping[str, Any]] = None
+
+        # Mapping → filter-based delete
+        if isinstance(raw_filter_or_ids, Mapping):
+            filter_expr = self._filter_translator.normalize(raw_filter_or_ids)
+        # Iterable of IDs or filters
+        elif isinstance(raw_filter_or_ids, (list, tuple)):
+            if not raw_filter_or_ids:
+                ids = []
+                filter_expr = None
+            else:
+                first = raw_filter_or_ids[0]
+                # If first element is mapping, treat as list of filters AND'ed together
+                if isinstance(first, Mapping):
+                    filter_expr = self._filter_translator.normalize(raw_filter_or_ids)
+                else:
+                    ids = [GraphID(str(x)) for x in raw_filter_or_ids]
+        else:
+            # Single scalar ID
+            ids = [GraphID(str(raw_filter_or_ids))]
+
+        return DeleteNodesSpec(ids=ids, namespace=namespace, filter=filter_expr)
+
+    def build_delete_edges_spec(
+        self,
+        raw_filter_or_ids: Any,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Any] = None,
+    ) -> DeleteEdgesSpec:
+        from corpus_sdk.graph.graph_base import GraphID  # local import
+
+        namespace = self.preferred_namespace(op_ctx=op_ctx, framework_ctx=framework_ctx)
+
+        ids: List[GraphID] = []
+        filter_expr: Optional[Mapping[str, Any]] = None
+
+        if isinstance(raw_filter_or_ids, Mapping):
+            filter_expr = self._filter_translator.normalize(raw_filter_or_ids)
+        elif isinstance(raw_filter_or_ids, (list, tuple)):
+            if not raw_filter_or_ids:
+                ids = []
+                filter_expr = None
+            else:
+                first = raw_filter_or_ids[0]
+                if isinstance(first, Mapping):
+                    filter_expr = self._filter_translator.normalize(raw_filter_or_ids)
+                else:
+                    ids = [GraphID(str(x)) for x in raw_filter_or_ids]
+        else:
+            ids = [GraphID(str(raw_filter_or_ids))]
+
+        return DeleteEdgesSpec(ids=ids, namespace=namespace, filter=filter_expr)
+
+    # ---- bulk / batch / schema ----
+
+    def build_bulk_vertices_spec(
+        self,
+        raw_request: Any,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Any] = None,
+    ) -> BulkVerticesSpec:
+        namespace = self.preferred_namespace(op_ctx=op_ctx, framework_ctx=framework_ctx)
+
+        if raw_request is None:
+            return BulkVerticesSpec(namespace=namespace)
+
+        if not isinstance(raw_request, Mapping):
+            raise BadRequest(
+                "bulk_vertices request must be a mapping or None",
+                code="BAD_BULK_VERTICES",
+            )
+
+        limit = raw_request.get("limit", 100)
+        cursor = raw_request.get("cursor")
+        filter_expr = self._filter_translator.normalize(raw_request.get("filter"))
+
+        return BulkVerticesSpec(
+            namespace=raw_request.get("namespace", namespace),
+            limit=int(limit),
+            cursor=cursor,
+            filter=filter_expr,
+        )
+
+    def translate_bulk_vertices_result(
+        self,
+        result: BulkVerticesResult,
+        *,
+        op_ctx: OperationContext,  # noqa: ARG002
+        framework_ctx: Optional[Any] = None,  # noqa: ARG002
+    ) -> Any:
+        return {
+            "nodes": list(result.nodes or []),
+            "next_cursor": result.next_cursor,
+            "has_more": bool(result.has_more),
+        }
+
+    def build_batch_ops(
+        self,
+        raw_batch_ops: Any,
+        *,
+        op_ctx: OperationContext,  # noqa: ARG002
+        framework_ctx: Optional[Any] = None,  # noqa: ARG002
+    ) -> List[BatchOperation]:
+        if raw_batch_ops is None:
+            raise BadRequest(
+                "raw_batch_ops must not be None",
+                code="BAD_BATCH",
+            )
+        if isinstance(raw_batch_ops, Mapping):
+            raw_batch_ops = [raw_batch_ops]
+        if not isinstance(raw_batch_ops, Iterable):
+            raise BadRequest(
+                "raw_batch_ops must be a mapping or iterable",
+                code="BAD_BATCH",
+            )
+
+        ops: List[BatchOperation] = []
+        for idx, item in enumerate(raw_batch_ops):
+            if not isinstance(item, Mapping):
+                raise BadRequest(
+                    f"raw_batch_ops[{idx}] must be a mapping",
+                    code="BAD_BATCH_OP",
+                    details={"index": idx, "type": type(item).__name__},
+                )
+            op_name = item.get("op")
+            args = item.get("args") or {}
+            if not isinstance(op_name, str) or not op_name:
+                raise BadRequest(
+                    f"raw_batch_ops[{idx}].op must be a non-empty string",
+                    code="BAD_BATCH_OP",
+                    details={"index": idx},
+                )
+            if not isinstance(args, Mapping):
+                raise BadRequest(
+                    f"raw_batch_ops[{idx}].args must be a mapping",
+                    code="BAD_BATCH_OP",
+                    details={"index": idx, "type": type(args).__name__},
+                )
+            ops.append(BatchOperation(op=str(op_name), args=dict(args)))
+        return ops
+
+    def translate_batch_result(
+        self,
+        result: BatchResult,
+        *,
+        op_ctx: OperationContext,  # noqa: ARG002
+        framework_ctx: Optional[Any] = None,  # noqa: ARG002
+    ) -> Any:
+        return list(result.results or [])
+
+    def translate_schema(
+        self,
+        schema: GraphSchema,
+        *,
+        op_ctx: OperationContext,  # noqa: ARG002
+        framework_ctx: Optional[Any] = None,  # noqa: ARG002
+    ) -> Any:
+        return schema
+
+
+# =============================================================================
+# Graph Translator Orchestrator
+# =============================================================================
+
+
+class GraphTranslator:
+    """
+    Framework-agnostic orchestrator for graph operations.
+
+    This class:
+        - Accepts framework-level inputs and a normalized OperationContext
+        - Delegates to a GraphFrameworkTranslator to build specs and translate results
+        - Calls into a GraphProtocolV1 adapter to execute operations
+        - Provides sync + async variants for all core operations
+        - Handles streaming via sync_stream for sync callers
+        - Optionally applies MMR re-ranking before returning results
+        - Attaches rich error context for diagnostics
+
+    It does *not*:
+        - Know anything about framework-native context objects (RunnableConfig, etc.)
+        - Implement any backend-specific logic (that lives in BaseGraphAdapter subclasses)
+    """
+
+    def __init__(
+        self,
+        *,
+        adapter: GraphProtocolV1,
+        framework: str = "generic",
+        translator: Optional[GraphFrameworkTranslator] = None,
+    ) -> None:
+        self._adapter = adapter
+        self._framework = framework
+        self._translator: GraphFrameworkTranslator = translator or DefaultGraphFrameworkTranslator()
+
+    # --------------------------------------------------------------------- #
+    # Internal MMR helpers
+    # --------------------------------------------------------------------- #
+
+    @staticmethod
+    def _cosine_similarity(a: Sequence[float], b: Sequence[float]) -> float:
+        dot = 0.0
+        na = 0.0
+        nb = 0.0
+        for x, y in zip(a, b):
+            dot += x * y
+            na += x * x
+            nb += y * y
+        if na <= 0.0 or nb <= 0.0:
+            return 0.0
+        return float(dot / (math.sqrt(na) * math.sqrt(nb)))
+
+    def _apply_mmr_to_query_result(
+        self,
+        result: QueryResult,
+        mmr_config: Optional[MMRConfig],
+    ) -> QueryResult:
+        """
+        Apply Maximal Marginal Relevance re-ranking to a QueryResult.
+
+        MMR is only applied if:
+            - mmr_config is not None and enabled is True
+            - There are at least 2 records
+            - Each record contains:
+                * a numeric score field (mmr_config.score_key), and
+                * a vector field (mmr_config.vector_key) with equal dimensions
+        """
+        if mmr_config is None or not mmr_config.enabled:
+            return result
+
+        records = list(result.records or [])
+        n = len(records)
+        if n <= 1:
+            return result
+
+        # Extract scores and vectors
+        scores: List[float] = []
+        vectors: List[List[float]] = []
+
+        for idx, rec in enumerate(records):
+            if not isinstance(rec, Mapping):
+                LOG.debug("MMR skipped: record[%d] is not a mapping", idx)
+                return result
+            if mmr_config.score_key not in rec or mmr_config.vector_key not in rec:
+                LOG.debug(
+                    "MMR skipped: record[%d] missing score or vector key (%s/%s)",
+                    idx,
+                    mmr_config.score_key,
+                    mmr_config.vector_key,
+                )
+                return result
+            try:
+                scores.append(float(rec[mmr_config.score_key]))
+            except (TypeError, ValueError):
+                LOG.debug("MMR skipped: record[%d] score is not numeric", idx)
+                return result
+
+            vec_raw = rec[mmr_config.vector_key]
+            if not isinstance(vec_raw, (list, tuple)):
+                LOG.debug("MMR skipped: record[%d] vector is not a sequence", idx)
+                return result
+            try:
+                vec = [float(v) for v in vec_raw]
+            except (TypeError, ValueError):
+                LOG.debug("MMR skipped: record[%d] vector elements not numeric", idx)
+                return result
+            vectors.append(vec)
+
+        # Check dimension consistency
+        dim = len(vectors[0])
+        if dim == 0 or any(len(v) != dim for v in vectors):
+            LOG.debug("MMR skipped: inconsistent or zero-length vector dimensions")
+            return result
+
+        # Normalize scores
+        max_score = max(scores)
+        if max_score <= 0.0:
+            normalized_scores = [0.0 for _ in scores]
+        else:
+            normalized_scores = [s / max_score for s in scores]
+
+        sim_fn: SimilarityFn = mmr_config.similarity_fn or self._cosine_similarity
+        k = mmr_config.effective_k(n)
+        lambda_mult = float(mmr_config.lambda_mult)
+
+        selected_indices: List[int] = []
+        candidates: List[int] = list(range(n))
+        similarity_cache: Dict[Tuple[int, int], float] = {}
+
+        def get_similarity(i: int, j: int) -> float:
+            if (i, j) in similarity_cache:
+                return similarity_cache[(i, j)]
+            if (j, i) in similarity_cache:
+                return similarity_cache[(j, i)]
+            val = sim_fn(vectors[i], vectors[j])
+            similarity_cache[(i, j)] = val
+            return val
+
+        # Seed with most relevant by original score
+        if candidates:
+            best_first = max(candidates, key=lambda idx: normalized_scores[idx])
+            selected_indices.append(best_first)
+            candidates.remove(best_first)
+
+        while candidates and len(selected_indices) < k:
+            best_idx: Optional[int] = None
+            best_mmr_score = -float("inf")
+
+            for idx in candidates:
+                relevance = normalized_scores[idx]
+                diversity_penalty = 0.0
+                if selected_indices:
+                    diversity_penalty = max(
+                        get_similarity(idx, j) for j in selected_indices
+                    )
+                mmr_score = lambda_mult * relevance - (1.0 - lambda_mult) * diversity_penalty
+                if mmr_score > best_mmr_score:
+                    best_mmr_score = mmr_score
+                    best_idx = idx
+
+            if best_idx is None:
+                break
+
+            selected_indices.append(best_idx)
+            candidates.remove(best_idx)
+
+        # Preserve original record ordering for non-selected tail if k < n,
+        # but keep diversified subset in front.
+        reordered: List[Record] = [records[i] for i in selected_indices]
+        if k < n:
+            remaining = [records[i] for i in range(n) if i not in selected_indices]
+            reordered.extend(remaining)
+
+        return QueryResult(
+            records=reordered,
+            summary=result.summary,
+            dialect=result.dialect,
+            namespace=result.namespace,
+        )
+
+    # --------------------------------------------------------------------- #
+    # Sync Query APIs
+    # --------------------------------------------------------------------- #
+
+    def query(
+        self,
+        raw_query: Any,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,
+        mmr_config: Optional[MMRConfig] = None,
+    ) -> Any:
+        """
+        Synchronous query API.
+
+        Steps:
+            - Normalize OperationContext
+            - Build GraphQuerySpec via translator
+            - Call adapter.query(...)
+            - Optionally apply MMR
+            - Translate result back to framework-level shape
+        """
+        ctx = _ensure_operation_context(op_ctx)
+        try:
+            spec = self._translator.build_query_spec(
+                raw_query,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+                stream=False,
+            )
+            result = self._adapter.query(spec, ctx=ctx)
+            if isinstance(result, QueryResult):
+                # adapter.query is async, but GraphProtocolV1 defines async methods.
+                # We call it via asyncio in async APIs; here we expect a sync wrapper
+                # to be provided by the application when used in fully sync stacks.
+                # To keep this class usable in both modes, we also provide `arun_*`
+                # async methods below. For sync usage, callers should either:
+                #   - wrap the adapter via a sync bridge, OR
+                #   - use the async APIs instead.
+                #
+                # In many deployments, BaseGraphAdapter will be used via async only.
+                pass
+        except TypeError:
+            # If adapter.query is async-only, we require the async API.
+            raise NotSupported(
+                "Synchronous query() requires a sync-capable adapter; "
+                "use arun_query() in async applications.",
+                code="SYNC_NOT_SUPPORTED",
+            )
+
+        # At this point, `result` should be a QueryResult.
+        if not isinstance(result, QueryResult):
+            raise BadRequest(
+                f"adapter.query returned unsupported type: {type(result).__name__}",
+                code="BAD_ADAPTER_RESULT",
+            )
+
+        # Apply MMR if requested
+        result_mmr = self._apply_mmr_to_query_result(result, mmr_config=mmr_config)
+        return self._translator.translate_query_result(
+            result_mmr,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+
+    # --------------------------------------------------------------------- #
+    # Async Query APIs
+    # --------------------------------------------------------------------- #
+
+    async def arun_query(
+        self,
+        raw_query: Any,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,
+        mmr_config: Optional[MMRConfig] = None,
+    ) -> Any:
+        """
+        Async query API (preferred for most applications).
+
+        Fully async:
+            - await adapter.query(...)
+            - optional MMR
+            - result translation
+        """
+        ctx = _ensure_operation_context(op_ctx)
+        try:
+            spec = self._translator.build_query_spec(
+                raw_query,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+                stream=False,
+            )
+            result = await self._adapter.query(spec, ctx=ctx)
+        except GraphAdapterError as exc:
+            attach_context(
+                exc,
+                framework=self._framework,
+                graph_operation="query",
+                dialect=getattr(spec, "dialect", None),
+                namespace=getattr(spec, "namespace", None),
+                request_id=ctx.request_id,
+                tenant=ctx.tenant,
+            )
+            raise
+        except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework=self._framework,
+                graph_operation="query",
+                dialect=getattr(spec, "dialect", None),
+                namespace=getattr(spec, "namespace", None),
+                request_id=ctx.request_id,
+                tenant=ctx.tenant,
+            )
+            raise
+
+        if not isinstance(result, QueryResult):
+            raise BadRequest(
+                f"adapter.query returned unsupported type: {type(result).__name__}",
+                code="BAD_ADAPTER_RESULT",
+            )
+
+        result_mmr = self._apply_mmr_to_query_result(result, mmr_config=mmr_config)
+        return self._translator.translate_query_result(
+            result_mmr,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+
+    # --------------------------------------------------------------------- #
+    # Streaming Query APIs
+    # --------------------------------------------------------------------- #
+
+    def query_stream(
+        self,
+        raw_query: Any,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,
+    ) -> Iterator[Any]:
+        """
+        Synchronous streaming query API.
+
+        Exposes a sync iterator that yields framework-level chunks by
+        bridging the async adapter.stream_query(...) via sync_stream.
+        """
+        ctx = _ensure_operation_context(op_ctx)
+
+        async def _stream_coro() -> AsyncIterator[Any]:
+            spec = self._translator.build_query_spec(
+                raw_query,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+                stream=True,
+            )
+            try:
+                async for chunk in self._adapter.stream_query(spec, ctx=ctx):
+                    yield self._translator.translate_query_chunk(
+                        chunk,
+                        op_ctx=ctx,
+                        framework_ctx=framework_ctx,
+                    )
+            except GraphAdapterError as exc:
+                attach_context(
+                    exc,
+                    framework=self._framework,
+                    graph_operation="stream_query",
+                    dialect=getattr(spec, "dialect", None),
+                    namespace=getattr(spec, "namespace", None),
+                    request_id=ctx.request_id,
+                    tenant=ctx.tenant,
+                )
+                raise
+            except Exception as exc:  # noqa: BLE001
+                attach_context(
+                    exc,
+                    framework=self._framework,
+                    graph_operation="stream_query",
+                    dialect=getattr(spec, "dialect", None),
+                    namespace=getattr(spec, "namespace", None),
+                    request_id=ctx.request_id,
+                    tenant=ctx.tenant,
+                )
+                raise
+
+        # sync_stream is the synchronous bridge; it handles running the async
+        # generator under the hood and yields translated chunks to the caller.
+        return sync_stream(
+            _stream_coro,
+            framework=self._framework,
+            error_context={
+                "operation": "graph.query_stream",
+            },
+        )
+
+    async def arun_query_stream(
+        self,
+        raw_query: Any,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,
+    ) -> AsyncIterator[Any]:
+        """
+        Async streaming query API.
+
+        Returns an async iterator yielding framework-level chunks.
+        """
+        ctx = _ensure_operation_context(op_ctx)
+        spec = self._translator.build_query_spec(
+            raw_query,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+            stream=True,
+        )
+
+        async def _agen() -> AsyncIterator[Any]:
+            try:
+                async for chunk in self._adapter.stream_query(spec, ctx=ctx):
+                    yield self._translator.translate_query_chunk(
+                        chunk,
+                        op_ctx=ctx,
+                        framework_ctx=framework_ctx,
+                    )
+            except GraphAdapterError as exc:
+                attach_context(
+                    exc,
+                    framework=self._framework,
+                    graph_operation="stream_query",
+                    dialect=getattr(spec, "dialect", None),
+                    namespace=getattr(spec, "namespace", None),
+                    request_id=ctx.request_id,
+                    tenant=ctx.tenant,
+                )
+                raise
+            except Exception as exc:  # noqa: BLE001
+                attach_context(
+                    exc,
+                    framework=self._framework,
+                    graph_operation="stream_query",
+                    dialect=getattr(spec, "dialect", None),
+                    namespace=getattr(spec, "namespace", None),
+                    request_id=ctx.request_id,
+                    tenant=ctx.tenant,
+                )
+                raise
+
+        return _agen()
+
+    # --------------------------------------------------------------------- #
+    # Sync mutation APIs
+    # --------------------------------------------------------------------- #
+
+    def upsert_nodes(
+        self,
+        raw_nodes: Any,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        ctx = _ensure_operation_context(op_ctx)
+        try:
+            spec = self._translator.build_upsert_nodes_spec(
+                raw_nodes,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+            result = self._adapter.upsert_nodes(spec, ctx=ctx)
+        except TypeError:
+            raise NotSupported(
+                "Synchronous upsert_nodes() requires a sync-capable adapter; "
+                "use arun_upsert_nodes() in async applications.",
+                code="SYNC_NOT_SUPPORTED",
+            )
+
+        return result
+
+    async def arun_upsert_nodes(
+        self,
+        raw_nodes: Any,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        ctx = _ensure_operation_context(op_ctx)
+        spec = self._translator.build_upsert_nodes_spec(
+            raw_nodes,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+        try:
+            return await self._adapter.upsert_nodes(spec, ctx=ctx)
+        except GraphAdapterError as exc:
+            attach_context(
+                exc,
+                framework=self._framework,
+                graph_operation="upsert_nodes",
+                namespace=getattr(spec, "namespace", None),
+                request_id=ctx.request_id,
+                tenant=ctx.tenant,
+            )
+            raise
+        except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework=self._framework,
+                graph_operation="upsert_nodes",
+                namespace=getattr(spec, "namespace", None),
+                request_id=ctx.request_id,
+                tenant=ctx.tenant,
+            )
+            raise
+
+    def upsert_edges(
+        self,
+        raw_edges: Any,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        ctx = _ensure_operation_context(op_ctx)
+        try:
+            spec = self._translator.build_upsert_edges_spec(
+                raw_edges,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+            result = self._adapter.upsert_edges(spec, ctx=ctx)
+        except TypeError:
+            raise NotSupported(
+                "Synchronous upsert_edges() requires a sync-capable adapter; "
+                "use arun_upsert_edges() in async applications.",
+                code="SYNC_NOT_SUPPORTED",
+            )
+
+        return result
+
+    async def arun_upsert_edges(
+        self,
+        raw_edges: Any,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        ctx = _ensure_operation_context(op_ctx)
+        spec = self._translator.build_upsert_edges_spec(
+            raw_edges,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+        try:
+            return await self._adapter.upsert_edges(spec, ctx=ctx)
+        except GraphAdapterError as exc:
+            attach_context(
+                exc,
+                framework=self._framework,
+                graph_operation="upsert_edges",
+                namespace=getattr(spec, "namespace", None),
+                request_id=ctx.request_id,
+                tenant=ctx.tenant,
+            )
+            raise
+        except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework=self._framework,
+                graph_operation="upsert_edges",
+                namespace=getattr(spec, "namespace", None),
+                request_id=ctx.request_id,
+                tenant=ctx.tenant,
+            )
+            raise
+
+    def delete_nodes(
+        self,
+        raw_filter_or_ids: Any,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        ctx = _ensure_operation_context(op_ctx)
+        try:
+            spec = self._translator.build_delete_nodes_spec(
+                raw_filter_or_ids,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+            result = self._adapter.delete_nodes(spec, ctx=ctx)
+        except TypeError:
+            raise NotSupported(
+                "Synchronous delete_nodes() requires a sync-capable adapter; "
+                "use arun_delete_nodes() in async applications.",
+                code="SYNC_NOT_SUPPORTED",
+            )
+
+        return result
+
+    async def arun_delete_nodes(
+        self,
+        raw_filter_or_ids: Any,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        ctx = _ensure_operation_context(op_ctx)
+        spec = self._translator.build_delete_nodes_spec(
+            raw_filter_or_ids,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+        try:
+            return await self._adapter.delete_nodes(spec, ctx=ctx)
+        except GraphAdapterError as exc:
+            attach_context(
+                exc,
+                framework=self._framework,
+                graph_operation="delete_nodes",
+                namespace=getattr(spec, "namespace", None),
+                request_id=ctx.request_id,
+                tenant=ctx.tenant,
+            )
+            raise
+        except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework=self._framework,
+                graph_operation="delete_nodes",
+                namespace=getattr(spec, "namespace", None),
+                request_id=ctx.request_id,
+                tenant=ctx.tenant,
+            )
+            raise
+
+    def delete_edges(
+        self,
+        raw_filter_or_ids: Any,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        ctx = _ensure_operation_context(op_ctx)
+        try:
+            spec = self._translator.build_delete_edges_spec(
+                raw_filter_or_ids,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+            result = self._adapter.delete_edges(spec, ctx=ctx)
+        except TypeError:
+            raise NotSupported(
+                "Synchronous delete_edges() requires a sync-capable adapter; "
+                "use arun_delete_edges() in async applications.",
+                code="SYNC_NOT_SUPPORTED",
+            )
+
+        return result
+
+    async def arun_delete_edges(
+        self,
+        raw_filter_or_ids: Any,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        ctx = _ensure_operation_context(op_ctx)
+        spec = self._translator.build_delete_edges_spec(
+            raw_filter_or_ids,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+        try:
+            return await self._adapter.delete_edges(spec, ctx=ctx)
+        except GraphAdapterError as exc:
+            attach_context(
+                exc,
+                framework=self._framework,
+                graph_operation="delete_edges",
+                namespace=getattr(spec, "namespace", None),
+                request_id=ctx.request_id,
+                tenant=ctx.tenant,
+            )
+            raise
+        except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework=self._framework,
+                graph_operation="delete_edges",
+                namespace=getattr(spec, "namespace", None),
+                request_id=ctx.request_id,
+                tenant=ctx.tenant,
+            )
+            raise
+
+    # --------------------------------------------------------------------- #
+    # Bulk vertices / batch / schema
+    # --------------------------------------------------------------------- #
+
+    def bulk_vertices(
+        self,
+        raw_request: Any,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        ctx = _ensure_operation_context(op_ctx)
+        try:
+            spec = self._translator.build_bulk_vertices_spec(
+                raw_request,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+            result = self._adapter.bulk_vertices(spec, ctx=ctx)
+        except TypeError:
+            raise NotSupported(
+                "Synchronous bulk_vertices() requires a sync-capable adapter; "
+                "use arun_bulk_vertices() in async applications.",
+                code="SYNC_NOT_SUPPORTED",
+            )
+
+        if not isinstance(result, BulkVerticesResult):
+            raise BadRequest(
+                f"adapter.bulk_vertices returned unsupported type: {type(result).__name__}",
+                code="BAD_ADAPTER_RESULT",
+            )
+
+        return self._translator.translate_bulk_vertices_result(
+            result,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+
+    async def arun_bulk_vertices(
+        self,
+        raw_request: Any,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        ctx = _ensure_operation_context(op_ctx)
+        spec = self._translator.build_bulk_vertices_spec(
+            raw_request,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+        try:
+            result = await self._adapter.bulk_vertices(spec, ctx=ctx)
+        except GraphAdapterError as exc:
+            attach_context(
+                exc,
+                framework=self._framework,
+                graph_operation="bulk_vertices",
+                namespace=getattr(spec, "namespace", None),
+                request_id=ctx.request_id,
+                tenant=ctx.tenant,
+            )
+            raise
+        except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework=self._framework,
+                graph_operation="bulk_vertices",
+                namespace=getattr(spec, "namespace", None),
+                request_id=ctx.request_id,
+                tenant=ctx.tenant,
+            )
+            raise
+
+        if not isinstance(result, BulkVerticesResult):
+            raise BadRequest(
+                f"adapter.bulk_vertices returned unsupported type: {type(result).__name__}",
+                code="BAD_ADAPTER_RESULT",
+            )
+
+        return self._translator.translate_bulk_vertices_result(
+            result,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+
+    def batch(
+        self,
+        raw_batch_ops: Any,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        ctx = _ensure_operation_context(op_ctx)
+        try:
+            ops = self._translator.build_batch_ops(
+                raw_batch_ops,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+            result = self._adapter.batch(ops, ctx=ctx)
+        except TypeError:
+            raise NotSupported(
+                "Synchronous batch() requires a sync-capable adapter; "
+                "use arun_batch() in async applications.",
+                code="SYNC_NOT_SUPPORTED",
+            )
+
+        if not isinstance(result, BatchResult):
+            raise BadRequest(
+                f"adapter.batch returned unsupported type: {type(result).__name__}",
+                code="BAD_ADAPTER_RESULT",
+            )
+        return self._translator.translate_batch_result(
+            result,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+
+    async def arun_batch(
+        self,
+        raw_batch_ops: Any,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        ctx = _ensure_operation_context(op_ctx)
+        ops = self._translator.build_batch_ops(
+            raw_batch_ops,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+        try:
+            result = await self._adapter.batch(ops, ctx=ctx)
+        except GraphAdapterError as exc:
+            attach_context(
+                exc,
+                framework=self._framework,
+                graph_operation="batch",
+                request_id=ctx.request_id,
+                tenant=ctx.tenant,
+            )
+            raise
+        except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework=self._framework,
+                graph_operation="batch",
+                request_id=ctx.request_id,
+                tenant=ctx.tenant,
+            )
+            raise
+
+        if not isinstance(result, BatchResult):
+            raise BadRequest(
+                f"adapter.batch returned unsupported type: {type(result).__name__}",
+                code="BAD_ADAPTER_RESULT",
+            )
+        return self._translator.translate_batch_result(
+            result,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+
+    async def arun_get_schema(
+        self,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        ctx = _ensure_operation_context(op_ctx)
+        try:
+            schema = await self._adapter.get_schema(ctx=ctx)
+        except GraphAdapterError as exc:
+            attach_context(
+                exc,
+                framework=self._framework,
+                graph_operation="get_schema",
+                request_id=ctx.request_id,
+                tenant=ctx.tenant,
+            )
+            raise
+        except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework=self._framework,
+                graph_operation="get_schema",
+                request_id=ctx.request_id,
+                tenant=ctx.tenant,
+            )
+            raise
+
+        if not isinstance(schema, GraphSchema):
+            raise BadRequest(
+                f"adapter.get_schema returned unsupported type: {type(schema).__name__}",
+                code="BAD_ADAPTER_RESULT",
+            )
+
+        return self._translator.translate_schema(
+            schema,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+
+    # No sync get_schema() provided because adapters are async-first; sync callers
+    # can use arun_get_schema() under a sync bridge if needed.
+
+
+# =============================================================================
+# Registry for per-framework translators
+# =============================================================================
+
+
+_TranslatorFactory = Callable[[GraphProtocolV1], GraphFrameworkTranslator]
+_GRAPH_TRANSLATOR_FACTORIES: Dict[str, _TranslatorFactory] = {}
+
+
+def register_graph_translator(
+    framework: str,
+    factory: _TranslatorFactory,
+) -> None:
+    """
+    Register or override a GraphFrameworkTranslator factory for a given framework.
+
+    Example
+    -------
+        def make_langchain_translator(adapter: GraphProtocolV1) -> GraphFrameworkTranslator:
+            return LangChainGraphTranslator(adapter=adapter)
+
+        register_graph_translator("langchain", make_langchain_translator)
+    """
+    if not framework or not isinstance(framework, str):
+        raise BadRequest(
+            "framework name must be a non-empty string",
+            code="BAD_TRANSLATOR_REGISTRATION",
+        )
+    if not callable(factory):
+        raise BadRequest(
+            "translator factory must be callable",
+            code="BAD_TRANSLATOR_REGISTRATION",
+        )
+    _GRAPH_TRANSLATOR_FACTORIES[framework] = factory
+    LOG.debug("Registered graph translator factory for framework=%s", framework)
+
+
+def get_graph_translator_factory(framework: str) -> Optional[_TranslatorFactory]:
+    """Return a previously registered translator factory for a framework, if any."""
+    return _GRAPH_TRANSLATOR_FACTORIES.get(framework)
+
+
+def create_graph_translator(
+    *,
+    adapter: GraphProtocolV1,
+    framework: str = "generic",
+    translator: Optional[GraphFrameworkTranslator] = None,
+) -> GraphTranslator:
+    """
+    Convenience helper to construct a GraphTranslator for a given framework.
+
+    Behavior:
+        - If `translator` is provided explicitly, it is used as-is.
+        - Else, if a factory is registered for `framework`, it is used.
+        - Else, DefaultGraphFrameworkTranslator is used.
+    """
+    if translator is None:
+        factory = get_graph_translator_factory(framework)
+        if factory is not None:
+            translator = factory(adapter)
+        else:
+            translator = DefaultGraphFrameworkTranslator()
+    return GraphTranslator(adapter=adapter, framework=framework, translator=translator)
+
+
+__all__ = [
+    "MMRConfig",
+    "SimilarityFn",
+    "FilterTranslator",
+    "GraphFrameworkTranslator",
+    "DefaultGraphFrameworkTranslator",
+    "GraphTranslator",
+    "register_graph_translator",
+    "get_graph_translator_factory",
+    "create_graph_translator",
+]
