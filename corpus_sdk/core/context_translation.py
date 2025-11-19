@@ -69,11 +69,18 @@ into framework-specific metadata:
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Union
+import re
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, TypeVar, Union
 
 from corpus_sdk.core.operation_context import OperationContext
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Type definitions
+# ---------------------------------------------------------------------------
+
+T = TypeVar('T')
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -97,6 +104,12 @@ KEY_RUN_ID = "run_id"
 KEY_TRACE_ID = "trace_id"
 KEY_CORRELATION_ID = "correlation_id"
 
+#: W3C Trace Context validation patterns
+#: trace-id: 32 hex chars, parent-id: 16 hex chars
+TRACEPARENT_TRACE_ID_LEN = 32
+TRACEPARENT_SPAN_ID_LEN = 16
+TRACEPARENT_HEX_PATTERN = re.compile(r'^[0-9a-f]+$', re.IGNORECASE)
+
 
 # Internal normalized context shape used before constructing OperationContext:
 # {
@@ -111,6 +124,19 @@ NormalizedContext = Dict[str, Any]
 
 class ContextTranslationError(ValueError):
     """Raised when context translation or validation fails."""
+    
+    def __init__(
+        self,
+        message: str,
+        *,
+        source: Optional[str] = None,
+        received_keys: Optional[List[str]] = None,
+        missing_keys: Optional[List[str]] = None,
+    ):
+        super().__init__(message)
+        self.source = source
+        self.received_keys = received_keys
+        self.missing_keys = missing_keys
 
 
 # ---------------------------------------------------------------------------
@@ -171,7 +197,10 @@ def translate_framework(name: str, *args: Any, **kwargs: Any) -> OperationContex
     """
     translator = get_framework_translator(name)
     if translator is None:
-        raise ContextTranslationError(f"No framework translator registered for: {name!r}")
+        raise ContextTranslationError(
+            f"No framework translator registered for: {name!r}",
+            source=f"registry:{name}",
+        )
 
     ctx_dict = translator(*args, **kwargs)
     _validate_normalized_context(ctx_dict, source=f"registry:{name}")
@@ -259,7 +288,7 @@ def from_llamaindex(
     LlamaIndex CallbackManager → OperationContext.
 
     Extracts:
-    - trace_id / span_id
+    - trace_id / span_id (constructs W3C traceparent if both present)
     - request_id / run_id
     - metadata from callback manager
 
@@ -277,7 +306,7 @@ def from_llamaindex(
 
     # Try common attributes
     trace_id = getattr(callback_manager, "trace_id", None)
-    span_id = getattr(callback_manager, "span_id", None)  # noqa: F841  # reserved for future use
+    span_id = getattr(callback_manager, "span_id", None)
     request_id = (
         getattr(callback_manager, "request_id", None)
         or getattr(callback_manager, "run_id", None)
@@ -300,6 +329,12 @@ def from_llamaindex(
     if framework_version:
         attrs[ATTR_FRAMEWORK_VERSION] = framework_version
 
+    # Preserve trace/span IDs for observability
+    if trace_id:
+        attrs["trace_id"] = _to_str_defensive(trace_id)
+    if span_id:
+        attrs["span_id"] = _to_str_defensive(span_id)
+
     # Extract tags
     tags = getattr(callback_manager, "tags", None)
     if tags:
@@ -310,8 +345,19 @@ def from_llamaindex(
     attrs.update(user_attrs)
 
     common = _extract_common_fields({}, metadata)
+    
     # Prefer explicit IDs from callback manager when available
-    common["request_id"] = request_id or trace_id or common["request_id"]
+    common["request_id"] = (
+        _to_str_defensive(request_id) if request_id is not None
+        else _to_str_defensive(trace_id) if trace_id is not None
+        else common["request_id"]
+    )
+    
+    # Construct W3C traceparent if we have valid trace_id and span_id but no explicit traceparent
+    if trace_id and span_id and not common["traceparent"]:
+        traceparent = _construct_traceparent(trace_id, span_id)
+        if traceparent:
+            common["traceparent"] = traceparent
 
     ctx_dict: NormalizedContext = {
         **common,
@@ -450,14 +496,18 @@ def from_autogen(
     if framework_version:
         attrs[ATTR_FRAMEWORK_VERSION] = framework_version
     if conversation_id is not None:
-        attrs["conversation_id"] = str(conversation_id)
+        attrs["conversation_id"] = _to_str_defensive(conversation_id)
 
     # Merge user attrs
     user_attrs = _get_dict(merged, "attrs")
     attrs.update(user_attrs)
 
     common = _extract_common_fields({}, merged)
-    common["request_id"] = request_id or run_id or common["request_id"]
+    common["request_id"] = (
+        _to_str_defensive(request_id) if request_id is not None
+        else _to_str_defensive(run_id) if run_id is not None
+        else common["request_id"]
+    )
 
     ctx_dict: NormalizedContext = {
         **common,
@@ -520,7 +570,7 @@ def from_crewai(
     if framework_version:
         attrs[ATTR_FRAMEWORK_VERSION] = framework_version
     if task_id is not None:
-        attrs["task_id"] = str(task_id)
+        attrs["task_id"] = _to_str_defensive(task_id)
     if crew_name:
         attrs["crew_name"] = crew_name
     if agent_name:
@@ -531,7 +581,11 @@ def from_crewai(
     attrs.update(user_attrs)
 
     common = _extract_common_fields({}, merged)
-    common["request_id"] = request_id or run_id or common["request_id"]
+    common["request_id"] = (
+        _to_str_defensive(request_id) if request_id is not None
+        else _to_str_defensive(run_id) if run_id is not None
+        else common["request_id"]
+    )
 
     ctx_dict: NormalizedContext = {
         **common,
@@ -588,9 +642,9 @@ def from_mcp(
 
     attrs: Dict[str, Any] = {ATTR_FRAMEWORK: "mcp"}
     if method:
-        attrs["mcp_method"] = str(method)
+        attrs["mcp_method"] = _to_str_defensive(method)
     if tool_name:
-        attrs["mcp_tool_name"] = str(tool_name)
+        attrs["mcp_tool_name"] = _to_str_defensive(tool_name)
 
     # Merge user attrs
     user_attrs = _get_dict(merged, "attrs")
@@ -599,7 +653,7 @@ def from_mcp(
     common = _extract_common_fields({}, merged)
     request_id = request.get("id")
     if request_id is not None:
-        common["request_id"] = str(request_id)
+        common["request_id"] = _to_str_defensive(request_id)
 
     ctx_dict: NormalizedContext = {
         **common,
@@ -622,6 +676,9 @@ def from_dict(ctx: Optional[Mapping[str, Any]]) -> OperationContext:
             "attrs": {...}
         }
 
+    This is a direct mapping without framework-specific extraction logic,
+    making it suitable for pre-normalized contexts.
+
     Args:
         ctx: Dictionary with context fields
 
@@ -629,19 +686,22 @@ def from_dict(ctx: Optional[Mapping[str, Any]]) -> OperationContext:
         OperationContext
     """
     if not ctx:
-        ctx_dict = _empty_context()
-        _validate_normalized_context(ctx_dict, source="dict")
-        return OperationContext(**ctx_dict)
+        return OperationContext(**_empty_context())
 
-    attrs = dict(ctx.get("attrs") or {})
-    common = _extract_common_fields(ctx, {})
+    # Direct extraction with defensive type coercion
+    request_id = ctx.get("request_id")
+    tenant = ctx.get("tenant")
+    deadline_ms = ctx.get("deadline_ms")
+    traceparent = ctx.get("traceparent")
+    attrs = ctx.get("attrs") or {}
 
-    ctx_dict: NormalizedContext = {
-        **common,
-        "attrs": attrs,
-    }
-    _validate_normalized_context(ctx_dict, source="dict")
-    return OperationContext(**ctx_dict)
+    return OperationContext(
+        request_id=_to_str_defensive(request_id) if request_id is not None else None,
+        tenant=_to_str_defensive(tenant) if tenant is not None else None,
+        deadline_ms=_coerce_deadline_ms(deadline_ms) if deadline_ms is not None else None,
+        traceparent=_to_str_defensive(traceparent) if traceparent is not None else None,
+        attrs=dict(attrs) if isinstance(attrs, Mapping) else {},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -811,7 +871,10 @@ def _validate_normalized_context(
             ctx,
         )
         raise ContextTranslationError(
-            f"Missing required keys in normalized context: {missing}"
+            f"Missing required keys in normalized context: {missing}",
+            source=source,
+            received_keys=list(ctx.keys()),
+            missing_keys=missing,
         )
 
 
@@ -839,13 +902,13 @@ def _extract_request_id(
         or metadata.get(KEY_RUN_ID)
         or metadata.get("id")
     )
-    return str(request_id) if request_id is not None else None
+    return _to_str_defensive(request_id) if request_id is not None else None
 
 
 def _extract_tenant(metadata: Mapping[str, Any]) -> Optional[str]:
     """Extract tenant from metadata."""
     tenant = metadata.get(KEY_TENANT)
-    return str(tenant) if tenant is not None else None
+    return _to_str_defensive(tenant) if tenant is not None else None
 
 
 def _extract_deadline_ms(metadata: Mapping[str, Any]) -> Optional[int]:
@@ -864,7 +927,93 @@ def _extract_traceparent(metadata: Mapping[str, Any]) -> Optional[str]:
         metadata.get(KEY_TRACEPARENT)
         or metadata.get("trace_parent")
     )
-    return str(traceparent) if traceparent is not None else None
+    return _to_str_defensive(traceparent) if traceparent is not None else None
+
+
+def _to_str_defensive(value: Any) -> str:
+    """
+    Defensively convert value to string.
+
+    Avoids redundant conversion if already a string.
+    Handles None by returning empty string or None based on context.
+
+    Args:
+        value: Value to convert to string
+
+    Returns:
+        String representation of value
+    """
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
+def _construct_traceparent(trace_id: Any, span_id: Any) -> Optional[str]:
+    """
+    Construct W3C Trace Context traceparent from trace_id and span_id.
+
+    Format: version-trace_id-parent_id-trace_flags
+    Example: 00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01
+
+    Validates:
+    - trace_id is 32 hex characters
+    - span_id is 16 hex characters
+
+    Args:
+        trace_id: Trace identifier (should be 32 hex chars)
+        span_id: Span/parent identifier (should be 16 hex chars)
+
+    Returns:
+        W3C traceparent string, or None if validation fails
+    """
+    trace_str = _to_str_defensive(trace_id)
+    span_str = _to_str_defensive(span_id)
+
+    # Strip common prefixes/formatting that might be present
+    trace_str = trace_str.replace('-', '').replace('0x', '')
+    span_str = span_str.replace('-', '').replace('0x', '')
+
+    # Validate lengths
+    if len(trace_str) != TRACEPARENT_TRACE_ID_LEN:
+        logger.debug(
+            "Invalid trace_id length for traceparent construction: "
+            "expected %d hex chars, got %d (value=%r)",
+            TRACEPARENT_TRACE_ID_LEN,
+            len(trace_str),
+            trace_id,
+        )
+        return None
+
+    if len(span_str) != TRACEPARENT_SPAN_ID_LEN:
+        logger.debug(
+            "Invalid span_id length for traceparent construction: "
+            "expected %d hex chars, got %d (value=%r)",
+            TRACEPARENT_SPAN_ID_LEN,
+            len(span_str),
+            span_id,
+        )
+        return None
+
+    # Validate hex format
+    if not TRACEPARENT_HEX_PATTERN.match(trace_str):
+        logger.debug(
+            "Invalid trace_id format for traceparent construction: "
+            "expected hex string, got %r",
+            trace_id,
+        )
+        return None
+
+    if not TRACEPARENT_HEX_PATTERN.match(span_str):
+        logger.debug(
+            "Invalid span_id format for traceparent construction: "
+            "expected hex string, got %r",
+            span_id,
+        )
+        return None
+
+    # Construct W3C traceparent: version-trace_id-parent_id-trace_flags
+    # Using "01" for trace_flags (sampled)
+    return f"00-{trace_str.lower()}-{span_str.lower()}-01"
 
 
 def _coerce_deadline_ms(value: Any) -> Optional[int]:
@@ -873,12 +1022,27 @@ def _coerce_deadline_ms(value: Any) -> Optional[int]:
 
     Convention:
     - None → None
+    - str → attempt float conversion, then apply numeric rules
     - int/float < ~1e8 are treated as seconds and converted to ms
     - int/float >= ~1e8 are assumed to already be milliseconds
     - timedelta-like objects use total_seconds()
+
+    Args:
+        value: Deadline/timeout value in various formats
+
+    Returns:
+        Milliseconds as int, or None if conversion fails
     """
     if value is None:
         return None
+
+    # Handle string conversion first
+    if isinstance(value, str):
+        try:
+            value = float(value)
+        except ValueError:
+            logger.debug("Failed to convert deadline string to numeric: %r", value)
+            return None
 
     # timedelta-like
     if hasattr(value, "total_seconds"):
@@ -891,7 +1055,7 @@ def _coerce_deadline_ms(value: Any) -> Optional[int]:
 
     # numeric
     if isinstance(value, (int, float)):
-        # Heuristic: if > 100M, assume ms (≈ 3 years)
+        # Heuristic: if > 100M, assume ms (≈ 3 years in seconds = ~94M)
         if float(value) > 1e8:
             return int(value)
         return int(float(value) * 1000.0)
@@ -900,12 +1064,22 @@ def _coerce_deadline_ms(value: Any) -> Optional[int]:
     return None
 
 
-def _safe_get(obj: Any, path: Sequence[Union[str, int]]) -> Any:
-    """Safely traverse nested mapping/attribute paths."""
+def _safe_get(obj: Any, path: Sequence[Union[str, int]], default: T = None) -> Union[T, Any]:
+    """
+    Safely traverse nested mapping/attribute paths.
+
+    Args:
+        obj: Object to traverse
+        path: Sequence of keys/attributes to follow
+        default: Default value if path traversal fails
+
+    Returns:
+        Value at path, or default if not found
+    """
     current = obj
     for key in path:
         if current is None:
-            return None
+            return default
         try:
             if isinstance(key, int):
                 current = current[key]
@@ -914,12 +1088,21 @@ def _safe_get(obj: Any, path: Sequence[Union[str, int]]) -> Any:
             else:
                 current = getattr(current, key)
         except Exception:
-            return None
-    return current
+            return default
+    return current if current is not None else default
 
 
 def _get_dict(obj: Any, key: str) -> Dict[str, Any]:
-    """Get a dict from obj[key] or obj.key, defaulting to empty dict."""
+    """
+    Get a dict from obj[key] or obj.key, defaulting to empty dict.
+
+    Args:
+        obj: Object or mapping to extract from
+        key: Key/attribute name
+
+    Returns:
+        Dictionary value, or empty dict if not found/invalid
+    """
     if isinstance(obj, Mapping):
         value = obj.get(key, {})
     else:
