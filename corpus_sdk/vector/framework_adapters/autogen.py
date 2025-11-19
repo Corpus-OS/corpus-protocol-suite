@@ -122,7 +122,7 @@ from corpus_sdk.llm.framework_adapters.common.error_context import attach_contex
 from corpus_sdk.core.context_translation import (
     from_autogen as context_from_autogen,
 )
-from corpus_sdk.core.sync_stream_bridge import SyncStreamBridge
+from corpus_sdk.core.sync_bridge import SyncStreamBridge
 
 logger = logging.getLogger(__name__)
 
