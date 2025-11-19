@@ -1,4 +1,4 @@
-# corpus_sdk/llm/framework_adapters/common/async_bridge.py
+# corpus_sdk/core/async_bridge.py
 # SPDX-License-Identifier: Apache-2.0
 
 """
