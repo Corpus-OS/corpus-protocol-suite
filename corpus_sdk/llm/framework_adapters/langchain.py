@@ -9,109 +9,115 @@ This module exposes Corpus `BaseLLMAdapter` implementations as
 
 - Async + sync generation
 - Async + sync streaming (true incremental streaming)
-- Proper callback integration (on_llm_end, on_llm_new_token for streaming)
+- Proper callback integration (on_llm_end, on_llm_new_token)
 - Protocol-first design: LangChain is a thin skin over Corpus
 
-Design goals
-------------
+Example
+-------
 
-1. Protocol-first:
-   LangChain is an integration surface, not the source of truth.
-   All real behavior flows through `BaseLLMAdapter`.
+    from corpus_sdk.llm.openai_adapter import OpenAIAdapter
+    from corpus_sdk.llm.framework_adapters.langchain import CorpusLangChainLLM
 
-2. Non-invasive:
-   No hacks into LangChain internals. We implement the official
-   `BaseChatModel` contract.
+    corpus_llm = OpenAIAdapter(api_key="...")
+    lc_llm = CorpusLangChainLLM(
+        corpus_adapter=corpus_llm,
+        model="gpt-4.1",
+    )
 
-3. True streaming:
-   Async streaming uses Corpus' `stream()` directly.
-   Sync streaming uses a background thread to bridge the async iterator
-   without buffering the whole response.
+    # Sync call
+    result = lc_llm.invoke("Hello!")
+    print(result.content)
 
-4. Safe defaults with escape hatches:
-   - `strict_roles` lets you opt into stricter role validation.
-   - Timeouts can be applied via the underlying Corpus adapter or via
-     the `AsyncBridge` layer if needed.
+    # Async call
+    result = await lc_llm.ainvoke("Hello!")
+
+    # Streaming (sync)
+    for chunk in lc_llm.stream("Hello!"):
+        print(chunk.content, end="", flush=True)
+
+    # Streaming (async)
+    async for chunk in lc_llm.astream("Hello!"):
+        print(chunk.content, end="", flush=True)
 """
 
 from __future__ import annotations
 
+import logging
 import threading
 from queue import Queue
-from typing import Any, AsyncIterator, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, TypeVar, Union
+from typing import Any, AsyncIterator, Dict, Iterator, List, Optional
 
 from langchain_core.callbacks import (
     AsyncCallbackManagerForLLMRun,
     CallbackManagerForLLMRun,
-    Callbacks,
 )
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
-from langchain_core.outputs import (
-    ChatGeneration,
-    ChatGenerationChunk,
-    ChatResult,
-    LLMResult,
-)
+from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 
-from corpus_sdk.llm.llm_base import BaseLLMAdapter, OperationContext
-from corpus_sdk.llm.framework_adapters.common.message_translation import (
-    MessageTranslator,
-    NormalizedMessage,
+from corpus_sdk.llm.llm_base import (
+    BaseLLMAdapter,
+    LLMChunk,
+    LLMCompletion,
+    OperationContext,
 )
-from corpus_sdk.llm.framework_adapters.common.context_translation import ContextTranslator
+from corpus_sdk.llm.framework_adapters.common.message_translation import (
+    from_langchain,
+    to_corpus,
+    NormalizedMessage,  # kept for type hints / future use
+)
+from corpus_sdk.llm.framework_adapters.common.context_translation import (
+    from_langchain as context_from_langchain,
+)
 from corpus_sdk.llm.framework_adapters.common.async_bridge import AsyncBridge
 
-T = TypeVar("T")
+logger = logging.getLogger(__name__)
 
 
 class CorpusLangChainLLM(BaseChatModel):
     """
-    LangChain `BaseChatModel` implementation backed by a Corpus LLM adapter.
+    LangChain `BaseChatModel` implementation backed by a Corpus `BaseLLMAdapter`.
 
-    Typical usage
-    -------------
+    This is a *thin* integration layer:
+    - Messages are normalized via `message_translation.from_langchain`
+    - Context is derived from LangChain's `RunnableConfig` via
+      `context_translation.from_langchain`
+    - All policy / resilience (deadlines, breaker, limiter, cache) lives in the
+      underlying `BaseLLMAdapter`, not here.
 
-        from corpus_sdk.llm.openai_adapter import OpenAIAdapter
-        from corpus_sdk.llm.framework_adapters.langchain import CorpusLangChainLLM
+    Attributes
+    ----------
+    corpus_adapter:
+        Underlying Corpus LLM adapter implementing `LLMProtocolV1`.
 
-        corpus_llm = OpenAIAdapter(api_key="...")
-        lc_llm = CorpusLangChainLLM.from_corpus_adapter(
-            corpus_adapter=corpus_llm,
-            model="gpt-4o",
-        )
+    model:
+        Default model identifier to pass to the adapter (optional override per call).
 
-        # Sync call
-        result = lc_llm.invoke("Hello!")
-        print(result.content)
+    temperature:
+        Default sampling temperature (can be overridden per invocation).
 
-        # Async call
-        result = await lc_llm.ainvoke("Hello!")
+    max_tokens:
+        Default max tokens for generation (can be overridden per invocation).
 
-        # Streaming (sync)
-        for chunk in lc_llm.stream("Hello!"):
-            print(chunk.content, end="", flush=True)
+    stream_queue_maxsize:
+        Max queue size for sync streaming bridge. `<= 0` means unbounded.
+        This is a backpressure knob between the background async worker and
+        the sync consumer.
 
-        # Streaming (async)
-        async for chunk in lc_llm.astream("Hello!"):
-            print(chunk.content, end="", flush=True)
-
-    Configuration knobs
-    -------------------
-    - `model`: default model name for Corpus.
-    - `temperature`, `max_tokens`: default sampling params.
-    - `strict_roles`: if True, LangChain → Corpus role mapping is stricter
-      (MessageTranslator enforces supported roles and may raise).
+    stream_thread_join_timeout:
+        Timeout (seconds) for waiting on the background streaming thread
+        during cleanup. Prevents hangs in pathological cases.
     """
 
     corpus_adapter: BaseLLMAdapter
     model: str = "default"
     temperature: float = 0.7
     max_tokens: Optional[int] = None
-    strict_roles: Optional[bool] = None  # None → MessageTranslator decides (e.g., via env)
+    stream_queue_maxsize: int = 16
+    stream_thread_join_timeout: float = 5.0
 
-    class Config:
-        arbitrary_types_allowed = True
+    # Pydantic v2-style config: allow arbitrary types like BaseLLMAdapter.
+    model_config = {"arbitrary_types_allowed": True}
 
     # ------------------------------------------------------------------ #
     # LangChain-required properties
@@ -119,127 +125,100 @@ class CorpusLangChainLLM(BaseChatModel):
 
     @property
     def _llm_type(self) -> str:
+        """Identifier used by LangChain in serialization / introspection."""
         return "corpus"
 
-    @property
-    def lc_serializable(self) -> bool:
-        # We don’t guarantee that `corpus_adapter` is serializable (often it isn’t).
-        return False
-
     # ------------------------------------------------------------------ #
-    # Convenience constructor / capabilities helpers
+    # Capabilities / feature helpers
     # ------------------------------------------------------------------ #
-
-    @classmethod
-    def from_corpus_adapter(
-        cls,
-        corpus_adapter: BaseLLMAdapter,
-        model: str = "default",
-        temperature: float = 0.7,
-        max_tokens: Optional[int] = None,
-        strict_roles: Optional[bool] = None,
-    ) -> "CorpusLangChainLLM":
-        """
-        Convenience constructor to build an LC model from a Corpus adapter.
-        """
-        return cls(
-            corpus_adapter=corpus_adapter,
-            model=model,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            strict_roles=strict_roles,
-        )
-
-    async def _adapter_capabilities(self) -> Any:
-        """
-        Fetch capabilities from the underlying Corpus adapter.
-
-        Adapters are free to cache this internally; this method is only used
-        for introspection helpers.
-        """
-        return await self.corpus_adapter.capabilities()
 
     def supports_streaming(self) -> bool:
         """
-        Returns True if the underlying Corpus adapter supports streaming.
+        Return True if the underlying adapter advertises streaming support.
+
+        If capabilities cannot be fetched for any reason, we default to True,
+        since most modern adapters support streaming and the adapter itself
+        will raise `NotSupported` if it does not.
         """
-        caps = AsyncBridge.run_async(self._adapter_capabilities())
-        return bool(getattr(caps, "supports_streaming", True))
+        try:
+            caps = AsyncBridge.run_async(self.corpus_adapter.capabilities())
+            return bool(getattr(caps, "supports_streaming", True))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("capabilities() failed when checking supports_streaming: %s", exc)
+            return True
 
     # ------------------------------------------------------------------ #
-    # Internal helpers
+    # Internal translation helpers
     # ------------------------------------------------------------------ #
 
-    def _normalize_messages(self, messages: List[BaseMessage]) -> List[NormalizedMessage]:
+    def _translate_messages(self, messages: List[BaseMessage]) -> List[Dict[str, Any]]:
         """
-        LangChain BaseMessage → NormalizedMessage (protocol intermediate).
+        LangChain messages → Corpus wire format ({role, content} dicts).
         """
-        return [
-            MessageTranslator.from_langchain(m, strict_roles=self.strict_roles)
-            for m in messages
-        ]
+        normalized: List[NormalizedMessage] = [from_langchain(m) for m in messages]
+        # `to_corpus` returns list[Mapping[str, Any]]; cast to Dict for callers.
+        return [dict(m) for m in to_corpus(normalized)]
 
-    def _build_corpus_messages(self, normalized: List[NormalizedMessage]) -> List[Dict[str, Any]]:
-        """
-        NormalizedMessage → Corpus protocol wire format.
-        """
-        return MessageTranslator.to_corpus(normalized)
-
-    def _extract_ctx_and_params(
+    def _build_context_and_params(
         self,
         *,
         stop: Optional[List[str]] = None,
         **kwargs: Any,
-    ) -> Tuple[OperationContext, Dict[str, Any]]:
+    ) -> tuple[OperationContext, Dict[str, Any]]:
         """
-        Extract Corpus OperationContext and sampling params from LC kwargs.
-        """
-        # LangChain passes RunnableConfig in `config` kwarg (if present).
-        config = kwargs.get("config")
-        ctx = ContextTranslator.from_langchain_config(config)
+        Extract `OperationContext` and Corpus sampling params from LangChain kwargs.
 
-        # Allow overrides via kwargs; otherwise use adapter defaults / class defaults.
+        Expected kwargs (optional):
+            - config: RunnableConfig-like dict (for context translation)
+            - model, temperature, max_tokens, top_p, frequency_penalty, presence_penalty
+
+        The returned `params` dict is shaped to match `LLMProtocolV1.complete/stream`.
+        """
+        config = kwargs.get("config")
+        ctx = context_from_langchain(config)
+
         params: Dict[str, Any] = {
-            "max_tokens": kwargs.get("max_tokens", self.max_tokens),
+            "model": kwargs.get("model", self.model),
             "temperature": kwargs.get("temperature", self.temperature),
+            "max_tokens": kwargs.get("max_tokens", self.max_tokens),
             "top_p": kwargs.get("top_p"),
             "frequency_penalty": kwargs.get("frequency_penalty"),
             "presence_penalty": kwargs.get("presence_penalty"),
             "stop_sequences": stop,
-            "model": kwargs.get("model", self.model),
         }
 
-        # Remove None values so Corpus adapter sees clean param set.
+        # Strip None values so the adapter sees a clean param set that matches
+        # its signature (no unexpected kwargs).
         params = {k: v for k, v in params.items() if v is not None}
         return ctx, params
 
-    def _build_chat_result(
-        self,
-        text: str,
-        model: Optional[str] = None,
-        finish_reason: Optional[str] = None,
-        usage: Optional[Any] = None,
-    ) -> ChatResult:
+    @staticmethod
+    def _build_chat_result(completion: LLMCompletion) -> ChatResult:
         """
-        Build LangChain ChatResult from Corpus completion response.
+        Map a Corpus `LLMCompletion` into a LangChain `ChatResult`.
         """
+        usage = completion.usage
+        usage_dict: Dict[str, int] = {
+            "prompt_tokens": usage.prompt_tokens,
+            "completion_tokens": usage.completion_tokens,
+            "total_tokens": usage.total_tokens,
+        }
+
         message = AIMessage(
-            content=text,
+            content=completion.text,
             additional_kwargs={
-                "model": model,
-                "finish_reason": finish_reason,
+                "model": completion.model,
+                "model_family": completion.model_family,
+                "finish_reason": completion.finish_reason,
             },
         )
 
         generation_info: Dict[str, Any] = {
-            "finish_reason": finish_reason,
+            "model": completion.model,
+            "model_family": completion.model_family,
+            "finish_reason": completion.finish_reason,
+            "usage": usage_dict,
         }
-        if usage is not None:
-            generation_info["usage"] = {
-                "prompt_tokens": getattr(usage, "prompt_tokens", None),
-                "completion_tokens": getattr(usage, "completion_tokens", None),
-                "total_tokens": getattr(usage, "total_tokens", None),
-            }
 
         generation = ChatGeneration(
             message=message,
@@ -247,8 +226,32 @@ class CorpusLangChainLLM(BaseChatModel):
         )
         return ChatResult(generations=[generation])
 
+    @staticmethod
+    def _chunk_to_generation_chunk(chunk: LLMChunk) -> ChatGenerationChunk:
+        """
+        Map a Corpus `LLMChunk` into a LangChain `ChatGenerationChunk`.
+        """
+        text = chunk.text or ""
+        ai_chunk = AIMessageChunk(content=text)
+
+        gen_info: Dict[str, Any] = {
+            "model": chunk.model,
+            "is_final": chunk.is_final,
+        }
+        if chunk.usage_so_far is not None:
+            gen_info["usage_so_far"] = {
+                "prompt_tokens": chunk.usage_so_far.prompt_tokens,
+                "completion_tokens": chunk.usage_so_far.completion_tokens,
+                "total_tokens": chunk.usage_so_far.total_tokens,
+            }
+
+        return ChatGenerationChunk(
+            message=ai_chunk,
+            generation_info=gen_info,
+        )
+
     # ------------------------------------------------------------------ #
-    # Core async generation
+    # Core async → Corpus calls
     # ------------------------------------------------------------------ #
 
     async def _acall_corpus_complete(
@@ -258,24 +261,17 @@ class CorpusLangChainLLM(BaseChatModel):
         **kwargs: Any,
     ) -> ChatResult:
         """
-        Core async path: LangChain messages → Corpus.complete() → ChatResult.
+        Core async path: LC messages → Corpus `complete()` → `ChatResult`.
         """
-        normalized = self._normalize_messages(messages)
-        corpus_messages = self._build_corpus_messages(normalized)
-        ctx, params = self._extract_ctx_and_params(stop=stop, **kwargs)
+        corpus_messages = self._translate_messages(messages)
+        ctx, params = self._build_context_and_params(stop=stop, **kwargs)
 
-        result = await self.corpus_adapter.complete(
+        completion = await self.corpus_adapter.complete(
             messages=corpus_messages,
             ctx=ctx,
             **params,
         )
-
-        return self._build_chat_result(
-            text=result.text,
-            model=getattr(result, "model", None),
-            finish_reason=getattr(result, "finish_reason", None),
-            usage=getattr(result, "usage", None),
-        )
+        return self._build_chat_result(completion)
 
     async def _acall_corpus_stream(
         self,
@@ -284,36 +280,20 @@ class CorpusLangChainLLM(BaseChatModel):
         **kwargs: Any,
     ) -> AsyncIterator[ChatGenerationChunk]:
         """
-        Core async streaming path: LangChain messages → Corpus.stream() → ChatGenerationChunk.
+        Core async streaming path: LC messages → Corpus `stream()` → `ChatGenerationChunk`.
         """
-        normalized = self._normalize_messages(messages)
-        corpus_messages = self._build_corpus_messages(normalized)
-        ctx, params = self._extract_ctx_and_params(stop=stop, **kwargs)
+        corpus_messages = self._translate_messages(messages)
+        ctx, params = self._build_context_and_params(stop=stop, **kwargs)
 
+        # `BaseLLMAdapter.stream` is async and returns an AsyncIterator[LLMChunk].
         stream = await self.corpus_adapter.stream(
             messages=corpus_messages,
             ctx=ctx,
             **params,
         )
 
-        # Protocol: async generator yielding Corpus chunks with `.text`, `.model`, etc.
-        try:
-            async for chunk in stream:
-                text = getattr(chunk, "text", "") or ""
-                model = getattr(chunk, "model", None)
-
-                ai_chunk = AIMessageChunk(content=text)
-                gen_chunk = ChatGenerationChunk(message=ai_chunk, generation_info={"model": model})
-                yield gen_chunk
-        finally:
-            # Best-effort cleanup for adapters that expose aclose().
-            agen = getattr(stream, "aclose", None)
-            if callable(agen):
-                try:
-                    await agen()
-                except Exception:
-                    # Don’t mask upstream errors with cleanup failures.
-                    pass
+        async for chunk in stream:
+            yield self._chunk_to_generation_chunk(chunk)
 
     # ------------------------------------------------------------------ #
     # LangChain async API
@@ -329,13 +309,15 @@ class CorpusLangChainLLM(BaseChatModel):
         """
         Async chat generation entrypoint used by LangChain.
         """
-        result = await self._acall_corpus_complete(messages, stop=stop, **kwargs)
-
-        # LC already called on_llm_start; we just need to signal end.
-        if run_manager is not None:
-            await run_manager.on_llm_end(result)
-
-        return result
+        try:
+            result = await self._acall_corpus_complete(messages, stop=stop, **kwargs)
+            if run_manager is not None:
+                await run_manager.on_llm_end(result)
+            return result
+        except Exception as exc:  # noqa: BLE001
+            if run_manager is not None:
+                await run_manager.on_llm_error(exc)
+            raise
 
     async def _astream(
         self,
@@ -350,26 +332,30 @@ class CorpusLangChainLLM(BaseChatModel):
         Emits `ChatGenerationChunk` instances incrementally and forwards
         tokens to LangChain callbacks via `on_llm_new_token`.
         """
-        async for gen_chunk in self._acall_corpus_stream(messages, stop=stop, **kwargs):
-            if run_manager is not None:
-                # Minimal callback: new token.
-                await run_manager.on_llm_new_token(gen_chunk.message.content or "")
-            yield gen_chunk
+        try:
+            async for gen_chunk in self._acall_corpus_stream(messages, stop=stop, **kwargs):
+                text = gen_chunk.message.content or ""
+                if run_manager is not None and text:
+                    await run_manager.on_llm_new_token(text)
+                yield gen_chunk
 
-        # Build a synthetic ChatResult for on_llm_end (optional but useful).
-        if run_manager is not None:
-            # We don't have the full text here without buffering.
-            # LangChain doesn't strictly require a full ChatResult in streaming,
-            # but we can emit an empty result as a termination signal.
-            empty_result = ChatResult(
-                generations=[
-                    ChatGeneration(
-                        message=AIMessage(content=""),
-                        generation_info={"streaming": True},
-                    )
-                ]
-            )
-            await run_manager.on_llm_end(empty_result)
+            # LangChain doesn't strictly require `on_llm_end` here, but it is
+            # useful for tools that rely on a well-formed lifecycle.
+            if run_manager is not None:
+                empty_result = ChatResult(
+                    generations=[
+                        ChatGeneration(
+                            message=AIMessage(content=""),
+                            generation_info={"streaming": True},
+                        )
+                    ]
+                )
+                await run_manager.on_llm_end(empty_result)
+
+        except Exception as exc:  # noqa: BLE001
+            if run_manager is not None:
+                await run_manager.on_llm_error(exc)
+            raise
 
     # ------------------------------------------------------------------ #
     # LangChain sync API
@@ -385,131 +371,185 @@ class CorpusLangChainLLM(BaseChatModel):
         """
         Sync chat generation entrypoint used by LangChain.
 
-        Bridges to `_acall_corpus_complete` using AsyncBridge.
+        Uses `AsyncBridge` to run the async Corpus call under the hood.
         """
-        result = AsyncBridge.run_async(
-            self._acall_corpus_complete(messages, stop=stop, **kwargs)
-        )
+        try:
+            result = AsyncBridge.run_async(
+                self._acall_corpus_complete(messages, stop=stop, **kwargs)
+            )
+            if run_manager is not None:
+                run_manager.on_llm_end(result)
+            return result
+        except Exception as exc:  # noqa: BLE001
+            if run_manager is not None:
+                run_manager.on_llm_error(exc)
+            raise
 
-        if run_manager is not None:
-            run_manager.on_llm_end(result)
-
-        return result
-
-    def stream(
+    def _stream(
         self,
-        input: Union[str, BaseMessage, List[BaseMessage]],
+        messages: List[BaseMessage],
         stop: Optional[List[str]] = None,
-        callbacks: Callbacks = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
         **kwargs: Any,
     ) -> Iterator[ChatGenerationChunk]:
         """
-        Sync streaming interface; returns an iterator of ChatGenerationChunk.
+        Sync streaming entrypoint used by LangChain.
 
-        This is a true streaming bridge: it uses a background thread and
-        an async iterator under the hood, but yields chunks to the caller
-        as they arrive, without buffering the full response.
+        Bridges the async streaming iterator via a background thread and a Queue,
+        yielding `ChatGenerationChunk` objects as they arrive without buffering the
+        entire response.
+
+        Best-effort cancellation:
+            - If the caller stops consuming early (breaks the iterator),
+              we signal the worker thread via a `cancel_event`.
+            - The worker checks this flag and attempts to close the underlying
+              async generator (if it exposes `aclose()`).
         """
-        # Normalize input to a list of messages using BaseChatModel helper.
-        messages: List[BaseMessage] = self._convert_input_to_messages(input)
+        # Queue between worker and main thread. maxsize <= 0 ⇒ unbounded.
+        maxsize = self.stream_queue_maxsize if self.stream_queue_maxsize > 0 else 0
+        queue: "Queue[Optional[ChatGenerationChunk]]" = Queue(maxsize=maxsize)
 
-        # Configure callback manager for this run.
-        callback_manager = self.callback_manager.configure(callbacks, self)
-        run_manager = callback_manager.on_llm_start(
-            {"name": self.__class__.__name__},
-            [messages],
-            invocation_params=kwargs,
-        )
-
-        # Queue and sentinel for cross-thread streaming.
-        q: "Queue[Optional[ChatGenerationChunk]]" = Queue()
         error_holder: List[BaseException] = []
+        done_event = threading.Event()
+        cancel_event = threading.Event()
+        finished_normally = False
 
-        def _worker() -> None:
+        def worker() -> None:
             """
-            Background thread: runs the async streaming coroutine and
-            pushes chunks into the queue.
+            Background thread that runs the async Corpus stream and enqueues chunks.
             """
 
-            async def _run_stream() -> None:
-                async for gen_chunk in self._astream(
-                    messages, stop=stop, run_manager=None, **kwargs
-                ):
-                    # Forward tokens via sync run_manager.
-                    if run_manager is not None:
-                        run_manager.on_llm_new_token(gen_chunk.message.content or "")
-                    q.put(gen_chunk)
+            async def run_stream() -> None:
+                corpus_messages = self._translate_messages(messages)
+                ctx, params = self._build_context_and_params(stop=stop, **kwargs)
+
+                agen = await self.corpus_adapter.stream(
+                    messages=corpus_messages,
+                    ctx=ctx,
+                    **params,
+                )
+
+                try:
+                    async for chunk in agen:
+                        if cancel_event.is_set():
+                            # Best-effort shutdown: ask the async generator to close
+                            # itself so the adapter can tear down any upstream stream.
+                            close = getattr(agen, "aclose", None)
+                            if callable(close):
+                                try:
+                                    await close()
+                                except Exception as close_exc:  # noqa: BLE001
+                                    logger.debug(
+                                        "Error closing Corpus stream after cancellation: %s",
+                                        close_exc,
+                                    )
+                            break
+
+                        queue.put(CorpusLangChainLLM._chunk_to_generation_chunk(chunk))
+                finally:
+                    # Always signal completion to the consumer.
+                    queue.put(None)
 
             try:
-                AsyncBridge.run_async(_run_stream())
+                AsyncBridge.run_async(run_stream())
             except BaseException as exc:  # noqa: BLE001
                 error_holder.append(exc)
+                # Ensure sentinel is in the queue even on error.
+                queue.put(None)
             finally:
-                # Sentinel to tell the main thread we're done.
-                q.put(None)
+                done_event.set()
 
-        # Start background streaming thread.
-        thread = threading.Thread(target=_worker, daemon=True)
+        thread = threading.Thread(target=worker, daemon=True)
         thread.start()
 
-        # Consume chunks as they arrive.
-        while True:
-            item = q.get()
-            if item is None:
-                break
-            yield item
+        try:
+            while True:
+                chunk = queue.get()
+                if chunk is None:
+                    finished_normally = True
+                    break
 
-        # Propagate any error from the background thread.
-        if error_holder:
-            exc = error_holder[0]
-            # Make sure callbacks see the error as an end-of-run event.
-            run_manager.on_llm_error(exc) if run_manager is not None else None
-            raise exc
+                if run_manager is not None and chunk.message.content:
+                    run_manager.on_llm_new_token(chunk.message.content)
 
-        # Final callback signaling end-of-run.
-        if run_manager is not None:
-            # As in async streaming, we don't rebuild full text here.
-            empty_result = ChatResult(
-                generations=[
-                    ChatGeneration(
-                        message=AIMessage(content=""),
-                        generation_info={"streaming": True},
-                    )
-                ]
-            )
-            run_manager.on_llm_end(empty_result)
+                yield chunk
+
+            # Wait a bit for the worker thread to finish cleanup.
+            thread.join(timeout=self.stream_thread_join_timeout)
+            if thread.is_alive():
+                logger.warning(
+                    "CorpusLangChainLLM streaming worker thread did not exit "
+                    "within %.2fs; continuing anyway",
+                    self.stream_thread_join_timeout,
+                )
+
+            if error_holder:
+                exc = error_holder[0]
+                if run_manager is not None:
+                    run_manager.on_llm_error(exc)
+                raise exc
+
+            if run_manager is not None:
+                empty_result = ChatResult(
+                    generations=[
+                        ChatGeneration(
+                            message=AIMessage(content=""),
+                            generation_info={"streaming": True},
+                        )
+                    ]
+                )
+                run_manager.on_llm_end(empty_result)
+
+        except Exception as exc:  # noqa: BLE001
+            # Caller stopped early or error occurred on the main thread.
+            if not finished_normally:
+                cancel_event.set()
+                # Give worker a short window to react to cancellation.
+                done_event.wait(timeout=self.stream_thread_join_timeout)
+
+            if run_manager is not None:
+                run_manager.on_llm_error(exc)
+            raise
 
     # ------------------------------------------------------------------ #
-    # Optional: token counting / LLMResult compatibility
+    # Optional: token counting / estimation
     # ------------------------------------------------------------------ #
-
-    async def _acount_tokens(self, messages: List[BaseMessage], **kwargs: Any) -> int:
-        """
-        Optional: use Corpus `count_tokens` if available.
-        """
-        if not hasattr(self.corpus_adapter, "count_tokens"):
-            raise NotImplementedError("Underlying Corpus adapter does not support count_tokens()")
-
-        normalized = self._normalize_messages(messages)
-        corpus_messages = self._build_corpus_messages(normalized)
-        ctx, params = self._extract_ctx_and_params(**kwargs)
-
-        result = await self.corpus_adapter.count_tokens(
-            messages=corpus_messages,
-            ctx=ctx,
-            model=params.get("model", self.model),
-        )
-        return int(getattr(result, "total_tokens", 0))
 
     def get_num_tokens_from_messages(self, messages: List[BaseMessage]) -> int:
         """
-        Optional LangChain helper for token estimation.
+        Estimate token count for a list of LangChain messages.
 
-        This uses the Corpus `count_tokens` API when available; otherwise,
-        it falls back to naive estimation (length of concatenated content).
+        Behavior:
+        - If the underlying adapter's `count_tokens` succeeds, use that.
+        - On any error, fall back to a naive character-based estimate.
+
+        NOTE:
+            The fallback heuristic (chars ÷ 4) is intentionally simple: callers
+            who need precise accounting should rely on the adapter's
+            `count_tokens` implementation.
         """
+        # Build a combined text similar to BaseLLMAdapter's preflight behavior.
+        parts: List[str] = []
+        for m in messages:
+            role = getattr(m, "type", None) or getattr(m, "role", "user")
+            parts.append(f"{role}:{str(m.content)}")
+        text = "\n".join(parts)
+
         try:
-            return AsyncBridge.run_async(self._acount_tokens(messages))
-        except (NotImplementedError, AttributeError):
-            # Naive fallback: total character length as a rough proxy.
-            return sum(len(str(m.content)) for m in messages)
+            tokens = AsyncBridge.run_async(
+                self.corpus_adapter.count_tokens(
+                    text=text,
+                    model=self.model,
+                    ctx=None,  # no explicit OperationContext from LC here
+                )
+            )
+            return int(tokens)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("count_tokens failed in CorpusLangChainLLM, using fallback: %s", exc)
+            # Very rough heuristic: ~4 characters per token.
+            if not text:
+                return 0
+            return max(1, len(text) // 4)
+
+
+__all__ = ["CorpusLangChainLLM"]
