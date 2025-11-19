@@ -2,13 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Error context utilities for framework adapters.
+Error context utilities for framework / component adapters.
 
 This module provides helpers for attaching rich debugging context to exceptions
-as they propagate through framework adapters. This context enrichment enables:
+as they propagate through adapters (LLM, vector, graph, embedding, etc.).
+This context enrichment enables:
 
-- Post-mortem debugging with framework-specific metadata
-- Error aggregation and analysis across multiple frameworks
+- Post-mortem debugging with framework- or component-specific metadata
+- Error aggregation and analysis across multiple frameworks and subsystems
 - Contextual logging without modifying exception messages
 - Discovery of error origins in multi-layer architectures
 
@@ -26,7 +27,7 @@ Typical usage
     except Exception as exc:
         attach_context(
             exc,
-            framework="langchain",
+            framework="langchain",  # or "vector_pinecone", "graph_router", etc.
             operation="complete",
             messages_count=len(messages),
             model="gpt-4",
@@ -44,6 +45,7 @@ Later, in error handlers or observability systems:
                     "framework": context.get("framework"),
                     "operation": context.get("operation"),
                     "messages_count": context.get("messages_count"),
+                    "resource_type": context.get("resource_type"),  # e.g. "llm", "vector"
                 }
             )
 
@@ -64,12 +66,13 @@ Design philosophy
 
 * Discoverable:
     Uses both `__corpus_context__` (canonical) and `__<framework>_context__`
-    (framework-specific) attributes for maximum discoverability in debuggers
-    and error aggregation systems.
+    (framework-/component-specific) attributes for maximum discoverability in
+    debuggers and error aggregation systems.
 
 * Composable:
     Multiple calls to attach_context merge contexts rather than overwriting,
-    allowing different layers to contribute their own context.
+    allowing different layers (LLM, vector, graph, embedding, router, etc.)
+    to contribute their own context.
 """
 
 from __future__ import annotations
@@ -86,7 +89,7 @@ def attach_context(
     **context: Any,
 ) -> None:
     """
-    Attach framework-specific debugging context to an exception.
+    Attach debugging context to an exception.
 
     This function enriches exceptions with metadata that aids in debugging,
     error aggregation, and observability. The context is stored as exception
@@ -97,10 +100,10 @@ def attach_context(
     1. `__corpus_context__` (canonical):
         Contains all context from Corpus SDK perspective.
 
-    2. `__<framework>_context__` (framework-specific):
-        Contains the same context but with a framework-specific attribute
-        name (e.g., `__langchain_context__`, `__autogen_context__`).
-        This aids discoverability when debugging framework-specific issues.
+    2. `__<framework>_context__` (framework/component-specific):
+        Contains the same context but with a more specific attribute name
+        (e.g., `__langchain_context__`, `__vector_pinecone_context__`).
+        This aids discoverability when debugging specific integrations.
 
     If context already exists on the exception (from a previous call),
     the new context is merged with the existing context. The `framework`
@@ -113,18 +116,30 @@ def attach_context(
         including built-in exceptions and custom error types.
 
     framework:
-        Framework identifier (e.g., "langchain", "llamaindex", "autogen",
-        "semantic_kernel"). This is used both as a context key and to
-        generate the framework-specific attribute name.
+        Identifier for the origin of this context. This can be:
+            - A framework name (e.g., "langchain", "llamaindex", "autogen")
+            - A component name (e.g., "vector_pinecone", "graph_router",
+              "embedding_openai")
+        It is used both as a context key and to generate the
+        framework/component-specific attribute name.
 
     **context:
         Arbitrary keyword arguments representing the context to attach.
-        Common keys include:
+
+        Common keys for LLMs might include:
             - operation: str (e.g., "complete", "stream", "count_tokens")
             - messages_count: int
             - model: str
             - temperature: float
             - max_tokens: int
+
+        Common keys for vector / graph / embedding might include:
+            - resource_type: str (e.g., "vector", "graph", "embedding", "llm")
+            - index_name / collection / namespace / graph_id
+            - top_k, vector_count
+            - operation: str (e.g., "query", "upsert", "delete")
+
+        Cross-cutting fields:
             - request_id: str
             - tenant: str (should be hashed if present)
             - error_stage: str (e.g., "translation", "api_call", "response_parsing")
@@ -133,7 +148,7 @@ def attach_context(
 
     Examples
     --------
-    Basic usage in an adapter:
+    Basic usage in an LLM adapter:
 
         try:
             result = await corpus_adapter.complete(messages=messages)
@@ -141,9 +156,25 @@ def attach_context(
             attach_context(
                 exc,
                 framework="langchain",
+                resource_type="llm",
                 operation="complete",
                 messages_count=len(messages),
                 model="gpt-4",
+            )
+            raise
+
+    In a vector adapter:
+
+        try:
+            result = await vector_adapter.query(...)
+        except Exception as exc:
+            attach_context(
+                exc,
+                framework="vector_pinecone",
+                resource_type="vector",
+                operation="query",
+                index_name="my-index",
+                top_k=10,
             )
             raise
 
@@ -215,8 +246,8 @@ def attach_context(
         # Set canonical corpus context
         setattr(exc, "__corpus_context__", merged_context)
 
-        # Set framework-specific context for discoverability
-        # e.g., __langchain_context__, __autogen_context__
+        # Set framework/component-specific context for discoverability
+        # e.g., __langchain_context__, __vector_pinecone_context__
         framework_attr = f"__{framework}_context__"
         setattr(exc, framework_attr, merged_context)
 
@@ -245,9 +276,10 @@ def get_context(
         The exception to retrieve context from.
 
     framework:
-        Optional framework identifier. If provided, attempts to retrieve
-        the framework-specific context attribute first (e.g.,
-        `__langchain_context__`) before falling back to `__corpus_context__`.
+        Optional origin identifier. If provided, attempts to retrieve
+        the framework/component-specific context attribute first (e.g.,
+        `__langchain_context__`, `__vector_pinecone_context__`) before
+        falling back to `__corpus_context__`.
 
     Returns
     -------
@@ -265,14 +297,15 @@ def get_context(
                 extra={
                     "operation": context.get("operation"),
                     "messages_count": context.get("messages_count"),
+                    "resource_type": context.get("resource_type"),
                 }
             )
 
-        # Framework-specific retrieval:
-        context = get_context(exc, framework="langchain")
+        # Framework/component-specific retrieval:
+        context = get_context(exc, framework="vector_pinecone")
     """
     try:
-        # Try framework-specific context first if requested
+        # Try framework-/component-specific context first if requested
         if framework:
             framework_attr = f"__{framework}_context__"
             if hasattr(exc, framework_attr):
@@ -310,8 +343,8 @@ def has_context(
         The exception to check.
 
     framework:
-        Optional framework identifier. If provided, checks for framework-
-        specific context instead of canonical corpus context.
+        Optional origin identifier. If provided, checks for framework/
+        component-specific context instead of canonical corpus context.
 
     Returns
     -------
@@ -344,9 +377,13 @@ def has_context(
     return False
 
 
-def clear_context(exc: BaseException) -> None:
+def clear_context(
+    exc: BaseException,
+    *,
+    framework: Optional[str] = None,
+) -> None:
     """
-    Remove all attached context from an exception.
+    Remove attached context from an exception.
 
     This is primarily useful in testing or in scenarios where you need to
     sanitize exceptions before serialization.
@@ -355,6 +392,15 @@ def clear_context(exc: BaseException) -> None:
     ----------
     exc:
         The exception to clear context from.
+
+    framework:
+        Optional origin identifier. If provided, only the corresponding
+        framework/component-specific attribute (e.g. `__langchain_context__`)
+        is removed, along with `__corpus_context__` if present.
+
+        If None (default), all framework/component-specific context attributes
+        that follow the `__<name>_context__` pattern are removed, in addition
+        to `__corpus_context__`.
 
     Examples
     --------
@@ -366,12 +412,15 @@ def clear_context(exc: BaseException) -> None:
             # Serialize exc without context metadata
             serialized = json.dumps({"error": str(exc)})
 
+        # Only clear context for a specific origin:
+        clear_context(exc, framework="vector_pinecone")
+
     Notes
     -----
-    This function removes both `__corpus_context__` and any framework-specific
-    context attributes it can find. However, it does not attempt to discover
-    all possible framework-specific attributes; it only removes ones that
-    follow the `__<framework>_context__` pattern for known frameworks.
+    This function removes both `__corpus_context__` and framework/component-
+    specific context attributes that follow the `__<name>_context__` pattern.
+    It does not attempt to discover arbitrary custom attributes; if callers
+    choose a different naming scheme, they must clear those manually.
 
     In practice, you rarely need this function; context attachment is designed
     to be transparent and does not interfere with normal exception handling.
@@ -379,20 +428,55 @@ def clear_context(exc: BaseException) -> None:
     try:
         # Remove canonical corpus context
         if hasattr(exc, "__corpus_context__"):
-            delattr(exc, "__corpus_context__")
+            try:
+                delattr(exc, "__corpus_context__")
+            except Exception as clear_error:  # noqa: BLE001
+                logger.debug(
+                    "Failed to delete __corpus_context__ from %s: %s",
+                    type(exc).__name__,
+                    clear_error,
+                )
 
-        # Remove known framework-specific contexts
-        known_frameworks = [
-            "langchain",
-            "llamaindex",
-            "autogen",
-            "semantic_kernel",
-            "haystack",
-        ]
-        for framework in known_frameworks:
+        # If a specific origin is requested, just remove that one.
+        if framework:
             framework_attr = f"__{framework}_context__"
             if hasattr(exc, framework_attr):
-                delattr(exc, framework_attr)
+                try:
+                    delattr(exc, framework_attr)
+                except Exception as clear_error:  # noqa: BLE001
+                    logger.debug(
+                        "Failed to delete %s from %s: %s",
+                        framework_attr,
+                        type(exc).__name__,
+                        clear_error,
+                    )
+            return
+
+        # Otherwise, remove all attributes that match the convention
+        # __<name>_context__ regardless of the name.
+        for attr in list(dir(exc)):
+            # We only care about attributes that:
+            #   - start with "__"
+            #   - end with "_context__"
+            # This matches names like "__langchain_context__",
+            # "__vector_pinecone_context__", etc.
+            if not (attr.startswith("__") and attr.endswith("_context__")):
+                continue
+
+            # Skip the canonical __corpus_context__ which was already handled.
+            if attr == "__corpus_context__":
+                continue
+
+            if hasattr(exc, attr):
+                try:
+                    delattr(exc, attr)
+                except Exception as clear_error:  # noqa: BLE001
+                    logger.debug(
+                        "Failed to delete %s from %s: %s",
+                        attr,
+                        type(exc).__name__,
+                        clear_error,
+                    )
 
     except Exception as clear_error:  # noqa: BLE001
         logger.debug(
