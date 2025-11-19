@@ -55,7 +55,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .vector_base import (
     BaseVectorAdapter,
@@ -77,7 +77,6 @@ from .vector_base import (
     BadRequest,
     DimensionMismatch,
     IndexNotReady,
-    NotSupported,
     ResourceExhausted,
     TransientNetwork,
     Unavailable,
@@ -114,6 +113,15 @@ class PineconeVectorAdapter(BaseVectorAdapter):
     - Does *not* manage index lifecycle; you create/delete indexes outside.
     - Namespaces are mapped directly to Pinecone namespaces.
     - Batch queries are implemented as parallel fan-out over single-query calls.
+
+    text_storage_strategy
+    ---------------------
+    - This adapter does not itself manage text persistence.
+    - BaseVectorAdapter handles text/docstore integration.
+    - Here we only:
+        * Validate the strategy value ("metadata", "docstore", "none").
+        * Enforce that "docstore" requires a docstore instance.
+        * Report the configured strategy via capabilities.
     """
 
     _component = "vector_pinecone"
@@ -171,6 +179,12 @@ class PineconeVectorAdapter(BaseVectorAdapter):
         if text_storage_strategy not in allowed_text_strategies:
             raise BadRequest(
                 f"text_storage_strategy must be one of {sorted(allowed_text_strategies)}",
+                code="BAD_CONFIG",
+            )
+
+        if text_storage_strategy == "docstore" and docstore is None:
+            raise BadRequest(
+                "text_storage_strategy='docstore' requires a docstore instance",
                 code="BAD_CONFIG",
             )
 
@@ -279,6 +293,12 @@ class PineconeVectorAdapter(BaseVectorAdapter):
     def _translate_error(self, err: Exception, *, op: str) -> VectorAdapterError:
         """
         Map Pinecone exceptions into normalized VectorAdapterError types.
+
+        Note:
+            We intentionally treat "no such index"/404 as IndexNotReady to keep
+            the error retryable in environments where index lifecycle may lag
+            behind adapter startup. Callers that want stricter behavior can
+            enforce index existence at provisioning time.
         """
         msg = str(err) or f"Pinecone error during {op}"
         logger.debug("Pinecone error in %s: %r", op, err)
@@ -338,9 +358,6 @@ class PineconeVectorAdapter(BaseVectorAdapter):
                 or status_int == 404
                 or name_lower in ("not_found", "index_not_found")
             ):
-                # If we fail during query and namespace has no data, we may
-                # want IndexNotReady semantics; at adapter level we use this
-                # primarily for missing index.
                 return IndexNotReady(
                     "Pinecone index or data not ready",
                     code="INDEX_NOT_READY",
@@ -425,7 +442,8 @@ class PineconeVectorAdapter(BaseVectorAdapter):
 
         Note:
             - `max_dimensions` is taken from configuration (if provided).
-            - `max_batch_size` is a soft planning hint, not a hard constraint.
+            - `max_batch_size` is a soft planning hint, but we also enforce it
+              as a hard limit on upsert/delete batches to protect the backend.
         """
         version = getattr(pinecone, "__version__", "unknown") if pinecone else "unknown"
         return VectorCapabilities(
@@ -458,6 +476,17 @@ class PineconeVectorAdapter(BaseVectorAdapter):
     ) -> QueryResult:
         index = self._get_index()
 
+        # Enforce top_k ceiling if configured.
+        if self._max_top_k and spec.top_k > self._max_top_k:
+            raise BadRequest(
+                f"top_k {spec.top_k} exceeds maximum of {self._max_top_k}",
+                code="BAD_REQUEST",
+                details={
+                    "max_top_k": self._max_top_k,
+                    "namespace": spec.namespace,
+                },
+            )
+
         # Strict dimensionality check if configured.
         if self._dimensions and len(spec.vector) != self._dimensions:
             raise DimensionMismatch(
@@ -476,6 +505,7 @@ class PineconeVectorAdapter(BaseVectorAdapter):
                 raise BadRequest(
                     f"filter too complex: {len(spec.filter)} terms exceeds "
                     f"{self._max_filter_terms}",
+                    code="BAD_REQUEST",
                     details={
                         "provided_terms": len(spec.filter),
                         "max_terms": self._max_filter_terms,
@@ -532,14 +562,8 @@ class PineconeVectorAdapter(BaseVectorAdapter):
                 )
             )
 
-        # If the index exists but contains no data in this namespace,
-        # surface a retryable IndexNotReady to align with the mock adapter.
-        if not raw_matches:
-            # We only treat it as "not ready" when *no* vectors exist in ns.
-            # Checking that exactly is expensive; we leave it as a "normal" empty result.
-            # Callers can decide whether an empty set is acceptable.
-            pass
-
+        # Empty results are treated as a normal condition; callers decide
+        # whether an empty result set is acceptable.
         return QueryResult(
             matches=matches,
             query_vector=list(spec.vector),
@@ -610,6 +634,19 @@ class PineconeVectorAdapter(BaseVectorAdapter):
     ) -> UpsertResult:
         index = self._get_index()
 
+        # Enforce batch size ceiling if configured.
+        if self._max_batch_size and len(spec.vectors) > self._max_batch_size:
+            raise BadRequest(
+                f"upsert batch size {len(spec.vectors)} exceeds maximum of {self._max_batch_size}",
+                code="BATCH_TOO_LARGE",
+                details={
+                    "max_batch_size": self._max_batch_size,
+                    "provided": len(spec.vectors),
+                    "suggested_batch_reduction": self._max_batch_size,
+                    "namespace": spec.namespace,
+                },
+            )
+
         if self._dimensions:
             for v in spec.vectors:
                 if len(v.vector) != self._dimensions:
@@ -674,6 +711,18 @@ class PineconeVectorAdapter(BaseVectorAdapter):
 
         kwargs: Dict[str, Any] = {"namespace": spec.namespace}
         if spec.ids:
+            # Enforce batch size ceiling if configured.
+            if self._max_batch_size and len(spec.ids) > self._max_batch_size:
+                raise BadRequest(
+                    f"delete batch size {len(spec.ids)} exceeds maximum of {self._max_batch_size}",
+                    code="BATCH_TOO_LARGE",
+                    details={
+                        "max_batch_size": self._max_batch_size,
+                        "provided": len(spec.ids),
+                        "suggested_batch_reduction": self._max_batch_size,
+                        "namespace": spec.namespace,
+                    },
+                )
             kwargs["ids"] = [str(i) for i in spec.ids]
         elif spec.filter:
             kwargs["filter"] = dict(spec.filter)
@@ -718,6 +767,7 @@ class PineconeVectorAdapter(BaseVectorAdapter):
             raise BadRequest(
                 f"distance_metric '{spec.distance_metric}' does not match "
                 f"configured metric '{self._metric}'",
+                code="BAD_CONFIG",
                 details={"metric": self._metric},
             )
 
@@ -725,6 +775,7 @@ class PineconeVectorAdapter(BaseVectorAdapter):
             raise BadRequest(
                 f"dimensions {spec.dimensions} do not match configured "
                 f"dimensions {self._dimensions}",
+                code="BAD_CONFIG",
                 details={"configured_dimensions": self._dimensions},
             )
 
@@ -795,17 +846,26 @@ class PineconeVectorAdapter(BaseVectorAdapter):
             stats = await self._run_in_thread(index.describe_index_stats)
             # Expected shape:
             #   {"namespaces": {"ns": {"vector_count": N}, ...}, ...}
-            ns_stats_raw: Mapping[str, Any] = stats.get("namespaces", {}) if isinstance(
-                stats, Mapping
-            ) else {}
+            if isinstance(stats, Mapping):
+                ns_stats_raw: Mapping[str, Any] = stats.get("namespaces", {}) or {}
+            else:
+                ns_stats_raw = getattr(stats, "namespaces", {}) or {}
+
             namespaces: Dict[str, Any] = {}
             for ns, info in ns_stats_raw.items():
                 if not isinstance(info, Mapping):
-                    continue
+                    # Best-effort: if info is an object, try attribute access.
+                    if hasattr(info, "vector_count"):
+                        count = int(getattr(info, "vector_count") or 0)
+                    else:
+                        continue
+                else:
+                    count = int(info.get("vector_count", 0) or 0)
+
                 namespaces[str(ns)] = {
                     "dimensions": self._dimensions,
                     "metric": self._metric,
-                    "count": int(info.get("vector_count", 0) or 0),
+                    "count": count,
                     "status": "ok",
                 }
 
