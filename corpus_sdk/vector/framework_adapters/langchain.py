@@ -60,6 +60,10 @@ Usage
     # Similarity search
     docs = store.similarity_search("hello", k=3)
 
+    # Streaming similarity search
+    for doc in store.similarity_search_stream("hello", k=3):
+        ...
+
     # As a retriever
     retriever = CorpusLangChainRetriever(vector_store=store, search_kwargs={"k": 3})
     relevant_docs = retriever.get_relevant_documents("hello")
@@ -74,6 +78,7 @@ from typing import (
     Any,
     Dict,
     Iterable,
+    Iterator,
     List,
     Mapping,
     Optional,
@@ -109,6 +114,7 @@ from corpus_sdk.llm.framework_adapters.common.context_translation import (
     from_langchain as context_from_langchain,
 )
 from corpus_sdk.llm.framework_adapters.common.error_context import attach_context
+from corpus_sdk.core.sync_stream_bridge import sync_stream
 
 logger = logging.getLogger(__name__)
 
@@ -780,6 +786,52 @@ class CorpusLangChainVectorStore(VectorStore):
         docs_scores = self._from_corpus_matches(matches)
         return [doc for doc, _ in docs_scores]
 
+    def similarity_search_stream(
+        self,
+        query: str,
+        k: int = 4,
+        filter: Optional[Mapping[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Iterator[Document]:
+        """
+        Streaming similarity search (sync), yielding Documents one by one.
+
+        This uses SyncStreamBridge under the hood via `sync_stream` to bridge
+        the async query into a synchronous iterator. The backend query itself
+        is still a single async call; this just exposes results incrementally.
+        """
+        embedding: Optional[Sequence[float]] = kwargs.get("embedding")
+        namespace: Optional[str] = kwargs.get("namespace")
+        ctx = self._build_ctx(**kwargs)
+
+        query_emb = self._embed_query(query, embedding=embedding)
+        top_k = k or self.default_top_k
+
+        async def _stream_coro():
+            matches = await self._aquery_embedding(
+                query_emb,
+                k=top_k,
+                namespace=namespace,
+                filter=filter,
+                include_vectors=False,
+                ctx=ctx,
+            )
+            for m in matches:
+                yield m
+
+        for match in sync_stream(
+            _stream_coro,
+            framework="langchain",
+            error_context={
+                "operation": "similarity_search_stream",
+                "namespace": namespace,
+                "top_k": top_k,
+            },
+        ):
+            docs_scores = self._from_corpus_matches([match])
+            if docs_scores:
+                yield docs_scores[0][0]
+
     async def asimilarity_search(
         self,
         query: str,
@@ -859,7 +911,7 @@ class CorpusLangChainVectorStore(VectorStore):
         return self._from_corpus_matches(matches)
 
     # ------------------------------------------------------------------ #
-    # MMR search (optional, but useful)
+    # MMR search (improved implementation)
     # ------------------------------------------------------------------ #
 
     @staticmethod
@@ -879,46 +931,85 @@ class CorpusLangChainVectorStore(VectorStore):
     def _mmr_select_indices(
         self,
         query_vec: Sequence[float],
-        candidate_vecs: List[Sequence[float]],
+        candidate_matches: List[VectorMatch],
         k: int,
         lambda_mult: float,
     ) -> List[int]:
         """
-        Greedy Maximal Marginal Relevance (MMR) selector.
+        Improved MMR selector that respects original database scores and caches similarities.
 
-        Returns indices into candidate_vecs.
+        Args:
+            query_vec: The query embedding vector
+            candidate_matches: Candidate matches with original scores and vectors
+            k: Number of results to select
+            lambda_mult: MMR lambda parameter (0-1), higher values favor relevance
+
+        Returns:
+            Indices into candidate_matches for selected results
         """
-        if not candidate_vecs or k <= 0:
+        if not candidate_matches or k <= 0:
             return []
 
-        k = min(k, len(candidate_vecs))
-        selected: List[int] = []
-        candidates = list(range(len(candidate_vecs)))
+        k = min(k, len(candidate_matches))
+        if k == 0:
+            return []
 
-        # Precompute query-candidate similarities
-        sim_query: List[float] = [
-            self._cosine_sim(query_vec, vec) for vec in candidate_vecs
-        ]
+        # Use original scores from database as relevance measure
+        original_scores = [float(match.score) for match in candidate_matches]
+        candidate_vecs = [match.vector.vector or [] for match in candidate_matches]
+        
+        # Normalize original scores to 0-1 range for consistency
+        max_orig_score = max(original_scores) if original_scores else 1.0
+        if max_orig_score <= 0.0:
+            normalized_scores = [0.0] * len(original_scores)
+        else:
+            normalized_scores = [score / max_orig_score for score in original_scores]
+        
+        # Precompute all pairwise similarities with caching
+        similarity_cache: Dict[Tuple[int, int], float] = {}
+        
+        def get_similarity(i: int, j: int) -> float:
+            if (i, j) in similarity_cache:
+                return similarity_cache[(i, j)]
+            if (j, i) in similarity_cache:
+                return similarity_cache[(j, i)]
+            
+            vec_i = candidate_vecs[i]
+            vec_j = candidate_vecs[j]
+            if not vec_i or not vec_j or len(vec_i) != len(vec_j):
+                sim = 0.0
+            else:
+                sim = self._cosine_sim(vec_i, vec_j)
+            
+            similarity_cache[(i, j)] = sim
+            return sim
+
+        selected: List[int] = []
+        candidates = list(range(len(candidate_matches)))
+        
+        # Start with the most relevant document based on original score
+        if candidates:
+            first_idx = max(candidates, key=lambda i: normalized_scores[i])
+            selected.append(first_idx)
+            candidates.remove(first_idx)
 
         while candidates and len(selected) < k:
             best_idx = None
             best_score = -float("inf")
 
             for idx in candidates:
-                # Relevance to the query
-                rel = sim_query[idx]
-
+                # Relevance term using original database score
+                relevance = normalized_scores[idx]
+                
                 # Diversity term: max similarity to already selected items
-                if selected:
-                    max_sim_to_selected = max(
-                        self._cosine_sim(candidate_vecs[idx], candidate_vecs[j])
-                        for j in selected
-                    )
-                else:
-                    max_sim_to_selected = 0.0
-
-                mmr_score = lambda_mult * rel - (1.0 - lambda_mult) * max_sim_to_selected
-
+                max_similarity = 0.0
+                for sel_idx in selected:
+                    similarity = get_similarity(idx, sel_idx)
+                    max_similarity = max(max_similarity, similarity)
+                
+                # MMR score balancing relevance and diversity
+                mmr_score = lambda_mult * relevance - (1.0 - lambda_mult) * max_similarity
+                
                 if mmr_score > best_score:
                     best_score = mmr_score
                     best_idx = idx
@@ -943,7 +1034,21 @@ class CorpusLangChainVectorStore(VectorStore):
         Perform Maximal Marginal Relevance (MMR) search (sync).
 
         This runs a similarity search with a larger `fetch_k` and then
-        selects a subset of results via MMR based on vector geometry.
+        selects a subset of results via MMR based on vector geometry and
+        original database scores.
+
+        Args:
+            query: Query string
+            k: Number of results to return
+            lambda_mult: MMR lambda parameter (0-1), higher values favor relevance
+            filter: Optional metadata filter
+            **kwargs: Additional arguments including:
+                - fetch_k: Number of candidates to fetch for MMR selection
+                - embedding: Optional precomputed query embedding
+                - namespace: Optional namespace override
+
+        Returns:
+            List of Documents selected via MMR
         """
         fetch_k: int = kwargs.get("fetch_k") or max(k * 4, k + 5)
         embedding: Optional[Sequence[float]] = kwargs.get("embedding")
@@ -967,24 +1072,15 @@ class CorpusLangChainVectorStore(VectorStore):
         if not matches:
             return []
 
-        # Extract candidate vectors and docs
-        candidate_vecs: List[List[float]] = []
-        docs_scores = self._from_corpus_matches(matches)
-        for match in matches:
-            vec = match.vector.vector or []
-            candidate_vecs.append([float(x) for x in vec])
-
-        # If we didn't get vectors, fall back to first-k results.
-        if not any(candidate_vecs) or any(len(v) != len(query_emb) for v in candidate_vecs):
-            return [doc for doc, _ in docs_scores[:k]]
-
+        # Use improved MMR that respects original scores
         indices = self._mmr_select_indices(
             query_vec=query_emb,
-            candidate_vecs=candidate_vecs,
+            candidate_matches=matches,
             k=k,
             lambda_mult=lambda_mult,
         )
 
+        docs_scores = self._from_corpus_matches(matches)
         return [docs_scores[i][0] for i in indices]
 
     async def amax_marginal_relevance_search(
@@ -1017,22 +1113,14 @@ class CorpusLangChainVectorStore(VectorStore):
         if not matches:
             return []
 
-        candidate_vecs: List[List[float]] = []
-        docs_scores = self._from_corpus_matches(matches)
-        for match in matches:
-            vec = match.vector.vector or []
-            candidate_vecs.append([float(x) for x in vec])
-
-        if not any(candidate_vecs) or any(len(v) != len(query_emb) for v in candidate_vecs):
-            return [doc for doc, _ in docs_scores[:k]]
-
         indices = self._mmr_select_indices(
             query_vec=query_emb,
-            candidate_vecs=candidate_vecs,
+            candidate_matches=matches,
             k=k,
             lambda_mult=lambda_mult,
         )
 
+        docs_scores = self._from_corpus_matches(matches)
         return [docs_scores[i][0] for i in indices]
 
     # ------------------------------------------------------------------ #
