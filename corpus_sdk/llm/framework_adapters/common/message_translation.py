@@ -760,3 +760,41 @@ def validate_message_roundtrip(framework: str, test_cases: List[Any]) -> bool:
             return False
 
     return True
+
+
+__all__ = [
+    # Core type & config
+    "NormalizedMessage",
+    "set_strict_role_validation",
+    "set_unknown_role_fallback",
+
+    # Corpus wire helpers
+    "to_corpus",
+    "to_corpus_single",
+    "from_corpus",
+    "from_corpus_many",
+
+    # LangChain
+    "from_langchain",
+    "to_langchain",
+
+    # LlamaIndex
+    "from_llamaindex",
+    "to_llamaindex",
+
+    # Semantic Kernel
+    "from_semantic_kernel",
+    "to_semantic_kernel",
+
+    # AutoGen
+    "from_autogen",
+    "to_autogen",
+
+    # CrewAI
+    "from_crewai",
+    "to_crewai",
+
+    # Validation helpers
+    "validate_message_roundtrip",
+]
+
