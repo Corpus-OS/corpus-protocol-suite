@@ -11,6 +11,8 @@ implementation, with:
 - Async + sync streaming chat (true incremental streaming)
 - Context propagation via `OperationContext`
 - Protocol-first design: LlamaIndex is a thin skin over Corpus
+- Optional transient error retry with exponential backoff
+- Configurable streaming bridge for testing and customization
 
 Design goals
 ------------
@@ -26,19 +28,17 @@ Design goals
 
 3. True streaming:
    - Async streaming uses `BaseLLMAdapter.stream()` directly.
-   - Sync streaming uses a background thread + queue to bridge the
-     async iterator to a blocking generator without buffering the
-     entire response.
+   - Sync streaming uses `SyncStreamBridge` for production-grade
+     sync streaming with backpressure, cancellation, and retry.
 
 4. Context + observability:
    - Request/trace IDs, deadlines, tenants, and tags are mapped into
      `OperationContext` using `ContextTranslator.from_llamaindex_callback_manager`.
-   - Errors are propagated as-is; we do not swallow provider errors.
+   - Errors are enriched with framework-specific context via `attach_context`.
 
 5. Cancellation-friendly:
    - Sync streaming optionally accepts a `cancel_event` (threading.Event)
-     via kwargs to allow callers to stop consumption early without
-     hanging on teardown.
+     via kwargs to allow callers to stop consumption early.
 
 This is SDK infrastructure, not business logic.
 """
@@ -47,17 +47,21 @@ from __future__ import annotations
 
 import logging
 import threading
-from queue import Queue, Empty
+import time
 from typing import (
     Any,
     AsyncIterator,
+    Awaitable,
+    Callable,
     Dict,
-    Iterable,
     Iterator,
     List,
     Mapping,
     Optional,
     Sequence,
+    Tuple,
+    Type,
+    Union,
 )
 
 from corpus_sdk.llm.llm_base import (
@@ -65,16 +69,20 @@ from corpus_sdk.llm.llm_base import (
     LLMChunk,
     LLMCompletion,
     OperationContext,
+    TransientNetwork,
+    Unavailable,
 )
+from corpus_sdk.llm.framework_adapters.common.async_bridge import AsyncBridge
+from corpus_sdk.llm.framework_adapters.common.context_translation import (
+    ContextTranslator,
+)
+from corpus_sdk.llm.framework_adapters.common.error_context import attach_context
 from corpus_sdk.llm.framework_adapters.common.message_translation import (
     NormalizedMessage,
     from_llamaindex,
     to_corpus,
 )
-from corpus_sdk.llm.framework_adapters.common.context_translation import (
-    ContextTranslator,
-)
-from corpus_sdk.llm.framework_adapters.common.async_bridge import AsyncBridge
+from corpus_sdk.llm.framework_adapters.common.sync_stream_bridge import SyncStreamBridge
 
 logger = logging.getLogger(__name__)
 
@@ -153,7 +161,7 @@ def _extract_stop_sequences(kwargs: Mapping[str, Any]) -> Optional[List[str]]:
         return None
     if isinstance(stop, str):
         return [stop]
-    if isinstance(stop, Iterable):
+    if isinstance(stop, (list, tuple)):
         return [str(s) for s in stop]
     return [str(stop)]
 
@@ -287,6 +295,9 @@ class CorpusLlamaIndexLLM(LLM):  # type: ignore[misc]
     """
     LlamaIndex `LLM` implementation backed by a Corpus LLM adapter.
 
+    This class implements the full LlamaIndex LLM interface with
+    production-grade streaming, error handling, and configurability.
+
     Attributes
     ----------
     corpus_adapter:
@@ -297,15 +308,59 @@ class CorpusLlamaIndexLLM(LLM):  # type: ignore[misc]
         Default sampling temperature.
     max_tokens:
         Default max_tokens limit (adapter may have its own default).
+
     stream_queue_maxsize:
         Max number of pending ChatResponse chunks buffered between the
         background thread and the caller in sync streaming.
-    stream_thread_join_timeout_s:
-        Timeout (seconds) when joining the background streaming thread
-        at the end of sync streaming.
     stream_poll_timeout_s:
         Timeout (seconds) when polling the queue in sync streaming;
         allows tuning for high-latency or low-latency workloads.
+    stream_join_timeout_s:
+        Timeout (seconds) when joining the background streaming thread
+        at the end of sync streaming.
+
+    max_transient_retries:
+        Number of retry attempts for transient errors during sync streaming
+        before the first chunk is emitted. Default: 0 (no retry).
+    transient_backoff_s:
+        Initial backoff delay (seconds) for streaming retry. Uses exponential
+        backoff: attempt N sleeps for `backoff * (2 ** (N - 1))` seconds.
+        Default: 0.25.
+    stream_transient_error_types:
+        Tuple of exception types to consider transient and eligible for retry
+        during sync streaming. Default: (TransientNetwork, Unavailable).
+
+    stream_bridge_factory:
+        Optional factory function for creating SyncStreamBridge instances.
+        Primarily used for testing/mocking. If None, uses default factory.
+
+    Examples
+    --------
+    Basic usage:
+
+        llm = CorpusLlamaIndexLLM(
+            corpus_adapter=OpenAIAdapter(api_key="..."),
+            model="gpt-4",
+        )
+
+    With retry enabled:
+
+        llm = CorpusLlamaIndexLLM(
+            corpus_adapter=OpenAIAdapter(api_key="..."),
+            model="gpt-4",
+            max_transient_retries=2,
+            transient_backoff_s=0.5,
+        )
+
+    With custom bridge factory (testing):
+
+        def mock_bridge_factory(**kwargs):
+            return MockSyncStreamBridge(**kwargs)
+
+        llm = CorpusLlamaIndexLLM(
+            corpus_adapter=mock_adapter,
+            stream_bridge_factory=mock_bridge_factory,
+        )
     """
 
     corpus_adapter: BaseLLMAdapter
@@ -313,17 +368,95 @@ class CorpusLlamaIndexLLM(LLM):  # type: ignore[misc]
     temperature: float = 0.7
     max_tokens: Optional[int] = None
 
-    # Sync streaming tuning knobs
+    # Sync streaming configuration
     stream_queue_maxsize: int = 16
-    stream_thread_join_timeout_s: float = 2.0
     stream_poll_timeout_s: float = 0.1
+    stream_join_timeout_s: float = 2.0
+
+    # Transient retry configuration for sync streaming
+    max_transient_retries: int = 0
+    transient_backoff_s: float = 0.25
+    stream_transient_error_types: Tuple[Type[BaseException], ...] = (
+        TransientNetwork,
+        Unavailable,
+    )
+
+    # Dependency injection for testing
+    stream_bridge_factory: Optional[Callable[..., SyncStreamBridge]] = None
 
     # Pydantic v2 config
     model_config = {"arbitrary_types_allowed": True}
 
-    def __init__(self, **data: Any) -> None:  # pragma: no cover - thin wrapper
+    def __init__(self, **data: Any) -> None:
         _ensure_llamaindex_installed()
         super().__init__(**data)
+
+    def _create_stream_bridge(
+        self,
+        *,
+        coro_factory: Callable[[], Awaitable[AsyncIterator[ChatResponse]]],
+        error_context: Dict[str, Any],
+        **stream_overrides: Any,
+    ) -> SyncStreamBridge:
+        """
+        Create a SyncStreamBridge instance with current configuration.
+
+        This method centralizes bridge creation and allows for dependency
+        injection via stream_bridge_factory.
+
+        Parameters
+        ----------
+        coro_factory:
+            Factory function that produces an awaitable that returns an
+            async iterator of ChatResponse.
+
+        error_context:
+            Additional context to attach to any errors raised during streaming.
+
+        stream_overrides:
+            Per-call overrides for streaming parameters.
+
+        Returns
+        -------
+        SyncStreamBridge
+            Configured bridge instance ready to run.
+        """
+        # Determine configuration with overrides
+        queue_maxsize = stream_overrides.get("stream_queue_maxsize", self.stream_queue_maxsize)
+        poll_timeout_s = stream_overrides.get("stream_poll_timeout_s", self.stream_poll_timeout_s)
+        join_timeout_s = stream_overrides.get("stream_join_timeout_s", self.stream_join_timeout_s)
+        max_retries = stream_overrides.get("stream_max_transient_retries", self.max_transient_retries)
+        backoff_s = stream_overrides.get("stream_transient_backoff_s", self.transient_backoff_s)
+        error_types = stream_overrides.get("stream_transient_error_types", self.stream_transient_error_types)
+        cancel_event = stream_overrides.get("cancel_event")
+
+        # Use custom factory if provided (for testing), otherwise use default
+        if self.stream_bridge_factory is not None:
+            return self.stream_bridge_factory(
+                coro_factory=coro_factory,
+                queue_maxsize=queue_maxsize,
+                poll_timeout_s=poll_timeout_s,
+                join_timeout_s=join_timeout_s,
+                cancel_event=cancel_event,
+                framework="llamaindex",
+                error_context=error_context,
+                max_transient_retries=max_retries,
+                transient_backoff_s=backoff_s,
+                transient_error_types=error_types,
+            )
+
+        return SyncStreamBridge(
+            coro_factory=coro_factory,
+            queue_maxsize=queue_maxsize,
+            poll_timeout_s=poll_timeout_s,
+            join_timeout_s=join_timeout_s,
+            cancel_event=cancel_event,
+            framework="llamaindex",
+            error_context=error_context,
+            max_transient_retries=max_retries,
+            transient_backoff_s=backoff_s,
+            transient_error_types=error_types,
+        )
 
     # ------------------------------------------------------------------ #
     # Core async chat API
@@ -346,18 +479,36 @@ class CorpusLlamaIndexLLM(LLM):  # type: ignore[misc]
             kwargs=kwargs,
         )
 
-        result: LLMCompletion = await self.corpus_adapter.complete(
-            messages=corpus_messages,
-            ctx=ctx,
-            **params,
-        )
+        try:
+            result: LLMCompletion = await self.corpus_adapter.complete(
+                messages=corpus_messages,
+                ctx=ctx,
+                **params,
+            )
 
-        return _build_chat_response(
-            text=result.text,
-            model=getattr(result, "model", None),
-            finish_reason=getattr(result, "finish_reason", None),
-            usage=getattr(result, "usage", None),
-        )
+            return _build_chat_response(
+                text=result.text,
+                model=getattr(result, "model", None),
+                finish_reason=getattr(result, "finish_reason", None),
+                usage=getattr(result, "usage", None),
+            )
+        except BaseException as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework="llamaindex",
+                operation="achat",
+                messages_count=len(messages),
+                model=params.get("model", self.model),
+                temperature=params.get("temperature"),
+                max_tokens=params.get("max_tokens"),
+                top_p=params.get("top_p"),
+                frequency_penalty=params.get("frequency_penalty"),
+                presence_penalty=params.get("presence_penalty"),
+                request_id=getattr(ctx, "request_id", None),
+                tenant=getattr(ctx, "tenant", None),
+                stream=False,
+            )
+            raise
 
     async def astream_chat(
         self,
@@ -379,32 +530,53 @@ class CorpusLlamaIndexLLM(LLM):  # type: ignore[misc]
             kwargs=kwargs,
         )
 
-        stream: AsyncIterator[LLMChunk] = await self.corpus_adapter.stream(
-            messages=corpus_messages,
-            ctx=ctx,
-            **params,
-        )
+        model_for_context = params.get("model", self.model)
 
-        async def _gen() -> AsyncIterator[ChatResponse]:
-            try:
-                async for chunk in stream:
-                    yield _build_chat_response_from_chunk(chunk)
-            finally:
-                aclose = getattr(stream, "aclose", None)
-                if callable(aclose):
-                    try:
-                        await aclose()
-                    except Exception as cleanup_error:  # noqa: BLE001
-                        logger.debug(
-                            "LlamaIndex stream cleanup failed: %s",
-                            cleanup_error,
-                            extra={"framework": "llamaindex"},
-                        )
+        try:
+            stream: AsyncIterator[LLMChunk] = await self.corpus_adapter.stream(
+                messages=corpus_messages,
+                ctx=ctx,
+                **params,
+            )
 
-        return _gen()
+            async def _gen() -> AsyncIterator[ChatResponse]:
+                try:
+                    async for chunk in stream:
+                        yield _build_chat_response_from_chunk(chunk)
+                finally:
+                    aclose = getattr(stream, "aclose", None)
+                    if callable(aclose):
+                        try:
+                            await aclose()
+                        except Exception as cleanup_error:  # noqa: BLE001
+                            logger.debug(
+                                "LlamaIndex stream cleanup failed: %s",
+                                cleanup_error,
+                                extra={"framework": "llamaindex"},
+                            )
+
+            return _gen()
+
+        except BaseException as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework="llamaindex",
+                operation="astream_chat",
+                messages_count=len(messages),
+                model=model_for_context,
+                temperature=params.get("temperature"),
+                max_tokens=params.get("max_tokens"),
+                top_p=params.get("top_p"),
+                frequency_penalty=params.get("frequency_penalty"),
+                presence_penalty=params.get("presence_penalty"),
+                request_id=getattr(ctx, "request_id", None),
+                tenant=getattr(ctx, "tenant", None),
+                stream=True,
+            )
+            raise
 
     # ------------------------------------------------------------------ #
-    # Sync chat API (bridged via AsyncBridge)
+    # Sync chat API (bridged via AsyncBridge + SyncStreamBridge)
     # ------------------------------------------------------------------ #
 
     def chat(
@@ -420,10 +592,13 @@ class CorpusLlamaIndexLLM(LLM):  # type: ignore[misc]
         try:
             return AsyncBridge.run_async(self.achat(messages, **kwargs))
         except BaseException as exc:  # noqa: BLE001
-            logger.exception(
-                "CorpusLlamaIndexLLM.chat failed",
-                exc_info=exc,
-                extra={"framework": "llamaindex"},
+            attach_context(
+                exc,
+                framework="llamaindex",
+                operation="chat",
+                messages_count=len(messages),
+                model=kwargs.get("model", self.model),
+                stream=False,
             )
             raise
 
@@ -435,30 +610,34 @@ class CorpusLlamaIndexLLM(LLM):  # type: ignore[misc]
         """
         Sync streaming chat.
 
-        Bridges `astream_chat` to a blocking generator using a background
-        thread + queue:
+        Bridges `astream_chat` to a blocking generator using SyncStreamBridge
+        for production-grade sync streaming with:
 
-        - Background thread runs the async streaming coroutine.
-        - Chunks are pushed into a bounded queue.
-        - The main thread yields chunks as they arrive.
-        - A sentinel (None) signals completion.
-        - Any exception in the worker is re-raised in the main thread.
+        - Background thread management
+        - Bounded queue for backpressure
+        - Proper cleanup and error propagation
+        - Optional transient retry (controlled by max_transient_retries)
 
-        Cancellation
-        ------------
-        Accepts an optional `cancel_event` (threading.Event) via kwargs:
+        Parameters
+        ----------
+        messages:
+            Sequence of LlamaIndex ChatMessage objects.
 
-            cancel = threading.Event()
-            for chunk in llm.stream_chat(messages, cancel_event=cancel):
-                ...
-                if should_stop:
-                    cancel.set()
+        kwargs:
+            - cancel_event: Optional[threading.Event] for early cancellation
+            - Per-call streaming overrides:
+                * stream_queue_maxsize
+                * stream_poll_timeout_s
+                * stream_join_timeout_s
+                * stream_max_transient_retries
+                * stream_transient_backoff_s
+                * stream_transient_error_types
+            - All other parameters as in `achat`.
 
-        Cancellation is best-effort:
-        - The main thread stops yielding further chunks as soon as
-          `cancel_event.is_set()` is observed.
-        - The worker thread is allowed to finish naturally; it is joined
-          with a bounded timeout to avoid hanging the caller.
+        Returns
+        -------
+        ChatResponseGen
+            Iterator of ChatResponse chunks.
         """
         cancel_event = kwargs.pop("cancel_event", None)
         if cancel_event is not None and not isinstance(cancel_event, threading.Event):
@@ -468,71 +647,48 @@ class CorpusLlamaIndexLLM(LLM):  # type: ignore[misc]
             )
             cancel_event = None
 
-        q: "Queue[Optional[ChatResponse]]" = Queue(maxsize=self.stream_queue_maxsize)
-        error_holder: List[BaseException] = []
-        done_event = threading.Event()
+        # Extract per-call streaming overrides
+        stream_overrides = {
+            "cancel_event": cancel_event,
+            "stream_queue_maxsize": kwargs.pop("stream_queue_maxsize", self.stream_queue_maxsize),
+            "stream_poll_timeout_s": kwargs.pop("stream_poll_timeout_s", self.stream_poll_timeout_s),
+            "stream_join_timeout_s": kwargs.pop("stream_join_timeout_s", self.stream_join_timeout_s),
+            "stream_max_transient_retries": kwargs.pop(
+                "stream_max_transient_retries", self.max_transient_retries
+            ),
+            "stream_transient_backoff_s": kwargs.pop(
+                "stream_transient_backoff_s", self.transient_backoff_s
+            ),
+            "stream_transient_error_types": kwargs.pop(
+                "stream_transient_error_types", self.stream_transient_error_types
+            ),
+        }
 
-        def _worker() -> None:
-            """
-            Background thread that runs `astream_chat` and enqueues
-            ChatResponse chunks.
-            """
+        # Validate error types if overridden
+        error_types = stream_overrides["stream_transient_error_types"]
+        if error_types is not None and not isinstance(error_types, tuple):
+            raise TypeError("stream_transient_error_types must be a tuple of exception types")
 
-            async def _run_stream() -> None:
-                async for resp in await self.astream_chat(messages, **kwargs):
-                    q.put(resp)
+        model_for_context = kwargs.get("model", self.model)
 
-            try:
-                AsyncBridge.run_async(_run_stream())
-            except BaseException as exc:  # noqa: BLE001
-                # Capture the error for the main thread; avoid double-logging.
-                error_holder.append(exc)
-            finally:
-                q.put(None)
-                done_event.set()
+        async def _coro_factory() -> AsyncIterator[ChatResponse]:
+            # Note: we return the async iterator, not iterate here
+            return await self.astream_chat(messages, **kwargs)
 
-        thread = threading.Thread(target=_worker, daemon=True)
-        thread.start()
+        error_context: Dict[str, Any] = {
+            "operation": "stream_chat",
+            "messages_count": len(messages),
+            "model": model_for_context,
+            **{k: v for k, v in stream_overrides.items() if k != "cancel_event"},
+        }
 
-        try:
-            while True:
-                if cancel_event is not None and cancel_event.is_set():
-                    logger.debug(
-                        "stream_chat cancellation requested; stopping consumption",
-                        extra={"framework": "llamaindex"},
-                    )
-                    break
+        bridge = self._create_stream_bridge(
+            coro_factory=_coro_factory,
+            error_context=error_context,
+            **stream_overrides,
+        )
 
-                try:
-                    item = q.get(timeout=self.stream_poll_timeout_s)
-                except Empty:
-                    if done_event.is_set() and q.empty():
-                        break
-                    continue
-
-                if item is None:
-                    break
-
-                yield item
-
-            thread.join(timeout=self.stream_thread_join_timeout_s)
-            if thread.is_alive():  # pragma: no cover - defensive
-                logger.debug(
-                    "LlamaIndex streaming worker thread did not terminate within %.2fs",
-                    self.stream_thread_join_timeout_s,
-                    extra={"framework": "llamaindex"},
-                )
-
-            if error_holder:
-                raise error_holder[0]
-
-        except BaseException as exc:  # noqa: BLE001
-            logger.exception(
-                "CorpusLlamaIndexLLM.stream_chat failed",
-                exc_info=exc,
-                extra={"framework": "llamaindex"},
-            )
-            raise
+        return bridge.run()
 
     # ------------------------------------------------------------------ #
     # Optional: token counting bridge
@@ -556,11 +712,21 @@ class CorpusLlamaIndexLLM(LLM):  # type: ignore[misc]
 
         ctx = _build_operation_context_from_callbacks(adapter=self, kwargs=kwargs)
 
-        return await self.corpus_adapter.count_tokens(
-            text=combined,
-            model=kwargs.get("model", self.model),
-            ctx=ctx,
-        )
+        try:
+            return await self.corpus_adapter.count_tokens(
+                text=combined,
+                model=kwargs.get("model", self.model),
+                ctx=ctx,
+            )
+        except BaseException as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework="llamaindex",
+                operation="acount_tokens",
+                messages_count=len(messages),
+                model=kwargs.get("model", self.model),
+            )
+            raise
 
     def count_tokens(
         self,
@@ -578,8 +744,8 @@ class CorpusLlamaIndexLLM(LLM):  # type: ignore[misc]
             return AsyncBridge.run_async(self.acount_tokens(messages, **kwargs))
         except (NotImplementedError, AttributeError):
             corpus_messages = _translate_messages_to_corpus(messages)
-            total_chars = sum(len(m["content"]) for m in corpus_messages)
-            approx_tokens = total_chars // 4
+            total_chars = sum(len(m.get("content", "")) for m in corpus_messages)
+            approx_tokens = max(1, total_chars // 4)
             logger.debug(
                 "count_tokens not supported by Corpus adapter; "
                 "using naive fallback (%s chars -> ~%s tokens)",
@@ -588,6 +754,15 @@ class CorpusLlamaIndexLLM(LLM):  # type: ignore[misc]
                 extra={"framework": "llamaindex"},
             )
             return approx_tokens
+        except BaseException as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework="llamaindex",
+                operation="count_tokens",
+                messages_count=len(messages),
+                model=kwargs.get("model", self.model),
+            )
+            raise
 
 
 __all__ = [
