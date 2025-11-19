@@ -3,6 +3,11 @@
 """
 Weaviate Vector adapter for the Vector Protocol V1.1.
 
+# corpus_sdk/vector/weaviate_adapter.py
+# SPDX-License-Identifier: Apache-2.0
+"""
+Weaviate Vector adapter for the Vector Protocol V1.1.
+
 This module implements a production-grade adapter on top of the
 `BaseVectorAdapter` / `VectorProtocolV1` contract, backed by Weaviate.
 
@@ -87,6 +92,7 @@ from .vector_base import (
     ResourceExhausted,
     TransientNetwork,
     Unavailable,
+    VectorAdapterError,
 )
 
 logger = logging.getLogger(__name__)
