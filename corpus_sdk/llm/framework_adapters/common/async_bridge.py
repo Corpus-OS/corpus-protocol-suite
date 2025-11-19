@@ -12,11 +12,19 @@ Key concerns handled here:
 - Nested event loops (Jupyter, asyncio-based apps)
 - Threaded execution when a loop is already running
 - Timeouts and cancellation
-- Clean shutdown / resource reuse
+- Thread safety for concurrent access
 
 This is *protocol infrastructure*, not business logic. Adapters should use
 these helpers to expose both async and sync entry points on top of async
 Corpus APIs.
+
+Design Philosophy
+-----------------
+Minimal API surface. If a feature isn't essential for async/sync bridging,
+it doesn't belong here.
+
+Resources (executor, event loop) live for the process lifetime. The OS
+handles cleanup on exit.
 """
 
 from __future__ import annotations
@@ -60,102 +68,110 @@ class AsyncBridge:
     """
     Helper for safely running async code from sync contexts.
 
-    Responsibilities
-    ----------------
-    - Manage an event loop for "normal" synchronous code paths.
-    - Detect when an event loop is already running and fall back to
-      running the coroutine in a dedicated thread.
-    - Provide decorators for wrapping async functions into sync APIs.
-    - Manage a shared ThreadPoolExecutor for nested-loop use cases.
+    Core Functionality
+    ------------------
+    - run_async: Execute a coroutine and return its result
+    - sync_wrapper: Decorator to convert async functions to sync
+
+    Thread Safety
+    -------------
+    All operations are thread-safe. A single RLock protects shared state.
+
+    Lifecycle
+    ---------
+    Resources are created lazily and live for the process lifetime.
+    No explicit cleanup is provided or needed.
+
+    Example:
+        # Direct usage
+        result = AsyncBridge.run_async(some_coro(), timeout=5.0)
+        
+        # Decorator usage
+        class MyAdapter:
+            async def afetch(self, url: str) -> str:
+                ...
+            
+            fetch = AsyncBridge.sync_wrapper(afetch)
     """
 
-    # Shared state
+    # Shared state - all access protected by _lock
+    _lock = threading.RLock()
     _loop: Optional[asyncio.AbstractEventLoop] = None
-    _loop_owned: bool = False  # whether this class created the loop
+    _loop_owned: bool = False
     _executor: Optional[ThreadPoolExecutor] = None
     _max_workers: int = DEFAULT_MAX_WORKERS
-    _lock = threading.Lock()
 
     # ------------------------------------------------------------------ #
-    # Loop / executor management
+    # Configuration
     # ------------------------------------------------------------------ #
 
     @classmethod
-    def configure_executor(cls, max_workers: int) -> None:
+    def configure(cls, max_workers: int) -> None:
         """
         Configure the maximum number of worker threads for the shared executor.
 
-        If the executor already exists, this does not resize it; it only
-        affects future creation. Call `shutdown()` first if you want to
-        recreate it with a new size.
+        This only affects future executor creation. If an executor already
+        exists, it will continue using its current thread count.
+
+        Args:
+            max_workers: Must be a positive integer
+
+        Raises:
+            ValueError: If max_workers <= 0
         """
         if max_workers <= 0:
             raise ValueError("max_workers must be a positive integer")
         with cls._lock:
             cls._max_workers = max_workers
 
-    @classmethod
-    def get_loop(cls) -> asyncio.AbstractEventLoop:
-        """
-        Get or create the primary event loop for sync contexts.
-
-        Behavior:
-        - If a cached loop exists and is not closed, return it.
-        - Else, try `asyncio.get_event_loop()`.
-        - If that fails or returns a closed loop, create a new loop via
-          `asyncio.new_event_loop()` and install it with `asyncio.set_event_loop()`.
-
-        Note:
-            This helper is for *non-nested* sync contexts. In nested-loop
-            situations (loop already running), `run_async` will detect
-            that and avoid using `run_until_complete` on the same loop.
-        """
-        with cls._lock:
-            if cls._loop is not None and not cls._loop.is_closed():
-                return cls._loop
-
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_closed():
-                    raise RuntimeError("Current event loop is closed")
-                cls._loop = loop
-                cls._loop_owned = False
-                return loop
-            except (RuntimeError, AssertionError):
-                # No current loop or unusable; create our own.
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                cls._loop = loop
-                cls._loop_owned = True
-                return loop
-
-    @classmethod
-    def _ensure_executor(cls) -> ThreadPoolExecutor:
-        """
-        Lazily create and return the shared ThreadPoolExecutor.
-
-        Used when we need to run async code while an event loop is
-        already running in the current thread (nested-loop case).
-        """
-        with cls._lock:
-            if cls._executor is None:
-                cls._executor = ThreadPoolExecutor(max_workers=cls._max_workers)
-            return cls._executor
-
     # ------------------------------------------------------------------ #
     # Internal helpers
     # ------------------------------------------------------------------ #
 
+    @classmethod
+    def _get_or_create_loop(cls) -> asyncio.AbstractEventLoop:
+        """
+        Get or create the primary event loop for sync contexts.
+        
+        Caller must hold cls._lock.
+        """
+        if cls._loop is not None and not cls._loop.is_closed():
+            return cls._loop
+
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_closed():
+                raise RuntimeError("Current event loop is closed")
+            cls._loop = loop
+            cls._loop_owned = False
+            return loop
+        except (RuntimeError, AssertionError):
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            cls._loop = loop
+            cls._loop_owned = True
+            return loop
+
+    @classmethod
+    def _get_or_create_executor(cls) -> ThreadPoolExecutor:
+        """
+        Lazily create and return the shared ThreadPoolExecutor.
+        
+        Caller must hold cls._lock.
+        """
+        if cls._executor is None:
+            cls._executor = ThreadPoolExecutor(
+                max_workers=cls._max_workers,
+                thread_name_prefix="corpus_async_"
+            )
+        return cls._executor
+
     @staticmethod
-    async def _maybe_with_timeout(
+    async def _with_timeout(
         coro: Coroutine[Any, Any, T],
         timeout: Optional[float],
     ) -> T:
-        """
-        Await a coroutine, optionally wrapping with asyncio.wait_for.
-
-        Raises AsyncBridgeTimeoutError on timeout.
-        """
+        """Await a coroutine with optional timeout."""
         if timeout is None:
             return await coro
         try:
@@ -166,7 +182,7 @@ class AsyncBridge:
             ) from exc
 
     # ------------------------------------------------------------------ #
-    # Public API: run_async
+    # Public API
     # ------------------------------------------------------------------ #
 
     @classmethod
@@ -178,208 +194,98 @@ class AsyncBridge:
         """
         Execute a coroutine from synchronous code and return its result.
 
-        Behavior:
-        - If an event loop is NOT running in this thread:
-            - Use the managed loop and `run_until_complete`.
-        - If an event loop IS running:
-            - Use a background thread with `asyncio.run` to avoid
-              nested event loops.
+        If an event loop is already running in this thread, executes the
+        coroutine in a background thread to avoid nested loop issues.
 
         Args:
-            coro:
-                The coroutine to execute.
-            timeout:
-                Optional per-call timeout in seconds. If None, falls
-                back to DEFAULT_RUN_TIMEOUT; if that is also None, no
-                timeout is applied.
+            coro: The coroutine to execute
+            timeout: Optional timeout in seconds
+
+        Returns:
+            The result of the coroutine
 
         Raises:
-            AsyncBridgeTimeoutError on timeout.
-            Any exception raised by the coroutine itself.
+            AsyncBridgeTimeoutError: On timeout
+            Any exception raised by the coroutine
+
+        Thread Safety:
+            Safe to call from multiple threads concurrently.
+
+        Example:
+            >>> async def fetch_data():
+            ...     return "data"
+            >>> result = AsyncBridge.run_async(fetch_data(), timeout=5.0)
         """
         effective_timeout = timeout if timeout is not None else DEFAULT_RUN_TIMEOUT
 
-        loop: Optional[asyncio.AbstractEventLoop]
+        # Check if we're in a running loop
         try:
             loop = asyncio.get_event_loop()
+            loop_running = loop.is_running()
         except RuntimeError:
-            loop = None
+            loop_running = False
 
-        # ------------------------------------------------------------------
-        # Case 1: Loop is already running (nested-loop environment).
-        # ------------------------------------------------------------------
-        if loop is not None and loop.is_running():
-            executor = cls._ensure_executor()
-
+        # Case 1: Running loop - use background thread
+        if loop_running:
             def _runner() -> T:
-                async def _inner() -> T:
-                    return await cls._maybe_with_timeout(coro, effective_timeout)
+                return asyncio.run(cls._with_timeout(coro, effective_timeout))
 
-                # New event loop in this background thread.
-                return asyncio.run(_inner())
+            with cls._lock:
+                executor = cls._get_or_create_executor()
+            
+            return executor.submit(_runner).result()
 
-            future = executor.submit(_runner)
-            # Let any exception propagate naturally.
-            return future.result()
-
-        # ------------------------------------------------------------------
-        # Case 2: No running loop in this thread; use our managed loop.
-        # ------------------------------------------------------------------
-        loop = cls.get_loop()
-
-        async def _inner() -> T:
-            return await cls._maybe_with_timeout(coro, effective_timeout)
+        # Case 2: No running loop - use managed loop
+        with cls._lock:
+            loop = cls._get_or_create_loop()
 
         try:
-            return loop.run_until_complete(_inner())
+            return loop.run_until_complete(cls._with_timeout(coro, effective_timeout))
         except KeyboardInterrupt:
-            # Best-effort cancellation: cancel all pending tasks on this loop.
-            pending = asyncio.all_tasks(loop=loop)
-            for task in pending:
+            # Cancel pending tasks on interrupt
+            for task in asyncio.all_tasks(loop=loop):
                 task.cancel()
             raise
-
-    # ------------------------------------------------------------------ #
-    # Decorators: sync_wrapper / sync_method
-    # ------------------------------------------------------------------ #
 
     @classmethod
     def sync_wrapper(
         cls,
         async_func: Callable[..., Coroutine[Any, Any, T]],
+        *,
+        timeout: Optional[float] = None,
     ) -> Callable[..., T]:
         """
-        Decorator: wrap an async function to expose a sync function
-        that uses AsyncBridge.run_async under the hood.
+        Decorator: wrap an async function to create a sync version.
 
-        Example
-        -------
-            class Adapter:
-                async def acomplete(self, prompt: str) -> str:
-                    ...
-
-                complete = AsyncBridge.sync_wrapper(acomplete)
-        """
-
-        @functools.wraps(async_func)
-        def wrapper(*args: Any, **kwargs: Any) -> T:
-            coro = async_func(*args, **kwargs)
-            return cls.run_async(coro)
-
-        return wrapper
-
-    @classmethod
-    def sync_method(
-        cls,
-        async_func: Callable[..., Coroutine[Any, Any, T]],
-    ) -> Callable[..., T]:
-        """
-        Decorator variant for instance methods.
-
-        Usage
-        -----
-            class Adapter:
-                @AsyncBridge.sync_method
-                async def acomplete(self, prompt: str) -> str:
-                    ...
-
-                # Now you can define a sync twin that internally uses the async one:
-                def complete(self, prompt: str) -> str:
-                    return AsyncBridge.run_async(self.acomplete(prompt))
-
-            # Or assign a sync alias directly:
-            class Adapter2:
-                async def acomplete(self, prompt: str) -> str:
-                    ...
-
-                complete = AsyncBridge.sync_method(acomplete)
-        """
-
-        @functools.wraps(async_func)
-        def wrapper(*args: Any, **kwargs: Any) -> T:
-            coro = async_func(*args, **kwargs)
-            return cls.run_async(coro)
-
-        return wrapper
-
-    # ------------------------------------------------------------------ #
-    # Optional utilities
-    # ------------------------------------------------------------------ #
-
-    @classmethod
-    def spawn(cls, coro: Coroutine[Any, Any, T]) -> asyncio.Future:
-        """
-        Schedule a coroutine on the managed loop without waiting for it.
+        Args:
+            async_func: The async function to wrap
+            timeout: Optional default timeout for all calls
 
         Returns:
-            asyncio.Future associated with the scheduled task.
+            A synchronous function with the same signature
 
-        Notes:
-            - This method requires that the managed loop is already
-              running in the current thread. If no loop is running,
-              a RuntimeError is raised.
-            - Intended primarily for background side-effects (metrics,
-              logging, etc.).
-            - Exceptions will be stored on the Future and need to be
-              observed somewhere to avoid "unobserved exception" logs.
+        Example:
+            >>> class Adapter:
+            ...     async def acomplete(self, prompt: str) -> str:
+            ...         return f"response: {prompt}"
+            ...     
+            ...     # Create sync version
+            ...     complete = AsyncBridge.sync_wrapper(acomplete)
+            ...     
+            ...     # Or as a decorator
+            ...     @AsyncBridge.sync_wrapper
+            ...     async def astream(self, prompt: str):
+            ...         ...
         """
-        loop = cls.get_loop()
-        if not loop.is_running():
-            raise RuntimeError(
-                "AsyncBridge.spawn() requires the managed event loop to be "
-                "already running. Start and manage the loop at a higher "
-                "level before using spawn()."
-            )
-        return loop.create_task(coro)
-
-    @classmethod
-    def run_in_thread(cls, func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
-        """
-        Run a synchronous callable in the shared ThreadPoolExecutor and
-        wait for its result.
-
-        This is a convenience helper for CPU or I/O-bound sync work that
-        you want to offload from the main thread, using the same executor
-        infrastructure as nested async calls.
-        """
-        executor = cls._ensure_executor()
-        future = executor.submit(func, *args, **kwargs)
-        return future.result()
-
-    @classmethod
-    def shutdown(cls) -> None:
-        """
-        Gracefully shut down the executor and (if owned) the managed loop.
-
-        Intended primarily for tests or short-lived scripts. In long-lived
-        processes (servers, notebooks) you usually do *not* want to call
-        this unless you're explicitly tearing down all async infrastructure.
-
-        Behavior:
-        - Shuts down the shared ThreadPoolExecutor, waiting for all
-          submitted tasks to complete.
-        - If the managed loop was created by AsyncBridge (`_loop_owned`
-          is True), closes it. Any tasks still pending on that loop will
-          be cancelled when the loop is closed.
-        """
-        with cls._lock:
-            if cls._executor is not None:
-                cls._executor.shutdown(wait=True)
-                cls._executor = None
-
-            if cls._loop is not None and cls._loop_owned and not cls._loop.is_closed():
-                # If the loop is running elsewhere, caller should ensure
-                # it is stopped before invoking shutdown().
-                if cls._loop.is_running():
-                    cls._loop.call_soon_threadsafe(cls._loop.stop)
-                cls._loop.close()
-
-            cls._loop = None
-            cls._loop_owned = False
+        @functools.wraps(async_func)
+        def wrapper(*args: Any, **kwargs: Any) -> T:
+            coro = async_func(*args, **kwargs)
+            return cls.run_async(coro, timeout=timeout)
+        return wrapper
 
 
 # ---------------------------------------------------------------------------
-# Module-level convenience aliases
+# Module-level convenience functions
 # ---------------------------------------------------------------------------
 
 
@@ -388,27 +294,35 @@ def run_async(
     timeout: Optional[float] = None,
 ) -> T:
     """
-    Module-level convenience wrapper around AsyncBridge.run_async.
+    Execute a coroutine from synchronous code.
+
+    Convenience wrapper around AsyncBridge.run_async.
+
+    Example:
+        >>> from corpus_sdk.llm.framework_adapters.common.async_bridge import run_async
+        >>> result = run_async(some_coro(), timeout=5.0)
     """
     return AsyncBridge.run_async(coro, timeout=timeout)
 
 
 def sync_wrapper(
     async_func: Callable[..., Coroutine[Any, Any, T]],
+    *,
+    timeout: Optional[float] = None,
 ) -> Callable[..., T]:
     """
-    Module-level convenience wrapper around AsyncBridge.sync_wrapper.
-    """
-    return AsyncBridge.sync_wrapper(async_func)
+    Decorator to convert async functions to sync.
 
+    Convenience wrapper around AsyncBridge.sync_wrapper.
 
-def sync_method(
-    async_func: Callable[..., Coroutine[Any, Any, T]],
-) -> Callable[..., T]:
+    Example:
+        >>> from corpus_sdk.llm.framework_adapters.common.async_bridge import sync_wrapper
+        >>> 
+        >>> @sync_wrapper
+        ... async def fetch(url: str) -> str:
+        ...     ...
     """
-    Module-level convenience wrapper around AsyncBridge.sync_method.
-    """
-    return AsyncBridge.sync_method(async_func)
+    return AsyncBridge.sync_wrapper(async_func, timeout=timeout)
 
 
 __all__ = [
@@ -418,5 +332,4 @@ __all__ = [
     "DEFAULT_RUN_TIMEOUT",
     "run_async",
     "sync_wrapper",
-    "sync_method",
 ]
