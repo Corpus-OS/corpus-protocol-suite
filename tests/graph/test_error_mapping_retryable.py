@@ -15,9 +15,13 @@ from corpus_sdk.graph.graph_base import (
     NotSupported,
     BadRequest,
 )
-from examples.common.ctx import make_ctx
 
 pytestmark = pytest.mark.asyncio
+
+
+def make_ctx(ctx_cls, **kwargs):
+    """Local helper to construct an OperationContext."""
+    return ctx_cls(**kwargs)
 
 
 def test_error_handling_retryable_errors_with_hints():
