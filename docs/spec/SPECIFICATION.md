@@ -1656,9 +1656,11 @@ The test suite validates:
 
 Implementations passing the full conformance test suite may display:
 
-```
-LLM Protocol ✓ | Vector Protocol ✓ | Graph Protocol ✓ | Embedding Protocol ✓
-```
+![LLM Protocol](https://img.shields.io/badge/CorpusLLM%20Protocol-100%25%20Conformant-brightgreen)
+![Vector Protocol](https://img.shields.io/badge/CorpusVector%20Protocol-100%25%20Conformant-brightgreen)
+![Graph Protocol](https://img.shields.io/badge/CorpusGraph%20Protocol-100%25%20Conformant-brightgreen)
+![Embedding Protocol](https://img.shields.io/badge/CorpusEmbedding%20Protocol-100%25%20Conformant-brightgreen)
+
 
 **Requirements for badge display:**
 - Pass 100% of protocol-specific conformance tests
@@ -1721,8 +1723,8 @@ No IANA actions are required.
 ## 21. Author's Address
 
 Corpus Working Group
-Email: [standards@adaptersdk.org](mailto:standards@adaptersdk.org)
-GitHub: [https://github.com/adapter-sdk/standards](https://github.com/adapter-sdk/standards)
+Email: [standards@corpusos.com](mailto:standards@corpusos.com)
+GitHub: [https://github.com/corpus-sdk/standards](https://github.com/corpus-sdk/standards)
 
 ---
 
@@ -2065,25 +2067,12 @@ Implementations claiming Corpus-compatible status SHOULD:
 
 ### Interoperability Test Suite
 
-Repository: `https://github.com/corpus/protocol-tests`
-
-Execution:
-
-```bash
-corpus-sdk verify --protocol=all
-```
-
 Coverage:
 
-* 247+ conformance tests
+* 400+ conformance tests
 * Cross-protocol flows
 * Error normalization and partial-failure handling
 * Streaming semantics verification
-
-### Known Implementations Registry
-
-Maintained in `protocol-tests` repository.
-Entries SHOULD include: implementation name, language, supported protocols, version(s), and conformance notes.
 
 ---
 
