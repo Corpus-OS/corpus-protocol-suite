@@ -19,11 +19,6 @@ from corpus_sdk.graph.graph_base import (
 pytestmark = pytest.mark.asyncio
 
 
-def make_ctx(ctx_cls, **kwargs):
-    """Local helper to construct an OperationContext."""
-    return ctx_cls(**kwargs)
-
-
 def clear_time_cache():
     """
     Placeholder to mirror previous API; no caching in this simplified version.
@@ -34,7 +29,7 @@ def clear_time_cache():
 async def test_query_ops_returns_list_of_mappings(adapter: BaseGraphAdapter):
     """§7.3.2: Query must return list of mapping/dict results."""
     clear_time_cache()
-    ctx = make_ctx(GraphContext, request_id="t_query_rows", tenant="test")
+    ctx = GraphContext(request_id="t_query_rows", tenant="test")
     rows = await adapter.query(dialect="cypher", text="RETURN 1 as value", ctx=ctx)
     assert isinstance(rows, list), "Query results must be a list"
     if rows:  # Some adapters may return empty lists for simple queries
@@ -43,7 +38,7 @@ async def test_query_ops_returns_list_of_mappings(adapter: BaseGraphAdapter):
 
 async def test_query_ops_requires_dialect_and_text(adapter: BaseGraphAdapter):
     """§7.4: Query must validate dialect and text parameters."""
-    ctx = make_ctx(GraphContext, request_id="t_query_req", tenant="test")
+    ctx = GraphContext(request_id="t_query_req", tenant="test")
 
     # Test empty text
     with pytest.raises(BadRequest) as exc_info:
@@ -56,7 +51,7 @@ async def test_query_ops_requires_dialect_and_text(adapter: BaseGraphAdapter):
 
 async def test_query_ops_params_are_bound_safely(adapter: BaseGraphAdapter):
     """§7.3.2: Query parameters must be safely bound."""
-    ctx = make_ctx(GraphContext, request_id="t_query_bind", tenant="test")
+    ctx = GraphContext(request_id="t_query_bind", tenant="test")
 
     # Test with potentially dangerous parameter values
     rows = await adapter.query(
@@ -70,7 +65,7 @@ async def test_query_ops_params_are_bound_safely(adapter: BaseGraphAdapter):
 
 async def test_query_ops_empty_params_allowed(adapter: BaseGraphAdapter):
     """§7.3.2: Empty or None parameters must be accepted."""
-    ctx = make_ctx(GraphContext, request_id="t_query_empty_params", tenant="test")
+    ctx = GraphContext(request_id="t_query_empty_params", tenant="test")
 
     # Test with None params
     rows_none = await adapter.query(
@@ -97,7 +92,7 @@ async def test_query_ops_valid_dialect_required(adapter: BaseGraphAdapter):
     if not caps.dialects:
         pytest.skip("Adapter declares no dialects")
 
-    ctx = make_ctx(GraphContext, request_id="t_query_valid_dialect", tenant="test")
+    ctx = GraphContext(request_id="t_query_valid_dialect", tenant="test")
 
     # Test with a known valid dialect
     valid_dialect = caps.dialects[0]
