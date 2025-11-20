@@ -21,11 +21,6 @@ from corpus_sdk.graph.graph_base import (
 pytestmark = pytest.mark.asyncio
 
 
-def make_ctx(ctx_cls, **kwargs):
-    """Local helper to construct an OperationContext."""
-    return ctx_cls(**kwargs)
-
-
 def remaining_budget_ms(ctx):
     """
     Simple remaining-budget computation based on ctx.deadline_ms, if present.
@@ -48,8 +43,7 @@ def clear_time_cache():
 async def test_deadline_budget_nonnegative():
     clear_time_cache()
     now = int(time.time() * 1000)
-    ctx = make_ctx(
-        GraphContext,
+    ctx = GraphContext(
         request_id="t_deadline_budget",
         tenant="t",
         deadline_ms=now + 50,
@@ -60,8 +54,7 @@ async def test_deadline_budget_nonnegative():
 
 async def test_deadline_exceeded_on_expired_budget(adapter):
     clear_time_cache()
-    ctx = make_ctx(
-        GraphContext,
+    ctx = GraphContext(
         request_id="t_deadline_expired",
         tenant="t",
         deadline_ms=int(time.time() * 1000) - 1,
@@ -72,8 +65,7 @@ async def test_deadline_exceeded_on_expired_budget(adapter):
 
 async def test_deadline_preflight_deadline_check(adapter):
     clear_time_cache()
-    ctx = make_ctx(
-        GraphContext,
+    ctx = GraphContext(
         request_id="t_deadline_preflight",
         tenant="t",
         deadline_ms=int(time.time() * 1000) - 100,
@@ -85,8 +77,7 @@ async def test_deadline_preflight_deadline_check(adapter):
 async def test_deadline_stream_respects_deadline_mid_operation(adapter):
     clear_time_cache()
     now = int(time.time() * 1000)
-    ctx = make_ctx(
-        GraphContext,
+    ctx = GraphContext(
         request_id="t_deadline_stream",
         tenant="t",
         deadline_ms=now + 1,
