@@ -116,7 +116,7 @@ PROTOCOLS_CONFIG = {
         name="llm",
         display_name="LLM Protocol V1.0",
         # Reference: currently 111 llm tests in the suite
-        conformance_levels={"gold": 111, "silver": 49, "development": 31},
+        conformance_levels={"gold": 111, "silver": 89, "development": 56},
         test_categories={
             "wire_contract": "Wire Contract & Routing",
             "core_ops": "Core Operations",
