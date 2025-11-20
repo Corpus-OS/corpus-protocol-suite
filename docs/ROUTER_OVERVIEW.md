@@ -156,6 +156,108 @@ At a high level, Corpus Router:
 
 ---
 
+## Frameworks as Adapters
+
+Frameworks like **LangChain**, **LlamaIndex**, **Semantic Kernel**, **CrewAI**, and **AutoGen** are not just clients of the Router — they can also be **providers** that Router routes *into*.
+
+You can wrap an existing framework as a **Corpus adapter**, so Router treats it like any other backend:
+
+### Router → Framework → Providers
+
+```text
+┌──────────────┐
+│ Your App     │
+└──────┬───────┘
+       │ Corpus Protocol
+       ▼
+┌──────────────┐
+│   Router     │
+└──────┬───────┘
+       │
+       ├─→ OpenAI Adapter (direct)
+       ├─→ Anthropic Adapter (direct)
+       └─→ LangChain Adapter ──→ LangChain LLM / tools / chains
+                                  └─→ Multiple providers
+```
+
+**Why use frameworks as adapters?**
+
+* **Leverage existing investments**
+  Reuse LangChain chains, LlamaIndex indexes, or Semantic Kernel skills as
+  Router-managed providers instead of rewriting everything as raw adapters.
+
+* **Framework-specific features**
+  Access LangChain’s tool-calling, LlamaIndex’s query engines, or AutoGen/CrewAI
+  agent orchestration **through** Router’s unified interface, with normalized
+  errors and metrics.
+
+* **Gradual migration**
+  Start with frameworks as adapters; move specific flows to direct
+  Corpus adapters over time as needed.
+
+### Example: LangChain as an LLM adapter
+
+```python
+from corpus_sdk.llm.llm_base import (
+    BaseLLMAdapter,
+    LLMCapabilities,
+)
+from langchain.chat_models import ChatOpenAI
+
+class LangChainLLMAdapter(BaseLLMAdapter):
+    """Wraps LangChain's LLM interface as a Corpus-compatible adapter."""
+
+    def __init__(self, model: str = "gpt-4"):
+        super().__init__()
+        self._llm = ChatOpenAI(model=model)
+
+    async def _do_capabilities(self) -> LLMCapabilities:
+        return LLMCapabilities(
+            server="langchain",
+            version="0.1.0",
+            model_family="gpt-4",
+            max_context_length=8192,
+            supports_streaming=True,
+            supports_roles=True,
+            supports_json_output=False,
+            supports_parallel_tool_calls=False,
+            idempotent_writes=False,
+            supports_multi_tenant=True,
+            supports_system_message=True,
+        )
+
+    async def _do_complete(self, messages, model: str | None = None, **kwargs):
+        # 1. Translate Corpus messages → LangChain format
+        lc_messages = self._to_langchain_messages(messages)
+
+        # 2. Call LangChain
+        result = await self._llm.ainvoke(lc_messages)
+
+        # 3. Translate back into a Corpus `LLMCompletion`
+        return self._from_langchain_result(result)
+
+    # You implement these helpers to match your message/result shapes:
+    def _to_langchain_messages(self, messages):
+        ...
+
+    def _from_langchain_result(self, result):
+        ...
+```
+
+**Same pattern works for:**
+
+* **LlamaIndex** as a Vector or Graph adapter (wrap their `VectorStore` / query engine).
+* **Semantic Kernel** as an LLM / Embedding adapter.
+* **CrewAI / AutoGen** as a “meta-LLM” adapter that runs multi-agent workflows behind a single `llm.complete` call.
+
+Result: Router can route to **framework-based** stacks and **raw provider** stacks side-by-side, with the same policies, metrics, and error taxonomy.
+
+> The next section describes the “opposite” pattern — frameworks acting as **clients** of Router. Both patterns can coexist:
+> • Use **frameworks as adapters** when you want Router to treat them as providers.
+> • Use **frameworks as clients** when they call Router as a backend.
+
+---
+
 ## Integration with Frameworks (LangChain, LlamaIndex, CrewAI, AutoGen, SK, MCP)
 
 Corpus is a **wire protocol**, not an application framework.
@@ -170,7 +272,7 @@ Any framework or client that can:
 
 …can talk to the Router without being “Corpus-native” internally.
 
-You get two main integration patterns:
+You get two main integration patterns (complementary to the adapter pattern above):
 
 ### 1. Framework → Corpus SDK → Router
 
@@ -384,7 +486,6 @@ Multi-tenancy is a first-class requirement in the Corpus Protocol Suite (see
     * `low_latency`
     * `high_quality`
     * `compliance_focused`
-
   * Per-tenant domain sub-strategies:
 
     * e.g., cheap LLM + premium vector DB, or vice versa.
@@ -572,7 +673,8 @@ Outside this repo (commercial):
 **Summary:**
 Corpus Router is the **protocol-native intelligent control plane** for the Corpus Suite: it
 understands the same wire protocol as `corpus_sdk`, routes across multiple
-providers and domains, enforces policies, learns what works, and keeps your
+providers and domains (including framework-based stacks like LangChain or LlamaIndex),
+enforces policies, learns what works, and keeps your
 applications decoupled from infrastructure churn—without inventing a new API
 surface on top.
 
