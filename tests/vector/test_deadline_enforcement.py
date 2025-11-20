@@ -9,6 +9,7 @@ Spec refs:
 
 import time
 import asyncio
+from typing import Optional
 import pytest
 from corpus_sdk.vector.vector_base import (
     OperationContext,

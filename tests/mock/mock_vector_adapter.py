@@ -119,18 +119,55 @@ class _MemoryStore:
 # ----------------------------- adapter class ------------------------------- #
 
 
-@dataclass
 class MockVectorAdapter(BaseVectorAdapter):
     """
     A mock Vector adapter for protocol demonstrations & conformance tests.
     """
 
-    name: str = "mock-vector"
-    # Deterministic for conformance runs (no random transient failures by default)
-    failure_rate: float = 0.0
-    _store: _MemoryStore = field(default_factory=_MemoryStore)
+    def __init__(
+        self,
+        name: str = "mock-vector",
+        failure_rate: float = 0.0,
+        **kwargs
+    ) -> None:
+        # Initialize the base adapter first
+        super().__init__(**kwargs)
+        
+        self.name = name
+        # Deterministic for conformance runs (no random transient failures by default)
+        self.failure_rate = failure_rate
+        self._store = _MemoryStore()
+        
+        """
+        Optional seeding of a 'default' namespace for demos. Disabled by default to
+        avoid masking IndexNotReady or isolation tests. Enable by setting:
 
-    def __post_init__(self) -> None:
+            VECTOR_SEED_DEFAULT=1
+        """
+        if os.getenv("VECTOR_SEED_DEFAULT", "0") == "1":
+            if "default" not in self._store.namespaces:
+                self._store.ensure_namespace(
+                    NamespaceSpec(
+                        namespace="default",
+                        dimensions=2,
+                        distance_metric=METRIC_COSINE,
+                    )
+                )
+            if not self._store.data.get("default"):
+                self._store.data["default"] = {
+                    "seed1": Vector(
+                        id="seed1",
+                        vector=[1.0, 0.0],
+                        metadata={"label": "alpha"},
+                        namespace="default",
+                    ),
+                    "seed2": Vector(
+                        id="seed2",
+                        vector=[0.0, 1.0],
+                        metadata={"label": "beta"},
+                        namespace="default",
+                    ),
+                }
         """
         Optional seeding of a 'default' namespace for demos. Disabled by default to
         avoid masking IndexNotReady or isolation tests. Enable by setting:

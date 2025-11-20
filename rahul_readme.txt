@@ -1,0 +1,1 @@
+for mockvector adapter = export VECTOR_SEED_DEFAULT=1

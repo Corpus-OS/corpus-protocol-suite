@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="1" skipped="0" tests="12" time="0.554" timestamp="2025-11-20T22:56:34.766438+05:30" hostname="rahul-G3-3590"><testcase classname="tests.vector.test_batch_size_limits" name="test_batch_limits_upsert_respects_max_batch_size" time="0.036" /><testcase classname="tests.vector.test_batch_size_limits" name="test_batch_limits_batch_size_exceeded_includes_suggestion" time="0.026" /><testcase classname="tests.vector.test_batch_size_limits" name="test_batch_limits_partial_failure_reporting_shape" time="0.027" /><testcase classname="tests.vector.test_batch_size_limits" name="test_batch_limits_batch_operations_atomic_per_vector" time="0.025" /><testcase classname="tests.vector.test_capabilities_shape" name="test_capabilities_capabilities_returns_correct_type" time="0.013" /><testcase classname="tests.vector.test_capabilities_shape" name="test_capabilities_identity_fields" time="0.013" /><testcase classname="tests.vector.test_capabilities_shape" name="test_capabilities_supported_metrics" time="0.013" /><testcase classname="tests.vector.test_capabilities_shape" name="test_capabilities_resource_limits_positive" time="0.013" /><testcase classname="tests.vector.test_capabilities_shape" name="test_capabilities_feature_flags_boolean" time="0.013" /><testcase classname="tests.vector.test_capabilities_shape" name="test_capabilities_idempotent_calls" time="0.023" /><testcase classname="tests.vector.test_capabilities_shape" name="test_capabilities_all_required_fields_present" time="0.013" /><testcase classname="tests.vector.test_context_siem" name="test_observability_context_propagates_to_metrics_siem_safe" time="0.023"><failure message="corpus_sdk.vector.vector_base.DimensionMismatch: query vector dimension 1 does not match namespace 2">tests/vector/test_context_siem.py:78: in test_observability_context_propagates_to_metrics_siem_safe
+    await adapter.query(QuerySpec(vector=[0.1], top_k=1, namespace="default"), ctx=ctx)
+corpus_sdk/vector/vector_base.py:1761: in query
+    result = await self._with_gates_unary(
+corpus_sdk/vector/vector_base.py:1532: in _with_gates_unary
+    result = await self._apply_deadline(call(), ctx)
+corpus_sdk/vector/vector_base.py:1356: in _apply_deadline
+    return await self._deadline.wrap(awaitable, ctx)
+corpus_sdk/vector/vector_base.py:612: in wrap
+    return await awaitable
+corpus_sdk/vector/vector_base.py:1688: in _call
+    result = await self._do_query(spec, ctx=ctx)
+tests/mock/mock_vector_adapter.py:261: in _do_query
+    raise DimensionMismatch(
+E   corpus_sdk.vector.vector_base.DimensionMismatch: query vector dimension 1 does not match namespace 2</failure></testcase></testsuite></testsuites>
