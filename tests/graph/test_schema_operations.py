@@ -18,11 +18,6 @@ from corpus_sdk.graph.graph_base import (
 pytestmark = pytest.mark.asyncio
 
 
-def make_ctx(ctx_cls, **kwargs):
-    """Local helper to construct an OperationContext."""
-    return ctx_cls(**kwargs)
-
-
 class CaptureMetrics(MetricsSink):
     def __init__(self) -> None:
         self.observations: List[dict] = []
@@ -68,14 +63,14 @@ class CaptureMetrics(MetricsSink):
 
 async def test_schema_ops_get_schema_returns_dict(adapter: BaseGraphAdapter):
     """§7.5: get_schema must return a dictionary."""
-    ctx = make_ctx(GraphContext, request_id="t_schema_dict", tenant="t")
+    ctx = GraphContext(request_id="t_schema_dict", tenant="t")
     schema = await adapter.get_schema(ctx=ctx)
     assert isinstance(schema, dict), "Schema must be returned as a dictionary"
 
 
 async def test_schema_ops_get_schema_structure_valid(adapter: BaseGraphAdapter):
     """§7.5: Schema must include expected structural elements."""
-    ctx = make_ctx(GraphContext, request_id="t_schema_keys", tenant="t")
+    ctx = GraphContext(request_id="t_schema_keys", tenant="t")
     schema = await adapter.get_schema(ctx=ctx)
 
     # Schema should have some structure, though exact keys may vary
@@ -91,8 +86,7 @@ async def test_schema_ops_schema_cached_in_standalone_mode(adapter: BaseGraphAda
     """§5.3: Schema should be cached in standalone mode."""
     # This test validates caching behavior through metrics
     metrics = CaptureMetrics()
-    ctx = make_ctx(
-        GraphContext,
+    ctx = GraphContext(
         request_id="t_schema_cache",
         tenant="t-cache",
         metrics=metrics,
@@ -115,7 +109,7 @@ async def test_schema_ops_schema_cached_in_standalone_mode(adapter: BaseGraphAda
 
 async def test_schema_ops_schema_consistency(adapter: BaseGraphAdapter):
     """§7.5: Schema should be consistent across calls."""
-    ctx = make_ctx(GraphContext, request_id="t_schema_consistent", tenant="t")
+    ctx = GraphContext(request_id="t_schema_consistent", tenant="t")
 
     # Get schema multiple times
     schema1 = await adapter.get_schema(ctx=ctx)
@@ -134,7 +128,7 @@ async def test_schema_ops_schema_serializable(adapter: BaseGraphAdapter):
     """§7.5: Schema should be JSON-serializable."""
     import json
 
-    ctx = make_ctx(GraphContext, request_id="t_schema_serialize", tenant="t")
+    ctx = GraphContext(request_id="t_schema_serialize", tenant="t")
     schema = await adapter.get_schema(ctx=ctx)
 
     # Should be able to serialize to JSON
