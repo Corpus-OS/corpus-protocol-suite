@@ -499,8 +499,9 @@ interface QueryChunk {
     has_more: boolean;
     dialect_used: string;
   };
-}
-
+```
+### 6.6 BulkVerticesSpec
+```typescript
 interface BulkVerticesSpec {
   operation: 'export' | 'import';
   format: string;          // e.g., "json"
@@ -508,8 +509,7 @@ interface BulkVerticesSpec {
   nodes?: Node[];          // Required when operation === "import"
 }
 ```
-
-### 6.6 GraphSchema
+### 6.7 GraphSchema
 ```typescript
 interface GraphSchema {
   node_labels: string[];
