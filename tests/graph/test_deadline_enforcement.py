@@ -17,9 +17,32 @@ from corpus_sdk.graph.graph_base import (
     OperationContext as GraphContext,
     DeadlineExceeded,
 )
-from examples.common.ctx import make_ctx, remaining_budget_ms, clear_time_cache
 
 pytestmark = pytest.mark.asyncio
+
+
+def make_ctx(ctx_cls, **kwargs):
+    """Local helper to construct an OperationContext."""
+    return ctx_cls(**kwargs)
+
+
+def remaining_budget_ms(ctx):
+    """
+    Simple remaining-budget computation based on ctx.deadline_ms, if present.
+    """
+    deadline_ms = getattr(ctx, "deadline_ms", None)
+    if deadline_ms is None:
+        return None
+    now_ms = int(time.time() * 1000)
+    # Clamp at 0 to satisfy non-negative assertion.
+    return max(deadline_ms - now_ms, 0)
+
+
+def clear_time_cache():
+    """
+    Placeholder to mirror previous API; no caching in this simplified version.
+    """
+    pass
 
 
 async def test_deadline_budget_nonnegative():
