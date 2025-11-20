@@ -15,9 +15,13 @@ from corpus_sdk.graph.graph_base import (
     HealthStatus,
     BaseGraphAdapter,
 )
-from examples.common.ctx import make_ctx
 
 pytestmark = pytest.mark.asyncio
+
+
+def make_ctx(ctx_cls, **kwargs):
+    """Local helper to construct an OperationContext."""
+    return ctx_cls(**kwargs)
 
 
 async def test_health_returns_required_fields(adapter: BaseGraphAdapter):
@@ -32,8 +36,12 @@ async def test_health_status_is_valid_enum(adapter: BaseGraphAdapter):
     """§7.6: Health status must be a valid enum value."""
     ctx = make_ctx(GraphContext, request_id="t_health_enum", tenant="t")
     h = await adapter.health(ctx=ctx)
-    assert h["status"] in (HealthStatus.OK, HealthStatus.DEGRADED, HealthStatus.UNAVAILABLE, HealthStatus.READ_ONLY), \
-        f"Invalid health status: {h['status']}"
+    assert h["status"] in (
+        HealthStatus.OK,
+        HealthStatus.DEGRADED,
+        HealthStatus.UNAVAILABLE,
+        HealthStatus.READ_ONLY,
+    ), f"Invalid health status: {h['status']}"
 
 
 async def test_health_includes_read_only_flag(adapter: BaseGraphAdapter):
@@ -59,4 +67,6 @@ async def test_health_consistent_on_error(adapter: BaseGraphAdapter):
     assert isinstance(h, dict), "Health response must be a dictionary"
     # Should maintain consistent structure regardless of health state
     required_fields = {"status", "server", "version", "read_only", "degraded"}
-    assert required_fields.issubset(h.keys()), f"Missing required health fields: {required_fields - set(h.keys())}"
+    assert required_fields.issubset(h.keys()), (
+        f"Missing required health fields: {required_fields - set(h.keys())}"
+    )
