@@ -21,9 +21,13 @@ from corpus_sdk.embedding.embedding_base import (
     MetricsSink,
     NotSupported,
 )
-from examples.common.ctx import make_ctx
 
 pytestmark = pytest.mark.asyncio
+
+
+def make_ctx(ctx_cls, **kwargs):
+    """Local helper to construct an OperationContext."""
+    return ctx_cls(**kwargs)
 
 
 class CaptureMetrics(MetricsSink):
@@ -70,7 +74,9 @@ class CaptureMetrics(MetricsSink):
         )
 
 
-async def test_observability_context_propagates_to_metrics(adapter: BaseEmbeddingAdapter):
+async def test_observability_context_propagates_to_metrics(
+    adapter: BaseEmbeddingAdapter,
+):
     """§13.1: Metrics must include correct component and operation."""
     m = CaptureMetrics()
     ctx = make_ctx(OperationContext, request_id="t_siem_ctx", tenant="acme", metrics=m)
@@ -108,10 +114,12 @@ async def test_observability_tenant_hashed_never_raw(adapter: BaseEmbeddingAdapt
     for observation in m.observations:
         extra = observation["extra"]
         serialized = str(extra).lower()
-        
+
         # Raw tenant must never appear
-        assert tenant.lower() not in serialized, f"Raw tenant leaked in {observation}"
-        
+        assert (
+            tenant.lower() not in serialized
+        ), f"Raw tenant leaked in {observation}"
+
         # Tenant-related keys should contain hashes, not raw values
         for key in extra:
             if "tenant" in key.lower():
@@ -139,22 +147,35 @@ async def test_observability_no_sensitive_data_in_metrics(adapter: BaseEmbedding
 
     try:
         await adapter.embed_batch(
-            BatchEmbedSpec(texts=sensitive_texts, model=adapter.supported_models[0]),
+            BatchEmbedSpec(
+                texts=sensitive_texts,
+                model=adapter.supported_models[0],
+            ),
             ctx=ctx,
         )
     except NotSupported:
         pass  # Batch not supported is OK for this test
 
     # Verify no sensitive data in any metrics
-    banned_patterns = sensitive_texts + ["text", "texts", "vector", "embedding", "embeddings"]
-    
+    banned_patterns = sensitive_texts + [
+        "text",
+        "texts",
+        "vector",
+        "embedding",
+        "embeddings",
+    ]
+
     for observation in m.observations:
         extra_str = str(observation["extra"]).lower()
         for pattern in banned_patterns:
-            assert pattern.lower() not in extra_str, f"Sensitive data '{pattern}' leaked in metrics"
+            assert (
+                pattern.lower() not in extra_str
+            ), f"Sensitive data '{pattern}' leaked in metrics"
 
 
-async def test_observability_metrics_emitted_on_error_path(adapter: BaseEmbeddingAdapter):
+async def test_observability_metrics_emitted_on_error_path(
+    adapter: BaseEmbeddingAdapter,
+):
     """§13.1: Error paths must emit metrics with appropriate error codes."""
     m = CaptureMetrics()
     ctx = make_ctx(
@@ -182,13 +203,15 @@ async def test_observability_metrics_emitted_on_error_path(adapter: BaseEmbeddin
     # Verify error observations
     failed_obs = [o for o in m.observations if not o["ok"]]
     assert failed_obs, "Expected failed observations for error cases"
-    
+
     # Verify error counters
     error_counters = [c for c in m.counters if "error" in c["name"].lower()]
     assert error_counters, "Expected error counters for failed operations"
 
 
-async def test_observability_batch_metrics_include_accurate_counts(adapter: BaseEmbeddingAdapter):
+async def test_observability_batch_metrics_include_accurate_counts(
+    adapter: BaseEmbeddingAdapter,
+):
     """§12.5: Batch metrics must accurately reflect success/failure counts."""
     caps = await adapter.capabilities()
     if not getattr(caps, "supports_batch_embedding", False):
@@ -211,19 +234,22 @@ async def test_observability_batch_metrics_include_accurate_counts(adapter: Base
 
     batch_obs = [o for o in m.observations if o["op"] == "embed_batch"]
     assert batch_obs, "Expected observe() for embed_batch"
-    
+
     last_obs = batch_obs[-1]
     extra = last_obs["extra"]
 
     # Verify batch_size matches input
     assert "batch_size" in extra or "size" in extra or "n_items" in extra
-    batch_size_key = next((k for k in extra.keys() if "batch" in k or "size" in k or "n_items" in k), None)
+    batch_size_key = next(
+        (k for k in extra.keys() if "batch" in k or "size" in k or "n_items" in k),
+        None,
+    )
     assert extra[batch_size_key] == len(texts)
 
     # Verify success/failure counts match actual results
     success_count = len(result.embeddings)
     failure_count = len(result.failed_texts)
-    
+
     # Check if metrics include success/failure breakdown
     if "success_count" in extra:
         assert extra["success_count"] == success_count
@@ -232,18 +258,22 @@ async def test_observability_batch_metrics_include_accurate_counts(adapter: Base
 
     # Operation should be marked OK if any successes, or False if all failed
     expected_ok = success_count > 0
-    assert last_obs["ok"] == expected_ok, f"Expected ok={expected_ok} for {success_count} successes, {failure_count} failures"
+    assert (
+        last_obs["ok"] == expected_ok
+    ), f"Expected ok={expected_ok} for {success_count} successes, {failure_count} failures"
 
 
-async def test_observability_deadline_metrics_include_bucket_tags(adapter: BaseEmbeddingAdapter):
+async def test_observability_deadline_metrics_include_bucket_tags(
+    adapter: BaseEmbeddingAdapter,
+):
     """§6.1: Deadline contexts must include deadline_bucket in metrics."""
     m = CaptureMetrics()
 
     now = int(time.time() * 1000)
     deadlines = [
-        now + 5000,   # 5s bucket
-        now + 500,    # 500ms bucket  
-        now + 50,     # 50ms bucket
+        now + 5000,  # 5s bucket
+        now + 500,  # 500ms bucket
+        now + 50,  # 50ms bucket
     ]
 
     for deadline in deadlines:
@@ -270,14 +300,16 @@ async def test_observability_deadline_metrics_include_bucket_tags(adapter: BaseE
             deadline_observations.append(obs)
 
     assert deadline_observations, "Expected deadline-related tags in metrics"
-    
+
     for obs in deadline_observations:
         extra = obs["extra"]
         deadline_keys = [k for k in extra.keys() if "deadline" in k.lower()]
         assert deadline_keys, f"Expected deadline bucket key, got {extra}"
 
 
-async def test_observability_metrics_include_operation_specific_tags(adapter: BaseEmbeddingAdapter):
+async def test_observability_metrics_include_operation_specific_tags(
+    adapter: BaseEmbeddingAdapter,
+):
     """§13.1: Metrics should include operation-specific context tags."""
     m = CaptureMetrics()
     ctx = make_ctx(
@@ -288,7 +320,7 @@ async def test_observability_metrics_include_operation_specific_tags(adapter: Ba
     )
 
     model = adapter.supported_models[0]
-    
+
     # Test different operations
     await adapter.embed(
         EmbedSpec(text="test", model=model, normalize=True),
@@ -298,13 +330,15 @@ async def test_observability_metrics_include_operation_specific_tags(adapter: Ba
     # Check for operation-specific tags
     embed_obs = [o for o in m.observations if o["op"] == "embed"]
     assert embed_obs
-    
+
     last_embed = embed_obs[-1]
     extra = last_embed["extra"]
-    
+
     # Should include model information
-    assert any("model" in k.lower() for k in extra.keys()), f"Expected model tag in {extra}"
-    
+    assert any(
+        "model" in k.lower() for k in extra.keys()
+    ), f"Expected model tag in {extra}"
+
     # Should include normalization context if applied
     if any("normalize" in k.lower() for k in extra.keys()):
         norm_key = next(k for k in extra.keys() if "normalize" in k.lower())
