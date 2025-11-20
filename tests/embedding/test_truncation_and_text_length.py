@@ -19,7 +19,6 @@ from corpus_sdk.embedding.embedding_base import (
     TextTooLong,
     BadRequest,
 )
-from examples.common.ctx import make_ctx
 
 pytestmark = pytest.mark.asyncio
 
@@ -32,7 +31,7 @@ async def test_truncation_embed_truncates_when_allowed_and_sets_flag(adapter: Ba
 
     max_len = caps.max_text_length
     long_text = "x" * (max_len + 10)
-    ctx = make_ctx(OperationContext, request_id="t_trunc_single_ok", tenant="t")
+    ctx = OperationContext(request_id="t_trunc_single_ok", tenant="t")
 
     spec = EmbedSpec(
         text=long_text,
@@ -54,7 +53,7 @@ async def test_truncation_embed_raises_when_truncation_disallowed(adapter: BaseE
 
     max_len = caps.max_text_length
     long_text = "x" * (max_len + 1)
-    ctx = make_ctx(OperationContext, request_id="t_trunc_single_err", tenant="t")
+    ctx = OperationContext(request_id="t_trunc_single_err", tenant="t")
 
     spec = EmbedSpec(
         text=long_text,
@@ -83,7 +82,7 @@ async def test_truncation_batch_truncates_all_when_allowed(adapter: BaseEmbeddin
     long1 = "a" * (max_len + 5)
     long2 = "b" * (max_len + 50)
 
-    ctx = make_ctx(OperationContext, request_id="t_trunc_batch_ok", tenant="t")
+    ctx = OperationContext(request_id="t_trunc_batch_ok", tenant="t")
     spec = BatchEmbedSpec(
         texts=[long1, long2],
         model=caps.supported_models[0],
@@ -107,7 +106,7 @@ async def test_truncation_batch_oversize_without_truncation_raises(adapter: Base
 
     max_len = caps.max_text_length
     long1 = "a" * (max_len + 1)
-    ctx = make_ctx(OperationContext, request_id="t_trunc_batch_err", tenant="t")
+    ctx = OperationContext(request_id="t_trunc_batch_err", tenant="t")
 
     spec = BatchEmbedSpec(
         texts=[long1],
@@ -132,7 +131,7 @@ async def test_truncation_short_texts_unchanged(adapter: BaseEmbeddingAdapter):
     text = "short text well within limit"
     assert len(text) < max_len
 
-    ctx = make_ctx(OperationContext, request_id="t_trunc_short", tenant="t")
+    ctx = OperationContext(request_id="t_trunc_short", tenant="t")
 
     spec = EmbedSpec(
         text=text,
@@ -155,7 +154,7 @@ async def test_truncation_exact_length_text_handled(adapter: BaseEmbeddingAdapte
     max_len = caps.max_text_length
     exact_text = "x" * max_len
 
-    ctx = make_ctx(OperationContext, request_id="t_trunc_exact", tenant="t")
+    ctx = OperationContext(request_id="t_trunc_exact", tenant="t")
 
     spec = EmbedSpec(
         text=exact_text,
@@ -186,7 +185,7 @@ async def test_truncation_batch_mixed_lengths_with_truncation(adapter: BaseEmbed
         "another short"
     ]
 
-    ctx = make_ctx(OperationContext, request_id="t_trunc_batch_mixed", tenant="t")
+    ctx = OperationContext(request_id="t_trunc_batch_mixed", tenant="t")
     spec = BatchEmbedSpec(
         texts=texts,
         model=caps.supported_models[0],
@@ -214,7 +213,7 @@ async def test_truncation_unicode_text_truncation(adapter: BaseEmbeddingAdapter)
     base_unicode = "Hello 世界 🌍✨"
     long_unicode = base_unicode * (caps.max_text_length // len(base_unicode) + 2)
     
-    ctx = make_ctx(OperationContext, request_id="t_trunc_unicode", tenant="t")
+    ctx = OperationContext(request_id="t_trunc_unicode", tenant="t")
 
     spec = EmbedSpec(
         text=long_unicode,
@@ -242,7 +241,7 @@ async def test_truncation_truncation_boundary_consistency(adapter: BaseEmbedding
     ]
 
     for text, should_truncate in boundary_cases:
-        ctx = make_ctx(OperationContext, request_id=f"t_trunc_bound_{len(text)}", tenant="t")
+        ctx = OperationContext(request_id=f"t_trunc_bound_{len(text)}", tenant="t")
         
         spec = EmbedSpec(
             text=text,
