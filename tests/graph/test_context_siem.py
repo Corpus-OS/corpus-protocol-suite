@@ -19,11 +19,6 @@ from corpus_sdk.graph.graph_base import (
 pytestmark = pytest.mark.asyncio
 
 
-def make_ctx(ctx_cls, **kwargs):
-    """Local helper to construct an OperationContext."""
-    return ctx_cls(**kwargs)
-
-
 class CaptureMetrics(MetricsSink):
     def __init__(self) -> None:
         self.observations: List[dict] = []
@@ -58,7 +53,7 @@ class CaptureMetrics(MetricsSink):
 
 async def test_observability_context_propagates_to_metrics_siem_safe(adapter):
     m = CaptureMetrics()
-    ctx = make_ctx(GraphContext, request_id="t_siem_ctx", tenant="acme", metrics=m)
+    ctx = GraphContext(request_id="t_siem_ctx", tenant="acme", metrics=m)
     await adapter.query(dialect="cypher", text="RETURN 1", ctx=ctx)
     assert any(o["op"] == "query" for o in m.observations)
 
@@ -66,7 +61,7 @@ async def test_observability_context_propagates_to_metrics_siem_safe(adapter):
 async def test_observability_tenant_hashed_never_raw(adapter):
     m = CaptureMetrics()
     tenant = "super-secret-tenant"
-    ctx = make_ctx(GraphContext, request_id="t_siem_hash", tenant=tenant, metrics=m)
+    ctx = GraphContext(request_id="t_siem_hash", tenant=tenant, metrics=m)
     await adapter.query(dialect="cypher", text="RETURN 1", ctx=ctx)
     extras = [o["extra"] for o in m.observations if o["op"] == "query"]
     assert extras and "tenant" in extras[-1]
@@ -75,7 +70,7 @@ async def test_observability_tenant_hashed_never_raw(adapter):
 
 async def test_observability_no_query_text_in_metrics(adapter):
     m = CaptureMetrics()
-    ctx = make_ctx(GraphContext, request_id="t_siem_noq", tenant="t", metrics=m)
+    ctx = GraphContext(request_id="t_siem_noq", tenant="t", metrics=m)
     await adapter.query(dialect="cypher", text="MATCH (n) RETURN n LIMIT 2", ctx=ctx)
     extra = [o["extra"] for o in m.observations if o["op"] == "query"][-1]
     for k in ("text", "query"):
@@ -84,7 +79,7 @@ async def test_observability_no_query_text_in_metrics(adapter):
 
 async def test_observability_metrics_emitted_on_error_path(adapter):
     m = CaptureMetrics()
-    ctx = make_ctx(GraphContext, request_id="t_siem_err", tenant="t", metrics=m)
+    ctx = GraphContext(request_id="t_siem_err", tenant="t", metrics=m)
     # use an obviously invalid dialect to trigger error
     with pytest.raises(Exception):
         await adapter.query(dialect="__no_such_dialect__", text="g.V()", ctx=ctx)
@@ -93,7 +88,7 @@ async def test_observability_metrics_emitted_on_error_path(adapter):
 
 async def test_observability_query_metrics_include_dialect(adapter):
     m = CaptureMetrics()
-    ctx = make_ctx(GraphContext, request_id="t_siem_dialect", tenant="t", metrics=m)
+    ctx = GraphContext(request_id="t_siem_dialect", tenant="t", metrics=m)
     await adapter.query(dialect="cypher", text="RETURN 1", ctx=ctx)
     extra = [o["extra"] for o in m.observations if o["op"] == "query"][-1]
     assert "dialect" in extra
@@ -101,7 +96,7 @@ async def test_observability_query_metrics_include_dialect(adapter):
 
 async def test_observability_batch_metrics_include_op_count(adapter):
     m = CaptureMetrics()
-    ctx = make_ctx(GraphContext, request_id="t_siem_batch", tenant="t", metrics=m)
+    ctx = GraphContext(request_id="t_siem_batch", tenant="t", metrics=m)
     ops = [{"type": "create_vertex", "label": "X", "props": {}}]
     await adapter.batch(ops, ctx=ctx)
     extra = [o["extra"] for o in m.observations if o["op"] == "batch"][-1]
