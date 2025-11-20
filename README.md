@@ -720,7 +720,7 @@ Benchmarks and deployment patterns for higher scale live in `docs/guides/IMPLEME
 
 ### One-Command Conformance Testing
 
-See `docs/conformance/CONFORMANCE_GUIDE.md` for full details. Summary:
+See `docs/guides/CONFORMANCE_GUIDE.md` for full details. Summary:
 
 #### Make targets (from repo root)
 
