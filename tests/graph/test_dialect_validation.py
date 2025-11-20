@@ -9,43 +9,62 @@ Asserts (Spec refs):
 """
 import pytest
 
-from corpus_sdk.examples.graph.mock_graph_adapter import MockGraphAdapter
 from corpus_sdk.graph.graph_base import (
     OperationContext as GraphContext,
     NotSupported,
 )
-from corpus_sdk.examples.common.ctx import make_ctx
 
 pytestmark = pytest.mark.asyncio
 
 
+def make_ctx(ctx_cls, **kwargs):
+    """Local helper to construct an OperationContext."""
+    return ctx_cls(**kwargs)
+
+
 @pytest.mark.parametrize("dialect", ["unknown", "sql", "sparql"])
-async def test_unknown_dialect_rejected(dialect):
-    a = MockGraphAdapter()
+async def test_unknown_dialect_rejected(adapter, dialect):
+    caps = await adapter.capabilities()
+    # If the adapter *does* support this dialect, we can't treat it as "unknown".
+    if dialect in getattr(caps, "dialects", []):
+        pytest.skip(f"Adapter declares dialect '{dialect}'; cannot treat it as unknown")
+
     ctx = make_ctx(GraphContext, request_id=f"t_dialect_bad_{dialect}", tenant="t")
     with pytest.raises(NotSupported):
-        await a.query(dialect=dialect, text="X", ctx=ctx)
+        await adapter.query(dialect=dialect, text="X", ctx=ctx)
 
 
-@pytest.mark.parametrize("dialect", ["cypher", "opencypher"])
-async def test_known_dialect_accepted(dialect):
-    a = MockGraphAdapter()
+async def test_known_dialect_accepted(adapter):
+    caps = await adapter.capabilities()
+    if not getattr(caps, "dialects", []):
+        pytest.skip("Adapter declares no dialects")
+
+    # Use the first declared dialect as a known-good dialect.
+    dialect = caps.dialects[0]
     ctx = make_ctx(GraphContext, request_id=f"t_dialect_ok_{dialect}", tenant="t")
-    rows = await a.query(dialect=dialect, text="RETURN 1", ctx=ctx)
+    rows = await adapter.query(dialect=dialect, text="RETURN 1", ctx=ctx)
     assert isinstance(rows, list)
 
 
-async def test_dialect_not_in_capabilities_raises_not_supported():
-    a = MockGraphAdapter()
+async def test_dialect_not_in_capabilities_raises_not_supported(adapter):
+    caps = await adapter.capabilities()
+    unknown = "gremlin"
+    if unknown in getattr(caps, "dialects", []):
+        pytest.skip(f"Adapter unexpectedly supports '{unknown}' dialect")
+
     ctx = make_ctx(GraphContext, request_id="t_dialect_gremlin", tenant="t")
     with pytest.raises(NotSupported) as ei:
-        await a.query(dialect="gremlin", text="g.V().limit(1)", ctx=ctx)
+        await adapter.query(dialect=unknown, text="g.V().limit(1)", ctx=ctx)
     assert "gremlin" in str(ei.value)
 
 
-async def test_error_message_includes_dialect_name():
-    a = MockGraphAdapter()
+async def test_error_message_includes_dialect_name(adapter):
+    caps = await adapter.capabilities()
+    dialect = "gql"
+    if dialect in getattr(caps, "dialects", []):
+        pytest.skip(f"Adapter unexpectedly supports '{dialect}' dialect")
+
     ctx = make_ctx(GraphContext, request_id="t_dialect_gql", tenant="t")
     with pytest.raises(NotSupported) as ei:
-        await a.query(dialect="gql", text="{}", ctx=ctx)
+        await adapter.query(dialect=dialect, text="{}", ctx=ctx)
     assert "gql" in str(ei.value)
