@@ -235,6 +235,8 @@ All adapters MUST use protocol-specific base errors:
 
 **Canonical Error Codes:** `BAD_REQUEST`, `AUTH_ERROR`, `RESOURCE_EXHAUSTED`, `TRANSIENT_NETWORK`, `UNAVAILABLE`, `NOT_SUPPORTED`, `DEADLINE_EXCEEDED`
 
+> **Error Code Scope:** These are base canonical codes; each protocol defines additional protocol-specific codes in its semantics section and §27.4.
+
 **Wire Error Mapping:** Error envelope `code` comes from `e.code` if set, otherwise `type(e).__name__.upper()`
 
 > **Error Naming Convention:** 
@@ -250,7 +252,7 @@ All adapters MUST use protocol-specific base errors:
 ### 2.12 Capability Probing
 - **Dynamic discovery:** Clients probe `capabilities()` to determine supported features
 - **Truthful reporting:** Adapters MUST accurately report actual capabilities
-- **Protocol field:** All capabilities objects MUST expose a `protocol` field with the canonical protocol ID
+- **Protocol field:** All capabilities objects MUST expose a `protocol` field with the canonical protocol ID from §0.2
 - **Caching:** Capabilities may be cached with appropriate TTL (typically 5-60 minutes)
 
 ### 2.13 Idempotency Expectations
@@ -296,12 +298,28 @@ type Metadata = {
 - **Constraints:** JSON-serializable values only
 - **Cardinality:** Bounded key sets recommended for filter performance
 
-### 3.3 Paging / Streaming Tokens
+### 3.3 Filter Expressions
+```typescript
+type FilterValue = string | number | boolean | null | (string | number)[];
+type FilterOperator = { 
+  gt?: number; gte?: number; lt?: number; lte?: number; 
+  in?: (string | number)[];
+};
+type FilterExpression = {
+  [field: string]: FilterValue | FilterOperator;
+};
+```
+- **Range queries:** `{ field: { gt: value } }` for greater than
+- **Set membership:** `{ field: [value1, value2] }` for IN queries
+- **Equality:** `{ field: value }` for exact matching
+- **Combination:** Multiple conditions combined with AND
+
+### 3.4 Paging / Streaming Tokens
 - **Opaque:** Clients treat as black strings
 - **Stateless:** Adapters may encode state but should avoid large payloads
 - **Expiration:** Tokens should be valid for reasonable periods (hours/days)
 
-### 3.4 Batches & Partial Failure Envelope
+### 3.5 Batches & Partial Failure Envelope
 ```typescript
 interface BatchResult<T> {
   processed_count: number;
@@ -316,26 +334,34 @@ interface BatchResult<T> {
 }
 ```
 
-### 3.5 Common Validation Rules
+### 3.6 Common Validation Rules
 - **Required fields:** Presence validated before provider calls
 - **Type checking:** JSON schema validation where applicable
 - **Range validation:** Numeric bounds enforcement
 - **Size limits:** Payload size constraints per capabilities
-
-### 3.6 JSON Schema Requirements
-- **Additional properties:** MUST be `false` unless explicitly allowed
-- **Nullability:** Fields explicitly marked optional vs required
-- **String formats:** UUID, ISO8601, email where semantically meaningful
-- **Array bounds:** Minimum/maximum lengths specified per capability
 
 ### 3.7 Shared Token Usage Type
 ```typescript
 interface TokenUsage {
   prompt_tokens: number;
   completion_tokens?: number;  // Optional for non-generation operations
-  total_tokens: number;
+  total_tokens: number;        // MUST equal prompt_tokens + (completion_tokens || 0)
 }
 ```
+
+### 3.8 Shared Count Tokens Specification
+```typescript
+interface CountTokensSpec {
+  text: string;
+  model: string;
+}
+```
+
+### 3.9 JSON Schema Requirements
+- **Additional properties:** MUST be `false` unless explicitly allowed
+- **Nullability:** Fields explicitly marked optional vs required
+- **String formats:** UUID, ISO8601, email where semantically meaningful
+- **Array bounds:** Minimum/maximum lengths specified per capability
 
 ## 4. Protocol Overview
 
@@ -435,22 +461,22 @@ interface Edge {
 }
 ```
 
-### 6.3 QuerySpec
+### 6.3 GraphQuerySpec
 ```typescript
-interface QuerySpec {
+interface GraphQuerySpec {
   text: string;                   // Query in supported dialect
   params?: Metadata;              // Named parameters for query
-  timeout_ms?: number;            // Query-specific timeout
+  timeout_ms?: number;            // Query-specific timeout (overrides context deadline)
   dialect?: string;               // Preferred query dialect
   namespace?: string;             // Namespace context
   stream?: boolean;               // Stream results
 }
 ```
 
-### 6.4 QueryResult
+### 6.4 GraphQueryResult
 ```typescript
-interface QueryResult {
-  records: any[];                 // Query result data
+interface GraphQueryResult {
+  records: Record<string, any>[]; // Query result data - each record is a map of column→value
   summary: {                      // Execution summary (REQUIRED)
     query_time_ms: number;
     results_count: number;
@@ -465,7 +491,7 @@ interface QueryResult {
 ### 6.5 QueryChunk
 ```typescript
 interface QueryChunk {
-  records: any[];                 // Incremental result data
+  records: Record<string, any>[]; // Incremental result data
   is_final: boolean;              // True for final chunk
   summary?: {                     // Final execution summary
     query_time_ms: number;
@@ -473,6 +499,41 @@ interface QueryChunk {
     has_more: boolean;
     dialect_used: string;
   };
+}
+
+interface BulkVerticesSpec {
+  operation: 'export' | 'import';
+  format: string;          // e.g., "json"
+  namespace?: string;
+  nodes?: Node[];          // Required when operation === "import"
+}
+```
+
+### 6.6 GraphSchema
+```typescript
+interface GraphSchema {
+  node_labels: string[];
+  edge_types: string[];
+  property_keys: string[];
+  constraints: ConstraintInfo[];  // Provider-specific constraint information
+  indexes: IndexInfo[];           // Provider-specific index information
+}
+
+// Provider-specific extension points - shape not guaranteed across providers
+interface ConstraintInfo {
+  type: string;                   // e.g., "UNIQUE", "NOT_NULL"
+  label?: string;                 // Node/edge label
+  properties?: string[];          // Property names
+  // Additional provider-specific fields allowed
+  [key: string]: any;
+}
+
+interface IndexInfo {
+  type: string;                   // e.g., "BTREE", "FULLTEXT"
+  label?: string;                 // Node/edge label
+  properties?: string[];          // Property names
+  // Additional provider-specific fields allowed
+  [key: string]: any;
 }
 ```
 
@@ -772,7 +833,7 @@ interface DeleteEdgesSpec {
 
 **Operation:** `graph.query`
 
-**Input:** `QuerySpec`
+**Input:** `GraphQuerySpec`
 
 **Request Body:**
 ```json
@@ -794,7 +855,7 @@ interface DeleteEdgesSpec {
 }
 ```
 
-**Output:** `QueryResult`
+**Output:** `GraphQueryResult`
 
 **Response Body:**
 ```json
@@ -825,7 +886,7 @@ interface DeleteEdgesSpec {
 
 **Operation:** `graph.stream_query`
 
-**Input:** `QuerySpec`
+**Input:** `GraphQuerySpec`
 
 **Request Body:**
 ```json
@@ -983,16 +1044,7 @@ interface DeleteEdgesSpec {
 }
 ```
 
-**Output:** 
-```typescript
-interface GraphSchema {
-  node_labels: string[];
-  edge_types: string[];
-  property_keys: string[];
-  constraints: any[];
-  indexes: any[];
-}
-```
+**Output:** `GraphSchema`
 
 **Response Body:**
 ```json
@@ -1008,14 +1060,14 @@ interface GraphSchema {
       {
         "type": "UNIQUE",
         "label": "User",
-        "property": "email"
+        "properties": ["email"]
       }
     ],
     "indexes": [
       {
         "type": "BTREE",
         "label": "User",
-        "property": "department"
+        "properties": ["department"]
       }
     ]
   }
@@ -1101,10 +1153,11 @@ interface GraphHealthStatus {
 - **ID uniqueness:** Node/edge IDs MUST be unique within their namespace
 
 ### 8.3 Streaming Guarantees
-- **Exactly-once delivery:** Each row MUST be delivered exactly once
+- **Exactly-once delivery:** Each row MUST be delivered exactly once within a single stream session
 - **Order preservation:** Results MUST be delivered in query result order
 - **Terminal event:** Stream MUST always end with final chunk (`is_final: true`)
-- **Cardinality bounds:** Streams SHOULD support at least 1M rows
+- **Cardinality bounds:** Streams SHOULD support at least 1M rows for well-behaved queries
+- **Transport failures:** If the transport connection fails mid-stream, the stream is considered terminated and cannot be resumed
 
 ### 8.4 Batch Operation Semantics
 - **Order preservation:** Operations MUST be executed in specified order
@@ -1122,7 +1175,7 @@ interface GraphHealthStatus {
 | Timeout | `DeadlineExceeded` | `DEADLINE_EXCEEDED` | `{"query_time_ms": 5000}` |
 
 ### 8.6 Deadlines
-- **Query timeout:** `timeout_ms` in QuerySpec overrides context deadline
+- **Query timeout:** `timeout_ms` in GraphQuerySpec overrides context deadline
 - **Stream duration:** Deadline applies to entire stream execution
 - **Batch operations:** Deadline applies to entire batch execution
 
@@ -1183,12 +1236,21 @@ interface ToolCall {
     arguments: string;           // JSON string
   };
 }
+
+interface ToolDefinition {
+  type: 'function';
+  function: {
+    name: string;
+    description?: string;
+    parameters: object;          // JSON Schema object
+  };
+}
 ```
 
 ### 10.2 CompletionSpec
 ```typescript
 interface CompletionSpec {
-  model: string;                  // Target model - SINGLE DEFINITION
+  model: string;
   messages: Message[];
   max_tokens?: number;
   temperature?: number;          // Range: [0.0, 2.0]
@@ -1197,6 +1259,17 @@ interface CompletionSpec {
   presence_penalty?: number;     // Range: [-2.0, 2.0]
   stop_sequences?: string[];
   system_message?: string;       // System message override
+  
+  // Advanced features (availability depends on capabilities)
+  seed?: number;                 // For deterministic outputs
+  response_format?: {            // For structured output
+    type: 'text' | 'json_object';
+  };
+  tools?: ToolDefinition[];      // Function calling tools
+  tool_choice?: 'auto' | 'none' | {  // Tool selection strategy
+    type: 'function';
+    function: { name: string };
+  };
 }
 ```
 
@@ -1282,7 +1355,7 @@ interface LLMChunk {
 **Validation:**
 - `messages` MUST be non-empty list of `{role, content}` objects
 - `messages` MUST be JSON-serializable
-- Parameter ranges enforced per `BaseLLMAdapter._validate_sampling_params`:
+- Parameter ranges MUST satisfy:
   - `temperature ∈ [0.0, 2.0]`
   - `top_p ∈ (0.0, 1.0]`
   - `frequency_penalty ∈ [-2.0, 2.0]`
@@ -1390,13 +1463,7 @@ interface LLMChunk {
 
 **Operation:** `llm.count_tokens`
 
-**Input:** 
-```typescript
-interface CountTokensSpec {
-  text: string;
-  model: string;
-}
-```
+**Input:** `CountTokensSpec`
 
 **Request Body:**
 ```json
@@ -1525,6 +1592,7 @@ interface LLMHealthStatus {
 - **Guaranteed JSON:** When `response_format: {type: "json_object"}`, output MUST be valid JSON
 - **Schema adherence:** JSON structure follows model training, no schema enforcement
 - **Error on violation:** Return `BAD_REQUEST` if JSON mode requested but prompt doesn't specify JSON
+- **Capability requirement:** If `supports_json_output` is false, return `NOT_SUPPORTED` for JSON mode requests
 
 ### 12.6 Tool Call Semantics
 - **Deterministic ordering:** Tool calls returned in consistent order
@@ -1547,7 +1615,7 @@ interface LLMHealthStatus {
 ### 12.9 Deadline Rules
 - **Generation timeouts:** Deadline applies to entire generation process
 - **Partial streams:** Stream may be terminated early if deadline exceeded
-- **Token counting:** Fast token counting with minimal timeout impact
+- **Token counting:** Fast operation with minimal timeout impact
 
 ---
 
@@ -1603,24 +1671,25 @@ interface VectorMatch {
   vector: Vector;
   score: number;                  // Similarity score (higher = more similar)
   distance: number;               // Raw distance metric (lower = more similar) - REQUIRED
+  // If backend provides only one of score/distance, synthesize the other in a stable way
 }
 ```
 
-### 14.3 QuerySpec
+### 14.3 VectorQuerySpec
 ```typescript
-interface QuerySpec {
+interface VectorQuerySpec {
   vector: number[];
   top_k: number;                  // Default: 10
   namespace?: string;             // Default: "default"
-  filter?: Metadata;              // Metadata filter conditions
+  filter?: FilterExpression;      // Metadata filter conditions
   include_metadata?: boolean;     // Default: true
   include_vectors?: boolean;      // Default: false
 }
 ```
 
-### 14.4 QueryResult
+### 14.4 VectorQueryResult
 ```typescript
-interface QueryResult {
+interface VectorQueryResult {
   matches: VectorMatch[];
   query_vector: number[];         // May be normalized
   namespace: string;
@@ -1654,7 +1723,7 @@ interface UpsertResult {
 interface DeleteSpec {
   ids: string[];
   namespace?: string;
-  filter?: Metadata;              // Delete by metadata filter
+  filter?: FilterExpression;      // Delete by metadata filter
 }
 ```
 
@@ -1748,7 +1817,7 @@ interface NamespaceResult {
 
 **Operation:** `vector.query`
 
-**Input:** `QuerySpec`
+**Input:** `VectorQuerySpec`
 
 **Validation:**
 - `vector` MUST be non-empty list of numeric values
@@ -1776,7 +1845,8 @@ interface NamespaceResult {
     "namespace": "documents",
     "filter": {
       "category": "technology",
-      "language": "en"
+      "language": "en",
+      "rating": { "gte": 4.0 }
     },
     "include_metadata": true,
     "include_vectors": false
@@ -1784,7 +1854,7 @@ interface NamespaceResult {
 }
 ```
 
-**Output:** `QueryResult`
+**Output:** `VectorQueryResult`
 
 **Response Body:**
 ```json
@@ -1801,7 +1871,8 @@ interface NamespaceResult {
           "metadata": {
             "title": "AI Research Paper",
             "category": "technology",
-            "language": "en"
+            "language": "en",
+            "rating": 4.5
           },
           "namespace": "documents"
         },
@@ -2157,9 +2228,9 @@ interface EmbeddingCapabilities {
   supports_truncation: boolean;
   supports_token_counting: boolean;
   supports_multi_tenant: boolean;
-  supports_deadline: boolean;     // ADDED MISSING FIELD
+  supports_deadline: boolean;
   normalizes_at_source: boolean;
-  idempotent_operations: boolean;
+  idempotent_writes: boolean;     // Standardized naming
   truncation_mode: string;        // "base" or "adapter"
   max_batch_tokens?: number;      // Optional: token-based batch limits
   supports_multilingual?: boolean; // Optional: multilingual support
@@ -2206,8 +2277,8 @@ interface EmbedResult {
 
 interface EmbeddingVector {
   vector: number[];
-  text: string;
-  model: string;
+  text: string;                   // Denormalized for convenience
+  model: string;                  // Denormalized for convenience
   dimensions: number;
 }
 ```
@@ -2269,7 +2340,7 @@ interface EmbedBatchResult {
     "supports_multi_tenant": true,
     "supports_deadline": true,
     "normalizes_at_source": true,
-    "idempotent_operations": true,
+    "idempotent_writes": true,
     "truncation_mode": "base",
     "max_batch_tokens": 8000000,
     "supports_multilingual": true,
@@ -2335,7 +2406,7 @@ interface EmbedBatchResult {
 
 **Operation:** `embedding.embed_batch`
 
-**Input:** `EmbedBatchSpec`
+**Input:`EmbedBatchSpec`
 
 **Validation:**
 - `model` MUST be non-empty string
@@ -2404,13 +2475,7 @@ interface EmbedBatchResult {
 
 **Operation:** `embedding.count_tokens`
 
-**Input:** 
-```typescript
-interface CountTokensSpec {
-  text: string;
-  model: string;
-}
-```
+**Input:** `CountTokensSpec`
 
 **Request Body:**
 ```json
@@ -2837,8 +2902,8 @@ All batch operations use consistent partial failure reporting:
     "server": "openai-adapter",
     "version": "1.0.0",
     "model_family": "openai",
-    "supported_models": ["gpt-4", "gpt-3.5-turbo"],
-    "max_context_length": 8192,
+    "supported_models": ["gpt-4.1-mini", "gpt-4.1-max"],
+    "max_context_length": 128000,
     "supports_streaming": true,
     "supports_count_tokens": true
   },
@@ -2860,10 +2925,10 @@ All batch operations use consistent partial failure reporting:
   "ResourceExhausted (retryable)": {
     "ok": false,
     "error": "ResourceExhausted",
-    "message": "Rate limit exceeded for model gpt-4",
+    "message": "Rate limit exceeded for model gpt-4.1-mini",
     "code": "RESOURCE_EXHAUSTED",
     "retry_after_ms": 5000,
-    "resource_scope": "model",
+    "details": {"resource_scope": "model"},
     "ms": 12.3
   },
   "BadRequest (non-retryable)": {
@@ -2920,9 +2985,9 @@ All batch operations use consistent partial failure reporting:
 
 **LLM Stream Frames:**
 ```json
-{"ok": true, "code": "OK", "ms": 12.3, "chunk": {"text": "Hello", "is_final": false, "model": "gpt-4"}}
-{"ok": true, "code": "OK", "ms": 15.7, "chunk": {"text": " world", "is_final": false, "model": "gpt-4"}}
-{"ok": true, "code": "OK", "ms": 18.2, "chunk": {"text": "!", "is_final": true, "model": "gpt-4", "usage_so_far": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}}}
+{"ok": true, "code": "OK", "ms": 12.3, "chunk": {"text": "Hello", "is_final": false, "model": "gpt-4.1-mini"}}
+{"ok": true, "code": "OK", "ms": 15.7, "chunk": {"text": " world", "is_final": false, "model": "gpt-4.1-mini"}}
+{"ok": true, "code": "OK", "ms": 18.2, "chunk": {"text": "!", "is_final": true, "model": "gpt-4.1-mini", "usage_so_far": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}}}
 ```
 
 ### 29.5 Context Deadline Examples
@@ -2970,17 +3035,17 @@ adapter = BaseLLMAdapter(mode="standalone")
 - **Embedding Operations:** capabilities, embed, embed_batch, count_tokens, health
 
 ### 30.2 Types Index
-- **Common Types:** OperationContext, Metadata, BatchResult, TokenUsage
-- **Graph Types:** Node, Edge, QuerySpec, QueryResult, QueryChunk, GraphSchema, GraphHealthStatus
-- **LLM Types:** Message, ToolCall, CompletionSpec, LLMCompletion, LLMChunk, LLMHealthStatus
-- **Vector Types:** Vector, VectorMatch, QuerySpec, QueryResult, UpsertSpec, UpsertResult, DeleteSpec, DeleteResult, NamespaceSpec, NamespaceResult, VectorHealthStatus
+- **Common Types:** OperationContext, Metadata, FilterExpression, BatchResult, TokenUsage, CountTokensSpec
+- **Graph Types:** Node, Edge, GraphQuerySpec, GraphQueryResult, QueryChunk, GraphSchema, ConstraintInfo, IndexInfo, GraphHealthStatus
+- **LLM Types:** Message, ToolCall, ToolDefinition, CompletionSpec, LLMCompletion, LLMChunk, LLMHealthStatus
+- **Vector Types:** Vector, VectorMatch, VectorQuerySpec, VectorQueryResult, UpsertSpec, UpsertResult, DeleteSpec, DeleteResult, NamespaceSpec, NamespaceResult, VectorHealthStatus
 - **Embedding Types:** EmbedSpec, EmbedBatchSpec, EmbedResult, EmbeddingVector, EmbedBatchResult, EmbeddingHealthStatus
 
 ### 30.3 Capabilities Index
 - **Graph Capabilities:** protocol, server, version, supported_query_dialects, supports_stream_query, supports_bulk_vertices, supports_batch, supports_schema, idempotent_writes, supports_deadline, supports_namespaces, supports_property_filters, supports_multi_tenant, max_batch_ops, max_query_complexity, max_nodes_per_transaction, supports_analytics_queries
 - **LLM Capabilities:** protocol, server, version, model_family, supported_models, max_context_length, supports_streaming, supports_roles, supports_system_message, supports_json_output, supports_parallel_tool_calls, supports_deadline, supports_count_tokens, idempotent_writes, supports_multi_tenant, max_tokens_per_minute, max_requests_per_minute, supports_function_calling, supports_vision, supports_logprobs
 - **Vector Capabilities:** protocol, server, version, max_dimensions, supported_metrics, supports_namespaces, supports_metadata_filtering, supports_batch_operations, max_batch_size, supports_index_management, supports_deadline, idempotent_writes, supports_multi_tenant, max_top_k, max_filter_terms, supports_hybrid_search, supports_sparse_vectors, max_namespaces, supports_vector_compression
-- **Embedding Capabilities:** protocol, server, version, supported_models, max_batch_size, max_text_length, max_dimensions, supports_normalization, supports_truncation, supports_token_counting, supports_multi_tenant, supports_deadline, normalizes_at_source, idempotent_operations, truncation_mode, max_batch_tokens, supports_multilingual, supports_custom_dimensions
+- **Embedding Capabilities:** protocol, server, version, supported_models, max_batch_size, max_text_length, max_dimensions, supports_normalization, supports_truncation, supports_token_counting, supports_multi_tenant, supports_deadline, normalizes_at_source, idempotent_writes, truncation_mode, max_batch_tokens, supports_multilingual, supports_custom_dimensions
 
 ### 30.4 Error Codes Index
 - BAD_REQUEST, AUTH_ERROR, RESOURCE_EXHAUSTED, TRANSIENT_NETWORK, UNAVAILABLE, NOT_SUPPORTED, DEADLINE_EXCEEDED, MODEL_OVERLOADED, TEXT_TOO_LONG, DIMENSION_MISMATCH, QUERY_PARSE_ERROR
