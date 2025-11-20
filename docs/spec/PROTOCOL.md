@@ -1,4 +1,4 @@
-# CORPUS GLEV PROTOCOLS
+# CORPUS PROTOCOLS
 
 **Table of Contents**
 - [0. Document Metadata](#0-document-metadata)
@@ -44,6 +44,10 @@
 **protocols_version:** `1.0`
 
 > This document defines the unified protocol specification for all Corpus adapters. It establishes the normative behavior, types, and semantics for Graph, LLM, Vector, and Embedding protocols while maintaining cross-protocol consistency.
+
+> **Document Precedence:** When PROTOCOLS.md and SPECIFICATION.md disagree on **wire format or field names**, PROTOCOLS.md is authoritative. SPECIFICATION.md is descriptive and may contain language-specific reference bindings.
+
+> **Type Definition Convention:** Type definitions use a TypeScript-like pseudo-notation as a language-neutral IDL for JSON structures. They are normative for the wire format. Python, Go, etc. bindings are reference implementations.
 
 ## 0. Document Metadata
 
@@ -233,6 +237,11 @@ All adapters MUST use protocol-specific base errors:
 
 **Wire Error Mapping:** Error envelope `code` comes from `e.code` if set, otherwise `type(e).__name__.upper()`
 
+> **Error Naming Convention:** 
+> - **Wire codes:** `ALL_CAPS_SNAKE` (e.g., `DIMENSION_MISMATCH`)
+> - **Exception/type names:** `PascalCase` (e.g., `DimensionMismatch`)
+> - Wire `code` MUST use the canonical ALL_CAPS identifier.
+
 ### 2.11 Observability & Metrics
 - **All operations** emit standardized metrics with tenant hashing
 - **SIEM-safe:** No raw content (prompts, vectors, embeddings) in logs, metrics, or errors
@@ -399,7 +408,7 @@ interface GraphCapabilities {
 ### 5.3 Query Dialect Negotiation
 - **Client preference:** Clients specify dialect in query requests
 - **Adapter fallback:** Adapters MAY translate between dialects if supported
-- **Error on unsupported:** `NotSupported` error for unknown dialects
+- **Error on unsupported:** `NOT_SUPPORTED` error for unknown dialects
 - **Parameter binding:** All dialects MUST support named parameter binding
 
 ## 6. Graph Types
@@ -530,8 +539,8 @@ interface UpsertNodesSpec {
 ```
 
 **Validation:**
-- `nodes` must be non-empty
-- Each `Node.properties` must be JSON-serializable
+- `nodes` MUST be non-empty
+- Each `Node.properties` MUST be JSON-serializable
 
 **Request Body:**
 ```json
@@ -604,9 +613,9 @@ interface UpsertEdgesSpec {
 ```
 
 **Validation:**
-- `edges` must be non-empty
-- `edge.label` must be non-empty string
-- Each `Edge.properties` must be JSON-serializable
+- `edges` MUST be non-empty
+- `edge.label` MUST be non-empty string
+- Each `Edge.properties` MUST be JSON-serializable
 
 **Request Body:**
 ```json
@@ -679,8 +688,8 @@ interface DeleteNodesSpec {
 ```
 
 **Validation:**
-- Must have either non-empty `ids` or `filter` (not both empty)
-- `filter`, if present, must be JSON-serializable
+- MUST have either non-empty `ids` or `filter` (not both empty)
+- `filter`, if present, MUST be JSON-serializable
 
 **Request Body:**
 ```json
@@ -726,8 +735,8 @@ interface DeleteEdgesSpec {
 ```
 
 **Validation:**
-- Must have either non-empty `ids` or `filter` (not both empty)
-- `filter`, if present, must be JSON-serializable
+- MUST have either non-empty `ids` or `filter` (not both empty)
+- `filter`, if present, MUST be JSON-serializable
 
 **Request Body:**
 ```json
@@ -899,7 +908,7 @@ interface DeleteEdgesSpec {
 **Availability:** Only if `capabilities.supports_batch` is true
 
 **Validation:**
-- `ops` must be non-empty
+- `ops` MUST be non-empty
 - If `max_batch_ops` is non-null, `len(ops) <= max_batch_ops`
 
 **Request Body:**
@@ -1032,7 +1041,7 @@ interface GraphSchema {
 
 **Output:**
 ```typescript
-interface HealthStatus {
+interface GraphHealthStatus {
   ok: boolean;
   status: "ok" | "degraded";
   server: string;
@@ -1082,35 +1091,35 @@ interface HealthStatus {
 ## 8. Graph Semantics (Normative)
 
 ### 8.1 Consistency Requirements
-- **Read-after-write:** Updates visible to subsequent queries
-- **Causal consistency:** Operations from same client observed in order
+- **Read-after-write:** Updates MUST be visible to subsequent queries
+- **Causal consistency:** Operations from same client MUST be observed in order
 - **Cross-tenant isolation:** No data leakage between tenants
 
 ### 8.2 Referential Integrity Rules
-- **Node deletion:** Connected edges automatically deleted when nodes are deleted
-- **Edge validation:** Source and target nodes must exist
-- **ID uniqueness:** Node/edge IDs unique within their namespace
+- **Node deletion:** Connected edges MUST be automatically deleted when nodes are deleted
+- **Edge validation:** Source and target nodes MUST exist
+- **ID uniqueness:** Node/edge IDs MUST be unique within their namespace
 
 ### 8.3 Streaming Guarantees
-- **Exactly-once delivery:** Each row delivered exactly once
-- **Order preservation:** Results delivered in query result order
-- **Terminal event:** Stream always ends with final chunk (`is_final: true`)
+- **Exactly-once delivery:** Each row MUST be delivered exactly once
+- **Order preservation:** Results MUST be delivered in query result order
+- **Terminal event:** Stream MUST always end with final chunk (`is_final: true`)
 - **Cardinality bounds:** Streams SHOULD support at least 1M rows
 
 ### 8.4 Batch Operation Semantics
-- **Order preservation:** Operations executed in specified order
-- **Atomic batches:** When `atomic=true`, all operations succeed or fail together
-- **Partial visibility:** Non-atomic batch results visible as they complete
-- **Failure isolation:** Individual operation failures don't affect others in non-atomic mode
+- **Order preservation:** Operations MUST be executed in specified order
+- **Atomic batches:** When `atomic=true`, all operations MUST succeed or fail together
+- **Partial visibility:** Non-atomic batch results MAY be visible as they complete
+- **Failure isolation:** Individual operation failures MUST NOT affect others in non-atomic mode
 
 ### 8.5 Error Mappings
-| Provider Error | Normalized Error | Details |
-|----------------|------------------|---------|
-| Syntax error | `QueryParseError` | `{"dialect": "cypher", "position": 45}` |
-| Unknown node | `VertexNotFound` | `{"node_id": "v123"}` |
-| Unknown edge | `EdgeNotFound` | `{"edge_id": "e456"}` |
-| Schema violation | `SchemaValidationError` | `{"constraint": "label_missing"}` |
-| Timeout | `DeadlineExceeded` | `{"query_time_ms": 5000}` |
+| Provider Error | Normalized Error | Wire Code | Details |
+|----------------|------------------|-----------|---------|
+| Syntax error | `QueryParseError` | `QUERY_PARSE_ERROR` | `{"dialect": "cypher", "position": 45}` |
+| Unknown node | `VertexNotFound` | `VERTEX_NOT_FOUND` | `{"node_id": "v123"}` |
+| Unknown edge | `EdgeNotFound` | `EDGE_NOT_FOUND` | `{"edge_id": "e456"}` |
+| Schema violation | `SchemaValidationError` | `SCHEMA_VALIDATION_ERROR` | `{"constraint": "label_missing"}` |
+| Timeout | `DeadlineExceeded` | `DEADLINE_EXCEEDED` | `{"query_time_ms": 5000}` |
 
 ### 8.6 Deadlines
 - **Query timeout:** `timeout_ms` in QuerySpec overrides context deadline
@@ -1179,7 +1188,7 @@ interface ToolCall {
 ### 10.2 CompletionSpec
 ```typescript
 interface CompletionSpec {
-  model: string;
+  model: string;                  // Target model - SINGLE DEFINITION
   messages: Message[];
   max_tokens?: number;
   temperature?: number;          // Range: [0.0, 2.0]
@@ -1187,7 +1196,6 @@ interface CompletionSpec {
   frequency_penalty?: number;    // Range: [-2.0, 2.0]
   presence_penalty?: number;     // Range: [-2.0, 2.0]
   stop_sequences?: string[];
-  model?: string;                // Target model
   system_message?: string;       // System message override
 }
 ```
@@ -1272,8 +1280,8 @@ interface LLMChunk {
 **Input:** `CompletionSpec`
 
 **Validation:**
-- `messages` must be non-empty list of `{role, content}` objects
-- `messages` must be JSON-serializable
+- `messages` MUST be non-empty list of `{role, content}` objects
+- `messages` MUST be JSON-serializable
 - Parameter ranges enforced per `BaseLLMAdapter._validate_sampling_params`:
   - `temperature ∈ [0.0, 2.0]`
   - `top_p ∈ (0.0, 1.0]`
@@ -1516,7 +1524,7 @@ interface LLMHealthStatus {
 ### 12.5 JSON Mode Strictness
 - **Guaranteed JSON:** When `response_format: {type: "json_object"}`, output MUST be valid JSON
 - **Schema adherence:** JSON structure follows model training, no schema enforcement
-- **Error on violation:** Return `BadRequest` if JSON mode requested but prompt doesn't specify JSON
+- **Error on violation:** Return `BAD_REQUEST` if JSON mode requested but prompt doesn't specify JSON
 
 ### 12.6 Tool Call Semantics
 - **Deterministic ordering:** Tool calls returned in consistent order
@@ -1529,12 +1537,12 @@ interface LLMHealthStatus {
 - **Final indication:** Clear termination with `is_final: true`
 
 ### 12.8 Error Mappings
-| Provider Error | Normalized Error | Details |
-|----------------|------------------|---------|
-| Rate limit exceeded | `ResourceExhausted` | `{"resource_scope": "model", "retry_after_ms": 5000}` |
-| Model overloaded | `ResourceExhausted` | `{"resource_scope": "model", "retry_after_ms": 10000}` |
-| Context length exceeded | `BadRequest` | `{"max_context_length": 8192, "provided_tokens": 8500}` |
-| Content filtered | `BadRequest` | `{"filtered_reason": "violates_policy"}` |
+| Provider Error | Normalized Error | Wire Code | Details |
+|----------------|------------------|-----------|---------|
+| Rate limit exceeded | `ResourceExhausted` | `RESOURCE_EXHAUSTED` | `{"resource_scope": "model", "retry_after_ms": 5000}` |
+| Model overloaded | `ResourceExhausted` | `RESOURCE_EXHAUSTED` | `{"resource_scope": "model", "retry_after_ms": 10000}` |
+| Context length exceeded | `BadRequest` | `BAD_REQUEST` | `{"max_context_length": 8192, "provided_tokens": 8500}` |
+| Content filtered | `BadRequest` | `BAD_REQUEST` | `{"filtered_reason": "violates_policy"}` |
 
 ### 12.9 Deadline Rules
 - **Generation timeouts:** Deadline applies to entire generation process
@@ -1743,10 +1751,10 @@ interface NamespaceResult {
 **Input:** `QuerySpec`
 
 **Validation:**
-- `vector` must be non-empty list of numeric values
-- `top_k` must be positive integer
-- `namespace` must be non-empty string
-- `filter`, if present, must be JSON-serializable mapping
+- `vector` MUST be non-empty list of numeric values
+- `top_k` MUST be positive integer
+- `namespace` MUST be non-empty string
+- `filter`, if present, MUST be JSON-serializable mapping
 
 **Capabilities Enforcement:**
 - If `max_dimensions > 0` and `len(vector) > max_dimensions` → `DIMENSION_MISMATCH`
@@ -1816,11 +1824,11 @@ interface NamespaceResult {
 **Input:** `UpsertSpec`
 
 **Validation:**
-- `namespace` must be non-empty
-- `vectors` must be non-empty
-- Each vector `id` must be non-empty string
-- Each `vector` must be non-empty numeric list
-- Each `metadata`, if present, must be JSON-serializable
+- `namespace` MUST be non-empty
+- `vectors` MUST be non-empty
+- Each vector `id` MUST be non-empty string
+- Each `vector` MUST be non-empty numeric list
+- Each `metadata`, if present, MUST be JSON-serializable
 
 **Capabilities Enforcement:**
 - If `max_batch_size` is set and `len(vectors) > max_batch_size` → `BAD_REQUEST`
@@ -1877,10 +1885,10 @@ interface NamespaceResult {
 **Input:** `DeleteSpec`
 
 **Validation:**
-- `namespace` must be non-empty
-- Must provide at least one of: non-empty `ids` or `filter`
-- `filter`, if present, must be JSON-serializable
-- Each `id` must be non-empty string
+- `namespace` MUST be non-empty
+- MUST provide at least one of: non-empty `ids` or `filter`
+- `filter`, if present, MUST be JSON-serializable
+- Each `id` MUST be non-empty string
 
 **Capabilities Enforcement:**
 - If `max_batch_size` is set and `ids` non-empty and `len(ids) > max_batch_size` → `BAD_REQUEST`
@@ -1925,9 +1933,9 @@ interface NamespaceResult {
 **Input:** `NamespaceSpec`
 
 **Validation:**
-- `namespace` must be non-empty string
-- `dimensions` must be positive integer
-- `distance_metric` must be one of supported metrics
+- `namespace` MUST be non-empty string
+- `dimensions` MUST be positive integer
+- `distance_metric` MUST be one of supported metrics
 
 **Capabilities Enforcement:**
 - If `max_dimensions` and `dimensions > max_dimensions` → `BAD_REQUEST`
@@ -1979,7 +1987,7 @@ interface NamespaceResult {
 **Input:** `{ namespace: string }`
 
 **Validation:**
-- `namespace` must be non-empty string
+- `namespace` MUST be non-empty string
 
 **Request Body:**
 ```json
@@ -2114,15 +2122,15 @@ interface VectorHealthStatus {
 - **Partial success:** Batch operations continue despite individual failures
 - **Order preservation:** Results maintain input order where applicable
 - **Size limits:** Batch size constrained by provider capabilities
-- **Empty batch validation:** Reject empty batches with `BadRequest`
+- **Empty batch validation:** Reject empty batches with `BAD_REQUEST`
 
 ### 16.6 Error Mappings
-| Provider Error | Normalized Error | Details |
-|----------------|------------------|---------|
-| Dimension mismatch | `DimensionMismatch` | `{"provided": 1537, "expected": 1536}` |
-| Namespace not found | `NamespaceNotFound` | `{"namespace": "unknown"}` |
-| Index not ready | `IndexNotReady` | `{"namespace": "building", "estimated_ms": 120000}` |
-| Batch size exceeded | `BadRequest` | `{"max_batch_size": 100, "provided": 150}` |
+| Provider Error | Normalized Error | Wire Code | Details |
+|----------------|------------------|-----------|---------|
+| Dimension mismatch | `DimensionMismatch` | `DIMENSION_MISMATCH` | `{"provided": 1537, "expected": 1536}` |
+| Namespace not found | `NamespaceNotFound` | `NAMESPACE_NOT_FOUND` | `{"namespace": "unknown"}` |
+| Index not ready | `IndexNotReady` | `INDEX_NOT_READY` | `{"namespace": "building", "estimated_ms": 120000}` |
+| Batch size exceeded | `BadRequest` | `BAD_REQUEST` | `{"max_batch_size": 100, "provided": 150}` |
 
 ### 16.7 Deadline Rules
 - **Query timeouts:** Deadline applies to entire search operation
@@ -2149,7 +2157,7 @@ interface EmbeddingCapabilities {
   supports_truncation: boolean;
   supports_token_counting: boolean;
   supports_multi_tenant: boolean;
-  supports_deadline: boolean;     // Added missing field
+  supports_deadline: boolean;     // ADDED MISSING FIELD
   normalizes_at_source: boolean;
   idempotent_operations: boolean;
   truncation_mode: string;        // "base" or "adapter"
@@ -2278,8 +2286,8 @@ interface EmbedBatchResult {
 **Input:** `EmbedSpec`
 
 **Validation:**
-- `text` must be non-empty string
-- `model` must be non-empty string
+- `text` MUST be non-empty string
+- `model` MUST be non-empty string
 
 **Request Body:**
 ```json
@@ -2330,8 +2338,8 @@ interface EmbedBatchResult {
 **Input:** `EmbedBatchSpec`
 
 **Validation:**
-- `model` must be non-empty string
-- `texts` must be non-empty list
+- `model` MUST be non-empty string
+- `texts` MUST be non-empty list
 
 **Request Body:**
 ```json
@@ -2521,7 +2529,7 @@ interface EmbeddingHealthStatus {
 - **Error on mismatch:** Return error if dimensions don't match expectations
 
 ### 20.4 Empty Input Handling
-- **Zero-length texts:** Reject empty inputs with `BadRequest` error
+- **Zero-length texts:** Reject empty inputs with `BAD_REQUEST` error
 - **Whitespace-only:** Treat as normal text, not empty
 - **Error preference:** Prefer error over zero vector for empty inputs
 
@@ -2536,11 +2544,11 @@ interface EmbeddingHealthStatus {
 - **Normalization:** Consistent normalization when requested
 
 ### 20.7 Error Mappings
-| Provider Error | Normalized Error | Details |
-|----------------|------------------|---------|
-| Text too long | `TextTooLong` | `{"max_text_length": 8192, "provided_length": 8500}` |
-| Model not available | `ModelNotAvailable` | `{"requested_model": "unknown-model"}` |
-| Normalization not supported | `NotSupported` | `{"feature": "normalization"}` |
+| Provider Error | Normalized Error | Wire Code | Details |
+|----------------|------------------|-----------|---------|
+| Text too long | `TextTooLong` | `TEXT_TOO_LONG` | `{"max_text_length": 8192, "provided_length": 8500}` |
+| Model not available | `ModelNotAvailable` | `MODEL_NOT_AVAILABLE` | `{"requested_model": "unknown-model"}` |
+| Normalization not supported | `NotSupported` | `NOT_SUPPORTED` | `{"feature": "normalization"}` |
 
 ### 20.8 Deadline Rules
 - **Batch timeouts:** Deadline applies to entire batch processing
@@ -2603,9 +2611,9 @@ All batch operations use consistent partial failure reporting:
 ```
 
 ### 22.4 Retry Semantics
-- **Automatic retry:** `TransientNetwork`, `Unavailable`, `ResourceExhausted`
-- **Conditional retry:** `DeadlineExceeded` only with increased deadline
-- **No retry:** `BadRequest`, `AuthError`, `NotSupported`
+- **Automatic retry:** `TRANSIENT_NETWORK`, `UNAVAILABLE`, `RESOURCE_EXHAUSTED`
+- **Conditional retry:** `DEADLINE_EXCEEDED` only with increased deadline
+- **No retry:** `BAD_REQUEST`, `AUTH_ERROR`, `NOT_SUPPORTED`
 
 ## 23. Testing & Conformance
 
@@ -2963,7 +2971,7 @@ adapter = BaseLLMAdapter(mode="standalone")
 
 ### 30.2 Types Index
 - **Common Types:** OperationContext, Metadata, BatchResult, TokenUsage
-- **Graph Types:** Node, Edge, QuerySpec, QueryResult, QueryChunk, GraphSchema, HealthStatus
+- **Graph Types:** Node, Edge, QuerySpec, QueryResult, QueryChunk, GraphSchema, GraphHealthStatus
 - **LLM Types:** Message, ToolCall, CompletionSpec, LLMCompletion, LLMChunk, LLMHealthStatus
 - **Vector Types:** Vector, VectorMatch, QuerySpec, QueryResult, UpsertSpec, UpsertResult, DeleteSpec, DeleteResult, NamespaceSpec, NamespaceResult, VectorHealthStatus
 - **Embedding Types:** EmbedSpec, EmbedBatchSpec, EmbedResult, EmbeddingVector, EmbedBatchResult, EmbeddingHealthStatus
@@ -2983,3 +2991,4 @@ adapter = BaseLLMAdapter(mode="standalone")
 ---
 
 *End of PROTOCOLS.md (protocols_version 1.0)*
+```
