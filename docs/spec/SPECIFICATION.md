@@ -181,14 +181,23 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 ## 3. Terminology
 
 **Adapter** — Concrete implementation of a protocol for a specific provider/backend.
+
 **Protocol** — Interface contract that adapters MUST implement.
+
 **Operation Context** — Metadata container for tracing, deadlines, tenancy, and cache hints.
+
 **Capabilities** — Dynamically discoverable features and limits of an adapter.
+
 **SIEM-Safe** — Observability that excludes PII and uses privacy-preserving identifiers.
+
 **Idempotency Key** — Client-provided token guaranteeing idempotent semantics.
+
 **Tenant Isolation** — Logical separation of data/control plane in multi-tenant deployments.
+
 **Backpressure** — Cooperative throttling to keep systems within safe operating limits.
+
 **Streaming Frame** — Single JSON object carrying a `data`, `end`, or `error` event in a streaming operation.
+
 **Batch Partial Failure** — Outcome where some batch items succeed and others fail, with per-item status reported.
 
 ---
