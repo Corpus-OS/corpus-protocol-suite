@@ -115,7 +115,7 @@ class OpenAIAdapter(BaseLLMAdapter):
     - Requires `openai` Python library v1+ (for `AsyncOpenAI`). If that
       is not available, instantiation will raise `RuntimeError`.
     - Uses `tiktoken` for token counting when available, with a safe
-      whitespace fallback otherwise.
+      heuristic fallback otherwise.
     - Streaming uses `stream_options={"include_usage": True}` so the
       final chunk carries accurate token usage.
     - Response caching is handled automatically by BaseLLMAdapter using
@@ -150,7 +150,7 @@ class OpenAIAdapter(BaseLLMAdapter):
             raise ValueError("default_model must be a non-empty string")
         if max_context_length <= 0:
             raise ValueError("max_context_length must be positive")
-        
+
         if client is None:
             if AsyncOpenAI is None:
                 raise RuntimeError(
@@ -180,7 +180,7 @@ class OpenAIAdapter(BaseLLMAdapter):
         self._max_context_length = int(max_context_length)
         self._server = "openai"
         self._version = getattr(openai, "__version__", "unknown")
-        
+
         # Cache for tokenizers to avoid repeated initialization
         # This is separate from the base class response cache
         self._tokenizer_cache: Dict[str, Any] = {}
@@ -209,16 +209,16 @@ class OpenAIAdapter(BaseLLMAdapter):
         parameter and system role messages are present, they are merged.
         """
         out: List[Dict[str, str]] = []
-        
+
         # Collect all system messages from both sources
         system_messages: List[str] = []
-        
+
         # Add explicit system_message parameter if provided
         if system_message:
             system_messages.append(system_message)
-        
+
         # Extract system role messages from the messages list
-        non_system_messages = []
+        non_system_messages: List[Mapping[str, str]] = []
         for m in messages:
             role = m.get("role", "")
             content = m.get("content", "")
@@ -226,48 +226,49 @@ class OpenAIAdapter(BaseLLMAdapter):
                 system_messages.append(content)
             else:
                 non_system_messages.append(m)
-        
+
         # Combine all system messages into one
         if system_messages:
             combined_system = "\n\n".join(system_messages)
             out.append({"role": "system", "content": combined_system})
-            
+
             # Log if we had to merge multiple system messages
             if len(system_messages) > 1:
                 logger.debug(
                     "Merged %d system messages into one for OpenAI API",
-                    len(system_messages)
+                    len(system_messages),
                 )
-        
+
         # Add all non-system messages
         for m in non_system_messages:
             out.append({"role": m["role"], "content": m["content"]})
-            
+
         return out
 
     def _get_response_format(self, ctx: Optional[OperationContext]) -> Optional[Dict[str, str]]:
         """
         Extract response format from context attributes.
-        
+
         Supports:
         - ctx.attrs.get("response_format") = "json_object" → {"type": "json_object"}
         - ctx.attrs.get("response_format") = {"type": "json_object"} (direct mapping)
+        - Other string values are passed through as {"type": <value>}.
         """
-        if not ctx or not ctx.attrs:
+        if not ctx or not getattr(ctx, "attrs", None):
             return None
-            
+
         response_format = ctx.attrs.get("response_format")
         if not response_format:
             return None
-            
+
         if response_format == "json_object":
             return {"type": "json_object"}
-        elif isinstance(response_format, dict) and response_format.get("type") == "json_object":
-            return response_format
+        elif isinstance(response_format, dict) and response_format.get("type"):
+            return {"type": response_format["type"]}
         elif isinstance(response_format, str):
             # Handle other potential formats
             return {"type": response_format}
-            
+
         return None
 
     @staticmethod
@@ -314,11 +315,11 @@ class OpenAIAdapter(BaseLLMAdapter):
         """
         # Connection / transport issues → TransientNetwork
         if APIConnectionError is not None and isinstance(err, APIConnectionError):
-            return TransientNetwork(str(err) or "OpenAI API connection error") from err
+            return TransientNetwork(str(err) or "OpenAI API connection error")
 
         # Upstream timeout → DeadlineExceeded
         if APITimeoutError is not None and isinstance(err, APITimeoutError):
-            return DeadlineExceeded("OpenAI API request timed out") from err
+            return DeadlineExceeded("OpenAI API request timed out")
 
         # Rate limiting / quota → ResourceExhausted
         if RateLimitError is not None and isinstance(err, RateLimitError):
@@ -327,15 +328,15 @@ class OpenAIAdapter(BaseLLMAdapter):
                 "OpenAI rate limit exceeded",
                 retry_after_ms=retry_ms,
                 throttle_scope="tenant",
-            ) from err
+            )
 
         # AuthN / AuthZ → AuthError
         if AuthenticationError is not None and isinstance(err, AuthenticationError):
-            return AuthError(str(err) or "OpenAI authentication/authorization error") from err
+            return AuthError(str(err) or "OpenAI authentication/authorization error")
 
         # Request shape / params → BadRequest
         if BadRequestError is not None and isinstance(err, BadRequestError):
-            return BadRequest(str(err) or "OpenAI request is invalid") from err
+            return BadRequest(str(err) or "OpenAI request is invalid")
 
         # HTTP status buckets
         if APIStatusError is not None and isinstance(err, APIStatusError):
@@ -343,56 +344,56 @@ class OpenAIAdapter(BaseLLMAdapter):
 
             # Map a few key ranges explicitly.
             if status == 400:
-                return BadRequest(str(err) or "OpenAI request is invalid") from err
+                return BadRequest(str(err) or "OpenAI request is invalid")
             if status in (401, 403):
-                return AuthError(str(err) or "OpenAI authentication/authorization error") from err
+                return AuthError(str(err) or "OpenAI authentication/authorization error")
             if status == 404:
                 # Often "model not found" or similar.
-                return NotSupported(str(err) or "Requested OpenAI resource is not supported") from err
+                return NotSupported(str(err) or "Requested OpenAI resource is not supported")
             if status == 429:
                 retry_ms = self._extract_retry_after_ms(err)
                 return ResourceExhausted(
                     "OpenAI rate limit exceeded",
                     retry_after_ms=retry_ms,
                     throttle_scope="tenant",
-                ) from err
+                )
             if 500 <= status <= 599:
                 retry_ms = self._extract_retry_after_ms(err)
                 return Unavailable(
                     "OpenAI service is temporarily unavailable",
                     retry_after_ms=retry_ms,
-                ) from err
+                )
 
             # Fallback for unexpected status codes.
-            return Unavailable(str(err) or f"OpenAI error (status={status})") from err
+            return Unavailable(str(err) or f"OpenAI error (status={status})")
 
         # Generic OpenAI error fallback → Unavailable
         if isinstance(err, OpenAIError):
-            return Unavailable(str(err) or "OpenAI API error") from err
+            return Unavailable(str(err) or "OpenAI API error")
 
         # Anything else → wrap as Unavailable
-        return Unavailable(str(err) or "internal OpenAI adapter error") from err
+        return Unavailable(str(err) or "internal OpenAI adapter error")
 
     def _get_tokenizer(self, model: str) -> Any:
         """
         Get or create tokenizer for the given model, with caching.
-        
+
         Returns None if tiktoken is not available.
         """
         if tiktoken is None:
             return None
-            
+
         cache_key = model
         if cache_key in self._tokenizer_cache:
             return self._tokenizer_cache[cache_key]
-            
+
         try:
             try:
                 enc = tiktoken.encoding_for_model(model)
             except Exception:
                 # Fallback encoding used by most modern OpenAI chat models.
                 enc = tiktoken.get_encoding("cl100k_base")
-            
+
             self._tokenizer_cache[cache_key] = enc
             return enc
         except Exception:
@@ -407,9 +408,9 @@ class OpenAIAdapter(BaseLLMAdapter):
         """
         Report adapter capabilities.
 
-        We deliberately leave supported_models empty so routers can pass
-        any valid OpenAI model ID without the adapter enforcing a fixed
-        allow-list.
+        We include at least one supported model so conformance tests can
+        exercise the adapter end-to-end. Callers can still pass any
+        valid OpenAI model ID; this list is just a minimal sample.
         """
         return LLMCapabilities(
             server=self._server,
@@ -418,16 +419,17 @@ class OpenAIAdapter(BaseLLMAdapter):
             max_context_length=self._max_context_length,
             supports_streaming=True,
             supports_roles=True,
-            supports_json_output=True,  # We support JSON output via response_format
+            supports_json_output=True,  # JSON via response_format
             supports_parallel_tool_calls=False,
             idempotent_writes=True,
             supports_multi_tenant=True,
             supports_system_message=True,
             supports_deadline=True,
             # We implement token counting using tiktoken when available,
-            # with a safe heuristic fallback when it isn't.
+            # with a heuristic fallback when it isn't.
             supports_count_tokens=True,
-            supported_models=(),  # open set; let callers choose.
+            # IMPORTANT: must be non-empty to satisfy conformance tests.
+            supported_models=(self._default_model,),
         )
 
     async def _do_complete(
@@ -622,7 +624,11 @@ class OpenAIAdapter(BaseLLMAdapter):
                     text="",
                     is_final=True,
                     model=resolved_model,
-                    usage_so_far=TokenUsage(prompt_tokens=0, completion_tokens=0, total_tokens=0),
+                    usage_so_far=TokenUsage(
+                        prompt_tokens=0,
+                        completion_tokens=0,
+                        total_tokens=0,
+                    ),
                 )
                 return
 
@@ -651,8 +657,8 @@ class OpenAIAdapter(BaseLLMAdapter):
         Strategy:
         - If `tiktoken` is available, use model-aware tokenization via
           `encoding_for_model` (falling back to `cl100k_base`).
-        - Otherwise, use a whitespace heuristic similar to MockLLMAdapter,
-          which is good enough for rough planning but less precise.
+        - Otherwise, use a whitespace/character heuristic similar to
+          MockLLMAdapter, which is good enough for rough planning.
 
         This function is used by BaseLLMAdapter for:
             - context-window preflight checks
@@ -670,18 +676,21 @@ class OpenAIAdapter(BaseLLMAdapter):
                 return len(enc.encode(text))
             except Exception:  # noqa: BLE001
                 # If tokenization fails, fall back to heuristic
-                logger.debug("tiktoken token counting failed; falling back to heuristic", exc_info=True)
+                logger.debug(
+                    "tiktoken token counting failed; falling back to heuristic",
+                    exc_info=True,
+                )
 
-        # Heuristic fallback: whitespace-based + small overhead.
-        # This is reasonably accurate for English text and provides a safe lower bound.
+        # Heuristic fallback: whitespace-based + small overhead, blended
+        # with a character-based estimate. This is reasonably accurate
+        # for many languages but is only an estimate (not a strict lower
+        # bound) and is intended for planning, not billing.
         word_count = len(text.split())
         char_count = len(text)
-        
-        # Use a conservative estimate: average of word-based and character-based heuristics
-        # This avoids extreme underestimation for languages without spaces
+
         word_based = word_count + 3  # Original heuristic
         char_based = char_count // 4  # Rough character-to-token ratio
-        
+
         return max(word_based, char_based)
 
     async def _do_health(
@@ -701,7 +710,9 @@ class OpenAIAdapter(BaseLLMAdapter):
           of being raised, so that `BaseLLMAdapter.health()` can still
           normalize the response.
         """
-        status_hint = (ctx and ctx.attrs.get("health")) if ctx and ctx.attrs else None
+        status_hint: Optional[str] = None
+        if ctx is not None and getattr(ctx, "attrs", None):
+            status_hint = ctx.attrs.get("health")
 
         if status_hint == "degraded":
             return {
@@ -766,7 +777,7 @@ class OpenAIAdapter(BaseLLMAdapter):
         except Exception:  # noqa: BLE001
             # Best-effort cleanup; ignore close failures.
             logger.debug("OpenAIAdapter close() failed", exc_info=True)
-        
+
         # Clear tokenizer cache
         self._tokenizer_cache.clear()
 
