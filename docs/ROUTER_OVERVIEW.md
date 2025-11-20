@@ -1,6 +1,6 @@
 # Corpus Router Overview
 
-> **One routing layer. Four AI domains. Learns what works.**  
+> **One routing layer. Four AI domains. Infinite Possibilities. Learns what works.**  
 > Built on the **Corpus Protocol Suite** (wire-level, vendor-neutral).
 
 Corpus Router is an **enterprise orchestration layer** for AI infrastructure across:
@@ -20,31 +20,115 @@ If the **Corpus SDK** is the reference implementation of the **protocols**, **Co
 
 ---
 
+## 🤔 The Problem: AI Infrastructure Chaos
+
+Every AI application today ends up fighting the same battle:
+
+```python
+# Your codebase becomes a patchwork of:
+- OpenAI error handling
+- Anthropic rate limiting
+- Pinecone vector formats
+- LangChain-specific patterns
+- LlamaIndex query engines
+- Custom retry logic everywhere
+- No unified observability
+````
+
+The result:
+
+* Vendor lock-in
+* Duplicated integration code
+* Operational complexity
+* Infrastructure debt that grows with every new provider or framework
+
+---
+
+## 💡 The Vision: Protocol-First Unification
+
+What if you could treat AI infrastructure like web infrastructure?
+
+* **HTTP** → Universal web protocol
+* **TCP/IP** → Universal network protocol
+* **Corpus Protocol** → Universal AI infrastructure protocol
+
+The **Corpus Protocol Suite** defines a stable **wire format** for LLM, Embedding, Vector, and Graph across apps, frameworks, routers, and providers.
+
+**Corpus Router implements this vision** — it is the **intelligent control plane** that speaks the same Corpus Protocol across all AI domains and all stacks:
+
+* Direct provider SDKs
+* Framework-based stacks (LangChain, LlamaIndex, Semantic Kernel, CrewAI, AutoGen)
+* Internal services and legacy systems
+
+---
+
+## 🎯 What Makes This Different
+
+Every other solution starts from the wrong end:
+
+| Solution Type                               | Approach                                  | Problem                   |
+| ------------------------------------------- | ----------------------------------------- | ------------------------- |
+| **Framework-first** (LangChain, LlamaIndex) | “Rewrite your app for **our** framework”  | Framework lock-in         |
+| **Provider-first** (OpenRouter, etc.)       | “Use **our** service for these providers” | Service dependency        |
+| **Gateway-first** (generic API proxies)     | “We’ll proxy your HTTP calls”             | No semantic understanding |
+
+**Corpus flips this:**
+
+* ✅ **Protocol-first** – “Here’s the universal wire format — build whatever frameworks and routers you want on top.”
+
+We’re *not* building yet another framework. We’re standardizing the **wire**:
+
+* The Router understands the semantics of `llm.complete`, `vector.query`, `graph.query`, `embedding.embed`, etc.
+* It can reason about errors, tokens, deadlines, and costs in a way generic gateways cannot.
+* Frameworks and providers plug into the same protocol instead of fighting each other.
+
+---
+
+## Why This Hasn’t Really Existed Before
+
+Most “routing” or “unification” layers are:
+
+* ❌ **Framework-first** – “Rewrite your app for *our* framework”
+* ❌ **Provider-first** – “Send traffic to *our* hosted API for these vendors”
+* ❌ **Gateway-first** – “Point your existing REST calls at our generic proxy”
+
+**Corpus is different:**
+
+* ✅ **Protocol-first** – “Here is a universal wire format; apps, frameworks, routers, and providers can all plug into it.”
+
+The Router is not a new application framework, and not a provider-specific proxy. It is a **control plane for a standard wire protocol**:
+
+* The **Corpus Protocol Suite** plays the role of “HTTP + status codes + JSON envelopes” for AI infra.
+* **Corpus SDK** is the reference client/server implementation of that protocol in Python.
+* **Corpus Router** is the protocol-native control plane that can sit under LangChain, LlamaIndex, Semantic Kernel, CrewAI, AutoGen, MCP, or custom stacks—**anywhere the wire protocol is spoken.**
+
+---
+
 ## Core Features (All Tiers)
 
 Across all deployments, Corpus Router provides:
 
-- **Universal interface across four domains**  
+* **Universal interface across four domains**
   One API for LLM providers, vector databases, graph databases, and embedding
   systems. Switch backends without changing application code—only routing config.
 
-- **Multi-provider routing & failover**  
+* **Multi-provider routing & failover**
   Route requests across providers in any domain, with automatic failover when
   services or regions are unhealthy.
 
-- **Request/response validation**  
+* **Request/response validation**
   Validate envelopes, schemas, limits, and policies *before* expensive provider
   calls using the shapes from `docs/spec/SCHEMA.md`.
 
-- **Unified observability & logging**  
+* **Unified observability & logging**
   A single metrics and tracing model (`docs/spec/METRICS.md`) across LLM, Vector,
   Graph, and Embedding traffic, regardless of provider or framework.
 
-- **Cost tracking & attribution**  
+* **Cost tracking & attribution**
   Per-tenant / per-team view of usage and cost, mapped to normalized operations
   (`llm.complete`, `vector.query`, etc.), not vendor-specific APIs.
 
-- **Deadline propagation & cancellation**  
+* **Deadline propagation & cancellation**
   Deadlines from `ctx.deadline_ms` are enforced and propagated downstream,
   preventing runaway calls and wasted budget.
 
@@ -55,26 +139,30 @@ These are all built on top of the same **wire-level contracts** defined in
 
 ## How Router Relates to Corpus SDK & Protocols
 
-- **Corpus Protocol Suite** (in `docs/spec/`)  
+* **Corpus Protocol Suite** (in `docs/spec/`)
   Defines the **wire-level contracts** for LLM, Embedding, Vector, and Graph:
-  - `SPECIFICATION.md` – overall spec and cross-protocol behavior
-  - `PROTOCOL.md` – envelopes, streaming semantics, `op` registry
-  - `ERRORS.md`, `METRICS.md`, `SCHEMA.md`, `VERSIONING.md`
 
-- **Corpus SDK**  
-  - Python reference implementation of those protocols.
-  - You build **adapters** against `*BaseAdapter` classes.
-  - Lives in this repo, documented in this README and `docs/guides/`.
+  * `SPECIFICATION.md` – overall spec and cross-protocol behavior
+  * `PROTOCOL.md` – envelopes, streaming semantics, `op` registry
+  * `ERRORS.md`, `METRICS.md`, `SCHEMA.md`, `VERSIONING.md`
 
-- **Corpus Router** (commercial)  
-  - Runs as a service (managed or on-prem).
-  - Speaks the **same wire protocol** as defined in `docs/spec/`.
-  - Uses **Corpus-compatible adapters** (or your own) to talk to providers.
-  - Adds:
-    - Multi-provider routing
-    - Policies (budgets, allowlists, data residency)
-    - Self-learning optimization
-    - Centralized metrics & traces across **all four domains**
+* **Corpus SDK**
+
+  * Python reference implementation of those protocols.
+  * You build **adapters** against `*BaseAdapter` classes.
+  * Lives in this repo, documented in this README and `docs/guides/`.
+
+* **Corpus Router** (commercial)
+
+  * Runs as a service (managed or on-prem).
+  * Speaks the **same wire protocol** as defined in `docs/spec/`.
+  * Uses **Corpus-compatible adapters** (or your own) to talk to providers.
+  * Adds:
+
+    * Multi-provider routing
+    * Policies (budgets, allowlists, data residency)
+    * Self-learning optimization
+    * Centralized metrics & traces across **all four domains**
 
 The Router does *not* change the protocol. It **consumes** the same wire format
 and capabilities you already use via `corpus_sdk`.
@@ -87,35 +175,35 @@ At a high level, Corpus Router:
 
 1. **Terminates Corpus Protocol requests**
 
-   - Accepts JSON envelopes (`op`, `ctx`, `args`) over HTTP/HTTP2/WebSocket.
-   - Validates against schemas from `docs/spec/SCHEMA.md`.
+   * Accepts JSON envelopes (`op`, `ctx`, `args`) over HTTP/HTTP2/WebSocket.
+   * Validates against schemas from `docs/spec/SCHEMA.md`.
 
 2. **Applies policies**
 
-   - Budget enforcement, rate limits, provider allowlists.
-   - Data residency & compliance constraints.
-   - Per-tenant isolation rules.
+   * Budget enforcement, rate limits, provider allowlists.
+   * Data residency & compliance constraints.
+   * Per-tenant isolation rules.
 
 3. **Selects a backend**
 
-   - Uses **capabilities** + **historical metrics**.
-   - Considers latency, cost, error rates, and quality signals.
-   - Can use static routing, weighted routing, or self-learning policies.
+   * Uses **capabilities** + **historical metrics**.
+   * Considers latency, cost, error rates, and quality signals.
+   * Can use static routing, weighted routing, or self-learning policies.
 
 4. **Calls providers via adapters**
 
-   - Uses adapters built on `corpus_sdk` bases (or equivalent).
-   - Adapters must pass the **conformance suites** in `docs/conformance/`.
+   * Uses adapters built on `corpus_sdk` bases (or equivalent).
+   * Adapters must pass the **conformance suites** in `docs/conformance/`.
 
 5. **Normalizes the response**
 
-   - Maps provider errors into the canonical taxonomy (`ERRORS.md`).
-   - Emits metrics according to `METRICS.md`.
-   - Returns a normalized response envelope to the caller.
+   * Maps provider errors into the canonical taxonomy (`ERRORS.md`).
+   * Emits metrics according to `METRICS.md`.
+   * Returns a normalized response envelope to the caller.
 
 ---
 
-## Architecture Overview
+## 🏛️ Architecture: Protocol-Native Control Plane
 
 **Key idea**: The Router is a **protocol-native control plane**. It does not invent a new API; it **only** routes Corpus Protocol traffic.
 
@@ -149,10 +237,83 @@ At a high level, Corpus Router:
  Mistral
  Cohere
  ...
-````
+```
+
+You can also view it as a **protocol-native control plane** over three broad classes of backends:
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│                    Your Applications                        │
+│  (LangChain, LlamaIndex, Semantic Kernel, CrewAI, AutoGen,  │
+│   MCP, custom microservices, legacy systems)                │
+└──────────────────────────────┬──────────────────────────────┘
+                                │
+                                │ Corpus Protocol (Universal Wire Format)
+                                │
+                                ▼
+                        ┌─────────────────┐
+                        │  Corpus Router  │
+                        │  • Self-Learning│◄──────────────────┐
+                        │  • Multi-Tenant │                   │
+                        │  • Policy Engine│   Learns from     │
+                        │  • Observability│   metadata only   │
+                        └─────────┬───────┘   (privacy-safe)  │
+                                  │                          │
+        ┌─────────────────────────┼─────────────────────────┐ │
+        │                         │                         │ │
+        ▼                         ▼                         ▼ │
+┌──────────────┐         ┌────────────────┐         ┌──────────────┐
+│ Direct       │         │ Framework      │         │ Custom       │
+│ Providers    │         │ Providers      │         │ Services     │
+│              │         │                │         │              │
+│ • OpenAI     │         │ • LangChain    │         │ • Internal   │
+│ • Anthropic  │         │ • LlamaIndex   │         │   APIs       │
+│ • Pinecone   │         │ • Semantic     │         │ • Legacy     │
+│ • Neo4j      │         │   Kernel       │         │   systems    │
+│ • ...        │         │ • CrewAI       │         │ • ...        │
+└──────────────┘         │ • AutoGen      │         └──────────────┘
+                         │ • ...          │
+                         └────────────────┘
+```
+
+Everything speaks the same language: **the Corpus Protocol**.
 
 * All adapters are **Corpus-compatible**: they implement the same ops and envelopes defined in `docs/spec/PROTOCOL.md`.
 * Your own services can be added as providers as soon as they pass conformance (see `docs/conformance/*`).
+
+---
+
+## 🏗️ How It Works: The Universal Adapter Pattern
+
+The core idea is **“universal adapter”**:
+
+* Apps and frameworks talk **Corpus Protocol** to the Router.
+* The Router talks **Corpus Protocol** to direct providers, to your internal services, *and* to your existing framework-based stacks when wrapped as adapters.
+
+### The Magic: Frameworks as First-Class Citizens
+
+Instead of picking winners in framework wars, Corpus treats **frameworks as equal providers**:
+
+```python
+# Your existing investments become Router-managed providers
+router.add_adapter("langchain-llm", LangChainLLMAdapter(your_chain))
+router.add_adapter("llamaindex-rag", LlamaIndexAdapter(your_index))
+router.add_adapter("semantic-kernel", SKAdapter(your_skills))
+
+# Router can now intelligently route between:
+# - Direct providers (OpenAI, Anthropic, etc.)
+# - Framework-based providers (your existing code)
+# - Custom services (your internal APIs)
+```
+
+This is what enables *bidirectional* integration:
+
+```text
+Framework → Protocol Layer → Providers     (normal)
+Protocol Layer → Framework → Providers     (revolutionary)
+```
+
+Your existing LangChain chains, LlamaIndex pipelines, and Semantic Kernel skills become **first-class providers** in the routing ecosystem.
 
 ---
 
@@ -252,6 +413,18 @@ class LangChainLLMAdapter(BaseLLMAdapter):
 
 Result: Router can route to **framework-based** stacks and **raw provider** stacks side-by-side, with the same policies, metrics, and error taxonomy.
 
+### No More Framework Wars
+
+You don’t have to pick a winner in:
+
+* LangChain vs LlamaIndex vs Semantic Kernel vs CrewAI vs AutoGen
+
+With Corpus as a **neutral wire-level layer**:
+
+* Your existing LangChain, LlamaIndex, Semantic Kernel, CrewAI, AutoGen, or MCP code can stay where it is.
+* Router can treat those frameworks either as **adapters** (providers it calls) or as **clients** (callers of the protocol).
+* The protocol is the stable contract in the middle.
+
 > The next section describes the “opposite” pattern — frameworks acting as **clients** of Router. Both patterns can coexist:
 > • Use **frameworks as adapters** when you want Router to treat them as providers.
 > • Use **frameworks as clients** when they call Router as a backend.
@@ -274,16 +447,15 @@ Any framework or client that can:
 
 You get two main integration patterns (complementary to the adapter pattern above):
 
-### 1. Framework → Corpus SDK → Router
+### 1. Framework → Corpus SDK → Router (Frameworks as Clients)
 
 * Use `corpus_sdk` as the **client** to the Router.
 * Swap vendor-specific LangChain/LlamaIndex/AutoGen/... LLM & Vector classes
   with thin wrappers that call Corpus operations via the SDK.
 
-Example flow (conceptual):
+Conceptual example:
 
 ```python
-# Inside your framework integration
 from corpus_sdk.llm.llm_base import BaseLLMAdapter, OperationContext
 
 class RouterLLMAdapter(BaseLLMAdapter):
@@ -291,9 +463,20 @@ class RouterLLMAdapter(BaseLLMAdapter):
     Adapter that talks to Corpus Router over the wire instead of
     a single provider SDK.
     """
-    async def _do_complete(self, messages, **kwargs):
+    def __init__(self, endpoint: str):
+        super().__init__()
+        self._endpoint = endpoint
+
+    async def _do_complete(self, messages, model: str | None = None, **kwargs):
         # Serialize as Corpus Protocol envelope and send to Router endpoint.
         # Router then decides which provider to call.
+        ctx = kwargs.get("ctx") or OperationContext(request_id="auto")
+        envelope = {
+            "op": "llm.complete",
+            "ctx": ctx.to_wire(),
+            "args": {"messages": messages, "model": model},
+        }
+        # send envelope to self._endpoint, parse response back into LLMCompletion
         ...
 ```
 
@@ -303,6 +486,22 @@ You can do the same for:
 * Semantic Kernel `TextEmbeddingGeneration`
 * CrewAI / AutoGen tool calls
 * Any other framework component that can call Python / HTTP
+
+Concrete-style snippet (intended shape, not a fixed API):
+
+```python
+from corpus_sdk.llm.framework_adapters.langchain import RouterLLMAdapter
+
+# LangChain uses Router as its LLM backend
+llm = RouterLLMAdapter(router_endpoint="https://router.corpus.io")
+chain = LLMChain(llm=llm, prompt=prompt)
+
+# Now all LangChain calls get Router benefits:
+# - Multi-provider routing
+# - Automatic failover
+# - Cost optimization
+# - Unified observability
+```
 
 ### 2. Router as MCP Server / Tool Backend
 
@@ -317,6 +516,13 @@ The Router can be exposed as an MCP server that:
   * Budgets & policies
   * Multi-provider failover
   * Unified observability
+
+Both directions can run at the same time:
+
+* **Router → Framework** (your code as providers, via adapters)
+* **Framework → Router** (Router as a backend)
+
+No big-bang migration required — you can start from whatever you already have.
 
 ---
 
@@ -416,6 +622,27 @@ Policies can be:
 Router evaluates policies **before** calling any provider, so non-compliant
 requests are rejected quickly and safely.
 
+Example shape:
+
+```yaml
+policies:
+  budget:
+    tenant_alpha: $1000/month
+    tenant_beta: $5000/month
+
+  compliance:
+    eu_tenants: eu_providers_only
+    healthcare: hipaa_compliant_only
+
+  performance:
+    premium_tier:
+      p95_latency_ms: 500
+    standard_tier:
+      p95_latency_ms: 2000
+```
+
+Define once; Router enforces everywhere.
+
 ---
 
 ## Self-Learning Routing (Privacy-Preserving)
@@ -458,6 +685,15 @@ The Router’s self-learning engine is **optional** but powerful:
   * No overrunning budgets.
   * No violating residency rules.
 
+**Business impact:**
+
+* Automatically routes to the most cost-effective providers that still meet SLOs.
+* Learns which models work best for different workloads.
+* Optimizes jointly across LLM, vector, graph, and embedding domains.
+* Provides real-time cost attribution per tenant/team.
+
+In practice, teams typically see **~30–60% cost reduction** while maintaining or improving quality once routing is tuned.
+
 ---
 
 ## Multi-Tenancy & Isolation
@@ -486,9 +722,16 @@ Multi-tenancy is a first-class requirement in the Corpus Protocol Suite (see
     * `low_latency`
     * `high_quality`
     * `compliance_focused`
+
   * Per-tenant domain sub-strategies:
 
     * e.g., cheap LLM + premium vector DB, or vice versa.
+
+This is what enables things like:
+
+* Isolated circuit breakers per tenant.
+* Separate cost tracking per tenant.
+* Custom strategies for enterprise vs internal vs free-tier tenants.
 
 ---
 
@@ -609,6 +852,37 @@ first-class backends.
 
 ---
 
+## 💰 Zero-Risk Enterprise Adoption
+
+If you already have large investments in LangChain, LlamaIndex, Semantic Kernel,
+CrewAI, AutoGen, or MCP, you don’t need a ground-up rewrite to adopt Corpus.
+
+**Current state (typical):**
+
+```python
+# 50K+ lines of LangChain / LlamaIndex / SK code
+# Tightly coupled to specific provider SDKs
+# Custom error handling and logging scattered everywhere
+# No unified view of cost, latency, or failures across providers
+# Growing infrastructure and compliance debt
+```
+
+**With Corpus Router:**
+
+```python
+# Same 50K+ lines of framework code
+# Wrapped as Corpus-compatible adapters in hours/days
+# Router handles multi-provider routing and failover
+# Unified observability across everything
+# Automatic error normalization via the shared taxonomy
+# Future-proof against provider churn and framework changes
+```
+
+You get enterprise-grade infrastructure without rewriting business logic.
+Migration can be incremental: move one framework, one pipeline, or one tenant at a time.
+
+---
+
 ## When to Use Router vs Just SDK
 
 * Use **`corpus_sdk` alone** when:
@@ -678,4 +952,5 @@ enforces policies, learns what works, and keeps your
 applications decoupled from infrastructure churn—without inventing a new API
 surface on top.
 
+```
 ```
