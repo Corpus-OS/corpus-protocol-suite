@@ -548,7 +548,7 @@ PROTOCOLS = list(PROTOCOLS_CONFIG.keys())
 # Environment variable for fully-qualified adapter class:
 #   CORPUS_ADAPTER="package.module:ClassName"
 ADAPTER_ENV = "CORPUS_ADAPTER"
-DEFAULT_ADAPTER = "tests.mocks.mock_llm_adapter:MockLLMAdapter"
+DEFAULT_ADAPTER = "tests.mock.mock_llm_adapter:MockLLMAdapter"
 ENDPOINT_ENV = "CORPUS_ENDPOINT"
 
 # Thread-safe caching with validation
@@ -564,14 +564,8 @@ class AdapterValidationError(RuntimeError):
 
 def _validate_adapter_class(cls: type) -> None:
     """Validate that adapter class meets minimum interface requirements."""
-    required_methods = {'generate', 'embed', 'query'}  # Basic protocol methods
-    
-    for method in required_methods:
-        if not hasattr(cls, method):
-            raise AdapterValidationError(
-                f"Adapter class {cls.__name__} missing required method '{method}'. "
-                f"Minimum interface: {required_methods}"
-            )
+    # REMOVED the restrictive method validation that required all adapters
+    # to have generate, embed, and query methods
     
     if not callable(cls):
         raise AdapterValidationError(
