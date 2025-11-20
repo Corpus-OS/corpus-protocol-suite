@@ -20,13 +20,8 @@ from corpus_sdk.graph.graph_base import (
 pytestmark = pytest.mark.asyncio
 
 
-def make_ctx(ctx_cls, **kwargs):
-    """Local helper to construct an OperationContext."""
-    return ctx_cls(**kwargs)
-
-
 async def test_batch_ops_bulk_vertices_returns_graph_ids(adapter):
-    ctx = make_ctx(GraphContext, request_id="t_bulk_ids", tenant="t")
+    ctx = GraphContext(request_id="t_bulk_ids", tenant="t")
     ids = await adapter.bulk_vertices(
         [("Doc", {"id": "d1"}), ("Doc", {"id": "d2"})],
         ctx=ctx,
@@ -39,7 +34,7 @@ async def test_batch_ops_bulk_vertices_respects_max_batch_ops(adapter):
     if getattr(caps, "max_batch_ops", None) is None:
         pytest.skip("Adapter does not declare max_batch_ops; cannot enforce max batch ops test")
 
-    ctx = make_ctx(GraphContext, request_id="t_bulk_limit", tenant="t")
+    ctx = GraphContext(request_id="t_bulk_limit", tenant="t")
     too_many = caps.max_batch_ops + 1
     with pytest.raises(BadRequest) as ei:
         await adapter.bulk_vertices(
@@ -50,7 +45,7 @@ async def test_batch_ops_bulk_vertices_respects_max_batch_ops(adapter):
 
 
 async def test_batch_ops_batch_operations_returns_results_per_op(adapter):
-    ctx = make_ctx(GraphContext, request_id="t_batch_results", tenant="t")
+    ctx = GraphContext(request_id="t_batch_results", tenant="t")
     ops = [
         BatchOperations.create_vertex_op("User", {"name": "Ada"}),
         BatchOperations.create_edge_op("READ", "v:User:1", "v:Doc:1", {}),
@@ -91,7 +86,7 @@ async def test_batch_ops_batch_size_exceeded_includes_suggestion(adapter):
     if getattr(caps, "max_batch_ops", None) is None:
         pytest.skip("Adapter does not declare max_batch_ops; cannot enforce suggestion hint test")
 
-    ctx = make_ctx(GraphContext, request_id="t_bulk_suggest", tenant="t")
+    ctx = GraphContext(request_id="t_bulk_suggest", tenant="t")
     too_many = caps.max_batch_ops * 2
     with pytest.raises(BadRequest) as ei:
         await adapter.bulk_vertices(
