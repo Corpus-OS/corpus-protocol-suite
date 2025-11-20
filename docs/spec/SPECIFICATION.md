@@ -272,6 +272,8 @@ Non-streaming operations:
 
 #### 4.1.3. Streaming Frames (MUST where applicable)
 
+**Note:** At the adapter boundary, streaming frames use the `{ok, code, ms, chunk}` envelope defined in PROTOCOLS.md. The `{event, data}` framing in this section is a higher-level event-stream overlay used by routers/gateways, not a replacement for the base adapter envelope.
+
 For streaming operations (`llm.stream`, `graph.stream_query`):
 
 **Data frame:**
@@ -367,34 +369,38 @@ Adapters MAY support one or more transports and SHOULD advertise:
 
 The following values of `op` are reserved for V1.0:
 
-| Section Number | Operation Name | op String | Protocol |
+| Operation Name | op String | Protocol | Description |
 |---|---|---|---|
-| 7.3.1 | upsert_nodes | graph.upsert_nodes | Graph |
-| 7.3.1 | delete_nodes | graph.delete_nodes | Graph |
-| 7.3.1 | upsert_edges | graph.upsert_edges | Graph |
-| 7.3.1 | delete_edges | graph.delete_edges | Graph |
-| 7.3.2 | query | graph.query | Graph |
-| 7.3.2 | stream_query | graph.stream_query | Graph |
-| 7.3.3 | bulk_vertices | graph.bulk_vertices | Graph |
-| 7.3.3 | batch | graph.batch | Graph |
-| 7.5 | get_schema | graph.get_schema | Graph |
-| 7.5 | capabilities | graph.capabilities | Graph |
-| 7.6 | health | graph.health | Graph |
-| 8.3 | complete | llm.complete | LLM |
-| 8.3 | stream | llm.stream | LLM |
-| 8.3 | count_tokens | llm.count_tokens | LLM |
-| 8.4 | capabilities | llm.capabilities | LLM |
-| 9.3 | query | vector.query | Vector |
-| 9.3 | upsert | vector.upsert | Vector |
-| 9.3 | delete | vector.delete | Vector |
-| 9.3 | create_namespace | vector.create_namespace | Vector |
-| 9.3 | delete_namespace | vector.delete_namespace | Vector |
-| 9.3 | capabilities | vector.capabilities | Vector |
-| 10.3 | capabilities | embedding.capabilities | Embedding |
-| 10.3 | embed | embedding.embed | Embedding |
-| 10.3 | embed_batch | embedding.embed_batch | Embedding |
-| 10.3 | count_tokens | embedding.count_tokens | Embedding |
-| 10.3 | health | embedding.health | Embedding |
+| capabilities | graph.capabilities | Graph | Discover supported graph features and limits |
+| upsert_nodes | graph.upsert_nodes | Graph | Create or update multiple nodes |
+| upsert_edges | graph.upsert_edges | Graph | Create or update multiple edges |
+| delete_nodes | graph.delete_nodes | Graph | Remove nodes by ID |
+| delete_edges | graph.delete_edges | Graph | Remove edges by ID |
+| query | graph.query | Graph | Execute a graph query and return results |
+| stream_query | graph.stream_query | Graph | Execute a graph query with streaming results |
+| bulk_vertices | graph.bulk_vertices | Graph | Bulk operations on vertices (import/export) |
+| batch | graph.batch | Graph | Execute multiple operations in batch |
+| get_schema | graph.get_schema | Graph | Retrieve graph schema information |
+| health | graph.health | Graph | Check adapter and provider health status |
+| capabilities | llm.capabilities | LLM | Discover supported LLM features and models |
+| complete | llm.complete | LLM | Generate LLM completion for given messages |
+| stream | llm.stream | LLM | Stream LLM completion incrementally |
+| count_tokens | llm.count_tokens | LLM | Count tokens in text for a specific model |
+| health | llm.health | LLM | Check LLM provider health and model availability |
+| capabilities | vector.capabilities | Vector | Discover supported vector features and limits |
+| query | vector.query | Vector | Find similar vectors using approximate nearest neighbor search |
+| upsert | vector.upsert | Vector | Insert or update vectors in a namespace |
+| delete | vector.delete | Vector | Remove vectors by ID |
+| create_namespace | vector.create_namespace | Vector | Create a new vector namespace/collection |
+| delete_namespace | vector.delete_namespace | Vector | Remove a vector namespace and all its vectors |
+| health | vector.health | Vector | Check vector store health and namespace status |
+| capabilities | embedding.capabilities | Embedding | Discover supported embedding features and models |
+| embed | embedding.embed | Embedding | Generate embedding vector for a single text |
+| embed_batch | embedding.embed_batch | Embedding | Generate embeddings for multiple texts in batch |
+| count_tokens | embedding.count_tokens | Embedding | Count tokens in text for embedding model |
+| health | embedding.health | Embedding | Check embedding provider health and model status |
+
+**Note:** Filter-based deletion operations (e.g., delete by metadata filter) MAY be supported via extensions (e.g., `graph.delete_nodes_by_filter`, `vector.delete_by_filter`).
 
 Adapters MAY expose additional `op` values via namespaced extensions (e.g. `vendorX.llm.complete_raw`) but MUST NOT alter semantics of reserved `op` strings.
 
@@ -583,7 +589,7 @@ Errors MUST use normalized `code` values and SHOULD include hints, e.g.:
 ```json
 {
   "ok": false,
-  "code": "RATE_LIMIT",
+  "code": "RESOURCE_EXHAUSTED",
   "error": "ResourceExhausted",
   "message": "Rate limit exceeded",
   "retry_after_ms": 1200,
@@ -933,6 +939,7 @@ Streaming:
   "features": {
     "supports_streaming": true,
     "supports_roles": true,
+    "supports_system_message": true,
     "supports_json_output": false,
     "supports_parallel_tool_calls": false,
     "supports_deadline": true,
@@ -1123,7 +1130,7 @@ class EmbeddingCapabilities:
     supports_truncation: bool = True
     supports_token_counting: bool = True
     supports_deadline: bool = True
-    idempotent_operations: bool = True
+    idempotent_operations: bool = True  # Wire key: idempotent_writes
     supports_multi_tenant: bool = True
 ```
 
@@ -1194,6 +1201,8 @@ Implementations MUST declare:
 * `server`, `version`, `supported_models`.
 * Optional: `max_batch_size`, `max_text_length`, `max_dimensions`.
 * Boolean flags as defined in `EmbeddingCapabilities`.
+
+**Note:** The wire-level key is `idempotent_writes` as defined in PROTOCOLS.md; `idempotent_operations` is the corresponding SDK field name.
 
 ### 10.6. Semantics
 
@@ -1309,6 +1318,28 @@ A `TransactionCoordinator` MAY provide best-effort multi-component workflows wit
 
 ### 12.4. Error Mapping Table (Normative)
 
+**Canonical Success Codes:**
+- `OK` - Operation completed successfully
+
+**Canonical Error Codes (Illustrative, Not Exhaustive):**
+- `BAD_REQUEST` - Invalid parameters, malformed requests
+- `AUTH_ERROR` - Invalid credentials, permissions
+- `RESOURCE_EXHAUSTED` - Rate limits, quotas exceeded
+- `TRANSIENT_NETWORK` - Network timeouts, connection issues
+- `UNAVAILABLE` - Service temporarily down
+- `NOT_SUPPORTED` - Unsupported operation or parameter
+- `DEADLINE_EXCEEDED` - Operation timeout
+- `MODEL_OVERLOADED` - Model capacity exceeded
+- `CONTENT_FILTERED` - Input violates content policy
+- `TEXT_TOO_LONG` - Input exceeds context window
+- `DIMENSION_MISMATCH` - Vector dimensions don't match
+- `INDEX_NOT_READY` - Vector index not ready for queries
+- `MODEL_NOT_AVAILABLE` - Requested model not available
+- `QUERY_PARSE_ERROR` - Invalid query syntax
+- `VERTEX_NOT_FOUND` - Graph node not found
+- `EDGE_NOT_FOUND` - Graph edge not found
+- `SCHEMA_VALIDATION_ERROR` - Schema constraint violation
+
 | Error Class        | HTTP    | Retryable   | Client Guidance                                       |
 | ------------------ | ------- | ----------- | ----------------------------------------------------- |
 | BadRequest         | 400     | No          | Fix request; do not retry                             |
@@ -1332,44 +1363,48 @@ A `TransactionCoordinator` MAY provide best-effort multi-component workflows wit
 
 For non-atomic batch operations (e.g. `embed_batch`, vector `upsert`, graph `batch`):
 
-The transport envelope for partial success MUST be:
+**Option B Selected:** Keep `code: "OK"` and encode partial vs full success inside result only (matching the existing BatchResult convention in PROTOCOLS.md).
+
+The transport envelope for batch operations MUST be:
 
 ```json
 {
   "ok": true,
-  "code": "PARTIAL_SUCCESS",
+  "code": "OK",
   "ms": 38.4,
   "result": {
-    "successes": 2,
-    "failures": 1,
-    "items": [
-      {
-        "index": 0,
-        "ok": true,
-        "result": { }
-      },
-      {
-        "index": 1,
-        "ok": true,
-        "result": { }
-      },
+    "processed_count": 2,
+    "failed_count": 1,
+    "failures": [
       {
         "index": 2,
-        "ok": false,
-        "code": "TEXT_TOO_LONG",
-        "message": "Input exceeds max_text_length",
-        "details": { }
+        "error": "TEXT_TOO_LONG",
+        "detail": "Input exceeds max_text_length"
+      }
+    ],
+    "results": [
+      {
+        "vector": [0.01, 0.02],
+        "model": "example-embed-1",
+        "dimensions": 2
+      },
+      {
+        "vector": [0.03, 0.04],
+        "model": "example-embed-1",
+        "dimensions": 2
       }
     ]
   }
 }
 ```
 
+**Note:** Protocol-specific batch operations use protocol-specific result field names (e.g., `embeddings` for embedding operations, `vectors` for vector operations) within the generic `BatchResult` wrapper.
+
 Requirements:
 
-* Use `ok:true` and `code:"PARTIAL_SUCCESS"` when at least one item succeeds and at least one fails.
-* Each failed item MUST include `index` and `code`. `message` and `details` are OPTIONAL.
-* Success items MUST preserve the input order across `items`.
+* Use `ok:true` and `code:"OK"` for all batch operations regardless of partial failures.
+* Each failed item MUST include `index` and `error`. `detail` is OPTIONAL.
+* Success items MUST preserve the input order across `results`.
 * MUST NOT drop failed items silently.
 
 ### 12.6. Backpressure Integration
@@ -1557,9 +1592,79 @@ Adapters MUST:
 
 ### 17.3. Testing
 
-* Unit tests for validation, mapping, idempotency, partial failures.
-* Integration tests across Graph/LLM/Vector/Embedding flows.
-* Chaos tests with injected errors, timeouts, and overloads.
+#### 17.3.1. One-Command Conformance Testing
+
+**Recommended: Make targets (from repo root)**
+```bash
+# Test ALL protocols at once (LLM + Vector + Graph + Embedding)
+make test-all-conformance
+
+# Test specific protocols
+make test-llm-conformance
+make test-vector-conformance
+make test-graph-conformance
+make test-embedding-conformance
+```
+
+**Alternative: Corpus SDK CLI**
+Available when installed with the entrypoint: `[project.scripts] corpus-sdk = "corpus_sdk.cli:main"`
+
+```bash
+# Show help / usage
+corpus-sdk
+
+# Run ALL protocol conformance suites
+corpus-sdk test-all-conformance
+corpus-sdk verify
+
+# Run specific protocol suites
+corpus-sdk test-llm-conformance
+corpus-sdk test-vector-conformance
+corpus-sdk test-graph-conformance
+corpus-sdk test-embedding-conformance
+
+# Filtered verify (run only selected protocols)
+corpus-sdk verify -p llm -p vector
+corpus-sdk verify -p embedding
+```
+
+**Direct: pytest (no wrappers)**
+```bash
+# Run everything with coverage
+pytest tests/ -v --cov=corpus_sdk --cov-report=html
+
+# Run specific protocol suites
+pytest tests/llm/ -v
+pytest tests/vector/ -v
+pytest tests/graph/ -v
+pytest tests/embedding/ -v
+```
+
+#### 17.3.2. Conformance Test Coverage
+
+The test suite validates:
+
+* **Wire format compliance** - All request/response envelopes match specification
+* **Error normalization** - Provider errors mapped to canonical taxonomy
+* **Streaming semantics** - Proper frame sequencing and terminal events
+* **Batch operations** - Partial failure handling and atomicity
+* **Capability discovery** - Truthful feature reporting
+* **Observability** - SIEM-safe metrics and logging
+* **Security** - Tenant isolation and content redaction
+
+#### 17.3.3. Corpus Protocol Suite Badge
+
+Implementations passing the full conformance test suite may display:
+
+```
+LLM Protocol ✓ | Vector Protocol ✓ | Graph Protocol ✓ | Embedding Protocol ✓
+```
+
+**Requirements for badge display:**
+- Pass 100% of protocol-specific conformance tests
+- Implement all required operations for claimed protocols
+- Maintain backward compatibility within major version
+- Follow SIEM-safe observability requirements
 
 ---
 
@@ -1828,7 +1933,7 @@ for attempt in range(5):
   "supports_truncation": true,
   "supports_token_counting": true,
   "supports_deadline": true,
-  "idempotent_operations": true,
+  "idempotent_writes": true,
   "supports_multi_tenant": true,
   "cache": {
     "supports_tags": true,
@@ -1867,35 +1972,30 @@ for attempt in range(5):
 ```json
 {
   "ok": true,
-  "code": "PARTIAL_SUCCESS",
+  "code": "OK",
   "ms": 38.4,
   "result": {
-    "successes": 2,
-    "failures": 1,
-    "items": [
-      {
-        "index": 0,
-        "ok": true,
-        "result": {
-          "vector": [0.01, 0.02],
-          "model": "example-embed-1",
-          "dimensions": 2
-        }
-      },
-      {
-        "index": 1,
-        "ok": true,
-        "result": {
-          "vector": [0.03, 0.04],
-          "model": "example-embed-1",
-          "dimensions": 2
-        }
-      },
+    "processed_count": 2,
+    "failed_count": 1,
+    "failures": [
       {
         "index": 2,
-        "ok": false,
-        "code": "TEXT_TOO_LONG",
-        "message": "Input exceeds max_text_length"
+        "error": "TEXT_TOO_LONG",
+        "detail": "Input exceeds max_text_length"
+      }
+    ],
+    "embeddings": [
+      {
+        "vector": [0.01, 0.02],
+        "text": "a",
+        "model": "example-embed-1",
+        "dimensions": 2
+      },
+      {
+        "vector": [0.03, 0.04],
+        "text": "b", 
+        "model": "example-embed-1",
+        "dimensions": 2
       }
     ]
   }
@@ -1911,7 +2011,6 @@ Content-Type: application/x-ndjson
 Transfer-Encoding: chunked
 X-Protocol-Streaming: chunked-json
 ```
-
 Body:
 
 ```json
