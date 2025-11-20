@@ -19,7 +19,6 @@ from corpus_sdk.embedding.embedding_base import (
     BatchEmbedSpec,
     NotSupported,
 )
-from examples.common.ctx import make_ctx
 
 pytestmark = pytest.mark.asyncio
 
@@ -40,7 +39,7 @@ async def test_normalization_single_embed_normalize_true_produces_unit_vector(ad
     if not supports_normalization(adapter):
         pytest.skip("Adapter does not support normalization")
 
-    ctx = make_ctx(OperationContext, request_id="t_norm_single_true", tenant="t")
+    ctx = OperationContext(request_id="t_norm_single_true", tenant="t")
 
     spec = EmbedSpec(
         text="normalize this text to unit length",
@@ -64,7 +63,7 @@ async def test_normalization_single_embed_normalize_false_not_forced_unit_norm(a
     if getattr(caps, "normalizes_at_source", False):
         pytest.skip("Adapter normalizes at source; cannot test non-unit norms")
 
-    ctx = make_ctx(OperationContext, request_id="t_norm_single_false", tenant="t")
+    ctx = OperationContext(request_id="t_norm_single_false", tenant="t")
 
     spec = EmbedSpec(
         text="provide raw vector without normalization",
@@ -84,7 +83,7 @@ async def test_normalization_batch_embed_normalize_true_all_unit_vectors(adapter
     if not supports_normalization(adapter):
         pytest.skip("Adapter does not support normalization")
 
-    ctx = make_ctx(OperationContext, request_id="t_norm_batch_true", tenant="t")
+    ctx = OperationContext(request_id="t_norm_batch_true", tenant="t")
 
     spec = BatchEmbedSpec(
         texts=["first text to normalize", "second text", "third example"],
@@ -105,7 +104,7 @@ async def test_normalization_not_supported_raises_clear_error(adapter: BaseEmbed
     if supports_normalization(adapter):
         pytest.skip("Adapter supports normalization")
 
-    ctx = make_ctx(OperationContext, request_id="t_norm_nosupport", tenant="t")
+    ctx = OperationContext(request_id="t_norm_nosupport", tenant="t")
 
     spec = EmbedSpec(
         text="test normalization error",
@@ -127,7 +126,7 @@ async def test_normalization_normalizes_at_source_respected(adapter: BaseEmbeddi
     if not getattr(caps, "normalizes_at_source", False):
         pytest.skip("Adapter does not normalize at source")
 
-    ctx = make_ctx(OperationContext, request_id="t_norm_source", tenant="t")
+    ctx = OperationContext(request_id="t_norm_source", tenant="t")
 
     spec = EmbedSpec(
         text="text for source-normalizing adapter",
@@ -147,7 +146,7 @@ async def test_normalization_consistency_across_calls(adapter: BaseEmbeddingAdap
     if not supports_normalization(adapter):
         pytest.skip("Adapter does not support normalization")
 
-    ctx = make_ctx(OperationContext, request_id="t_norm_consistent", tenant="t")
+    ctx = OperationContext(request_id="t_norm_consistent", tenant="t")
 
     spec = EmbedSpec(
         text="identical text for consistency check",
@@ -175,7 +174,7 @@ async def test_normalization_different_texts_different_vectors(adapter: BaseEmbe
     if not supports_normalization(adapter):
         pytest.skip("Adapter does not support normalization")
 
-    ctx = make_ctx(OperationContext, request_id="t_norm_different", tenant="t")
+    ctx = OperationContext(request_id="t_norm_different", tenant="t")
 
     spec1 = EmbedSpec(text="first unique text", model=adapter.supported_models[0], normalize=True)
     spec2 = EmbedSpec(text="second different text", model=adapter.supported_models[0], normalize=True)
@@ -199,7 +198,7 @@ async def test_normalization_small_vectors_handled(adapter: BaseEmbeddingAdapter
     if not supports_normalization(adapter):
         pytest.skip("Adapter does not support normalization")
 
-    ctx = make_ctx(OperationContext, request_id="t_norm_small", tenant="t")
+    ctx = OperationContext(request_id="t_norm_small", tenant="t")
 
     # Test with very short text that might produce small vectors
     short_texts = ["a", "hi", "ok"]
@@ -218,7 +217,7 @@ async def test_normalization_batch_mixed_normalization(adapter: BaseEmbeddingAda
     if not supports_normalization(adapter):
         pytest.skip("Adapter does not support normalization")
 
-    ctx = make_ctx(OperationContext, request_id="t_norm_batch_mixed", tenant="t")
+    ctx = OperationContext(request_id="t_norm_batch_mixed", tenant="t")
 
     # Note: BatchEmbedSpec applies normalization uniformly to all items
     # This tests that the batch-level normalization flag works correctly
