@@ -548,7 +548,7 @@ PROTOCOLS = list(PROTOCOLS_CONFIG.keys())
 # Environment variable for fully-qualified adapter class:
 #   CORPUS_ADAPTER="package.module:ClassName"
 ADAPTER_ENV = "CORPUS_ADAPTER"
-DEFAULT_ADAPTER = "tests.mocks.mock_llm_adapter:MockLLMAdapter"
+DEFAULT_ADAPTER = "tests.mock.mock_llm_adapter:MockLLMAdapter"
 ENDPOINT_ENV = "CORPUS_ENDPOINT"
 
 # Thread-safe caching with validation
