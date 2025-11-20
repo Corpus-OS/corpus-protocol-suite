@@ -73,18 +73,9 @@ check-deps:
 check-versions:
 	@echo "📦 Checking critical dependency versions..."
 	@python -c "import sys; print(f'Python {sys.version}')"
-	@python - <<'PY'
-import importlib
-def ver(mod):
-    try:
-        m = importlib.import_module(mod)
-        v = getattr(m, '__version__', 'unknown')
-    except Exception as e:
-        v = f'not installed ({e})'
-    print(f'{mod} {v}')
-for m in ('pytest','jsonschema','rfc3339_validator'):
-    ver(m)
-PY
+	@python -c "import importlib; print('pytest', getattr(importlib.import_module('pytest'), '__version__', 'unknown'))" 2>/dev/null || echo "pytest not installed"
+	@python -c "import importlib; print('jsonschema', getattr(importlib.import_module('jsonschema'), '__version__', 'unknown'))" 2>/dev/null || echo "jsonschema not installed"  
+	@python -c "import importlib; print('rfc3339_validator', getattr(importlib.import_module('rfc3339_validator'), '__version__', 'unknown'))" 2>/dev/null || echo "rfc3339_validator not installed"
 
 # --------------------------------------------------------------------------- #
 # Environment Validation & Setup
@@ -226,57 +217,29 @@ test-root-conformance: check-deps
 # Generate conformance report (with error handling and duration aggregation if JUnit XML is present)
 conformance-report: test-conformance
 	@echo "📊 Generating detailed conformance report..."
-	@python - <<'PY'
-try:
-    import json, datetime, os, glob, re
-    from xml.etree import ElementTree
-    
-    # Aggregate results from JUnit XML files
-    total_tests = 0
-    total_failures = 0
-    total_errors = 0
-    total_time = 0.0
-    
-    for xml_file in glob.glob("*_results.xml"):
-        try:
-            tree = ElementTree.parse(xml_file)
-            root = tree.getroot()
-            total_tests += int(root.get("tests", 0))
-            total_failures += int(root.get("failures", 0))
-            total_errors += int(root.get("errors", 0))
-            total_time += float(root.get("time", 0))
-        except Exception as e:
-            print(f"⚠️  Could not parse {xml_file}: {e}")
-    
-    status = "PASS" if total_failures == 0 and total_errors == 0 else "FAIL"
-    
-    results = {
-        "protocols": "$(PROTOCOLS)",
-        "status": status,
-        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
-        "summary": {
-            "total_tests": total_tests,
-            "failures": total_failures,
-            "errors": total_errors,
-            "duration_seconds": round(total_time, 3)
-        },
-        "coverage_threshold": $(COV_FAIL_UNDER),
-        "test_suites": ["schema", "golden", "llm", "vector", "graph", "embedding", "cli", "root_conformance"],
-        "environment": os.getenv("CORPUS_TEST_ENV", "default")
-    }
-    
-    with open("conformance_report.json", "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2)
-    
-    print("✅ Conformance report: conformance_report.json")
-    print(f"📈 Summary: {total_tests} tests, {total_failures} failures, {total_errors} errors")
-    print(f"⏱️  Duration: {round(total_time, 3)}s")
-    print(f"🎯 Status: {status}")
-    
-except Exception as e:
-    print(f"❌ Failed to generate report: {e}")
-    raise SystemExit(1)
-PY
+	@echo 'import json, datetime, os, glob, re' > .report_gen.py
+	@echo 'from xml.etree import ElementTree' >> .report_gen.py
+	@echo 'total_tests = 0; total_failures = 0; total_errors = 0; total_time = 0.0' >> .report_gen.py
+	@echo 'for xml_file in glob.glob("*_results.xml"):' >> .report_gen.py
+	@echo '    try:' >> .report_gen.py
+	@echo '        tree = ElementTree.parse(xml_file)' >> .report_gen.py
+	@echo '        root = tree.getroot()' >> .report_gen.py
+	@echo '        total_tests += int(root.get("tests", 0))' >> .report_gen.py
+	@echo '        total_failures += int(root.get("failures", 0))' >> .report_gen.py
+	@echo '        total_errors += int(root.get("errors", 0))' >> .report_gen.py
+	@echo '        total_time += float(root.get("time", 0))' >> .report_gen.py
+	@echo '    except Exception as e:' >> .report_gen.py
+	@echo '        print(f"⚠️  Could not parse {xml_file}: {e}")' >> .report_gen.py
+	@echo 'status = "PASS" if total_failures == 0 and total_errors == 0 else "FAIL"' >> .report_gen.py
+	@echo 'results = {"protocols": "$(PROTOCOLS)", "status": status, "timestamp": datetime.datetime.utcnow().isoformat() + "Z", "summary": {"total_tests": total_tests, "failures": total_failures, "errors": total_errors, "duration_seconds": round(total_time, 3)}, "coverage_threshold": $(COV_FAIL_UNDER), "test_suites": ["schema", "golden", "llm", "vector", "graph", "embedding", "cli", "root_conformance"], "environment": os.getenv("CORPUS_TEST_ENV", "default")}' >> .report_gen.py
+	@echo 'with open("conformance_report.json", "w", encoding="utf-8") as f:' >> .report_gen.py
+	@echo '    json.dump(results, f, indent=2)' >> .report_gen.py
+	@echo 'print("✅ Conformance report: conformance_report.json")' >> .report_gen.py
+	@echo 'print(f"📈 Summary: {total_tests} tests, {total_failures} failures, {total_errors} errors")' >> .report_gen.py
+	@echo 'print(f"⏱️  Duration: {round(total_time, 3)}s")' >> .report_gen.py
+	@echo 'print(f"🎯 Status: {status}")' >> .report_gen.py
+	@python .report_gen.py || (echo "❌ Failed to generate report" && exit 1)
+	@rm -f .report_gen.py
 
 # Upload results to conformance service
 upload-results:

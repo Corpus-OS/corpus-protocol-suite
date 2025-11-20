@@ -338,11 +338,11 @@ class AnthropicAdapter(BaseLLMAdapter):
         """
         # Connection / transport issues → TransientNetwork
         if APIConnectionError is not None and isinstance(err, APIConnectionError):
-            return TransientNetwork(str(err) or "Anthropic API connection error") from err
+            return TransientNetwork(str(err) or "Anthropic API connection error") 
 
         # Upstream timeout → DeadlineExceeded
         if APITimeoutError is not None and isinstance(err, APITimeoutError):
-            return DeadlineExceeded("Anthropic API request timed out") from err
+            return DeadlineExceeded("Anthropic API request timed out") 
 
         # Rate limiting / quota → ResourceExhausted
         if RateLimitError is not None and isinstance(err, RateLimitError):
@@ -351,49 +351,48 @@ class AnthropicAdapter(BaseLLMAdapter):
                 "Anthropic rate limit exceeded",
                 retry_after_ms=retry_ms,
                 throttle_scope="tenant",
-            ) from err
+            ) 
 
         # AuthN / AuthZ → AuthError
         if AuthenticationError is not None and isinstance(err, AuthenticationError):
-            return AuthError(str(err) or "Anthropic authentication/authorization error") from err
-
+            return AuthError(str(err) or "Anthropic authentication/authorization error") 
         # Request shape / params → BadRequest
         if BadRequestError is not None and isinstance(err, BadRequestError):
-            return BadRequest(str(err) or "Anthropic request is invalid") from err
+            return BadRequest(str(err) or "Anthropic request is invalid") 
 
         # HTTP status buckets
         if APIStatusError is not None and isinstance(err, APIStatusError):
             status = int(getattr(err, "status_code", 0) or 0)
 
             if status == 400:
-                return BadRequest(str(err) or "Anthropic request is invalid") from err
+                return BadRequest(str(err) or "Anthropic request is invalid") 
             if status in (401, 403):
-                return AuthError(str(err) or "Anthropic authentication/authorization error") from err
+                return AuthError(str(err) or "Anthropic authentication/authorization error") 
             if status == 404:
-                return NotSupported(str(err) or "Requested Anthropic resource is not supported") from err
+                return NotSupported(str(err) or "Requested Anthropic resource is not supported") 
             if status == 429:
                 retry_ms = self._extract_retry_after_ms(err)
                 return ResourceExhausted(
                     "Anthropic rate limit exceeded",
                     retry_after_ms=retry_ms,
                     throttle_scope="tenant",
-                ) from err
+                ) 
             if 500 <= status <= 599:
                 retry_ms = self._extract_retry_after_ms(err)
                 return Unavailable(
                     "Anthropic service is temporarily unavailable",
                     retry_after_ms=retry_ms,
-                ) from err
-            return Unavailable(str(err) or f"Anthropic error (status={status})") from err
+                ) 
+            return Unavailable(str(err) or f"Anthropic error (status={status})") 
 
         # Generic Anthropic error fallback → Unavailable
         if isinstance(err, APIError):
-            return Unavailable(str(err) or "Anthropic API error") from err
+            return Unavailable(str(err) or "Anthropic API error") 
         if isinstance(err, AnthropicError):
-            return Unavailable(str(err) or "Anthropic SDK error") from err
+            return Unavailable(str(err) or "Anthropic SDK error") 
 
         # Anything else → wrap as Unavailable
-        return Unavailable(str(err) or "internal Anthropic adapter error") from err
+        return Unavailable(str(err) or "internal Anthropic adapter error") 
 
     def _get_stream_cache_key(
         self,

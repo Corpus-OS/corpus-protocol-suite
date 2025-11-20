@@ -314,11 +314,11 @@ class OpenAIAdapter(BaseLLMAdapter):
         """
         # Connection / transport issues → TransientNetwork
         if APIConnectionError is not None and isinstance(err, APIConnectionError):
-            return TransientNetwork(str(err) or "OpenAI API connection error") from err
+            return TransientNetwork(str(err) or "OpenAI API connection error") 
 
         # Upstream timeout → DeadlineExceeded
         if APITimeoutError is not None and isinstance(err, APITimeoutError):
-            return DeadlineExceeded("OpenAI API request timed out") from err
+            return DeadlineExceeded("OpenAI API request timed out") 
 
         # Rate limiting / quota → ResourceExhausted
         if RateLimitError is not None and isinstance(err, RateLimitError):
@@ -327,15 +327,15 @@ class OpenAIAdapter(BaseLLMAdapter):
                 "OpenAI rate limit exceeded",
                 retry_after_ms=retry_ms,
                 throttle_scope="tenant",
-            ) from err
+            ) 
 
         # AuthN / AuthZ → AuthError
         if AuthenticationError is not None and isinstance(err, AuthenticationError):
-            return AuthError(str(err) or "OpenAI authentication/authorization error") from err
+            return AuthError(str(err) or "OpenAI authentication/authorization error")
 
         # Request shape / params → BadRequest
         if BadRequestError is not None and isinstance(err, BadRequestError):
-            return BadRequest(str(err) or "OpenAI request is invalid") from err
+            return BadRequest(str(err) or "OpenAI request is invalid") 
 
         # HTTP status buckets
         if APIStatusError is not None and isinstance(err, APIStatusError):
@@ -343,35 +343,35 @@ class OpenAIAdapter(BaseLLMAdapter):
 
             # Map a few key ranges explicitly.
             if status == 400:
-                return BadRequest(str(err) or "OpenAI request is invalid") from err
+                return BadRequest(str(err) or "OpenAI request is invalid") 
             if status in (401, 403):
-                return AuthError(str(err) or "OpenAI authentication/authorization error") from err
+                return AuthError(str(err) or "OpenAI authentication/authorization error") 
             if status == 404:
                 # Often "model not found" or similar.
-                return NotSupported(str(err) or "Requested OpenAI resource is not supported") from err
+                return NotSupported(str(err) or "Requested OpenAI resource is not supported") 
             if status == 429:
                 retry_ms = self._extract_retry_after_ms(err)
                 return ResourceExhausted(
                     "OpenAI rate limit exceeded",
                     retry_after_ms=retry_ms,
                     throttle_scope="tenant",
-                ) from err
+                )
             if 500 <= status <= 599:
                 retry_ms = self._extract_retry_after_ms(err)
                 return Unavailable(
                     "OpenAI service is temporarily unavailable",
                     retry_after_ms=retry_ms,
-                ) from err
+                ) 
 
             # Fallback for unexpected status codes.
-            return Unavailable(str(err) or f"OpenAI error (status={status})") from err
+            return Unavailable(str(err) or f"OpenAI error (status={status})") 
 
         # Generic OpenAI error fallback → Unavailable
         if isinstance(err, OpenAIError):
-            return Unavailable(str(err) or "OpenAI API error") from err
+            return Unavailable(str(err) or "OpenAI API error") 
 
         # Anything else → wrap as Unavailable
-        return Unavailable(str(err) or "internal OpenAI adapter error") from err
+        return Unavailable(str(err) or "internal OpenAI adapter error") 
 
     def _get_tokenizer(self, model: str) -> Any:
         """

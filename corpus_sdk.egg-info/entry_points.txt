@@ -1,0 +1,2 @@
+[console_scripts]
+corpus-sdk = corpus_sdk.cli:main

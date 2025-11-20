@@ -1622,7 +1622,7 @@ class BaseLLMAdapter(LLMProtocolV1):
             async for chunk in agen:
                 yield chunk
 
-        return await self._with_gates_stream(
+        return self._with_gates_stream(
             op="stream",
             ctx=ctx,
             agen_factory=agen_factory,

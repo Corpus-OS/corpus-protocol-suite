@@ -548,7 +548,7 @@ PROTOCOLS = list(PROTOCOLS_CONFIG.keys())
 # Environment variable for fully-qualified adapter class:
 #   CORPUS_ADAPTER="package.module:ClassName"
 ADAPTER_ENV = "CORPUS_ADAPTER"
-DEFAULT_ADAPTER = "tests.mocks.mock_llm_adapter:MockLLMAdapter"
+DEFAULT_ADAPTER = "tests.mock.mock_llm_adapter:MockLLMAdapter"
 ENDPOINT_ENV = "CORPUS_ENDPOINT"
 
 # Thread-safe caching with validation
@@ -564,19 +564,19 @@ class AdapterValidationError(RuntimeError):
 
 def _validate_adapter_class(cls: type) -> None:
     """Validate that adapter class meets minimum interface requirements."""
-    required_methods = {'generate', 'embed', 'query'}  # Basic protocol methods
-    
-    for method in required_methods:
-        if not hasattr(cls, method):
-            raise AdapterValidationError(
-                f"Adapter class {cls.__name__} missing required method '{method}'. "
-                f"Minimum interface: {required_methods}"
-            )
+    # Basic validation - just ensure the class is instantiable
+    # Protocol-specific method validation is handled by individual test suites
     
     if not callable(cls):
         raise AdapterValidationError(
             f"Adapter class {cls.__name__} is not callable (missing __init__ or __call__)."
         )
+    
+    # Optional: check if it's a known protocol adapter type
+    # LLM adapters should have complete/stream methods
+    # Vector adapters should have embed/query methods
+    # Graph adapters should have query methods
+    # This is informational only, not enforced
 
 
 def _load_class_from_spec(spec: str) -> type:
