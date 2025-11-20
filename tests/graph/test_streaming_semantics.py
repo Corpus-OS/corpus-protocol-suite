@@ -21,11 +21,6 @@ from corpus_sdk.graph.graph_base import (
 pytestmark = pytest.mark.asyncio
 
 
-def make_ctx(ctx_cls, **kwargs):
-    """Local helper to construct an OperationContext."""
-    return ctx_cls(**kwargs)
-
-
 def clear_time_cache():
     """
     Placeholder to mirror previous API; no caching in this simplified version.
@@ -35,7 +30,7 @@ def clear_time_cache():
 
 async def test_streaming_stream_query_yields_mappings(adapter: BaseGraphAdapter):
     """§7.3.2: stream_query must yield dictionary results."""
-    ctx = make_ctx(GraphContext, request_id="t_stream_rows", tenant="t")
+    ctx = GraphContext(request_id="t_stream_rows", tenant="t")
 
     count = 0
     async for item in adapter.stream_query(
@@ -54,7 +49,7 @@ async def test_streaming_stream_query_yields_mappings(adapter: BaseGraphAdapter)
 
 async def test_streaming_can_be_interrupted_early(adapter: BaseGraphAdapter):
     """§7.3.2: Streams must support early interruption."""
-    ctx = make_ctx(GraphContext, request_id="t_stream_early", tenant="t")
+    ctx = GraphContext(request_id="t_stream_early", tenant="t")
 
     count = 0
     async for _ in adapter.stream_query(
@@ -72,7 +67,7 @@ async def test_streaming_can_be_interrupted_early(adapter: BaseGraphAdapter):
 
 async def test_streaming_releases_resources_on_cancel(adapter: BaseGraphAdapter):
     """§7.3.2: Streams must release resources when cancelled."""
-    ctx = make_ctx(GraphContext, request_id="t_stream_cancel", tenant="t")
+    ctx = GraphContext(request_id="t_stream_cancel", tenant="t")
 
     # Start streaming and consume one item
     stream = adapter.stream_query(
@@ -94,8 +89,7 @@ async def test_streaming_respects_deadline(adapter: BaseGraphAdapter):
     now_ms = int(time.time() * 1000)
 
     # Use a very short deadline to force timeout
-    ctx = make_ctx(
-        GraphContext,
+    ctx = GraphContext(
         request_id="t_stream_deadline",
         tenant="t",
         deadline_ms=now_ms + 10,
@@ -115,7 +109,7 @@ async def test_streaming_respects_deadline(adapter: BaseGraphAdapter):
 
 async def test_streaming_empty_results_handled(adapter: BaseGraphAdapter):
     """§7.3.2: Empty streams should be handled gracefully."""
-    ctx = make_ctx(GraphContext, request_id="t_stream_empty", tenant="t")
+    ctx = GraphContext(request_id="t_stream_empty", tenant="t")
 
     # Test with a query that likely returns no results
     count = 0
@@ -132,7 +126,7 @@ async def test_streaming_empty_results_handled(adapter: BaseGraphAdapter):
 
 async def test_streaming_large_results_handled(adapter: BaseGraphAdapter):
     """§7.3.2: Streams should handle large result sets efficiently."""
-    ctx = make_ctx(GraphContext, request_id="t_stream_large", tenant="t")
+    ctx = GraphContext(request_id="t_stream_large", tenant="t")
 
     # Stream a reasonable number of items to test chunking
     max_items = 20
