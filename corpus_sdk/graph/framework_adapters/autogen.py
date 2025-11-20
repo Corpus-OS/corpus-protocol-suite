@@ -85,7 +85,7 @@ from corpus_sdk.core.context_translation import (
     from_autogen as core_ctx_from_autogen,
 )
 from corpus_sdk.core.error_context import attach_context
-from corpus_sdk.core.sync_stream_bridge import sync_stream
+from corpus_sdk.core.sync_bridge import sync_stream
 from corpus_sdk.graph.graph_base import (
     BadRequest,
     BatchOperation,
