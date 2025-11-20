@@ -158,7 +158,7 @@ At a high level, Corpus Router:
 
 ## Frameworks as Adapters
 
-Frameworks like **LangChain**, **LlamaIndex**, **Semantic Kernel**, **CrewAI**, and **AutoGen** are not just clients of the Router — they can also be **providers** that Router routes *into*.
+Frameworks like **LangChain**, **LlamaIndex**, **Semantic Kernel**, **CrewAI**, and **AutoGen** are not just clients of the Router — they can also be **providers** that Corpus routes *into*.
 
 You can wrap an existing framework as a **Corpus adapter**, so Router treats it like any other backend:
 
