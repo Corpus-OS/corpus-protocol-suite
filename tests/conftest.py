@@ -564,8 +564,8 @@ class AdapterValidationError(RuntimeError):
 
 def _validate_adapter_class(cls: type) -> None:
     """Validate that adapter class meets minimum interface requirements."""
-    # Basic validation - just ensure the class is instantiable
-    # Protocol-specific method validation is handled by individual test suites
+    # REMOVED the restrictive method validation that required all adapters
+    # to have generate, embed, and query methods
     
     if not callable(cls):
         raise AdapterValidationError(
