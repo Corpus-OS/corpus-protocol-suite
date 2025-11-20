@@ -19,11 +19,6 @@ from corpus_sdk.graph.graph_base import (
 pytestmark = pytest.mark.asyncio
 
 
-def make_ctx(ctx_cls, **kwargs):
-    """Local helper to construct an OperationContext."""
-    return ctx_cls(**kwargs)
-
-
 def test_error_handling_retryable_errors_with_hints():
     """
     Validate that AdapterError supports retry_after_ms hints for retryable errors.
@@ -38,8 +33,7 @@ async def test_error_handling_error_includes_operation_field(adapter):
     if getattr(caps, "max_batch_ops", None) is None:
         pytest.skip("Adapter does not declare max_batch_ops; cannot trigger bulk_vertices error")
 
-    ctx = make_ctx(
-        GraphContext,
+    ctx = GraphContext(
         request_id="t_err_opfield",
         tenant="t",
     )
@@ -57,8 +51,7 @@ async def test_error_handling_error_includes_dialect_field(adapter):
     unknown = "__err_dialect__"
     assert unknown not in caps.dialects
 
-    ctx = make_ctx(
-        GraphContext,
+    ctx = GraphContext(
         request_id="t_err_dialect",
         tenant="t",
     )
@@ -68,8 +61,7 @@ async def test_error_handling_error_includes_dialect_field(adapter):
 
 
 async def test_error_handling_bad_request_on_empty_label(adapter):
-    ctx = make_ctx(
-        GraphContext,
+    ctx = GraphContext(
         request_id="t_err_badreq",
         tenant="t",
     )
@@ -82,8 +74,7 @@ async def test_error_handling_not_supported_on_unknown_dialect(adapter):
     unknown = "__sparql_like__"
     assert unknown not in caps.dialects
 
-    ctx = make_ctx(
-        GraphContext,
+    ctx = GraphContext(
         request_id="t_err_notsup",
         tenant="t",
     )
