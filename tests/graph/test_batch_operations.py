@@ -16,9 +16,13 @@ from corpus_sdk.graph.graph_base import (
     GraphID,
     BadRequest,
 )
-from examples.common.ctx import make_ctx
 
 pytestmark = pytest.mark.asyncio
+
+
+def make_ctx(ctx_cls, **kwargs):
+    """Local helper to construct an OperationContext."""
+    return ctx_cls(**kwargs)
 
 
 async def test_batch_ops_bulk_vertices_returns_graph_ids(adapter):
