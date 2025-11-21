@@ -32,10 +32,6 @@ from typing import (
 
 from corpus_sdk.core.context_translation import ContextTranslator
 from corpus_sdk.core.error_context import attach_context
-from corpus_sdk.llm.framework_adapters.common.llm_translation import (
-    DefaultLLMFrameworkTranslator,
-    LLMTranslator,
-)
 from corpus_sdk.llm.framework_adapters.common.message_translation import (
     NormalizedMessage,
     from_llamaindex,
@@ -191,26 +187,48 @@ def _build_operation_context_from_callbacks(
     *,
     adapter: "CorpusLlamaIndexLLM",
     kwargs: Mapping[str, Any],
-) -> Optional[OperationContext]:
+) -> OperationContext:
     """
-    Build an OperationContext using the LlamaIndex callback manager.
+    Build an OperationContext using the LlamaIndex callback manager, mirroring
+    the context-translation pattern used in other adapters.
 
-    Prefer the `callback_manager` passed in kwargs; otherwise fall back
-    to the adapter's own callback manager attribute, if present.
+    We:
+      - Prefer an explicit `callback_manager` in kwargs.
+      - Fall back to `adapter.callback_manager` if present.
+      - Delegate to `ContextTranslator.from_llamaindex_callback_manager`.
+      - Always return an OperationContext (never None) with a safe fallback.
     """
     cbm: Optional[Any] = kwargs.get("callback_manager", None)
     if cbm is None:
         cbm = getattr(adapter, "callback_manager", None)
 
+    ctx: Optional[OperationContext] = None
     try:
-        return ContextTranslator.from_llamaindex_callback_manager(cbm)
+        # Pass framework_version analogously to other adapters (autogen/langchain)
+        ctx = ContextTranslator.from_llamaindex_callback_manager(
+            cbm,
+            framework_version=getattr(adapter, "framework_version", None),
+        )
     except Exception as exc:  # noqa: BLE001
         logger.debug(
             "ContextTranslator.from_llamaindex_callback_manager failed: %s",
             exc,
             extra={"framework": "llamaindex"},
         )
-        return None
+        ctx = None
+
+    if isinstance(ctx, OperationContext):
+        return ctx
+
+    # Fallback: an empty, but valid, OperationContext
+    return OperationContext(
+        request_id=None,
+        idempotency_key=None,
+        deadline_ms=None,
+        traceparent=None,
+        tenant=None,
+        attrs={},
+    )
 
 
 def _sampling_params_from_kwargs(
@@ -220,7 +238,7 @@ def _sampling_params_from_kwargs(
     kwargs: Mapping[str, Any],
 ) -> Dict[str, Any]:
     """
-    Map LlamaIndex sampling kwargs into Corpus/translator params.
+    Map LlamaIndex sampling kwargs into Corpus params.
     """
     # Validate temperature if provided
     temperature = kwargs.get("temperature", adapter.temperature)
@@ -236,7 +254,7 @@ def _sampling_params_from_kwargs(
         "presence_penalty": kwargs.get("presence_penalty"),
         "stop_sequences": stop_sequences,
     }
-    # Strip None values so the translator sees a clean param set.
+    # Strip None values so the translator/adapter sees a clean param set.
     return {k: v for k, v in params.items() if v is not None}
 
 
@@ -323,6 +341,91 @@ def _build_chat_response_from_chunk(chunk: LLMChunk) -> ChatResponse:
 
 
 # ---------------------------------------------------------------------------
+# Local LLM translator (mini abstraction over LLMProtocolV1)
+# --------------------------------------------------------------------------- #
+
+
+class _LocalLLMTranslator:
+    """
+    Minimal translator for framework adapters.
+
+    This is a local, LlamaIndex-specific equivalent of the shared translator
+    pattern used in other adapters. It centralizes calls into `LLMProtocolV1`
+    and exposes a stable interface:
+
+        - arun_complete
+        - complete
+        - arun_stream
+        - stream
+
+    so the adapter logic can remain focused on framework-specific shaping
+    (LlamaIndex messages in, ChatResponse/ChatResponseGen out).
+    """
+
+    def __init__(self, adapter: LLMProtocolV1, framework: str = "llamaindex") -> None:
+        self._adapter = adapter
+        self._framework = framework  # reserved for future use (metrics, logging, etc.)
+
+    async def arun_complete(
+        self,
+        *,
+        messages: List[Dict[str, Any]],
+        op_ctx: OperationContext,
+        params: Dict[str, Any],
+    ) -> LLMCompletion:
+        """Async completion routed directly to the underlying LLMProtocolV1."""
+        return await self._adapter.acomplete(
+            messages=messages,
+            ctx=op_ctx,
+            **params,
+        )
+
+    def complete(
+        self,
+        *,
+        messages: List[Dict[str, Any]],
+        op_ctx: OperationContext,
+        params: Dict[str, Any],
+    ) -> LLMCompletion:
+        """Sync completion routed directly to the underlying LLMProtocolV1."""
+        return self._adapter.complete(
+            messages=messages,
+            ctx=op_ctx,
+            **params,
+        )
+
+    async def arun_stream(
+        self,
+        *,
+        messages: List[Dict[str, Any]],
+        op_ctx: OperationContext,
+        params: Dict[str, Any],
+    ) -> AsyncIterator[LLMChunk]:
+        """Async streaming routed directly to the underlying LLMProtocolV1."""
+        async for chunk in self._adapter.astream(
+            messages=messages,
+            ctx=op_ctx,
+            **params,
+        ):
+            yield chunk
+
+    def stream(
+        self,
+        *,
+        messages: List[Dict[str, Any]],
+        op_ctx: OperationContext,
+        params: Dict[str, Any],
+    ) -> Iterator[LLMChunk]:
+        """Sync streaming routed directly to the underlying LLMProtocolV1."""
+        for chunk in self._adapter.stream(
+            messages=messages,
+            ctx=op_ctx,
+            **params,
+        ):
+            yield chunk
+
+
+# ---------------------------------------------------------------------------
 # Main adapter
 # ---------------------------------------------------------------------------
 
@@ -336,8 +439,8 @@ class CorpusLlamaIndexLLM(LLM):  # type: ignore[misc]
     - Messages are normalized via `message_translation.from_llamaindex`.
     - Context is derived from LlamaIndex's callback manager via
       `ContextTranslator.from_llamaindex_callback_manager`.
-    - All policy / resilience and async→sync bridging lives in
-      `LLMTranslator` and the underlying `LLMProtocolV1`, not here.
+    - All protocol calls and streaming orchestration are centralized in a
+      local translator and the underlying `LLMProtocolV1`, not here.
 
     Usage:
         llm = CorpusLlamaIndexLLM(
@@ -356,33 +459,25 @@ class CorpusLlamaIndexLLM(LLM):  # type: ignore[misc]
     temperature: float = 0.7
     max_tokens: Optional[int] = None
 
+    # Optional framework version for observability / context translation
+    framework_version: Optional[str] = None
+
     # Pydantic / LlamaIndex config
     model_config = {"arbitrary_types_allowed": True}
 
-    class _LlamaIndexLLMFrameworkTranslator(DefaultLLMFrameworkTranslator):
-        """
-        LlamaIndex-specific framework translator.
-
-        Currently just inherits the default behavior (pass-through of
-        protocol-level results), but exists as a dedicated hook for
-        LlamaIndex-specific customizations in the future.
-        """
-
-        pass
-
     def __init__(self, **data: Any) -> None:
         _ensure_llamaindex_installed()
-        
+
         # Validate critical parameters if provided
-        if 'llm_adapter' in data and not isinstance(data['llm_adapter'], LLMProtocolV1):
+        if "llm_adapter" in data and not isinstance(data["llm_adapter"], LLMProtocolV1):
             raise TypeError("llm_adapter must implement LLMProtocolV1")
-        
-        if 'temperature' in data and not 0 <= data['temperature'] <= 2:
+
+        if "temperature" in data and not 0 <= data["temperature"] <= 2:
             raise ValueError("temperature must be between 0 and 2")
-            
-        if 'max_tokens' in data and data['max_tokens'] is not None and data['max_tokens'] < 1:
+
+        if "max_tokens" in data and data["max_tokens"] is not None and data["max_tokens"] < 1:
             raise ValueError("max_tokens must be positive")
-        
+
         super().__init__(**data)
 
     # ------------------------------------------------------------------ #
@@ -390,18 +485,16 @@ class CorpusLlamaIndexLLM(LLM):  # type: ignore[misc]
     # ------------------------------------------------------------------ #
 
     @cached_property
-    def _translator(self) -> LLMTranslator:
+    def _translator(self) -> _LocalLLMTranslator:
         """
-        Lazily construct and cache the `LLMTranslator`.
+        Lazily construct and cache the local translator.
 
         All orchestration, including any async→sync bridging needed by the
-        underlying protocol implementation, is centralized in `LLMTranslator`.
+        underlying protocol implementation, is centralized here.
         """
-        framework_translator = self._LlamaIndexLLMFrameworkTranslator()
-        return LLMTranslator(
+        return _LocalLLMTranslator(
             adapter=self.llm_adapter,
             framework="llamaindex",
-            translator=framework_translator,
         )
 
     # ------------------------------------------------------------------ #
@@ -416,7 +509,7 @@ class CorpusLlamaIndexLLM(LLM):  # type: ignore[misc]
         stream: bool,
         messages_count: int,
         model: str,
-        ctx: Optional[OperationContext],
+        ctx: OperationContext,
         params: Dict[str, Any],
     ):
         """
@@ -436,8 +529,8 @@ class CorpusLlamaIndexLLM(LLM):  # type: ignore[misc]
                 top_p=params.get("top_p"),
                 frequency_penalty=params.get("frequency_penalty"),
                 presence_penalty=params.get("presence_penalty"),
-                request_id=getattr(ctx, "request_id", None) if ctx is not None else None,
-                tenant=getattr(ctx, "tenant", None) if ctx is not None else None,
+                request_id=ctx.request_id,
+                tenant=ctx.tenant,
                 stream=stream,
             )
             raise
@@ -450,7 +543,7 @@ class CorpusLlamaIndexLLM(LLM):  # type: ignore[misc]
         stream: bool,
         messages_count: int,
         model: str,
-        ctx: Optional[OperationContext],
+        ctx: OperationContext,
         params: Dict[str, Any],
     ):
         """
@@ -470,8 +563,8 @@ class CorpusLlamaIndexLLM(LLM):  # type: ignore[misc]
                 top_p=params.get("top_p"),
                 frequency_penalty=params.get("frequency_penalty"),
                 presence_penalty=params.get("presence_penalty"),
-                request_id=getattr(ctx, "request_id", None) if ctx is not None else None,
-                tenant=getattr(ctx, "tenant", None) if ctx is not None else None,
+                request_id=ctx.request_id,
+                tenant=ctx.tenant,
                 stream=stream,
             )
             raise
@@ -547,8 +640,8 @@ class CorpusLlamaIndexLLM(LLM):  # type: ignore[misc]
         """
         Async streaming chat entrypoint required by LlamaIndex.
 
-        Uses `LLMTranslator.arun_stream` and yields ChatResponse objects
-        incrementally as chunks arrive.
+        Uses the local translator's async streaming and yields ChatResponse
+        objects incrementally as chunks arrive.
 
         Parameters
         ----------
@@ -599,7 +692,7 @@ class CorpusLlamaIndexLLM(LLM):  # type: ignore[misc]
             return _gen()
 
     # ------------------------------------------------------------------ #
-    # Sync chat API (translator does async→sync bridging)
+    # Sync chat API
     # ------------------------------------------------------------------ #
 
     def chat(
@@ -610,7 +703,7 @@ class CorpusLlamaIndexLLM(LLM):  # type: ignore[misc]
         """
         Sync chat.
 
-        Uses the synchronous `LLMTranslator.complete` path.
+        Uses the synchronous translator.complete path.
 
         Parameters
         ----------
@@ -671,9 +764,7 @@ class CorpusLlamaIndexLLM(LLM):  # type: ignore[misc]
         """
         Sync streaming chat.
 
-        Uses the synchronous `LLMTranslator.stream` path, which is
-        responsible for any async→sync bridging required by the
-        underlying protocol implementation.
+        Uses the synchronous translator.stream path.
 
         Parameters
         ----------
@@ -736,7 +827,7 @@ class CorpusLlamaIndexLLM(LLM):  # type: ignore[misc]
         Token counting helper.
 
         Strategy:
-        1. Try translator's count_tokens (handles async bridging)
+        1. Try translator's count_tokens (if implemented)
         2. Try protocol adapter's count_tokens
         3. Fall back to improved character-based estimate
 
@@ -753,8 +844,8 @@ class CorpusLlamaIndexLLM(LLM):  # type: ignore[misc]
         Note
         ----
         The fallback heuristic is intentionally simple: callers who need
-        precise accounting should rely on the adapter's or translator's
-        own `count_tokens` implementation.
+        precise accounting should rely on the adapter's own `count_tokens`
+        implementation if available.
         """
         if not messages:
             return 0
@@ -765,7 +856,7 @@ class CorpusLlamaIndexLLM(LLM):  # type: ignore[misc]
 
         translator = self._translator
 
-        # 1. Try translator-level counting (handles async bridging)
+        # 1. Try translator-level counting (if present)
         if hasattr(translator, "count_tokens"):
             try:
                 tokens = translator.count_tokens(
@@ -811,20 +902,19 @@ class CorpusLlamaIndexLLM(LLM):  # type: ignore[misc]
     def _estimate_tokens_from_messages(self, messages: Sequence[ChatMessage]) -> int:
         """Improved token estimation with better heuristics."""
         combined_text = self._combine_messages_for_counting(messages)
-        
+
         if not combined_text:
             return 0
-            
-        # More sophisticated estimation: 
-        # - 4 chars per token for English text
+
+        # More sophisticated estimation:
+        # - ~4 chars per token for English text
         # - Minimum 1 token per message
         char_count = len(combined_text)
         message_count = len(messages)
-        
-        # Balance between character-based and message-based estimation
+
         char_based = max(1, char_count // 4)
         message_based = max(1, message_count)
-        
+
         return max(char_based, message_based)
 
 
