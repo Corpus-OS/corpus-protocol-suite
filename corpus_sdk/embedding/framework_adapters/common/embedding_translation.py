@@ -102,7 +102,7 @@ from corpus_sdk.embedding.embedding_base import (
 )
 
 from corpus_sdk.core.context_translation import from_dict as ctx_from_dict
-from corpus_sdk.core.sync_stream_bridge import SyncStreamBridge
+from corpus_sdk.core.sync_bridge import SyncStreamBridge
 from corpus_sdk.core.async_bridge import AsyncBridge
 from corpus_sdk.llm.framework_adapters.common.error_context import attach_context
 
