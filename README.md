@@ -18,11 +18,11 @@ Designed to compose cleanly under any external control plane (router, scheduler,
 
 ## The Vision: Protocol-First Unification
 
+**What if you could treat AI infrastructure like web infrastructure?**
+
 - **HTTP** → Universal web protocol
 - **TCP/IP** → Universal network protocol  
 - **Corpus Protocol** → Universal AI infrastructure protocol
-
-**CORPUS Protocol implements this vision** - it's the intelligent control plane that speaks the universal Corpus Protocol across all AI domains.
 
 > **Open-Core Model**
 >
