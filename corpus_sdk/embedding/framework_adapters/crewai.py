@@ -41,6 +41,7 @@ from corpus_sdk.core.context_translation import (
 from corpus_sdk.core.error_context import attach_context
 from corpus_sdk.embedding.embedding_base import (
     EmbeddingProtocolV1,
+    OperationContext,
 )
 from corpus_sdk.embedding.framework_adapters.common.embedding_translation import (
     EmbeddingTranslator,
@@ -209,25 +210,27 @@ class CorpusCrewAIEmbeddings:
         crewai_context: Optional[Mapping[str, Any]] = None,
         model: Optional[str] = None,
         **kwargs: Any,
-    ) -> Tuple[Any, Dict[str, Any], Dict[str, Any]]:
+    ) -> Tuple[OperationContext, Dict[str, Any], Dict[str, Any]]:
         """
         Build contexts for CrewAI execution environment.
         """
         # Convert CrewAI context to core OperationContext
-        core_ctx = context_from_crewai(crewai_context)
+        core_ctx: OperationContext = context_from_crewai(c
+
+rewai_context)
 
         # Normalized dict for embedding OperationContext
         op_ctx_dict: Dict[str, Any] = {}
-        if hasattr(core_ctx, 'to_dict'):
+        if hasattr(core_ctx, "to_dict"):
             op_ctx_dict = core_ctx.to_dict()
-        elif hasattr(core_ctx, '__dict__'):
+        elif hasattr(core_ctx, "__dict__"):
             op_ctx_dict = core_ctx.__dict__
 
         # Framework-level context for CrewAI-specific hints
         framework_ctx: Dict[str, Any] = {
             "framework": "crewai",
         }
-        
+
         effective_model = model or self.model
         if effective_model:
             framework_ctx["model"] = effective_model
@@ -244,16 +247,22 @@ class CorpusCrewAIEmbeddings:
     def _coerce_embedding_matrix(self, result: Any) -> List[List[float]]:
         """
         Coerce translator result into embedding matrix.
+
+        Supports:
+        - {"embeddings": [[...], [...]], "model": "...", "usage": {...}}
+        - Direct matrix: [[...], [...]]
+        - EmbedResult-like with `.embeddings` attribute
+
+        Implemented without `match`/`case` so this module works on Python 3.9+.
         """
         embeddings_obj: Any
 
-        match result:
-            case {"embeddings": emb}:
-                embeddings_obj = emb
-            case _ if hasattr(result, "embeddings"):
-                embeddings_obj = getattr(result, "embeddings")
-            case _:
-                embeddings_obj = result
+        if isinstance(result, Mapping) and "embeddings" in result:
+            embeddings_obj = result["embeddings"]
+        elif hasattr(result, "embeddings"):
+            embeddings_obj = getattr(result, "embeddings")
+        else:
+            embeddings_obj = result
 
         if not isinstance(embeddings_obj, Sequence):
             raise TypeError(
@@ -317,6 +326,19 @@ class CorpusCrewAIEmbeddings:
 
         Used by CrewAI agents during RAG operations and knowledge processing.
         """
+        # Soft warning for very large batches when no batch_config is provided.
+        if isinstance(texts, Sequence) and not isinstance(texts, (str, bytes)):
+            batch_size = len(texts)
+            if (
+                batch_size > 10_000
+                and (self.batch_config is None or getattr(self.batch_config, "max_batch_size", None) is None)
+            ):
+                logger.warning(
+                    "embed_documents called with batch_size=%d and no batch_config.max_batch_size; "
+                    "ensure your adapter/translator can safely handle large batches.",
+                    batch_size,
+                )
+
         _, op_ctx_dict, framework_ctx = self._build_contexts(
             crewai_context=crewai_context,
             model=model,
@@ -373,6 +395,19 @@ class CorpusCrewAIEmbeddings:
         """
         Async embedding for multiple documents.
         """
+        # Soft warning for very large batches when no batch_config is provided.
+        if isinstance(texts, Sequence) and not isinstance(texts, (str, bytes)):
+            batch_size = len(texts)
+            if (
+                batch_size > 10_000
+                and (self.batch_config is None or getattr(self.batch_config, "max_batch_size", None) is None)
+            ):
+                logger.warning(
+                    "aembed_documents called with batch_size=%d and no batch_config.max_batch_size; "
+                    "ensure your adapter/translator can safely handle large batches.",
+                    batch_size,
+                )
+
         _, op_ctx_dict, framework_ctx = self._build_contexts(
             crewai_context=crewai_context,
             model=model,
@@ -458,7 +493,7 @@ def create_embedder(
 
 __all__ = [
     "CorpusCrewAIEmbeddings",
-    "CrewAIEmbedder", 
+    "CrewAIEmbedder",
     "create_embedder",
     "ErrorCodes",
 ]
