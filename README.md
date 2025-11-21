@@ -16,6 +16,16 @@ Unlike in-process-only frameworks, CORPUS defines **stable wire-level contracts*
 
 Designed to compose cleanly under any external control plane (router, scheduler, rate limiter) while remaining usable in a lightweight **standalone** mode.
 
+## The Vision: Protocol-First Unification
+
+**What if you could treat AI infrastructure like web infrastructure?**
+
+- **HTTP** → Universal web protocol
+- **TCP/IP** → Universal network protocol  
+- **Corpus Protocol** → Universal AI infrastructure protocol
+
+**Corpus Router implements this vision** - it's the intelligent control plane that speaks the universal Corpus Protocol across all AI domains.
+
 > **Open-Core Model**
 >
 > - The **CORPUS Protocol Suite** and this **CORPUS SDK** are **fully open source** (Apache-2.0).
