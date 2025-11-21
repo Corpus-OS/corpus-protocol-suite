@@ -30,11 +30,9 @@ from typing import (
     Optional,
     Sequence,
     Tuple,
-    Union,
     Protocol,
     TypeVar,
     Callable,
-    cast,
 )
 
 from corpus_sdk.core.context_translation import (
@@ -234,11 +232,12 @@ class CorpusAutoGenEmbeddings:
         autogen_context: Optional[Mapping[str, Any]] = None,
         model: Optional[str] = None,
         **kwargs: Any,
-    ) -> Tuple[OperationContext, Dict[str, Any], Dict[str, Any]]:
+    ) -> Tuple[Optional[OperationContext], Dict[str, Any], Dict[str, Any]]:
         """
         Build contexts for AutoGen execution environment.
 
-        Uses the existing `context_from_autogen` implementation.
+        Uses the existing `context_from_autogen` implementation with
+        defensive validation to ensure OperationContext compatibility.
 
         Parameters
         ----------
@@ -249,24 +248,46 @@ class CorpusAutoGenEmbeddings:
         Returns
         -------
         Tuple of:
-        - `core_ctx`: core OperationContext (from existing context translation)
+        - `core_ctx`: core OperationContext or None if no context provided
         - `op_ctx_dict`: normalized dict for embedding layer
         - `framework_ctx`: AutoGen-specific context for translator
         """
-        # Use existing context translation implementation
-        core_ctx: OperationContext = context_from_autogen(autogen_context)
-
-        # Normalized dict for embedding OperationContext reconstruction
+        core_ctx: Optional[OperationContext] = None
         op_ctx_dict: Dict[str, Any] = {}
-        if hasattr(core_ctx, "to_dict"):
-            op_ctx_dict = core_ctx.to_dict()
-        elif hasattr(core_ctx, "__dict__"):
-            op_ctx_dict = core_ctx.__dict__
+        framework_ctx: Dict[str, Any] = {"framework": "autogen"}
 
-        # Framework-level context for AutoGen-specific hints
-        framework_ctx: Dict[str, Any] = {
-            "framework": "autogen",
-        }
+        # Handle AutoGen context with defensive validation
+        if autogen_context is not None:
+            try:
+                core_ctx = context_from_autogen(autogen_context)
+                if not isinstance(core_ctx, OperationContext):
+                    logger.warning(
+                        "context_from_autogen returned non-OperationContext type: %s. "
+                        "Using empty context.",
+                        type(core_ctx).__name__
+                    )
+                    core_ctx = None
+            except Exception as e:
+                logger.warning(
+                    "Failed to create OperationContext from autogen_context: %s. "
+                    "Using empty context.",
+                    e
+                )
+                core_ctx = None
+
+        # Build normalized dict for embedding OperationContext
+        # Prefer using core_ctx directly if available, fall back to dict representation
+        if core_ctx is not None:
+            # Use the actual OperationContext for maximum context fidelity
+            op_ctx_dict = {"_operation_context": core_ctx}
+            # Also include dict representation for backwards compatibility
+            if hasattr(core_ctx, "to_dict"):
+                op_ctx_dict.update(core_ctx.to_dict())
+            elif hasattr(core_ctx, "__dict__"):
+                op_ctx_dict.update(core_ctx.__dict__)
+        else:
+            # Ensure we always have at least an empty dict for the translator
+            op_ctx_dict = {}
 
         # Add model information if available
         effective_model = model or self.model
@@ -313,25 +334,22 @@ class CorpusAutoGenEmbeddings:
 
         if not isinstance(embeddings_obj, Sequence):
             raise TypeError(
-                f"Translator result does not contain a valid embeddings sequence: "
-                f"type={type(embeddings_obj).__name__}",
-                code=ErrorCodes.INVALID_EMBEDDING_RESULT,
+                f"[{ErrorCodes.INVALID_EMBEDDING_RESULT}] Translator result does not contain a valid embeddings sequence: "
+                f"type={type(embeddings_obj).__name__}"
             )
 
         matrix: List[List[float]] = []
         for i, row in enumerate(embeddings_obj):
             if not isinstance(row, Sequence):
                 raise TypeError(
-                    f"Expected each embedding row to be a sequence, "
-                    f"got {type(row).__name__} at index {i}",
-                    code=ErrorCodes.INVALID_EMBEDDING_RESULT,
+                    f"[{ErrorCodes.INVALID_EMBEDDING_RESULT}] Expected each embedding row to be a sequence, "
+                    f"got {type(row).__name__} at index {i}"
                 )
             try:
                 matrix.append([float(x) for x in row])
             except (TypeError, ValueError) as e:
                 raise TypeError(
-                    f"Failed to convert embedding values to float at row {i}: {e}",
-                    code=ErrorCodes.EMBEDDING_CONVERSION_ERROR,
+                    f"[{ErrorCodes.EMBEDDING_CONVERSION_ERROR}] Failed to convert embedding values to float at row {i}: {e}"
                 ) from e
 
         return matrix
@@ -346,8 +364,7 @@ class CorpusAutoGenEmbeddings:
 
         if not matrix:
             raise ValueError(
-                "Translator returned no embeddings for single-text input",
-                code=ErrorCodes.EMPTY_EMBEDDING_RESULT,
+                f"[{ErrorCodes.EMPTY_EMBEDDING_RESULT}] Translator returned no embeddings for single-text input"
             )
 
         if len(matrix) > 1:
@@ -431,6 +448,10 @@ class CorpusAutoGenEmbeddings:
             **kwargs,
         )
 
+        # Pass the rich OperationContext through the framework context for maximum fidelity
+        if core_ctx is not None:
+            framework_ctx["_operation_context"] = core_ctx
+
         translated = self._translator.embed(
             raw_texts=texts,
             op_ctx=op_ctx_dict,
@@ -467,6 +488,10 @@ class CorpusAutoGenEmbeddings:
             model=model,
             **kwargs,
         )
+
+        # Pass the rich OperationContext through the framework context for maximum fidelity
+        if core_ctx is not None:
+            framework_ctx["_operation_context"] = core_ctx
 
         translated = self._translator.embed(
             raw_texts=text,
@@ -522,6 +547,10 @@ class CorpusAutoGenEmbeddings:
             **kwargs,
         )
 
+        # Pass the rich OperationContext through the framework context for maximum fidelity
+        if core_ctx is not None:
+            framework_ctx["_operation_context"] = core_ctx
+
         translated = await self._translator.arun_embed(
             raw_texts=texts,
             op_ctx=op_ctx_dict,
@@ -558,6 +587,10 @@ class CorpusAutoGenEmbeddings:
             model=model,
             **kwargs,
         )
+
+        # Pass the rich OperationContext through the framework context for maximum fidelity
+        if core_ctx is not None:
+            framework_ctx["_operation_context"] = core_ctx
 
         translated = await self._translator.arun_embed(
             raw_texts=text,
