@@ -100,7 +100,7 @@ Modern AI platforms juggle multiple LLM, embedding, vector, and graph backends. 
 - **SIEM-safe metrics** (low-cardinality; tenant hashed)  
 - **Deadline propagation** for cancellation & cost control  
 - **Two modes**: compose under your own router (**thin**) or use lightweight infra (**standalone**)  
-- A **wire-first protocol** that can be implemented by any language/runtime, with this SDK as the reference impl  
+- A **wire-first protocol** that can be implemented by any language/runtime, with this SDK as the reference implementation  
 
 ### Keep Your Frameworks, Standardize Your Infra
 
