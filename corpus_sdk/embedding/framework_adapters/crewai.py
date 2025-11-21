@@ -21,12 +21,24 @@ protocol-first Corpus embedding stack.
 from __future__ import annotations
 
 import logging
-from functools import cached_property
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union, Protocol
+from functools import cached_property, wraps
+from typing import (
+    Any,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Protocol,
+    TypeVar,
+    Callable,
+)
 
 from corpus_sdk.core.context_translation import (
     from_crewai as context_from_crewai,
 )
+from corpus_sdk.core.error_context import attach_context
 from corpus_sdk.embedding.embedding_base import (
     EmbeddingProtocolV1,
 )
@@ -36,18 +48,75 @@ from corpus_sdk.embedding.framework_adapters.common.embedding_translation import
     TextNormalizationConfig,
     create_embedding_translator,
 )
-from corpus_sdk.llm.framework_adapters.common.error_context import attach_context
 
 logger = logging.getLogger(__name__)
 
+# Type variables for decorators
+T = TypeVar("T")
 
-class CrewAIEmbedderProtocol(Protocol):
+# Error code constants
+class ErrorCodes:
+    INVALID_EMBEDDING_RESULT = "INVALID_EMBEDDING_RESULT"
+    EMPTY_EMBEDDING_RESULT = "EMPTY_EMBEDDING_RESULT"
+    EMBEDDING_CONVERSION_ERROR = "EMBEDDING_CONVERSION_ERROR"
+
+
+def with_embedding_error_context(
+    operation: str,
+    **context_kwargs: Any,
+) -> Callable[[Callable[..., T]], Callable[..., T]]:
     """
-    Protocol representing the minimal embedder interface expected by CrewAI.
+    Decorator to automatically attach error context to embedding exceptions.
+    """
+    def decorator(func: Callable[..., T]) -> Callable[..., T]:
+        @wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> T:
+            try:
+                return func(*args, **kwargs)
+            except Exception as exc:
+                enhanced_context = context_kwargs.copy()
+                attach_context(
+                    exc,
+                    framework="crewai",
+                    operation=f"embedding_{operation}",
+                    **enhanced_context,
+                )
+                raise
+        return wrapper
+    return decorator
 
-    This structural protocol allows `create_crewai_embedder` to declare a
-    stable return type without requiring a hard dependency on CrewAI's
-    concrete types at type-check time.
+
+def with_async_embedding_error_context(
+    operation: str,
+    **context_kwargs: Any,
+) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    """
+    Decorator to automatically attach error context to async embedding exceptions.
+    """
+    def decorator(func: Callable[..., T]) -> Callable[..., T]:
+        @wraps(func)
+        async def wrapper(*args: Any, **kwargs: Any) -> T:
+            try:
+                return await func(*args, **kwargs)
+            except Exception as exc:
+                enhanced_context = context_kwargs.copy()
+                attach_context(
+                    exc,
+                    framework="crewai",
+                    operation=f"embedding_{operation}",
+                    **enhanced_context,
+                )
+                raise
+        return wrapper
+    return decorator
+
+
+class CrewAIEmbedder(Protocol):
+    """
+    Protocol representing the embedder interface expected by CrewAI agents.
+
+    This allows type-safe integration with CrewAI's agent embedder system
+    without requiring a hard dependency on CrewAI at type-check time.
     """
 
     def embed_documents(
@@ -58,9 +127,7 @@ class CrewAIEmbedderProtocol(Protocol):
         model: Optional[str] = None,
         **kwargs: Any,
     ) -> List[List[float]]:
-        """
-        Embed multiple documents for CrewAI RAG and knowledge workflows.
-        """
+        """Embed multiple documents for CrewAI RAG workflows."""
         ...
 
     def embed_query(
@@ -71,9 +138,7 @@ class CrewAIEmbedderProtocol(Protocol):
         model: Optional[str] = None,
         **kwargs: Any,
     ) -> List[float]:
-        """
-        Embed a single query for CrewAI retrieval and decision-making.
-        """
+        """Embed a single query for CrewAI retrieval."""
         ...
 
 
@@ -81,44 +146,30 @@ class CorpusCrewAIEmbeddings:
     """
     CrewAI embedding service backed by a Corpus `EmbeddingProtocolV1` adapter.
 
-    Responsibilities (this layer)
-    -----------------------------
-    - Provide embeddings for CrewAI agents via `embed_documents` and `embed_query`
-    - Integrate with CrewAI agent `embedder` attribute and knowledge sources
-    - Derive `OperationContext` from CrewAI execution context
-    - Build framework_ctx for model selection and CrewAI-specific hints
-    - Use `EmbeddingTranslator` for core embedding logic
-    - Handle sync/async execution patterns compatible with CrewAI flows
-    - Attach structured error context for CrewAI workflows
+    This class implements the CrewAI embedder interface and can be directly
+    assigned to CrewAI agents via the `embedder` attribute.
 
-    Non-responsibilities
-    --------------------
-    - Text normalization, batching logic, token-aware batching
-    - Provider-specific behavior (rate limits, retries, etc.)
+    Example:
+    ```python
+    from crewai import Agent
+    from corpus_sdk.embedding.framework_adapters.crewai import create_embedder
 
-    All of those live in:
-    - `corpus_sdk.embedding.framework_adapters.common.embedding_translation`
-    - Concrete `EmbeddingProtocolV1` adapter implementations.
+    embedder = create_embedder(corpus_adapter=my_adapter)
+    agent = Agent(
+        role="Researcher",
+        goal="Research AI developments",
+        backstory="Expert analyst",
+        embedder=embedder  # Direct assignment
+    )
+    ```
 
     Attributes
     ----------
-    corpus_adapter:
-        Underlying Corpus embedding adapter implementing `EmbeddingProtocolV1`.
-
-    model:
-        Optional default model identifier. Can be overridden via CrewAI
-        agent configuration or execution context.
-
-    batch_config:
-        Optional `BatchConfig` to control batching behavior.
-
-    text_normalization_config:
-        Optional `TextNormalizationConfig` to control whitespace cleanup,
-        truncation, casing, encoding, etc.
-
-    crewai_config:
-        Optional CrewAI-specific configuration for agent context and
-        knowledge source integration.
+    corpus_adapter: Underlying Corpus embedding protocol adapter
+    model: Optional default model identifier
+    batch_config: Optional batching configuration
+    text_normalization_config: Optional text normalization settings
+    crewai_config: Optional CrewAI-specific configuration
     """
 
     def __init__(
@@ -143,13 +194,11 @@ class CorpusCrewAIEmbeddings:
     def _translator(self) -> EmbeddingTranslator:
         """
         Lazily construct and cache the `EmbeddingTranslator`.
-
-        Uses `cached_property` for thread safety and performance.
         """
         return create_embedding_translator(
             adapter=self.corpus_adapter,
             framework="crewai",
-            translator=None,  # use registry/default generic translator
+            translator=None,
             batch_config=self.batch_config,
             text_normalization_config=self.text_normalization_config,
         )
@@ -163,59 +212,38 @@ class CorpusCrewAIEmbeddings:
     ) -> Tuple[Any, Dict[str, Any], Dict[str, Any]]:
         """
         Build contexts for CrewAI execution environment.
-
-        Parameters
-        ----------
-        crewai_context:
-            Optional CrewAI execution context containing agent info,
-            task details, and workflow metadata.
-        model:
-            Optional per-call model override.
-        **kwargs:
-            Additional framework-level hints to be passed through to the
-            translator as part of `framework_ctx`.
-
-        Returns
-        -------
-        Tuple of:
-        - `core_ctx`: core OperationContext (from context_translation)
-        - `op_ctx_dict`: normalized dict for embedding layer
-        - `framework_ctx`: CrewAI-specific context for translator
         """
         # Convert CrewAI context to core OperationContext
         core_ctx = context_from_crewai(crewai_context)
 
-        # Normalized dict for embedding OperationContext reconstruction
-        op_ctx_dict: Dict[str, Any] = core_ctx.to_dict()
+        # Normalized dict for embedding OperationContext
+        op_ctx_dict: Dict[str, Any] = {}
+        if hasattr(core_ctx, 'to_dict'):
+            op_ctx_dict = core_ctx.to_dict()
+        elif hasattr(core_ctx, '__dict__'):
+            op_ctx_dict = core_ctx.__dict__
 
         # Framework-level context for CrewAI-specific hints
         framework_ctx: Dict[str, Any] = {
             "framework": "crewai",
         }
+        
         effective_model = model or self.model
         if effective_model:
             framework_ctx["model"] = effective_model
 
-        # Add CrewAI-specific context for knowledge sources and agent roles
+        # Add CrewAI-specific context
         if crewai_context:
-            framework_ctx["crewai_agent_role"] = crewai_context.get("agent_role")
-            framework_ctx["crewai_task_id"] = crewai_context.get("task_id")
-            framework_ctx["crewai_workflow"] = crewai_context.get("workflow")
+            framework_ctx["agent_role"] = crewai_context.get("agent_role")
+            framework_ctx["task_id"] = crewai_context.get("task_id")
+            framework_ctx["workflow"] = crewai_context.get("workflow")
 
-        # Add any additional framework-level hints
         framework_ctx.update(kwargs)
-
         return core_ctx, op_ctx_dict, framework_ctx
 
-    @staticmethod
-    def _coerce_embedding_matrix(result: Any) -> List[List[float]]:
+    def _coerce_embedding_matrix(self, result: Any) -> List[List[float]]:
         """
-        Coerce translator result into a List[List[float]] embedding matrix.
-
-        Supports the same result formats as the LangChain adapter:
-        - {"embeddings": [[...], [...]], "model": "...", "usage": {...}}
-        - Direct matrix: [[...], [...]]
-        - EmbedResult-like with `.embeddings` attribute
+        Coerce translator result into embedding matrix.
         """
         embeddings_obj: Any
 
@@ -229,42 +257,43 @@ class CorpusCrewAIEmbeddings:
 
         if not isinstance(embeddings_obj, Sequence):
             raise TypeError(
-                f"Translator result does not contain a valid embeddings sequence: "
-                f"type={type(embeddings_obj).__name__}"
+                f"Translator result does not contain valid embeddings sequence: "
+                f"type={type(embeddings_obj).__name__}",
+                code=ErrorCodes.INVALID_EMBEDDING_RESULT,
             )
 
         matrix: List[List[float]] = []
         for i, row in enumerate(embeddings_obj):
             if not isinstance(row, Sequence):
                 raise TypeError(
-                    f"Expected each embedding row to be a sequence, "
-                    f"got {type(row).__name__} at index {i}"
+                    f"Expected embedding row to be sequence, got {type(row).__name__} at index {i}",
+                    code=ErrorCodes.INVALID_EMBEDDING_RESULT,
                 )
             try:
                 matrix.append([float(x) for x in row])
             except (TypeError, ValueError) as e:
                 raise TypeError(
-                    f"Failed to convert embedding values to float at row {i}: {e}"
+                    f"Failed to convert embedding values to float at row {i}: {e}",
+                    code=ErrorCodes.EMBEDDING_CONVERSION_ERROR,
                 ) from e
 
         return matrix
 
-    @staticmethod
-    def _coerce_embedding_vector(result: Any) -> List[float]:
+    def _coerce_embedding_vector(self, result: Any) -> List[float]:
         """
-        Coerce translator result for a single-text embed into List[float].
-
-        Normalizes via `_coerce_embedding_matrix` and handles single/multiple rows.
+        Coerce translator result for single-text embed.
         """
-        matrix = CorpusCrewAIEmbeddings._coerce_embedding_matrix(result)
+        matrix = self._coerce_embedding_matrix(result)
 
         if not matrix:
-            raise ValueError("Translator returned no embeddings for single-text input")
+            raise ValueError(
+                "Translator returned no embeddings for single-text input",
+                code=ErrorCodes.EMPTY_EMBEDDING_RESULT,
+            )
 
         if len(matrix) > 1:
             logger.warning(
-                "Expected a single embedding for query, but got %d rows; "
-                "using the first row.",
+                "Expected single embedding for query, got %d rows; using first row.",
                 len(matrix),
             )
 
@@ -274,6 +303,7 @@ class CorpusCrewAIEmbeddings:
     # Core Embedding API (CrewAI Compatible)
     # ------------------------------------------------------------------ #
 
+    @with_embedding_error_context("documents")
     def embed_documents(
         self,
         texts: List[str],
@@ -285,21 +315,7 @@ class CorpusCrewAIEmbeddings:
         """
         Sync embedding for multiple documents.
 
-        This method is designed to be called by CrewAI agents during
-        RAG operations and knowledge source processing.
-
-        Parameters
-        ----------
-        texts:
-            List of documents to embed.
-        crewai_context:
-            Optional CrewAI execution context containing agent role,
-            task information, and workflow metadata.
-        model:
-            Optional per-call model override.
-        **kwargs:
-            Additional framework-level hints to be passed through to the
-            translator as part of `framework_ctx`.
+        Used by CrewAI agents during RAG operations and knowledge processing.
         """
         _, op_ctx_dict, framework_ctx = self._build_contexts(
             crewai_context=crewai_context,
@@ -307,30 +323,14 @@ class CorpusCrewAIEmbeddings:
             **kwargs,
         )
 
-        try:
-            translated = self._translator.embed(
-                raw_texts=texts,
-                op_ctx=op_ctx_dict,
-                framework_ctx=framework_ctx,
-            )
-            return self._coerce_embedding_matrix(translated)
-        except Exception as exc:  # noqa: BLE001
-            # Enrich with CrewAI-specific context; core protocol context is
-            # already attached inside EmbeddingTranslator.
-            try:
-                attach_context(
-                    exc,
-                    embedding_operation="embed_documents",
-                    texts_count=len(texts),
-                    agent_role=framework_ctx.get("crewai_agent_role"),
-                    task_id=framework_ctx.get("crewai_task_id"),
-                    crewai_workflow=framework_ctx.get("crewai_workflow"),
-                )
-            except Exception:
-                # Never mask the original error
-                pass
-            raise
+        translated = self._translator.embed(
+            raw_texts=texts,
+            op_ctx=op_ctx_dict,
+            framework_ctx=framework_ctx,
+        )
+        return self._coerce_embedding_matrix(translated)
 
+    @with_embedding_error_context("query")
     def embed_query(
         self,
         text: str,
@@ -342,20 +342,7 @@ class CorpusCrewAIEmbeddings:
         """
         Sync embedding for a single query.
 
-        Used by CrewAI for query understanding, retrieval, and
-        agent decision-making processes.
-
-        Parameters
-        ----------
-        text:
-            Query text to embed.
-        crewai_context:
-            Optional CrewAI execution context.
-        model:
-            Optional per-call model override.
-        **kwargs:
-            Additional framework-level hints to be passed through to the
-            translator as part of `framework_ctx`.
+        Used by CrewAI for query understanding and retrieval.
         """
         _, op_ctx_dict, framework_ctx = self._build_contexts(
             crewai_context=crewai_context,
@@ -363,34 +350,18 @@ class CorpusCrewAIEmbeddings:
             **kwargs,
         )
 
-        try:
-            translated = self._translator.embed(
-                raw_texts=text,
-                op_ctx=op_ctx_dict,
-                framework_ctx=framework_ctx,
-            )
-            return self._coerce_embedding_vector(translated)
-        except Exception as exc:  # noqa: BLE001
-            # Enrich with CrewAI-specific context; core protocol context is
-            # already attached inside EmbeddingTranslator.
-            try:
-                attach_context(
-                    exc,
-                    embedding_operation="embed_query",
-                    text_len=len(text or ""),
-                    agent_role=framework_ctx.get("crewai_agent_role"),
-                    task_id=framework_ctx.get("crewai_task_id"),
-                    crewai_workflow=framework_ctx.get("crewai_workflow"),
-                )
-            except Exception:
-                # Never mask the original error
-                pass
-            raise
+        translated = self._translator.embed(
+            raw_texts=text,
+            op_ctx=op_ctx_dict,
+            framework_ctx=framework_ctx,
+        )
+        return self._coerce_embedding_vector(translated)
 
     # ------------------------------------------------------------------ #
     # Async API for CrewAI Flows
     # ------------------------------------------------------------------ #
 
+    @with_async_embedding_error_context("documents")
     async def aembed_documents(
         self,
         texts: List[str],
@@ -401,50 +372,21 @@ class CorpusCrewAIEmbeddings:
     ) -> List[List[float]]:
         """
         Async embedding for multiple documents.
-
-        Designed for use with CrewAI's async flows and event-driven workflows.
-
-        Parameters
-        ----------
-        texts:
-            List of documents to embed.
-        crewai_context:
-            Optional CrewAI execution context.
-        model:
-            Optional per-call model override.
-        **kwargs:
-            Additional framework-level hints to be passed through to the
-            translator as part of `framework_ctx`.
         """
-        core_ctx, op_ctx_dict, framework_ctx = self._build_contexts(
+        _, op_ctx_dict, framework_ctx = self._build_contexts(
             crewai_context=crewai_context,
             model=model,
             **kwargs,
         )
 
-        try:
-            translated = await self._translator.arun_embed(
-                raw_texts=texts,
-                op_ctx=op_ctx_dict,
-                framework_ctx=framework_ctx,
-            )
-            return self._coerce_embedding_matrix(translated)
-        except Exception as exc:  # noqa: BLE001
-            # Enrich with CrewAI-specific context for async workflows.
-            try:
-                attach_context(
-                    exc,
-                    embedding_operation="aembed_documents",
-                    texts_count=len(texts),
-                    agent_role=framework_ctx.get("crewai_agent_role"),
-                    task_id=framework_ctx.get("crewai_task_id"),
-                    crewai_workflow=framework_ctx.get("crewai_workflow"),
-                )
-            except Exception:
-                # Never mask the original error
-                pass
-            raise
+        translated = await self._translator.arun_embed(
+            raw_texts=texts,
+            op_ctx=op_ctx_dict,
+            framework_ctx=framework_ctx,
+        )
+        return self._coerce_embedding_matrix(translated)
 
+    @with_async_embedding_error_context("query")
     async def aembed_query(
         self,
         text: str,
@@ -455,80 +397,57 @@ class CorpusCrewAIEmbeddings:
     ) -> List[float]:
         """
         Async embedding for a single query.
-
-        Used in CrewAI's asynchronous workflows and flow-based executions.
-
-        Parameters
-        ----------
-        text:
-            Query text to embed.
-        crewai_context:
-            Optional CrewAI execution context.
-        model:
-            Optional per-call model override.
-        **kwargs:
-            Additional framework-level hints to be passed through to the
-            translator as part of `framework_ctx`.
         """
-        core_ctx, op_ctx_dict, framework_ctx = self._build_contexts(
+        _, op_ctx_dict, framework_ctx = self._build_contexts(
             crewai_context=crewai_context,
             model=model,
             **kwargs,
         )
 
-        try:
-            translated = await self._translator.arun_embed(
-                raw_texts=text,
-                op_ctx=op_ctx_dict,
-                framework_ctx=framework_ctx,
-            )
-            return self._coerce_embedding_vector(translated)
-        except Exception as exc:  # noqa: BLE001
-            # Enrich with CrewAI-specific context for async query embeddings.
-            try:
-                attach_context(
-                    exc,
-                    embedding_operation="aembed_query",
-                    text_len=len(text or ""),
-                    agent_role=framework_ctx.get("crewai_agent_role"),
-                    task_id=framework_ctx.get("crewai_task_id"),
-                    crewai_workflow=framework_ctx.get("crewai_workflow"),
-                )
-            except Exception:
-                # Never mask the original error
-                pass
-            raise
+        translated = await self._translator.arun_embed(
+            raw_texts=text,
+            op_ctx=op_ctx_dict,
+            framework_ctx=framework_ctx,
+        )
+        return self._coerce_embedding_vector(translated)
 
 
-# Convenience function for CrewAI integration
-def create_crewai_embedder(
+def create_embedder(
     corpus_adapter: EmbeddingProtocolV1,
     model: Optional[str] = None,
     **kwargs: Any,
-) -> CrewAIEmbedderProtocol:
+) -> CrewAIEmbedder:
     """
-    Create a CrewAI-compatible embedder for use with Agent embedder attribute.
+    Create a CrewAI-compatible embedder for agent integration.
 
-    Example usage:
+    Example:
     ```python
     from crewai import Agent
-    from corpus_sdk.embedding.framework_adapters.crewai import create_crewai_embedder
+    from corpus_sdk.embedding.framework_adapters.crewai import create_embedder
 
-    # Create embedder
-    embedder = create_crewai_embedder(
+    embedder = create_embedder(
         corpus_adapter=my_adapter,
         model="text-embedding-3-large"
     )
 
-    # Use with CrewAI agent
     agent = Agent(
         role="Researcher",
-        goal="Research latest AI developments",
-        backstory="Expert research analyst",
-        embedder=embedder,
+        goal="Research AI developments", 
+        backstory="Expert analyst",
+        embedder=embedder,  # Direct assignment
         tools=[...]
     )
     ```
+
+    Parameters
+    ----------
+    corpus_adapter: Corpus embedding protocol adapter
+    model: Model identifier for embedding operations
+    **kwargs: Additional arguments for CorpusCrewAIEmbeddings
+
+    Returns
+    -------
+    CrewAIEmbedder compatible embedder instance
     """
     return CorpusCrewAIEmbeddings(
         corpus_adapter=corpus_adapter,
@@ -539,5 +458,7 @@ def create_crewai_embedder(
 
 __all__ = [
     "CorpusCrewAIEmbeddings",
-    "create_crewai_embedder",
+    "CrewAIEmbedder", 
+    "create_embedder",
+    "ErrorCodes",
 ]
