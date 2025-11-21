@@ -1,1348 +1,543 @@
-# corpus_sdk/graph/framework_adapters/crewai.py
+# corpus_sdk/embedding/framework_adapters/crewai.py
 # SPDX-License-Identifier: Apache-2.0
 
 """
-CrewAI adapter for Corpus Graph protocol.
+CrewAI adapter for Corpus Embedding protocol.
 
-This module exposes a Corpus `GraphProtocolV1` implementation as a
-CrewAI-friendly client, with:
+This module exposes Corpus `EmbeddingProtocolV1` implementations as
+embedding services within CrewAI agents and workflows, with:
 
-- Sync + async query APIs
-- Sync + async streaming query APIs
-- Proper integration with Corpus GraphProtocolV1
-- OperationContext propagation derived from CrewAI tasks / metadata
-- Error-context enrichment for observability and debugging
-- Orchestration, translation, and async→sync bridging via GraphTranslator
+- Seamless integration with CrewAI agent `embedder` attribute
+- Support for CrewAI knowledge sources and RAG workflows
+- Context normalization for CrewAI-specific execution context
+- Framework-agnostic orchestration via `EmbeddingTranslator`
+- Async → sync bridging using `AsyncBridge`
+- Rich error context attachment for observability
 
-Design philosophy
------------------
-- Protocol-first: CrewAI is a thin skin over the Corpus graph adapter.
-- All heavy lifting (deadlines, breakers, rate limiting, caching, etc.) lives
-  in the underlying `BaseGraphAdapter` / `GraphProtocolV1` implementation.
-- This layer focuses on:
-    * Translating CrewAI Task → OperationContext
-    * Building raw query / mutation shapes for GraphTranslator
-    * Delegating all sync/async and streaming orchestration to GraphTranslator
-
-Responsibilities
-----------------
-- Provide a convenient, CrewAI-oriented client for graph operations
-- Keep all graph operations going through `GraphTranslator` so that
-  async→sync bridging, streaming, and error-context logic are centralized
-- Preserve protocol-level types (`QueryResult`, `QueryChunk`, etc.) for
-  CrewAI callers
-
-Non-responsibilities
---------------------
-- Backend-specific graph behavior (lives in graph adapters)
-- CrewAI agent orchestration and task logic
-- MMR and diversification details (handled inside GraphTranslator)
+The design follows CrewAI's adapter patterns while maintaining the
+protocol-first Corpus embedding stack.
 """
 
 from __future__ import annotations
 
 import logging
 from functools import cached_property
-from typing import (
-    Any,
-    AsyncIterator,
-    Iterator,
-    List,
-    Mapping,
-    Optional,
-    Protocol,
-)
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union, Protocol
 
 from corpus_sdk.core.context_translation import (
-    from_crewai as core_ctx_from_crewai,
+    from_crewai as context_from_crewai,
 )
-from corpus_sdk.core.error_context import attach_context
-from corpus_sdk.graph.framework_adapters.common.graph_translation import (
-    DefaultGraphFrameworkTranslator,
-    GraphTranslator,
+from corpus_sdk.embedding.embedding_base import (
+    EmbeddingProtocolV1,
 )
-from corpus_sdk.graph.graph_base import (
-    BadRequest,
-    BatchOperation,
-    BatchResult,
-    BulkVerticesResult,
-    BulkVerticesSpec,
-    DeleteEdgesSpec,
-    DeleteNodesSpec,
-    DeleteResult,
-    GraphProtocolV1,
-    GraphSchema,
-    OperationContext,
-    QueryChunk,
-    QueryResult,
-    UpsertEdgesSpec,
-    UpsertNodesSpec,
-    UpsertResult,
+from corpus_sdk.embedding.framework_adapters.common.embedding_translation import (
+    EmbeddingTranslator,
+    BatchConfig,
+    TextNormalizationConfig,
+    create_embedding_translator,
 )
+from corpus_sdk.llm.framework_adapters.common.error_context import attach_context
 
 logger = logging.getLogger(__name__)
 
 
-class CrewAIGraphClientProtocol(Protocol):
+class CrewAIEmbedderProtocol(Protocol):
     """
-    Protocol representing the minimal CrewAI-aware graph client interface
-    implemented by this module.
+    Protocol representing the minimal embedder interface expected by CrewAI.
 
-    This structural protocol allows callers to type against the graph client
-    without depending on the concrete `CorpusCrewAIGraphClient` class.
-    """
-
-    # Query
-
-    def query(
-        self,
-        query: str,
-        *,
-        params: Optional[Mapping[str, Any]] = None,
-        dialect: Optional[str] = None,
-        namespace: Optional[str] = None,
-        timeout_ms: Optional[int] = None,
-        task: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> QueryResult:
-        ...
-
-    async def aquery(
-        self,
-        query: str,
-        *,
-        params: Optional[Mapping[str, Any]] = None,
-        dialect: Optional[str] = None,
-        namespace: Optional[str] = None,
-        timeout_ms: Optional[int] = None,
-        task: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> QueryResult:
-        ...
-
-    def stream_query(
-        self,
-        query: str,
-        *,
-        params: Optional[Mapping[str, Any]] = None,
-        dialect: Optional[str] = None,
-        namespace: Optional[str] = None,
-        timeout_ms: Optional[int] = None,
-        task: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> Iterator[QueryChunk]:
-        ...
-
-    async def astream_query(
-        self,
-        query: str,
-        *,
-        params: Optional[Mapping[str, Any]] = None,
-        dialect: Optional[str] = None,
-        namespace: Optional[str] = None,
-        timeout_ms: Optional[int] = None,
-        task: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> AsyncIterator[QueryChunk]:
-        ...
-
-    # Upsert
-
-    def upsert_nodes(
-        self,
-        spec: UpsertNodesSpec,
-        *,
-        task: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> UpsertResult:
-        ...
-
-    async def aupsert_nodes(
-        self,
-        spec: UpsertNodesSpec,
-        *,
-        task: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> UpsertResult:
-        ...
-
-    def upsert_edges(
-        self,
-        spec: UpsertEdgesSpec,
-        *,
-        task: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> UpsertResult:
-        ...
-
-    async def aupsert_edges(
-        self,
-        spec: UpsertEdgesSpec,
-        *,
-        task: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> UpsertResult:
-        ...
-
-    # Delete
-
-    def delete_nodes(
-        self,
-        spec: DeleteNodesSpec,
-        *,
-        task: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> DeleteResult:
-        ...
-
-    async def adelete_nodes(
-        self,
-        spec: DeleteNodesSpec,
-        *,
-        task: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> DeleteResult:
-        ...
-
-    def delete_edges(
-        self,
-        spec: DeleteEdgesSpec,
-        *,
-        task: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> DeleteResult:
-        ...
-
-    async def adelete_edges(
-        self,
-        spec: DeleteEdgesSpec,
-        *,
-        task: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> DeleteResult:
-        ...
-
-    # Bulk / batch / schema / health
-
-    def bulk_vertices(
-        self,
-        spec: BulkVerticesSpec,
-        *,
-        task: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> BulkVerticesResult:
-        ...
-
-    async def abulk_vertices(
-        self,
-        spec: BulkVerticesSpec,
-        *,
-        task: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> BulkVerticesResult:
-        ...
-
-    def batch(
-        self,
-        ops: List[BatchOperation],
-        *,
-        task: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> BatchResult:
-        ...
-
-    async def abatch(
-        self,
-        ops: List[BatchOperation],
-        *,
-        task: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> BatchResult:
-        ...
-
-    def get_schema(
-        self,
-        *,
-        task: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> GraphSchema:
-        ...
-
-    async def aget_schema(
-        self,
-        *,
-        task: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> GraphSchema:
-        ...
-
-    def health(
-        self,
-        *,
-        task: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> Mapping[str, Any]:
-        ...
-
-    async def ahealth(
-        self,
-        *,
-        task: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> Mapping[str, Any]:
-        ...
-
-
-class CorpusCrewAIGraphClient:
-    """
-    CrewAI-oriented client wrapper around a Corpus `GraphProtocolV1`.
-
-    This is a thin integration layer that:
-
-    - Translates CrewAI Task / metadata into a Corpus `OperationContext`
-      using `core_ctx_from_crewai`.
-    - Uses `GraphTranslator` (with a CrewAI-specific framework translator) to:
-        * Build Graph*Spec objects from simple inputs
-        * Execute sync + async graph operations
-        * Orchestrate streaming with proper cancellation and error handling
-    - Delegates all async→sync bridging and streaming glue to GraphTranslator.
-    - Attaches rich error context (`attach_context`) on this layer with
-      CrewAI-specific hints when failures occur.
+    This structural protocol allows `create_crewai_embedder` to declare a
+    stable return type without requiring a hard dependency on CrewAI's
+    concrete types at type-check time.
     """
 
-    class _CrewAIGraphFrameworkTranslator(DefaultGraphFrameworkTranslator):
+    def embed_documents(
+        self,
+        texts: List[str],
+        *,
+        crewai_context: Optional[Mapping[str, Any]] = None,
+        model: Optional[str] = None,
+        **kwargs: Any,
+    ) -> List[List[float]]:
         """
-        CrewAI-specific GraphFrameworkTranslator.
-
-        This translator reuses the common DefaultGraphFrameworkTranslator for
-        spec construction and context handling, but deliberately *does not*
-        reshape core protocol results:
-
-        - QueryResult is returned as-is
-        - QueryChunk is returned as-is
-        - BulkVerticesResult is returned as-is
-        - BatchResult is returned as-is
-        - GraphSchema is returned as-is
+        Embed multiple documents for CrewAI RAG and knowledge workflows.
         """
+        ...
 
-        def translate_query_result(
-            self,
-            result: QueryResult,
-            *,
-            op_ctx: OperationContext,  # noqa: ARG002
-            framework_ctx: Optional[Any] = None,  # noqa: ARG002
-        ) -> QueryResult:
-            return result
+    def embed_query(
+        self,
+        text: str,
+        *,
+        crewai_context: Optional[Mapping[str, Any]] = None,
+        model: Optional[str] = None,
+        **kwargs: Any,
+    ) -> List[float]:
+        """
+        Embed a single query for CrewAI retrieval and decision-making.
+        """
+        ...
 
-        def translate_query_chunk(
-            self,
-            chunk: QueryChunk,
-            *,
-            op_ctx: OperationContext,  # noqa: ARG002
-            framework_ctx: Optional[Any] = None,  # noqa: ARG002
-        ) -> QueryChunk:
-            return chunk
 
-        def translate_bulk_vertices_result(
-            self,
-            result: BulkVerticesResult,
-            *,
-            op_ctx: OperationContext,  # noqa: ARG002
-            framework_ctx: Optional[Any] = None,  # noqa: ARG002
-        ) -> BulkVerticesResult:
-            return result
+class CorpusCrewAIEmbeddings:
+    """
+    CrewAI embedding service backed by a Corpus `EmbeddingProtocolV1` adapter.
 
-        def translate_batch_result(
-            self,
-            result: BatchResult,
-            *,
-            op_ctx: OperationContext,  # noqa: ARG002
-            framework_ctx: Optional[Any] = None,  # noqa: ARG002
-        ) -> BatchResult:
-            return result
+    Responsibilities (this layer)
+    -----------------------------
+    - Provide embeddings for CrewAI agents via `embed_documents` and `embed_query`
+    - Integrate with CrewAI agent `embedder` attribute and knowledge sources
+    - Derive `OperationContext` from CrewAI execution context
+    - Build framework_ctx for model selection and CrewAI-specific hints
+    - Use `EmbeddingTranslator` for core embedding logic
+    - Handle sync/async execution patterns compatible with CrewAI flows
+    - Attach structured error context for CrewAI workflows
 
-        def translate_schema(
-            self,
-            schema: GraphSchema,
-            *,
-            op_ctx: OperationContext,  # noqa: ARG002
-            framework_ctx: Optional[Any] = None,  # noqa: ARG002
-        ) -> GraphSchema:
-            return schema
+    Non-responsibilities
+    --------------------
+    - Text normalization, batching logic, token-aware batching
+    - Provider-specific behavior (rate limits, retries, etc.)
+
+    All of those live in:
+    - `corpus_sdk.embedding.framework_adapters.common.embedding_translation`
+    - Concrete `EmbeddingProtocolV1` adapter implementations.
+
+    Attributes
+    ----------
+    corpus_adapter:
+        Underlying Corpus embedding adapter implementing `EmbeddingProtocolV1`.
+
+    model:
+        Optional default model identifier. Can be overridden via CrewAI
+        agent configuration or execution context.
+
+    batch_config:
+        Optional `BatchConfig` to control batching behavior.
+
+    text_normalization_config:
+        Optional `TextNormalizationConfig` to control whitespace cleanup,
+        truncation, casing, encoding, etc.
+
+    crewai_config:
+        Optional CrewAI-specific configuration for agent context and
+        knowledge source integration.
+    """
 
     def __init__(
         self,
-        *,
-        graph_adapter: GraphProtocolV1,
-        default_dialect: Optional[str] = None,
-        default_namespace: Optional[str] = None,
-        framework_version: Optional[str] = None,
-    ) -> None:
-        self._graph: GraphProtocolV1 = graph_adapter
-        self._default_dialect: Optional[str] = default_dialect
-        self._default_namespace: Optional[str] = default_namespace
-        self._framework_version: Optional[str] = framework_version
-
-    # ------------------------------------------------------------------ #
-    # Translator (lazy, cached) – mirrors AutoGen adapter pattern
-    # ------------------------------------------------------------------ #
-
-    @cached_property
-    def _translator(self) -> GraphTranslator:
-        """
-        Lazily construct and cache the `GraphTranslator`.
-
-        Uses `cached_property` for thread safety and performance, mirroring
-        the embedding / AutoGen adapter patterns.
-        """
-        framework_translator = self._CrewAIGraphFrameworkTranslator()
-        return GraphTranslator(
-            adapter=self._graph,
-            framework="crewai",
-            translator=framework_translator,
-        )
+        corpus_adapter: EmbeddingProtocolV1,
+        model: Optional[str] = None,
+        batch_config: Optional[BatchConfig] = None,
+        text_normalization_config: Optional[TextNormalizationConfig] = None,
+        crewai_config: Optional[Dict[str, Any]] = None,
+    ):
+        self.corpus_adapter = corpus_adapter
+        self.model = model
+        self.batch_config = batch_config
+        self.text_normalization_config = text_normalization_config
+        self.crewai_config = crewai_config or {}
 
     # ------------------------------------------------------------------ #
     # Internal helpers
     # ------------------------------------------------------------------ #
 
-    def _build_ctx(
+    @cached_property
+    def _translator(self) -> EmbeddingTranslator:
+        """
+        Lazily construct and cache the `EmbeddingTranslator`.
+
+        Uses `cached_property` for thread safety and performance.
+        """
+        return create_embedding_translator(
+            adapter=self.corpus_adapter,
+            framework="crewai",
+            translator=None,  # use registry/default generic translator
+            batch_config=self.batch_config,
+            text_normalization_config=self.text_normalization_config,
+        )
+
+    def _build_contexts(
         self,
         *,
-        task: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> Optional[OperationContext]:
+        crewai_context: Optional[Mapping[str, Any]] = None,
+        model: Optional[str] = None,
+        **kwargs: Any,
+    ) -> Tuple[Any, Dict[str, Any], Dict[str, Any]]:
         """
-        Build an OperationContext from CrewAI-style inputs.
+        Build contexts for CrewAI execution environment.
 
-        Expected inputs
-        ----------------
-        - task: CrewAI Task instance (optional)
-        - extra_context: Optional mapping merged into attrs (best effort)
+        Parameters
+        ----------
+        crewai_context:
+            Optional CrewAI execution context containing agent info,
+            task details, and workflow metadata.
+        model:
+            Optional per-call model override.
+        **kwargs:
+            Additional framework-level hints to be passed through to the
+            translator as part of `framework_ctx`.
 
-        If both are None/empty, returns None and lets downstream helpers
-        construct an "empty" OperationContext as needed.
+        Returns
+        -------
+        Tuple of:
+        - `core_ctx`: core OperationContext (from context_translation)
+        - `op_ctx_dict`: normalized dict for embedding layer
+        - `framework_ctx`: CrewAI-specific context for translator
         """
-        extra = dict(extra_context or {})
+        # Convert CrewAI context to core OperationContext
+        core_ctx = context_from_crewai(crewai_context)
 
-        if task is None and not extra:
-            return None
+        # Normalized dict for embedding OperationContext reconstruction
+        op_ctx_dict: Dict[str, Any] = core_ctx.to_dict()
 
-        try:
-            ctx = core_ctx_from_crewai(
-                task,
-                framework_version=self._framework_version,
-                **extra,
-            )
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="crewai",
-                operation="context_translation",
-            )
-            raise
+        # Framework-level context for CrewAI-specific hints
+        framework_ctx: Dict[str, Any] = {
+            "framework": "crewai",
+        }
+        effective_model = model or self.model
+        if effective_model:
+            framework_ctx["model"] = effective_model
 
-        if not isinstance(ctx, OperationContext):
-            raise BadRequest(
-                f"from_crewai produced unsupported context type: {type(ctx).__name__}",
-                code="BAD_OPERATION_CONTEXT",
-            )
+        # Add CrewAI-specific context for knowledge sources and agent roles
+        if crewai_context:
+            framework_ctx["crewai_agent_role"] = crewai_context.get("agent_role")
+            framework_ctx["crewai_task_id"] = crewai_context.get("task_id")
+            framework_ctx["crewai_workflow"] = crewai_context.get("workflow")
 
-        return ctx
+        # Add any additional framework-level hints
+        framework_ctx.update(kwargs)
+
+        return core_ctx, op_ctx_dict, framework_ctx
 
     @staticmethod
-    def _validate_query(query: str) -> None:
+    def _coerce_embedding_matrix(result: Any) -> List[List[float]]:
         """
-        Validate that a query string is non-empty and of the correct type.
+        Coerce translator result into a List[List[float]] embedding matrix.
+
+        Supports the same result formats as the LangChain adapter:
+        - {"embeddings": [[...], [...]], "model": "...", "usage": {...}}
+        - Direct matrix: [[...], [...]]
+        - EmbedResult-like with `.embeddings` attribute
         """
-        if not isinstance(query, str) or not query.strip():
-            raise BadRequest("query must be a non-empty string")
+        embeddings_obj: Any
 
-    def _build_raw_query(
-        self,
-        query: str,
-        *,
-        params: Optional[Mapping[str, Any]],
-        dialect: Optional[str],
-        namespace: Optional[str],
-        timeout_ms: Optional[int],
-        stream: bool,
-    ) -> Mapping[str, Any]:
+        match result:
+            case {"embeddings": emb}:
+                embeddings_obj = emb
+            case _ if hasattr(result, "embeddings"):
+                embeddings_obj = getattr(result, "embeddings")
+            case _:
+                embeddings_obj = result
+
+        if not isinstance(embeddings_obj, Sequence):
+            raise TypeError(
+                f"Translator result does not contain a valid embeddings sequence: "
+                f"type={type(embeddings_obj).__name__}"
+            )
+
+        matrix: List[List[float]] = []
+        for i, row in enumerate(embeddings_obj):
+            if not isinstance(row, Sequence):
+                raise TypeError(
+                    f"Expected each embedding row to be a sequence, "
+                    f"got {type(row).__name__} at index {i}"
+                )
+            try:
+                matrix.append([float(x) for x in row])
+            except (TypeError, ValueError) as e:
+                raise TypeError(
+                    f"Failed to convert embedding values to float at row {i}: {e}"
+                ) from e
+
+        return matrix
+
+    @staticmethod
+    def _coerce_embedding_vector(result: Any) -> List[float]:
         """
-        Build a raw query mapping suitable for GraphTranslator.
+        Coerce translator result for a single-text embed into List[float].
 
-        The common GraphTranslator expects:
-            - Either a plain string, or
-            - A mapping with:
-                * text (str)
-                * dialect (optional)
-                * params (optional mapping)
-                * namespace (optional)
-                * timeout_ms (optional)
-                * stream (bool)
+        Normalizes via `_coerce_embedding_matrix` and handles single/multiple rows.
         """
-        effective_dialect = dialect or self._default_dialect
-        effective_namespace = namespace or self._default_namespace
+        matrix = CorpusCrewAIEmbeddings._coerce_embedding_matrix(result)
 
-        raw: dict[str, Any] = {
-            "text": query,
-            "params": dict(params or {}),
-            "stream": bool(stream),
-        }
+        if not matrix:
+            raise ValueError("Translator returned no embeddings for single-text input")
 
-        if effective_dialect is not None:
-            raw["dialect"] = effective_dialect
-        if effective_namespace is not None:
-            raw["namespace"] = effective_namespace
-        if timeout_ms is not None:
-            raw["timeout_ms"] = int(timeout_ms)
+        if len(matrix) > 1:
+            logger.warning(
+                "Expected a single embedding for query, but got %d rows; "
+                "using the first row.",
+                len(matrix),
+            )
 
-        return raw
-
-    def _framework_ctx_for_namespace(
-        self,
-        namespace: Optional[str],
-    ) -> Mapping[str, Any]:
-        """
-        Build a minimal framework_ctx mapping that lets the common translator
-        derive a preferred namespace when needed.
-        """
-        effective_namespace = namespace or self._default_namespace
-        return {"namespace": effective_namespace} if effective_namespace is not None else {}
+        return matrix[0]
 
     # ------------------------------------------------------------------ #
-    # Query (sync + async)
+    # Core Embedding API (CrewAI Compatible)
     # ------------------------------------------------------------------ #
 
-    def query(
+    def embed_documents(
         self,
-        query: str,
+        texts: List[str],
         *,
-        params: Optional[Mapping[str, Any]] = None,
-        dialect: Optional[str] = None,
-        namespace: Optional[str] = None,
-        timeout_ms: Optional[int] = None,
-        task: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> QueryResult:
+        crewai_context: Optional[Mapping[str, Any]] = None,
+        model: Optional[str] = None,
+        **kwargs: Any,
+    ) -> List[List[float]]:
         """
-        Execute a non-streaming graph query (sync).
+        Sync embedding for multiple documents.
 
-        Returns the underlying `QueryResult` from the GraphProtocol adapter.
+        This method is designed to be called by CrewAI agents during
+        RAG operations and knowledge source processing.
+
+        Parameters
+        ----------
+        texts:
+            List of documents to embed.
+        crewai_context:
+            Optional CrewAI execution context containing agent role,
+            task information, and workflow metadata.
+        model:
+            Optional per-call model override.
+        **kwargs:
+            Additional framework-level hints to be passed through to the
+            translator as part of `framework_ctx`.
         """
-        self._validate_query(query)
-
-        ctx = self._build_ctx(task=task, extra_context=extra_context)
-        raw_query = self._build_raw_query(
-            query=query,
-            params=params,
-            dialect=dialect,
-            namespace=namespace,
-            timeout_ms=timeout_ms,
-            stream=False,
+        _, op_ctx_dict, framework_ctx = self._build_contexts(
+            crewai_context=crewai_context,
+            model=model,
+            **kwargs,
         )
-        framework_ctx = self._framework_ctx_for_namespace(namespace)
 
         try:
-            result = self._translator.query(
-                raw_query,
-                op_ctx=ctx,
+            translated = self._translator.embed(
+                raw_texts=texts,
+                op_ctx=op_ctx_dict,
                 framework_ctx=framework_ctx,
-                mmr_config=None,
             )
-            if not isinstance(result, QueryResult):
-                raise BadRequest(
-                    f"GraphTranslator.query returned unsupported type: {type(result).__name__}",
-                    code="BAD_TRANSLATED_RESULT",
-                )
-            return result
+            return self._coerce_embedding_matrix(translated)
         except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="crewai",
-                operation="query_sync",
-                query=query,
-                dialect=dialect or self._default_dialect,
-                namespace=namespace or self._default_namespace,
-            )
+            # Enrich with CrewAI-specific context; core protocol context is
+            # already attached inside EmbeddingTranslator.
+            try:
+                attach_context(
+                    exc,
+                    embedding_operation="embed_documents",
+                    texts_count=len(texts),
+                    agent_role=framework_ctx.get("crewai_agent_role"),
+                    task_id=framework_ctx.get("crewai_task_id"),
+                    crewai_workflow=framework_ctx.get("crewai_workflow"),
+                )
+            except Exception:
+                # Never mask the original error
+                pass
             raise
 
-    async def aquery(
+    def embed_query(
         self,
-        query: str,
+        text: str,
         *,
-        params: Optional[Mapping[str, Any]] = None,
-        dialect: Optional[str] = None,
-        namespace: Optional[str] = None,
-        timeout_ms: Optional[int] = None,
-        task: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> QueryResult:
+        crewai_context: Optional[Mapping[str, Any]] = None,
+        model: Optional[str] = None,
+        **kwargs: Any,
+    ) -> List[float]:
         """
-        Execute a non-streaming graph query (async).
+        Sync embedding for a single query.
 
-        Returns the underlying `QueryResult`.
+        Used by CrewAI for query understanding, retrieval, and
+        agent decision-making processes.
+
+        Parameters
+        ----------
+        text:
+            Query text to embed.
+        crewai_context:
+            Optional CrewAI execution context.
+        model:
+            Optional per-call model override.
+        **kwargs:
+            Additional framework-level hints to be passed through to the
+            translator as part of `framework_ctx`.
         """
-        self._validate_query(query)
-
-        ctx = self._build_ctx(task=task, extra_context=extra_context)
-        raw_query = self._build_raw_query(
-            query=query,
-            params=params,
-            dialect=dialect,
-            namespace=namespace,
-            timeout_ms=timeout_ms,
-            stream=False,
+        _, op_ctx_dict, framework_ctx = self._build_contexts(
+            crewai_context=crewai_context,
+            model=model,
+            **kwargs,
         )
-        framework_ctx = self._framework_ctx_for_namespace(namespace)
 
         try:
-            result = await self._translator.arun_query(
-                raw_query,
-                op_ctx=ctx,
+            translated = self._translator.embed(
+                raw_texts=text,
+                op_ctx=op_ctx_dict,
                 framework_ctx=framework_ctx,
-                mmr_config=None,
             )
-            if not isinstance(result, QueryResult):
-                raise BadRequest(
-                    f"GraphTranslator.arun_query returned unsupported type: {type(result).__name__}",
-                    code="BAD_TRANSLATED_RESULT",
-                )
-            return result
+            return self._coerce_embedding_vector(translated)
         except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="crewai",
-                operation="query_async",
-                query=query,
-                dialect=dialect or self._default_dialect,
-                namespace=namespace or self._default_namespace,
-            )
+            # Enrich with CrewAI-specific context; core protocol context is
+            # already attached inside EmbeddingTranslator.
+            try:
+                attach_context(
+                    exc,
+                    embedding_operation="embed_query",
+                    text_len=len(text or ""),
+                    agent_role=framework_ctx.get("crewai_agent_role"),
+                    task_id=framework_ctx.get("crewai_task_id"),
+                    crewai_workflow=framework_ctx.get("crewai_workflow"),
+                )
+            except Exception:
+                # Never mask the original error
+                pass
             raise
 
     # ------------------------------------------------------------------ #
-    # Streaming query (sync + async)
+    # Async API for CrewAI Flows
     # ------------------------------------------------------------------ #
 
-    def stream_query(
+    async def aembed_documents(
         self,
-        query: str,
+        texts: List[str],
         *,
-        params: Optional[Mapping[str, Any]] = None,
-        dialect: Optional[str] = None,
-        namespace: Optional[str] = None,
-        timeout_ms: Optional[int] = None,  # kept for API symmetry (passed via raw_query)
-        task: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> Iterator[QueryChunk]:
+        crewai_context: Optional[Mapping[str, Any]] = None,
+        model: Optional[str] = None,
+        **kwargs: Any,
+    ) -> List[List[float]]:
         """
-        Execute a streaming graph query (sync), yielding `QueryChunk` items.
+        Async embedding for multiple documents.
 
-        Delegates streaming orchestration to GraphTranslator, which uses
-        SyncStreamBridge under the hood. This method itself does not use
-        any async→sync bridges directly.
+        Designed for use with CrewAI's async flows and event-driven workflows.
+
+        Parameters
+        ----------
+        texts:
+            List of documents to embed.
+        crewai_context:
+            Optional CrewAI execution context.
+        model:
+            Optional per-call model override.
+        **kwargs:
+            Additional framework-level hints to be passed through to the
+            translator as part of `framework_ctx`.
         """
-        self._validate_query(query)
-
-        ctx = self._build_ctx(task=task, extra_context=extra_context)
-        raw_query = self._build_raw_query(
-            query=query,
-            params=params,
-            dialect=dialect,
-            namespace=namespace,
-            timeout_ms=timeout_ms,
-            stream=True,
+        core_ctx, op_ctx_dict, framework_ctx = self._build_contexts(
+            crewai_context=crewai_context,
+            model=model,
+            **kwargs,
         )
-        framework_ctx = self._framework_ctx_for_namespace(namespace)
 
         try:
-            for chunk in self._translator.query_stream(
-                raw_query,
-                op_ctx=ctx,
+            translated = await self._translator.arun_embed(
+                raw_texts=texts,
+                op_ctx=op_ctx_dict,
                 framework_ctx=framework_ctx,
-            ):
-                if not isinstance(chunk, QueryChunk):
-                    raise BadRequest(
-                        f"GraphTranslator.query_stream yielded unsupported type: {type(chunk).__name__}",
-                        code="BAD_TRANSLATED_CHUNK",
-                    )
-                yield chunk
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="crewai",
-                operation="stream_query_sync",
-                query=query,
-                dialect=dialect or self._default_dialect,
-                namespace=namespace or self._default_namespace,
             )
+            return self._coerce_embedding_matrix(translated)
+        except Exception as exc:  # noqa: BLE001
+            # Enrich with CrewAI-specific context for async workflows.
+            try:
+                attach_context(
+                    exc,
+                    embedding_operation="aembed_documents",
+                    texts_count=len(texts),
+                    agent_role=framework_ctx.get("crewai_agent_role"),
+                    task_id=framework_ctx.get("crewai_task_id"),
+                    crewai_workflow=framework_ctx.get("crewai_workflow"),
+                )
+            except Exception:
+                # Never mask the original error
+                pass
             raise
 
-    async def astream_query(
+    async def aembed_query(
         self,
-        query: str,
+        text: str,
         *,
-        params: Optional[Mapping[str, Any]] = None,
-        dialect: Optional[str] = None,
-        namespace: Optional[str] = None,
-        timeout_ms: Optional[int] = None,  # kept for API symmetry (passed via raw_query)
-        task: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> AsyncIterator[QueryChunk]:
+        crewai_context: Optional[Mapping[str, Any]] = None,
+        model: Optional[str] = None,
+        **kwargs: Any,
+    ) -> List[float]:
         """
-        Execute a streaming graph query (async), yielding `QueryChunk` items.
-        """
-        self._validate_query(query)
+        Async embedding for a single query.
 
-        ctx = self._build_ctx(task=task, extra_context=extra_context)
-        raw_query = self._build_raw_query(
-            query=query,
-            params=params,
-            dialect=dialect,
-            namespace=namespace,
-            timeout_ms=timeout_ms,
-            stream=True,
+        Used in CrewAI's asynchronous workflows and flow-based executions.
+
+        Parameters
+        ----------
+        text:
+            Query text to embed.
+        crewai_context:
+            Optional CrewAI execution context.
+        model:
+            Optional per-call model override.
+        **kwargs:
+            Additional framework-level hints to be passed through to the
+            translator as part of `framework_ctx`.
+        """
+        core_ctx, op_ctx_dict, framework_ctx = self._build_contexts(
+            crewai_context=crewai_context,
+            model=model,
+            **kwargs,
         )
-        framework_ctx = self._framework_ctx_for_namespace(namespace)
 
         try:
-            async for chunk in self._translator.arun_query_stream(
-                raw_query,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            ):
-                if not isinstance(chunk, QueryChunk):
-                    raise BadRequest(
-                        f"GraphTranslator.arun_query_stream yielded unsupported type: {type(chunk).__name__}",
-                        code="BAD_TRANSLATED_CHUNK",
-                    )
-                yield chunk
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="crewai",
-                operation="stream_query_async",
-                query=query,
-                dialect=dialect or self._default_dialect,
-                namespace=namespace or self._default_namespace,
-            )
-            raise
-
-    # ------------------------------------------------------------------ #
-    # Upsert nodes / edges (sync + async)
-    # ------------------------------------------------------------------ #
-
-    def upsert_nodes(
-        self,
-        spec: UpsertNodesSpec,
-        *,
-        task: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> UpsertResult:
-        """
-        Sync wrapper for upserting nodes.
-
-        Delegates to GraphTranslator with `raw_nodes` taken from `spec.nodes`,
-        and passes the desired namespace via framework_ctx so that the
-        translator can build the correct UpsertNodesSpec.
-        """
-        ctx = self._build_ctx(task=task, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
-
-        try:
-            result = self._translator.upsert_nodes(
-                spec.nodes,
-                op_ctx=ctx,
+            translated = await self._translator.arun_embed(
+                raw_texts=text,
+                op_ctx=op_ctx_dict,
                 framework_ctx=framework_ctx,
             )
-            if not isinstance(result, UpsertResult):
-                raise BadRequest(
-                    f"GraphTranslator.upsert_nodes returned unsupported type: {type(result).__name__}",
-                    code="BAD_UPSERT_RESULT",
-                )
-            return result
+            return self._coerce_embedding_vector(translated)
         except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="crewai",
-                operation="upsert_nodes_sync",
-                namespace=getattr(spec, "namespace", None),
-                count=len(spec.nodes),
-            )
+            # Enrich with CrewAI-specific context for async query embeddings.
+            try:
+                attach_context(
+                    exc,
+                    embedding_operation="aembed_query",
+                    text_len=len(text or ""),
+                    agent_role=framework_ctx.get("crewai_agent_role"),
+                    task_id=framework_ctx.get("crewai_task_id"),
+                    crewai_workflow=framework_ctx.get("crewai_workflow"),
+                )
+            except Exception:
+                # Never mask the original error
+                pass
             raise
 
-    async def aupsert_nodes(
-        self,
-        spec: UpsertNodesSpec,
-        *,
-        task: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> UpsertResult:
-        """
-        Async wrapper for upserting nodes.
-        """
-        ctx = self._build_ctx(task=task, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
 
-        try:
-            result = await self._translator.arun_upsert_nodes(
-                spec.nodes,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-            if not isinstance(result, UpsertResult):
-                raise BadRequest(
-                    f"GraphTranslator.arun_upsert_nodes returned unsupported type: {type(result).__name__}",
-                    code="BAD_UPSERT_RESULT",
-                )
-            return result
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="crewai",
-                operation="upsert_nodes_async",
-                namespace=getattr(spec, "namespace", None),
-                count=len(spec.nodes),
-            )
-            raise
+# Convenience function for CrewAI integration
+def create_crewai_embedder(
+    corpus_adapter: EmbeddingProtocolV1,
+    model: Optional[str] = None,
+    **kwargs: Any,
+) -> CrewAIEmbedderProtocol:
+    """
+    Create a CrewAI-compatible embedder for use with Agent embedder attribute.
 
-    def upsert_edges(
-        self,
-        spec: UpsertEdgesSpec,
-        *,
-        task: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> UpsertResult:
-        """
-        Sync wrapper for upserting edges.
-        """
-        ctx = self._build_ctx(task=task, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
+    Example usage:
+    ```python
+    from crewai import Agent
+    from corpus_sdk.embedding.framework_adapters.crewai import create_crewai_embedder
 
-        try:
-            result = self._translator.upsert_edges(
-                spec.edges,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-            if not isinstance(result, UpsertResult):
-                raise BadRequest(
-                    f"GraphTranslator.upsert_edges returned unsupported type: {type(result).__name__}",
-                    code="BAD_UPSERT_RESULT",
-                )
-            return result
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="crewai",
-                operation="upsert_edges_sync",
-                namespace=getattr(spec, "namespace", None),
-                count=len(spec.edges),
-            )
-            raise
+    # Create embedder
+    embedder = create_crewai_embedder(
+        corpus_adapter=my_adapter,
+        model="text-embedding-3-large"
+    )
 
-    async def aupsert_edges(
-        self,
-        spec: UpsertEdgesSpec,
-        *,
-        task: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> UpsertResult:
-        """
-        Async wrapper for upserting edges.
-        """
-        ctx = self._build_ctx(task=task, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
-
-        try:
-            result = await self._translator.arun_upsert_edges(
-                spec.edges,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-            if not isinstance(result, UpsertResult):
-                raise BadRequest(
-                    f"GraphTranslator.arun_upsert_edges returned unsupported type: {type(result).__name__}",
-                    code="BAD_UPSERT_RESULT",
-                )
-            return result
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="crewai",
-                operation="upsert_edges_async",
-                namespace=getattr(spec, "namespace", None),
-                count=len(spec.edges),
-            )
-            raise
-
-    # ------------------------------------------------------------------ #
-    # Delete nodes / edges (sync + async)
-    # ------------------------------------------------------------------ #
-
-    def delete_nodes(
-        self,
-        spec: DeleteNodesSpec,
-        *,
-        task: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> DeleteResult:
-        """
-        Sync wrapper for deleting nodes.
-
-        Uses DeleteNodesSpec to derive either an ID list or a filter
-        expression for the GraphTranslator.
-        """
-        ctx = self._build_ctx(task=task, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
-
-        if spec.filter is not None:
-            raw_filter_or_ids: Any = spec.filter
-        else:
-            raw_filter_or_ids = list(spec.ids or [])
-
-        try:
-            result = self._translator.delete_nodes(
-                raw_filter_or_ids,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-            if not isinstance(result, DeleteResult):
-                raise BadRequest(
-                    f"GraphTranslator.delete_nodes returned unsupported type: {type(result).__name__}",
-                    code="BAD_DELETE_RESULT",
-                )
-            return result
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="crewai",
-                operation="delete_nodes_sync",
-                namespace=getattr(spec, "namespace", None),
-                ids_count=len(spec.ids or []),
-            )
-            raise
-
-    async def adelete_nodes(
-        self,
-        spec: DeleteNodesSpec,
-        *,
-        task: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> DeleteResult:
-        """
-        Async wrapper for deleting nodes.
-        """
-        ctx = self._build_ctx(task=task, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
-
-        if spec.filter is not None:
-            raw_filter_or_ids: Any = spec.filter
-        else:
-            raw_filter_or_ids = list(spec.ids or [])
-
-        try:
-            result = await self._translator.arun_delete_nodes(
-                raw_filter_or_ids,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-            if not isinstance(result, DeleteResult):
-                raise BadRequest(
-                    f"GraphTranslator.arun_delete_nodes returned unsupported type: {type(result).__name__}",
-                    code="BAD_DELETE_RESULT",
-                )
-            return result
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="crewai",
-                operation="delete_nodes_async",
-                namespace=getattr(spec, "namespace", None),
-                ids_count=len(spec.ids or []),
-            )
-            raise
-
-    def delete_edges(
-        self,
-        spec: DeleteEdgesSpec,
-        *,
-        task: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> DeleteResult:
-        """
-        Sync wrapper for deleting edges.
-        """
-        ctx = self._build_ctx(task=task, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
-
-        if spec.filter is not None:
-            raw_filter_or_ids: Any = spec.filter
-        else:
-            raw_filter_or_ids = list(spec.ids or [])
-
-        try:
-            result = self._translator.delete_edges(
-                raw_filter_or_ids,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-            if not isinstance(result, DeleteResult):
-                raise BadRequest(
-                    f"GraphTranslator.delete_edges returned unsupported type: {type(result).__name__}",
-                    code="BAD_DELETE_RESULT",
-                )
-            return result
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="crewai",
-                operation="delete_edges_sync",
-                namespace=getattr(spec, "namespace", None),
-                ids_count=len(spec.ids or []),
-            )
-            raise
-
-    async def adelete_edges(
-        self,
-        spec: DeleteEdgesSpec,
-        *,
-        task: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> DeleteResult:
-        """
-        Async wrapper for deleting edges.
-        """
-        ctx = self._build_ctx(task=task, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
-
-        if spec.filter is not None:
-            raw_filter_or_ids: Any = spec.filter
-        else:
-            raw_filter_or_ids = list(spec.ids or [])
-
-        try:
-            result = await self._translator.arun_delete_edges(
-                raw_filter_or_ids,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-            if not isinstance(result, DeleteResult):
-                raise BadRequest(
-                    f"GraphTranslator.arun_delete_edges returned unsupported type: {type(result).__name__}",
-                    code="BAD_DELETE_RESULT",
-                )
-            return result
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="crewai",
-                operation="delete_edges_async",
-                namespace=getattr(spec, "namespace", None),
-                ids_count=len(spec.ids or []),
-            )
-            raise
-
-    # ------------------------------------------------------------------ #
-    # Bulk vertices (sync + async)
-    # ------------------------------------------------------------------ #
-
-    def bulk_vertices(
-        self,
-        spec: BulkVerticesSpec,
-        *,
-        task: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> BulkVerticesResult:
-        """
-        Sync wrapper for bulk_vertices.
-
-        Converts `BulkVerticesSpec` into the raw request shape expected by
-        GraphTranslator and returns the underlying `BulkVerticesResult`.
-        """
-        ctx = self._build_ctx(task=task, extra_context=extra_context)
-
-        raw_request: Mapping[str, Any] = {
-            "namespace": spec.namespace,
-            "limit": spec.limit,
-            "cursor": spec.cursor,
-            "filter": spec.filter,
-        }
-
-        framework_ctx = self._framework_ctx_for_namespace(spec.namespace)
-
-        try:
-            result = self._translator.bulk_vertices(
-                raw_request,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-            if not isinstance(result, BulkVerticesResult):
-                raise BadRequest(
-                    f"GraphTranslator.bulk_vertices returned unsupported type: {type(result).__name__}",
-                    code="BAD_BULK_VERTICES_RESULT",
-                )
-            return result
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="crewai",
-                operation="bulk_vertices_sync",
-                namespace=getattr(spec, "namespace", None),
-                limit=spec.limit,
-            )
-            raise
-
-    async def abulk_vertices(
-        self,
-        spec: BulkVerticesSpec,
-        *,
-        task: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> BulkVerticesResult:
-        """
-        Async wrapper for bulk_vertices.
-        """
-        ctx = self._build_ctx(task=task, extra_context=extra_context)
-
-        raw_request: Mapping[str, Any] = {
-            "namespace": spec.namespace,
-            "limit": spec.limit,
-            "cursor": spec.cursor,
-            "filter": spec.filter,
-        }
-
-        framework_ctx = self._framework_ctx_for_namespace(spec.namespace)
-
-        try:
-            result = await self._translator.arun_bulk_vertices(
-                raw_request,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-            if not isinstance(result, BulkVerticesResult):
-                raise BadRequest(
-                    f"GraphTranslator.arun_bulk_vertices returned unsupported type: {type(result).__name__}",
-                    code="BAD_BULK_VERTICES_RESULT",
-                )
-            return result
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="crewai",
-                operation="bulk_vertices_async",
-                namespace=getattr(spec, "namespace", None),
-                limit=spec.limit,
-            )
-            raise
-
-    # ------------------------------------------------------------------ #
-    # Batch (sync + async)
-    # ------------------------------------------------------------------ #
-
-    def batch(
-        self,
-        ops: List[BatchOperation],
-        *,
-        task: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> BatchResult:
-        """
-        Sync wrapper for batch operations.
-
-        Translates `BatchOperation` dataclasses into the raw mapping shape
-        expected by GraphTranslator and returns the underlying `BatchResult`.
-        """
-        ctx = self._build_ctx(task=task, extra_context=extra_context)
-
-        raw_batch_ops: List[Mapping[str, Any]] = [
-            {"op": op.op, "args": dict(op.args or {})} for op in ops
-        ]
-
-        try:
-            result = self._translator.batch(
-                raw_batch_ops,
-                op_ctx=ctx,
-                framework_ctx={},
-            )
-            if not isinstance(result, BatchResult):
-                raise BadRequest(
-                    f"GraphTranslator.batch returned unsupported type: {type(result).__name__}",
-                    code="BAD_BATCH_RESULT",
-                )
-            return result
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="crewai",
-                operation="batch_sync",
-                ops_count=len(ops),
-            )
-            raise
-
-    async def abatch(
-        self,
-        ops: List[BatchOperation],
-        *,
-        task: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> BatchResult:
-        """
-        Async wrapper for batch operations.
-        """
-        ctx = self._build_ctx(task=task, extra_context=extra_context)
-
-        raw_batch_ops: List[Mapping[str, Any]] = [
-            {"op": op.op, "args": dict(op.args or {})} for op in ops
-        ]
-
-        try:
-            result = await self._translator.arun_batch(
-                raw_batch_ops,
-                op_ctx=ctx,
-                framework_ctx={},
-            )
-            if not isinstance(result, BatchResult):
-                raise BadRequest(
-                    f"GraphTranslator.arun_batch returned unsupported type: {type(result).__name__}",
-                    code="BAD_BATCH_RESULT",
-                )
-            return result
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="crewai",
-                operation="batch_async",
-                ops_count=len(ops),
-            )
-            raise
-
-    # ------------------------------------------------------------------ #
-    # Schema / health (sync + async)
-    # ------------------------------------------------------------------ #
-
-    def get_schema(
-        self,
-        *,
-        task: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> GraphSchema:
-        """
-        Sync wrapper around `graph_adapter.get_schema(...)`.
-
-        Delegates to GraphTranslator so that async→sync bridging and
-        error-context handling are centralized.
-        """
-        ctx = self._build_ctx(task=task, extra_context=extra_context)
-        try:
-            schema = self._translator.get_schema(
-                op_ctx=ctx,
-                framework_ctx={},
-            )
-            if not isinstance(schema, GraphSchema):
-                raise BadRequest(
-                    f"GraphTranslator.get_schema returned unsupported type: {type(schema).__name__}",
-                    code="BAD_TRANSLATED_SCHEMA",
-                )
-            return schema
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="crewai",
-                operation="get_schema_sync",
-            )
-            raise
-
-    async def aget_schema(
-        self,
-        *,
-        task: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> GraphSchema:
-        """
-        Async wrapper around `graph_adapter.get_schema(...)`.
-
-        Delegates to GraphTranslator.
-        """
-        ctx = self._build_ctx(task=task, extra_context=extra_context)
-        try:
-            schema = await self._translator.arun_get_schema(
-                op_ctx=ctx,
-                framework_ctx={},
-            )
-            if not isinstance(schema, GraphSchema):
-                raise BadRequest(
-                    f"GraphTranslator.arun_get_schema returned unsupported type: {type(schema).__name__}",
-                    code="BAD_TRANSLATED_SCHEMA",
-                )
-            return schema
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="crewai",
-                operation="get_schema_async",
-            )
-            raise
-
-    def health(
-        self,
-        *,
-        task: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> Mapping[str, Any]:
-        """
-        Health check (sync).
-
-        Assumes the adapter exposes a sync `health(ctx=...)` method.
-        Returns the normalized health mapping from the underlying adapter.
-        """
-        ctx = self._build_ctx(task=task, extra_context=extra_context)
-        try:
-            health_result = self._graph.health(ctx=ctx)
-            if not isinstance(health_result, Mapping):
-                raise BadRequest(
-                    f"graph_adapter.health returned unsupported type: {type(health_result).__name__}",
-                    code="BAD_HEALTH_RESULT",
-                )
-            return dict(health_result)
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="crewai",
-                operation="health_sync",
-            )
-            raise
-
-    async def ahealth(
-        self,
-        *,
-        task: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> Mapping[str, Any]:
-        """
-        Health check (async).
-
-        Assumes the adapter exposes an async `health(ctx=...)` method.
-        """
-        ctx = self._build_ctx(task=task, extra_context=extra_context)
-        try:
-            health_result = await self._graph.health(ctx=ctx)
-            if not isinstance(health_result, Mapping):
-                raise BadRequest(
-                    f"graph_adapter.health returned unsupported type: {type(health_result).__name__}",
-                    code="BAD_HEALTH_RESULT",
-                )
-            return dict(health_result)
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="crewai",
-                operation="health_async",
-            )
-            raise
+    # Use with CrewAI agent
+    agent = Agent(
+        role="Researcher",
+        goal="Research latest AI developments",
+        backstory="Expert research analyst",
+        embedder=embedder,
+        tools=[...]
+    )
+    ```
+    """
+    return CorpusCrewAIEmbeddings(
+        corpus_adapter=corpus_adapter,
+        model=model,
+        **kwargs,
+    )
 
 
 __all__ = [
-    "CrewAIGraphClientProtocol",
-    "CorpusCrewAIGraphClient",
+    "CorpusCrewAIEmbeddings",
+    "create_crewai_embedder",
 ]
