@@ -10,7 +10,7 @@ This module exposes Corpus `EmbeddingProtocolV1` implementations as
 - Sync + async embedding for documents and queries
 - Context normalization via `context_translation.from_langchain`
 - Framework-agnostic orchestration via `EmbeddingTranslator`
-- Async → sync bridging using `AsyncBridge`
+- Async → sync bridging handled in the common embedding layer
 - Rich error context attachment for observability
 - Model selection via framework_ctx / OperationContext attrs
 
@@ -22,11 +22,10 @@ from __future__ import annotations
 
 import logging
 from functools import cached_property
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from langchain_core.embeddings import Embeddings
 
-from corpus_sdk.core.async_bridge import AsyncBridge
 from corpus_sdk.core.context_translation import (
     from_langchain as context_from_langchain,
 )
@@ -42,91 +41,6 @@ from corpus_sdk.embedding.framework_adapters.common.embedding_translation import
 from corpus_sdk.llm.framework_adapters.common.error_context import attach_context
 
 logger = logging.getLogger(__name__)
-
-
-class EmbeddingOperationError(Exception):
-    """Base exception for embedding operations with context."""
-    def __init__(self, message: str, context: Optional[Dict[str, Any]] = None):
-        super().__init__(message)
-        self.context = context or {}
-
-
-def _with_error_context(
-    framework: str,
-    operation: str,
-    **default_context: Any,
-) -> Any:
-    """
-    Decorator to attach error context to exceptions from embedding operations.
-    
-    Args:
-        framework: The framework name ("langchain")
-        operation: The operation name ("embed_documents", "embed_query")
-        default_context: Default context values to attach
-    """
-    def decorator(func):
-        if isinstance(func, type) or not callable(func):
-            raise TypeError("_with_error_context can only decorate callables")
-            
-        async def async_wrapper(self, *args, **kwargs):
-            core_ctx = None
-            try:
-                # Extract core_ctx from method arguments or build it
-                if hasattr(self, '_build_contexts'):
-                    # For class methods that use _build_contexts
-                    config = kwargs.get('config')
-                    model = kwargs.get('model')
-                    core_ctx, _, _ = self._build_contexts(config=config, model=model)
-                return await func(self, *args, **kwargs)
-            except Exception as exc:
-                context = default_context.copy()
-                context.update({
-                    "framework": framework,
-                    "embedding_operation": operation,
-                    "request_id": getattr(core_ctx, "request_id", None) if core_ctx else None,
-                    "tenant": getattr(core_ctx, "tenant", None) if core_ctx else None,
-                })
-                # Add operation-specific context
-                if operation == "embed_documents":
-                    context["texts_count"] = len(kwargs.get('texts', []))
-                elif operation == "embed_query":
-                    context["text_len"] = len(kwargs.get('text', ''))
-                
-                try:
-                    attach_context(exc, **context)
-                except Exception:
-                    pass  # Never mask original error
-                raise
-
-        def sync_wrapper(self, *args, **kwargs):
-            core_ctx = None
-            try:
-                if hasattr(self, '_build_contexts'):
-                    config = kwargs.get('config')
-                    model = kwargs.get('model')
-                    core_ctx, _, _ = self._build_contexts(config=config, model=model)
-                return func(self, *args, **kwargs)
-            except Exception as exc:
-                context = default_context.copy()
-                context.update({
-                    "framework": framework,
-                    "embedding_operation": operation,
-                    "request_id": getattr(core_ctx, "request_id", None) if core_ctx else None,
-                    "tenant": getattr(core_ctx, "tenant", None) if core_ctx else None,
-                })
-                if operation == "embed_documents":
-                    context["texts_count"] = len(kwargs.get('texts', []))
-                elif operation == "embed_query":
-                    context["text_len"] = len(kwargs.get('text', ''))
-                
-                try:
-                    attach_context(exc, **context)
-                except Exception:
-                    pass
-                raise
-
-        return async_wrapper if func.__name__.startswith('a') else sync_wrapper
-    return decorator
 
 
 class CorpusLangChainEmbeddings(Embeddings):
@@ -145,8 +59,8 @@ class CorpusLangChainEmbeddings(Embeddings):
         * Build EmbedSpecs
         * Call the underlying adapter
         * Translate the result to a framework-facing shape
-    - Use `AsyncBridge` to bridge async protocol calls for sync APIs.
-    - Attach structured error context via `attach_context`.
+    - Rely on `EmbeddingTranslator` for async↔sync bridging and timeouts.
+    - Attach structured, LangChain-specific error context via `attach_context`.
 
     Non-responsibilities
     --------------------
@@ -227,7 +141,9 @@ class CorpusLangChainEmbeddings(Embeddings):
         op_ctx_dict: Dict[str, Any] = core_ctx.to_dict()
 
         # Framework-level context: currently we mainly care about model hint.
-        framework_ctx: Dict[str, Any] = {}
+        framework_ctx: Dict[str, Any] = {
+            "framework": "langchain",
+        }
         effective_model = model or self.model
         if effective_model:
             framework_ctx["model"] = effective_model
@@ -250,9 +166,8 @@ class CorpusLangChainEmbeddings(Embeddings):
         This makes the adapter resilient to future translator customizations,
         as long as they expose an `embeddings` vector-of-vectors somewhere.
         """
-        # Use structural pattern matching for cleaner type handling (Python 3.10+)
         embeddings_obj: Any
-        
+
         match result:
             case {"embeddings": emb}:
                 embeddings_obj = emb
@@ -294,7 +209,7 @@ class CorpusLangChainEmbeddings(Embeddings):
         - If it has multiple rows → return the first row but log a warning
         """
         matrix = CorpusLangChainEmbeddings._coerce_embedding_matrix(result)
-        
+
         if not matrix:
             raise ValueError("Translator returned no embeddings for single-text input")
 
@@ -307,17 +222,10 @@ class CorpusLangChainEmbeddings(Embeddings):
 
         return matrix[0]
 
-    def _get_timeout_from_context(self, core_ctx: Any) -> Optional[float]:
-        """Extract timeout from core context, converting ms to seconds."""
-        if hasattr(core_ctx, "deadline_ms") and core_ctx.deadline_ms is not None:
-            return core_ctx.deadline_ms / 1000.0
-        return None
-
     # ------------------------------------------------------------------ #
     # Async API
     # ------------------------------------------------------------------ #
 
-    @_with_error_context("langchain", "embed_documents")
     async def aembed_documents(
         self,
         texts: List[str],
@@ -339,19 +247,34 @@ class CorpusLangChainEmbeddings(Embeddings):
         model:
             Optional per-call model override.
         """
-        _, op_ctx_dict, framework_ctx = self._build_contexts(
+        core_ctx, op_ctx_dict, framework_ctx = self._build_contexts(
             config=config,
             model=model,
         )
 
-        translated = await self._translator.arun_embed(
-            raw_texts=texts,
-            op_ctx=op_ctx_dict,
-            framework_ctx=framework_ctx,
-        )
-        return self._coerce_embedding_matrix(translated)
+        try:
+            translated = await self._translator.arun_embed(
+                raw_texts=texts,
+                op_ctx=op_ctx_dict,
+                framework_ctx=framework_ctx,
+            )
+            return self._coerce_embedding_matrix(translated)
+        except Exception as exc:  # noqa: BLE001
+            # Enrich with LangChain-specific context; protocol-level context
+            # is already attached by EmbeddingTranslator.
+            try:
+                attach_context(
+                    exc,
+                    embedding_operation="aembed_documents",
+                    texts_count=len(texts),
+                    langchain_model_hint=framework_ctx.get("model"),
+                    langchain_config_present=config is not None,
+                )
+            except Exception:
+                # Never mask the original error
+                pass
+            raise
 
-    @_with_error_context("langchain", "embed_query")  
     async def aembed_query(
         self,
         text: str,
@@ -372,23 +295,36 @@ class CorpusLangChainEmbeddings(Embeddings):
         model:
             Optional per-call model override.
         """
-        _, op_ctx_dict, framework_ctx = self._build_contexts(
+        core_ctx, op_ctx_dict, framework_ctx = self._build_contexts(
             config=config,
             model=model,
         )
 
-        translated = await self._translator.arun_embed(
-            raw_texts=text,
-            op_ctx=op_ctx_dict,
-            framework_ctx=framework_ctx,
-        )
-        return self._coerce_embedding_vector(translated)
+        try:
+            translated = await self._translator.arun_embed(
+                raw_texts=text,
+                op_ctx=op_ctx_dict,
+                framework_ctx=framework_ctx,
+            )
+            return self._coerce_embedding_vector(translated)
+        except Exception as exc:  # noqa: BLE001
+            try:
+                attach_context(
+                    exc,
+                    embedding_operation="aembed_query",
+                    text_len=len(text or ""),
+                    langchain_model_hint=framework_ctx.get("model"),
+                    langchain_config_present=config is not None,
+                )
+            except Exception:
+                # Never mask the original error
+                pass
+            raise
 
     # ------------------------------------------------------------------ #
-    # Sync API (via AsyncBridge)
+    # Sync API (via EmbeddingTranslator)
     # ------------------------------------------------------------------ #
 
-    @_with_error_context("langchain", "embed_documents")
     def embed_documents(
         self,
         texts: List[str],
@@ -400,27 +336,38 @@ class CorpusLangChainEmbeddings(Embeddings):
         """
         Sync embedding for multiple documents.
 
-        Uses `AsyncBridge` on top of the async translator path so:
-        - We honor `deadline_ms` from the OperationContext as a timeout.
-        - We avoid nested event loops in Jupyter / async environments.
+        Uses the synchronous `EmbeddingTranslator.embed` API, which internally
+        bridges async protocol calls and respects any `deadline_ms` timeout
+        encoded in the OperationContext.
         """
         core_ctx, op_ctx_dict, framework_ctx = self._build_contexts(
             config=config,
             model=model,
         )
-        timeout = self._get_timeout_from_context(core_ctx)
 
-        async def _coro() -> List[List[float]]:
-            translated = await self._translator.arun_embed(
+        try:
+            translated = self._translator.embed(
                 raw_texts=texts,
                 op_ctx=op_ctx_dict,
                 framework_ctx=framework_ctx,
             )
             return self._coerce_embedding_matrix(translated)
+        except Exception as exc:  # noqa: BLE001
+            # Enrich with LangChain-specific context; protocol-level context
+            # is already attached by EmbeddingTranslator.
+            try:
+                attach_context(
+                    exc,
+                    embedding_operation="embed_documents",
+                    texts_count=len(texts),
+                    langchain_model_hint=framework_ctx.get("model"),
+                    langchain_config_present=config is not None,
+                )
+            except Exception:
+                # Never mask the original error
+                pass
+            raise
 
-        return AsyncBridge.run_async(_coro(), timeout=timeout)
-
-    @_with_error_context("langchain", "embed_query")
     def embed_query(
         self,
         text: str,
@@ -432,24 +379,35 @@ class CorpusLangChainEmbeddings(Embeddings):
         """
         Sync embedding for a single query.
 
-        Uses `AsyncBridge` on top of the async translator path with respect
-        to any `deadline_ms` set in the OperationContext.
+        Uses the synchronous `EmbeddingTranslator.embed` API, which internally
+        bridges async protocol calls and respects any `deadline_ms` timeout
+        encoded in the OperationContext.
         """
         core_ctx, op_ctx_dict, framework_ctx = self._build_contexts(
             config=config,
             model=model,
         )
-        timeout = self._get_timeout_from_context(core_ctx)
 
-        async def _coro() -> List[float]:
-            translated = await self._translator.arun_embed(
+        try:
+            translated = self._translator.embed(
                 raw_texts=text,
                 op_ctx=op_ctx_dict,
                 framework_ctx=framework_ctx,
             )
             return self._coerce_embedding_vector(translated)
-
-        return AsyncBridge.run_async(_coro(), timeout=timeout)
+        except Exception as exc:  # noqa: BLE001
+            try:
+                attach_context(
+                    exc,
+                    embedding_operation="embed_query",
+                    text_len=len(text or ""),
+                    langchain_model_hint=framework_ctx.get("model"),
+                    langchain_config_present=config is not None,
+                )
+            except Exception:
+                # Never mask the original error
+                pass
+            raise
 
 
 __all__ = [
