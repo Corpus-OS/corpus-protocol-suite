@@ -21,14 +21,25 @@ framework-specific skin over the protocol-first Corpus embedding stack.
 from __future__ import annotations
 
 import logging
-from functools import cached_property
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from functools import cached_property, wraps
+from typing import (
+    Any,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    TypeVar,
+    Callable,
+)
 
 from langchain_core.embeddings import Embeddings
 
 from corpus_sdk.core.context_translation import (
     from_langchain as context_from_langchain,
 )
+from corpus_sdk.core.error_context import attach_context
 from corpus_sdk.embedding.embedding_base import (
     EmbeddingProtocolV1,
 )
@@ -38,9 +49,67 @@ from corpus_sdk.embedding.framework_adapters.common.embedding_translation import
     TextNormalizationConfig,
     create_embedding_translator,
 )
-from corpus_sdk.llm.framework_adapters.common.error_context import attach_context
 
 logger = logging.getLogger(__name__)
+
+# Type variables for decorators
+T = TypeVar("T")
+
+# Error code constants
+class ErrorCodes:
+    INVALID_EMBEDDING_RESULT = "INVALID_EMBEDDING_RESULT"
+    EMPTY_EMBEDDING_RESULT = "EMPTY_EMBEDDING_RESULT"
+    EMBEDDING_CONVERSION_ERROR = "EMBEDDING_CONVERSION_ERROR"
+
+
+def with_embedding_error_context(
+    operation: str,
+    **context_kwargs: Any,
+) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    """
+    Decorator to automatically attach error context to embedding exceptions.
+    """
+    def decorator(func: Callable[..., T]) -> Callable[..., T]:
+        @wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> T:
+            try:
+                return func(*args, **kwargs)
+            except Exception as exc:
+                enhanced_context = context_kwargs.copy()
+                attach_context(
+                    exc,
+                    framework="langchain",
+                    operation=f"embedding_{operation}",
+                    **enhanced_context,
+                )
+                raise
+        return wrapper
+    return decorator
+
+
+def with_async_embedding_error_context(
+    operation: str,
+    **context_kwargs: Any,
+) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    """
+    Decorator to automatically attach error context to async embedding exceptions.
+    """
+    def decorator(func: Callable[..., T]) -> Callable[..., T]:
+        @wraps(func)
+        async def wrapper(*args: Any, **kwargs: Any) -> T:
+            try:
+                return await func(*args, **kwargs)
+            except Exception as exc:
+                enhanced_context = context_kwargs.copy()
+                attach_context(
+                    exc,
+                    framework="langchain",
+                    operation=f"embedding_{operation}",
+                    **enhanced_context,
+                )
+                raise
+        return wrapper
+    return decorator
 
 
 class CorpusLangChainEmbeddings(Embeddings):
@@ -138,7 +207,11 @@ class CorpusLangChainEmbeddings(Embeddings):
         core_ctx = context_from_langchain(config)
 
         # Normalized dict for embedding OperationContext reconstruction.
-        op_ctx_dict: Dict[str, Any] = core_ctx.to_dict()
+        op_ctx_dict: Dict[str, Any] = {}
+        if hasattr(core_ctx, 'to_dict'):
+            op_ctx_dict = core_ctx.to_dict()
+        elif hasattr(core_ctx, '__dict__'):
+            op_ctx_dict = core_ctx.__dict__
 
         # Framework-level context: currently we mainly care about model hint.
         framework_ctx: Dict[str, Any] = {
@@ -150,8 +223,7 @@ class CorpusLangChainEmbeddings(Embeddings):
 
         return core_ctx, op_ctx_dict, framework_ctx
 
-    @staticmethod
-    def _coerce_embedding_matrix(result: Any) -> List[List[float]]:
+    def _coerce_embedding_matrix(self, result: Any) -> List[List[float]]:
         """
         Coerce translator result into a List[List[float]] embedding matrix.
 
@@ -179,7 +251,8 @@ class CorpusLangChainEmbeddings(Embeddings):
         if not isinstance(embeddings_obj, Sequence):
             raise TypeError(
                 f"Translator result does not contain a valid embeddings sequence: "
-                f"type={type(embeddings_obj).__name__}"
+                f"type={type(embeddings_obj).__name__}",
+                code=ErrorCodes.INVALID_EMBEDDING_RESULT,
             )
 
         matrix: List[List[float]] = []
@@ -187,19 +260,20 @@ class CorpusLangChainEmbeddings(Embeddings):
             if not isinstance(row, Sequence):
                 raise TypeError(
                     f"Expected each embedding row to be a sequence, "
-                    f"got {type(row).__name__} at index {i}"
+                    f"got {type(row).__name__} at index {i}",
+                    code=ErrorCodes.INVALID_EMBEDDING_RESULT,
                 )
             try:
                 matrix.append([float(x) for x in row])
             except (TypeError, ValueError) as e:
                 raise TypeError(
-                    f"Failed to convert embedding values to float at row {i}: {e}"
+                    f"Failed to convert embedding values to float at row {i}: {e}",
+                    code=ErrorCodes.EMBEDDING_CONVERSION_ERROR,
                 ) from e
 
         return matrix
 
-    @staticmethod
-    def _coerce_embedding_vector(result: Any) -> List[float]:
+    def _coerce_embedding_vector(self, result: Any) -> List[float]:
         """
         Coerce translator result for a single-text embed into List[float].
 
@@ -208,10 +282,13 @@ class CorpusLangChainEmbeddings(Embeddings):
         - If it has exactly one row → return that row
         - If it has multiple rows → return the first row but log a warning
         """
-        matrix = CorpusLangChainEmbeddings._coerce_embedding_matrix(result)
+        matrix = self._coerce_embedding_matrix(result)
 
         if not matrix:
-            raise ValueError("Translator returned no embeddings for single-text input")
+            raise ValueError(
+                "Translator returned no embeddings for single-text input",
+                code=ErrorCodes.EMPTY_EMBEDDING_RESULT,
+            )
 
         if len(matrix) > 1:
             logger.warning(
@@ -226,6 +303,7 @@ class CorpusLangChainEmbeddings(Embeddings):
     # Async API
     # ------------------------------------------------------------------ #
 
+    @with_async_embedding_error_context("documents")
     async def aembed_documents(
         self,
         texts: List[str],
@@ -252,29 +330,14 @@ class CorpusLangChainEmbeddings(Embeddings):
             model=model,
         )
 
-        try:
-            translated = await self._translator.arun_embed(
-                raw_texts=texts,
-                op_ctx=op_ctx_dict,
-                framework_ctx=framework_ctx,
-            )
-            return self._coerce_embedding_matrix(translated)
-        except Exception as exc:  # noqa: BLE001
-            # Enrich with LangChain-specific context; protocol-level context
-            # is already attached by EmbeddingTranslator.
-            try:
-                attach_context(
-                    exc,
-                    embedding_operation="aembed_documents",
-                    texts_count=len(texts),
-                    langchain_model_hint=framework_ctx.get("model"),
-                    langchain_config_present=config is not None,
-                )
-            except Exception:
-                # Never mask the original error
-                pass
-            raise
+        translated = await self._translator.arun_embed(
+            raw_texts=texts,
+            op_ctx=op_ctx_dict,
+            framework_ctx=framework_ctx,
+        )
+        return self._coerce_embedding_matrix(translated)
 
+    @with_async_embedding_error_context("query")
     async def aembed_query(
         self,
         text: str,
@@ -300,31 +363,18 @@ class CorpusLangChainEmbeddings(Embeddings):
             model=model,
         )
 
-        try:
-            translated = await self._translator.arun_embed(
-                raw_texts=text,
-                op_ctx=op_ctx_dict,
-                framework_ctx=framework_ctx,
-            )
-            return self._coerce_embedding_vector(translated)
-        except Exception as exc:  # noqa: BLE001
-            try:
-                attach_context(
-                    exc,
-                    embedding_operation="aembed_query",
-                    text_len=len(text or ""),
-                    langchain_model_hint=framework_ctx.get("model"),
-                    langchain_config_present=config is not None,
-                )
-            except Exception:
-                # Never mask the original error
-                pass
-            raise
+        translated = await self._translator.arun_embed(
+            raw_texts=text,
+            op_ctx=op_ctx_dict,
+            framework_ctx=framework_ctx,
+        )
+        return self._coerce_embedding_vector(translated)
 
     # ------------------------------------------------------------------ #
     # Sync API (via EmbeddingTranslator)
     # ------------------------------------------------------------------ #
 
+    @with_embedding_error_context("documents")
     def embed_documents(
         self,
         texts: List[str],
@@ -345,29 +395,14 @@ class CorpusLangChainEmbeddings(Embeddings):
             model=model,
         )
 
-        try:
-            translated = self._translator.embed(
-                raw_texts=texts,
-                op_ctx=op_ctx_dict,
-                framework_ctx=framework_ctx,
-            )
-            return self._coerce_embedding_matrix(translated)
-        except Exception as exc:  # noqa: BLE001
-            # Enrich with LangChain-specific context; protocol-level context
-            # is already attached by EmbeddingTranslator.
-            try:
-                attach_context(
-                    exc,
-                    embedding_operation="embed_documents",
-                    texts_count=len(texts),
-                    langchain_model_hint=framework_ctx.get("model"),
-                    langchain_config_present=config is not None,
-                )
-            except Exception:
-                # Never mask the original error
-                pass
-            raise
+        translated = self._translator.embed(
+            raw_texts=texts,
+            op_ctx=op_ctx_dict,
+            framework_ctx=framework_ctx,
+        )
+        return self._coerce_embedding_matrix(translated)
 
+    @with_embedding_error_context("query")
     def embed_query(
         self,
         text: str,
@@ -388,28 +423,15 @@ class CorpusLangChainEmbeddings(Embeddings):
             model=model,
         )
 
-        try:
-            translated = self._translator.embed(
-                raw_texts=text,
-                op_ctx=op_ctx_dict,
-                framework_ctx=framework_ctx,
-            )
-            return self._coerce_embedding_vector(translated)
-        except Exception as exc:  # noqa: BLE001
-            try:
-                attach_context(
-                    exc,
-                    embedding_operation="embed_query",
-                    text_len=len(text or ""),
-                    langchain_model_hint=framework_ctx.get("model"),
-                    langchain_config_present=config is not None,
-                )
-            except Exception:
-                # Never mask the original error
-                pass
-            raise
+        translated = self._translator.embed(
+            raw_texts=text,
+            op_ctx=op_ctx_dict,
+            framework_ctx=framework_ctx,
+        )
+        return self._coerce_embedding_vector(translated)
 
 
 __all__ = [
     "CorpusLangChainEmbeddings",
+    "ErrorCodes",
 ]
