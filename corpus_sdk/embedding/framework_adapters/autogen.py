@@ -24,7 +24,6 @@ import logging
 from functools import cached_property
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
-from corpus_sdk.core.async_bridge import AsyncBridge
 from corpus_sdk.core.context_translation import (
     from_autogen as context_from_autogen,  # Using existing implementation
 )
@@ -255,12 +254,6 @@ class CorpusAutoGenEmbeddings:
 
         return matrix[0]
 
-    def _get_timeout_from_context(self, core_ctx: Any) -> Optional[float]:
-        """Extract timeout from core context, converting ms to seconds."""
-        if hasattr(core_ctx, "deadline_ms") and core_ctx.deadline_ms is not None:
-            return core_ctx.deadline_ms / 1000.0
-        return None
-
     # ------------------------------------------------------------------ #
     # Core AutoGen EmbeddingFunction Interface
     # ------------------------------------------------------------------ #
@@ -317,33 +310,31 @@ class CorpusAutoGenEmbeddings:
             model=model,
             **kwargs,
         )
-        timeout = self._get_timeout_from_context(core_ctx)
 
-        async def _coro() -> List[List[float]]:
+        try:
+            translated = self._translator.embed(
+                raw_texts=texts,
+                op_ctx=op_ctx_dict,
+                framework_ctx=framework_ctx,
+            )
+            return self._coerce_embedding_matrix(translated)
+        except Exception as exc:  # noqa: BLE001
+            # Enrich with AutoGen-specific context; core protocol context is
+            # already attached inside EmbeddingTranslator.
             try:
-                translated = await self._translator.arun_embed(
-                    raw_texts=texts,
-                    op_ctx=op_ctx_dict,
-                    framework_ctx=framework_ctx,
+                attach_context(
+                    exc,
+                    embedding_operation="embed_documents",
+                    texts_count=len(texts),
+                    agent_name=framework_ctx.get("agent_name"),
+                    conversation_id=framework_ctx.get("conversation_id"),
+                    workflow_type=framework_ctx.get("workflow_type"),
+                    retriever_name=framework_ctx.get("retriever_name"),
                 )
-                return self._coerce_embedding_matrix(translated)
-            except Exception as exc:  # noqa: BLE001
-                try:
-                    attach_context(
-                        exc,
-                        framework="autogen",
-                        embedding_operation="embed_documents",
-                        texts_count=len(texts),
-                        agent_name=framework_ctx.get("agent_name"),
-                        conversation_id=framework_ctx.get("conversation_id"),
-                        request_id=getattr(core_ctx, "request_id", None),
-                        tenant=getattr(core_ctx, "tenant", None),
-                    )
-                except Exception:
-                    pass  # Never mask original error
-                raise
-
-        return AsyncBridge.run_async(_coro(), timeout=timeout)
+            except Exception:
+                # Never mask the original error
+                pass
+            raise
 
     def embed_query(
         self,
@@ -373,33 +364,31 @@ class CorpusAutoGenEmbeddings:
             model=model,
             **kwargs,
         )
-        timeout = self._get_timeout_from_context(core_ctx)
 
-        async def _coro() -> List[float]:
+        try:
+            translated = self._translator.embed(
+                raw_texts=text,
+                op_ctx=op_ctx_dict,
+                framework_ctx=framework_ctx,
+            )
+            return self._coerce_embedding_vector(translated)
+        except Exception as exc:  # noqa: BLE001
+            # Enrich with AutoGen-specific context; core protocol context is
+            # already attached inside EmbeddingTranslator.
             try:
-                translated = await self._translator.arun_embed(
-                    raw_texts=text,
-                    op_ctx=op_ctx_dict,
-                    framework_ctx=framework_ctx,
+                attach_context(
+                    exc,
+                    embedding_operation="embed_query",
+                    text_len=len(text or ""),
+                    agent_name=framework_ctx.get("agent_name"),
+                    conversation_id=framework_ctx.get("conversation_id"),
+                    workflow_type=framework_ctx.get("workflow_type"),
+                    retriever_name=framework_ctx.get("retriever_name"),
                 )
-                return self._coerce_embedding_vector(translated)
-            except Exception as exc:  # noqa: BLE001
-                try:
-                    attach_context(
-                        exc,
-                        framework="autogen",
-                        embedding_operation="embed_query",
-                        text_len=len(text or ""),
-                        agent_name=framework_ctx.get("agent_name"),
-                        conversation_id=framework_ctx.get("conversation_id"),
-                        request_id=getattr(core_ctx, "request_id", None),
-                        tenant=getattr(core_ctx, "tenant", None),
-                    )
-                except Exception:
-                    pass
-                raise
-
-        return AsyncBridge.run_async(_coro(), timeout=timeout)
+            except Exception:
+                # Never mask the original error
+                pass
+            raise
 
     # ------------------------------------------------------------------ #
     # Async API for AutoGen Async Workflows
@@ -442,18 +431,19 @@ class CorpusAutoGenEmbeddings:
             )
             return self._coerce_embedding_matrix(translated)
         except Exception as exc:  # noqa: BLE001
+            # Enrich with AutoGen-specific context for async workflows.
             try:
                 attach_context(
                     exc,
-                    framework="autogen",
                     embedding_operation="aembed_documents",
                     texts_count=len(texts),
                     agent_name=framework_ctx.get("agent_name"),
                     conversation_id=framework_ctx.get("conversation_id"),
-                    request_id=getattr(core_ctx, "request_id", None),
-                    tenant=getattr(core_ctx, "tenant", None),
+                    workflow_type=framework_ctx.get("workflow_type"),
+                    retriever_name=framework_ctx.get("retriever_name"),
                 )
             except Exception:
+                # Never mask the original error
                 pass
             raise
 
@@ -494,18 +484,19 @@ class CorpusAutoGenEmbeddings:
             )
             return self._coerce_embedding_vector(translated)
         except Exception as exc:  # noqa: BLE001
+            # Enrich with AutoGen-specific context for async query embeddings.
             try:
                 attach_context(
                     exc,
-                    framework="autogen",
                     embedding_operation="aembed_query",
                     text_len=len(text or ""),
                     agent_name=framework_ctx.get("agent_name"),
                     conversation_id=framework_ctx.get("conversation_id"),
-                    request_id=getattr(core_ctx, "request_id", None),
-                    tenant=getattr(core_ctx, "tenant", None),
+                    workflow_type=framework_ctx.get("workflow_type"),
+                    retriever_name=framework_ctx.get("retriever_name"),
                 )
             except Exception:
+                # Never mask the original error
                 pass
             raise
 
