@@ -42,7 +42,7 @@ Non-responsibilities
 from __future__ import annotations
 
 import logging
-from functools import cached_property
+from functools import cached_property, wraps
 from typing import (
     Any,
     AsyncIterator,
@@ -52,6 +52,9 @@ from typing import (
     Mapping,
     Optional,
     Protocol,
+    TypeVar,
+    Callable,
+    cast,
 )
 
 from corpus_sdk.core.context_translation import (
@@ -83,6 +86,88 @@ from corpus_sdk.graph.graph_base import (
 
 logger = logging.getLogger(__name__)
 
+# Type variables for decorators
+T = TypeVar("T")
+R = TypeVar("R")
+
+# Error code constants
+class ErrorCodes:
+    BAD_OPERATION_CONTEXT = "BAD_OPERATION_CONTEXT"
+    BAD_TRANSLATED_SCHEMA = "BAD_TRANSLATED_SCHEMA"
+    BAD_HEALTH_RESULT = "BAD_HEALTH_RESULT"
+    BAD_TRANSLATED_RESULT = "BAD_TRANSLATED_RESULT"
+    BAD_TRANSLATED_CHUNK = "BAD_TRANSLATED_CHUNK"
+    BAD_UPSERT_RESULT = "BAD_UPSERT_RESULT"
+    BAD_DELETE_RESULT = "BAD_DELETE_RESULT"
+    BAD_BULK_VERTICES_RESULT = "BAD_BULK_VERTICES_RESULT"
+    BAD_BATCH_RESULT = "BAD_BATCH_RESULT"
+
+
+def with_error_context(
+    operation: str,
+    **context_kwargs: Any,
+) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    """
+    Decorator to automatically attach error context to exceptions.
+    
+    Args:
+        operation: The operation name for error context
+        **context_kwargs: Additional context to attach to errors
+    """
+    def decorator(func: Callable[..., T]) -> Callable[..., T]:
+        @wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> T:
+            try:
+                return func(*args, **kwargs)
+            except Exception as exc:
+                # Extract additional context from function arguments if needed
+                enhanced_context = context_kwargs.copy()
+                
+                # For query operations, try to extract query info
+                if operation.startswith(("query_", "stream_query_")):
+                    if len(args) > 1 and isinstance(args[1], str):
+                        enhanced_context["query"] = args[1]
+                
+                attach_context(
+                    exc,
+                    framework="llamaindex",
+                    operation=operation,
+                    **enhanced_context,
+                )
+                raise
+        return wrapper
+    return decorator
+
+
+def with_async_error_context(
+    operation: str,
+    **context_kwargs: Any,
+) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    """
+    Decorator to automatically attach error context to exceptions in async functions.
+    """
+    def decorator(func: Callable[..., T]) -> Callable[..., T]:
+        @wraps(func)
+        async def wrapper(*args: Any, **kwargs: Any) -> T:
+            try:
+                return await func(*args, **kwargs)
+            except Exception as exc:
+                enhanced_context = context_kwargs.copy()
+                
+                if operation.startswith(("query_", "stream_query_")):
+                    if len(args) > 1 and isinstance(args[1], str):
+                        enhanced_context["query"] = args[1]
+                
+                attach_context(
+                    exc,
+                    framework="llamaindex",
+                    operation=operation,
+                    **enhanced_context,
+                )
+                raise
+        return wrapper
+    return decorator
+
 
 class LlamaIndexGraphClientProtocol(Protocol):
     """
@@ -93,7 +178,47 @@ class LlamaIndexGraphClientProtocol(Protocol):
     without depending on the concrete `CorpusLlamaIndexGraphClient` class.
     """
 
-    # Query
+    # Capabilities / schema / health -------------------------------------
+
+    def capabilities(self) -> Mapping[str, Any]:
+        ...
+
+    async def acapabilities(self) -> Mapping[str, Any]:
+        ...
+
+    def get_schema(
+        self,
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> GraphSchema:
+        ...
+
+    async def aget_schema(
+        self,
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> GraphSchema:
+        ...
+
+    def health(
+        self,
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> Mapping[str, Any]:
+        ...
+
+    async def ahealth(
+        self,
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> Mapping[str, Any]:
+        ...
+
+    # Query / streaming ---------------------------------------------------
 
     def query(
         self,
@@ -147,7 +272,7 @@ class LlamaIndexGraphClientProtocol(Protocol):
     ) -> AsyncIterator[QueryChunk]:
         ...
 
-    # Upsert
+    # Upsert --------------------------------------------------------------
 
     def upsert_nodes(
         self,
@@ -185,7 +310,7 @@ class LlamaIndexGraphClientProtocol(Protocol):
     ) -> UpsertResult:
         ...
 
-    # Delete
+    # Delete --------------------------------------------------------------
 
     def delete_nodes(
         self,
@@ -223,7 +348,7 @@ class LlamaIndexGraphClientProtocol(Protocol):
     ) -> DeleteResult:
         ...
 
-    # Bulk / batch / schema / health
+    # Bulk / batch --------------------------------------------------------
 
     def bulk_vertices(
         self,
@@ -259,38 +384,6 @@ class LlamaIndexGraphClientProtocol(Protocol):
         callback_manager: Optional[Any] = None,
         extra_context: Optional[Mapping[str, Any]] = None,
     ) -> BatchResult:
-        ...
-
-    def get_schema(
-        self,
-        *,
-        callback_manager: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> GraphSchema:
-        ...
-
-    async def aget_schema(
-        self,
-        *,
-        callback_manager: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> GraphSchema:
-        ...
-
-    def health(
-        self,
-        *,
-        callback_manager: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> Mapping[str, Any]:
-        ...
-
-    async def ahealth(
-        self,
-        *,
-        callback_manager: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> Mapping[str, Any]:
         ...
 
 
@@ -330,8 +423,8 @@ class CorpusLlamaIndexGraphClient:
             self,
             result: QueryResult,
             *,
-            op_ctx: OperationContext,  # noqa: ARG002
-            framework_ctx: Optional[Any] = None,  # noqa: ARG002
+            op_ctx: OperationContext,
+            framework_ctx: Optional[Any] = None,
         ) -> QueryResult:
             return result
 
@@ -339,8 +432,8 @@ class CorpusLlamaIndexGraphClient:
             self,
             chunk: QueryChunk,
             *,
-            op_ctx: OperationContext,  # noqa: ARG002
-            framework_ctx: Optional[Any] = None,  # noqa: ARG002
+            op_ctx: OperationContext,
+            framework_ctx: Optional[Any] = None,
         ) -> QueryChunk:
             return chunk
 
@@ -348,8 +441,8 @@ class CorpusLlamaIndexGraphClient:
             self,
             result: BulkVerticesResult,
             *,
-            op_ctx: OperationContext,  # noqa: ARG002
-            framework_ctx: Optional[Any] = None,  # noqa: ARG002
+            op_ctx: OperationContext,
+            framework_ctx: Optional[Any] = None,
         ) -> BulkVerticesResult:
             return result
 
@@ -357,8 +450,8 @@ class CorpusLlamaIndexGraphClient:
             self,
             result: BatchResult,
             *,
-            op_ctx: OperationContext,  # noqa: ARG002
-            framework_ctx: Optional[Any] = None,  # noqa: ARG002
+            op_ctx: OperationContext,
+            framework_ctx: Optional[Any] = None,
         ) -> BatchResult:
             return result
 
@@ -366,8 +459,8 @@ class CorpusLlamaIndexGraphClient:
             self,
             schema: GraphSchema,
             *,
-            op_ctx: OperationContext,  # noqa: ARG002
-            framework_ctx: Optional[Any] = None,  # noqa: ARG002
+            op_ctx: OperationContext,
+            framework_ctx: Optional[Any] = None,
         ) -> GraphSchema:
             return schema
 
@@ -431,7 +524,7 @@ class CorpusLlamaIndexGraphClient:
                 callback_manager,
                 **extra,
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             attach_context(
                 exc,
                 framework="llamaindex",
@@ -442,7 +535,7 @@ class CorpusLlamaIndexGraphClient:
         if not isinstance(ctx, OperationContext):
             raise BadRequest(
                 f"from_llamaindex produced unsupported context type: {type(ctx).__name__}",
-                code="BAD_OPERATION_CONTEXT",
+                code=ErrorCodes.BAD_OPERATION_CONTEXT,
             )
 
         return ctx
@@ -507,10 +600,201 @@ class CorpusLlamaIndexGraphClient:
         effective_namespace = namespace or self._default_namespace
         return {"namespace": effective_namespace} if effective_namespace is not None else {}
 
+    def _validate_result_type(
+        self,
+        result: Any,
+        expected_type: type[T],
+        operation: str,
+        error_code: str,
+    ) -> T:
+        """
+        Validate that a result is of the expected type.
+        
+        Args:
+            result: The result to validate
+            expected_type: The expected type
+            operation: Operation name for error message
+            error_code: Error code for BadRequest
+            
+        Returns:
+            The validated result cast to expected type
+        """
+        if not isinstance(result, expected_type):
+            raise BadRequest(
+                f"{operation} returned unsupported type: {type(result).__name__}",
+                code=error_code,
+            )
+        return cast(T, result)
+
+    # ------------------------------------------------------------------ #
+    # Capabilities / schema / health
+    # ------------------------------------------------------------------ #
+
+    @with_error_context("capabilities_sync")
+    def capabilities(self) -> Mapping[str, Any]:
+        """
+        Sync wrapper around capabilities, delegating async→sync bridging
+        to GraphTranslator.
+        """
+        caps = self._translator.capabilities()
+        # We normalize to a simple dict for LlamaIndex consumption.
+        return {
+            "server": caps.server,
+            "version": caps.version,
+            "protocol": caps.protocol,
+            "supports_stream_query": caps.supports_stream_query,
+            "supported_query_dialects": list(caps.supported_query_dialects or ()),
+            "supports_namespaces": caps.supports_namespaces,
+            "supports_property_filters": caps.supports_property_filters,
+            "supports_bulk_vertices": caps.supports_bulk_vertices,
+            "supports_batch": caps.supports_batch,
+            "supports_schema": caps.supports_schema,
+            "idempotent_writes": caps.idempotent_writes,
+            "supports_multi_tenant": caps.supports_multi_tenant,
+            "supports_deadline": caps.supports_deadline,
+            "max_batch_ops": caps.max_batch_ops,
+        }
+
+    @with_async_error_context("capabilities_async")
+    async def acapabilities(self) -> Mapping[str, Any]:
+        """
+        Async capabilities accessor.
+
+        We delegate to GraphTranslator for consistency, then normalize to a
+        simple dict for LlamaIndex consumption.
+        """
+        caps = await self._translator.arun_capabilities()
+        return {
+            "server": caps.server,
+            "version": caps.version,
+            "protocol": caps.protocol,
+            "supports_stream_query": caps.supports_stream_query,
+            "supported_query_dialects": list(caps.supported_query_dialects or ()),
+            "supports_namespaces": caps.supports_namespaces,
+            "supports_property_filters": caps.supports_property_filters,
+            "supports_bulk_vertices": caps.supports_bulk_vertices,
+            "supports_batch": caps.supports_batch,
+            "supports_schema": caps.supports_schema,
+            "idempotent_writes": caps.idempotent_writes,
+            "supports_multi_tenant": caps.supports_multi_tenant,
+            "supports_deadline": caps.supports_deadline,
+            "max_batch_ops": caps.max_batch_ops,
+        }
+
+    @with_error_context("get_schema_sync")
+    def get_schema(
+        self,
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> GraphSchema:
+        """
+        Sync wrapper around `graph_adapter.get_schema(...)`.
+
+        Delegates to GraphTranslator so that async→sync bridging and
+        error-context handling are centralized.
+        """
+        ctx = self._build_ctx(
+            callback_manager=callback_manager,
+            extra_context=extra_context,
+        )
+        schema = self._translator.get_schema(
+            op_ctx=ctx,
+            framework_ctx={},
+        )
+        return self._validate_result_type(
+            schema,
+            GraphSchema,
+            "GraphTranslator.get_schema",
+            ErrorCodes.BAD_TRANSLATED_SCHEMA,
+        )
+
+    @with_async_error_context("get_schema_async")
+    async def aget_schema(
+        self,
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> GraphSchema:
+        """
+        Async wrapper around `graph_adapter.get_schema(...)`.
+
+        Delegates to GraphTranslator.
+        """
+        ctx = self._build_ctx(
+            callback_manager=callback_manager,
+            extra_context=extra_context,
+        )
+        schema = await self._translator.arun_get_schema(
+            op_ctx=ctx,
+            framework_ctx={},
+        )
+        return self._validate_result_type(
+            schema,
+            GraphSchema,
+            "GraphTranslator.arun_get_schema",
+            ErrorCodes.BAD_TRANSLATED_SCHEMA,
+        )
+
+    @with_error_context("health_sync")
+    def health(
+        self,
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> Mapping[str, Any]:
+        """
+        Health check (sync).
+
+        Uses GraphTranslator for consistency with other operations.
+        """
+        ctx = self._build_ctx(
+            callback_manager=callback_manager,
+            extra_context=extra_context,
+        )
+        health_result = self._translator.health(
+            op_ctx=ctx,
+            framework_ctx={},
+        )
+        return self._validate_result_type(
+            health_result,
+            Mapping,
+            "GraphTranslator.health",
+            ErrorCodes.BAD_HEALTH_RESULT,
+        )
+
+    @with_async_error_context("health_async")
+    async def ahealth(
+        self,
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> Mapping[str, Any]:
+        """
+        Health check (async).
+
+        Uses GraphTranslator for consistency with other operations.
+        """
+        ctx = self._build_ctx(
+            callback_manager=callback_manager,
+            extra_context=extra_context,
+        )
+        health_result = await self._translator.arun_health(
+            op_ctx=ctx,
+            framework_ctx={},
+        )
+        return self._validate_result_type(
+            health_result,
+            Mapping,
+            "GraphTranslator.arun_health",
+            ErrorCodes.BAD_HEALTH_RESULT,
+        )
+
     # ------------------------------------------------------------------ #
     # Query (sync + async)
     # ------------------------------------------------------------------ #
 
+    @with_error_context("query_sync")
     def query(
         self,
         query: str,
@@ -543,30 +827,20 @@ class CorpusLlamaIndexGraphClient:
         )
         framework_ctx = self._framework_ctx_for_namespace(namespace)
 
-        try:
-            result = self._translator.query(
-                raw_query,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-                mmr_config=None,
-            )
-            if not isinstance(result, QueryResult):
-                raise BadRequest(
-                    f"GraphTranslator.query returned unsupported type: {type(result).__name__}",
-                    code="BAD_TRANSLATED_RESULT",
-                )
-            return result
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="llamaindex",
-                operation="query_sync",
-                query=query,
-                dialect=dialect or self._default_dialect,
-                namespace=namespace or self._default_namespace,
-            )
-            raise
+        result = self._translator.query(
+            raw_query,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+            mmr_config=None,
+        )
+        return self._validate_result_type(
+            result,
+            QueryResult,
+            "GraphTranslator.query",
+            ErrorCodes.BAD_TRANSLATED_RESULT,
+        )
 
+    @with_async_error_context("query_async")
     async def aquery(
         self,
         query: str,
@@ -599,34 +873,24 @@ class CorpusLlamaIndexGraphClient:
         )
         framework_ctx = self._framework_ctx_for_namespace(namespace)
 
-        try:
-            result = await self._translator.arun_query(
-                raw_query,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-                mmr_config=None,
-            )
-            if not isinstance(result, QueryResult):
-                raise BadRequest(
-                    f"GraphTranslator.arun_query returned unsupported type: {type(result).__name__}",
-                    code="BAD_TRANSLATED_RESULT",
-                )
-            return result
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="llamaindex",
-                operation="query_async",
-                query=query,
-                dialect=dialect or self._default_dialect,
-                namespace=namespace or self._default_namespace,
-            )
-            raise
+        result = await self._translator.arun_query(
+            raw_query,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+            mmr_config=None,
+        )
+        return self._validate_result_type(
+            result,
+            QueryResult,
+            "GraphTranslator.arun_query",
+            ErrorCodes.BAD_TRANSLATED_RESULT,
+        )
 
     # ------------------------------------------------------------------ #
     # Streaming query (sync + async)
     # ------------------------------------------------------------------ #
 
+    @with_error_context("stream_query_sync")
     def stream_query(
         self,
         query: str,
@@ -634,7 +898,7 @@ class CorpusLlamaIndexGraphClient:
         params: Optional[Mapping[str, Any]] = None,
         dialect: Optional[str] = None,
         namespace: Optional[str] = None,
-        timeout_ms: Optional[int] = None,  # kept for API symmetry (passed via raw_query)
+        timeout_ms: Optional[int] = None,
         callback_manager: Optional[Any] = None,
         extra_context: Optional[Mapping[str, Any]] = None,
     ) -> Iterator[QueryChunk]:
@@ -661,29 +925,19 @@ class CorpusLlamaIndexGraphClient:
         )
         framework_ctx = self._framework_ctx_for_namespace(namespace)
 
-        try:
-            for chunk in self._translator.query_stream(
-                raw_query,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            ):
-                if not isinstance(chunk, QueryChunk):
-                    raise BadRequest(
-                        f"GraphTranslator.query_stream yielded unsupported type: {type(chunk).__name__}",
-                        code="BAD_TRANSLATED_CHUNK",
-                    )
-                yield chunk
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="llamaindex",
-                operation="stream_query_sync",
-                query=query,
-                dialect=dialect or self._default_dialect,
-                namespace=namespace or self._default_namespace,
+        for chunk in self._translator.query_stream(
+            raw_query,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        ):
+            yield self._validate_result_type(
+                chunk,
+                QueryChunk,
+                "GraphTranslator.query_stream",
+                ErrorCodes.BAD_TRANSLATED_CHUNK,
             )
-            raise
 
+    @with_async_error_context("stream_query_async")
     async def astream_query(
         self,
         query: str,
@@ -691,7 +945,7 @@ class CorpusLlamaIndexGraphClient:
         params: Optional[Mapping[str, Any]] = None,
         dialect: Optional[str] = None,
         namespace: Optional[str] = None,
-        timeout_ms: Optional[int] = None,  # kept for API symmetry (passed via raw_query)
+        timeout_ms: Optional[int] = None,
         callback_manager: Optional[Any] = None,
         extra_context: Optional[Mapping[str, Any]] = None,
     ) -> AsyncIterator[QueryChunk]:
@@ -714,33 +968,23 @@ class CorpusLlamaIndexGraphClient:
         )
         framework_ctx = self._framework_ctx_for_namespace(namespace)
 
-        try:
-            async for chunk in self._translator.arun_query_stream(
-                raw_query,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            ):
-                if not isinstance(chunk, QueryChunk):
-                    raise BadRequest(
-                        f"GraphTranslator.arun_query_stream yielded unsupported type: {type(chunk).__name__}",
-                        code="BAD_TRANSLATED_CHUNK",
-                    )
-                yield chunk
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="llamaindex",
-                operation="stream_query_async",
-                query=query,
-                dialect=dialect or self._default_dialect,
-                namespace=namespace or self._default_namespace,
+        async for chunk in self._translator.arun_query_stream(
+            raw_query,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        ):
+            yield self._validate_result_type(
+                chunk,
+                QueryChunk,
+                "GraphTranslator.arun_query_stream",
+                ErrorCodes.BAD_TRANSLATED_CHUNK,
             )
-            raise
 
     # ------------------------------------------------------------------ #
     # Upsert nodes / edges (sync + async)
     # ------------------------------------------------------------------ #
 
+    @with_error_context("upsert_nodes_sync")
     def upsert_nodes(
         self,
         spec: UpsertNodesSpec,
@@ -761,28 +1005,19 @@ class CorpusLlamaIndexGraphClient:
         )
         framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
 
-        try:
-            result = self._translator.upsert_nodes(
-                spec.nodes,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-            if not isinstance(result, UpsertResult):
-                raise BadRequest(
-                    f"GraphTranslator.upsert_nodes returned unsupported type: {type(result).__name__}",
-                    code="BAD_UPSERT_RESULT",
-                )
-            return result
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="llamaindex",
-                operation="upsert_nodes_sync",
-                namespace=getattr(spec, "namespace", None),
-                count=len(spec.nodes),
-            )
-            raise
+        result = self._translator.upsert_nodes(
+            spec.nodes,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+        return self._validate_result_type(
+            result,
+            UpsertResult,
+            "GraphTranslator.upsert_nodes",
+            ErrorCodes.BAD_UPSERT_RESULT,
+        )
 
+    @with_async_error_context("upsert_nodes_async")
     async def aupsert_nodes(
         self,
         spec: UpsertNodesSpec,
@@ -799,28 +1034,19 @@ class CorpusLlamaIndexGraphClient:
         )
         framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
 
-        try:
-            result = await self._translator.arun_upsert_nodes(
-                spec.nodes,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-            if not isinstance(result, UpsertResult):
-                raise BadRequest(
-                    f"GraphTranslator.arun_upsert_nodes returned unsupported type: {type(result).__name__}",
-                    code="BAD_UPSERT_RESULT",
-                )
-            return result
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="llamaindex",
-                operation="upsert_nodes_async",
-                namespace=getattr(spec, "namespace", None),
-                count=len(spec.nodes),
-            )
-            raise
+        result = await self._translator.arun_upsert_nodes(
+            spec.nodes,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+        return self._validate_result_type(
+            result,
+            UpsertResult,
+            "GraphTranslator.arun_upsert_nodes",
+            ErrorCodes.BAD_UPSERT_RESULT,
+        )
 
+    @with_error_context("upsert_edges_sync")
     def upsert_edges(
         self,
         spec: UpsertEdgesSpec,
@@ -837,28 +1063,19 @@ class CorpusLlamaIndexGraphClient:
         )
         framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
 
-        try:
-            result = self._translator.upsert_edges(
-                spec.edges,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-            if not isinstance(result, UpsertResult):
-                raise BadRequest(
-                    f"GraphTranslator.upsert_edges returned unsupported type: {type(result).__name__}",
-                    code="BAD_UPSERT_RESULT",
-                )
-            return result
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="llamaindex",
-                operation="upsert_edges_sync",
-                namespace=getattr(spec, "namespace", None),
-                count=len(spec.edges),
-            )
-            raise
+        result = self._translator.upsert_edges(
+            spec.edges,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+        return self._validate_result_type(
+            result,
+            UpsertResult,
+            "GraphTranslator.upsert_edges",
+            ErrorCodes.BAD_UPSERT_RESULT,
+        )
 
+    @with_async_error_context("upsert_edges_async")
     async def aupsert_edges(
         self,
         spec: UpsertEdgesSpec,
@@ -875,32 +1092,23 @@ class CorpusLlamaIndexGraphClient:
         )
         framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
 
-        try:
-            result = await self._translator.arun_upsert_edges(
-                spec.edges,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-            if not isinstance(result, UpsertResult):
-                raise BadRequest(
-                    f"GraphTranslator.arun_upsert_edges returned unsupported type: {type(result).__name__}",
-                    code="BAD_UPSERT_RESULT",
-                )
-            return result
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="llamaindex",
-                operation="upsert_edges_async",
-                namespace=getattr(spec, "namespace", None),
-                count=len(spec.edges),
-            )
-            raise
+        result = await self._translator.arun_upsert_edges(
+            spec.edges,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+        return self._validate_result_type(
+            result,
+            UpsertResult,
+            "GraphTranslator.arun_upsert_edges",
+            ErrorCodes.BAD_UPSERT_RESULT,
+        )
 
     # ------------------------------------------------------------------ #
     # Delete nodes / edges (sync + async)
     # ------------------------------------------------------------------ #
 
+    @with_error_context("delete_nodes_sync")
     def delete_nodes(
         self,
         spec: DeleteNodesSpec,
@@ -925,28 +1133,19 @@ class CorpusLlamaIndexGraphClient:
         else:
             raw_filter_or_ids = list(spec.ids or [])
 
-        try:
-            result = self._translator.delete_nodes(
-                raw_filter_or_ids,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-            if not isinstance(result, DeleteResult):
-                raise BadRequest(
-                    f"GraphTranslator.delete_nodes returned unsupported type: {type(result).__name__}",
-                    code="BAD_DELETE_RESULT",
-                )
-            return result
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="llamaindex",
-                operation="delete_nodes_sync",
-                namespace=getattr(spec, "namespace", None),
-                ids_count=len(spec.ids or []),
-            )
-            raise
+        result = self._translator.delete_nodes(
+            raw_filter_or_ids,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+        return self._validate_result_type(
+            result,
+            DeleteResult,
+            "GraphTranslator.delete_nodes",
+            ErrorCodes.BAD_DELETE_RESULT,
+        )
 
+    @with_async_error_context("delete_nodes_async")
     async def adelete_nodes(
         self,
         spec: DeleteNodesSpec,
@@ -968,28 +1167,19 @@ class CorpusLlamaIndexGraphClient:
         else:
             raw_filter_or_ids = list(spec.ids or [])
 
-        try:
-            result = await self._translator.arun_delete_nodes(
-                raw_filter_or_ids,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-            if not isinstance(result, DeleteResult):
-                raise BadRequest(
-                    f"GraphTranslator.arun_delete_nodes returned unsupported type: {type(result).__name__}",
-                    code="BAD_DELETE_RESULT",
-                )
-            return result
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="llamaindex",
-                operation="delete_nodes_async",
-                namespace=getattr(spec, "namespace", None),
-                ids_count=len(spec.ids or []),
-            )
-            raise
+        result = await self._translator.arun_delete_nodes(
+            raw_filter_or_ids,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+        return self._validate_result_type(
+            result,
+            DeleteResult,
+            "GraphTranslator.arun_delete_nodes",
+            ErrorCodes.BAD_DELETE_RESULT,
+        )
 
+    @with_error_context("delete_edges_sync")
     def delete_edges(
         self,
         spec: DeleteEdgesSpec,
@@ -1011,28 +1201,19 @@ class CorpusLlamaIndexGraphClient:
         else:
             raw_filter_or_ids = list(spec.ids or [])
 
-        try:
-            result = self._translator.delete_edges(
-                raw_filter_or_ids,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-            if not isinstance(result, DeleteResult):
-                raise BadRequest(
-                    f"GraphTranslator.delete_edges returned unsupported type: {type(result).__name__}",
-                    code="BAD_DELETE_RESULT",
-                )
-            return result
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="llamaindex",
-                operation="delete_edges_sync",
-                namespace=getattr(spec, "namespace", None),
-                ids_count=len(spec.ids or []),
-            )
-            raise
+        result = self._translator.delete_edges(
+            raw_filter_or_ids,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+        return self._validate_result_type(
+            result,
+            DeleteResult,
+            "GraphTranslator.delete_edges",
+            ErrorCodes.BAD_DELETE_RESULT,
+        )
 
+    @with_async_error_context("delete_edges_async")
     async def adelete_edges(
         self,
         spec: DeleteEdgesSpec,
@@ -1054,32 +1235,23 @@ class CorpusLlamaIndexGraphClient:
         else:
             raw_filter_or_ids = list(spec.ids or [])
 
-        try:
-            result = await self._translator.arun_delete_edges(
-                raw_filter_or_ids,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-            if not isinstance(result, DeleteResult):
-                raise BadRequest(
-                    f"GraphTranslator.arun_delete_edges returned unsupported type: {type(result).__name__}",
-                    code="BAD_DELETE_RESULT",
-                )
-            return result
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="llamaindex",
-                operation="delete_edges_async",
-                namespace=getattr(spec, "namespace", None),
-                ids_count=len(spec.ids or []),
-            )
-            raise
+        result = await self._translator.arun_delete_edges(
+            raw_filter_or_ids,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+        return self._validate_result_type(
+            result,
+            DeleteResult,
+            "GraphTranslator.arun_delete_edges",
+            ErrorCodes.BAD_DELETE_RESULT,
+        )
 
     # ------------------------------------------------------------------ #
     # Bulk vertices (sync + async)
     # ------------------------------------------------------------------ #
 
+    @with_error_context("bulk_vertices_sync")
     def bulk_vertices(
         self,
         spec: BulkVerticesSpec,
@@ -1107,28 +1279,19 @@ class CorpusLlamaIndexGraphClient:
 
         framework_ctx = self._framework_ctx_for_namespace(spec.namespace)
 
-        try:
-            result = self._translator.bulk_vertices(
-                raw_request,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-            if not isinstance(result, BulkVerticesResult):
-                raise BadRequest(
-                    f"GraphTranslator.bulk_vertices returned unsupported type: {type(result).__name__}",
-                    code="BAD_BULK_VERTICES_RESULT",
-                )
-            return result
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="llamaindex",
-                operation="bulk_vertices_sync",
-                namespace=getattr(spec, "namespace", None),
-                limit=spec.limit,
-            )
-            raise
+        result = self._translator.bulk_vertices(
+            raw_request,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+        return self._validate_result_type(
+            result,
+            BulkVerticesResult,
+            "GraphTranslator.bulk_vertices",
+            ErrorCodes.BAD_BULK_VERTICES_RESULT,
+        )
 
+    @with_async_error_context("bulk_vertices_async")
     async def abulk_vertices(
         self,
         spec: BulkVerticesSpec,
@@ -1153,32 +1316,23 @@ class CorpusLlamaIndexGraphClient:
 
         framework_ctx = self._framework_ctx_for_namespace(spec.namespace)
 
-        try:
-            result = await self._translator.arun_bulk_vertices(
-                raw_request,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-            if not isinstance(result, BulkVerticesResult):
-                raise BadRequest(
-                    f"GraphTranslator.arun_bulk_vertices returned unsupported type: {type(result).__name__}",
-                    code="BAD_BULK_VERTICES_RESULT",
-                )
-            return result
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="llamaindex",
-                operation="bulk_vertices_async",
-                namespace=getattr(spec, "namespace", None),
-                limit=spec.limit,
-            )
-            raise
+        result = await self._translator.arun_bulk_vertices(
+            raw_request,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+        return self._validate_result_type(
+            result,
+            BulkVerticesResult,
+            "GraphTranslator.arun_bulk_vertices",
+            ErrorCodes.BAD_BULK_VERTICES_RESULT,
+        )
 
     # ------------------------------------------------------------------ #
     # Batch (sync + async)
     # ------------------------------------------------------------------ #
 
+    @with_error_context("batch_sync")
     def batch(
         self,
         ops: List[BatchOperation],
@@ -1201,27 +1355,19 @@ class CorpusLlamaIndexGraphClient:
             {"op": op.op, "args": dict(op.args or {})} for op in ops
         ]
 
-        try:
-            result = self._translator.batch(
-                raw_batch_ops,
-                op_ctx=ctx,
-                framework_ctx={},
-            )
-            if not isinstance(result, BatchResult):
-                raise BadRequest(
-                    f"GraphTranslator.batch returned unsupported type: {type(result).__name__}",
-                    code="BAD_BATCH_RESULT",
-                )
-            return result
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="llamaindex",
-                operation="batch_sync",
-                ops_count=len(ops),
-            )
-            raise
+        result = self._translator.batch(
+            raw_batch_ops,
+            op_ctx=ctx,
+            framework_ctx={},
+        )
+        return self._validate_result_type(
+            result,
+            BatchResult,
+            "GraphTranslator.batch",
+            ErrorCodes.BAD_BATCH_RESULT,
+        )
 
+    @with_async_error_context("batch_async")
     async def abatch(
         self,
         ops: List[BatchOperation],
@@ -1241,165 +1387,21 @@ class CorpusLlamaIndexGraphClient:
             {"op": op.op, "args": dict(op.args or {})} for op in ops
         ]
 
-        try:
-            result = await self._translator.arun_batch(
-                raw_batch_ops,
-                op_ctx=ctx,
-                framework_ctx={},
-            )
-            if not isinstance(result, BatchResult):
-                raise BadRequest(
-                    f"GraphTranslator.arun_batch returned unsupported type: {type(result).__name__}",
-                    code="BAD_BATCH_RESULT",
-                )
-            return result
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="llamaindex",
-                operation="batch_async",
-                ops_count=len(ops),
-            )
-            raise
-
-    # ------------------------------------------------------------------ #
-    # Schema / health (sync + async)
-    # ------------------------------------------------------------------ #
-
-    def get_schema(
-        self,
-        *,
-        callback_manager: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> GraphSchema:
-        """
-        Sync wrapper around `graph_adapter.get_schema(...)`.
-
-        Delegates to GraphTranslator so that async→sync bridging and
-        error-context handling are centralized.
-        """
-        ctx = self._build_ctx(
-            callback_manager=callback_manager,
-            extra_context=extra_context,
+        result = await self._translator.arun_batch(
+            raw_batch_ops,
+            op_ctx=ctx,
+            framework_ctx={},
         )
-        try:
-            schema = self._translator.get_schema(
-                op_ctx=ctx,
-                framework_ctx={},
-            )
-            if not isinstance(schema, GraphSchema):
-                raise BadRequest(
-                    f"GraphTranslator.get_schema returned unsupported type: {type(schema).__name__}",
-                    code="BAD_TRANSLATED_SCHEMA",
-                )
-            return schema
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="llamaindex",
-                operation="get_schema_sync",
-            )
-            raise
-
-    async def aget_schema(
-        self,
-        *,
-        callback_manager: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> GraphSchema:
-        """
-        Async wrapper around `graph_adapter.get_schema(...)`.
-
-        Delegates to GraphTranslator.
-        """
-        ctx = self._build_ctx(
-            callback_manager=callback_manager,
-            extra_context=extra_context,
+        return self._validate_result_type(
+            result,
+            BatchResult,
+            "GraphTranslator.arun_batch",
+            ErrorCodes.BAD_BATCH_RESULT,
         )
-        try:
-            schema = await self._translator.arun_get_schema(
-                op_ctx=ctx,
-                framework_ctx={},
-            )
-            if not isinstance(schema, GraphSchema):
-                raise BadRequest(
-                    f"GraphTranslator.arun_get_schema returned unsupported type: {type(schema).__name__}",
-                    code="BAD_TRANSLATED_SCHEMA",
-                )
-            return schema
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="llamaindex",
-                operation="get_schema_async",
-            )
-            raise
-
-    def health(
-        self,
-        *,
-        callback_manager: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> Mapping[str, Any]:
-        """
-        Health check (sync).
-
-        Assumes the adapter exposes a sync `health(ctx=...)` method.
-        Returns the normalized health mapping from the underlying adapter.
-        """
-        ctx = self._build_ctx(
-            callback_manager=callback_manager,
-            extra_context=extra_context,
-        )
-        try:
-            health_result = self._graph.health(ctx=ctx)
-            if not isinstance(health_result, Mapping):
-                raise BadRequest(
-                    f"graph_adapter.health returned unsupported type: {type(health_result).__name__}",
-                    code="BAD_HEALTH_RESULT",
-                )
-            return dict(health_result)
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="llamaindex",
-                operation="health_sync",
-            )
-            raise
-
-    async def ahealth(
-        self,
-        *,
-        callback_manager: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> Mapping[str, Any]:
-        """
-        Health check (async).
-
-        Assumes the adapter exposes an async `health(ctx=...)` method.
-        """
-        ctx = self._build_ctx(
-            callback_manager=callback_manager,
-            extra_context=extra_context,
-        )
-        try:
-            health_result = await self._graph.health(ctx=ctx)
-            if not isinstance(health_result, Mapping):
-                raise BadRequest(
-                    f"graph_adapter.health returned unsupported type: {type(health_result).__name__}",
-                    code="BAD_HEALTH_RESULT",
-                )
-            return dict(health_result)
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="llamaindex",
-                operation="health_async",
-            )
-            raise
 
 
 __all__ = [
     "LlamaIndexGraphClientProtocol",
     "CorpusLlamaIndexGraphClient",
+    "ErrorCodes",
 ]
