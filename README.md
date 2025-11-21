@@ -18,8 +18,6 @@ Designed to compose cleanly under any external control plane (router, scheduler,
 
 ## The Vision: Protocol-First Unification
 
-**What if you could treat AI infrastructure like web infrastructure?**
-
 - **HTTP** → Universal web protocol
 - **TCP/IP** → Universal network protocol  
 - **Corpus Protocol** → Universal AI infrastructure protocol
