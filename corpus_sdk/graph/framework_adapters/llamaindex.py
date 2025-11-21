@@ -8,10 +8,11 @@ This module exposes a Corpus `GraphProtocolV1` implementation as a
 LlamaIndex-friendly client, with:
 
 - Sync + async query APIs
-- Streaming query support (async + sync via SyncStreamBridge)
+- Sync + async streaming query APIs
 - Proper integration with Corpus GraphProtocolV1
 - OperationContext propagation derived from LlamaIndex callback manager
 - Error-context enrichment for observability and debugging
+- Orchestration, translation, and async→sync bridging via GraphTranslator
 
 Design philosophy
 -----------------
@@ -20,69 +21,47 @@ Design philosophy
   the underlying `BaseGraphAdapter` / GraphProtocolV1 implementation.
 - This layer focuses on:
     * Translating LlamaIndex callback manager → OperationContext
-    * Building GraphQuerySpec via GraphTranslator
-    * Bridging async Corpus APIs into sync calls via AsyncBridge
-    * Providing safe streaming utilities for sync callers
+    * Building raw query / mutation shapes for GraphTranslator
+    * Delegating all sync/async and streaming orchestration to GraphTranslator
 
-Usage (example)
----------------
+Responsibilities
+----------------
+- Provide a convenient, LlamaIndex-oriented client for graph operations
+- Keep all graph operations going through `GraphTranslator` so that
+  async→sync bridging, streaming, and error-context logic are centralized
+- Preserve protocol-level types (`QueryResult`, `QueryChunk`, etc.) for
+  LlamaIndex callers
 
-    from corpus_sdk.graph.graph_base import BaseGraphAdapter
-    from corpus_sdk.graph.framework_adapters.llamaindex import (
-        CorpusLlamaIndexGraphClient,
-    )
-
-    graph_adapter: BaseGraphAdapter = ...
-    client = CorpusLlamaIndexGraphClient(
-        graph_adapter=graph_adapter,
-        default_dialect="cypher",
-        default_namespace="my-graph",
-    )
-
-    # Sync query
-    result = client.query(
-        "MATCH (n) RETURN n LIMIT 5",
-        callback_manager=my_callback_manager,
-    )
-
-    # Async query
-    result = await client.aquery(
-        "MATCH (n) RETURN n LIMIT 5",
-        callback_manager=my_callback_manager,
-    )
-
-    # Sync streaming query
-    for chunk in client.stream_query(
-        "MATCH (n) RETURN n LIMIT 100",
-        callback_manager=my_callback_manager,
-    ):
-        process(chunk.records)
-
-    # Async streaming query
-    async for chunk in client.astream_query(
-        "MATCH (n) RETURN n LIMIT 100",
-        callback_manager=my_callback_manager,
-    ):
-        process(chunk.records)
+Non-responsibilities
+--------------------
+- Backend-specific graph behavior (lives in graph adapters)
+- LlamaIndex index/query engine orchestration logic
+- MMR and diversification details (handled inside GraphTranslator)
 """
 
 from __future__ import annotations
 
 import logging
+from functools import cached_property
 from typing import (
     Any,
     AsyncIterator,
+    Dict,
     Iterator,
     List,
     Mapping,
     Optional,
+    Protocol,
 )
 
 from corpus_sdk.core.context_translation import (
-    from_llamaindex as context_from_llamaindex,
+    from_llamaindex as core_ctx_from_llamaindex,
 )
 from corpus_sdk.core.error_context import attach_context
-from corpus_sdk.core.sync_stream_bridge import sync_stream
+from corpus_sdk.graph.framework_adapters.common.graph_translation import (
+    DefaultGraphFrameworkTranslator,
+    GraphTranslator,
+)
 from corpus_sdk.graph.graph_base import (
     BadRequest,
     BatchOperation,
@@ -92,20 +71,227 @@ from corpus_sdk.graph.graph_base import (
     DeleteEdgesSpec,
     DeleteNodesSpec,
     DeleteResult,
-    GraphAdapterError,
     GraphProtocolV1,
-    GraphQuerySpec,
     GraphSchema,
+    OperationContext,
     QueryChunk,
     QueryResult,
     UpsertEdgesSpec,
     UpsertNodesSpec,
     UpsertResult,
 )
-from corpus_sdk.graph.graph_translation import GraphTranslator
-from corpus_sdk.llm.framework_adapters.common.async_bridge import AsyncBridge
 
 logger = logging.getLogger(__name__)
+
+
+class LlamaIndexGraphClientProtocol(Protocol):
+    """
+    Protocol representing the minimal LlamaIndex-aware graph client interface
+    implemented by this module.
+
+    This structural protocol allows callers to type against the graph client
+    without depending on the concrete `CorpusLlamaIndexGraphClient` class.
+    """
+
+    # Query
+
+    def query(
+        self,
+        query: str,
+        *,
+        params: Optional[Mapping[str, Any]] = None,
+        dialect: Optional[str] = None,
+        namespace: Optional[str] = None,
+        timeout_ms: Optional[int] = None,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> QueryResult:
+        ...
+
+    async def aquery(
+        self,
+        query: str,
+        *,
+        params: Optional[Mapping[str, Any]] = None,
+        dialect: Optional[str] = None,
+        namespace: Optional[str] = None,
+        timeout_ms: Optional[int] = None,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> QueryResult:
+        ...
+
+    def stream_query(
+        self,
+        query: str,
+        *,
+        params: Optional[Mapping[str, Any]] = None,
+        dialect: Optional[str] = None,
+        namespace: Optional[str] = None,
+        timeout_ms: Optional[int] = None,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> Iterator[QueryChunk]:
+        ...
+
+    async def astream_query(
+        self,
+        query: str,
+        *,
+        params: Optional[Mapping[str, Any]] = None,
+        dialect: Optional[str] = None,
+        namespace: Optional[str] = None,
+        timeout_ms: Optional[int] = None,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> AsyncIterator[QueryChunk]:
+        ...
+
+    # Upsert
+
+    def upsert_nodes(
+        self,
+        spec: UpsertNodesSpec,
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> UpsertResult:
+        ...
+
+    async def aupsert_nodes(
+        self,
+        spec: UpsertNodesSpec,
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> UpsertResult:
+        ...
+
+    def upsert_edges(
+        self,
+        spec: UpsertEdgesSpec,
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> UpsertResult:
+        ...
+
+    async def aupsert_edges(
+        self,
+        spec: UpsertEdgesSpec,
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> UpsertResult:
+        ...
+
+    # Delete
+
+    def delete_nodes(
+        self,
+        spec: DeleteNodesSpec,
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> DeleteResult:
+        ...
+
+    async def adelete_nodes(
+        self,
+        spec: DeleteNodesSpec,
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> DeleteResult:
+        ...
+
+    def delete_edges(
+        self,
+        spec: DeleteEdgesSpec,
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> DeleteResult:
+        ...
+
+    async def adelete_edges(
+        self,
+        spec: DeleteEdgesSpec,
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> DeleteResult:
+        ...
+
+    # Bulk / batch / schema / health
+
+    def bulk_vertices(
+        self,
+        spec: BulkVerticesSpec,
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> BulkVerticesResult:
+        ...
+
+    async def abulk_vertices(
+        self,
+        spec: BulkVerticesSpec,
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> BulkVerticesResult:
+        ...
+
+    def batch(
+        self,
+        ops: List[BatchOperation],
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> BatchResult:
+        ...
+
+    async def abatch(
+        self,
+        ops: List[BatchOperation],
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> BatchResult:
+        ...
+
+    def get_schema(
+        self,
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> GraphSchema:
+        ...
+
+    async def aget_schema(
+        self,
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> GraphSchema:
+        ...
+
+    def health(
+        self,
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> Mapping[str, Any]:
+        ...
+
+    async def ahealth(
+        self,
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> Mapping[str, Any]:
+        ...
 
 
 class CorpusLlamaIndexGraphClient:
@@ -115,39 +301,75 @@ class CorpusLlamaIndexGraphClient:
     This is a thin integration layer that:
 
     - Translates LlamaIndex `CallbackManager` instances into a Corpus
-      `OperationContext` using `GraphTranslator.from_llamaindex` or,
-      as a fallback, `context_translation.from_llamaindex`.
-    - Uses `GraphTranslator` to build `GraphQuerySpec` from simple
-      parameters (query string, dialect, params, namespace, timeout).
-    - Provides sync + async APIs for:
-        * query / aquery
-        * stream_query / astream_query
-        * upsert_nodes / aupsert_nodes
-        * upsert_edges / aupsert_edges
-        * delete_nodes / adelete_nodes
-        * delete_edges / adelete_edges
-        * bulk_vertices / abulk_vertices
-        * batch / abatch
-        * get_schema / aget_schema
-        * health / ahealth
-    - Uses `AsyncBridge` and `sync_stream` to safely bridge async adapter
-      methods into synchronous calls, mirroring the patterns used for
-      LangChain integration.
-    - Attaches rich error context (framework, component, operation, etc.)
-      to every failure path.
-
-    Attributes
-    ----------
-    graph_adapter:
-        Underlying Corpus graph adapter implementing `GraphProtocolV1`.
-
-    default_dialect:
-        Default query dialect used when caller does not specify one.
-
-    default_namespace:
-        Default logical graph / namespace for operations when not
-        explicitly overridden by the caller.
+      `OperationContext` using `core_ctx_from_llamaindex`.
+    - Uses `GraphTranslator` (with a LlamaIndex-specific framework translator) to:
+        * Build Graph*Spec objects from simple inputs
+        * Execute sync + async graph operations
+        * Orchestrate streaming with proper cancellation and error handling
+    - Delegates all async→sync bridging and streaming glue to GraphTranslator.
+    - Attaches rich error context (`attach_context`) on this layer with
+      LlamaIndex-specific hints when failures occur.
     """
+
+    class _LlamaIndexGraphFrameworkTranslator(DefaultGraphFrameworkTranslator):
+        """
+        LlamaIndex-specific GraphFrameworkTranslator.
+
+        This translator reuses the common DefaultGraphFrameworkTranslator for
+        spec construction and context handling, but deliberately *does not*
+        reshape core protocol results:
+
+        - QueryResult is returned as-is
+        - QueryChunk is returned as-is
+        - BulkVerticesResult is returned as-is
+        - BatchResult is returned as-is
+        - GraphSchema is returned as-is
+        """
+
+        def translate_query_result(
+            self,
+            result: QueryResult,
+            *,
+            op_ctx: OperationContext,  # noqa: ARG002
+            framework_ctx: Optional[Any] = None,  # noqa: ARG002
+        ) -> QueryResult:
+            return result
+
+        def translate_query_chunk(
+            self,
+            chunk: QueryChunk,
+            *,
+            op_ctx: OperationContext,  # noqa: ARG002
+            framework_ctx: Optional[Any] = None,  # noqa: ARG002
+        ) -> QueryChunk:
+            return chunk
+
+        def translate_bulk_vertices_result(
+            self,
+            result: BulkVerticesResult,
+            *,
+            op_ctx: OperationContext,  # noqa: ARG002
+            framework_ctx: Optional[Any] = None,  # noqa: ARG002
+        ) -> BulkVerticesResult:
+            return result
+
+        def translate_batch_result(
+            self,
+            result: BatchResult,
+            *,
+            op_ctx: OperationContext,  # noqa: ARG002
+            framework_ctx: Optional[Any] = None,  # noqa: ARG002
+        ) -> BatchResult:
+            return result
+
+        def translate_schema(
+            self,
+            schema: GraphSchema,
+            *,
+            op_ctx: OperationContext,  # noqa: ARG002
+            framework_ctx: Optional[Any] = None,  # noqa: ARG002
+        ) -> GraphSchema:
+            return schema
 
     def __init__(
         self,
@@ -156,692 +378,1028 @@ class CorpusLlamaIndexGraphClient:
         default_dialect: Optional[str] = None,
         default_namespace: Optional[str] = None,
     ) -> None:
-        self._graph = graph_adapter
-        self._default_dialect = default_dialect
-        self._default_namespace = default_namespace
+        self._graph: GraphProtocolV1 = graph_adapter
+        self._default_dialect: Optional[str] = default_dialect
+        self._default_namespace: Optional[str] = default_namespace
 
-        # GraphTranslator centralizes GraphQuerySpec construction and
-        # framework-aware context translation semantics.
-        self._translator = GraphTranslator(
-            default_dialect=default_dialect,
-            default_namespace=default_namespace,
+    # ------------------------------------------------------------------ #
+    # Translator (lazy, cached) – mirrors AutoGen / LangChain adapters
+    # ------------------------------------------------------------------ #
+
+    @cached_property
+    def _translator(self) -> GraphTranslator:
+        """
+        Lazily construct and cache the `GraphTranslator`.
+
+        Uses `cached_property` for thread safety and performance.
+        """
+        framework_translator = self._LlamaIndexGraphFrameworkTranslator()
+        return GraphTranslator(
+            adapter=self._graph,
             framework="llamaindex",
+            translator=framework_translator,
         )
 
-    # --------------------------------------------------------------------- #
+    # ------------------------------------------------------------------ #
     # Internal helpers
-    # --------------------------------------------------------------------- #
+    # ------------------------------------------------------------------ #
 
-    def _build_ctx(self, **kwargs: Any):
+    def _build_ctx(
+        self,
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> Optional[OperationContext]:
         """
         Build an OperationContext from LlamaIndex-style inputs.
 
-        Expected kwargs:
-            - callback_manager: LlamaIndex CallbackManager (optional)
+        Expected inputs
+        ----------------
+        - callback_manager: LlamaIndex CallbackManager (optional)
+        - extra_context: Optional mapping merged into attrs (best effort)
+
+        If both are None/empty, returns None and lets downstream helpers
+        construct an "empty" OperationContext as needed.
         """
-        callback_manager = kwargs.get("callback_manager")
-        if callback_manager is None:
+        extra: Dict[str, Any] = dict(extra_context or {})
+
+        if callback_manager is None and not extra:
             return None
 
-        # Preferred path: use GraphTranslator's framework-specific helper.
         try:
-            return self._translator.from_llamaindex(callback_manager)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(
-                "GraphTranslator.from_llamaindex failed; falling back to "
-                "core context_from_llamaindex: %s",
-                exc,
-            )
-
-        # Fallback: direct use of core context_translation.
-        try:
-            return context_from_llamaindex(callback_manager)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("context_from_llamaindex failed: %s", exc)
-            return None
-
-    def _build_query_spec(
-        self,
-        query: str,
-        *,
-        dialect: Optional[str],
-        params: Optional[Mapping[str, Any]],
-        namespace: Optional[str],
-        timeout_ms: Optional[int],
-        stream: bool,
-    ) -> GraphQuerySpec:
-        """
-        Build a GraphQuerySpec via GraphTranslator, enforcing defaults.
-        """
-        eff_dialect = dialect or self._default_dialect
-        eff_namespace = namespace or self._default_namespace
-        try:
-            return self._translator.build_query_spec(
-                text=query,
-                dialect=eff_dialect,
-                params=params,
-                namespace=eff_namespace,
-                timeout_ms=timeout_ms,
-                stream=stream,
+            ctx = core_ctx_from_llamaindex(
+                callback_manager,
+                **extra,
             )
         except Exception as exc:  # noqa: BLE001
-            # Normalize to BadRequest with attached context.
             attach_context(
                 exc,
                 framework="llamaindex",
-                component="graph",
-                operation="build_query_spec",
-                dialect=eff_dialect,
-                namespace=eff_namespace,
+                operation="context_translation",
             )
-            if isinstance(exc, GraphAdapterError):
-                raise
-            raise BadRequest(
-                f"failed to build GraphQuerySpec: {exc}",
-                details={
-                    "dialect": eff_dialect,
-                    "namespace": eff_namespace,
-                    "stream": stream,
-                },
-            ) from exc
+            raise
 
-    # --------------------------------------------------------------------- #
-    # Query API (sync + async)
-    # --------------------------------------------------------------------- #
+        if not isinstance(ctx, OperationContext):
+            raise BadRequest(
+                f"from_llamaindex produced unsupported context type: {type(ctx).__name__}",
+                code="BAD_OPERATION_CONTEXT",
+            )
+
+        return ctx
+
+    @staticmethod
+    def _validate_query(query: str) -> None:
+        """
+        Validate that a query string is non-empty and of the correct type.
+        """
+        if not isinstance(query, str) or not query.strip():
+            raise BadRequest("query must be a non-empty string")
+
+    def _build_raw_query(
+        self,
+        query: str,
+        *,
+        params: Optional[Mapping[str, Any]],
+        dialect: Optional[str],
+        namespace: Optional[str],
+        timeout_ms: Optional[int],
+        stream: bool,
+    ) -> Mapping[str, Any]:
+        """
+        Build a raw query mapping suitable for GraphTranslator.
+
+        The common GraphTranslator expects:
+            - Either a plain string, or
+            - A mapping with:
+                * text (str)
+                * dialect (optional)
+                * params (optional mapping)
+                * namespace (optional)
+                * timeout_ms (optional)
+                * stream (bool)
+        """
+        effective_dialect = dialect or self._default_dialect
+        effective_namespace = namespace or self._default_namespace
+
+        raw: Dict[str, Any] = {
+            "text": query,
+            "params": dict(params or {}),
+            "stream": bool(stream),
+        }
+
+        if effective_dialect is not None:
+            raw["dialect"] = effective_dialect
+        if effective_namespace is not None:
+            raw["namespace"] = effective_namespace
+        if timeout_ms is not None:
+            raw["timeout_ms"] = int(timeout_ms)
+
+        return raw
+
+    def _framework_ctx_for_namespace(
+        self,
+        namespace: Optional[str],
+    ) -> Mapping[str, Any]:
+        """
+        Build a minimal framework_ctx mapping that lets the common translator
+        derive a preferred namespace when needed.
+        """
+        effective_namespace = namespace or self._default_namespace
+        return {"namespace": effective_namespace} if effective_namespace is not None else {}
+
+    # ------------------------------------------------------------------ #
+    # Query (sync + async)
+    # ------------------------------------------------------------------ #
 
     def query(
         self,
         query: str,
         *,
-        dialect: Optional[str] = None,
         params: Optional[Mapping[str, Any]] = None,
+        dialect: Optional[str] = None,
         namespace: Optional[str] = None,
         timeout_ms: Optional[int] = None,
-        **kwargs: Any,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
     ) -> QueryResult:
         """
-        Execute a non-streaming graph query (sync) from LlamaIndex code.
+        Execute a non-streaming graph query (sync).
 
-        This bridges the async `graph_adapter.query` method into a
-        synchronous call using AsyncBridge.
+        Returns the underlying `QueryResult` from the GraphProtocol adapter.
         """
-        ctx = self._build_ctx(**kwargs)
-        spec = self._build_query_spec(
+        self._validate_query(query)
+
+        ctx = self._build_ctx(
+            callback_manager=callback_manager,
+            extra_context=extra_context,
+        )
+        raw_query = self._build_raw_query(
             query=query,
-            dialect=dialect,
             params=params,
+            dialect=dialect,
             namespace=namespace,
             timeout_ms=timeout_ms,
             stream=False,
         )
+        framework_ctx = self._framework_ctx_for_namespace(namespace)
+
         try:
-            return AsyncBridge.run_async(self._graph.query(spec, ctx=ctx))
-        except Exception as exc:  # noqa: BLE001
-            try:
-                attach_context(
-                    exc,
-                    framework="llamaindex",
-                    component="graph",
-                    operation="query_sync",
-                    dialect=spec.dialect,
-                    namespace=spec.namespace,
+            result = self._translator.query(
+                raw_query,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+                mmr_config=None,
+            )
+            if not isinstance(result, QueryResult):
+                raise BadRequest(
+                    f"GraphTranslator.query returned unsupported type: {type(result).__name__}",
+                    code="BAD_TRANSLATED_RESULT",
                 )
-            except Exception:  # noqa: BLE001
-                logger.debug("attach_context failed in query_sync", exc_info=True)
+            return result
+        except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework="llamaindex",
+                operation="query_sync",
+                query=query,
+                dialect=dialect or self._default_dialect,
+                namespace=namespace or self._default_namespace,
+            )
             raise
 
     async def aquery(
         self,
         query: str,
         *,
-        dialect: Optional[str] = None,
         params: Optional[Mapping[str, Any]] = None,
+        dialect: Optional[str] = None,
         namespace: Optional[str] = None,
         timeout_ms: Optional[int] = None,
-        **kwargs: Any,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
     ) -> QueryResult:
         """
-        Execute a non-streaming graph query (async) from LlamaIndex code.
+        Execute a non-streaming graph query (async).
+
+        Returns the underlying `QueryResult`.
         """
-        ctx = self._build_ctx(**kwargs)
-        spec = self._build_query_spec(
+        self._validate_query(query)
+
+        ctx = self._build_ctx(
+            callback_manager=callback_manager,
+            extra_context=extra_context,
+        )
+        raw_query = self._build_raw_query(
             query=query,
-            dialect=dialect,
             params=params,
+            dialect=dialect,
             namespace=namespace,
             timeout_ms=timeout_ms,
             stream=False,
         )
+        framework_ctx = self._framework_ctx_for_namespace(namespace)
+
         try:
-            return await self._graph.query(spec, ctx=ctx)
-        except Exception as exc:  # noqa: BLE001
-            try:
-                attach_context(
-                    exc,
-                    framework="llamaindex",
-                    component="graph",
-                    operation="query_async",
-                    dialect=spec.dialect,
-                    namespace=spec.namespace,
+            result = await self._translator.arun_query(
+                raw_query,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+                mmr_config=None,
+            )
+            if not isinstance(result, QueryResult):
+                raise BadRequest(
+                    f"GraphTranslator.arun_query returned unsupported type: {type(result).__name__}",
+                    code="BAD_TRANSLATED_RESULT",
                 )
-            except Exception:  # noqa: BLE001
-                logger.debug("attach_context failed in query_async", exc_info=True)
+            return result
+        except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework="llamaindex",
+                operation="query_async",
+                query=query,
+                dialect=dialect or self._default_dialect,
+                namespace=namespace or self._default_namespace,
+            )
             raise
 
-    # --------------------------------------------------------------------- #
-    # Streaming Query API (sync + async)
-    # --------------------------------------------------------------------- #
+    # ------------------------------------------------------------------ #
+    # Streaming query (sync + async)
+    # ------------------------------------------------------------------ #
 
     def stream_query(
         self,
         query: str,
         *,
-        dialect: Optional[str] = None,
         params: Optional[Mapping[str, Any]] = None,
+        dialect: Optional[str] = None,
         namespace: Optional[str] = None,
-        timeout_ms: Optional[int] = None,
-        **kwargs: Any,
+        timeout_ms: Optional[int] = None,  # kept for API symmetry (passed via raw_query)
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
     ) -> Iterator[QueryChunk]:
         """
-        Execute a streaming graph query (sync), yielding QueryChunk objects.
+        Execute a streaming graph query (sync), yielding `QueryChunk` items.
 
-        This uses SyncStreamBridge (via `sync_stream`) to bridge the async
-        streaming call into a synchronous iterator, preserving:
-            - deadline propagation
-            - backpressure
-            - error context
+        Delegates streaming orchestration to GraphTranslator, which uses
+        SyncStreamBridge under the hood. This method itself does not use
+        any async→sync bridges directly.
         """
-        ctx = self._build_ctx(**kwargs)
-        spec = self._build_query_spec(
+        self._validate_query(query)
+
+        ctx = self._build_ctx(
+            callback_manager=callback_manager,
+            extra_context=extra_context,
+        )
+        raw_query = self._build_raw_query(
             query=query,
-            dialect=dialect,
             params=params,
+            dialect=dialect,
             namespace=namespace,
             timeout_ms=timeout_ms,
             stream=True,
         )
+        framework_ctx = self._framework_ctx_for_namespace(namespace)
 
-        async def _agen() -> AsyncIterator[QueryChunk]:
-            try:
-                async for chunk in self._graph.stream_query(spec, ctx=ctx):
-                    yield chunk
-            except Exception as exc:  # noqa: BLE001
-                try:
-                    attach_context(
-                        exc,
-                        framework="llamaindex",
-                        component="graph",
-                        operation="stream_query_async",
-                        dialect=spec.dialect,
-                        namespace=spec.namespace,
+        try:
+            for chunk in self._translator.query_stream(
+                raw_query,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            ):
+                if not isinstance(chunk, QueryChunk):
+                    raise BadRequest(
+                        f"GraphTranslator.query_stream yielded unsupported type: {type(chunk).__name__}",
+                        code="BAD_TRANSLATED_CHUNK",
                     )
-                except Exception:  # noqa: BLE001
-                    logger.debug(
-                        "attach_context failed in stream_query_async",
-                        exc_info=True,
-                    )
-                raise
-
-        for chunk in sync_stream(
-            _agen,
-            framework="llamaindex",
-            error_context={
-                "component": "graph",
-                "operation": "stream_query_sync",
-                "dialect": spec.dialect,
-                "namespace": spec.namespace,
-            },
-        ):
-            yield chunk
+                yield chunk
+        except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework="llamaindex",
+                operation="stream_query_sync",
+                query=query,
+                dialect=dialect or self._default_dialect,
+                namespace=namespace or self._default_namespace,
+            )
+            raise
 
     async def astream_query(
         self,
         query: str,
         *,
-        dialect: Optional[str] = None,
         params: Optional[Mapping[str, Any]] = None,
+        dialect: Optional[str] = None,
         namespace: Optional[str] = None,
-        timeout_ms: Optional[int] = None,
-        **kwargs: Any,
+        timeout_ms: Optional[int] = None,  # kept for API symmetry (passed via raw_query)
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
     ) -> AsyncIterator[QueryChunk]:
         """
-        Execute a streaming graph query (async), yielding QueryChunk objects.
+        Execute a streaming graph query (async), yielding `QueryChunk` items.
         """
-        ctx = self._build_ctx(**kwargs)
-        spec = self._build_query_spec(
+        self._validate_query(query)
+
+        ctx = self._build_ctx(
+            callback_manager=callback_manager,
+            extra_context=extra_context,
+        )
+        raw_query = self._build_raw_query(
             query=query,
-            dialect=dialect,
             params=params,
+            dialect=dialect,
             namespace=namespace,
             timeout_ms=timeout_ms,
             stream=True,
         )
+        framework_ctx = self._framework_ctx_for_namespace(namespace)
 
-        async def _inner() -> AsyncIterator[QueryChunk]:
-            try:
-                async for chunk in self._graph.stream_query(spec, ctx=ctx):
-                    yield chunk
-            except Exception as exc:  # noqa: BLE001
-                try:
-                    attach_context(
-                        exc,
-                        framework="llamaindex",
-                        component="graph",
-                        operation="stream_query_async",
-                        dialect=spec.dialect,
-                        namespace=spec.namespace,
+        try:
+            async for chunk in self._translator.arun_query_stream(
+                raw_query,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            ):
+                if not isinstance(chunk, QueryChunk):
+                    raise BadRequest(
+                        f"GraphTranslator.arun_query_stream yielded unsupported type: {type(chunk).__name__}",
+                        code="BAD_TRANSLATED_CHUNK",
                     )
-                except Exception:  # noqa: BLE001
-                    logger.debug(
-                        "attach_context failed in stream_query_async (inner)",
-                        exc_info=True,
-                    )
-                raise
+                yield chunk
+        except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework="llamaindex",
+                operation="stream_query_async",
+                query=query,
+                dialect=dialect or self._default_dialect,
+                namespace=namespace or self._default_namespace,
+            )
+            raise
 
-        return _inner()
-
-    # --------------------------------------------------------------------- #
-    # Write / mutation API (sync + async)
-    # These accept GraphProtocol spec objects directly.
-    # --------------------------------------------------------------------- #
+    # ------------------------------------------------------------------ #
+    # Upsert nodes / edges (sync + async)
+    # ------------------------------------------------------------------ #
 
     def upsert_nodes(
         self,
         spec: UpsertNodesSpec,
-        **kwargs: Any,
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
     ) -> UpsertResult:
         """
-        Batch upsert nodes (sync).
+        Sync wrapper for upserting nodes.
+
+        Delegates to GraphTranslator with `raw_nodes` taken from `spec.nodes`,
+        and passes the desired namespace via framework_ctx so that the
+        translator can build the correct UpsertNodesSpec.
         """
-        ctx = self._build_ctx(**kwargs)
+        ctx = self._build_ctx(
+            callback_manager=callback_manager,
+            extra_context=extra_context,
+        )
+        framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
+
         try:
-            return AsyncBridge.run_async(self._graph.upsert_nodes(spec, ctx=ctx))
-        except Exception as exc:  # noqa: BLE001
-            try:
-                attach_context(
-                    exc,
-                    framework="llamaindex",
-                    component="graph",
-                    operation="upsert_nodes_sync",
-                    namespace=spec.namespace,
-                    node_count=len(spec.nodes),
+            result = self._translator.upsert_nodes(
+                spec.nodes,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+            if not isinstance(result, UpsertResult):
+                raise BadRequest(
+                    f"GraphTranslator.upsert_nodes returned unsupported type: {type(result).__name__}",
+                    code="BAD_UPSERT_RESULT",
                 )
-            except Exception:  # noqa: BLE001
-                logger.debug("attach_context failed in upsert_nodes_sync", exc_info=True)
+            return result
+        except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework="llamaindex",
+                operation="upsert_nodes_sync",
+                namespace=getattr(spec, "namespace", None),
+                count=len(spec.nodes),
+            )
             raise
 
     async def aupsert_nodes(
         self,
         spec: UpsertNodesSpec,
-        **kwargs: Any,
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
     ) -> UpsertResult:
         """
-        Batch upsert nodes (async).
+        Async wrapper for upserting nodes.
         """
-        ctx = self._build_ctx(**kwargs)
+        ctx = self._build_ctx(
+            callback_manager=callback_manager,
+            extra_context=extra_context,
+        )
+        framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
+
         try:
-            return await self._graph.upsert_nodes(spec, ctx=ctx)
-        except Exception as exc:  # noqa: BLE001
-            try:
-                attach_context(
-                    exc,
-                    framework="llamaindex",
-                    component="graph",
-                    operation="upsert_nodes_async",
-                    namespace=spec.namespace,
-                    node_count=len(spec.nodes),
+            result = await self._translator.arun_upsert_nodes(
+                spec.nodes,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+            if not isinstance(result, UpsertResult):
+                raise BadRequest(
+                    f"GraphTranslator.arun_upsert_nodes returned unsupported type: {type(result).__name__}",
+                    code="BAD_UPSERT_RESULT",
                 )
-            except Exception:  # noqa: BLE001
-                logger.debug("attach_context failed in upsert_nodes_async", exc_info=True)
+            return result
+        except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework="llamaindex",
+                operation="upsert_nodes_async",
+                namespace=getattr(spec, "namespace", None),
+                count=len(spec.nodes),
+            )
             raise
 
     def upsert_edges(
         self,
         spec: UpsertEdgesSpec,
-        **kwargs: Any,
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
     ) -> UpsertResult:
         """
-        Batch upsert edges (sync).
+        Sync wrapper for upserting edges.
         """
-        ctx = self._build_ctx(**kwargs)
+        ctx = self._build_ctx(
+            callback_manager=callback_manager,
+            extra_context=extra_context,
+        )
+        framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
+
         try:
-            return AsyncBridge.run_async(self._graph.upsert_edges(spec, ctx=ctx))
-        except Exception as exc:  # noqa: BLE001
-            try:
-                attach_context(
-                    exc,
-                    framework="llamaindex",
-                    component="graph",
-                    operation="upsert_edges_sync",
-                    namespace=spec.namespace,
-                    edge_count=len(spec.edges),
+            result = self._translator.upsert_edges(
+                spec.edges,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+            if not isinstance(result, UpsertResult):
+                raise BadRequest(
+                    f"GraphTranslator.upsert_edges returned unsupported type: {type(result).__name__}",
+                    code="BAD_UPSERT_RESULT",
                 )
-            except Exception:  # noqa: BLE001
-                logger.debug("attach_context failed in upsert_edges_sync", exc_info=True)
+            return result
+        except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework="llamaindex",
+                operation="upsert_edges_sync",
+                namespace=getattr(spec, "namespace", None),
+                count=len(spec.edges),
+            )
             raise
 
     async def aupsert_edges(
         self,
         spec: UpsertEdgesSpec,
-        **kwargs: Any,
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
     ) -> UpsertResult:
         """
-        Batch upsert edges (async).
+        Async wrapper for upserting edges.
         """
-        ctx = self._build_ctx(**kwargs)
+        ctx = self._build_ctx(
+            callback_manager=callback_manager,
+            extra_context=extra_context,
+        )
+        framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
+
         try:
-            return await self._graph.upsert_edges(spec, ctx=ctx)
-        except Exception as exc:  # noqa: BLE001
-            try:
-                attach_context(
-                    exc,
-                    framework="llamaindex",
-                    component="graph",
-                    operation="upsert_edges_async",
-                    namespace=spec.namespace,
-                    edge_count=len(spec.edges),
+            result = await self._translator.arun_upsert_edges(
+                spec.edges,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+            if not isinstance(result, UpsertResult):
+                raise BadRequest(
+                    f"GraphTranslator.arun_upsert_edges returned unsupported type: {type(result).__name__}",
+                    code="BAD_UPSERT_RESULT",
                 )
-            except Exception:  # noqa: BLE001
-                logger.debug("attach_context failed in upsert_edges_async", exc_info=True)
+            return result
+        except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework="llamaindex",
+                operation="upsert_edges_async",
+                namespace=getattr(spec, "namespace", None),
+                count=len(spec.edges),
+            )
             raise
+
+    # ------------------------------------------------------------------ #
+    # Delete nodes / edges (sync + async)
+    # ------------------------------------------------------------------ #
 
     def delete_nodes(
         self,
         spec: DeleteNodesSpec,
-        **kwargs: Any,
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
     ) -> DeleteResult:
         """
-        Batch delete nodes by IDs and/or filter (sync).
+        Sync wrapper for deleting nodes.
+
+        Uses DeleteNodesSpec to derive either an ID list or a filter
+        expression for the GraphTranslator.
         """
-        ctx = self._build_ctx(**kwargs)
+        ctx = self._build_ctx(
+            callback_manager=callback_manager,
+            extra_context=extra_context,
+        )
+        framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
+
+        if spec.filter is not None:
+            raw_filter_or_ids: Any = spec.filter
+        else:
+            raw_filter_or_ids = list(spec.ids or [])
+
         try:
-            return AsyncBridge.run_async(self._graph.delete_nodes(spec, ctx=ctx))
-        except Exception as exc:  # noqa: BLE001
-            try:
-                attach_context(
-                    exc,
-                    framework="llamaindex",
-                    component="graph",
-                    operation="delete_nodes_sync",
-                    namespace=spec.namespace,
-                    ids_count=len(spec.ids),
-                    has_filter=bool(spec.filter),
+            result = self._translator.delete_nodes(
+                raw_filter_or_ids,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+            if not isinstance(result, DeleteResult):
+                raise BadRequest(
+                    f"GraphTranslator.delete_nodes returned unsupported type: {type(result).__name__}",
+                    code="BAD_DELETE_RESULT",
                 )
-            except Exception:  # noqa: BLE001
-                logger.debug("attach_context failed in delete_nodes_sync", exc_info=True)
+            return result
+        except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework="llamaindex",
+                operation="delete_nodes_sync",
+                namespace=getattr(spec, "namespace", None),
+                ids_count=len(spec.ids or []),
+            )
             raise
 
     async def adelete_nodes(
         self,
         spec: DeleteNodesSpec,
-        **kwargs: Any,
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
     ) -> DeleteResult:
         """
-        Batch delete nodes by IDs and/or filter (async).
+        Async wrapper for deleting nodes.
         """
-        ctx = self._build_ctx(**kwargs)
+        ctx = self._build_ctx(
+            callback_manager=callback_manager,
+            extra_context=extra_context,
+        )
+        framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
+
+        if spec.filter is not None:
+            raw_filter_or_ids: Any = spec.filter
+        else:
+            raw_filter_or_ids = list(spec.ids or [])
+
         try:
-            return await self._graph.delete_nodes(spec, ctx=ctx)
-        except Exception as exc:  # noqa: BLE001
-            try:
-                attach_context(
-                    exc,
-                    framework="llamaindex",
-                    component="graph",
-                    operation="delete_nodes_async",
-                    namespace=spec.namespace,
-                    ids_count=len(spec.ids),
-                    has_filter=bool(spec.filter),
+            result = await self._translator.arun_delete_nodes(
+                raw_filter_or_ids,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+            if not isinstance(result, DeleteResult):
+                raise BadRequest(
+                    f"GraphTranslator.arun_delete_nodes returned unsupported type: {type(result).__name__}",
+                    code="BAD_DELETE_RESULT",
                 )
-            except Exception:  # noqa: BLE001
-                logger.debug("attach_context failed in delete_nodes_async", exc_info=True)
+            return result
+        except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework="llamaindex",
+                operation="delete_nodes_async",
+                namespace=getattr(spec, "namespace", None),
+                ids_count=len(spec.ids or []),
+            )
             raise
 
     def delete_edges(
         self,
         spec: DeleteEdgesSpec,
-        **kwargs: Any,
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
     ) -> DeleteResult:
         """
-        Batch delete edges by IDs and/or filter (sync).
+        Sync wrapper for deleting edges.
         """
-        ctx = self._build_ctx(**kwargs)
+        ctx = self._build_ctx(
+            callback_manager=callback_manager,
+            extra_context=extra_context,
+        )
+        framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
+
+        if spec.filter is not None:
+            raw_filter_or_ids: Any = spec.filter
+        else:
+            raw_filter_or_ids = list(spec.ids or [])
+
         try:
-            return AsyncBridge.run_async(self._graph.delete_edges(spec, ctx=ctx))
-        except Exception as exc:  # noqa: BLE001
-            try:
-                attach_context(
-                    exc,
-                    framework="llamaindex",
-                    component="graph",
-                    operation="delete_edges_sync",
-                    namespace=spec.namespace,
-                    ids_count=len(spec.ids),
-                    has_filter=bool(spec.filter),
+            result = self._translator.delete_edges(
+                raw_filter_or_ids,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+            if not isinstance(result, DeleteResult):
+                raise BadRequest(
+                    f"GraphTranslator.delete_edges returned unsupported type: {type(result).__name__}",
+                    code="BAD_DELETE_RESULT",
                 )
-            except Exception:  # noqa: BLE001
-                logger.debug("attach_context failed in delete_edges_sync", exc_info=True)
+            return result
+        except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework="llamaindex",
+                operation="delete_edges_sync",
+                namespace=getattr(spec, "namespace", None),
+                ids_count=len(spec.ids or []),
+            )
             raise
 
     async def adelete_edges(
         self,
         spec: DeleteEdgesSpec,
-        **kwargs: Any,
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
     ) -> DeleteResult:
         """
-        Batch delete edges by IDs and/or filter (async).
+        Async wrapper for deleting edges.
         """
-        ctx = self._build_ctx(**kwargs)
+        ctx = self._build_ctx(
+            callback_manager=callback_manager,
+            extra_context=extra_context,
+        )
+        framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
+
+        if spec.filter is not None:
+            raw_filter_or_ids: Any = spec.filter
+        else:
+            raw_filter_or_ids = list(spec.ids or [])
+
         try:
-            return await self._graph.delete_edges(spec, ctx=ctx)
-        except Exception as exc:  # noqa: BLE001
-            try:
-                attach_context(
-                    exc,
-                    framework="llamaindex",
-                    component="graph",
-                    operation="delete_edges_async",
-                    namespace=spec.namespace,
-                    ids_count=len(spec.ids),
-                    has_filter=bool(spec.filter),
+            result = await self._translator.arun_delete_edges(
+                raw_filter_or_ids,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+            if not isinstance(result, DeleteResult):
+                raise BadRequest(
+                    f"GraphTranslator.arun_delete_edges returned unsupported type: {type(result).__name__}",
+                    code="BAD_DELETE_RESULT",
                 )
-            except Exception:  # noqa: BLE001
-                logger.debug("attach_context failed in delete_edges_async", exc_info=True)
+            return result
+        except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework="llamaindex",
+                operation="delete_edges_async",
+                namespace=getattr(spec, "namespace", None),
+                ids_count=len(spec.ids or []),
+            )
             raise
 
-    # --------------------------------------------------------------------- #
-    # Bulk vertices / batch / schema / health (sync + async)
-    # --------------------------------------------------------------------- #
+    # ------------------------------------------------------------------ #
+    # Bulk vertices (sync + async)
+    # ------------------------------------------------------------------ #
 
     def bulk_vertices(
         self,
         spec: BulkVerticesSpec,
-        **kwargs: Any,
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
     ) -> BulkVerticesResult:
         """
-        Bulk vertex scan (sync).
+        Sync wrapper for bulk_vertices.
+
+        Converts `BulkVerticesSpec` into the raw request shape expected by
+        GraphTranslator and returns the underlying `BulkVerticesResult`.
         """
-        ctx = self._build_ctx(**kwargs)
+        ctx = self._build_ctx(
+            callback_manager=callback_manager,
+            extra_context=extra_context,
+        )
+
+        raw_request: Mapping[str, Any] = {
+            "namespace": spec.namespace,
+            "limit": spec.limit,
+            "cursor": spec.cursor,
+            "filter": spec.filter,
+        }
+
+        framework_ctx = self._framework_ctx_for_namespace(spec.namespace)
+
         try:
-            return AsyncBridge.run_async(self._graph.bulk_vertices(spec, ctx=ctx))
-        except Exception as exc:  # noqa: BLE001
-            try:
-                attach_context(
-                    exc,
-                    framework="llamaindex",
-                    component="graph",
-                    operation="bulk_vertices_sync",
-                    namespace=spec.namespace,
-                    limit=spec.limit,
-                    has_filter=bool(spec.filter),
+            result = self._translator.bulk_vertices(
+                raw_request,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+            if not isinstance(result, BulkVerticesResult):
+                raise BadRequest(
+                    f"GraphTranslator.bulk_vertices returned unsupported type: {type(result).__name__}",
+                    code="BAD_BULK_VERTICES_RESULT",
                 )
-            except Exception:  # noqa: BLE001
-                logger.debug("attach_context failed in bulk_vertices_sync", exc_info=True)
+            return result
+        except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework="llamaindex",
+                operation="bulk_vertices_sync",
+                namespace=getattr(spec, "namespace", None),
+                limit=spec.limit,
+            )
             raise
 
     async def abulk_vertices(
         self,
         spec: BulkVerticesSpec,
-        **kwargs: Any,
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
     ) -> BulkVerticesResult:
         """
-        Bulk vertex scan (async).
+        Async wrapper for bulk_vertices.
         """
-        ctx = self._build_ctx(**kwargs)
+        ctx = self._build_ctx(
+            callback_manager=callback_manager,
+            extra_context=extra_context,
+        )
+
+        raw_request: Mapping[str, Any] = {
+            "namespace": spec.namespace,
+            "limit": spec.limit,
+            "cursor": spec.cursor,
+            "filter": spec.filter,
+        }
+
+        framework_ctx = self._framework_ctx_for_namespace(spec.namespace)
+
         try:
-            return await self._graph.bulk_vertices(spec, ctx=ctx)
-        except Exception as exc:  # noqa: BLE001
-            try:
-                attach_context(
-                    exc,
-                    framework="llamaindex",
-                    component="graph",
-                    operation="bulk_vertices_async",
-                    namespace=spec.namespace,
-                    limit=spec.limit,
-                    has_filter=bool(spec.filter),
+            result = await self._translator.arun_bulk_vertices(
+                raw_request,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+            if not isinstance(result, BulkVerticesResult):
+                raise BadRequest(
+                    f"GraphTranslator.arun_bulk_vertices returned unsupported type: {type(result).__name__}",
+                    code="BAD_BULK_VERTICES_RESULT",
                 )
-            except Exception:  # noqa: BLE001
-                logger.debug("attach_context failed in bulk_vertices_async", exc_info=True)
+            return result
+        except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework="llamaindex",
+                operation="bulk_vertices_async",
+                namespace=getattr(spec, "namespace", None),
+                limit=spec.limit,
+            )
             raise
+
+    # ------------------------------------------------------------------ #
+    # Batch (sync + async)
+    # ------------------------------------------------------------------ #
 
     def batch(
         self,
         ops: List[BatchOperation],
-        **kwargs: Any,
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
     ) -> BatchResult:
         """
-        Batch execution of multiple graph operations (sync).
+        Sync wrapper for batch operations.
+
+        Translates `BatchOperation` dataclasses into the raw mapping shape
+        expected by GraphTranslator and returns the underlying `BatchResult`.
         """
-        ctx = self._build_ctx(**kwargs)
+        ctx = self._build_ctx(
+            callback_manager=callback_manager,
+            extra_context=extra_context,
+        )
+
+        raw_batch_ops: List[Mapping[str, Any]] = [
+            {"op": op.op, "args": dict(op.args or {})} for op in ops
+        ]
+
         try:
-            return AsyncBridge.run_async(self._graph.batch(ops, ctx=ctx))
-        except Exception as exc:  # noqa: BLE001
-            try:
-                attach_context(
-                    exc,
-                    framework="llamaindex",
-                    component="graph",
-                    operation="batch_sync",
-                    ops_count=len(ops),
+            result = self._translator.batch(
+                raw_batch_ops,
+                op_ctx=ctx,
+                framework_ctx={},
+            )
+            if not isinstance(result, BatchResult):
+                raise BadRequest(
+                    f"GraphTranslator.batch returned unsupported type: {type(result).__name__}",
+                    code="BAD_BATCH_RESULT",
                 )
-            except Exception:  # noqa: BLE001
-                logger.debug("attach_context failed in batch_sync", exc_info=True)
+            return result
+        except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework="llamaindex",
+                operation="batch_sync",
+                ops_count=len(ops),
+            )
             raise
 
     async def abatch(
         self,
         ops: List[BatchOperation],
-        **kwargs: Any,
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
     ) -> BatchResult:
         """
-        Batch execution of multiple graph operations (async).
+        Async wrapper for batch operations.
         """
-        ctx = self._build_ctx(**kwargs)
+        ctx = self._build_ctx(
+            callback_manager=callback_manager,
+            extra_context=extra_context,
+        )
+
+        raw_batch_ops: List[Mapping[str, Any]] = [
+            {"op": op.op, "args": dict(op.args or {})} for op in ops
+        ]
+
         try:
-            return await self._graph.batch(ops, ctx=ctx)
-        except Exception as exc:  # noqa: BLE001
-            try:
-                attach_context(
-                    exc,
-                    framework="llamaindex",
-                    component="graph",
-                    operation="batch_async",
-                    ops_count=len(ops),
+            result = await self._translator.arun_batch(
+                raw_batch_ops,
+                op_ctx=ctx,
+                framework_ctx={},
+            )
+            if not isinstance(result, BatchResult):
+                raise BadRequest(
+                    f"GraphTranslator.arun_batch returned unsupported type: {type(result).__name__}",
+                    code="BAD_BATCH_RESULT",
                 )
-            except Exception:  # noqa: BLE001
-                logger.debug("attach_context failed in batch_async", exc_info=True)
+            return result
+        except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework="llamaindex",
+                operation="batch_async",
+                ops_count=len(ops),
+            )
             raise
+
+    # ------------------------------------------------------------------ #
+    # Schema / health (sync + async)
+    # ------------------------------------------------------------------ #
 
     def get_schema(
         self,
-        **kwargs: Any,
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
     ) -> GraphSchema:
         """
-        Schema introspection (sync).
+        Sync wrapper around `graph_adapter.get_schema(...)`.
+
+        Delegates to GraphTranslator so that async→sync bridging and
+        error-context handling are centralized.
         """
-        ctx = self._build_ctx(**kwargs)
+        ctx = self._build_ctx(
+            callback_manager=callback_manager,
+            extra_context=extra_context,
+        )
         try:
-            return AsyncBridge.run_async(self._graph.get_schema(ctx=ctx))
-        except Exception as exc:  # noqa: BLE001
-            try:
-                attach_context(
-                    exc,
-                    framework="llamaindex",
-                    component="graph",
-                    operation="get_schema_sync",
+            schema = self._translator.get_schema(
+                op_ctx=ctx,
+                framework_ctx={},
+            )
+            if not isinstance(schema, GraphSchema):
+                raise BadRequest(
+                    f"GraphTranslator.get_schema returned unsupported type: {type(schema).__name__}",
+                    code="BAD_TRANSLATED_SCHEMA",
                 )
-            except Exception:  # noqa: BLE001
-                logger.debug("attach_context failed in get_schema_sync", exc_info=True)
+            return schema
+        except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework="llamaindex",
+                operation="get_schema_sync",
+            )
             raise
 
     async def aget_schema(
         self,
-        **kwargs: Any,
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
     ) -> GraphSchema:
         """
-        Schema introspection (async).
+        Async wrapper around `graph_adapter.get_schema(...)`.
+
+        Delegates to GraphTranslator.
         """
-        ctx = self._build_ctx(**kwargs)
+        ctx = self._build_ctx(
+            callback_manager=callback_manager,
+            extra_context=extra_context,
+        )
         try:
-            return await self._graph.get_schema(ctx=ctx)
-        except Exception as exc:  # noqa: BLE001
-            try:
-                attach_context(
-                    exc,
-                    framework="llamaindex",
-                    component="graph",
-                    operation="get_schema_async",
+            schema = await self._translator.arun_get_schema(
+                op_ctx=ctx,
+                framework_ctx={},
+            )
+            if not isinstance(schema, GraphSchema):
+                raise BadRequest(
+                    f"GraphTranslator.arun_get_schema returned unsupported type: {type(schema).__name__}",
+                    code="BAD_TRANSLATED_SCHEMA",
                 )
-            except Exception:  # noqa: BLE001
-                logger.debug("attach_context failed in get_schema_async", exc_info=True)
+            return schema
+        except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework="llamaindex",
+                operation="get_schema_async",
+            )
             raise
 
     def health(
         self,
-        **kwargs: Any,
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
     ) -> Mapping[str, Any]:
         """
         Health check (sync).
+
+        Assumes the adapter exposes a sync `health(ctx=...)` method.
+        Returns the normalized health mapping from the underlying adapter.
         """
-        ctx = self._build_ctx(**kwargs)
+        ctx = self._build_ctx(
+            callback_manager=callback_manager,
+            extra_context=extra_context,
+        )
         try:
-            return AsyncBridge.run_async(self._graph.health(ctx=ctx))
-        except Exception as exc:  # noqa: BLE001
-            try:
-                attach_context(
-                    exc,
-                    framework="llamaindex",
-                    component="graph",
-                    operation="health_sync",
+            health_result = self._graph.health(ctx=ctx)
+            if not isinstance(health_result, Mapping):
+                raise BadRequest(
+                    f"graph_adapter.health returned unsupported type: {type(health_result).__name__}",
+                    code="BAD_HEALTH_RESULT",
                 )
-            except Exception:  # noqa: BLE001
-                logger.debug("attach_context failed in health_sync", exc_info=True)
+            return dict(health_result)
+        except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework="llamaindex",
+                operation="health_sync",
+            )
             raise
 
     async def ahealth(
         self,
-        **kwargs: Any,
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
     ) -> Mapping[str, Any]:
         """
         Health check (async).
+
+        Assumes the adapter exposes an async `health(ctx=...)` method.
         """
-        ctx = self._build_ctx(**kwargs)
+        ctx = self._build_ctx(
+            callback_manager=callback_manager,
+            extra_context=extra_context,
+        )
         try:
-            return await self._graph.health(ctx=ctx)
-        except Exception as exc:  # noqa: BLE001
-            try:
-                attach_context(
-                    exc,
-                    framework="llamaindex",
-                    component="graph",
-                    operation="health_async",
+            health_result = await self._graph.health(ctx=ctx)
+            if not isinstance(health_result, Mapping):
+                raise BadRequest(
+                    f"graph_adapter.health returned unsupported type: {type(health_result).__name__}",
+                    code="BAD_HEALTH_RESULT",
                 )
-            except Exception:  # noqa: BLE001
-                logger.debug("attach_context failed in health_async", exc_info=True)
+            return dict(health_result)
+        except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework="llamaindex",
+                operation="health_async",
+            )
             raise
 
 
 __all__ = [
+    "LlamaIndexGraphClientProtocol",
     "CorpusLlamaIndexGraphClient",
 ]
