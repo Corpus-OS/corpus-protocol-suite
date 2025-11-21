@@ -3,9 +3,9 @@
 ![Version](https://img.shields.io/badge/version-1.0.0-blue)
 ![Python](https://img.shields.io/badge/python-3.9+-blue)
 
-Reference implementation of the **Corpus Protocol Suite** — a **wire-first, vendor-neutral** SDK for interoperable AI/data backends: **LLM**, **Embedding**, **Vector**, and **Graph**.
+Reference implementation of the **CORPUS Protocols Suite** — a **wire-first, vendor-neutral** SDK for interoperable AI/data backends: **LLM**, **Embedding**, **Vector**, and **Graph**.
 
-Unlike in-process-only frameworks, Corpus defines **stable wire-level contracts** (ops, envelopes, errors, capabilities) so applications, routers, and providers can interoperate over the network. This SDK implements those protocols for Python with:
+Unlike in-process-only frameworks, CORPUS defines **stable wire-level contracts** (ops, envelopes, errors, capabilities) so applications, routers, and providers can interoperate over the network. This SDK implements those protocols for Python with:
 
 - Consistent error taxonomies
 - Capability discovery
@@ -18,9 +18,9 @@ Designed to compose cleanly under any external control plane (router, scheduler,
 
 > **Open-Core Model**
 >
-> - The **Corpus Protocol Suite** and this **Corpus SDK** are **fully open source** (Apache-2.0).
-> - **Corpus Router** and **official production adapters** are **commercial** offerings built *on top of* the same public protocols. They are optional; any compatible router/control plane can be used.
-> - Using Corpus SDK or implementing the Corpus Protocols does **not** lock you into Corpus Router. The protocols are vendor-neutral by design.
+> - The **CORPUS Protocol Suite** and this **CORPUS SDK** are **fully open source** (Apache-2.0).
+> - **CORPUS Router** and **official production adapters** are **commercial** offerings built *on top of* the same public protocols. They are optional; any compatible router/control plane can be used.
+> - Using CORPUS SDK or implementing the CORPUS Protocols does **not** lock you into CORPUS Router. The protocols are vendor-neutral by design.
 
 ---
 
@@ -30,7 +30,7 @@ This repo ships both the SDK and the protocol documentation.
 
 **Spec (normative):** `docs/spec/`
 
-- `SPECIFICATION.md` – Corpus Protocol Suite specification (all domains, cross-cutting behavior).
+- `SPECIFICATION.md` – CORPUS Protocol Suite specification (all domains, cross-cutting behavior).
 - `PROTOCOL.md` – Wire-level envelopes, streaming semantics, canonical `op` registry.
 - `ERRORS.md` – Canonical error taxonomy & mapping rules.
 - `METRICS.md` – Metrics schema & SIEM-safe observability.
@@ -60,9 +60,9 @@ Start here (README) + `docs/guides/QUICK_START.md`, then dive into `docs/spec/` 
 
 ## Table of Contents
 
-1. [Why Corpus SDK](#why-corpus-sdk)
-2. [How Corpus Compares](#how-corpus-compares)
-3. [When Not to Use Corpus](#when-not-to-use-corpus)
+1. [Why CORPUS SDK](#why-CORPUS-sdk)
+2. [How CORPUS Compares](#how-CORPUS-compares)
+3. [When Not to Use CORPUS](#when-not-to-use-CORPUS)
 4. [Features at a Glance](#features-at-a-glance)
 5. [Install](#install)
 6. [⚡ 5-Minute Quick Start](#-5-minute-quick-start)
@@ -82,7 +82,7 @@ Start here (README) + `docs/guides/QUICK_START.md`, then dive into `docs/spec/` 
 
 ---
 
-## Why Corpus SDK
+## Why CORPUS SDK
 
 Modern AI platforms juggle multiple LLM, embedding, vector, and graph backends. Each vendor has unique APIs, error schemes, rate limits, and capabilities — making cross-provider integration brittle and costly.
 
@@ -93,7 +93,7 @@ Modern AI platforms juggle multiple LLM, embedding, vector, and graph backends. 
 - **Vendor Lock-in**: Applications tightly coupled to specific AI infrastructure choices  
 - **Operational Complexity**: Inconsistent monitoring, logging, and error handling across AI services  
 
-**Corpus SDK provides:**
+**CORPUS SDK provides:**
 
 - **Stable, runtime-checkable protocols** across domains  
 - **Normalized errors** with retry hints and scopes  
@@ -104,31 +104,31 @@ Modern AI platforms juggle multiple LLM, embedding, vector, and graph backends. 
 
 ### Keep Your Frameworks, Standardize Your Infra
 
-Corpus is **not** a replacement for LangChain, LlamaIndex, Semantic Kernel, CrewAI, AutoGen, or MCP.
+CORPUS is **not** a replacement for LangChain, LlamaIndex, Semantic Kernel, CrewAI, AutoGen, or MCP.
 
 Instead:
 
 - Use those frameworks for **orchestration, agents, tools, RAG pipelines**, etc.
-- Use **Corpus SDK** to standardize the **infra layer** underneath them (LLM, Vector, Graph, Embedding).
+- Use **CORPUS SDK** to standardize the **infra layer** underneath them (LLM, Vector, Graph, Embedding).
 - Talk to **all** your backends through one protocol, even if different teams picked different frameworks.
 
 Your app teams keep their frameworks. Your platform team gets **one protocol**, **one error taxonomy**, and **one observability model** across all of them.
 
 ---
 
-## How Corpus Compares
+## How CORPUS Compares
 
 ### Who is this for?
 
-- **For app developers** – Keep using **LangChain, LlamaIndex, Semantic Kernel, AutoGen, CrewAI, or MCP** for what they’re great at (agents, tools, RAG, orchestration), while talking to **all** your backends through the same **Corpus protocols**. Swap frameworks or providers without rewriting business logic or error handling.
+- **For app developers** – Keep using **LangChain, LlamaIndex, Semantic Kernel, AutoGen, CrewAI, or MCP** for what they’re great at (agents, tools, RAG, orchestration), while talking to **all** your backends through the same **CORPUS protocols**. Swap frameworks or providers without rewriting business logic or error handling.
 
-- **For framework maintainers** – Implement one Corpus adapter per protocol (LLM / Vector / Graph / Embedding) and instantly support any backend that passes the Corpus conformance tests. Fewer bespoke integrations, fewer “this provider behaves differently” bugs.
+- **For framework maintainers** – Implement one CORPUS adapter per protocol (LLM / Vector / Graph / Embedding) and instantly support any backend that passes the CORPUS conformance tests. Fewer bespoke integrations, fewer “this provider behaves differently” bugs.
 
 - **For backend vendors** – Implement `llm/v1`, `embedding/v1`, `vector/v1`, or `graph/v1` once, run the open test suite (`docs/conformance/`), and your service “just works” with multiple frameworks and MCP tools. Golden samples + conformance tests give you a clear definition of correctness.
 
 - **For platform / infra teams** – Get unified observability: normalized error codes, deadlines, and metrics across all frameworks and providers. One set of dashboards, alerts, and SLOs that cover LLM, vector, and graph traffic end-to-end.
 
-- **For MCP users** – The Corpus MCP server exposes your protocols as standard MCP tools (LLM, vector search, graph query, etc.). Any MCP client (including ChatGPT) can call into your existing infra with consistent behavior and safety guarantees.
+- **For MCP users** – The CORPUS MCP server exposes your protocols as standard MCP tools (LLM, vector search, graph query, etc.). Any MCP client (including ChatGPT) can call into your existing infra with consistent behavior and safety guarantees.
 
 - **For security & compliance** – A shared, SIEM-safe error taxonomy and context model (tenant hashing, attrs) makes it easier to audit, trace, and reason about behavior across multiple services without leaking sensitive identifiers.
 
@@ -136,11 +136,11 @@ Your app teams keep their frameworks. Your platform team gets **one protocol**, 
 
 - **For everyone tired of glue code** – Instead of N×M custom integrations between frameworks and providers, you get one stable protocol layer in the middle. Integrate once, interoperate everywhere.
 
-- **For teams with “too many frameworks”** – Normalize infrastructure **once** under Corpus (LLM/Vector/Graph/Embedding) while letting individual teams keep their preferred frameworks on top.
+- **For teams with “too many frameworks”** – Normalize infrastructure **once** under CORPUS (LLM/Vector/Graph/Embedding) while letting individual teams keep their preferred frameworks on top.
 
-### How Corpus Compares
+### How CORPUS Compares
 
-| Aspect                    | LangChain/LlamaIndex | OpenRouter | MCP                  | **Corpus SDK**                        |
+| Aspect                    | LangChain/LlamaIndex | OpenRouter | MCP                  | **CORPUS SDK**                        |
 |---------------------------|----------------------|-----------|----------------------|--------------------------------------|
 | **Scope**                 | Application framework | LLM unification | Tools & data sources | **AI infrastructure protocols**      |
 | **Domains Covered**       | LLM + Tools          | LLM only  | Tools + Data         | **LLM + Vector + Graph + Embedding** |
@@ -155,32 +155,32 @@ Your app teams keep their frameworks. Your platform team gets **one protocol**, 
 - **LangChain/LlamaIndex**: Building complex AI applications with tool orchestration  
 - **OpenRouter**: Quick LLM unification without infrastructure changes  
 - **MCP**: Standardizing tools and data sources for AI applications  
-- **Corpus SDK**: Standardizing entire AI infrastructure stack with production observability  
+- **CORPUS SDK**: Standardizing entire AI infrastructure stack with production observability  
 
-### Unified Integration: Frameworks as Corpus Adapters
+### Unified Integration: Frameworks as CORPUS Adapters
 
-The key advantage of Corpus’s protocol-first, **wire-level** approach is that **LangChain, LlamaIndex, Semantic Kernel, AutoGen, CrewAI, OpenRouter, and MCP can all be integrated as adapters within the Corpus ecosystem**:
+The key advantage of CORPUS’s protocol-first, **wire-level** approach is that **LangChain, LlamaIndex, Semantic Kernel, AutoGen, CrewAI, OpenRouter, and MCP can all be integrated as adapters within the CORPUS ecosystem**:
 
 ```python
-# LangChain as a Corpus LLM adapter
+# LangChain as a CORPUS LLM adapter
 class LangChainLLMAdapter(BaseLLMAdapter):
     async def _do_complete(self, messages, **kwargs):
-        # Wrap LangChain LLM with Corpus standardization
+        # Wrap LangChain LLM with CORPUS standardization
         llm = ChatOpenAI(model=kwargs["model"])
         result = await llm.ainvoke(messages)
         return self._normalize_langchain_result(result)
 
-# OpenRouter as a Corpus LLM adapter  
+# OpenRouter as a CORPUS LLM adapter  
 class OpenRouterAdapter(BaseLLMAdapter):
     async def _do_complete(self, messages, **kwargs):
-        # Standardize OpenRouter API with Corpus error handling
+        # Standardize OpenRouter API with CORPUS error handling
         response = await self._call_openrouter(messages, kwargs["model"])
         return self._normalize_openrouter_result(response)
 
-# MCP as a Corpus Tools adapter
+# MCP as a CORPUS Tools adapter
 class MCPToolsAdapter(BaseLLMAdapter):
     async def _do_complete(self, messages, **kwargs):
-        # Use MCP servers as tools within Corpus LLM flow
+        # Use MCP servers as tools within CORPUS LLM flow
         mcp_tools = await self._get_mcp_tools()
         return await self._complete_with_tools(messages, mcp_tools)
 ````
@@ -189,32 +189,32 @@ class MCPToolsAdapter(BaseLLMAdapter):
 
 * **Standardized observability**: All adapters emit the same metrics and error taxonomy
 * **Consistent routing**: Mix and match providers, frameworks, and protocols under one routing layer
-* **Production reliability**: All integrations inherit Corpus’s deadline propagation, retry logic, and circuit breaking
+* **Production reliability**: All integrations inherit CORPUS’s deadline propagation, retry logic, and circuit breaking
 * **Vendor neutrality**: Switch between LangChain, LlamaIndex, Semantic Kernel, CrewAI, AutoGen, OpenRouter, or direct providers without changing application code
 
-Instead of choosing one framework, use **Corpus** as the unifying layer that standardizes them all.
+Instead of choosing one framework, use **CORPUS** as the unifying layer that standardizes them all.
 
 **Why this matters:**
 
 * Your existing LangChain chains, LlamaIndex indexes, Semantic Kernel skills, or AutoGen/CrewAI agents become **first-class providers** in a standardized ecosystem.
 * Infra teams see **one protocol and one set of metrics**, even if different products are built on different frameworks.
-* You can migrate gradually: start by wrapping frameworks as adapters, then replace pieces with direct Corpus adapters only where it pays off.
+* You can migrate gradually: start by wrapping frameworks as adapters, then replace pieces with direct CORPUS adapters only where it pays off.
 
-### Common Framework + Corpus Patterns
+### Common Framework + CORPUS Patterns
 
-| Pattern                                   | Where Corpus SDK Lives          | What You Get                                 |
+| Pattern                                   | Where CORPUS SDK Lives          | What You Get                                 |
 | ----------------------------------------- | ------------------------------- | -------------------------------------------- |
-| Framework → Corpus → Providers            | Framework uses Corpus as client | Unified errors/metrics across providers      |
-| Corpus → Framework-as-adapter → Providers | Framework wrapped as adapter    | Reuse existing chains/indices as “providers” |
+| Framework → CORPUS → Providers            | Framework uses CORPUS as client | Unified errors/metrics across providers      |
+| CORPUS → Framework-as-adapter → Providers | Framework wrapped as adapter    | Reuse existing chains/indices as “providers” |
 | Mixed: some direct, some framework        | Both of the above               | Gradual migration, no big-bang rewrites      |
 
 You don’t have to pick one. Large teams typically run **all three** patterns at once.
 
 ---
 
-## When Not to Use Corpus
+## When Not to Use CORPUS
 
-You probably don’t need `corpus_sdk` or Corpus Router if:
+You probably don’t need `CORPUS_sdk` or CORPUS Router if:
 
 * **You’re single-provider and happy**: One LLM/vector/graph backend, and you’re fine with their SDKs and breaking changes.
 * **No governance/compliance pressure**: No per-tenant isolation, budgets, audit trails, or data residency constraints.
@@ -222,9 +222,9 @@ You probably don’t need `corpus_sdk` or Corpus Router if:
 * **You want infra logic in-app**: You prefer to hard-code routing, retries, backoff, and failover directly.
 * **It’s a quick throwaway prototype**: Lock-in, metrics, and resilience aren’t worth thinking about (yet).
 
-If any of these stop being true, `corpus_sdk` is the incremental next step; **Corpus Router** becomes relevant once you need centralized, explainable, multi-provider routing.
+If any of these stop being true, `CORPUS_sdk` is the incremental next step; **CORPUS Router** becomes relevant once you need centralized, explainable, multi-provider routing.
 
-> If you’re happily single-provider **inside a single framework** and don’t need shared observability or governance, keep it simple and stick with that framework. Corpus becomes valuable once you have **multiple frameworks and/or multiple providers** and want one coherent infra layer under them.
+> If you’re happily single-provider **inside a single framework** and don’t need shared observability or governance, keep it simple and stick with that framework. CORPUS becomes valuable once you have **multiple frameworks and/or multiple providers** and want one coherent infra layer under them.
 
 ---
 
@@ -236,7 +236,7 @@ If any of these stop being true, `corpus_sdk` is the incremental next step; **Co
 * **Metrics hooks** that never leak PII (tenant hashing)
 * **Optional in-memory cache** (Embedding + LLM complete), rate limiter, and simple circuit breaker in **standalone** mode
 * **Wire-first protocol design** with canonical JSON envelopes for transport-agnostic interoperability
-* **Canonical `op` registry** aligned with the Corpus Protocol Suite for consistent routing and interoperability
+* **Canonical `op` registry** aligned with the CORPUS Protocol Suite for consistent routing and interoperability
 * **Lifecycle management** with async context manager support for clean resource cleanup
 * Everything ships in **single files per domain** (protocols + base) to keep adoption friction low
 
@@ -245,7 +245,7 @@ If any of these stop being true, `corpus_sdk` is the incremental next step; **Co
 ## Install
 
 ```bash
-pip install corpus_sdk
+pip install CORPUS_sdk
 ```
 
 * Python ≥ 3.9 recommended
@@ -257,17 +257,17 @@ pip install corpus_sdk
 
 ```python
 # Simplest possible working example - get started in under 5 minutes
-from corpus_sdk.llm.llm_base import BaseLLMAdapter, OperationContext
+from CORPUS_sdk.llm.llm_base import BaseLLMAdapter, OperationContext
 
 class QuickAdapter(BaseLLMAdapter):
     async def _do_complete(self, messages, **kwargs):
-        return {"text": "Hello from Corpus!", "model": "quick-demo"}
+        return {"text": "Hello from CORPUS!", "model": "quick-demo"}
 
 # Use it immediately
 adapter = QuickAdapter()
 ctx = OperationContext(request_id="test-123")
 result = await adapter.complete(messages=[{"role": "user", "content": "Hi"}], ctx=ctx)
-print(result.text)  # "Hello from Corpus!"
+print(result.text)  # "Hello from CORPUS!"
 ```
 
 A more complete quick-start with all four protocols lives in `docs/guides/QUICK_START.md`.
@@ -276,7 +276,7 @@ A more complete quick-start with all four protocols lives in `docs/guides/QUICK_
 
 ## Modes: `thin` vs `standalone`
 
-Corpus SDK can operate in two mutually exclusive modes:
+CORPUS SDK can operate in two mutually exclusive modes:
 
 * **`thin` (default)**
   All infra hooks are **no-ops**. Use this when you already have a control plane (router/scheduler/limiter/caching/circuit breaker). Prevents **double-stacking** resiliency.
@@ -298,7 +298,7 @@ If you run in **standalone** without a metrics sink, the SDK will emit a warning
 * **Protocol vs Base** – Protocols define the required behavior; bases implement validation, deadlines, observability, and error normalization. You implement `_do_*` hooks.
 * **OperationContext** – Carries `request_id`, `idempotency_key`, `deadline_ms`, `traceparent`, `tenant`, and optional cache hints across all operations.
 * **Wire Protocol** – Canonical envelopes (`op`, `ctx`, `args`) and response shapes (`ok`, `code`, `result`) defined in `docs/spec/PROTOCOL.md`.
-* **Corpus-Compatible** – Implementations that honor the envelopes, reserved `op` strings, and error taxonomy described in `docs/spec/` and validated by `docs/conformance/`.
+* **CORPUS-Compatible** – Implementations that honor the envelopes, reserved `op` strings, and error taxonomy described in `docs/spec/` and validated by `docs/conformance/`.
 
 ---
 
@@ -309,7 +309,7 @@ If you run in **standalone** without a metrics sink, the SDK will emit a warning
 ### Embeddings Quickstart
 
 ```python
-from corpus_sdk.embedding.embedding_base import (
+from CORPUS_sdk.embedding.embedding_base import (
     BaseEmbeddingAdapter, EmbedSpec, OperationContext, EmbeddingVector,
     EmbeddingCapabilities, BatchEmbedSpec, BatchEmbedResult, EmbedResult
 )
@@ -392,7 +392,7 @@ async with ExampleEmbeddingAdapter() as adapter:
 ### LLM Quickstart
 
 ```python
-from corpus_sdk.llm.llm_base import (
+from CORPUS_sdk.llm.llm_base import (
     BaseLLMAdapter, OperationContext, LLMCompletion,
     TokenUsage, LLMCapabilities, LLMChunk, LLMStreamResult
 )
@@ -465,7 +465,7 @@ async with ExampleLLMAdapter() as adapter:
 ### Vector Quickstart
 
 ```python
-from corpus_sdk.vector.vector_base import (
+from CORPUS_sdk.vector.vector_base import (
     BaseVectorAdapter, VectorCapabilities, QuerySpec, QueryResult,
     Vector, VectorMatch, UpsertSpec, UpsertResult, DeleteSpec,
     DeleteResult, NamespaceSpec, NamespaceResult, OperationContext, VectorID
@@ -568,7 +568,7 @@ print(result.matches[0].score)
 ### Graph Quickstart
 
 ```python
-from corpus_sdk.graph.graph_base import (
+from CORPUS_sdk.graph.graph_base import (
     BaseGraphAdapter, GraphCapabilities, GraphQuerySpec,
     UpsertNodesSpec, UpsertEdgesSpec, Node, Edge, GraphID,
     OperationContext, GraphQueryResult, UpsertNodesResult,
@@ -767,7 +767,7 @@ make test-graph-conformance
 make test-embedding-conformance
 ```
 
-#### Corpus SDK CLI
+#### CORPUS SDK CLI
 
 > `[project.scripts] corpus-sdk = "corpus_sdk.cli:main"`
 
@@ -803,14 +803,14 @@ pytest tests/graph/ -v
 pytest tests/embedding/ -v
 ```
 
-#### Corpus Protocol Suite Badge
+#### CORPUS Protocol Suite Badge
 
-![LLM Protocol](https://img.shields.io/badge/CorpusLLM%20Protocol-100%25%20Conformant-brightgreen)
-![Vector Protocol](https://img.shields.io/badge/CorpusVector%20Protocol-100%25%20Conformant-brightgreen)
-![Graph Protocol](https://img.shields.io/badge/CorpusGraph%20Protocol-100%25%20Conformant-brightgreen)
-![Embedding Protocol](https://img.shields.io/badge/CorpusEmbedding%20Protocol-100%25%20Conformant-brightgreen)
+![LLM Protocol](https://img.shields.io/badge/CORPUSLLM%20Protocol-100%25%20Conformant-brightgreen)
+![Vector Protocol](https://img.shields.io/badge/CORPUSVector%20Protocol-100%25%20Conformant-brightgreen)
+![Graph Protocol](https://img.shields.io/badge/CORPUSGraph%20Protocol-100%25%20Conformant-brightgreen)
+![Embedding Protocol](https://img.shields.io/badge/CORPUSEmbedding%20Protocol-100%25%20Conformant-brightgreen)
 
-Requirements for “Corpus-Compatible” certification are in `docs/conformance/CERTIFICATION.md`.
+Requirements for “CORPUS-Compatible” certification are in `docs/conformance/CERTIFICATION.md`.
 
 ---
 
@@ -855,7 +855,7 @@ Enable detailed logging:
 ```python
 import logging
 logging.basicConfig(level=logging.DEBUG)
-logging.getLogger("corpus_sdk").setLevel(logging.DEBUG)
+logging.getLogger("CORPUS_sdk").setLevel(logging.DEBUG)
 ```
 
 ---
@@ -866,19 +866,19 @@ logging.getLogger("corpus_sdk").setLevel(logging.DEBUG)
 
 **Q: Is the SDK fully open source while the router is commercial?**
 
-**A:** Yes. The SDK (protocols + bases + example adapters) is **open source** under Apache-2.0. **Corpus Router** and **official adapters** are **commercial** (managed cloud or on-prem).
+**A:** Yes. The SDK (protocols + bases + example adapters) is **open source** under Apache-2.0. **CORPUS Router** and **official adapters** are **commercial** (managed cloud or on-prem).
 
 **Q: Will you maintain official adapters for major providers (OpenAI, Anthropic, Pinecone, etc.)?**
 
-**A:** Yes. We maintain **closed-source, production-grade adapters** for major providers as part of Corpus Router subscriptions.
+**A:** Yes. We maintain **closed-source, production-grade adapters** for major providers as part of CORPUS Router subscriptions.
 
-**Q: Can Corpus Router run on-premises or is it cloud-only?**
+**Q: Can CORPUS Router run on-premises or is it cloud-only?**
 
-**A:** Both. Corpus Router is available as a **managed cloud** service and as an **on-prem** deployment for regulated/air-gapped environments.
+**A:** Both. CORPUS Router is available as a **managed cloud** service and as an **on-prem** deployment for regulated/air-gapped environments.
 
-**Q: Do I have to use Corpus Router?**
+**Q: Do I have to use CORPUS Router?**
 
-**A:** No. The SDK composes with any router/control plane. Corpus Router is optional and adheres to the same public protocols.
+**A:** No. The SDK composes with any router/control plane. CORPUS Router is optional and adheres to the same public protocols.
 
 **Q: Can I split protocols and bases into separate files?**
 
@@ -886,17 +886,17 @@ logging.getLogger("corpus_sdk").setLevel(logging.DEBUG)
 
 ### **MCP/LangChain/OpenRouter Comparison**
 
-**Q: How does Corpus compare to LangChain/LlamaIndex?**
+**Q: How does CORPUS compare to LangChain/LlamaIndex?**
 
-**A:** LangChain and LlamaIndex are **application-level frameworks** for building AI applications, while Corpus is an **infrastructure protocol** for standardizing backend services. You can use Corpus SDK underneath LangChain/LlamaIndex to get provider-agnostic LLM, embedding, vector, and graph operations with consistent error handling and observability.
+**A:** LangChain and LlamaIndex are **application-level frameworks** for building AI applications, while CORPUS is an **infrastructure protocol** for standardizing backend services. You can use CORPUS SDK underneath LangChain/LlamaIndex to get provider-agnostic LLM, embedding, vector, and graph operations with consistent error handling and observability.
 
-**Q: How does Corpus compare to Model Context Protocol (MCP)?**
+**Q: How does CORPUS compare to Model Context Protocol (MCP)?**
 
-**A:** MCP focuses on standardizing **tools and data sources** for AI applications, while Corpus standardizes **core AI infrastructure services** (LLM, Vector, Graph, Embedding). They're complementary — you could use MCP for tool integration and Corpus for backend service abstraction.
+**A:** MCP focuses on standardizing **tools and data sources** for AI applications, while CORPUS standardizes **core AI infrastructure services** (LLM, Vector, Graph, Embedding). They're complementary — you could use MCP for tool integration and CORPUS for backend service abstraction.
 
-**Q: How does Corpus compare to OpenRouter?**
+**Q: How does CORPUS compare to OpenRouter?**
 
-**A:** OpenRouter provides a unified API for **LLM providers only**, while Corpus covers **four domains** (LLM, Vector, Graph, Embedding) with standardized error handling, metrics, and capabilities discovery. Corpus is a protocol you can implement anywhere, while OpenRouter is a specific service.
+**A:** OpenRouter provides a unified API for **LLM providers only**, while CORPUS covers **four domains** (LLM, Vector, Graph, Embedding) with standardized error handling, metrics, and capabilities discovery. CORPUS is a protocol you can implement anywhere, while OpenRouter is a specific service.
 
 ### Technical
 
@@ -940,35 +940,35 @@ Guidelines:
 * **Maintain low-cardinality metrics** – Never add PII to `extra` fields.
 * **Observe SemVer** – Call out breaking changes and update `docs/spec/VERSIONING.md`.
 
-We especially welcome **community adapter contributions** (e.g., new LLM/vector/graph backends implemented against the Corpus Protocol Suite).
+We especially welcome **community adapter contributions** (e.g., new LLM/vector/graph backends implemented against the CORPUS Protocol Suite).
 
 ---
 
 ## License & Commercial Options
 
 * License: **Apache-2.0**. See `LICENSE`. SPDX headers are included at the top of source files.
-* Implementation of the **Corpus Protocol Suite** is free and encouraged. Independent implementations SHOULD preserve wire compatibility if they refer to themselves as **Corpus-Compatible**. See `docs/conformance/CERTIFICATION.md`.
+* Implementation of the **CORPUS Protocol Suite** is free and encouraged. Independent implementations SHOULD preserve wire compatibility if they refer to themselves as **CORPUS-Compatible**. See `docs/conformance/CERTIFICATION.md`.
 
 ### SDK vs Platform
 
 | Need                                | Solution                                   | Cost           |
 | ----------------------------------- | ------------------------------------------ | -------------- |
-| Learning / prototyping              | `corpus_sdk` + example adapters            | **Free (OSS)** |
-| Production with your own infra      | `corpus_sdk` + your adapters               | **Free (OSS)** |
-| Production with official adapters   | `corpus_sdk` + **Official Adapters**       | **Commercial** |
-| Enterprise multi-provider (managed) | `corpus_sdk` + **Corpus Router (Managed)** | **Commercial** |
-| Enterprise multi-provider (on-prem) | `corpus_sdk` + **Corpus Router (On-Prem)** | **Commercial** |
+| Learning / prototyping              | `CORPUS_sdk` + example adapters            | **Free (OSS)** |
+| Production with your own infra      | `CORPUS_sdk` + your adapters               | **Free (OSS)** |
+| Production with official adapters   | `CORPUS_sdk` + **Official Adapters**       | **Commercial** |
+| Enterprise multi-provider (managed) | `CORPUS_sdk` + **CORPUS Router (Managed)** | **Commercial** |
+| Enterprise multi-provider (on-prem) | `CORPUS_sdk` + **CORPUS Router (On-Prem)** | **Commercial** |
 
-**Router details & architecture** live in a separate doc (see `docs/guides/ROUTER_OVERVIEW.md` or corpus.io) to keep this README focused on the SDK and protocols.
+**Router details & architecture** live in a separate doc (see `docs/guides/ROUTER_OVERVIEW.md` or CORPUS.io) to keep this README focused on the SDK and protocols.
 
 **Contact**
 
-* Sales & commercial: `sales@corpus.io`
-* Technical & community: `discussions@corpus.io`
-* Partnerships: `partners@corpus.io`
+* Sales & commercial: `sales@CORPUS.io`
+* Technical & community: `discussions@CORPUS.io`
+* Partnerships: `partners@CORPUS.io`
 
 ---
 
-**Built by the Corpus team** — aiming to make **wire-level AI infrastructure** something you integrate once and then stop thinking about.
+**Built by the CORPUS team** — aiming to make **wire-level AI infrastructure** something you integrate once and then stop thinking about.
 
 ```
