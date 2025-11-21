@@ -21,6 +21,7 @@ while maintaining the protocol-first Corpus embedding stack.
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from functools import cached_property
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -48,6 +49,54 @@ try:
     from llama_index.core.embeddings import DEFAULT_EMBED_BATCH_SIZE
 except ImportError:
     DEFAULT_EMBED_BATCH_SIZE = 512
+
+
+# ---------------------------------------------------------------------------
+# Error Context Decorator (Eliminates Boilerplate)
+# ---------------------------------------------------------------------------
+
+@contextmanager
+def _embedding_error_context(
+    operation: str,
+    *,
+    text_len: Optional[int] = None,
+    texts_count: Optional[int] = None,
+    framework_ctx: Optional[Dict[str, Any]] = None,
+    model_name: str,
+):
+    """
+    Context manager for consistent error context attachment in embedding operations.
+    
+    Eliminates repetitive try/except boilerplate across all embedding methods.
+    """
+    try:
+        yield
+    except Exception as exc:  # noqa: BLE001
+        # Build error context from parameters
+        error_context = {
+            "embedding_operation": operation,
+            "llamaindex_model_name": model_name,
+        }
+        
+        if text_len is not None:
+            error_context["text_len"] = text_len
+        if texts_count is not None:
+            error_context["texts_count"] = texts_count
+        if framework_ctx:
+            if "node_ids" in framework_ctx:
+                error_context["node_ids"] = framework_ctx.get("node_ids")
+            if "index_id" in framework_ctx:
+                error_context["index_id"] = framework_ctx.get("index_id")
+            if "callback_manager" in framework_ctx:
+                error_context["has_callback_manager"] = bool(framework_ctx.get("callback_manager"))
+        
+        # Attach context without masking the original error
+        try:
+            attach_context(exc, **error_context)
+        except Exception:
+            # Never mask the original error if context attachment fails
+            pass
+        raise
 
 
 class CorpusLlamaIndexEmbeddings(BaseEmbedding):
@@ -125,6 +174,13 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         embed_batch_size:
             Batch size for embedding operations (defaults to LlamaIndex standard)
         """
+        # Validate critical parameters
+        if not isinstance(corpus_adapter, EmbeddingProtocolV1):
+            raise TypeError("corpus_adapter must implement EmbeddingProtocolV1")
+        
+        if embed_batch_size < 1:
+            raise ValueError("embed_batch_size must be positive")
+
         self.corpus_adapter = corpus_adapter
         self._model_name = model_name
         self.batch_config = batch_config
@@ -191,31 +247,40 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         - `op_ctx_dict`: normalized dict for embedding layer
         - `framework_ctx`: LlamaIndex-specific context for translator
         """
-        # Use existing context translation implementation
-        core_ctx = context_from_llamaindex(llamaindex_context)
+        # Validate input
+        if llamaindex_context is not None and not isinstance(llamaindex_context, Mapping):
+            logger.warning("llamaindex_context should be a Mapping, got %s", type(llamaindex_context))
+            llamaindex_context = None
 
-        # Normalized dict for embedding OperationContext reconstruction
-        op_ctx_dict: Dict[str, Any] = core_ctx.to_dict()
+        try:
+            # Use existing context translation implementation
+            core_ctx = context_from_llamaindex(llamaindex_context)
 
-        # Framework-level context for LlamaIndex-specific hints
-        framework_ctx: Dict[str, Any] = {
-            "framework": "llamaindex",
-            "model_name": self.model_name,
-        }
+            # Normalized dict for embedding OperationContext reconstruction
+            op_ctx_dict: Dict[str, Any] = core_ctx.to_dict()
 
-        # Add LlamaIndex-specific context for nodes and retrieval
-        if llamaindex_context:
-            if "node_ids" in llamaindex_context:
-                framework_ctx["node_ids"] = llamaindex_context["node_ids"]
-            if "index_id" in llamaindex_context:
-                framework_ctx["index_id"] = llamaindex_context["index_id"]
-            if "callback_manager" in llamaindex_context:
-                framework_ctx["callback_manager"] = llamaindex_context["callback_manager"]
+            # Framework-level context for LlamaIndex-specific hints
+            framework_ctx: Dict[str, Any] = {
+                "framework": "llamaindex",
+                "model_name": self.model_name,
+            }
 
-        # Add any additional kwargs to framework context
-        framework_ctx.update(kwargs)
+            # Add LlamaIndex-specific context for nodes and retrieval
+            if llamaindex_context:
+                if "node_ids" in llamaindex_context:
+                    framework_ctx["node_ids"] = llamaindex_context["node_ids"]
+                if "index_id" in llamaindex_context:
+                    framework_ctx["index_id"] = llamaindex_context["index_id"]
+                if "callback_manager" in llamaindex_context:
+                    framework_ctx["callback_manager"] = llamaindex_context["callback_manager"]
 
-        return core_ctx, op_ctx_dict, framework_ctx
+            # Add any additional kwargs to framework context
+            framework_ctx.update(kwargs)
+
+            return core_ctx, op_ctx_dict, framework_ctx
+        except Exception as e:
+            logger.error("Failed to build LlamaIndex contexts: %s", e)
+            raise ValueError(f"Context building failed: {e}") from e
 
     @staticmethod
     def _coerce_embedding_matrix(result: Any) -> List[List[float]]:
@@ -282,8 +347,46 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
 
         return matrix[0]
 
+    @property
+    def _get_embedding_dimension(self) -> int:
+        """
+        Get embedding dimension for proper zero vector fallback.
+        
+        Returns
+        -------
+        int
+            Embedding dimension, with fallback to common default (768)
+        """
+        # Try to get dimension from adapter if available
+        if hasattr(self.corpus_adapter, 'get_embedding_dimension'):
+            try:
+                return self.corpus_adapter.get_embedding_dimension()
+            except Exception as e:
+                logger.debug("Failed to get embedding dimension from adapter: %s", e)
+        
+        # Common fallback dimension
+        return 768
+
+    def _handle_empty_text(self, text: str) -> List[float]:
+        """
+        Handle empty text by returning appropriate zero vector.
+        
+        Parameters
+        ----------
+        text:
+            Input text that is empty or whitespace-only
+            
+        Returns
+        -------
+        List[float]
+            Zero vector of appropriate dimension
+        """
+        logger.warning("Empty text provided for embedding, returning zero vector")
+        dimension = self._get_embedding_dimension
+        return [0.0] * dimension
+
     # ------------------------------------------------------------------ #
-    # Core LlamaIndex Abstract Method Implementation
+    # Core LlamaIndex Abstract Method Implementation (Clean with Decorator)
     # ------------------------------------------------------------------ #
 
     def _get_query_embedding(self, query: str, **kwargs: Any) -> List[float]:
@@ -305,34 +408,27 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         List[float]
             Query embedding vector
         """
+        # Handle empty query
+        if not query or not query.strip():
+            return self._handle_empty_text(query)
+
         _, op_ctx_dict, framework_ctx = self._build_contexts(
             llamaindex_context=kwargs,
             **kwargs,
         )
 
-        try:
+        with _embedding_error_context(
+            "_get_query_embedding",
+            text_len=len(query),
+            framework_ctx=framework_ctx,
+            model_name=self.model_name,
+        ):
             translated = self._translator.embed(
                 raw_texts=query,
                 op_ctx=op_ctx_dict,
                 framework_ctx=framework_ctx,
             )
             return self._coerce_embedding_vector(translated)
-        except Exception as exc:  # noqa: BLE001
-            # Enrich with LlamaIndex-specific context; protocol-level context
-            # is already attached by EmbeddingTranslator.
-            try:
-                attach_context(
-                    exc,
-                    embedding_operation="_get_query_embedding",
-                    text_len=len(query or ""),
-                    node_ids=framework_ctx.get("node_ids"),
-                    index_id=framework_ctx.get("index_id"),
-                    llamaindex_model_name=self.model_name,
-                )
-            except Exception:
-                # Never mask the original error
-                pass
-            raise
 
     async def _aget_query_embedding(self, query: str, **kwargs: Any) -> List[float]:
         """
@@ -353,33 +449,27 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         List[float]
             Query embedding vector
         """
+        # Handle empty query
+        if not query or not query.strip():
+            return self._handle_empty_text(query)
+
         core_ctx, op_ctx_dict, framework_ctx = self._build_contexts(
             llamaindex_context=kwargs,
             **kwargs,
         )
 
-        try:
+        with _embedding_error_context(
+            "_aget_query_embedding",
+            text_len=len(query),
+            framework_ctx=framework_ctx,
+            model_name=self.model_name,
+        ):
             translated = await self._translator.arun_embed(
                 raw_texts=query,
                 op_ctx=op_ctx_dict,
                 framework_ctx=framework_ctx,
             )
             return self._coerce_embedding_vector(translated)
-        except Exception as exc:  # noqa: BLE001
-            try:
-                attach_context(
-                    exc,
-                    embedding_operation="_aget_query_embedding",
-                    text_len=len(query or ""),
-                    node_ids=framework_ctx.get("node_ids"),
-                    index_id=framework_ctx.get("index_id"),
-                    llamaindex_model_name=self.model_name,
-                    llamaindex_has_context=bool(core_ctx),
-                )
-            except Exception:
-                # Never mask the original error
-                pass
-            raise
 
     def _get_text_embedding(self, text: str, **kwargs: Any) -> List[float]:
         """
@@ -400,32 +490,27 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         List[float]
             Text embedding vector
         """
+        # Handle empty text
+        if not text or not text.strip():
+            return self._handle_empty_text(text)
+
         _, op_ctx_dict, framework_ctx = self._build_contexts(
             llamaindex_context=kwargs,
             **kwargs,
         )
 
-        try:
+        with _embedding_error_context(
+            "_get_text_embedding",
+            text_len=len(text),
+            framework_ctx=framework_ctx,
+            model_name=self.model_name,
+        ):
             translated = self._translator.embed(
                 raw_texts=text,
                 op_ctx=op_ctx_dict,
                 framework_ctx=framework_ctx,
             )
             return self._coerce_embedding_vector(translated)
-        except Exception as exc:  # noqa: BLE001
-            try:
-                attach_context(
-                    exc,
-                    embedding_operation="_get_text_embedding",
-                    text_len=len(text or ""),
-                    node_ids=framework_ctx.get("node_ids"),
-                    index_id=framework_ctx.get("index_id"),
-                    llamaindex_model_name=self.model_name,
-                )
-            except Exception:
-                # Never mask the original error
-                pass
-            raise
 
     async def _aget_text_embedding(self, text: str, **kwargs: Any) -> List[float]:
         """
@@ -446,33 +531,27 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         List[float]
             Text embedding vector
         """
+        # Handle empty text
+        if not text or not text.strip():
+            return self._handle_empty_text(text)
+
         core_ctx, op_ctx_dict, framework_ctx = self._build_contexts(
             llamaindex_context=kwargs,
             **kwargs,
         )
 
-        try:
+        with _embedding_error_context(
+            "_aget_text_embedding",
+            text_len=len(text),
+            framework_ctx=framework_ctx,
+            model_name=self.model_name,
+        ):
             translated = await self._translator.arun_embed(
                 raw_texts=text,
                 op_ctx=op_ctx_dict,
                 framework_ctx=framework_ctx,
             )
             return self._coerce_embedding_vector(translated)
-        except Exception as exc:  # noqa: BLE001
-            try:
-                attach_context(
-                    exc,
-                    embedding_operation="_aget_text_embedding",
-                    text_len=len(text or ""),
-                    node_ids=framework_ctx.get("node_ids"),
-                    index_id=framework_ctx.get("index_id"),
-                    llamaindex_model_name=self.model_name,
-                    llamaindex_has_context=bool(core_ctx),
-                )
-            except Exception:
-                # Never mask the original error
-                pass
-            raise
 
     def _get_text_embeddings(self, texts: List[str], **kwargs: Any) -> List[List[float]]:
         """
@@ -493,32 +572,108 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         List[List[float]]
             Batch of text embedding vectors
         """
+        # Filter out empty texts and handle them separately
+        non_empty_texts = [t for t in texts if t and t.strip()]
+        empty_indices = [i for i, t in enumerate(texts) if not t or not t.strip()]
+        
+        if not non_empty_texts:
+            # All texts are empty, return zero vectors
+            dimension = self._get_embedding_dimension
+            return [[0.0] * dimension for _ in texts]
+
         _, op_ctx_dict, framework_ctx = self._build_contexts(
             llamaindex_context=kwargs,
             **kwargs,
         )
 
-        try:
+        with _embedding_error_context(
+            "_get_text_embeddings",
+            texts_count=len(texts),
+            framework_ctx=framework_ctx,
+            model_name=self.model_name,
+        ):
             translated = self._translator.embed(
-                raw_texts=texts,
+                raw_texts=non_empty_texts,
                 op_ctx=op_ctx_dict,
                 framework_ctx=framework_ctx,
             )
-            return self._coerce_embedding_matrix(translated)
-        except Exception as exc:  # noqa: BLE001
-            try:
-                attach_context(
-                    exc,
-                    embedding_operation="_get_text_embeddings",
-                    texts_count=len(texts),
-                    node_ids=framework_ctx.get("node_ids"),
-                    index_id=framework_ctx.get("index_id"),
-                    llamaindex_model_name=self.model_name,
-                )
-            except Exception:
-                # Never mask the original error
-                pass
-            raise
+            embeddings = self._coerce_embedding_matrix(translated)
+            
+            # Insert zero vectors for empty texts at their original positions
+            if empty_indices:
+                dimension = len(embeddings[0]) if embeddings else self._get_embedding_dimension
+                result_embeddings = []
+                non_empty_idx = 0
+                for i in range(len(texts)):
+                    if i in empty_indices:
+                        result_embeddings.append([0.0] * dimension)
+                    else:
+                        result_embeddings.append(embeddings[non_empty_idx])
+                        non_empty_idx += 1
+                return result_embeddings
+            
+            return embeddings
+
+    async def _aget_text_embeddings(self, texts: List[str], **kwargs: Any) -> List[List[float]]:
+        """
+        Async batch text embedding implementation for LlamaIndex nodes.
+
+        This provides optimized async batch embedding for multiple nodes,
+        which is crucial for LlamaIndex's performance during async index building.
+
+        Parameters
+        ----------
+        texts:
+            List of node texts to embed
+        **kwargs:
+            Additional LlamaIndex context and parameters
+
+        Returns
+        -------
+        List[List[float]]
+            Batch of text embedding vectors
+        """
+        # Filter out empty texts and handle them separately
+        non_empty_texts = [t for t in texts if t and t.strip()]
+        empty_indices = [i for i, t in enumerate(texts) if not t or not t.strip()]
+        
+        if not non_empty_texts:
+            # All texts are empty, return zero vectors
+            dimension = self._get_embedding_dimension
+            return [[0.0] * dimension for _ in texts]
+
+        core_ctx, op_ctx_dict, framework_ctx = self._build_contexts(
+            llamaindex_context=kwargs,
+            **kwargs,
+        )
+
+        with _embedding_error_context(
+            "_aget_text_embeddings",
+            texts_count=len(texts),
+            framework_ctx=framework_ctx,
+            model_name=self.model_name,
+        ):
+            translated = await self._translator.arun_embed(
+                raw_texts=non_empty_texts,
+                op_ctx=op_ctx_dict,
+                framework_ctx=framework_ctx,
+            )
+            embeddings = self._coerce_embedding_matrix(translated)
+            
+            # Insert zero vectors for empty texts at their original positions
+            if empty_indices:
+                dimension = len(embeddings[0]) if embeddings else self._get_embedding_dimension
+                result_embeddings = []
+                non_empty_idx = 0
+                for i in range(len(texts)):
+                    if i in empty_indices:
+                        result_embeddings.append([0.0] * dimension)
+                    else:
+                        result_embeddings.append(embeddings[non_empty_idx])
+                        non_empty_idx += 1
+                return result_embeddings
+            
+            return embeddings
 
 
 # ------------------------------------------------------------------ #
