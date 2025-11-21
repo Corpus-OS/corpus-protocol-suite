@@ -22,9 +22,8 @@ from __future__ import annotations
 
 import logging
 from functools import cached_property
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union, Protocol
 
-from corpus_sdk.core.async_bridge import AsyncBridge
 from corpus_sdk.core.context_translation import (
     from_crewai as context_from_crewai,
 )
@@ -40,6 +39,42 @@ from corpus_sdk.embedding.framework_adapters.common.embedding_translation import
 from corpus_sdk.llm.framework_adapters.common.error_context import attach_context
 
 logger = logging.getLogger(__name__)
+
+
+class CrewAIEmbedderProtocol(Protocol):
+    """
+    Protocol representing the minimal embedder interface expected by CrewAI.
+
+    This structural protocol allows `create_crewai_embedder` to declare a
+    stable return type without requiring a hard dependency on CrewAI's
+    concrete types at type-check time.
+    """
+
+    def embed_documents(
+        self,
+        texts: List[str],
+        *,
+        crewai_context: Optional[Mapping[str, Any]] = None,
+        model: Optional[str] = None,
+        **kwargs: Any,
+    ) -> List[List[float]]:
+        """
+        Embed multiple documents for CrewAI RAG and knowledge workflows.
+        """
+        ...
+
+    def embed_query(
+        self,
+        text: str,
+        *,
+        crewai_context: Optional[Mapping[str, Any]] = None,
+        model: Optional[str] = None,
+        **kwargs: Any,
+    ) -> List[float]:
+        """
+        Embed a single query for CrewAI retrieval and decision-making.
+        """
+        ...
 
 
 class CorpusCrewAIEmbeddings:
@@ -124,6 +159,7 @@ class CorpusCrewAIEmbeddings:
         *,
         crewai_context: Optional[Mapping[str, Any]] = None,
         model: Optional[str] = None,
+        **kwargs: Any,
     ) -> Tuple[Any, Dict[str, Any], Dict[str, Any]]:
         """
         Build contexts for CrewAI execution environment.
@@ -135,6 +171,9 @@ class CorpusCrewAIEmbeddings:
             task details, and workflow metadata.
         model:
             Optional per-call model override.
+        **kwargs:
+            Additional framework-level hints to be passed through to the
+            translator as part of `framework_ctx`.
 
         Returns
         -------
@@ -150,7 +189,9 @@ class CorpusCrewAIEmbeddings:
         op_ctx_dict: Dict[str, Any] = core_ctx.to_dict()
 
         # Framework-level context for CrewAI-specific hints
-        framework_ctx: Dict[str, Any] = {}
+        framework_ctx: Dict[str, Any] = {
+            "framework": "crewai",
+        }
         effective_model = model or self.model
         if effective_model:
             framework_ctx["model"] = effective_model
@@ -160,6 +201,9 @@ class CorpusCrewAIEmbeddings:
             framework_ctx["crewai_agent_role"] = crewai_context.get("agent_role")
             framework_ctx["crewai_task_id"] = crewai_context.get("task_id")
             framework_ctx["crewai_workflow"] = crewai_context.get("workflow")
+
+        # Add any additional framework-level hints
+        framework_ctx.update(kwargs)
 
         return core_ctx, op_ctx_dict, framework_ctx
 
@@ -226,12 +270,6 @@ class CorpusCrewAIEmbeddings:
 
         return matrix[0]
 
-    def _get_timeout_from_context(self, core_ctx: Any) -> Optional[float]:
-        """Extract timeout from core context, converting ms to seconds."""
-        if hasattr(core_ctx, "deadline_ms") and core_ctx.deadline_ms is not None:
-            return core_ctx.deadline_ms / 1000.0
-        return None
-
     # ------------------------------------------------------------------ #
     # Core Embedding API (CrewAI Compatible)
     # ------------------------------------------------------------------ #
@@ -259,38 +297,39 @@ class CorpusCrewAIEmbeddings:
             task information, and workflow metadata.
         model:
             Optional per-call model override.
+        **kwargs:
+            Additional framework-level hints to be passed through to the
+            translator as part of `framework_ctx`.
         """
-        core_ctx, op_ctx_dict, framework_ctx = self._build_contexts(
+        _, op_ctx_dict, framework_ctx = self._build_contexts(
             crewai_context=crewai_context,
             model=model,
+            **kwargs,
         )
-        timeout = self._get_timeout_from_context(core_ctx)
 
-        async def _coro() -> List[List[float]]:
+        try:
+            translated = self._translator.embed(
+                raw_texts=texts,
+                op_ctx=op_ctx_dict,
+                framework_ctx=framework_ctx,
+            )
+            return self._coerce_embedding_matrix(translated)
+        except Exception as exc:  # noqa: BLE001
+            # Enrich with CrewAI-specific context; core protocol context is
+            # already attached inside EmbeddingTranslator.
             try:
-                translated = await self._translator.arun_embed(
-                    raw_texts=texts,
-                    op_ctx=op_ctx_dict,
-                    framework_ctx=framework_ctx,
+                attach_context(
+                    exc,
+                    embedding_operation="embed_documents",
+                    texts_count=len(texts),
+                    agent_role=framework_ctx.get("crewai_agent_role"),
+                    task_id=framework_ctx.get("crewai_task_id"),
+                    crewai_workflow=framework_ctx.get("crewai_workflow"),
                 )
-                return self._coerce_embedding_matrix(translated)
-            except Exception as exc:  # noqa: BLE001
-                try:
-                    attach_context(
-                        exc,
-                        framework="crewai",
-                        embedding_operation="embed_documents",
-                        texts_count=len(texts),
-                        agent_role=framework_ctx.get("crewai_agent_role"),
-                        task_id=framework_ctx.get("crewai_task_id"),
-                        request_id=getattr(core_ctx, "request_id", None),
-                        tenant=getattr(core_ctx, "tenant", None),
-                    )
-                except Exception:
-                    pass  # Never mask original error
-                raise
-
-        return AsyncBridge.run_async(_coro(), timeout=timeout)
+            except Exception:
+                # Never mask the original error
+                pass
+            raise
 
     def embed_query(
         self,
@@ -314,38 +353,39 @@ class CorpusCrewAIEmbeddings:
             Optional CrewAI execution context.
         model:
             Optional per-call model override.
+        **kwargs:
+            Additional framework-level hints to be passed through to the
+            translator as part of `framework_ctx`.
         """
-        core_ctx, op_ctx_dict, framework_ctx = self._build_contexts(
+        _, op_ctx_dict, framework_ctx = self._build_contexts(
             crewai_context=crewai_context,
             model=model,
+            **kwargs,
         )
-        timeout = self._get_timeout_from_context(core_ctx)
 
-        async def _coro() -> List[float]:
+        try:
+            translated = self._translator.embed(
+                raw_texts=text,
+                op_ctx=op_ctx_dict,
+                framework_ctx=framework_ctx,
+            )
+            return self._coerce_embedding_vector(translated)
+        except Exception as exc:  # noqa: BLE001
+            # Enrich with CrewAI-specific context; core protocol context is
+            # already attached inside EmbeddingTranslator.
             try:
-                translated = await self._translator.arun_embed(
-                    raw_texts=text,
-                    op_ctx=op_ctx_dict,
-                    framework_ctx=framework_ctx,
+                attach_context(
+                    exc,
+                    embedding_operation="embed_query",
+                    text_len=len(text or ""),
+                    agent_role=framework_ctx.get("crewai_agent_role"),
+                    task_id=framework_ctx.get("crewai_task_id"),
+                    crewai_workflow=framework_ctx.get("crewai_workflow"),
                 )
-                return self._coerce_embedding_vector(translated)
-            except Exception as exc:  # noqa: BLE001
-                try:
-                    attach_context(
-                        exc,
-                        framework="crewai",
-                        embedding_operation="embed_query",
-                        text_len=len(text or ""),
-                        agent_role=framework_ctx.get("crewai_agent_role"),
-                        task_id=framework_ctx.get("crewai_task_id"),
-                        request_id=getattr(core_ctx, "request_id", None),
-                        tenant=getattr(core_ctx, "tenant", None),
-                    )
-                except Exception:
-                    pass
-                raise
-
-        return AsyncBridge.run_async(_coro(), timeout=timeout)
+            except Exception:
+                # Never mask the original error
+                pass
+            raise
 
     # ------------------------------------------------------------------ #
     # Async API for CrewAI Flows
@@ -372,10 +412,14 @@ class CorpusCrewAIEmbeddings:
             Optional CrewAI execution context.
         model:
             Optional per-call model override.
+        **kwargs:
+            Additional framework-level hints to be passed through to the
+            translator as part of `framework_ctx`.
         """
         core_ctx, op_ctx_dict, framework_ctx = self._build_contexts(
             crewai_context=crewai_context,
             model=model,
+            **kwargs,
         )
 
         try:
@@ -386,18 +430,18 @@ class CorpusCrewAIEmbeddings:
             )
             return self._coerce_embedding_matrix(translated)
         except Exception as exc:  # noqa: BLE001
+            # Enrich with CrewAI-specific context for async workflows.
             try:
                 attach_context(
                     exc,
-                    framework="crewai",
-                    embedding_operation="embed_documents",
+                    embedding_operation="aembed_documents",
                     texts_count=len(texts),
                     agent_role=framework_ctx.get("crewai_agent_role"),
                     task_id=framework_ctx.get("crewai_task_id"),
-                    request_id=getattr(core_ctx, "request_id", None),
-                    tenant=getattr(core_ctx, "tenant", None),
+                    crewai_workflow=framework_ctx.get("crewai_workflow"),
                 )
             except Exception:
+                # Never mask the original error
                 pass
             raise
 
@@ -422,10 +466,14 @@ class CorpusCrewAIEmbeddings:
             Optional CrewAI execution context.
         model:
             Optional per-call model override.
+        **kwargs:
+            Additional framework-level hints to be passed through to the
+            translator as part of `framework_ctx`.
         """
         core_ctx, op_ctx_dict, framework_ctx = self._build_contexts(
             crewai_context=crewai_context,
             model=model,
+            **kwargs,
         )
 
         try:
@@ -436,18 +484,18 @@ class CorpusCrewAIEmbeddings:
             )
             return self._coerce_embedding_vector(translated)
         except Exception as exc:  # noqa: BLE001
+            # Enrich with CrewAI-specific context for async query embeddings.
             try:
                 attach_context(
                     exc,
-                    framework="crewai",
-                    embedding_operation="embed_query",
+                    embedding_operation="aembed_query",
                     text_len=len(text or ""),
                     agent_role=framework_ctx.get("crewai_agent_role"),
                     task_id=framework_ctx.get("crewai_task_id"),
-                    request_id=getattr(core_ctx, "request_id", None),
-                    tenant=getattr(core_ctx, "tenant", None),
+                    crewai_workflow=framework_ctx.get("crewai_workflow"),
                 )
             except Exception:
+                # Never mask the original error
                 pass
             raise
 
@@ -457,7 +505,7 @@ def create_crewai_embedder(
     corpus_adapter: EmbeddingProtocolV1,
     model: Optional[str] = None,
     **kwargs: Any,
-) -> CorpusCrewAIEmbeddings:
+) -> CrewAIEmbedderProtocol:
     """
     Create a CrewAI-compatible embedder for use with Agent embedder attribute.
 
@@ -485,7 +533,7 @@ def create_crewai_embedder(
     return CorpusCrewAIEmbeddings(
         corpus_adapter=corpus_adapter,
         model=model,
-        **kwargs
+        **kwargs,
     )
 
 
