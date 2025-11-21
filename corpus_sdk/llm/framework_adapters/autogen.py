@@ -13,7 +13,7 @@ Key responsibilities
 - Convert them to Corpus wire messages (via message normalization helpers)
 - Build OperationContext from AutoGen conversation / metadata
 - Construct sampling / routing parameters (model, temperature, stop, etc.)
-- Delegate sync/async + streaming orchestration to `LLMTranslator`
+- Delegate sync/async + streaming orchestration directly to LLM protocol
 - Convert protocol-level `LLMCompletion` / `LLMChunk` into OpenAI-style
   ChatCompletion / ChatCompletionChunk payloads
 - Enrich exceptions with AutoGen-specific debug metadata via `attach_context`
@@ -24,13 +24,13 @@ Design principles
     The Corpus `LLMProtocolV1` is the source of truth; this module is a thin
     compatibility layer for AutoGen.
 
-- Translator-centric:
-    All async→sync bridging, streaming glue, and common error-handling are
-    handled by `LLMTranslator`, mirroring the graph adapter pattern.
+- Direct protocol calls:
+    No unnecessary abstraction layers - call LLM protocol methods directly
+    after handling AutoGen-specific translation.
 
 - Non-invasive:
     No retries, circuit breaking, or deadlines are implemented here beyond
-    what the LLM protocol / translator already provide.
+    what the LLM protocol already provides.
 
 - Rich error context:
     Exceptions are annotated via `attach_context` with framework-specific
@@ -41,11 +41,11 @@ from __future__ import annotations
 
 import logging
 import time
-from contextlib import asynccontextmanager, contextmanager
-from functools import cached_property
+from functools import wraps
 from typing import (
     Any,
     AsyncIterator,
+    Awaitable,
     Dict,
     Iterator,
     Mapping,
@@ -53,6 +53,7 @@ from typing import (
     Protocol,
     Sequence,
     Tuple,
+    TypeVar,
     Union,
 )
 from uuid import uuid4
@@ -64,10 +65,6 @@ from corpus_sdk.llm.framework_adapters.common.message_translation import (
     from_autogen,
     to_corpus,
 )
-from corpus_sdk.llm.framework_adapters.common.llm_translation import (
-    DefaultLLMFrameworkTranslator,
-    LLMTranslator,
-)
 from corpus_sdk.llm.llm_base import (
     LLMChunk,
     LLMCompletion,
@@ -76,6 +73,9 @@ from corpus_sdk.llm.llm_base import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Type variables for decorators
+T = TypeVar("T")
 
 
 class AutoGenLLMClientProtocol(Protocol):
@@ -110,6 +110,149 @@ def _new_id(prefix: str = "chatcmpl") -> str:
     return f"{prefix}-{uuid4().hex}"
 
 
+# ---------------------------------------------------------------------------
+# Error Context Decorators (Rich Dynamic Context)
+# ---------------------------------------------------------------------------
+
+
+def _create_error_context_decorator(
+    operation: str,
+    is_async: bool = False,
+) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    """
+    Factory for creating error context decorators with rich per-call metrics.
+    """
+    def decorator_factory(
+        **static_context: Any,
+    ) -> Callable[[Callable[..., T]], Callable[..., T]]:
+        def decorator(func: Callable[..., T]) -> Callable[..., T]:
+            if is_async:
+
+                @wraps(func)
+                async def async_wrapper(self: Any, *args: Any, **kwargs: Any) -> T:
+                    # Extract dynamic context from call
+                    dynamic_context = _extract_dynamic_context(self, args, kwargs, operation)
+                    full_context = {**static_context, **dynamic_context}
+
+                    try:
+                        return await func(self, *args, **kwargs)
+                    except Exception as exc:  # noqa: BLE001
+                        attach_context(
+                            exc,
+                            framework="autogen",
+                            operation=f"llm_{operation}",
+                            **full_context,
+                        )
+                        raise
+
+                return async_wrapper
+            else:
+
+                @wraps(func)
+                def sync_wrapper(self: Any, *args: Any, **kwargs: Any) -> T:
+                    # Extract dynamic context from call
+                    dynamic_context = _extract_dynamic_context(self, args, kwargs, operation)
+                    full_context = {**static_context, **dynamic_context}
+
+                    try:
+                        return func(self, *args, **kwargs)
+                    except Exception as exc:  # noqa: BLE001
+                        attach_context(
+                            exc,
+                            framework="autogen",
+                            operation=f"llm_{operation}",
+                            **full_context,
+                        )
+                        raise
+
+                return sync_wrapper
+
+        return decorator
+    return decorator_factory
+
+
+def _extract_dynamic_context(
+    instance: Any,
+    args: Tuple[Any, ...],
+    kwargs: Dict[str, Any],
+    operation: str,
+) -> Dict[str, Any]:
+    """
+    Extract rich dynamic context from method call for enhanced observability.
+    """
+    dynamic_ctx: Dict[str, Any] = {
+        "model": getattr(instance, "model", "unknown"),
+        "operation": operation,
+    }
+
+    # Extract message-based metrics
+    if args and isinstance(args[0], (list, tuple)):
+        messages = args[0]
+        dynamic_ctx["messages_count"] = len(messages)
+
+        # Calculate rough content metrics and roles distribution
+        roles: Dict[str, int] = {}
+        total_chars = 0
+        for msg in messages:
+            if not isinstance(msg, Mapping):
+                continue
+            role = msg.get("role", "unknown")
+            roles[role] = roles.get(role, 0) + 1
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                total_chars += len(content)
+
+        dynamic_ctx["roles_distribution"] = roles
+        dynamic_ctx["total_content_chars"] = total_chars
+
+    # Extract AutoGen-specific context presence flags
+    if kwargs.get("conversation") is not None:
+        dynamic_ctx["has_conversation"] = True
+    if kwargs.get("context") is not None:
+        dynamic_ctx["has_extra_context"] = True
+
+    # Extract sampling parameters (if provided)
+    sampling_params = [
+        "temperature",
+        "max_tokens",
+        "top_p",
+        "frequency_penalty",
+        "presence_penalty",
+    ]
+    for param in sampling_params:
+        if param in kwargs:
+            dynamic_ctx[param] = kwargs[param]
+
+    # Stream flag
+    if "stream" in kwargs:
+        dynamic_ctx["stream"] = bool(kwargs["stream"])
+
+    # Request-scoped identifiers (if provided)
+    if "request_id" in kwargs:
+        dynamic_ctx["request_id"] = kwargs["request_id"]
+    if "tenant" in kwargs:
+        dynamic_ctx["tenant"] = kwargs["tenant"]
+
+    return dynamic_ctx
+
+
+# Convenience decorators with rich context extraction
+def with_llm_error_context(
+    operation: str,
+    **static_context: Any,
+) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    """Decorator for sync LLM methods with rich dynamic context extraction."""
+    return _create_error_context_decorator(operation, is_async=False)(**static_context)
+
+
+def with_async_llm_error_context(
+    operation: str,
+    **static_context: Any,
+) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    """Decorator for async LLM methods with rich dynamic context extraction."""
+    return _create_error_context_decorator(operation, is_async=True)(**static_context)
+
+
 class CorpusAutoGenChatClient:
     """
     OpenAI-style chat client backed by a Corpus `LLMProtocolV1`.
@@ -125,16 +268,55 @@ class CorpusAutoGenChatClient:
 
         {"role": "user", "content": "Hello"}
 
-    They are normalized into Corpus wire messages and then passed through
-    `LLMTranslator` to the underlying `LLMProtocolV1` implementation.
+    They are normalized into Corpus wire messages and then passed directly
+    to the underlying `LLMProtocolV1` implementation.
+
+    Example:
+    ```python
+    from corpus_sdk.llm.framework_adapters.autogen import CorpusAutoGenChatClient
+    import autogen
+
+    # Initialize with any Corpus LLMProtocolV1 adapter
+    llm_client = CorpusAutoGenChatClient(
+        llm_adapter=my_adapter,
+        model="gpt-4",
+        temperature=0.7
+    )
+
+    # Use with AutoGen agent configuration
+    agent = autogen.AssistantAgent(
+        name="assistant",
+        llm_config={
+            "config_list": [{
+                "model": "gpt-4",
+                "api_key": "sk-...",  # Not used by Corpus client
+                "client": llm_client  # Direct client assignment
+            }]
+        }
+    )
+    ```
+
+    Error Handling Example:
+    ```python
+    try:
+        response = llm_client.create(
+            messages=[{"role": "user", "content": "Hello"}],
+            model="gpt-4",
+            temperature=0.7,
+            conversation=agent_conversation
+        )
+    except Exception as e:
+        # Rich error context automatically attached with message counts, roles, etc.
+        logger.error("LLM call failed with context", exc_info=e)
+    ```
 
     Streaming
     ---------
     - Async streaming: `acreate(..., stream=True)` returns an async iterator
       of OpenAI ChatCompletion chunk payloads.
 
-    - Sync streaming: `create(..., stream=True)` uses the sync streaming
-      path of `LLMTranslator` to yield chunks synchronously.
+    - Sync streaming: `create(..., stream=True)` returns an iterator of
+      ChatCompletion chunk payloads.
 
     Error context
     -------------
@@ -143,18 +325,6 @@ class CorpusAutoGenChatClient:
     higher-level handlers to inspect request-specific metadata without
     modifying exception messages or types.
     """
-
-    class _AutoGenLLMFrameworkTranslator(DefaultLLMFrameworkTranslator):
-        """
-        AutoGen-specific LLM framework translator.
-
-        Currently this subclass does not override any behavior from
-        `DefaultLLMFrameworkTranslator`, but it exists to mirror the graph
-        adapter pattern and to provide a dedicated hook for AutoGen-specific
-        customizations in the future.
-        """
-
-        pass
 
     # ------------------------------------------------------------------ #
     # Construction
@@ -169,103 +339,22 @@ class CorpusAutoGenChatClient:
         max_tokens: Optional[int] = None,
         framework_version: Optional[str] = None,
     ) -> None:
+        if not hasattr(llm_adapter, "complete") or not callable(
+            getattr(llm_adapter, "complete", None)
+        ):
+            raise TypeError("llm_adapter must implement LLMProtocolV1 with 'complete' method")
+
         self._llm: LLMProtocolV1 = llm_adapter
         self.model = model
         self.temperature = float(temperature)
         self.max_tokens = max_tokens
         self._framework_version = framework_version
 
-    # ------------------------------------------------------------------ #
-    # Translator (lazy, cached)
-    # ------------------------------------------------------------------ #
-
-    @cached_property
-    def _translator(self) -> LLMTranslator:
-        """
-        Lazily construct and cache the `LLMTranslator`.
-
-        This mirrors the graph adapter pattern: all async→sync bridging,
-        streaming orchestration, and protocol-level error handling are
-        centralized in `LLMTranslator`.
-        """
-        framework_translator = self._AutoGenLLMFrameworkTranslator()
-        return LLMTranslator(
-            adapter=self._llm,
-            framework="autogen",
-            translator=framework_translator,
+        logger.info(
+            "CorpusAutoGenChatClient initialized with model=%s, temperature=%.2f",
+            self.model,
+            self.temperature,
         )
-
-    # ------------------------------------------------------------------ #
-    # Error-context helpers (to avoid boilerplate)
-    # ------------------------------------------------------------------ #
-
-    @contextmanager
-    def _error_context(
-        self,
-        operation: str,
-        *,
-        stream: bool,
-        messages_count: int,
-        model: str,
-        ctx: OperationContext,
-        params: Mapping[str, Any],
-    ):
-        """
-        Sync error-context wrapper to centralize attach_context usage.
-        """
-        try:
-            yield
-        except BaseException as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="autogen",
-                operation=operation,
-                messages_count=messages_count,
-                model=model,
-                temperature=params.get("temperature"),
-                max_tokens=params.get("max_tokens"),
-                top_p=params.get("top_p"),
-                frequency_penalty=params.get("frequency_penalty"),
-                presence_penalty=params.get("presence_penalty"),
-                request_id=ctx.request_id,
-                tenant=ctx.tenant,
-                stream=stream,
-            )
-            raise
-
-    @asynccontextmanager
-    async def _error_context_async(
-        self,
-        operation: str,
-        *,
-        stream: bool,
-        messages_count: int,
-        model: str,
-        ctx: OperationContext,
-        params: Mapping[str, Any],
-    ):
-        """
-        Async error-context wrapper to centralize attach_context usage.
-        """
-        try:
-            yield
-        except BaseException as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="autogen",
-                operation=operation,
-                messages_count=messages_count,
-                model=model,
-                temperature=params.get("temperature"),
-                max_tokens=params.get("max_tokens"),
-                top_p=params.get("top_p"),
-                frequency_penalty=params.get("frequency_penalty"),
-                presence_penalty=params.get("presence_penalty"),
-                request_id=ctx.request_id,
-                tenant=ctx.tenant,
-                stream=stream,
-            )
-            raise
 
     # ------------------------------------------------------------------ #
     # Internal helpers
@@ -436,10 +525,81 @@ class CorpusAutoGenChatClient:
 
         return payload
 
+    def _execute_completion(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        ctx: OperationContext,
+        params: Dict[str, Any],
+        is_async: bool = False,
+    ) -> Union[LLMCompletion, Awaitable[LLMCompletion]]:
+        """
+        Unified completion execution using direct protocol calls.
+
+        For `is_async=False` returns `LLMCompletion`.
+        For `is_async=True` returns `Awaitable[LLMCompletion]`.
+        """
+        corpus_messages = self._translate_messages(messages)
+
+        logger.debug(
+            "Executing %s completion for %d messages with model: %s",
+            "async" if is_async else "sync",
+            len(messages),
+            params.get("model", self.model),
+        )
+
+        if is_async:
+            return self._llm.acomplete(
+                messages=corpus_messages,
+                ctx=ctx,
+                **params,
+            )
+        else:
+            return self._llm.complete(
+                messages=corpus_messages,
+                ctx=ctx,
+                **params,
+            )
+
+    def _execute_streaming(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        ctx: OperationContext,
+        params: Dict[str, Any],
+        is_async: bool = False,
+    ) -> Union[Iterator[LLMChunk], AsyncIterator[LLMChunk]]:
+        """
+        Unified streaming execution using direct protocol calls.
+
+        For `is_async=False` returns `Iterator[LLMChunk]`.
+        For `is_async=True` returns `AsyncIterator[LLMChunk]`.
+        """
+        corpus_messages = self._translate_messages(messages)
+
+        logger.debug(
+            "Executing %s streaming for %d messages with model: %s",
+            "async" if is_async else "sync",
+            len(messages),
+            params.get("model", self.model),
+        )
+
+        if is_async:
+            return self._llm.astream(
+                messages=corpus_messages,
+                ctx=ctx,
+                **params,
+            )
+        else:
+            return self._llm.stream(
+                messages=corpus_messages,
+                ctx=ctx,
+                **params,
+            )
+
     # ------------------------------------------------------------------ #
     # Public async API (AutoGen-facing)
     # ------------------------------------------------------------------ #
 
+    @with_async_llm_error_context("acreate")
     async def acreate(
         self,
         messages: Sequence[Mapping[str, Any]],
@@ -480,25 +640,16 @@ class CorpusAutoGenChatClient:
             extra_context=extra_context,
             **kwargs,
         )
-        corpus_messages = self._translate_messages(messages)
-        model_for_context = params.get("model", self.model)
-        messages_count = len(messages)
 
         if not stream:
-            async with self._error_context_async(
-                "complete_async",
-                stream=False,
-                messages_count=messages_count,
-                model=model_for_context,
+            result_awaitable = self._execute_completion(
+                messages=messages,
                 ctx=ctx,
                 params=params,
-            ):
-                result = await self._translator.arun_complete(
-                    messages=corpus_messages,
-                    op_ctx=ctx,
-                    params=params,
-                )
-                return self._completion_to_openai(result)
+                is_async=True,
+            )
+            result = await result_awaitable
+            return self._completion_to_openai(result)
 
         # Streaming: return async iterator of OpenAI-style chunks.
         async def _gen() -> AsyncIterator[Dict[str, Any]]:
@@ -506,27 +657,22 @@ class CorpusAutoGenChatClient:
             created = _now_epoch_s()
             is_first = True
 
-            async with self._error_context_async(
-                "stream_async",
-                stream=True,
-                messages_count=messages_count,
-                model=model_for_context,
+            chunk_iter = self._execute_streaming(
+                messages=messages,
                 ctx=ctx,
                 params=params,
-            ):
-                async for chunk in self._translator.arun_stream(
-                    messages=corpus_messages,
-                    op_ctx=ctx,
-                    params=params,
-                ):
-                    yield self._chunk_to_openai(
-                        chunk,
-                        stream_id=stream_id,
-                        created=created,
-                        model_fallback=model_for_context,
-                        is_first=is_first,
-                    )
-                    is_first = False
+                is_async=True,
+            )
+
+            async for chunk in chunk_iter:
+                yield self._chunk_to_openai(
+                    chunk,
+                    stream_id=stream_id,
+                    created=created,
+                    model_fallback=params.get("model", self.model),
+                    is_first=is_first,
+                )
+                is_first = False
 
         return _gen()
 
@@ -534,6 +680,7 @@ class CorpusAutoGenChatClient:
     # Public sync API (AutoGen-facing)
     # ------------------------------------------------------------------ #
 
+    @with_llm_error_context("create")
     def create(
         self,
         messages: Sequence[Mapping[str, Any]],
@@ -574,53 +721,38 @@ class CorpusAutoGenChatClient:
             extra_context=extra_context,
             **kwargs,
         )
-        corpus_messages = self._translate_messages(messages)
-        model_for_context = params.get("model", self.model)
-        messages_count = len(messages)
 
         if not stream:
-            with self._error_context(
-                "complete_sync",
-                stream=False,
-                messages_count=messages_count,
-                model=model_for_context,
+            result = self._execute_completion(
+                messages=messages,
                 ctx=ctx,
                 params=params,
-            ):
-                result = self._translator.complete(
-                    messages=corpus_messages,
-                    op_ctx=ctx,
-                    params=params,
-                )
-                return self._completion_to_openai(result)
+                is_async=False,
+            )
+            return self._completion_to_openai(result)
 
-        # Streaming: sync path via LLMTranslator.stream.
+        # Streaming: sync path via direct protocol streaming.
         def _iter() -> Iterator[Dict[str, Any]]:
             stream_id = _new_id()
             created = _now_epoch_s()
             is_first = True
 
-            with self._error_context(
-                "stream_sync",
-                stream=True,
-                messages_count=messages_count,
-                model=model_for_context,
+            chunk_iter = self._execute_streaming(
+                messages=messages,
                 ctx=ctx,
                 params=params,
-            ):
-                for chunk in self._translator.stream(
-                    messages=corpus_messages,
-                    op_ctx=ctx,
-                    params=params,
-                ):
-                    yield self._chunk_to_openai(
-                        chunk,
-                        stream_id=stream_id,
-                        created=created,
-                        model_fallback=model_for_context,
-                        is_first=is_first,
-                    )
-                    is_first = False
+                is_async=False,
+            )
+
+            for chunk in chunk_iter:
+                yield self._chunk_to_openai(
+                    chunk,
+                    stream_id=stream_id,
+                    created=created,
+                    model_fallback=params.get("model", self.model),
+                    is_first=is_first,
+                )
+                is_first = False
 
         return _iter()
 
@@ -636,4 +768,6 @@ class CorpusAutoGenChatClient:
 __all__ = [
     "AutoGenLLMClientProtocol",
     "CorpusAutoGenChatClient",
+    "with_llm_error_context",
+    "with_async_llm_error_context",
 ]
