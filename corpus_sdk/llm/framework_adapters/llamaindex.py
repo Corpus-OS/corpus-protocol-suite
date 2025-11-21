@@ -10,14 +10,13 @@ implementation, with:
 - Async + sync chat generation
 - Async + sync streaming chat (true incremental streaming)
 - Context propagation via `OperationContext`
-- Protocol-first, translator-centric design: LlamaIndex is a thin skin over Corpus
+- Protocol-first design: Direct LLMProtocolV1 access with message translation
 """
 
 from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager, contextmanager
-from functools import cached_property
 from typing import (
     Any,
     AsyncIterator,
@@ -30,7 +29,9 @@ from typing import (
     Mapping,
 )
 
-from corpus_sdk.core.context_translation import ContextTranslator
+from corpus_sdk.core.context_translation import (
+    from_llamaindex as context_from_llamaindex,
+)
 from corpus_sdk.core.error_context import attach_context
 from corpus_sdk.llm.framework_adapters.common.message_translation import (
     NormalizedMessage,
@@ -52,9 +53,8 @@ logger = logging.getLogger(__name__)
 
 _LLAMAINDEX_IMPORT_ERROR: Optional[BaseException] = None
 
-try:  # pragma: no cover - import shape differs across versions
-    # Newer LlamaIndex (0.10+) layout
-    from llama_index.core.llms import (  # type: ignore[import]
+try:
+    from llama_index.core.llms import (
         LLM,
         ChatMessage,
         ChatResponse,
@@ -62,10 +62,10 @@ try:  # pragma: no cover - import shape differs across versions
         ChatResponseGen,
         MessageRole,
     )
-    from llama_index.core.callbacks import CallbackManager  # type: ignore[import]
-except BaseException as exc:  # pragma: no cover - optional dependency
+    from llama_index.core.callbacks import CallbackManager
+except BaseException as exc:  # pragma: no cover - optional dependency path
     _LLAMAINDEX_IMPORT_ERROR = exc
-    # Minimal stand-ins for type checkers; never used at runtime if LI is missing.
+    # Fallbacks for type checking and import-time safety
     LLM = object  # type: ignore[assignment]
     ChatMessage = object  # type: ignore[assignment]
     ChatResponse = object  # type: ignore[assignment]
@@ -76,12 +76,7 @@ except BaseException as exc:  # pragma: no cover - optional dependency
 
 
 def _ensure_llamaindex_installed() -> None:
-    """
-    Raise a helpful error if LlamaIndex is not installed.
-
-    Importing this module is always safe; instantiating the adapter
-    checks the optional dependency.
-    """
+    """Raise helpful error if LlamaIndex is not installed."""
     if _LLAMAINDEX_IMPORT_ERROR is not None:
         raise RuntimeError(
             "LlamaIndex is required to use CorpusLlamaIndexLLM. "
@@ -89,173 +84,28 @@ def _ensure_llamaindex_installed() -> None:
         ) from _LLAMAINDEX_IMPORT_ERROR
 
 
-# ---------------------------------------------------------------------------
-# Protocol (structural interface)
-# ---------------------------------------------------------------------------
-
-
 class LlamaIndexLLMProtocol(Protocol):
-    """
-    Structural protocol for a LlamaIndex-compatible Corpus LLM.
+    """Structural protocol for LlamaIndex-compatible Corpus LLM."""
 
-    This lets callers type against the adapter interface without
-    depending on the concrete `CorpusLlamaIndexLLM` class.
-    """
-
-    async def achat(
-        self,
-        messages: Sequence[ChatMessage],
-        **kwargs: Any,
-    ) -> ChatResponse:
+    async def achat(self, messages: Sequence[ChatMessage], **kwargs: Any) -> ChatResponse:
         ...
 
-    async def astream_chat(
-        self,
-        messages: Sequence[ChatMessage],
-        **kwargs: Any,
-    ) -> ChatResponseAsyncGen:
+    async def astream_chat(self, messages: Sequence[ChatMessage], **kwargs: Any) -> ChatResponseAsyncGen:
         ...
 
-    def chat(
-        self,
-        messages: Sequence[ChatMessage],
-        **kwargs: Any,
-    ) -> ChatResponse:
+    def chat(self, messages: Sequence[ChatMessage], **kwargs: Any) -> ChatResponse:
         ...
 
-    def stream_chat(
-        self,
-        messages: Sequence[ChatMessage],
-        **kwargs: Any,
-    ) -> ChatResponseGen:
+    def stream_chat(self, messages: Sequence[ChatMessage], **kwargs: Any) -> ChatResponseGen:
         ...
 
-    def count_tokens(
-        self,
-        messages: Sequence[ChatMessage],
-        **kwargs: Any,
-    ) -> int:
+    def count_tokens(self, messages: Sequence[ChatMessage], **kwargs: Any) -> int:
         ...
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers (robust with validation)
+# ChatResponse builders
 # ---------------------------------------------------------------------------
-
-
-def _translate_messages_to_corpus(
-    messages: Sequence[Any],
-) -> List[Dict[str, str]]:
-    """
-    LlamaIndex ChatMessage -> Corpus wire messages with error handling.
-    """
-    if not messages:
-        logger.warning("Empty messages list provided to LlamaIndex adapter")
-        return []
-
-    try:
-        normalized: List[NormalizedMessage] = [from_llamaindex(m) for m in messages]
-        return [dict(m) for m in to_corpus(normalized)]
-    except Exception as e:
-        logger.error("Failed to translate LlamaIndex messages: %s", e)
-        raise ValueError(f"Message translation failed: {e}") from e
-
-
-def _extract_stop_sequences(kwargs: Mapping[str, Any]) -> Optional[List[str]]:
-    """
-    Heuristically extract stop sequences from LlamaIndex kwargs.
-
-    Supports:
-        - stop="foo"
-        - stop=["foo", "bar"]
-        - stop_sequences=[...]
-    """
-    stop = kwargs.get("stop")
-    if stop is None:
-        stop = kwargs.get("stop_sequences")
-
-    if stop is None:
-        return None
-    if isinstance(stop, str):
-        return [stop]
-    if isinstance(stop, (list, tuple)):
-        return [str(s) for s in stop]
-    return [str(stop)]
-
-
-def _build_operation_context_from_callbacks(
-    *,
-    adapter: "CorpusLlamaIndexLLM",
-    kwargs: Mapping[str, Any],
-) -> OperationContext:
-    """
-    Build an OperationContext using the LlamaIndex callback manager, mirroring
-    the context-translation pattern used in other adapters.
-
-    We:
-      - Prefer an explicit `callback_manager` in kwargs.
-      - Fall back to `adapter.callback_manager` if present.
-      - Delegate to `ContextTranslator.from_llamaindex_callback_manager`.
-      - Always return an OperationContext (never None) with a safe fallback.
-    """
-    cbm: Optional[Any] = kwargs.get("callback_manager", None)
-    if cbm is None:
-        cbm = getattr(adapter, "callback_manager", None)
-
-    ctx: Optional[OperationContext] = None
-    try:
-        # Pass framework_version analogously to other adapters (autogen/langchain)
-        ctx = ContextTranslator.from_llamaindex_callback_manager(
-            cbm,
-            framework_version=getattr(adapter, "framework_version", None),
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.debug(
-            "ContextTranslator.from_llamaindex_callback_manager failed: %s",
-            exc,
-            extra={"framework": "llamaindex"},
-        )
-        ctx = None
-
-    if isinstance(ctx, OperationContext):
-        return ctx
-
-    # Fallback: an empty, but valid, OperationContext
-    return OperationContext(
-        request_id=None,
-        idempotency_key=None,
-        deadline_ms=None,
-        traceparent=None,
-        tenant=None,
-        attrs={},
-    )
-
-
-def _sampling_params_from_kwargs(
-    *,
-    adapter: "CorpusLlamaIndexLLM",
-    stop_sequences: Optional[List[str]],
-    kwargs: Mapping[str, Any],
-) -> Dict[str, Any]:
-    """
-    Map LlamaIndex sampling kwargs into Corpus params.
-    """
-    # Validate temperature if provided
-    temperature = kwargs.get("temperature", adapter.temperature)
-    if not 0 <= temperature <= 2:
-        logger.warning("Temperature %s out of reasonable range 0-2", temperature)
-
-    params: Dict[str, Any] = {
-        "model": kwargs.get("model", adapter.model),
-        "max_tokens": kwargs.get("max_tokens", adapter.max_tokens),
-        "temperature": temperature,
-        "top_p": kwargs.get("top_p"),
-        "frequency_penalty": kwargs.get("frequency_penalty"),
-        "presence_penalty": kwargs.get("presence_penalty"),
-        "stop_sequences": stop_sequences,
-    }
-    # Strip None values so the translator/adapter sees a clean param set.
-    return {k: v for k, v in params.items() if v is not None}
 
 
 def _build_chat_response(
@@ -267,10 +117,15 @@ def _build_chat_response(
 ) -> ChatResponse:
     """
     Construct a minimal LlamaIndex ChatResponse from a Corpus LLMCompletion.
+
+    Returns
+    -------
+    ChatResponse
+        LlamaIndex chat response with proper metadata.
     """
     try:
         role_assistant = getattr(MessageRole, "ASSISTANT", "assistant")
-    except Exception:  # pragma: no cover
+    except Exception:
         role_assistant = "assistant"
 
     msg = ChatMessage(
@@ -294,19 +149,21 @@ def _build_chat_response(
         return ChatResponse(message=msg, raw=None, additional_kwargs=additional_kwargs)
     except TypeError:
         # Older versions may not support additional_kwargs
-        return ChatResponse(message=msg)  # type: ignore[call-arg]
+        return ChatResponse(message=msg)
 
 
 def _build_chat_response_from_chunk(chunk: LLMChunk) -> ChatResponse:
     """
     Build a ChatResponse for streaming from a single LLMChunk.
 
-    The `delta` is set to the chunk text so consumers can reconstruct
-    the full message incrementally if desired.
+    Returns
+    -------
+    ChatResponse
+        LlamaIndex chat response with incremental content.
     """
     try:
         role_assistant = getattr(MessageRole, "ASSISTANT", "assistant")
-    except Exception:  # pragma: no cover
+    except Exception:
         role_assistant = "assistant"
 
     msg = ChatMessage(
@@ -337,92 +194,44 @@ def _build_chat_response_from_chunk(chunk: LLMChunk) -> ChatResponse:
         )
     except TypeError:
         # Older versions without delta/additional_kwargs
-        return ChatResponse(message=msg)  # type: ignore[call-arg]
+        return ChatResponse(message=msg)
 
 
 # ---------------------------------------------------------------------------
-# Local LLM translator (mini abstraction over LLMProtocolV1)
-# --------------------------------------------------------------------------- #
+# Internal metrics helpers for observability
+# ---------------------------------------------------------------------------
 
 
-class _LocalLLMTranslator:
+def _analyze_messages_for_context(messages: Sequence[ChatMessage]) -> Dict[str, Any]:
     """
-    Minimal translator for framework adapters.
+    Derive role distribution and content metrics for error context.
 
-    This is a local, LlamaIndex-specific equivalent of the shared translator
-    pattern used in other adapters. It centralizes calls into `LLMProtocolV1`
-    and exposes a stable interface:
+    Parameters
+    ----------
+    messages : Sequence[ChatMessage]
+        LlamaIndex chat messages.
 
-        - arun_complete
-        - complete
-        - arun_stream
-        - stream
-
-    so the adapter logic can remain focused on framework-specific shaping
-    (LlamaIndex messages in, ChatResponse/ChatResponseGen out).
+    Returns
+    -------
+    Dict[str, Any]
+        Metrics including messages_count, roles_distribution and total_content_chars.
     """
+    roles: Dict[str, int] = {}
+    total_chars = 0
 
-    def __init__(self, adapter: LLMProtocolV1, framework: str = "llamaindex") -> None:
-        self._adapter = adapter
-        self._framework = framework  # reserved for future use (metrics, logging, etc.)
+    for msg in messages:
+        # LlamaIndex messages may expose `role` or `message.role`
+        role = getattr(msg, "role", getattr(msg, "type", "unknown"))
+        content = getattr(msg, "content", "")
+        roles[role] = roles.get(role, 0) + 1
+        if isinstance(content, str):
+            total_chars += len(content)
 
-    async def arun_complete(
-        self,
-        *,
-        messages: List[Dict[str, Any]],
-        op_ctx: OperationContext,
-        params: Dict[str, Any],
-    ) -> LLMCompletion:
-        """Async completion routed directly to the underlying LLMProtocolV1."""
-        return await self._adapter.acomplete(
-            messages=messages,
-            ctx=op_ctx,
-            **params,
-        )
-
-    def complete(
-        self,
-        *,
-        messages: List[Dict[str, Any]],
-        op_ctx: OperationContext,
-        params: Dict[str, Any],
-    ) -> LLMCompletion:
-        """Sync completion routed directly to the underlying LLMProtocolV1."""
-        return self._adapter.complete(
-            messages=messages,
-            ctx=op_ctx,
-            **params,
-        )
-
-    async def arun_stream(
-        self,
-        *,
-        messages: List[Dict[str, Any]],
-        op_ctx: OperationContext,
-        params: Dict[str, Any],
-    ) -> AsyncIterator[LLMChunk]:
-        """Async streaming routed directly to the underlying LLMProtocolV1."""
-        async for chunk in self._adapter.astream(
-            messages=messages,
-            ctx=op_ctx,
-            **params,
-        ):
-            yield chunk
-
-    def stream(
-        self,
-        *,
-        messages: List[Dict[str, Any]],
-        op_ctx: OperationContext,
-        params: Dict[str, Any],
-    ) -> Iterator[LLMChunk]:
-        """Sync streaming routed directly to the underlying LLMProtocolV1."""
-        for chunk in self._adapter.stream(
-            messages=messages,
-            ctx=op_ctx,
-            **params,
-        ):
-            yield chunk
+    return {
+        "messages_count": len(messages),
+        "roles_distribution": roles,
+        "total_content_chars": total_chars,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -430,17 +239,11 @@ class _LocalLLMTranslator:
 # ---------------------------------------------------------------------------
 
 
-class CorpusLlamaIndexLLM(LLM):  # type: ignore[misc]
+class CorpusLlamaIndexLLM(LLM):
     """
     LlamaIndex `LLM` implementation backed by a Corpus `LLMProtocolV1`.
 
-    This class is a thin integration layer:
-
-    - Messages are normalized via `message_translation.from_llamaindex`.
-    - Context is derived from LlamaIndex's callback manager via
-      `ContextTranslator.from_llamaindex_callback_manager`.
-    - All protocol calls and streaming orchestration are centralized in a
-      local translator and the underlying `LLMProtocolV1`, not here.
+    This is a thin integration layer with direct protocol access.
 
     Usage:
         llm = CorpusLlamaIndexLLM(
@@ -451,126 +254,165 @@ class CorpusLlamaIndexLLM(LLM):  # type: ignore[misc]
         response = llm.chat([ChatMessage(role="user", content="Hello!")])
     """
 
-    # Underlying protocol implementation
     llm_adapter: LLMProtocolV1
-
-    # Defaults for sampling with validation
     model: str = "default"
     temperature: float = 0.7
     max_tokens: Optional[int] = None
-
-    # Optional framework version for observability / context translation
     framework_version: Optional[str] = None
 
-    # Pydantic / LlamaIndex config
     model_config = {"arbitrary_types_allowed": True}
 
     def __init__(self, **data: Any) -> None:
         _ensure_llamaindex_installed()
 
-        # Validate critical parameters if provided
-        if "llm_adapter" in data and not isinstance(data["llm_adapter"], LLMProtocolV1):
+        if "llm_adapter" in data and not hasattr(data["llm_adapter"], "complete"):
             raise TypeError("llm_adapter must implement LLMProtocolV1")
 
         if "temperature" in data and not 0 <= data["temperature"] <= 2:
             raise ValueError("temperature must be between 0 and 2")
 
-        if "max_tokens" in data and data["max_tokens"] is not None and data["max_tokens"] < 1:
+        if "max_tokens" in data and data.get("max_tokens") is not None and data["max_tokens"] < 1:
             raise ValueError("max_tokens must be positive")
 
         super().__init__(**data)
 
-    # ------------------------------------------------------------------ #
-    # Translator (cached for performance)
-    # ------------------------------------------------------------------ #
-
-    @cached_property
-    def _translator(self) -> _LocalLLMTranslator:
-        """
-        Lazily construct and cache the local translator.
-
-        All orchestration, including any async→sync bridging needed by the
-        underlying protocol implementation, is centralized here.
-        """
-        return _LocalLLMTranslator(
-            adapter=self.llm_adapter,
-            framework="llamaindex",
+        logger.info(
+            "CorpusLlamaIndexLLM initialized with model=%s, temperature=%.2f",
+            self.model,
+            self.temperature,
         )
 
     # ------------------------------------------------------------------ #
-    # Error-context helpers (robust and consistent)
+    # Error context management
     # ------------------------------------------------------------------ #
+
+    def _build_error_context(
+        self,
+        operation: str,
+        stream: bool,
+        messages: Sequence[ChatMessage],
+        model: str,
+        ctx: OperationContext,
+        params: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Build consistent, rich error context for observability.
+
+        Includes both sampling parameters and message-level metrics.
+        """
+        msg_metrics = _analyze_messages_for_context(messages)
+        return {
+            "framework": "llamaindex",
+            "operation": operation,
+            "model": model,
+            "temperature": params.get("temperature"),
+            "max_tokens": params.get("max_tokens"),
+            "top_p": params.get("top_p"),
+            "frequency_penalty": params.get("frequency_penalty"),
+            "presence_penalty": params.get("presence_penalty"),
+            "stop_sequences": params.get("stop_sequences"),
+            "request_id": ctx.request_id,
+            "tenant": ctx.tenant,
+            "stream": stream,
+            **msg_metrics,
+        }
 
     @contextmanager
     def _error_context(
         self,
         operation: str,
-        *,
         stream: bool,
-        messages_count: int,
+        messages: Sequence[ChatMessage],
         model: str,
         ctx: OperationContext,
         params: Dict[str, Any],
     ):
-        """
-        Sync error-context wrapper to centralize attach_context usage.
-        """
+        """Sync error-context wrapper."""
+        error_ctx = self._build_error_context(operation, stream, messages, model, ctx, params)
         try:
             yield
         except BaseException as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="llamaindex",
-                operation=operation,
-                messages_count=messages_count,
-                model=model,
-                temperature=params.get("temperature"),
-                max_tokens=params.get("max_tokens"),
-                top_p=params.get("top_p"),
-                frequency_penalty=params.get("frequency_penalty"),
-                presence_penalty=params.get("presence_penalty"),
-                request_id=ctx.request_id,
-                tenant=ctx.tenant,
-                stream=stream,
-            )
+            attach_context(exc, **error_ctx)
             raise
 
     @asynccontextmanager
     async def _error_context_async(
         self,
         operation: str,
-        *,
         stream: bool,
-        messages_count: int,
+        messages: Sequence[ChatMessage],
         model: str,
         ctx: OperationContext,
         params: Dict[str, Any],
     ):
-        """
-        Async error-context wrapper to centralize attach_context usage.
-        """
+        """Async error-context wrapper."""
+        error_ctx = self._build_error_context(operation, stream, messages, model, ctx, params)
         try:
             yield
         except BaseException as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="llamaindex",
-                operation=operation,
-                messages_count=messages_count,
-                model=model,
-                temperature=params.get("temperature"),
-                max_tokens=params.get("max_tokens"),
-                top_p=params.get("top_p"),
-                frequency_penalty=params.get("frequency_penalty"),
-                presence_penalty=params.get("presence_penalty"),
-                request_id=ctx.request_id,
-                tenant=ctx.tenant,
-                stream=stream,
-            )
+            attach_context(exc, **error_ctx)
             raise
 
     # ------------------------------------------------------------------ #
-    # Core async chat API (production-ready with validation)
+    # Internal helpers
+    # ------------------------------------------------------------------ #
+
+    def _translate_messages(self, messages: Sequence[ChatMessage]) -> List[Dict[str, Any]]:
+        """LlamaIndex messages → Corpus wire format."""
+        if not messages:
+            logger.warning("Empty messages list provided to LlamaIndex adapter")
+            return []
+
+        try:
+            normalized: List[NormalizedMessage] = [from_llamaindex(m) for m in messages]
+            return [dict(m) for m in to_corpus(normalized)]
+        except Exception as e:  # noqa: BLE001
+            logger.error("Failed to translate LlamaIndex messages: %s", e)
+            raise ValueError(f"Message translation failed: {e}") from e
+
+    def _build_operation_context(self, kwargs: Mapping[str, Any]) -> OperationContext:
+        """Build OperationContext from LlamaIndex kwargs."""
+        callback_manager = kwargs.get("callback_manager")
+        return context_from_llamaindex(
+            callback_manager,
+            framework_version=self.framework_version,
+        )
+
+    def _extract_stop_sequences(self, kwargs: Mapping[str, Any]) -> Optional[List[str]]:
+        """Extract stop sequences from kwargs."""
+        stop = kwargs.get("stop") or kwargs.get("stop_sequences")
+        if stop is None:
+            return None
+        if isinstance(stop, str):
+            return [stop]
+        if isinstance(stop, (list, tuple)):
+            return [str(s) for s in stop]
+        return [str(stop)]
+
+    def _build_sampling_params(
+        self,
+        stop: Optional[List[str]],
+        kwargs: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        """Build sampling parameters from kwargs, with validation."""
+        temperature = kwargs.get("temperature", self.temperature)
+        if not 0 <= temperature <= 2:
+            logger.warning("Temperature %s out of reasonable range 0-2", temperature)
+
+        params: Dict[str, Any] = {
+            "model": kwargs.get("model", self.model),
+            "temperature": temperature,
+            "max_tokens": kwargs.get("max_tokens", self.max_tokens),
+            "top_p": kwargs.get("top_p"),
+            "frequency_penalty": kwargs.get("frequency_penalty"),
+            "presence_penalty": kwargs.get("presence_penalty"),
+            "stop_sequences": stop,
+        }
+        # Strip None for a clean param set
+        return {k: v for k, v in params.items() if v is not None}
+
+    # ------------------------------------------------------------------ #
+    # Async API
     # ------------------------------------------------------------------ #
 
     async def achat(
@@ -583,13 +425,10 @@ class CorpusLlamaIndexLLM(LLM):  # type: ignore[misc]
 
         Parameters
         ----------
-        messages:
+        messages : Sequence[ChatMessage]
             Sequence of LlamaIndex ChatMessage objects.
-
-        kwargs:
-            - callback_manager: CallbackManager for context propagation
-            - model, temperature, max_tokens, top_p, frequency_penalty,
-              presence_penalty, stop/stop_sequences
+        **kwargs : Any
+            LlamaIndex parameters including callback_manager and sampling params.
 
         Returns
         -------
@@ -599,30 +438,25 @@ class CorpusLlamaIndexLLM(LLM):  # type: ignore[misc]
         if not messages:
             raise ValueError("Messages list cannot be empty")
 
-        corpus_messages = _translate_messages_to_corpus(messages)
-        stop_sequences = _extract_stop_sequences(kwargs)
-        ctx = _build_operation_context_from_callbacks(adapter=self, kwargs=kwargs)
-        params = _sampling_params_from_kwargs(
-            adapter=self,
-            stop_sequences=stop_sequences,
-            kwargs=kwargs,
-        )
+        corpus_messages = self._translate_messages(messages)
+        stop_sequences = self._extract_stop_sequences(kwargs)
+        ctx = self._build_operation_context(kwargs)
+        params = self._build_sampling_params(stop_sequences, kwargs)
 
         model_for_context = params.get("model", self.model)
-        messages_count = len(corpus_messages)
 
         async with self._error_context_async(
             "achat",
             stream=False,
-            messages_count=messages_count,
+            messages=messages,
             model=model_for_context,
             ctx=ctx,
             params=params,
         ):
-            result: LLMCompletion = await self._translator.arun_complete(
+            result: LLMCompletion = await self.llm_adapter.acomplete(
                 messages=corpus_messages,
-                op_ctx=ctx,
-                params=params,
+                ctx=ctx,
+                **params,
             )
 
             return _build_chat_response(
@@ -640,18 +474,12 @@ class CorpusLlamaIndexLLM(LLM):  # type: ignore[misc]
         """
         Async streaming chat entrypoint required by LlamaIndex.
 
-        Uses the local translator's async streaming and yields ChatResponse
-        objects incrementally as chunks arrive.
-
         Parameters
         ----------
-        messages:
+        messages : Sequence[ChatMessage]
             Sequence of LlamaIndex ChatMessage objects.
-
-        kwargs:
-            - callback_manager: CallbackManager for context propagation
-            - model, temperature, max_tokens, top_p, frequency_penalty,
-              presence_penalty, stop/stop_sequences
+        **kwargs : Any
+            LlamaIndex parameters including callback_manager and sampling params.
 
         Returns
         -------
@@ -661,38 +489,34 @@ class CorpusLlamaIndexLLM(LLM):  # type: ignore[misc]
         if not messages:
             raise ValueError("Messages list cannot be empty")
 
-        corpus_messages = _translate_messages_to_corpus(messages)
-        stop_sequences = _extract_stop_sequences(kwargs)
-        ctx = _build_operation_context_from_callbacks(adapter=self, kwargs=kwargs)
-        params = _sampling_params_from_kwargs(
-            adapter=self,
-            stop_sequences=stop_sequences,
-            kwargs=kwargs,
-        )
+        corpus_messages = self._translate_messages(messages)
+        stop_sequences = self._extract_stop_sequences(kwargs)
+        ctx = self._build_operation_context(kwargs)
+        params = self._build_sampling_params(stop_sequences, kwargs)
 
         model_for_context = params.get("model", self.model)
-        messages_count = len(corpus_messages)
 
         async with self._error_context_async(
             "astream_chat",
             stream=True,
-            messages_count=messages_count,
+            messages=messages,
             model=model_for_context,
             ctx=ctx,
             params=params,
         ):
             async def _gen() -> AsyncIterator[ChatResponse]:
-                async for chunk in self._translator.arun_stream(
+                # Direct protocol access for streaming
+                async for chunk in self.llm_adapter.astream(
                     messages=corpus_messages,
-                    op_ctx=ctx,
-                    params=params,
+                    ctx=ctx,
+                    **params,
                 ):
                     yield _build_chat_response_from_chunk(chunk)
 
             return _gen()
 
     # ------------------------------------------------------------------ #
-    # Sync chat API
+    # Sync API
     # ------------------------------------------------------------------ #
 
     def chat(
@@ -701,19 +525,14 @@ class CorpusLlamaIndexLLM(LLM):  # type: ignore[misc]
         **kwargs: Any,
     ) -> ChatResponse:
         """
-        Sync chat.
-
-        Uses the synchronous translator.complete path.
+        Sync chat entrypoint required by LlamaIndex.
 
         Parameters
         ----------
-        messages:
+        messages : Sequence[ChatMessage]
             Sequence of LlamaIndex ChatMessage objects.
-
-        kwargs:
-            - callback_manager: CallbackManager for context propagation
-            - model, temperature, max_tokens, top_p, frequency_penalty,
-              presence_penalty, stop/stop_sequences
+        **kwargs : Any
+            LlamaIndex parameters including callback_manager and sampling params.
 
         Returns
         -------
@@ -723,30 +542,25 @@ class CorpusLlamaIndexLLM(LLM):  # type: ignore[misc]
         if not messages:
             raise ValueError("Messages list cannot be empty")
 
-        corpus_messages = _translate_messages_to_corpus(messages)
-        stop_sequences = _extract_stop_sequences(kwargs)
-        ctx = _build_operation_context_from_callbacks(adapter=self, kwargs=kwargs)
-        params = _sampling_params_from_kwargs(
-            adapter=self,
-            stop_sequences=stop_sequences,
-            kwargs=kwargs,
-        )
+        corpus_messages = self._translate_messages(messages)
+        stop_sequences = self._extract_stop_sequences(kwargs)
+        ctx = self._build_operation_context(kwargs)
+        params = self._build_sampling_params(stop_sequences, kwargs)
 
         model_for_context = params.get("model", self.model)
-        messages_count = len(corpus_messages)
 
         with self._error_context(
             "chat",
             stream=False,
-            messages_count=messages_count,
+            messages=messages,
             model=model_for_context,
             ctx=ctx,
             params=params,
         ):
-            result: LLMCompletion = self._translator.complete(
+            result: LLMCompletion = self.llm_adapter.complete(
                 messages=corpus_messages,
-                op_ctx=ctx,
-                params=params,
+                ctx=ctx,
+                **params,
             )
 
             return _build_chat_response(
@@ -762,19 +576,14 @@ class CorpusLlamaIndexLLM(LLM):  # type: ignore[misc]
         **kwargs: Any,
     ) -> ChatResponseGen:
         """
-        Sync streaming chat.
-
-        Uses the synchronous translator.stream path.
+        Sync streaming chat entrypoint required by LlamaIndex.
 
         Parameters
         ----------
-        messages:
+        messages : Sequence[ChatMessage]
             Sequence of LlamaIndex ChatMessage objects.
-
-        kwargs:
-            - callback_manager: CallbackManager for context propagation
-            - model, temperature, max_tokens, top_p, frequency_penalty,
-              presence_penalty, stop/stop_sequences
+        **kwargs : Any
+            LlamaIndex parameters including callback_manager and sampling params.
 
         Returns
         -------
@@ -784,38 +593,34 @@ class CorpusLlamaIndexLLM(LLM):  # type: ignore[misc]
         if not messages:
             raise ValueError("Messages list cannot be empty")
 
-        corpus_messages = _translate_messages_to_corpus(messages)
-        stop_sequences = _extract_stop_sequences(kwargs)
-        ctx = _build_operation_context_from_callbacks(adapter=self, kwargs=kwargs)
-        params = _sampling_params_from_kwargs(
-            adapter=self,
-            stop_sequences=stop_sequences,
-            kwargs=kwargs,
-        )
+        corpus_messages = self._translate_messages(messages)
+        stop_sequences = self._extract_stop_sequences(kwargs)
+        ctx = self._build_operation_context(kwargs)
+        params = self._build_sampling_params(stop_sequences, kwargs)
 
         model_for_context = params.get("model", self.model)
-        messages_count = len(corpus_messages)
 
         with self._error_context(
             "stream_chat",
             stream=True,
-            messages_count=messages_count,
+            messages=messages,
             model=model_for_context,
             ctx=ctx,
             params=params,
         ):
             def _gen() -> Iterator[ChatResponse]:
-                for chunk in self._translator.stream(
+                # Direct protocol access for streaming
+                for chunk in self.llm_adapter.stream(
                     messages=corpus_messages,
-                    op_ctx=ctx,
-                    params=params,
+                    ctx=ctx,
+                    **params,
                 ):
                     yield _build_chat_response_from_chunk(chunk)
 
             return _gen()
 
     # ------------------------------------------------------------------ #
-    # Token counting (robust with multiple fallbacks)
+    # Token counting
     # ------------------------------------------------------------------ #
 
     def count_tokens(
@@ -826,69 +631,45 @@ class CorpusLlamaIndexLLM(LLM):  # type: ignore[misc]
         """
         Token counting helper.
 
-        Strategy:
-        1. Try translator's count_tokens (if implemented)
-        2. Try protocol adapter's count_tokens
-        3. Fall back to improved character-based estimate
-
         Parameters
         ----------
-        messages:
+        messages : Sequence[ChatMessage]
             Sequence of LlamaIndex ChatMessage objects.
+        **kwargs : Any
+            Additional parameters.
 
         Returns
         -------
         int
             Estimated token count for the messages.
-
-        Note
-        ----
-        The fallback heuristic is intentionally simple: callers who need
-        precise accounting should rely on the adapter's own `count_tokens`
-        implementation if available.
         """
         if not messages:
             return 0
 
-        corpus_messages = _translate_messages_to_corpus(messages)
-        ctx = _build_operation_context_from_callbacks(adapter=self, kwargs=kwargs)
-        params: Dict[str, Any] = {"model": kwargs.get("model", self.model)}
+        ctx = self._build_operation_context(kwargs)
+        model = kwargs.get("model", self.model)
 
-        translator = self._translator
-
-        # 1. Try translator-level counting (if present)
-        if hasattr(translator, "count_tokens"):
-            try:
-                tokens = translator.count_tokens(
-                    messages=corpus_messages,
-                    op_ctx=ctx,
-                    params=params,
-                )
-                return int(tokens)
-            except Exception as exc:  # noqa: BLE001
-                logger.debug(
-                    "translator.count_tokens failed in CorpusLlamaIndexLLM, "
-                    "falling back to heuristic: %s",
-                    exc,
-                    extra={"framework": "llamaindex"},
-                )
-
-        # 2. Try protocol adapter counting
+        # Try protocol adapter counting first
         if hasattr(self.llm_adapter, "count_tokens"):
             try:
-                # Build combined text for counting
                 combined_text = self._combine_messages_for_counting(messages)
                 tokens = self.llm_adapter.count_tokens(
                     text=combined_text,
-                    model=params["model"],
+                    model=model,
                     ctx=ctx,
                 )
                 return int(tokens)
             except Exception as exc:  # noqa: BLE001
                 logger.debug("Protocol count_tokens failed: %s", exc)
 
-        # 3. Improved character-based estimate
-        return self._estimate_tokens_from_messages(messages)
+        # Fall back to improved character-based estimate
+        try:
+            return self._estimate_tokens_from_messages(messages)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Token estimation failed: %s", exc)
+
+        # Ultimate fallback to simple character count
+        return self._simple_token_estimate(messages)
 
     def _combine_messages_for_counting(self, messages: Sequence[ChatMessage]) -> str:
         """Combine messages into a single string for token counting."""
@@ -906,9 +687,6 @@ class CorpusLlamaIndexLLM(LLM):  # type: ignore[misc]
         if not combined_text:
             return 0
 
-        # More sophisticated estimation:
-        # - ~4 chars per token for English text
-        # - Minimum 1 token per message
         char_count = len(combined_text)
         message_count = len(messages)
 
@@ -916,6 +694,11 @@ class CorpusLlamaIndexLLM(LLM):  # type: ignore[misc]
         message_based = max(1, message_count)
 
         return max(char_based, message_based)
+
+    def _simple_token_estimate(self, messages: Sequence[ChatMessage]) -> int:
+        """Simple fallback token estimation."""
+        combined_text = self._combine_messages_for_counting(messages)
+        return max(1, len(combined_text) // 4)
 
 
 __all__ = [
