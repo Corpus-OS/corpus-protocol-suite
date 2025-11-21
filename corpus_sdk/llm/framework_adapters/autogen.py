@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import logging
 import time
+from contextlib import asynccontextmanager, contextmanager
 from functools import cached_property
 from typing import (
     Any,
@@ -51,6 +52,7 @@ from typing import (
     Optional,
     Protocol,
     Sequence,
+    Tuple,
     Union,
 )
 from uuid import uuid4
@@ -194,6 +196,78 @@ class CorpusAutoGenChatClient:
         )
 
     # ------------------------------------------------------------------ #
+    # Error-context helpers (to avoid boilerplate)
+    # ------------------------------------------------------------------ #
+
+    @contextmanager
+    def _error_context(
+        self,
+        operation: str,
+        *,
+        stream: bool,
+        messages_count: int,
+        model: str,
+        ctx: OperationContext,
+        params: Mapping[str, Any],
+    ):
+        """
+        Sync error-context wrapper to centralize attach_context usage.
+        """
+        try:
+            yield
+        except BaseException as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework="autogen",
+                operation=operation,
+                messages_count=messages_count,
+                model=model,
+                temperature=params.get("temperature"),
+                max_tokens=params.get("max_tokens"),
+                top_p=params.get("top_p"),
+                frequency_penalty=params.get("frequency_penalty"),
+                presence_penalty=params.get("presence_penalty"),
+                request_id=ctx.request_id,
+                tenant=ctx.tenant,
+                stream=stream,
+            )
+            raise
+
+    @asynccontextmanager
+    async def _error_context_async(
+        self,
+        operation: str,
+        *,
+        stream: bool,
+        messages_count: int,
+        model: str,
+        ctx: OperationContext,
+        params: Mapping[str, Any],
+    ):
+        """
+        Async error-context wrapper to centralize attach_context usage.
+        """
+        try:
+            yield
+        except BaseException as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework="autogen",
+                operation=operation,
+                messages_count=messages_count,
+                model=model,
+                temperature=params.get("temperature"),
+                max_tokens=params.get("max_tokens"),
+                top_p=params.get("top_p"),
+                frequency_penalty=params.get("frequency_penalty"),
+                presence_penalty=params.get("presence_penalty"),
+                request_id=ctx.request_id,
+                tenant=ctx.tenant,
+                stream=stream,
+            )
+            raise
+
+    # ------------------------------------------------------------------ #
     # Internal helpers
     # ------------------------------------------------------------------ #
 
@@ -235,7 +309,6 @@ class CorpusAutoGenChatClient:
         to reach the protocol layer, it should be carried via the context
         translator (conversation / extra_context) and OperationContext.attrs.
         """
-        # Build OperationContext from AutoGen-specific context if provided.
         ctx = ContextTranslator.from_autogen_context(
             conversation=conversation,
             extra=extra_context,
@@ -409,32 +482,23 @@ class CorpusAutoGenChatClient:
         )
         corpus_messages = self._translate_messages(messages)
         model_for_context = params.get("model", self.model)
+        messages_count = len(messages)
 
         if not stream:
-            try:
+            async with self._error_context_async(
+                "complete_async",
+                stream=False,
+                messages_count=messages_count,
+                model=model_for_context,
+                ctx=ctx,
+                params=params,
+            ):
                 result = await self._translator.arun_complete(
                     messages=corpus_messages,
                     op_ctx=ctx,
                     params=params,
                 )
                 return self._completion_to_openai(result)
-            except BaseException as exc:  # noqa: BLE001
-                attach_context(
-                    exc,
-                    framework="autogen",
-                    operation="complete_async",
-                    messages_count=len(messages),
-                    model=model_for_context,
-                    temperature=params.get("temperature"),
-                    max_tokens=params.get("max_tokens"),
-                    top_p=params.get("top_p"),
-                    frequency_penalty=params.get("frequency_penalty"),
-                    presence_penalty=params.get("presence_penalty"),
-                    request_id=ctx.request_id,
-                    tenant=ctx.tenant,
-                    stream=False,
-                )
-                raise
 
         # Streaming: return async iterator of OpenAI-style chunks.
         async def _gen() -> AsyncIterator[Dict[str, Any]]:
@@ -442,7 +506,14 @@ class CorpusAutoGenChatClient:
             created = _now_epoch_s()
             is_first = True
 
-            try:
+            async with self._error_context_async(
+                "stream_async",
+                stream=True,
+                messages_count=messages_count,
+                model=model_for_context,
+                ctx=ctx,
+                params=params,
+            ):
                 async for chunk in self._translator.arun_stream(
                     messages=corpus_messages,
                     op_ctx=ctx,
@@ -456,23 +527,6 @@ class CorpusAutoGenChatClient:
                         is_first=is_first,
                     )
                     is_first = False
-            except BaseException as exc:  # noqa: BLE001
-                attach_context(
-                    exc,
-                    framework="autogen",
-                    operation="stream_async",
-                    messages_count=len(messages),
-                    model=model_for_context,
-                    temperature=params.get("temperature"),
-                    max_tokens=params.get("max_tokens"),
-                    top_p=params.get("top_p"),
-                    frequency_penalty=params.get("frequency_penalty"),
-                    presence_penalty=params.get("presence_penalty"),
-                    request_id=ctx.request_id,
-                    tenant=ctx.tenant,
-                    stream=True,
-                )
-                raise
 
         return _gen()
 
@@ -522,33 +576,23 @@ class CorpusAutoGenChatClient:
         )
         corpus_messages = self._translate_messages(messages)
         model_for_context = params.get("model", self.model)
+        messages_count = len(messages)
 
         if not stream:
-            # Non-streaming: sync path via LLMTranslator.
-            try:
+            with self._error_context(
+                "complete_sync",
+                stream=False,
+                messages_count=messages_count,
+                model=model_for_context,
+                ctx=ctx,
+                params=params,
+            ):
                 result = self._translator.complete(
                     messages=corpus_messages,
                     op_ctx=ctx,
                     params=params,
                 )
                 return self._completion_to_openai(result)
-            except BaseException as exc:  # noqa: BLE001
-                attach_context(
-                    exc,
-                    framework="autogen",
-                    operation="complete_sync",
-                    messages_count=len(messages),
-                    model=model_for_context,
-                    temperature=params.get("temperature"),
-                    max_tokens=params.get("max_tokens"),
-                    top_p=params.get("top_p"),
-                    frequency_penalty=params.get("frequency_penalty"),
-                    presence_penalty=params.get("presence_penalty"),
-                    request_id=ctx.request_id,
-                    tenant=ctx.tenant,
-                    stream=False,
-                )
-                raise
 
         # Streaming: sync path via LLMTranslator.stream.
         def _iter() -> Iterator[Dict[str, Any]]:
@@ -556,7 +600,14 @@ class CorpusAutoGenChatClient:
             created = _now_epoch_s()
             is_first = True
 
-            try:
+            with self._error_context(
+                "stream_sync",
+                stream=True,
+                messages_count=messages_count,
+                model=model_for_context,
+                ctx=ctx,
+                params=params,
+            ):
                 for chunk in self._translator.stream(
                     messages=corpus_messages,
                     op_ctx=ctx,
@@ -570,23 +621,6 @@ class CorpusAutoGenChatClient:
                         is_first=is_first,
                     )
                     is_first = False
-            except BaseException as exc:  # noqa: BLE001
-                attach_context(
-                    exc,
-                    framework="autogen",
-                    operation="stream_sync",
-                    messages_count=len(messages),
-                    model=model_for_context,
-                    temperature=params.get("temperature"),
-                    max_tokens=params.get("max_tokens"),
-                    top_p=params.get("top_p"),
-                    frequency_penalty=params.get("frequency_penalty"),
-                    presence_penalty=params.get("presence_penalty"),
-                    request_id=ctx.request_id,
-                    tenant=ctx.tenant,
-                    stream=True,
-                )
-                raise
 
         return _iter()
 
