@@ -12,12 +12,12 @@ Provide a high-level orchestration and translation layer between:
 
 This module is intentionally *framework-neutral* and focuses on:
 
-- Building `EmbedSpec` / batch embed specs from framework-level inputs
+- Building `EmbedSpec` / `BatchEmbedSpec` from framework-level inputs
 - Translating `EmbedResult` / `EmbedChunk` back to framework-facing shapes
 - Handling text normalization (truncation, cleaning, batching)
 - Providing sync + async APIs, including streaming via a sync bridge
 - Attaching rich error context for observability
-- Managing token counting and cost tracking
+- Passing through token usage / cost tracking data from adapters
 
 Context translation
 -------------------
@@ -32,12 +32,14 @@ This module does **not** parse framework configs directly. Instead:
 
 Batching strategy
 -----------------
-Embedding operations benefit heavily from batching:
+This layer exposes both single-embed and batch-embed APIs:
 
-- Automatic batching of single/multiple texts
-- Configurable batch size limits (model-dependent)
-- Token-aware batching to stay under model limits
-- Retry logic for batch failures with exponential backoff
+- `embed` / `arun_embed` for single logical embed calls
+- `batch_embed` / `arun_batch_embed` for explicit batches
+
+Automatic, model-aware batching (token limits, retries, etc.) is typically the
+responsibility of the underlying adapter or a higher-level orchestrator. This
+module keeps batching orchestration minimal and predictable.
 
 Text normalization
 ------------------
@@ -45,45 +47,25 @@ This layer handles common text preprocessing:
 
 - Whitespace normalization
 - Empty text filtering
-- Truncation to model max length
-- Encoding validation (UTF-8)
-
-Streaming
----------
-For streaming embeds (useful for large document sets), this module exposes:
-
-- An async API that yields translated framework chunks, and
-- A sync API that wraps the async generator via `SyncStreamBridge`, preserving
-  proper cancellation and error propagation.
-
-Registry
---------
-A small registry lets you register per-framework embedding translators:
-
-- `register_embedding_translator("my_framework", factory)`
-- `create_embedding_translator("my_framework", adapter, ...)`
-
-This makes it straightforward to plug in framework-specific behaviors while
-reusing the common orchestration logic here.
+- Truncation to model max length (char-based heuristic)
+- Encoding validation (UTF-8 or configurable)
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import (
     Any,
     AsyncIterator,
     Callable,
     Dict,
-    Iterable,
     Iterator,
     List,
     Mapping,
     Optional,
     Protocol,
     Sequence,
-    TypeVar,
     Union,
 )
 
@@ -96,9 +78,7 @@ from corpus_sdk.embedding.embedding_base import (
     EmbedChunk,
     BatchEmbedResult,
     EmbeddingStats,
-    EmbeddingAdapterError,
     BadRequest,
-    NotSupported,
 )
 
 from corpus_sdk.core.context_translation import from_dict as ctx_from_dict
@@ -107,8 +87,6 @@ from corpus_sdk.core.async_bridge import AsyncBridge
 from corpus_sdk.llm.framework_adapters.common.error_context import attach_context
 
 LOG = logging.getLogger(__name__)
-
-T = TypeVar("T")
 
 
 # =============================================================================
@@ -123,8 +101,8 @@ def _ensure_operation_context(
     Normalize various context shapes into an embedding OperationContext.
 
     Accepts:
-        - None: returns an "empty" context
-        - OperationContext: returned as-is
+        - None: returns an "empty" context (via context_translation)
+        - OperationContext: returned as-is (assumed already validated)
         - Mapping[str, Any]: interpreted via context_translation.from_dict,
           then adapted into an embedding OperationContext.
 
@@ -134,6 +112,7 @@ def _ensure_operation_context(
         - This helper simply ensures the embedding adapter receives the right type.
     """
     if ctx is None:
+        # Build empty context through the standard translation pipeline
         core_ctx = ctx_from_dict({})
     elif isinstance(ctx, OperationContext):
         return ctx
@@ -146,6 +125,7 @@ def _ensure_operation_context(
         )
 
     # Reconstruct as embedding OperationContext with validation
+    # This ensures we have the exact type expected by embedding adapters
     return OperationContext(
         request_id=getattr(core_ctx, "request_id", None),
         idempotency_key=getattr(core_ctx, "idempotency_key", None),
@@ -164,35 +144,37 @@ def _ensure_operation_context(
 @dataclass(frozen=True)
 class BatchConfig:
     """
-    Configuration for automatic batching of embedding requests.
+    Configuration for batching behavior.
 
-    Batching is CRITICAL for embedding performance:
-    - Reduces network round-trips
-    - Improves throughput via model parallelism
-    - Lowers cost (many providers charge per request)
-    - Enables better resource utilization
+    Note
+    ----
+    This class *does not* implement batching logic itself. It is a shared
+    configuration object that can be passed to components that actually
+    perform batching (e.g., adapters or higher-level orchestrators).
+
+    The EmbeddingTranslator stores this config for inspection / wiring, but it
+    never splits or groups texts on its own.
 
     Attributes:
         enabled:
-            Whether to apply automatic batching. If False, each text is
-            embedded individually (not recommended for production).
+            Hint for whether batching should be applied by the component that
+            actually performs embedding calls.
 
         max_batch_size:
             Maximum number of texts per batch. Model-dependent.
             Common values: 32 (sentence-transformers), 96 (OpenAI), 2048 (Cohere).
 
         max_tokens_per_batch:
-            Optional token limit per batch. If set, batches are sized to
-            stay under this limit. Requires token counting support.
+            Optional token limit per batch. Typically enforced by adapters that
+            support token counting.
 
         sort_by_length:
-            If True, sort texts by length before batching. This can improve
-            efficiency by grouping similar-length texts together, reducing
-            padding overhead in transformer models.
+            Hint for implementations that want to sort texts by length before
+            batching to reduce padding overhead.
 
         retry_on_partial_failure:
-            If True and a batch fails, retry failed items individually.
-            Useful for handling rate limits or individual text issues.
+            Hint for implementations that want to retry individual items if a
+            batch partially fails (e.g., transient rate limiting).
     """
 
     enabled: bool = True
@@ -201,13 +183,15 @@ class BatchConfig:
     sort_by_length: bool = True
     retry_on_partial_failure: bool = True
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         """Validate batch configuration parameters."""
         if self.enabled:
             if self.max_batch_size <= 0:
                 raise ValueError(f"max_batch_size must be positive, got {self.max_batch_size}")
             if self.max_tokens_per_batch is not None and self.max_tokens_per_batch <= 0:
-                raise ValueError(f"max_tokens_per_batch must be positive, got {self.max_tokens_per_batch}")
+                raise ValueError(
+                    f"max_tokens_per_batch must be positive, got {self.max_tokens_per_batch}"
+                )
 
 
 # =============================================================================
@@ -223,12 +207,12 @@ class TextNormalizationConfig:
     Proper text normalization is important for:
     - Consistent embedding quality
     - Avoiding model errors (empty texts, invalid UTF-8)
-    - Staying within model token limits
+    - Staying within model token limits (via a char-based proxy)
     - Reducing noise in embeddings
 
     Attributes:
         normalize_whitespace:
-            If True, collapse multiple whitespace characters to single space,
+            If True, collapse multiple whitespace characters to single spaces
             and strip leading/trailing whitespace.
 
         remove_empty:
@@ -242,7 +226,7 @@ class TextNormalizationConfig:
             How to truncate long texts:
             - "end": Keep beginning, truncate end (default)
             - "start": Keep end, truncate beginning
-            - "middle": Keep beginning and end, truncate middle
+            - "middle": Keep beginning and end, truncate middle.
 
         encoding:
             Text encoding to validate/enforce. Default "utf-8".
@@ -260,11 +244,12 @@ class TextNormalizationConfig:
     encoding: str = "utf-8"
     lowercase: bool = False
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         """Validate text normalization configuration."""
         if self.truncate_strategy not in ("end", "start", "middle"):
             raise ValueError(
-                f"truncate_strategy must be 'end', 'start', or 'middle', got {self.truncate_strategy!r}"
+                "truncate_strategy must be 'end', 'start', or 'middle', "
+                f"got {self.truncate_strategy!r}"
             )
         if self.max_length is not None and self.max_length <= 0:
             raise ValueError(f"max_length must be positive, got {self.max_length}")
@@ -278,7 +263,7 @@ class TextNormalizationConfig:
 class TextNormalizer:
     """Helper for normalizing text before embedding."""
 
-    def __init__(self, config: TextNormalizationConfig):
+    def __init__(self, config: TextNormalizationConfig) -> None:
         self.config = config
 
     def normalize(self, text: str) -> Optional[str]:
@@ -292,18 +277,21 @@ class TextNormalizer:
             LOG.warning("TextNormalizer: non-string text %r, converting", type(text))
             text = str(text)
 
-        # Validate encoding
-        if self.config.encoding != "utf-8":
+        # Validate / enforce encoding if requested
+        if self.config.encoding:
             try:
                 text = text.encode(self.config.encoding).decode(self.config.encoding)
             except (UnicodeEncodeError, UnicodeDecodeError):
                 LOG.debug("TextNormalizer: encoding error, using replacement chars")
-                text = text.encode(self.config.encoding, errors="replace").decode(self.config.encoding)
+                text = text.encode(self.config.encoding, errors="replace").decode(
+                    self.config.encoding
+                )
 
         # Normalize whitespace
         if self.config.normalize_whitespace:
             import re
-            text = re.sub(r'\s+', ' ', text).strip()
+
+            text = re.sub(r"\s+", " ", text).strip()
 
         # Remove empty
         if self.config.remove_empty and not text.strip():
@@ -315,7 +303,9 @@ class TextNormalizer:
 
         # Truncate
         if self.config.max_length is not None and len(text) > self.config.max_length:
-            text = self._truncate(text, self.config.max_length, self.config.truncate_strategy)
+            text = self._truncate(
+                text, self.config.max_length, self.config.truncate_strategy
+            )
 
         return text
 
@@ -326,7 +316,7 @@ class TextNormalizer:
         Returns:
             List of normalized texts (may be shorter than input if texts filtered).
         """
-        normalized = []
+        normalized: List[str] = []
         for text in texts:
             result = self.normalize(text)
             if result is not None:
@@ -341,14 +331,14 @@ class TextNormalizer:
 
         if strategy == "end":
             return text[:max_length]
-        elif strategy == "start":
+        if strategy == "start":
             return text[-max_length:]
-        elif strategy == "middle":
-            # Keep first and last portions
+        if strategy == "middle":
             keep_each = max_length // 2
             return text[:keep_each] + text[-keep_each:]
-        else:
-            return text[:max_length]
+
+        # Fallback (should not be hit if validated in config)
+        return text[:max_length]
 
 
 # =============================================================================
@@ -362,12 +352,12 @@ class EmbeddingFrameworkTranslator(Protocol):
 
     Implementations are responsible for:
         - Converting framework-level embed inputs into Embed*Spec types
-        - Converting Embedding results into framework-level outputs
+        - Converting embedding results into framework-level outputs
         - Handling framework-specific document/text representations
 
     The default implementation provided here is generic and treats inputs as
-    strings or lists of strings. Frameworks with richer abstractions 
-    (LangChain Document, LlamaIndex Node, etc.) can provide their own 
+    strings or lists of strings. Frameworks with richer abstractions
+    (LangChain Document, LlamaIndex Node, etc.) can provide their own
     implementations and register them via the registry.
     """
 
@@ -465,10 +455,10 @@ class DefaultEmbeddingFrameworkTranslator:
             * a list/sequence of strings
         - Applies text normalization if configured
         - For results:
-            * EmbedResult → list of embeddings
-            * EmbedChunk → list of embeddings per chunk
-            * BatchEmbedResult → nested list structure
-            * EmbeddingStats → underlying stats object
+            * EmbedResult → dict with embeddings, model, usage
+            * EmbedChunk → dict per chunk
+            * BatchEmbedResult → dict with nested lists for batch embeddings
+            * EmbeddingStats → returned as-is
 
     Frameworks with richer abstractions (LangChain Document with page_content,
     LlamaIndex Node with text, etc.) are expected to provide their own
@@ -497,18 +487,18 @@ class DefaultEmbeddingFrameworkTranslator:
             model = framework_ctx.get("model")
             if model is not None and str(model).strip():
                 return str(model)
-        
+
         attrs = op_ctx.attrs or {}
         # Try embedding_model first (most specific)
         model = attrs.get("embedding_model")
         if model is not None and str(model).strip():
             return str(model)
-        
+
         # Fall back to generic model
         model = attrs.get("model")
         if model is not None and str(model).strip():
             return str(model)
-        
+
         return None
 
     # ---- embed translation ----
@@ -518,7 +508,7 @@ class DefaultEmbeddingFrameworkTranslator:
         raw_texts: Any,
         *,
         op_ctx: OperationContext,
-        framework_ctx: Optional[Any] = None,
+        framework_ctx: Optional[Any] = None,  # noqa: ARG002
         stream: bool = False,
     ) -> EmbedSpec:
         model = self.preferred_model(op_ctx=op_ctx, framework_ctx=framework_ctx)
@@ -544,30 +534,29 @@ class DefaultEmbeddingFrameworkTranslator:
                     "raw_texts must contain at least one text",
                     code="BAD_TEXT_EMPTY",
                 )
-            
-            # Normalize all texts
+
             normalized = self._text_normalizer.normalize_batch(raw_texts)
             if not normalized:
                 raise BadRequest(
                     "All texts were filtered out during normalization",
                     code="BAD_TEXT_ALL_EMPTY",
                 )
-            
+
             return EmbedSpec(
                 texts=normalized,
                 model=model,
                 stream=stream,
             )
 
-        # Case 3: raw_texts is a mapping with EmbedSpec fields
+        # Case 3: raw_texts is a mapping with EmbedSpec-like fields
         if isinstance(raw_texts, Mapping):
             texts = raw_texts.get("texts")
             if not texts:
                 raise BadRequest(
-                    "raw_texts.texts must be a non-empty list",
+                    "raw_texts.texts must be a non-empty string or list",
                     code="BAD_TEXT_EMPTY",
                 )
-            
+
             if isinstance(texts, str):
                 texts = [texts]
             elif not isinstance(texts, (list, tuple)):
@@ -575,17 +564,16 @@ class DefaultEmbeddingFrameworkTranslator:
                     "raw_texts.texts must be a string or list of strings",
                     code="BAD_TEXTS",
                 )
-            
-            # Normalize texts
+
             normalized = self._text_normalizer.normalize_batch(texts)
             if not normalized:
                 raise BadRequest(
                     "All texts were filtered out during normalization",
                     code="BAD_TEXT_ALL_EMPTY",
                 )
-            
+
             req_model = raw_texts.get("model")
-            
+
             return EmbedSpec(
                 texts=normalized,
                 model=str(req_model) if req_model is not None else model,
@@ -632,7 +620,7 @@ class DefaultEmbeddingFrameworkTranslator:
         raw_batch: Any,
         *,
         op_ctx: OperationContext,
-        framework_ctx: Optional[Any] = None,
+        framework_ctx: Optional[Any] = None,  # noqa: ARG002
     ) -> BatchEmbedSpec:
         model = self.preferred_model(op_ctx=op_ctx, framework_ctx=framework_ctx)
 
@@ -643,7 +631,7 @@ class DefaultEmbeddingFrameworkTranslator:
                     "raw_batch.batches must be a non-empty list",
                     code="BAD_BATCH",
                 )
-            
+
             # Each batch is a list of texts
             normalized_batches: List[List[str]] = []
             for idx, batch in enumerate(batches):
@@ -655,21 +643,21 @@ class DefaultEmbeddingFrameworkTranslator:
                     )
                 normalized = self._text_normalizer.normalize_batch(batch)
                 if not normalized:
-                    LOG.warning(
+                    LOG.info(
                         "Batch %d was filtered out completely during normalization",
                         idx,
                     )
                     continue
                 normalized_batches.append(normalized)
-            
+
             if not normalized_batches:
                 raise BadRequest(
                     "All batches were filtered out during normalization",
                     code="BAD_BATCH_ALL_EMPTY",
                 )
-            
+
             req_model = raw_batch.get("model")
-            
+
             return BatchEmbedSpec(
                 batches=normalized_batches,
                 model=str(req_model) if req_model is not None else model,
@@ -677,7 +665,7 @@ class DefaultEmbeddingFrameworkTranslator:
 
         # Assume raw_batch is a list of lists
         if isinstance(raw_batch, (list, tuple)):
-            normalized_batches: List[List[str]] = []
+            normalized_batches = []
             for idx, batch in enumerate(raw_batch):
                 if not isinstance(batch, (list, tuple)):
                     raise BadRequest(
@@ -687,19 +675,19 @@ class DefaultEmbeddingFrameworkTranslator:
                     )
                 normalized = self._text_normalizer.normalize_batch(batch)
                 if not normalized:
-                    LOG.warning(
+                    LOG.info(
                         "Batch %d was filtered out completely during normalization",
                         idx,
                     )
                     continue
                 normalized_batches.append(normalized)
-            
+
             if not normalized_batches:
                 raise BadRequest(
                     "All batches were filtered out during normalization",
                     code="BAD_BATCH_ALL_EMPTY",
                 )
-            
+
             return BatchEmbedSpec(
                 batches=normalized_batches,
                 model=model,
@@ -718,7 +706,9 @@ class DefaultEmbeddingFrameworkTranslator:
         framework_ctx: Optional[Any] = None,  # noqa: ARG002
     ) -> Any:
         return {
-            "batch_embeddings": [list(batch or []) for batch in (result.batch_embeddings or [])],
+            "batch_embeddings": [
+                list(batch or []) for batch in (result.batch_embeddings or [])
+            ],
             "model": result.model,
             "usage": dict(result.usage or {}) if result.usage else None,
         }
@@ -748,8 +738,14 @@ class EmbeddingTranslator:
         - Calls into an EmbeddingProtocolV1 adapter to execute operations
         - Provides sync + async variants for all core operations
         - Handles streaming via SyncStreamBridge for sync callers
-        - Applies automatic batching when configured
         - Attaches rich error context for diagnostics
+
+    Batching
+    --------
+    This class does not perform automatic batch splitting. The `batch_config`
+    parameter is stored so that callers or adapters can share a common
+    configuration object for batching policies. If you need automatic batching,
+    implement it in the adapter or in a higher-level orchestration layer.
 
     Sync methods use AsyncBridge to call async adapters from sync contexts.
 
@@ -768,7 +764,11 @@ class EmbeddingTranslator:
     ) -> None:
         self._adapter = adapter
         self._framework = framework
-        self._translator: EmbeddingFrameworkTranslator = translator or DefaultEmbeddingFrameworkTranslator()
+        self._translator: EmbeddingFrameworkTranslator = (
+            translator or DefaultEmbeddingFrameworkTranslator()
+        )
+        # batch_config is stored for potential inspection/use by callers or
+        # adapter implementations; this class itself does not split batches.
         self._batch_config = batch_config or BatchConfig()
 
     # --------------------------------------------------------------------- #
@@ -793,7 +793,8 @@ class EmbeddingTranslator:
             - Call adapter.embed(...) via AsyncBridge
             - Translate result back to framework-level shape
         """
-        async def _embed_coro():
+
+        async def _embed_coro() -> Any:
             ctx = _ensure_operation_context(op_ctx)
             try:
                 spec = self._translator.build_embed_spec(
@@ -803,10 +804,11 @@ class EmbeddingTranslator:
                     stream=False,
                 )
                 result = await self._adapter.embed(spec, ctx=ctx)
-                
+
                 if not isinstance(result, EmbedResult):
                     raise BadRequest(
-                        f"adapter.embed returned unsupported type: {type(result).__name__}",
+                        f"adapter.embed returned unsupported type: "
+                        f"{type(result).__name__}",
                         code="BAD_ADAPTER_RESULT",
                     )
 
@@ -816,7 +818,6 @@ class EmbeddingTranslator:
                     framework_ctx=framework_ctx,
                 )
             except Exception as exc:
-                # Attach error context to all exceptions
                 attach_context(
                     exc,
                     framework=self._framework,
@@ -826,7 +827,6 @@ class EmbeddingTranslator:
                 )
                 raise
 
-        # Use AsyncBridge with deadline from context
         ctx = _ensure_operation_context(op_ctx)
         timeout = ctx.deadline_ms / 1000.0 if ctx.deadline_ms else None
         return AsyncBridge.run_async(_embed_coro(), timeout=timeout)
@@ -858,10 +858,11 @@ class EmbeddingTranslator:
                 stream=False,
             )
             result = await self._adapter.embed(spec, ctx=ctx)
-            
+
             if not isinstance(result, EmbedResult):
                 raise BadRequest(
-                    f"adapter.embed returned unsupported type: {type(result).__name__}",
+                    f"adapter.embed returned unsupported type: "
+                    f"{type(result).__name__}",
                     code="BAD_ADAPTER_RESULT",
                 )
 
@@ -896,9 +897,6 @@ class EmbeddingTranslator:
 
         Exposes a sync iterator that yields framework-level chunks by
         bridging the async adapter.stream_embed(...) via SyncStreamBridge.
-
-        Useful for embedding large document sets where you want results
-        as they become available rather than waiting for entire batch.
         """
         ctx = _ensure_operation_context(op_ctx)
 
@@ -927,7 +925,6 @@ class EmbeddingTranslator:
                 )
                 raise
 
-        # Use SyncStreamBridge for sync streaming
         bridge = SyncStreamBridge(
             coro_factory=_stream_factory,
             framework=self._framework,
@@ -987,8 +984,14 @@ class EmbeddingTranslator:
         op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
         framework_ctx: Optional[Any] = None,
     ) -> Any:
-        """Synchronous batch_embed (uses AsyncBridge)."""
-        async def _batch_coro():
+        """
+        Synchronous batch_embed API (uses AsyncBridge).
+
+        Expects framework-level input that can be translated into a BatchEmbedSpec
+        by the configured translator.
+        """
+
+        async def _batch_coro() -> Any:
             ctx = _ensure_operation_context(op_ctx)
             try:
                 spec = self._translator.build_batch_embed_spec(
@@ -997,13 +1000,14 @@ class EmbeddingTranslator:
                     framework_ctx=framework_ctx,
                 )
                 result = await self._adapter.batch_embed(spec, ctx=ctx)
-                
+
                 if not isinstance(result, BatchEmbedResult):
                     raise BadRequest(
-                        f"adapter.batch_embed returned unsupported type: {type(result).__name__}",
+                        f"adapter.batch_embed returned unsupported type: "
+                        f"{type(result).__name__}",
                         code="BAD_ADAPTER_RESULT",
                     )
-                
+
                 return self._translator.translate_batch_embed_result(
                     result,
                     op_ctx=ctx,
@@ -1030,7 +1034,7 @@ class EmbeddingTranslator:
         op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
         framework_ctx: Optional[Any] = None,
     ) -> Any:
-        """Async batch_embed."""
+        """Async batch_embed API."""
         ctx = _ensure_operation_context(op_ctx)
         try:
             spec = self._translator.build_batch_embed_spec(
@@ -1039,13 +1043,14 @@ class EmbeddingTranslator:
                 framework_ctx=framework_ctx,
             )
             result = await self._adapter.batch_embed(spec, ctx=ctx)
-            
+
             if not isinstance(result, BatchEmbedResult):
                 raise BadRequest(
-                    f"adapter.batch_embed returned unsupported type: {type(result).__name__}",
+                    f"adapter.batch_embed returned unsupported type: "
+                    f"{type(result).__name__}",
                     code="BAD_ADAPTER_RESULT",
                 )
-            
+
             return self._translator.translate_batch_embed_result(
                 result,
                 op_ctx=ctx,
@@ -1072,14 +1077,16 @@ class EmbeddingTranslator:
         framework_ctx: Optional[Any] = None,
     ) -> Any:
         """Synchronous get_stats (uses AsyncBridge)."""
-        async def _stats_coro():
+
+        async def _stats_coro() -> Any:
             ctx = _ensure_operation_context(op_ctx)
             try:
                 stats = await self._adapter.get_stats(ctx=ctx)
-                
+
                 if not isinstance(stats, EmbeddingStats):
                     raise BadRequest(
-                        f"adapter.get_stats returned unsupported type: {type(stats).__name__}",
+                        f"adapter.get_stats returned unsupported type: "
+                        f"{type(stats).__name__}",
                         code="BAD_ADAPTER_RESULT",
                     )
 
@@ -1112,10 +1119,11 @@ class EmbeddingTranslator:
         ctx = _ensure_operation_context(op_ctx)
         try:
             stats = await self._adapter.get_stats(ctx=ctx)
-            
+
             if not isinstance(stats, EmbeddingStats):
                 raise BadRequest(
-                    f"adapter.get_stats returned unsupported type: {type(stats).__name__}",
+                    f"adapter.get_stats returned unsupported type: "
+                    f"{type(stats).__name__}",
                     code="BAD_ADAPTER_RESULT",
                 )
 
@@ -1205,7 +1213,7 @@ def create_embedding_translator(
             translator = DefaultEmbeddingFrameworkTranslator(
                 text_normalizer=text_normalizer
             )
-    
+
     return EmbeddingTranslator(
         adapter=adapter,
         framework=framework,
