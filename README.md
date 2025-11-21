@@ -86,8 +86,6 @@ Start here (README) + `docs/guides/QUICK_START.md`, then dive into `docs/spec/` 
 
 Modern AI platforms juggle multiple LLM, embedding, vector, and graph backends. Each vendor has unique APIs, error schemes, rate limits, and capabilities — making cross-provider integration brittle and costly.
 
-### The Core Problem: AI Infrastructure Chaos
-
 - **Provider Proliferation**: Dozens of LLM providers, vector databases, and graph databases with incompatible APIs  
 - **Duplicate Integration**: Enterprises rewriting the same error handling, observability, and resilience patterns for each provider  
 - **Vendor Lock-in**: Applications tightly coupled to specific AI infrastructure choices  
