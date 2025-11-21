@@ -11,7 +11,7 @@ This module exposes Corpus `EmbeddingProtocolV1` implementations as
 - Support for LlamaIndex node-based document processing
 - Context normalization using existing `context_translation.from_llamaindex`
 - Framework-agnostic orchestration via `EmbeddingTranslator`
-- Async → sync bridging using `AsyncBridge`
+- Async → sync bridging handled in the common embedding layer
 - Rich error context attachment for observability
 
 The design leverages LlamaIndex's focus on efficient indexing and retrieval
@@ -22,12 +22,11 @@ from __future__ import annotations
 
 import logging
 from functools import cached_property
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from llama_index.core.embeddings import BaseEmbedding
 from llama_index.core.callbacks import CallbackManager
 
-from corpus_sdk.core.async_bridge import AsyncBridge
 from corpus_sdk.core.context_translation import (
     from_llamaindex as context_from_llamaindex,  # Using existing implementation
 )
@@ -181,6 +180,9 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         llamaindex_context:
             Optional LlamaIndex context containing service context,
             callback manager, and node information.
+        **kwargs:
+            Additional framework-level hints to be passed through to the
+            translator as part of `framework_ctx`.
 
         Returns
         -------
@@ -280,12 +282,6 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
 
         return matrix[0]
 
-    def _get_timeout_from_context(self, core_ctx: Any) -> Optional[float]:
-        """Extract timeout from core context, converting ms to seconds."""
-        if hasattr(core_ctx, "deadline_ms") and core_ctx.deadline_ms is not None:
-            return core_ctx.deadline_ms / 1000.0
-        return None
-
     # ------------------------------------------------------------------ #
     # Core LlamaIndex Abstract Method Implementation
     # ------------------------------------------------------------------ #
@@ -309,37 +305,34 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         List[float]
             Query embedding vector
         """
-        core_ctx, op_ctx_dict, framework_ctx = self._build_contexts(
+        _, op_ctx_dict, framework_ctx = self._build_contexts(
             llamaindex_context=kwargs,
             **kwargs,
         )
-        timeout = self._get_timeout_from_context(core_ctx)
 
-        async def _coro() -> List[float]:
+        try:
+            translated = self._translator.embed(
+                raw_texts=query,
+                op_ctx=op_ctx_dict,
+                framework_ctx=framework_ctx,
+            )
+            return self._coerce_embedding_vector(translated)
+        except Exception as exc:  # noqa: BLE001
+            # Enrich with LlamaIndex-specific context; protocol-level context
+            # is already attached by EmbeddingTranslator.
             try:
-                translated = await self._translator.arun_embed(
-                    raw_texts=query,
-                    op_ctx=op_ctx_dict,
-                    framework_ctx=framework_ctx,
+                attach_context(
+                    exc,
+                    embedding_operation="_get_query_embedding",
+                    text_len=len(query or ""),
+                    node_ids=framework_ctx.get("node_ids"),
+                    index_id=framework_ctx.get("index_id"),
+                    llamaindex_model_name=self.model_name,
                 )
-                return self._coerce_embedding_vector(translated)
-            except Exception as exc:  # noqa: BLE001
-                try:
-                    attach_context(
-                        exc,
-                        framework="llamaindex",
-                        embedding_operation="_get_query_embedding",
-                        text_len=len(query or ""),
-                        request_id=getattr(core_ctx, "request_id", None),
-                        tenant=getattr(core_ctx, "tenant", None),
-                        node_ids=framework_ctx.get("node_ids"),
-                        index_id=framework_ctx.get("index_id"),
-                    )
-                except Exception:
-                    pass  # Never mask original error
-                raise
-
-        return AsyncBridge.run_async(_coro(), timeout=timeout)
+            except Exception:
+                # Never mask the original error
+                pass
+            raise
 
     async def _aget_query_embedding(self, query: str, **kwargs: Any) -> List[float]:
         """
@@ -376,15 +369,15 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
             try:
                 attach_context(
                     exc,
-                    framework="llamaindex",
                     embedding_operation="_aget_query_embedding",
                     text_len=len(query or ""),
-                    request_id=getattr(core_ctx, "request_id", None),
-                    tenant=getattr(core_ctx, "tenant", None),
                     node_ids=framework_ctx.get("node_ids"),
                     index_id=framework_ctx.get("index_id"),
+                    llamaindex_model_name=self.model_name,
+                    llamaindex_has_context=bool(core_ctx),
                 )
             except Exception:
+                # Never mask the original error
                 pass
             raise
 
@@ -407,38 +400,32 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         List[float]
             Text embedding vector
         """
-        # For single text embedding, we reuse the same pattern as query embedding
-        core_ctx, op_ctx_dict, framework_ctx = self._build_contexts(
+        _, op_ctx_dict, framework_ctx = self._build_contexts(
             llamaindex_context=kwargs,
             **kwargs,
         )
-        timeout = self._get_timeout_from_context(core_ctx)
 
-        async def _coro() -> List[float]:
+        try:
+            translated = self._translator.embed(
+                raw_texts=text,
+                op_ctx=op_ctx_dict,
+                framework_ctx=framework_ctx,
+            )
+            return self._coerce_embedding_vector(translated)
+        except Exception as exc:  # noqa: BLE001
             try:
-                translated = await self._translator.arun_embed(
-                    raw_texts=text,
-                    op_ctx=op_ctx_dict,
-                    framework_ctx=framework_ctx,
+                attach_context(
+                    exc,
+                    embedding_operation="_get_text_embedding",
+                    text_len=len(text or ""),
+                    node_ids=framework_ctx.get("node_ids"),
+                    index_id=framework_ctx.get("index_id"),
+                    llamaindex_model_name=self.model_name,
                 )
-                return self._coerce_embedding_vector(translated)
-            except Exception as exc:  # noqa: BLE001
-                try:
-                    attach_context(
-                        exc,
-                        framework="llamaindex",
-                        embedding_operation="_get_text_embedding",
-                        text_len=len(text or ""),
-                        request_id=getattr(core_ctx, "request_id", None),
-                        tenant=getattr(core_ctx, "tenant", None),
-                        node_ids=framework_ctx.get("node_ids"),
-                        index_id=framework_ctx.get("index_id"),
-                    )
-                except Exception:
-                    pass
-                raise
-
-        return AsyncBridge.run_async(_coro(), timeout=timeout)
+            except Exception:
+                # Never mask the original error
+                pass
+            raise
 
     async def _aget_text_embedding(self, text: str, **kwargs: Any) -> List[float]:
         """
@@ -475,15 +462,15 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
             try:
                 attach_context(
                     exc,
-                    framework="llamaindex",
                     embedding_operation="_aget_text_embedding",
                     text_len=len(text or ""),
-                    request_id=getattr(core_ctx, "request_id", None),
-                    tenant=getattr(core_ctx, "tenant", None),
                     node_ids=framework_ctx.get("node_ids"),
                     index_id=framework_ctx.get("index_id"),
+                    llamaindex_model_name=self.model_name,
+                    llamaindex_has_context=bool(core_ctx),
                 )
             except Exception:
+                # Never mask the original error
                 pass
             raise
 
@@ -506,37 +493,32 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         List[List[float]]
             Batch of text embedding vectors
         """
-        core_ctx, op_ctx_dict, framework_ctx = self._build_contexts(
+        _, op_ctx_dict, framework_ctx = self._build_contexts(
             llamaindex_context=kwargs,
             **kwargs,
         )
-        timeout = self._get_timeout_from_context(core_ctx)
 
-        async def _coro() -> List[List[float]]:
+        try:
+            translated = self._translator.embed(
+                raw_texts=texts,
+                op_ctx=op_ctx_dict,
+                framework_ctx=framework_ctx,
+            )
+            return self._coerce_embedding_matrix(translated)
+        except Exception as exc:  # noqa: BLE001
             try:
-                translated = await self._translator.arun_embed(
-                    raw_texts=texts,
-                    op_ctx=op_ctx_dict,
-                    framework_ctx=framework_ctx,
+                attach_context(
+                    exc,
+                    embedding_operation="_get_text_embeddings",
+                    texts_count=len(texts),
+                    node_ids=framework_ctx.get("node_ids"),
+                    index_id=framework_ctx.get("index_id"),
+                    llamaindex_model_name=self.model_name,
                 )
-                return self._coerce_embedding_matrix(translated)
-            except Exception as exc:  # noqa: BLE001
-                try:
-                    attach_context(
-                        exc,
-                        framework="llamaindex",
-                        embedding_operation="_get_text_embeddings",
-                        texts_count=len(texts),
-                        request_id=getattr(core_ctx, "request_id", None),
-                        tenant=getattr(core_ctx, "tenant", None),
-                        node_ids=framework_ctx.get("node_ids"),
-                        index_id=framework_ctx.get("index_id"),
-                    )
-                except Exception:
-                    pass
-                raise
-
-        return AsyncBridge.run_async(_coro(), timeout=timeout)
+            except Exception:
+                # Never mask the original error
+                pass
+            raise
 
 
 # ------------------------------------------------------------------ #
@@ -593,11 +575,11 @@ def configure_llamaindex_embeddings(
         model_name=model_name,
         **kwargs,
     )
-    
+
     logger.info(
         f"Corpus LlamaIndex embeddings configured: {model_name}"
     )
-    
+
     return embeddings
 
 
