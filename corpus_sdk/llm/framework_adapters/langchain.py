@@ -10,13 +10,13 @@ This module exposes Corpus `LLMProtocolV1` implementations as
 - Async + sync generation
 - Async + sync streaming (true incremental streaming)
 - Proper callback integration (on_llm_end, on_llm_new_token, on_llm_error)
-- Protocol-first, translator-centric design: LangChain is a thin skin over Corpus
+- Protocol-first design: Direct LLMProtocolV1 access with message translation
 - Production-grade error handling and observability
 
 Design principles
 -----------------
-- Translator-centric: All complexity delegated to a local LLM translator
-- Framework-native: Full LangChain callback and streaming support
+- Direct protocol access: No unnecessary abstraction layers
+- Framework-native: Full LangChain callback and streaming support  
 - Observable: Rich error context and comprehensive logging
 - Robust: Production-ready with proper resource management
 """
@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager, contextmanager
-from functools import cached_property
 from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, Protocol
 
 from langchain_core.callbacks import (
@@ -56,15 +55,11 @@ logger = logging.getLogger(__name__)
 
 # Framework constants for consistency
 _FRAMEWORK_NAME = "langchain"
-_STREAM_COMPLETION_MARKER = "[stream_completed]"
 
 
 class LangChainLLMProtocol(Protocol):
     """
     Structural protocol for LangChain-compatible Corpus chat models.
-
-    This lets callers type against the adapter interface without
-    depending on the concrete `CorpusLangChainLLM` class.
     """
 
     async def _agenerate(
@@ -104,91 +99,6 @@ class LangChainLLMProtocol(Protocol):
         ...
 
 
-# --------------------------------------------------------------------------- #
-# Local LLM translator (mini abstraction over LLMProtocolV1)
-# --------------------------------------------------------------------------- #
-
-
-class _LocalLLMTranslator:
-    """
-    Minimal translator for framework adapters.
-
-    This is a local, LangChain-specific equivalent of the shared translator
-    pattern used in other adapters. It centralizes calls into `LLMProtocolV1`
-    and exposes a stable interface:
-
-        - arun_complete
-        - complete
-        - arun_stream
-        - stream
-
-    so the adapter logic can remain focused on framework-specific shaping
-    (LangChain messages in, LangChain ChatResult / ChatGenerationChunk out).
-    """
-
-    def __init__(self, adapter: LLMProtocolV1, framework: str = _FRAMEWORK_NAME) -> None:
-        self._adapter = adapter
-        self._framework = framework  # reserved for future use (metrics, logging, etc.)
-
-    async def arun_complete(
-        self,
-        *,
-        messages: List[Dict[str, Any]],
-        op_ctx: OperationContext,
-        params: Dict[str, Any],
-    ) -> LLMCompletion:
-        """Async completion routed directly to the underlying LLMProtocolV1."""
-        return await self._adapter.acomplete(
-            messages=messages,
-            ctx=op_ctx,
-            **params,
-        )
-
-    def complete(
-        self,
-        *,
-        messages: List[Dict[str, Any]],
-        op_ctx: OperationContext,
-        params: Dict[str, Any],
-    ) -> LLMCompletion:
-        """Sync completion routed directly to the underlying LLMProtocolV1."""
-        return self._adapter.complete(
-            messages=messages,
-            ctx=op_ctx,
-            **params,
-        )
-
-    async def arun_stream(
-        self,
-        *,
-        messages: List[Dict[str, Any]],
-        op_ctx: OperationContext,
-        params: Dict[str, Any],
-    ) -> AsyncIterator[LLMChunk]:
-        """Async streaming routed directly to the underlying LLMProtocolV1."""
-        async for chunk in self._adapter.astream(
-            messages=messages,
-            ctx=op_ctx,
-            **params,
-        ):
-            yield chunk
-
-    def stream(
-        self,
-        *,
-        messages: List[Dict[str, Any]],
-        op_ctx: OperationContext,
-        params: Dict[str, Any],
-    ) -> Iterator[LLMChunk]:
-        """Sync streaming routed directly to the underlying LLMProtocolV1."""
-        for chunk in self._adapter.stream(
-            messages=messages,
-            ctx=op_ctx,
-            **params,
-        ):
-            yield chunk
-
-
 class CorpusLangChainLLM(BaseChatModel):
     """
     LangChain `BaseChatModel` implementation backed by a Corpus `LLMProtocolV1`.
@@ -198,9 +108,7 @@ class CorpusLangChainLLM(BaseChatModel):
     - Messages are normalized via `message_translation.from_langchain`.
     - Context is derived from LangChain's `RunnableConfig` via
       `context_translation.from_langchain`.
-    - All policy / resilience (deadlines, breakers, rate limiting, caching,
-      async→sync bridging details) lives in the underlying protocol
-      implementation and the local translator, not here.
+    - All LLM calls go directly to the underlying protocol implementation.
 
     Usage:
         llm = CorpusLangChainLLM(
@@ -219,10 +127,10 @@ class CorpusLangChainLLM(BaseChatModel):
     temperature: float = 0.7
     max_tokens: Optional[int] = None
 
-    # Pydantic v2-style config: allow arbitrary types like LLMProtocolV1.
+    # Pydantic v2-style config
     model_config = {
         "arbitrary_types_allowed": True,
-        "protected_namespaces": (),  # Pydantic v2 compatibility
+        "protected_namespaces": (),
     }
 
     def __init__(
@@ -236,8 +144,8 @@ class CorpusLangChainLLM(BaseChatModel):
         **kwargs: Any,
     ) -> None:
         # Validate critical parameters
-        if not isinstance(llm_adapter, LLMProtocolV1):
-            raise TypeError("llm_adapter must implement LLMProtocolV1")
+        if not hasattr(llm_adapter, "complete") or not callable(getattr(llm_adapter, "complete")):
+            raise TypeError("llm_adapter must implement LLMProtocolV1 with 'complete' method")
 
         if not 0 <= temperature <= 2:
             raise ValueError("temperature must be between 0 and 2")
@@ -251,6 +159,12 @@ class CorpusLangChainLLM(BaseChatModel):
         self.temperature = float(temperature)
         self.max_tokens = max_tokens
         self._framework_version = framework_version
+
+        logger.info(
+            "CorpusLangChainLLM initialized with model=%s, temperature=%.2f",
+            self.model,
+            self.temperature,
+        )
 
     # ------------------------------------------------------------------ #
     # LangChain-required properties
@@ -272,40 +186,33 @@ class CorpusLangChainLLM(BaseChatModel):
         }
 
     # ------------------------------------------------------------------ #
-    # Translator (lazy, cached, robust)
+    # Error context management (consistent with other adapters)
     # ------------------------------------------------------------------ #
 
-    @cached_property
-    def _translator(self) -> _LocalLLMTranslator:
-        """
-        Lazily construct and cache the local LLM translator.
-
-        All orchestration, including any async→sync bridging needed by the
-        underlying protocol implementation, is centralized in this translator.
-        """
-        return _LocalLLMTranslator(
-            adapter=self._llm,
-            framework=_FRAMEWORK_NAME,
-        )
-
-    # ------------------------------------------------------------------ #
-    # Capabilities / feature helpers
-    # ------------------------------------------------------------------ #
-
-    @property
-    def supports_streaming(self) -> bool:
-        """
-        Indicate streaming support to LangChain.
-
-        When using `LLMProtocolV1` + the local translator, we assume streaming
-        is supported; if a concrete implementation does not, it should
-        raise at call time.
-        """
-        return True
-
-    # ------------------------------------------------------------------ #
-    # Error-context helpers (robust and consistent)
-    # ------------------------------------------------------------------ #
+    def _build_error_context(
+        self,
+        operation: str,
+        stream: bool,
+        messages_count: int,
+        model: str,
+        ctx: OperationContext,
+        params: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Build consistent error context across all operations."""
+        return {
+            "framework": _FRAMEWORK_NAME,
+            "operation": operation,
+            "messages_count": messages_count,
+            "model": model,
+            "temperature": params.get("temperature"),
+            "max_tokens": params.get("max_tokens"),
+            "top_p": params.get("top_p"),
+            "frequency_penalty": params.get("frequency_penalty"),
+            "presence_penalty": params.get("presence_penalty"),
+            "request_id": ctx.request_id,
+            "tenant": ctx.tenant,
+            "stream": stream,
+        }
 
     @contextmanager
     def _error_context(
@@ -321,24 +228,13 @@ class CorpusLangChainLLM(BaseChatModel):
         """
         Sync error-context wrapper to centralize attach_context usage.
         """
+        error_ctx = self._build_error_context(
+            operation, stream, messages_count, model, ctx, params
+        )
         try:
             yield
-        except BaseException as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework=_FRAMEWORK_NAME,
-                operation=operation,
-                messages_count=messages_count,
-                model=model,
-                temperature=params.get("temperature"),
-                max_tokens=params.get("max_tokens"),
-                top_p=params.get("top_p"),
-                frequency_penalty=params.get("frequency_penalty"),
-                presence_penalty=params.get("presence_penalty"),
-                request_id=ctx.request_id,
-                tenant=ctx.tenant,
-                stream=stream,
-            )
+        except BaseException as exc:
+            attach_context(exc, **error_ctx)
             raise
 
     @asynccontextmanager
@@ -355,24 +251,13 @@ class CorpusLangChainLLM(BaseChatModel):
         """
         Async error-context wrapper to centralize attach_context usage.
         """
+        error_ctx = self._build_error_context(
+            operation, stream, messages_count, model, ctx, params
+        )
         try:
             yield
-        except BaseException as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework=_FRAMEWORK_NAME,
-                operation=operation,
-                messages_count=messages_count,
-                model=model,
-                temperature=params.get("temperature"),
-                max_tokens=params.get("max_tokens"),
-                top_p=params.get("top_p"),
-                frequency_penalty=params.get("frequency_penalty"),
-                presence_penalty=params.get("presence_penalty"),
-                request_id=ctx.request_id,
-                tenant=ctx.tenant,
-                stream=stream,
-            )
+        except BaseException as exc:
+            attach_context(exc, **error_ctx)
             raise
 
     # ------------------------------------------------------------------ #
@@ -382,6 +267,11 @@ class CorpusLangChainLLM(BaseChatModel):
     def _translate_messages(self, messages: List[BaseMessage]) -> List[Dict[str, Any]]:
         """
         LangChain messages → Corpus wire format ({role, content} dicts).
+        
+        Returns
+        -------
+        List[Dict[str, Any]]
+            Normalized messages in Corpus wire format
         """
         if not messages:
             logger.warning("Empty messages list provided to LangChain adapter")
@@ -389,7 +279,6 @@ class CorpusLangChainLLM(BaseChatModel):
 
         try:
             normalized: List[NormalizedMessage] = [from_langchain(m) for m in messages]
-            # `to_corpus` returns list[Mapping[str, Any]]; cast to Dict for callers.
             return [dict(m) for m in to_corpus(normalized)]
         except Exception as e:
             logger.error("Failed to translate LangChain messages: %s", e)
@@ -404,11 +293,10 @@ class CorpusLangChainLLM(BaseChatModel):
         """
         Extract `OperationContext` and Corpus sampling params from LangChain kwargs.
 
-        Expected kwargs (optional):
-            - config: RunnableConfig-like dict (for context translation)
-            - model, temperature, max_tokens, top_p, frequency_penalty, presence_penalty
-
-        The returned `params` dict is shaped to match translator.complete/stream.
+        Returns
+        -------
+        tuple[OperationContext, Dict[str, Any]]
+            Operation context and cleaned sampling parameters
         """
         config = kwargs.get("config")
         ctx = context_from_langchain(
@@ -431,14 +319,19 @@ class CorpusLangChainLLM(BaseChatModel):
             "stop_sequences": stop,
         }
 
-        # Strip None values so the protocol sees a clean param set.
-        params = {k: v for k, v in params.items() if v is not None}
-        return ctx, params
+        # Strip None values so the protocol sees a clean param set
+        clean_params = {k: v for k, v in params.items() if v is not None}
+        return ctx, clean_params
 
     @staticmethod
     def _build_chat_result(completion: LLMCompletion) -> ChatResult:
         """
         Map a Corpus `LLMCompletion` into a LangChain `ChatResult`.
+        
+        Returns
+        -------
+        ChatResult
+            LangChain chat result with proper metadata
         """
         usage = completion.usage
         usage_dict: Dict[str, int] = {
@@ -478,6 +371,11 @@ class CorpusLangChainLLM(BaseChatModel):
     def _chunk_to_generation_chunk(chunk: LLMChunk) -> ChatGenerationChunk:
         """
         Map a Corpus `LLMChunk` into a LangChain `ChatGenerationChunk`.
+        
+        Returns
+        -------
+        ChatGenerationChunk
+            LangChain generation chunk with proper metadata
         """
         text = chunk.text or ""
         ai_chunk = AIMessageChunk(content=text)
@@ -501,7 +399,7 @@ class CorpusLangChainLLM(BaseChatModel):
         )
 
     # ------------------------------------------------------------------ #
-    # LangChain async API (production-ready with proper cleanup)
+    # LangChain async API (direct protocol access)
     # ------------------------------------------------------------------ #
 
     async def _agenerate(
@@ -513,6 +411,27 @@ class CorpusLangChainLLM(BaseChatModel):
     ) -> ChatResult:
         """
         Async chat generation entrypoint used by LangChain.
+
+        Parameters
+        ----------
+        messages : List[BaseMessage]
+            List of LangChain messages
+        stop : Optional[List[str]], optional
+            Stop sequences, by default None
+        run_manager : Optional[AsyncCallbackManagerForLLMRun], optional
+            Async callback manager, by default None
+        **kwargs : Any
+            Additional LangChain parameters
+
+        Returns
+        -------
+        ChatResult
+            LangChain chat result
+
+        Raises
+        ------
+        Exception
+            Any exception from the underlying LLM with rich context attached
         """
         corpus_messages = self._translate_messages(messages)
         ctx, params = self._build_context_and_params(stop=stop, **kwargs)
@@ -536,10 +455,11 @@ class CorpusLangChainLLM(BaseChatModel):
             ctx=ctx,
             params=params,
         ):
-            result: LLMCompletion = await self._translator.arun_complete(
+            # Direct protocol access - no unnecessary abstraction
+            result: LLMCompletion = await self._llm.acomplete(
                 messages=corpus_messages,
-                op_ctx=ctx,
-                params=params,
+                ctx=ctx,
+                **params,
             )
             chat_result = self._build_chat_result(result)
 
@@ -558,8 +478,26 @@ class CorpusLangChainLLM(BaseChatModel):
         """
         Async streaming entrypoint used by LangChain.
 
-        Emits `ChatGenerationChunk` instances incrementally and forwards
-        tokens to LangChain callbacks via `on_llm_new_token`.
+        Parameters
+        ----------
+        messages : List[BaseMessage]
+            List of LangChain messages
+        stop : Optional[List[str]], optional
+            Stop sequences, by default None
+        run_manager : Optional[AsyncCallbackManagerForLLMRun], optional
+            Async callback manager, by default None
+        **kwargs : Any
+            Additional LangChain parameters
+
+        Yields
+        ------
+        ChatGenerationChunk
+            Streaming generation chunks
+
+        Raises
+        ------
+        Exception
+            Any exception from the underlying LLM with rich context attached
         """
         corpus_messages = self._translate_messages(messages)
         ctx, params = self._build_context_and_params(stop=stop, **kwargs)
@@ -585,10 +523,11 @@ class CorpusLangChainLLM(BaseChatModel):
         ):
             stream_canceled = False
             try:
-                async for chunk in self._translator.arun_stream(
+                # Direct protocol access for streaming
+                async for chunk in self._llm.astream(
                     messages=corpus_messages,
-                    op_ctx=ctx,
-                    params=params,
+                    ctx=ctx,
+                    **params,
                 ):
                     gen_chunk = self._chunk_to_generation_chunk(chunk)
                     text = gen_chunk.message.content or ""
@@ -616,7 +555,7 @@ class CorpusLangChainLLM(BaseChatModel):
                     completion_result = ChatResult(
                         generations=[
                             ChatGeneration(
-                                message=AIMessage(content=_STREAM_COMPLETION_MARKER),
+                                message=AIMessage(content=""),
                                 generation_info={
                                     "streaming": True,
                                     "completed": True,
@@ -641,7 +580,26 @@ class CorpusLangChainLLM(BaseChatModel):
         """
         Sync chat generation entrypoint used by LangChain.
 
-        Uses the synchronous translator.complete path.
+        Parameters
+        ----------
+        messages : List[BaseMessage]
+            List of LangChain messages
+        stop : Optional[List[str]], optional
+            Stop sequences, by default None
+        run_manager : Optional[CallbackManagerForLLMRun], optional
+            Sync callback manager, by default None
+        **kwargs : Any
+            Additional LangChain parameters
+
+        Returns
+        -------
+        ChatResult
+            LangChain chat result
+
+        Raises
+        ------
+        Exception
+            Any exception from the underlying LLM with rich context attached
         """
         corpus_messages = self._translate_messages(messages)
         ctx, params = self._build_context_and_params(stop=stop, **kwargs)
@@ -665,10 +623,11 @@ class CorpusLangChainLLM(BaseChatModel):
             ctx=ctx,
             params=params,
         ):
-            result: LLMCompletion = self._translator.complete(
+            # Direct protocol access
+            result: LLMCompletion = self._llm.complete(
                 messages=corpus_messages,
-                op_ctx=ctx,
-                params=params,
+                ctx=ctx,
+                **params,
             )
             chat_result = self._build_chat_result(result)
 
@@ -687,7 +646,26 @@ class CorpusLangChainLLM(BaseChatModel):
         """
         Sync streaming entrypoint used by LangChain.
 
-        Uses the synchronous translator.stream path.
+        Parameters
+        ----------
+        messages : List[BaseMessage]
+            List of LangChain messages
+        stop : Optional[List[str]], optional
+            Stop sequences, by default None
+        run_manager : Optional[CallbackManagerForLLMRun], optional
+            Sync callback manager, by default None
+        **kwargs : Any
+            Additional LangChain parameters
+
+        Yields
+        ------
+        ChatGenerationChunk
+            Streaming generation chunks
+
+        Raises
+        ------
+        Exception
+            Any exception from the underlying LLM with rich context attached
         """
         corpus_messages = self._translate_messages(messages)
         ctx, params = self._build_context_and_params(stop=stop, **kwargs)
@@ -713,10 +691,11 @@ class CorpusLangChainLLM(BaseChatModel):
         ):
             stream_canceled = False
             try:
-                for chunk in self._translator.stream(
+                # Direct protocol access for streaming
+                for chunk in self._llm.stream(
                     messages=corpus_messages,
-                    op_ctx=ctx,
-                    params=params,
+                    ctx=ctx,
+                    **params,
                 ):
                     gen_chunk = self._chunk_to_generation_chunk(chunk)
                     text = gen_chunk.message.content or ""
@@ -744,7 +723,7 @@ class CorpusLangChainLLM(BaseChatModel):
                     completion_result = ChatResult(
                         generations=[
                             ChatGeneration(
-                                message=AIMessage(content=_STREAM_COMPLETION_MARKER),
+                                message=AIMessage(content=""),
                                 generation_info={
                                     "streaming": True,
                                     "completed": True,
@@ -763,11 +742,15 @@ class CorpusLangChainLLM(BaseChatModel):
         """
         Estimate token count for a list of LangChain messages.
 
-        Strategy:
-        1. Try translator's count_tokens (if implemented)
-        2. Try protocol adapter's count_tokens
-        3. Fall back to improved character-based estimate
-        4. Ultimate fallback to superclass implementation
+        Parameters
+        ----------
+        messages : List[BaseMessage]
+            List of LangChain messages
+
+        Returns
+        -------
+        int
+            Estimated token count
         """
         if not messages:
             return 0
@@ -778,25 +761,10 @@ class CorpusLangChainLLM(BaseChatModel):
             None,
             framework_version=self._framework_version,
         )
-        params: Dict[str, Any] = {"model": self.model}
 
-        # 1. Try translator-level counting (if present)
-        translator = self._translator
-        if hasattr(translator, "count_tokens"):
-            try:
-                tokens = translator.count_tokens(
-                    messages=corpus_messages,
-                    op_ctx=ctx,
-                    params=params,
-                )
-                return int(tokens)
-            except Exception as exc:
-                logger.debug("Translator count_tokens failed: %s", exc)
-
-        # 2. Try protocol adapter counting
+        # Try protocol adapter counting first
         if hasattr(self._llm, "count_tokens"):
             try:
-                # Build combined text for counting
                 combined_text = self._combine_messages_for_counting(messages)
                 tokens = self._llm.count_tokens(
                     text=combined_text,
@@ -807,13 +775,13 @@ class CorpusLangChainLLM(BaseChatModel):
             except Exception as exc:
                 logger.debug("Protocol count_tokens failed: %s", exc)
 
-        # 3. Improved character-based estimate
+        # Fall back to improved character-based estimate
         try:
             return self._estimate_tokens_from_messages(messages)
         except Exception as exc:
             logger.debug("Token estimation failed: %s", exc)
 
-        # 4. Ultimate fallback to superclass
+        # Ultimate fallback to superclass
         return super().get_num_tokens_from_messages(messages)
 
     def _combine_messages_for_counting(self, messages: List[BaseMessage]) -> str:
@@ -832,9 +800,7 @@ class CorpusLangChainLLM(BaseChatModel):
         if not combined_text:
             return 0
 
-        # More sophisticated estimation:
-        # - ~4 chars per token for English text
-        # - Minimum 1 token per message
+        # More sophisticated estimation
         char_count = len(combined_text)
         message_count = len(messages)
 
@@ -844,7 +810,19 @@ class CorpusLangChainLLM(BaseChatModel):
         return max(char_based, message_based)
 
     def get_num_tokens(self, text: str) -> int:
-        """Token counting for single text string."""
+        """
+        Token counting for single text string.
+
+        Parameters
+        ----------
+        text : str
+            Input text to count tokens for
+
+        Returns
+        -------
+        int
+            Estimated token count
+        """
         from langchain_core.messages import HumanMessage
 
         return self.get_num_tokens_from_messages([HumanMessage(content=text)])
