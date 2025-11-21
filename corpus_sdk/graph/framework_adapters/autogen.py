@@ -479,12 +479,36 @@ class CorpusAutoGenGraphClient:
         graph_adapter: GraphProtocolV1,
         default_dialect: Optional[str] = None,
         default_namespace: Optional[str] = None,
+        default_timeout_ms: Optional[int] = None,  # ESSENTIAL CHANGE #1: Configurable timeout
         framework_version: Optional[str] = None,
     ) -> None:
         self._graph: GraphProtocolV1 = graph_adapter
         self._default_dialect: Optional[str] = default_dialect
         self._default_namespace: Optional[str] = default_namespace
+        self._default_timeout_ms: Optional[int] = default_timeout_ms  # Store timeout
         self._framework_version: Optional[str] = framework_version
+
+    # ------------------------------------------------------------------ #
+    # ESSENTIAL CHANGE #2: Resource Management (Context Managers)
+    # ------------------------------------------------------------------ #
+
+    def __enter__(self) -> CorpusAutoGenGraphClient:
+        """Support context manager protocol for resource cleanup."""
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        """Clean up resources when exiting context."""
+        if hasattr(self._graph, 'close'):
+            self._graph.close()
+
+    async def __aenter__(self) -> CorpusAutoGenGraphClient:
+        """Support async context manager protocol."""
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        """Clean up resources when exiting async context."""
+        if hasattr(self._graph, 'aclose'):
+            await self._graph.aclose()
 
     # ------------------------------------------------------------------ #
     # Translator (lazy, cached) – mirrors embedding adapter pattern
@@ -561,6 +585,30 @@ class CorpusAutoGenGraphClient:
         if not isinstance(query, str) or not query.strip():
             raise BadRequest("query must be a non-empty string")
 
+    # ------------------------------------------------------------------ #
+    # ESSENTIAL CHANGE #3: Enhanced Input Validation
+    # ------------------------------------------------------------------ #
+
+    def _validate_upsert_spec(self, spec: UpsertNodesSpec) -> None:
+        """Validate upsert specification before processing."""
+        if not spec.nodes:
+            raise BadRequest("UpsertNodesSpec must contain at least one node")
+        
+        for node in spec.nodes:
+            if not node.id:
+                raise BadRequest("All nodes must have an ID")
+
+    def _validate_batch_ops(self, ops: List[BatchOperation]) -> None:
+        """Validate batch operations before processing."""
+        if not ops:
+            raise BadRequest("Batch operations list cannot be empty")
+        
+        # Check against graph capabilities if available
+        caps = self._graph.capabilities()
+        max_ops = caps.max_batch_ops or 100
+        if len(ops) > max_ops:
+            raise BadRequest(f"Too many batch operations: {len(ops)} (max: {max_ops})")
+
     def _build_raw_query(
         self,
         query: str,
@@ -586,6 +634,7 @@ class CorpusAutoGenGraphClient:
         """
         effective_dialect = dialect or self._default_dialect
         effective_namespace = namespace or self._default_namespace
+        effective_timeout = timeout_ms or self._default_timeout_ms  # Use default timeout
 
         raw: Dict[str, Any] = {
             "text": query,
@@ -597,8 +646,8 @@ class CorpusAutoGenGraphClient:
             raw["dialect"] = effective_dialect
         if effective_namespace is not None:
             raw["namespace"] = effective_namespace
-        if timeout_ms is not None:
-            raw["timeout_ms"] = int(timeout_ms)
+        if effective_timeout is not None:  # Include timeout if specified
+            raw["timeout_ms"] = int(effective_timeout)
 
         return raw
 
@@ -979,6 +1028,8 @@ class CorpusAutoGenGraphClient:
         and passes the desired namespace via framework_ctx so that the
         translator can build the correct UpsertNodesSpec.
         """
+        self._validate_upsert_spec(spec)  # ESSENTIAL CHANGE: Added validation
+
         ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
         framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
 
@@ -1005,6 +1056,8 @@ class CorpusAutoGenGraphClient:
         """
         Async wrapper for upserting nodes.
         """
+        self._validate_upsert_spec(spec)  # ESSENTIAL CHANGE: Added validation
+
         ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
         framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
 
@@ -1296,6 +1349,8 @@ class CorpusAutoGenGraphClient:
         Translates `BatchOperation` dataclasses into the raw mapping shape
         expected by GraphTranslator and returns the underlying `BatchResult`.
         """
+        self._validate_batch_ops(ops)  # ESSENTIAL CHANGE: Added validation
+
         ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
 
         raw_batch_ops: List[Mapping[str, Any]] = [
@@ -1325,6 +1380,8 @@ class CorpusAutoGenGraphClient:
         """
         Async wrapper for batch operations.
         """
+        self._validate_batch_ops(ops)  # ESSENTIAL CHANGE: Added validation
+
         ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
 
         raw_batch_ops: List[Mapping[str, Any]] = [
