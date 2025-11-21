@@ -20,7 +20,7 @@ If the **Corpus SDK** is the reference implementation of the **protocols**, **Co
 
 ---
 
-## 🤔 The Problem: AI Infrastructure Chaos
+## The Problem: AI Infrastructure Chaos
 
 Every AI application today ends up fighting the same battle:
 
@@ -44,7 +44,7 @@ The result:
 
 ---
 
-## 💡 The Vision: Protocol-First Unification
+## The Vision: Protocol-First Unification
 
 What if you could treat AI infrastructure like web infrastructure?
 
