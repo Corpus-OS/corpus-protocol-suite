@@ -18,8 +18,8 @@ Design goals
 
 * Protocol-first, translator-centric:
     Semantic Kernel is an integration surface. All real behavior goes
-    through the Corpus `LLMProtocolV1` and `LLMTranslator` in
-    `corpus_sdk.llm.framework_adapters.common.llm_translation`.
+    through the Corpus `LLMProtocolV1`, with a lightweight local translator
+    that centralizes protocol calls for this adapter.
 
 * Optional dependency safe:
     This module can be imported without Semantic Kernel installed.
@@ -39,7 +39,7 @@ Design goals
 
 * Centralized resilience:
     - Any retries / backoff / circuit breaking live in the
-      `LLMProtocolV1` implementation and/or `LLMTranslator`, not here.
+      `LLMProtocolV1` implementation, not here.
 
 Usage:
     sk_chat = CorpusSemanticKernelChatCompletion(
@@ -67,10 +67,6 @@ from typing import (
 
 from corpus_sdk.core.context_translation import ContextTranslator
 from corpus_sdk.core.error_context import attach_context
-from corpus_sdk.llm.framework_adapters.common.llm_translation import (
-    DefaultLLMFrameworkTranslator,
-    LLMTranslator,
-)
 from corpus_sdk.llm.framework_adapters.common.message_translation import (
     MessageTranslator,
     NormalizedMessage,
@@ -307,11 +303,31 @@ def _build_ctx_and_sampling_params(
     Build OperationContext and Corpus sampling params from SK prompt settings.
     """
     # Use ContextTranslator to preserve tenant / trace / deadline when possible.
-    ctx = ContextTranslator.from_semantic_kernel_context(
-        sk_context=None,
-        settings=settings,
-        framework_version=framework_version,
-    )
+    ctx: Optional[OperationContext]
+    try:
+        ctx = ContextTranslator.from_semantic_kernel_context(
+            sk_context=None,
+            settings=settings,
+            framework_version=framework_version,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "ContextTranslator.from_semantic_kernel_context failed: %s",
+            exc,
+            extra={"framework": "semantic_kernel"},
+        )
+        ctx = None
+
+    if not isinstance(ctx, OperationContext):
+        # Fallback: empty but valid context
+        ctx = OperationContext(
+            request_id=None,
+            idempotency_key=None,
+            deadline_ms=None,
+            traceparent=None,
+            tenant=None,
+            attrs={},
+        )
 
     # Settings introspection is intentionally conservative and string-based to
     # tolerate minor SK version changes.
@@ -414,6 +430,59 @@ def _chunk_to_streaming_chat_message(
 
 
 # ---------------------------------------------------------------------------
+# Local LLM translator (mini abstraction over LLMProtocolV1)
+# --------------------------------------------------------------------------- #
+
+
+class _LocalLLMTranslator:
+    """
+    Minimal translator for the Semantic Kernel adapter.
+
+    This local translator centralizes calls into `LLMProtocolV1` and exposes
+    a stable async interface:
+
+        - arun_complete
+        - arun_stream
+
+    so the adapter logic can remain focused on SK-specific shaping
+    (ChatHistory in, ChatMessageContent/StreamingChatMessageContent out).
+    """
+
+    def __init__(self, adapter: LLMProtocolV1, framework: str = "semantic_kernel") -> None:
+        self._adapter = adapter
+        self._framework = framework  # reserved for future use (metrics, logging, etc.)
+
+    async def arun_complete(
+        self,
+        *,
+        messages: List[Dict[str, Any]],
+        op_ctx: OperationContext,
+        params: Dict[str, Any],
+    ) -> LLMCompletion:
+        """Async completion routed directly to the underlying LLMProtocolV1."""
+        return await self._adapter.acomplete(
+            messages=messages,
+            ctx=op_ctx,
+            **params,
+        )
+
+    async def arun_stream(
+        self,
+        *,
+        messages: List[Dict[str, Any]],
+        op_ctx: OperationContext,
+        params: Dict[str, Any],
+    ) -> AsyncIterator[LLMChunk]:
+        """Async streaming routed directly to the underlying LLMProtocolV1."""
+        async for chunk in self._adapter.astream(
+            messages=messages,
+            ctx=op_ctx,
+            **params,
+        ):
+            yield chunk
+
+
+# ---------------------------------------------------------------------------
 # Public adapter
 # ---------------------------------------------------------------------------
 
@@ -423,7 +492,7 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
     Semantic Kernel `ChatCompletionClientBase` backed by a Corpus LLM protocol.
 
     This class allows SK agents to use any implementation of `LLMProtocolV1`
-    (wrapped by `LLMTranslator`) as their chat completion service.
+    as their chat completion service, via a small local translator.
 
     Attributes
     ----------
@@ -451,16 +520,6 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
     # Optional framework metadata
     _framework_version: Optional[str]
 
-    class _SemanticKernelLLMFrameworkTranslator(DefaultLLMFrameworkTranslator):
-        """
-        Semantic Kernel–specific LLMFrameworkTranslator.
-
-        Currently inherits default behavior (pass-through of protocol-level
-        results), but exists as a hook for SK-specific customization.
-        """
-
-        pass
-
     def __init__(
         self,
         llm_adapter: LLMProtocolV1,
@@ -482,10 +541,10 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
         # Validate critical parameters
         if not isinstance(llm_adapter, LLMProtocolV1):
             raise TypeError("llm_adapter must implement LLMProtocolV1")
-        
+
         if not 0 <= temperature <= 2:
             raise ValueError("temperature must be between 0 and 2")
-        
+
         if max_tokens is not None and max_tokens < 1:
             raise ValueError("max_tokens must be positive")
 
@@ -502,18 +561,16 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
     # ------------------------------------------------------------------ #
 
     @cached_property
-    def _translator(self) -> LLMTranslator:
+    def _translator(self) -> _LocalLLMTranslator:
         """
-        Lazily construct and cache the `LLMTranslator`.
+        Lazily construct and cache the local translator.
 
-        All orchestration, including any async policy needed by the
-        underlying protocol implementation, is centralized in `LLMTranslator`.
+        All orchestration specific to Semantic Kernel is centralized here,
+        while protocol behavior lives in the underlying `LLMProtocolV1`.
         """
-        framework_translator = self._SemanticKernelLLMFrameworkTranslator()
-        return LLMTranslator(
+        return _LocalLLMTranslator(
             adapter=self.llm_adapter,
             framework="semantic_kernel",
-            translator=framework_translator,
         )
 
     # ------------------------------------------------------------------ #
@@ -528,7 +585,7 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
         stream: bool,
         messages_count: int,
         model: str,
-        ctx: Optional[OperationContext],
+        ctx: OperationContext,
         params: Dict[str, Any],
     ):
         """
@@ -548,8 +605,8 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
                 top_p=params.get("top_p"),
                 frequency_penalty=params.get("frequency_penalty"),
                 presence_penalty=params.get("presence_penalty"),
-                request_id=getattr(ctx, "request_id", None) if ctx is not None else None,
-                tenant=getattr(ctx, "tenant", None) if ctx is not None else None,
+                request_id=ctx.request_id,
+                tenant=ctx.tenant,
                 stream=stream,
             )
             raise
@@ -666,7 +723,7 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
         **kwargs: Any,
     ) -> AsyncIterator[StreamingChatMessageContent]:
         """
-        Streaming chat completion via `LLMTranslator.arun_stream`.
+        Streaming chat completion via the local translator's `arun_stream`.
 
         Yields Semantic Kernel `StreamingChatMessageContent` objects for each
         chunk produced by the Corpus protocol.
