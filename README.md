@@ -24,7 +24,7 @@ Designed to compose cleanly under any external control plane (router, scheduler,
 - **TCP/IP** → Universal network protocol  
 - **Corpus Protocol** → Universal AI infrastructure protocol
 
-**Corpus Router implements this vision** - it's the intelligent control plane that speaks the universal Corpus Protocol across all AI domains.
+**CORPUS Protocol implements this vision** - it's the intelligent control plane that speaks the universal Corpus Protocol across all AI domains.
 
 > **Open-Core Model**
 >
