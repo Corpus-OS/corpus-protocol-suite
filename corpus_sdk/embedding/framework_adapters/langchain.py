@@ -21,7 +21,7 @@ framework-specific skin over the protocol-first Corpus embedding stack.
 from __future__ import annotations
 
 import logging
-from functools import cached_property, wraps
+from functools import wraps
 from typing import (
     Any,
     Dict,
@@ -34,6 +34,7 @@ from typing import (
     Callable,
 )
 
+from pydantic import BaseModel, ConfigDict, PrivateAttr
 from langchain_core.embeddings import Embeddings
 
 from corpus_sdk.core.context_translation import (
@@ -42,6 +43,7 @@ from corpus_sdk.core.context_translation import (
 from corpus_sdk.core.error_context import attach_context
 from corpus_sdk.embedding.embedding_base import (
     EmbeddingProtocolV1,
+    OperationContext,
 )
 from corpus_sdk.embedding.framework_adapters.common.embedding_translation import (
     EmbeddingTranslator,
@@ -74,7 +76,7 @@ def with_embedding_error_context(
         def wrapper(*args: Any, **kwargs: Any) -> T:
             try:
                 return func(*args, **kwargs)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 enhanced_context = context_kwargs.copy()
                 attach_context(
                     exc,
@@ -99,7 +101,7 @@ def with_async_embedding_error_context(
         async def wrapper(*args: Any, **kwargs: Any) -> T:
             try:
                 return await func(*args, **kwargs)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 enhanced_context = context_kwargs.copy()
                 attach_context(
                     exc,
@@ -112,34 +114,12 @@ def with_async_embedding_error_context(
     return decorator
 
 
-class CorpusLangChainEmbeddings(Embeddings):
+class CorpusLangChainEmbeddings(BaseModel, Embeddings):
     """
     LangChain `Embeddings` backed by a Corpus `EmbeddingProtocolV1` adapter.
 
-    Responsibilities (this layer)
-    -----------------------------
-    - Accept LangChain-style calls (`embed_documents`, `embed_query`,
-      and their async variants).
-    - Derive an `OperationContext` from optional LangChain `config`
-      via `context_translation.from_langchain`.
-    - Build a small `framework_ctx` (currently just `model`) that is
-      passed to the common embedding translator.
-    - Use `EmbeddingTranslator` to:
-        * Build EmbedSpecs
-        * Call the underlying adapter
-        * Translate the result to a framework-facing shape
-    - Rely on `EmbeddingTranslator` for async↔sync bridging and timeouts.
-    - Attach structured, LangChain-specific error context via `attach_context`.
-
-    Non-responsibilities
-    --------------------
-    - Text normalization (whitespace, truncation, casing).
-    - Batching logic, token-aware batching, cost tracking.
-    - Provider-specific behavior (rate limits, retries, etc.).
-
-    All of those live in:
-    - `corpus_sdk.embedding.framework_adapters.common.embedding_translation`
-    - Concrete `EmbeddingProtocolV1` adapter implementations.
+    Inherits from `BaseModel` to support Pydantic-style initialization (standard
+    in LangChain) and `Embeddings` to satisfy the interface contract.
 
     Attributes
     ----------
@@ -148,17 +128,16 @@ class CorpusLangChainEmbeddings(Embeddings):
 
     model:
         Optional default model identifier. Can be overridden per call by
-        passing `model=...` to `embed_documents` / `embed_query` /
-        their async variants. If unset, the underlying adapter / translator
-        is responsible for choosing a default.
+        passing `model=...` to `embed_documents` / `embed_query` or their
+        async variants.
 
     batch_config:
         Optional `BatchConfig` to control batching behavior. If None, the
-        default config in the common embedding layer is used.
+        defaults in the common embedding layer are used.
 
     text_normalization_config:
         Optional `TextNormalizationConfig` to control whitespace cleanup,
-        truncation, casing, encoding, etc. If None, the default is used.
+        truncation, casing, encoding, etc.
     """
 
     corpus_adapter: EmbeddingProtocolV1
@@ -166,54 +145,55 @@ class CorpusLangChainEmbeddings(Embeddings):
     batch_config: Optional[BatchConfig] = None
     text_normalization_config: Optional[TextNormalizationConfig] = None
 
-    # Pydantic v2-style config: allow arbitrary types like EmbeddingProtocolV1.
-    model_config = {"arbitrary_types_allowed": True}
+    # Pydantic v2 configuration
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    # Private attribute for caching the translator instance
+    _translator_cache: Optional[EmbeddingTranslator] = PrivateAttr(default=None)
 
     # ------------------------------------------------------------------ #
     # Internal helpers
     # ------------------------------------------------------------------ #
 
-    @cached_property
+    @property
     def _translator(self) -> EmbeddingTranslator:
         """
         Lazily construct and cache the `EmbeddingTranslator`.
 
-        Uses `cached_property` for cleaner implementation and thread safety.
+        Uses a PrivateAttr cache so this remains compatible with Pydantic v2.
         """
-        return create_embedding_translator(
-            adapter=self.corpus_adapter,
-            framework="langchain",
-            translator=None,  # use registry/default generic translator
-            batch_config=self.batch_config,
-            text_normalization_config=self.text_normalization_config,
-        )
+        if self._translator_cache is None:
+            self._translator_cache = create_embedding_translator(
+                adapter=self.corpus_adapter,
+                framework="langchain",
+                translator=None,  # use registry/default generic translator
+                batch_config=self.batch_config,
+                text_normalization_config=self.text_normalization_config,
+            )
+        return self._translator_cache
 
     def _build_contexts(
         self,
         *,
         config: Optional[Mapping[str, Any]] = None,
         model: Optional[str] = None,
-    ) -> Tuple[Any, Dict[str, Any], Dict[str, Any]]:
+    ) -> Tuple[OperationContext, Dict[str, Any], Dict[str, Any]]:
         """
         Build:
         - `core_ctx`: core OperationContext (from context_translation)
         - `op_ctx_dict`: normalized dict version of core_ctx (for embedding layer)
         - `framework_ctx`: dict passed to the translator for LangChain-specific hints
-
-        We deliberately pass `op_ctx_dict` into the embedding translation layer
-        so that it can reconstruct its own embedding OperationContext type
-        independently.
         """
-        core_ctx = context_from_langchain(config)
+        core_ctx: OperationContext = context_from_langchain(config)
 
         # Normalized dict for embedding OperationContext reconstruction.
         op_ctx_dict: Dict[str, Any] = {}
-        if hasattr(core_ctx, 'to_dict'):
+        if hasattr(core_ctx, "to_dict"):
             op_ctx_dict = core_ctx.to_dict()
-        elif hasattr(core_ctx, '__dict__'):
+        elif hasattr(core_ctx, "__dict__"):
             op_ctx_dict = core_ctx.__dict__
 
-        # Framework-level context: currently we mainly care about model hint.
+        # Framework-level context: currently we mainly care about a model hint.
         framework_ctx: Dict[str, Any] = {
             "framework": "langchain",
         }
@@ -235,22 +215,18 @@ class CorpusLangChainEmbeddings(Embeddings):
         - EmbedResult-like with `.embeddings` attribute:
             result.embeddings -> [[...], [...]]
 
-        This makes the adapter resilient to future translator customizations,
-        as long as they expose an `embeddings` vector-of-vectors somewhere.
+        Python 3.9–compatible (avoids `match` / `case`).
         """
-        embeddings_obj: Any
-
-        match result:
-            case {"embeddings": emb}:
-                embeddings_obj = emb
-            case _ if hasattr(result, "embeddings"):
-                embeddings_obj = getattr(result, "embeddings")
-            case _:
-                embeddings_obj = result
+        if isinstance(result, Mapping) and "embeddings" in result:
+            embeddings_obj: Any = result["embeddings"]
+        elif hasattr(result, "embeddings"):
+            embeddings_obj = getattr(result, "embeddings")
+        else:
+            embeddings_obj = result
 
         if not isinstance(embeddings_obj, Sequence):
             raise TypeError(
-                f"Translator result does not contain a valid embeddings sequence: "
+                "Translator result does not contain a valid embeddings sequence: "
                 f"type={type(embeddings_obj).__name__}",
                 code=ErrorCodes.INVALID_EMBEDDING_RESULT,
             )
@@ -259,7 +235,7 @@ class CorpusLangChainEmbeddings(Embeddings):
         for i, row in enumerate(embeddings_obj):
             if not isinstance(row, Sequence):
                 raise TypeError(
-                    f"Expected each embedding row to be a sequence, "
+                    "Expected each embedding row to be a sequence, "
                     f"got {type(row).__name__} at index {i}",
                     code=ErrorCodes.INVALID_EMBEDDING_RESULT,
                 )
@@ -277,10 +253,10 @@ class CorpusLangChainEmbeddings(Embeddings):
         """
         Coerce translator result for a single-text embed into List[float].
 
-        We always normalize via `_coerce_embedding_matrix` and then:
+        Strategy:
         - If the matrix is empty → raise
         - If it has exactly one row → return that row
-        - If it has multiple rows → return the first row but log a warning
+        - If it has multiple rows → return the first row and log a warning
         """
         matrix = self._coerce_embedding_matrix(result)
 
@@ -298,6 +274,36 @@ class CorpusLangChainEmbeddings(Embeddings):
             )
 
         return matrix[0]
+
+    def _warn_if_extreme_batch(
+        self,
+        texts: Sequence[str],
+        *,
+        op_name: str,
+    ) -> None:
+        """
+        Soft warning for extremely large batches when no batch_config limit
+        is configured. Actual batching / chunking is handled by the translator.
+        """
+        if isinstance(texts, (str, bytes)):
+            return
+
+        batch_size = len(texts)
+        if batch_size <= 10_000:
+            return
+
+        max_batch_size = (
+            None
+            if self.batch_config is None
+            else getattr(self.batch_config, "max_batch_size", None)
+        )
+        if max_batch_size is None:
+            logger.warning(
+                "%s called with batch_size=%d and no explicit BatchConfig.max_batch_size; "
+                "ensure your adapter/translator can handle very large batches.",
+                op_name,
+                batch_size,
+            )
 
     # ------------------------------------------------------------------ #
     # Async API
@@ -325,7 +331,9 @@ class CorpusLangChainEmbeddings(Embeddings):
         model:
             Optional per-call model override.
         """
-        core_ctx, op_ctx_dict, framework_ctx = self._build_contexts(
+        self._warn_if_extreme_batch(texts, op_name="aembed_documents")
+
+        _core_ctx, op_ctx_dict, framework_ctx = self._build_contexts(
             config=config,
             model=model,
         )
@@ -358,7 +366,7 @@ class CorpusLangChainEmbeddings(Embeddings):
         model:
             Optional per-call model override.
         """
-        core_ctx, op_ctx_dict, framework_ctx = self._build_contexts(
+        _core_ctx, op_ctx_dict, framework_ctx = self._build_contexts(
             config=config,
             model=model,
         )
@@ -371,7 +379,7 @@ class CorpusLangChainEmbeddings(Embeddings):
         return self._coerce_embedding_vector(translated)
 
     # ------------------------------------------------------------------ #
-    # Sync API (via EmbeddingTranslator)
+    # Sync API
     # ------------------------------------------------------------------ #
 
     @with_embedding_error_context("documents")
@@ -390,7 +398,9 @@ class CorpusLangChainEmbeddings(Embeddings):
         bridges async protocol calls and respects any `deadline_ms` timeout
         encoded in the OperationContext.
         """
-        core_ctx, op_ctx_dict, framework_ctx = self._build_contexts(
+        self._warn_if_extreme_batch(texts, op_name="embed_documents")
+
+        _core_ctx, op_ctx_dict, framework_ctx = self._build_contexts(
             config=config,
             model=model,
         )
@@ -418,7 +428,7 @@ class CorpusLangChainEmbeddings(Embeddings):
         bridges async protocol calls and respects any `deadline_ms` timeout
         encoded in the OperationContext.
         """
-        core_ctx, op_ctx_dict, framework_ctx = self._build_contexts(
+        _core_ctx, op_ctx_dict, framework_ctx = self._build_contexts(
             config=config,
             model=model,
         )
