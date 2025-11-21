@@ -9,14 +9,17 @@ Semantic Kernel in two layers:
 
 1. Core Python API:
    - `CorpusSemanticKernelVectorStore`: protocol-first vector store that
-     talks to a Corpus `BaseVectorAdapter` using VectorProtocolV1.
-   - Sync + async add/search/delete APIs.
-   - Optional streaming search via SyncStreamBridge.
-   - Optional Maximal Marginal Relevance (MMR) search.
-   - Optional client-side score thresholding.
-   - Capability-aware handling of namespaces, metadata filters, and
-     backend batch limits.
-   - Integration with OperationContext via `corpus_sdk.core.context_translation`.
+     talks to a Corpus `BaseVectorAdapter` using VectorProtocolV1 via VectorTranslator.
+   - Sync + async add/search/delete APIs (mirroring Semantic Kernel patterns)
+   - Proper integration with Corpus VectorProtocolV1 via VectorTranslator
+   - Namespace + metadata filter handling (capability-aware)
+   - Batch upserts and deletes that respect backend limits (enforced in translator)
+   - Optional client-side score thresholding
+   - Optional embedding function integration
+   - Optional streaming search via VectorTranslator.query_stream
+   - Optional Maximal Marginal Relevance (MMR) search
+   - Comprehensive configuration validation with runtime checks
+   - Graceful error recovery for partial batch failures
 
 2. Semantic Kernel plugin:
    - `CorpusSemanticKernelVectorPlugin`: a plugin object that can be
@@ -25,16 +28,23 @@ Semantic Kernel in two layers:
      or `Kernel.add_plugin(...)`.
    - Provides `@kernel_function`-decorated functions that SK can expose
      to the model for tool/function-calling.
+   - Full OperationContext propagation via `corpus_sdk.core.context_translation.from_semantic_kernel`
+   - Rich error context via `corpus_sdk.core.error_context.attach_context`
 
 Design philosophy
 -----------------
-- Protocol-first: all heavy lifting lives in `BaseVectorAdapter`.
-- Framework-agnostic core: the vector store does not depend on SK types.
-- SK-specific layer: plugin functions that translate SK context into
-  OperationContext using `from_semantic_kernel`.
+- Protocol-first: Semantic Kernel is a thin skin over Corpus vector adapters.
+- All heavy lifting (backpressure, deadlines, breakers, batching, etc.) lives in
+  the underlying adapter + the shared VectorTranslator, not here.
+- This layer focuses on:
+    * Translating SK-friendly documents ↔ Corpus Vector objects
+    * Respecting VectorCapabilities (namespaces, filters, batch sizes)
+    * Delegating sync/async orchestration to VectorTranslator
+    * Providing AI-optimized functions for Semantic Kernel tool calling
+    * Supporting SK-specific patterns (streaming, context propagation, memory)
 
-Usage (simplified)
-------------------
+Usage
+-----
 
     from semantic_kernel import Kernel
     from semantic_kernel.functions import KernelPlugin
@@ -68,6 +78,9 @@ Usage (simplified)
     # Now the model can call:
     #   corpus_vector.vector_search(...)
     #   corpus_vector.vector_search_stream(...)
+    #   corpus_vector.vector_mmr_search(...)
+    #   corpus_vector.vector_store_document(...)
+    #   corpus_vector.vector_get_capabilities(...)
 """
 
 from __future__ import annotations
@@ -75,9 +88,9 @@ from __future__ import annotations
 import logging
 import math
 import uuid
+from functools import cached_property
 from typing import (
     Any,
-    AsyncIterator,
     Dict,
     Iterable,
     Iterator,
@@ -92,7 +105,6 @@ from corpus_sdk.core.context_translation import (
     from_semantic_kernel as context_from_semantic_kernel,
     from_dict as context_from_dict,
 )
-from corpus_sdk.core.sync_bridge import sync_stream
 from corpus_sdk.vector.vector_base import (
     BaseVectorAdapter,
     Vector,
@@ -100,9 +112,6 @@ from corpus_sdk.vector.vector_base import (
     QueryResult,
     UpsertResult,
     DeleteResult,
-    QuerySpec,
-    UpsertSpec,
-    DeleteSpec,
     OperationContext,
     VectorCapabilities,
     # Errors
@@ -110,13 +119,17 @@ from corpus_sdk.vector.vector_base import (
     NotSupported,
     VectorAdapterError,
 )
-from corpus_sdk.core.async_bridge import AsyncBridge
+from corpus_sdk.vector.framework_adapters.common.vector_translation import (
+    DefaultVectorFrameworkTranslator,
+    VectorTranslator,
+)
 from corpus_sdk.core.error_context import attach_context
 
 # Semantic Kernel imports are optional; if SK is not installed, we fall back
 # to a no-op decorator so the rest of the SDK remains usable.
 try:  # pragma: no cover - import guard
     from semantic_kernel.functions import kernel_function
+    from semantic_kernel.exceptions import KernelFunctionException
 except Exception:  # pragma: no cover - SK not installed
 
     def kernel_function(func: Any = None, **_: Any):  # type: ignore[override]
@@ -136,6 +149,10 @@ except Exception:  # pragma: no cover - SK not installed
             return func
         return _wrap
 
+    class KernelFunctionException(Exception):  # type: ignore
+        """Fallback exception when SK is not available."""
+        pass
+
 
 logger = logging.getLogger(__name__)
 
@@ -148,43 +165,17 @@ class CorpusSemanticKernelVectorStore:
     Corpus vector store integration for Semantic Kernel.
 
     This class is framework-agnostic; it does not depend on SK types.
-    It provides sync + async APIs for:
+    It provides sync + async APIs optimized for Semantic Kernel patterns:
 
-    - Adding texts/documents
-    - Similarity search (with or without scores)
-    - Streaming similarity search (sync, via SyncStreamBridge)
-    - Maximal Marginal Relevance (MMR) search
-    - Delete by ID or metadata filter
+    - AI-friendly document formats and return types
+    - Streaming support for real-time applications
+    - MMR search for balanced relevance and diversity
+    - Comprehensive configuration validation with runtime enforcement
+    - Graceful error recovery for batch operations
 
-    Semantic Kernel-specific context is translated into an
-    `OperationContext` via `from_semantic_kernel` in the plugin layer.
-    This class accepts either:
-
-    - `ctx: OperationContext` directly, or
-    - `sk_context` / `sk_settings` / `context_dict` for on-the-fly
-      translation via `from_semantic_kernel` / `from_dict`.
+    All heavy lifting is delegated to VectorTranslator for consistent
+    orchestration across all framework adapters.
     """
-
-    corpus_adapter: BaseVectorAdapter
-    namespace: Optional[str] = "default"
-
-    id_field: str = "id"
-    text_field: str = "page_content"
-    metadata_field: Optional[str] = None
-
-    score_threshold: Optional[float] = None
-    batch_size: int = 100
-    max_query_batch_size: Optional[int] = None
-    default_top_k: int = 4
-
-    # Optional embedding integration
-    embedding_function: Optional[Any] = None  # Callable[[List[str]], Embeddings]
-
-    # Cached capabilities
-    _caps: Optional[VectorCapabilities] = None
-
-    # Pydantic-style config (kept for symmetry with other adapters)
-    model_config = {"arbitrary_types_allowed": True}
 
     def __init__(
         self,
@@ -196,21 +187,97 @@ class CorpusSemanticKernelVectorStore:
         metadata_field: Optional[str] = None,
         score_threshold: Optional[float] = None,
         batch_size: int = 100,
-        max_query_batch_size: Optional[int] = None,
         default_top_k: int = 4,
         embedding_function: Optional[Any] = None,
     ) -> None:
+        # Validate and set configuration with runtime checks
         self.corpus_adapter = corpus_adapter
         self.namespace = namespace
-        self.id_field = id_field
-        self.text_field = text_field
-        self.metadata_field = metadata_field
-        self.score_threshold = score_threshold
-        self.batch_size = int(batch_size)
-        self.max_query_batch_size = max_query_batch_size
-        self.default_top_k = int(default_top_k)
+
+        # Validate and set fields with uniqueness check
+        self.id_field = str(id_field)
+        self.text_field = str(text_field)
+        self.metadata_field = str(metadata_field) if metadata_field else None
+
+        # Validate field uniqueness
+        reserved_fields = {self.id_field, self.text_field}
+        if self.metadata_field:
+            reserved_fields.add(self.metadata_field)
+        if len(reserved_fields) != (3 if self.metadata_field else 2):
+            raise ValueError(
+                f"Reserved metadata fields must be unique: {reserved_fields}"
+            )
+
+        # Validate and set numeric parameters with bounds checking
+        self.score_threshold = self._validate_score_threshold(score_threshold)
+        self.batch_size = self._validate_batch_size(batch_size)
+        self.default_top_k = self._validate_default_top_k(default_top_k)
         self.embedding_function = embedding_function
-        self._caps = None
+
+        # Cached capabilities
+        self._caps: Optional[VectorCapabilities] = None
+
+    def _validate_batch_size(self, batch_size: int) -> int:
+        """Ensure batch_size is reasonable for vector operations."""
+        batch_size = int(batch_size)
+        if batch_size < 1:
+            raise ValueError("batch_size must be at least 1")
+        if batch_size > 10000:
+            logger.warning(
+                "batch_size %d is unusually large; consider reducing for better performance",
+                batch_size,
+            )
+        return batch_size
+
+    def _validate_default_top_k(self, default_top_k: int) -> int:
+        """Ensure default_top_k is reasonable for similarity search."""
+        default_top_k = int(default_top_k)
+        if default_top_k < 1:
+            raise ValueError("default_top_k must be at least 1")
+        if default_top_k > 1000:
+            logger.warning(
+                "default_top_k %d is unusually large; most applications use 4-100",
+                default_top_k,
+            )
+        return default_top_k
+
+    def _validate_score_threshold(
+        self,
+        score_threshold: Optional[float],
+    ) -> Optional[float]:
+        """Ensure score_threshold is a valid similarity score."""
+        if score_threshold is not None:
+            score_threshold = float(score_threshold)
+            if score_threshold < 0.0 or score_threshold > 1.0:
+                raise ValueError("score_threshold must be between 0.0 and 1.0")
+            if score_threshold > 0.9:
+                logger.warning(
+                    "score_threshold %.2f is very high; may filter out relevant results",
+                    score_threshold,
+                )
+        return score_threshold
+
+    # ------------------------------------------------------------------ #
+    # VectorTranslator integration
+    # ------------------------------------------------------------------ #
+
+    @cached_property
+    def _translator(self) -> VectorTranslator:
+        """
+        Lazily construct and cache the VectorTranslator.
+
+        The translator owns:
+        - Sync/async orchestration
+        - Batch splitting according to backend capabilities
+        - Raw→spec translation (dicts → QuerySpec/UpsertSpec/DeleteSpec)
+        - Error recovery and partial failure handling for batch operations
+        """
+        framework_translator = DefaultVectorFrameworkTranslator()
+        return VectorTranslator(
+            adapter=self.corpus_adapter,
+            framework="semantic_kernel",
+            translator=framework_translator,
+        )
 
     # ------------------------------------------------------------------ #
     # Capability helpers
@@ -218,31 +285,51 @@ class CorpusSemanticKernelVectorStore:
 
     def _get_caps_sync(self) -> VectorCapabilities:
         """
-        Synchronously fetch and cache VectorCapabilities.
-
-        Uses AsyncBridge to call the async adapter.
+        Synchronously fetch and cache VectorCapabilities via VectorTranslator.
         """
         if self._caps is not None:
             return self._caps
         try:
-            caps = AsyncBridge.run_async(self.corpus_adapter.capabilities())
+            caps = self._translator.capabilities()
             self._caps = caps
             return caps
         except Exception as exc:  # noqa: BLE001
-            attach_context(exc, framework="semantic_kernel", operation="capabilities")
+            attach_context(
+                exc,
+                framework="semantic_kernel",
+                operation="capabilities_sync",
+            )
             raise
 
     async def _get_caps_async(self) -> VectorCapabilities:
-        """Async capability fetch with caching."""
+        """Async capability fetch with caching via VectorTranslator."""
         if self._caps is not None:
             return self._caps
         try:
-            caps = await self.corpus_adapter.capabilities()
+            caps = await self._translator.arun_capabilities()
             self._caps = caps
             return caps
         except Exception as exc:  # noqa: BLE001
-            attach_context(exc, framework="semantic_kernel", operation="capabilities")
+            attach_context(
+                exc,
+                framework="semantic_kernel",
+                operation="capabilities_async",
+            )
             raise
+
+    def get_capabilities(self) -> VectorCapabilities:
+        """
+        Public method to get capabilities without breaking encapsulation.
+
+        Used by the plugin layer to expose capabilities to AI models.
+        """
+        return self._get_caps_sync()
+
+    async def aget_capabilities(self) -> VectorCapabilities:
+        """
+        Async public method to get capabilities without breaking encapsulation.
+        """
+        return await self._get_caps_async()
 
     def _effective_namespace(self, namespace: Optional[str]) -> Optional[str]:
         """
@@ -468,160 +555,351 @@ class CorpusSemanticKernelVectorStore:
             results.append((text, nested_meta, float(m.score)))
         return results
 
+    def _format_for_ai_model(self, matches: List[VectorMatch]) -> List[Dict[str, Any]]:
+        """
+        Format results for optimal consumption by AI models in SK.
+
+        Returns consistent structure with clear confidence scores and
+        token-efficient content formatting. Filters out internal system fields.
+        """
+
+        def _truncate_for_tokens(text: str, max_length: int = 500) -> str:
+            """Truncate text for token efficiency in AI model responses."""
+            if len(text) <= max_length:
+                return text
+            return text[:max_length].rsplit(" ", 1)[0] + "..."
+
+        # Define fields that should be filtered out as they're internal/system
+        internal_fields = {"id", "vector", "_id", "_vector", "embedding", "timestamp"}
+
+        return [
+            {
+                "content": _truncate_for_tokens(text),
+                "metadata": {k: v for k, v in meta.items() if k not in internal_fields},
+                "confidence": round(score, 3),
+                "source": "vector_database",
+            }
+            for text, meta, score in self._from_corpus_matches(matches)
+        ]
+
     # ------------------------------------------------------------------ #
-    # Core async Corpus operations
+    # Raw request builders for VectorTranslator
     # ------------------------------------------------------------------ #
 
-    async def _aupsert_vectors(
+    def _build_upsert_request(
         self,
         vectors: List[Vector],
         *,
         namespace: Optional[str],
-        ctx: Optional[OperationContext],
-    ) -> UpsertResult:
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """
-        Async upsert of a batch of Corpus Vector objects.
-
-        Respects backend max_batch_size if reported in capabilities.
-        Aggregates per-batch UpsertResult into a single result.
+        Build the raw upsert request + framework_ctx for VectorTranslator.
         """
-        caps = await self._get_caps_async()
-        max_batch = caps.max_batch_size or self.batch_size or len(vectors)
-        effective_batch_size = max(1, min(max_batch, self.batch_size or max_batch))
-
-        upserted_total = 0
-        failures_total: List[Dict[str, Any]] = []
-
         ns = self._effective_namespace(namespace)
+        raw: Dict[str, Any] = {
+            "namespace": ns,
+            "vectors": vectors,
+        }
+        framework_ctx: Dict[str, Any] = {"namespace": ns} if ns is not None else {}
+        return raw, framework_ctx
 
-        for i in range(0, len(vectors), effective_batch_size):
-            batch = vectors[i : i + effective_batch_size]
-            try:
-                spec = UpsertSpec(namespace=ns, vectors=batch)
-                result = await self.corpus_adapter.upsert(spec, ctx=ctx)
-                upserted_total += int(result.upserted_count or 0)
-                if result.failures:
-                    failures_total.extend(list(result.failures))
-            except Exception as exc:  # noqa: BLE001
-                attach_context(
-                    exc,
-                    framework="semantic_kernel",
-                    operation="upsert",
-                    namespace=ns,
-                    batch_index=i // effective_batch_size,
-                    batch_size=len(batch),
-                )
-                raise
-
-        return UpsertResult(
-            upserted_count=upserted_total,
-            failed_count=len(failures_total),
-            failures=failures_total,
-        )
-
-    async def _aquery_embedding(
+    def _build_query_request(
         self,
         embedding: Sequence[float],
         *,
-        k: int,
+        top_k: int,
         namespace: Optional[str],
         filter: Optional[Mapping[str, Any]],
         include_vectors: bool,
-        ctx: Optional[OperationContext],
-    ) -> List[VectorMatch]:
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """
-        Async similarity query for a single embedding.
+        Build the raw query request + framework_ctx for VectorTranslator.
         """
-        caps = await self._get_caps_async()
         ns = self._effective_namespace(namespace)
+        raw: Dict[str, Any] = {
+            "vector": [float(x) for x in embedding],
+            "top_k": int(top_k),
+            "namespace": ns,
+            "filter": dict(filter) if filter else None,
+            "include_metadata": True,
+            "include_vectors": bool(include_vectors),
+        }
+        framework_ctx: Dict[str, Any] = {"namespace": ns} if ns is not None else {}
+        return raw, framework_ctx
 
-        if caps.max_top_k is not None and k > caps.max_top_k:
-            raise BadRequest(
-                f"top_k {k} exceeds maximum of {caps.max_top_k}",
-                code="BAD_TOP_K",
-                details={"max_top_k": caps.max_top_k, "namespace": ns},
-            )
-
-        if filter and not caps.supports_metadata_filtering:
-            raise NotSupported(
-                "metadata filtering is not supported by the underlying vector adapter",
-                code="FILTER_NOT_SUPPORTED",
-                details={"namespace": ns},
-            )
-
-        spec = QuerySpec(
-            vector=[float(x) for x in embedding],
-            top_k=k,
-            namespace=ns,
-            filter=dict(filter) if filter else None,
-            include_metadata=True,
-            include_vectors=include_vectors,
-        )
-
-        try:
-            result: QueryResult = await self.corpus_adapter.query(spec, ctx=ctx)
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="semantic_kernel",
-                operation="query",
-                namespace=ns,
-                top_k=k,
-            )
-            raise
-
-        matches = list(result.matches or [])
-
-        if self.score_threshold is not None:
-            matches = [m for m in matches if float(m.score) >= float(self.score_threshold)]
-
-        return matches
-
-    async def _adelete_vectors(
+    def _build_delete_request(
         self,
         *,
         ids: Optional[List[str]],
         namespace: Optional[str],
         filter: Optional[Mapping[str, Any]],
-        ctx: Optional[OperationContext],
-    ) -> DeleteResult:
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """
-        Async delete by IDs or filter.
+        Build the raw delete request + framework_ctx for VectorTranslator.
+        """
+        ns = self._effective_namespace(namespace)
+        raw: Dict[str, Any] = {
+            "namespace": ns,
+            "ids": [str(i) for i in ids] if ids else None,
+            "filter": dict(filter) if filter else None,
+        }
+        framework_ctx: Dict[str, Any] = {"namespace": ns} if ns is not None else {}
+        return raw, framework_ctx
+
+    # ------------------------------------------------------------------ #
+    # Graceful error recovery for batch operations
+    # ------------------------------------------------------------------ #
+
+    def _handle_partial_upsert_failure(
+        self,
+        result: UpsertResult,
+        total_texts: int,
+        namespace: Optional[str],
+    ) -> None:
+        """
+        Handle partial failures in batch upsert operations gracefully.
+
+        Logs warnings for partial failures but doesn't raise exceptions for
+        non-critical failures, allowing successful operations to proceed.
+        Only raises exceptions for complete failures or critical errors.
+        """
+        if result.failed_count and result.failed_count > 0:
+            successful = result.upserted_count or 0
+            failed = result.failed_count
+
+            logger.warning(
+                "Partial upsert failure: %d/%d texts succeeded, %d failed in namespace %s",
+                successful,
+                total_texts,
+                failed,
+                namespace or "default",
+            )
+
+            # Log details of individual failures for debugging
+            if result.failures:
+                for failure in result.failures[:5]:  # Log first 5 failures
+                    logger.debug("Upsert failure: %s", failure)
+                if len(result.failures) > 5:
+                    logger.debug(
+                        "... and %d more failures", len(result.failures) - 5
+                    )
+
+        # Only raise exception if no texts were upserted at all
+        if (result.upserted_count or 0) == 0 and total_texts > 0:
+            raise VectorAdapterError(
+                f"All {total_texts} texts failed to upsert",
+                code="BATCH_UPSERT_FAILED",
+                details={
+                    "total_texts": total_texts,
+                    "namespace": namespace,
+                    "failures": result.failures or [],
+                },
+            )
+
+    # ------------------------------------------------------------------ #
+    # Validation helpers aligned with VectorCapabilities
+    # ------------------------------------------------------------------ #
+
+    def _validate_query_params_sync(
+        self,
+        top_k: int,
+        namespace: Optional[str],
+        filter: Optional[Mapping[str, Any]],
+    ) -> int:
+        """
+        Validate query parameters in a sync context against capabilities.
+
+        Returns the effective top_k value (possibly reduced to max_top_k).
+        """
+        caps = self._get_caps_sync()
+        ns = self._effective_namespace(namespace)
+        effective_top_k = int(top_k)
+
+        if caps.max_top_k is not None and effective_top_k > caps.max_top_k:
+            err = BadRequest(
+                f"top_k {effective_top_k} exceeds maximum of {caps.max_top_k}",
+                code="BAD_TOP_K",
+                details={"max_top_k": caps.max_top_k, "namespace": ns},
+            )
+            attach_context(
+                err,
+                framework="semantic_kernel",
+                operation="query_sync",
+                namespace=ns,
+                top_k=effective_top_k,
+            )
+            raise err
+
+        if filter and not caps.supports_metadata_filtering:
+            err = NotSupported(
+                "metadata filtering is not supported by the underlying vector adapter",
+                code="FILTER_NOT_SUPPORTED",
+                details={"namespace": ns},
+            )
+            attach_context(
+                err,
+                framework="semantic_kernel",
+                operation="query_sync",
+                namespace=ns,
+                top_k=effective_top_k,
+            )
+            raise err
+
+        return effective_top_k
+
+    async def _validate_query_params_async(
+        self,
+        top_k: int,
+        namespace: Optional[str],
+        filter: Optional[Mapping[str, Any]],
+    ) -> int:
+        """
+        Validate query parameters in an async context against capabilities.
+
+        Returns the effective top_k value (possibly reduced to max_top_k).
+        """
+        caps = await self._get_caps_async()
+        ns = self._effective_namespace(namespace)
+        effective_top_k = int(top_k)
+
+        if caps.max_top_k is not None and effective_top_k > caps.max_top_k:
+            err = BadRequest(
+                f"top_k {effective_top_k} exceeds maximum of {caps.max_top_k}",
+                code="BAD_TOP_K",
+                details={"max_top_k": caps.max_top_k, "namespace": ns},
+            )
+            attach_context(
+                err,
+                framework="semantic_kernel",
+                operation="query_async",
+                namespace=ns,
+                top_k=effective_top_k,
+            )
+            raise err
+
+        if filter and not caps.supports_metadata_filtering:
+            err = NotSupported(
+                "metadata filtering is not supported by the underlying vector adapter",
+                code="FILTER_NOT_SUPPORTED",
+                details={"namespace": ns},
+            )
+            attach_context(
+                err,
+                framework="semantic_kernel",
+                operation="query_async",
+                namespace=ns,
+                top_k=effective_top_k,
+            )
+            raise err
+
+        return effective_top_k
+
+    def _validate_delete_params_sync(
+        self,
+        *,
+        ids: Optional[List[str]],
+        namespace: Optional[str],
+        filter: Optional[Mapping[str, Any]],
+    ) -> None:
+        """
+        Validate delete parameters in a sync context against capabilities.
+        """
+        caps = self._get_caps_sync()
+        ns = self._effective_namespace(namespace)
+
+        if filter and not caps.supports_metadata_filtering:
+            err = NotSupported(
+                "delete by metadata filter is not supported by the underlying vector adapter",
+                code="FILTER_NOT_SUPPORTED",
+                details={"namespace": ns},
+            )
+            attach_context(
+                err,
+                framework="semantic_kernel",
+                operation="delete_sync",
+                namespace=ns,
+                ids_count=len(ids or []),
+            )
+            raise err
+
+        if not ids and not filter:
+            err = BadRequest(
+                "must provide ids or filter for delete",
+                code="BAD_DELETE",
+            )
+            attach_context(
+                err,
+                framework="semantic_kernel",
+                operation="delete_sync",
+                namespace=ns,
+                ids_count=0,
+            )
+            raise err
+
+    async def _validate_delete_params_async(
+        self,
+        *,
+        ids: Optional[List[str]],
+        namespace: Optional[str],
+        filter: Optional[Mapping[str, Any]],
+    ) -> None:
+        """
+        Validate delete parameters in an async context against capabilities.
         """
         caps = await self._get_caps_async()
         ns = self._effective_namespace(namespace)
 
         if filter and not caps.supports_metadata_filtering:
-            raise NotSupported(
+            err = NotSupported(
                 "delete by metadata filter is not supported by the underlying vector adapter",
                 code="FILTER_NOT_SUPPORTED",
                 details={"namespace": ns},
             )
-
-        if not ids and not filter:
-            raise BadRequest(
-                "must provide ids or filter for delete",
-                code="BAD_DELETE",
-            )
-
-        spec = DeleteSpec(
-            namespace=ns,
-            ids=[str(i) for i in ids] if ids else None,
-            filter=dict(filter) if filter else None,
-        )
-
-        try:
-            result: DeleteResult = await self.corpus_adapter.delete(spec, ctx=ctx)
-            return result
-        except Exception as exc:  # noqa: BLE001
             attach_context(
-                exc,
+                err,
                 framework="semantic_kernel",
-                operation="delete",
+                operation="delete_async",
                 namespace=ns,
                 ids_count=len(ids or []),
             )
-            raise
+            raise err
+
+        if not ids and not filter:
+            err = BadRequest(
+                "must provide ids or filter for delete",
+                code="BAD_DELETE",
+            )
+            attach_context(
+                err,
+                framework="semantic_kernel",
+                operation="delete_async",
+                namespace=ns,
+                ids_count=0,
+            )
+            raise err
+
+    def _validate_query_result_type(
+        self,
+        result: Any,
+        *,
+        operation: str,
+    ) -> QueryResult:
+        """
+        Ensure the translator returned a QueryResult.
+        """
+        if isinstance(result, QueryResult):
+            return result
+
+        err = BadRequest(
+            f"{operation} returned unsupported type: {type(result).__name__}",
+            code="BAD_TRANSLATED_RESULT",
+        )
+        attach_context(
+            err,
+            framework="semantic_kernel",
+            operation=operation,
+        )
+        raise err
 
     # ------------------------------------------------------------------ #
     # Embedding helper for queries
@@ -676,7 +954,7 @@ class CorpusSemanticKernelVectorStore:
         return [float(x) for x in embs[0]]
 
     # ------------------------------------------------------------------ #
-    # Public sync/async API
+    # Public sync/async API using VectorTranslator
     # ------------------------------------------------------------------ #
 
     def add_texts(
@@ -688,6 +966,12 @@ class CorpusSemanticKernelVectorStore:
     ) -> List[str]:
         """
         Add texts to the vector store (sync).
+
+        Behavior:
+        - Uses `embedding_function` if configured, unless explicit `embeddings`
+          are passed via kwargs.
+        - Delegates batching + capability-aware upserts to VectorTranslator.
+        - Handles partial failures gracefully via _handle_partial_upsert_failure.
         """
         texts_list = list(texts)
         if not texts_list:
@@ -709,16 +993,28 @@ class CorpusSemanticKernelVectorStore:
             namespace=namespace,
         )
 
+        raw_request, framework_ctx = self._build_upsert_request(
+            vectors,
+            namespace=namespace,
+        )
+
         try:
-            AsyncBridge.run_async(
-                self._aupsert_vectors(
-                    vectors,
-                    namespace=namespace,
-                    ctx=ctx,
-                )
+            result = self._translator.upsert(
+                raw_request,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
             )
+
+            # Handle partial failures gracefully
+            if isinstance(result, UpsertResult):
+                self._handle_partial_upsert_failure(
+                    result,
+                    len(texts_list),
+                    namespace,
+                )
+
         except Exception:
-            # Errors already have context attached.
+            # Errors already have context attached by the translator.
             raise
 
         return ids_norm
@@ -753,11 +1049,30 @@ class CorpusSemanticKernelVectorStore:
             namespace=namespace,
         )
 
-        await self._aupsert_vectors(
+        raw_request, framework_ctx = self._build_upsert_request(
             vectors,
             namespace=namespace,
-            ctx=ctx,
         )
+
+        try:
+            result = await self._translator.arun_upsert(
+                raw_request,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+
+            # Handle partial failures gracefully
+            if isinstance(result, UpsertResult):
+                self._handle_partial_upsert_failure(
+                    result,
+                    len(texts_list),
+                    namespace,
+                )
+
+        except Exception:
+            # Translator/adapter already annotated the error.
+            raise
+
         return ids_norm
 
     def add_documents(
@@ -803,40 +1118,66 @@ class CorpusSemanticKernelVectorStore:
         **kwargs: Any,
     ) -> List[Dict[str, Any]]:
         """
-        Perform similarity search and return document dicts (sync).
+        Perform similarity search and return AI-optimized document dicts (sync).
 
         Return shape:
-            [{"page_content": str, "metadata": dict, "score": float}, ...]
+            [
+                {
+                    "content": str,
+                    "metadata": dict,
+                    "confidence": float,
+                    "source": "vector_database",
+                },
+                ...
+            ]
         """
         embedding: Optional[Sequence[float]] = kwargs.get("embedding")
         namespace: Optional[str] = kwargs.get("namespace")
         ctx = self._build_ctx(**kwargs)
 
         query_emb = self._embed_query(query, embedding=embedding)
+        top_k = k or self.default_top_k
+        top_k = self._validate_query_params_sync(top_k, namespace, filter)
+
+        raw_query, framework_ctx = self._build_query_request(
+            query_emb,
+            top_k=top_k,
+            namespace=namespace,
+            filter=filter,
+            include_vectors=False,
+        )
+
         try:
-            matches = AsyncBridge.run_async(
-                self._aquery_embedding(
-                    query_emb,
-                    k=k or self.default_top_k,
-                    namespace=namespace,
-                    filter=filter,
-                    include_vectors=False,
-                    ctx=ctx,
-                )
+            result_any = self._translator.query(
+                raw_query,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
             )
-        except Exception:
+        except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework="semantic_kernel",
+                operation="similarity_search_sync",
+                namespace=self._effective_namespace(namespace),
+                top_k=top_k,
+            )
             raise
 
-        docs = []
-        for text, meta, score in self._from_corpus_matches(matches):
-            docs.append(
-                {
-                    "page_content": text,
-                    "metadata": meta,
-                    "score": score,
-                }
-            )
-        return docs
+        result = self._validate_query_result_type(
+            result_any,
+            operation="translator.query_sync",
+        )
+
+        matches_list: List[VectorMatch] = list(result.matches or [])
+
+        # Apply client-side score thresholding
+        if self.score_threshold is not None:
+            threshold = float(self.score_threshold)
+            matches_list = [
+                m for m in matches_list if float(m.score) >= threshold
+            ]
+
+        return self._format_for_ai_model(matches_list)
 
     def similarity_search_stream(
         self,
@@ -846,45 +1187,72 @@ class CorpusSemanticKernelVectorStore:
         **kwargs: Any,
     ) -> Iterator[Dict[str, Any]]:
         """
-        Streaming similarity search (sync), yielding document dicts one by one.
+        Streaming similarity search (sync), yielding AI-optimized document dicts.
 
-        This uses SyncStreamBridge under the hood via `sync_stream` to bridge
-        the async query into a synchronous iterator.
+        Each yielded item has the shape:
+            {
+                "content": str,
+                "metadata": dict,
+                "confidence": float,
+                "source": "vector_database",
+            }
         """
         embedding: Optional[Sequence[float]] = kwargs.get("embedding")
         namespace: Optional[str] = kwargs.get("namespace")
         ctx = self._build_ctx(**kwargs)
         top_k = k or self.default_top_k
+        top_k = self._validate_query_params_sync(top_k, namespace, filter)
 
         query_emb = self._embed_query(query, embedding=embedding)
 
-        async def _stream_coro() -> AsyncIterator[VectorMatch]:
-            matches = await self._aquery_embedding(
-                query_emb,
-                k=top_k,
-                namespace=namespace,
-                filter=filter,
-                include_vectors=False,
-                ctx=ctx,
-            )
-            for m in matches:
-                yield m
+        raw_query, framework_ctx = self._build_query_request(
+            query_emb,
+            top_k=top_k,
+            namespace=namespace,
+            filter=filter,
+            include_vectors=False,
+        )
 
-        for match in sync_stream(
-            _stream_coro,
-            framework="semantic_kernel",
-            error_context={
-                "operation": "similarity_search_stream",
-                "namespace": namespace,
-                "top_k": top_k,
-            },
-        ):
-            text, meta, score = self._from_corpus_matches([match])[0]
-            yield {
-                "page_content": text,
-                "metadata": meta,
-                "score": score,
-            }
+        try:
+            for item in self._translator.query_stream(
+                raw_query,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            ):
+                if not isinstance(item, VectorMatch):
+                    err = VectorAdapterError(
+                        f"VectorTranslator.query_stream yielded unsupported type: {type(item).__name__}",
+                        code="BAD_STREAM_CHUNK",
+                    )
+                    attach_context(
+                        err,
+                        framework="semantic_kernel",
+                        operation="similarity_search_stream",
+                        namespace=self._effective_namespace(namespace),
+                        top_k=top_k,
+                    )
+                    raise err
+
+                match = item
+                # Client-side score thresholding per chunk
+                if (
+                    self.score_threshold is not None
+                    and float(match.score) < float(self.score_threshold)
+                ):
+                    continue
+
+                formatted = self._format_for_ai_model([match])
+                if formatted:
+                    yield formatted[0]
+        except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework="semantic_kernel",
+                operation="similarity_search_stream",
+                namespace=self._effective_namespace(namespace),
+                top_k=top_k,
+            )
+            raise
 
     async def asimilarity_search(
         self,
@@ -894,31 +1262,56 @@ class CorpusSemanticKernelVectorStore:
         **kwargs: Any,
     ) -> List[Dict[str, Any]]:
         """
-        Perform similarity search and return document dicts (async).
+        Perform similarity search and return AI-optimized document dicts (async).
+
+        Return shape:
+            [
+                {
+                    "content": str,
+                    "metadata": dict,
+                    "confidence": float,
+                    "source": "vector_database",
+                },
+                ...
+            ]
         """
         embedding: Optional[Sequence[float]] = kwargs.get("embedding")
         namespace: Optional[str] = kwargs.get("namespace")
         ctx = self._build_ctx(**kwargs)
 
         query_emb = self._embed_query(query, embedding=embedding)
-        matches = await self._aquery_embedding(
+        top_k = k or self.default_top_k
+        top_k = await self._validate_query_params_async(top_k, namespace, filter)
+
+        raw_query, framework_ctx = self._build_query_request(
             query_emb,
-            k=k or self.default_top_k,
+            top_k=top_k,
             namespace=namespace,
             filter=filter,
             include_vectors=False,
-            ctx=ctx,
         )
-        docs = []
-        for text, meta, score in self._from_corpus_matches(matches):
-            docs.append(
-                {
-                    "page_content": text,
-                    "metadata": meta,
-                    "score": score,
-                }
-            )
-        return docs
+
+        result_any = await self._translator.arun_query(
+            raw_query,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+
+        result = self._validate_query_result_type(
+            result_any,
+            operation="translator.query_async",
+        )
+
+        matches_list: List[VectorMatch] = list(result.matches or [])
+
+        # Apply client-side score thresholding
+        if self.score_threshold is not None:
+            threshold = float(self.score_threshold)
+            matches_list = [
+                m for m in matches_list if float(m.score) >= threshold
+            ]
+
+        return self._format_for_ai_model(matches_list)
 
     def similarity_search_with_score(
         self,
@@ -928,10 +1321,13 @@ class CorpusSemanticKernelVectorStore:
         **kwargs: Any,
     ) -> List[Tuple[Dict[str, Any], float]]:
         """
-        Similarity search returning (doc_dict, score) tuples (sync).
+        Similarity search returning (doc_dict, confidence) tuples (sync).
+
+        Each doc_dict has the AI-optimized shape:
+            {"content", "metadata", "confidence", "source"}.
         """
         docs = self.similarity_search(query, k=k, filter=filter, **kwargs)
-        return [(doc, float(doc["score"])) for doc in docs]
+        return [(doc, float(doc["confidence"])) for doc in docs]
 
     async def asimilarity_search_with_score(
         self,
@@ -941,10 +1337,13 @@ class CorpusSemanticKernelVectorStore:
         **kwargs: Any,
     ) -> List[Tuple[Dict[str, Any], float]]:
         """
-        Similarity search returning (doc_dict, score) tuples (async).
+        Similarity search returning (doc_dict, confidence) tuples (async).
+
+        Each doc_dict has the AI-optimized shape:
+            {"content", "metadata", "confidence", "source"}.
         """
         docs = await self.asimilarity_search(query, k=k, filter=filter, **kwargs)
-        return [(doc, float(doc["score"])) for doc in docs]
+        return [(doc, float(doc["confidence"])) for doc in docs]
 
     # ------------------------------------------------------------------ #
     # MMR search (improved implementation)
@@ -966,7 +1365,6 @@ class CorpusSemanticKernelVectorStore:
 
     def _mmr_select_indices(
         self,
-        query_vec: Sequence[float],
         candidate_matches: List[VectorMatch],
         k: int,
         lambda_mult: float,
@@ -975,7 +1373,6 @@ class CorpusSemanticKernelVectorStore:
         Improved MMR selector that respects original database scores and caches similarities.
 
         Args:
-            query_vec: The query embedding vector
             candidate_matches: Candidate matches with original scores and vectors
             k: Number of results to select
             lambda_mult: MMR lambda parameter (0-1), higher values favor relevance
@@ -1064,48 +1461,71 @@ class CorpusSemanticKernelVectorStore:
 
         This runs a similarity search with a larger `fetch_k` and then
         selects a subset of results via MMR based on vector geometry and
-        original database scores.
+        original database scores. Returns AI-optimized document dicts:
+            {"content", "metadata", "confidence", "source"}.
         """
+        if not (0.0 <= lambda_mult <= 1.0):
+            err = BadRequest(
+                f"lambda_mult must be in [0, 1], got {lambda_mult}",
+                code="BAD_MMR_LAMBDA",
+            )
+            attach_context(
+                err,
+                framework="semantic_kernel",
+                operation="mmr_search_sync",
+                lambda_mult=lambda_mult,
+            )
+            raise err
+
         fetch_k: int = kwargs.get("fetch_k") or max(k * 4, k + 5)
         embedding: Optional[Sequence[float]] = kwargs.get("embedding")
         namespace: Optional[str] = kwargs.get("namespace")
         ctx = self._build_ctx(**kwargs)
 
+        # Validate fetch_k against capabilities (treating it as top_k for the query)
+        fetch_k = self._validate_query_params_sync(fetch_k, namespace, filter)
+
         query_emb = self._embed_query(query, embedding=embedding)
 
-        matches = AsyncBridge.run_async(
-            self._aquery_embedding(
-                query_emb,
-                k=fetch_k,
-                namespace=namespace,
-                filter=filter,
-                include_vectors=True,
-                ctx=ctx,
-            )
+        raw_query, framework_ctx = self._build_query_request(
+            query_emb,
+            top_k=fetch_k,
+            namespace=namespace,
+            filter=filter,
+            include_vectors=True,
         )
 
-        if not matches:
+        result_any = self._translator.query(
+            raw_query,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+
+        result = self._validate_query_result_type(
+            result_any,
+            operation="translator.query_mmr_sync",
+        )
+
+        matches_list: List[VectorMatch] = list(result.matches or [])
+
+        # Apply client-side score thresholding
+        if self.score_threshold is not None:
+            threshold = float(self.score_threshold)
+            matches_list = [
+                m for m in matches_list if float(m.score) >= threshold
+            ]
+
+        if not matches_list:
             return []
 
         indices = self._mmr_select_indices(
-            query_vec=query_emb,
-            candidate_matches=matches,
+            candidate_matches=matches_list,
             k=k,
             lambda_mult=lambda_mult,
         )
 
-        docs: List[Dict[str, Any]] = []
-        flattened = self._from_corpus_matches(matches)
-        for idx in indices:
-            text, meta, score = flattened[idx]
-            docs.append(
-                {
-                    "page_content": text,
-                    "metadata": meta,
-                    "score": score,
-                }
-            )
-        return docs
+        selected_matches = [matches_list[i] for i in indices]
+        return self._format_for_ai_model(selected_matches)
 
     async def amax_marginal_relevance_search(
         self,
@@ -1117,45 +1537,74 @@ class CorpusSemanticKernelVectorStore:
     ) -> List[Dict[str, Any]]:
         """
         Perform Maximal Marginal Relevance (MMR) search (async).
+
+        This runs a similarity search with a larger `fetch_k` and then
+        selects a subset of results via MMR based on vector geometry and
+        original database scores. Returns AI-optimized document dicts:
+            {"content", "metadata", "confidence", "source"}.
         """
+        if not (0.0 <= lambda_mult <= 1.0):
+            err = BadRequest(
+                f"lambda_mult must be in [0, 1], got {lambda_mult}",
+                code="BAD_MMR_LAMBDA",
+            )
+            attach_context(
+                err,
+                framework="semantic_kernel",
+                operation="mmr_search_async",
+                lambda_mult=lambda_mult,
+            )
+            raise err
+
         fetch_k: int = kwargs.get("fetch_k") or max(k * 4, k + 5)
         embedding: Optional[Sequence[float]] = kwargs.get("embedding")
         namespace: Optional[str] = kwargs.get("namespace")
         ctx = self._build_ctx(**kwargs)
 
+        # Validate fetch_k against capabilities (treating it as top_k for the query)
+        fetch_k = await self._validate_query_params_async(fetch_k, namespace, filter)
+
         query_emb = self._embed_query(query, embedding=embedding)
 
-        matches = await self._aquery_embedding(
+        raw_query, framework_ctx = self._build_query_request(
             query_emb,
-            k=fetch_k,
+            top_k=fetch_k,
             namespace=namespace,
             filter=filter,
             include_vectors=True,
-            ctx=ctx,
         )
 
-        if not matches:
+        result_any = await self._translator.arun_query(
+            raw_query,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+
+        result = self._validate_query_result_type(
+            result_any,
+            operation="translator.query_mmr_async",
+        )
+
+        matches_list: List[VectorMatch] = list(result.matches or [])
+
+        # Apply client-side score thresholding
+        if self.score_threshold is not None:
+            threshold = float(self.score_threshold)
+            matches_list = [
+                m for m in matches_list if float(m.score) >= threshold
+            ]
+
+        if not matches_list:
             return []
 
         indices = self._mmr_select_indices(
-            query_vec=query_emb,
-            candidate_matches=matches,
+            candidate_matches=matches_list,
             k=k,
             lambda_mult=lambda_mult,
         )
 
-        docs: List[Dict[str, Any]] = []
-        flattened = self._from_corpus_matches(matches)
-        for idx in indices:
-            text, meta, score = flattened[idx]
-            docs.append(
-                {
-                    "page_content": text,
-                    "metadata": meta,
-                    "score": score,
-                }
-            )
-        return docs
+        selected_matches = [matches_list[i] for i in indices]
+        return self._format_for_ai_model(selected_matches)
 
     # ------------------------------------------------------------------ #
     # Delete API
@@ -1173,14 +1622,28 @@ class CorpusSemanticKernelVectorStore:
         """
         namespace: Optional[str] = kwargs.get("namespace")
         ctx = self._build_ctx(**kwargs)
-        AsyncBridge.run_async(
-            self._adelete_vectors(
-                ids=ids,
-                namespace=namespace,
-                filter=filter,
-                ctx=ctx,
-            )
+
+        self._validate_delete_params_sync(
+            ids=ids,
+            namespace=namespace,
+            filter=filter,
         )
+
+        raw_request, framework_ctx = self._build_delete_request(
+            ids=ids,
+            namespace=namespace,
+            filter=filter,
+        )
+
+        try:
+            self._translator.delete(
+                raw_request,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+        except Exception:
+            # Translator/adapter already annotated the error.
+            raise
 
     async def adelete(
         self,
@@ -1194,11 +1657,23 @@ class CorpusSemanticKernelVectorStore:
         """
         namespace: Optional[str] = kwargs.get("namespace")
         ctx = self._build_ctx(**kwargs)
-        await self._adelete_vectors(
+
+        await self._validate_delete_params_async(
             ids=ids,
             namespace=namespace,
             filter=filter,
-            ctx=ctx,
+        )
+
+        raw_request, framework_ctx = self._build_delete_request(
+            ids=ids,
+            namespace=namespace,
+            filter=filter,
+        )
+
+        await self._translator.arun_delete(
+            raw_request,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
         )
 
     # ------------------------------------------------------------------ #
@@ -1262,34 +1737,84 @@ class CorpusSemanticKernelVectorPlugin:
         self.vector_store = vector_store
         self.framework_version = framework_version
 
-    def _build_ctx_from_sk(
+    def _build_sk_aware_context(
         self,
         sk_context: Optional[Any],
         sk_settings: Optional[Any],
     ) -> OperationContext:
         """
-        Translate SK context/settings into OperationContext.
+        Enhanced context translation that understands SK-specific patterns.
 
-        Any translation errors are logged and result in an empty context
-        rather than failing the call outright.
+        Includes SK variables, skill context, and other SK-specific metadata
+        for comprehensive tracing and debugging.
         """
         try:
-            return context_from_semantic_kernel(
+            base_ctx = context_from_semantic_kernel(
                 sk_context,
                 settings=sk_settings,
                 framework_version=self.framework_version,
             )
+
+            # Add SK-specific context extensions
+            if hasattr(sk_context, "variables") and sk_context.variables:
+                base_ctx.extra_context["sk_variables"] = dict(sk_context.variables)
+            if hasattr(sk_context, "skill_name") and sk_context.skill_name:
+                base_ctx.extra_context["sk_skill"] = sk_context.skill_name
+            if hasattr(sk_context, "function_name") and sk_context.function_name:
+                base_ctx.extra_context["sk_function"] = sk_context.function_name
+
+            return base_ctx
         except Exception as exc:  # noqa: BLE001
             logger.debug("context_from_semantic_kernel failed in plugin: %s", exc)
             # Fall back to empty context
             return context_from_dict({})
 
+    def _handle_sk_plugin_error(
+        self,
+        exc: Exception,
+        operation: str,
+        **context: Any,
+    ) -> None:
+        """
+        SK plugins need particularly good error handling since they're often
+        called autonomously by AI models without human intervention.
+        """
+        attach_context(
+            exc,
+            framework="semantic_kernel",
+            operation=operation,
+            **context,
+        )
+
+        # Convert to SK-friendly error format
+        if isinstance(exc, NotSupported):
+            raise KernelFunctionException(
+                f"Vector operation not supported: {exc}",
+                exc.code if hasattr(exc, "code") else "NOT_SUPPORTED",
+            )
+        elif isinstance(exc, BadRequest):
+            raise KernelFunctionException(
+                f"Invalid vector operation: {exc}",
+                exc.code if hasattr(exc, "code") else "BAD_REQUEST",
+            )
+        elif isinstance(exc, VectorAdapterError):
+            raise KernelFunctionException(
+                f"Vector database error: {exc}",
+                exc.code if hasattr(exc, "code") else "VECTOR_ERROR",
+            )
+        else:
+            # Generic error for unexpected exceptions
+            raise KernelFunctionException(
+                f"Vector search failed: {exc}",
+                "INTERNAL_ERROR",
+            )
+
     @kernel_function(
         name="vector_search",
         description=(
-            "Retrieve the most relevant documents from the Corpus vector index "
-            "using semantic similarity. Returns a list of objects with "
-            "page_content, metadata, and score."
+            "Search for semantically similar documents in the vector database. "
+            "Use this when you need to find relevant information based on meaning "
+            "rather than keyword matching. Returns documents with content, metadata, and confidence scores."
         ),
     )
     async def vector_search(
@@ -1306,8 +1831,9 @@ class CorpusSemanticKernelVectorPlugin:
         Semantic Kernel-exposed similarity search (async).
 
         This is the primary function SK will call during tool/function-calling.
+        Returns AI-optimized document format for easy consumption by models.
         """
-        ctx = self._build_ctx_from_sk(sk_context, sk_settings)
+        ctx = self._build_sk_aware_context(sk_context, sk_settings)
 
         try:
             docs = await self.vector_store.asimilarity_search(
@@ -1319,19 +1845,20 @@ class CorpusSemanticKernelVectorPlugin:
             )
             return docs
         except Exception as exc:  # noqa: BLE001
-            attach_context(
+            self._handle_sk_plugin_error(
                 exc,
-                framework="semantic_kernel",
                 operation="plugin_vector_search",
                 query=query,
+                k=k,
+                namespace=namespace,
             )
-            raise
 
     @kernel_function(
         name="vector_search_stream",
         description=(
             "Streaming variant of vector_search. Yields documents one by one "
-            "as they are retrieved. Each item has page_content, metadata, and score."
+            "as they are retrieved. Each item has content, metadata, and confidence score. "
+            "Useful for real-time applications and progressive UI updates."
         ),
     )
     def vector_search_stream(
@@ -1348,10 +1875,9 @@ class CorpusSemanticKernelVectorPlugin:
         Semantic Kernel-exposed streaming similarity search (sync generator).
 
         SK will detect that this is a streaming kernel function because it
-        returns an iterator. Under the hood, this uses SyncStreamBridge via
-        `vector_store.similarity_search_stream`.
+        returns an iterator. Uses VectorTranslator.query_stream under the hood.
         """
-        ctx = self._build_ctx_from_sk(sk_context, sk_settings)
+        ctx = self._build_sk_aware_context(sk_context, sk_settings)
 
         try:
             for doc in self.vector_store.similarity_search_stream(
@@ -1363,19 +1889,21 @@ class CorpusSemanticKernelVectorPlugin:
             ):
                 yield doc
         except Exception as exc:  # noqa: BLE001
-            attach_context(
+            self._handle_sk_plugin_error(
                 exc,
-                framework="semantic_kernel",
                 operation="plugin_vector_search_stream",
                 query=query,
+                k=k,
+                namespace=namespace,
             )
-            raise
 
     @kernel_function(
         name="vector_mmr_search",
         description=(
             "Maximal Marginal Relevance (MMR) search over the Corpus vector index. "
-            "Balances relevance and diversity; returns a list of documents."
+            "Balances relevance and diversity to provide a varied set of results "
+            "while maintaining high relevance. Returns a list of documents with "
+            "content, metadata, and confidence scores."
         ),
     )
     async def vector_mmr_search(
@@ -1391,8 +1919,11 @@ class CorpusSemanticKernelVectorPlugin:
     ) -> List[Dict[str, Any]]:
         """
         Semantic Kernel-exposed MMR search (async).
+
+        Provides balanced results between relevance and diversity, useful for
+        exploration and avoiding redundant information.
         """
-        ctx = self._build_ctx_from_sk(sk_context, sk_settings)
+        ctx = self._build_sk_aware_context(sk_context, sk_settings)
 
         try:
             docs = await self.vector_store.amax_marginal_relevance_search(
@@ -1405,13 +1936,90 @@ class CorpusSemanticKernelVectorPlugin:
             )
             return docs
         except Exception as exc:  # noqa: BLE001
-            attach_context(
+            self._handle_sk_plugin_error(
                 exc,
-                framework="semantic_kernel",
                 operation="plugin_vector_mmr_search",
                 query=query,
+                k=k,
+                lambda_mult=lambda_mult,
+                namespace=namespace,
             )
-            raise
+
+    @kernel_function(
+        name="vector_store_document",
+        description=(
+            "Store a document or piece of information in the vector database for later retrieval. "
+            "Use this to add new knowledge or memories that can be searched later."
+        ),
+    )
+    async def store_document(
+        self,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        document_id: Optional[str] = None,
+        namespace: Optional[str] = None,
+        sk_context: Optional[Any] = None,
+        sk_settings: Optional[Any] = None,
+    ) -> str:
+        """
+        Semantic Kernel-exposed document storage (async).
+
+        AI-friendly function for storing documents in vector memory.
+        Returns the ID of the stored document for future reference.
+        """
+        ctx = self._build_sk_aware_context(sk_context, sk_settings)
+
+        try:
+            ids = await self.vector_store.aadd_texts(
+                texts=[content],
+                metadatas=[metadata or {}],
+                ids=[document_id] if document_id else None,
+                namespace=namespace,
+                ctx=ctx,
+            )
+            return ids[0] if ids else "unknown"
+        except Exception as exc:  # noqa: BLE001
+            self._handle_sk_plugin_error(
+                exc,
+                operation="plugin_store_document",
+                content_length=len(content),
+                namespace=namespace,
+            )
+
+    @kernel_function(
+        name="vector_get_capabilities",
+        description=(
+            "Get information about what the vector database supports, including "
+            "maximum batch sizes, filtering capabilities, and other features."
+        ),
+    )
+    async def get_capabilities(
+        self,
+        sk_context: Optional[Any] = None,
+        sk_settings: Optional[Any] = None,
+    ) -> Dict[str, Any]]:
+        """
+        Semantic Kernel-exposed capability query (async).
+
+        Lets AI models understand what operations are available and their limits.
+        Uses public methods instead of private ones for proper encapsulation.
+        """
+        _ = self._build_sk_aware_context(sk_context, sk_settings)
+
+        try:
+            caps = await self.vector_store.aget_capabilities()
+            return {
+                "max_batch_size": caps.max_batch_size,
+                "max_top_k": caps.max_top_k,
+                "supports_metadata_filtering": caps.supports_metadata_filtering,
+                "supports_namespaces": caps.supports_namespaces,
+                "description": "Corpus VectorProtocol vector database",
+            }
+        except Exception as exc:  # noqa: BLE001
+            self._handle_sk_plugin_error(
+                exc,
+                operation="plugin_get_capabilities",
+            )
 
 
 __all__ = [
