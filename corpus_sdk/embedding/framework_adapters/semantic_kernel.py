@@ -11,7 +11,7 @@ This module exposes Corpus `EmbeddingProtocolV1` implementations as
 - Support for Semantic Kernel's plugin system and function chaining
 - Context normalization using existing `context_translation.from_semantic_kernel`
 - Framework-agnostic orchestration via `EmbeddingTranslator`
-- Async → sync bridging using `AsyncBridge`
+- Async → sync bridging handled in the common embedding layer
 - Rich error context attachment for observability
 
 The design integrates seamlessly with Semantic Kernel's planner and
@@ -22,9 +22,8 @@ from __future__ import annotations
 
 import logging
 from functools import cached_property
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Protocol
 
-from corpus_sdk.core.async_bridge import AsyncBridge
 from corpus_sdk.core.context_translation import (
     from_semantic_kernel as context_from_semantic_kernel,  # Using existing implementation
 )
@@ -150,6 +149,11 @@ class CorpusSemanticKernelEmbeddings:
         sk_context:
             Optional Semantic Kernel context containing kernel,
             function, and plugin information.
+        model_id:
+            Optional per-call model override.
+        **kwargs:
+            Additional framework-level hints to be passed through to the
+            translator as part of `framework_ctx`.
 
         Returns
         -------
@@ -255,12 +259,6 @@ class CorpusSemanticKernelEmbeddings:
 
         return matrix[0]
 
-    def _get_timeout_from_context(self, core_ctx: Any) -> Optional[float]:
-        """Extract timeout from core context, converting ms to seconds."""
-        if hasattr(core_ctx, "deadline_ms") and core_ctx.deadline_ms is not None:
-            return core_ctx.deadline_ms / 1000.0
-        return None
-
     # ------------------------------------------------------------------ #
     # Core Semantic Kernel EmbeddingGeneration Methods
     # ------------------------------------------------------------------ #
@@ -288,39 +286,37 @@ class CorpusSemanticKernelEmbeddings:
         model_id:
             Optional per-call model override
         """
-        core_ctx, op_ctx_dict, framework_ctx = self._build_contexts(
+        _, op_ctx_dict, framework_ctx = self._build_contexts(
             sk_context=sk_context,
             model_id=model_id,
             **kwargs,
         )
-        timeout = self._get_timeout_from_context(core_ctx)
 
-        async def _coro() -> List[List[float]]:
+        try:
+            translated = self._translator.embed(
+                raw_texts=texts,
+                op_ctx=op_ctx_dict,
+                framework_ctx=framework_ctx,
+            )
+            return self._coerce_embedding_matrix(translated)
+        except Exception as exc:  # noqa: BLE001
+            # Enrich with Semantic Kernel-specific context; protocol-level
+            # context is already attached by EmbeddingTranslator.
             try:
-                translated = await self._translator.arun_embed(
-                    raw_texts=texts,
-                    op_ctx=op_ctx_dict,
-                    framework_ctx=framework_ctx,
+                attach_context(
+                    exc,
+                    embedding_operation="generate_embeddings",
+                    texts_count=len(texts),
+                    plugin_name=framework_ctx.get("plugin_name"),
+                    function_name=framework_ctx.get("function_name"),
+                    kernel_id=framework_ctx.get("kernel_id"),
+                    memory_type=framework_ctx.get("memory_type"),
+                    semantic_kernel_model_id=framework_ctx.get("model_id"),
                 )
-                return self._coerce_embedding_matrix(translated)
-            except Exception as exc:  # noqa: BLE001
-                try:
-                    attach_context(
-                        exc,
-                        framework="semantic_kernel",
-                        embedding_operation="generate_embeddings",
-                        texts_count=len(texts),
-                        plugin_name=framework_ctx.get("plugin_name"),
-                        function_name=framework_ctx.get("function_name"),
-                        kernel_id=framework_ctx.get("kernel_id"),
-                        request_id=getattr(core_ctx, "request_id", None),
-                        tenant=getattr(core_ctx, "tenant", None),
-                    )
-                except Exception:
-                    pass  # Never mask original error
-                raise
-
-        return AsyncBridge.run_async(_coro(), timeout=timeout)
+            except Exception:
+                # Never mask the original error
+                pass
+            raise
 
     async def generate_embeddings_async(
         self,
@@ -362,16 +358,17 @@ class CorpusSemanticKernelEmbeddings:
             try:
                 attach_context(
                     exc,
-                    framework="semantic_kernel",
                     embedding_operation="generate_embeddings_async",
                     texts_count=len(texts),
                     plugin_name=framework_ctx.get("plugin_name"),
                     function_name=framework_ctx.get("function_name"),
                     kernel_id=framework_ctx.get("kernel_id"),
-                    request_id=getattr(core_ctx, "request_id", None),
-                    tenant=getattr(core_ctx, "tenant", None),
+                    memory_type=framework_ctx.get("memory_type"),
+                    semantic_kernel_model_id=framework_ctx.get("model_id"),
+                    semantic_kernel_has_context=bool(core_ctx),
                 )
             except Exception:
+                # Never mask the original error
                 pass
             raise
 
@@ -402,39 +399,35 @@ class CorpusSemanticKernelEmbeddings:
         model_id:
             Optional per-call model override
         """
-        core_ctx, op_ctx_dict, framework_ctx = self._build_contexts(
+        _, op_ctx_dict, framework_ctx = self._build_contexts(
             sk_context=sk_context,
             model_id=model_id,
             **kwargs,
         )
-        timeout = self._get_timeout_from_context(core_ctx)
 
-        async def _coro() -> List[float]:
+        try:
+            translated = self._translator.embed(
+                raw_texts=text,
+                op_ctx=op_ctx_dict,
+                framework_ctx=framework_ctx,
+            )
+            return self._coerce_embedding_vector(translated)
+        except Exception as exc:  # noqa: BLE001
             try:
-                translated = await self._translator.arun_embed(
-                    raw_texts=text,
-                    op_ctx=op_ctx_dict,
-                    framework_ctx=framework_ctx,
+                attach_context(
+                    exc,
+                    embedding_operation="generate_embedding",
+                    text_len=len(text or ""),
+                    plugin_name=framework_ctx.get("plugin_name"),
+                    function_name=framework_ctx.get("function_name"),
+                    kernel_id=framework_ctx.get("kernel_id"),
+                    memory_type=framework_ctx.get("memory_type"),
+                    semantic_kernel_model_id=framework_ctx.get("model_id"),
                 )
-                return self._coerce_embedding_vector(translated)
-            except Exception as exc:  # noqa: BLE001
-                try:
-                    attach_context(
-                        exc,
-                        framework="semantic_kernel",
-                        embedding_operation="generate_embedding",
-                        text_len=len(text or ""),
-                        plugin_name=framework_ctx.get("plugin_name"),
-                        function_name=framework_ctx.get("function_name"),
-                        kernel_id=framework_ctx.get("kernel_id"),
-                        request_id=getattr(core_ctx, "request_id", None),
-                        tenant=getattr(core_ctx, "tenant", None),
-                    )
-                except Exception:
-                    pass
-                raise
-
-        return AsyncBridge.run_async(_coro(), timeout=timeout)
+            except Exception:
+                # Never mask the original error
+                pass
+            raise
 
     async def generate_embedding_async(
         self,
@@ -476,16 +469,17 @@ class CorpusSemanticKernelEmbeddings:
             try:
                 attach_context(
                     exc,
-                    framework="semantic_kernel",
                     embedding_operation="generate_embedding_async",
                     text_len=len(text or ""),
                     plugin_name=framework_ctx.get("plugin_name"),
                     function_name=framework_ctx.get("function_name"),
                     kernel_id=framework_ctx.get("kernel_id"),
-                    request_id=getattr(core_ctx, "request_id", None),
-                    tenant=getattr(core_ctx, "tenant", None),
+                    memory_type=framework_ctx.get("memory_type"),
+                    semantic_kernel_model_id=framework_ctx.get("model_id"),
+                    semantic_kernel_has_context=bool(core_ctx),
                 )
             except Exception:
+                # Never mask the original error
                 pass
             raise
 
@@ -624,10 +618,10 @@ def register_with_semantic_kernel(
     # Register with Semantic Kernel's service collection
     try:
         # For newer Semantic Kernel versions with service collection
-        if hasattr(kernel, 'add_service'):
+        if hasattr(kernel, "add_service"):
             kernel.add_service(embeddings, service_id=service_id)
         # For older versions or alternative registration patterns
-        elif hasattr(kernel, 'register_embedding_generation'):
+        elif hasattr(kernel, "register_embedding_generation"):
             kernel.register_embedding_generation(embeddings, service_id=service_id)
         else:
             logger.warning(
@@ -647,11 +641,30 @@ def register_with_semantic_kernel(
     return embeddings
 
 
+class SemanticKernelMemoryBuilderProtocol(Protocol):
+    """
+    Structural protocol describing the minimal MemoryBuilder interface
+    used by this module.
+
+    This avoids a hard dependency on Semantic Kernel's concrete types
+    while still giving helper functions a precise return type.
+    """
+
+    def build(self) -> Any:
+        """
+        Build and return a memory instance.
+
+        The concrete memory type is application-specific and therefore
+        left as `Any` here.
+        """
+        ...
+
+
 def create_memory_builder(
     corpus_adapter: EmbeddingProtocolV1,
     model_id: Optional[str] = None,
     **kwargs: Any,
-) -> Tuple[CorpusSemanticKernelEmbeddings, Any]:
+) -> Tuple[CorpusSemanticKernelEmbeddings, SemanticKernelMemoryBuilderProtocol]:
     """
     Create a Semantic Kernel memory builder with Corpus embeddings.
 
@@ -683,7 +696,7 @@ def create_memory_builder(
 
     Returns
     -------
-    Tuple[CorpusSemanticKernelEmbeddings, Any]
+    Tuple[CorpusSemanticKernelEmbeddings, SemanticKernelMemoryBuilderProtocol]
         Embedding service and memory builder instance
     """
     try:
@@ -707,7 +720,7 @@ def create_memory_builder(
     )
 
     # Create memory builder
-    memory_builder = MemoryBuilder(kernel=kernel)
+    memory_builder: SemanticKernelMemoryBuilderProtocol = MemoryBuilder(kernel=kernel)
 
     logger.info(
         "Semantic Kernel memory builder created with Corpus embeddings"
