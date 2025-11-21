@@ -22,7 +22,17 @@ from __future__ import annotations
 
 import logging
 from functools import cached_property
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import (
+    Any,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+    Protocol,
+)
 
 from corpus_sdk.core.context_translation import (
     from_autogen as context_from_autogen,  # Using existing implementation
@@ -39,6 +49,36 @@ from corpus_sdk.embedding.framework_adapters.common.embedding_translation import
 from corpus_sdk.llm.framework_adapters.common.error_context import attach_context
 
 logger = logging.getLogger(__name__)
+
+
+class AutoGenVectorStoreRetrieverProtocol(Protocol):
+    """
+    Protocol representing the minimal AutoGen VectorStoreRetriever interface
+    used by this module.
+
+    The concrete implementation is typically `autogen.retrieve_utils.VectorStoreRetriever`,
+    but this structural protocol avoids a hard dependency at type-check time while
+    still providing strong typing for the helper function return type.
+    """
+
+    @property
+    def vectorstore(self) -> Any:
+        """
+        Underlying vector store used for retrieval.
+
+        The concrete type is AutoGen- and application-specific, so it is left
+        as `Any` here to keep the protocol flexible.
+        """
+        ...
+
+    def retrieve(self, query: str, **kwargs: Any) -> Any:
+        """
+        Retrieve documents for the given query.
+
+        Implementations may return framework-specific document or node types;
+        callers in this module do not rely on the concrete return type.
+        """
+        ...
 
 
 class CorpusAutoGenEmbeddings:
@@ -509,7 +549,7 @@ def create_autogen_retriever(
     corpus_adapter: EmbeddingProtocolV1,
     vector_store: Any,
     **kwargs: Any,
-) -> Any:
+) -> AutoGenVectorStoreRetrieverProtocol:
     """
     Create an AutoGen VectorStoreRetriever with Corpus embeddings.
 
@@ -553,8 +593,8 @@ def create_autogen_retriever(
 
     Returns
     -------
-    Any
-        AutoGen VectorStoreRetriever instance
+    AutoGenVectorStoreRetrieverProtocol
+        AutoGen VectorStoreRetriever instance using Corpus embeddings.
     """
     try:
         from autogen.retrieve_utils import VectorStoreRetriever
