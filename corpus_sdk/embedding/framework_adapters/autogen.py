@@ -43,6 +43,7 @@ from corpus_sdk.core.context_translation import (
 from corpus_sdk.core.error_context import attach_context
 from corpus_sdk.embedding.embedding_base import (
     EmbeddingProtocolV1,
+    OperationContext,
 )
 from corpus_sdk.embedding.framework_adapters.common.embedding_translation import (
     EmbeddingTranslator,
@@ -70,6 +71,7 @@ def with_embedding_error_context(
     """
     Decorator to automatically attach error context to embedding exceptions.
     """
+
     def decorator(func: Callable[..., T]) -> Callable[..., T]:
         @wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> T:
@@ -84,7 +86,9 @@ def with_embedding_error_context(
                     **enhanced_context,
                 )
                 raise
+
         return wrapper
+
     return decorator
 
 
@@ -95,6 +99,7 @@ def with_async_embedding_error_context(
     """
     Decorator to automatically attach error context to async embedding exceptions.
     """
+
     def decorator(func: Callable[..., T]) -> Callable[..., T]:
         @wraps(func)
         async def wrapper(*args: Any, **kwargs: Any) -> T:
@@ -109,7 +114,9 @@ def with_async_embedding_error_context(
                     **enhanced_context,
                 )
                 raise
+
         return wrapper
+
     return decorator
 
 
@@ -227,7 +234,7 @@ class CorpusAutoGenEmbeddings:
         autogen_context: Optional[Mapping[str, Any]] = None,
         model: Optional[str] = None,
         **kwargs: Any,
-    ) -> Tuple[Any, Dict[str, Any], Dict[str, Any]]:
+    ) -> Tuple[OperationContext, Dict[str, Any], Dict[str, Any]]:
         """
         Build contexts for AutoGen execution environment.
 
@@ -247,13 +254,13 @@ class CorpusAutoGenEmbeddings:
         - `framework_ctx`: AutoGen-specific context for translator
         """
         # Use existing context translation implementation
-        core_ctx = context_from_autogen(autogen_context)
+        core_ctx: OperationContext = context_from_autogen(autogen_context)
 
         # Normalized dict for embedding OperationContext reconstruction
         op_ctx_dict: Dict[str, Any] = {}
-        if hasattr(core_ctx, 'to_dict'):
+        if hasattr(core_ctx, "to_dict"):
             op_ctx_dict = core_ctx.to_dict()
-        elif hasattr(core_ctx, '__dict__'):
+        elif hasattr(core_ctx, "__dict__"):
             op_ctx_dict = core_ctx.__dict__
 
         # Framework-level context for AutoGen-specific hints
@@ -292,16 +299,17 @@ class CorpusAutoGenEmbeddings:
         - EmbedResult-like with `.embeddings` attribute
 
         This ensures consistency across all framework adapters.
+
+        Note: Implemented without match/case so this module works on Python 3.9+.
         """
         embeddings_obj: Any
 
-        match result:
-            case {"embeddings": emb}:
-                embeddings_obj = emb
-            case _ if hasattr(result, "embeddings"):
-                embeddings_obj = getattr(result, "embeddings")
-            case _:
-                embeddings_obj = result
+        if isinstance(result, Mapping) and "embeddings" in result:
+            embeddings_obj = result["embeddings"]
+        elif hasattr(result, "embeddings"):
+            embeddings_obj = getattr(result, "embeddings")
+        else:
+            embeddings_obj = result
 
         if not isinstance(embeddings_obj, Sequence):
             raise TypeError(
@@ -404,6 +412,19 @@ class CorpusAutoGenEmbeddings:
         model:
             Optional per-call model override
         """
+        # Soft warning for very large batches when no batch_config is provided.
+        if isinstance(texts, Sequence) and not isinstance(texts, (str, bytes)):
+            batch_size = len(texts)
+            if (
+                batch_size > 10_000
+                and (self.batch_config is None or getattr(self.batch_config, "max_batch_size", None) is None)
+            ):
+                logger.warning(
+                    "embed_documents called with batch_size=%d and no batch_config.max_batch_size; "
+                    "ensure your adapter/translator can safely handle large batches.",
+                    batch_size,
+                )
+
         core_ctx, op_ctx_dict, framework_ctx = self._build_contexts(
             autogen_context=autogen_context,
             model=model,
@@ -482,6 +503,19 @@ class CorpusAutoGenEmbeddings:
         model:
             Optional per-call model override
         """
+        # Soft warning for very large batches when no batch_config is provided.
+        if isinstance(texts, Sequence) and not isinstance(texts, (str, bytes)):
+            batch_size = len(texts)
+            if (
+                batch_size > 10_000
+                and (self.batch_config is None or getattr(self.batch_config, "max_batch_size", None) is None)
+            ):
+                logger.warning(
+                    "aembed_documents called with batch_size=%d and no batch_config.max_batch_size; "
+                    "ensure your adapter/translator can safely handle large batches.",
+                    batch_size,
+                )
+
         core_ctx, op_ctx_dict, framework_ctx = self._build_contexts(
             autogen_context=autogen_context,
             model=model,
@@ -536,6 +570,29 @@ class CorpusAutoGenEmbeddings:
 # ------------------------------------------------------------------ #
 # AutoGen-Specific Helper Functions
 # ------------------------------------------------------------------ #
+
+def _validate_vector_store_for_autogen(vector_store: Any) -> None:
+    """
+    Best-effort validation that the provided vector_store looks like a
+    typical vector store object AutoGen expects.
+
+    We keep this intentionally loose to avoid over-constraining users:
+      - Accepts stores that expose common vector-store methods like
+        `similarity_search` or `query`.
+    """
+    if vector_store is None:
+        raise TypeError("vector_store must not be None")
+
+    has_similarity = hasattr(vector_store, "similarity_search")
+    has_query = hasattr(vector_store, "query")
+
+    if not (has_similarity or has_query):
+        logger.warning(
+            "Vector store %r does not expose common methods like 'similarity_search' "
+            "or 'query'. It may not be compatible with AutoGen's VectorStoreRetriever.",
+            type(vector_store).__name__,
+        )
+
 
 def create_retriever(
     corpus_adapter: EmbeddingProtocolV1,
@@ -596,16 +653,33 @@ def create_retriever(
         )
         raise
 
+    # Best-effort validation before mutating the vector store.
+    _validate_vector_store_for_autogen(vector_store)
+
     embedding_function = CorpusAutoGenEmbeddings(
         corpus_adapter=corpus_adapter,
         **kwargs,
     )
 
-    # Configure the vector store with our embedding function
-    if hasattr(vector_store, '_embedding_function'):
-        vector_store._embedding_function = embedding_function
-    elif hasattr(vector_store, 'embedding_function'):
-        vector_store.embedding_function = embedding_function
+    # Configure the vector store with our embedding function.
+    # Prefer public attribute; fall back to private `_embedding_function`
+    # for libraries that don't expose a clean setter.
+    if hasattr(vector_store, "embedding_function"):
+        setattr(vector_store, "embedding_function", embedding_function)
+    elif hasattr(vector_store, "_embedding_function"):
+        logger.debug(
+            "Setting private attribute '_embedding_function' on vector_store %r. "
+            "If the vector store library changes its internals, this may break.",
+            type(vector_store).__name__,
+        )
+        setattr(vector_store, "_embedding_function", embedding_function)
+    else:
+        logger.warning(
+            "Vector store %r does not expose an 'embedding_function' or "
+            "'_embedding_function' attribute. You may need to configure the "
+            "embedding function manually.",
+            type(vector_store).__name__,
+        )
 
     retriever = VectorStoreRetriever(vectorstore=vector_store)
 
