@@ -24,63 +24,36 @@ Design philosophy
     * Building raw query / mutation shapes for GraphTranslator
     * Delegating all sync/async and streaming orchestration to GraphTranslator
 
-Usage (example)
----------------
+Responsibilities
+----------------
+- Provide a convenient, AutoGen-oriented client for graph operations
+- Keep all graph operations going through `GraphTranslator` so that
+  async→sync bridging, streaming, and error-context logic are centralized
+- Preserve protocol-level types (`QueryResult`, `QueryChunk`, etc.) for
+  AutoGen callers
 
-    from corpus_sdk.graph.graph_base import BaseGraphAdapter
-    from corpus_sdk.graph.framework_adapters.autogen import (
-        CorpusAutoGenGraphClient,
-    )
-
-    graph_adapter: BaseGraphAdapter = ...
-    client = CorpusAutoGenGraphClient(
-        graph_adapter=graph_adapter,
-        default_dialect="cypher",
-        default_namespace="my-graph",
-    )
-
-    # Somewhere inside AutoGen tool / agent code:
-
-    # Sync query
-    result = client.query(
-        "MATCH (n) RETURN n LIMIT 5",
-        conversation=autogen_conversation,
-    )
-
-    # Async query
-    result = await client.aquery(
-        "MATCH (n) RETURN n LIMIT 5",
-        conversation=autogen_conversation,
-    )
-
-    # Sync streaming query
-    for chunk in client.stream_query(
-        "MATCH (n) RETURN n LIMIT 100",
-        conversation=autogen_conversation,
-    ):
-        do_something(chunk.records)
-
-    # Async streaming query
-    async for chunk in client.astream_query(
-        "MATCH (n) RETURN n LIMIT 100",
-        conversation=autogen_conversation,
-    ):
-        do_something(chunk.records)
+Non-responsibilities
+--------------------
+- Backend-specific graph behavior (lives in graph adapters)
+- AutoGen agent orchestration and conversation logic
+- MMR and diversification details (handled inside GraphTranslator)
 """
 
 from __future__ import annotations
 
 import logging
+from functools import cached_property
 from typing import (
     Any,
     AsyncIterator,
+    Dict,
     Iterator,
     List,
     Mapping,
     Optional,
+    Protocol,
 )
 
-from corpus_sdk.core.async_bridge import AsyncBridge
 from corpus_sdk.core.context_translation import (
     from_autogen as core_ctx_from_autogen,
 )
@@ -112,70 +85,222 @@ from corpus_sdk.graph.graph_base import (
 logger = logging.getLogger(__name__)
 
 
-class AutoGenGraphFrameworkTranslator(DefaultGraphFrameworkTranslator):
+class AutoGenGraphClientProtocol(Protocol):
     """
-    AutoGen-specific GraphFrameworkTranslator.
+    Protocol representing the minimal AutoGen-aware graph client interface
+    implemented by this module.
 
-    This translator reuses the common DefaultGraphFrameworkTranslator for
-    spec construction and context handling, but deliberately *does not*
-    reshape core protocol results:
-
-    - QueryResult is returned as-is
-    - QueryChunk is returned as-is
-    - BulkVerticesResult is returned as-is
-    - BatchResult is returned as-is
-    - GraphSchema is returned as-is
-
-    This keeps the AutoGen client as a thin wrapper over the Corpus
-    GraphProtocol while still centralizing async→sync bridging,
-    streaming orchestration, and error-context attachment within the
-    shared GraphTranslator orchestrator.
+    This structural protocol allows callers to type against the graph client
+    without depending on the concrete `CorpusAutoGenGraphClient` class.
     """
 
-    def translate_query_result(
-        self,
-        result: QueryResult,
-        *,
-        op_ctx: OperationContext,  # noqa: ARG002
-        framework_ctx: Optional[Any] = None,  # noqa: ARG002
-    ) -> QueryResult:
-        return result
+    # Capabilities / schema / health
 
-    def translate_query_chunk(
-        self,
-        chunk: QueryChunk,
-        *,
-        op_ctx: OperationContext,  # noqa: ARG002
-        framework_ctx: Optional[Any] = None,  # noqa: ARG002
-    ) -> QueryChunk:
-        return chunk
+    def capabilities(self) -> Dict[str, Any]:
+        ...
 
-    def translate_bulk_vertices_result(
-        self,
-        result: BulkVerticesResult,
-        *,
-        op_ctx: OperationContext,  # noqa: ARG002
-        framework_ctx: Optional[Any] = None,  # noqa: ARG002
-    ) -> BulkVerticesResult:
-        return result
+    async def acapabilities(self) -> Dict[str, Any]:
+        ...
 
-    def translate_batch_result(
+    def get_schema(
         self,
-        result: BatchResult,
         *,
-        op_ctx: OperationContext,  # noqa: ARG002
-        framework_ctx: Optional[Any] = None,  # noqa: ARG002
-    ) -> BatchResult:
-        return result
-
-    def translate_schema(
-        self,
-        schema: GraphSchema,
-        *,
-        op_ctx: OperationContext,  # noqa: ARG002
-        framework_ctx: Optional[Any] = None,  # noqa: ARG002
+        conversation: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
     ) -> GraphSchema:
-        return schema
+        ...
+
+    async def aget_schema(
+        self,
+        *,
+        conversation: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> GraphSchema:
+        ...
+
+    def health(
+        self,
+        *,
+        conversation: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        ...
+
+    async def ahealth(
+        self,
+        *,
+        conversation: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        ...
+
+    # Query
+
+    def query(
+        self,
+        query: str,
+        *,
+        params: Optional[Mapping[str, Any]] = None,
+        dialect: Optional[str] = None,
+        namespace: Optional[str] = None,
+        timeout_ms: Optional[int] = None,
+        conversation: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> QueryResult:
+        ...
+
+    async def aquery(
+        self,
+        query: str,
+        *,
+        params: Optional[Mapping[str, Any]] = None,
+        dialect: Optional[str] = None,
+        namespace: Optional[str] = None,
+        timeout_ms: Optional[int] = None,
+        conversation: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> QueryResult:
+        ...
+
+    def stream_query(
+        self,
+        query: str,
+        *,
+        params: Optional[Mapping[str, Any]] = None,
+        dialect: Optional[str] = None,
+        namespace: Optional[str] = None,
+        timeout_ms: Optional[int] = None,
+        conversation: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> Iterator[QueryChunk]:
+        ...
+
+    async def astream_query(
+        self,
+        query: str,
+        *,
+        params: Optional[Mapping[str, Any]] = None,
+        dialect: Optional[str] = None,
+        namespace: Optional[str] = None,
+        timeout_ms: Optional[int] = None,
+        conversation: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> AsyncIterator[QueryChunk]:
+        ...
+
+    # Upsert
+
+    def upsert_nodes(
+        self,
+        spec: UpsertNodesSpec,
+        *,
+        conversation: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> UpsertResult:
+        ...
+
+    async def aupsert_nodes(
+        self,
+        spec: UpsertNodesSpec,
+        *,
+        conversation: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> UpsertResult:
+        ...
+
+    def upsert_edges(
+        self,
+        spec: UpsertEdgesSpec,
+        *,
+        conversation: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> UpsertResult:
+        ...
+
+    async def aupsert_edges(
+        self,
+        spec: UpsertEdgesSpec,
+        *,
+        conversation: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> UpsertResult:
+        ...
+
+    # Delete
+
+    def delete_nodes(
+        self,
+        spec: DeleteNodesSpec,
+        *,
+        conversation: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> DeleteResult:
+        ...
+
+    async def adelete_nodes(
+        self,
+        spec: DeleteNodesSpec,
+        *,
+        conversation: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> DeleteResult:
+        ...
+
+    def delete_edges(
+        self,
+        spec: DeleteEdgesSpec,
+        *,
+        conversation: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> DeleteResult:
+        ...
+
+    async def adelete_edges(
+        self,
+        spec: DeleteEdgesSpec,
+        *,
+        conversation: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> DeleteResult:
+        ...
+
+    # Bulk / batch
+
+    def bulk_vertices(
+        self,
+        spec: BulkVerticesSpec,
+        *,
+        conversation: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> BulkVerticesResult:
+        ...
+
+    async def abulk_vertices(
+        self,
+        spec: BulkVerticesSpec,
+        *,
+        conversation: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> BulkVerticesResult:
+        ...
+
+    def batch(
+        self,
+        ops: List[BatchOperation],
+        *,
+        conversation: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> BatchResult:
+        ...
+
+    async def abatch(
+        self,
+        ops: List[BatchOperation],
+        *,
+        conversation: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> BatchResult:
+        ...
 
 
 class CorpusAutoGenGraphClient:
@@ -185,7 +310,7 @@ class CorpusAutoGenGraphClient:
     This is a thin integration layer that:
 
     - Translates AutoGen conversation / metadata into a Corpus `OperationContext`
-      using `core.context_translation.from_autogen`.
+      using `core_ctx_from_autogen`.
     - Uses `GraphTranslator` (with an AutoGen-specific framework translator) to:
         * Build Graph*Spec objects from simple inputs
         * Execute sync + async graph operations
@@ -194,21 +319,73 @@ class CorpusAutoGenGraphClient:
     - Attaches rich error context (`attach_context`) on this layer with
       AutoGen-specific hints when failures occur.
 
-    Attributes
-    ----------
-    graph_adapter:
-        Underlying Corpus graph adapter implementing `GraphProtocolV1`.
-
-    default_dialect:
-        Default query dialect used when caller does not specify one.
-
-    default_namespace:
-        Default logical graph / namespace for operations when not
-        explicitly overridden by the caller.
-
-    framework_version:
-        Optional AutoGen framework version for tagging context.
+    Capabilities / health
+    ---------------------
+    - The sync `capabilities()` and `health()` methods assume a sync-capable
+      adapter implementation for these methods.
+    - The async `acapabilities()` / `ahealth()` variants assume the adapter
+      exposes proper async methods for these calls.
     """
+
+    class _AutoGenGraphFrameworkTranslator(DefaultGraphFrameworkTranslator):
+        """
+        AutoGen-specific GraphFrameworkTranslator.
+
+        This translator reuses the common DefaultGraphFrameworkTranslator for
+        spec construction and context handling, but deliberately *does not*
+        reshape core protocol results:
+
+        - QueryResult is returned as-is
+        - QueryChunk is returned as-is
+        - BulkVerticesResult is returned as-is
+        - BatchResult is returned as-is
+        - GraphSchema is returned as-is
+        """
+
+        def translate_query_result(
+            self,
+            result: QueryResult,
+            *,
+            op_ctx: OperationContext,  # noqa: ARG002
+            framework_ctx: Optional[Any] = None,  # noqa: ARG002
+        ) -> QueryResult:
+            return result
+
+        def translate_query_chunk(
+            self,
+            chunk: QueryChunk,
+            *,
+            op_ctx: OperationContext,  # noqa: ARG002
+            framework_ctx: Optional[Any] = None,  # noqa: ARG002
+        ) -> QueryChunk:
+            return chunk
+
+        def translate_bulk_vertices_result(
+            self,
+            result: BulkVerticesResult,
+            *,
+            op_ctx: OperationContext,  # noqa: ARG002
+            framework_ctx: Optional[Any] = None,  # noqa: ARG002
+        ) -> BulkVerticesResult:
+            return result
+
+        def translate_batch_result(
+            self,
+            result: BatchResult,
+            *,
+            op_ctx: OperationContext,  # noqa: ARG002
+            framework_ctx: Optional[Any] = None,  # noqa: ARG002
+        ) -> BatchResult:
+            return result
+
+        def translate_schema(
+            self,
+            schema: GraphSchema,
+            *,
+            op_ctx: OperationContext,  # noqa: ARG002
+            framework_ctx: Optional[Any] = None,  # noqa: ARG002
+        ) -> GraphSchema:
+            return schema
 
     def __init__(
         self,
@@ -223,20 +400,28 @@ class CorpusAutoGenGraphClient:
         self._default_namespace: Optional[str] = default_namespace
         self._framework_version: Optional[str] = framework_version
 
-        # AutoGen-specific framework translator that preserves protocol result types.
-        framework_translator = AutoGenGraphFrameworkTranslator()
+    # ------------------------------------------------------------------ #
+    # Translator (lazy, cached) – mirrors embedding adapter pattern
+    # ------------------------------------------------------------------ #
 
-        # Orchestrator: central place for async→sync bridging, streaming,
-        # MMR (if used), and error-context attachment for graph operations.
-        self._translator = GraphTranslator(
-            adapter=graph_adapter,
+    @cached_property
+    def _translator(self) -> GraphTranslator:
+        """
+        Lazily construct and cache the `GraphTranslator`.
+
+        Uses `cached_property` for thread safety and performance, mirroring
+        the embedding adapter pattern.
+        """
+        framework_translator = self._AutoGenGraphFrameworkTranslator()
+        return GraphTranslator(
+            adapter=self._graph,
             framework="autogen",
             translator=framework_translator,
         )
 
-    # --------------------------------------------------------------------- #
+    # ------------------------------------------------------------------ #
     # Internal helpers
-    # --------------------------------------------------------------------- #
+    # ------------------------------------------------------------------ #
 
     def _build_ctx(
         self,
@@ -247,14 +432,15 @@ class CorpusAutoGenGraphClient:
         """
         Build an OperationContext from AutoGen-style inputs.
 
-        Expected inputs:
-            - conversation: AutoGen conversation object (optional)
-            - extra_context: Optional mapping merged into attrs (best effort)
+        Expected inputs
+        ----------------
+        - conversation: AutoGen conversation object (optional)
+        - extra_context: Optional mapping merged into attrs (best effort)
 
         If both are None/empty, returns None and lets downstream helpers
         construct an "empty" OperationContext as needed.
         """
-        extra = dict(extra_context or {})
+        extra: Dict[str, Any] = dict(extra_context or {})
 
         if conversation is None and not extra:
             return None
@@ -265,7 +451,7 @@ class CorpusAutoGenGraphClient:
                 framework_version=self._framework_version,
                 **extra,
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             attach_context(
                 exc,
                 framework="autogen",
@@ -315,7 +501,7 @@ class CorpusAutoGenGraphClient:
         effective_dialect = dialect or self._default_dialect
         effective_namespace = namespace or self._default_namespace
 
-        raw: dict[str, Any] = {
+        raw: Dict[str, Any] = {
             "text": query,
             "params": dict(params or {}),
             "stream": bool(stream),
@@ -342,7 +528,7 @@ class CorpusAutoGenGraphClient:
         return {"namespace": effective_namespace} if effective_namespace is not None else {}
 
     @staticmethod
-    def _capabilities_to_dict(caps: GraphCapabilities) -> Mapping[str, Any]:
+    def _capabilities_to_dict(caps: GraphCapabilities) -> Dict[str, Any]:
         """
         Convert a GraphCapabilities dataclass into an AutoGen-friendly dict.
         """
@@ -363,60 +549,26 @@ class CorpusAutoGenGraphClient:
             "max_batch_ops": caps.max_batch_ops,
         }
 
-    def _ensure_capabilities(self, value: Any) -> GraphCapabilities:
-        """
-        Ensure the capabilities call result is a GraphCapabilities instance.
-
-        Handles both synchronous and coroutine-returning adapters by using
-        AsyncBridge only in this localized helper.
-        """
-        if hasattr(value, "__await__"):
-            value = AsyncBridge.run_async(value)
-
-        if not isinstance(value, GraphCapabilities):
-            raise BadRequest(
-                f"graph_adapter.capabilities returned unsupported type: {type(value).__name__}",
-                code="BAD_ADAPTER_RESULT",
-            )
-        return value
-
-    def _ensure_mapping_result(
-        self,
-        value: Any,
-        *,
-        error_code: str,
-        error_type_name: str,
-    ) -> Mapping[str, Any]:
-        """
-        Ensure a sync or async adapter result is a Mapping[str, Any].
-
-        Uses AsyncBridge for coroutine results and normalizes to a plain dict.
-        """
-        if hasattr(value, "__await__"):
-            value = AsyncBridge.run_async(value)
-
-        if not isinstance(value, Mapping):
-            raise BadRequest(
-                f"{error_type_name} returned unsupported type: {type(value).__name__}",
-                code=error_code,
-            )
-        return dict(value)
-
-    # --------------------------------------------------------------------- #
+    # ------------------------------------------------------------------ #
     # Capabilities / schema / health
-    # --------------------------------------------------------------------- #
+    # ------------------------------------------------------------------ #
 
-    def capabilities(self) -> Mapping[str, Any]:
+    def capabilities(self) -> Dict[str, Any]:
         """
         Sync wrapper around `graph_adapter.capabilities()`.
 
+        Assumes the adapter exposes a sync `capabilities()` method.
         Returns the dataclass as a plain dict for AutoGen-friendly consumption.
         """
         try:
-            raw_caps = self._graph.capabilities()
-            caps = self._ensure_capabilities(raw_caps)
+            caps = self._graph.capabilities()
+            if not isinstance(caps, GraphCapabilities):
+                raise BadRequest(
+                    f"graph_adapter.capabilities returned unsupported type: {type(caps).__name__}",
+                    code="BAD_ADAPTER_RESULT",
+                )
             return self._capabilities_to_dict(caps)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             attach_context(
                 exc,
                 framework="autogen",
@@ -424,9 +576,11 @@ class CorpusAutoGenGraphClient:
             )
             raise
 
-    async def acapabilities(self) -> Mapping[str, Any]:
+    async def acapabilities(self) -> Dict[str, Any]:
         """
         Async capabilities accessor with AutoGen-friendly dict output.
+
+        Assumes the adapter exposes an async `capabilities()` method.
         """
         try:
             caps = await self._graph.capabilities()
@@ -436,7 +590,7 @@ class CorpusAutoGenGraphClient:
                     code="BAD_ADAPTER_RESULT",
                 )
             return self._capabilities_to_dict(caps)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             attach_context(
                 exc,
                 framework="autogen",
@@ -468,7 +622,7 @@ class CorpusAutoGenGraphClient:
                     code="BAD_TRANSLATED_SCHEMA",
                 )
             return schema
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             attach_context(
                 exc,
                 framework="autogen",
@@ -499,7 +653,7 @@ class CorpusAutoGenGraphClient:
                     code="BAD_TRANSLATED_SCHEMA",
                 )
             return schema
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             attach_context(
                 exc,
                 framework="autogen",
@@ -512,21 +666,23 @@ class CorpusAutoGenGraphClient:
         *,
         conversation: Optional[Any] = None,
         extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> Mapping[str, Any]:
+    ) -> Dict[str, Any]:
         """
         Sync health check wrapper.
 
+        Assumes the adapter exposes a sync `health(ctx=...)` method.
         Returns the normalized health mapping from the underlying adapter.
         """
         ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
         try:
             health_result = self._graph.health(ctx=ctx)
-            return self._ensure_mapping_result(
-                health_result,
-                error_code="BAD_HEALTH_RESULT",
-                error_type_name="graph_adapter.health",
-            )
-        except Exception as exc:
+            if not isinstance(health_result, Mapping):
+                raise BadRequest(
+                    f"graph_adapter.health returned unsupported type: {type(health_result).__name__}",
+                    code="BAD_HEALTH_RESULT",
+                )
+            return dict(health_result)
+        except Exception as exc:  # noqa: BLE001
             attach_context(
                 exc,
                 framework="autogen",
@@ -539,9 +695,11 @@ class CorpusAutoGenGraphClient:
         *,
         conversation: Optional[Any] = None,
         extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> Mapping[str, Any]:
+    ) -> Dict[str, Any]:
         """
         Async health check wrapper.
+
+        Assumes the adapter exposes an async `health(ctx=...)` method.
         """
         ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
         try:
@@ -552,7 +710,7 @@ class CorpusAutoGenGraphClient:
                     code="BAD_HEALTH_RESULT",
                 )
             return dict(health_result)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             attach_context(
                 exc,
                 framework="autogen",
@@ -560,9 +718,9 @@ class CorpusAutoGenGraphClient:
             )
             raise
 
-    # --------------------------------------------------------------------- #
+    # ------------------------------------------------------------------ #
     # Query (sync + async)
-    # --------------------------------------------------------------------- #
+    # ------------------------------------------------------------------ #
 
     def query(
         self,
@@ -606,7 +764,7 @@ class CorpusAutoGenGraphClient:
                     code="BAD_TRANSLATED_RESULT",
                 )
             return result
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             attach_context(
                 exc,
                 framework="autogen",
@@ -659,7 +817,7 @@ class CorpusAutoGenGraphClient:
                     code="BAD_TRANSLATED_RESULT",
                 )
             return result
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             attach_context(
                 exc,
                 framework="autogen",
@@ -670,9 +828,9 @@ class CorpusAutoGenGraphClient:
             )
             raise
 
-    # --------------------------------------------------------------------- #
+    # ------------------------------------------------------------------ #
     # Streaming query (sync + async)
-    # --------------------------------------------------------------------- #
+    # ------------------------------------------------------------------ #
 
     def stream_query(
         self,
@@ -717,7 +875,7 @@ class CorpusAutoGenGraphClient:
                         code="BAD_TRANSLATED_CHUNK",
                     )
                 yield chunk
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             attach_context(
                 exc,
                 framework="autogen",
@@ -767,7 +925,7 @@ class CorpusAutoGenGraphClient:
                         code="BAD_TRANSLATED_CHUNK",
                     )
                 yield chunk
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             attach_context(
                 exc,
                 framework="autogen",
@@ -778,9 +936,9 @@ class CorpusAutoGenGraphClient:
             )
             raise
 
-    # --------------------------------------------------------------------- #
+    # ------------------------------------------------------------------ #
     # Upsert nodes / edges (sync + async)
-    # --------------------------------------------------------------------- #
+    # ------------------------------------------------------------------ #
 
     def upsert_nodes(
         self,
@@ -811,7 +969,7 @@ class CorpusAutoGenGraphClient:
                     code="BAD_UPSERT_RESULT",
                 )
             return result
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             attach_context(
                 exc,
                 framework="autogen",
@@ -846,7 +1004,7 @@ class CorpusAutoGenGraphClient:
                     code="BAD_UPSERT_RESULT",
                 )
             return result
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             attach_context(
                 exc,
                 framework="autogen",
@@ -881,7 +1039,7 @@ class CorpusAutoGenGraphClient:
                     code="BAD_UPSERT_RESULT",
                 )
             return result
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             attach_context(
                 exc,
                 framework="autogen",
@@ -916,7 +1074,7 @@ class CorpusAutoGenGraphClient:
                     code="BAD_UPSERT_RESULT",
                 )
             return result
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             attach_context(
                 exc,
                 framework="autogen",
@@ -926,9 +1084,9 @@ class CorpusAutoGenGraphClient:
             )
             raise
 
-    # --------------------------------------------------------------------- #
+    # ------------------------------------------------------------------ #
     # Delete nodes / edges (sync + async)
-    # --------------------------------------------------------------------- #
+    # ------------------------------------------------------------------ #
 
     def delete_nodes(
         self,
@@ -963,7 +1121,7 @@ class CorpusAutoGenGraphClient:
                     code="BAD_DELETE_RESULT",
                 )
             return result
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             attach_context(
                 exc,
                 framework="autogen",
@@ -1003,7 +1161,7 @@ class CorpusAutoGenGraphClient:
                     code="BAD_DELETE_RESULT",
                 )
             return result
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             attach_context(
                 exc,
                 framework="autogen",
@@ -1043,7 +1201,7 @@ class CorpusAutoGenGraphClient:
                     code="BAD_DELETE_RESULT",
                 )
             return result
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             attach_context(
                 exc,
                 framework="autogen",
@@ -1083,7 +1241,7 @@ class CorpusAutoGenGraphClient:
                     code="BAD_DELETE_RESULT",
                 )
             return result
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             attach_context(
                 exc,
                 framework="autogen",
@@ -1093,9 +1251,9 @@ class CorpusAutoGenGraphClient:
             )
             raise
 
-    # --------------------------------------------------------------------- #
+    # ------------------------------------------------------------------ #
     # Bulk vertices (sync + async)
-    # --------------------------------------------------------------------- #
+    # ------------------------------------------------------------------ #
 
     def bulk_vertices(
         self,
@@ -1133,7 +1291,7 @@ class CorpusAutoGenGraphClient:
                     code="BAD_BULK_VERTICES_RESULT",
                 )
             return result
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             attach_context(
                 exc,
                 framework="autogen",
@@ -1176,7 +1334,7 @@ class CorpusAutoGenGraphClient:
                     code="BAD_BULK_VERTICES_RESULT",
                 )
             return result
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             attach_context(
                 exc,
                 framework="autogen",
@@ -1186,9 +1344,9 @@ class CorpusAutoGenGraphClient:
             )
             raise
 
-    # --------------------------------------------------------------------- #
+    # ------------------------------------------------------------------ #
     # Batch (sync + async)
-    # --------------------------------------------------------------------- #
+    # ------------------------------------------------------------------ #
 
     def batch(
         self,
@@ -1221,7 +1379,7 @@ class CorpusAutoGenGraphClient:
                     code="BAD_BATCH_RESULT",
                 )
             return result
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             attach_context(
                 exc,
                 framework="autogen",
@@ -1258,7 +1416,7 @@ class CorpusAutoGenGraphClient:
                     code="BAD_BATCH_RESULT",
                 )
             return result
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             attach_context(
                 exc,
                 framework="autogen",
