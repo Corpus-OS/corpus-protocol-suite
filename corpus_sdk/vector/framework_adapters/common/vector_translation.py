@@ -362,6 +362,7 @@ class VectorFrameworkTranslator(Protocol):
         - Converting framework-level query/mutation inputs into Vector*Spec types
         - Converting Vector results into framework-level outputs
         - (Optionally) applying MMR or other post-processing steps
+        - (Optionally) mapping VectorAdapterError into framework-specific errors
 
     The default implementation provided here is generic and treats inputs as
     dicts/arrays that already closely match VectorSpec shapes. Frameworks with
@@ -466,6 +467,28 @@ class VectorFrameworkTranslator(Protocol):
     ) -> Any:
         ...
 
+    # ---- error mapping ----
+
+    def map_adapter_error(
+        self,
+        error: VectorAdapterError,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Any] = None,
+    ) -> Exception:
+        """
+        Map VectorAdapterError to framework-specific exceptions.
+
+        Args:
+            error: The original adapter error.
+            op_ctx: Operation context.
+            framework_ctx: Framework-specific context.
+
+        Returns:
+            Framework-specific exception (or the original error).
+        """
+        ...
+
     # ---- optional hooks ----
 
     def preferred_namespace(
@@ -530,24 +553,41 @@ class DefaultVectorFrameworkTranslator:
             ns = framework_ctx.get("collection") or framework_ctx.get("namespace")
             if ns is not None and str(ns).strip():
                 return str(ns)
-        
+
         attrs = op_ctx.attrs or {}
         # Try vector_namespace first (most specific)
         ns = attrs.get("vector_namespace")
         if ns is not None and str(ns).strip():
             return str(ns)
-        
+
         # Try collection (vector-specific)
         ns = attrs.get("collection")
         if ns is not None and str(ns).strip():
             return str(ns)
-        
+
         # Fall back to generic namespace
         ns = attrs.get("namespace")
         if ns is not None and str(ns).strip():
             return str(ns)
-        
+
         return None
+
+    # ---- error mapping ----
+
+    def map_adapter_error(
+        self,
+        error: VectorAdapterError,
+        *,
+        op_ctx: OperationContext,  # noqa: ARG002
+        framework_ctx: Optional[Any] = None,  # noqa: ARG002
+    ) -> Exception:
+        """
+        Default behavior: surface the adapter error as-is.
+
+        Framework-specific translators can override this to map to their
+        own exception hierarchies.
+        """
+        return error
 
     # ---- query translation ----
 
@@ -561,13 +601,14 @@ class DefaultVectorFrameworkTranslator:
     ) -> VectorQuerySpec:
         namespace = self.preferred_namespace(op_ctx=op_ctx, framework_ctx=framework_ctx)
 
-        # Case 1: raw_query is a vector (list/tuple of floats)
+        # Case 1: raw_query is a vector (list/tuple of floats).
+        # Default behavior: top_k=10, include_metadata=True, include_vectors=False.
         if isinstance(raw_query, (list, tuple)):
             try:
                 vector = [float(v) for v in raw_query]
                 return VectorQuerySpec(
                     vector=vector,
-                    top_k=10,  # Default
+                    top_k=10,
                     filters=None,
                     namespace=namespace,
                     include_metadata=True,
@@ -588,7 +629,7 @@ class DefaultVectorFrameworkTranslator:
                     "raw_query.vector must be a list/tuple of floats",
                     code="BAD_QUERY",
                 )
-            
+
             try:
                 vector = [float(v) for v in vector]
             except (TypeError, ValueError):
@@ -597,7 +638,13 @@ class DefaultVectorFrameworkTranslator:
                     code="BAD_QUERY_VECTOR",
                 )
 
-            top_k = raw_query.get("top_k", 10)
+            top_k = int(raw_query.get("top_k", 10))
+            if top_k <= 0:
+                raise BadRequest(
+                    f"top_k must be positive, got {top_k}",
+                    code="BAD_QUERY_TOP_K",
+                )
+
             filters = raw_query.get("filters")
             rq_namespace = raw_query.get("namespace") or raw_query.get("collection")
             include_metadata = raw_query.get("include_metadata", True)
@@ -609,7 +656,7 @@ class DefaultVectorFrameworkTranslator:
 
             return VectorQuerySpec(
                 vector=vector,
-                top_k=int(top_k),
+                top_k=top_k,
                 filters=filters,
                 namespace=str(rq_namespace) if rq_namespace is not None else namespace,
                 include_metadata=bool(include_metadata),
@@ -682,7 +729,7 @@ class DefaultVectorFrameworkTranslator:
                     code="BAD_DOCUMENTS",
                     details={"index": idx, "type": type(item).__name__},
                 )
-            
+
             # Extract vector
             vector = item.get("vector") or item.get("embedding")
             if not isinstance(vector, (list, tuple)):
@@ -691,7 +738,7 @@ class DefaultVectorFrameworkTranslator:
                     code="BAD_DOCUMENT_VECTOR",
                     details={"index": idx},
                 )
-            
+
             try:
                 vector = [float(v) for v in vector]
             except (TypeError, ValueError):
@@ -793,11 +840,19 @@ class DefaultVectorFrameworkTranslator:
                     code="BAD_UPDATES",
                     details={"index": idx, "type": type(item).__name__},
                 )
-            
+
+            raw_id = item.get("id")
+            if raw_id is None or (isinstance(raw_id, str) and not raw_id.strip()):
+                raise BadRequest(
+                    f"raw_updates[{idx}] is missing a valid 'id'",
+                    code="BAD_UPDATE_ID",
+                    details={"index": idx},
+                )
+
             update_dict: Dict[str, Any] = {
-                "id": str(item.get("id")),
+                "id": str(raw_id),
             }
-            
+
             # Optional vector update
             if "vector" in item or "embedding" in item:
                 vector = item.get("vector") or item.get("embedding")
@@ -809,11 +864,11 @@ class DefaultVectorFrameworkTranslator:
                         code="BAD_UPDATE_VECTOR",
                         details={"index": idx},
                     )
-            
+
             # Optional metadata update
             if "metadata" in item:
                 update_dict["metadata"] = dict(item["metadata"])
-            
+
             updates.append(update_dict)
 
         return VectorUpdateSpec(updates=updates, namespace=namespace)
@@ -885,7 +940,7 @@ class VectorTranslator:
         dot = sum(x * y for x, y in zip(a, b))
         na = math.sqrt(sum(x * x for x in a))
         nb = math.sqrt(sum(y * y for y in b))
-        
+
         if na <= 0.0 or nb <= 0.0:
             return 0.0
         return float(dot / (na * nb))
@@ -969,7 +1024,7 @@ class VectorTranslator:
             min_score = min(scores)
             max_score = max(scores)
             score_range = max_score - min_score
-            
+
             if score_range <= 0.0:
                 # All scores identical
                 normalized_scores = [1.0 for _ in scores]
@@ -983,7 +1038,7 @@ class VectorTranslator:
 
         selected_indices: List[int] = []
         candidates: List[int] = list(range(n))
-        
+
         # Optimized similarity cache with canonical key ordering
         similarity_cache: Dict[Tuple[int, int], float] = {}
 
@@ -1067,6 +1122,7 @@ class VectorTranslator:
             - Apply MMR (CRITICAL for vector quality)
             - Translate result back to framework-level shape
         """
+
         async def _query_coro():
             ctx = _ensure_operation_context(op_ctx)
             try:
@@ -1077,7 +1133,7 @@ class VectorTranslator:
                     stream=False,
                 )
                 result = await self._adapter.query(spec, ctx=ctx)
-                
+
                 if not isinstance(result, QueryResult):
                     raise BadRequest(
                         f"adapter.query returned unsupported type: {type(result).__name__}",
@@ -1091,6 +1147,13 @@ class VectorTranslator:
                     op_ctx=ctx,
                     framework_ctx=framework_ctx,
                 )
+            except VectorAdapterError as adapter_error:
+                mapped_error = self._translator.map_adapter_error(
+                    adapter_error, op_ctx=ctx, framework_ctx=framework_ctx
+                )
+                if mapped_error is not adapter_error:
+                    raise mapped_error from adapter_error
+                raise
             except Exception as exc:
                 # Attach error context to all exceptions
                 attach_context(
@@ -1136,7 +1199,7 @@ class VectorTranslator:
                 stream=False,
             )
             result = await self._adapter.query(spec, ctx=ctx)
-            
+
             if not isinstance(result, QueryResult):
                 raise BadRequest(
                     f"adapter.query returned unsupported type: {type(result).__name__}",
@@ -1149,6 +1212,13 @@ class VectorTranslator:
                 op_ctx=ctx,
                 framework_ctx=framework_ctx,
             )
+        except VectorAdapterError as adapter_error:
+            mapped_error = self._translator.map_adapter_error(
+                adapter_error, op_ctx=ctx, framework_ctx=framework_ctx
+            )
+            if mapped_error is not adapter_error:
+                raise mapped_error from adapter_error
+            raise
         except Exception as exc:
             attach_context(
                 exc,
@@ -1197,6 +1267,13 @@ class VectorTranslator:
                         op_ctx=ctx,
                         framework_ctx=framework_ctx,
                     )
+            except VectorAdapterError as adapter_error:
+                mapped_error = self._translator.map_adapter_error(
+                    adapter_error, op_ctx=ctx, framework_ctx=framework_ctx
+                )
+                if mapped_error is not adapter_error:
+                    raise mapped_error from adapter_error
+                raise
             except Exception as exc:
                 attach_context(
                     exc,
@@ -1248,6 +1325,13 @@ class VectorTranslator:
                     op_ctx=ctx,
                     framework_ctx=framework_ctx,
                 )
+        except VectorAdapterError as adapter_error:
+            mapped_error = self._translator.map_adapter_error(
+                adapter_error, op_ctx=ctx, framework_ctx=framework_ctx
+            )
+            if mapped_error is not adapter_error:
+                raise mapped_error from adapter_error
+            raise
         except Exception as exc:
             attach_context(
                 exc,
@@ -1270,6 +1354,7 @@ class VectorTranslator:
         framework_ctx: Optional[Any] = None,
     ) -> Any:
         """Synchronous upsert (uses AsyncBridge)."""
+
         async def _upsert_coro():
             ctx = _ensure_operation_context(op_ctx)
             try:
@@ -1279,18 +1364,25 @@ class VectorTranslator:
                     framework_ctx=framework_ctx,
                 )
                 result = await self._adapter.upsert(spec, ctx=ctx)
-                
+
                 if not isinstance(result, UpsertResult):
                     raise BadRequest(
                         f"adapter.upsert returned unsupported type: {type(result).__name__}",
                         code="BAD_ADAPTER_RESULT",
                     )
-                
+
                 return self._translator.translate_upsert_result(
                     result,
                     op_ctx=ctx,
                     framework_ctx=framework_ctx,
                 )
+            except VectorAdapterError as adapter_error:
+                mapped_error = self._translator.map_adapter_error(
+                    adapter_error, op_ctx=ctx, framework_ctx=framework_ctx
+                )
+                if mapped_error is not adapter_error:
+                    raise mapped_error from adapter_error
+                raise
             except Exception as exc:
                 attach_context(
                     exc,
@@ -1321,18 +1413,25 @@ class VectorTranslator:
                 framework_ctx=framework_ctx,
             )
             result = await self._adapter.upsert(spec, ctx=ctx)
-            
+
             if not isinstance(result, UpsertResult):
                 raise BadRequest(
                     f"adapter.upsert returned unsupported type: {type(result).__name__}",
                     code="BAD_ADAPTER_RESULT",
                 )
-            
+
             return self._translator.translate_upsert_result(
                 result,
                 op_ctx=ctx,
                 framework_ctx=framework_ctx,
             )
+        except VectorAdapterError as adapter_error:
+            mapped_error = self._translator.map_adapter_error(
+                adapter_error, op_ctx=ctx, framework_ctx=framework_ctx
+            )
+            if mapped_error is not adapter_error:
+                raise mapped_error from adapter_error
+            raise
         except Exception as exc:
             attach_context(
                 exc,
@@ -1351,6 +1450,7 @@ class VectorTranslator:
         framework_ctx: Optional[Any] = None,
     ) -> Any:
         """Synchronous delete (uses AsyncBridge)."""
+
         async def _delete_coro():
             ctx = _ensure_operation_context(op_ctx)
             try:
@@ -1360,18 +1460,25 @@ class VectorTranslator:
                     framework_ctx=framework_ctx,
                 )
                 result = await self._adapter.delete(spec, ctx=ctx)
-                
+
                 if not isinstance(result, DeleteResult):
                     raise BadRequest(
                         f"adapter.delete returned unsupported type: {type(result).__name__}",
                         code="BAD_ADAPTER_RESULT",
                     )
-                
+
                 return self._translator.translate_delete_result(
                     result,
                     op_ctx=ctx,
                     framework_ctx=framework_ctx,
                 )
+            except VectorAdapterError as adapter_error:
+                mapped_error = self._translator.map_adapter_error(
+                    adapter_error, op_ctx=ctx, framework_ctx=framework_ctx
+                )
+                if mapped_error is not adapter_error:
+                    raise mapped_error from adapter_error
+                raise
             except Exception as exc:
                 attach_context(
                     exc,
@@ -1402,18 +1509,25 @@ class VectorTranslator:
                 framework_ctx=framework_ctx,
             )
             result = await self._adapter.delete(spec, ctx=ctx)
-            
+
             if not isinstance(result, DeleteResult):
                 raise BadRequest(
                     f"adapter.delete returned unsupported type: {type(result).__name__}",
                     code="BAD_ADAPTER_RESULT",
                 )
-            
+
             return self._translator.translate_delete_result(
                 result,
                 op_ctx=ctx,
                 framework_ctx=framework_ctx,
             )
+        except VectorAdapterError as adapter_error:
+            mapped_error = self._translator.map_adapter_error(
+                adapter_error, op_ctx=ctx, framework_ctx=framework_ctx
+            )
+            if mapped_error is not adapter_error:
+                raise mapped_error from adapter_error
+            raise
         except Exception as exc:
             attach_context(
                 exc,
@@ -1432,6 +1546,7 @@ class VectorTranslator:
         framework_ctx: Optional[Any] = None,
     ) -> Any:
         """Synchronous update (uses AsyncBridge)."""
+
         async def _update_coro():
             ctx = _ensure_operation_context(op_ctx)
             try:
@@ -1441,18 +1556,25 @@ class VectorTranslator:
                     framework_ctx=framework_ctx,
                 )
                 result = await self._adapter.update(spec, ctx=ctx)
-                
+
                 if not isinstance(result, UpdateResult):
                     raise BadRequest(
                         f"adapter.update returned unsupported type: {type(result).__name__}",
                         code="BAD_ADAPTER_RESULT",
                     )
-                
+
                 return self._translator.translate_update_result(
                     result,
                     op_ctx=ctx,
                     framework_ctx=framework_ctx,
                 )
+            except VectorAdapterError as adapter_error:
+                mapped_error = self._translator.map_adapter_error(
+                    adapter_error, op_ctx=ctx, framework_ctx=framework_ctx
+                )
+                if mapped_error is not adapter_error:
+                    raise mapped_error from adapter_error
+                raise
             except Exception as exc:
                 attach_context(
                     exc,
@@ -1483,18 +1605,25 @@ class VectorTranslator:
                 framework_ctx=framework_ctx,
             )
             result = await self._adapter.update(spec, ctx=ctx)
-            
+
             if not isinstance(result, UpdateResult):
                 raise BadRequest(
                     f"adapter.update returned unsupported type: {type(result).__name__}",
                     code="BAD_ADAPTER_RESULT",
                 )
-            
+
             return self._translator.translate_update_result(
                 result,
                 op_ctx=ctx,
                 framework_ctx=framework_ctx,
             )
+        except VectorAdapterError as adapter_error:
+            mapped_error = self._translator.map_adapter_error(
+                adapter_error, op_ctx=ctx, framework_ctx=framework_ctx
+            )
+            if mapped_error is not adapter_error:
+                raise mapped_error from adapter_error
+            raise
         except Exception as exc:
             attach_context(
                 exc,
@@ -1516,11 +1645,12 @@ class VectorTranslator:
         framework_ctx: Optional[Any] = None,
     ) -> Any:
         """Synchronous get_stats (uses AsyncBridge)."""
+
         async def _stats_coro():
             ctx = _ensure_operation_context(op_ctx)
             try:
                 stats = await self._adapter.get_stats(ctx=ctx)
-                
+
                 if not isinstance(stats, VectorStats):
                     raise BadRequest(
                         f"adapter.get_stats returned unsupported type: {type(stats).__name__}",
@@ -1532,6 +1662,13 @@ class VectorTranslator:
                     op_ctx=ctx,
                     framework_ctx=framework_ctx,
                 )
+            except VectorAdapterError as adapter_error:
+                mapped_error = self._translator.map_adapter_error(
+                    adapter_error, op_ctx=ctx, framework_ctx=framework_ctx
+                )
+                if mapped_error is not adapter_error:
+                    raise mapped_error from adapter_error
+                raise
             except Exception as exc:
                 attach_context(
                     exc,
@@ -1556,7 +1693,7 @@ class VectorTranslator:
         ctx = _ensure_operation_context(op_ctx)
         try:
             stats = await self._adapter.get_stats(ctx=ctx)
-            
+
             if not isinstance(stats, VectorStats):
                 raise BadRequest(
                     f"adapter.get_stats returned unsupported type: {type(stats).__name__}",
@@ -1568,6 +1705,13 @@ class VectorTranslator:
                 op_ctx=ctx,
                 framework_ctx=framework_ctx,
             )
+        except VectorAdapterError as adapter_error:
+            mapped_error = self._translator.map_adapter_error(
+                adapter_error, op_ctx=ctx, framework_ctx=framework_ctx
+            )
+            if mapped_error is not adapter_error:
+                raise mapped_error from adapter_error
+            raise
         except Exception as exc:
             attach_context(
                 exc,
