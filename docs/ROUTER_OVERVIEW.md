@@ -1,7 +1,7 @@
 # Corpus Router Overview
 
 > **One routing layer. Four AI domains. Infinite Possibilities. Learns what works.**  
-> Built on the **Corpus Protocol Suite** (wire-level, vendor-neutral).
+  > Built on the **Corpus Protocol** (wire-level, vendor-neutral).
 
 Corpus Router is an **enterprise orchestration layer** for AI infrastructure across:
 
