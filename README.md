@@ -214,7 +214,7 @@ You don’t have to pick one. Large teams typically run **all three** patterns a
 
 ## When Not to Use CORPUS
 
-You probably don’t need `CORPUS_sdk` or CORPUS Router if:
+You probably don’t need `corpus_sdk` or CORPUS Router if:
 
 * **You’re single-provider and happy**: One LLM/vector/graph backend, and you’re fine with their SDKs and breaking changes.
 * **No governance/compliance pressure**: No per-tenant isolation, budgets, audit trails, or data residency constraints.
@@ -222,7 +222,7 @@ You probably don’t need `CORPUS_sdk` or CORPUS Router if:
 * **You want infra logic in-app**: You prefer to hard-code routing, retries, backoff, and failover directly.
 * **It’s a quick throwaway prototype**: Lock-in, metrics, and resilience aren’t worth thinking about (yet).
 
-If any of these stop being true, `CORPUS_sdk` is the incremental next step; **CORPUS Router** becomes relevant once you need centralized, explainable, multi-provider routing.
+If any of these stop being true, `corpus_sdk` is the incremental next step; **CORPUS Router** becomes relevant once you need centralized, explainable, multi-provider routing.
 
 > If you’re happily single-provider **inside a single framework** and don’t need shared observability or governance, keep it simple and stick with that framework. CORPUS becomes valuable once you have **multiple frameworks and/or multiple providers** and want one coherent infra layer under them.
 
@@ -245,7 +245,7 @@ If any of these stop being true, `CORPUS_sdk` is the incremental next step; **CO
 ## Install
 
 ```bash
-pip install CORPUS_sdk
+pip install corpus_sdk
 ```
 
 * Python ≥ 3.9 recommended
@@ -257,7 +257,7 @@ pip install CORPUS_sdk
 
 ```python
 # Simplest possible working example - get started in under 5 minutes
-from CORPUS_sdk.llm.llm_base import BaseLLMAdapter, OperationContext
+from corpus_sdk.llm.llm_base import BaseLLMAdapter, OperationContext
 
 class QuickAdapter(BaseLLMAdapter):
     async def _do_complete(self, messages, **kwargs):
@@ -309,7 +309,7 @@ If you run in **standalone** without a metrics sink, the SDK will emit a warning
 ### Embeddings Quickstart
 
 ```python
-from CORPUS_sdk.embedding.embedding_base import (
+from corpus_sdk.embedding.embedding_base import (
     BaseEmbeddingAdapter, EmbedSpec, OperationContext, EmbeddingVector,
     EmbeddingCapabilities, BatchEmbedSpec, BatchEmbedResult, EmbedResult
 )
@@ -392,7 +392,7 @@ async with ExampleEmbeddingAdapter() as adapter:
 ### LLM Quickstart
 
 ```python
-from CORPUS_sdk.llm.llm_base import (
+from corpus_sdk.llm.llm_base import (
     BaseLLMAdapter, OperationContext, LLMCompletion,
     TokenUsage, LLMCapabilities, LLMChunk, LLMStreamResult
 )
@@ -465,7 +465,7 @@ async with ExampleLLMAdapter() as adapter:
 ### Vector Quickstart
 
 ```python
-from CORPUS_sdk.vector.vector_base import (
+from corpus_sdk.vector.vector_base import (
     BaseVectorAdapter, VectorCapabilities, QuerySpec, QueryResult,
     Vector, VectorMatch, UpsertSpec, UpsertResult, DeleteSpec,
     DeleteResult, NamespaceSpec, NamespaceResult, OperationContext, VectorID
@@ -568,7 +568,7 @@ print(result.matches[0].score)
 ### Graph Quickstart
 
 ```python
-from CORPUS_sdk.graph.graph_base import (
+from corpus_sdk.graph.graph_base import (
     BaseGraphAdapter, GraphCapabilities, GraphQuerySpec,
     UpsertNodesSpec, UpsertEdgesSpec, Node, Edge, GraphID,
     OperationContext, GraphQueryResult, UpsertNodesResult,
@@ -855,7 +855,7 @@ Enable detailed logging:
 ```python
 import logging
 logging.basicConfig(level=logging.DEBUG)
-logging.getLogger("CORPUS_sdk").setLevel(logging.DEBUG)
+logging.getLogger("corpus_sdk").setLevel(logging.DEBUG)
 ```
 
 ---
@@ -953,11 +953,11 @@ We especially welcome **community adapter contributions** (e.g., new LLM/vector/
 
 | Need                                | Solution                                   | Cost           |
 | ----------------------------------- | ------------------------------------------ | -------------- |
-| Learning / prototyping              | `CORPUS_sdk` + example adapters            | **Free (OSS)** |
-| Production with your own infra      | `CORPUS_sdk` + your adapters               | **Free (OSS)** |
-| Production with official adapters   | `CORPUS_sdk` + **Official Adapters**       | **Commercial** |
-| Enterprise multi-provider (managed) | `CORPUS_sdk` + **CORPUS Router (Managed)** | **Commercial** |
-| Enterprise multi-provider (on-prem) | `CORPUS_sdk` + **CORPUS Router (On-Prem)** | **Commercial** |
+| Learning / prototyping              | `corpus_sdk` + example adapters            | **Free (OSS)** |
+| Production with your own infra      | `corpus_sdk` + your adapters               | **Free (OSS)** |
+| Production with official adapters   | `corpus_sdk` + **Official Adapters**       | **Commercial** |
+| Enterprise multi-provider (managed) | `corpus_sdk` + **CORPUS Router (Managed)** | **Commercial** |
+| Enterprise multi-provider (on-prem) | `corpus_sdk` + **CORPUS Router (On-Prem)** | **Commercial** |
 
 **Router details & architecture** live in a separate doc (see `docs/guides/ROUTER_OVERVIEW.md` or CORPUS.io) to keep this README focused on the SDK and protocols.
 
