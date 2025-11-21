@@ -10,7 +10,7 @@ This module exposes Corpus `BaseVectorAdapter` implementations as
 - Sync + async add/search APIs (mirroring LangChain's VectorStore)
 - Proper integration with Corpus VectorProtocolV1
 - Namespace + metadata filter handling (capability-aware)
-- Batch upserts and deletes that respect backend limits
+- Batch upserts and deletes that respect backend limits (via VectorTranslator)
 - Optional client-side score thresholding
 - Optional embedding function integration
 - Optional max marginal relevance (MMR) search
@@ -18,12 +18,13 @@ This module exposes Corpus `BaseVectorAdapter` implementations as
 Design philosophy
 -----------------
 - Protocol-first: LangChain is a thin skin over Corpus vector adapters.
-- All heavy lifting (backpressure, deadlines, breakers, etc.) lives in
-  the underlying `BaseVectorAdapter`, not here.
+- All heavy lifting (backpressure, deadlines, breakers, batching, etc.) lives in
+  the underlying adapter + the shared VectorTranslator, not here.
 - This layer focuses on:
     * Translating LangChain Documents ↔ Corpus Vector objects
     * Respecting VectorCapabilities (namespaces, filters, batch sizes)
-    * Bridging async Corpus APIs into LangChain's sync interface via AsyncBridge
+    * Delegating sync/async orchestration to VectorTranslator
+    * Propagating LangChain config into OperationContext
 
 Usage
 -----
@@ -74,6 +75,7 @@ from __future__ import annotations
 import logging
 import math
 import uuid
+from functools import cached_property
 from typing import (
     Any,
     Callable,
@@ -99,9 +101,6 @@ from corpus_sdk.vector.vector_base import (
     QueryResult,
     UpsertResult,
     DeleteResult,
-    QuerySpec,
-    UpsertSpec,
-    DeleteSpec,
     OperationContext,
     VectorCapabilities,
     # Errors
@@ -109,13 +108,15 @@ from corpus_sdk.vector.vector_base import (
     NotSupported,
     VectorAdapterError,
 )
+from corpus_sdk.vector.framework_adapters.common.vector_translation import (
+    DefaultVectorFrameworkTranslator,
+    VectorTranslator,
+)
 
-from corpus_sdk.llm.framework_adapters.common.async_bridge import AsyncBridge
 from corpus_sdk.llm.framework_adapters.common.context_translation import (
     from_langchain as context_from_langchain,
 )
 from corpus_sdk.llm.framework_adapters.common.error_context import attach_context
-from corpus_sdk.core.sync_stream_bridge import sync_stream
 
 logger = logging.getLogger(__name__)
 
@@ -129,9 +130,11 @@ class CorpusLangChainVectorStore(VectorStore):
 
     This class is a thin integration layer:
     - Documents are mapped to Corpus VectorProtocol `Vector` objects.
-    - Similarity search calls map to adapter `query()` calls.
-    - Namespaces + metadata filters are honored based on VectorCapabilities.
-    - Sync APIs are implemented via `AsyncBridge` on top of async Corpus methods.
+    - Similarity search calls map to translator-level `query()` calls.
+    - Namespaces + metadata filters are honored based on VectorCapabilities
+      (as enforced by the shared VectorTranslator).
+    - All sync/async orchestration is delegated to `VectorTranslator`, so this
+      adapter does not use any AsyncBridge or sync-stream utilities directly.
 
     Attributes
     ----------
@@ -158,8 +161,7 @@ class CorpusLangChainVectorStore(VectorStore):
 
     batch_size:
         Planning hint for upsert/delete batches. The effective batch size is
-        `min(batch_size, capabilities.max_batch_size)` when the backend reports
-        a max batch size; otherwise `batch_size`.
+        enforced inside the shared `VectorTranslator` via VectorCapabilities.
 
     max_query_batch_size:
         Placeholder for future multi-query APIs. Currently unused.
@@ -210,8 +212,26 @@ class CorpusLangChainVectorStore(VectorStore):
     model_config = {"arbitrary_types_allowed": True}
 
     # ------------------------------------------------------------------ #
-    # VectorStore-required properties / metadata
+    # Translator + VectorStore-required properties / metadata
     # ------------------------------------------------------------------ #
+
+    @cached_property
+    def _translator(self) -> VectorTranslator:
+        """
+        Lazily construct and cache the `VectorTranslator`.
+
+        All sync/async bridging, batching, and capability-aware orchestration
+        is delegated to this shared translator. This adapter only:
+        - Builds raw request shapes
+        - Translates between LangChain and Corpus types
+        - Applies framework-specific post-processing (e.g., MMR).
+        """
+        framework_translator = DefaultVectorFrameworkTranslator()
+        return VectorTranslator(
+            adapter=self.corpus_adapter,
+            framework="langchain",
+            translator=framework_translator,
+        )
 
     @property
     def _vectorstore_type(self) -> str:
@@ -226,12 +246,13 @@ class CorpusLangChainVectorStore(VectorStore):
         """
         Synchronously fetch and cache VectorCapabilities.
 
-        Uses AsyncBridge to call the async adapter.
+        Uses the VectorTranslator's sync capabilities API. All underlying
+        async behavior and bridging is owned by the translator, not here.
         """
         if self._caps is not None:
             return self._caps
         try:
-            caps = AsyncBridge.run_async(self.corpus_adapter.capabilities())
+            caps = self._translator.capabilities()
             self._caps = caps
             return caps
         except Exception as exc:  # noqa: BLE001
@@ -239,11 +260,15 @@ class CorpusLangChainVectorStore(VectorStore):
             raise
 
     async def _get_caps_async(self) -> VectorCapabilities:
-        """Async capability fetch with caching."""
+        """
+        Async capability fetch with caching.
+
+        Uses the VectorTranslator's async capabilities API.
+        """
         if self._caps is not None:
             return self._caps
         try:
-            caps = await self.corpus_adapter.capabilities()
+            caps = await self._translator.arun_capabilities()
             self._caps = caps
             return caps
         except Exception as exc:  # noqa: BLE001
@@ -274,6 +299,17 @@ class CorpusLangChainVectorStore(VectorStore):
         still passed down, but the adapter may ignore it.
         """
         return namespace if namespace is not None else self.namespace
+
+    def _framework_ctx_for_namespace(
+        self,
+        namespace: Optional[str],
+    ) -> Mapping[str, Any]:
+        """
+        Build a minimal framework_ctx mapping that lets the translator know
+        which logical namespace is being targeted.
+        """
+        ns = self._effective_namespace(namespace)
+        return {"namespace": ns} if ns is not None else {}
 
     # ------------------------------------------------------------------ #
     # Translation helpers: LC Documents ↔ Corpus Vector
@@ -483,8 +519,6 @@ class CorpusLangChainVectorStore(VectorStore):
             if self.metadata_field and self.metadata_field in meta:
                 nested = meta.get(self.metadata_field) or {}
                 if isinstance(nested, Mapping):
-                    # Merge nested metadata into the top-level dict, but keep
-                    # reserved keys like text/id from the top-level.
                     nested_meta = dict(nested)
                 else:
                     nested_meta = {}
@@ -505,58 +539,23 @@ class CorpusLangChainVectorStore(VectorStore):
             results.append((doc, float(m.score)))
         return results
 
-    # ------------------------------------------------------------------ #
-    # Core async Corpus operations
-    # ------------------------------------------------------------------ #
-
-    async def _aupsert_vectors(
+    def _apply_score_threshold(
         self,
-        vectors: List[Vector],
-        *,
-        namespace: Optional[str],
-        ctx: Optional[OperationContext],
-    ) -> UpsertResult:
+        matches: Sequence[VectorMatch],
+    ) -> List[VectorMatch]:
         """
-        Async upsert of a batch of Corpus Vector objects.
-
-        Respects backend max_batch_size if reported in capabilities.
-        Aggregates per-batch UpsertResult into a single result.
+        Apply optional client-side score thresholding to a list of matches.
         """
-        caps = await self._get_caps_async()
-        max_batch = caps.max_batch_size or self.batch_size or len(vectors)
-        effective_batch_size = max(1, min(max_batch, self.batch_size or max_batch))
+        if self.score_threshold is None:
+            return list(matches)
+        threshold = float(self.score_threshold)
+        return [m for m in matches if float(m.score) >= threshold]
 
-        upserted_total = 0
-        failures_total: List[Dict[str, Any]] = []
+    # ------------------------------------------------------------------ #
+    # Raw request-building helpers for VectorTranslator
+    # ------------------------------------------------------------------ #
 
-        ns = self._effective_namespace(namespace)
-
-        for i in range(0, len(vectors), effective_batch_size):
-            batch = vectors[i : i + effective_batch_size]
-            try:
-                spec = UpsertSpec(namespace=ns, vectors=batch)
-                result = await self.corpus_adapter.upsert(spec, ctx=ctx)
-                upserted_total += int(result.upserted_count or 0)
-                if result.failures:
-                    failures_total.extend(list(result.failures))
-            except Exception as exc:  # noqa: BLE001
-                attach_context(
-                    exc,
-                    framework="langchain",
-                    operation="upsert",
-                    namespace=ns,
-                    batch_index=i // effective_batch_size,
-                    batch_size=len(batch),
-                )
-                raise
-
-        return UpsertResult(
-            upserted_count=upserted_total,
-            failed_count=len(failures_total),
-            failures=failures_total,
-        )
-
-    async def _aquery_embedding(
+    def _build_query_request(
         self,
         embedding: Sequence[float],
         *,
@@ -564,101 +563,58 @@ class CorpusLangChainVectorStore(VectorStore):
         namespace: Optional[str],
         filter: Optional[Mapping[str, Any]],
         include_vectors: bool,
-        ctx: Optional[OperationContext],
-    ) -> List[VectorMatch]:
+    ) -> Tuple[Mapping[str, Any], Mapping[str, Any]]:
         """
-        Async similarity query for a single embedding.
+        Build a raw query mapping suitable for VectorTranslator.
+
+        The translator is responsible for converting this into a QuerySpec and
+        executing the backend query with proper capability checks.
         """
-        caps = await self._get_caps_async()
         ns = self._effective_namespace(namespace)
+        raw_query: Dict[str, Any] = {
+            "vector": [float(x) for x in embedding],
+            "top_k": int(k),
+            "namespace": ns,
+            "filter": dict(filter) if filter else None,
+            "include_metadata": True,
+            "include_vectors": bool(include_vectors),
+        }
+        framework_ctx = self._framework_ctx_for_namespace(ns)
+        return raw_query, framework_ctx
 
-        if caps.max_top_k is not None and k > caps.max_top_k:
-            err = BadRequest(
-                f"top_k {k} exceeds maximum of {caps.max_top_k}",
-                code="BAD_TOP_K",
-                details={"max_top_k": caps.max_top_k, "namespace": ns},
-            )
-            attach_context(
-                err,
-                framework="langchain",
-                operation="query",
-                namespace=ns,
-                top_k=k,
-            )
-            raise err
+    def _build_upsert_request(
+        self,
+        vectors: List[Vector],
+        *,
+        namespace: Optional[str],
+    ) -> Tuple[Mapping[str, Any], Mapping[str, Any]]:
+        """
+        Build a raw upsert mapping suitable for VectorTranslator.
 
-        if filter and not caps.supports_metadata_filtering:
-            err = NotSupported(
-                "metadata filtering is not supported by the underlying vector adapter",
-                code="FILTER_NOT_SUPPORTED",
-                details={"namespace": ns},
-            )
-            attach_context(
-                err,
-                framework="langchain",
-                operation="query",
-                namespace=ns,
-                top_k=k,
-            )
-            raise err
+        The translator handles batching and capability-aware limits.
+        """
+        ns = self._effective_namespace(namespace)
+        raw_request: Dict[str, Any] = {
+            "namespace": ns,
+            "vectors": vectors,
+        }
+        framework_ctx = self._framework_ctx_for_namespace(ns)
+        return raw_request, framework_ctx
 
-        spec = QuerySpec(
-            vector=[float(x) for x in embedding],
-            top_k=k,
-            namespace=ns,
-            filter=dict(filter) if filter else None,
-            include_metadata=True,
-            include_vectors=include_vectors,
-        )
-
-        try:
-            result: QueryResult = await self.corpus_adapter.query(spec, ctx=ctx)
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="langchain",
-                operation="query",
-                namespace=ns,
-                top_k=k,
-            )
-            raise
-
-        matches = list(result.matches or [])
-
-        # Apply optional client-side score threshold
-        if self.score_threshold is not None:
-            matches = [m for m in matches if float(m.score) >= float(self.score_threshold)]
-
-        return matches
-
-    async def _adelete_vectors(
+    def _build_delete_request(
         self,
         *,
         ids: Optional[List[str]],
         namespace: Optional[str],
         filter: Optional[Mapping[str, Any]],
-        ctx: Optional[OperationContext],
-    ) -> DeleteResult:
+    ) -> Tuple[Mapping[str, Any], Mapping[str, Any]]:
         """
-        Async delete by IDs or filter.
-        """
-        caps = await self._get_caps_async()
-        ns = self._effective_namespace(namespace)
+        Build a raw delete mapping suitable for VectorTranslator.
 
-        if filter and not caps.supports_metadata_filtering:
-            err = NotSupported(
-                "delete by metadata filter is not supported by the underlying vector adapter",
-                code="FILTER_NOT_SUPPORTED",
-                details={"namespace": ns},
-            )
-            attach_context(
-                err,
-                framework="langchain",
-                operation="delete",
-                namespace=ns,
-                ids_count=len(ids or []),
-            )
-            raise err
+        Local validation ensures the caller provides at least ids or filter;
+        capability-specific checks are handled by the translator.
+        """
+        ns = self._effective_namespace(namespace)
 
         if not ids and not filter:
             err = BadRequest(
@@ -674,24 +630,13 @@ class CorpusLangChainVectorStore(VectorStore):
             )
             raise err
 
-        spec = DeleteSpec(
-            namespace=ns,
-            ids=[str(i) for i in ids] if ids else None,
-            filter=dict(filter) if filter else None,
-        )
-
-        try:
-            result: DeleteResult = await self.corpus_adapter.delete(spec, ctx=ctx)
-            return result
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="langchain",
-                operation="delete",
-                namespace=ns,
-                ids_count=len(ids or []),
-            )
-            raise
+        raw_request: Dict[str, Any] = {
+            "namespace": ns,
+            "ids": [str(i) for i in ids] if ids else None,
+            "filter": dict(filter) if filter else None,
+        }
+        framework_ctx = self._framework_ctx_for_namespace(ns)
+        return raw_request, framework_ctx
 
     # ------------------------------------------------------------------ #
     # LangChain VectorStore sync API
@@ -710,7 +655,7 @@ class CorpusLangChainVectorStore(VectorStore):
         Behavior:
         - Uses `embedding_function` if configured, unless explicit `embeddings`
           are passed via kwargs.
-        - Respects backend batch size limits when performing upserts.
+        - Delegates batching + capability-aware upserts to VectorTranslator.
         """
         texts_list = list(texts)
         if not texts_list:
@@ -732,16 +677,22 @@ class CorpusLangChainVectorStore(VectorStore):
             namespace=namespace,
         )
 
+        raw_request, framework_ctx = self._build_upsert_request(
+            vectors,
+            namespace=namespace,
+        )
+
         try:
-            AsyncBridge.run_async(
-                self._aupsert_vectors(
-                    vectors,
-                    namespace=namespace,
-                    ctx=ctx,
-                )
+            # All sync/async bridging and batching is inside the translator.
+            result: UpsertResult = self._translator.upsert(
+                raw_request,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
             )
+            # We intentionally ignore result contents here; failures are surfaced
+            # via exceptions (with context) from the translator/adapter.
         except Exception:
-            # Errors already have context attached in _aupsert_vectors.
+            # Errors already have context attached by the translator.
             raise
 
         return ids_norm
@@ -776,10 +727,15 @@ class CorpusLangChainVectorStore(VectorStore):
             namespace=namespace,
         )
 
-        await self._aupsert_vectors(
+        raw_request, framework_ctx = self._build_upsert_request(
             vectors,
             namespace=namespace,
-            ctx=ctx,
+        )
+
+        await self._translator.arun_upsert(
+            raw_request,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
         )
         return ids_norm
 
@@ -878,20 +834,39 @@ class CorpusLangChainVectorStore(VectorStore):
         ctx = self._build_ctx(**kwargs)
 
         query_emb = self._embed_query(query, embedding=embedding)
+        top_k = k or self.default_top_k
+
+        raw_query, framework_ctx = self._build_query_request(
+            query_emb,
+            k=top_k,
+            namespace=namespace,
+            filter=filter,
+            include_vectors=False,
+        )
+
         try:
-            matches = AsyncBridge.run_async(
-                self._aquery_embedding(
-                    query_emb,
-                    k=k or self.default_top_k,
-                    namespace=namespace,
-                    filter=filter,
-                    include_vectors=False,
-                    ctx=ctx,
-                )
+            result_any = self._translator.query(
+                raw_query,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
             )
         except Exception:
+            # Errors are already enriched by the translator.
             raise
 
+        if not isinstance(result_any, QueryResult):
+            err = VectorAdapterError(
+                f"VectorTranslator.query returned unsupported type: {type(result_any).__name__}",
+                code="BAD_TRANSLATED_RESULT",
+            )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="similarity_search",
+            )
+            raise err
+
+        matches = self._apply_score_threshold(list(result_any.matches or []))
         docs_scores = self._from_corpus_matches(matches)
         return [doc for doc, _ in docs_scores]
 
@@ -905,9 +880,11 @@ class CorpusLangChainVectorStore(VectorStore):
         """
         Streaming similarity search (sync), yielding Documents one by one.
 
-        This uses `sync_stream` under the hood to bridge an async generator into
-        a synchronous iterator, while keeping the backend query semantics
-        identical to `similarity_search`.
+        This delegates streaming orchestration to VectorTranslator.query_stream.
+        The adapter only:
+        - Builds the raw query
+        - Applies client-side score thresholding
+        - Converts matches to LangChain Documents.
         """
         embedding: Optional[Sequence[float]] = kwargs.get("embedding")
         namespace: Optional[str] = kwargs.get("namespace")
@@ -916,33 +893,38 @@ class CorpusLangChainVectorStore(VectorStore):
         query_emb = self._embed_query(query, embedding=embedding)
         top_k = k or self.default_top_k
 
-        async def _stream_coro():
-            """
-            Async generator that yields VectorMatch items for streaming.
+        raw_query, framework_ctx = self._build_query_request(
+            query_emb,
+            k=top_k,
+            namespace=namespace,
+            filter=filter,
+            include_vectors=False,
+        )
 
-            This is a simple, readable pattern compatible with `sync_stream`,
-            exposing VectorMatch items one by one.
-            """
-            matches = await self._aquery_embedding(
-                query_emb,
-                k=top_k,
-                namespace=namespace,
-                filter=filter,
-                include_vectors=False,
-                ctx=ctx,
-            )
-            for match in matches:
-                yield match
-
-        for match in sync_stream(
-            _stream_coro,
-            framework="langchain",
-            error_context={
-                "operation": "similarity_search_stream",
-                "namespace": namespace,
-                "top_k": top_k,
-            },
+        for item in self._translator.query_stream(
+            raw_query,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
         ):
+            # The translator should stream VectorMatch items directly.
+            if not isinstance(item, VectorMatch):
+                err = VectorAdapterError(
+                    f"VectorTranslator.query_stream yielded unsupported type: {type(item).__name__}",
+                    code="BAD_TRANSLATED_CHUNK",
+                )
+                attach_context(
+                    err,
+                    framework="langchain",
+                    operation="similarity_search_stream",
+                )
+                raise err
+
+            match = item
+            # Client-side score thresholding per chunk
+            if self.score_threshold is not None:
+                if float(match.score) < float(self.score_threshold):
+                    continue
+
             docs_scores = self._from_corpus_matches([match])
             if docs_scores:
                 yield docs_scores[0][0]
@@ -962,14 +944,35 @@ class CorpusLangChainVectorStore(VectorStore):
         ctx = self._build_ctx(**kwargs)
 
         query_emb = self._embed_query(query, embedding=embedding)
-        matches = await self._aquery_embedding(
+        top_k = k or self.default_top_k
+
+        raw_query, framework_ctx = self._build_query_request(
             query_emb,
-            k=k or self.default_top_k,
+            k=top_k,
             namespace=namespace,
             filter=filter,
             include_vectors=False,
-            ctx=ctx,
         )
+
+        result_any = await self._translator.arun_query(
+            raw_query,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+
+        if not isinstance(result_any, QueryResult):
+            err = VectorAdapterError(
+                f"VectorTranslator.arun_query returned unsupported type: {type(result_any).__name__}",
+                code="BAD_TRANSLATED_RESULT",
+            )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="asimilarity_search",
+            )
+            raise err
+
+        matches = self._apply_score_threshold(list(result_any.matches or []))
         docs_scores = self._from_corpus_matches(matches)
         return [doc for doc, _ in docs_scores]
 
@@ -988,16 +991,35 @@ class CorpusLangChainVectorStore(VectorStore):
         ctx = self._build_ctx(**kwargs)
 
         query_emb = self._embed_query(query, embedding=embedding)
-        matches = AsyncBridge.run_async(
-            self._aquery_embedding(
-                query_emb,
-                k=k or self.default_top_k,
-                namespace=namespace,
-                filter=filter,
-                include_vectors=False,
-                ctx=ctx,
-            )
+        top_k = k or self.default_top_k
+
+        raw_query, framework_ctx = self._build_query_request(
+            query_emb,
+            k=top_k,
+            namespace=namespace,
+            filter=filter,
+            include_vectors=False,
         )
+
+        result_any = self._translator.query(
+            raw_query,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+
+        if not isinstance(result_any, QueryResult):
+            err = VectorAdapterError(
+                f"VectorTranslator.query returned unsupported type: {type(result_any).__name__}",
+                code="BAD_TRANSLATED_RESULT",
+            )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="similarity_search_with_score",
+            )
+            raise err
+
+        matches = self._apply_score_threshold(list(result_any.matches or []))
         return self._from_corpus_matches(matches)
 
     async def asimilarity_search_with_score(
@@ -1015,14 +1037,35 @@ class CorpusLangChainVectorStore(VectorStore):
         ctx = self._build_ctx(**kwargs)
 
         query_emb = self._embed_query(query, embedding=embedding)
-        matches = await self._aquery_embedding(
+        top_k = k or self.default_top_k
+
+        raw_query, framework_ctx = self._build_query_request(
             query_emb,
-            k=k or self.default_top_k,
+            k=top_k,
             namespace=namespace,
             filter=filter,
             include_vectors=False,
-            ctx=ctx,
         )
+
+        result_any = await self._translator.arun_query(
+            raw_query,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+
+        if not isinstance(result_any, QueryResult):
+            err = VectorAdapterError(
+                f"VectorTranslator.arun_query returned unsupported type: {type(result_any).__name__}",
+                code="BAD_TRANSLATED_RESULT",
+            )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="asimilarity_search_with_score",
+            )
+            raise err
+
+        matches = self._apply_score_threshold(list(result_any.matches or []))
         return self._from_corpus_matches(matches)
 
     # ------------------------------------------------------------------ #
@@ -1239,29 +1282,44 @@ class CorpusLangChainVectorStore(VectorStore):
 
         query_emb = self._embed_query(query, embedding=embedding)
 
-        # We need vectors back to compute MMR.
-        matches = AsyncBridge.run_async(
-            self._aquery_embedding(
-                query_emb,
-                k=fetch_k,
-                namespace=namespace,
-                filter=filter,
-                include_vectors=True,
-                ctx=ctx,
-            )
+        raw_query, framework_ctx = self._build_query_request(
+            query_emb,
+            k=fetch_k,
+            namespace=namespace,
+            filter=filter,
+            include_vectors=True,  # MMR needs vectors
         )
 
-        if not matches:
+        result_any = self._translator.query(
+            raw_query,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+
+        if not isinstance(result_any, QueryResult):
+            err = VectorAdapterError(
+                f"VectorTranslator.query returned unsupported type: {type(result_any).__name__}",
+                code="BAD_TRANSLATED_RESULT",
+            )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="mmr_search",
+            )
+            raise err
+
+        candidate_matches = self._apply_score_threshold(list(result_any.matches or []))
+        if not candidate_matches:
             return []
 
         indices = self._mmr_select_indices(
             query_vec=query_emb,
-            candidate_matches=matches,
+            candidate_matches=candidate_matches,
             k=k,
             lambda_mult=lambda_mult,
         )
 
-        docs_scores = self._from_corpus_matches(matches)
+        docs_scores = self._from_corpus_matches(candidate_matches)
         return [docs_scores[i][0] for i in indices]
 
     async def amax_marginal_relevance_search(
@@ -1298,26 +1356,44 @@ class CorpusLangChainVectorStore(VectorStore):
 
         query_emb = self._embed_query(query, embedding=embedding)
 
-        matches = await self._aquery_embedding(
+        raw_query, framework_ctx = self._build_query_request(
             query_emb,
             k=fetch_k,
             namespace=namespace,
             filter=filter,
             include_vectors=True,
-            ctx=ctx,
         )
 
-        if not matches:
+        result_any = await self._translator.arun_query(
+            raw_query,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+
+        if not isinstance(result_any, QueryResult):
+            err = VectorAdapterError(
+                f"VectorTranslator.arun_query returned unsupported type: {type(result_any).__name__}",
+                code="BAD_TRANSLATED_RESULT",
+            )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="mmr_search_async",
+            )
+            raise err
+
+        candidate_matches = self._apply_score_threshold(list(result_any.matches or []))
+        if not candidate_matches:
             return []
 
         indices = self._mmr_select_indices(
             query_vec=query_emb,
-            candidate_matches=matches,
+            candidate_matches=candidate_matches,
             k=k,
             lambda_mult=lambda_mult,
         )
 
-        docs_scores = self._from_corpus_matches(matches)
+        docs_scores = self._from_corpus_matches(candidate_matches)
         return [docs_scores[i][0] for i in indices]
 
     # ------------------------------------------------------------------ #
@@ -1336,14 +1412,24 @@ class CorpusLangChainVectorStore(VectorStore):
         """
         namespace: Optional[str] = kwargs.get("namespace")
         ctx = self._build_ctx(**kwargs)
-        AsyncBridge.run_async(
-            self._adelete_vectors(
-                ids=ids,
-                namespace=namespace,
-                filter=filter,
-                ctx=ctx,
-            )
+
+        raw_request, framework_ctx = self._build_delete_request(
+            ids=ids,
+            namespace=namespace,
+            filter=filter,
         )
+
+        try:
+            result: DeleteResult = self._translator.delete(
+                raw_request,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+            # Result is returned for completeness; current LangChain interface
+            # only requires that deletion executes or raises.
+        except Exception:
+            # Translator/adapter already annotated the error.
+            raise
 
     async def adelete(
         self,
@@ -1357,11 +1443,17 @@ class CorpusLangChainVectorStore(VectorStore):
         """
         namespace: Optional[str] = kwargs.get("namespace")
         ctx = self._build_ctx(**kwargs)
-        await self._adelete_vectors(
+
+        raw_request, framework_ctx = self._build_delete_request(
             ids=ids,
             namespace=namespace,
             filter=filter,
-            ctx=ctx,
+        )
+
+        await self._translator.arun_delete(
+            raw_request,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
         )
 
     # ------------------------------------------------------------------ #
