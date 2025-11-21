@@ -1,4 +1,4 @@
-# Corpus SDK
+# Corpus (Core Orchestration Runtime for Polyglot Unified Systems) SDK
 
 ![Version](https://img.shields.io/badge/version-1.0.0-blue)
 ![Python](https://img.shields.io/badge/python-3.9+-blue)
@@ -100,7 +100,19 @@ Modern AI platforms juggle multiple LLM, embedding, vector, and graph backends. 
 - **SIEM-safe metrics** (low-cardinality; tenant hashed)  
 - **Deadline propagation** for cancellation & cost control  
 - **Two modes**: compose under your own router (**thin**) or use lightweight infra (**standalone**)  
-- A **wire-first protocol** that can be implemented by any language/runtime, with this SDK as the reference impl
+- A **wire-first protocol** that can be implemented by any language/runtime, with this SDK as the reference impl  
+
+### Keep Your Frameworks, Standardize Your Infra
+
+Corpus is **not** a replacement for LangChain, LlamaIndex, Semantic Kernel, CrewAI, AutoGen, or MCP.
+
+Instead:
+
+- Use those frameworks for **orchestration, agents, tools, RAG pipelines**, etc.
+- Use **Corpus SDK** to standardize the **infra layer** underneath them (LLM, Vector, Graph, Embedding).
+- Talk to **all** your backends through one protocol, even if different teams picked different frameworks.
+
+Your app teams keep their frameworks. Your platform team gets **one protocol**, **one error taxonomy**, and **one observability model** across all of them.
 
 ---
 
@@ -108,7 +120,7 @@ Modern AI platforms juggle multiple LLM, embedding, vector, and graph backends. 
 
 ### Who is this for?
 
-- **For app developers** – Build on **LangChain, LlamaIndex, Semantic Kernel, AutoGen, CrewAI, or MCP** and still talk to your backends through the same **Corpus protocols**. Swap frameworks or providers without rewriting business logic or error handling.
+- **For app developers** – Keep using **LangChain, LlamaIndex, Semantic Kernel, AutoGen, CrewAI, or MCP** for what they’re great at (agents, tools, RAG, orchestration), while talking to **all** your backends through the same **Corpus protocols**. Swap frameworks or providers without rewriting business logic or error handling.
 
 - **For framework maintainers** – Implement one Corpus adapter per protocol (LLM / Vector / Graph / Embedding) and instantly support any backend that passes the Corpus conformance tests. Fewer bespoke integrations, fewer “this provider behaves differently” bugs.
 
@@ -124,6 +136,8 @@ Modern AI platforms juggle multiple LLM, embedding, vector, and graph backends. 
 
 - **For everyone tired of glue code** – Instead of N×M custom integrations between frameworks and providers, you get one stable protocol layer in the middle. Integrate once, interoperate everywhere.
 
+- **For teams with “too many frameworks”** – Normalize infrastructure **once** under Corpus (LLM/Vector/Graph/Embedding) while letting individual teams keep their preferred frameworks on top.
+
 ### How Corpus Compares
 
 | Aspect                    | LangChain/LlamaIndex | OpenRouter | MCP                  | **Corpus SDK**                        |
@@ -131,7 +145,7 @@ Modern AI platforms juggle multiple LLM, embedding, vector, and graph backends. 
 | **Scope**                 | Application framework | LLM unification | Tools & data sources | **AI infrastructure protocols**      |
 | **Domains Covered**       | LLM + Tools          | LLM only  | Tools + Data         | **LLM + Vector + Graph + Embedding** |
 | **Error Standardization** | Partial              | Limited   | N/A                  | **Comprehensive taxonomy**           |
-| **Multi-Provider Routing**| Basic               | Managed service | N/A              | **Protocol for any router**         |
+| **Multi-Provider Routing**| Basic                | Managed service | N/A              | **Protocol for any router**         |
 | **Observability**         | Basic                | Limited   | N/A                  | **Built-in metrics + tracing**      |
 | **Installation**          | Heavy dependencies   | Service API | Early stage        | **Lightweight, async-first**        |
 | **Vendor Neutrality**     | High                 | Service-dependent | High           | **Protocol-first, no lock-in**      |
@@ -180,6 +194,22 @@ class MCPToolsAdapter(BaseLLMAdapter):
 
 Instead of choosing one framework, use **Corpus** as the unifying layer that standardizes them all.
 
+**Why this matters:**
+
+* Your existing LangChain chains, LlamaIndex indexes, Semantic Kernel skills, or AutoGen/CrewAI agents become **first-class providers** in a standardized ecosystem.
+* Infra teams see **one protocol and one set of metrics**, even if different products are built on different frameworks.
+* You can migrate gradually: start by wrapping frameworks as adapters, then replace pieces with direct Corpus adapters only where it pays off.
+
+### Common Framework + Corpus Patterns
+
+| Pattern                                   | Where Corpus SDK Lives          | What You Get                                 |
+| ----------------------------------------- | ------------------------------- | -------------------------------------------- |
+| Framework → Corpus → Providers            | Framework uses Corpus as client | Unified errors/metrics across providers      |
+| Corpus → Framework-as-adapter → Providers | Framework wrapped as adapter    | Reuse existing chains/indices as “providers” |
+| Mixed: some direct, some framework        | Both of the above               | Gradual migration, no big-bang rewrites      |
+
+You don’t have to pick one. Large teams typically run **all three** patterns at once.
+
 ---
 
 ## When Not to Use Corpus
@@ -193,6 +223,8 @@ You probably don’t need `corpus_sdk` or Corpus Router if:
 * **It’s a quick throwaway prototype**: Lock-in, metrics, and resilience aren’t worth thinking about (yet).
 
 If any of these stop being true, `corpus_sdk` is the incremental next step; **Corpus Router** becomes relevant once you need centralized, explainable, multi-provider routing.
+
+> If you’re happily single-provider **inside a single framework** and don’t need shared observability or governance, keep it simple and stick with that framework. Corpus becomes valuable once you have **multiple frameworks and/or multiple providers** and want one coherent infra layer under them.
 
 ---
 
@@ -825,7 +857,9 @@ import logging
 logging.basicConfig(level=logging.DEBUG)
 logging.getLogger("corpus_sdk").setLevel(logging.DEBUG)
 ```
+
 ---
+
 ## FAQ
 
 ### General
@@ -858,7 +892,7 @@ logging.getLogger("corpus_sdk").setLevel(logging.DEBUG)
 
 **Q: How does Corpus compare to Model Context Protocol (MCP)?**
 
-**A:** MCP focuses on standardizing **tools and data sources** for AI applications, while Corpus standardizes **core AI infrastructure services** (LLM, Vector, Graph, Embedding). They're complementary - you could use MCP for tool integration and Corpus for backend service abstraction.
+**A:** MCP focuses on standardizing **tools and data sources** for AI applications, while Corpus standardizes **core AI infrastructure services** (LLM, Vector, Graph, Embedding). They're complementary — you could use MCP for tool integration and Corpus for backend service abstraction.
 
 **Q: How does Corpus compare to OpenRouter?**
 
