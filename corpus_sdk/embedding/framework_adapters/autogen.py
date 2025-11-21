@@ -21,7 +21,7 @@ maintaining the protocol-first Corpus embedding stack.
 from __future__ import annotations
 
 import logging
-from functools import cached_property
+from functools import cached_property, wraps
 from typing import (
     Any,
     Dict,
@@ -32,11 +32,15 @@ from typing import (
     Tuple,
     Union,
     Protocol,
+    TypeVar,
+    Callable,
+    cast,
 )
 
 from corpus_sdk.core.context_translation import (
-    from_autogen as context_from_autogen,  # Using existing implementation
+    from_autogen as context_from_autogen,
 )
+from corpus_sdk.core.error_context import attach_context
 from corpus_sdk.embedding.embedding_base import (
     EmbeddingProtocolV1,
 )
@@ -46,38 +50,83 @@ from corpus_sdk.embedding.framework_adapters.common.embedding_translation import
     TextNormalizationConfig,
     create_embedding_translator,
 )
-from corpus_sdk.llm.framework_adapters.common.error_context import attach_context
 
 logger = logging.getLogger(__name__)
 
+# Type variables for decorators
+T = TypeVar("T")
 
-class AutoGenVectorStoreRetrieverProtocol(Protocol):
+# Error code constants
+class ErrorCodes:
+    INVALID_EMBEDDING_RESULT = "INVALID_EMBEDDING_RESULT"
+    EMPTY_EMBEDDING_RESULT = "EMPTY_EMBEDDING_RESULT"
+    EMBEDDING_CONVERSION_ERROR = "EMBEDDING_CONVERSION_ERROR"
+
+
+def with_embedding_error_context(
+    operation: str,
+    **context_kwargs: Any,
+) -> Callable[[Callable[..., T]], Callable[..., T]]:
     """
-    Protocol representing the minimal AutoGen VectorStoreRetriever interface
-    used by this module.
+    Decorator to automatically attach error context to embedding exceptions.
+    """
+    def decorator(func: Callable[..., T]) -> Callable[..., T]:
+        @wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> T:
+            try:
+                return func(*args, **kwargs)
+            except Exception as exc:
+                enhanced_context = context_kwargs.copy()
+                attach_context(
+                    exc,
+                    framework="autogen",
+                    operation=f"embedding_{operation}",
+                    **enhanced_context,
+                )
+                raise
+        return wrapper
+    return decorator
 
-    The concrete implementation is typically `autogen.retrieve_utils.VectorStoreRetriever`,
-    but this structural protocol avoids a hard dependency at type-check time while
-    still providing strong typing for the helper function return type.
+
+def with_async_embedding_error_context(
+    operation: str,
+    **context_kwargs: Any,
+) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    """
+    Decorator to automatically attach error context to async embedding exceptions.
+    """
+    def decorator(func: Callable[..., T]) -> Callable[..., T]:
+        @wraps(func)
+        async def wrapper(*args: Any, **kwargs: Any) -> T:
+            try:
+                return await func(*args, **kwargs)
+            except Exception as exc:
+                enhanced_context = context_kwargs.copy()
+                attach_context(
+                    exc,
+                    framework="autogen",
+                    operation=f"embedding_{operation}",
+                    **enhanced_context,
+                )
+                raise
+        return wrapper
+    return decorator
+
+
+class AutoGenRetriever(Protocol):
+    """
+    Protocol representing AutoGen VectorStoreRetriever interface.
+    
+    Shorter name for cleaner usage throughout the module.
     """
 
     @property
     def vectorstore(self) -> Any:
-        """
-        Underlying vector store used for retrieval.
-
-        The concrete type is AutoGen- and application-specific, so it is left
-        as `Any` here to keep the protocol flexible.
-        """
+        """Underlying vector store used for retrieval."""
         ...
 
     def retrieve(self, query: str, **kwargs: Any) -> Any:
-        """
-        Retrieve documents for the given query.
-
-        Implementations may return framework-specific document or node types;
-        callers in this module do not rely on the concrete return type.
-        """
+        """Retrieve documents for the given query."""
         ...
 
 
@@ -201,7 +250,11 @@ class CorpusAutoGenEmbeddings:
         core_ctx = context_from_autogen(autogen_context)
 
         # Normalized dict for embedding OperationContext reconstruction
-        op_ctx_dict: Dict[str, Any] = core_ctx.to_dict()
+        op_ctx_dict: Dict[str, Any] = {}
+        if hasattr(core_ctx, 'to_dict'):
+            op_ctx_dict = core_ctx.to_dict()
+        elif hasattr(core_ctx, '__dict__'):
+            op_ctx_dict = core_ctx.__dict__
 
         # Framework-level context for AutoGen-specific hints
         framework_ctx: Dict[str, Any] = {
@@ -229,8 +282,7 @@ class CorpusAutoGenEmbeddings:
 
         return core_ctx, op_ctx_dict, framework_ctx
 
-    @staticmethod
-    def _coerce_embedding_matrix(result: Any) -> List[List[float]]:
+    def _coerce_embedding_matrix(self, result: Any) -> List[List[float]]:
         """
         Coerce translator result into a List[List[float]] embedding matrix.
 
@@ -254,7 +306,8 @@ class CorpusAutoGenEmbeddings:
         if not isinstance(embeddings_obj, Sequence):
             raise TypeError(
                 f"Translator result does not contain a valid embeddings sequence: "
-                f"type={type(embeddings_obj).__name__}"
+                f"type={type(embeddings_obj).__name__}",
+                code=ErrorCodes.INVALID_EMBEDDING_RESULT,
             )
 
         matrix: List[List[float]] = []
@@ -262,28 +315,32 @@ class CorpusAutoGenEmbeddings:
             if not isinstance(row, Sequence):
                 raise TypeError(
                     f"Expected each embedding row to be a sequence, "
-                    f"got {type(row).__name__} at index {i}"
+                    f"got {type(row).__name__} at index {i}",
+                    code=ErrorCodes.INVALID_EMBEDDING_RESULT,
                 )
             try:
                 matrix.append([float(x) for x in row])
             except (TypeError, ValueError) as e:
                 raise TypeError(
-                    f"Failed to convert embedding values to float at row {i}: {e}"
+                    f"Failed to convert embedding values to float at row {i}: {e}",
+                    code=ErrorCodes.EMBEDDING_CONVERSION_ERROR,
                 ) from e
 
         return matrix
 
-    @staticmethod
-    def _coerce_embedding_vector(result: Any) -> List[float]:
+    def _coerce_embedding_vector(self, result: Any) -> List[float]:
         """
         Coerce translator result for a single-text embed into List[float].
 
         Normalizes via `_coerce_embedding_matrix` and handles single/multiple rows.
         """
-        matrix = CorpusAutoGenEmbeddings._coerce_embedding_matrix(result)
+        matrix = self._coerce_embedding_matrix(result)
 
         if not matrix:
-            raise ValueError("Translator returned no embeddings for single-text input")
+            raise ValueError(
+                "Translator returned no embeddings for single-text input",
+                code=ErrorCodes.EMPTY_EMBEDDING_RESULT,
+            )
 
         if len(matrix) > 1:
             logger.warning(
@@ -298,6 +355,7 @@ class CorpusAutoGenEmbeddings:
     # Core AutoGen EmbeddingFunction Interface
     # ------------------------------------------------------------------ #
 
+    @with_embedding_error_context("function_call")
     def __call__(self, texts: List[str]) -> List[List[float]]:
         """
         Make the instance callable for AutoGen's EmbeddingFunction protocol.
@@ -322,6 +380,7 @@ class CorpusAutoGenEmbeddings:
         """
         return self.embed_documents(texts)
 
+    @with_embedding_error_context("documents")
     def embed_documents(
         self,
         texts: List[str],
@@ -351,31 +410,14 @@ class CorpusAutoGenEmbeddings:
             **kwargs,
         )
 
-        try:
-            translated = self._translator.embed(
-                raw_texts=texts,
-                op_ctx=op_ctx_dict,
-                framework_ctx=framework_ctx,
-            )
-            return self._coerce_embedding_matrix(translated)
-        except Exception as exc:  # noqa: BLE001
-            # Enrich with AutoGen-specific context; core protocol context is
-            # already attached inside EmbeddingTranslator.
-            try:
-                attach_context(
-                    exc,
-                    embedding_operation="embed_documents",
-                    texts_count=len(texts),
-                    agent_name=framework_ctx.get("agent_name"),
-                    conversation_id=framework_ctx.get("conversation_id"),
-                    workflow_type=framework_ctx.get("workflow_type"),
-                    retriever_name=framework_ctx.get("retriever_name"),
-                )
-            except Exception:
-                # Never mask the original error
-                pass
-            raise
+        translated = self._translator.embed(
+            raw_texts=texts,
+            op_ctx=op_ctx_dict,
+            framework_ctx=framework_ctx,
+        )
+        return self._coerce_embedding_matrix(translated)
 
+    @with_embedding_error_context("query")
     def embed_query(
         self,
         text: str,
@@ -405,35 +447,18 @@ class CorpusAutoGenEmbeddings:
             **kwargs,
         )
 
-        try:
-            translated = self._translator.embed(
-                raw_texts=text,
-                op_ctx=op_ctx_dict,
-                framework_ctx=framework_ctx,
-            )
-            return self._coerce_embedding_vector(translated)
-        except Exception as exc:  # noqa: BLE001
-            # Enrich with AutoGen-specific context; core protocol context is
-            # already attached inside EmbeddingTranslator.
-            try:
-                attach_context(
-                    exc,
-                    embedding_operation="embed_query",
-                    text_len=len(text or ""),
-                    agent_name=framework_ctx.get("agent_name"),
-                    conversation_id=framework_ctx.get("conversation_id"),
-                    workflow_type=framework_ctx.get("workflow_type"),
-                    retriever_name=framework_ctx.get("retriever_name"),
-                )
-            except Exception:
-                # Never mask the original error
-                pass
-            raise
+        translated = self._translator.embed(
+            raw_texts=text,
+            op_ctx=op_ctx_dict,
+            framework_ctx=framework_ctx,
+        )
+        return self._coerce_embedding_vector(translated)
 
     # ------------------------------------------------------------------ #
     # Async API for AutoGen Async Workflows
     # ------------------------------------------------------------------ #
 
+    @with_async_embedding_error_context("documents")
     async def aembed_documents(
         self,
         texts: List[str],
@@ -463,30 +488,14 @@ class CorpusAutoGenEmbeddings:
             **kwargs,
         )
 
-        try:
-            translated = await self._translator.arun_embed(
-                raw_texts=texts,
-                op_ctx=op_ctx_dict,
-                framework_ctx=framework_ctx,
-            )
-            return self._coerce_embedding_matrix(translated)
-        except Exception as exc:  # noqa: BLE001
-            # Enrich with AutoGen-specific context for async workflows.
-            try:
-                attach_context(
-                    exc,
-                    embedding_operation="aembed_documents",
-                    texts_count=len(texts),
-                    agent_name=framework_ctx.get("agent_name"),
-                    conversation_id=framework_ctx.get("conversation_id"),
-                    workflow_type=framework_ctx.get("workflow_type"),
-                    retriever_name=framework_ctx.get("retriever_name"),
-                )
-            except Exception:
-                # Never mask the original error
-                pass
-            raise
+        translated = await self._translator.arun_embed(
+            raw_texts=texts,
+            op_ctx=op_ctx_dict,
+            framework_ctx=framework_ctx,
+        )
+        return self._coerce_embedding_matrix(translated)
 
+    @with_async_embedding_error_context("query")
     async def aembed_query(
         self,
         text: str,
@@ -516,40 +525,23 @@ class CorpusAutoGenEmbeddings:
             **kwargs,
         )
 
-        try:
-            translated = await self._translator.arun_embed(
-                raw_texts=text,
-                op_ctx=op_ctx_dict,
-                framework_ctx=framework_ctx,
-            )
-            return self._coerce_embedding_vector(translated)
-        except Exception as exc:  # noqa: BLE001
-            # Enrich with AutoGen-specific context for async query embeddings.
-            try:
-                attach_context(
-                    exc,
-                    embedding_operation="aembed_query",
-                    text_len=len(text or ""),
-                    agent_name=framework_ctx.get("agent_name"),
-                    conversation_id=framework_ctx.get("conversation_id"),
-                    workflow_type=framework_ctx.get("workflow_type"),
-                    retriever_name=framework_ctx.get("retriever_name"),
-                )
-            except Exception:
-                # Never mask the original error
-                pass
-            raise
+        translated = await self._translator.arun_embed(
+            raw_texts=text,
+            op_ctx=op_ctx_dict,
+            framework_ctx=framework_ctx,
+        )
+        return self._coerce_embedding_vector(translated)
 
 
 # ------------------------------------------------------------------ #
 # AutoGen-Specific Helper Functions
 # ------------------------------------------------------------------ #
 
-def create_autogen_retriever(
+def create_retriever(
     corpus_adapter: EmbeddingProtocolV1,
     vector_store: Any,
     **kwargs: Any,
-) -> AutoGenVectorStoreRetrieverProtocol:
+) -> AutoGenRetriever:
     """
     Create an AutoGen VectorStoreRetriever with Corpus embeddings.
 
@@ -558,14 +550,14 @@ def create_autogen_retriever(
 
     Example usage:
     ```python
-    from autogen.retrieve_utils import create_autogen_retriever
+    from corpus_sdk.embedding.framework_adapters.autogen import create_retriever
     from chromadb import Chroma
 
     # Create vector store
     vectorstore = Chroma(collection_name="autogen_docs")
 
     # Create retriever with Corpus embeddings
-    retriever = create_autogen_retriever(
+    retriever = create_retriever(
         corpus_adapter=my_adapter,
         vector_store=vectorstore,
         model="text-embedding-3-large"
@@ -593,7 +585,7 @@ def create_autogen_retriever(
 
     Returns
     -------
-    AutoGenVectorStoreRetrieverProtocol
+    AutoGenRetriever
         AutoGen VectorStoreRetriever instance using Corpus embeddings.
     """
     try:
@@ -618,13 +610,13 @@ def create_autogen_retriever(
     retriever = VectorStoreRetriever(vectorstore=vector_store)
 
     logger.info(
-        f"AutoGen retriever created with Corpus embeddings"
+        "AutoGen retriever created with Corpus embeddings"
     )
 
     return retriever
 
 
-def register_autogen_embedding(
+def register_embeddings(
     corpus_adapter: EmbeddingProtocolV1,
     model: Optional[str] = None,
     **kwargs: Any,
@@ -637,10 +629,10 @@ def register_autogen_embedding(
 
     Example usage:
     ```python
-    from corpus_sdk.embedding.framework_adapters.autogen import register_autogen_embedding
+    from corpus_sdk.embedding.framework_adapters.autogen import register_embeddings
 
     # Register globally
-    embedder = register_autogen_embedding(
+    embedder = register_embeddings(
         corpus_adapter=my_adapter,
         model="text-embedding-3-large"
     )
@@ -677,6 +669,8 @@ def register_autogen_embedding(
 
 __all__ = [
     "CorpusAutoGenEmbeddings",
-    "create_autogen_retriever",
-    "register_autogen_embedding",
+    "AutoGenRetriever",
+    "create_retriever",
+    "register_embeddings",
+    "ErrorCodes",
 ]
