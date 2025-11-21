@@ -4,23 +4,22 @@
 """
 Semantic Kernel adapter for Corpus LLM protocol.
 
-This module exposes a Corpus `BaseLLMAdapter` as a Semantic Kernel
+This module exposes a Corpus `LLMProtocolV1` as a Semantic Kernel
 `ChatCompletionClientBase` implementation so that:
 
-- SK agents can use any Corpus-backed LLM adapter as a chat completion service.
+- SK agents can use any Corpus-backed LLM implementation as a chat completion service.
 - Async + streaming flows remain async-first (no background threads).
 - Context / deadlines / tenant hints are propagated via `OperationContext`.
 - Sampling parameters are bridged from `PromptExecutionSettings` to Corpus.
-- Optional transient error retry with exponential backoff.
-- Rich error context for enhanced observability and debugging.
+- Rich error context is attached for enhanced observability and debugging.
 
 Design goals
 ------------
 
-* Protocol-first:
+* Protocol-first, translator-centric:
     Semantic Kernel is an integration surface. All real behavior goes
-    through the Corpus `BaseLLMAdapter` and the LLM protocol in
-    `corpus_sdk.llm.llm_base`.
+    through the Corpus `LLMProtocolV1` and `LLMTranslator` in
+    `corpus_sdk.llm.framework_adapters.common.llm_translation`.
 
 * Optional dependency safe:
     This module can be imported without Semantic Kernel installed.
@@ -36,44 +35,26 @@ Design goals
 * Async-first:
     - No sync wrappers or background threads.
     - Cancellation works via normal asyncio task cancellation semantics
-      plus ctx.deadline_ms at the Corpus adapter layer.
+      plus ctx.deadline_ms at the Corpus protocol layer.
 
-* Production resilience:
-    - Configurable retry for transient errors
-    - Rich error context attachment for debugging
-    - Comprehensive logging and observability
+* Centralized resilience:
+    - Any retries / backoff / circuit breaking live in the
+      `LLMProtocolV1` implementation and/or `LLMTranslator`, not here.
 
-Typical usage
--------------
-
-    from semantic_kernel.agents import ChatCompletionAgent
-    from corpus_sdk.llm.openai_adapter import OpenAIAdapter
-    from corpus_sdk.llm.framework_adapters.semantic_kernel import (
-        CorpusSemanticKernelChatCompletion,
+Usage:
+    sk_chat = CorpusSemanticKernelChatCompletion(
+        llm_adapter=adapter,
+        model="gpt-4",
+        temperature=0.7
     )
-
-    corpus_adapter = OpenAIAdapter(api_key="...")
-
-    sk_llm = CorpusSemanticKernelChatCompletion(
-        corpus_adapter=corpus_adapter,
-        model="gpt-4o",
-        # Optional: enable retry for transient errors
-        max_transient_retries=2,
-        transient_backoff_s=0.5,
-    )
-
-    agent = ChatCompletionAgent(
-        service=sk_llm,
-        name="MyAgent",
-        instructions="You are a helpful assistant.",
-    )
+    response = await sk_chat.get_chat_message_content(chat_history, settings)
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import time
+from contextlib import asynccontextmanager
+from functools import cached_property
 from typing import (
     Any,
     AsyncIterator,
@@ -81,24 +62,24 @@ from typing import (
     List,
     Mapping,
     Optional,
-    Tuple,
-    Type,
-    Union,
+    Protocol,
 )
 
-from corpus_sdk.llm.llm_base import (
-    BaseLLMAdapter,
-    LLMChunk,
-    LLMCompletion,
-    OperationContext,
-    TransientNetwork,
-    Unavailable,
-)
 from corpus_sdk.core.context_translation import ContextTranslator
 from corpus_sdk.core.error_context import attach_context
+from corpus_sdk.llm.framework_adapters.common.llm_translation import (
+    DefaultLLMFrameworkTranslator,
+    LLMTranslator,
+)
 from corpus_sdk.llm.framework_adapters.common.message_translation import (
     MessageTranslator,
     NormalizedMessage,
+)
+from corpus_sdk.llm.llm_base import (
+    LLMChunk,
+    LLMCompletion,
+    LLMProtocolV1,
+    OperationContext,
 )
 
 logger = logging.getLogger(__name__)
@@ -133,7 +114,53 @@ else:  # pragma: no cover - trivial branch
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers
+# Protocol (structural interface)
+# ---------------------------------------------------------------------------
+
+
+class SemanticKernelLLMProtocol(Protocol):
+    """
+    Structural protocol for a Semantic Kernel–compatible Corpus LLM adapter.
+
+    This matches the key async interface SK uses, without depending on the
+    concrete `CorpusSemanticKernelChatCompletion` class.
+    """
+
+    async def get_chat_message_content(
+        self,
+        chat_history: ChatHistory,
+        settings: PromptExecutionSettings,
+        **kwargs: Any,
+    ) -> ChatMessageContent:
+        ...
+
+    async def get_chat_message_contents(
+        self,
+        chat_history: ChatHistory,
+        settings: PromptExecutionSettings,
+        **kwargs: Any,
+    ) -> List[ChatMessageContent]:
+        ...
+
+    async def get_streaming_chat_message_content(
+        self,
+        chat_history: ChatHistory,
+        settings: PromptExecutionSettings,
+        **kwargs: Any,
+    ) -> AsyncIterator[StreamingChatMessageContent]:
+        ...
+
+    async def get_streaming_chat_message_contents(
+        self,
+        chat_history: ChatHistory,
+        settings: PromptExecutionSettings,
+        **kwargs: Any,
+    ) -> AsyncIterator[StreamingChatMessageContent]:
+        ...
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers (robust with validation)
 # ---------------------------------------------------------------------------
 
 
@@ -200,30 +227,38 @@ def _history_to_normalized_messages(history: ChatHistory) -> List[NormalizedMess
     `MessageTranslator.from_semantic_kernel`, and then later map that to
     Corpus wire format via `MessageTranslator.to_corpus`.
     """
-    normalized: List[NormalizedMessage] = []
+    if not history:
+        logger.warning("Empty chat history provided to Semantic Kernel adapter")
+        return []
 
-    # `ChatHistory` is iterable in recent SK versions; if not, we fall back
-    # to `history.messages` when present.
     try:
-        iterable = list(history)  # type: ignore[arg-type]
-    except TypeError:
-        iterable = getattr(history, "messages", []) or []
+        normalized: List[NormalizedMessage] = []
 
-    for msg in iterable:
-        role = _author_role_to_protocol_role(getattr(msg, "role", None))
-        text = _extract_text_from_chat_message(msg)
-        metadata: Mapping[str, Any] = getattr(msg, "metadata", {}) or {}
+        # `ChatHistory` is iterable in recent SK versions; if not, we fall back
+        # to `history.messages` when present.
+        try:
+            iterable = list(history)  # type: ignore[arg-type]
+        except TypeError:
+            iterable = getattr(history, "messages", []) or []
 
-        minimal: Dict[str, Any] = {
-            "role": role,
-            "content": text,
-            "metadata": dict(metadata),
-        }
+        for msg in iterable:
+            role = _author_role_to_protocol_role(getattr(msg, "role", None))
+            text = _extract_text_from_chat_message(msg)
+            metadata: Mapping[str, Any] = getattr(msg, "metadata", {}) or {}
 
-        nm = MessageTranslator.from_semantic_kernel(minimal)
-        normalized.append(nm)
+            minimal: Dict[str, Any] = {
+                "role": role,
+                "content": text,
+                "metadata": dict(metadata),
+            }
 
-    return normalized
+            nm = MessageTranslator.from_semantic_kernel(minimal)
+            normalized.append(nm)
+
+        return normalized
+    except Exception as e:
+        logger.error("Failed to translate Semantic Kernel chat history: %s", e)
+        raise ValueError(f"Chat history translation failed: {e}") from e
 
 
 def _normalized_to_corpus_messages(
@@ -239,7 +274,7 @@ def _log_sampling_param_warnings(params: Mapping[str, Any]) -> None:
     """
     Best-effort validation of SK sampling params.
 
-    We do not enforce ranges here (that's the adapter's job via BaseLLMAdapter),
+    We do not enforce ranges here (that's the protocol/adapter's job),
     but we log when values are clearly outside typical production ranges.
     """
     temp = params.get("temperature")
@@ -267,7 +302,7 @@ def _build_ctx_and_sampling_params(
     default_model: str,
     default_temperature: float,
     default_max_tokens: Optional[int],
-) -> Tuple[OperationContext, Dict[str, Any]]:
+) -> tuple[OperationContext, Dict[str, Any]]:
     """
     Build OperationContext and Corpus sampling params from SK prompt settings.
     """
@@ -315,10 +350,10 @@ def _build_ctx_and_sampling_params(
         "stop_sequences": _get("stop_sequences") or _get("stop"),
     }
 
-    # Light validation / warnings; real enforcement happens in BaseLLMAdapter.
+    # Light validation / warnings; real enforcement happens in protocol/adapter.
     _log_sampling_param_warnings(params)
 
-    # Strip out Nones so the Corpus adapter sees a clean param dict.
+    # Strip out Nones so the protocol sees a clean param dict.
     return ctx, {k: v for k, v in params.items() if v is not None}
 
 
@@ -378,73 +413,6 @@ def _chunk_to_streaming_chat_message(
     )
 
 
-async def _with_transient_retry(
-    coro_func: Callable[[], Awaitable[T]],
-    *,
-    max_retries: int,
-    backoff_s: float,
-    error_types: Tuple[Type[BaseException], ...],
-    error_context: Dict[str, Any],
-) -> T:
-    """
-    Execute an async function with transient error retry.
-
-    Only retries for specified error types and only up to max_retries.
-    Uses exponential backoff between attempts.
-    """
-    attempt = 0
-    last_exc: Optional[BaseException] = None
-
-    while True:
-        try:
-            return await coro_func()
-        except error_types as exc:
-            last_exc = exc
-            if attempt >= max_retries:
-                break
-
-            attempt += 1
-            delay = backoff_s * (2.0 ** (attempt - 1))
-            
-            attach_context(
-                exc,
-                framework="semantic_kernel",
-                operation="transient_retry",
-                attempt=attempt,
-                max_retries=max_retries,
-                delay_s=delay,
-                **error_context,
-            )
-
-            logger.warning(
-                "Transient error in Semantic Kernel adapter (attempt %d/%d), "
-                "retrying after %.2fs: %s",
-                attempt,
-                max_retries,
-                delay,
-                exc,
-            )
-            
-            await asyncio.sleep(delay)
-        except BaseException as exc:
-            last_exc = exc
-            break
-
-    if last_exc is not None:
-        attach_context(
-            last_exc,
-            framework="semantic_kernel",
-            operation="final_attempt",
-            attempt=attempt,
-            max_retries=max_retries,
-            **error_context,
-        )
-        raise last_exc
-    
-    # This should never happen, but for type safety
-    raise RuntimeError("Unexpected error in _with_transient_retry")
-
-
 # ---------------------------------------------------------------------------
 # Public adapter
 # ---------------------------------------------------------------------------
@@ -452,70 +420,56 @@ async def _with_transient_retry(
 
 class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
     """
-    Semantic Kernel `ChatCompletionClientBase` backed by a Corpus LLM adapter.
+    Semantic Kernel `ChatCompletionClientBase` backed by a Corpus LLM protocol.
 
-    This class allows SK agents to use any Corpus-backed LLM implementation
-    (implementing `BaseLLMAdapter`) as their chat completion service.
+    This class allows SK agents to use any implementation of `LLMProtocolV1`
+    (wrapped by `LLMTranslator`) as their chat completion service.
 
     Attributes
     ----------
-    corpus_adapter:
-        Underlying Corpus adapter implementing `BaseLLMAdapter`.
-    model:
-        Default model identifier to use when SK settings do not override it.
-    temperature:
-        Default sampling temperature.
-    max_tokens:
-        Default maximum tokens for completions (if SK settings do not override).
+    llm_adapter:
+        Underlying Corpus adapter implementing `LLMProtocolV1`.
+
+    default model + sampling defaults:
+        Used when SK settings do not override them.
+
     framework_version:
         Optional Semantic Kernel version string for context attribution.
+
     service_id:
         Optional SK service identifier used by the Kernel's service registry.
-
-    max_transient_retries:
-        Number of retry attempts for transient errors. Default: 0 (no retry).
-    transient_backoff_s:
-        Initial backoff delay (seconds) for retry. Uses exponential backoff.
-        Default: 0.25.
-    transient_error_types:
-        Tuple of exception types to consider transient and eligible for retry.
-        Default: (TransientNetwork, Unavailable).
-
-    Examples
-    --------
-    Basic usage:
-
-        sk_llm = CorpusSemanticKernelChatCompletion(
-            corpus_adapter=OpenAIAdapter(api_key="..."),
-            model="gpt-4",
-        )
-
-    With retry enabled:
-
-        sk_llm = CorpusSemanticKernelChatCompletion(
-            corpus_adapter=OpenAIAdapter(api_key="..."),
-            model="gpt-4",
-            max_transient_retries=3,
-            transient_backoff_s=0.5,
-        )
     """
+
+    # Underlying protocol implementation
+    llm_adapter: LLMProtocolV1
+
+    # Default sampling configuration
+    _default_model: str
+    _default_temperature: float
+    _default_max_tokens: Optional[int]
+
+    # Optional framework metadata
+    _framework_version: Optional[str]
+
+    class _SemanticKernelLLMFrameworkTranslator(DefaultLLMFrameworkTranslator):
+        """
+        Semantic Kernel–specific LLMFrameworkTranslator.
+
+        Currently inherits default behavior (pass-through of protocol-level
+        results), but exists as a hook for SK-specific customization.
+        """
+
+        pass
 
     def __init__(
         self,
-        corpus_adapter: BaseLLMAdapter,
+        llm_adapter: LLMProtocolV1,
         *,
         model: str = "default",
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
         framework_version: Optional[str] = None,
         service_id: Optional[str] = None,
-        # Retry configuration
-        max_transient_retries: int = 0,
-        transient_backoff_s: float = 0.25,
-        transient_error_types: Tuple[Type[BaseException], ...] = (
-            TransientNetwork,
-            Unavailable,
-        ),
     ) -> None:
         if _SEMANTIC_KERNEL_IMPORT_ERROR is not None:
             # Give a very direct, one-hop error for misconfiguration.
@@ -525,61 +479,80 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
                 "CorpusSemanticKernelChatCompletion."
             ) from _SEMANTIC_KERNEL_IMPORT_ERROR
 
+        # Validate critical parameters
+        if not isinstance(llm_adapter, LLMProtocolV1):
+            raise TypeError("llm_adapter must implement LLMProtocolV1")
+        
+        if not 0 <= temperature <= 2:
+            raise ValueError("temperature must be between 0 and 2")
+        
+        if max_tokens is not None and max_tokens < 1:
+            raise ValueError("max_tokens must be positive")
+
         super().__init__(service_id=service_id)
 
-        self._corpus_adapter = corpus_adapter
+        self.llm_adapter = llm_adapter
         self._default_model = model
         self._default_temperature = float(temperature)
         self._default_max_tokens = max_tokens
         self._framework_version = framework_version
 
-        # Retry configuration
-        self._max_transient_retries = max(0, int(max_transient_retries))
-        self._transient_backoff_s = float(transient_backoff_s)
-        self._transient_error_types = transient_error_types
+    # ------------------------------------------------------------------ #
+    # Translator (cached for optimal performance)
+    # ------------------------------------------------------------------ #
 
-    async def _execute_with_retry(
+    @cached_property
+    def _translator(self) -> LLMTranslator:
+        """
+        Lazily construct and cache the `LLMTranslator`.
+
+        All orchestration, including any async policy needed by the
+        underlying protocol implementation, is centralized in `LLMTranslator`.
+        """
+        framework_translator = self._SemanticKernelLLMFrameworkTranslator()
+        return LLMTranslator(
+            adapter=self.llm_adapter,
+            framework="semantic_kernel",
+            translator=framework_translator,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Error-context helper (robust and consistent)
+    # ------------------------------------------------------------------ #
+
+    @asynccontextmanager
+    async def _error_context_async(
         self,
         operation: str,
-        coro_func: Callable[[], Awaitable[T]],
-        context: Dict[str, Any],
-    ) -> T:
+        *,
+        stream: bool,
+        messages_count: int,
+        model: str,
+        ctx: Optional[OperationContext],
+        params: Dict[str, Any],
+    ):
         """
-        Execute an async operation with optional transient error retry.
-
-        Parameters
-        ----------
-        operation:
-            Name of the operation for error context.
-        coro_func:
-            Async function to execute.
-        context:
-            Additional context for error reporting.
-
-        Returns
-        -------
-        T
-            Result of the async operation.
+        Async error-context wrapper to centralize attach_context usage.
         """
-        error_context = {
-            "operation": operation,
-            **context,
-        }
-
-        if self._max_transient_retries > 0:
-            return await _with_transient_retry(
-                coro_func,
-                max_retries=self._max_transient_retries,
-                backoff_s=self._transient_backoff_s,
-                error_types=self._transient_error_types,
-                error_context=error_context,
+        try:
+            yield
+        except BaseException as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework="semantic_kernel",
+                operation=operation,
+                messages_count=messages_count,
+                model=model,
+                temperature=params.get("temperature"),
+                max_tokens=params.get("max_tokens"),
+                top_p=params.get("top_p"),
+                frequency_penalty=params.get("frequency_penalty"),
+                presence_penalty=params.get("presence_penalty"),
+                request_id=getattr(ctx, "request_id", None) if ctx is not None else None,
+                tenant=getattr(ctx, "tenant", None) if ctx is not None else None,
+                stream=stream,
             )
-        else:
-            try:
-                return await coro_func()
-            except BaseException as exc:
-                attach_context(exc, framework="semantic_kernel", **error_context)
-                raise
+            raise
 
     # ------------------------------------------------------------------ #
     # Core async API expected by ChatCompletionClientBase
@@ -592,28 +565,35 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
         **kwargs: Any,
     ) -> ChatMessageContent:
         """
-        Execute a single chat completion call via the Corpus adapter.
+        Execute a single chat completion call via the Corpus LLM protocol.
 
         Parameters
         ----------
         chat_history:
-            Semantic Kernel chat history (messages so far).
+            Semantic Kernel ChatHistory containing the conversation.
+
         settings:
-            Provider-specific or generic prompt execution settings.
-        **kwargs:
-            Additional provider-specific settings; we look at `model` and
-            retry overrides: `max_transient_retries`, `transient_backoff_s`,
-            `transient_error_types`.
+            PromptExecutionSettings with model and sampling parameters.
+
+        kwargs:
+            Additional parameters including:
+            - model: Optional model override
+            - Other framework-specific context
 
         Returns
         -------
         ChatMessageContent
-            SK chat message content with assistant response.
+            Semantic Kernel chat message with assistant response.
+
+        Raises
+        ------
+        ValueError
+            If chat_history is empty or message translation fails.
+        RuntimeError
+            If the underlying LLM protocol call fails.
         """
-        # Extract per-call retry overrides
-        max_retries_override = kwargs.pop("max_transient_retries", None)
-        backoff_override = kwargs.pop("transient_backoff_s", None)
-        error_types_override = kwargs.pop("transient_error_types", None)
+        if not chat_history:
+            raise ValueError("Chat history cannot be empty")
 
         normalized = _history_to_normalized_messages(chat_history)
         corpus_messages = _normalized_to_corpus_messages(normalized)
@@ -627,60 +607,23 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
             default_max_tokens=self._default_max_tokens,
         )
 
-        async def _complete() -> ChatMessageContent:
-            completion = await self._corpus_adapter.complete(
+        model_for_context = params.get("model", self._default_model)
+        messages_count = len(corpus_messages)
+
+        async with self._error_context_async(
+            "get_chat_message_content",
+            stream=False,
+            messages_count=messages_count,
+            model=model_for_context,
+            ctx=ctx,
+            params=params,
+        ):
+            completion: LLMCompletion = await self._translator.arun_complete(
                 messages=corpus_messages,
-                ctx=ctx,
-                **params,
+                op_ctx=ctx,
+                params=params,
             )
             return _completion_to_chat_message(completion)
-
-        # Use overrides if provided, otherwise instance defaults
-        max_retries = (
-            max_retries_override if max_retries_override is not None 
-            else self._max_transient_retries
-        )
-        backoff_s = (
-            backoff_override if backoff_override is not None 
-            else self._transient_backoff_s
-        )
-        error_types = (
-            error_types_override if error_types_override is not None 
-            else self._transient_error_types
-        )
-
-        context = {
-            "messages_count": len(corpus_messages),
-            "model": params.get("model", self._default_model),
-            "temperature": params.get("temperature"),
-            "max_tokens": params.get("max_tokens"),
-            "top_p": params.get("top_p"),
-            "frequency_penalty": params.get("frequency_penalty"),
-            "presence_penalty": params.get("presence_penalty"),
-            "request_id": getattr(ctx, "request_id", None),
-            "tenant": getattr(ctx, "tenant", None),
-            "stream": False,
-            "max_transient_retries": max_retries,
-            "transient_backoff_s": backoff_s,
-        }
-
-        if error_types:
-            context["transient_error_types"] = [t.__name__ for t in error_types]
-
-        if max_retries > 0:
-            return await _with_transient_retry(
-                _complete,
-                max_retries=max_retries,
-                backoff_s=backoff_s,
-                error_types=error_types,
-                error_context=context,
-            )
-        else:
-            try:
-                return await _complete()
-            except BaseException as exc:
-                attach_context(exc, framework="semantic_kernel", **context)
-                raise
 
     async def get_chat_message_contents(
         self,
@@ -691,6 +634,27 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
         """
         Convenience wrapper returning a single-element list for SK APIs that
         expect a collection of messages.
+
+        Parameters
+        ----------
+        chat_history:
+            Semantic Kernel ChatHistory containing the conversation.
+
+        settings:
+            PromptExecutionSettings with model and sampling parameters.
+
+        kwargs:
+            Additional parameters including model override and context.
+
+        Returns
+        -------
+        List[ChatMessageContent]
+            Single-element list containing the assistant response.
+
+        Note
+        ----
+        This method exists for compatibility with SK APIs that expect
+        multiple messages, though typically only one response is generated.
         """
         msg = await self.get_chat_message_content(chat_history, settings, **kwargs)
         return [msg]
@@ -702,29 +666,36 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
         **kwargs: Any,
     ) -> AsyncIterator[StreamingChatMessageContent]:
         """
-        Streaming chat completion via Corpus `stream()`.
+        Streaming chat completion via `LLMTranslator.arun_stream`.
 
         Yields Semantic Kernel `StreamingChatMessageContent` objects for each
-        chunk produced by the Corpus adapter.
+        chunk produced by the Corpus protocol.
 
         Parameters
         ----------
         chat_history:
-            Semantic Kernel chat history.
+            Semantic Kernel ChatHistory containing the conversation.
+
         settings:
-            Prompt execution settings.
-        **kwargs:
-            Additional settings including retry overrides.
+            PromptExecutionSettings with model and sampling parameters.
+
+        kwargs:
+            Additional parameters including model override and context.
 
         Yields
         ------
         StreamingChatMessageContent
-            Streaming chat message content chunks.
+            Incremental streaming chat messages with metadata.
+
+        Raises
+        ------
+        ValueError
+            If chat_history is empty or message translation fails.
+        RuntimeError
+            If the underlying LLM protocol streaming fails.
         """
-        # Extract per-call retry overrides (for the initial stream creation)
-        max_retries_override = kwargs.pop("max_transient_retries", None)
-        backoff_override = kwargs.pop("transient_backoff_s", None)
-        error_types_override = kwargs.pop("transient_error_types", None)
+        if not chat_history:
+            raise ValueError("Chat history cannot be empty")
 
         normalized = _history_to_normalized_messages(chat_history)
         corpus_messages = _normalized_to_corpus_messages(normalized)
@@ -738,82 +709,23 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
             default_max_tokens=self._default_max_tokens,
         )
 
-        context = {
-            "operation": "get_streaming_chat_message_content",
-            "messages_count": len(corpus_messages),
-            "model": params.get("model", self._default_model),
-            "temperature": params.get("temperature"),
-            "max_tokens": params.get("max_tokens"),
-            "top_p": params.get("top_p"),
-            "frequency_penalty": params.get("frequency_penalty"),
-            "presence_penalty": params.get("presence_penalty"),
-            "request_id": getattr(ctx, "request_id", None),
-            "tenant": getattr(ctx, "tenant", None),
-            "stream": True,
-        }
+        model_for_context = params.get("model", self._default_model)
+        messages_count = len(corpus_messages)
 
-        # Use overrides if provided, otherwise instance defaults
-        max_retries = (
-            max_retries_override if max_retries_override is not None 
-            else self._max_transient_retries
-        )
-        backoff_s = (
-            backoff_override if backoff_override is not None 
-            else self._transient_backoff_s
-        )
-        error_types = (
-            error_types_override if error_types_override is not None 
-            else self._transient_error_types
-        )
-
-        async def _create_stream() -> AsyncIterator[LLMChunk]:
-            return await self._corpus_adapter.stream(
+        async with self._error_context_async(
+            "get_streaming_chat_message_content",
+            stream=True,
+            messages_count=messages_count,
+            model=model_for_context,
+            ctx=ctx,
+            params=params,
+        ):
+            async for chunk in self._translator.arun_stream(
                 messages=corpus_messages,
-                ctx=ctx,
-                **params,
-            )
-
-        # Retry only the stream creation, not individual chunks
-        if max_retries > 0:
-            stream_context = context.copy()
-            stream_context.update({
-                "max_transient_retries": max_retries,
-                "transient_backoff_s": backoff_s,
-            })
-            if error_types:
-                stream_context["transient_error_types"] = [t.__name__ for t in error_types]
-
-            stream = await _with_transient_retry(
-                _create_stream,
-                max_retries=max_retries,
-                backoff_s=backoff_s,
-                error_types=error_types,
-                error_context=stream_context,
-            )
-        else:
-            try:
-                stream = await _create_stream()
-            except BaseException as exc:
-                attach_context(exc, framework="semantic_kernel", **context)
-                raise
-
-        try:
-            async for chunk in stream:
+                op_ctx=ctx,
+                params=params,
+            ):
                 yield _chunk_to_streaming_chat_message(chunk)
-        except BaseException as exc:
-            attach_context(exc, framework="semantic_kernel", **context)
-            raise
-        finally:
-            # Best-effort cleanup for adapters that implement aclose() on streams.
-            aclose = getattr(stream, "aclose", None)
-            if callable(aclose):
-                try:
-                    await aclose()
-                except Exception as cleanup_exc:  # pragma: no cover - extremely defensive
-                    logger.debug(
-                        "CorpusSemanticKernelChatCompletion: stream cleanup failed: %s",
-                        cleanup_exc,
-                    )
 
     async def get_streaming_chat_message_contents(
         self,
@@ -825,6 +737,27 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
         Convenience wrapper providing an alias returning an async iterator of
         streaming messages. Recent SK versions favor the singular name, but
         some APIs may expect the plural form.
+
+        Parameters
+        ----------
+        chat_history:
+            Semantic Kernel ChatHistory containing the conversation.
+
+        settings:
+            PromptExecutionSettings with model and sampling parameters.
+
+        kwargs:
+            Additional parameters including model override and context.
+
+        Yields
+        ------
+        StreamingChatMessageContent
+            Incremental streaming chat messages with metadata.
+
+        Note
+        ----
+        This method delegates to `get_streaming_chat_message_content` and
+        exists for API compatibility with different SK versions.
         """
         async for msg in self.get_streaming_chat_message_content(
             chat_history,
@@ -835,5 +768,6 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
 
 
 __all__ = [
+    "SemanticKernelLLMProtocol",
     "CorpusSemanticKernelChatCompletion",
 ]
