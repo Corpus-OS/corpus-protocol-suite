@@ -289,6 +289,87 @@ class DeleteEdgesSpec:
     filter: Optional[Mapping[str, Any]] = None
 
 
+# ---- Transaction and Traversal specs ----------------------------------------
+
+@dataclass(frozen=True)
+class GraphTransaction:
+    """
+    Transaction context for atomic batch operations.
+
+    Attributes:
+        operations: List of batch operations to execute atomically
+        namespace: Optional namespace / graph for the transaction
+        timeout_ms: Optional transaction-level timeout
+    """
+    operations: List[BatchOperation]
+    namespace: Optional[str] = None
+    timeout_ms: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class GraphTraversalSpec:
+    """
+    Specification for graph traversal operations.
+
+    Attributes:
+        start_nodes: List of node IDs to start traversal from
+        max_depth: Maximum traversal depth (default: 1)
+        direction: Traversal direction - "OUTGOING", "INCOMING", or "BOTH"
+        relationship_types: Optional filter for relationship types/labels
+        node_filters: Optional property filters for nodes to include
+        relationship_filters: Optional property filters for relationships to traverse
+        return_properties: Optional list of node/relationship properties to return
+        namespace: Optional namespace / graph for traversal
+    """
+    start_nodes: List[str]
+    max_depth: int = 1
+    direction: str = "OUTGOING"
+    relationship_types: Optional[Tuple[str, ...]] = None
+    node_filters: Optional[Mapping[str, Any]] = None
+    relationship_filters: Optional[Mapping[str, Any]] = None
+    return_properties: Optional[Tuple[str, ...]] = None
+    namespace: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        # Validate direction
+        if self.direction not in {"OUTGOING", "INCOMING", "BOTH"}:
+            raise BadRequest(
+                f"direction must be OUTGOING, INCOMING, or BOTH, got {self.direction}"
+            )
+        # Validate max_depth
+        if self.max_depth < 1:
+            raise BadRequest("max_depth must be at least 1")
+
+
+@dataclass
+class TraversalResult:
+    """
+    Result for graph traversal operations.
+
+    Attributes:
+        nodes: List of nodes discovered during traversal
+        relationships: List of relationships traversed
+        paths: List of complete paths (node-relationship-node sequences)
+        summary: Optional traversal metadata and statistics
+        namespace: Target namespace / graph
+    """
+    nodes: List[Node]
+    relationships: List[Edge]
+    paths: List[List[Union[Node, Edge]]]  # Alternating node-edge-node sequence
+    summary: Mapping[str, Any]
+    namespace: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.nodes is None:
+            object.__setattr__(self, "nodes", [])
+        if self.relationships is None:
+            object.__setattr__(self, "relationships", [])
+        if self.paths is None:
+            object.__setattr__(self, "paths", [])
+        if self.summary is None:
+            object.__setattr__(self, "summary", {})
+
+
 # ---- Bulk / Batch specs ------------------------------------------
 
 @dataclass(frozen=True)
@@ -349,8 +430,18 @@ class BatchResult:
 
     Attributes:
         results: Per-operation results (success or error payloads).
+        success: Whether the entire batch succeeded
+        error: Error message if batch failed
+        transaction_id: Optional transaction identifier for atomic batches
     """
     results: List[Any]
+    success: bool = True
+    error: Optional[str] = None
+    transaction_id: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.results is None:
+            object.__setattr__(self, "results", [])
 
 
 # ---- Schema Introspection ----------------------------------------
@@ -830,6 +921,10 @@ class GraphCapabilities:
         supports_multi_tenant: Whether tenant-aware isolation is supported.
         supports_deadline: Whether ctx.deadline_ms is respected.
         max_batch_ops: Optional maximum number of ops per batch (adapter-defined).
+        supports_transaction: Whether atomic transactions are supported.
+        supports_traversal: Whether graph traversal operations are supported.
+        max_traversal_depth: Optional maximum traversal depth supported.
+        supports_path_queries: Whether path-based queries are supported.
     """
     server: str
     version: str
@@ -845,6 +940,10 @@ class GraphCapabilities:
     supports_multi_tenant: bool = False
     supports_deadline: bool = True
     max_batch_ops: Optional[int] = None
+    supports_transaction: bool = False
+    supports_traversal: bool = False
+    max_traversal_depth: Optional[int] = None
+    supports_path_queries: bool = False
 
 
 # =============================================================================
@@ -940,6 +1039,60 @@ class GraphProtocolV1(Protocol):
     ) -> Mapping[str, Any]:
         ...
 
+    # ---- Transaction and Traversal operations -------------------------------
+
+    async def transaction(
+        self,
+        operations: List[BatchOperation],
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> BatchResult:
+        """
+        Execute a batch of operations atomically as a transaction.
+
+        This provides ACID guarantees for the entire batch - either all
+        operations succeed or none are applied.
+
+        Args:
+            operations: List of batch operations to execute atomically
+            ctx: Operation context including deadline and tracing
+
+        Returns:
+            BatchResult with transaction-level success/failure status
+
+        Raises:
+            NotSupported: If transactions are not supported by the backend
+            BadRequest: If transaction operations are invalid
+            DeadlineExceeded: If transaction exceeds context deadline
+        """
+        ...
+
+    async def traversal(
+        self,
+        spec: GraphTraversalSpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> TraversalResult:
+        """
+        Perform graph traversal starting from specified nodes.
+
+        Traversal explores the graph structure by following relationships
+        from starting nodes up to a specified depth.
+
+        Args:
+            spec: Traversal specification including start nodes, depth, filters
+            ctx: Operation context including deadline and tracing
+
+        Returns:
+            TraversalResult containing discovered nodes, relationships, and paths
+
+        Raises:
+            NotSupported: If traversal operations are not supported
+            BadRequest: If traversal specification is invalid
+            DeadlineExceeded: If traversal exceeds context deadline
+        """
+        ...
+
 
 # =============================================================================
 # Base Instrumented Adapter (DRY gates via _with_gates)
@@ -1028,6 +1181,8 @@ class BaseGraphAdapter(GraphProtocolV1):
             "get_schema",
             "health",
             "batch",
+            "transaction",
+            "traversal",
         }
         if batch_supported_ops is not None:
             self._batch_supported_ops = set(batch_supported_ops)
@@ -1903,6 +2058,156 @@ class BaseGraphAdapter(GraphProtocolV1):
             self._record("health", t0, False, code="UnhandledException", ctx=ctx)
             raise Unavailable("health check failed") from e
 
+    # ---- Transaction and Traversal operations -------------------------------
+
+    async def transaction(
+        self,
+        operations: List[BatchOperation],
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> BatchResult:
+        """
+        Execute a batch of operations atomically as a transaction.
+
+        This provides ACID guarantees for the entire batch - either all
+        operations succeed or none are applied.
+
+        Args:
+            operations: List of batch operations to execute atomically
+            ctx: Operation context including deadline and tracing
+
+        Returns:
+            BatchResult with transaction-level success/failure status
+
+        Raises:
+            NotSupported: If transactions are not supported by the backend
+            BadRequest: If transaction operations are invalid
+            DeadlineExceeded: If transaction exceeds context deadline
+        """
+        caps = await self.capabilities()
+        if not caps.supports_transaction:
+            raise NotSupported("transactions are not supported by this adapter")
+
+        if not operations:
+            raise BadRequest("transaction operations must not be empty")
+
+        if caps.max_batch_ops is not None and len(operations) > caps.max_batch_ops:
+            raise BadRequest(
+                f"transaction ops count {len(operations)} exceeds maximum of {caps.max_batch_ops}",
+                details={"max_batch_ops": caps.max_batch_ops},
+            )
+
+        # Validate transaction operations
+        for idx, op in enumerate(operations):
+            if not isinstance(op.op, str) or not op.op:
+                raise BadRequest(
+                    "each BatchOperation.op must be a non-empty string",
+                    details={"index": idx},
+                )
+            if not isinstance(op.args, Mapping):
+                raise BadRequest(
+                    "each BatchOperation.args must be a mapping",
+                    details={"index": idx, "type": type(op.args).__name__},
+                )
+
+        async def _call() -> BatchResult:
+            result = await self._do_transaction(operations, ctx=ctx)
+
+            # Invalidate caches for successful write operations in transaction
+            if result.success:
+                namespaces_to_invalidate = set()
+                for idx, op in enumerate(operations):
+                    if op.op in {"upsert_nodes", "upsert_edges", "delete_nodes", "delete_edges"}:
+                        if self._batch_op_succeeded(op, result, idx):
+                            namespace = self._extract_namespace_from_batch_op(op)
+                            if namespace is not None:
+                                namespaces_to_invalidate.add(namespace)
+
+                # Invalidate each affected namespace
+                for namespace in namespaces_to_invalidate:
+                    await self._invalidate_namespace_cache(namespace)
+
+            return result
+
+        return await self._with_gates_unary(
+            op="transaction",
+            ctx=ctx,
+            call=_call,
+            metric_extra={"ops": len(operations)},
+        )
+
+    async def traversal(
+        self,
+        spec: GraphTraversalSpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> TraversalResult:
+        """
+        Perform graph traversal starting from specified nodes.
+
+        Traversal explores the graph structure by following relationships
+        from starting nodes up to a specified depth.
+
+        Args:
+            spec: Traversal specification including start nodes, depth, filters
+            ctx: Operation context including deadline and tracing
+
+        Returns:
+            TraversalResult containing discovered nodes, relationships, and paths
+
+        Raises:
+            NotSupported: If traversal operations are not supported
+            BadRequest: If traversal specification is invalid
+            DeadlineExceeded: If traversal exceeds context deadline
+        """
+        caps = await self.capabilities()
+        if not caps.supports_traversal:
+            raise NotSupported("traversal operations are not supported by this adapter")
+
+        if not spec.start_nodes:
+            raise BadRequest("traversal requires at least one start node")
+
+        if caps.max_traversal_depth is not None and spec.max_depth > caps.max_traversal_depth:
+            raise BadRequest(
+                f"traversal depth {spec.max_depth} exceeds maximum of {caps.max_traversal_depth}",
+                details={"max_traversal_depth": caps.max_traversal_depth},
+            )
+
+        # Validate filters
+        if spec.node_filters is not None:
+            self._validate_properties_map(spec.node_filters)
+        if spec.relationship_filters is not None:
+            self._validate_properties_map(spec.relationship_filters)
+
+        async def _call() -> TraversalResult:
+            # Use pluggable cache interface for read-only traversals
+            if not isinstance(self._cache, NoopCache):
+                key = self._make_cache_key(op="traversal", spec=spec, ctx=ctx)
+                cached = await self._cache.get(key)
+                if cached:
+                    self._metrics.counter(
+                        component=self._component,
+                        name="cache_hits",
+                        value=1,
+                        extra={"op": "traversal"},
+                    )
+                    return cached
+            res = await self._do_traversal(spec, ctx=ctx)
+            if not isinstance(self._cache, NoopCache):
+                await self._cache.set(key, res, ttl_s=self._cache_query_ttl_s)
+            return res
+
+        return await self._with_gates_unary(
+            op="traversal",
+            ctx=ctx,
+            call=_call,
+            metric_extra={
+                "start_nodes": len(spec.start_nodes),
+                "max_depth": spec.max_depth,
+                "direction": spec.direction,
+            },
+        )
+
     # --- backend hooks -------------------------------------------------------
 
     async def _do_capabilities(self) -> GraphCapabilities:
@@ -1985,6 +2290,34 @@ class BaseGraphAdapter(GraphProtocolV1):
         ctx: Optional[OperationContext] = None,
     ) -> Mapping[str, Any]:
         raise NotImplementedError
+
+    async def _do_transaction(
+        self,
+        operations: List[BatchOperation],
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> BatchResult:
+        """
+        Backend hook for atomic transaction execution.
+
+        Adapters should override this to provide transaction support.
+        Default implementation raises NotSupported.
+        """
+        raise NotSupported("transactions are not implemented by this adapter")
+
+    async def _do_traversal(
+        self,
+        spec: GraphTraversalSpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> TraversalResult:
+        """
+        Backend hook for graph traversal operations.
+
+        Adapters should override this to provide traversal support.
+        Default implementation raises NotSupported.
+        """
+        raise NotSupported("traversal operations are not implemented by this adapter")
 
 
 # =============================================================================
@@ -2086,6 +2419,8 @@ class WireGraphHandler:
             - graph.batch
             - graph.get_schema
             - graph.health
+            - graph.transaction
+            - graph.traversal
 
         Streaming:
             - graph.stream_query via handle_stream(...)
@@ -2158,6 +2493,16 @@ class WireGraphHandler:
                 res = await self._adapter.health(ctx=ctx)
                 return _success_to_wire(res, (time.monotonic() - t0) * 1000.0)
 
+            if op == "graph.transaction":
+                ops = [BatchOperation(**o) for o in args.get("operations", [])]
+                res = await self._adapter.transaction(ops, ctx=ctx)
+                return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
+
+            if op == "graph.traversal":
+                spec = GraphTraversalSpec(**args)
+                res = await self._adapter.traversal(spec, ctx=ctx)
+                return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
+
             raise NotSupported(f"unknown or non-unary operation '{op}'")
         except Exception as e:
             ms = (time.monotonic() - t0) * 1000.0
@@ -2200,6 +2545,9 @@ __all__ = [
     "UpsertEdgesSpec",
     "DeleteNodesSpec",
     "DeleteEdgesSpec",
+    "GraphTransaction",
+    "GraphTraversalSpec",
+    "TraversalResult",
     "BulkVerticesSpec",
     "BulkVerticesResult",
     "BatchOperation",
