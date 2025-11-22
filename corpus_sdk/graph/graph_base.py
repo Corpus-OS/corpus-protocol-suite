@@ -289,7 +289,7 @@ class DeleteEdgesSpec:
     filter: Optional[Mapping[str, Any]] = None
 
 
-# ---- Bulk / Batch specs (restored) ------------------------------------------
+# ---- Bulk / Batch specs ------------------------------------------
 
 @dataclass(frozen=True)
 class BulkVerticesSpec:
@@ -353,7 +353,7 @@ class BatchResult:
     results: List[Any]
 
 
-# ---- Schema Introspection (restored) ----------------------------------------
+# ---- Schema Introspection ----------------------------------------
 
 @dataclass
 class GraphSchema:
@@ -983,6 +983,7 @@ class BaseGraphAdapter(GraphProtocolV1):
         auto_timestamp_writes: bool = False,
         strict_batch_validation: bool = False,
         batch_supported_ops: Optional[Iterable[str]] = None,
+        allow_self_loops: bool = True,
     ) -> None:
         self._metrics: MetricsSink = metrics or NoopMetrics()
 
@@ -1015,6 +1016,8 @@ class BaseGraphAdapter(GraphProtocolV1):
         # Behavior flags
         self._auto_timestamp_writes = bool(auto_timestamp_writes)
         self._strict_batch_validation = bool(strict_batch_validation)
+        self._allow_self_loops = bool(allow_self_loops)
+
         default_supported_ops = {
             "query",
             "upsert_nodes",
@@ -1177,6 +1180,14 @@ class BaseGraphAdapter(GraphProtocolV1):
     def _validate_edge(self, edge: Edge) -> None:
         if not isinstance(edge.label, str) or not edge.label:
             raise BadRequest("edge.label must be a non-empty string")
+        if not edge.src or not isinstance(edge.src, str):
+            raise BadRequest("edge.src must be a non-empty string")
+        if not edge.dst or not isinstance(edge.dst, str):
+            raise BadRequest("edge.dst must be a non-empty string")
+        
+        if not self._allow_self_loops and edge.src == edge.dst:
+            raise BadRequest("Self-loops are not allowed by this adapter")
+
         if edge.properties is not None:
             self._validate_properties_map(edge.properties)
 
@@ -1725,6 +1736,12 @@ class BaseGraphAdapter(GraphProtocolV1):
 
         supported_ops = self._batch_supported_ops
 
+        # Track batch composition for granular metrics
+        nodes_upserted = 0
+        edges_upserted = 0
+        nodes_deleted = 0
+        edges_deleted = 0
+
         # Enhanced operation-specific validation (opt-in strictness)
         for idx, op_spec in enumerate(ops):
             if not isinstance(op_spec.op, str) or not op_spec.op:
@@ -1737,6 +1754,16 @@ class BaseGraphAdapter(GraphProtocolV1):
                     "each BatchOperation.args must be a mapping",
                     details={"index": idx, "type": type(op_spec.args).__name__},
                 )
+
+            # Calculate granular metrics
+            if op_spec.op == "upsert_nodes":
+                nodes_upserted += len(op_spec.args.get("nodes", []))
+            elif op_spec.op == "upsert_edges":
+                edges_upserted += len(op_spec.args.get("edges", []))
+            elif op_spec.op == "delete_nodes":
+                nodes_deleted += len(op_spec.args.get("ids", []))
+            elif op_spec.op == "delete_edges":
+                edges_deleted += len(op_spec.args.get("ids", []))
 
             if self._strict_batch_validation:
                 if op_spec.op not in supported_ops:
@@ -1779,6 +1806,16 @@ class BaseGraphAdapter(GraphProtocolV1):
                 await self._invalidate_namespace_cache(namespace)
 
             return result
+
+        # Emit granular batch metrics
+        if nodes_upserted > 0:
+            self._metrics.counter(component=self._component, name="batch_nodes_upserted", value=nodes_upserted)
+        if edges_upserted > 0:
+            self._metrics.counter(component=self._component, name="batch_edges_upserted", value=edges_upserted)
+        if nodes_deleted > 0:
+            self._metrics.counter(component=self._component, name="batch_nodes_deleted", value=nodes_deleted)
+        if edges_deleted > 0:
+            self._metrics.counter(component=self._component, name="batch_edges_deleted", value=edges_deleted)
 
         return await self._with_gates_unary(
             op="batch",
