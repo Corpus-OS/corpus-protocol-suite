@@ -16,6 +16,7 @@ Vector Protocol V1.0. It defines:
 - A thin WireVectorHandler that converts wire envelopes ⇄ typed API
 - First-class text storage support via DocStore integration
 - Optional batch query operations for performance optimization
+- Automatic vector normalization for cosine similarity optimization
 
 Design Philosophy
 -----------------
@@ -67,6 +68,14 @@ offering a safe "batteries included" option for direct use:
       - a simple token-bucket rate limiter
     Suitable for development and light production. Not a replacement for a
     full-blown distributed control plane.
+
+Auto-Normalization Feature
+--------------------------
+When enabled (auto_normalize=True), vectors are automatically normalized to unit
+length (L2 norm) during upsert and query operations. This is particularly useful
+for cosine similarity searches where normalized vectors provide more consistent
+results. The feature includes optimizations to avoid unnecessary normalization
+when vectors are already approximately unit length.
 
 Threading & Processes
 ---------------------
@@ -134,6 +143,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import time
 from dataclasses import dataclass, asdict
 from typing import (
@@ -150,7 +160,7 @@ from typing import (
     runtime_checkable,
 )
 
-VECTOR_PROTOCOL_VERSION = "1.0.0"
+VECTOR_PROTOCOL_VERSION = "1.0.1"
 VECTOR_PROTOCOL_ID = "vector/v1.0"
 LOG = logging.getLogger(__name__)
 
@@ -259,8 +269,10 @@ class DocStore(Protocol):
     async def delete(self, doc_id: str) -> None:
         """Delete document"""
         ...
-    # batch_delete is intentionally not required by the protocol;
-    # BaseVectorAdapter will use it opportunistically via getattr() if present.
+        
+    async def batch_delete(self, doc_ids: List[str]) -> None:
+        """Delete multiple documents (required implementation)"""
+        ...
 
 
 class InMemoryDocStore:
@@ -286,7 +298,7 @@ class InMemoryDocStore:
         self._store.pop(doc_id, None)
 
     async def batch_delete(self, doc_ids: List[str]) -> None:
-        """Optional batch delete helper used opportunistically by BaseVectorAdapter."""
+        """Required batch delete implementation."""
         for doc_id in doc_ids:
             self._store.pop(doc_id, None)
 
@@ -358,7 +370,7 @@ class RedisDocStore:
         await self._redis.delete(self._key(doc_id))
 
     async def batch_delete(self, doc_ids: List[str]) -> None:
-        """Optional batch delete helper used opportunistically by BaseVectorAdapter."""
+        """Required batch delete implementation."""
         if not doc_ids:
             return
         keys = [self._key(doc_id) for doc_id in doc_ids]
@@ -1093,6 +1105,9 @@ class VectorAdapterConfig:
           are not provided. Use 0 to disable caching for that operation.
         - `limiter_*` and `breaker_*` are used only when BaseVectorAdapter is
           constructing its own SimpleTokenBucketLimiter / SimpleCircuitBreaker.
+        - `auto_normalize`: If True, vectors in upsert/query operations are 
+          normalized to unit length (L2) automatically. This is particularly
+          useful for cosine similarity searches.
     """
     cache_query_ttl_s: int = 60
     cache_caps_ttl_s: int = 30
@@ -1100,6 +1115,7 @@ class VectorAdapterConfig:
     breaker_reset_timeout_s: float = 10.0
     limiter_rate_per_sec: int = 50
     limiter_burst: int = 100
+    auto_normalize: bool = False
 
 
 # =============================================================================
@@ -1122,10 +1138,17 @@ class BaseVectorAdapter(VectorProtocolV1):
       - Canonical metrics emission for ops & latency
       - Automatic text storage/retrieval via DocStore
       - Cache invalidation on write operations
+      - Optional automatic vector normalization for cosine similarity
 
     Text Storage Behavior:
       - Upsert: Docstore failures cause the entire operation to fail (atomicity)
       - Query: Docstore failures cause missing text but don't fail the query (graceful degradation)
+
+    Auto-Normalization Behavior:
+      - When enabled (auto_normalize=True), vectors are automatically normalized to unit length
+      - Particularly useful for cosine similarity searches
+      - Includes optimization to skip normalization if vector is already unit length
+      - Applied consistently to query, batch_query, and upsert operations
 
     Threading:
         - In-memory infra (cache, breaker, limiter) is not thread-safe.
@@ -1187,6 +1210,7 @@ class BaseVectorAdapter(VectorProtocolV1):
             cache_caps_ttl_s if cache_caps_ttl_s is not None 
             else cfg.cache_caps_ttl_s
         )
+        self._auto_normalize = cfg.auto_normalize
 
         m = (mode or "thin").strip().lower()
         if m not in {"thin", "standalone"}:
@@ -1219,7 +1243,7 @@ class BaseVectorAdapter(VectorProtocolV1):
 
         # Capabilities cache key is namespaced per adapter instance (module/class/id)
         self._caps_cache_key = (
-            f"vector:capabilities:"
+            f"{VECTOR_PROTOCOL_VERSION}:capabilities:"
             f"{self.__class__.__module__}.{self.__class__.__qualname__}:{id(self)}"
         )
 
@@ -1249,8 +1273,11 @@ class BaseVectorAdapter(VectorProtocolV1):
 
         Override in backend implementations that maintain external resources.
         Default implementation is a no-op.
+        
+        Note: In-memory components (cache, breaker, limiter) do not require
+        explicit cleanup as they have no external resource handles.
         """
-        return None
+        pass
 
     # --- internal helpers (validation and instrumentation) -------------------
 
@@ -1260,19 +1287,37 @@ class BaseVectorAdapter(VectorProtocolV1):
         if not isinstance(value, str) or not value.strip():
             raise BadRequest(f"{name} must be a non-empty string")
 
-    @staticmethod
-    def _validate_vector(vector: List[float]) -> None:
+    def _validate_vector(self, vector: List[float], normalize: bool = False) -> List[float]:
         """
-        Validate that a vector is properly formed.
+        Validate that a vector is properly formed and optionally normalize it.
 
         Requirements:
             - non-empty list
             - all elements numeric (int/float)
+        
+        Args:
+            vector: The input vector list.
+            normalize: If True, returns the L2 normalized version of the vector.
+                       Throws BadRequest if vector length is zero.
+        
+        Returns:
+            The validated (and potentially normalized) vector.
         """
         if not isinstance(vector, list) or not vector:
             raise BadRequest("vector must be a non-empty list of floats")
         if not all(isinstance(x, (int, float)) for x in vector):
             raise BadRequest("vector must contain only numeric values")
+
+        if normalize:
+            norm = math.sqrt(sum(x * x for x in vector))
+            if norm == 0:
+                raise BadRequest("cannot normalize zero-length vector")
+            # Optimization: if already close to 1.0, return as-is
+            if abs(norm - 1.0) < 1e-6:
+                return vector
+            return [x / norm for x in vector]
+        
+        return vector
 
     @staticmethod
     def _ensure_json_serializable(value: Any, label: str) -> None:
@@ -1407,12 +1452,13 @@ class BaseVectorAdapter(VectorProtocolV1):
             - backend identity (server/version)
             - tenant hash (if present)
             - text storage strategy
+            - protocol version for cache safety
         """
         tenant_h = self._tenant_hash(ctx.tenant) if ctx else None
         caps_part = f"{caps.server}:{caps.version}" if caps else "unknown"
         text_strategy = caps.text_storage_strategy if caps else "unknown"
         return (
-            f"v1:query:"
+            f"{VECTOR_PROTOCOL_VERSION}:query:"
             f"{caps_part}:"
             f"ns={spec.namespace}:"
             f"topk={spec.top_k}:"
@@ -1449,7 +1495,7 @@ class BaseVectorAdapter(VectorProtocolV1):
         ])
         
         return (
-            f"v1:batch_query:"
+            f"{VECTOR_PROTOCOL_VERSION}:batch_query:"
             f"{caps_part}:"
             f"ns={spec.namespace}:"
             f"queries={queries_hash}:"
@@ -1626,13 +1672,21 @@ class BaseVectorAdapter(VectorProtocolV1):
             - If docstore is configured and text hydration fails, the query continues
               but vectors will have text=None (graceful degradation).
 
+        Auto-Normalization:
+            - If auto_normalize is enabled, query vectors are normalized to unit length
+            - Particularly useful for cosine similarity searches
+
         Backpressure note:
             - For high top_k values or very hot namespaces, consider using a
               distributed rate limiter in addition to the built-in per-process
               token bucket to avoid overload in large clusters.
         """
-        # Structural validation
-        self._validate_vector(spec.vector)
+        # Structural validation and optional normalization
+        spec_vector = self._validate_vector(spec.vector, normalize=self._auto_normalize)
+        
+        # Track if normalization occurred for metrics
+        normalization_occurred = self._auto_normalize and spec_vector is not spec.vector
+        
         self._require_non_empty("namespace", spec.namespace)
         if not isinstance(spec.top_k, int) or spec.top_k <= 0:
             raise BadRequest("top_k must be a positive integer")
@@ -1640,6 +1694,17 @@ class BaseVectorAdapter(VectorProtocolV1):
             raise BadRequest("filter must be a mapping (dict) when provided")
         if not isinstance(spec.include_metadata, bool) or not isinstance(spec.include_vectors, bool):
             raise BadRequest("include_metadata/include_vectors must be booleans")
+
+        # If normalization changed the vector, create new spec
+        if normalization_occurred:
+             spec = QuerySpec(
+                 vector=spec_vector,
+                 top_k=spec.top_k,
+                 namespace=spec.namespace,
+                 filter=spec.filter,
+                 include_metadata=spec.include_metadata,
+                 include_vectors=spec.include_vectors
+             )
 
         # JSON-serializability validation for filters (wire/caching safety)
         if spec.filter is not None:
@@ -1756,6 +1821,9 @@ class BaseVectorAdapter(VectorProtocolV1):
                 extra["matches"] = len(res.matches)
             except Exception:
                 pass
+            # Record normalization metrics if it occurred
+            if normalization_occurred:
+                extra["vector_normalized"] = True
             return extra
 
         result = await self._with_gates_unary(
@@ -1764,6 +1832,15 @@ class BaseVectorAdapter(VectorProtocolV1):
             call=_call,
             on_result=_on_result,
         )
+
+        # Record normalization metric if it occurred
+        if normalization_occurred:
+            self._metrics.counter(
+                component=self._component,
+                name="vectors_normalized",
+                value=1,
+                extra={"op": "query"},
+            )
 
         # Request counters (keep legacy name and add cross-component-friendly name)
         self._metrics.counter(
@@ -1795,20 +1872,50 @@ class BaseVectorAdapter(VectorProtocolV1):
         Docstore Behavior:
             - If docstore is configured and text hydration fails, the batch query continues
               but vectors will have text=None (graceful degradation).
+
+        Auto-Normalization:
+            - If auto_normalize is enabled, all query vectors are normalized to unit length
         """
         self._require_non_empty("namespace", spec.namespace)
         if not spec.queries:
             raise BadRequest("queries must not be empty")
         
-        # Validate each query
+        # Validate each query and track normalization
+        normalized_queries = []
+        queries_changed = False
+        normalization_count = 0
+        
         for i, query in enumerate(spec.queries):
-            self._validate_vector(query.vector)
+            norm_vec = self._validate_vector(query.vector, normalize=self._auto_normalize)
+            
+            # Track if this vector was normalized
+            if self._auto_normalize and norm_vec is not query.vector:
+                queries_changed = True
+                normalization_count += 1
+            
             if not isinstance(query.top_k, int) or query.top_k <= 0:
                 raise BadRequest(f"query[{i}].top_k must be a positive integer")
             if query.filter is not None and not isinstance(query.filter, Mapping):
                 raise BadRequest(f"query[{i}].filter must be a mapping (dict) when provided")
             if query.filter is not None:
                 self._ensure_json_serializable(query.filter, f"query[{i}].filter")
+            
+            if self._auto_normalize and norm_vec is not query.vector:
+                # Create updated query spec
+                normalized_queries.append(QuerySpec(
+                    vector=norm_vec,
+                    top_k=query.top_k,
+                    namespace=query.namespace,
+                    filter=query.filter,
+                    include_metadata=query.include_metadata,
+                    include_vectors=query.include_vectors
+                ))
+            else:
+                normalized_queries.append(query)
+
+        # Update spec if normalization occurred
+        if queries_changed:
+            spec = BatchQuerySpec(queries=normalized_queries, namespace=spec.namespace)
 
         async def _call() -> List[QueryResult]:
             caps = await self.capabilities()
@@ -1921,11 +2028,15 @@ class BaseVectorAdapter(VectorProtocolV1):
 
         def _on_result(results: List[QueryResult]) -> Mapping[str, Any]:
             total_matches = sum(len(result.matches) for result in results)
-            return {
+            extra = {
                 "namespace": spec.namespace,
                 "query_count": len(spec.queries),
                 "total_matches": total_matches,
             }
+            # Record normalization metrics if any occurred
+            if normalization_count > 0:
+                extra["vectors_normalized"] = normalization_count
+            return extra
 
         results = await self._with_gates_unary(
             op="batch_query",
@@ -1933,6 +2044,15 @@ class BaseVectorAdapter(VectorProtocolV1):
             call=_call,
             on_result=_on_result,
         )
+
+        # Record normalization metrics if any occurred
+        if normalization_count > 0:
+            self._metrics.counter(
+                component=self._component,
+                name="vectors_normalized",
+                value=normalization_count,
+                extra={"op": "batch_query"},
+            )
 
         self._metrics.counter(
             component=self._component,
@@ -1968,6 +2088,10 @@ class BaseVectorAdapter(VectorProtocolV1):
             - If docstore is configured and text storage fails, the entire upsert
               operation fails (atomicity).
 
+        Auto-Normalization:
+            - If auto_normalize is enabled, all vectors are normalized to unit length
+              before storage
+
         Guidance:
             - For very large batches, respect capabilities.max_batch_size and
               chunk requests accordingly to avoid memory pressure.
@@ -1977,13 +2101,38 @@ class BaseVectorAdapter(VectorProtocolV1):
             raise BadRequest("vectors must not be empty")
 
         # Validate each vector, id, and its metadata
+        # Normalize vectors if auto_normalize is enabled
+        validated_vectors = []
+        vectors_changed = False
+        normalization_count = 0
+        
         for v in spec.vectors:
             self._require_non_empty("vector.id", str(v.id))
-            self._validate_vector(v.vector)
+            norm_vec = self._validate_vector(v.vector, normalize=self._auto_normalize)
+            
+            # Track if this vector was normalized
+            if self._auto_normalize and norm_vec is not v.vector:
+                vectors_changed = True
+                normalization_count += 1
+            
             if v.metadata is not None and not isinstance(v.metadata, Mapping):
                 raise BadRequest("metadata must be a mapping (dict) when provided")
             if v.metadata is not None:
                 self._ensure_json_serializable(v.metadata, "metadata")
+            
+            if self._auto_normalize and norm_vec is not v.vector:
+                validated_vectors.append(Vector(
+                    id=v.id,
+                    vector=norm_vec,
+                    metadata=v.metadata,
+                    namespace=v.namespace,
+                    text=v.text
+                ))
+            else:
+                validated_vectors.append(v)
+
+        if vectors_changed:
+            spec = UpsertSpec(vectors=validated_vectors, namespace=spec.namespace)
 
         async def _call() -> UpsertResult:
             caps = await self.capabilities()
@@ -2077,11 +2226,15 @@ class BaseVectorAdapter(VectorProtocolV1):
             return result
 
         def _on_result(res: UpsertResult) -> Mapping[str, Any]:
-            return {
+            extra = {
                 "namespace": spec.namespace,
                 "vectors_processed": len(spec.vectors),
                 "upserted_count": res.upserted_count,
             }
+            # Record normalization metrics if any occurred
+            if normalization_count > 0:
+                extra["vectors_normalized"] = normalization_count
+            return extra
 
         result = await self._with_gates_unary(
             op="upsert",
@@ -2089,6 +2242,15 @@ class BaseVectorAdapter(VectorProtocolV1):
             call=_call,
             on_result=_on_result,
         )
+
+        # Record normalization metrics if any occurred
+        if normalization_count > 0:
+            self._metrics.counter(
+                component=self._component,
+                name="vectors_normalized",
+                value=normalization_count,
+                extra={"op": "upsert"},
+            )
 
         # Token-style counters for upserted vectors and requests
         self._metrics.counter(
@@ -2159,16 +2321,11 @@ class BaseVectorAdapter(VectorProtocolV1):
 
             # Clean up docstore entries and cache on successful delete
             if result.deleted_count > 0:
-                # Clean up docstore entries (best effort, with optional batch_delete)
+                # Clean up docstore entries (using efficient batch_delete)
                 if self._docstore is not None and spec.ids:
                     try:
                         doc_ids = [str(doc_id) for doc_id in spec.ids]
-                        batch_delete = getattr(self._docstore, "batch_delete", None)
-                        if callable(batch_delete):
-                            await batch_delete(doc_ids)
-                        else:
-                            for doc_id in doc_ids:
-                                await self._docstore.delete(doc_id)
+                        await self._docstore.batch_delete(doc_ids)
                     except Exception:
                         # Log but don't fail the operation
                         LOG.debug("Failed to clean up docstore entries after delete")
