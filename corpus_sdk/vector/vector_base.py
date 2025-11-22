@@ -2669,7 +2669,10 @@ class WireVectorHandler:
                 return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
 
             if op == "vector.query":
-                spec = QuerySpec(**args)
+                try:
+                    spec = QuerySpec(**args)
+                except TypeError as te:
+                    raise BadRequest(f"missing required field(s): {str(te)}")
                 res = await self._adapter.query(spec, ctx=ctx)
                 return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
 

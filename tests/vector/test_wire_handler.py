@@ -30,6 +30,11 @@ from corpus_sdk.vector.vector_base import (
     Unavailable,
     BaseVectorAdapter,
     WireVectorHandler,
+    VectorCapabilities,
+    QueryResult,
+    UpsertResult,
+    DeleteResult,
+    NamespaceResult,
 )
 
 pytestmark = pytest.mark.asyncio
@@ -52,58 +57,60 @@ class TrackingMockVectorAdapter(BaseVectorAdapter):
         self.last_ctx = ctx
         self.last_args = dict(kwargs)
 
-    async def capabilities(self):
+    async def _do_capabilities(self):
         self._track("capabilities", None)
-        return {
-            "protocol": VECTOR_PROTOCOL_ID,
-            "server": "test-vector",
-            "version": "1.0.0",
-            "max_dimensions": 8,
-            "supported_metrics": ("cosine", "euclidean"),
-            "supports_namespaces": True,
-            "supports_metadata_filtering": True,
-        }
+        return VectorCapabilities(
+            protocol=VECTOR_PROTOCOL_ID,
+            server="test-vector",
+            version="1.0.0",
+            max_dimensions=8,
+            supported_metrics=("cosine", "euclidean"),
+            supports_namespaces=True,
+            supports_metadata_filtering=True,
+        )
 
-    async def query(self, spec, *, ctx: Optional[OperationContext] = None):
+    async def _do_query(self, spec, *, ctx: Optional[OperationContext] = None):
         self._track("query", ctx, spec=spec)
-        return {
-            "namespace": spec.namespace,
-            "query_vector": spec.vector,
-            "matches": [],
-            "total_matches": 0
-        }
+        return QueryResult(
+            namespace=spec.namespace,
+            query_vector=spec.vector,
+            matches=[],
+            total_matches=0
+        )
 
-    async def upsert(self, spec, *, ctx: Optional[OperationContext] = None):
+    async def _do_upsert(self, spec, *, ctx: Optional[OperationContext] = None):
         self._track("upsert", ctx, spec=spec)
-        return {
-            "upserted_count": len(spec.vectors),
-            "failed_count": 0,
-            "failures": []
-        }
+        return UpsertResult(
+            upserted_count=len(spec.vectors),
+            failed_count=0,
+            failures=[]
+        )
 
-    async def delete(self, spec, *, ctx: Optional[OperationContext] = None):
+    async def _do_delete(self, spec, *, ctx: Optional[OperationContext] = None):
         self._track("delete", ctx, spec=spec)
-        return {
-            "deleted_count": len(spec.ids) if spec.ids else 0,
-            "failed_count": 0,
-            "failures": []
-        }
+        return DeleteResult(
+            deleted_count=len(spec.ids) if spec.ids else 0,
+            failed_count=0,
+            failures=[]
+        )
 
-    async def create_namespace(self, spec, *, ctx: Optional[OperationContext] = None):
+    async def _do_create_namespace(self, spec, *, ctx: Optional[OperationContext] = None):
         self._track("create_namespace", ctx, spec=spec)
-        return {
-            "success": True,
-            "namespace": spec.namespace
-        }
+        return NamespaceResult(
+            success=True,
+            namespace=spec.namespace,
+            details={}
+        )
 
-    async def delete_namespace(self, namespace: str, *, ctx: Optional[OperationContext] = None):
+    async def _do_delete_namespace(self, namespace: str, *, ctx: Optional[OperationContext] = None):
         self._track("delete_namespace", ctx, namespace=namespace)
-        return {
-            "success": True,
-            "namespace": namespace
-        }
+        return NamespaceResult(
+            success=True,
+            namespace=namespace,
+            details={}
+        )
 
-    async def health(self, *, ctx: Optional[OperationContext] = None):
+    async def _do_health(self, *, ctx: Optional[OperationContext] = None):
         self._track("health", ctx)
         return {
             "ok": True,
@@ -120,14 +127,14 @@ class ErrorAdapter(TrackingMockVectorAdapter):
         super().__init__()
         self._exc = exc
 
-    async def query(self, spec, *, ctx: Optional[OperationContext] = None):
+    async def _do_query(self, spec, *, ctx: Optional[OperationContext] = None):
         raise self._exc
 
 
 class BoomAdapter(TrackingMockVectorAdapter):
     """Adapter that raises unexpected exceptions for testing error mapping."""
     
-    async def query(self, spec, *, ctx: Optional[OperationContext] = None):
+    async def _do_query(self, spec, *, ctx: Optional[OperationContext] = None):
         raise RuntimeError("unexpected failure")
 
 
