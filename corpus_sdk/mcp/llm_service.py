@@ -722,8 +722,8 @@ class MCPLLMTranslationService:
                     "STREAMING_DISABLED",
                     request_id,
                 )
-            # Streaming path
-            return self._stream_generation(
+            # Streaming path – return the async generator itself
+            return await self._stream_generation(
                 prompt=prompt,
                 model=model,
                 max_tokens=max_tokens,
@@ -736,8 +736,10 @@ class MCPLLMTranslationService:
             )
 
         # Non-streaming path
+        acquired = False
         try:
             await self._request_semaphore.acquire(priority, request_id)
+            acquired = True
             self._active_requests += 1
             result = await self._process_generation_request(
                 prompt=prompt,
@@ -774,8 +776,9 @@ class MCPLLMTranslationService:
             self._record_failure()
             raise
         finally:
-            self._request_semaphore.release()
-            self._active_requests = max(0, self._active_requests - 1)
+            if acquired:
+                self._request_semaphore.release()
+                self._active_requests = max(0, self._active_requests - 1)
 
     # -------------------------------------------------------------------------
     # Internal non-streaming execution
@@ -976,9 +979,12 @@ class MCPLLMTranslationService:
 
         async def _stream() -> AsyncGenerator[StreamingChunk, None]:
             nonlocal chunks_delivered
-            await self._request_semaphore.acquire(priority, request_id)
-            self._active_requests += 1
+            acquired = False
             try:
+                await self._request_semaphore.acquire(priority, request_id)
+                acquired = True
+                self._active_requests += 1
+
                 agen = await self._llm.arun_stream(
                     raw_messages=messages,
                     model=model,
@@ -1025,8 +1031,9 @@ class MCPLLMTranslationService:
                 self._record_failure()
                 raise
             finally:
-                self._request_semaphore.release()
-                self._active_requests = max(0, self._active_requests - 1)
+                if acquired:
+                    self._request_semaphore.release()
+                    self._active_requests = max(0, self._active_requests - 1)
 
         return _stream()
 
