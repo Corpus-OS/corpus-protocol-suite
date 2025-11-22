@@ -31,7 +31,7 @@ pytestmark = pytest.mark.asyncio
 
 async def test_error_handling_text_too_long_maps_correctly(adapter: BaseEmbeddingAdapter):
     """§10.4: TextTooLong must map to TEXT_TOO_LONG and be non-retryable."""
-    caps = adapter.capabilities
+    caps = await adapter.capabilities()
     if caps.max_text_length is None:
         pytest.skip("Adapter does not declare max_text_length")
 
@@ -87,7 +87,7 @@ async def test_error_handling_bad_request_validation(adapter: BaseEmbeddingAdapt
 
 async def test_error_handling_not_supported_clear_messages(adapter: BaseEmbeddingAdapter):
     """§10.4: NotSupported errors must indicate missing features clearly."""
-    caps = adapter.capabilities
+    caps = await adapter.capabilities()
     
     # Test normalization if not supported
     if not getattr(caps, "supports_normalization", False):
@@ -130,14 +130,15 @@ async def test_error_handling_deadline_exceeded_maps_correctly(adapter: BaseEmbe
 
 async def test_error_handling_batch_partial_failure_codes(adapter: BaseEmbeddingAdapter):
     """§12.5: Batch failures must use normalized error codes."""
-    if not getattr(adapter.capabilities, "supports_batch_embedding", True):
+    caps = await adapter.capabilities()
+    if not getattr(caps, "supports_batch_embedding", True):
         pytest.skip("Batch embedding not supported")
 
     ctx = OperationContext(request_id="t_batch_errors", tenant="test")
     
     # Mix of valid and invalid inputs
     texts = ["valid", "", "another valid", " "]
-    spec = BatchEmbedSpec(texts=texts, model=adapter.supported_models[0])
+    spec = BatchEmbedSpec(texts=texts, model=caps.supported_models[0])
     
     result = await adapter.embed_batch(spec, ctx=ctx)
     

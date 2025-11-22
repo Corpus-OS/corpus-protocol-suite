@@ -17,6 +17,8 @@ from corpus_sdk.embedding.embedding_base import (
     BatchEmbedSpec,
     OperationContext,
     NotSupported,
+    BadRequest,
+    ModelNotAvailable,
 )
 
 pytestmark = pytest.mark.asyncio
@@ -163,7 +165,7 @@ async def test_capabilities_max_batch_size_respected(adapter: BaseEmbeddingAdapt
             result = await adapter.embed_batch(spec, ctx=ctx)
             # If it succeeds, verify it handled the oversize correctly
             assert len(result.embeddings) + len(result.failed_texts) <= caps.max_batch_size + 1
-        except (ValueError, NotSupported) as e:
+        except (ValueError, NotSupported, BadRequest) as e:
             # Expected behavior - reject oversized batch
             assert "batch" in str(e).lower() or "size" in str(e).lower() or "limit" in str(e).lower()
 
@@ -184,7 +186,7 @@ async def test_capabilities_max_text_length_respected(adapter: BaseEmbeddingAdap
             result = await adapter.embed(spec, ctx=ctx)
             if caps.truncation_mode == "none":
                 pytest.fail("Oversized text should fail when truncation_mode is 'none'")
-        except (ValueError, NotSupported) as e:
+        except (ValueError, NotSupported, BadRequest) as e:
             # Expected behavior for non-truncating adapters
             assert "length" in str(e).lower() or "size" in str(e).lower() or "limit" in str(e).lower()
 
@@ -204,7 +206,7 @@ async def test_capabilities_supported_models_accurate(adapter: BaseEmbeddingAdap
     for model in unsupported_models:
         if model not in caps.supported_models:
             invalid_spec = EmbedSpec(text="test", model=model, normalize=False)
-            with pytest.raises((ValueError, NotSupported)):
+            with pytest.raises((ValueError, NotSupported, ModelNotAvailable)):
                 await adapter.embed(invalid_spec, ctx=ctx)
             break
 

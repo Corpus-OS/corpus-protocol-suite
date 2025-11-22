@@ -56,6 +56,9 @@ corpus-sdk = "corpus_sdk.cli:main"
 asyncio_mode = "auto"
 testpaths = ["tests"]
 addopts = "-v --strict-markers --strict-config"
+markers = [
+    "skip_if_not_supported: skip tests if feature is not supported by the adapter",
+]
 
 # --- Formatting/Linting/Typing (recommended, optional) ---
 

@@ -25,7 +25,7 @@ pytestmark = pytest.mark.asyncio
 
 async def test_truncation_embed_truncates_when_allowed_and_sets_flag(adapter: BaseEmbeddingAdapter):
     """§10.6: truncate=True should truncate long texts and set truncated flag."""
-    caps = adapter.capabilities
+    caps = await adapter.capabilities()
     if caps.max_text_length is None:
         pytest.skip("Adapter does not declare max_text_length")
 
@@ -47,7 +47,7 @@ async def test_truncation_embed_truncates_when_allowed_and_sets_flag(adapter: Ba
 
 async def test_truncation_embed_raises_when_truncation_disallowed(adapter: BaseEmbeddingAdapter):
     """§10.4: truncate=False with long text must raise TextTooLong."""
-    caps = adapter.capabilities
+    caps = await adapter.capabilities()
     if caps.max_text_length is None:
         pytest.skip("Adapter does not declare max_text_length")
 
@@ -72,7 +72,7 @@ async def test_truncation_embed_raises_when_truncation_disallowed(adapter: BaseE
 
 async def test_truncation_batch_truncates_all_when_allowed(adapter: BaseEmbeddingAdapter):
     """§10.6: Batch should truncate all items when truncate=True."""
-    caps = adapter.capabilities
+    caps = await adapter.capabilities()
     if caps.max_text_length is None:
         pytest.skip("Adapter does not declare max_text_length")
     if not getattr(caps, "supports_batch_embedding", True):
@@ -98,7 +98,7 @@ async def test_truncation_batch_truncates_all_when_allowed(adapter: BaseEmbeddin
 
 async def test_truncation_batch_oversize_without_truncation_raises(adapter: BaseEmbeddingAdapter):
     """§10.4: Batch with truncate=False and long text must raise TextTooLong."""
-    caps = adapter.capabilities
+    caps = await adapter.capabilities()
     if caps.max_text_length is None:
         pytest.skip("Adapter does not declare max_text_length")
     if not getattr(caps, "supports_batch_embedding", True):
@@ -125,7 +125,7 @@ async def test_truncation_batch_oversize_without_truncation_raises(adapter: Base
 
 async def test_truncation_short_texts_unchanged(adapter: BaseEmbeddingAdapter):
     """§10.6: Short texts within limits should pass through unchanged."""
-    caps = adapter.capabilities
+    caps = await adapter.capabilities()
     max_len = caps.max_text_length or 1024  # Use default if not specified
 
     text = "short text well within limit"
@@ -135,7 +135,7 @@ async def test_truncation_short_texts_unchanged(adapter: BaseEmbeddingAdapter):
 
     spec = EmbedSpec(
         text=text,
-        model=adapter.supported_models[0],
+        model=caps.supported_models[0],
         truncate=True,  # Even with truncate=True, short text should be unchanged
         normalize=False,
     )
@@ -147,7 +147,7 @@ async def test_truncation_short_texts_unchanged(adapter: BaseEmbeddingAdapter):
 
 async def test_truncation_exact_length_text_handled(adapter: BaseEmbeddingAdapter):
     """§10.6: Texts at exact max length should be handled correctly."""
-    caps = adapter.capabilities
+    caps = await adapter.capabilities()
     if caps.max_text_length is None:
         pytest.skip("Adapter does not declare max_text_length")
 
@@ -170,7 +170,7 @@ async def test_truncation_exact_length_text_handled(adapter: BaseEmbeddingAdapte
 
 async def test_truncation_batch_mixed_lengths_with_truncation(adapter: BaseEmbeddingAdapter):
     """§12.5: Batch should handle mixed length texts with truncation."""
-    caps = adapter.capabilities
+    caps = await adapter.capabilities()
     if caps.max_text_length is None:
         pytest.skip("Adapter does not declare max_text_length")
     if not getattr(caps, "supports_batch_embedding", True):
@@ -205,7 +205,7 @@ async def test_truncation_batch_mixed_lengths_with_truncation(adapter: BaseEmbed
 
 async def test_truncation_unicode_text_truncation(adapter: BaseEmbeddingAdapter):
     """§10.6: Truncation should handle Unicode text correctly."""
-    caps = adapter.capabilities
+    caps = await adapter.capabilities()
     if caps.max_text_length is None:
         pytest.skip("Adapter does not declare max_text_length")
 
@@ -229,7 +229,7 @@ async def test_truncation_unicode_text_truncation(adapter: BaseEmbeddingAdapter)
 
 async def test_truncation_truncation_boundary_consistency(adapter: BaseEmbeddingAdapter):
     """§10.6: Truncation should be consistent around boundary lengths."""
-    caps = adapter.capabilities
+    caps = await adapter.capabilities()
     if caps.max_text_length is None:
         pytest.skip("Adapter does not declare max_text_length")
 
