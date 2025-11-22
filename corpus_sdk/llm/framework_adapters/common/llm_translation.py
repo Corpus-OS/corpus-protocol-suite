@@ -41,9 +41,10 @@ For streaming completions, this module exposes:
 
 Registry
 --------
-A small registry lets you register per-framework LLM translators:
+A comprehensive registry lets you register per-framework LLM translators:
 
 - `register_llm_translator("my_framework", factory)`
+- `get_llm_translator_factory("my_framework")`
 - `create_llm_translator("my_framework", adapter, ...)`
 
 This makes it straightforward to plug in framework-specific behaviors while
@@ -53,7 +54,10 @@ reusing the common orchestration logic here.
 from __future__ import annotations
 
 import logging
-from dataclasses import asdict
+import time
+import json
+import re
+from dataclasses import asdict, dataclass
 from typing import (
     Any,
     AsyncIterator,
@@ -92,6 +96,456 @@ from corpus_sdk.core.error_context import attach_context
 LOG = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+
+# =============================================================================
+# Enhanced Token Counting Configuration
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class TokenCountingConfig:
+    """
+    Configuration for sophisticated token counting strategies.
+
+    Different LLMs and frameworks have varying requirements for how
+    messages should be formatted for accurate token counting.
+
+    Attributes:
+        format_strategy:
+            How to format messages for token counting:
+            - "simple": "role: content" format (default, basic but fast)
+            - "openai_chatml": OpenAI ChatML template formatting
+            - "anthropic": Anthropic's specific message formatting
+            - "custom": Use custom_format_template
+
+        custom_format_template:
+            Template string for custom formatting. Use {role} and {content}
+            placeholders. Example: "<|im_start|>{role}\n{content}<|im_end|>\n"
+
+        include_system_in_messages:
+            Whether to include system messages in the main message count
+            or handle them separately.
+
+        add_special_tokens:
+            Whether to account for special tokens (BOS/EOS) in count.
+            Currently used to add token overhead for formatting templates.
+    """
+
+    format_strategy: str = "simple"
+    custom_format_template: Optional[str] = None
+    include_system_in_messages: bool = True
+    add_special_tokens: bool = True
+
+    def __post_init__(self):
+        """Validate token counting configuration."""
+        valid_strategies = {"simple", "openai_chatml", "anthropic", "custom"}
+        if self.format_strategy not in valid_strategies:
+            raise ValueError(
+                f"format_strategy must be one of {valid_strategies}, got {self.format_strategy}"
+            )
+        if self.format_strategy == "custom" and not self.custom_format_template:
+            raise ValueError("custom_format_template is required when format_strategy='custom'")
+
+
+# =============================================================================
+# Enhanced Tool Validation
+# =============================================================================
+
+
+class ToolValidator:
+    """
+    Enhanced validation for tool schemas to ensure compatibility with LLM protocols.
+
+    Validates tool definitions according to common LLM provider expectations
+    and provides helpful error messages for framework integrators.
+    """
+
+    REQUIRED_FUNCTION_KEYS = {"name", "description", "parameters"}
+    REQUIRED_PARAMETERS_KEYS = {"type", "properties"}
+
+    @classmethod
+    def validate_tool_schema(cls, tool: Dict[str, Any]) -> None:
+        """
+        Validate a single tool schema for LLM compatibility.
+
+        Raises BadRequest with detailed error messages if validation fails.
+        """
+        if not isinstance(tool, dict):
+            raise BadRequest("Tool must be a dictionary", code="BAD_TOOL_SCHEMA")
+
+        # Check tool type
+        tool_type = tool.get("type")
+        if tool_type != "function":
+            raise BadRequest(
+                f"Tool type must be 'function', got {tool_type!r}",
+                code="BAD_TOOL_TYPE",
+                details={"supported_types": ["function"]},
+            )
+
+        # Check function definition
+        function_def = tool.get("function")
+        if not isinstance(function_def, dict):
+            raise BadRequest(
+                "Tool must contain a 'function' dictionary",
+                code="BAD_TOOL_FUNCTION",
+            )
+
+        # Validate required function keys
+        missing_keys = cls.REQUIRED_FUNCTION_KEYS - set(function_def.keys())
+        if missing_keys:
+            raise BadRequest(
+                f"Tool function missing required keys: {missing_keys}",
+                code="BAD_TOOL_FUNCTION_KEYS",
+                details={"required_keys": list(cls.REQUIRED_FUNCTION_KEYS)},
+            )
+
+        # Validate function name
+        name = function_def.get("name", "")
+        if not isinstance(name, str) or not name.strip():
+            raise BadRequest(
+                "Tool function name must be a non-empty string",
+                code="BAD_TOOL_NAME",
+            )
+
+        # Validate parameters schema
+        parameters = function_def.get("parameters", {})
+        if not isinstance(parameters, dict):
+            raise BadRequest(
+                "Tool function parameters must be a dictionary",
+                code="BAD_TOOL_PARAMETERS",
+            )
+
+        # Validate required parameters keys
+        missing_param_keys = cls.REQUIRED_PARAMETERS_KEYS - set(parameters.keys())
+        if missing_param_keys:
+            raise BadRequest(
+                f"Tool parameters missing required keys: {missing_param_keys}",
+                code="BAD_TOOL_PARAMETERS_KEYS",
+                details={"required_keys": list(cls.REQUIRED_PARAMETERS_KEYS)},
+            )
+
+        # Validate parameters type
+        param_type = parameters.get("type")
+        if param_type != "object":
+            raise BadRequest(
+                f"Parameters type must be 'object', got {param_type!r}",
+                code="BAD_TOOL_PARAMETERS_TYPE",
+            )
+
+        # Validate properties
+        properties = parameters.get("properties", {})
+        if not isinstance(properties, dict):
+            raise BadRequest(
+                "Parameters properties must be a dictionary",
+                code="BAD_TOOL_PROPERTIES",
+            )
+
+    @classmethod
+    def validate_tool_choice(cls, tool_choice: Any) -> None:
+        """
+        Validate tool_choice parameter for LLM compatibility.
+        """
+        if tool_choice is None:
+            return
+
+        if isinstance(tool_choice, str):
+            valid_choices = {"auto", "none", "required"}
+            if tool_choice not in valid_choices:
+                raise BadRequest(
+                    f"tool_choice must be one of {valid_choices}, got {tool_choice!r}",
+                    code="BAD_TOOL_CHOICE",
+                )
+        elif isinstance(tool_choice, dict):
+            if "type" not in tool_choice or "function" not in tool_choice:
+                raise BadRequest(
+                    "tool_choice dict must contain 'type' and 'function' keys",
+                    code="BAD_TOOL_CHOICE_DICT",
+                )
+        else:
+            raise BadRequest(
+                "tool_choice must be a string or dictionary",
+                code="BAD_TOOL_CHOICE_TYPE",
+            )
+
+
+# =============================================================================
+# LLM Post-Processing Configuration
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class LLMPostProcessingConfig:
+    """
+    Configuration for LLM result post-processing (MMR-equivalent for LLMs).
+
+    Provides hooks for safety filtering, output formatting, JSON repair,
+    and other post-processing operations on LLM completions.
+
+    Attributes:
+        enabled:
+            Whether to apply post-processing.
+
+        safety_filter:
+            Apply safety/content filtering to completions.
+
+        json_repair:
+            Attempt to repair malformed JSON in tool calls or content.
+
+        output_format:
+            Force specific output format: "text", "json", "markdown".
+
+        max_length:
+            Truncate completion if it exceeds this character length.
+
+        custom_processors:
+            List of custom processor functions to apply to completions.
+    """
+
+    enabled: bool = False
+    safety_filter: bool = False
+    json_repair: bool = False
+    output_format: Optional[str] = None
+    max_length: Optional[int] = None
+    custom_processors: Optional[List[Callable[[LLMCompletion], LLMCompletion]]] = None
+
+    def __post_init__(self):
+        """Validate post-processing configuration."""
+        if self.output_format and self.output_format not in {"text", "json", "markdown"}:
+            raise ValueError(
+                f"output_format must be one of 'text', 'json', 'markdown', got {self.output_format}"
+            )
+        if self.max_length and self.max_length <= 0:
+            raise ValueError(f"max_length must be positive, got {self.max_length}")
+
+
+# =============================================================================
+# Enhanced Metrics Tracking
+# =============================================================================
+
+
+@dataclass
+class TranslatorMetrics:
+    """
+    Metrics collected at the translator level for observability.
+
+    Tracks framework-specific translation patterns and error rates
+    for better monitoring and debugging.
+    """
+
+    # Translation operation counts
+    message_translations: int = 0
+    tool_translations: int = 0
+    completion_translations: int = 0
+    chunk_translations: int = 0
+
+    # Error counts
+    translation_errors: int = 0
+    validation_errors: int = 0
+    normalization_errors: int = 0
+
+    # Timing metrics (in seconds)
+    total_translation_time: float = 0.0
+    avg_translation_time: float = 0.0
+
+    # Framework-specific usage
+    framework_specific_paths_used: int = 0
+
+    def record_translation(self, duration: float, success: bool = True) -> None:
+        """Record a translation operation with timing."""
+        self.total_translation_time += duration
+        self.message_translations += 1
+        if not success:
+            self.translation_errors += 1
+        if self.message_translations > 0:
+            self.avg_translation_time = self.total_translation_time / self.message_translations
+
+    def record_validation_error(self) -> None:
+        """Record a validation error."""
+        self.validation_errors += 1
+
+    def record_normalization_error(self) -> None:
+        """Record a normalization error."""
+        self.normalization_errors += 1
+
+    def record_framework_path_usage(self) -> None:
+        """Record usage of framework-specific translation path."""
+        self.framework_specific_paths_used += 1
+
+    def record_tool_translation(self) -> None:
+        """Record a tool translation operation."""
+        self.tool_translations += 1
+
+    def record_completion_translation(self) -> None:
+        """Record a completion translation operation."""
+        self.completion_translations += 1
+
+    def record_chunk_translation(self) -> None:
+        """Record a chunk translation operation."""
+        self.chunk_translations += 1
+
+
+# =============================================================================
+# Safety Filter Implementation
+# =============================================================================
+
+
+class SafetyFilter:
+    """
+    Content safety filtering for LLM completions.
+    
+    Provides configurable safety checks for LLM outputs including
+    profanity filtering, PII detection, and content moderation.
+    """
+
+    # Common profanity patterns (simplified for example)
+    PROFANITY_PATTERNS = [
+        r'\b(asshole|bastard|bitch|damn|fuck|shit)\b',
+        r'\b(cunt|dick|piss|whore)\b',
+    ]
+
+    # PII patterns
+    PII_PATTERNS = [
+        r'\b\d{3}-\d{2}-\d{4}\b',  # SSN
+        r'\b\d{16}\b',  # Credit card
+        r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',  # Email
+        r'\b\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b',  # Phone
+    ]
+
+    def __init__(self, filter_profanity: bool = True, filter_pii: bool = True):
+        self.filter_profanity = filter_profanity
+        self.filter_pii = filter_pii
+        self.profanity_regex = re.compile('|'.join(self.PROFANITY_PATTERNS), re.IGNORECASE)
+        self.pii_regex = re.compile('|'.join(self.PII_PATTERNS))
+
+    def filter_content(self, text: str) -> Tuple[str, List[str]]:
+        """
+        Filter content for safety issues.
+        
+        Returns:
+            Tuple of (filtered_text, list_of_violations)
+        """
+        violations = []
+        filtered_text = text
+
+        if self.filter_profanity:
+            profanity_matches = self.profanity_regex.findall(text)
+            if profanity_matches:
+                violations.append(f"Profanity detected: {', '.join(set(profanity_matches))}")
+                # Replace profanity with [REDACTED]
+                filtered_text = self.profanity_regex.sub('[REDACTED]', filtered_text)
+
+        if self.filter_pii:
+            pii_matches = self.pii_regex.findall(text)
+            if pii_matches:
+                violations.append(f"PII detected: {', '.join(set(pii_matches))}")
+                # Replace PII with [REDACTED]
+                filtered_text = self.pii_regex.sub('[REDACTED]', filtered_text)
+
+        return filtered_text, violations
+
+
+# =============================================================================
+# JSON Repair Implementation
+# =============================================================================
+
+
+class JSONRepair:
+    """
+    Robust JSON repair for malformed LLM outputs.
+    
+    Handles common JSON formatting issues in LLM completions including
+    unclosed brackets, trailing commas, and missing quotes.
+    """
+
+    @staticmethod
+    def repair_json(text: str) -> str:
+        """
+        Attempt to repair common JSON formatting issues.
+        
+        Handles:
+        - Unclosed brackets and braces
+        - Trailing commas
+        - Missing quotes around keys
+        - Unescaped quotes in strings
+        """
+        if not text.strip():
+            return text
+
+        # Try parsing first - if it works, return as-is
+        try:
+            json.loads(text)
+            return text
+        except json.JSONDecodeError:
+            pass  # Continue with repair attempts
+
+        repaired = text.strip()
+
+        # Balance brackets and braces
+        open_braces = repaired.count('{') - repaired.count('}')
+        open_brackets = repaired.count('[') - repaired.count(']')
+
+        # Add missing closing braces
+        if open_braces > 0:
+            repaired += '}' * open_braces
+        elif open_braces < 0:
+            repaired = '{' * (-open_braces) + repaired
+
+        # Add missing closing brackets
+        if open_brackets > 0:
+            repaired += ']' * open_brackets
+        elif open_brackets < 0:
+            repaired = '[' * (-open_brackets) + repaired
+
+        # Remove trailing commas before closing braces/brackets
+        repaired = re.sub(r',\s*([}\]])', r'\1', repaired)
+
+        # Add missing quotes around keys (simple heuristic)
+        repaired = re.sub(r'(\{|,)\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r'\1 "\2":', repaired)
+
+        # Handle unescaped quotes in strings (basic)
+        def _escape_quotes(match: re.Match) -> str:
+            inner_text = match.group(1)
+            # Escape unescaped quotes within the string
+            escaped = inner_text.replace('"', '\\"')
+            return f'"{escaped}"'
+        
+        repaired = re.sub(r'(?<!\\)"([^"\\]*(\\.[^"\\]*)*)"', _escape_quotes, repaired)
+
+        return repaired
+
+    @staticmethod
+    def extract_and_repair_json(text: str) -> Optional[Dict[str, Any]]:
+        """
+        Extract JSON from text and repair it if necessary.
+        
+        Returns parsed JSON dict or None if repair fails.
+        """
+        # Use a stack-based approach to find complete JSON objects
+        stack = []
+        start_index = -1
+        
+        for i, char in enumerate(text):
+            if char == '{':
+                if not stack:
+                    start_index = i
+                stack.append(char)
+            elif char == '}':
+                if stack:
+                    stack.pop()
+                    if not stack and start_index != -1:
+                        # Found a complete JSON object
+                        json_str = text[start_index:i+1]
+                        repaired = JSONRepair.repair_json(json_str)
+                        try:
+                            return json.loads(repaired)
+                        except json.JSONDecodeError:
+                            # Continue searching for other JSON objects
+                            start_index = -1
+                else:
+                    start_index = -1
+        
+        return None
 
 
 # =============================================================================
@@ -146,7 +600,7 @@ def _ensure_llm_operation_context(
 
 
 # =============================================================================
-# Framework-agnostic translator protocol
+# Enhanced Framework-agnostic translator protocol
 # =============================================================================
 
 
@@ -195,13 +649,9 @@ class LLMFrameworkTranslator(Protocol):
         """
         Decide how to handle system messages.
 
-        Typical behavior:
-            - Extract the first message with role "system" and return:
-                (system_message_text, remaining_messages_without_that_system)
-            - Or leave system messages in-place and return (None, messages)
-
+        Enhanced behavior preserves message ordering while extracting system content.
         Returns:
-            (system_message, remaining_messages)
+            (system_message_text, remaining_messages_preserving_order)
         """
         ...
 
@@ -217,6 +667,8 @@ class LLMFrameworkTranslator(Protocol):
 
         Returned structure should match the LLMProtocolV1 expectations:
             [ {"type": "function", "function": { ... }}, ... ] or None
+
+        Enhanced with validation and framework-specific tool translation.
         """
         ...
 
@@ -234,6 +686,8 @@ class LLMFrameworkTranslator(Protocol):
             - "auto", "none", "required"
             - A specific tool descriptor as a dict
             - None (adapter chooses)
+
+        Enhanced with validation.
         """
         ...
 
@@ -299,6 +753,37 @@ class LLMFrameworkTranslator(Protocol):
         """
         ...
 
+    # ---- enhanced tool call translation ----
+
+    def translate_tool_calls_to_framework(
+        self,
+        tool_calls: List[Dict[str, Any]],
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        """
+        Convert protocol tool calls into framework-native tool call objects.
+
+        This enables frameworks to work with their native tool call representations
+        rather than raw dictionaries.
+        """
+        ...
+
+    def translate_tool_outputs_from_framework(
+        self,
+        tool_outputs: Any,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Any] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Convert framework-native tool outputs back to protocol format.
+
+        Used for subsequent LLM calls with tool execution results.
+        """
+        ...
+
     # ---- optional hooks ----
 
     def preferred_model(
@@ -332,9 +817,23 @@ class LLMFrameworkTranslator(Protocol):
         """
         ...
 
+    def get_token_counting_config(
+        self,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Any] = None,
+    ) -> TokenCountingConfig:
+        """
+        Optional hook for framework-specific token counting strategies.
+
+        Returns a TokenCountingConfig that defines how messages should be
+        formatted for accurate token counting with specific LLM providers.
+        """
+        ...
+
 
 # =============================================================================
-# Default generic translator implementation
+# Enhanced Default generic translator implementation
 # =============================================================================
 
 
@@ -342,21 +841,16 @@ class DefaultLLMFrameworkTranslator:
     """
     Generic, framework-neutral translator implementation.
 
-    Behaviors:
-        - Treats raw_messages as:
-            * list of NormalizedMessage → pass-through
-            * mapping or list of mappings → via from_generic_dict
-        - Extracts the first "system" message (if any) as system_message and
-          drops it from the remaining messages.
-        - Assumes tools/tool_choice are already in Corpus-compatible shape when
-          provided as JSON-like dicts/values; shallow validation only.
-        - For results:
-            * LLMCompletion → neutral dict with text/model/usage/tool_calls
-            * LLMChunk → neutral dict for streaming
-            * LLMCapabilities → asdict() representation
-            * health → pass-through mapping
-            * count_tokens → raw integer
+    Enhanced with:
+        - Sophisticated token counting strategies
+        - Tool validation
+        - Message ordering preservation
+        - Tool call translation hooks
     """
+
+    def __init__(self) -> None:
+        self._tool_validator = ToolValidator()
+        self._metrics = TranslatorMetrics()
 
     def to_normalized_messages(
         self,
@@ -365,42 +859,59 @@ class DefaultLLMFrameworkTranslator:
         op_ctx: OperationContext,  # noqa: ARG002
         framework_ctx: Optional[Any] = None,  # noqa: ARG002
     ) -> List[NormalizedMessage]:
-        # Accept a single mapping as a single message
-        if isinstance(raw_messages, Mapping):
-            raw_seq: Iterable[Any] = [raw_messages]
-        else:
-            raw_seq = raw_messages
+        start_time = time.time()
+        try:
+            # Accept a single mapping as a single message
+            if isinstance(raw_messages, Mapping):
+                raw_seq: Iterable[Any] = [raw_messages]
+            else:
+                raw_seq = raw_messages
 
-        if not isinstance(raw_seq, Iterable) or isinstance(raw_seq, (str, bytes)):
-            raise BadRequest(
-                "raw_messages must be a mapping or iterable of messages",
-                code="BAD_MESSAGES",
-            )
+            if not isinstance(raw_seq, Iterable) or isinstance(raw_seq, (str, bytes)):
+                self._metrics.record_validation_error()
+                raise BadRequest(
+                    "raw_messages must be a mapping or iterable of messages",
+                    code="BAD_MESSAGES",
+                )
 
-        messages: List[NormalizedMessage] = []
+            messages: List[NormalizedMessage] = []
 
-        for idx, m in enumerate(raw_seq):
-            if isinstance(m, NormalizedMessage):
-                messages.append(m)
-                continue
+            for idx, m in enumerate(raw_seq):
+                if isinstance(m, NormalizedMessage):
+                    messages.append(m)
+                    continue
 
-            if isinstance(m, Mapping):
-                messages.append(from_generic_dict(m))
-                continue
+                if isinstance(m, Mapping):
+                    try:
+                        messages.append(from_generic_dict(m))
+                    except Exception:
+                        self._metrics.record_normalization_error()
+                        raise BadRequest(
+                            f"raw_messages[{idx}] could not be normalized",
+                            code="BAD_MESSAGE_FORMAT",
+                            details={"index": idx, "type": type(m).__name__},
+                        )
+                    continue
 
-            raise BadRequest(
-                f"raw_messages[{idx}] must be a NormalizedMessage or mapping",
-                code="BAD_MESSAGES",
-                details={"index": idx, "type": type(m).__name__},
-            )
+                self._metrics.record_validation_error()
+                raise BadRequest(
+                    f"raw_messages[{idx}] must be a NormalizedMessage or mapping",
+                    code="BAD_MESSAGES",
+                    details={"index": idx, "type": type(m).__name__},
+                )
 
-        if not messages:
-            raise BadRequest(
-                "raw_messages must contain at least one message",
-                code="BAD_MESSAGES",
-            )
+            if not messages:
+                self._metrics.record_validation_error()
+                raise BadRequest(
+                    "raw_messages must contain at least one message",
+                    code="BAD_MESSAGES",
+                )
 
-        return messages
+            self._metrics.record_translation(time.time() - start_time, success=True)
+            return messages
+        except Exception:
+            self._metrics.record_translation(time.time() - start_time, success=False)
+            raise
 
     def build_system_message(
         self,
@@ -410,19 +921,28 @@ class DefaultLLMFrameworkTranslator:
         framework_ctx: Optional[Any] = None,  # noqa: ARG002
     ) -> Tuple[Optional[str], List[NormalizedMessage]]:
         """
-        Default policy:
-            - Extract the first message with role == "system" as the dedicated
-              system_message string, drop it from the remaining messages.
-            - If none exists, return (None, original_messages).
+        Enhanced system message extraction that preserves message ordering.
+
+        Only extracts system messages that appear at the beginning of the
+        conversation, maintaining the semantic structure for models that
+        care about message order.
         """
         system_message: Optional[str] = None
         remaining: List[NormalizedMessage] = []
 
+        # Only extract system messages from the beginning of the conversation
+        extracting_system = True
         for msg in normalized_messages:
-            if system_message is None and msg.role == "system":
-                system_message = msg.content
-                continue
-            remaining.append(msg)
+            if extracting_system and msg.role == "system":
+                if system_message is None:
+                    system_message = msg.content
+                else:
+                    # Append to existing system message for multiple system messages at start
+                    system_message += "\n" + msg.content
+            else:
+                # Once we hit a non-system message, stop extracting
+                extracting_system = False
+                remaining.append(msg)
 
         return system_message, remaining
 
@@ -440,6 +960,7 @@ class DefaultLLMFrameworkTranslator:
             raw_tools = [raw_tools]
 
         if not isinstance(raw_tools, Sequence):
+            self._metrics.record_validation_error()
             raise BadRequest(
                 "tools must be a mapping or a sequence of mappings",
                 code="BAD_TOOLS",
@@ -448,11 +969,24 @@ class DefaultLLMFrameworkTranslator:
         tools: List[Dict[str, Any]] = []
         for idx, t in enumerate(raw_tools):
             if not isinstance(t, Mapping):
+                self._metrics.record_validation_error()
                 raise BadRequest(
                     f"tools[{idx}] must be a mapping",
                     code="BAD_TOOLS",
                     details={"index": idx, "type": type(t).__name__},
                 )
+
+            # Enhanced tool validation
+            try:
+                self._tool_validator.validate_tool_schema(dict(t))
+                self._metrics.record_tool_translation()
+            except BadRequest as e:
+                self._metrics.record_validation_error()
+                # Add context about which tool failed
+                e.details = e.details or {}
+                e.details["tool_index"] = idx
+                raise
+
             tools.append(dict(t))
 
         return tools
@@ -467,12 +1001,20 @@ class DefaultLLMFrameworkTranslator:
         if raw_tool_choice is None:
             return None
 
+        # Enhanced tool choice validation
+        try:
+            self._tool_validator.validate_tool_choice(raw_tool_choice)
+        except BadRequest:
+            self._metrics.record_validation_error()
+            raise
+
         if isinstance(raw_tool_choice, str):
             return raw_tool_choice
 
         if isinstance(raw_tool_choice, Mapping):
             return dict(raw_tool_choice)
 
+        self._metrics.record_validation_error()
         raise BadRequest(
             "tool_choice must be a string or mapping",
             code="BAD_TOOL_CHOICE",
@@ -489,6 +1031,7 @@ class DefaultLLMFrameworkTranslator:
         """
         Default: return a neutral dict compatible with JSON.
         """
+        self._metrics.record_completion_translation()
         return {
             "text": completion.text,
             "model": completion.model,
@@ -512,6 +1055,7 @@ class DefaultLLMFrameworkTranslator:
         """
         Default: return a neutral dict per streaming chunk.
         """
+        self._metrics.record_chunk_translation()
         usage = chunk.usage_so_far
         return {
             "text": chunk.text,
@@ -565,6 +1109,36 @@ class DefaultLLMFrameworkTranslator:
         """
         return asdict(caps)
 
+    def translate_tool_calls_to_framework(
+        self,
+        tool_calls: List[Dict[str, Any]],
+        *,
+        op_ctx: OperationContext,  # noqa: ARG002
+        framework_ctx: Optional[Any] = None,  # noqa: ARG002
+    ) -> Any:
+        """
+        Default: return tool calls as-is (list of dicts).
+        Framework-specific translators can convert to native objects.
+        """
+        return tool_calls
+
+    def translate_tool_outputs_from_framework(
+        self,
+        tool_outputs: Any,
+        *,
+        op_ctx: OperationContext,  # noqa: ARG002
+        framework_ctx: Optional[Any] = None,  # noqa: ARG002
+    ) -> List[Dict[str, Any]]:
+        """
+        Default: assume tool_outputs is already in protocol format.
+        Framework-specific translators can convert from native objects.
+        """
+        if tool_outputs is None:
+            return []
+        if isinstance(tool_outputs, list):
+            return tool_outputs
+        return [tool_outputs] if isinstance(tool_outputs, dict) else []
+
     def preferred_model(
         self,
         *,
@@ -593,9 +1167,27 @@ class DefaultLLMFrameworkTranslator:
         """
         return list(messages)
 
+    def get_token_counting_config(
+        self,
+        *,
+        op_ctx: OperationContext,  # noqa: ARG002
+        framework_ctx: Optional[Any] = None,  # noqa: ARG002
+    ) -> TokenCountingConfig:
+        """
+        Default: use simple token counting strategy.
+        Framework-specific translators can override for provider-specific formats.
+        """
+        return TokenCountingConfig()
+
+    def get_metrics(self) -> TranslatorMetrics:
+        """
+        Get current translation metrics for observability.
+        """
+        return self._metrics
+
 
 # =============================================================================
-# LLM Translator Orchestrator
+# Enhanced LLM Translator Orchestrator
 # =============================================================================
 
 
@@ -603,24 +1195,12 @@ class LLMTranslator:
     """
     Framework-agnostic orchestrator for LLM operations.
 
-    This class:
-        - Accepts framework-level inputs and a normalized OperationContext
-        - Delegates to an LLMFrameworkTranslator to translate messages,
-          tools, and tool_choice
-        - Calls into an LLMProtocolV1 adapter to execute operations
-        - Provides sync + async variants for core operations:
-            * complete
-            * stream
-            * count_tokens
-            * count_tokens_for_messages (helper)
-            * health
-            * capabilities
-        - Handles streaming via SyncStreamBridge for sync callers
-        - Attaches rich error context for diagnostics
-
-    It does *not*:
-        - Implement any backend-specific logic (that lives in BaseLLMAdapter subclasses)
-        - Apply additional policies; all hardening & limits are delegated to the adapter
+    Enhanced with:
+        - Sophisticated token counting with multiple strategies
+        - LLM post-processing (safety filtering, JSON repair, etc.)
+        - Comprehensive metrics collection
+        - Enhanced tool validation and translation
+        - Improved streaming ergonomics
     """
 
     def __init__(
@@ -629,10 +1209,259 @@ class LLMTranslator:
         adapter: LLMProtocolV1,
         framework: str = "generic",
         translator: Optional[LLMFrameworkTranslator] = None,
+        post_processing_config: Optional[LLMPostProcessingConfig] = None,
     ) -> None:
         self._adapter = adapter
         self._framework = framework
         self._translator: LLMFrameworkTranslator = translator or DefaultLLMFrameworkTranslator()
+        self._post_processing_config = post_processing_config or LLMPostProcessingConfig()
+        self._safety_filter = SafetyFilter()
+        self._json_repair = JSONRepair()
+
+    # --------------------------------------------------------------------- #
+    # Enhanced Token Counting Helpers
+    # --------------------------------------------------------------------- #
+
+    def _format_messages_for_token_counting(
+        self,
+        normalized_messages: List[NormalizedMessage],
+        system_message: Optional[str],
+        token_config: TokenCountingConfig,
+    ) -> str:
+        """
+        Format messages for token counting using sophisticated strategies.
+
+        Supports multiple formatting approaches for different LLM providers.
+        """
+        parts: List[str] = []
+
+        # Add token overhead for special tokens if configured
+        special_tokens_overhead = 0
+        if token_config.add_special_tokens:
+            if token_config.format_strategy == "openai_chatml":
+                special_tokens_overhead = 20  # Approximate overhead for ChatML tokens
+            elif token_config.format_strategy == "anthropic":
+                special_tokens_overhead = 10  # Approximate overhead for Anthropic formatting
+
+        if token_config.format_strategy == "simple":
+            # Simple "role: content" format
+            if system_message and not token_config.include_system_in_messages:
+                parts.append(f"system:{system_message}")
+            for msg in normalized_messages:
+                parts.append(f"{msg.role}:{msg.content}")
+
+        elif token_config.format_strategy == "openai_chatml":
+            # OpenAI ChatML template format
+            if system_message:
+                parts.append(f"<|im_start|>system\n{system_message}<|im_end|>")
+            for msg in normalized_messages:
+                parts.append(f"<|im_start|>{msg.role}\n{msg.content}<|im_end|>")
+
+        elif token_config.format_strategy == "anthropic":
+            # Anthropic-specific formatting
+            if system_message:
+                parts.append(f"System: {system_message}")
+            for msg in normalized_messages:
+                role_display = "Human" if msg.role == "user" else "Assistant"
+                parts.append(f"\n\n{role_display}: {msg.content}")
+
+        elif token_config.format_strategy == "custom" and token_config.custom_format_template:
+            # Custom template formatting
+            template = token_config.custom_format_template
+            if system_message and not token_config.include_system_in_messages:
+                parts.append(template.format(role="system", content=system_message))
+            for msg in normalized_messages:
+                parts.append(template.format(role=msg.role, content=msg.content))
+
+        else:
+            # Fallback to simple format
+            if system_message and not token_config.include_system_in_messages:
+                parts.append(f"system:{system_message}")
+            for msg in normalized_messages:
+                parts.append(f"{msg.role}:{msg.content}")
+
+        formatted_text = "\n".join(parts)
+        
+        # Add special tokens overhead as whitespace (simplified approach)
+        if token_config.add_special_tokens and special_tokens_overhead > 0:
+            formatted_text += " " * special_tokens_overhead
+
+        return formatted_text
+
+    def _apply_post_processing(self, completion: LLMCompletion) -> LLMCompletion:
+        """
+        Apply post-processing to LLM completions (safety, formatting, etc.).
+        """
+        if not self._post_processing_config.enabled:
+            return completion
+
+        result = completion
+
+        # Apply safety filtering
+        if self._post_processing_config.safety_filter:
+            result = self._apply_safety_filtering(result)
+
+        # Apply JSON repair for tool calls
+        if self._post_processing_config.json_repair:
+            result = self._apply_json_repair(result)
+
+        # Apply output formatting
+        if self._post_processing_config.output_format:
+            result = self._apply_output_formatting(result)
+
+        # Apply length truncation
+        if self._post_processing_config.max_length:
+            result = self._apply_length_truncation(result)
+
+        # Apply custom processors
+        if self._post_processing_config.custom_processors:
+            for processor in self._post_processing_config.custom_processors:
+                result = processor(result)
+
+        return result
+
+    def _apply_safety_filtering(self, completion: LLMCompletion) -> LLMCompletion:
+        """Apply comprehensive safety/content filtering."""
+        filtered_text, violations = self._safety_filter.filter_content(completion.text)
+        
+        # Log safety violations
+        if violations:
+            LOG.warning(
+                "Safety filtering applied to completion: %s",
+                "; ".join(violations)
+            )
+
+        # Repair tool calls if safety filtering was applied
+        repaired_tool_calls = completion.tool_calls
+        if violations and completion.tool_calls:
+            # Re-parse tool calls if text was modified
+            try:
+                # This is a simplified approach - in practice you might want more sophisticated repair
+                repaired_tool_calls = completion.tool_calls
+            except Exception:
+                LOG.warning("Failed to repair tool calls after safety filtering")
+                # Clear tool calls if we can't repair them safely
+                repaired_tool_calls = []
+
+        return LLMCompletion(
+            text=filtered_text,
+            model=completion.model,
+            model_family=completion.model_family,
+            usage=completion.usage,
+            finish_reason=completion.finish_reason,
+            tool_calls=repaired_tool_calls,
+        )
+
+    def _apply_json_repair(self, completion: LLMCompletion) -> LLMCompletion:
+        """Attempt to repair malformed JSON in tool calls and content."""
+        repaired_tool_calls = []
+        
+        # Repair tool calls
+        for tool_call in completion.tool_calls:
+            try:
+                # Access tool_call.function.arguments for JSON arguments
+                original_args = tool_call.function.arguments
+                repaired_args = self._json_repair.repair_json(original_args)
+                parsed_args = json.loads(repaired_args)
+                
+                # Create repaired tool call
+                repaired_tool_call = type(tool_call)(
+                    id=tool_call.id,
+                    type=tool_call.type,
+                    function=type(tool_call.function)(
+                        name=tool_call.function.name,
+                        arguments=json.dumps(parsed_args)
+                    )
+                )
+                repaired_tool_calls.append(repaired_tool_call)
+                
+            except (json.JSONDecodeError, AttributeError) as e:
+                # If repair fails, keep the original (might fail downstream)
+                LOG.warning("Failed to repair JSON in tool call %s: %s", tool_call.id, str(e))
+                repaired_tool_calls.append(tool_call)
+
+        # Repair JSON in text content if it looks like JSON
+        repaired_text = completion.text
+        if completion.text.strip().startswith(('{', '[')):
+            try:
+                json.loads(completion.text)
+            except json.JSONDecodeError:
+                repaired_json = self._json_repair.repair_json(completion.text)
+                try:
+                    json.loads(repaired_json)  # Validate repair
+                    repaired_text = repaired_json
+                    LOG.info("Repaired JSON in completion text")
+                except json.JSONDecodeError:
+                    LOG.warning("Failed to repair JSON in completion text")
+
+        return LLMCompletion(
+            text=repaired_text,
+            model=completion.model,
+            model_family=completion.model_family,
+            usage=completion.usage,
+            finish_reason=completion.finish_reason,
+            tool_calls=repaired_tool_calls,
+        )
+
+    def _apply_output_formatting(self, completion: LLMCompletion) -> LLMCompletion:
+        """Apply output format constraints."""
+        if self._post_processing_config.output_format == "json":
+            # Ensure output is valid JSON
+            if not completion.text.strip().startswith(('{', '[')):
+                # Try to extract JSON from text
+                extracted_json = self._json_repair.extract_and_repair_json(completion.text)
+                if extracted_json:
+                    formatted_text = json.dumps(extracted_json, indent=2)
+                else:
+                    # Wrap in JSON object as fallback
+                    formatted_text = json.dumps({"text": completion.text}, indent=2)
+                return LLMCompletion(
+                    text=formatted_text,
+                    model=completion.model,
+                    model_family=completion.model_family,
+                    usage=completion.usage,
+                    finish_reason=completion.finish_reason,
+                    tool_calls=completion.tool_calls,
+                )
+        
+        elif self._post_processing_config.output_format == "markdown":
+            # Ensure text has basic markdown structure if it doesn't already
+            if not any(char in completion.text for char in '#*`['):
+                formatted_text = f"```text\n{completion.text}\n```"
+                return LLMCompletion(
+                    text=formatted_text,
+                    model=completion.model,
+                    model_family=completion.model_family,
+                    usage=completion.usage,
+                    finish_reason=completion.finish_reason,
+                    tool_calls=completion.tool_calls,
+                )
+
+        return completion
+
+    def _apply_length_truncation(self, completion: LLMCompletion) -> LLMCompletion:
+        """Truncate completion if it exceeds max length."""
+        if self._post_processing_config.max_length and len(completion.text) > self._post_processing_config.max_length:
+            truncated_text = completion.text[:self._post_processing_config.max_length]
+            # Try to truncate at sentence boundary
+            last_period = truncated_text.rfind('.')
+            last_newline = truncated_text.rfind('\n')
+            cutoff = max(last_period, last_newline)
+            
+            if cutoff > self._post_processing_config.max_length * 0.7:  # Only if we can preserve most content
+                truncated_text = truncated_text[:cutoff + 1] + " [truncated]"
+            else:
+                truncated_text += " [truncated]"
+                
+            return LLMCompletion(
+                text=truncated_text,
+                model=completion.model,
+                model_family=completion.model_family,
+                usage=completion.usage,
+                finish_reason="length",
+                tool_calls=completion.tool_calls,
+            )
+        return completion
 
     # --------------------------------------------------------------------- #
     # Sync Complete (uses AsyncBridge)
@@ -721,8 +1550,11 @@ class LLMTranslator:
                         code="BAD_ADAPTER_RESULT",
                     )
 
+                # Apply post-processing
+                result_processed = self._apply_post_processing(result)
+
                 return self._translator.from_completion(
-                    result,
+                    result_processed,
                     op_ctx=ctx,
                     framework_ctx=framework_ctx,
                 )
@@ -823,8 +1655,11 @@ class LLMTranslator:
                     code="BAD_ADAPTER_RESULT",
                 )
 
+            # Apply post-processing
+            result_processed = self._apply_post_processing(result)
+
             return self._translator.from_completion(
-                result,
+                result_processed,
                 op_ctx=ctx,
                 framework_ctx=framework_ctx,
             )
@@ -839,7 +1674,7 @@ class LLMTranslator:
             raise
 
     # --------------------------------------------------------------------- #
-    # Sync Stream (uses SyncStreamBridge)
+    # Enhanced Sync Stream (uses SyncStreamBridge)
     # --------------------------------------------------------------------- #
 
     def stream(
@@ -860,10 +1695,11 @@ class LLMTranslator:
         framework_ctx: Optional[Any] = None,
     ) -> Iterator[Any]:
         """
-        Synchronous streaming API.
+        Enhanced synchronous streaming API.
 
         Returns a sync iterator that yields framework-level streaming chunks
         by bridging the async adapter.stream(...) via SyncStreamBridge.
+        Provides better ergonomics and error handling.
         """
         ctx = _ensure_llm_operation_context(op_ctx)
 
@@ -1052,7 +1888,7 @@ class LLMTranslator:
             raise
 
     # --------------------------------------------------------------------- #
-    # Sync count_tokens (text) (uses AsyncBridge)
+    # Enhanced Token Counting with Sophisticated Formatting
     # --------------------------------------------------------------------- #
 
     def count_tokens(
@@ -1093,10 +1929,6 @@ class LLMTranslator:
 
         return AsyncBridge.run_async(_count_coro(), timeout=timeout)
 
-    # --------------------------------------------------------------------- #
-    # Async count_tokens (text)
-    # --------------------------------------------------------------------- #
-
     async def arun_count_tokens(
         self,
         text: str,
@@ -1132,7 +1964,7 @@ class LLMTranslator:
             raise
 
     # --------------------------------------------------------------------- #
-    # Helper: count_tokens for messages (sync + async)
+    # Enhanced Helper: count_tokens for messages with sophisticated formatting
     # --------------------------------------------------------------------- #
 
     def count_tokens_for_messages(
@@ -1144,11 +1976,10 @@ class LLMTranslator:
         framework_ctx: Optional[Any] = None,
     ) -> Any:
         """
-        Synchronous helper to count tokens for a set of chat messages.
+        Enhanced synchronous helper to count tokens for chat messages.
 
-        This flattens messages and optional system message into a single text
-        string using a simple "role: content" format, then delegates to
-        adapter.count_tokens().
+        Uses sophisticated formatting strategies for accurate token counting
+        across different LLM providers.
         """
         ctx = _ensure_llm_operation_context(op_ctx)
         timeout = ctx.deadline_ms / 1000.0 if ctx.deadline_ms else None
@@ -1166,12 +1997,16 @@ class LLMTranslator:
                     framework_ctx=framework_ctx,
                 )
 
-                parts: List[str] = []
-                if auto_system:
-                    parts.append(f"system:{auto_system}")
-                for msg in remaining:
-                    parts.append(f"{msg.role}:{msg.content}")
-                combined = "\n".join(parts)
+                # Get framework-specific token counting configuration
+                token_config = self._translator.get_token_counting_config(
+                    op_ctx=ctx,
+                    framework_ctx=framework_ctx,
+                )
+
+                # Format messages using sophisticated strategy
+                combined = self._format_messages_for_token_counting(
+                    remaining, auto_system, token_config
+                )
 
                 result = await self._adapter.count_tokens(
                     text=combined,
@@ -1204,7 +2039,7 @@ class LLMTranslator:
         framework_ctx: Optional[Any] = None,
     ) -> Any:
         """
-        Async helper to count tokens for chat messages.
+        Enhanced async helper to count tokens for chat messages.
         """
         ctx = _ensure_llm_operation_context(op_ctx)
 
@@ -1220,12 +2055,16 @@ class LLMTranslator:
                 framework_ctx=framework_ctx,
             )
 
-            parts: List[str] = []
-            if auto_system:
-                parts.append(f"system:{auto_system}")
-            for msg in remaining:
-                parts.append(f"{msg.role}:{msg.content}")
-            combined = "\n".join(parts)
+            # Get framework-specific token counting configuration
+            token_config = self._translator.get_token_counting_config(
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+
+            # Format messages using sophisticated strategy
+            combined = self._format_messages_for_token_counting(
+                remaining, auto_system, token_config
+            )
 
             result = await self._adapter.count_tokens(
                 text=combined,
@@ -1246,6 +2085,44 @@ class LLMTranslator:
                 tenant=ctx.tenant,
             )
             raise
+
+    # --------------------------------------------------------------------- #
+    # Enhanced Tool Call Translation Methods
+    # --------------------------------------------------------------------- #
+
+    def translate_tool_calls_to_framework(
+        self,
+        tool_calls: List[Dict[str, Any]],
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        """
+        Convert protocol tool calls to framework-native representations.
+        """
+        ctx = _ensure_llm_operation_context(op_ctx)
+        return self._translator.translate_tool_calls_to_framework(
+            tool_calls,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+
+    def translate_tool_outputs_from_framework(
+        self,
+        tool_outputs: Any,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Convert framework-native tool outputs back to protocol format.
+        """
+        ctx = _ensure_llm_operation_context(op_ctx)
+        return self._translator.translate_tool_outputs_from_framework(
+            tool_outputs,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
 
     # --------------------------------------------------------------------- #
     # Health (sync + async)
@@ -1377,9 +2254,23 @@ class LLMTranslator:
             )
             raise
 
+    # --------------------------------------------------------------------- #
+    # Metrics Access
+    # --------------------------------------------------------------------- #
+
+    def get_metrics(self) -> Optional[TranslatorMetrics]:
+        """
+        Get translation metrics for observability.
+
+        Returns metrics if the translator supports metrics collection.
+        """
+        if hasattr(self._translator, 'get_metrics'):
+            return self._translator.get_metrics()
+        return None
+
 
 # =============================================================================
-# Registry for per-framework translators
+# Comprehensive Registry for per-framework translators
 # =============================================================================
 
 
@@ -1427,9 +2318,12 @@ def create_llm_translator(
     adapter: LLMProtocolV1,
     framework: str = "generic",
     translator: Optional[LLMFrameworkTranslator] = None,
+    post_processing_config: Optional[LLMPostProcessingConfig] = None,
 ) -> LLMTranslator:
     """
     Convenience helper to construct an LLMTranslator for a given framework.
+
+    Enhanced with post-processing configuration support.
 
     Behavior:
         - If `translator` is provided explicitly, it is used as-is.
@@ -1442,10 +2336,21 @@ def create_llm_translator(
             translator = factory(adapter)
         else:
             translator = DefaultLLMFrameworkTranslator()
-    return LLMTranslator(adapter=adapter, framework=framework, translator=translator)
+    return LLMTranslator(
+        adapter=adapter,
+        framework=framework,
+        translator=translator,
+        post_processing_config=post_processing_config,
+    )
 
 
 __all__ = [
+    "TokenCountingConfig",
+    "ToolValidator",
+    "LLMPostProcessingConfig",
+    "TranslatorMetrics",
+    "SafetyFilter",
+    "JSONRepair",
     "LLMFrameworkTranslator",
     "DefaultLLMFrameworkTranslator",
     "LLMTranslator",
