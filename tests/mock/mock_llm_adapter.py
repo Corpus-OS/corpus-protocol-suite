@@ -19,7 +19,7 @@ import asyncio
 import hashlib
 import random
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, List, Mapping, Optional, Sequence
+from typing import Any, AsyncIterator, Dict, List, Mapping, Optional, Sequence, Union
 
 from corpus_sdk.llm.llm_base import (
     BaseLLMAdapter,
@@ -33,6 +33,7 @@ from corpus_sdk.llm.llm_base import (
     ResourceExhausted,
     BadRequest,
     DeadlineExceeded,
+    NotSupported,
 )
 
 # Demo-only helpers (not required by tests)
@@ -336,7 +337,7 @@ class MockLLMAdapter(BaseLLMAdapter):
     async def _do_complete(
         self,
         *,
-        messages: List[Mapping[str, str]],
+        messages: List[Mapping[str, Any]],
         max_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
@@ -345,9 +346,16 @@ class MockLLMAdapter(BaseLLMAdapter):
         stop_sequences: Optional[List[str]] = None,
         model: Optional[str] = None,
         system_message: Optional[str] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
         ctx: Optional[LLMContext] = None,
     ) -> LLMCompletion:
-        """Pretend to complete a chat turn with deterministic behavior."""
+        """
+        Pretend to complete a chat turn with deterministic behavior.
+
+        tools and tool_choice are accepted to conform to the BaseLLMAdapter
+        contract for tool calling, but are intentionally ignored by this mock.
+        """
         # Role validation (beyond base schema checks)
         self._validate_roles(messages)
 
@@ -397,7 +405,7 @@ class MockLLMAdapter(BaseLLMAdapter):
     async def _do_stream(
         self,
         *,
-        messages: List[Mapping[str, str]],
+        messages: List[Mapping[str, Any]],
         max_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
@@ -406,9 +414,16 @@ class MockLLMAdapter(BaseLLMAdapter):
         stop_sequences: Optional[List[str]] = None,
         model: Optional[str] = None,
         system_message: Optional[str] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
         ctx: Optional[LLMContext] = None,
     ) -> AsyncIterator[LLMChunk]:
-        """Simulate token streaming with progressive usage and final sentinel chunk."""
+        """
+        Simulate token streaming with progressive usage and final sentinel chunk.
+
+        tools and tool_choice are accepted to match the BaseLLMAdapter contract
+        but are ignored by this mock implementation.
+        """
         # Role validation
         self._validate_roles(messages)
 
@@ -470,6 +485,45 @@ class MockLLMAdapter(BaseLLMAdapter):
             is_final=True,
             model=model_name,
             usage_so_far=final_usage,
+        )
+
+    # -----------------------------------------------------------------------
+    # Stream override to delegate to BaseLLMAdapter with full validation
+    # -----------------------------------------------------------------------
+    async def stream(
+        self,
+        *,
+        messages: List[Mapping[str, str]],
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        frequency_penalty: Optional[float] = None,
+        presence_penalty: Optional[float] = None,
+        stop_sequences: Optional[List[str]] = None,
+        model: Optional[str] = None,
+        system_message: Optional[str] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
+        ctx: Optional[LLMContext] = None,
+    ) -> AsyncIterator[LLMChunk]:
+        """
+        Override stream to maintain explicit protocol parity while delegating
+        the actual behavior (validation, deadlines, metrics, gates) to the
+        BaseLLMAdapter implementation.
+        """
+        return await super().stream(
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            frequency_penalty=frequency_penalty,
+            presence_penalty=presence_penalty,
+            stop_sequences=stop_sequences,
+            model=model,
+            system_message=system_message,
+            tools=tools,
+            tool_choice=tool_choice,
+            ctx=ctx,
         )
 
     # -----------------------------------------------------------------------
