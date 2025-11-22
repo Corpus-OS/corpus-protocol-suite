@@ -17,7 +17,7 @@ Scope
 -----
 - This module is **LLM/chat-specific**: it is meant for chat messages only.
 - It is **framework-agnostic**: implementations for LangChain, LlamaIndex,
-  Semantic Kernel, AutoGen, CrewAI, etc. are optional adapters on top of a
+  Semantic Kernel, AutoGen, CrewAI, MCP, etc. are optional adapters on top of a
   protocol-first core.
 - Non-chat products (vector, graph, embedding) should use their own protocol
   types rather than `NormalizedMessage`.
@@ -33,6 +33,8 @@ Design goals
     adapter functions and are optional.
 - Configurable:
     Strict vs. lenient role validation, configurable fallback role.
+    Configuration is stored in context-local variables to remain safe in
+    multi-threaded or async applications.
 
 Primary entry points
 --------------------
@@ -49,12 +51,20 @@ Framework adapters:
 - from_semantic_kernel / to_semantic_kernel
 - from_autogen / to_autogen
 - from_crewai / to_crewai
+- from_mcp / to_mcp
+
+Notes
+-----
+- MCP JSON-RPC envelopes (e.g. {"id", "method", "params", ...}) are handled at
+  higher layers (e.g. context translation). This module only deals with
+  *chat-style* message objects that have a "role" and "content".
 """
 
 from __future__ import annotations
 
 import json
 import os
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple, TYPE_CHECKING
 
@@ -63,33 +73,54 @@ if TYPE_CHECKING:  # pragma: no cover
     from llama_index.core.llms import ChatMessage  # type: ignore
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Configuration (context-local for thread/async safety)
 # ---------------------------------------------------------------------------
 
-STRICT_ROLE_VALIDATION: bool = os.getenv("CORPUS_STRICT_ROLES", "0") in {
+_STRICT_ROLE_VALIDATION_DEFAULT: bool = os.getenv("CORPUS_STRICT_ROLES", "0") in {
     "1",
     "true",
     "TRUE",
 }
 
-# Default fallback role when encountering unknown roles in lenient mode.
-# This is a Corpus chat protocol role, not a framework-specific label.
-_UNKNOWN_ROLE_FALLBACK: str = os.getenv("CORPUS_UNKNOWN_ROLE", "assistant").strip().lower()
+_UNKNOWN_ROLE_FALLBACK_DEFAULT: str = os.getenv(
+    "CORPUS_UNKNOWN_ROLE",
+    "assistant",
+).strip().lower()
+if _UNKNOWN_ROLE_FALLBACK_DEFAULT not in {"system", "user", "assistant", "tool", "function"}:
+    _UNKNOWN_ROLE_FALLBACK_DEFAULT = "assistant"
+
+#: Context-local strict role validation flag.
+STRICT_ROLE_VALIDATION_VAR: ContextVar[bool] = ContextVar(
+    "corpus_strict_role_validation",
+    default=_STRICT_ROLE_VALIDATION_DEFAULT,
+)
+
+#: Context-local unknown role fallback.
+_UNKNOWN_ROLE_FALLBACK_VAR: ContextVar[str] = ContextVar(
+    "corpus_unknown_role_fallback",
+    default=_UNKNOWN_ROLE_FALLBACK_DEFAULT,
+)
 
 
 def set_strict_role_validation(enabled: bool) -> None:
-    """Enable or disable strict role validation at runtime."""
-    global STRICT_ROLE_VALIDATION
-    STRICT_ROLE_VALIDATION = bool(enabled)
+    """
+    Enable or disable strict role validation for the current context.
+
+    This uses a ContextVar, so changes are local to the current task / thread
+    (and any children that inherit the context), rather than a process-wide
+    global. This avoids cross-request interference in multi-tenant servers.
+    """
+    STRICT_ROLE_VALIDATION_VAR.set(bool(enabled))
 
 
 def set_unknown_role_fallback(fallback: str) -> None:
     """
-    Configure the fallback canonical role for unknown roles.
+    Configure the fallback canonical role for unknown roles for the current context.
 
     Allowed values: "system", "user", "assistant", "tool", "function".
+
+    This uses a ContextVar, so changes are local to the current task / thread.
     """
-    global _UNKNOWN_ROLE_FALLBACK
     value = str(fallback).strip().lower()
     if value not in {"system", "user", "assistant", "tool", "function"}:
         raise ValueError(
@@ -97,7 +128,7 @@ def set_unknown_role_fallback(fallback: str) -> None:
             '{"system", "user", "assistant", "tool", "function"}, '
             f"got {fallback!r}"
         )
-    _UNKNOWN_ROLE_FALLBACK = value
+    _UNKNOWN_ROLE_FALLBACK_VAR.set(value)
 
 
 # ---------------------------------------------------------------------------
@@ -111,8 +142,8 @@ class NormalizedMessage:
     Protocol-centric representation of a single chat message.
 
     This is the "narrow waist" across frameworks: all upstream chat messages
-    (LangChain, LlamaIndex, SK, AutoGen, CrewAI, or custom) should be mapped
-    into this structure before being sent over the Corpus chat protocol.
+    (LangChain, LlamaIndex, SK, AutoGen, CrewAI, MCP, or custom) should be
+    mapped into this structure before being sent over the Corpus chat protocol.
 
     Attributes
     ----------
@@ -209,11 +240,11 @@ def _normalize_role(raw_role: Optional[str]) -> Tuple[str, Optional[str]]:
         return canonical, (original if canonical != original else None)
 
     # Unknown role
-    if STRICT_ROLE_VALIDATION:
+    if STRICT_ROLE_VALIDATION_VAR.get():
         raise ValueError(f"Unknown message role: {original!r}")
 
-    # Lenient fallback
-    fallback = _UNKNOWN_ROLE_FALLBACK
+    # Lenient fallback (context-local)
+    fallback = _UNKNOWN_ROLE_FALLBACK_VAR.get()
     if fallback not in {"system", "user", "assistant", "tool", "function"}:
         fallback = "assistant"
     return fallback, original
@@ -237,6 +268,10 @@ def _stringify_content(content: Any) -> Tuple[str, Optional[Any]]:
     - list[Mapping] → JSON + preserve original (OpenAI-style parts)
     - other iterables → str(list(...)) + preserve original list
     - fallthrough → str() conversion
+
+    Note:
+    - json.dumps uses default=str so that datetime and other non-serializable
+      objects are safely represented without raising TypeError.
     """
     if isinstance(content, str):
         return content, None
@@ -244,7 +279,15 @@ def _stringify_content(content: Any) -> Tuple[str, Optional[Any]]:
     # Mapping → JSON
     if isinstance(content, Mapping):
         try:
-            return json.dumps(content, ensure_ascii=False, sort_keys=True), content
+            return (
+                json.dumps(
+                    content,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                ),
+                content,
+            )
         except (TypeError, RecursionError):
             return repr(content), content
 
@@ -257,7 +300,15 @@ def _stringify_content(content: Any) -> Tuple[str, Optional[Any]]:
     # OpenAI-style content parts: [{"type": "...", ...}, ...]
     if as_list and all(isinstance(p, Mapping) for p in as_list):
         try:
-            return json.dumps(as_list, ensure_ascii=False, sort_keys=True), as_list
+            return (
+                json.dumps(
+                    as_list,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                ),
+                as_list,
+            )
         except (TypeError, RecursionError):
             return repr(as_list), as_list
 
@@ -763,6 +814,134 @@ def to_crewai(msg: NormalizedMessage) -> Dict[str, Any]:
     return result
 
 
+# ---------------------------------------------------------------------------
+# MCP
+# ---------------------------------------------------------------------------
+
+
+def from_mcp(msg: Mapping[str, Any] | Any) -> NormalizedMessage:
+    """
+    MCP message → NormalizedMessage.
+
+    Supported shapes
+    ----------------
+    - Mapping-based messages (recommended):
+        {
+            "role": str,          # required for correct role mapping
+            "content": Any,       # required; may be string or structured
+            "metadata": Mapping,  # optional, merged into metadata
+            ... other keys ...    # preserved as top-level metadata fields
+        }
+
+    - Object-based messages:
+        Objects exposing `.role` and `.content` attributes, plus optional
+        attributes such as `metadata`, `tool_calls`, `function_call`,
+        `id`, `conversation_id`, `created_at`, etc.
+
+    Behavior
+    --------
+    - Uses `_normalize_role` for role handling (strict vs lenient).
+    - Uses `_stringify_content` for content, preserving structured values in
+      metadata["corpus_raw_content"].
+    - Stores the original message in metadata["corpus_raw"].
+    - Preserves non-reserved keys as metadata entries so they can round-trip.
+    - If a `metadata` field is present but is **not** a Mapping, it is kept
+      as-is and additionally stored as `metadata["mcp_metadata_raw"]` to avoid
+      losing shape information.
+    """
+    if isinstance(msg, Mapping):
+        raw_role = msg.get("role", "user")
+        raw_content = msg.get("content", "")
+        content, structured = _stringify_content(raw_content)
+
+        metadata: Dict[str, Any] = {"corpus_raw": msg}
+        # Preserve all other top-level keys besides role/content
+        for k, v in msg.items():
+            if k in {"role", "content"}:
+                continue
+            if k == "metadata":
+                # Merge mapping-style metadata, preserve non-mapping as raw
+                if isinstance(v, Mapping):
+                    metadata.update(dict(v))
+                else:
+                    metadata["metadata"] = v
+                    metadata["mcp_metadata_raw"] = v
+            else:
+                metadata[k] = v
+    else:
+        raw_role = getattr(msg, "role", "user")
+        raw_content = getattr(msg, "content", "")
+        content, structured = _stringify_content(raw_content)
+
+        metadata = {"corpus_raw": msg}
+        # Preserve common MCP-style attributes when present
+        for attr in (
+            "name",
+            "metadata",
+            "tool_calls",
+            "function_call",
+            "id",
+            "conversation_id",
+            "created_at",
+        ):
+            if not hasattr(msg, attr):
+                continue
+            value = getattr(msg, attr)
+            if attr == "metadata":
+                # Merge mapping-style metadata, preserve non-mapping as raw
+                if isinstance(value, Mapping):
+                    metadata.update(dict(value))
+                else:
+                    metadata["metadata"] = value
+                    metadata["mcp_metadata_raw"] = value
+            else:
+                metadata[attr] = value
+
+    role, original_role = _normalize_role(raw_role)
+    if original_role is not None:
+        metadata["corpus_original_role"] = original_role
+    if structured is not None:
+        metadata["corpus_raw_content"] = structured
+
+    return NormalizedMessage(role=role, content=content, metadata=metadata)
+
+
+def to_mcp(msg: NormalizedMessage) -> Dict[str, Any]:
+    """
+    NormalizedMessage → MCP-style dict.
+
+    Returns:
+        {
+            "role": str,
+            "content": Any,
+            ... non-corpus metadata flattened at top level ...
+        }
+
+    Notes
+    -----
+    - Content reconstruction prefers `msg.raw_content` (i.e. the preserved
+      structured form from `corpus_raw_content`) when available.
+    - All non-`corpus_*` metadata keys are emitted as top-level fields so that
+      keys like `id`, `conversation_id`, `tool_calls`, etc. round-trip cleanly.
+    - This function does not attempt to reconstruct a full JSON-RPC envelope;
+      it only returns a chat-style message object suitable for MCP tooling.
+    """
+    # Reconstruct content
+    content = msg.raw_content if msg.raw_content is not None else msg.content
+
+    result: Dict[str, Any] = {
+        "role": msg.role,
+        "content": content,
+    }
+
+    # Add non-corpus metadata as top-level fields for maximum compatibility
+    for k, v in msg.metadata.items():
+        if not k.startswith("corpus_"):
+            result[k] = v
+
+    return result
+
+
 __all__ = [
     # Core type
     "NormalizedMessage",
@@ -787,5 +966,6 @@ __all__ = [
     "to_autogen",
     "from_crewai",
     "to_crewai",
+    "from_mcp",
+    "to_mcp",
 ]
-
