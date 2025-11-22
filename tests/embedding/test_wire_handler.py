@@ -30,7 +30,7 @@ from corpus_sdk.embedding.embedding_base import (
     TextTooLong,
     OperationContext,
 )
-from corpus_sdk.examples.embedding.mock_embedding_adapter import MockEmbeddingAdapter
+from tests.mock.mock_embedding_adapter import MockEmbeddingAdapter
 
 pytestmark = pytest.mark.asyncio
 

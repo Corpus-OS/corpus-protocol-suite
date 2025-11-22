@@ -317,7 +317,7 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
         return await self._with_gates_unary(
             op="embed_batch",
             ctx=ctx,
-            call_coro=_run(),
+            call=_run,
             metric_extra=metric_extra,
             error_extra=error_extra,
         )
@@ -364,6 +364,7 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
                             text=ev.text,
                             model=ev.model,
                             dimensions=len(vec),
+                            index=ev.index,
                         )
 
                 embeddings.append(ev)
@@ -437,6 +438,7 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
                         text=text,
                         model=spec.model,
                         dimensions=len(vec),
+                        index=i,
                     )
                 )
                 total_tokens += self._approx_tokens(text)

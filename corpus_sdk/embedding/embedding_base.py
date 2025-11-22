@@ -154,6 +154,7 @@ class EmbeddingVector:
         text: The source text that was embedded
         model: Model used to generate the embedding
         dimensions: Vector dimensions
+        index: Optional index in the original batch (for batch operations)
         metadata: Optional metadata associated with this embedding
                   (e.g., document/chunk identifiers).
     """
@@ -161,6 +162,7 @@ class EmbeddingVector:
     text: str
     model: str
     dimensions: int
+    index: Optional[int] = None
     metadata: Optional[Dict[str, Any]] = None
 
 
@@ -410,6 +412,7 @@ class OperationContext:
         deadline_ms: Absolute epoch milliseconds when operation should timeout
         traceparent: W3C Trace Context header for distributed tracing
         tenant: Multi-tenant isolation scope (NEVER logged or exposed in metrics)
+        metrics: Optional metrics sink for operation telemetry
         attrs: Additional operation attributes for extensibility and middleware
     """
     request_id: Optional[str] = None
@@ -417,6 +420,7 @@ class OperationContext:
     deadline_ms: Optional[int] = None
     traceparent: Optional[str] = None
     tenant: Optional[str] = None
+    metrics: Optional['MetricsSink'] = None
     attrs: Optional[Mapping[str, Any]] = None
 
     def __post_init__(self) -> None:
@@ -817,6 +821,8 @@ class EmbeddingCapabilities:
         supports_truncation: Whether text truncation is supported
         supports_token_counting: Whether token counting is available
         supports_streaming: Whether streaming embeddings are supported
+        supports_batch_embedding: Whether batch embedding operations are supported
+        supports_caching: Whether embedding caching is supported
         idempotent_operations: Whether operations are idempotent with idempotency_key
         supports_multi_tenant: Whether multi-tenant isolation is supported
         normalizes_at_source: Whether adapter normalizes vectors at source when requested
@@ -833,6 +839,8 @@ class EmbeddingCapabilities:
     supports_truncation: bool = True
     supports_token_counting: bool = False
     supports_streaming: bool = False
+    supports_batch_embedding: bool = True
+    supports_caching: bool = False
     idempotent_operations: bool = False
     supports_multi_tenant: bool = False
     normalizes_at_source: bool = False
@@ -1197,6 +1205,8 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
                         x["deadline_bucket"] = "<60s"
                     else:
                         x["deadline_bucket"] = ">=60s"
+            
+            # Record to adapter's built-in metrics
             self._metrics.observe(
                 component=self._component,
                 op=op,
@@ -1205,6 +1215,18 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
                 code=code,
                 extra=x or None,
             )
+            
+            # Also record to context metrics if provided
+            if ctx and ctx.metrics:
+                ctx.metrics.observe(
+                    component=self._component,
+                    op=op,
+                    ms=ms,
+                    ok=ok,
+                    code=code,
+                    extra=x or None,
+                )
+            
             if not ok:
                 self._metrics.counter(
                     component=self._component,
@@ -1212,6 +1234,14 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
                     value=1,
                     extra={"code": code},
                 )
+                # Also record error counter to context metrics if provided
+                if ctx and ctx.metrics:
+                    ctx.metrics.counter(
+                        component=self._component,
+                        name="errors_total",
+                        value=1,
+                        extra={"code": code},
+                    )
         except Exception:
             # Metrics failures MUST NOT affect request path.
             pass

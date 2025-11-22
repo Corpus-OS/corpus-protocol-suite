@@ -28,15 +28,15 @@ from corpus_sdk.embedding.embedding_base import (
 pytestmark = pytest.mark.asyncio
 
 
-def supports_batch_embedding(adapter: BaseEmbeddingAdapter) -> bool:
+async def supports_batch_embedding(adapter: BaseEmbeddingAdapter) -> bool:
     """Check batch embedding capability."""
-    caps = adapter.capabilities
+    caps = await adapter.capabilities()
     return getattr(caps, "supports_batch_embedding", True)  # Default True per spec
 
 
 async def test_batch_partial_returns_batch_result(adapter: BaseEmbeddingAdapter):
     """§10.3: embed_batch must return valid BatchEmbedResult."""
-    if not supports_batch_embedding(adapter):
+    if not await supports_batch_embedding(adapter):
         pytest.skip("Batch embedding not supported")
 
     ctx = OperationContext(request_id="t_batch_ok", tenant="test")
@@ -87,10 +87,10 @@ async def test_batch_partial_requires_non_empty_texts(adapter: BaseEmbeddingAdap
 
 async def test_batch_partial_respects_max_batch_size(adapter: BaseEmbeddingAdapter):
     """§10.5: Batch size must respect declared limits."""
-    if not supports_batch_embedding(adapter):
+    if not await supports_batch_embedding(adapter):
         pytest.skip("Batch embedding not supported")
 
-    caps = adapter.capabilities
+    caps = await adapter.capabilities()
     if caps.max_batch_size is None:
         pytest.skip("Adapter does not declare max_batch_size")
 

@@ -80,7 +80,7 @@ async def test_health_shape_consistent_on_error_like_response(adapter: BaseEmbed
 async def test_health_models_includes_supported_models(adapter: BaseEmbeddingAdapter):
     """§10.3: Health models should include adapter's supported models."""
     h = await adapter.health()
-    caps = adapter.capabilities
+    caps = await adapter.capabilities()
     
     # Health should include all supported models
     for supported_model in caps.supported_models:
