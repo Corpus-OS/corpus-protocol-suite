@@ -109,6 +109,9 @@ from corpus_sdk.graph.graph_base import (
     QueryResult,
     UpsertEdgesSpec,
     UpsertNodesSpec,
+    GraphTransaction,
+    GraphTraversalSpec,
+    TraversalResult,
     BadRequest,
     NotSupported,
 )
@@ -385,6 +388,46 @@ class GraphFrameworkTranslator(Protocol):
     ) -> Any:
         ...
 
+    # ---- transaction translation ----
+
+    def build_transaction_spec(
+        self,
+        raw_transaction: Any,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Any] = None,
+    ) -> List[BatchOperation]:
+        ...
+
+    def translate_transaction_result(
+        self,
+        result: BatchResult,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        ...
+
+    # ---- traversal translation ----
+
+    def build_traversal_spec(
+        self,
+        raw_traversal: Any,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Any] = None,
+    ) -> GraphTraversalSpec:
+        ...
+
+    def translate_traversal_result(
+        self,
+        result: TraversalResult,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        ...
+
     # ---- mutation translation ----
 
     def build_upsert_nodes_spec(
@@ -622,6 +665,97 @@ class DefaultGraphFrameworkTranslator:
             "records": list(chunk.records or []),
             "is_final": bool(chunk.is_final),
             "summary": dict(chunk.summary or {}) if chunk.summary is not None else None,
+        }
+
+    # ---- transaction translation ----
+
+    def build_transaction_spec(
+        self,
+        raw_transaction: Any,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Any] = None,
+    ) -> List[BatchOperation]:
+        """Build transaction spec from raw transaction operations."""
+        # Transactions are essentially batch operations with atomic guarantees
+        return self.build_batch_ops(
+            raw_transaction,
+            op_ctx=op_ctx,
+            framework_ctx=framework_ctx,
+        )
+
+    def translate_transaction_result(
+        self,
+        result: BatchResult,
+        *,
+        op_ctx: OperationContext,  # noqa: ARG002
+        framework_ctx: Optional[Any] = None,  # noqa: ARG002
+    ) -> Any:
+        """Translate transaction result to framework format."""
+        return {
+            "success": bool(result.success),
+            "results": list(result.results or []),
+            "error": result.error,
+            "transaction_id": getattr(result, "transaction_id", None),
+        }
+
+    # ---- traversal translation ----
+
+    def build_traversal_spec(
+        self,
+        raw_traversal: Any,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Any] = None,
+    ) -> GraphTraversalSpec:
+        """Build traversal spec from raw traversal request."""
+        namespace = self.preferred_namespace(op_ctx=op_ctx, framework_ctx=framework_ctx)
+
+        if isinstance(raw_traversal, Mapping):
+            # Extract traversal parameters
+            start_nodes = raw_traversal.get("start_nodes", [])
+            max_depth = raw_traversal.get("max_depth", 1)
+            direction = raw_traversal.get("direction", "OUTGOING")
+            relationship_types = raw_traversal.get("relationship_types")
+            node_filters = raw_traversal.get("node_filters")
+            relationship_filters = raw_traversal.get("relationship_filters")
+            return_properties = raw_traversal.get("return_properties")
+            traversal_namespace = raw_traversal.get("namespace", namespace)
+
+            # Normalize filters
+            normalized_node_filters = self._filter_translator.normalize(node_filters) if node_filters else None
+            normalized_rel_filters = self._filter_translator.normalize(relationship_filters) if relationship_filters else None
+
+            return GraphTraversalSpec(
+                start_nodes=[str(node_id) for node_id in start_nodes],
+                max_depth=int(max_depth),
+                direction=str(direction),
+                relationship_types=tuple(relationship_types) if relationship_types else None,
+                node_filters=normalized_node_filters,
+                relationship_filters=normalized_rel_filters,
+                return_properties=tuple(return_properties) if return_properties else None,
+                namespace=str(traversal_namespace) if traversal_namespace else namespace,
+            )
+
+        raise BadRequest(
+            f"Unsupported raw_traversal type: {type(raw_traversal).__name__}",
+            code="BAD_TRAVERSAL",
+        )
+
+    def translate_traversal_result(
+        self,
+        result: TraversalResult,
+        *,
+        op_ctx: OperationContext,  # noqa: ARG002
+        framework_ctx: Optional[Any] = None,  # noqa: ARG002
+    ) -> Any:
+        """Translate traversal result to framework format."""
+        return {
+            "nodes": list(result.nodes or []),
+            "relationships": list(result.relationships or []),
+            "paths": list(result.paths or []),
+            "summary": dict(result.summary or {}),
+            "namespace": result.namespace,
         }
 
     # ---- mutation translation ----
@@ -1190,6 +1324,176 @@ class GraphTranslator:
                 exc,
                 framework=self._framework,
                 graph_operation="query",
+                request_id=ctx.request_id,
+                tenant=ctx.tenant,
+            )
+            raise
+
+    # --------------------------------------------------------------------- #
+    # Transaction APIs
+    # --------------------------------------------------------------------- #
+
+    def transaction(
+        self,
+        raw_transaction: Any,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        """Synchronous transaction API (uses AsyncBridge)."""
+        async def _transaction_coro():
+            ctx = _ensure_operation_context(op_ctx)
+            try:
+                ops = self._translator.build_transaction_spec(
+                    raw_transaction,
+                    op_ctx=ctx,
+                    framework_ctx=framework_ctx,
+                )
+                result = await self._adapter.transaction(ops, ctx=ctx)
+                
+                if not isinstance(result, BatchResult):
+                    raise BadRequest(
+                        f"adapter.transaction returned unsupported type: {type(result).__name__}",
+                        code="BAD_ADAPTER_RESULT",
+                    )
+                
+                return self._translator.translate_transaction_result(
+                    result,
+                    op_ctx=ctx,
+                    framework_ctx=framework_ctx,
+                )
+            except Exception as exc:
+                attach_context(
+                    exc,
+                    framework=self._framework,
+                    graph_operation="transaction",
+                    request_id=ctx.request_id,
+                    tenant=ctx.tenant,
+                )
+                raise
+
+        ctx = _ensure_operation_context(op_ctx)
+        timeout = ctx.deadline_ms / 1000.0 if ctx.deadline_ms else None
+        return AsyncBridge.run_async(_transaction_coro(), timeout=timeout)
+
+    async def arun_transaction(
+        self,
+        raw_transaction: Any,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        """Async transaction API."""
+        ctx = _ensure_operation_context(op_ctx)
+        try:
+            ops = self._translator.build_transaction_spec(
+                raw_transaction,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+            result = await self._adapter.transaction(ops, ctx=ctx)
+            
+            if not isinstance(result, BatchResult):
+                raise BadRequest(
+                    f"adapter.transaction returned unsupported type: {type(result).__name__}",
+                    code="BAD_ADAPTER_RESULT",
+                )
+            
+            return self._translator.translate_transaction_result(
+                result,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+        except Exception as exc:
+            attach_context(
+                exc,
+                framework=self._framework,
+                graph_operation="transaction",
+                request_id=ctx.request_id,
+                tenant=ctx.tenant,
+            )
+            raise
+
+    # --------------------------------------------------------------------- #
+    # Traversal APIs
+    # --------------------------------------------------------------------- #
+
+    def traversal(
+        self,
+        raw_traversal: Any,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        """Synchronous traversal API (uses AsyncBridge)."""
+        async def _traversal_coro():
+            ctx = _ensure_operation_context(op_ctx)
+            try:
+                spec = self._translator.build_traversal_spec(
+                    raw_traversal,
+                    op_ctx=ctx,
+                    framework_ctx=framework_ctx,
+                )
+                result = await self._adapter.traversal(spec, ctx=ctx)
+                
+                if not isinstance(result, TraversalResult):
+                    raise BadRequest(
+                        f"adapter.traversal returned unsupported type: {type(result).__name__}",
+                        code="BAD_ADAPTER_RESULT",
+                    )
+                
+                return self._translator.translate_traversal_result(
+                    result,
+                    op_ctx=ctx,
+                    framework_ctx=framework_ctx,
+                )
+            except Exception as exc:
+                attach_context(
+                    exc,
+                    framework=self._framework,
+                    graph_operation="traversal",
+                    request_id=ctx.request_id,
+                    tenant=ctx.tenant,
+                )
+                raise
+
+        ctx = _ensure_operation_context(op_ctx)
+        timeout = ctx.deadline_ms / 1000.0 if ctx.deadline_ms else None
+        return AsyncBridge.run_async(_traversal_coro(), timeout=timeout)
+
+    async def arun_traversal(
+        self,
+        raw_traversal: Any,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        """Async traversal API."""
+        ctx = _ensure_operation_context(op_ctx)
+        try:
+            spec = self._translator.build_traversal_spec(
+                raw_traversal,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+            result = await self._adapter.traversal(spec, ctx=ctx)
+            
+            if not isinstance(result, TraversalResult):
+                raise BadRequest(
+                    f"adapter.traversal returned unsupported type: {type(result).__name__}",
+                    code="BAD_ADAPTER_RESULT",
+                )
+            
+            return self._translator.translate_traversal_result(
+                result,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+        except Exception as exc:
+            attach_context(
+                exc,
+                framework=self._framework,
+                graph_operation="traversal",
                 request_id=ctx.request_id,
                 tenant=ctx.tenant,
             )
