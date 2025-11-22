@@ -16,6 +16,7 @@ from corpus_sdk.vector.vector_base import (
     UpsertResult,
     DimensionMismatch,
     BadRequest,
+    NotSupported,
 )
 
 pytestmark = pytest.mark.asyncio

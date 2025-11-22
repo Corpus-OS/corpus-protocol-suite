@@ -13,6 +13,7 @@ from corpus_sdk.vector.vector_base import (
     UpsertSpec,
     QuerySpec,
     DeleteSpec,
+    DeleteResult,
     BadRequest,
     NotSupported,
 )

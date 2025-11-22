@@ -119,18 +119,26 @@ class _MemoryStore:
 # ----------------------------- adapter class ------------------------------- #
 
 
-@dataclass
 class MockVectorAdapter(BaseVectorAdapter):
     """
     A mock Vector adapter for protocol demonstrations & conformance tests.
     """
 
-    name: str = "mock-vector"
-    # Deterministic for conformance runs (no random transient failures by default)
-    failure_rate: float = 0.0
-    _store: _MemoryStore = field(default_factory=_MemoryStore)
-
-    def __post_init__(self) -> None:
+    def __init__(
+        self,
+        name: str = "mock-vector",
+        failure_rate: float = 0.0,
+        **kwargs
+    ) -> None:
+        # Initialize the base adapter first
+        super().__init__(**kwargs)
+        
+        self.name = name
+        # Deterministic for conformance runs (no random transient failures by default)
+        self.failure_rate = failure_rate
+        self._store = _MemoryStore()
+        
+        # Optional seeding logic
         """
         Optional seeding of a 'default' namespace for demos. Disabled by default to
         avoid masking IndexNotReady or isolation tests. Enable by setting:
