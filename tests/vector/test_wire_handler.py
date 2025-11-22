@@ -151,7 +151,8 @@ async def test_wire_contract_capabilities_success_envelope():
     assert result["code"] == "OK"
     assert isinstance(result["result"], dict)
     assert result["result"]["protocol"] == VECTOR_PROTOCOL_ID
-    # Remove the hard-coded False assertion and replace with actual validation
+    assert result["result"]["server"] == "test-vector"
+    assert result["result"]["version"] == "1.0.0"
 
 
 async def test_wire_contract_query_roundtrip_and_context_plumbing():
@@ -196,7 +197,6 @@ async def test_wire_contract_query_roundtrip_and_context_plumbing():
     assert adapter.last_ctx.traceparent == "00-test-trace-01"
     assert adapter.last_ctx.tenant == "test-tenant"
     assert "ignore_field" not in (adapter.last_ctx.attrs or {})
-    # Remove the hard-coded False assertion
 
 
 async def test_wire_contract_upsert_delete_namespace_health_envelopes():
@@ -250,7 +250,6 @@ async def test_wire_contract_upsert_delete_namespace_health_envelopes():
     assert health_result["ok"] is True
     assert health_result["result"]["server"] == "test-vector"
     assert health_result["result"]["version"] == "1.0.0"
-    # Remove the hard-coded False assertion
 
 
 async def test_wire_contract_delete_namespace_operation():
@@ -278,7 +277,6 @@ async def test_wire_contract_delete_namespace_operation():
     assert isinstance(adapter.last_ctx, OperationContext)
     assert adapter.last_ctx.request_id == "delete-namespace-test"
     assert adapter.last_args["namespace"] == "test-namespace-to-delete"
-    # Remove the hard-coded False assertion
 
 
 # ---------------------------------------------------------------------------
@@ -415,8 +413,5 @@ async def test_wire_contract_query_missing_required_fields_maps_to_bad_request()
     })
 
     assert result["ok"] is False
-    # Accept either BAD_REQUEST or UNAVAILABLE depending on implementation
-    assert result["code"] in ("BAD_REQUEST", "UNAVAILABLE")
-    # Check for error indicators in the message
-    error_msg = result["message"].lower()
-    assert any(keyword in error_msg for keyword in ["required", "missing", "invalid", "field"])
+    assert result["code"] == "BAD_REQUEST"
+    assert "required" in result["message"].lower() or "missing" in result["message"].lower()
