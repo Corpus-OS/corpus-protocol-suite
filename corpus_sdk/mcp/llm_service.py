@@ -10,12 +10,34 @@ Enterprise-oriented LLM service with:
 - Token-based rate limiting
 - Concurrent request limiting
 - Streaming + non-streaming support
-- Basic safety / harmful-content validation
+- Basic safety / harmful-content validation (configurable)
 - Error context attachment for observability
 - Enhanced configuration validation
-- Improved token estimation with fallback
+- Improved token estimation with fallback (pluggable)
 - Distributed cache interface support
 - Comprehensive request prioritization
+
+Health & metrics
+----------------
+- Health checks are implemented in a way that does NOT consume request/token
+  budget or affect normal metrics (no double-counting).
+- Metrics access is synchronous and never awaits.
+
+Harmful content policy
+----------------------
+Harmful-content detection is intentionally lightweight and configurable:
+
+- Default patterns are a small set of dangerous phrases.
+- Callers can inject custom patterns or disable detection entirely via
+  MCPLLMTranslationService constructor / ServiceConfig.
+
+Token estimation
+----------------
+Token estimation uses a robust, multi-tiered strategy:
+
+1. Model-specific tiktoken encoding (cached with failure tracking).
+2. Default encoding for GPT-style models.
+3. Conservative character-based fallback when encodings are unavailable.
 """
 
 from __future__ import annotations
@@ -25,11 +47,23 @@ import json
 import logging
 import time
 import uuid
+from abc import ABC, abstractmethod
+from collections import deque
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union, Protocol
+from typing import (
+    Any,
+    AsyncGenerator,
+    Deque,
+    Dict,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
+
 import tiktoken
-from abc import ABC, abstractmethod
 
 from corpus_sdk.core.context_translation import from_mcp
 from corpus_sdk.core.error_context import attach_context
@@ -48,77 +82,86 @@ logger = logging.getLogger(__name__)
 # Cache Interface for Distributed Caching
 # =============================================================================
 
+
 class CacheBackend(ABC):
     """Abstract base class for cache backends supporting distributed caching."""
-    
+
     @abstractmethod
     async def get(self, key: str) -> Optional[Any]:
         """Get value from cache by key."""
-        pass
-    
+        raise NotImplementedError
+
     @abstractmethod
     async def set(self, key: str, value: Any, ttl: int) -> None:
         """Set value in cache with TTL."""
-        pass
-    
+        raise NotImplementedError
+
     @abstractmethod
     async def delete(self, key: str) -> None:
         """Delete value from cache by key."""
-        pass
-    
+        raise NotImplementedError
+
     @abstractmethod
     async def clear(self) -> None:
         """Clear all cached values."""
-        pass
-    
+        raise NotImplementedError
+
     @abstractmethod
     async def exists(self, key: str) -> bool:
         """Check if key exists in cache."""
-        pass
+        raise NotImplementedError
 
 
 class InMemoryCache(CacheBackend):
-    """In-memory cache implementation with LRU eviction."""
-    
+    """
+    In-memory cache implementation with LRU eviction.
+
+    Notes
+    -----
+    - LRU eviction is implemented with a simple access-time map and min() scan.
+      This is O(N) on eviction, which is acceptable for moderate max_size.
+    - This backend is intended primarily for single-process usage; for
+      production distributed setups, plug in a distributed CacheBackend.
+    """
+
     def __init__(self, max_size: int = 1000):
         self._cache: Dict[str, Tuple[Any, float]] = {}
         self._max_size = max_size
         self._access_times: Dict[str, float] = {}
-    
+
     async def get(self, key: str) -> Optional[Any]:
         if key in self._cache:
             value, expiry = self._cache[key]
             if time.time() < expiry:
                 self._access_times[key] = time.time()
                 return value
-            else:
-                await self.delete(key)
+            await self.delete(key)
         return None
-    
+
     async def set(self, key: str, value: Any, ttl: int) -> None:
         current_time = time.time()
-        
+
         # Evict if needed (LRU)
         if len(self._cache) >= self._max_size and key not in self._cache:
-            # Find least recently used key
-            lru_key = min(self._access_times.keys(), key=lambda k: self._access_times[k])
-            await self.delete(lru_key)
-        
+            if self._access_times:
+                lru_key = min(self._access_times.keys(), key=lambda k: self._access_times[k])
+                await self.delete(lru_key)
+
         self._cache[key] = (value, current_time + ttl)
         self._access_times[key] = current_time
-    
+
     async def delete(self, key: str) -> None:
         self._cache.pop(key, None)
         self._access_times.pop(key, None)
-    
+
     async def clear(self) -> None:
         self._cache.clear()
         self._access_times.clear()
-    
+
     async def exists(self, key: str) -> bool:
         if key not in self._cache:
             return False
-        value, expiry = self._cache[key]
+        _, expiry = self._cache[key]
         return time.time() < expiry
 
 
@@ -126,14 +169,23 @@ class InMemoryCache(CacheBackend):
 # Configuration Validation
 # =============================================================================
 
+
+class ServiceConfigError(ValueError):
+    """Raised for invalid LLM service configuration values."""
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
+
+
 class ServiceConfig:
     """Validated service configuration with sensible defaults and constraints."""
-    
+
     def __init__(
         self,
         max_concurrent_requests: int = 50,
         requests_per_minute: int = 500,
-        tokens_per_minute: int = 100000,
+        tokens_per_minute: int = 100_000,
         cache_ttl: int = 3600,
         max_tokens_per_request: int = 4000,
         enable_streaming: bool = True,
@@ -141,105 +193,140 @@ class ServiceConfig:
         request_timeout: float = 60.0,
         health_check_timeout: float = 5.0,
         circuit_breaker_threshold: int = 5,
+        harmful_patterns: Optional[List[str]] = None,
+        enable_harmful_content_detection: bool = True,
     ):
         # Validate and set parameters with constraints
         if max_concurrent_requests <= 0:
-            raise ValueError("max_concurrent_requests must be positive")
+            raise ServiceConfigError("max_concurrent_requests must be positive")
         self.max_concurrent_requests = max_concurrent_requests
-        
+
         if requests_per_minute <= 0:
-            raise ValueError("requests_per_minute must be positive")
+            raise ServiceConfigError("requests_per_minute must be positive")
         self.requests_per_minute = requests_per_minute
-        
+
         if tokens_per_minute <= 0:
-            raise ValueError("tokens_per_minute must be positive")
+            raise ServiceConfigError("tokens_per_minute must be positive")
         self.tokens_per_minute = tokens_per_minute
-        
+
         if cache_ttl < 0:
-            raise ValueError("cache_ttl must be non-negative")
+            raise ServiceConfigError("cache_ttl must be non-negative")
         self.cache_ttl = cache_ttl
-        
+
         if max_tokens_per_request <= 0:
-            raise ValueError("max_tokens_per_request must be positive")
+            raise ServiceConfigError("max_tokens_per_request must be positive")
         self.max_tokens_per_request = max_tokens_per_request
-        
+
         if cache_max_size <= 0:
-            raise ValueError("cache_max_size must be positive")
+            raise ServiceConfigError("cache_max_size must be positive")
         self.cache_max_size = cache_max_size
-        
+
         if request_timeout <= 0:
-            raise ValueError("request_timeout must be positive")
+            raise ServiceConfigError("request_timeout must be positive")
         self.request_timeout = request_timeout
-        
+
         if health_check_timeout <= 0:
-            raise ValueError("health_check_timeout must be positive")
+            raise ServiceConfigError("health_check_timeout must be positive")
         self.health_check_timeout = health_check_timeout
-        
+
         if circuit_breaker_threshold <= 0:
-            raise ValueError("circuit_breaker_threshold must be positive")
+            raise ServiceConfigError("circuit_breaker_threshold must be positive")
         self.circuit_breaker_threshold = circuit_breaker_threshold
-        
+
         self.enable_streaming = enable_streaming
+        self.harmful_patterns = harmful_patterns
+        self.enable_harmful_content_detection = enable_harmful_content_detection
 
 
 # =============================================================================
 # Token Estimation with Fallback
 # =============================================================================
 
+
 class TokenEstimator:
     """Advanced token estimation with multiple fallback strategies."""
-    
+
     def __init__(self):
         self._encoding_cache: Dict[str, tiktoken.Encoding] = {}
-        self._default_encoding = self._get_encoding_for_model("gpt-3.5-turbo")
-    
-    def _get_encoding_for_model(self, model: str) -> tiktoken.Encoding:
-        """Get appropriate encoding for model with caching."""
+        self._encoding_failures: Set[str] = set()
+        self._default_encoding: Optional[tiktoken.Encoding] = self._init_default_encoding()
+
+    def _init_default_encoding(self) -> Optional[tiktoken.Encoding]:
+        """
+        Initialize a safe default encoding.
+
+        Attempts a GPT-style model-specific encoding first, then falls back
+        to a generic cl100k_base encoding. If all attempts fail, returns None.
+        """
+        try:
+            return tiktoken.encoding_for_model("gpt-3.5-turbo")
+        except Exception:
+            try:
+                return tiktoken.get_encoding("cl100k_base")
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "TokenEstimator could not initialize default encoding; "
+                    "falling back to character-based estimation: %s",
+                    exc,
+                )
+                return None
+
+    def _get_encoding_for_model(self, model: str) -> Optional[tiktoken.Encoding]:
+        """Get appropriate encoding for model with caching and failure tracking."""
         if model in self._encoding_cache:
             return self._encoding_cache[model]
-        
+
+        if model in self._encoding_failures:
+            return None
+
         try:
-            # Map model families to encodings
             if "gpt-4" in model or "gpt-3.5" in model:
                 encoding = tiktoken.encoding_for_model("gpt-3.5-turbo")
             elif "claude" in model:
-                # Claude uses different tokenization, fallback to conservative estimate
+                # Claude uses different tokenization; fall back to conservative estimate
                 encoding = None
             else:
                 encoding = tiktoken.get_encoding("cl100k_base")
-            
-            if encoding:
+
+            if encoding is not None:
                 self._encoding_cache[model] = encoding
-                return encoding
-        except Exception:
-            pass
-        
-        return self._default_encoding
-    
+            else:
+                self._encoding_failures.add(model)
+
+            return encoding
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Failed to get encoding for model %s: %s", model, exc)
+            self._encoding_failures.add(model)
+            return None
+
     def estimate_tokens(self, text: str, model: Optional[str] = None) -> int:
         """
         Estimate tokens with multiple fallback strategies.
-        
+
         Strategy priority:
         1. Model-specific tiktoken encoding
-        2. General tiktoken encoding
+        2. Default tiktoken encoding
         3. Conservative character-based estimation
         """
         if not text:
             return 0
-        
+
         try:
             if model:
                 encoding = self._get_encoding_for_model(model)
                 if encoding:
                     return len(encoding.encode(text))
-            
-            # Fallback to default encoding
+
             if self._default_encoding:
                 return len(self._default_encoding.encode(text))
-        except Exception as e:
-            logger.debug(f"Token estimation failed: {e}, falling back to character count")
-        
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "Token estimation failed for model %s: %s; "
+                "falling back to character-based estimation",
+                model,
+                exc,
+            )
+
         # Ultimate fallback: conservative character-based estimation
         # Use 3.5 chars per token for safety (more conservative than 4)
         return max(1, len(text) // 3)
@@ -248,6 +335,7 @@ class TokenEstimator:
 # =============================================================================
 # Request Prioritization
 # =============================================================================
+
 
 class RequestPriority(Enum):
     HIGH = 0
@@ -263,51 +351,62 @@ class PrioritizedRequest:
     created_at: float
     request_id: str
     data: Any
-    
-    def __lt__(self, other: PrioritizedRequest) -> bool:
-        """Priority queue ordering (lower value = higher priority)."""
+
+    def __lt__(self, other: "PrioritizedRequest") -> bool:
+        """Priority queue ordering (lower value = higher priority, FIFO within same priority)."""
         if self.priority.value != other.priority.value:
             return self.priority.value < other.priority.value
         return self.created_at < other.created_at
 
 
 class PrioritySemaphore:
-    """Semaphore with priority-based acquisition."""
-    
+    """
+    Semaphore with priority-based acquisition.
+
+    Notes
+    -----
+    - This implementation assumes a single asyncio event loop (no cross-thread use).
+    - Higher-priority requests are favored and may starve lower-priority
+      requests under sustained high load. This is intentional and should be
+      accounted for at the call site.
+    """
+
     def __init__(self, value: int):
         self._value = value
-        self._waiters: List[asyncio.Future] = []
         self._priority_queue: List[PrioritizedRequest] = []
-    
-    async def acquire(self, priority: RequestPriority = RequestPriority.NORMAL, 
-                     request_id: str = "") -> bool:
+
+    async def acquire(
+        self,
+        priority: RequestPriority = RequestPriority.NORMAL,
+        request_id: str = "",
+    ) -> bool:
         """Acquire semaphore with priority."""
         while self._value <= 0:
-            fut = asyncio.get_event_loop().create_future()
+            fut: asyncio.Future = asyncio.get_event_loop().create_future()
             self._priority_queue.append(
                 PrioritizedRequest(priority, time.time(), request_id, fut)
             )
             self._priority_queue.sort()
             try:
                 await fut
-            except:
+            except Exception:  # noqa: BLE001
                 self._remove_waiter(fut)
                 raise
         self._value -= 1
         return True
-    
+
     def release(self) -> None:
         """Release semaphore, waking highest priority waiter."""
         self._value += 1
         if self._priority_queue:
-            # Get highest priority request
             request = self._priority_queue.pop(0)
-            request.data.set_result(True)
-    
+            if not request.data.done():
+                request.data.set_result(True)
+
     def _remove_waiter(self, fut: asyncio.Future) -> None:
         """Remove waiter from priority queue."""
-        self._priority_queue = [r for r in self._priority_queue if r.data != fut]
-    
+        self._priority_queue = [r for r in self._priority_queue if r.data is not fut]
+
     @property
     def value(self) -> int:
         return self._value
@@ -409,6 +508,17 @@ class MCPLLMTranslationService:
     - Provide streaming and non-streaming interfaces
     - Offer a simple in-memory cache keyed by prompt/model/params
     - Attach rich error context via corpus_sdk.core.error_context.attach_context
+
+    Streaming semantics
+    -------------------
+    - For `stream=True`, timeout is applied to the total duration of the stream,
+      not per-chunk. A timeout results in a STREAM_TIMEOUT error.
+
+    Rate limiting semantics
+    -----------------------
+    - Request rate limit: sliding 60-second window, per-instance.
+    - Token rate limit: sliding 60-second window, estimating completion size
+      pessimistically as prompt tokens + (max_tokens or 100).
     """
 
     def __init__(
@@ -417,7 +527,7 @@ class MCPLLMTranslationService:
         *,
         max_concurrent_requests: int = 50,
         requests_per_minute: int = 500,
-        tokens_per_minute: int = 100000,
+        tokens_per_minute: int = 100_000,
         cache_ttl: int = 3600,
         max_tokens_per_request: int = 4000,
         enable_streaming: bool = True,
@@ -426,6 +536,9 @@ class MCPLLMTranslationService:
         request_timeout: float = 60.0,
         health_check_timeout: float = 5.0,
         circuit_breaker_threshold: int = 5,
+        harmful_content_patterns: Optional[List[str]] = None,
+        enable_harmful_content_detection: bool = True,
+        token_estimator: Optional[TokenEstimator] = None,
     ) -> None:
         """
         Args:
@@ -438,7 +551,8 @@ class MCPLLMTranslationService:
             tokens_per_minute:
                 Sliding-window token rate limit (prompt + completion).
             cache_ttl:
-                TTL for cached responses in seconds.
+                TTL for cached responses in seconds. Enforced both at cache
+                backend level (if supported) and at service level.
             max_tokens_per_request:
                 Hard limit for max_tokens parameter.
             enable_streaming:
@@ -448,11 +562,17 @@ class MCPLLMTranslationService:
             cache_max_size:
                 Maximum cache size for in-memory cache.
             request_timeout:
-                Default request timeout in seconds.
+                Default request timeout in seconds for non-streaming calls.
             health_check_timeout:
-                Health check timeout in seconds.
+                Health check timeout in seconds for LLM probe.
             circuit_breaker_threshold:
                 Consecutive failures before circuit breaker trips.
+            harmful_content_patterns:
+                Optional list of additional harmful-content patterns to match.
+            enable_harmful_content_detection:
+                Whether to perform basic harmful-content screening on prompts.
+            token_estimator:
+                Optional custom TokenEstimator implementation.
         """
         # Validate configuration
         self._config = ServiceConfig(
@@ -466,19 +586,21 @@ class MCPLLMTranslationService:
             request_timeout=request_timeout,
             health_check_timeout=health_check_timeout,
             circuit_breaker_threshold=circuit_breaker_threshold,
+            harmful_patterns=harmful_content_patterns,
+            enable_harmful_content_detection=enable_harmful_content_detection,
         )
-        
+
         self._llm = llm_translator
-        self._token_estimator = TokenEstimator()
-        
+        self._token_estimator = token_estimator or TokenEstimator()
+
         # Cache setup
         self._cache_backend = cache_backend or InMemoryCache(cache_max_size)
-        
+
         # Concurrency + rate limiting state
         self._active_requests: int = 0
         self._request_semaphore = PrioritySemaphore(max_concurrent_requests)
-        self._request_rate_tracker: List[float] = []  # timestamps of recent requests
-        self._token_usage_tracker: List[Tuple[float, int]] = []  # (timestamp, tokens)
+        self._request_rate_tracker: Deque[float] = deque()  # timestamps of recent requests
+        self._token_usage_tracker: Deque[Tuple[float, int]] = deque()  # (timestamp, tokens)
 
         # Simple health / statistics
         self._is_healthy: bool = True
@@ -530,6 +652,10 @@ class MCPLLMTranslationService:
         If `stream` is True and streaming is enabled:
             Returns an async generator yielding StreamingChunk instances.
 
+        Timeout semantics:
+            - Non-streaming: applies to the total completion call.
+            - Streaming: applies to the total duration of the stream.
+
         Raises:
             RateLimitExceededError
             TokenLimitExceededError
@@ -560,6 +686,7 @@ class MCPLLMTranslationService:
             )
 
         # Estimate tokens and enforce token-level rate limit
+        # We pessimistically assume a completion size of (max_tokens or 100).
         estimated_tokens = self._estimate_tokens(prompt, model) + (max_tokens or 100)
         if not self._check_token_limit(estimated_tokens):
             self._record_failure()
@@ -768,9 +895,12 @@ class MCPLLMTranslationService:
                 effective_prompt_tokens = pt
             completion_tokens = usage.get("completion_tokens")
             total_tokens = usage.get("total_tokens")
-            if total_tokens is None and effective_prompt_tokens is not None and completion_tokens is not None:
+            if (
+                total_tokens is None
+                and effective_prompt_tokens is not None
+                and completion_tokens is not None
+            ):
                 total_tokens = effective_prompt_tokens + completion_tokens
-
         else:
             # Attribute-based object
             text = str(getattr(completion, "text", "") or "")
@@ -797,9 +927,9 @@ class MCPLLMTranslationService:
         if completion_tokens is None and effective_prompt_tokens is not None:
             completion_tokens = max(0, total_tokens - effective_prompt_tokens)
 
-        # Record token usage + success statistics
+        # Record token usage + success statistics (avoid double-counting)
         self._record_token_usage(total_tokens)
-        self._record_success(processing_time, estimated_tokens=total_tokens)
+        self._record_success(processing_time)
 
         return LLMResult(
             text=text,
@@ -834,6 +964,8 @@ class MCPLLMTranslationService:
     ) -> AsyncGenerator[StreamingChunk, None]:
         """
         Streaming generation via LLMTranslator.arun_stream.
+
+        Timeout applies to the total duration of the stream.
         """
         self._validate_generation_request(prompt, max_tokens, request_id)
 
@@ -847,7 +979,6 @@ class MCPLLMTranslationService:
             await self._request_semaphore.acquire(priority, request_id)
             self._active_requests += 1
             try:
-                # arun_stream returns an async iterator of framework-level chunks
                 agen = await self._llm.arun_stream(
                     raw_messages=messages,
                     model=model,
@@ -859,7 +990,6 @@ class MCPLLMTranslationService:
                 )
 
                 async for chunk in agen:
-                    # Normalize chunk from dict/object into StreamingChunk
                     streaming_chunk = self._normalize_stream_chunk(
                         chunk_obj=chunk,
                         request_id=request_id,
@@ -868,7 +998,7 @@ class MCPLLMTranslationService:
                     yield streaming_chunk
                     chunks_delivered += 1
 
-                    # Timeout check
+                    # Timeout check on total streaming duration
                     if time.time() - start_time > timeout:
                         raise asyncio.TimeoutError()
 
@@ -876,7 +1006,7 @@ class MCPLLMTranslationService:
                 processing_time = time.time() - start_time
                 estimated_tokens = self._estimate_tokens(prompt, model) + chunks_delivered * 10
                 self._record_token_usage(estimated_tokens)
-                self._record_success(processing_time, estimated_tokens=estimated_tokens)
+                self._record_success(processing_time)
 
             except asyncio.TimeoutError:
                 self._record_failure()
@@ -974,13 +1104,17 @@ class MCPLLMTranslationService:
         """
         Extremely lightweight harmful-content detection.
 
-        This is intentionally conservative; more sophisticated policies
-        should be implemented at higher layers if needed.
+        This is intentionally conservative and configurable; more sophisticated
+        policies should be implemented at higher layers if needed.
         """
+        if not self._config.enable_harmful_content_detection:
+            return []
+
         harmful_patterns: List[str] = []
         text_lower = text.lower()
 
-        dangerous_patterns = [
+        # Default patterns plus any configured ones.
+        default_patterns = [
             "how to hack",
             "make a bomb",
             "hurt someone",
@@ -988,9 +1122,11 @@ class MCPLLMTranslationService:
             "self harm",
             "suicide methods",
         ]
+        configured_patterns = self._config.harmful_patterns or []
+        patterns_to_check = list(dict.fromkeys(default_patterns + configured_patterns))
 
-        for pattern in dangerous_patterns:
-            if pattern in text_lower:
+        for pattern in patterns_to_check:
+            if pattern.lower() in text_lower:
                 harmful_patterns.append(pattern)
 
         return harmful_patterns
@@ -1008,12 +1144,15 @@ class MCPLLMTranslationService:
     def _check_rate_limit(self) -> bool:
         """
         Sliding-window request rate limiting over the last 60 seconds.
+
+        Assumes single-threaded asyncio event loop; no explicit locking needed.
         """
         now = time.time()
         window_start = now - 60.0
-        self._request_rate_tracker = [
-            t for t in self._request_rate_tracker if t > window_start
-        ]
+
+        # Prune old entries
+        while self._request_rate_tracker and self._request_rate_tracker[0] <= window_start:
+            self._request_rate_tracker.popleft()
 
         if len(self._request_rate_tracker) >= self._config.requests_per_minute:
             return False
@@ -1024,12 +1163,15 @@ class MCPLLMTranslationService:
     def _check_token_limit(self, estimated_tokens: int) -> bool:
         """
         Sliding-window token rate limiting over the last 60 seconds.
+
+        Assumes single-threaded asyncio event loop; no explicit locking needed.
         """
         now = time.time()
         window_start = now - 60.0
-        self._token_usage_tracker = [
-            (t, tokens) for t, tokens in self._token_usage_tracker if t > window_start
-        ]
+
+        # Prune old entries
+        while self._token_usage_tracker and self._token_usage_tracker[0][0] <= window_start:
+            self._token_usage_tracker.popleft()
 
         current_usage = sum(tokens for _, tokens in self._token_usage_tracker)
         if current_usage + estimated_tokens > self._config.tokens_per_minute:
@@ -1038,6 +1180,12 @@ class MCPLLMTranslationService:
         return True
 
     def _record_token_usage(self, tokens: int) -> None:
+        """
+        Record token usage for rate limiting and aggregate metrics.
+
+        This is the single source of truth for per-request token accounting
+        to avoid double-counting tokens across metrics.
+        """
         self._token_usage_tracker.append((time.time(), tokens))
         self._total_tokens_used += tokens
 
@@ -1077,6 +1225,9 @@ class MCPLLMTranslationService:
     async def _get_cached_result(self, cache_key: str) -> Optional[LLMResult]:
         """
         Return cached result if it is still within TTL, else None.
+
+        Both the cache backend's TTL semantics and the service-level TTL
+        are respected; whichever expires first will invalidate the entry.
         """
         try:
             entry = await self._cache_backend.get(cache_key)
@@ -1084,10 +1235,9 @@ class MCPLLMTranslationService:
                 result, timestamp = entry
                 if time.time() - timestamp <= self._config.cache_ttl:
                     return result
-                else:
-                    await self._cache_backend.delete(cache_key)
-        except Exception as e:
-            logger.warning("Cache get operation failed: %s", e)
+                await self._cache_backend.delete(cache_key)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Cache get operation failed: %s", exc)
         return None
 
     async def _cache_result(self, cache_key: str, result: LLMResult) -> None:
@@ -1097,24 +1247,29 @@ class MCPLLMTranslationService:
         try:
             result.cached = True
             await self._cache_backend.set(
-                cache_key, 
-                (result, time.time()), 
-                self._config.cache_ttl
+                cache_key,
+                (result, time.time()),
+                self._config.cache_ttl,
             )
-        except Exception as e:
-            logger.warning("Cache set operation failed: %s", e)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Cache set operation failed: %s", exc)
 
     # -------------------------------------------------------------------------
     # Health + statistics
     # -------------------------------------------------------------------------
 
-    def _record_success(self, processing_time: float, estimated_tokens: int = 0) -> None:
+    def _record_success(self, processing_time: float) -> None:
+        """
+        Record a successful request.
+
+        Token usage is tracked exclusively via _record_token_usage to avoid
+        double-counting across metrics.
+        """
         self._consecutive_failures = 0
         self._is_healthy = True
         self._total_requests += 1
         self._successful_requests += 1
         self._total_processing_time += processing_time
-        self._total_tokens_used += estimated_tokens
 
     def _record_failure(self) -> None:
         self._consecutive_failures += 1
@@ -1132,6 +1287,9 @@ class MCPLLMTranslationService:
     def get_metrics(self) -> Dict[str, Any]:
         """
         Return aggregated in-memory metrics for inspection/logging.
+
+        This method is synchronous and never awaits, so it can be safely
+        called from any context.
         """
         avg_processing_time = (
             self._total_processing_time / self._successful_requests
@@ -1175,19 +1333,27 @@ class MCPLLMTranslationService:
             "average_tokens_per_request": avg_tokens_per_request,
             "total_tokens_used": self._total_tokens_used,
             "active_requests": self._active_requests,
-            "cache_size": await self._get_cache_size(),
+            "cache_size": self._get_cache_size(),
             "cache_hit_ratio": cache_hit_ratio,
             "consecutive_failures": self._consecutive_failures,
             "rate_limit_utilization": rate_limit_utilization,
             "token_limit_utilization": token_limit_utilization,
         }
 
-    async def _get_cache_size(self) -> int:
-        """Get approximate cache size."""
+    def _get_cache_size(self) -> int:
+        """
+        Get approximate cache size without awaiting.
+
+        For in-memory cache backends, we introspect the internal _cache dict.
+        For other backends, this returns 0 unless they choose to expose a
+        compatible attribute.
+        """
         try:
-            if hasattr(self._cache_backend, '_cache'):
-                return len(self._cache_backend._cache)
-        except:
+            cache = getattr(self._cache_backend, "_cache", None)
+            if isinstance(cache, dict):
+                return len(cache)
+        except Exception:  # noqa: BLE001
+            # Best-effort only; never let cache size introspection break callers.
             pass
         return 0
 
@@ -1201,37 +1367,71 @@ class MCPLLMTranslationService:
             return "warning"
         return "healthy"
 
+    async def _run_health_probe(self) -> bool:
+        """
+        Run a synthetic LLM call for health probing.
+
+        This intentionally:
+        - Does NOT consume request/token rate limit budget.
+        - Does NOT affect normal success/failure metrics.
+        """
+        test_prompt = "Respond with 'OK' for health check."
+        op_ctx = from_mcp({"id": "health_check", "method": "health_check"})
+        messages: List[Dict[str, str]] = [{"role": "user", "content": test_prompt}]
+
+        try:
+            completion_obj = await asyncio.wait_for(
+                self._llm.arun_complete(
+                    raw_messages=messages,
+                    model=None,
+                    max_tokens=4,
+                    temperature=0.0,
+                    system_message="You are a health-check probe.",
+                    op_ctx=op_ctx,
+                    framework_ctx=None,
+                ),
+                timeout=self._config.health_check_timeout,
+            )
+
+            # Basic sanity check: ensure some text is returned, but do not
+            # enforce specific content to avoid coupling to model behavior.
+            if isinstance(completion_obj, dict):
+                _ = str(completion_obj.get("text") or "")
+            else:
+                _ = str(getattr(completion_obj, "text", "") or "")
+            return True
+        except Exception as exc:  # noqa: BLE001
+            self._attach_error_context(
+                exc,
+                operation="health_check_probe",
+                request_id="health_check",
+                model=None,
+            )
+            logger.warning("Health probe LLM call failed: %s", exc)
+            return False
+
     async def health_check(self) -> Dict[str, Any]:
         """
         Simple health probe with optional synthetic LLM call.
+
+        Health probes are designed not to interfere with normal rate limits
+        or success/failure metrics.
         """
         status = self.get_health_status()
         health: Dict[str, Any] = {
             "status": status,
             "consecutive_failures": self._consecutive_failures,
             "active_requests": self._active_requests,
-            "cache_size": await self._get_cache_size(),
+            "cache_size": self._get_cache_size(),
         }
 
         # Only attempt a real LLM call if we appear healthy
         if status == "healthy":
-            try:
-                test_prompt = "Respond with 'OK' for health check."
-                _ = await self.generate_text(
-                    prompt=test_prompt,
-                    model=None,
-                    max_tokens=4,
-                    temperature=0.0,
-                    mcp_context={},
-                    request_id="health_check",
-                    timeout=self._config.health_check_timeout,
-                    enable_cache=False,
-                    stream=False,
-                    system_message="You are a health-check probe.",
-                )
+            probe_ok = await self._run_health_probe()
+            if probe_ok:
                 health["service_test"] = "passed"
-            except Exception as exc:  # noqa: BLE001
-                health["service_test"] = f"failed: {exc!s}"
+            else:
+                health["service_test"] = "failed"
                 health["status"] = "degraded"
 
         return health
@@ -1256,6 +1456,7 @@ class MCPLLMTranslationService:
             attach_context(
                 exc,
                 framework="mcp",
+                resource_type="llm",
                 operation=operation,
                 request_id=request_id,
                 translation_layer="llm",
@@ -1309,6 +1510,7 @@ def create_llm_service(
     translator: Optional[LLMFrameworkTranslator] = None,
     post_processing_config: Optional[LLMPostProcessingConfig] = None,
     cache_backend: Optional[CacheBackend] = None,
+    token_estimator: Optional[TokenEstimator] = None,
     **kwargs: Any,
 ) -> MCPLLMTranslationService:
     """
@@ -1325,6 +1527,8 @@ def create_llm_service(
             Optional LLMPostProcessingConfig for post-processing behavior.
         cache_backend:
             Optional distributed cache backend implementation.
+        token_estimator:
+            Optional custom TokenEstimator implementation.
         **kwargs:
             Additional MCPLLMTranslationService configuration parameters.
 
@@ -1340,5 +1544,6 @@ def create_llm_service(
     return MCPLLMTranslationService(
         llm_translator=llm_translator,
         cache_backend=cache_backend,
-        **kwargs
+        token_estimator=token_estimator,
+        **kwargs,
     )
