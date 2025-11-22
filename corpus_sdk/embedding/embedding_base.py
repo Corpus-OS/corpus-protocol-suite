@@ -98,6 +98,15 @@ Unary Responses (error):
         "ms": <float>
     }
 
+Streaming Responses:
+
+    {
+        "ok": true,
+        "code": "STREAMING",
+        "ms": <float>,
+        "chunk": { ... }        # streaming chunk payload
+    }
+
 The WireEmbeddingHandler in this file is the reference adapter for this contract and is
 intentionally transport-agnostic (HTTP, gRPC, WebSocket, etc.).
 """
@@ -122,6 +131,8 @@ from typing import (
     Protocol,
     Tuple,
     runtime_checkable,
+    AsyncIterator,
+    Union,
 )
 
 EMBEDDING_PROTOCOL_VERSION = "1.0.0"
@@ -185,6 +196,57 @@ class EmbeddingBatch:
     model: str
     truncate: bool = True
     normalize: bool = False
+
+
+# =============================================================================
+# Streaming Types (v1.0 with fixes)
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class EmbedChunk:
+    """
+    A streaming chunk of embedding results.
+
+    Attributes:
+        embeddings: Partial or complete embedding vectors
+        is_final: Whether this is the final chunk in the stream
+        usage: Optional usage statistics for this chunk
+        model: Model used for generation
+    """
+    embeddings: List[EmbeddingVector]
+    is_final: bool = False
+    usage: Optional[Dict[str, Any]] = None
+    model: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class EmbeddingStats:
+    """
+    Statistics and usage information for embedding operations.
+
+    Attributes:
+        total_requests: Total number of embedding requests processed
+        total_texts: Total number of texts embedded
+        total_tokens: Total tokens processed
+        cache_hits: Number of cache hits
+        cache_misses: Number of cache misses
+        avg_processing_time_ms: Average processing time per request
+        error_count: Total number of errors encountered
+        stream_requests: Number of streaming requests processed
+        stream_chunks_generated: Total chunks generated across all streams
+        stream_abandoned: Number of streams abandoned before completion
+    """
+    total_requests: int = 0
+    total_texts: int = 0
+    total_tokens: int = 0
+    cache_hits: int = 0
+    cache_misses: int = 0
+    avg_processing_time_ms: float = 0.0
+    error_count: int = 0
+    stream_requests: int = 0
+    stream_chunks_generated: int = 0
+    stream_abandoned: int = 0
 
 
 # =============================================================================
@@ -536,7 +598,7 @@ class EnforcingDeadline:
             return await awaitable
         remaining = ctx.remaining_ms()
         if remaining is not None and remaining <= 0:
-            raise DeadlineExceeded("deadline already exceeded")
+            raise DeadlineExceeded("deadline already expired")
         try:
             return await asyncio.wait_for(
                 awaitable,
@@ -754,6 +816,7 @@ class EmbeddingCapabilities:
         supports_normalization: Whether vector normalization is supported
         supports_truncation: Whether text truncation is supported
         supports_token_counting: Whether token counting is available
+        supports_streaming: Whether streaming embeddings are supported
         idempotent_operations: Whether operations are idempotent with idempotency_key
         supports_multi_tenant: Whether multi-tenant isolation is supported
         normalizes_at_source: Whether adapter normalizes vectors at source when requested
@@ -769,6 +832,7 @@ class EmbeddingCapabilities:
     supports_normalization: bool = False
     supports_truncation: bool = True
     supports_token_counting: bool = False
+    supports_streaming: bool = False
     idempotent_operations: bool = False
     supports_multi_tenant: bool = False
     normalizes_at_source: bool = False
@@ -793,12 +857,14 @@ class EmbedSpec:
         normalize: Whether to normalize output vector to unit length
         metadata: Optional metadata to associate with the resulting embedding
                   (not sent on the wire; used locally).
+        stream: Whether to stream the embedding results
     """
     text: str
     model: str
     truncate: bool = True
     normalize: bool = False
     metadata: Optional[Dict[str, Any]] = None
+    stream: bool = False
 
 
 @dataclass(frozen=True)
@@ -909,8 +975,13 @@ class EmbeddingProtocolV1(Protocol):
         spec: EmbedSpec,
         *,
         ctx: Optional[OperationContext] = None,
-    ) -> EmbedResult:
-        """Generate embedding for a single text."""
+    ) -> Union[EmbedResult, AsyncIterator[EmbedChunk]]:
+        """
+        Generate embedding for a single text.
+        
+        Returns:
+            EmbedResult for non-streaming requests, AsyncIterator[EmbedChunk] for streaming
+        """
         ...
 
     async def embed_batch(
@@ -934,6 +1005,10 @@ class EmbeddingProtocolV1(Protocol):
 
     async def health(self, *, ctx: Optional[OperationContext] = None) -> Dict[str, Any]:
         """Check the health status of the embedding backend."""
+        ...
+
+    async def get_stats(self, *, ctx: Optional[OperationContext] = None) -> EmbeddingStats:
+        """Get embedding operation statistics and usage information."""
         ...
 
 
@@ -1045,6 +1120,14 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         # Allow 0 to mean "no caching".
         self._cache_embed_ttl_s: int = max(0, int(cache_embed_ttl_s))
         self._cache_caps_ttl_s: int = max(0, int(cache_caps_ttl_s))
+
+        # Streaming metrics tracking
+        self._stream_stats = {
+            "active_streams": 0,
+            "total_chunks": 0,
+            "abandoned_streams": 0,
+            "completed_streams": 0,
+        }
 
     # --- internal helpers (validation, hashing, metrics, deadlines) ---
 
@@ -1160,7 +1243,7 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
             return
         remaining = ctx.remaining_ms()
         if remaining is not None and remaining <= 0:
-            raise DeadlineExceeded("deadline already exceeded")
+            raise DeadlineExceeded("deadline already expired")
 
     @staticmethod
     def _format_cache_key(prefix: str, *parts: str) -> str:
@@ -1275,6 +1358,95 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
                 )
                 self._breaker.on_error(e)
                 raise
+
+    # --- streaming helpers ---
+
+    async def _with_streaming_gates(
+        self,
+        *,
+        op: str,
+        ctx: Optional[OperationContext],
+        stream_factory: Callable[[], AsyncIterator[Any]],
+        metric_extra: Optional[Mapping[str, Any]] = None,
+    ) -> AsyncIterator[Any]:
+        """
+        Streaming gate wrapper that handles metrics, circuit breaking, and rate limiting
+        for streaming operations.
+        """
+        self._fail_if_expired(ctx)
+
+        if not self._breaker.allow():
+            raise Unavailable("circuit open")
+
+        async with self._rate_limited():
+            t0 = time.monotonic()
+            chunks_yielded = 0
+            stream_completed = False
+            
+            try:
+                # Track active stream
+                self._stream_stats["active_streams"] += 1
+                
+                async for chunk in self._apply_deadline(stream_factory(), ctx):
+                    chunks_yielded += 1
+                    self._stream_stats["total_chunks"] += 1
+                    yield chunk
+                
+                stream_completed = True
+                self._stream_stats["completed_streams"] += 1
+                
+                # Record successful stream completion
+                self._record(
+                    f"{op}_stream",
+                    t0,
+                    True,
+                    ctx=ctx,
+                    chunks=chunks_yielded,
+                    **(metric_extra or {}),
+                )
+                self._breaker.on_success()
+                
+            except EmbeddingAdapterError as e:
+                code = e.code or type(e).__name__
+                extra = dict(metric_extra or {})
+                extra["chunks_yielded"] = chunks_yielded
+                self._record(
+                    f"{op}_stream",
+                    t0,
+                    False,
+                    code=code,
+                    ctx=ctx,
+                    **extra,
+                )
+                if not stream_completed and chunks_yielded > 0:
+                    self._stream_stats["abandoned_streams"] += 1
+                self._breaker.on_error(e)
+                raise
+            except Exception as e:
+                extra = dict(metric_extra or {})
+                extra["chunks_yielded"] = chunks_yielded
+                self._record(
+                    f"{op}_stream",
+                    t0,
+                    False,
+                    code="UnhandledException",
+                    ctx=ctx,
+                    **extra,
+                )
+                if not stream_completed and chunks_yielded > 0:
+                    self._stream_stats["abandoned_streams"] += 1
+                self._breaker.on_error(e)
+                raise
+            finally:
+                self._stream_stats["active_streams"] -= 1
+                # Record streaming-specific metrics
+                if chunks_yielded > 0:
+                    self._metrics.counter(
+                        component=self._component,
+                        name="stream_chunks",
+                        value=chunks_yielded,
+                        extra={"op": op, "completed": stream_completed},
+                    )
 
     # --- metadata helpers ----------------------------------------------------
 
@@ -1410,7 +1582,7 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         self,
         spec: EmbedSpec,
         ctx: Optional[OperationContext],
-    ) -> EmbedResult:
+    ) -> Union[EmbedResult, AsyncIterator[EmbedChunk]]:
         """
         Core implementation of embed() separated for easier testing and
         reuse from the gated public method.
@@ -1418,7 +1590,27 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         NOTE: Cache stores base results without caller-supplied metadata.
         Metadata is attached per call on top of the cached base.
         """
-        # Capabilities for validation and limits.
+        # Check if streaming is requested
+        if spec.stream:
+            caps = await self._do_capabilities()
+            if not caps.supports_streaming:
+                raise NotSupported("streaming embeddings not supported by this adapter")
+            
+            # For streaming, use the streaming gate wrapper
+            metric_extra: Dict[str, Any] = {}
+            if self._tag_model_in_metrics:
+                model_tag = self._safe_model_tag(spec.model)
+                if model_tag:
+                    metric_extra["model"] = model_tag
+            
+            return self._with_streaming_gates(
+                op="embed",
+                ctx=ctx,
+                stream_factory=lambda: self._do_stream_embed(spec, ctx=ctx),
+                metric_extra=metric_extra,
+            )
+
+        # Non-streaming path continues with caching logic
         caps = await self._do_capabilities()
         if spec.model not in caps.supported_models:
             raise ModelNotAvailable(f"Model '{spec.model}' is not supported")
@@ -1439,6 +1631,7 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
             truncate=spec.truncate,
             normalize=spec.normalize,
             metadata=None,  # provider does not see caller metadata by default
+            stream=False,   # internal call is always non-streaming
         )
 
         # Optional cache: isolated per tenant via _embed_cache_key.
@@ -1522,7 +1715,7 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         spec: EmbedSpec,
         *,
         ctx: Optional[OperationContext] = None,
-    ) -> EmbedResult:
+    ) -> Union[EmbedResult, AsyncIterator[EmbedChunk]]:
         """
         Generate embedding for a single text with validation, gates, and metrics.
 
@@ -1531,6 +1724,11 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         self._require_non_empty("text", spec.text)
         self._require_non_empty("model", spec.model)
 
+        # Handle streaming case separately (already handled in _embed_core)
+        if spec.stream:
+            return await self._embed_core(spec, ctx)
+
+        # Non-streaming case uses the standard gate wrapper
         metric_extra: Dict[str, Any] = {}
         error_extra: Dict[str, Any] = {}
 
@@ -1899,6 +2097,28 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
             call=lambda: self._health_core(ctx),
         )
 
+    async def get_stats(self, *, ctx: Optional[OperationContext] = None) -> EmbeddingStats:
+        """
+        Get embedding operation statistics and usage information.
+        
+        Includes streaming-specific metrics in addition to base statistics.
+        """
+        base_stats = await self._do_get_stats(ctx)
+        
+        # Enhance with real-time streaming metrics
+        return EmbeddingStats(
+            total_requests=base_stats.total_requests,
+            total_texts=base_stats.total_texts,
+            total_tokens=base_stats.total_tokens,
+            cache_hits=base_stats.cache_hits,
+            cache_misses=base_stats.cache_misses,
+            avg_processing_time_ms=base_stats.avg_processing_time_ms,
+            error_count=base_stats.error_count,
+            stream_requests=self._stream_stats["completed_streams"] + self._stream_stats["abandoned_streams"],
+            stream_chunks_generated=self._stream_stats["total_chunks"],
+            stream_abandoned=self._stream_stats["abandoned_streams"],
+        )
+
     # --- async context manager (resource cleanup hook) ---
 
     async def __aenter__(self) -> "BaseEmbeddingAdapter":
@@ -1930,6 +2150,22 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         ctx: Optional[OperationContext] = None,
     ) -> EmbedResult:
         """Implement single text embedding with validated inputs."""
+        raise NotImplementedError
+
+    async def _do_stream_embed(
+        self,
+        spec: EmbedSpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> AsyncIterator[EmbedChunk]:
+        """
+        Implement streaming text embedding with validated inputs.
+        
+        Yield EmbedChunk objects until the stream is complete.
+        
+        Note: Streaming implementations should consider caching the final
+        aggregated result when the stream completes successfully.
+        """
         raise NotImplementedError
 
     async def _do_embed_batch(
@@ -1965,6 +2201,14 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
     async def _do_health(self, *, ctx: Optional[OperationContext] = None) -> Dict[str, Any]:
         """Implement health check for the embedding backend."""
         raise NotImplementedError
+
+    async def _do_get_stats(self, ctx: Optional[OperationContext] = None) -> EmbeddingStats:
+        """
+        Implement statistics collection for embedding operations.
+        
+        Default implementation returns empty stats. Override for detailed metrics.
+        """
+        return EmbeddingStats()
 
 
 # =============================================================================
@@ -2037,6 +2281,21 @@ def _success_to_wire(result: Any, ms: float) -> Dict[str, Any]:
     }
 
 
+def _stream_chunk_to_wire(chunk: EmbedChunk, ms: float) -> Dict[str, Any]:
+    """
+    Map streaming chunk to canonical streaming envelope.
+    
+    Note: Transport layers must handle streaming responses appropriately.
+    This is a helper for chunk serialization only.
+    """
+    return {
+        "ok": True,
+        "code": "STREAMING",
+        "ms": ms,
+        "chunk": asdict(chunk),
+    }
+
+
 class WireEmbeddingHandler:
     """
     Thin wire-level adapter that exposes an EmbeddingProtocolV1 implementation using
@@ -2048,6 +2307,10 @@ class WireEmbeddingHandler:
 
     Note: The wire contract currently does NOT carry metadata/metadatas. Those
     fields are local-only conveniences and must be populated by in-process callers.
+
+    Important: This handler only supports unary operations. Streaming operations
+    require transport-specific handling and cannot be fully represented in a
+    single JSON response envelope.
     """
 
     def __init__(self, adapter: EmbeddingProtocolV1):
@@ -2059,10 +2322,11 @@ class WireEmbeddingHandler:
 
         Supports:
             - embedding.capabilities
-            - embedding.embed
+            - embedding.embed (non-streaming only)
             - embedding.embed_batch
             - embedding.count_tokens
             - embedding.health
+            - embedding.get_stats
         """
         t0 = time.monotonic()
         try:
@@ -2078,11 +2342,19 @@ class WireEmbeddingHandler:
                 return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
 
             if op == "embedding.embed":
+                # Check for streaming - wire handler doesn't support streaming responses
+                if args.get("stream", False):
+                    raise NotSupported(
+                        "streaming embeddings not supported via wire handler - "
+                        "use transport-specific streaming implementation"
+                    )
+                
                 spec = EmbedSpec(
                     text=args.get("text", ""),
                     model=args.get("model", ""),
                     truncate=bool(args.get("truncate", True)),
                     normalize=bool(args.get("normalize", False)),
+                    stream=False,  # Force non-streaming for wire handler
                     metadata=None,  # metadata not in wire contract
                 )
                 res = await self._adapter.embed(spec, ctx=ctx)
@@ -2116,6 +2388,10 @@ class WireEmbeddingHandler:
                 res = await self._adapter.health(ctx=ctx)
                 return _success_to_wire(res, (time.monotonic() - t0) * 1000.0)
 
+            if op == "embedding.get_stats":
+                res = await self._adapter.get_stats(ctx=ctx)
+                return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
+
             raise NotSupported(f"unknown operation '{op}'")
 
         except Exception as e:
@@ -2133,6 +2409,8 @@ __all__ = [
     "EmbeddingVector",
     "EmbeddingResult",
     "EmbeddingBatch",
+    "EmbedChunk",
+    "EmbeddingStats",
     "EmbeddingAdapterError",
     "BadRequest",
     "AuthError",
@@ -2175,4 +2453,5 @@ __all__ = [
     "_ctx_from_wire",
     "_error_to_wire",
     "_success_to_wire",
+    "_stream_chunk_to_wire",
 ]
