@@ -49,14 +49,25 @@ A comprehensive registry lets you register per-framework LLM translators:
 
 This makes it straightforward to plug in framework-specific behaviors while
 reusing the common orchestration logic here.
+
+Post-processing overrides
+-------------------------
+Per-request LLM completion post-processing can be controlled via
+`OperationContext.attrs` using the following keys:
+
+- `llm_postprocess_enabled`: bool-like, enable/disable post-processing
+- `llm_postprocess_safety_filter`: bool-like, enable/disable safety filtering
+- `llm_postprocess_json_repair`: bool-like, enable/disable JSON repair
+- `llm_postprocess_output_format`: "text" | "json" | "markdown"
+- `llm_postprocess_max_length`: int-like, maximum output length in characters
 """
 
 from __future__ import annotations
 
-import logging
-import time
 import json
+import logging
 import re
+import time
 from dataclasses import asdict, dataclass
 from typing import (
     Any,
@@ -71,31 +82,28 @@ from typing import (
     Protocol,
     Sequence,
     Tuple,
-    TypeVar,
     Union,
 )
 
 from corpus_sdk.llm.llm_base import (
+    BadRequest,
+    LLMCapabilities,
+    LLMChunk,
+    LLMCompletion,
     LLMProtocolV1,
     OperationContext,
-    LLMCompletion,
-    LLMChunk,
-    LLMCapabilities,
-    BadRequest,
 )
 from corpus_sdk.llm.framework_adapters.common.message_translation import (
     NormalizedMessage,
-    to_corpus,
     from_generic_dict,
+    to_corpus,
 )
-from corpus_sdk.core.context_translation import from_dict as ctx_from_dict
-from corpus_sdk.core.sync_bridge import SyncStreamBridge
 from corpus_sdk.core.async_bridge import AsyncBridge
+from corpus_sdk.core.context_translation import from_dict as ctx_from_dict
 from corpus_sdk.core.error_context import attach_context
+from corpus_sdk.core.sync_bridge import SyncStreamBridge
 
 LOG = logging.getLogger(__name__)
-
-T = TypeVar("T")
 
 
 # =============================================================================
@@ -121,11 +129,13 @@ class TokenCountingConfig:
 
         custom_format_template:
             Template string for custom formatting. Use {role} and {content}
-            placeholders. Example: "<|im_start|>{role}\n{content}<|im_end|>\n"
+            placeholders. Example: "<|im_start|>{role}\\n{content}<|im_end|>\\n"
 
         include_system_in_messages:
-            Whether to include system messages in the main message count
-            or handle them separately.
+            When True, the system message (if any) is embedded into the
+            formatted text for token counting. When False, system messages
+            are omitted from the formatted text (callers may count them
+            separately if desired).
 
         add_special_tokens:
             Whether to account for special tokens (BOS/EOS) in count.
@@ -137,7 +147,7 @@ class TokenCountingConfig:
     include_system_in_messages: bool = True
     add_special_tokens: bool = True
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         """Validate token counting configuration."""
         valid_strategies = {"simple", "openai_chatml", "anthropic", "custom"}
         if self.format_strategy not in valid_strategies:
@@ -145,12 +155,23 @@ class TokenCountingConfig:
                 f"format_strategy must be one of {valid_strategies}, got {self.format_strategy}"
             )
         if self.format_strategy == "custom" and not self.custom_format_template:
-            raise ValueError("custom_format_template is required when format_strategy='custom'")
+            raise ValueError(
+                "custom_format_template is required when format_strategy='custom'"
+            )
 
 
 # =============================================================================
 # Enhanced Tool Validation
 # =============================================================================
+
+
+class ToolValidationError(BadRequest):
+    """
+    Specialized BadRequest subtype for tool schema and tool_choice validation.
+
+    This keeps external behavior compatible with BadRequest while allowing
+    downstream systems to distinguish tool-related issues if desired.
+    """
 
 
 class ToolValidator:
@@ -169,82 +190,99 @@ class ToolValidator:
         """
         Validate a single tool schema for LLM compatibility.
 
-        Raises BadRequest with detailed error messages if validation fails.
+        Raises ToolValidationError with detailed error messages if validation fails.
         """
         if not isinstance(tool, dict):
-            raise BadRequest("Tool must be a dictionary", code="BAD_TOOL_SCHEMA")
+            raise ToolValidationError(
+                "Tool must be a dictionary",
+                code="BAD_TOOL_SCHEMA",
+                details={"received_type": type(tool).__name__},
+            )
 
         # Check tool type
         tool_type = tool.get("type")
         if tool_type != "function":
-            raise BadRequest(
+            raise ToolValidationError(
                 f"Tool type must be 'function', got {tool_type!r}",
                 code="BAD_TOOL_TYPE",
-                details={"supported_types": ["function"]},
+                details={"supported_types": ["function"], "received_type": tool_type},
             )
 
         # Check function definition
         function_def = tool.get("function")
         if not isinstance(function_def, dict):
-            raise BadRequest(
+            raise ToolValidationError(
                 "Tool must contain a 'function' dictionary",
                 code="BAD_TOOL_FUNCTION",
+                details={"received_type": type(function_def).__name__},
             )
 
         # Validate required function keys
         missing_keys = cls.REQUIRED_FUNCTION_KEYS - set(function_def.keys())
         if missing_keys:
-            raise BadRequest(
+            raise ToolValidationError(
                 f"Tool function missing required keys: {missing_keys}",
                 code="BAD_TOOL_FUNCTION_KEYS",
-                details={"required_keys": list(cls.REQUIRED_FUNCTION_KEYS)},
+                details={
+                    "required_keys": sorted(cls.REQUIRED_FUNCTION_KEYS),
+                    "missing_keys": sorted(missing_keys),
+                },
             )
 
         # Validate function name
         name = function_def.get("name", "")
         if not isinstance(name, str) or not name.strip():
-            raise BadRequest(
+            raise ToolValidationError(
                 "Tool function name must be a non-empty string",
                 code="BAD_TOOL_NAME",
+                details={"received_value": name},
             )
 
         # Validate parameters schema
         parameters = function_def.get("parameters", {})
         if not isinstance(parameters, dict):
-            raise BadRequest(
+            raise ToolValidationError(
                 "Tool function parameters must be a dictionary",
                 code="BAD_TOOL_PARAMETERS",
+                details={"received_type": type(parameters).__name__},
             )
 
         # Validate required parameters keys
         missing_param_keys = cls.REQUIRED_PARAMETERS_KEYS - set(parameters.keys())
         if missing_param_keys:
-            raise BadRequest(
+            raise ToolValidationError(
                 f"Tool parameters missing required keys: {missing_param_keys}",
                 code="BAD_TOOL_PARAMETERS_KEYS",
-                details={"required_keys": list(cls.REQUIRED_PARAMETERS_KEYS)},
+                details={
+                    "required_keys": sorted(cls.REQUIRED_PARAMETERS_KEYS),
+                    "missing_keys": sorted(missing_param_keys),
+                },
             )
 
         # Validate parameters type
         param_type = parameters.get("type")
         if param_type != "object":
-            raise BadRequest(
+            raise ToolValidationError(
                 f"Parameters type must be 'object', got {param_type!r}",
                 code="BAD_TOOL_PARAMETERS_TYPE",
+                details={"received_type": param_type},
             )
 
         # Validate properties
         properties = parameters.get("properties", {})
         if not isinstance(properties, dict):
-            raise BadRequest(
+            raise ToolValidationError(
                 "Parameters properties must be a dictionary",
                 code="BAD_TOOL_PROPERTIES",
+                details={"received_type": type(properties).__name__},
             )
 
     @classmethod
     def validate_tool_choice(cls, tool_choice: Any) -> None:
         """
         Validate tool_choice parameter for LLM compatibility.
+
+        Raises ToolValidationError with detailed error messages if validation fails.
         """
         if tool_choice is None:
             return
@@ -252,20 +290,27 @@ class ToolValidator:
         if isinstance(tool_choice, str):
             valid_choices = {"auto", "none", "required"}
             if tool_choice not in valid_choices:
-                raise BadRequest(
+                raise ToolValidationError(
                     f"tool_choice must be one of {valid_choices}, got {tool_choice!r}",
                     code="BAD_TOOL_CHOICE",
+                    details={
+                        "valid_choices": sorted(valid_choices),
+                        "received_value": tool_choice,
+                    },
                 )
         elif isinstance(tool_choice, dict):
-            if "type" not in tool_choice or "function" not in tool_choice:
-                raise BadRequest(
+            missing = [key for key in ("type", "function") if key not in tool_choice]
+            if missing:
+                raise ToolValidationError(
                     "tool_choice dict must contain 'type' and 'function' keys",
                     code="BAD_TOOL_CHOICE_DICT",
+                    details={"missing_keys": missing},
                 )
         else:
-            raise BadRequest(
+            raise ToolValidationError(
                 "tool_choice must be a string or dictionary",
                 code="BAD_TOOL_CHOICE_TYPE",
+                details={"received_type": type(tool_choice).__name__},
             )
 
 
@@ -309,13 +354,14 @@ class LLMPostProcessingConfig:
     max_length: Optional[int] = None
     custom_processors: Optional[List[Callable[[LLMCompletion], LLMCompletion]]] = None
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         """Validate post-processing configuration."""
         if self.output_format and self.output_format not in {"text", "json", "markdown"}:
             raise ValueError(
-                f"output_format must be one of 'text', 'json', 'markdown', got {self.output_format}"
+                "output_format must be one of 'text', 'json', 'markdown', "
+                f"got {self.output_format}"
             )
-        if self.max_length and self.max_length <= 0:
+        if self.max_length is not None and self.max_length <= 0:
             raise ValueError(f"max_length must be positive, got {self.max_length}")
 
 
@@ -358,7 +404,9 @@ class TranslatorMetrics:
         if not success:
             self.translation_errors += 1
         if self.message_translations > 0:
-            self.avg_translation_time = self.total_translation_time / self.message_translations
+            self.avg_translation_time = (
+                self.total_translation_time / self.message_translations
+            )
 
     def record_validation_error(self) -> None:
         """Record a validation error."""
@@ -393,54 +441,56 @@ class TranslatorMetrics:
 class SafetyFilter:
     """
     Content safety filtering for LLM completions.
-    
+
     Provides configurable safety checks for LLM outputs including
     profanity filtering, PII detection, and content moderation.
     """
 
     # Common profanity patterns (simplified for example)
     PROFANITY_PATTERNS = [
-        r'\b(asshole|bastard|bitch|damn|fuck|shit)\b',
-        r'\b(cunt|dick|piss|whore)\b',
+        r"\b(asshole|bastard|bitch|damn|fuck|shit)\b",
+        r"\b(cunt|dick|piss|whore)\b",
     ]
 
-    # PII patterns
+    # PII patterns (simplified)
     PII_PATTERNS = [
-        r'\b\d{3}-\d{2}-\d{4}\b',  # SSN
-        r'\b\d{16}\b',  # Credit card
-        r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',  # Email
-        r'\b\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b',  # Phone
+        r"\b\d{3}-\d{2}-\d{4}\b",  # SSN
+        r"\b\d{16}\b",  # Credit card
+        r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b",  # Email
+        r"\b\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b",  # Phone
     ]
 
-    def __init__(self, filter_profanity: bool = True, filter_pii: bool = True):
+    # Compile regexes once at class-definition time for performance
+    _PROFANITY_REGEX = re.compile("|".join(PROFANITY_PATTERNS), re.IGNORECASE)
+    _PII_REGEX = re.compile("|".join(PII_PATTERNS))
+
+    def __init__(self, filter_profanity: bool = True, filter_pii: bool = True) -> None:
         self.filter_profanity = filter_profanity
         self.filter_pii = filter_pii
-        self.profanity_regex = re.compile('|'.join(self.PROFANITY_PATTERNS), re.IGNORECASE)
-        self.pii_regex = re.compile('|'.join(self.PII_PATTERNS))
 
     def filter_content(self, text: str) -> Tuple[str, List[str]]:
         """
         Filter content for safety issues.
-        
+
         Returns:
             Tuple of (filtered_text, list_of_violations)
         """
-        violations = []
+        violations: List[str] = []
         filtered_text = text
 
         if self.filter_profanity:
-            profanity_matches = self.profanity_regex.findall(text)
+            profanity_matches = self._PROFANITY_REGEX.findall(text)
             if profanity_matches:
-                violations.append(f"Profanity detected: {', '.join(set(profanity_matches))}")
-                # Replace profanity with [REDACTED]
-                filtered_text = self.profanity_regex.sub('[REDACTED]', filtered_text)
+                violations.append(
+                    f"Profanity detected: {', '.join(sorted(set(profanity_matches)))}"
+                )
+                filtered_text = self._PROFANITY_REGEX.sub("[REDACTED]", filtered_text)
 
         if self.filter_pii:
-            pii_matches = self.pii_regex.findall(text)
+            pii_matches = self._PII_REGEX.findall(text)
             if pii_matches:
-                violations.append(f"PII detected: {', '.join(set(pii_matches))}")
-                # Replace PII with [REDACTED]
-                filtered_text = self.pii_regex.sub('[REDACTED]', filtered_text)
+                violations.append("PII detected")
+                filtered_text = self._PII_REGEX.sub("[REDACTED]", filtered_text)
 
         return filtered_text, violations
 
@@ -453,7 +503,7 @@ class SafetyFilter:
 class JSONRepair:
     """
     Robust JSON repair for malformed LLM outputs.
-    
+
     Handles common JSON formatting issues in LLM completions including
     unclosed brackets, trailing commas, and missing quotes.
     """
@@ -462,90 +512,440 @@ class JSONRepair:
     def repair_json(text: str) -> str:
         """
         Attempt to repair common JSON formatting issues.
-        
+
         Handles:
         - Unclosed brackets and braces
         - Trailing commas
         - Missing quotes around keys
-        - Unescaped quotes in strings
+        - (Optionally) unescaped quotes in strings
         """
-        if not text.strip():
+        stripped = text.strip()
+        if not stripped:
+            return text
+
+        # Fast-path exit: if there are no obvious JSON structural characters,
+        # there is nothing to repair.
+        if "{" not in stripped and "[" not in stripped:
             return text
 
         # Try parsing first - if it works, return as-is
         try:
-            json.loads(text)
-            return text
+            json.loads(stripped)
+            return stripped
         except json.JSONDecodeError:
-            pass  # Continue with repair attempts
+            pass
 
-        repaired = text.strip()
+        repaired = stripped
 
-        # Balance brackets and braces
-        open_braces = repaired.count('{') - repaired.count('}')
-        open_brackets = repaired.count('[') - repaired.count(']')
+        # Balance braces and brackets
+        open_braces = repaired.count("{") - repaired.count("}")
+        open_brackets = repaired.count("[") - repaired.count("]")
 
-        # Add missing closing braces
         if open_braces > 0:
-            repaired += '}' * open_braces
+            repaired += "}" * open_braces
         elif open_braces < 0:
-            repaired = '{' * (-open_braces) + repaired
+            repaired = "{" * (-open_braces) + repaired
 
-        # Add missing closing brackets
         if open_brackets > 0:
-            repaired += ']' * open_brackets
+            repaired += "]" * open_brackets
         elif open_brackets < 0:
-            repaired = '[' * (-open_brackets) + repaired
+            repaired = "[" * (-open_brackets) + repaired
 
         # Remove trailing commas before closing braces/brackets
-        repaired = re.sub(r',\s*([}\]])', r'\1', repaired)
+        repaired = re.sub(r",\s*([}\]])", r"\1", repaired)
 
         # Add missing quotes around keys (simple heuristic)
-        repaired = re.sub(r'(\{|,)\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r'\1 "\2":', repaired)
+        repaired = re.sub(
+            r"(\{|,)\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:",
+            r'\1 "\2":',
+            repaired,
+        )
 
-        # Handle unescaped quotes in strings (basic)
-        def _escape_quotes(match: re.Match) -> str:
-            inner_text = match.group(1)
-            # Escape unescaped quotes within the string
-            escaped = inner_text.replace('"', '\\"')
-            return f'"{escaped}"'
-        
-        repaired = re.sub(r'(?<!\\)"([^"\\]*(\\.[^"\\]*)*)"', _escape_quotes, repaired)
+        # After structural fixes, try parsing again
+        try:
+            json.loads(repaired)
+            return repaired
+        except json.JSONDecodeError:
+            pass
 
+        # Detect obviously suspicious quotes (e.g., odd number of quotes)
+        quote_count = repaired.count('"')
+        if quote_count % 2 != 0:
+            # Only in this suspicious case do we attempt a more invasive
+            # escape of quotes inside string-like regions.
+            def _escape_quotes(match: re.Match) -> str:
+                inner_text = match.group(1)
+                escaped = inner_text.replace('"', '\\"')
+                return f'"{escaped}"'
+
+            repaired_with_escaped = re.sub(
+                r'(?<!\\)"([^"\\]*(\\.[^"\\]*)*)"',
+                _escape_quotes,
+                repaired,
+            )
+            return repaired_with_escaped
+
+        # If still not parseable and quotes look sane, return the structurally
+        # repaired version without further modifications.
         return repaired
 
     @staticmethod
-    def extract_and_repair_json(text: str) -> Optional[Dict[str, Any]]:
+    def _extract_first_balanced(
+        text: str,
+        opener: str,
+        closer: str,
+    ) -> Optional[Any]:
         """
-        Extract JSON from text and repair it if necessary.
-        
-        Returns parsed JSON dict or None if repair fails.
+        Extract first balanced JSON fragment using the given opener/closer.
+
+        Returns parsed JSON (dict or list) or None if extraction/parse fails.
         """
-        # Use a stack-based approach to find complete JSON objects
-        stack = []
+        stack: List[str] = []
         start_index = -1
-        
+
         for i, char in enumerate(text):
-            if char == '{':
+            if char == opener:
                 if not stack:
                     start_index = i
                 stack.append(char)
-            elif char == '}':
+            elif char == closer:
                 if stack:
                     stack.pop()
                     if not stack and start_index != -1:
-                        # Found a complete JSON object
-                        json_str = text[start_index:i+1]
+                        json_str = text[start_index : i + 1]
                         repaired = JSONRepair.repair_json(json_str)
                         try:
                             return json.loads(repaired)
                         except json.JSONDecodeError:
-                            # Continue searching for other JSON objects
                             start_index = -1
                 else:
                     start_index = -1
-        
+
         return None
+
+    @staticmethod
+    def extract_and_repair_json(text: str) -> Optional[Any]:
+        """
+        Extract JSON from text and repair it if necessary.
+
+        Returns parsed JSON (dict or list) or None if repair fails.
+        """
+        # Try to extract objects first
+        if "{" in text:
+            obj = JSONRepair._extract_first_balanced(text, "{", "}")
+            if obj is not None:
+                return obj
+
+        # Fallback: try to extract arrays
+        if "[" in text:
+            arr = JSONRepair._extract_first_balanced(text, "[", "]")
+            if arr is not None:
+                return arr
+
+        return None
+
+
+# =============================================================================
+# Completion Post-Processor (extracted for complexity management)
+# =============================================================================
+
+
+@dataclass
+class LLMCompletionPostProcessor:
+    """
+    Encapsulates completion post-processing logic (safety, JSON repair,
+    formatting, truncation) so that LLMTranslator remains focused on
+    orchestration concerns.
+
+    This class is stateless with respect to individual requests; per-request
+    overrides are derived from OperationContext.attrs.
+
+    Per-request override keys in OperationContext.attrs:
+        - llm_postprocess_enabled
+        - llm_postprocess_safety_filter
+        - llm_postprocess_json_repair
+        - llm_postprocess_output_format
+        - llm_postprocess_max_length
+    """
+
+    base_config: LLMPostProcessingConfig
+    safety_filter: SafetyFilter
+    json_repair: JSONRepair
+
+    # Attribute keys for per-request overrides
+    ATTR_ENABLED = "llm_postprocess_enabled"
+    ATTR_SAFETY_FILTER = "llm_postprocess_safety_filter"
+    ATTR_JSON_REPAIR = "llm_postprocess_json_repair"
+    ATTR_OUTPUT_FORMAT = "llm_postprocess_output_format"
+    ATTR_MAX_LENGTH = "llm_postprocess_max_length"
+
+    def apply(
+        self,
+        completion: LLMCompletion,
+        ctx: OperationContext,
+    ) -> LLMCompletion:
+        """
+        Apply post-processing to a completion using the base configuration
+        and any per-request overrides present in ctx.attrs.
+        """
+        config = self._resolve_config(ctx)
+
+        if not config.enabled:
+            return completion
+
+        result = completion
+
+        # Apply safety filtering
+        if config.safety_filter:
+            result = self._apply_safety_filtering(result)
+
+        # Apply JSON repair for tool calls/content
+        if config.json_repair:
+            result = self._apply_json_repair(result)
+
+        # Apply output formatting
+        if config.output_format:
+            result = self._apply_output_formatting(result, config)
+
+        # Apply length truncation
+        if config.max_length is not None:
+            result = self._apply_length_truncation(result, config.max_length)
+
+        # Apply any custom processors last
+        if config.custom_processors:
+            for processor in config.custom_processors:
+                try:
+                    result = processor(result)
+                except Exception as processor_exc:  # noqa: BLE001
+                    LOG.debug(
+                        "Custom post-processing processor failed: %s",
+                        processor_exc,
+                    )
+
+        return result
+
+    # ----- configuration resolution -------------------------------------------------
+
+    def _resolve_config(self, ctx: OperationContext) -> LLMPostProcessingConfig:
+        """
+        Resolve the effective post-processing configuration for this request.
+
+        If no override-related attributes are present, the base configuration
+        is returned directly to avoid unnecessary allocations.
+        """
+        attrs = ctx.attrs or {}
+        override_keys = {
+            self.ATTR_ENABLED,
+            self.ATTR_SAFETY_FILTER,
+            self.ATTR_JSON_REPAIR,
+            self.ATTR_OUTPUT_FORMAT,
+            self.ATTR_MAX_LENGTH,
+        }
+
+        if not any(key in attrs for key in override_keys):
+            return self.base_config
+
+        enabled = self._coerce_bool(attrs.get(self.ATTR_ENABLED), self.base_config.enabled)
+        safety_filter = self._coerce_bool(
+            attrs.get(self.ATTR_SAFETY_FILTER),
+            self.base_config.safety_filter,
+        )
+        json_repair = self._coerce_bool(
+            attrs.get(self.ATTR_JSON_REPAIR),
+            self.base_config.json_repair,
+        )
+
+        output_format = attrs.get(self.ATTR_OUTPUT_FORMAT, self.base_config.output_format)
+        max_length_raw = attrs.get(self.ATTR_MAX_LENGTH, self.base_config.max_length)
+        max_length = self._coerce_int(max_length_raw)
+
+        if max_length is None and isinstance(self.base_config.max_length, int):
+            max_length = self.base_config.max_length
+
+        return LLMPostProcessingConfig(
+            enabled=enabled,
+            safety_filter=safety_filter,
+            json_repair=json_repair,
+            output_format=output_format,
+            max_length=max_length,
+            custom_processors=self.base_config.custom_processors,
+        )
+
+    @staticmethod
+    def _coerce_bool(value: Any, default: bool) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"true", "1", "yes", "y", "on"}:
+                return True
+            if lowered in {"false", "0", "no", "n", "off"}:
+                return False
+        return bool(value)
+
+    @staticmethod
+    def _coerce_int(value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        if isinstance(value, int):
+            return value
+        try:
+            return int(str(value).strip())
+        except (TypeError, ValueError):
+            return None
+
+    # ----- concrete processing steps ------------------------------------------------
+
+    def _apply_safety_filtering(self, completion: LLMCompletion) -> LLMCompletion:
+        """Apply comprehensive safety/content filtering."""
+        filtered_text, violations = self.safety_filter.filter_content(completion.text)
+
+        if violations:
+            LOG.warning(
+                "Safety filtering applied to completion: %s",
+                "; ".join(violations),
+            )
+
+        repaired_tool_calls = completion.tool_calls
+        if violations and completion.tool_calls:
+            # Keep the original tool calls; we don't mutate them based on
+            # safety filtering alone at this layer.
+            repaired_tool_calls = completion.tool_calls
+
+        return LLMCompletion(
+            text=filtered_text,
+            model=completion.model,
+            model_family=completion.model_family,
+            usage=completion.usage,
+            finish_reason=completion.finish_reason,
+            tool_calls=repaired_tool_calls,
+        )
+
+    def _apply_json_repair(self, completion: LLMCompletion) -> LLMCompletion:
+        """Attempt to repair malformed JSON in tool calls and content."""
+        repaired_tool_calls: List[Any] = []
+
+        # Repair tool calls
+        for tool_call in completion.tool_calls:
+            try:
+                original_args = tool_call.function.arguments
+
+                # Only attempt repair if arguments are a string-like JSON payload
+                if not isinstance(original_args, str):
+                    repaired_tool_calls.append(tool_call)
+                    continue
+
+                repaired_args = self.json_repair.repair_json(original_args)
+                parsed_args = json.loads(repaired_args)
+
+                repaired_tool_call = type(tool_call)(
+                    id=tool_call.id,
+                    type=tool_call.type,
+                    function=type(tool_call.function)(
+                        name=tool_call.function.name,
+                        arguments=json.dumps(parsed_args),
+                    ),
+                )
+                repaired_tool_calls.append(repaired_tool_call)
+            except (json.JSONDecodeError, AttributeError, TypeError) as exc:
+                # Non-fatal: keep the original tool call, just log at debug.
+                LOG.debug(
+                    "Failed to repair JSON in tool call %s: %s",
+                    getattr(tool_call, "id", "<unknown>"),
+                    exc,
+                )
+                repaired_tool_calls.append(tool_call)
+
+        # Repair JSON in text content if it appears to be JSON
+        repaired_text = completion.text
+        stripped = completion.text.strip()
+        if stripped.startswith(("{", "[")):
+            try:
+                json.loads(stripped)
+            except json.JSONDecodeError:
+                repaired_json = self.json_repair.repair_json(stripped)
+                try:
+                    json.loads(repaired_json)
+                    repaired_text = repaired_json
+                    LOG.info("Repaired JSON in completion text")
+                except json.JSONDecodeError:
+                    LOG.warning("Failed to repair JSON in completion text")
+
+        return LLMCompletion(
+            text=repaired_text,
+            model=completion.model,
+            model_family=completion.model_family,
+            usage=completion.usage,
+            finish_reason=completion.finish_reason,
+            tool_calls=repaired_tool_calls,
+        )
+
+    def _apply_output_formatting(
+        self,
+        completion: LLMCompletion,
+        config: LLMPostProcessingConfig,
+    ) -> LLMCompletion:
+        """Apply output format constraints."""
+        if config.output_format == "json":
+            stripped = completion.text.strip()
+            if not stripped.startswith(("{", "[")):
+                extracted_json = self.json_repair.extract_and_repair_json(stripped)
+                if extracted_json is not None:
+                    formatted_text = json.dumps(extracted_json, indent=2)
+                else:
+                    formatted_text = json.dumps({"text": completion.text}, indent=2)
+                return LLMCompletion(
+                    text=formatted_text,
+                    model=completion.model,
+                    model_family=completion.model_family,
+                    usage=completion.usage,
+                    finish_reason=completion.finish_reason,
+                    tool_calls=completion.tool_calls,
+                )
+
+        elif config.output_format == "markdown":
+            if not any(ch in completion.text for ch in "#*`["):
+                formatted_text = f"```text\n{completion.text}\n```"
+                return LLMCompletion(
+                    text=formatted_text,
+                    model=completion.model,
+                    model_family=completion.model_family,
+                    usage=completion.usage,
+                    finish_reason=completion.finish_reason,
+                    tool_calls=completion.tool_calls,
+                )
+
+        return completion
+
+    @staticmethod
+    def _apply_length_truncation(
+        completion: LLMCompletion,
+        max_length: int,
+    ) -> LLMCompletion:
+        """Truncate completion if it exceeds max length."""
+        if max_length <= 0 or len(completion.text) <= max_length:
+            return completion
+
+        truncated_text = completion.text[:max_length]
+        last_period = truncated_text.rfind(".")
+        last_newline = truncated_text.rfind("\n")
+        cutoff = max(last_period, last_newline)
+
+        if cutoff > max_length * 0.7:
+            truncated_text = truncated_text[: cutoff + 1] + " [truncated]"
+        else:
+            truncated_text = truncated_text + " [truncated]"
+
+        return LLMCompletion(
+            text=truncated_text,
+            model=completion.model,
+            model_family=completion.model_family,
+            usage=completion.usage,
+            finish_reason="length",
+            tool_calls=completion.tool_calls,
+        )
 
 
 # =============================================================================
@@ -587,8 +987,6 @@ def _ensure_llm_operation_context(
             code="BAD_OPERATION_CONTEXT",
         )
 
-    # Reconstruct as LLM OperationContext with validation and without
-    # leaking any framework-native details.
     return OperationContext(
         request_id=getattr(core_ctx, "request_id", None),
         idempotency_key=getattr(core_ctx, "idempotency_key", None),
@@ -867,11 +1265,14 @@ class DefaultLLMFrameworkTranslator:
             else:
                 raw_seq = raw_messages
 
-            if not isinstance(raw_seq, Iterable) or isinstance(raw_seq, (str, bytes)):
+            if not isinstance(raw_seq, Iterable) or isinstance(
+                raw_seq, (str, bytes)
+            ):
                 self._metrics.record_validation_error()
                 raise BadRequest(
                     "raw_messages must be a mapping or iterable of messages",
                     code="BAD_MESSAGES",
+                    details={"received_type": type(raw_seq).__name__},
                 )
 
             messages: List[NormalizedMessage] = []
@@ -930,17 +1331,14 @@ class DefaultLLMFrameworkTranslator:
         system_message: Optional[str] = None
         remaining: List[NormalizedMessage] = []
 
-        # Only extract system messages from the beginning of the conversation
         extracting_system = True
         for msg in normalized_messages:
             if extracting_system and msg.role == "system":
                 if system_message is None:
                     system_message = msg.content
                 else:
-                    # Append to existing system message for multiple system messages at start
                     system_message += "\n" + msg.content
             else:
-                # Once we hit a non-system message, stop extracting
                 extracting_system = False
                 remaining.append(msg)
 
@@ -964,6 +1362,7 @@ class DefaultLLMFrameworkTranslator:
             raise BadRequest(
                 "tools must be a mapping or a sequence of mappings",
                 code="BAD_TOOLS",
+                details={"received_type": type(raw_tools).__name__},
             )
 
         tools: List[Dict[str, Any]] = []
@@ -976,15 +1375,13 @@ class DefaultLLMFrameworkTranslator:
                     details={"index": idx, "type": type(t).__name__},
                 )
 
-            # Enhanced tool validation
             try:
                 self._tool_validator.validate_tool_schema(dict(t))
                 self._metrics.record_tool_translation()
-            except BadRequest as e:
+            except ToolValidationError as exc:
                 self._metrics.record_validation_error()
-                # Add context about which tool failed
-                e.details = e.details or {}
-                e.details["tool_index"] = idx
+                exc.details = exc.details or {}
+                exc.details.setdefault("tool_index", idx)
                 raise
 
             tools.append(dict(t))
@@ -1001,10 +1398,9 @@ class DefaultLLMFrameworkTranslator:
         if raw_tool_choice is None:
             return None
 
-        # Enhanced tool choice validation
         try:
             self._tool_validator.validate_tool_choice(raw_tool_choice)
-        except BadRequest:
+        except ToolValidationError:
             self._metrics.record_validation_error()
             raise
 
@@ -1137,7 +1533,15 @@ class DefaultLLMFrameworkTranslator:
             return []
         if isinstance(tool_outputs, list):
             return tool_outputs
-        return [tool_outputs] if isinstance(tool_outputs, dict) else []
+        if isinstance(tool_outputs, dict):
+            return [tool_outputs]
+
+        # Stricter behavior: surface mis-typed tool outputs early.
+        raise BadRequest(
+            "tool_outputs must be a list or dict when not None",
+            code="BAD_TOOL_OUTPUTS",
+            details={"received_type": type(tool_outputs).__name__},
+        )
 
     def preferred_model(
         self,
@@ -1210,13 +1614,20 @@ class LLMTranslator:
         framework: str = "generic",
         translator: Optional[LLMFrameworkTranslator] = None,
         post_processing_config: Optional[LLMPostProcessingConfig] = None,
+        safety_filter: Optional[SafetyFilter] = None,
+        json_repair: Optional[JSONRepair] = None,
     ) -> None:
         self._adapter = adapter
         self._framework = framework
-        self._translator: LLMFrameworkTranslator = translator or DefaultLLMFrameworkTranslator()
+        self._translator: LLMFrameworkTranslator = (
+            translator or DefaultLLMFrameworkTranslator()
+        )
         self._post_processing_config = post_processing_config or LLMPostProcessingConfig()
-        self._safety_filter = SafetyFilter()
-        self._json_repair = JSONRepair()
+        self._post_processor = LLMCompletionPostProcessor(
+            base_config=self._post_processing_config,
+            safety_filter=safety_filter or SafetyFilter(),
+            json_repair=json_repair or JSONRepair(),
+        )
 
     # --------------------------------------------------------------------- #
     # Enhanced Token Counting Helpers
@@ -1235,233 +1646,72 @@ class LLMTranslator:
         """
         parts: List[str] = []
 
-        # Add token overhead for special tokens if configured
         special_tokens_overhead = 0
         if token_config.add_special_tokens:
             if token_config.format_strategy == "openai_chatml":
-                special_tokens_overhead = 20  # Approximate overhead for ChatML tokens
+                special_tokens_overhead = 20  # Approximate ChatML overhead
             elif token_config.format_strategy == "anthropic":
-                special_tokens_overhead = 10  # Approximate overhead for Anthropic formatting
+                special_tokens_overhead = 10  # Approximate Anthropic overhead
 
         if token_config.format_strategy == "simple":
-            # Simple "role: content" format
-            if system_message and not token_config.include_system_in_messages:
+            if system_message and token_config.include_system_in_messages:
                 parts.append(f"system:{system_message}")
             for msg in normalized_messages:
                 parts.append(f"{msg.role}:{msg.content}")
 
         elif token_config.format_strategy == "openai_chatml":
-            # OpenAI ChatML template format
-            if system_message:
+            if system_message and token_config.include_system_in_messages:
                 parts.append(f"<|im_start|>system\n{system_message}<|im_end|>")
             for msg in normalized_messages:
                 parts.append(f"<|im_start|>{msg.role}\n{msg.content}<|im_end|>")
 
         elif token_config.format_strategy == "anthropic":
-            # Anthropic-specific formatting
-            if system_message:
+            if system_message and token_config.include_system_in_messages:
                 parts.append(f"System: {system_message}")
             for msg in normalized_messages:
                 role_display = "Human" if msg.role == "user" else "Assistant"
                 parts.append(f"\n\n{role_display}: {msg.content}")
 
-        elif token_config.format_strategy == "custom" and token_config.custom_format_template:
-            # Custom template formatting
+        elif (
+            token_config.format_strategy == "custom"
+            and token_config.custom_format_template
+        ):
             template = token_config.custom_format_template
-            if system_message and not token_config.include_system_in_messages:
+            if system_message and token_config.include_system_in_messages:
                 parts.append(template.format(role="system", content=system_message))
             for msg in normalized_messages:
                 parts.append(template.format(role=msg.role, content=msg.content))
 
         else:
-            # Fallback to simple format
-            if system_message and not token_config.include_system_in_messages:
+            if system_message and token_config.include_system_in_messages:
                 parts.append(f"system:{system_message}")
             for msg in normalized_messages:
                 parts.append(f"{msg.role}:{msg.content}")
 
         formatted_text = "\n".join(parts)
-        
-        # Add special tokens overhead as whitespace (simplified approach)
+
         if token_config.add_special_tokens and special_tokens_overhead > 0:
             formatted_text += " " * special_tokens_overhead
 
         return formatted_text
 
-    def _apply_post_processing(self, completion: LLMCompletion) -> LLMCompletion:
+    @staticmethod
+    def _coerce_token_count(result: Any) -> int:
         """
-        Apply post-processing to LLM completions (safety, formatting, etc.).
+        Coerce adapter.count_tokens result into an int, or raise BadRequest.
         """
-        if not self._post_processing_config.enabled:
-            return completion
-
-        result = completion
-
-        # Apply safety filtering
-        if self._post_processing_config.safety_filter:
-            result = self._apply_safety_filtering(result)
-
-        # Apply JSON repair for tool calls
-        if self._post_processing_config.json_repair:
-            result = self._apply_json_repair(result)
-
-        # Apply output formatting
-        if self._post_processing_config.output_format:
-            result = self._apply_output_formatting(result)
-
-        # Apply length truncation
-        if self._post_processing_config.max_length:
-            result = self._apply_length_truncation(result)
-
-        # Apply custom processors
-        if self._post_processing_config.custom_processors:
-            for processor in self._post_processing_config.custom_processors:
-                result = processor(result)
-
-        return result
-
-    def _apply_safety_filtering(self, completion: LLMCompletion) -> LLMCompletion:
-        """Apply comprehensive safety/content filtering."""
-        filtered_text, violations = self._safety_filter.filter_content(completion.text)
-        
-        # Log safety violations
-        if violations:
-            LOG.warning(
-                "Safety filtering applied to completion: %s",
-                "; ".join(violations)
-            )
-
-        # Repair tool calls if safety filtering was applied
-        repaired_tool_calls = completion.tool_calls
-        if violations and completion.tool_calls:
-            # Re-parse tool calls if text was modified
+        if isinstance(result, (int, float)):
+            return int(result)
+        if isinstance(result, str):
             try:
-                # This is a simplified approach - in practice you might want more sophisticated repair
-                repaired_tool_calls = completion.tool_calls
-            except Exception:
-                LOG.warning("Failed to repair tool calls after safety filtering")
-                # Clear tool calls if we can't repair them safely
-                repaired_tool_calls = []
-
-        return LLMCompletion(
-            text=filtered_text,
-            model=completion.model,
-            model_family=completion.model_family,
-            usage=completion.usage,
-            finish_reason=completion.finish_reason,
-            tool_calls=repaired_tool_calls,
+                return int(float(result.strip()))
+            except ValueError:
+                pass
+        raise BadRequest(
+            "adapter.count_tokens returned non-numeric value",
+            code="BAD_ADAPTER_COUNT",
+            details={"received_type": type(result).__name__},
         )
-
-    def _apply_json_repair(self, completion: LLMCompletion) -> LLMCompletion:
-        """Attempt to repair malformed JSON in tool calls and content."""
-        repaired_tool_calls = []
-        
-        # Repair tool calls
-        for tool_call in completion.tool_calls:
-            try:
-                # Access tool_call.function.arguments for JSON arguments
-                original_args = tool_call.function.arguments
-                repaired_args = self._json_repair.repair_json(original_args)
-                parsed_args = json.loads(repaired_args)
-                
-                # Create repaired tool call
-                repaired_tool_call = type(tool_call)(
-                    id=tool_call.id,
-                    type=tool_call.type,
-                    function=type(tool_call.function)(
-                        name=tool_call.function.name,
-                        arguments=json.dumps(parsed_args)
-                    )
-                )
-                repaired_tool_calls.append(repaired_tool_call)
-                
-            except (json.JSONDecodeError, AttributeError) as e:
-                # If repair fails, keep the original (might fail downstream)
-                LOG.warning("Failed to repair JSON in tool call %s: %s", tool_call.id, str(e))
-                repaired_tool_calls.append(tool_call)
-
-        # Repair JSON in text content if it looks like JSON
-        repaired_text = completion.text
-        if completion.text.strip().startswith(('{', '[')):
-            try:
-                json.loads(completion.text)
-            except json.JSONDecodeError:
-                repaired_json = self._json_repair.repair_json(completion.text)
-                try:
-                    json.loads(repaired_json)  # Validate repair
-                    repaired_text = repaired_json
-                    LOG.info("Repaired JSON in completion text")
-                except json.JSONDecodeError:
-                    LOG.warning("Failed to repair JSON in completion text")
-
-        return LLMCompletion(
-            text=repaired_text,
-            model=completion.model,
-            model_family=completion.model_family,
-            usage=completion.usage,
-            finish_reason=completion.finish_reason,
-            tool_calls=repaired_tool_calls,
-        )
-
-    def _apply_output_formatting(self, completion: LLMCompletion) -> LLMCompletion:
-        """Apply output format constraints."""
-        if self._post_processing_config.output_format == "json":
-            # Ensure output is valid JSON
-            if not completion.text.strip().startswith(('{', '[')):
-                # Try to extract JSON from text
-                extracted_json = self._json_repair.extract_and_repair_json(completion.text)
-                if extracted_json:
-                    formatted_text = json.dumps(extracted_json, indent=2)
-                else:
-                    # Wrap in JSON object as fallback
-                    formatted_text = json.dumps({"text": completion.text}, indent=2)
-                return LLMCompletion(
-                    text=formatted_text,
-                    model=completion.model,
-                    model_family=completion.model_family,
-                    usage=completion.usage,
-                    finish_reason=completion.finish_reason,
-                    tool_calls=completion.tool_calls,
-                )
-        
-        elif self._post_processing_config.output_format == "markdown":
-            # Ensure text has basic markdown structure if it doesn't already
-            if not any(char in completion.text for char in '#*`['):
-                formatted_text = f"```text\n{completion.text}\n```"
-                return LLMCompletion(
-                    text=formatted_text,
-                    model=completion.model,
-                    model_family=completion.model_family,
-                    usage=completion.usage,
-                    finish_reason=completion.finish_reason,
-                    tool_calls=completion.tool_calls,
-                )
-
-        return completion
-
-    def _apply_length_truncation(self, completion: LLMCompletion) -> LLMCompletion:
-        """Truncate completion if it exceeds max length."""
-        if self._post_processing_config.max_length and len(completion.text) > self._post_processing_config.max_length:
-            truncated_text = completion.text[:self._post_processing_config.max_length]
-            # Try to truncate at sentence boundary
-            last_period = truncated_text.rfind('.')
-            last_newline = truncated_text.rfind('\n')
-            cutoff = max(last_period, last_newline)
-            
-            if cutoff > self._post_processing_config.max_length * 0.7:  # Only if we can preserve most content
-                truncated_text = truncated_text[:cutoff + 1] + " [truncated]"
-            else:
-                truncated_text += " [truncated]"
-                
-            return LLMCompletion(
-                text=truncated_text,
-                model=completion.model,
-                model_family=completion.model_family,
-                usage=completion.usage,
-                finish_reason="length",
-                tool_calls=completion.tool_calls,
-            )
-        return completion
 
     # --------------------------------------------------------------------- #
     # Sync Complete (uses AsyncBridge)
@@ -1511,7 +1761,9 @@ class LLMTranslator:
                     framework_ctx=framework_ctx,
                 )
 
-                effective_system = system_message if system_message is not None else auto_system
+                effective_system = (
+                    system_message if system_message is not None else auto_system
+                )
                 tools_corpus = self._translator.build_tools(
                     tools,
                     op_ctx=ctx,
@@ -1550,8 +1802,7 @@ class LLMTranslator:
                         code="BAD_ADAPTER_RESULT",
                     )
 
-                # Apply post-processing
-                result_processed = self._apply_post_processing(result)
+                result_processed = self._post_processor.apply(result, ctx)
 
                 return self._translator.from_completion(
                     result_processed,
@@ -1562,6 +1813,8 @@ class LLMTranslator:
                 attach_context(
                     exc,
                     framework=self._framework,
+                    resource_type="llm",
+                    operation="complete",
                     llm_operation="complete",
                     request_id=ctx.request_id,
                     tenant=ctx.tenant,
@@ -1616,7 +1869,9 @@ class LLMTranslator:
                 framework_ctx=framework_ctx,
             )
 
-            effective_system = system_message if system_message is not None else auto_system
+            effective_system = (
+                system_message if system_message is not None else auto_system
+            )
             tools_corpus = self._translator.build_tools(
                 tools,
                 op_ctx=ctx,
@@ -1655,8 +1910,7 @@ class LLMTranslator:
                     code="BAD_ADAPTER_RESULT",
                 )
 
-            # Apply post-processing
-            result_processed = self._apply_post_processing(result)
+            result_processed = self._post_processor.apply(result, ctx)
 
             return self._translator.from_completion(
                 result_processed,
@@ -1667,6 +1921,8 @@ class LLMTranslator:
             attach_context(
                 exc,
                 framework=self._framework,
+                resource_type="llm",
+                operation="complete",
                 llm_operation="complete",
                 request_id=ctx.request_id,
                 tenant=ctx.tenant,
@@ -1722,7 +1978,9 @@ class LLMTranslator:
                     framework_ctx=framework_ctx,
                 )
 
-                effective_system = system_message if system_message is not None else auto_system
+                effective_system = (
+                    system_message if system_message is not None else auto_system
+                )
                 tools_corpus = self._translator.build_tools(
                     tools,
                     op_ctx=ctx,
@@ -1770,6 +2028,8 @@ class LLMTranslator:
                 attach_context(
                     exc,
                     framework=self._framework,
+                    resource_type="llm",
+                    operation="stream",
                     llm_operation="stream",
                     request_id=ctx.request_id,
                     tenant=ctx.tenant,
@@ -1833,7 +2093,9 @@ class LLMTranslator:
                 framework_ctx=framework_ctx,
             )
 
-            effective_system = system_message if system_message is not None else auto_system
+            effective_system = (
+                system_message if system_message is not None else auto_system
+            )
             tools_corpus = self._translator.build_tools(
                 tools,
                 op_ctx=ctx,
@@ -1881,6 +2143,8 @@ class LLMTranslator:
             attach_context(
                 exc,
                 framework=self._framework,
+                resource_type="llm",
+                operation="stream",
                 llm_operation="stream",
                 request_id=ctx.request_id,
                 tenant=ctx.tenant,
@@ -1912,8 +2176,9 @@ class LLMTranslator:
                     model=model,
                     ctx=ctx,
                 )
+                numeric = self._coerce_token_count(result)
                 return self._translator.from_count_tokens(
-                    int(result),
+                    numeric,
                     op_ctx=ctx,
                     framework_ctx=framework_ctx,
                 )
@@ -1921,6 +2186,8 @@ class LLMTranslator:
                 attach_context(
                     exc,
                     framework=self._framework,
+                    resource_type="llm",
+                    operation="count_tokens",
                     llm_operation="count_tokens",
                     request_id=ctx.request_id,
                     tenant=ctx.tenant,
@@ -1948,8 +2215,9 @@ class LLMTranslator:
                 model=model,
                 ctx=ctx,
             )
+            numeric = self._coerce_token_count(result)
             return self._translator.from_count_tokens(
-                int(result),
+                numeric,
                 op_ctx=ctx,
                 framework_ctx=framework_ctx,
             )
@@ -1957,6 +2225,8 @@ class LLMTranslator:
             attach_context(
                 exc,
                 framework=self._framework,
+                resource_type="llm",
+                operation="count_tokens",
                 llm_operation="count_tokens",
                 request_id=ctx.request_id,
                 tenant=ctx.tenant,
@@ -1997,15 +2267,15 @@ class LLMTranslator:
                     framework_ctx=framework_ctx,
                 )
 
-                # Get framework-specific token counting configuration
                 token_config = self._translator.get_token_counting_config(
                     op_ctx=ctx,
                     framework_ctx=framework_ctx,
                 )
 
-                # Format messages using sophisticated strategy
                 combined = self._format_messages_for_token_counting(
-                    remaining, auto_system, token_config
+                    remaining,
+                    auto_system,
+                    token_config,
                 )
 
                 result = await self._adapter.count_tokens(
@@ -2013,8 +2283,9 @@ class LLMTranslator:
                     model=model,
                     ctx=ctx,
                 )
+                numeric = self._coerce_token_count(result)
                 return self._translator.from_count_tokens(
-                    int(result),
+                    numeric,
                     op_ctx=ctx,
                     framework_ctx=framework_ctx,
                 )
@@ -2022,6 +2293,8 @@ class LLMTranslator:
                 attach_context(
                     exc,
                     framework=self._framework,
+                    resource_type="llm",
+                    operation="count_tokens_for_messages",
                     llm_operation="count_tokens_for_messages",
                     request_id=ctx.request_id,
                     tenant=ctx.tenant,
@@ -2055,15 +2328,15 @@ class LLMTranslator:
                 framework_ctx=framework_ctx,
             )
 
-            # Get framework-specific token counting configuration
             token_config = self._translator.get_token_counting_config(
                 op_ctx=ctx,
                 framework_ctx=framework_ctx,
             )
 
-            # Format messages using sophisticated strategy
             combined = self._format_messages_for_token_counting(
-                remaining, auto_system, token_config
+                remaining,
+                auto_system,
+                token_config,
             )
 
             result = await self._adapter.count_tokens(
@@ -2071,8 +2344,9 @@ class LLMTranslator:
                 model=model,
                 ctx=ctx,
             )
+            numeric = self._coerce_token_count(result)
             return self._translator.from_count_tokens(
-                int(result),
+                numeric,
                 op_ctx=ctx,
                 framework_ctx=framework_ctx,
             )
@@ -2080,6 +2354,8 @@ class LLMTranslator:
             attach_context(
                 exc,
                 framework=self._framework,
+                resource_type="llm",
+                operation="count_tokens_for_messages",
                 llm_operation="count_tokens_for_messages",
                 request_id=ctx.request_id,
                 tenant=ctx.tenant,
@@ -2152,6 +2428,8 @@ class LLMTranslator:
                 attach_context(
                     exc,
                     framework=self._framework,
+                    resource_type="llm",
+                    operation="health",
                     llm_operation="health",
                     request_id=ctx.request_id,
                     tenant=ctx.tenant,
@@ -2182,6 +2460,8 @@ class LLMTranslator:
             attach_context(
                 exc,
                 framework=self._framework,
+                resource_type="llm",
+                operation="health",
                 llm_operation="health",
                 request_id=ctx.request_id,
                 tenant=ctx.tenant,
@@ -2218,6 +2498,8 @@ class LLMTranslator:
                 attach_context(
                     exc,
                     framework=self._framework,
+                    resource_type="llm",
+                    operation="capabilities",
                     llm_operation="capabilities",
                     request_id=ctx.request_id,
                     tenant=ctx.tenant,
@@ -2248,6 +2530,8 @@ class LLMTranslator:
             attach_context(
                 exc,
                 framework=self._framework,
+                resource_type="llm",
+                operation="capabilities",
                 llm_operation="capabilities",
                 request_id=ctx.request_id,
                 tenant=ctx.tenant,
@@ -2264,7 +2548,7 @@ class LLMTranslator:
 
         Returns metrics if the translator supports metrics collection.
         """
-        if hasattr(self._translator, 'get_metrics'):
+        if hasattr(self._translator, "get_metrics"):
             return self._translator.get_metrics()
         return None
 
@@ -2287,7 +2571,9 @@ def register_llm_translator(
 
     Example
     -------
-        def make_langchain_llm_translator(adapter: LLMProtocolV1) -> LLMFrameworkTranslator:
+        def make_langchain_llm_translator(
+            adapter: LLMProtocolV1,
+        ) -> LLMFrameworkTranslator:
             return LangChainLLMTranslator(adapter=adapter)
 
         register_llm_translator("langchain", make_langchain_llm_translator)
@@ -2319,6 +2605,8 @@ def create_llm_translator(
     framework: str = "generic",
     translator: Optional[LLMFrameworkTranslator] = None,
     post_processing_config: Optional[LLMPostProcessingConfig] = None,
+    safety_filter: Optional[SafetyFilter] = None,
+    json_repair: Optional[JSONRepair] = None,
 ) -> LLMTranslator:
     """
     Convenience helper to construct an LLMTranslator for a given framework.
@@ -2341,16 +2629,20 @@ def create_llm_translator(
         framework=framework,
         translator=translator,
         post_processing_config=post_processing_config,
+        safety_filter=safety_filter,
+        json_repair=json_repair,
     )
 
 
 __all__ = [
     "TokenCountingConfig",
+    "ToolValidationError",
     "ToolValidator",
     "LLMPostProcessingConfig",
     "TranslatorMetrics",
     "SafetyFilter",
     "JSONRepair",
+    "LLMCompletionPostProcessor",
     "LLMFrameworkTranslator",
     "DefaultLLMFrameworkTranslator",
     "LLMTranslator",
