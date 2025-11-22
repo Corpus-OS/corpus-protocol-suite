@@ -488,45 +488,6 @@ class MockLLMAdapter(BaseLLMAdapter):
         )
 
     # -----------------------------------------------------------------------
-    # Stream override to delegate to BaseLLMAdapter with full validation
-    # -----------------------------------------------------------------------
-    async def stream(
-        self,
-        *,
-        messages: List[Mapping[str, str]],
-        max_tokens: Optional[int] = None,
-        temperature: Optional[float] = None,
-        top_p: Optional[float] = None,
-        frequency_penalty: Optional[float] = None,
-        presence_penalty: Optional[float] = None,
-        stop_sequences: Optional[List[str]] = None,
-        model: Optional[str] = None,
-        system_message: Optional[str] = None,
-        tools: Optional[List[Dict[str, Any]]] = None,
-        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
-        ctx: Optional[LLMContext] = None,
-    ) -> AsyncIterator[LLMChunk]:
-        """
-        Override stream to maintain explicit protocol parity while delegating
-        the actual behavior (validation, deadlines, metrics, gates) to the
-        BaseLLMAdapter implementation.
-        """
-        return await super().stream(
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            frequency_penalty=frequency_penalty,
-            presence_penalty=presence_penalty,
-            stop_sequences=stop_sequences,
-            model=model,
-            system_message=system_message,
-            tools=tools,
-            tool_choice=tool_choice,
-            ctx=ctx,
-        )
-
-    # -----------------------------------------------------------------------
     # Token counting
     # -----------------------------------------------------------------------
     async def _do_count_tokens(

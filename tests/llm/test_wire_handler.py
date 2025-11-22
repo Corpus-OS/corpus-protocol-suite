@@ -81,11 +81,11 @@ class TrackingMockLLMAdapter(BaseLLMAdapter):
 
     # --- backend hooks w/ tracking ------------------------------------------
 
-    async def capabilities(self) -> LLMCapabilities:
+    async def _do_capabilities(self) -> LLMCapabilities:
         self._store("capabilities", None)
         return self._caps
 
-    async def complete(
+    async def _do_complete(
         self,
         *,
         messages,
@@ -97,6 +97,8 @@ class TrackingMockLLMAdapter(BaseLLMAdapter):
         stop_sequences=None,
         model=None,
         system_message=None,
+        tools=None,
+        tool_choice=None,
         ctx: Optional[OperationContext] = None,
     ) -> LLMCompletion:
         self._store(
@@ -118,7 +120,7 @@ class TrackingMockLLMAdapter(BaseLLMAdapter):
             finish_reason="stop"
         )
 
-    async def stream(
+    async def _do_stream(
         self,
         *,
         messages,
@@ -130,6 +132,8 @@ class TrackingMockLLMAdapter(BaseLLMAdapter):
         stop_sequences=None,
         model=None,
         system_message=None,
+        tools=None,
+        tool_choice=None,
         ctx: Optional[OperationContext] = None,
     ) -> AsyncIterator[LLMChunk]:
         self._store(
@@ -146,7 +150,7 @@ class TrackingMockLLMAdapter(BaseLLMAdapter):
         yield LLMChunk(text="content", is_final=False)
         yield LLMChunk(text="[end]", is_final=True)
 
-    async def count_tokens(
+    async def _do_count_tokens(
         self,
         text: str,
         *,
@@ -156,7 +160,7 @@ class TrackingMockLLMAdapter(BaseLLMAdapter):
         self._store("count_tokens", ctx, text=text, model=model)
         return len(text.split())  # Simple token approximation
 
-    async def health(
+    async def _do_health(
         self,
         *,
         ctx: Optional[OperationContext] = None,
@@ -178,7 +182,7 @@ class ErrorAdapter(TrackingMockLLMAdapter):
         super().__init__()
         self._exc = exc
 
-    async def complete(
+    async def _do_complete(
         self,
         *,
         messages,
@@ -190,6 +194,8 @@ class ErrorAdapter(TrackingMockLLMAdapter):
         stop_sequences=None,
         model=None,
         system_message=None,
+        tools=None,
+        tool_choice=None,
         ctx: Optional[OperationContext] = None,
     ) -> LLMCompletion:
         raise self._exc
@@ -200,7 +206,7 @@ class BoomAdapter(TrackingMockLLMAdapter):
     Adapter that raises unexpected exceptions for testing error mapping.
     """
     
-    async def complete(
+    async def _do_complete(
         self,
         *,
         messages,
@@ -212,6 +218,8 @@ class BoomAdapter(TrackingMockLLMAdapter):
         stop_sequences=None,
         model=None,
         system_message=None,
+        tools=None,
+        tool_choice=None,
         ctx: Optional[OperationContext] = None,
     ) -> LLMCompletion:
         raise RuntimeError("boom")

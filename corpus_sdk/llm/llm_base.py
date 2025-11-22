@@ -1732,12 +1732,14 @@ class BaseLLMAdapter(LLMProtocolV1):
             async for chunk in agen:
                 yield chunk
 
-        return await self._with_gates_stream(
+        generator = await self._with_gates_stream(
             op="stream",
             ctx=ctx,
             agen_factory=agen_factory,
             metric_extra=metric_extra,
         )
+        async for chunk in generator:
+            yield chunk
 
     async def count_tokens(
         self,
