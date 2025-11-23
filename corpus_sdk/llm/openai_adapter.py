@@ -13,6 +13,7 @@ Goals
 - Preserve async/streaming semantics.
 - Normalize provider errors into Corpus' error taxonomy.
 - Provide token usage accounting for cost/quota tracking.
+- Provide first-class tool calling support where the provider supports it.
 - Play nicely with higher-level framework adapters
   (LangChain, LlamaIndex, Semantic Kernel, etc.).
 
@@ -34,7 +35,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, AsyncIterator, Dict, List, Mapping, Optional
+from email.utils import parsedate_to_datetime
+from time import time as _time
+from typing import Any, AsyncIterator, Dict, List, Mapping, Optional, Union
 
 import openai  # type: ignore
 
@@ -51,6 +54,8 @@ from corpus_sdk.llm.llm_base import (
     OperationContext,
     ResourceExhausted,
     TokenUsage,
+    ToolCall,
+    ToolCallFunction,
     TransientNetwork,
     Unavailable,
 )
@@ -78,6 +83,10 @@ RateLimitError = getattr(openai, "RateLimitError", None)
 AuthenticationError = getattr(openai, "AuthenticationError", None)
 BadRequestError = getattr(openai, "BadRequestError", None)
 OpenAIError = getattr(openai, "OpenAIError", Exception)
+
+# Allowed roles kept in sync with MockLLMAdapter so conformance tests see
+# identical role semantics across adapters.
+_ALLOWED_ROLES = {"system", "user", "assistant"}
 
 
 class OpenAIAdapter(BaseLLMAdapter):
@@ -123,6 +132,9 @@ class OpenAIAdapter(BaseLLMAdapter):
       tokenizer caching for performance optimization.
     - JSON output mode can be enabled via `ctx.attrs.get("response_format")`
       set to "json_object".
+    - Tool calling is supported by forwarding the protocol's tool schema
+      directly to OpenAI's tools API and mapping tool calls back into
+      `LLMCompletion.tool_calls`.
     """
 
     def __init__(
@@ -188,6 +200,20 @@ class OpenAIAdapter(BaseLLMAdapter):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _validate_roles(messages: List[Mapping[str, Any]]) -> None:
+        """
+        Enforce a strict role set consistent with MockLLMAdapter.
+
+        This keeps error behavior deterministic and aligned across adapters,
+        and fails fast with a normalized BadRequest instead of deferring to
+        provider-specific behavior for unknown roles.
+        """
+        for m in messages:
+            role = str(m.get("role", ""))
+            if role not in _ALLOWED_ROLES:
+                raise BadRequest(f"unknown role: {role!r}")
 
     def _resolve_model(self, model: Optional[str]) -> str:
         """Resolve caller-supplied model or fall back to the default."""
@@ -285,25 +311,53 @@ class OpenAIAdapter(BaseLLMAdapter):
 
     @staticmethod
     def _extract_retry_after_ms(err: Any) -> Optional[int]:
-        """Best-effort extraction of Retry-After header from OpenAI errors."""
+        """
+        Extract Retry-After header from OpenAI errors.
+
+        Handles both:
+        - Retry-After: 60             (integer seconds)
+        - Retry-After: Wed, 21 Oct... (HTTP date)
+        and performs a case-insensitive header lookup.
+        """
         try:
             resp = getattr(err, "response", None)
             if resp is None:
                 return None
+
             headers = getattr(resp, "headers", None)
             if not headers:
                 return None
-            val = (
-                headers.get("retry-after")
-                or headers.get("Retry-After")
-                or headers.get("Retry-after")
-            )
+
+            # Case-insensitive header lookup
+            val = None
+            for key in ("retry-after", "Retry-After", "Retry-after", "retry_after"):
+                if key in headers:
+                    val = headers.get(key)
+                    if val is not None:
+                        break
+
             if val is None:
                 return None
-            # Retry-After is usually seconds; we treat it as such.
-            seconds = int(str(val).strip())
-            return max(0, seconds) * 1000
-        except Exception:  # noqa: BLE001
+
+            val_str = str(val).strip()
+
+            # Try integer seconds first
+            try:
+                seconds = int(val_str)
+                return max(0, seconds) * 1000
+            except ValueError:
+                pass
+
+            # Try HTTP-date format
+            try:
+                retry_datetime = parsedate_to_datetime(val_str)
+                now = _time()
+                delay_seconds = int(retry_datetime.timestamp() - now)
+                return max(0, delay_seconds) * 1000
+            except Exception:
+                return None
+
+        except Exception:
             return None
 
     def _translate_openai_error(self, err: Exception) -> LLMAdapterError:
@@ -419,8 +473,9 @@ class OpenAIAdapter(BaseLLMAdapter):
             max_context_length=self._max_context_length,
             supports_streaming=True,
             supports_roles=True,
-            supports_json_output=True,  # JSON via response_format
-            supports_parallel_tool_calls=False,
+            supports_json_output=True,   # JSON via response_format
+            supports_tools=True,         # Real tool calling support enabled
+            supports_parallel_tool_calls=True,
             idempotent_writes=True,
             supports_multi_tenant=True,
             supports_system_message=True,
@@ -444,14 +499,24 @@ class OpenAIAdapter(BaseLLMAdapter):
         stop_sequences: Optional[List[str]] = None,
         model: Optional[str] = None,
         system_message: Optional[str] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
         ctx: Optional[OperationContext] = None,
     ) -> LLMCompletion:
         """
         Backend implementation of `complete()` using Chat Completions.
 
-        Note: Response caching is handled automatically by BaseLLMAdapter
-        via the _make_complete_cache_key mechanism.
+        Notes:
+        - Response caching is handled automatically by BaseLLMAdapter via
+          the _make_complete_cache_key mechanism.
+        - Tools and tool_choice are forwarded directly to OpenAI when
+          provided; tool calls returned by OpenAI are mapped into the
+          protocol's ToolCall dataclasses.
         """
+        # Enforce the same role restrictions as the mock adapter so both
+        # behave equivalently from the protocol's perspective.
+        self._validate_roles(messages)
+
         resolved_model = self._resolve_model(model)
         oai_messages = self._build_messages(
             messages=messages,
@@ -462,7 +527,7 @@ class OpenAIAdapter(BaseLLMAdapter):
         response_format = self._get_response_format(ctx)
 
         try:
-            # Build the base request parameters
+            # Build the base request parameters (no PII in logs: we never log content)
             request_params: Dict[str, Any] = {
                 "model": resolved_model,
                 "messages": oai_messages,
@@ -475,13 +540,33 @@ class OpenAIAdapter(BaseLLMAdapter):
                 "stream": False,
             }
 
-            # Add response_format if specified
             if response_format:
                 request_params["response_format"] = response_format
 
+            if tools:
+                request_params["tools"] = tools
+            if tool_choice is not None:
+                request_params["tool_choice"] = tool_choice
+
+            logger.debug(
+                "OpenAIAdapter.complete: model=%s, messages=%d, max_tokens=%s, tools=%d, tool_choice_type=%s",
+                resolved_model,
+                len(oai_messages),
+                str(max_tokens),
+                len(tools) if tools else 0,
+                type(tool_choice).__name__ if tool_choice is not None else "None",
+            )
+
             resp = await self._client.chat.completions.create(**request_params)
 
+            logger.debug(
+                "OpenAIAdapter.complete: response_model=%s, usage=%s",
+                getattr(resp, "model", "unknown"),
+                self._usage_from_response(resp),
+            )
+
         except Exception as exc:  # noqa: BLE001
+            logger.warning("OpenAIAdapter.complete failed: %s", exc, exc_info=True)
             raise self._translate_openai_error(exc) from exc
 
         # Extract the primary choice.
@@ -498,6 +583,23 @@ class OpenAIAdapter(BaseLLMAdapter):
         if not text and hasattr(choice, "text"):
             text = getattr(choice, "text", "") or ""
 
+        # Map tool calls if present on the message
+        tool_calls: List[ToolCall] = []
+        raw_tool_calls = getattr(message, "tool_calls", None) if message is not None else None
+        if raw_tool_calls:
+            for tc in raw_tool_calls:
+                fn = getattr(tc, "function", None)
+                tool_calls.append(
+                    ToolCall(
+                        id=str(getattr(tc, "id", "") or ""),
+                        type=str(getattr(tc, "type", "") or "function"),
+                        function=ToolCallFunction(
+                            name=str(getattr(fn, "name", "") or "") if fn is not None else "",
+                            arguments=str(getattr(fn, "arguments", "") or "") if fn is not None else "",
+                        ),
+                    )
+                )
+
         finish_reason = getattr(choice, "finish_reason", None) or "stop"
         usage = self._usage_from_response(resp)
         model_id = getattr(resp, "model", None) or resolved_model
@@ -508,6 +610,7 @@ class OpenAIAdapter(BaseLLMAdapter):
             model_family=self._model_family,
             usage=usage,
             finish_reason=str(finish_reason),
+            tool_calls=tool_calls,
         )
 
     async def _do_stream(
@@ -522,6 +625,8 @@ class OpenAIAdapter(BaseLLMAdapter):
         stop_sequences: Optional[List[str]] = None,
         model: Optional[str] = None,
         system_message: Optional[str] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
         ctx: Optional[OperationContext] = None,
     ) -> AsyncIterator[LLMChunk]:
         """
@@ -535,8 +640,17 @@ class OpenAIAdapter(BaseLLMAdapter):
         contains exact token usage; this is surfaced on the final chunk
         via `usage_so_far`.
 
-        Note: Streaming responses are not cached by BaseLLMAdapter.
+        Note:
+        - Streaming responses are not cached by BaseLLMAdapter.
+        - Tools and tool_choice are forwarded to OpenAI; this adapter
+          currently does not reconstruct tool_calls incrementally in
+          streaming mode and focuses on text and usage. Callers that
+          need full tool call streaming can interpret the OpenAI events
+          directly or build a higher-level aggregator.
         """
+        # Enforce the same role restrictions as the mock adapter.
+        self._validate_roles(messages)
+
         resolved_model = self._resolve_model(model)
         oai_messages = self._build_messages(
             messages=messages,
@@ -558,17 +672,32 @@ class OpenAIAdapter(BaseLLMAdapter):
                 "presence_penalty": presence_penalty,
                 "stop": stop_sequences,
                 "stream": True,
-                # Key improvement: ask OpenAI to include usage in the stream.
+                # Ask OpenAI to include usage in the stream so we can surface
+                # final token usage on the terminal chunk.
                 "stream_options": {"include_usage": True},
             }
 
-            # Add response_format if specified
             if response_format:
                 request_params["response_format"] = response_format
+
+            if tools:
+                request_params["tools"] = tools
+            if tool_choice is not None:
+                request_params["tool_choice"] = tool_choice
+
+            logger.debug(
+                "OpenAIAdapter.stream: model=%s, messages=%d, max_tokens=%s, tools=%d, tool_choice_type=%s",
+                resolved_model,
+                len(oai_messages),
+                str(max_tokens),
+                len(tools) if tools else 0,
+                type(tool_choice).__name__ if tool_choice is not None else "None",
+            )
 
             stream = await self._client.chat.completions.create(**request_params)
 
         except Exception as exc:  # noqa: BLE001
+            logger.warning("OpenAIAdapter.stream failed to create stream: %s", exc, exc_info=True)
             raise self._translate_openai_error(exc) from exc
 
         # Aggregate model + usage info as we go; usage is normally only
@@ -609,17 +738,20 @@ class OpenAIAdapter(BaseLLMAdapter):
                     )
 
                 if text:
-                    # Emit delta chunks as we receive them.
+                    # Emit delta chunks as we receive them. We intentionally
+                    # do not attach usage_so_far here because OpenAI only
+                    # provides usage reliably at the end of the stream and
+                    # we avoid adding heavy per-chunk token counting.
                     yield LLMChunk(
                         text=text,
                         is_final=False,
                         model=last_model_id,
-                        usage_so_far=None,  # not tracked per-chunk
+                        usage_so_far=None,
                     )
 
             # Handle case where stream ends with no chunks received
             if received_chunks == 0:
-                logger.warning("OpenAI stream ended with no chunks received")
+                logger.warning("OpenAIAdapter.stream: stream ended with no chunks received")
                 yield LLMChunk(
                     text="",
                     is_final=True,
@@ -633,6 +765,7 @@ class OpenAIAdapter(BaseLLMAdapter):
                 return
 
         except Exception as exc:  # noqa: BLE001
+            logger.warning("OpenAIAdapter.stream failed during iteration: %s", exc, exc_info=True)
             # Translate any errors that occur during streaming
             raise self._translate_openai_error(exc) from exc
 
@@ -744,7 +877,7 @@ class OpenAIAdapter(BaseLLMAdapter):
             # We intentionally do NOT raise here; BaseLLMAdapter.health()
             # expects a mapping and will treat this as a successful but
             # unhealthy probe.
-            logger.warning("OpenAIAdapter health check failed: %s", err)
+            logger.warning("OpenAIAdapter health check failed: %s", err, exc_info=True)
             return {
                 "ok": False,
                 "status": "error",
