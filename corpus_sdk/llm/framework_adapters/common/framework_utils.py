@@ -385,7 +385,7 @@ def _extract_text_object(
 def coerce_text_completion(
     result: Any,
     *,
-    framework: Optional[str],
+    framework: Optional[str] = None,
     error_codes: CoercionErrorCodes,
     logger: Optional[logging.Logger] = None,
     limits: Optional[ResourceLimits] = None,
@@ -398,6 +398,20 @@ def coerce_text_completion(
     - If string → validate & return
     - If sequence → join as string
     - Otherwise → error with framework-specific error codes
+
+    Parameters
+    ----------
+    result:
+        Arbitrary provider / framework result object.
+    framework:
+        Optional framework label for logging / diagnostics. If None, falls
+        back to `error_codes.framework_label` and then "unknown".
+    error_codes:
+        Error code bundle.
+    logger:
+        Optional logger.
+    limits:
+        Optional ResourceLimits for content flattening.
     """
     _validate_error_codes(error_codes)
     framework_name = _normalize_framework(framework, error_codes)
@@ -507,7 +521,7 @@ def _coerce_single_chat_message(
 def coerce_chat_messages(
     result: Any,
     *,
-    framework: Optional[str],
+    framework: Optional[str] = None,
     error_codes: CoercionErrorCodes,
     skip_invalid: bool = False,
     logger: Optional[logging.Logger] = None,
@@ -535,7 +549,8 @@ def coerce_chat_messages(
     result:
         Arbitrary provider / framework result object.
     framework:
-        Framework label for logging / diagnostics.
+        Optional framework label for logging / diagnostics. If None, falls
+        back to `error_codes.framework_label` and then "unknown".
     error_codes:
         Error code bundle (must be valid).
     skip_invalid:
@@ -634,7 +649,7 @@ def coerce_chat_messages(
 def coerce_token_usage(
     result: Any,
     *,
-    framework: Optional[str],
+    framework: Optional[str] = None,
     error_codes: CoercionErrorCodes,
     logger: Optional[logging.Logger] = None,
     limits: Optional[TokenLimits] = None,
@@ -650,6 +665,20 @@ def coerce_token_usage(
     Enforces:
     - Non-negative, finite integers
     - Upper bounds for individual fields and total_tokens
+
+    Parameters
+    ----------
+    result:
+        Arbitrary provider / framework result object.
+    framework:
+        Optional framework label for logging / diagnostics. If None, falls
+        back to `error_codes.framework_label` and then "unknown".
+    error_codes:
+        Error code bundle.
+    logger:
+        Optional logger.
+    limits:
+        Optional TokenLimits for sanity bounds.
     """
     _validate_error_codes(error_codes)
     framework_name = _normalize_framework(framework, error_codes)
@@ -729,7 +758,7 @@ def coerce_token_usage(
 def iter_text_from_stream_events(
     events: Iterable[Any],
     *,
-    framework: Optional[str],
+    framework: Optional[str] = None,
     error_codes: CoercionErrorCodes,
     logger: Optional[logging.Logger] = None,
     limits: Optional[ResourceLimits] = None,
@@ -754,7 +783,8 @@ def iter_text_from_stream_events(
     events:
         Iterable of provider-specific stream events.
     framework:
-        Framework label for logging / diagnostics.
+        Optional framework label for logging / diagnostics. If None, falls
+        back to `error_codes.framework_label` and then "unknown".
     error_codes:
         Error codes bundle for structured failures when skip_errors=False.
     logger:
@@ -843,7 +873,7 @@ def _extract_message_like_from_event(event: Any) -> Any:
 def iter_chat_messages_from_stream_events(
     events: Iterable[Any],
     *,
-    framework: Optional[str],
+    framework: Optional[str] = None,
     error_codes: CoercionErrorCodes,
     logger: Optional[logging.Logger] = None,
     limits: Optional[ResourceLimits] = None,
@@ -868,7 +898,8 @@ def iter_chat_messages_from_stream_events(
     events:
         Iterable of provider-specific stream events.
     framework:
-        Framework label for logging / diagnostics.
+        Optional framework label for logging / diagnostics. If None, falls
+        back to `error_codes.framework_label` and then "unknown".
     error_codes:
         Error codes bundle for structured failures when skip_errors=False.
     logger:
