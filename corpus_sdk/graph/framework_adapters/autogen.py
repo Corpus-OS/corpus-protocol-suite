@@ -96,9 +96,6 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 R = TypeVar("R")
 
-# Keep a module-level alias to the base coercion error codes for alignment
-COERCION_ERROR_CODES_BASE = CoercionErrorCodes
-
 
 # ---------------------------------------------------------------------------
 # Error code constants (standalone, NOT subclassing CoercionErrorCodes)
@@ -111,8 +108,8 @@ class ErrorCodes:
 
     This intentionally does not subclass `CoercionErrorCodes`. Shared utilities
     that rely on symbolic names can still refer to this class explicitly while
-    the underlying CoercionErrorCodes remain available via
-    `COERCION_ERROR_CODES_BASE` for cross-framework alignment.
+    the underlying CoercionErrorCodes remain available from the common
+    framework utilities for cross-framework alignment.
     """
 
     BAD_OPERATION_CONTEXT = "BAD_OPERATION_CONTEXT"
@@ -279,7 +276,7 @@ def _create_error_context_decorator(
     return decorator_factory
 
 
-def with_error_context(
+def with_graph_error_context(
     operation: str,
     **static_context: Any,
 ) -> Callable[[Callable[..., T]], Callable[..., T]]:
@@ -287,12 +284,17 @@ def with_error_context(
     return _create_error_context_decorator(operation, is_async=False)(**static_context)
 
 
-def with_async_error_context(
+def with_async_graph_error_context(
     operation: str,
     **static_context: Any,
 ) -> Callable[[Callable[..., T]], Callable[..., T]]:
     """Decorator for async methods with rich dynamic context extraction."""
     return _create_error_context_decorator(operation, is_async=True)(**static_context)
+
+
+# Backwards-compatible aliases (if callers were using old names)
+with_error_context = with_graph_error_context
+with_async_error_context = with_async_graph_error_context
 
 
 # ---------------------------------------------------------------------------
@@ -608,17 +610,34 @@ class CorpusAutoGenGraphClient:
         graph_adapter: GraphProtocolV1,
         default_dialect: Optional[str] = None,
         default_namespace: Optional[str] = None,
-        default_timeout_ms: Optional[int] = None,  # ESSENTIAL CHANGE #1: Configurable timeout
+        default_timeout_ms: Optional[int] = None,
         framework_version: Optional[str] = None,
     ) -> None:
+        """
+        Initialize an AutoGen-oriented graph client.
+
+        Parameters
+        ----------
+        graph_adapter:
+            Underlying `GraphProtocolV1` implementation.
+        default_dialect:
+            Optional default query dialect to use when none is provided per call.
+        default_namespace:
+            Optional default namespace to use when none is provided per call.
+        default_timeout_ms:
+            Optional default per-query timeout in milliseconds. Used when
+            `timeout_ms` is not explicitly passed to query methods.
+        framework_version:
+            Optional framework version string for observability.
+        """
         self._graph: GraphProtocolV1 = graph_adapter
         self._default_dialect: Optional[str] = default_dialect
         self._default_namespace: Optional[str] = default_namespace
-        self._default_timeout_ms: Optional[int] = default_timeout_ms  # Store timeout
+        self._default_timeout_ms: Optional[int] = default_timeout_ms
         self._framework_version: Optional[str] = framework_version
 
     # ------------------------------------------------------------------ #
-    # ESSENTIAL CHANGE #2: Resource Management (Context Managers)
+    # Resource management (context managers)
     # ------------------------------------------------------------------ #
 
     def __enter__(self) -> CorpusAutoGenGraphClient:
@@ -715,29 +734,37 @@ class CorpusAutoGenGraphClient:
         if not isinstance(query, str) or not query.strip():
             raise BadRequest("query must be a non-empty string")
 
-    # ------------------------------------------------------------------ #
-    # ESSENTIAL CHANGE #3: Enhanced Input Validation
-    # ------------------------------------------------------------------ #
-
-    def _validate_upsert_spec(self, spec: UpsertNodesSpec) -> None:
-        """Validate upsert specification before processing."""
+    def _validate_upsert_nodes_spec(self, spec: UpsertNodesSpec) -> None:
+        """Validate upsert specification for nodes before processing."""
         if not spec.nodes:
             raise BadRequest("UpsertNodesSpec must contain at least one node")
 
         for node in spec.nodes:
-            if not node.id:
+            if not getattr(node, "id", None):
                 raise BadRequest("All nodes must have an ID")
+
+    def _validate_upsert_edges_spec(self, spec: UpsertEdgesSpec) -> None:
+        """Validate upsert specification for edges before processing."""
+        if not spec.edges:
+            raise BadRequest("UpsertEdgesSpec must contain at least one edge")
+
+        for edge in spec.edges:
+            if not getattr(edge, "id", None):
+                raise BadRequest("All edges must have an ID")
 
     def _validate_batch_ops(self, ops: List[BatchOperation]) -> None:
         """Validate batch operations before processing."""
         if not ops:
             raise BadRequest("Batch operations list cannot be empty")
 
-        # Check against graph capabilities if available
+        # Check against graph capabilities if available.
+        # Only enforce a limit when the backend explicitly sets a positive max.
         caps = self._graph.capabilities()
-        max_ops = caps.max_batch_ops or 100
-        if len(ops) > max_ops:
-            raise BadRequest(f"Too many batch operations: {len(ops)} (max: {max_ops})")
+        max_ops = caps.max_batch_ops
+        if max_ops is not None and max_ops > 0 and len(ops) > max_ops:
+            raise BadRequest(
+                f"Too many batch operations: {len(ops)} (max: {max_ops})",
+            )
 
     def _build_raw_query(
         self,
@@ -764,7 +791,7 @@ class CorpusAutoGenGraphClient:
         """
         effective_dialect = dialect or self._default_dialect
         effective_namespace = namespace or self._default_namespace
-        effective_timeout = timeout_ms or self._default_timeout_ms  # Use default timeout
+        effective_timeout = timeout_ms or self._default_timeout_ms
 
         raw: Dict[str, Any] = {
             "text": query,
@@ -776,7 +803,7 @@ class CorpusAutoGenGraphClient:
             raw["dialect"] = effective_dialect
         if effective_namespace is not None:
             raw["namespace"] = effective_namespace
-        if effective_timeout is not None:  # Include timeout if specified
+        if effective_timeout is not None:
             raw["timeout_ms"] = int(effective_timeout)
 
         return raw
@@ -848,7 +875,7 @@ class CorpusAutoGenGraphClient:
     # Capabilities / schema / health
     # ------------------------------------------------------------------ #
 
-    @with_error_context("capabilities_sync")
+    @with_graph_error_context("capabilities_sync")
     def capabilities(self) -> Dict[str, Any]:
         """
         Sync wrapper around `graph_adapter.capabilities()`.
@@ -858,7 +885,7 @@ class CorpusAutoGenGraphClient:
         caps = self._translator.capabilities()
         return self._capabilities_to_dict(caps)
 
-    @with_async_error_context("capabilities_async")
+    @with_async_graph_error_context("capabilities_async")
     async def acapabilities(self) -> Dict[str, Any]:
         """
         Async capabilities accessor with AutoGen-friendly dict output.
@@ -868,7 +895,7 @@ class CorpusAutoGenGraphClient:
         caps = await self._translator.arun_capabilities()
         return self._capabilities_to_dict(caps)
 
-    @with_error_context("get_schema_sync")
+    @with_graph_error_context("get_schema_sync")
     def get_schema(
         self,
         *,
@@ -893,7 +920,7 @@ class CorpusAutoGenGraphClient:
             ErrorCodes.BAD_TRANSLATED_SCHEMA,
         )
 
-    @with_async_error_context("get_schema_async")
+    @with_async_graph_error_context("get_schema_async")
     async def aget_schema(
         self,
         *,
@@ -917,7 +944,7 @@ class CorpusAutoGenGraphClient:
             ErrorCodes.BAD_TRANSLATED_SCHEMA,
         )
 
-    @with_error_context("health_sync")
+    @with_graph_error_context("health_sync")
     def health(
         self,
         *,
@@ -941,7 +968,7 @@ class CorpusAutoGenGraphClient:
             ErrorCodes.BAD_HEALTH_RESULT,
         )
 
-    @with_async_error_context("health_async")
+    @with_async_graph_error_context("health_async")
     async def ahealth(
         self,
         *,
@@ -969,7 +996,7 @@ class CorpusAutoGenGraphClient:
     # Query (sync + async)
     # ------------------------------------------------------------------ #
 
-    @with_error_context("query_sync")
+    @with_graph_error_context("query_sync")
     def query(
         self,
         query: str,
@@ -1012,7 +1039,7 @@ class CorpusAutoGenGraphClient:
             ErrorCodes.BAD_TRANSLATED_RESULT,
         )
 
-    @with_async_error_context("query_async")
+    @with_async_graph_error_context("query_async")
     async def aquery(
         self,
         query: str,
@@ -1059,7 +1086,7 @@ class CorpusAutoGenGraphClient:
     # Streaming query (sync + async)
     # ------------------------------------------------------------------ #
 
-    @with_error_context("stream_query_sync")
+    @with_graph_error_context("stream_query_sync")
     def stream_query(
         self,
         query: str,
@@ -1103,7 +1130,7 @@ class CorpusAutoGenGraphClient:
                 ErrorCodes.BAD_TRANSLATED_CHUNK,
             )
 
-    @with_async_error_context("stream_query_async")
+    @with_async_graph_error_context("stream_query_async")
     async def astream_query(
         self,
         query: str,
@@ -1147,7 +1174,7 @@ class CorpusAutoGenGraphClient:
     # Upsert nodes / edges (sync + async)
     # ------------------------------------------------------------------ #
 
-    @with_error_context("upsert_nodes_sync")
+    @with_graph_error_context("upsert_nodes_sync")
     def upsert_nodes(
         self,
         spec: UpsertNodesSpec,
@@ -1162,10 +1189,12 @@ class CorpusAutoGenGraphClient:
         and passes the desired namespace via framework_ctx so that the
         translator can build the correct UpsertNodesSpec.
         """
-        self._validate_upsert_spec(spec)
+        self._validate_upsert_nodes_spec(spec)
 
         ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
+        framework_ctx = self._framework_ctx_for_namespace(
+            getattr(spec, "namespace", None),
+        )
 
         result = self._translator.upsert_nodes(
             spec.nodes,
@@ -1179,7 +1208,7 @@ class CorpusAutoGenGraphClient:
             ErrorCodes.BAD_UPSERT_RESULT,
         )
 
-    @with_async_error_context("upsert_nodes_async")
+    @with_async_graph_error_context("upsert_nodes_async")
     async def aupsert_nodes(
         self,
         spec: UpsertNodesSpec,
@@ -1190,10 +1219,12 @@ class CorpusAutoGenGraphClient:
         """
         Async wrapper for upserting nodes.
         """
-        self._validate_upsert_spec(spec)
+        self._validate_upsert_nodes_spec(spec)
 
         ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
+        framework_ctx = self._framework_ctx_for_namespace(
+            getattr(spec, "namespace", None),
+        )
 
         result = await self._translator.arun_upsert_nodes(
             spec.nodes,
@@ -1207,7 +1238,7 @@ class CorpusAutoGenGraphClient:
             ErrorCodes.BAD_UPSERT_RESULT,
         )
 
-    @with_error_context("upsert_edges_sync")
+    @with_graph_error_context("upsert_edges_sync")
     def upsert_edges(
         self,
         spec: UpsertEdgesSpec,
@@ -1218,8 +1249,12 @@ class CorpusAutoGenGraphClient:
         """
         Sync wrapper for upserting edges.
         """
+        self._validate_upsert_edges_spec(spec)
+
         ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
+        framework_ctx = self._framework_ctx_for_namespace(
+            getattr(spec, "namespace", None),
+        )
 
         result = self._translator.upsert_edges(
             spec.edges,
@@ -1233,7 +1268,7 @@ class CorpusAutoGenGraphClient:
             ErrorCodes.BAD_UPSERT_RESULT,
         )
 
-    @with_async_error_context("upsert_edges_async")
+    @with_async_graph_error_context("upsert_edges_async")
     async def aupsert_edges(
         self,
         spec: UpsertEdgesSpec,
@@ -1244,8 +1279,12 @@ class CorpusAutoGenGraphClient:
         """
         Async wrapper for upserting edges.
         """
+        self._validate_upsert_edges_spec(spec)
+
         ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
+        framework_ctx = self._framework_ctx_for_namespace(
+            getattr(spec, "namespace", None),
+        )
 
         result = await self._translator.arun_upsert_edges(
             spec.edges,
@@ -1263,7 +1302,7 @@ class CorpusAutoGenGraphClient:
     # Delete nodes / edges (sync + async)
     # ------------------------------------------------------------------ #
 
-    @with_error_context("delete_nodes_sync")
+    @with_graph_error_context("delete_nodes_sync")
     def delete_nodes(
         self,
         spec: DeleteNodesSpec,
@@ -1278,7 +1317,9 @@ class CorpusAutoGenGraphClient:
         expression for the GraphTranslator.
         """
         ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
+        framework_ctx = self._framework_ctx_for_namespace(
+            getattr(spec, "namespace", None),
+        )
 
         if spec.filter is not None:
             raw_filter_or_ids: Any = spec.filter
@@ -1297,7 +1338,7 @@ class CorpusAutoGenGraphClient:
             ErrorCodes.BAD_DELETE_RESULT,
         )
 
-    @with_async_error_context("delete_nodes_async")
+    @with_async_graph_error_context("delete_nodes_async")
     async def adelete_nodes(
         self,
         spec: DeleteNodesSpec,
@@ -1309,7 +1350,9 @@ class CorpusAutoGenGraphClient:
         Async wrapper for deleting nodes.
         """
         ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
+        framework_ctx = self._framework_ctx_for_namespace(
+            getattr(spec, "namespace", None),
+        )
 
         if spec.filter is not None:
             raw_filter_or_ids: Any = spec.filter
@@ -1328,7 +1371,7 @@ class CorpusAutoGenGraphClient:
             ErrorCodes.BAD_DELETE_RESULT,
         )
 
-    @with_error_context("delete_edges_sync")
+    @with_graph_error_context("delete_edges_sync")
     def delete_edges(
         self,
         spec: DeleteEdgesSpec,
@@ -1340,7 +1383,9 @@ class CorpusAutoGenGraphClient:
         Sync wrapper for deleting edges.
         """
         ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
+        framework_ctx = self._framework_ctx_for_namespace(
+            getattr(spec, "namespace", None),
+        )
 
         if spec.filter is not None:
             raw_filter_or_ids: Any = spec.filter
@@ -1359,7 +1404,7 @@ class CorpusAutoGenGraphClient:
             ErrorCodes.BAD_DELETE_RESULT,
         )
 
-    @with_async_error_context("delete_edges_async")
+    @with_async_graph_error_context("delete_edges_async")
     async def adelete_edges(
         self,
         spec: DeleteEdgesSpec,
@@ -1371,7 +1416,9 @@ class CorpusAutoGenGraphClient:
         Async wrapper for deleting edges.
         """
         ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
+        framework_ctx = self._framework_ctx_for_namespace(
+            getattr(spec, "namespace", None),
+        )
 
         if spec.filter is not None:
             raw_filter_or_ids: Any = spec.filter
@@ -1394,7 +1441,7 @@ class CorpusAutoGenGraphClient:
     # Bulk vertices (sync + async)
     # ------------------------------------------------------------------ #
 
-    @with_error_context("bulk_vertices_sync")
+    @with_graph_error_context("bulk_vertices_sync")
     def bulk_vertices(
         self,
         spec: BulkVerticesSpec,
@@ -1431,7 +1478,7 @@ class CorpusAutoGenGraphClient:
             ErrorCodes.BAD_BULK_VERTICES_RESULT,
         )
 
-    @with_async_error_context("bulk_vertices_async")
+    @with_async_graph_error_context("bulk_vertices_async")
     async def abulk_vertices(
         self,
         spec: BulkVerticesSpec,
@@ -1469,7 +1516,7 @@ class CorpusAutoGenGraphClient:
     # Batch (sync + async)
     # ------------------------------------------------------------------ #
 
-    @with_error_context("batch_sync")
+    @with_graph_error_context("batch_sync")
     def batch(
         self,
         ops: List[BatchOperation],
@@ -1503,7 +1550,7 @@ class CorpusAutoGenGraphClient:
             ErrorCodes.BAD_BATCH_RESULT,
         )
 
-    @with_async_error_context("batch_async")
+    @with_async_graph_error_context("batch_async")
     async def abatch(
         self,
         ops: List[BatchOperation],
@@ -1539,6 +1586,8 @@ __all__ = [
     "AutoGenGraphClientProtocol",
     "CorpusAutoGenGraphClient",
     "ErrorCodes",
+    "with_graph_error_context",
+    "with_async_graph_error_context",
     "with_error_context",
     "with_async_error_context",
 ]
