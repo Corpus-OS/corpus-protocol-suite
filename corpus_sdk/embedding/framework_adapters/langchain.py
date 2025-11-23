@@ -510,7 +510,6 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         """
         return coerce_embedding_matrix(
             result=result,
-            framework="langchain",
             error_codes=EMBEDDING_COERCION_ERROR_CODES,
             logger=logger,
         )
@@ -524,7 +523,6 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         """
         return coerce_embedding_vector(
             result=result,
-            framework="langchain",
             error_codes=EMBEDDING_COERCION_ERROR_CODES,
             logger=logger,
         )
