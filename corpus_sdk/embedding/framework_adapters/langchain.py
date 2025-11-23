@@ -67,6 +67,7 @@ class ErrorCodes:
     # Correct spelling (primary)
     LANGCHAIN_CONFIG_INVALID = "LANGCHAIN_CONFIG_INVALID"
 
+
 class LangChainConfig(TypedDict, total=False):
     """Structured type for LangChain RunnableConfig context."""
     configurable: Optional[Dict[str, Any]]
@@ -250,19 +251,17 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         config: Optional[Mapping[str, Any]] = None,
         model: Optional[str] = None,
         **kwargs: Any,
-    ) -> Tuple[Optional[OperationContext], Dict[str, Any], Dict[str, Any]]:
+    ) -> Tuple[Optional[OperationContext], Dict[str, Any]]:
         """
         Build contexts for LangChain execution environment with comprehensive validation.
 
         Returns
         -------
         Tuple of:
-        - core_ctx: core OperationContext or None if no/invalid context
-        - op_ctx_dict: normalized dict for embedding layer with rich context preservation
+        - core_ctx: OperationContext instance (or None if unavailable)
         - framework_ctx: LangChain-specific context for translator
         """
         core_ctx: Optional[OperationContext] = None
-        op_ctx_dict: Dict[str, Any] = {}
         framework_ctx: Dict[str, Any] = {
             "framework": "langchain",
         }
@@ -283,13 +282,13 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
                 else:
                     logger.warning(
                         "context_from_langchain returned non-OperationContext type: %s. "
-                        "Proceeding with empty OperationContext.",
+                        "Proceeding without OperationContext.",
                         type(core_ctx_candidate).__name__,
                     )
             except Exception as e:  # noqa: BLE001
                 logger.warning(
                     "Failed to create OperationContext from LangChain config: %s. "
-                    "Proceeding with empty OperationContext.",
+                    "Proceeding without OperationContext.",
                     e,
                 )
                 # Attach a snapshot for observability while preserving behavior
@@ -303,19 +302,6 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
                     operation="context_build",
                     config_snapshot=snapshot,
                 )
-
-        # Build comprehensive context dictionary preserving rich OperationContext
-        if core_ctx is not None:
-            # Preserve the rich OperationContext object for maximum fidelity
-            op_ctx_dict = {"_operation_context": core_ctx}
-
-            # Include structured dict representation for compatibility
-            if hasattr(core_ctx, "to_dict"):
-                op_ctx_dict.update(core_ctx.to_dict())
-            elif hasattr(core_ctx, "__dict__"):
-                op_ctx_dict.update(core_ctx.__dict__)
-        else:
-            op_ctx_dict = {}
 
         # Framework-level context for LangChain-specific optimizations
         effective_model = model or self.model
@@ -341,7 +327,11 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         # Include any extra call-specific hints
         framework_ctx.update(kwargs)
 
-        return core_ctx, op_ctx_dict, framework_ctx
+        # Also surface the OperationContext itself for downstream inspection, if present
+        if core_ctx is not None:
+            framework_ctx["_operation_context"] = core_ctx
+
+        return core_ctx, framework_ctx
 
     def _validate_langchain_config_structure(
         self,
@@ -376,24 +366,29 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         """
         Coerce translator result into a List[List[float]] embedding matrix with comprehensive validation.
 
-        Expected shapes supported:
-        - Default translator:
-            {"embeddings": [[...], [...]], "model": "...", "usage": {...}}
-        - Direct matrix:
-            [[...], [...]]
-        - EmbedResult-like with `.embeddings` attribute:
-            result.embeddings -> [[...], [...]]
-
-        Python 3.9–compatible (avoids `match` / `case`).
+        Supported shapes:
+        - {"embeddings": [[...], [...]], ...}
+        - {"embedding": [...], ...} (single embedding vector)
+        - Direct matrix: [[...], [...]]
+        - Objects with `.embeddings` or `.embedding` attributes
         """
-        if isinstance(result, Mapping) and "embeddings" in result:
-            embeddings_obj: Any = result["embeddings"]
+        if isinstance(result, Mapping):
+            if "embeddings" in result:
+                embeddings_obj: Any = result["embeddings"]
+            elif "embedding" in result:
+                embeddings_obj = [result["embedding"]]
+            else:
+                embeddings_obj = result
         elif hasattr(result, "embeddings"):
             embeddings_obj = getattr(result, "embeddings")
+        elif hasattr(result, "embedding"):
+            embeddings_obj = [getattr(result, "embedding")]
         else:
             embeddings_obj = result
 
-        if not isinstance(embeddings_obj, Sequence):
+        if not isinstance(embeddings_obj, Sequence) or isinstance(
+            embeddings_obj, (str, bytes)
+        ):
             raise TypeError(
                 f"[{ErrorCodes.INVALID_EMBEDDING_RESULT}] "
                 f"Translator result does not contain a valid embeddings sequence: "
@@ -402,14 +397,13 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
 
         matrix: List[List[float]] = []
         for i, row in enumerate(embeddings_obj):
-            if not isinstance(row, Sequence):
+            if not isinstance(row, Sequence) or isinstance(row, (str, bytes)):
                 raise TypeError(
                     f"[{ErrorCodes.INVALID_EMBEDDING_RESULT}] "
                     f"Expected each embedding row to be a sequence, "
                     f"got {type(row).__name__} at index {i}"
                 )
 
-            # Validate row is not empty
             if len(row) == 0:
                 logger.warning("Empty embedding row at index %d, skipping", i)
                 continue
@@ -492,7 +486,7 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
     @with_async_embedding_error_context("documents")
     async def aembed_documents(
         self,
-        texts: List[str],
+        texts: Sequence[str],
         *,
         config: Optional[Mapping[str, Any]] = None,
         model: Optional[str] = None,
@@ -504,7 +498,7 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         Parameters
         ----------
         texts:
-            List of documents to embed.
+            Sequence of documents to embed.
         config:
             Optional LangChain RunnableConfig-like dict. Used only for
             context translation (request_id, tenant, deadline, tags, etc.).
@@ -515,15 +509,11 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         """
         self._warn_if_extreme_batch(texts, op_name="aembed_documents")
 
-        core_ctx, op_ctx_dict, framework_ctx = self._build_contexts(
+        core_ctx, framework_ctx = self._build_contexts(
             config=config,
             model=model,
             **kwargs,
         )
-
-        # Pass the rich OperationContext through for maximum fidelity
-        if core_ctx is not None:
-            framework_ctx["_operation_context"] = core_ctx
 
         logger.debug(
             "Async embedding %d documents for LangChain run: %s",
@@ -532,8 +522,8 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         )
 
         translated = await self._translator.arun_embed(
-            raw_texts=texts,
-            op_ctx=op_ctx_dict,
+            raw_texts=list(texts),
+            op_ctx=core_ctx,
             framework_ctx=framework_ctx,
         )
         return self._coerce_embedding_matrix(translated)
@@ -561,15 +551,11 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         **kwargs:
             Additional framework-specific parameters.
         """
-        core_ctx, op_ctx_dict, framework_ctx = self._build_contexts(
+        core_ctx, framework_ctx = self._build_contexts(
             config=config,
             model=model,
             **kwargs,
         )
-
-        # Pass the rich OperationContext through for maximum fidelity
-        if core_ctx is not None:
-            framework_ctx["_operation_context"] = core_ctx
 
         logger.debug(
             "Async embedding query for LangChain run: %s",
@@ -578,7 +564,7 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
 
         translated = await self._translator.arun_embed(
             raw_texts=text,
-            op_ctx=op_ctx_dict,
+            op_ctx=core_ctx,
             framework_ctx=framework_ctx,
         )
         return self._coerce_embedding_vector(translated)
@@ -590,7 +576,7 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
     @with_embedding_error_context("documents")
     def embed_documents(
         self,
-        texts: List[str],
+        texts: Sequence[str],
         *,
         config: Optional[Mapping[str, Any]] = None,
         model: Optional[str] = None,
@@ -605,15 +591,11 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         """
         self._warn_if_extreme_batch(texts, op_name="embed_documents")
 
-        core_ctx, op_ctx_dict, framework_ctx = self._build_contexts(
+        core_ctx, framework_ctx = self._build_contexts(
             config=config,
             model=model,
             **kwargs,
         )
-
-        # Pass the rich OperationContext through for maximum fidelity
-        if core_ctx is not None:
-            framework_ctx["_operation_context"] = core_ctx
 
         logger.debug(
             "Sync embedding %d documents for LangChain run: %s",
@@ -622,8 +604,8 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         )
 
         translated = self._translator.embed(
-            raw_texts=texts,
-            op_ctx=op_ctx_dict,
+            raw_texts=list(texts),
+            op_ctx=core_ctx,
             framework_ctx=framework_ctx,
         )
         return self._coerce_embedding_matrix(translated)
@@ -644,15 +626,11 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         bridges async protocol calls and respects any `deadline_ms` timeout
         encoded in the OperationContext.
         """
-        core_ctx, op_ctx_dict, framework_ctx = self._build_contexts(
+        core_ctx, framework_ctx = self._build_contexts(
             config=config,
             model=model,
             **kwargs,
         )
-
-        # Pass the rich OperationContext through for maximum fidelity
-        if core_ctx is not None:
-            framework_ctx["_operation_context"] = core_ctx
 
         logger.debug(
             "Sync embedding query for LangChain run: %s",
@@ -661,7 +639,7 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
 
         translated = self._translator.embed(
             raw_texts=text,
-            op_ctx=op_ctx_dict,
+            op_ctx=core_ctx,
             framework_ctx=framework_ctx,
         )
         return self._coerce_embedding_vector(translated)
