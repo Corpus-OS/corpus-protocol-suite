@@ -36,7 +36,6 @@ from typing import (
 )
 
 from pydantic import BaseModel, ConfigDict, PrivateAttr, field_validator
-from langchain_core.embeddings import Embeddings
 
 from corpus_sdk.core.context_translation import (
     from_langchain as context_from_langchain,
@@ -60,6 +59,29 @@ from corpus_sdk.embedding.framework_adapters.common.framework_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Safe conditional import for LangChain Embeddings
+# ---------------------------------------------------------------------------
+
+try:
+    from langchain_core.embeddings import Embeddings  # type: ignore[no-redef]
+
+    LANGCHAIN_AVAILABLE = True
+except ImportError:  # pragma: no cover - only used when LangChain isn't installed
+
+    class Embeddings:  # type: ignore[no-redef]
+        """
+        Minimal fallback base class when LangChain is not installed.
+
+        This is only to keep imports from failing. Using the adapter without
+        LangChain installed is effectively a misconfiguration.
+        """
+
+        pass
+
+    LANGCHAIN_AVAILABLE = False
+
 
 # Type variables for decorators
 T = TypeVar("T")
@@ -111,7 +133,9 @@ def with_embedding_error_context(
                     **enhanced_context,
                 )
                 raise
+
         return wrapper
+
     return decorator
 
 
@@ -136,7 +160,9 @@ def with_async_embedding_error_context(
                     **enhanced_context,
                 )
                 raise
+
         return wrapper
+
     return decorator
 
 
@@ -151,23 +177,25 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
     -------
     ```python
     from langchain.vectorstores import Chroma
-    from corpus_sdk.embedding.framework_adapters.langchain import CorpusLangChainEmbeddings
+    from corpus_sdk.embedding.framework_adapters.langchain import (
+        configure_langchain_embeddings,
+    )
 
-    embeddings = CorpusLangChainEmbeddings(
+    embeddings = configure_langchain_embeddings(
         corpus_adapter=my_adapter,
         model="text-embedding-3-large",
-        batch_config=BatchConfig(max_batch_size=1000)
+        batch_config=BatchConfig(max_batch_size=1000),
     )
 
     vectorstore = Chroma.from_documents(
         documents=documents,
         embedding=embeddings,
-        collection_name="research_papers"
+        collection_name="research_papers",
     )
 
     retriever = vectorstore.as_retriever(
         search_type="similarity",
-        search_kwargs={"k": 10}
+        search_kwargs={"k": 10},
     )
     ```
 
@@ -179,8 +207,8 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
             texts=research_docs,
             config={
                 "tags": ["research", "batch-processing"],
-                "metadata": {"pipeline": "document-indexing"}
-            }
+                "metadata": {"pipeline": "document-indexing"},
+            },
         )
     except Exception as e:
         # Rich error context automatically attached
@@ -584,8 +612,105 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         return self._coerce_embedding_vector(translated)
 
 
+# ------------------------------------------------------------------ #
+# LangChain "configuration / registration" helpers
+# ------------------------------------------------------------------ #
+
+
+def configure_langchain_embeddings(
+    corpus_adapter: EmbeddingProtocolV1,
+    model: Optional[str] = None,
+    **kwargs: Any,
+) -> CorpusLangChainEmbeddings:
+    """
+    Configure and return Corpus embeddings for LangChain usage.
+
+    This mirrors the *shape* of the Semantic Kernel / LlamaIndex helpers:
+
+    - Always constructs and returns a `CorpusLangChainEmbeddings` instance.
+    - If LangChain is not installed, the adapter still constructs, but you
+      obviously won't be able to plug it into real LangChain pipelines.
+
+    Unlike Semantic Kernel or LlamaIndex, LangChain does not expose a single
+    global "Settings" object for embeddings, so this helper does *not* attempt
+    any global registration; you pass the returned instance into vectorstores,
+    retrievers, chains, etc.
+
+    Example
+    -------
+    ```python
+    from corpus_sdk.embedding.framework_adapters.langchain import (
+        configure_langchain_embeddings,
+    )
+
+    embeddings = configure_langchain_embeddings(
+        corpus_adapter=my_adapter,
+        model="text-embedding-3-large",
+    )
+    ```
+
+    Parameters
+    ----------
+    corpus_adapter:
+        Corpus embedding protocol adapter implementing `EmbeddingProtocolV1`.
+    model:
+        Optional default model identifier.
+    **kwargs:
+        Additional arguments for `CorpusLangChainEmbeddings`
+        (e.g. batch_config, text_normalization_config).
+
+    Returns
+    -------
+    CorpusLangChainEmbeddings
+        Configured embeddings instance ready for LangChain integration.
+    """
+    embeddings = CorpusLangChainEmbeddings(
+        corpus_adapter=corpus_adapter,
+        model=model,
+        **kwargs,
+    )
+
+    if not LANGCHAIN_AVAILABLE:
+        logger.debug(
+            "LangChain is not installed; returning embeddings without any "
+            "framework-level integration.",
+        )
+    else:
+        logger.info(
+            "Corpus LangChain embeddings configured with model=%s",
+            model or "default",
+        )
+
+    return embeddings
+
+
+def register_with_langchain(
+    corpus_adapter: EmbeddingProtocolV1,
+    model: Optional[str] = None,
+    **kwargs: Any,
+) -> CorpusLangChainEmbeddings:
+    """
+    Alias for `configure_langchain_embeddings` to mirror the
+    `register_with_semantic_kernel` / `register_with_llamaindex`
+    naming convention.
+
+    This helper is primarily for API symmetry across framework adapters,
+    rather than actual global registration.
+    """
+    return configure_langchain_embeddings(
+        corpus_adapter=corpus_adapter,
+        model=model,
+        **kwargs,
+    )
+
+
 __all__ = [
     "CorpusLangChainEmbeddings",
     "LangChainConfig",
     "ErrorCodes",
+    "configure_langchain_embeddings",
+    "register_with_langchain",
+    "with_embedding_error_context",
+    "with_async_embedding_error_context",
+    "LANGCHAIN_AVAILABLE",
 ]
