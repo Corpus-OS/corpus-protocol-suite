@@ -16,6 +16,8 @@ This module exposes Corpus `EmbeddingProtocolV1` implementations as
 
 The design mirrors the Corpus LangChain LLM adapter: this is a *thin*,
 framework-specific skin over the protocol-first Corpus embedding stack.
+
+Resilience (retries, caching, rate limiting, etc.) is expected to be provided by the underlying adapter, typically a BaseEmbeddingAdapter subclass.
 """
 
 from __future__ import annotations
