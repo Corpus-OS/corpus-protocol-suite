@@ -74,6 +74,7 @@ try:
 
     LLAMAINDEX_AVAILABLE = True
 except ImportError:  # pragma: no cover - only used when LlamaIndex isn't installed
+
     class BaseEmbedding:  # type: ignore[no-redef]
         """
         Minimal fallback BaseEmbedding when LlamaIndex is not installed.
@@ -101,18 +102,31 @@ except ImportError:  # pragma: no cover - only used when LlamaIndex isn't instal
 # ---------------------------------------------------------------------------
 
 
-class ErrorCodes(CoercionErrorCodes):
+class ErrorCodes:
     """
     Error code constants for the LlamaIndex embedding adapter.
 
-    Inherits from CoercionErrorCodes so shared coercion utilities can
-    reference the same symbolic names while remaining framework-specific.
+    This is a simple namespace for framework-specific codes. The shared
+    coercion helpers use `EMBEDDING_COERCION_ERROR_CODES`, which is a
+    `CoercionErrorCodes` instance derived from these values.
     """
 
+    # Coercion-level (used by common framework_utils)
     INVALID_EMBEDDING_RESULT = "INVALID_EMBEDDING_RESULT"
     EMPTY_EMBEDDING_RESULT = "EMPTY_EMBEDDING_RESULT"
     EMBEDDING_CONVERSION_ERROR = "EMBEDDING_CONVERSION_ERROR"
+
+    # LlamaIndex-specific context errors
     LLAMAINDEX_CONTEXT_INVALID = "LLAMAINDEX_CONTEXT_INVALID"
+
+
+# Coercion configuration for the common embedding utils
+EMBEDDING_COERCION_ERROR_CODES: CoercionErrorCodes = CoercionErrorCodes(
+    invalid_result=ErrorCodes.INVALID_EMBEDDING_RESULT,
+    empty_result=ErrorCodes.EMPTY_EMBEDDING_RESULT,
+    conversion_error=ErrorCodes.EMBEDDING_CONVERSION_ERROR,
+    framework_label="llamaindex",
+)
 
 
 class LlamaIndexContext(TypedDict, total=False):
@@ -140,6 +154,7 @@ def _create_error_context_decorator(
     ) -> Callable[[Callable[..., T]], Callable[..., T]]:
         def decorator(func: Callable[..., T]) -> Callable[..., T]:
             if is_async:
+
                 @wraps(func)
                 async def async_wrapper(self: Any, *args: Any, **kwargs: Any) -> T:
                     dynamic_context = _extract_dynamic_context(
@@ -162,6 +177,7 @@ def _create_error_context_decorator(
 
                 return async_wrapper
             else:
+
                 @wraps(func)
                 def sync_wrapper(self: Any, *args: Any, **kwargs: Any) -> T:
                     dynamic_context = _extract_dynamic_context(
@@ -463,7 +479,8 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         """
         return coerce_embedding_matrix(
             result=result,
-            error_codes=ErrorCodes,
+            framework="llamaindex",
+            error_codes=EMBEDDING_COERCION_ERROR_CODES,
             logger=logger,
         )
 
@@ -476,7 +493,8 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         """
         return coerce_embedding_vector(
             result=result,
-            error_codes=ErrorCodes,
+            framework="llamaindex",
+            error_codes=EMBEDDING_COERCION_ERROR_CODES,
             logger=logger,
         )
 
@@ -621,8 +639,8 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
                 if i in empty_indices:
                     result_embeddings.append([0.0] * dimension)
                 else:
-                        result_embeddings.append(embeddings[non_empty_idx])
-                        non_empty_idx += 1
+                    result_embeddings.append(embeddings[non_empty_idx])
+                    non_empty_idx += 1
             return result_embeddings
 
         return embeddings
