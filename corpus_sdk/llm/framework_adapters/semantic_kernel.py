@@ -40,14 +40,14 @@ Design goals
 
 5. Context + observability:
    - `OperationContext` built from Semantic Kernel settings
-   - Rich error context attached via the framework-level error_context helpers
+   - Rich error context attached via lazy, decorator-based helpers
 """
 
 from __future__ import annotations
 
 import logging
-from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from functools import wraps
 from typing import (
     Any,
     AsyncIterator,
@@ -58,6 +58,9 @@ from typing import (
     Protocol,
     TYPE_CHECKING,
     cast,
+    Callable,
+    Tuple,
+    TypeVar,
 )
 
 from corpus_sdk.core.context_translation import (
@@ -76,8 +79,19 @@ from corpus_sdk.llm.framework_adapters.common.llm_translation import (
     JSONRepair,
     create_llm_translator,
 )
+from corpus_sdk.llm.framework_adapters.common.framework_utils import (
+    CoercionErrorCodes,
+)
 
 logger = logging.getLogger(__name__)
+
+# Framework identifier used consistently for translator + error context
+_FRAMEWORK_NAME = "semantic_kernel"
+
+# Symbolic init error prefix for easier log/search correlation
+_INIT_ERROR_CODE = "SEMANTIC_KERNEL_LLM_BAD_INIT"
+
+T = TypeVar("T")
 
 # ---------------------------------------------------------------------------
 # Optional Semantic Kernel imports
@@ -117,6 +131,15 @@ else:  # pragma: no cover - optional dependency path
         _SEMANTIC_KERNEL_IMPORT_ERROR = _IMPORT_EXC
     else:
         _SEMANTIC_KERNEL_IMPORT_ERROR = None
+
+
+def _ensure_semantic_kernel_installed() -> None:
+    """Raise a helpful error if Semantic Kernel is not installed."""
+    if _SEMANTIC_KERNEL_IMPORT_ERROR is not None:
+        raise RuntimeError(
+            "semantic-kernel is not installed or failed to import. "
+            "Install it via: pip install semantic-kernel"
+        ) from _SEMANTIC_KERNEL_IMPORT_ERROR
 
 
 class SemanticKernelLLMProtocol(Protocol):
@@ -160,6 +183,18 @@ class SemanticKernelLLMProtocol(Protocol):
         **kwargs: Any,
     ) -> AsyncIterator["StreamingChatMessageContent"]:
         ...
+
+
+# ---------------------------------------------------------------------------
+# Error-code bundle (CoercionErrorCodes alignment)
+# ---------------------------------------------------------------------------
+
+ERROR_CODES = CoercionErrorCodes(
+    invalid_result="SEMANTIC_KERNEL_LLM_INVALID_RESULT",
+    empty_result="SEMANTIC_KERNEL_LLM_EMPTY_RESULT",
+    conversion_error="SEMANTIC_KERNEL_LLM_CONVERSION_ERROR",
+    framework_label=_FRAMEWORK_NAME,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +242,168 @@ def _analyze_chat_history(chat_history: Any) -> Dict[str, Any]:
         "roles_distribution": roles_distribution,
         "total_content_chars": total_chars,
     }
+
+
+# ---------------------------------------------------------------------------
+# Error context helpers (decorator-based, lazy)
+# ---------------------------------------------------------------------------
+
+
+def _extract_dynamic_context(
+    instance: Any,
+    args: Tuple[Any, ...],
+    kwargs: Dict[str, Any],
+    operation: str,
+) -> Dict[str, Any]:
+    """
+    Extract rich dynamic context for error enrichment.
+
+    This is called *only* on the error path to avoid overhead for successful calls.
+    """
+    dynamic_ctx: Dict[str, Any] = {
+        "framework_name": _FRAMEWORK_NAME,
+        "model": getattr(instance, "model", "unknown"),
+        "temperature": getattr(instance, "temperature", 0.7),
+        "operation": operation,
+    }
+
+    # Chat history metrics
+    try:
+        if args:
+            chat_history = args[0]
+            try:
+                dynamic_ctx["messages_count"] = len(chat_history)  # type: ignore[arg-type]
+            except Exception:
+                pass
+
+            metrics = _analyze_chat_history(chat_history)
+            dynamic_ctx.update(metrics)
+    except Exception as metrics_exc:  # pragma: no cover
+        logger.debug(
+            "Failed to compute Semantic Kernel message metrics for error context: %s",
+            metrics_exc,
+        )
+
+    # Try to include resolved sampling params + context identifiers
+    # by reusing the instance helpers on the error path.
+    try:
+        if len(args) >= 2:
+            settings = args[1]
+            ctx = instance._build_operation_context(settings)  # type: ignore[attr-defined]
+            params = instance._build_sampling_params(settings, kwargs)  # type: ignore[attr-defined]
+
+            dynamic_ctx["request_id"] = getattr(ctx, "request_id", None)
+            dynamic_ctx["tenant"] = getattr(ctx, "tenant", None)
+
+            for key in (
+                "model",
+                "temperature",
+                "max_tokens",
+                "top_p",
+                "frequency_penalty",
+                "presence_penalty",
+                "stop_sequences",
+            ):
+                if key in params and params[key] is not None:
+                    dynamic_ctx[f"resolved_{key}"] = params[key]
+    except Exception as ctx_exc:  # pragma: no cover
+        logger.debug(
+            "Failed to compute Semantic Kernel context params for error context: %s",
+            ctx_exc,
+        )
+
+    return dynamic_ctx
+
+
+def _create_error_context_decorator(
+    operation: str,
+    is_async: bool = False,
+) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    """
+    Factory for creating error-context decorators with lazy dynamic context.
+
+    Successful calls are unaffected; on exception we compute metrics and
+    attach them via `attach_context` with a consistent LLM-oriented operation.
+    """
+
+    def decorator_factory(
+        **static_context: Any,
+    ) -> Callable[[Callable[..., T]], Callable[..., T]]:
+        def decorator(func: Callable[..., T]) -> Callable[..., T]:
+            if is_async:
+
+                @wraps(func)
+                async def async_wrapper(self: Any, *args: Any, **kwargs: Any) -> T:
+                    try:
+                        return await func(self, *args, **kwargs)
+                    except Exception as exc:  # noqa: BLE001
+                        dynamic_ctx = _extract_dynamic_context(
+                            self,
+                            args,
+                            kwargs,
+                            operation,
+                        )
+                        full_ctx = {
+                            "error_codes": ERROR_CODES,
+                            **static_context,
+                            **dynamic_ctx,
+                        }
+                        attach_context(
+                            exc,
+                            framework=_FRAMEWORK_NAME,
+                            operation=f"llm_{operation}",
+                            **full_ctx,
+                        )
+                        raise
+
+                return async_wrapper
+            else:
+
+                @wraps(func)
+                def sync_wrapper(self: Any, *args: Any, **kwargs: Any) -> T:
+                    try:
+                        return func(self, *args, **kwargs)
+                    except Exception as exc:  # noqa: BLE001
+                        dynamic_ctx = _extract_dynamic_context(
+                            self,
+                            args,
+                            kwargs,
+                            operation,
+                        )
+                        full_ctx = {
+                            "error_codes": ERROR_CODES,
+                            **static_context,
+                            **dynamic_ctx,
+                        }
+                        attach_context(
+                            exc,
+                            framework=_FRAMEWORK_NAME,
+                            operation=f"llm_{operation}",
+                            **full_ctx,
+                        )
+                        raise
+
+                return sync_wrapper
+
+        return decorator
+
+    return decorator_factory
+
+
+def with_llm_error_context(
+    operation: str,
+    **static_context: Any,
+) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    """Decorator for sync LLM methods with rich dynamic context extraction."""
+    return _create_error_context_decorator(operation, is_async=False)(**static_context)
+
+
+def with_async_llm_error_context(
+    operation: str,
+    **static_context: Any,
+) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    """Decorator for async LLM methods with rich dynamic context extraction."""
+    return _create_error_context_decorator(operation, is_async=True)(**static_context)
 
 
 # ---------------------------------------------------------------------------
@@ -259,16 +456,15 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
     Semantic Kernel `ChatCompletionClientBase` backed by a Corpus LLM via
     the shared `LLMTranslator` with `framework="semantic_kernel"`.
 
-    This class no longer performs its own message translation or talks
-    directly to `LLMProtocolV1`; instead, it:
+    This class does not perform its own message translation or talk directly
+    to provider APIs; instead, it:
 
     - Builds an `OperationContext` from Semantic Kernel settings
     - Builds sampling params and a small `framework_ctx`
     - Delegates to `LLMTranslator` with `framework="semantic_kernel"`
 
-    The framework-specific behavior (message normalization, OpenAI shape
-    conversion, etc.) is handled by the registered Semantic Kernel
-    `LLMFrameworkTranslator` or the default translator.
+    Framework-specific behavior (message normalization, OpenAI shape handling,
+    etc.) is handled by the registered Semantic Kernel `LLMFrameworkTranslator`.
     """
 
     llm_adapter: LLMProtocolV1
@@ -294,25 +490,7 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
         safety_filter: Optional[SafetyFilter] = None,
         json_repair: Optional[JSONRepair] = None,
     ) -> None:
-        if _SEMANTIC_KERNEL_IMPORT_ERROR is not None:
-            raise RuntimeError(
-                "semantic-kernel is not installed or failed to import. "
-                "Install it via: pip install semantic-kernel"
-            ) from _SEMANTIC_KERNEL_IMPORT_ERROR
-
-        # Harden adapter validation: we rely on async protocol surface.
-        if not hasattr(llm_adapter, "acomplete") or not callable(
-            getattr(llm_adapter, "acomplete", None)
-        ):
-            raise TypeError(
-                "llm_adapter must implement LLMProtocolV1 with an async 'acomplete' method"
-            )
-        if not hasattr(llm_adapter, "astream") or not callable(
-            getattr(llm_adapter, "astream", None)
-        ):
-            raise TypeError(
-                "llm_adapter must implement LLMProtocolV1 with an async 'astream' method"
-            )
+        _ensure_semantic_kernel_installed()
 
         # Resolve configuration precedence: config object > legacy kwargs.
         if config is not None:
@@ -336,23 +514,15 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
             effective_safety_filter = safety_filter
             effective_json_repair = json_repair
 
-        # Single validation point for sampling defaults.
-        if not 0.0 <= self.temperature <= 2.0:
-            raise ValueError(
-                f"temperature must be between 0.0 and 2.0, got {self.temperature}"
-            )
-
-        if self.max_tokens is not None and self.max_tokens < 1:
-            raise ValueError(
-                f"max_tokens must be positive, got {self.max_tokens}"
-            )
+        # Validate adapter + sampling defaults in a shared, symbolic way.
+        self._validate_init_params(llm_adapter)
 
         super().__init__(service_id=service_id)
 
         # Build the shared LLMTranslator for the "semantic_kernel" framework.
         self._translator: LLMTranslator = create_llm_translator(
             adapter=llm_adapter,
-            framework="semantic_kernel",
+            framework=_FRAMEWORK_NAME,
             translator=translator,
             post_processing_config=effective_post_processing,
             safety_filter=effective_safety_filter,
@@ -372,89 +542,47 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
         )
 
     # ------------------------------------------------------------------ #
-    # Error context management
+    # Internal validation / helpers
     # ------------------------------------------------------------------ #
 
-    def _build_error_context(
-        self,
-        operation: str,
-        stream: bool,
-        messages_count: int,
-        model: str,
-        ctx: OperationContext,
-        params: Dict[str, Any],
-        extra_metrics: Optional[Mapping[str, Any]] = None,
-    ) -> Dict[str, Any]:
+    def _validate_init_params(self, llm_adapter: LLMProtocolV1) -> None:
         """
-        Build consistent error context payload.
+        Validate initialization parameters and adapter capabilities.
 
-        Includes:
-        - resource_type, operation, stream
-        - routing + sampling parameters
-        - request identifiers
-        - lightweight message metrics (roles, content size) when available
+        - Ensures the adapter exposes core `LLMProtocolV1` methods.
+        - Validates temperature and max_tokens constraints.
         """
-        error_ctx: Dict[str, Any] = {
-            "resource_type": "llm",
-            "operation": operation,
-            "messages_count": messages_count,
-            "model": model,
-            "temperature": params.get("temperature"),
-            "max_tokens": params.get("max_tokens"),
-            "top_p": params.get("top_p"),
-            "frequency_penalty": params.get("frequency_penalty"),
-            "presence_penalty": params.get("presence_penalty"),
-            "stop_sequences": params.get("stop_sequences"),
-            "request_id": ctx.request_id,
-            "tenant": ctx.tenant,
-            "stream": stream,
-        }
-
-        if extra_metrics:
-            error_ctx.update(extra_metrics)
-
-        return error_ctx
-
-    @asynccontextmanager
-    async def _error_context_async(
-        self,
-        operation: str,
-        *,
-        stream: bool,
-        messages_count: int,
-        model: str,
-        ctx: OperationContext,
-        params: Dict[str, Any],
-        extra_metrics: Optional[Mapping[str, Any]] = None,
-    ):
-        """
-        Async error-context wrapper.
-
-        Ensures any exception raised within is enriched with structured,
-        framework-specific context, without mutating the original type.
-        """
-        error_ctx = self._build_error_context(
-            operation=operation,
-            stream=stream,
-            messages_count=messages_count,
-            model=model,
-            ctx=ctx,
-            params=params,
-            extra_metrics=extra_metrics,
+        required_methods = (
+            "complete",
+            "stream",
+            "count_tokens",
+            "health",
+            "capabilities",
         )
-        try:
-            yield
-        except BaseException as exc:  # noqa: BLE001
-            try:
-                # `framework` is passed as the required origin identifier,
-                # and error_ctx carries the rest of the metadata.
-                attach_context(exc, framework="semantic_kernel", **error_ctx)
-            except Exception:  # pragma: no cover - never mask original error
-                logger.debug(
-                    "Failed to attach Semantic Kernel error context",
-                    exc_info=True,
+        missing = [
+            m
+            for m in required_methods
+            if not callable(getattr(llm_adapter, m, None))
+        ]
+        if missing:
+            raise TypeError(
+                f"{_INIT_ERROR_CODE}: "
+                "llm_adapter must implement LLMProtocolV1; missing methods: "
+                + ", ".join(missing)
+            )
+
+        if not isinstance(self.temperature, (int, float)) or not (
+            0.0 <= float(self.temperature) <= 2.0
+        ):
+            raise ValueError(
+                f"{_INIT_ERROR_CODE}: temperature must be between 0.0 and 2.0"
+            )
+
+        if self.max_tokens is not None:
+            if not isinstance(self.max_tokens, int) or self.max_tokens < 1:
+                raise ValueError(
+                    f"{_INIT_ERROR_CODE}: max_tokens must be a positive integer"
                 )
-            raise
 
     # ------------------------------------------------------------------ #
     # Internal helpers: context, sampling, framework_ctx
@@ -514,10 +642,20 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
         if max_tokens is None:
             max_tokens = self.max_tokens
 
-        stop_sequences = (
+        raw_stop = (
             getattr(settings, "stop_sequences", None)
             or getattr(settings, "stop", None)
         )
+
+        stop_sequences: Optional[List[str]]
+        if raw_stop is None:
+            stop_sequences = None
+        elif isinstance(raw_stop, str):
+            stop_sequences = [raw_stop]
+        elif isinstance(raw_stop, (list, tuple)):
+            stop_sequences = [str(s) for s in raw_stop]
+        else:
+            stop_sequences = [str(raw_stop)]
 
         params: Dict[str, Any] = {
             "model": model,
@@ -556,7 +694,7 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
         `LLMFrameworkTranslator` for `"semantic_kernel"`.
         """
         framework_ctx: Dict[str, Any] = {
-            "framework": "semantic_kernel",
+            "framework": _FRAMEWORK_NAME,
             "framework_version": self.framework_version,
             "service_id": getattr(self, "service_id", None),
             "settings_type": type(settings).__name__,
@@ -574,6 +712,7 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
     # Semantic Kernel async API (via LLMTranslator)
     # ------------------------------------------------------------------ #
 
+    @with_async_llm_error_context("get_chat_message_content")
     async def get_chat_message_content(
         self,
         chat_history: "ChatHistory",
@@ -593,38 +732,24 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
         params = self._build_sampling_params(settings, kwargs)
         framework_ctx = self._build_framework_ctx(settings, kwargs)
 
-        model_for_context = params.get("model", self.model)
-        messages_count = len(chat_history)
-        metrics = _analyze_chat_history(chat_history)
+        result = await self._translator.arun_complete(
+            raw_messages=chat_history,
+            model=params.get("model"),
+            max_tokens=params.get("max_tokens"),
+            temperature=params.get("temperature"),
+            top_p=params.get("top_p"),
+            frequency_penalty=params.get("frequency_penalty"),
+            presence_penalty=params.get("presence_penalty"),
+            stop_sequences=params.get("stop_sequences"),
+            tools=kwargs.get("tools"),
+            tool_choice=kwargs.get("tool_choice"),
+            system_message=kwargs.get("system_message"),
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+        return cast("ChatMessageContent", result)
 
-        async with self._error_context_async(
-            "get_chat_message_content",
-            stream=False,
-            messages_count=messages_count,
-            model=model_for_context,
-            ctx=ctx,
-            params=params,
-            extra_metrics=metrics,
-        ):
-            # Delegate to LLMTranslator; the SK framework translator defines
-            # the exact return shape (expected: ChatMessageContent).
-            result = await self._translator.arun_complete(
-                raw_messages=chat_history,
-                model=params.get("model"),
-                max_tokens=params.get("max_tokens"),
-                temperature=params.get("temperature"),
-                top_p=params.get("top_p"),
-                frequency_penalty=params.get("frequency_penalty"),
-                presence_penalty=params.get("presence_penalty"),
-                stop_sequences=params.get("stop_sequences"),
-                tools=kwargs.get("tools"),
-                tool_choice=kwargs.get("tool_choice"),
-                system_message=kwargs.get("system_message"),
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-            return cast("ChatMessageContent", result)
-
+    @with_async_llm_error_context("get_chat_message_contents")
     async def get_chat_message_contents(
         self,
         chat_history: "ChatHistory",
@@ -638,6 +763,7 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
         message = await self.get_chat_message_content(chat_history, settings, **kwargs)
         return [message]
 
+    @with_async_llm_error_context("get_streaming_chat_message_content")
     async def get_streaming_chat_message_content(
         self,
         chat_history: "ChatHistory",
@@ -658,55 +784,42 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
         params = self._build_sampling_params(settings, kwargs)
         framework_ctx = self._build_framework_ctx(settings, kwargs)
 
-        model_for_context = params.get("model", self.model)
-        messages_count = len(chat_history)
-        metrics = _analyze_chat_history(chat_history)
+        agen: Optional[AsyncIterator[Any]] = None
+        try:
+            agen = await self._translator.arun_stream(
+                raw_messages=chat_history,
+                model=params.get("model"),
+                max_tokens=params.get("max_tokens"),
+                temperature=params.get("temperature"),
+                top_p=params.get("top_p"),
+                frequency_penalty=params.get("frequency_penalty"),
+                presence_penalty=params.get("presence_penalty"),
+                stop_sequences=params.get("stop_sequences"),
+                tools=kwargs.get("tools"),
+                tool_choice=kwargs.get("tool_choice"),
+                system_message=kwargs.get("system_message"),
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
 
-        async with self._error_context_async(
-            "get_streaming_chat_message_content",
-            stream=True,
-            messages_count=messages_count,
-            model=model_for_context,
-            ctx=ctx,
-            params=params,
-            extra_metrics=metrics,
-        ):
-            agen: Optional[AsyncIterator[Any]] = None
-            try:
-                agen = await self._translator.arun_stream(
-                    raw_messages=chat_history,
-                    model=params.get("model"),
-                    max_tokens=params.get("max_tokens"),
-                    temperature=params.get("temperature"),
-                    top_p=params.get("top_p"),
-                    frequency_penalty=params.get("frequency_penalty"),
-                    presence_penalty=params.get("presence_penalty"),
-                    stop_sequences=params.get("stop_sequences"),
-                    tools=kwargs.get("tools"),
-                    tool_choice=kwargs.get("tool_choice"),
-                    system_message=kwargs.get("system_message"),
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
+            async for chunk in agen:
+                # The Semantic Kernel translator defines the chunk shape;
+                # expected: StreamingChatMessageContent.
+                yield cast("StreamingChatMessageContent", chunk)
+        finally:
+            # Best-effort cleanup of async generator resources.
+            if agen is not None:
+                close_method = getattr(agen, "aclose", None)
+                if close_method and callable(close_method):
+                    try:
+                        await close_method()
+                    except Exception:
+                        logger.debug(
+                            "Failed to close Semantic Kernel streaming generator",
+                            exc_info=True,
+                        )
 
-                async for chunk in agen:
-                    # The Semantic Kernel translator defines the chunk shape;
-                    # expected: StreamingChatMessageContent.
-                    yield cast("StreamingChatMessageContent", chunk)
-
-            finally:
-                # Best-effort cleanup of async generator resources.
-                if agen is not None:
-                    close_method = getattr(agen, "aclose", None)
-                    if close_method and callable(close_method):
-                        try:
-                            await close_method()
-                        except Exception:
-                            logger.debug(
-                                "Failed to close Semantic Kernel streaming generator",
-                                exc_info=True,
-                            )
-
+    @with_async_llm_error_context("get_streaming_chat_message_contents")
     async def get_streaming_chat_message_contents(
         self,
         chat_history: "ChatHistory",
@@ -729,4 +842,7 @@ __all__ = [
     "SemanticKernelLLMProtocol",
     "SemanticKernelChatConfig",
     "CorpusSemanticKernelChatCompletion",
+    "with_llm_error_context",
+    "with_async_llm_error_context",
+    "ERROR_CODES",
 ]
