@@ -3,65 +3,93 @@
 """
 Azure OpenAI LLM adapter for the Corpus LLM Protocol.
 
-This module implements a production-grade adapter on top of the
-`BaseLLMAdapter` / LLMProtocolV1 contract, targeting Microsoft Azure
-OpenAI Service via the official `openai` Python client (v1+ async API
-with `AsyncAzureOpenAI`).
+ARCHITECTURE
+------------
+This adapter implements the Corpus LLMProtocolV1 contract by wrapping
+the official OpenAI Python client (AsyncAzureOpenAI) for Azure OpenAI.
+Key design choices:
 
-Key Differences from OpenAI Adapter
-------------------------------------
-- Uses Azure-specific endpoint structure and authentication
-- Supports both API key and Azure AD (Entra ID) authentication
-- Uses deployment names instead of model names in API calls
-- Handles Azure-specific rate limiting and error responses
-- Requires API version specification
+1. Error Translation:
+   All SDK errors are mapped into the Corpus error taxonomy via
+   _translate_azure_error so routers can reason about failures in a
+   provider-agnostic way.
 
-Goals
------
-- Map Corpus protocol → Azure OpenAI Chat Completions.
-- Preserve async/streaming semantics.
-- Normalize provider errors into Corpus' error taxonomy.
-- Provide token usage accounting for cost/quota tracking.
-- Support enterprise authentication (Azure AD).
-- Play nicely with higher-level framework adapters
-  (LangChain, LlamaIndex, Semantic Kernel, etc.).
+2. Token Counting:
+   Uses tiktoken when available for model-aware tokenization with a
+   blended heuristic (words + chars) fallback. This is used by
+   BaseLLMAdapter for context-window preflight and coarse quota planning.
 
-Usage
------
-    from corpus_sdk.llm.azure_openai_adapter import AzureOpenAIAdapter
+3. Deployment vs Model:
+   Azure uses deployment names in API calls. The adapter exposes a
+   logical model name (default_model) in capabilities while always
+   calling Azure with deployment_name via the `model` parameter.
 
-    # Option 1: API Key authentication
-    adapter = AzureOpenAIAdapter(
-        azure_endpoint="https://myresource.openai.azure.com",
-        api_key="your-api-key",
-        deployment_name="gpt-4",
-        api_version="2024-02-15-preview",
-    )
+4. Streaming Usage:
+   Streaming uses stream_options={"include_usage": True} so the final
+   event carries accurate usage, which is surfaced on the final
+   LLMChunk via usage_so_far.
 
-    # Option 2: Azure AD authentication
-    from azure.identity.aio import DefaultAzureCredential
-    
-    credential = DefaultAzureCredential()
-    async def token_provider():
-        token = await credential.get_token("https://cognitiveservices.azure.com/.default")
-        return token.token
-    
-    adapter = AzureOpenAIAdapter(
-        azure_endpoint="https://myresource.openai.azure.com",
-        azure_ad_token_provider=token_provider,
-        deployment_name="gpt-4",
-    )
+CTX INTEGRATION
+---------------
+The adapter cooperates with OperationContext and BaseLLMAdapter:
 
-    result = await adapter.complete(
-        messages=[{"role": "user", "content": "Hello!"}],
-    )
-    print(result.text)
+- Deadlines:
+    ctx.deadline_ms is converted into a per-request timeout in seconds
+    via _compute_timeout and passed to Azure calls
+    (chat.completions.create, models.list).
+
+- Tracing:
+    ctx.request_id → X-Request-ID header
+    ctx.traceparent → traceparent header
+
+- Tenant Tagging:
+    ctx.tenant is hashed using BaseLLMAdapter._tenant_hash into a
+    stable, non-PII identifier and passed as the `user` parameter to
+    chat completion calls. This gives Azure a consistent user handle
+    for rate limiting and telemetry without exposing raw tenant ids.
+
+- Provider-Specific Escape Hatch:
+    ctx.attrs.get("azure_extra") (if a dict) is merged into the request
+    parameters (without overriding built-in keys). This allows advanced
+    tuning (e.g., extra_headers, extra_body, seed, n) without changing
+    the generic protocol surface.
+
+EXTENSION POINTS
+----------------
+To add another provider adapter:
+
+1. Inherit from BaseLLMAdapter.
+2. Implement:
+    - _do_capabilities
+    - _do_complete
+    - _do_stream
+    - _do_count_tokens
+    - _do_health
+3. Add a _translate_*_error helper to normalize SDK exceptions.
+4. Follow the same ctx patterns (timeouts, tracing, tenant hashing).
+
+DEBUGGING
+---------
+Enable debug logging:
+
+    logging.getLogger("corpus_sdk.llm.azure_openai_adapter").setLevel(logging.DEBUG)
+
+This logs (without PII):
+- System-message merge behavior
+- Fallback paths for token counting
+- Health-check results and error translations
+
+COMPATIBILITY
+-------------
+Requires: openai>=1.0.0 (AsyncAzureOpenAI API)
+Optional: tiktoken>=0.5.0 (accurate token counting)
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from time import time as _time
 from typing import Any, AsyncIterator, Callable, Dict, List, Mapping, Optional, Union
 
 import openai  # type: ignore
@@ -118,61 +146,6 @@ class AzureOpenAIAdapter(BaseLLMAdapter):
 
     This adapter is async-first and plugs directly into the Corpus
     protocol stack via `BaseLLMAdapter`.
-
-    Parameters
-    ----------
-    azure_endpoint:
-        Azure OpenAI resource endpoint, e.g.,
-        "https://myresource.openai.azure.com"
-    deployment_name:
-        Azure deployment name (not the model name). This is the name you
-        configured in Azure Portal for your model deployment.
-    client:
-        Pre-configured `AsyncAzureOpenAI` client instance. Recommended when
-        you want to control retry, proxies, organization, etc. If provided,
-        all other auth parameters are ignored.
-    api_key:
-        API key for Azure OpenAI. Used when client is not provided.
-        Mutually exclusive with azure_ad_token_provider.
-    api_version:
-        Azure OpenAI API version string, e.g., "2024-02-15-preview".
-        Defaults to "2024-02-15-preview".
-    azure_ad_token_provider:
-        Callable that returns an Azure AD token for authentication.
-        Mutually exclusive with api_key.
-        Example:
-            from azure.identity.aio import DefaultAzureCredential
-            credential = DefaultAzureCredential()
-            async def token_provider():
-                token = await credential.get_token(
-                    "https://cognitiveservices.azure.com/.default"
-                )
-                return token.token
-    default_model:
-        Logical model name for capabilities reporting. Defaults to the
-        deployment_name.
-    model_family:
-        Logical family name surfaced in `LLMCompletion.model_family`.
-    max_context_length:
-        Approximate max context window size used only for capabilities
-        reporting and *approximate* planning. We deliberately do not
-        hard-enforce this against provider limits.
-    metrics, mode, ...:
-        Passed through to `BaseLLMAdapter`.
-
-    Notes
-    -----
-    - Requires `openai` Python library v1+ (for `AsyncAzureOpenAI`). If
-      that is not available, instantiation will raise `RuntimeError`.
-    - Uses `tiktoken` for token counting when available, with a safe
-      heuristic fallback otherwise.
-    - Streaming uses `stream_options={"include_usage": True}` so the
-      final chunk carries accurate token usage.
-    - Response caching is handled automatically by BaseLLMAdapter using
-      the provided `cache` parameter. This adapter only implements
-      tokenizer caching for performance optimization.
-    - JSON output mode can be enabled via `ctx.attrs.get("response_format")`
-      set to "json_object".
     """
 
     def __init__(
@@ -257,6 +230,41 @@ class AzureOpenAIAdapter(BaseLLMAdapter):
         # Cache for tokenizers to avoid repeated initialization
         # This is separate from the base class response cache
         self._tokenizer_cache: Dict[str, Any] = {}
+
+    # ------------------------------------------------------------------
+    # CTX helpers (tenant hash, timeout)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _tenant_hash(tenant: Optional[str]) -> Optional[str]:
+        """
+        Use the BaseLLMAdapter tenant hashing (stable, non-reversible) so
+        Azure user tags are consistent with other adapters.
+        """
+        try:
+            return BaseLLMAdapter._tenant_hash(tenant)  # type: ignore[attr-defined]
+        except AttributeError:
+            if not tenant:
+                return None
+            import hashlib
+            return hashlib.sha256(tenant.encode("utf-8")).hexdigest()[:12]
+
+    @staticmethod
+    def _compute_timeout(ctx: Optional[OperationContext]) -> Optional[float]:
+        """
+        Convert ctx.deadline_ms to a per-request timeout in seconds.
+
+        - Returns None if no deadline is set.
+        - Returns a small positive timeout if the deadline is already
+          exceeded, letting Azure fail quickly instead of hanging.
+        """
+        if ctx is None or ctx.deadline_ms is None:
+            return None
+        now_ms = int(_time() * 1000)
+        remaining_ms = ctx.deadline_ms - now_ms
+        if remaining_ms <= 0:
+            return 1.0
+        return max(0.1, remaining_ms / 1000.0)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -605,27 +613,52 @@ class AzureOpenAIAdapter(BaseLLMAdapter):
         # Extract response format from context if specified
         response_format = self._get_response_format(ctx)
 
+        # Build the base request parameters
+        # Key difference: Azure uses deployment_name via the model parameter
+        timeout = self._compute_timeout(ctx)
+        request_params: Dict[str, Any] = {
+            "model": self._deployment_name,  # Azure deployment name, not logical model
+            "messages": azure_messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+            "frequency_penalty": frequency_penalty,
+            "presence_penalty": presence_penalty,
+            "stop": stop_sequences,
+            "stream": False,
+        }
+
+        if response_format:
+            request_params["response_format"] = response_format
+        if timeout is not None:
+            request_params["timeout"] = timeout
+
+        # CTX → extra_headers + user
+        extra_headers: Dict[str, str] = {}
+        user_tag: Optional[str] = None
+
+        if ctx is not None:
+            if ctx.request_id:
+                extra_headers["X-Request-ID"] = ctx.request_id
+            if ctx.traceparent:
+                extra_headers["traceparent"] = ctx.traceparent
+            if ctx.tenant:
+                user_tag = self._tenant_hash(ctx.tenant)
+
+            if extra_headers:
+                request_params["extra_headers"] = extra_headers
+            if user_tag:
+                request_params["user"] = user_tag
+
+            # Provider escape hatch: ctx.attrs["azure_extra"]
+            extra = ctx.attrs.get("azure_extra") if getattr(ctx, "attrs", None) else None
+            if isinstance(extra, dict):
+                for k, v in extra.items():
+                    if k not in request_params:
+                        request_params[k] = v
+
         try:
-            # Build the base request parameters
-            # Key difference: Azure uses deployment_name via the model parameter
-            request_params: Dict[str, Any] = {
-                "model": self._deployment_name,  # Azure deployment name, not logical model
-                "messages": azure_messages,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-                "top_p": top_p,
-                "frequency_penalty": frequency_penalty,
-                "presence_penalty": presence_penalty,
-                "stop": stop_sequences,
-                "stream": False,
-            }
-
-            # Add response_format if specified
-            if response_format:
-                request_params["response_format"] = response_format
-
             resp = await self._client.chat.completions.create(**request_params)
-
         except Exception as exc:  # noqa: BLE001
             raise self._translate_azure_error(exc) from exc
 
@@ -703,28 +736,51 @@ class AzureOpenAIAdapter(BaseLLMAdapter):
         # Extract response format from context if specified
         response_format = self._get_response_format(ctx)
 
+        timeout = self._compute_timeout(ctx)
+        # Build the base request parameters
+        request_params: Dict[str, Any] = {
+            "model": self._deployment_name,  # Azure deployment name, not logical model
+            "messages": azure_messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+            "frequency_penalty": frequency_penalty,
+            "presence_penalty": presence_penalty,
+            "stop": stop_sequences,
+            "stream": True,
+            # Key improvement: ask Azure OpenAI to include usage in the stream.
+            "stream_options": {"include_usage": True},
+        }
+
+        if response_format:
+            request_params["response_format"] = response_format
+        if timeout is not None:
+            request_params["timeout"] = timeout
+
+        extra_headers: Dict[str, str] = {}
+        user_tag: Optional[str] = None
+
+        if ctx is not None:
+            if ctx.request_id:
+                extra_headers["X-Request-ID"] = ctx.request_id
+            if ctx.traceparent:
+                extra_headers["traceparent"] = ctx.traceparent
+            if ctx.tenant:
+                user_tag = self._tenant_hash(ctx.tenant)
+
+            if extra_headers:
+                request_params["extra_headers"] = extra_headers
+            if user_tag:
+                request_params["user"] = user_tag
+
+            extra = ctx.attrs.get("azure_extra") if getattr(ctx, "attrs", None) else None
+            if isinstance(extra, dict):
+                for k, v in extra.items():
+                    if k not in request_params:
+                        request_params[k] = v
+
         try:
-            # Build the base request parameters
-            request_params: Dict[str, Any] = {
-                "model": self._deployment_name,  # Azure deployment name, not logical model
-                "messages": azure_messages,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-                "top_p": top_p,
-                "frequency_penalty": frequency_penalty,
-                "presence_penalty": presence_penalty,
-                "stop": stop_sequences,
-                "stream": True,
-                # Key improvement: ask Azure OpenAI to include usage in the stream.
-                "stream_options": {"include_usage": True},
-            }
-
-            # Add response_format if specified
-            if response_format:
-                request_params["response_format"] = response_format
-
             stream = await self._client.chat.completions.create(**request_params)
-
         except Exception as exc:  # noqa: BLE001
             raise self._translate_azure_error(exc) from exc
 
@@ -804,7 +860,7 @@ class AzureOpenAIAdapter(BaseLLMAdapter):
         text: str,
         *,
         model: Optional[str] = None,
-        ctx: Optional[OperationContext] = None,
+        ctx: Optional[OperationContext] = None,  # ctx accepted for symmetry, but unused
     ) -> int:
         """
         Token counting for Azure OpenAI models.
@@ -884,11 +940,23 @@ class AzureOpenAIAdapter(BaseLLMAdapter):
                 "version": self._version,
             }
 
+        timeout = self._compute_timeout(ctx)
+        request_params: Dict[str, Any] = {}
+        if timeout is not None:
+            request_params["timeout"] = timeout
+
+        extra_headers: Dict[str, str] = {}
+        if ctx is not None:
+            if ctx.request_id:
+                extra_headers["X-Request-ID"] = ctx.request_id
+            if ctx.traceparent:
+                extra_headers["traceparent"] = ctx.traceparent
+        if extra_headers:
+            request_params["extra_headers"] = extra_headers
+
         try:
             # Minimal live check: ensure we can talk to the API at all.
-            # For Azure, we try to list deployments or make a minimal request.
-            # We don't depend on the exact payload shape here.
-            await self._client.models.list()
+            await self._client.models.list(**request_params)
             return {
                 "ok": True,
                 "status": "healthy",
