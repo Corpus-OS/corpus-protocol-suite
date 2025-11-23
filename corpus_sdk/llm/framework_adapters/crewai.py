@@ -38,8 +38,8 @@ Design goals
    so you get protocol-level streaming semantics with CrewAI-friendly outputs.
 
 5. Context + observability:
-   - `OperationContext` built from CrewAI context
-   - Rich error context attached via the framework-level error_context helpers
+   - `OperationContext` built from CrewAI context via `ContextTranslator`
+   - Rich error context attached via core `attach_context` with `operation="llm_*"`
 """
 
 from __future__ import annotations
@@ -64,13 +64,8 @@ from typing import (
     TypedDict,
 )
 
-# Context translation for OperationContext
-from corpus_sdk.core.context_translation import from_crewai as from_crewai_context
-
-# Framework-level error context helpers (not core)
-from corpus_sdk.llm.framework_adapters.common.error_context import attach_context
-
-# LLM protocol + translator orchestration
+from corpus_sdk.core.context_translation import ContextTranslator
+from corpus_sdk.core.error_context import attach_context
 from corpus_sdk.llm.llm_base import (
     LLMProtocolV1,
     OperationContext,
@@ -83,11 +78,24 @@ from corpus_sdk.llm.framework_adapters.common.llm_translation import (
     JSONRepair,
     create_llm_translator,
 )
+from corpus_sdk.llm.framework_adapters.common.framework_utils import (
+    CoercionErrorCodes,
+)
 
 logger = logging.getLogger(__name__)
 
-# Type variables for decorators
 T = TypeVar("T")
+
+# ---------------------------------------------------------------------------
+# Error-code bundle (shared-style CoercionErrorCodes for this framework)
+# ---------------------------------------------------------------------------
+
+ERROR_CODES = CoercionErrorCodes(
+    invalid_result="CREWAI_LLM_INVALID_RESULT",
+    empty_result="CREWAI_LLM_EMPTY_RESULT",
+    conversion_error="CREWAI_LLM_CONVERSION_ERROR",
+    framework_label="crewai",
+)
 
 # ---------------------------------------------------------------------------
 # Type definitions for CrewAI compatibility
@@ -105,13 +113,13 @@ class CrewAIMessage(Protocol):
     def content(self) -> str: ...
 
 
-# Type aliases for better readability
 CrewAIMessageInput = Union[str, Mapping[str, Any], CrewAIMessage]
 CrewAIMessageSequence = Sequence[CrewAIMessageInput]
 
 
 class CrewAIContext(TypedDict, total=False):
     """Structured type for CrewAI execution context."""
+
     agent_role: Optional[str]
     agent_goal: Optional[str]
     task_description: Optional[str]
@@ -170,7 +178,7 @@ class CrewAILLMConfig:
 
 
 # ---------------------------------------------------------------------------
-# Error Context Helpers (Extracted for Clarity)
+# Error context helpers (aligned with other LLM adapters)
 # ---------------------------------------------------------------------------
 
 
@@ -178,10 +186,10 @@ def _extract_role_content(msg: Any) -> tuple[str, str]:
     """Extract role and content from various message formats."""
     if isinstance(msg, Mapping):
         return msg.get("role", "unknown"), msg.get("content", "")
-    elif hasattr(msg, "role") and hasattr(msg, "content"):
+    if hasattr(msg, "role") and hasattr(msg, "content"):
         return getattr(msg, "role", "unknown"), getattr(msg, "content", "")
-    else:  # string message
-        return "user", str(msg)
+    # string message
+    return "user", str(msg)
 
 
 def _analyze_message_metrics(messages: Sequence[Any]) -> tuple[Dict[str, int], int]:
@@ -234,9 +242,9 @@ def _extract_messages_from_args(first_arg: Any) -> list[Any]:
     """Safely extract messages from method arguments."""
     if isinstance(first_arg, (str, Mapping)) or hasattr(first_arg, "role"):
         return [first_arg]
-    elif isinstance(first_arg, (list, tuple)):
+    if isinstance(first_arg, (list, tuple)):
         return list(first_arg)
-    elif first_arg is not None:
+    if first_arg is not None:
         return [str(first_arg)]
     return []
 
@@ -250,16 +258,16 @@ def _extract_dynamic_context(
     """
     Extract rich dynamic context from method call for enhanced observability.
 
-    NOTE: This is intentionally called only in the error path to avoid
-    unnecessary overhead on successful calls.
+    This is called only in the error path to avoid hot-path overhead.
     """
     dynamic_ctx: Dict[str, Any] = {
         "model": getattr(instance, "model", "unknown"),
         "temperature": getattr(instance, "temperature", 0.7),
         "operation": operation,
+        "error_codes": ERROR_CODES,
     }
 
-    # Extract message metrics
+    # Message metrics
     if args:
         messages = _extract_messages_from_args(args[0])
         if messages:
@@ -268,11 +276,11 @@ def _extract_dynamic_context(
             dynamic_ctx["roles_distribution"] = roles
             dynamic_ctx["total_content_chars"] = total_chars
 
-    # Extract context from kwargs
+    # Context + sampling flags
     _extract_kwargs_context(kwargs, dynamic_ctx)
 
-    # Stream flag for streaming operations
-    if operation in ["astream", "stream"]:
+    # Streaming hint
+    if operation in ("astream", "stream"):
         dynamic_ctx["stream"] = True
 
     return dynamic_ctx
@@ -283,12 +291,10 @@ def _create_error_context_decorator(
     is_async: bool = False,
 ) -> Callable[[Callable[..., T]], Callable[..., T]]:
     """
-    Factory for creating error context decorators with rich per-call metrics.
+    Factory for creating error-context decorators with rich per-call metrics.
 
-    Performance note:
-    ------------------
-    We lazily extract dynamic context *only on exceptions*, so successful
-    calls don't pay the cost of iterating messages / counting characters.
+    - Attaches `framework="crewai"` and `operation=f"llm_{operation}"`
+    - Injects `ERROR_CODES` into the attached context
     """
 
     def decorator_factory(
@@ -301,17 +307,22 @@ def _create_error_context_decorator(
                 async def async_wrapper(self: Any, *args: Any, **kwargs: Any) -> T:
                     try:
                         return await func(self, *args, **kwargs)
-                    except Exception as exc:
+                    except Exception as exc:  # noqa: BLE001
                         dynamic_context = _extract_dynamic_context(
                             self,
                             args,
                             kwargs,
                             operation,
                         )
-                        full_context = {**static_context, **dynamic_context}
+                        full_context = {
+                            "error_codes": ERROR_CODES,
+                            **static_context,
+                            **dynamic_context,
+                        }
                         attach_context(
                             exc,
                             framework="crewai",
+                            operation=f"llm_{operation}",
                             **full_context,
                         )
                         raise
@@ -323,17 +334,22 @@ def _create_error_context_decorator(
                 def sync_wrapper(self: Any, *args: Any, **kwargs: Any) -> T:
                     try:
                         return func(self, *args, **kwargs)
-                    except Exception as exc:
+                    except Exception as exc:  # noqa: BLE001
                         dynamic_context = _extract_dynamic_context(
                             self,
                             args,
                             kwargs,
                             operation,
                         )
-                        full_context = {**static_context, **dynamic_context}
+                        full_context = {
+                            "error_codes": ERROR_CODES,
+                            **static_context,
+                            **dynamic_context,
+                        }
                         attach_context(
                             exc,
                             framework="crewai",
+                            operation=f"llm_{operation}",
                             **full_context,
                         )
                         raise
@@ -345,13 +361,14 @@ def _create_error_context_decorator(
     return decorator_factory
 
 
-# Convenience decorators with rich context extraction
 def with_llm_error_context(
     operation: str,
     **static_context: Any,
 ) -> Callable[[Callable[..., T]], Callable[..., T]]:
     """Decorator for sync LLM methods with rich dynamic context extraction."""
-    return _create_error_context_decorator(operation, is_async=False)(**static_context)
+    return _create_error_context_decorator(operation, is_async=False)(
+        **static_context
+    )
 
 
 def with_async_llm_error_context(
@@ -359,7 +376,9 @@ def with_async_llm_error_context(
     **static_context: Any,
 ) -> Callable[[Callable[..., T]], Callable[..., T]]:
     """Decorator for async LLM methods with rich dynamic context extraction."""
-    return _create_error_context_decorator(operation, is_async=True)(**static_context)
+    return _create_error_context_decorator(operation, is_async=True)(
+        **static_context
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -384,22 +403,22 @@ def _extract_stop_sequences(kwargs: Mapping[str, Any]) -> Optional[list[str]]:
 
 def _build_operation_context_from_kwargs(kwargs: Mapping[str, Any]) -> OperationContext:
     """
-    Build OperationContext from generic kwargs using context translation.
+    Build OperationContext from generic kwargs using core ContextTranslator.
 
-    Returns
-    -------
-    OperationContext
-        Context object with CrewAI execution context
+    Defensive behavior:
+    - If `ctx` is already an OperationContext, return it.
+    - Else, call `ContextTranslator.from_crewai_context(...)`.
+    - If that call fails, attach rich context and re-raise.
+    - If it returns a non-OperationContext, attach context and raise TypeError.
     """
-    # If caller already built an OperationContext, trust it.
-    ctx = kwargs.get("ctx")
-    if isinstance(ctx, OperationContext):
-        return ctx
+    # Caller-provided context wins
+    existing_ctx = kwargs.get("ctx")
+    if isinstance(existing_ctx, OperationContext):
+        return existing_ctx
 
     framework_version = kwargs.get("framework_version")
     task = kwargs.get("task")
 
-    # Only include fields that are meaningful for context translation.
     allowed_keys = {
         "request_id",
         "traceparent",
@@ -419,14 +438,40 @@ def _build_operation_context_from_kwargs(kwargs: Mapping[str, Any]) -> Operation
         k: v for k, v in kwargs.items() if k in allowed_keys
     }
 
-    ctx = from_crewai_context(
-        task=task,
-        framework_version=framework_version,
-        **context_kwargs,
-    )
+    try:
+        ctx = ContextTranslator.from_crewai_context(
+            task=task,
+            framework_version=framework_version,
+            **context_kwargs,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Mirror other adapters: attach context on translation failure
+        attach_context(
+            exc,
+            framework="crewai",
+            operation="llm_context_translation",
+            framework_version=framework_version,
+            source="crewai_kwargs",
+            **context_kwargs,
+        )
+        raise
+
+    if not isinstance(ctx, OperationContext):
+        exc = TypeError(
+            "ContextTranslator.from_crewai_context produced unsupported "
+            f"context type: {type(ctx).__name__}"
+        )
+        attach_context(
+            exc,
+            framework="crewai",
+            operation="llm_context_translation",
+            framework_version=framework_version,
+            returned_type=type(ctx).__name__,
+        )
+        raise exc
 
     logger.debug(
-        "Built OperationContext from CrewAI context with agent_role: %s, crew_id: %s",
+        "Built OperationContext from CrewAI context with agent_role=%s, crew_id=%s",
         context_kwargs.get("agent_role", "unknown"),
         context_kwargs.get("crew_id", "unknown"),
     )
@@ -441,13 +486,10 @@ def _build_sampling_params(
     default_max_tokens: Optional[int],
     kwargs: Mapping[str, Any],
 ) -> Dict[str, Any]:
-    """Build sampling parameters from kwargs and defaults.
+    """
+    Build sampling parameters from kwargs and defaults.
 
-    Returns
-    -------
-    Dict[str, Any]
-        Cleaned sampling parameters with None values removed.
-        Only includes fields understood by `LLMTranslator`.
+    Only includes fields understood by `LLMTranslator`.
     """
     stop_sequences = _extract_stop_sequences(kwargs)
 
@@ -461,13 +503,12 @@ def _build_sampling_params(
         "stop_sequences": stop_sequences,
     }
 
-    # Drop None values so translator sees only explicit parameters
     clean_params = {k: v for k, v in params.items() if v is not None}
 
     logger.debug(
         "Built sampling params for CrewAI: model=%s, temperature=%.2f, max_tokens=%s",
         clean_params.get("model", "default"),
-        clean_params.get("temperature", 0.7),
+        float(clean_params.get("temperature", 0.7)),
         clean_params.get("max_tokens", "default"),
     )
 
@@ -481,8 +522,8 @@ def _build_framework_ctx(
     """
     Build a framework_ctx payload for the CrewAI translator.
 
-    This stays lightweight and purely informational; all "real" translation
-    logic lives in the registered LLMFrameworkTranslator for "crewai".
+    This stays lightweight and purely informational; all translation logic
+    lives in the registered LLMFrameworkTranslator for "crewai".
     """
     crewai_context_keys = [
         "agent_role",
@@ -505,8 +546,7 @@ def _build_framework_ctx(
         "crewai_context": crewai_ctx,
     }
 
-    # Include any explicitly passed tools / tool_choice / system_message
-    # so the CrewAI translator can see them if it wants.
+    # Optional knobs that the CrewAI framework translator may care about
     for key in ("tools", "tool_choice", "system_message"):
         if key in kwargs:
             framework_ctx[key] = kwargs[key]
@@ -523,16 +563,15 @@ class CorpusCrewAILLM:
     """
     CrewAI-compatible LLM wrapper backed by the shared `LLMTranslator`.
 
-    This class no longer talks directly to `LLMProtocolV1` or performs its own
-    message translation; instead, it:
+    This class does not talk directly to provider APIs; instead, it:
 
     - Builds an `OperationContext` from CrewAI kwargs
     - Builds sampling params and a small `framework_ctx`
     - Delegates to `LLMTranslator` with `framework="crewai"`
 
-    The framework-specific behavior (message normalization, system message
-    handling, OpenAI shape conversion, etc.) is handled by the registered
-    CrewAI `LLMFrameworkTranslator` or the default translator.
+    Framework-specific behavior (message normalization, system messages,
+    OpenAI-shape handling, etc.) is handled by the registered
+    `LLMFrameworkTranslator` for "crewai".
     """
 
     def __init__(
@@ -544,47 +583,17 @@ class CorpusCrewAILLM:
         max_tokens: Optional[int] = None,
         framework_version: Optional[str] = None,
         require_crewai: bool = False,
-        # New optional config layer
         config: Optional[CrewAILLMConfig] = None,
-        # Optional explicit translator wiring
         translator: Optional[LLMFrameworkTranslator] = None,
         post_processing_config: Optional[LLMPostProcessingConfig] = None,
         safety_filter: Optional[SafetyFilter] = None,
         json_repair: Optional[JSONRepair] = None,
     ) -> None:
-        """Initialize the CrewAI LLM adapter.
-
-        Parameters
-        ----------
-        llm_adapter : LLMProtocolV1
-            Corpus LLM protocol adapter instance.
-        model : str, optional
-            Default model name if no config is provided, by default "default".
-        temperature : float, optional
-            Default sampling temperature if no config is provided, by default 0.7.
-        max_tokens : Optional[int], optional
-            Default maximum tokens if no config is provided, by default None.
-        framework_version : Optional[str], optional
-            CrewAI framework version for context, by default None.
-        require_crewai : bool, optional
-            Whether to validate CrewAI installation, by default False.
-        config : Optional[CrewAILLMConfig], optional
-            Optional configuration wrapper. When provided, it becomes the
-            source of truth for model/temperature/max_tokens and post-processing.
-        translator : Optional[LLMFrameworkTranslator], optional
-            Optional framework-specific translator for "crewai".
-        post_processing_config : Optional[LLMPostProcessingConfig], optional
-            Optional post-processing configuration; overrides config.post_processing_config.
-        safety_filter : Optional[SafetyFilter], optional
-            Optional safety filter; overrides config.safety_filter.
-        json_repair : Optional[JSONRepair], optional
-            Optional JSON repair; overrides config.json_repair.
+        """
+        Initialize the CrewAI LLM adapter.
         """
         if require_crewai:
             _ensure_crewai_installed()
-
-        if not hasattr(llm_adapter, "complete") or not callable(getattr(llm_adapter, "complete")):
-            raise TypeError("llm_adapter must implement LLMProtocolV1 with 'complete' method")
 
         # Resolve configuration precedence: explicit config > legacy kwargs.
         if config is not None:
@@ -593,7 +602,9 @@ class CorpusCrewAILLM:
             self.max_tokens = config.max_tokens
             self._framework_version = config.framework_version or framework_version
 
-            effective_post_processing = post_processing_config or config.post_processing_config
+            effective_post_processing = (
+                post_processing_config or config.post_processing_config
+            )
             effective_safety_filter = safety_filter or config.safety_filter
             effective_json_repair = json_repair or config.json_repair
         else:
@@ -606,7 +617,8 @@ class CorpusCrewAILLM:
             effective_safety_filter = safety_filter
             effective_json_repair = json_repair
 
-        # Build the shared LLMTranslator for the "crewai" framework
+        self._validate_init_params(llm_adapter)
+
         self._translator: LLMTranslator = create_llm_translator(
             adapter=llm_adapter,
             framework="crewai",
@@ -616,13 +628,84 @@ class CorpusCrewAILLM:
             json_repair=effective_json_repair,
         )
 
+        self._llm_adapter = llm_adapter
+
         logger.info(
-            "CorpusCrewAILLM initialized with model=%s, temperature=%.2f, max_tokens=%s, framework_version=%s",
+            "CorpusCrewAILLM initialized with model=%s, temperature=%.2f, "
+            "max_tokens=%s, framework_version=%s",
             self.model,
             self.temperature,
             self.max_tokens or "default",
             self._framework_version or "unknown",
         )
+
+    # ------------------------------------------------------------------ #
+    # Resource management (context managers) – aligned with other adapters
+    # ------------------------------------------------------------------ #
+
+    def __enter__(self) -> CorpusCrewAILLM:
+        """Support sync context manager protocol for resource cleanup."""
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        """Clean up resources when exiting sync context."""
+        close = getattr(self._llm_adapter, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Error while closing LLM adapter: %s", exc)
+
+    async def __aenter__(self) -> CorpusCrewAILLM:
+        """Support async context manager protocol."""
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        """Clean up resources when exiting async context."""
+        aclose = getattr(self._llm_adapter, "aclose", None)
+        if callable(aclose):
+            try:
+                await aclose()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Error while async-closing LLM adapter: %s", exc)
+
+    # ------------------------------------------------------------------ #
+    # Internal validation / helpers
+    # ------------------------------------------------------------------ #
+
+    def _validate_init_params(self, llm_adapter: LLMProtocolV1) -> None:
+        """
+        Validate initialization parameters and adapter capabilities.
+
+        - Ensures the adapter exposes core `LLMProtocolV1` methods.
+        - Validates temperature and max_tokens constraints.
+        """
+        required_methods = (
+            "complete",
+            "stream",
+            "count_tokens",
+            "health",
+            "capabilities",
+        )
+        missing = [
+            m
+            for m in required_methods
+            if not callable(getattr(llm_adapter, m, None))
+        ]
+        if missing:
+            raise TypeError(
+                "llm_adapter must implement LLMProtocolV1; missing methods: "
+                + ", ".join(missing)
+            )
+
+        if not isinstance(self.temperature, (int, float)) or not (
+            0.0 <= float(self.temperature) <= 2.0
+        ):
+            raise ValueError("temperature must be between 0.0 and 2.0")
+
+        if self.max_tokens is not None:
+            if not isinstance(self.max_tokens, int) or self.max_tokens < 1:
+                raise ValueError("max_tokens must be a positive integer")
 
     def _apply_instance_defaults(self, kwargs: Mapping[str, Any]) -> Dict[str, Any]:
         """
@@ -631,13 +714,16 @@ class CorpusCrewAILLM:
         Ensures `framework_version` is present if configured.
         """
         updated = dict(kwargs)
-        if "framework_version" not in updated and self._framework_version is not None:
+        if (
+            "framework_version" not in updated
+            and self._framework_version is not None
+        ):
             updated["framework_version"] = self._framework_version
         return updated
 
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
     # Async completion
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
 
     @with_async_llm_error_context("acomplete")
     async def acomplete(
@@ -647,28 +733,6 @@ class CorpusCrewAILLM:
     ) -> Any:
         """
         Async completion for CrewAI workflows.
-
-        Parameters
-        ----------
-        messages : Union[CrewAIMessageInput, CrewAIMessageSequence]
-            CrewAI message input (string, dict, message object, or sequence).
-            These are passed as raw messages into the `LLMTranslator`.
-        **kwargs : Any
-            - model, temperature, max_tokens, top_p, frequency_penalty, presence_penalty, stop
-            - agent_role, agent_goal, task_description, crew_id, crew_name, process_id, task_id
-            - request_id, tenant, framework_version
-            - tools, tool_choice, system_message (optional; forwarded via framework_ctx)
-
-        Returns
-        -------
-        Any
-            Framework-level completion as produced by the CrewAI LLMFrameworkTranslator.
-            (Typically a string for CrewAI, but the translator defines the exact shape.)
-
-        Raises
-        ------
-        Exception
-            Any exception from the underlying LLM/translator with rich context attached.
         """
         kwargs = self._apply_instance_defaults(kwargs)
         ctx = _build_operation_context_from_kwargs(kwargs)
@@ -678,7 +742,10 @@ class CorpusCrewAILLM:
             default_max_tokens=self.max_tokens,
             kwargs=kwargs,
         )
-        framework_ctx = _build_framework_ctx(kwargs.get("framework_version"), kwargs)
+        framework_ctx = _build_framework_ctx(
+            kwargs.get("framework_version"),
+            kwargs,
+        )
 
         result = await self._translator.arun_complete(
             raw_messages=messages,
@@ -696,12 +763,11 @@ class CorpusCrewAILLM:
             framework_ctx=framework_ctx,
         )
 
-        # The CrewAI translator is responsible for returning the right shape (e.g., text).
         return result
 
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
     # Async streaming
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
 
     @with_async_llm_error_context("astream")
     async def astream(
@@ -711,19 +777,6 @@ class CorpusCrewAILLM:
     ) -> AsyncIterator[Any]:
         """
         Async streaming completion for CrewAI workflows.
-
-        Parameters
-        ----------
-        messages : Union[CrewAIMessageInput, CrewAIMessageSequence]
-            CrewAI message input (string, dict, message object, or sequence).
-        **kwargs : Any
-            Same as `acomplete`.
-
-        Yields
-        ------
-        Any
-            Streaming chunks as produced by the CrewAI LLMFrameworkTranslator
-            (typically text tokens for CrewAI).
         """
         kwargs = self._apply_instance_defaults(kwargs)
         ctx = _build_operation_context_from_kwargs(kwargs)
@@ -733,7 +786,10 @@ class CorpusCrewAILLM:
             default_max_tokens=self.max_tokens,
             kwargs=kwargs,
         )
-        framework_ctx = _build_framework_ctx(kwargs.get("framework_version"), kwargs)
+        framework_ctx = _build_framework_ctx(
+            kwargs.get("framework_version"),
+            kwargs,
+        )
 
         agen = await self._translator.arun_stream(
             raw_messages=messages,
@@ -752,12 +808,11 @@ class CorpusCrewAILLM:
         )
 
         async for chunk in agen:
-            # The CrewAI translator defines the chunk shape; usually a text token.
             yield chunk
 
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
     # Sync completion
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
 
     @with_llm_error_context("complete")
     def complete(
@@ -767,18 +822,6 @@ class CorpusCrewAILLM:
     ) -> Any:
         """
         Sync completion for CrewAI workflows.
-
-        Parameters
-        ----------
-        messages : Union[CrewAIMessageInput, CrewAIMessageSequence]
-            CrewAI message input (string, dict, message object, or sequence).
-        **kwargs : Any
-            Same as `acomplete`.
-
-        Returns
-        -------
-        Any
-            Framework-level completion as produced by the CrewAI LLMFrameworkTranslator.
         """
         kwargs = self._apply_instance_defaults(kwargs)
         ctx = _build_operation_context_from_kwargs(kwargs)
@@ -788,7 +831,10 @@ class CorpusCrewAILLM:
             default_max_tokens=self.max_tokens,
             kwargs=kwargs,
         )
-        framework_ctx = _build_framework_ctx(kwargs.get("framework_version"), kwargs)
+        framework_ctx = _build_framework_ctx(
+            kwargs.get("framework_version"),
+            kwargs,
+        )
 
         result = self._translator.complete(
             raw_messages=messages,
@@ -808,12 +854,12 @@ class CorpusCrewAILLM:
 
         return result
 
-    # Make the instance directly callable for convenience
+    # Direct call convenience: llm(...) behaves like llm.complete(...)
     __call__ = complete
 
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
     # Sync streaming
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
 
     @with_llm_error_context("stream")
     def stream(
@@ -823,19 +869,6 @@ class CorpusCrewAILLM:
     ) -> Iterator[Any]:
         """
         Sync streaming completion for CrewAI workflows.
-
-        Parameters
-        ----------
-        messages : Union[CrewAIMessageInput, CrewAIMessageSequence]
-            CrewAI message input (string, dict, message object, or sequence).
-        **kwargs : Any
-            Same as `acomplete`.
-
-        Yields
-        ------
-        Any
-            Streaming chunks as produced by the CrewAI LLMFrameworkTranslator
-            (typically text tokens for CrewAI).
         """
         kwargs = self._apply_instance_defaults(kwargs)
         ctx = _build_operation_context_from_kwargs(kwargs)
@@ -845,7 +878,10 @@ class CorpusCrewAILLM:
             default_max_tokens=self.max_tokens,
             kwargs=kwargs,
         )
-        framework_ctx = _build_framework_ctx(kwargs.get("framework_version"), kwargs)
+        framework_ctx = _build_framework_ctx(
+            kwargs.get("framework_version"),
+            kwargs,
+        )
 
         iterator = self._translator.stream(
             raw_messages=messages,
@@ -876,4 +912,5 @@ __all__ = [
     "CrewAIMessageSequence",
     "with_llm_error_context",
     "with_async_llm_error_context",
+    "ERROR_CODES",
 ]
