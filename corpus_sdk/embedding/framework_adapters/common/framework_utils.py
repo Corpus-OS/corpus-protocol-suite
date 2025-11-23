@@ -19,13 +19,14 @@ It intentionally stays *framework-neutral* and uses only:
 Adapters remain responsible for:
 
 - Choosing the appropriate error codes
-- Providing the correct framework name and operation name
+- Providing the correct framework label (via `framework_label`)
 - Applying framework-specific context / logging
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import re
 from dataclasses import dataclass
 from typing import Any, List, Mapping, Optional, Protocol, Sequence
@@ -55,18 +56,19 @@ def _infer_framework_name(
     explicit_framework: Optional[str] = None,
 ) -> str:
     """
-    Infer framework name from error codes class with proper fallback chain.
+    Infer framework name from error codes object with proper fallback chain.
 
     Priority:
     1. Explicit framework parameter
-    2. error_codes.framework_name attribute (if present)
-    3. Inferred from error_codes class name
-    4. Fallback to "adapter"
+    2. `framework_label` attribute on error_codes (if present)
+    3. `framework_name` attribute on error_codes (legacy compatibility)
+    4. Inferred from error_codes class name
+    5. Fallback to "adapter"
 
     Parameters
     ----------
     error_codes:
-        Error codes object (typically CoercionErrorCodes subclass).
+        Error codes object (typically a `CoercionErrorCodes` instance).
     explicit_framework:
         Explicit framework override.
 
@@ -79,26 +81,31 @@ def _infer_framework_name(
     if explicit_framework:
         return explicit_framework
 
-    # Priority 2: Explicit attribute
+    # Priority 2: Explicit framework_label attribute (preferred)
+    if hasattr(error_codes, "framework_label"):
+        framework_label = getattr(error_codes, "framework_label")
+        if isinstance(framework_label, str) and framework_label:
+            return framework_label
+
+    # Priority 3: Legacy framework_name attribute
     if hasattr(error_codes, "framework_name"):
         framework_name = getattr(error_codes, "framework_name")
         if isinstance(framework_name, str) and framework_name:
             return framework_name
 
-    # Priority 3: Infer from class name
-    class_name = type(error_codes).__name__
+    # Priority 4: Infer from class name
+    cls = type(error_codes)
+    class_name = getattr(cls, "__name__", "") or ""
     if class_name and class_name != "CoercionErrorCodes":
         # Remove common suffixes
         name = re.sub(r"(ErrorCodes|Error|Codes)$", "", class_name)
-        
         # Convert PascalCase to snake_case
         # E.g., "LangChain" -> "lang_chain"
         name = re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
-        
         if name:
             return name
 
-    # Priority 4: Fallback
+    # Priority 5: Fallback
     return "adapter"
 
 
@@ -122,20 +129,18 @@ def _validate_error_codes(error_codes: Any) -> None:
         If error_codes is missing required attributes.
     """
     required_attrs = [
-        "INVALID_EMBEDDING_RESULT",
-        "EMPTY_EMBEDDING_RESULT",
-        "EMBEDDING_CONVERSION_ERROR",
-        "DIMENSION_MISMATCH",
+        "invalid_result",
+        "empty_result",
+        "conversion_error",
+        "dimension_mismatch",
     ]
-    
-    missing_attrs = [
-        attr for attr in required_attrs if not hasattr(error_codes, attr)
-    ]
-    
-    if missing_attrs:
+
+    missing = [attr for attr in required_attrs if not hasattr(error_codes, attr)]
+    if missing:
         raise TypeError(
-            f"error_codes missing required attributes: {', '.join(missing_attrs)}. "
-            f"Must provide a CoercionErrorCodes instance or compatible object."
+            "error_codes missing required attributes: "
+            f"{', '.join(missing)}. Expected a CoercionErrorCodes instance "
+            "or a compatible object with these attributes."
         )
 
 
@@ -155,18 +160,16 @@ def _validate_float_value(value: float, *, framework: str) -> None:
     ValueError
         If value is NaN or infinity.
     """
-    import math
-    
     if math.isnan(value):
         raise ValueError(
             f"{framework}: embedding contains NaN value - this typically indicates "
-            f"an upstream computation error"
+            "an upstream computation error"
         )
-    
+
     if math.isinf(value):
         raise ValueError(
             f"{framework}: embedding contains infinity value - this may indicate "
-            f"numerical instability or overflow"
+            "numerical instability or overflow"
         )
 
 
@@ -198,28 +201,28 @@ class CoercionErrorCodes:
 
     Attributes
     ----------
-    INVALID_EMBEDDING_RESULT:
+    invalid_result:
         Code used when the result structure is not a valid embedding container.
 
-    EMPTY_EMBEDDING_RESULT:
+    empty_result:
         Code used when no valid embedding rows remain after processing.
 
-    EMBEDDING_CONVERSION_ERROR:
+    conversion_error:
         Code used when numeric conversion to float fails.
 
-    DIMENSION_MISMATCH:
+    dimension_mismatch:
         Code used when embedding rows have inconsistent dimensions.
-    
-    framework_name:
-        Optional framework identifier for improved error messages and logging.
-        If not provided, will be inferred from the class name.
+
+    framework_label:
+        Logical name of the framework issuing the call (e.g., "langchain",
+        "crewai", "semantic_kernel"). Used purely for logs / messages.
     """
 
-    INVALID_EMBEDDING_RESULT: str = "INVALID_EMBEDDING_RESULT"
-    EMPTY_EMBEDDING_RESULT: str = "EMPTY_EMBEDDING_RESULT"
-    EMBEDDING_CONVERSION_ERROR: str = "EMBEDDING_CONVERSION_ERROR"
-    DIMENSION_MISMATCH: str = "DIMENSION_MISMATCH"
-    framework_name: Optional[str] = None
+    invalid_result: str = "INVALID_EMBEDDING_RESULT"
+    empty_result: str = "EMPTY_EMBEDDING_RESULT"
+    conversion_error: str = "EMBEDDING_CONVERSION_ERROR"
+    dimension_mismatch: str = "DIMENSION_MISMATCH"
+    framework_label: str = "adapter"
 
 
 @dataclass(frozen=True)
@@ -323,7 +326,7 @@ def _validate_dimension_consistency(
         raise ValueError(
             f"{framework}: embedding dimension {expected_dim} exceeds maximum "
             f"allowed dimension {MAX_EMBEDDING_DIMENSION} - this may indicate "
-            f"a malformed result or potential memory exhaustion attack"
+            "a malformed result or potential memory exhaustion attack"
         )
 
     # Performance optimization: limit validation on very large matrices
@@ -340,7 +343,6 @@ def _validate_dimension_consistency(
     for idx in range(1, rows_to_validate):
         row = matrix[idx]
         if len(row) != expected_dim:
-            # Collect all mismatches for diagnostics
             mismatches = [
                 (i, len(r))
                 for i, r in enumerate(matrix[:rows_to_validate])
@@ -354,7 +356,7 @@ def _validate_dimension_consistency(
                 mismatches[:10],  # Limit to first 10 for readability
             )
             raise ValueError(
-                f"[{error_codes.DIMENSION_MISMATCH}] "
+                f"[{error_codes.dimension_mismatch}] "
                 f"{framework}: embedding dimension mismatch at row {idx}: "
                 f"expected {expected_dim}, got {len(row)}"
             )
@@ -366,7 +368,6 @@ def _validate_dimension_consistency(
             try:
                 _validate_float_value(value, framework=framework)
             except ValueError:
-                # If first row has issues, do full scan to report all problems
                 log.warning(
                     "%s: detected invalid values in embeddings, performing full scan",
                     framework,
@@ -380,7 +381,9 @@ def _validate_dimension_consistency(
                                 f"{framework}: invalid value at row {row_idx}, "
                                 f"column {col_idx}: {e}"
                             ) from e
-                raise  # Re-raise original error if we didn't find more details
+                # If we somehow get here without raising inside the loop,
+                # re-raise the original error to avoid silent failure.
+                raise
 
 
 def coerce_embedding_matrix(
@@ -404,8 +407,8 @@ def coerce_embedding_matrix(
         Arbitrary result returned by the translator / adapter.
     error_codes:
         Bundle of error codes to embed in exception messages. Must have
-        attributes: INVALID_EMBEDDING_RESULT, EMPTY_EMBEDDING_RESULT,
-        EMBEDDING_CONVERSION_ERROR, DIMENSION_MISMATCH.
+        attributes: invalid_result, empty_result, conversion_error,
+        dimension_mismatch.
     logger:
         Optional logger; if omitted, the module-level logger is used.
     validate_dimensions:
@@ -417,7 +420,7 @@ def coerce_embedding_matrix(
         Default False for performance; enable for debugging or untrusted sources.
     framework:
         Optional framework label for logging. If not provided, will be inferred
-        from error_codes class name or framework_name attribute.
+        from `error_codes.framework_label` or class name.
 
     Returns
     -------
@@ -433,29 +436,6 @@ def coerce_embedding_matrix(
         If no non-empty embedding rows remain after processing, or if
         dimensions are inconsistent when validation is enabled, or if
         values are invalid when value validation is enabled.
-
-    Examples
-    --------
-    >>> # Standard usage with automatic framework inference
-    >>> from corpus_sdk.embedding.framework_adapters.langchain import ErrorCodes
-    >>> result = {"embeddings": [[1.0, 2.0], [3.0, 4.0]]}
-    >>> matrix = coerce_embedding_matrix(result, error_codes=ErrorCodes())
-    >>> # Infers framework="langchain" from ErrorCodes class name
-    
-    >>> # Performance-critical path with validation disabled
-    >>> matrix = coerce_embedding_matrix(
-    ...     trusted_result,
-    ...     error_codes=error_codes,
-    ...     validate_dimensions=False,
-    ... )
-    
-    >>> # Debugging with full validation enabled
-    >>> matrix = coerce_embedding_matrix(
-    ...     untrusted_result,
-    ...     error_codes=error_codes,
-    ...     validate_dimensions=True,
-    ...     validate_values=True,
-    ... )
     """
     log = logger or LOG
 
@@ -468,8 +448,6 @@ def coerce_embedding_matrix(
     embeddings_obj = _extract_embeddings_object(result)
 
     # Normalize to matrix shape
-    raw_rows: Sequence[Sequence[Any]]
-
     if isinstance(embeddings_obj, Sequence) and not isinstance(
         embeddings_obj, (str, bytes)
     ):
@@ -477,7 +455,7 @@ def coerce_embedding_matrix(
             embeddings_obj[0], (str, bytes)
         ):
             # Already a matrix: [[1,2], [3,4]]
-            raw_rows = embeddings_obj
+            raw_rows: Sequence[Sequence[Any]] = embeddings_obj
         elif embeddings_obj:
             # Single vector: [1,2,3] → [[1,2,3]]
             raw_rows = [embeddings_obj]
@@ -486,7 +464,7 @@ def coerce_embedding_matrix(
             raw_rows = []
     else:
         raise TypeError(
-            f"[{error_codes.INVALID_EMBEDDING_RESULT}] "
+            f"[{error_codes.invalid_result}] "
             f"{framework_label}: translator result does not contain a valid embeddings "
             f"sequence (type={type(embeddings_obj).__name__})"
         )
@@ -496,7 +474,7 @@ def coerce_embedding_matrix(
     for idx, row in enumerate(raw_rows):
         if not isinstance(row, Sequence) or isinstance(row, (str, bytes)):
             raise TypeError(
-                f"[{error_codes.INVALID_EMBEDDING_RESULT}] "
+                f"[{error_codes.invalid_result}] "
                 f"{framework_label}: expected each embedding row to be a non-string "
                 f"sequence, got {type(row).__name__} at index {idx}"
             )
@@ -513,7 +491,7 @@ def coerce_embedding_matrix(
             vector = [float(x) for x in row]
         except (TypeError, ValueError) as exc:
             raise TypeError(
-                f"[{error_codes.EMBEDDING_CONVERSION_ERROR}] "
+                f"[{error_codes.conversion_error}] "
                 f"{framework_label}: failed to convert embedding values to float at "
                 f"row {idx}: {exc}"
             ) from exc
@@ -522,7 +500,7 @@ def coerce_embedding_matrix(
 
     if not matrix:
         raise ValueError(
-            f"[{error_codes.EMPTY_EMBEDDING_RESULT}] "
+            f"[{error_codes.empty_result}] "
             f"{framework_label}: translator returned no valid embedding rows"
         )
 
@@ -572,7 +550,7 @@ def coerce_embedding_vector(
         Optional logger; if omitted, the module-level logger is used.
     framework:
         Optional framework label for logging. If not provided, will be inferred
-        from error_codes class name or framework_name attribute.
+        from `error_codes.framework_label` or class name.
 
     Returns
     -------
@@ -586,16 +564,16 @@ def coerce_embedding_vector(
     """
     log = logger or LOG
 
+    framework_label = _infer_framework_name(error_codes, framework)
+
     matrix = coerce_embedding_matrix(
         result,
         error_codes=error_codes,
         logger=log,
-        framework=framework,
+        framework=framework_label,
     )
 
     if len(matrix) > 1:
-        # Use same framework inference for consistent messaging
-        framework_label = _infer_framework_name(error_codes, framework)
         log.warning(
             "%s: expected a single embedding vector but received %d rows; "
             "using the first row",
