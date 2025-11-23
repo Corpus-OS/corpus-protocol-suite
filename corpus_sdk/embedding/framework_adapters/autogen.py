@@ -55,6 +55,7 @@ logger = logging.getLogger(__name__)
 # Type variables for decorators
 T = TypeVar("T")
 
+
 # Error code constants
 class ErrorCodes:
     INVALID_EMBEDDING_RESULT = "INVALID_EMBEDDING_RESULT"
@@ -121,7 +122,7 @@ def with_async_embedding_error_context(
 class AutoGenRetriever(Protocol):
     """
     Protocol representing AutoGen VectorStoreRetriever interface.
-    
+
     Shorter name for cleaner usage throughout the module.
     """
 
@@ -169,7 +170,7 @@ class CorpusAutoGenEmbeddings:
         Optional `BatchConfig` to control batching behavior.
 
     text_normalization_config:
-        Optional `TextNormalization_config` to control whitespace cleanup,
+        Optional `TextNormalizationConfig` to control whitespace cleanup,
         truncation, casing, encoding, etc.
 
     autogen_config:
@@ -232,62 +233,41 @@ class CorpusAutoGenEmbeddings:
         autogen_context: Optional[Mapping[str, Any]] = None,
         model: Optional[str] = None,
         **kwargs: Any,
-    ) -> Tuple[Optional[OperationContext], Dict[str, Any], Dict[str, Any]]:
+    ) -> Tuple[Optional[OperationContext], Dict[str, Any]]:
         """
-        Build contexts for AutoGen execution environment.
-
-        Uses the existing `context_from_autogen` implementation with
-        defensive validation to ensure OperationContext compatibility.
-
-        Parameters
-        ----------
-        autogen_context:
-            Optional AutoGen context containing agent information,
-            conversation state, and workflow metadata.
+        Build contexts for the AutoGen execution environment.
 
         Returns
         -------
         Tuple of:
-        - `core_ctx`: core OperationContext or None if no context provided
-        - `op_ctx_dict`: normalized dict for embedding layer
-        - `framework_ctx`: AutoGen-specific context for translator
+        - core_ctx:
+            An `OperationContext` instance if successfully derived from
+            `autogen_context`, otherwise None (the translator will build
+            a fresh context when needed).
+        - framework_ctx:
+            AutoGen-specific framework context used by the translator
+            for model selection and observability.
         """
         core_ctx: Optional[OperationContext] = None
-        op_ctx_dict: Dict[str, Any] = {}
         framework_ctx: Dict[str, Any] = {"framework": "autogen"}
 
-        # Handle AutoGen context with defensive validation
         if autogen_context is not None:
             try:
-                core_ctx = context_from_autogen(autogen_context)
-                if not isinstance(core_ctx, OperationContext):
+                maybe_ctx = context_from_autogen(autogen_context)
+                if isinstance(maybe_ctx, OperationContext):
+                    core_ctx = maybe_ctx
+                else:
                     logger.warning(
                         "context_from_autogen returned non-OperationContext type: %s. "
-                        "Using empty context.",
-                        type(core_ctx).__name__
+                        "Using empty OperationContext.",
+                        type(maybe_ctx).__name__,
                     )
-                    core_ctx = None
             except Exception as e:
                 logger.warning(
                     "Failed to create OperationContext from autogen_context: %s. "
-                    "Using empty context.",
-                    e
+                    "Falling back to None (translator will synthesize context).",
+                    e,
                 )
-                core_ctx = None
-
-        # Build normalized dict for embedding OperationContext
-        # Prefer using core_ctx directly if available, fall back to dict representation
-        if core_ctx is not None:
-            # Use the actual OperationContext for maximum context fidelity
-            op_ctx_dict = {"_operation_context": core_ctx}
-            # Also include dict representation for backwards compatibility
-            if hasattr(core_ctx, "to_dict"):
-                op_ctx_dict.update(core_ctx.to_dict())
-            elif hasattr(core_ctx, "__dict__"):
-                op_ctx_dict.update(core_ctx.__dict__)
-        else:
-            # Ensure we always have at least an empty dict for the translator
-            op_ctx_dict = {}
 
         # Add model information if available
         effective_model = model or self.model
@@ -308,48 +288,60 @@ class CorpusAutoGenEmbeddings:
         # Add any additional kwargs to framework context
         framework_ctx.update(kwargs)
 
-        return core_ctx, op_ctx_dict, framework_ctx
+        return core_ctx, framework_ctx
 
     def _coerce_embedding_matrix(self, result: Any) -> List[List[float]]:
         """
         Coerce translator result into a List[List[float]] embedding matrix.
 
-        Supports the same result formats as other adapters:
-        - {"embeddings": [[...], [...]], "model": "...", "usage": {...}}
+        Supports result formats:
+        - {"embeddings": [[...], [...]], ...}
+        - {"embedding": [...], ...}  (single embedding)
         - Direct matrix: [[...], [...]]
-        - EmbedResult-like with `.embeddings` attribute
+        - Objects with `.embeddings` or `.embedding` attributes
 
-        This ensures consistency across all framework adapters.
-
-        Note: Implemented without match/case so this module works on Python 3.9+.
+        This ensures consistency across all framework adapters while
+        retaining strict type validation and conversion.
         """
         embeddings_obj: Any
 
-        if isinstance(result, Mapping) and "embeddings" in result:
-            embeddings_obj = result["embeddings"]
+        if isinstance(result, Mapping):
+            if "embeddings" in result:
+                embeddings_obj = result["embeddings"]
+            elif "embedding" in result:
+                # Single embedding vector from unary translator
+                embeddings_obj = [result["embedding"]]
+            else:
+                embeddings_obj = result
         elif hasattr(result, "embeddings"):
             embeddings_obj = getattr(result, "embeddings")
+        elif hasattr(result, "embedding"):
+            # Raw EmbedResult-like object
+            embeddings_obj = [getattr(result, "embedding")]
         else:
             embeddings_obj = result
 
-        if not isinstance(embeddings_obj, Sequence):
+        if not isinstance(embeddings_obj, Sequence) or isinstance(
+            embeddings_obj, (str, bytes)
+        ):
             raise TypeError(
-                f"[{ErrorCodes.INVALID_EMBEDDING_RESULT}] Translator result does not contain a valid embeddings sequence: "
-                f"type={type(embeddings_obj).__name__}"
+                f"[{ErrorCodes.INVALID_EMBEDDING_RESULT}] Translator result does not contain a "
+                f"valid embeddings sequence: type={type(embeddings_obj).__name__}"
             )
 
         matrix: List[List[float]] = []
         for i, row in enumerate(embeddings_obj):
-            if not isinstance(row, Sequence):
+            if not isinstance(row, Sequence) or isinstance(row, (str, bytes)):
                 raise TypeError(
-                    f"[{ErrorCodes.INVALID_EMBEDDING_RESULT}] Expected each embedding row to be a sequence, "
-                    f"got {type(row).__name__} at index {i}"
+                    f"[{ErrorCodes.INVALID_EMBEDDING_RESULT}] Expected each embedding row to be a "
+                    f"sequence, got {type(row).__name__} at index {i}"
                 )
             try:
                 matrix.append([float(x) for x in row])
             except (TypeError, ValueError) as e:
                 raise TypeError(
-                    f"[{ErrorCodes.EMBEDDING_CONVERSION_ERROR}] Failed to convert embedding values to float at row {i}: {e}"
+                    f"[{ErrorCodes.EMBEDDING_CONVERSION_ERROR}] Failed to convert embedding values "
+                    f"to float at row {i}: {e}"
                 ) from e
 
         return matrix
@@ -364,7 +356,8 @@ class CorpusAutoGenEmbeddings:
 
         if not matrix:
             raise ValueError(
-                f"[{ErrorCodes.EMPTY_EMBEDDING_RESULT}] Translator returned no embeddings for single-text input"
+                f"[{ErrorCodes.EMPTY_EMBEDDING_RESULT}] Translator returned no embeddings "
+                f"for single-text input"
             )
 
         if len(matrix) > 1:
@@ -381,7 +374,7 @@ class CorpusAutoGenEmbeddings:
     # ------------------------------------------------------------------ #
 
     @with_embedding_error_context("function_call")
-    def __call__(self, texts: List[str]) -> List[List[float]]:
+    def __call__(self, texts: Sequence[str]) -> List[List[float]]:
         """
         Make the instance callable for AutoGen's EmbeddingFunction protocol.
 
@@ -396,19 +389,19 @@ class CorpusAutoGenEmbeddings:
         Parameters
         ----------
         texts:
-            List of texts to embed
+            Sequence of texts to embed
 
         Returns
         -------
         List[List[float]]
             Batch of text embedding vectors
         """
-        return self.embed_documents(texts)
+        return self.embed_documents(list(texts))
 
     @with_embedding_error_context("documents")
     def embed_documents(
         self,
-        texts: List[str],
+        texts: Sequence[str],
         *,
         autogen_context: Optional[Mapping[str, Any]] = None,
         model: Optional[str] = None,
@@ -423,18 +416,20 @@ class CorpusAutoGenEmbeddings:
         Parameters
         ----------
         texts:
-            List of documents to embed
+            Sequence of documents to embed
         autogen_context:
             Optional AutoGen context containing agent and conversation info
         model:
             Optional per-call model override
         """
-        # Soft warning for very large batches when no batch_config is provided.
         if isinstance(texts, Sequence) and not isinstance(texts, (str, bytes)):
             batch_size = len(texts)
             if (
                 batch_size > 10_000
-                and (self.batch_config is None or getattr(self.batch_config, "max_batch_size", None) is None)
+                and (
+                    self.batch_config is None
+                    or getattr(self.batch_config, "max_batch_size", None) is None
+                )
             ):
                 logger.warning(
                     "embed_documents called with batch_size=%d and no batch_config.max_batch_size; "
@@ -442,19 +437,15 @@ class CorpusAutoGenEmbeddings:
                     batch_size,
                 )
 
-        core_ctx, op_ctx_dict, framework_ctx = self._build_contexts(
+        core_ctx, framework_ctx = self._build_contexts(
             autogen_context=autogen_context,
             model=model,
             **kwargs,
         )
 
-        # Pass the rich OperationContext through the framework context for maximum fidelity
-        if core_ctx is not None:
-            framework_ctx["_operation_context"] = core_ctx
-
         translated = self._translator.embed(
-            raw_texts=texts,
-            op_ctx=op_ctx_dict,
+            raw_texts=list(texts),
+            op_ctx=core_ctx,
             framework_ctx=framework_ctx,
         )
         return self._coerce_embedding_matrix(translated)
@@ -483,19 +474,15 @@ class CorpusAutoGenEmbeddings:
         model:
             Optional per-call model override
         """
-        core_ctx, op_ctx_dict, framework_ctx = self._build_contexts(
+        core_ctx, framework_ctx = self._build_contexts(
             autogen_context=autogen_context,
             model=model,
             **kwargs,
         )
 
-        # Pass the rich OperationContext through the framework context for maximum fidelity
-        if core_ctx is not None:
-            framework_ctx["_operation_context"] = core_ctx
-
         translated = self._translator.embed(
             raw_texts=text,
-            op_ctx=op_ctx_dict,
+            op_ctx=core_ctx,
             framework_ctx=framework_ctx,
         )
         return self._coerce_embedding_vector(translated)
@@ -507,7 +494,7 @@ class CorpusAutoGenEmbeddings:
     @with_async_embedding_error_context("documents")
     async def aembed_documents(
         self,
-        texts: List[str],
+        texts: Sequence[str],
         *,
         autogen_context: Optional[Mapping[str, Any]] = None,
         model: Optional[str] = None,
@@ -522,18 +509,20 @@ class CorpusAutoGenEmbeddings:
         Parameters
         ----------
         texts:
-            List of documents to embed
+            Sequence of documents to embed
         autogen_context:
             Optional AutoGen context
         model:
             Optional per-call model override
         """
-        # Soft warning for very large batches when no batch_config is provided.
         if isinstance(texts, Sequence) and not isinstance(texts, (str, bytes)):
             batch_size = len(texts)
             if (
                 batch_size > 10_000
-                and (self.batch_config is None or getattr(self.batch_config, "max_batch_size", None) is None)
+                and (
+                    self.batch_config is None
+                    or getattr(self.batch_config, "max_batch_size", None) is None
+                )
             ):
                 logger.warning(
                     "aembed_documents called with batch_size=%d and no batch_config.max_batch_size; "
@@ -541,19 +530,15 @@ class CorpusAutoGenEmbeddings:
                     batch_size,
                 )
 
-        core_ctx, op_ctx_dict, framework_ctx = self._build_contexts(
+        core_ctx, framework_ctx = self._build_contexts(
             autogen_context=autogen_context,
             model=model,
             **kwargs,
         )
 
-        # Pass the rich OperationContext through the framework context for maximum fidelity
-        if core_ctx is not None:
-            framework_ctx["_operation_context"] = core_ctx
-
         translated = await self._translator.arun_embed(
-            raw_texts=texts,
-            op_ctx=op_ctx_dict,
+            raw_texts=list(texts),
+            op_ctx=core_ctx,
             framework_ctx=framework_ctx,
         )
         return self._coerce_embedding_matrix(translated)
@@ -582,19 +567,15 @@ class CorpusAutoGenEmbeddings:
         model:
             Optional per-call model override
         """
-        core_ctx, op_ctx_dict, framework_ctx = self._build_contexts(
+        core_ctx, framework_ctx = self._build_contexts(
             autogen_context=autogen_context,
             model=model,
             **kwargs,
         )
 
-        # Pass the rich OperationContext through the framework context for maximum fidelity
-        if core_ctx is not None:
-            framework_ctx["_operation_context"] = core_ctx
-
         translated = await self._translator.arun_embed(
             raw_texts=text,
-            op_ctx=op_ctx_dict,
+            op_ctx=core_ctx,
             framework_ctx=framework_ctx,
         )
         return self._coerce_embedding_vector(translated)
@@ -603,6 +584,7 @@ class CorpusAutoGenEmbeddings:
 # ------------------------------------------------------------------ #
 # AutoGen-Specific Helper Functions
 # ------------------------------------------------------------------ #
+
 
 def _validate_vector_store_for_autogen(vector_store: Any) -> None:
     """
@@ -768,7 +750,8 @@ def register_embeddings(
     )
 
     logger.info(
-        f"Corpus AutoGen embeddings registered: {model or 'default model'}"
+        "Corpus AutoGen embeddings registered: %s",
+        model or "default model",
     )
 
     return embeddings
