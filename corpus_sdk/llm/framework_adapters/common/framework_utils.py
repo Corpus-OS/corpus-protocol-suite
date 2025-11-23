@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# corpus_sdk/llm/framework_adapters/common/framework_utils.py
 """
 Shared utilities for framework-specific LLM adapters.
 
