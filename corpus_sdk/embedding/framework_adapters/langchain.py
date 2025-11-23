@@ -17,7 +17,8 @@ This module exposes Corpus `EmbeddingProtocolV1` implementations as
 The design mirrors the Corpus LangChain LLM adapter: this is a *thin*,
 framework-specific skin over the protocol-first Corpus embedding stack.
 
-Resilience (retries, caching, rate limiting, etc.) is expected to be provided by the underlying adapter, typically a BaseEmbeddingAdapter subclass.
+Resilience (retries, caching, rate limiting, etc.) is expected to be provided
+by the underlying adapter, typically a BaseEmbeddingAdapter subclass.
 """
 
 from __future__ import annotations
@@ -100,12 +101,18 @@ class ErrorCodes(CoercionErrorCodes):
     INVALID_EMBEDDING_RESULT = "INVALID_EMBEDDING_RESULT"
     EMPTY_EMBEDDING_RESULT = "EMPTY_EMBEDDING_RESULT"
     EMBEDDING_CONVERSION_ERROR = "EMBEDDING_CONVERSION_ERROR"
-    # Correct spelling (primary)
     LANGCHAIN_CONFIG_INVALID = "LANGCHAIN_CONFIG_INVALID"
 
 
 class LangChainConfig(TypedDict, total=False):
-    """Structured type for LangChain RunnableConfig context."""
+    """
+    Structured type for LangChain RunnableConfig-like context.
+
+    This mirrors the common fields exposed by LangChain's RunnableConfig /
+    invocation layer and is used both for type safety and for observability
+    context extraction.
+    """
+
     configurable: Optional[Dict[str, Any]]
     tags: Optional[List[str]]
     metadata: Optional[Dict[str, Any]]
@@ -114,58 +121,135 @@ class LangChainConfig(TypedDict, total=False):
     run_id: Optional[str]
 
 
-def with_embedding_error_context(
+# ---------------------------------------------------------------------------
+# Error-context decorators with dynamic context extraction
+# ---------------------------------------------------------------------------
+
+
+def _extract_dynamic_context(
+    instance: Any,
+    args: Tuple[Any, ...],
+    kwargs: Dict[str, Any],
     operation: str,
-    **context_kwargs: Any,
+) -> Dict[str, Any]:
+    """
+    Extract rich dynamic context from a LangChain embedding call.
+
+    Captures:
+    - model identifier from the embedding instance
+    - text_len for single-text operations
+    - texts_count / empty_texts_count for batch operations
+    - LangChain routing fields (run_id, run_name, tags)
+    """
+    dynamic_ctx: Dict[str, Any] = {
+        "model": getattr(instance, "model", "unknown"),
+    }
+
+    # Text / batch metrics
+    if operation == "query" and args and isinstance(args[0], str):
+        dynamic_ctx["text_len"] = len(args[0])
+    elif operation == "documents" and args and isinstance(args[0], Sequence):
+        texts_seq = args[0]
+        dynamic_ctx["texts_count"] = len(texts_seq)
+        empty_count = sum(
+            1 for text in texts_seq
+            if not isinstance(text, str) or not text.strip()
+        )
+        if empty_count:
+            dynamic_ctx["empty_texts_count"] = empty_count
+
+    # LangChain-specific config (if passed via keyword)
+    config = kwargs.get("config") or {}
+    if isinstance(config, Mapping):
+        if "run_id" in config:
+            dynamic_ctx["run_id"] = config["run_id"]
+        if "run_name" in config:
+            dynamic_ctx["run_name"] = config["run_name"]
+        if "tags" in config:
+            dynamic_ctx["tags"] = config["tags"]
+
+    return dynamic_ctx
+
+
+def _create_error_context_decorator(
+    operation: str,
+    is_async: bool = False,
 ) -> Callable[[Callable[..., T]], Callable[..., T]]:
     """
-    Decorator to automatically attach error context to embedding exceptions.
+    Factory for creating error-context decorators with rich per-call metrics.
+
+    Mirrors the pattern used in other framework adapters (LlamaIndex,
+    Semantic Kernel, AutoGen, CrewAI) for consistent observability.
     """
-    def decorator(func: Callable[..., T]) -> Callable[..., T]:
-        @wraps(func)
-        def wrapper(*args: Any, **kwargs: Any) -> T:
-            try:
-                return func(*args, **kwargs)
-            except Exception as exc:  # noqa: BLE001
-                enhanced_context = context_kwargs.copy()
-                attach_context(
-                    exc,
-                    framework="langchain",
-                    operation=f"embedding_{operation}",
-                    **enhanced_context,
-                )
-                raise
 
-        return wrapper
+    def decorator_factory(
+        **static_context: Any,
+    ) -> Callable[[Callable[..., T]], Callable[..., T]]:
+        def decorator(func: Callable[..., T]) -> Callable[..., T]:
+            if is_async:
+                @wraps(func)
+                async def async_wrapper(self: Any, *args: Any, **kwargs: Any) -> T:
+                    dynamic_context = _extract_dynamic_context(
+                        self,
+                        args,
+                        kwargs,
+                        operation,
+                    )
+                    full_context = {**static_context, **dynamic_context}
+                    try:
+                        return await func(self, *args, **kwargs)
+                    except Exception as exc:  # noqa: BLE001
+                        attach_context(
+                            exc,
+                            framework="langchain",
+                            operation=f"embedding_{operation}",
+                            **full_context,
+                        )
+                        raise
 
-    return decorator
+                return async_wrapper
+            else:
+                @wraps(func)
+                def sync_wrapper(self: Any, *args: Any, **kwargs: Any) -> T:
+                    dynamic_context = _extract_dynamic_context(
+                        self,
+                        args,
+                        kwargs,
+                        operation,
+                    )
+                    full_context = {**static_context, **dynamic_context}
+                    try:
+                        return func(self, *args, **kwargs)
+                    except Exception as exc:  # noqa: BLE001
+                        attach_context(
+                            exc,
+                            framework="langchain",
+                            operation=f"embedding_{operation}",
+                            **full_context,
+                        )
+                        raise
+
+                return sync_wrapper
+
+        return decorator
+
+    return decorator_factory
+
+
+def with_embedding_error_context(
+    operation: str,
+    **static_context: Any,
+) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    """Decorator for sync methods with rich dynamic context extraction."""
+    return _create_error_context_decorator(operation, is_async=False)(**static_context)
 
 
 def with_async_embedding_error_context(
     operation: str,
-    **context_kwargs: Any,
+    **static_context: Any,
 ) -> Callable[[Callable[..., T]], Callable[..., T]]:
-    """
-    Decorator to automatically attach error context to async embedding exceptions.
-    """
-    def decorator(func: Callable[..., T]) -> Callable[..., T]:
-        @wraps(func)
-        async def wrapper(*args: Any, **kwargs: Any) -> T:
-            try:
-                return await func(*args, **kwargs)
-            except Exception as exc:  # noqa: BLE001
-                enhanced_context = context_kwargs.copy()
-                attach_context(
-                    exc,
-                    framework="langchain",
-                    operation=f"embedding_{operation}",
-                    **enhanced_context,
-                )
-                raise
-
-        return wrapper
-
-    return decorator
+    """Decorator for async methods with rich dynamic context extraction."""
+    return _create_error_context_decorator(operation, is_async=True)(**static_context)
 
 
 class CorpusLangChainEmbeddings(BaseModel, Embeddings):
@@ -290,7 +374,7 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
     def _build_contexts(
         self,
         *,
-        config: Optional[Mapping[str, Any]] = None,
+        config: Optional[LangChainConfig] = None,
         model: Optional[str] = None,
         **kwargs: Any,
     ) -> Tuple[Optional[OperationContext], Dict[str, Any]]:
@@ -457,7 +541,7 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         self,
         texts: Sequence[str],
         *,
-        config: Optional[Mapping[str, Any]] = None,
+        config: Optional[LangChainConfig] = None,
         model: Optional[str] = None,
         **kwargs: Any,
     ) -> List[List[float]]:
@@ -502,7 +586,7 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         self,
         text: str,
         *,
-        config: Optional[Mapping[str, Any]] = None,
+        config: Optional[LangChainConfig] = None,
         model: Optional[str] = None,
         **kwargs: Any,
     ) -> List[float]:
@@ -547,7 +631,7 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         self,
         texts: Sequence[str],
         *,
-        config: Optional[Mapping[str, Any]] = None,
+        config: Optional[LangChainConfig] = None,
         model: Optional[str] = None,
         **kwargs: Any,
     ) -> List[List[float]]:
@@ -584,7 +668,7 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         self,
         text: str,
         *,
-        config: Optional[Mapping[str, Any]] = None,
+        config: Optional[LangChainConfig] = None,
         model: Optional[str] = None,
         **kwargs: Any,
     ) -> List[float]:
