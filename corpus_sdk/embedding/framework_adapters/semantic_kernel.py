@@ -16,6 +16,8 @@ Semantic Kernel embedding services, with:
 
 The design integrates with Semantic Kernel's planner and plugin architecture
 while maintaining the protocol-first Corpus embedding stack.
+
+Resilience (retries, caching, rate limiting, etc.) is expected to be provided by the underlying adapter, typically a BaseEmbeddingAdapter subclass.
 """
 
 from __future__ import annotations
