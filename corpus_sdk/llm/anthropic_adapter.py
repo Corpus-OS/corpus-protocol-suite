@@ -3,37 +3,90 @@
 """
 Anthropic LLM adapter for the Corpus LLM Protocol.
 
-This module implements a production-grade adapter on top of the
-`BaseLLMAdapter` / LLMProtocolV1 contract, targeting the official
-`anthropic` Python client (v1+ async API via `AsyncAnthropic`).
+ARCHITECTURE
+------------
+This adapter implements the Corpus LLMProtocolV1 contract by wrapping
+the official Anthropic Python client (AsyncAnthropic). Core behavior:
 
-Goals
------
-- Map Corpus protocol → Anthropic Messages API.
-- Preserve async/streaming semantics.
-- Normalize provider errors into Corpus' error taxonomy.
-- Provide token usage accounting for cost/quota tracking.
-- Respect Anthropic-specific nuances (system vs messages, required max_tokens,
-  stop_sequences naming, tokenizer API, etc.).
+1. Error Translation:
+   All Anthropic SDK errors are normalized into the Corpus error taxonomy
+   (see _translate_anthropic_error) so routers can reason about failures
+   without vendor-specific conditionals.
 
-Usage
------
-    from anthropic import AsyncAnthropic
-    from corpus_sdk.llm.anthropic_adapter import AnthropicAdapter
+2. Token Counting:
+   Prefers Anthropic's `messages.count_tokens` when available and falls
+   back to a blended heuristic (word+char based) for planning and
+   context-window preflight via BaseLLMAdapter.
 
-    client = AsyncAnthropic(api_key="sk-ant-...")
-    adapter = AnthropicAdapter(client=client, default_model="claude-3-5-sonnet-latest")
+3. System vs Messages:
+   Corpus-style "system" messages and the explicit `system_message`
+   parameter are merged into a single Anthropic `system` string, while
+   "user"/"assistant" messages become Messages API messages.
 
-    result = await adapter.complete(
-        messages=[{"role": "user", "content": "Hello!"}],
-    )
-    print(result.text)
+4. Streaming Usage:
+   Anthropic streaming does not expose usage directly. The adapter
+   accumulates the streamed text and then uses `count_tokens` to
+   compute an approximate TokenUsage for the final sentinel chunk.
+
+CTX INTEGRATION
+---------------
+The adapter cooperates with BaseLLMAdapter's OperationContext:
+
+- Deadlines:
+    ctx.deadline_ms is converted into a per-request timeout via
+    _compute_timeout and sent to Anthropic (messages.create,
+    messages.stream, messages.count_tokens, models.list).
+
+- Tracing:
+    ctx.request_id → X-Request-ID header
+    ctx.traceparent → traceparent header
+
+- Tenant Isolation:
+    ctx.tenant is hashed via BaseLLMAdapter._tenant_hash and mapped to
+    metadata["user_id"] so Anthropic can associate traffic with a
+    stable, non-PII user identifier.
+
+- Provider-Specific Escape Hatch:
+    ctx.attrs.get("anthropic_extra") (if a dict) is merged into the
+    Anthropic call parameters for advanced tuning without polluting
+    the generic protocol surface.
+
+EXTENSION POINTS
+----------------
+To implement another provider adapter:
+
+1. Inherit from BaseLLMAdapter
+2. Implement:
+    - _do_capabilities
+    - _do_complete
+    - _do_stream
+    - _do_count_tokens
+    - _do_health
+3. Add a _translate_*_error helper to normalize SDK exceptions.
+4. Follow the same ctx patterns for timeouts, tracing, and tenant IDs.
+
+DEBUGGING
+---------
+Enable debug logging:
+
+    logging.getLogger("corpus_sdk.llm.anthropic_adapter").setLevel(logging.DEBUG)
+
+This logs (without PII):
+- System-message merge behavior
+- Fallback paths for token counting
+- Health-check failures and error translations
+
+COMPATIBILITY
+-------------
+Requires: anthropic (AsyncAnthropic API)
+Tested with: anthropic>=0.29.0, Python 3.9-3.12
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from time import time as _time
 from typing import Any, AsyncIterator, Dict, List, Mapping, Optional, Tuple, Union
 
 import anthropic  # type: ignore
@@ -85,42 +138,6 @@ class AnthropicAdapter(BaseLLMAdapter):
 
     This adapter is async-first and plugs directly into the Corpus
     protocol stack via `BaseLLMAdapter`.
-
-    Parameters
-    ----------
-    client:
-        Pre-configured `AsyncAnthropic` client instance. Recommended when you
-        want to control retries, proxies, etc.
-    api_key:
-        API key used when a client is not provided. Ignored if `client`
-        is given.
-    base_url:
-        Optional custom base URL (for EU endpoints, proxies, gateways, etc.).
-    default_model:
-        Model to use when callers don't specify one explicitly.
-        e.g. "claude-3-5-sonnet-latest".
-    model_family:
-        Logical family name surfaced in `LLMCompletion.model_family`.
-    max_context_length:
-        Approximate max context window size used only for capabilities
-        reporting and *approximate* planning.
-    default_max_tokens:
-        Fallback max_tokens when callers pass `None`. Anthropic requires
-        `max_tokens` on every call, so we must always send something.
-    metrics, mode, ...:
-        Passed through to `BaseLLMAdapter`.
-
-    Notes
-    -----
-    - Requires `anthropic` Python library with `AsyncAnthropic`. If that
-      is not available, instantiation will raise `RuntimeError`.
-    - Uses Anthropic's `messages.count_tokens` when available for token
-      counting, with a safe heuristic fallback otherwise.
-    - Streaming uses the Messages streaming API. Anthropic does not
-      surface token usage directly in the stream today, so we compute
-      final usage via a follow-up token-counting call.
-    - JSON output mode is supported via prompt engineering since Anthropic
-      doesn't have a native JSON response format parameter.
     """
 
     def __init__(
@@ -183,6 +200,42 @@ class AnthropicAdapter(BaseLLMAdapter):
         
         # Cache for prompt tokens during streaming to avoid double-counting
         self._stream_prompt_cache: Dict[str, int] = {}
+
+    # ------------------------------------------------------------------
+    # CTX helpers (tenant hash, timeout)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _tenant_hash(tenant: Optional[str]) -> Optional[str]:
+        """
+        Use the BaseLLMAdapter tenant hashing (stable, non-reversible) so
+        Anthropic metadata gets a consistent user_id across adapters.
+        """
+        try:
+            return BaseLLMAdapter._tenant_hash(tenant)  # type: ignore[attr-defined]
+        except AttributeError:
+            if not tenant:
+                return None
+            import hashlib
+            return hashlib.sha256(tenant.encode("utf-8")).hexdigest()[:12]
+
+    @staticmethod
+    def _compute_timeout(ctx: Optional[OperationContext]) -> Optional[float]:
+        """
+        Convert ctx.deadline_ms to a per-request timeout in seconds.
+
+        - Returns None if no deadline is set.
+        - Returns a small positive timeout if the deadline is already exceeded,
+          letting Anthropic fail quickly instead of hanging indefinitely.
+        """
+        if ctx is None or ctx.deadline_ms is None:
+            return None
+        now_ms = int(_time() * 1000)
+        remaining_ms = ctx.deadline_ms - now_ms
+        if remaining_ms <= 0:
+            return 1.0
+        # Clamp to a minimum of 0.1s to avoid zero-second timeouts.
+        return max(0.1, remaining_ms / 1000.0)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -539,16 +592,47 @@ class AnthropicAdapter(BaseLLMAdapter):
 
         max_tokens_effective = max_tokens if max_tokens is not None else self._default_max_tokens
 
+        # Build request params with ctx-based timeout, headers, metadata
+        timeout = self._compute_timeout(ctx)
+        request_params: Dict[str, Any] = {
+            "model": resolved_model,
+            "max_tokens": max_tokens_effective,
+            "messages": anthro_messages,
+            "system": enhanced_system,
+            "temperature": temperature,
+            "top_p": top_p,
+            "stop_sequences": stop_sequences,
+        }
+        if timeout is not None:
+            request_params["timeout"] = timeout
+
+        extra_headers: Dict[str, str] = {}
+        metadata: Dict[str, Any] = {}
+
+        if ctx is not None:
+            if ctx.request_id:
+                extra_headers["X-Request-ID"] = ctx.request_id
+            if ctx.traceparent:
+                extra_headers["traceparent"] = ctx.traceparent
+            if ctx.tenant:
+                user_tag = self._tenant_hash(ctx.tenant)
+                if user_tag:
+                    metadata["user_id"] = user_tag
+
+            if extra_headers:
+                request_params["extra_headers"] = extra_headers
+            if metadata:
+                request_params["metadata"] = metadata
+
+            # Provider-specific escape hatch: ctx.attrs["anthropic_extra"]
+            extra = ctx.attrs.get("anthropic_extra") if ctx.attrs else None
+            if isinstance(extra, dict):
+                for k, v in extra.items():
+                    if k not in request_params:
+                        request_params[k] = v
+
         try:
-            resp = await self._client.messages.create(
-                model=resolved_model,
-                max_tokens=max_tokens_effective,
-                messages=anthro_messages,
-                system=enhanced_system,
-                temperature=temperature,
-                top_p=top_p,
-                stop_sequences=stop_sequences,
-            )
+            resp = await self._client.messages.create(**request_params)
         except Exception as exc:  # noqa: BLE001
             raise self._translate_anthropic_error(exc) from exc
 
@@ -630,17 +714,47 @@ class AnthropicAdapter(BaseLLMAdapter):
             model=resolved_model,
         )
 
+        # Build request params with ctx-based timeout, headers, metadata
+        timeout = self._compute_timeout(ctx)
+        request_params: Dict[str, Any] = {
+            "model": resolved_model,
+            "max_tokens": max_tokens_effective,
+            "messages": anthro_messages,
+            "system": enhanced_system,
+            "temperature": temperature,
+            "top_p": top_p,
+            "stop_sequences": stop_sequences,
+        }
+        if timeout is not None:
+            request_params["timeout"] = timeout
+
+        extra_headers: Dict[str, str] = {}
+        metadata: Dict[str, Any] = {}
+
+        if ctx is not None:
+            if ctx.request_id:
+                extra_headers["X-Request-ID"] = ctx.request_id
+            if ctx.traceparent:
+                extra_headers["traceparent"] = ctx.traceparent
+            if ctx.tenant:
+                user_tag = self._tenant_hash(ctx.tenant)
+                if user_tag:
+                    metadata["user_id"] = user_tag
+
+            if extra_headers:
+                request_params["extra_headers"] = extra_headers
+            if metadata:
+                request_params["metadata"] = metadata
+
+            extra = ctx.attrs.get("anthropic_extra") if ctx.attrs else None
+            if isinstance(extra, dict):
+                for k, v in extra.items():
+                    if k not in request_params:
+                        request_params[k] = v
+
         try:
             # Async streaming context manager.
-            async with self._client.messages.stream(
-                model=resolved_model,
-                max_tokens=max_tokens_effective,
-                messages=anthro_messages,
-                system=enhanced_system,
-                temperature=temperature,
-                top_p=top_p,
-                stop_sequences=stop_sequences,
-            ) as stream:
+            async with self._client.messages.stream(**request_params) as stream:
                 # Use the convenience text_stream, which yields just the
                 # assistant text deltas in order.
                 async for delta_text in stream.text_stream:
@@ -743,11 +857,38 @@ class AnthropicAdapter(BaseLLMAdapter):
         try:
             messages_client = getattr(self._client, "messages", None)
             if messages_client is not None and hasattr(messages_client, "count_tokens"):
-                # Represent text as a single-user message for counting.
-                resp = await messages_client.count_tokens(
-                    model=resolved_model,
-                    messages=[{"role": "user", "content": text}],
-                )
+                timeout = self._compute_timeout(ctx)
+                request_params: Dict[str, Any] = {
+                    "model": resolved_model,
+                    "messages": [{"role": "user", "content": text}],
+                }
+                if timeout is not None:
+                    request_params["timeout"] = timeout
+
+                extra_headers: Dict[str, str] = {}
+                metadata: Dict[str, Any] = {}
+                if ctx is not None:
+                    if ctx.request_id:
+                        extra_headers["X-Request-ID"] = ctx.request_id
+                    if ctx.traceparent:
+                        extra_headers["traceparent"] = ctx.traceparent
+                    if ctx.tenant:
+                        user_tag = self._tenant_hash(ctx.tenant)
+                        if user_tag:
+                            metadata["user_id"] = user_tag
+
+                    if extra_headers:
+                        request_params["extra_headers"] = extra_headers
+                    if metadata:
+                        request_params["metadata"] = metadata
+
+                    extra = ctx.attrs.get("anthropic_extra") if ctx.attrs else None
+                    if isinstance(extra, dict):
+                        for k, v in extra.items():
+                            if k not in request_params:
+                                request_params[k] = v
+
+                resp = await messages_client.count_tokens(**request_params)
                 tokens = getattr(resp, "input_tokens", None)
                 if tokens is None:
                     usage = getattr(resp, "usage", None)
@@ -805,9 +946,44 @@ class AnthropicAdapter(BaseLLMAdapter):
                 "version": self._version,
             }
 
+        # Build timeout and headers/metadata for health probe as well
+        timeout = self._compute_timeout(ctx)
+        request_params: Dict[str, Any] = {}
+        if timeout is not None:
+            request_params["timeout"] = timeout
+
+        extra_headers: Dict[str, str] = {}
+        metadata: Dict[str, Any] = {}
+        if ctx is not None:
+            if ctx.request_id:
+                extra_headers["X-Request-ID"] = ctx.request_id
+            if ctx.traceparent:
+                extra_headers["traceparent"] = ctx.traceparent
+            if ctx.tenant:
+                user_tag = self._tenant_hash(ctx.tenant)
+                if user_tag:
+                    metadata["user_id"] = user_tag
+
+        if extra_headers:
+            request_params["extra_headers"] = extra_headers
+        if metadata:
+            request_params["metadata"] = metadata
+
         try:
             # Minimal live check: ensure we can talk to the API at all.
-            await self._client.models.list()
+            models_client = getattr(self._client, "models", None)
+            if models_client is None or not hasattr(models_client, "list"):
+                # If the client doesn't expose models.list, treat as degraded.
+                return {
+                    "ok": False,
+                    "status": "error",
+                    "server": self._server,
+                    "version": self._version,
+                    "error_code": "NOT_SUPPORTED",
+                    "error_message": "models.list not supported by Anthropic client",
+                }
+
+            await models_client.list(**request_params)
             return {
                 "ok": True,
                 "status": "healthy",
