@@ -33,6 +33,7 @@ from typing import (
     Tuple,
     TypeVar,
     List,
+    TypedDict,
 )
 
 from corpus_sdk.core.context_translation import (
@@ -62,16 +63,32 @@ T = TypeVar("T")
 
 
 # --------------------------------------------------------------------------- #
-# Error codes (aligned with other framework adapters)
+# Error codes + context types
 # --------------------------------------------------------------------------- #
 
 
 class ErrorCodes(CoercionErrorCodes):
-    """Error code constants for AutoGen embedding adapter."""
+    """
+    Error code constants for AutoGen embedding adapter.
+
+    Inherits from CoercionErrorCodes so shared coercion utilities can
+    reference the same symbolic names while remaining framework-specific.
+    """
 
     INVALID_EMBEDDING_RESULT = "INVALID_EMBEDDING_RESULT"
     EMPTY_EMBEDDING_RESULT = "EMPTY_EMBEDDING_RESULT"
     EMBEDDING_CONVERSION_ERROR = "EMBEDDING_CONVERSION_ERROR"
+    AUTOGEN_CONTEXT_INVALID = "AUTOGEN_CONTEXT_INVALID"
+
+
+class AutoGenContext(TypedDict, total=False):
+    """Structured type for AutoGen execution context."""
+    agent_name: Optional[str]
+    conversation_id: Optional[str]
+    workflow_type: Optional[str]
+    retriever_name: Optional[str]
+    request_id: Optional[str]
+    user_id: Optional[str]
 
 
 # --------------------------------------------------------------------------- #
@@ -97,68 +114,136 @@ class AutoGenRetriever(Protocol):
 
 
 # --------------------------------------------------------------------------- #
-# Error-context decorators
+# Error-context decorators with dynamic context extraction
 # --------------------------------------------------------------------------- #
+
+
+def _extract_dynamic_context(
+    instance: Any,
+    args: Tuple[Any, ...],
+    kwargs: Dict[str, Any],
+    operation: str,
+) -> Dict[str, Any]:
+    """
+    Extract dynamic context from an embedding call for enhanced observability.
+
+    Captures:
+    - model identifier from the embedding instance
+    - text_len for single-text operations
+    - texts_count / empty_texts_count for batch operations
+    - key AutoGen routing fields (conversation_id, agent_name, workflow_type, retriever_name)
+    """
+    dynamic_ctx: Dict[str, Any] = {
+        "model": getattr(instance, "model", "unknown"),
+    }
+
+    # Text / batch metrics
+    if operation in ("query",) and args and isinstance(args[0], str):
+        dynamic_ctx["text_len"] = len(args[0])
+    elif operation in ("documents", "function_call") and args and isinstance(args[0], Sequence):
+        texts_seq = args[0]
+        dynamic_ctx["texts_count"] = len(texts_seq)
+        empty_count = sum(
+            1 for text in texts_seq
+            if not isinstance(text, str) or not text.strip()
+        )
+        if empty_count:
+            dynamic_ctx["empty_texts_count"] = empty_count
+
+    # AutoGen-specific context (if passed through kwargs)
+    autogen_context = kwargs.get("autogen_context") or {}
+    if isinstance(autogen_context, Mapping):
+        if "conversation_id" in autogen_context:
+            dynamic_ctx["conversation_id"] = autogen_context["conversation_id"]
+        if "agent_name" in autogen_context:
+            dynamic_ctx["agent_name"] = autogen_context["agent_name"]
+        if "workflow_type" in autogen_context:
+            dynamic_ctx["workflow_type"] = autogen_context["workflow_type"]
+        if "retriever_name" in autogen_context:
+            dynamic_ctx["retriever_name"] = autogen_context["retriever_name"]
+
+    return dynamic_ctx
+
+
+def _create_error_context_decorator(
+    operation: str,
+    is_async: bool = False,
+) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    """
+    Factory for creating error context decorators with rich per-call metrics.
+
+    Mirrors the pattern used in other framework adapters (e.g., LlamaIndex,
+    Semantic Kernel) to keep behavior consistent.
+    """
+
+    def decorator_factory(
+        **static_context: Any,
+    ) -> Callable[[Callable[..., T]], Callable[..., T]]:
+        def decorator(func: Callable[..., T]) -> Callable[..., T]:
+            if is_async:
+                @wraps(func)
+                async def async_wrapper(self: Any, *args: Any, **kwargs: Any) -> T:
+                    dynamic_context = _extract_dynamic_context(
+                        self,
+                        args,
+                        kwargs,
+                        operation,
+                    )
+                    full_context = {**static_context, **dynamic_context}
+                    try:
+                        return await func(self, *args, **kwargs)
+                    except Exception as exc:  # noqa: BLE001
+                        attach_context(
+                            exc,
+                            framework="autogen",
+                            operation=f"embedding_{operation}",
+                            **full_context,
+                        )
+                        raise
+
+                return async_wrapper
+            else:
+                @wraps(func)
+                def sync_wrapper(self: Any, *args: Any, **kwargs: Any) -> T:
+                    dynamic_context = _extract_dynamic_context(
+                        self,
+                        args,
+                        kwargs,
+                        operation,
+                    )
+                    full_context = {**static_context, **dynamic_context}
+                    try:
+                        return func(self, *args, **kwargs)
+                    except Exception as exc:  # noqa: BLE001
+                        attach_context(
+                            exc,
+                            framework="autogen",
+                            operation=f"embedding_{operation}",
+                            **full_context,
+                        )
+                        raise
+
+                return sync_wrapper
+
+        return decorator
+
+    return decorator_factory
 
 
 def with_embedding_error_context(
     operation: str,
     **static_context: Any,
 ) -> Callable[[Callable[..., T]], Callable[..., T]]:
-    """
-    Decorator to automatically attach error context to sync embedding exceptions.
-
-    We intentionally catch broad `Exception` at this layer because embedding
-    operations must not leak internal adapter errors without rich context.
-    """
-
-    def decorator(func: Callable[..., T]) -> Callable[..., T]:
-        @wraps(func)
-        def wrapper(*args: Any, **kwargs: Any) -> T:
-            try:
-                return func(*args, **kwargs)
-            except Exception as exc:
-                attach_context(
-                    exc,
-                    framework="autogen",
-                    operation=f"embedding_{operation}",
-                    **static_context,
-                )
-                raise
-
-        return wrapper
-
-    return decorator
+    """Decorator for sync methods with rich dynamic context extraction."""
+    return _create_error_context_decorator(operation, is_async=False)(**static_context)
 
 
 def with_async_embedding_error_context(
     operation: str,
     **static_context: Any,
 ) -> Callable[[Callable[..., T]], Callable[..., T]]:
-    """
-    Decorator to automatically attach error context to async embedding exceptions.
-
-    We intentionally catch broad `Exception` at this layer to ensure that any
-    async embedding failure carries framework and operation metadata.
-    """
-
-    def decorator(func: Callable[..., T]) -> Callable[..., T]:
-        @wraps(func)
-        async def wrapper(*args: Any, **kwargs: Any) -> T:
-            try:
-                return await func(*args, **kwargs)
-            except Exception as exc:
-                attach_context(
-                    exc,
-                    framework="autogen",
-                    operation=f"embedding_{operation}",
-                    **static_context,
-                )
-                raise
-
-        return wrapper
-
-    return decorator
+    """Decorator for async methods with rich dynamic context extraction."""
+    return _create_error_context_decorator(operation, is_async=True)(**static_context)
 
 
 # --------------------------------------------------------------------------- #
@@ -218,11 +303,11 @@ class CorpusAutoGenEmbeddings:
     ) -> None:
         # Behavioral validation (duck-typed) instead of strict isinstance
         if not hasattr(corpus_adapter, "embed") or not callable(
-            getattr(corpus_adapter, "embed", None)
+            getattr(corpus_adapter, "embed", None),
         ):
             raise TypeError(
                 "corpus_adapter must implement an EmbeddingProtocolV1-compatible "
-                "interface with an 'embed' method"
+                "interface with an 'embed' method",
             )
 
         self.corpus_adapter = corpus_adapter
@@ -287,15 +372,15 @@ class CorpusAutoGenEmbeddings:
         if autogen_context is not None:
             if not isinstance(autogen_context, Mapping):
                 logger.warning(
-                    "autogen_context should be a Mapping, got %s; ignoring context",
+                    "[%s] autogen_context should be a Mapping, got %s; ignoring context",
+                    ErrorCodes.AUTOGEN_CONTEXT_INVALID,
                     type(autogen_context).__name__,
                 )
             else:
                 try:
                     core_candidate = context_from_autogen(autogen_context)
-                except Exception as exc:
-                    # We intentionally catch all exceptions from context translation:
-                    # context is best-effort and must never break embedding calls.
+                except Exception as exc:  # noqa: BLE001
+                    # Context translation is best-effort and must never break embeddings
                     logger.warning(
                         "Failed to create OperationContext from autogen_context: %s. "
                         "Proceeding without OperationContext.",
@@ -605,7 +690,7 @@ def create_retriever(
     """
     try:
         from autogen.retrieve_utils import VectorStoreRetriever
-    except ImportError as exc:
+    except ImportError as exc:  # noqa: BLE001
         message = (
             "AutoGen is not installed. To use create_retriever, install the "
             "AutoGen package, for example: 'pip install pyautogen'."
@@ -675,8 +760,11 @@ def register_embeddings(
 
 __all__ = [
     "CorpusAutoGenEmbeddings",
+    "AutoGenContext",
     "AutoGenRetriever",
     "create_retriever",
     "register_embeddings",
     "ErrorCodes",
+    "with_embedding_error_context",
+    "with_async_embedding_error_context",
 ]
