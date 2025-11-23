@@ -118,57 +118,141 @@ class CrewAIEmbedder(Protocol):
         ...
 
 
-def with_embedding_error_context(
+# --------------------------------------------------------------------------- #
+# Error-context decorators with dynamic context extraction
+# --------------------------------------------------------------------------- #
+
+
+def _extract_dynamic_context(
+    instance: Any,
+    args: Tuple[Any, ...],
+    kwargs: Dict[str, Any],
     operation: str,
-    **context_kwargs: Any,
+) -> Dict[str, Any]:
+    """
+    Extract rich dynamic context from a CrewAI embedding call.
+
+    Captures:
+    - model identifier from the embedding instance
+    - text_len for single-text operations
+    - texts_count / empty_texts_count for batch operations
+    - CrewAI routing fields (agent_role, task_id, crew_id, workflow, process_id)
+    """
+    dynamic_ctx: Dict[str, Any] = {
+        "model": getattr(instance, "model", "unknown"),
+    }
+
+    # Text / batch metrics
+    if operation == "query" and args and isinstance(args[0], str):
+        dynamic_ctx["text_len"] = len(args[0])
+    elif operation == "documents" and args and isinstance(args[0], Sequence):
+        texts_seq = args[0]
+        dynamic_ctx["texts_count"] = len(texts_seq)
+        empty_count = sum(
+            1 for text in texts_seq
+            if not isinstance(text, str) or not text.strip()
+        )
+        if empty_count:
+            dynamic_ctx["empty_texts_count"] = empty_count
+
+    # CrewAI-specific context (if passed via keyword)
+    crewai_context = kwargs.get("crewai_context") or {}
+    if isinstance(crewai_context, Mapping):
+        if "agent_role" in crewai_context:
+            dynamic_ctx["agent_role"] = crewai_context["agent_role"]
+        if "task_id" in crewai_context:
+            dynamic_ctx["task_id"] = crewai_context["task_id"]
+        if "workflow" in crewai_context:
+            dynamic_ctx["workflow"] = crewai_context["workflow"]
+        if "crew_id" in crewai_context:
+            dynamic_ctx["crew_id"] = crewai_context["crew_id"]
+        if "agent_id" in crewai_context:
+            dynamic_ctx["agent_id"] = crewai_context["agent_id"]
+        if "process_id" in crewai_context:
+            dynamic_ctx["process_id"] = crewai_context["process_id"]
+
+    return dynamic_ctx
+
+
+def _create_error_context_decorator(
+    operation: str,
+    is_async: bool = False,
 ) -> Callable[[Callable[..., T]], Callable[..., T]]:
     """
-    Decorator to automatically attach error context to embedding exceptions.
+    Factory for creating error context decorators with rich per-call metrics.
 
-    Captures the framework name and a logical operation label so that
-    downstream logging/monitoring can distinguish CrewAI embedding failures.
+    Mirrors the pattern used in other framework adapters (LlamaIndex,
+    Semantic Kernel, AutoGen) for consistent observability.
     """
-    def decorator(func: Callable[..., T]) -> Callable[..., T]:
-        @wraps(func)
-        def wrapper(*args: Any, **kwargs: Any) -> T:
-            try:
-                return func(*args, **kwargs)
-            except Exception as exc:  # noqa: BLE001
-                enhanced_context = context_kwargs.copy()
-                attach_context(
-                    exc,
-                    framework="crewai",
-                    operation=f"embedding_{operation}",
-                    **enhanced_context,
-                )
-                raise
-        return wrapper
-    return decorator
+
+    def decorator_factory(
+        **static_context: Any,
+    ) -> Callable[[Callable[..., T]], Callable[..., T]]:
+        def decorator(func: Callable[..., T]) -> Callable[..., T]:
+            if is_async:
+                @wraps(func)
+                async def async_wrapper(self: Any, *args: Any, **kwargs: Any) -> T:
+                    dynamic_context = _extract_dynamic_context(
+                        self,
+                        args,
+                        kwargs,
+                        operation,
+                    )
+                    full_context = {**static_context, **dynamic_context}
+                    try:
+                        return await func(self, *args, **kwargs)
+                    except Exception as exc:  # noqa: BLE001
+                        attach_context(
+                            exc,
+                            framework="crewai",
+                            operation=f"embedding_{operation}",
+                            **full_context,
+                        )
+                        raise
+
+                return async_wrapper
+            else:
+                @wraps(func)
+                def sync_wrapper(self: Any, *args: Any, **kwargs: Any) -> T:
+                    dynamic_context = _extract_dynamic_context(
+                        self,
+                        args,
+                        kwargs,
+                        operation,
+                    )
+                    full_context = {**static_context, **dynamic_context}
+                    try:
+                        return func(self, *args, **kwargs)
+                    except Exception as exc:  # noqa: BLE001
+                        attach_context(
+                            exc,
+                            framework="crewai",
+                            operation=f"embedding_{operation}",
+                            **full_context,
+                        )
+                        raise
+
+                return sync_wrapper
+
+        return decorator
+
+    return decorator_factory
+
+
+def with_embedding_error_context(
+    operation: str,
+    **static_context: Any,
+) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    """Decorator for sync methods with rich dynamic context extraction."""
+    return _create_error_context_decorator(operation, is_async=False)(**static_context)
 
 
 def with_async_embedding_error_context(
     operation: str,
-    **context_kwargs: Any,
+    **static_context: Any,
 ) -> Callable[[Callable[..., T]], Callable[..., T]]:
-    """
-    Decorator to automatically attach error context to async embedding exceptions.
-    """
-    def decorator(func: Callable[..., T]) -> Callable[..., T]:
-        @wraps(func)
-        async def wrapper(*args: Any, **kwargs: Any) -> T:
-            try:
-                return await func(*args, **kwargs)
-            except Exception as exc:  # noqa: BLE001
-                enhanced_context = context_kwargs.copy()
-                attach_context(
-                    exc,
-                    framework="crewai",
-                    operation=f"embedding_{operation}",
-                    **enhanced_context,
-                )
-                raise
-        return wrapper
-    return decorator
+    """Decorator for async methods with rich dynamic context extraction."""
+    return _create_error_context_decorator(operation, is_async=True)(**static_context)
 
 
 class CrewAIConfig(TypedDict, total=False):
@@ -185,60 +269,6 @@ class CorpusCrewAIEmbeddings:
 
     This class implements the CrewAI embedder interface and can be directly
     assigned to CrewAI agents via the `embedder` attribute.
-
-    Example:
-    ```python
-    from crewai import Agent, Task, Crew
-    from corpus_sdk.embedding.framework_adapters.crewai import create_embedder
-
-    # Create embedder with optimized CrewAI configuration
-    embedder = create_embedder(
-        corpus_adapter=my_adapter,
-        model="text-embedding-3-large",
-        crewai_config={
-            "max_embedding_retries": 3,
-            "task_aware_batching": True
-        }
-    )
-
-    # Use with CrewAI agent
-    researcher = Agent(
-        role="Senior Research Analyst",
-        goal="Uncover breakthrough AI research insights",
-        backstory="Expert analyst with deep technical understanding",
-        embedder=embedder,
-        tools=[web_search_tool, document_processor]
-    )
-
-    # Embedder automatically receives CrewAI context during execution
-    task = Task(
-        description="Research latest LLM architectures and their performance characteristics",
-        agent=researcher,
-        expected_output="Comprehensive analysis report"
-    )
-
-    crew = Crew(agents=[researcher], tasks=[task])
-    ```
-
-    Error Handling Example:
-    ```python
-    try:
-        embeddings = embedder.embed_documents(
-            texts=research_docs,
-            crewai_context={"agent_role": "Researcher", "task_id": "llm_analysis"}
-        )
-    except Exception as e:
-        # Rich error context automatically attached
-        logger.error("Embedding failed with context", exc_info=e)
-    ```
-
-    Attributes
-    ----------
-    corpus_adapter: Underlying Corpus embedding protocol adapter
-    model: Optional default model identifier
-    batch_config: Optional batching configuration
-    text_normalization_config: Optional text normalization settings
-    crewai_config: CrewAI-specific configuration with validation
     """
 
     def __init__(
@@ -251,11 +281,11 @@ class CorpusCrewAIEmbeddings:
     ):
         # Behavioral validation (duck-typed) instead of strict isinstance
         if not hasattr(corpus_adapter, "embed") or not callable(
-            getattr(corpus_adapter, "embed", None)
+            getattr(corpus_adapter, "embed", None),
         ):
             raise TypeError(
                 "corpus_adapter must implement an EmbeddingProtocolV1-compatible "
-                "interface with an 'embed' method"
+                "interface with an 'embed' method",
             )
 
         self.corpus_adapter = corpus_adapter
@@ -393,7 +423,7 @@ class CorpusCrewAIEmbeddings:
                     "agent_id": crewai_context.get("agent_id"),
                     "crew_id": crewai_context.get("crew_id"),
                     "process_id": crewai_context.get("process_id"),
-                }
+                },
             )
 
             if (
@@ -421,7 +451,7 @@ class CorpusCrewAIEmbeddings:
         if not isinstance(context, Mapping):
             raise ValueError(
                 f"[{ErrorCodes.CREWAI_CONTEXT_INVALID}] "
-                f"CrewAI context must be a mapping, got {type(context).__name__}"
+                f"CrewAI context must be a mapping, got {type(context).__name__}",
             )
 
         if not context.get("agent_role") and not context.get("task_id"):
@@ -609,6 +639,11 @@ class CorpusCrewAIEmbeddings:
         return self._coerce_embedding_vector(translated)
 
 
+# ------------------------------------------------------------------ #
+# CrewAI Registration Helpers
+# ------------------------------------------------------------------ #
+
+
 def create_embedder(
     corpus_adapter: EmbeddingProtocolV1,
     model: Optional[str] = None,
@@ -616,6 +651,9 @@ def create_embedder(
 ) -> CrewAIEmbedder:
     """
     Create a CrewAI-compatible embedder for seamless agent integration.
+
+    This is the simplest entry-point when you want to manually assign
+    `embedder=...` on individual agents.
     """
     embedder = CorpusCrewAIEmbeddings(
         corpus_adapter=corpus_adapter,
@@ -631,11 +669,94 @@ def create_embedder(
     return embedder
 
 
+def register_with_crewai(
+    crew: Any,
+    corpus_adapter: EmbeddingProtocolV1,
+    model: Optional[str] = None,
+    **kwargs: Any,
+) -> CorpusCrewAIEmbeddings:
+    """
+    Register Corpus embeddings with a CrewAI `Crew` instance.
+
+    This helper:
+    - Creates a `CorpusCrewAIEmbeddings` instance
+    - Attempts to attach it as `embedder` on each agent in `crew.agents`
+    - Logs warnings instead of failing hard if the shape is unexpected
+
+    Example
+    -------
+    ```python
+    from crewai import Agent, Task, Crew
+    from corpus_sdk.embedding.framework_adapters.crewai import register_with_crewai
+
+    researcher = Agent(...)
+    writer = Agent(...)
+    crew = Crew(agents=[researcher, writer], tasks=[...])
+
+    embedder = register_with_crewai(
+        crew=crew,
+        corpus_adapter=my_adapter,
+        model="text-embedding-3-large",
+        crewai_config={"task_aware_batching": True},
+    )
+    ```
+    """
+    if crew is None:
+        raise ValueError("crew cannot be None")
+
+    embedder = CorpusCrewAIEmbeddings(
+        corpus_adapter=corpus_adapter,
+        model=model,
+        **kwargs,
+    )
+
+    agents_attr = getattr(crew, "agents", None)
+    if agents_attr is None:
+        logger.warning(
+            "Crew object %r has no 'agents' attribute; cannot auto-attach embedder. "
+            "Assign it manually on each agent (agent.embedder = embedder).",
+            type(crew).__name__,
+        )
+    else:
+        try:
+            agents = agents_attr() if callable(agents_attr) else agents_attr
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to introspect crew.agents on %r: %s. "
+                "You may need to attach the embedder manually.",
+                type(crew).__name__,
+                exc,
+            )
+            agents = []
+
+        attached = 0
+        for agent in agents or []:
+            if hasattr(agent, "embedder"):
+                setattr(agent, "embedder", embedder)
+                attached += 1
+            else:
+                logger.debug(
+                    "CrewAI agent %r has no 'embedder' attribute; skipping.",
+                    type(agent).__name__,
+                )
+
+        logger.info(
+            "Corpus CrewAI embedder registered for crew %r; attached to %d agents",
+            getattr(crew, "name", None) or type(crew).__name__,
+            attached,
+        )
+
+    return embedder
+
+
 __all__ = [
     "CorpusCrewAIEmbeddings",
     "CrewAIEmbedder",
     "CrewAIContext",
     "CrewAIConfig",
     "create_embedder",
+    "register_with_crewai",
     "ErrorCodes",
+    "with_embedding_error_context",
+    "with_async_embedding_error_context",
 ]
