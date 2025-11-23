@@ -14,20 +14,29 @@ This module exposes Corpus `LLMProtocolV1` implementations via the shared
 - Production-grade error handling and observability
 - Centralized token counting via LLMTranslator with robust fallbacks
 
-Design principles
------------------
-- Translator-first:
-    All provider-specific logic (message normalization, post-processing,
-    tools, output shaping) is handled by the shared `LLMTranslator` for
-    the `"langchain"` framework.
+Design goals
+------------
 
-- Framework-native:
-    This adapter only owns the LangChain-facing interface, context building,
-    and callback wiring. It returns `ChatResult` / `ChatGenerationChunk`.
+1. Protocol + translator first:
+   All calls go through the shared `LLMTranslator` with the `"semantic_kernel"`
+   framework, so message normalization, post-processing, tools, and error context
+   are consistent across frameworks.
 
-- Observable and robust:
-    Lazy error-context decorators attach rich context only on failure,
-    and streaming paths clean up iterators correctly.
+2. Optional dependency safe:
+   Import of Langchain is guarded. Importing this module is safe even if
+   Langchain is not installed.
+
+3. Simple & explicit interface:
+   Clean API that Langchain can use directly by plugging in this client
+   as a `ChatCompletionClientBase` implementation.
+
+4. True streaming:
+   Streaming goes through `LLMTranslator.arun_stream`, so you get protocol-level
+   streaming semantics with Langchain–friendly outputs.
+
+5. Context + observability:
+   - `OperationContext` built from Langchain prompt settings
+   - Rich error context attached via the framework-level error_context helpers
 """
 
 from __future__ import annotations
