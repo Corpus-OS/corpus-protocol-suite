@@ -35,9 +35,6 @@ from typing import (
     TypedDict,
 )
 
-from llama_index.core.embeddings import BaseEmbedding
-from llama_index.core.callbacks import CallbackManager
-
 from corpus_sdk.core.context_translation import (
     from_llamaindex as context_from_llamaindex,
 )
@@ -64,11 +61,36 @@ logger = logging.getLogger(__name__)
 # Type variables for decorators
 T = TypeVar("T")
 
-# Use LlamaIndex's default batch size constant
+# ---------------------------------------------------------------------------
+# Safe conditional imports for LlamaIndex
+# ---------------------------------------------------------------------------
+
 try:
-    from llama_index.core.embeddings import DEFAULT_EMBED_BATCH_SIZE
-except ImportError:  # pragma: no cover - fallback for older LlamaIndex
+    from llama_index.core.embeddings import BaseEmbedding, DEFAULT_EMBED_BATCH_SIZE
+    from llama_index.core.callbacks import CallbackManager
+
+    LLAMAINDEX_AVAILABLE = True
+except ImportError:  # pragma: no cover - only used when LlamaIndex isn't installed
+    class BaseEmbedding:  # type: ignore[no-redef]
+        """
+        Minimal fallback BaseEmbedding when LlamaIndex is not installed.
+
+        This is only here so importing this module doesn't explode in environments
+        without LlamaIndex. Any attempt to actually *use* this class without
+        LlamaIndex should be considered a misconfiguration.
+        """
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:  # noqa: D401
+            # Deliberately do nothing; real usage will fail earlier in practice.
+            pass
+
+    class CallbackManager:  # type: ignore[no-redef]
+        """Fallback CallbackManager stub when LlamaIndex is not installed."""
+        pass
+
+    # Reasonable default used when the real constant is not available
     DEFAULT_EMBED_BATCH_SIZE = 512
+    LLAMAINDEX_AVAILABLE = False
 
 
 # ---------------------------------------------------------------------------
@@ -706,7 +728,7 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
     async def _aget_text_embeddings(
         self,
         texts: Sequence[str],
-        **kwargs: Any),
+        **kwargs: Any,
     ) -> List[List[float]]:
         """
         Async batch text embedding implementation for LlamaIndex nodes.
@@ -715,7 +737,7 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
 
 
 # ------------------------------------------------------------------ #
-# LlamaIndex Settings Integration
+# LlamaIndex Settings / Service Registration Helpers
 # ------------------------------------------------------------------ #
 
 
@@ -725,7 +747,30 @@ def configure_llamaindex_embeddings(
     **kwargs: Any,
 ) -> CorpusLlamaIndexEmbeddings:
     """
-    Configure and return Corpus embeddings for LlamaIndex global settings.
+    Configure and optionally register Corpus embeddings with LlamaIndex.
+
+    This mirrors the behavior of `register_with_semantic_kernel`:
+
+    - Always constructs and returns a `CorpusLlamaIndexEmbeddings` instance.
+    - When LlamaIndex is installed and `llama_index.core.Settings` is available,
+      it will *attempt* to register the embeddings as the global `embed_model`.
+      If that fails (version differences, custom configs, etc.), it logs a warning
+      and still returns the embeddings instance.
+
+    Parameters
+    ----------
+    corpus_adapter:
+        Corpus embedding protocol adapter implementing `EmbeddingProtocolV1`.
+    model_name:
+        Model identifier for embedding operations as seen by LlamaIndex.
+    **kwargs:
+        Additional arguments for `CorpusLlamaIndexEmbeddings` (e.g. batch_config,
+        text_normalization_config, callback_manager, embed_batch_size).
+
+    Returns
+    -------
+    CorpusLlamaIndexEmbeddings
+        Configured embedding service instance.
     """
     embeddings = CorpusLlamaIndexEmbeddings(
         corpus_adapter=corpus_adapter,
@@ -733,15 +778,68 @@ def configure_llamaindex_embeddings(
         **kwargs,
     )
 
-    logger.info("Corpus LlamaIndex embeddings configured: %s", model_name)
+    if not LLAMAINDEX_AVAILABLE:
+        logger.debug(
+            "LlamaIndex is not installed; returning embeddings without global "
+            "Settings registration.",
+        )
+        return embeddings
+
+    # Best-effort registration with LlamaIndex global Settings
+    try:
+        from llama_index.core import Settings  # type: ignore
+
+        try:
+            Settings.embed_model = embeddings
+            logger.info(
+                "Corpus LlamaIndex embeddings configured and registered as "
+                "Settings.embed_model: %s",
+                model_name,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "Failed to configure LlamaIndex Settings.embed_model: %s. "
+                "You may need to register the embeddings manually.",
+                e,
+            )
+    except ImportError:  # pragma: no cover - older / different LlamaIndex layouts
+        logger.debug(
+            "LlamaIndex Settings API not available; unable to auto-register "
+            "embed_model. Returning embeddings instance only.",
+        )
+
     return embeddings
+
+
+def register_with_llamaindex(
+    corpus_adapter: EmbeddingProtocolV1,
+    model_name: str = "corpus-embedding-protocol",
+    **kwargs: Any,
+) -> CorpusLlamaIndexEmbeddings:
+    """
+    Alias for `configure_llamaindex_embeddings` to mirror the
+    `register_with_semantic_kernel` naming convention.
+
+    This helper is convenient when you want symmetrical API shapes across
+    framework adapters:
+
+    - `register_with_semantic_kernel(kernel, ...)`
+    - `register_with_llamaindex(corpus_adapter, ...)`
+    """
+    return configure_llamaindex_embeddings(
+        corpus_adapter=corpus_adapter,
+        model_name=model_name,
+        **kwargs,
+    )
 
 
 __all__ = [
     "CorpusLlamaIndexEmbeddings",
     "LlamaIndexContext",
     "configure_llamaindex_embeddings",
+    "register_with_llamaindex",
     "ErrorCodes",
     "with_embedding_error_context",
     "with_async_embedding_error_context",
+    "LLAMAINDEX_AVAILABLE",
 ]
