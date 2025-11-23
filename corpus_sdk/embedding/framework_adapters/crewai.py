@@ -259,7 +259,6 @@ def with_async_embedding_error_context(
 
 class CrewAIConfig(TypedDict, total=False):
     """Structured configuration for CrewAI-specific settings."""
-    max_embedding_retries: int
     fallback_to_simple_context: bool
     enable_agent_context_propagation: bool
     task_aware_batching: bool
@@ -306,20 +305,17 @@ class CorpusCrewAIEmbeddings:
         """Validate and normalize CrewAI configuration with sensible defaults."""
         validated: CrewAIConfig = config.copy()
 
-        # Set defaults for missing values
-        if "max_embedding_retries" not in validated:
-            validated["max_embedding_retries"] = 3
-        if "fallback_to_simple_context" not in validated:
-            validated["fallback_to_simple_context"] = True
-        if "enable_agent_context_propagation" not in validated:
-            validated["enable_agent_context_propagation"] = True
-        if "task_aware_batching" not in validated:
-            validated["task_aware_batching"] = False
+        validated.setdefault("fallback_to_simple_context", True)
+        validated.setdefault("enable_agent_context_propagation", True)
+        validated.setdefault("task_aware_batching", False)
 
-        # Validate numeric ranges
-        if validated["max_embedding_retries"] < 0:
-            logger.warning("max_embedding_retries cannot be negative, setting to 0")
-            validated["max_embedding_retries"] = 0
+        # Bool coercion for robustness
+        for key in (
+            "fallback_to_simple_context",
+            "enable_agent_context_propagation",
+            "task_aware_batching",
+        ):
+            validated[key] = bool(validated[key])
 
         return validated
 
