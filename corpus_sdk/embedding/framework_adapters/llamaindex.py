@@ -16,6 +16,8 @@ This module exposes Corpus `EmbeddingProtocolV1` implementations as
 
 The design leverages LlamaIndex's focus on efficient indexing and retrieval
 while maintaining the protocol-first Corpus embedding stack.
+
+Resilience (retries, caching, rate limiting, etc.) is expected to be provided by the underlying adapter, typically a BaseEmbeddingAdapter subclass.
 """
 
 from __future__ import annotations
