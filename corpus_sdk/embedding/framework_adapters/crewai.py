@@ -84,7 +84,7 @@ class CrewAIEmbedder(Protocol):
 
     def embed_documents(
         self,
-        texts: List[str],
+        texts: Sequence[str],
         *,
         crewai_context: Optional[CrewAIContext] = None,
         model: Optional[str] = None,
@@ -117,7 +117,7 @@ def with_embedding_error_context(
         def wrapper(*args: Any, **kwargs: Any) -> T:
             try:
                 return func(*args, **kwargs)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 enhanced_context = context_kwargs.copy()
                 attach_context(
                     exc,
@@ -142,7 +142,7 @@ def with_async_embedding_error_context(
         async def wrapper(*args: Any, **kwargs: Any) -> T:
             try:
                 return await func(*args, **kwargs)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 enhanced_context = context_kwargs.copy()
                 attach_context(
                     exc,
@@ -240,14 +240,15 @@ class CorpusCrewAIEmbeddings:
         self.crewai_config = self._validate_crewai_config(crewai_config or {})
 
         logger.info(
-            f"CorpusCrewAIEmbeddings initialized with model: {model or 'default'}, "
-            f"config: {self.crewai_config}"
+            "CorpusCrewAIEmbeddings initialized with model: %s, config: %s",
+            model or "default",
+            self.crewai_config,
         )
 
     def _validate_crewai_config(self, config: CrewAIConfig) -> CrewAIConfig:
         """Validate and normalize CrewAI configuration with sensible defaults."""
         validated = config.copy()
-        
+
         # Set defaults for missing values
         if "max_embedding_retries" not in validated:
             validated["max_embedding_retries"] = 3
@@ -273,7 +274,7 @@ class CorpusCrewAIEmbeddings:
     def _translator(self) -> EmbeddingTranslator:
         """
         Lazily construct and cache the `EmbeddingTranslator`.
-        
+
         Uses `cached_property` for thread safety and optimal performance
         in multi-agent CrewAI environments.
         """
@@ -291,7 +292,7 @@ class CorpusCrewAIEmbeddings:
         crewai_context: Optional[CrewAIContext] = None,
         model: Optional[str] = None,
         **kwargs: Any,
-    ) -> Tuple[Optional[OperationContext], Dict[str, Any], Dict[str, Any]]:
+    ) -> Tuple[Optional[OperationContext], Dict[str, Any]]:
         """
         Build contexts for CrewAI execution environment with comprehensive validation.
 
@@ -299,11 +300,9 @@ class CorpusCrewAIEmbeddings:
         -------
         Tuple of:
         - core_ctx: core OperationContext or None if no/invalid context
-        - op_ctx_dict: normalized dict for embedding layer
         - framework_ctx: CrewAI-specific context for translator
         """
         core_ctx: Optional[OperationContext] = None
-        op_ctx_dict: Dict[str, Any] = {}
         framework_ctx: Dict[str, Any] = {
             "framework": "crewai",
             "config": self.crewai_config,
@@ -312,17 +311,16 @@ class CorpusCrewAIEmbeddings:
         # Convert CrewAI context to core OperationContext with comprehensive error handling
         if crewai_context is not None:
             try:
-                # Validate CrewAI context structure
                 self._validate_crewai_context_structure(crewai_context)
-                
+
                 core_ctx_candidate = context_from_crewai(crewai_context)
                 if isinstance(core_ctx_candidate, OperationContext):
                     core_ctx = core_ctx_candidate
                     logger.debug(
                         "Successfully created OperationContext from CrewAI context "
                         "for agent: %s, task: %s",
-                        crewai_context.get('agent_role', 'unknown'),
-                        crewai_context.get('task_id', 'unknown')
+                        crewai_context.get("agent_role", "unknown"),
+                        crewai_context.get("task_id", "unknown"),
                     )
                 else:
                     logger.warning(
@@ -331,34 +329,24 @@ class CorpusCrewAIEmbeddings:
                         type(core_ctx_candidate).__name__,
                     )
                     if self.crewai_config["fallback_to_simple_context"]:
-                        # Create minimal context as fallback
                         core_ctx = OperationContext()
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 logger.warning(
                     "Failed to create OperationContext from crewai_context: %s. "
                     "Using empty context.",
                     e,
                 )
+                try:
+                    snapshot = dict(crewai_context)
+                except Exception:  # noqa: BLE001
+                    snapshot = {"repr": repr(crewai_context)}
                 attach_context(
                     e,
                     framework="crewai",
                     operation="context_build",
-                    crewai_context_snapshot=dict(crewai_context),
+                    crewai_context_snapshot=snapshot,
                     config=self.crewai_config,
                 )
-
-        # Build comprehensive context dictionary preserving rich OperationContext
-        if core_ctx is not None:
-            # Preserve the rich OperationContext object for maximum fidelity
-            op_ctx_dict = {"_operation_context": core_ctx}
-            
-            # Include structured dict representation for compatibility
-            if hasattr(core_ctx, "to_dict"):
-                op_ctx_dict.update(core_ctx.to_dict())
-            elif hasattr(core_ctx, "__dict__"):
-                op_ctx_dict.update(core_ctx.__dict__)
-        else:
-            op_ctx_dict = {}
 
         # Framework-level context for CrewAI-specific optimizations
         effective_model = model or self.model
@@ -367,23 +355,36 @@ class CorpusCrewAIEmbeddings:
 
         # Add rich CrewAI-specific context for observability and optimization
         if crewai_context:
-            framework_ctx.update({
-                "agent_role": crewai_context.get("agent_role"),
-                "task_id": crewai_context.get("task_id"),
-                "workflow": crewai_context.get("workflow"),
-                "agent_id": crewai_context.get("agent_id"),
-                "crew_id": crewai_context.get("crew_id"),
-                "process_id": crewai_context.get("process_id"),
-            })
+            framework_ctx.update(
+                {
+                    "agent_role": crewai_context.get("agent_role"),
+                    "task_id": crewai_context.get("task_id"),
+                    "workflow": crewai_context.get("workflow"),
+                    "agent_id": crewai_context.get("agent_id"),
+                    "crew_id": crewai_context.get("crew_id"),
+                    "process_id": crewai_context.get("process_id"),
+                }
+            )
 
-            # Enable task-aware batching if configured
-            if self.crewai_config["task_aware_batching"] and crewai_context.get("task_id"):
-                framework_ctx["batch_strategy"] = f"task_aware_{crewai_context['task_id']}"
+            if (
+                self.crewai_config["task_aware_batching"]
+                and crewai_context.get("task_id")
+            ):
+                framework_ctx["batch_strategy"] = (
+                    f"task_aware_{crewai_context['task_id']}"
+                )
 
         # Include any extra call-specific hints while preserving structure
-        framework_ctx.update({k: v for k, v in kwargs.items() if not k.startswith('_')})
-        
-        return core_ctx, op_ctx_dict, framework_ctx
+        framework_ctx.update({k: v for k, v in kwargs.items() if not k.startswith("_")})
+
+        # Stash OperationContext for downstream inspection when enabled
+        if (
+            core_ctx is not None
+            and self.crewai_config["enable_agent_context_propagation"]
+        ):
+            framework_ctx["_operation_context"] = core_ctx
+
+        return core_ctx, framework_ctx
 
     def _validate_crewai_context_structure(self, context: CrewAIContext) -> None:
         """Validate CrewAI context structure and log warnings for anomalies."""
@@ -393,11 +394,10 @@ class CorpusCrewAIEmbeddings:
                 f"CrewAI context must be a dictionary, got {type(context).__name__}"
             )
 
-        # Check for required context fields in production scenarios
-        if not context.get('agent_role') and not context.get('task_id'):
+        if not context.get("agent_role") and not context.get("task_id"):
             logger.debug(
                 "CrewAI context missing both agent_role and task_id - "
-                "reduced observability for embeddings"
+                "reduced observability for embeddings",
             )
 
     def _coerce_embedding_matrix(self, result: Any) -> List[List[float]]:
@@ -406,21 +406,27 @@ class CorpusCrewAIEmbeddings:
 
         Supports:
         - {"embeddings": [[...], [...]], "model": "...", "usage": {...}}
+        - {"embedding": [...]} (single embedding vector)
         - Direct matrix: [[...], [...]]
-        - EmbedResult-like with `.embeddings` attribute
-
-        Implemented without `match`/`case` for Python 3.9+ compatibility.
+        - EmbedResult-like with `.embeddings` or `.embedding` attribute
         """
-        embeddings_obj: Any
-
-        if isinstance(result, Mapping) and "embeddings" in result:
-            embeddings_obj = result["embeddings"]
+        if isinstance(result, Mapping):
+            if "embeddings" in result:
+                embeddings_obj: Any = result["embeddings"]
+            elif "embedding" in result:
+                embeddings_obj = [result["embedding"]]
+            else:
+                embeddings_obj = result
         elif hasattr(result, "embeddings"):
             embeddings_obj = getattr(result, "embeddings")
+        elif hasattr(result, "embedding"):
+            embeddings_obj = [getattr(result, "embedding")]
         else:
             embeddings_obj = result
 
-        if not isinstance(embeddings_obj, Sequence):
+        if not isinstance(embeddings_obj, Sequence) or isinstance(
+            embeddings_obj, (str, bytes)
+        ):
             raise TypeError(
                 f"[{ErrorCodes.INVALID_EMBEDDING_RESULT}] "
                 f"Translator result does not contain valid embeddings sequence: "
@@ -429,17 +435,16 @@ class CorpusCrewAIEmbeddings:
 
         matrix: List[List[float]] = []
         for i, row in enumerate(embeddings_obj):
-            if not isinstance(row, Sequence):
+            if not isinstance(row, Sequence) or isinstance(row, (str, bytes)):
                 raise TypeError(
                     f"[{ErrorCodes.INVALID_EMBEDDING_RESULT}] "
                     f"Expected embedding row to be sequence, got {type(row).__name__} at index {i}"
                 )
-            
-            # Validate row is not empty
+
             if len(row) == 0:
-                logger.warning(f"Empty embedding row at index {i}, skipping")
+                logger.warning("Empty embedding row at index %d, skipping", i)
                 continue
-                
+
             try:
                 embedding_vector = [float(x) for x in row]
                 matrix.append(embedding_vector)
@@ -469,10 +474,50 @@ class CorpusCrewAIEmbeddings:
                 "Expected single embedding for query, got %d rows; using first row. "
                 "Context: %s",
                 len(matrix),
-                {"multiple_embeddings_received": len(matrix)}
+                {"multiple_embeddings_received": len(matrix)},
             )
 
         return matrix[0]
+
+    def _warn_if_extreme_batch(
+        self,
+        texts: Sequence[str],
+        *,
+        op_name: str,
+    ) -> None:
+        """
+        Shared helper for large-batch warnings in CrewAI flows.
+
+        Uses CrewAI-aware thresholds while remaining non-fatal.
+        """
+        if isinstance(texts, (str, bytes)):
+            return
+
+        batch_size = len(texts)
+        if batch_size <= 10_000:
+            return
+
+        if batch_size > 10_000:
+            logger.warning(
+                "%s called with batch_size=%d; consider splitting across multiple "
+                "CrewAI tasks for better responsiveness",
+                op_name,
+                batch_size,
+            )
+
+        max_batch_size = (
+            None
+            if self.batch_config is None
+            else getattr(self.batch_config, "max_batch_size", None)
+        )
+        if batch_size > 50_000 and max_batch_size is None:
+            logger.warning(
+                "%s called with batch_size=%d and no batch_config.max_batch_size; "
+                "this may impact CrewAI agent responsiveness. You may also want to "
+                "enable task_aware_batching in crewai_config.",
+                op_name,
+                batch_size,
+            )
 
     # ------------------------------------------------------------------ #
     # Core Embedding API (CrewAI Compatible)
@@ -481,7 +526,7 @@ class CorpusCrewAIEmbeddings:
     @with_embedding_error_context("documents")
     def embed_documents(
         self,
-        texts: List[str],
+        texts: Sequence[str],
         *,
         crewai_context: Optional[CrewAIContext] = None,
         model: Optional[str] = None,
@@ -491,66 +536,25 @@ class CorpusCrewAIEmbeddings:
         Sync embedding for multiple documents.
 
         Used by CrewAI agents during RAG operations and knowledge processing.
-
-        Parameters
-        ----------
-        texts: List of document texts to embed
-        crewai_context: Optional CrewAI execution context for agent/task awareness
-        model: Optional model override for this specific call
-        **kwargs: Additional framework-specific parameters
-
-        Returns
-        -------
-        List of embedding vectors, one per input text
-
-        Raises
-        ------
-        TypeError: If embedding result format is invalid
-        ValueError: If no embeddings are generated
-        Exception: Any underlying embedding errors with enriched context
         """
-        # Comprehensive batch size validation with CrewAI-aware thresholds
-        if isinstance(texts, Sequence) and not isinstance(texts, (str, bytes)):
-            batch_size = len(texts)
-            
-            # CrewAI-specific batch size recommendations
-            if batch_size > 10_000:
-                logger.warning(
-                    "Large batch size %d detected for CrewAI workflow - "
-                    "consider splitting across multiple tasks for better performance",
-                    batch_size
-                )
-            
-            if (
-                batch_size > 50_000
-                and (self.batch_config is None or getattr(self.batch_config, "max_batch_size", None) is None)
-            ):
-                logger.warning(
-                    "embed_documents called with batch_size=%d and no batch_config.max_batch_size; "
-                    "this may impact CrewAI agent responsiveness",
-                    batch_size,
-                )
+        self._warn_if_extreme_batch(texts, op_name="embed_documents")
 
-        core_ctx, op_ctx_dict, framework_ctx = self._build_contexts(
+        core_ctx, framework_ctx = self._build_contexts(
             crewai_context=crewai_context,
             model=model,
             **kwargs,
         )
 
-        # Pass the rich OperationContext through for maximum fidelity and observability
-        if core_ctx is not None and self.crewai_config["enable_agent_context_propagation"]:
-            framework_ctx["_operation_context"] = core_ctx
-
         logger.debug(
             "Embedding %d documents for CrewAI agent: %s, task: %s",
             len(texts),
-            crewai_context.get('agent_role', 'unknown') if crewai_context else 'unknown',
-            crewai_context.get('task_id', 'unknown') if crewai_context else 'unknown'
+            crewai_context.get("agent_role", "unknown") if crewai_context else "unknown",
+            crewai_context.get("task_id", "unknown") if crewai_context else "unknown",
         )
 
         translated = self._translator.embed(
-            raw_texts=texts,
-            op_ctx=op_ctx_dict,
+            raw_texts=list(texts),
+            op_ctx=core_ctx,
             framework_ctx=framework_ctx,
         )
         return self._coerce_embedding_matrix(translated)
@@ -568,36 +572,21 @@ class CorpusCrewAIEmbeddings:
         Sync embedding for a single query.
 
         Used by CrewAI for query understanding and retrieval in agent workflows.
-
-        Parameters
-        ----------
-        text: Query text to embed
-        crewai_context: Optional CrewAI execution context
-        model: Optional model override
-        **kwargs: Additional parameters
-
-        Returns
-        -------
-        Single embedding vector for the query text
         """
-        core_ctx, op_ctx_dict, framework_ctx = self._build_contexts(
+        core_ctx, framework_ctx = self._build_contexts(
             crewai_context=crewai_context,
             model=model,
             **kwargs,
         )
 
-        # Ensure rich context propagation for query understanding
-        if core_ctx is not None and self.crewai_config["enable_agent_context_propagation"]:
-            framework_ctx["_operation_context"] = core_ctx
-
         logger.debug(
             "Embedding query for CrewAI agent: %s",
-            crewai_context.get('agent_role', 'unknown') if crewai_context else 'unknown'
+            crewai_context.get("agent_role", "unknown") if crewai_context else "unknown",
         )
 
         translated = self._translator.embed(
             raw_texts=text,
-            op_ctx=op_ctx_dict,
+            op_ctx=core_ctx,
             framework_ctx=framework_ctx,
         )
         return self._coerce_embedding_vector(translated)
@@ -609,7 +598,7 @@ class CorpusCrewAIEmbeddings:
     @with_async_embedding_error_context("documents")
     async def aembed_documents(
         self,
-        texts: List[str],
+        texts: Sequence[str],
         *,
         crewai_context: Optional[CrewAIContext] = None,
         model: Optional[str] = None,
@@ -620,36 +609,23 @@ class CorpusCrewAIEmbeddings:
 
         Designed for async CrewAI workflows and parallel agent execution.
         """
-        if isinstance(texts, Sequence) and not isinstance(texts, (str, bytes)):
-            batch_size = len(texts)
-            if (
-                batch_size > 10_000
-                and (self.batch_config is None or getattr(self.batch_config, "max_batch_size", None) is None)
-            ):
-                logger.warning(
-                    "aembed_documents called with batch_size=%d and no batch_config.max_batch_size; "
-                    "consider enabling task_aware_batching in crewai_config",
-                    batch_size,
-                )
+        self._warn_if_extreme_batch(texts, op_name="aembed_documents")
 
-        core_ctx, op_ctx_dict, framework_ctx = self._build_contexts(
+        core_ctx, framework_ctx = self._build_contexts(
             crewai_context=crewai_context,
             model=model,
             **kwargs,
         )
 
-        if core_ctx is not None and self.crewai_config["enable_agent_context_propagation"]:
-            framework_ctx["_operation_context"] = core_ctx
-
         logger.debug(
             "Async embedding %d documents for CrewAI task: %s",
             len(texts),
-            crewai_context.get('task_id', 'unknown') if crewai_context else 'unknown'
+            crewai_context.get("task_id", "unknown") if crewai_context else "unknown",
         )
 
         translated = await self._translator.arun_embed(
-            raw_texts=texts,
-            op_ctx=op_ctx_dict,
+            raw_texts=list(texts),
+            op_ctx=core_ctx,
             framework_ctx=framework_ctx,
         )
         return self._coerce_embedding_matrix(translated)
@@ -668,18 +644,15 @@ class CorpusCrewAIEmbeddings:
 
         Optimized for async CrewAI agent interactions and real-time workflows.
         """
-        core_ctx, op_ctx_dict, framework_ctx = self._build_contexts(
+        core_ctx, framework_ctx = self._build_contexts(
             crewai_context=crewai_context,
             model=model,
             **kwargs,
         )
 
-        if core_ctx is not None and self.crewai_config["enable_agent_context_propagation"]:
-            framework_ctx["_operation_context"] = core_ctx
-
         translated = await self._translator.arun_embed(
             raw_texts=text,
-            op_ctx=op_ctx_dict,
+            op_ctx=core_ctx,
             framework_ctx=framework_ctx,
         )
         return self._coerce_embedding_vector(translated)
@@ -692,55 +665,6 @@ def create_embedder(
 ) -> CrewAIEmbedder:
     """
     Create a CrewAI-compatible embedder for seamless agent integration.
-
-    Example:
-    ```python
-    from crewai import Agent, Task, Crew
-    from corpus_sdk.embedding.framework_adapters.crewai import create_embedder
-
-    # Create optimized embedder for research crew
-    research_embedder = create_embedder(
-        corpus_adapter=research_adapter,
-        model="text-embedding-3-large",
-        crewai_config={
-            "task_aware_batching": True,
-            "max_embedding_retries": 3
-        }
-    )
-
-    # Create different embedder for analysis crew with specialized config
-    analysis_embedder = create_embedder(
-        corpus_adapter=analysis_adapter, 
-        model="text-embedding-3-small",
-        crewai_config={
-            "enable_agent_context_propagation": False  # Lighter weight for simple tasks
-        }
-    )
-
-    research_agent = Agent(
-        role="Research Specialist",
-        goal="Conduct deep research analysis",
-        backstory="Expert researcher",
-        embedder=research_embedder
-    )
-
-    analysis_agent = Agent(
-        role="Data Analyst", 
-        goal="Analyze research findings",
-        backstory="Statistical expert",
-        embedder=analysis_embedder
-    )
-    ```
-
-    Parameters
-    ----------
-    corpus_adapter: Corpus embedding protocol adapter
-    model: Model identifier for embedding operations
-    **kwargs: Additional arguments for CorpusCrewAIEmbeddings
-
-    Returns
-    -------
-    CrewAIEmbedder compatible embedder instance optimized for CrewAI workflows
     """
     embedder = CorpusCrewAIEmbeddings(
         corpus_adapter=corpus_adapter,
@@ -750,15 +674,15 @@ def create_embedder(
 
     logger.info(
         "CrewAI embedder created successfully with model: %s",
-        model or "default"
+        model or "default",
     )
-    
+
     return embedder
 
 
 __all__ = [
     "CorpusCrewAIEmbeddings",
-    "CrewAIEmbedder", 
+    "CrewAIEmbedder",
     "CrewAIContext",
     "CrewAIConfig",
     "create_embedder",
