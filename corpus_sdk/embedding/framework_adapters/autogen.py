@@ -69,18 +69,30 @@ T = TypeVar("T")
 # --------------------------------------------------------------------------- #
 
 
-class ErrorCodes(CoercionErrorCodes):
+class ErrorCodes:
     """
     Error code constants for AutoGen embedding adapter.
 
-    Inherits from CoercionErrorCodes so shared coercion utilities can
-    reference the same symbolic names while remaining framework-specific.
+    This is a simple namespace for framework-specific codes. The shared
+    coercion helpers use `EMBEDDING_COERCION_ERROR_CODES`, which is a
+    `CoercionErrorCodes` instance derived from these values.
     """
 
+    # Coercion-level (used by framework_utils)
     INVALID_EMBEDDING_RESULT = "INVALID_EMBEDDING_RESULT"
     EMPTY_EMBEDDING_RESULT = "EMPTY_EMBEDDING_RESULT"
     EMBEDDING_CONVERSION_ERROR = "EMBEDDING_CONVERSION_ERROR"
+
+    # AutoGen-specific context errors
     AUTOGEN_CONTEXT_INVALID = "AUTOGEN_CONTEXT_INVALID"
+
+
+# Coercion configuration for the common embedding utils
+EMBEDDING_COERCION_ERROR_CODES: CoercionErrorCodes = CoercionErrorCodes(
+    invalid_result=ErrorCodes.INVALID_EMBEDDING_RESULT,
+    empty_result=ErrorCodes.EMPTY_EMBEDDING_RESULT,
+    conversion_error=ErrorCodes.EMBEDDING_CONVERSION_ERROR,
+)
 
 
 class AutoGenContext(TypedDict, total=False):
@@ -445,7 +457,8 @@ class CorpusAutoGenEmbeddings:
         """
         return coerce_embedding_matrix(
             result=result,
-            error_codes=ErrorCodes,
+            framework="autogen",
+            error_codes=EMBEDDING_COERCION_ERROR_CODES,
             logger=logger,
         )
 
@@ -455,7 +468,8 @@ class CorpusAutoGenEmbeddings:
         """
         return coerce_embedding_vector(
             result=result,
-            error_codes=ErrorCodes,
+            framework="autogen",
+            error_codes=EMBEDDING_COERCION_ERROR_CODES,
             logger=logger,
         )
 
@@ -689,6 +703,7 @@ def create_retriever(
         vector_store=vectorstore,
         model="text-embedding-3-large"
     )
+    ```
     """
     try:
         from autogen.retrieve_utils import VectorStoreRetriever
