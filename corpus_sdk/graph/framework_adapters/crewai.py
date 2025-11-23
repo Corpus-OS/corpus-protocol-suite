@@ -42,7 +42,7 @@ Non-responsibilities
 from __future__ import annotations
 
 import logging
-from functools import cached_property, wraps
+from functools import cached_property
 from typing import (
     Any,
     AsyncIterator,
@@ -54,7 +54,6 @@ from typing import (
     Protocol,
     TypeVar,
     Callable,
-    cast,
 )
 
 from corpus_sdk.core.context_translation import (
@@ -97,7 +96,6 @@ logger = logging.getLogger(__name__)
 
 # Type variables for decorators
 T = TypeVar("T")
-R = TypeVar("R")
 
 
 # Error code constants (flat, framework-specific)
@@ -118,15 +116,42 @@ class ErrorCodes:
 # Error-context decorators (centralized via common framework utils)
 # --------------------------------------------------------------------------- #
 
-with_error_context = create_graph_error_context_decorator(
-    framework="crewai",
-    is_async=False,
-)
 
-with_async_error_context = create_graph_error_context_decorator(
-    framework="crewai",
-    is_async=True,
-)
+def with_graph_error_context(
+    operation: str,
+    **static_context: Any,
+) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    """
+    Decorator for sync methods with rich dynamic context extraction.
+
+    Thin wrapper over the shared `create_graph_error_context_decorator`
+    for the CrewAI framework.
+    """
+    return create_graph_error_context_decorator(
+        framework="crewai",
+        is_async=False,
+    )(operation=operation, **static_context)
+
+
+def with_async_graph_error_context(
+    operation: str,
+    **static_context: Any,
+) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    """
+    Decorator for async methods with rich dynamic context extraction.
+
+    Thin wrapper over the shared `create_graph_error_context_decorator`
+    for the CrewAI framework.
+    """
+    return create_graph_error_context_decorator(
+        framework="crewai",
+        is_async=True,
+    )(operation=operation, **static_context)
+
+
+# Backwards-compatible aliases (for older imports)
+with_error_context = with_graph_error_context
+with_async_error_context = with_async_graph_error_context
 
 
 class CrewAIGraphClientProtocol(Protocol):
@@ -430,17 +455,34 @@ class CorpusCrewAIGraphClient:
         graph_adapter: GraphProtocolV1,
         default_dialect: Optional[str] = None,
         default_namespace: Optional[str] = None,
-        default_timeout_ms: Optional[int] = None,  # ESSENTIAL CHANGE #1: Configurable timeout
+        default_timeout_ms: Optional[int] = None,
         framework_version: Optional[str] = None,
     ) -> None:
+        """
+        Initialize a CrewAI-oriented graph client.
+
+        Parameters
+        ----------
+        graph_adapter:
+            Underlying `GraphProtocolV1` implementation.
+        default_dialect:
+            Optional default query dialect to use when none is provided per call.
+        default_namespace:
+            Optional default namespace to use when none is provided per call.
+        default_timeout_ms:
+            Optional default per-query timeout in milliseconds. Used when
+            `timeout_ms` is not explicitly passed to query methods.
+        framework_version:
+            Optional framework version string for observability.
+        """
         self._graph: GraphProtocolV1 = graph_adapter
         self._default_dialect: Optional[str] = default_dialect
         self._default_namespace: Optional[str] = default_namespace
-        self._default_timeout_ms: Optional[int] = default_timeout_ms  # Store timeout
+        self._default_timeout_ms: Optional[int] = default_timeout_ms
         self._framework_version: Optional[str] = framework_version
 
     # ------------------------------------------------------------------ #
-    # ESSENTIAL CHANGE #2: Resource Management (Context Managers)
+    # Resource Management (Context Managers)
     # ------------------------------------------------------------------ #
 
     def __enter__(self) -> CorpusCrewAIGraphClient:
@@ -553,7 +595,7 @@ class CorpusCrewAIGraphClient:
         """
         effective_dialect = dialect or self._default_dialect
         effective_namespace = namespace or self._default_namespace
-        effective_timeout = timeout_ms or self._default_timeout_ms  # Use default timeout
+        effective_timeout = timeout_ms or self._default_timeout_ms
 
         raw: Dict[str, Any] = {
             "text": query,
@@ -565,7 +607,7 @@ class CorpusCrewAIGraphClient:
             raw["dialect"] = effective_dialect
         if effective_namespace is not None:
             raw["namespace"] = effective_namespace
-        if effective_timeout is not None:  # Include timeout if specified
+        if effective_timeout is not None:
             raw["timeout_ms"] = int(effective_timeout)
 
         return raw
@@ -585,7 +627,7 @@ class CorpusCrewAIGraphClient:
     # Capabilities / schema / health
     # ------------------------------------------------------------------ #
 
-    @with_error_context("capabilities_sync")
+    @with_graph_error_context("capabilities_sync")
     def capabilities(self) -> Mapping[str, Any]:
         """
         Sync wrapper around capabilities, delegating async→sync bridging
@@ -594,7 +636,7 @@ class CorpusCrewAIGraphClient:
         caps = self._translator.capabilities()
         return graph_capabilities_to_dict(caps)
 
-    @with_async_error_context("capabilities_async")
+    @with_async_graph_error_context("capabilities_async")
     async def acapabilities(self) -> Mapping[str, Any]:
         """
         Async capabilities accessor.
@@ -605,7 +647,7 @@ class CorpusCrewAIGraphClient:
         caps = await self._translator.arun_capabilities()
         return graph_capabilities_to_dict(caps)
 
-    @with_error_context("get_schema_sync")
+    @with_graph_error_context("get_schema_sync")
     def get_schema(
         self,
         *,
@@ -630,7 +672,7 @@ class CorpusCrewAIGraphClient:
             error_code=ErrorCodes.BAD_TRANSLATED_SCHEMA,
         )
 
-    @with_async_error_context("get_schema_async")
+    @with_async_graph_error_context("get_schema_async")
     async def aget_schema(
         self,
         *,
@@ -654,7 +696,7 @@ class CorpusCrewAIGraphClient:
             error_code=ErrorCodes.BAD_TRANSLATED_SCHEMA,
         )
 
-    @with_error_context("health_sync")
+    @with_graph_error_context("health_sync")
     def health(
         self,
         *,
@@ -678,7 +720,7 @@ class CorpusCrewAIGraphClient:
             error_code=ErrorCodes.BAD_HEALTH_RESULT,
         )
 
-    @with_async_error_context("health_async")
+    @with_async_graph_error_context("health_async")
     async def ahealth(
         self,
         *,
@@ -706,7 +748,7 @@ class CorpusCrewAIGraphClient:
     # Query (sync + async)
     # ------------------------------------------------------------------ #
 
-    @with_error_context("query_sync")
+    @with_graph_error_context("query_sync")
     def query(
         self,
         query: str,
@@ -749,7 +791,7 @@ class CorpusCrewAIGraphClient:
             error_code=ErrorCodes.BAD_TRANSLATED_RESULT,
         )
 
-    @with_async_error_context("query_async")
+    @with_async_graph_error_context("query_async")
     async def aquery(
         self,
         query: str,
@@ -796,7 +838,7 @@ class CorpusCrewAIGraphClient:
     # Streaming query (sync + async)
     # ------------------------------------------------------------------ #
 
-    @with_error_context("stream_query_sync")
+    @with_graph_error_context("stream_query_sync")
     def stream_query(
         self,
         query: str,
@@ -840,7 +882,7 @@ class CorpusCrewAIGraphClient:
                 error_code=ErrorCodes.BAD_TRANSLATED_CHUNK,
             )
 
-    @with_async_error_context("stream_query_async")
+    @with_async_graph_error_context("stream_query_async")
     async def astream_query(
         self,
         query: str,
@@ -884,7 +926,7 @@ class CorpusCrewAIGraphClient:
     # Upsert nodes / edges (sync + async)
     # ------------------------------------------------------------------ #
 
-    @with_error_context("upsert_nodes_sync")
+    @with_graph_error_context("upsert_nodes_sync")
     def upsert_nodes(
         self,
         spec: UpsertNodesSpec,
@@ -902,7 +944,9 @@ class CorpusCrewAIGraphClient:
         validate_upsert_nodes_spec(spec)
 
         ctx = self._build_ctx(task=task, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
+        framework_ctx = self._framework_ctx_for_namespace(
+            getattr(spec, "namespace", None),
+        )
 
         result = self._translator.upsert_nodes(
             spec.nodes,
@@ -916,7 +960,7 @@ class CorpusCrewAIGraphClient:
             error_code=ErrorCodes.BAD_UPSERT_RESULT,
         )
 
-    @with_async_error_context("upsert_nodes_async")
+    @with_async_graph_error_context("upsert_nodes_async")
     async def aupsert_nodes(
         self,
         spec: UpsertNodesSpec,
@@ -930,7 +974,9 @@ class CorpusCrewAIGraphClient:
         validate_upsert_nodes_spec(spec)
 
         ctx = self._build_ctx(task=task, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
+        framework_ctx = self._framework_ctx_for_namespace(
+            getattr(spec, "namespace", None),
+        )
 
         result = await self._translator.arun_upsert_nodes(
             spec.nodes,
@@ -944,7 +990,7 @@ class CorpusCrewAIGraphClient:
             error_code=ErrorCodes.BAD_UPSERT_RESULT,
         )
 
-    @with_error_context("upsert_edges_sync")
+    @with_graph_error_context("upsert_edges_sync")
     def upsert_edges(
         self,
         spec: UpsertEdgesSpec,
@@ -956,7 +1002,9 @@ class CorpusCrewAIGraphClient:
         Sync wrapper for upserting edges.
         """
         ctx = self._build_ctx(task=task, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
+        framework_ctx = self._framework_ctx_for_namespace(
+            getattr(spec, "namespace", None),
+        )
 
         result = self._translator.upsert_edges(
             spec.edges,
@@ -970,7 +1018,7 @@ class CorpusCrewAIGraphClient:
             error_code=ErrorCodes.BAD_UPSERT_RESULT,
         )
 
-    @with_async_error_context("upsert_edges_async")
+    @with_async_graph_error_context("upsert_edges_async")
     async def aupsert_edges(
         self,
         spec: UpsertEdgesSpec,
@@ -982,7 +1030,9 @@ class CorpusCrewAIGraphClient:
         Async wrapper for upserting edges.
         """
         ctx = self._build_ctx(task=task, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
+        framework_ctx = self._framework_ctx_for_namespace(
+            getattr(spec, "namespace", None),
+        )
 
         result = await self._translator.arun_upsert_edges(
             spec.edges,
@@ -1000,7 +1050,7 @@ class CorpusCrewAIGraphClient:
     # Delete nodes / edges (sync + async)
     # ------------------------------------------------------------------ #
 
-    @with_error_context("delete_nodes_sync")
+    @with_graph_error_context("delete_nodes_sync")
     def delete_nodes(
         self,
         spec: DeleteNodesSpec,
@@ -1015,7 +1065,9 @@ class CorpusCrewAIGraphClient:
         expression for the GraphTranslator.
         """
         ctx = self._build_ctx(task=task, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
+        framework_ctx = self._framework_ctx_for_namespace(
+            getattr(spec, "namespace", None),
+        )
 
         if spec.filter is not None:
             raw_filter_or_ids: Any = spec.filter
@@ -1034,7 +1086,7 @@ class CorpusCrewAIGraphClient:
             error_code=ErrorCodes.BAD_DELETE_RESULT,
         )
 
-    @with_async_error_context("delete_nodes_async")
+    @with_async_graph_error_context("delete_nodes_async")
     async def adelete_nodes(
         self,
         spec: DeleteNodesSpec,
@@ -1046,7 +1098,9 @@ class CorpusCrewAIGraphClient:
         Async wrapper for deleting nodes.
         """
         ctx = self._build_ctx(task=task, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
+        framework_ctx = self._framework_ctx_for_namespace(
+            getattr(spec, "namespace", None),
+        )
 
         if spec.filter is not None:
             raw_filter_or_ids: Any = spec.filter
@@ -1065,7 +1119,7 @@ class CorpusCrewAIGraphClient:
             error_code=ErrorCodes.BAD_DELETE_RESULT,
         )
 
-    @with_error_context("delete_edges_sync")
+    @with_graph_error_context("delete_edges_sync")
     def delete_edges(
         self,
         spec: DeleteEdgesSpec,
@@ -1077,7 +1131,9 @@ class CorpusCrewAIGraphClient:
         Sync wrapper for deleting edges.
         """
         ctx = self._build_ctx(task=task, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
+        framework_ctx = self._framework_ctx_for_namespace(
+            getattr(spec, "namespace", None),
+        )
 
         if spec.filter is not None:
             raw_filter_or_ids: Any = spec.filter
@@ -1096,7 +1152,7 @@ class CorpusCrewAIGraphClient:
             error_code=ErrorCodes.BAD_DELETE_RESULT,
         )
 
-    @with_async_error_context("delete_edges_async")
+    @with_async_graph_error_context("delete_edges_async")
     async def adelete_edges(
         self,
         spec: DeleteEdgesSpec,
@@ -1108,7 +1164,9 @@ class CorpusCrewAIGraphClient:
         Async wrapper for deleting edges.
         """
         ctx = self._build_ctx(task=task, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
+        framework_ctx = self._framework_ctx_for_namespace(
+            getattr(spec, "namespace", None),
+        )
 
         if spec.filter is not None:
             raw_filter_or_ids: Any = spec.filter
@@ -1131,7 +1189,7 @@ class CorpusCrewAIGraphClient:
     # Bulk vertices (sync + async)
     # ------------------------------------------------------------------ #
 
-    @with_error_context("bulk_vertices_sync")
+    @with_graph_error_context("bulk_vertices_sync")
     def bulk_vertices(
         self,
         spec: BulkVerticesSpec,
@@ -1168,7 +1226,7 @@ class CorpusCrewAIGraphClient:
             error_code=ErrorCodes.BAD_BULK_VERTICES_RESULT,
         )
 
-    @with_async_error_context("bulk_vertices_async")
+    @with_async_graph_error_context("bulk_vertices_async")
     async def abulk_vertices(
         self,
         spec: BulkVerticesSpec,
@@ -1206,7 +1264,7 @@ class CorpusCrewAIGraphClient:
     # Batch (sync + async)
     # ------------------------------------------------------------------ #
 
-    @with_error_context("batch_sync")
+    @with_graph_error_context("batch_sync")
     def batch(
         self,
         ops: List[BatchOperation],
@@ -1240,7 +1298,7 @@ class CorpusCrewAIGraphClient:
             error_code=ErrorCodes.BAD_BATCH_RESULT,
         )
 
-    @with_async_error_context("batch_async")
+    @with_async_graph_error_context("batch_async")
     async def abatch(
         self,
         ops: List[BatchOperation],
@@ -1276,4 +1334,8 @@ __all__ = [
     "CrewAIGraphClientProtocol",
     "CorpusCrewAIGraphClient",
     "ErrorCodes",
+    "with_graph_error_context",
+    "with_async_graph_error_context",
+    "with_error_context",
+    "with_async_error_context",
 ]
