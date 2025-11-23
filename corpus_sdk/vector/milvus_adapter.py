@@ -58,7 +58,7 @@ import asyncio
 import logging
 import os
 import json
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Set
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Set, Callable, TypeVar
 
 from corpus_sdk.vector.vector_base import (
     BaseVectorAdapter,
@@ -88,6 +88,8 @@ from corpus_sdk.vector.vector_base import (
 )
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 # Try to import the modern Milvus client.
 try:  # pragma: no cover - import surface only
@@ -288,7 +290,7 @@ class MilvusVectorAdapter(BaseVectorAdapter):
         return self._client
 
     @staticmethod
-    async def _run_in_thread(func, *args, **kwargs):
+    async def _run_in_thread(func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
         """Run blocking client calls on a worker thread."""
         return await asyncio.to_thread(func, *args, **kwargs)
 
@@ -300,52 +302,77 @@ class MilvusVectorAdapter(BaseVectorAdapter):
         return getattr(obj, key, default)
 
     @staticmethod
-    def _get_ctx_timeout_s(ctx: Optional[OperationContext]) -> Optional[float]:
+    def _attach_ctx_details(
+        base_details: Dict[str, Any],
+        ctx: Optional[OperationContext],
+    ) -> Dict[str, Any]:
         """
-        Extract a remaining timeout (in seconds) from OperationContext, if available.
-        We only look for a `remaining_timeout_s` attribute to avoid guessing.
+        Enrich error details with SIEM-safe context fields.
+
+        We deliberately avoid including raw tenant identifiers and only add
+        low-cardinality, non-sensitive IDs suitable for logs/metrics.
+        """
+        details = dict(base_details)
+        if ctx is None:
+            return details
+        if getattr(ctx, "request_id", None):
+            details.setdefault("request_id", ctx.request_id)
+        if getattr(ctx, "traceparent", None):
+            details.setdefault("traceparent", ctx.traceparent)
+        return details
+
+    def _get_ctx_timeout_s(self, ctx: Optional[OperationContext]) -> Optional[float]:
+        """
+        Derive a per-call timeout in seconds from ctx.deadline_ms (via remaining_ms).
+
+        Returns:
+            - None  → no inner timeout (outer BaseVectorAdapter deadline still applies).
+            - 0.0   → deadline already exceeded (callers will typically fail fast).
+            - > 0.0 → remaining_ms / 1000.0
         """
         if ctx is None:
             return None
-        timeout = getattr(ctx, "remaining_timeout_s", None)
-        try:
-            return float(timeout) if timeout is not None else None
-        except Exception:
+        # Keep this aligned with Pinecone's adapter semantics.
+        remaining = ctx.remaining_ms()
+        if remaining is None:
             return None
+        if remaining <= 0:
+            return 0.0
+        return remaining / 1000.0
 
     async def _call_milvus(
         self,
-        func,
+        *,
         op: str,
+        func: Callable[..., T],
         ctx: Optional[OperationContext],
-        *args,
-        **kwargs,
-    ):
+        **kwargs: Any,
+    ) -> T:
         """
         Invoke a Milvus client function in a worker thread, honoring ctx deadlines.
 
-        - If ctx.remaining_timeout_s is present and > 0, wrap the call in
-          asyncio.wait_for() using that timeout.
-        - asyncio.TimeoutError is translated into TransientNetwork.
-        - Other exceptions are translated via _translate_error.
+        - Uses `_run_in_thread` to keep the adapter async-first.
+        - If ctx.remaining_ms() is present, wraps the call in asyncio.wait_for().
+        - asyncio.TimeoutError is translated into TransientNetwork with ctx details.
+        - Other exceptions are translated via _translate_error with ctx details.
         """
         timeout_s = self._get_ctx_timeout_s(ctx)
         try:
-            if timeout_s is not None and timeout_s > 0:
+            if timeout_s is not None:
                 return await asyncio.wait_for(
-                    self._run_in_thread(func, *args, **kwargs),
+                    self._run_in_thread(func, **kwargs),
                     timeout=timeout_s,
                 )
-            return await self._run_in_thread(func, *args, **kwargs)
+            return await self._run_in_thread(func, **kwargs)
         except asyncio.TimeoutError as exc:
             raise TransientNetwork(
                 "Milvus operation timed out",
                 code="TRANSIENT_NETWORK",
                 retry_after_ms=500,
-                details={"op": op},
+                details=self._attach_ctx_details({"op": op}, ctx),
             ) from exc
         except Exception as exc:  # noqa: BLE001
-            raise self._translate_error(exc, op=op) from exc
+            raise self._translate_error(exc, op=op, ctx=ctx) from exc
 
     def _convert_score(self, raw_score: float) -> Tuple[float, float]:
         """
@@ -373,7 +400,13 @@ class MilvusVectorAdapter(BaseVectorAdapter):
         # Fallback
         return d, d
 
-    def _translate_error(self, err: Exception, *, op: str) -> VectorAdapterError:
+    def _translate_error(
+        self,
+        err: Exception,
+        *,
+        op: str,
+        ctx: Optional[OperationContext],
+    ) -> VectorAdapterError:
         """
         Map Milvus exceptions into normalized VectorAdapterError types.
 
@@ -407,7 +440,7 @@ class MilvusVectorAdapter(BaseVectorAdapter):
                     "Milvus rate limit exceeded",
                     code="RESOURCE_EXHAUSTED",
                     retry_after_ms=500,
-                    details={"op": op},
+                    details=self._attach_ctx_details({"op": op}, ctx),
                 )
 
             # Auth / permission
@@ -415,7 +448,7 @@ class MilvusVectorAdapter(BaseVectorAdapter):
                 return AuthError(
                     "Milvus authentication/authorization error",
                     code="AUTH_ERROR",
-                    details={"op": op},
+                    details=self._attach_ctx_details({"op": op}, ctx),
                 )
 
             # Collection not found / index not ready
@@ -423,13 +456,13 @@ class MilvusVectorAdapter(BaseVectorAdapter):
                 "collection not found" in lowered
                 or "partition not found" in lowered
                 or "not found" in lowered
-                or (status_int is not None and status_int == 7)  # common NOT_FOUND code
+                or (status_int is not None and status_int == 7)  # NOT_FOUND code
             ):
                 return IndexNotReady(
                     "Milvus collection or partition not ready",
                     code="INDEX_NOT_READY",
                     retry_after_ms=1000,
-                    details={"op": op},
+                    details=self._attach_ctx_details({"op": op}, ctx),
                 )
 
             # Timeouts / transient
@@ -438,7 +471,7 @@ class MilvusVectorAdapter(BaseVectorAdapter):
                     "Milvus transient network error",
                     code="TRANSIENT_NETWORK",
                     retry_after_ms=500,
-                    details={"op": op},
+                    details=self._attach_ctx_details({"op": op}, ctx),
                 )
 
             # Validation / bad request
@@ -450,14 +483,14 @@ class MilvusVectorAdapter(BaseVectorAdapter):
                 return BadRequest(
                     msg,
                     code="BAD_REQUEST",
-                    details={"op": op},
+                    details=self._attach_ctx_details({"op": op}, ctx),
                 )
 
             # Server-side or unknown errors
             return Unavailable(
                 msg,
                 code="UNAVAILABLE",
-                details={"op": op},
+                details=self._attach_ctx_details({"op": op}, ctx),
             )
 
         # Generic transport/network issues
@@ -467,21 +500,21 @@ class MilvusVectorAdapter(BaseVectorAdapter):
                 "Milvus network timeout",
                 code="TRANSIENT_NETWORK",
                 retry_after_ms=500,
-                details={"op": op},
+                details=self._attach_ctx_details({"op": op}, ctx),
             )
         if "connection" in lowered_generic:
             return TransientNetwork(
                 "Milvus connection error",
                 code="TRANSIENT_NETWORK",
                 retry_after_ms=500,
-                details={"op": op},
+                details=self._attach_ctx_details({"op": op}, ctx),
             )
 
         # Fallback
         return Unavailable(
             msg,
             code="UNAVAILABLE",
-            details={"op": op},
+            details=self._attach_ctx_details({"op": op}, ctx),
         )
 
     async def _ensure_namespace_known(
@@ -507,10 +540,10 @@ class MilvusVectorAdapter(BaseVectorAdapter):
 
         client = self._get_client()
         partitions = await self._call_milvus(
-            client.list_partitions,
-            op,
-            ctx,
-            self._collection_name,
+            op=op,
+            func=client.list_partitions,
+            ctx=ctx,
+            collection_name=self._collection_name,
         )
 
         if isinstance(partitions, list):
@@ -617,8 +650,8 @@ class MilvusVectorAdapter(BaseVectorAdapter):
         Report Milvus-backed capabilities.
 
         Notes:
-            - `max_dimensions` is set to 0 to avoid double-enforcement in the
-              BaseVectorAdapter; dimensionality is enforced explicitly here.
+            - `max_dimensions` is taken from configuration (if provided); we
+              still perform explicit dimension checks in this adapter.
             - `max_batch_size` is advertised here and enforced by
               BaseVectorAdapter for upsert/delete before hitting this layer.
         """
@@ -626,7 +659,7 @@ class MilvusVectorAdapter(BaseVectorAdapter):
         return VectorCapabilities(
             server="milvus",
             version=version,
-            max_dimensions=0,
+            max_dimensions=self._dimensions or 0,
             supported_metrics=(self._metric,),
             supports_namespaces=True,  # mapped to partitions
             supports_metadata_filtering=True,
@@ -676,6 +709,20 @@ class MilvusVectorAdapter(BaseVectorAdapter):
                 },
             )
 
+        # Optionally guard filter complexity.
+        if self._max_filter_terms is not None and spec.filter:
+            if len(spec.filter) > self._max_filter_terms:
+                raise BadRequest(
+                    f"filter too complex: {len(spec.filter)} terms exceeds "
+                    f"{self._max_filter_terms}",
+                    code="BAD_REQUEST",
+                    details={
+                        "provided_terms": len(spec.filter),
+                        "max_terms": self._max_filter_terms,
+                        "namespace": spec.namespace,
+                    },
+                )
+
         # Build metadata filter expression if provided.
         filter_expr = ""
         if spec.filter:
@@ -692,7 +739,9 @@ class MilvusVectorAdapter(BaseVectorAdapter):
         # Namespace existence & readiness semantics.
         if spec.namespace:
             namespace_known = await self._ensure_namespace_known(
-                spec.namespace, op="query", ctx=ctx
+                spec.namespace,
+                op="query",
+                ctx=ctx,
             )
             if not namespace_known:
                 raise BadRequest(
@@ -733,9 +782,9 @@ class MilvusVectorAdapter(BaseVectorAdapter):
             kwargs["filter"] = filter_expr
 
         resp = await self._call_milvus(
-            client.search,
-            "query",
-            ctx,
+            op="query",
+            func=client.search,
+            ctx=ctx,
             **kwargs,
         )
 
@@ -849,7 +898,7 @@ class MilvusVectorAdapter(BaseVectorAdapter):
         try:
             results = await asyncio.gather(*tasks)
         except Exception as exc:  # noqa: BLE001
-            raise self._translate_error(exc, op="batch_query") from exc
+            raise self._translate_error(exc, op="batch_query", ctx=ctx) from exc
 
         return results
 
@@ -901,9 +950,9 @@ class MilvusVectorAdapter(BaseVectorAdapter):
         upserted = 0
         if rows:
             resp = await self._call_milvus(
-                client.insert,
-                "upsert",
-                ctx,
+                op="upsert",
+                func=client.insert,
+                ctx=ctx,
                 **kwargs,
             )
 
@@ -938,7 +987,9 @@ class MilvusVectorAdapter(BaseVectorAdapter):
         # Namespace existence semantics for delete:
         if spec.namespace:
             namespace_known = await self._ensure_namespace_known(
-                spec.namespace, op="delete", ctx=ctx
+                spec.namespace,
+                op="delete",
+                ctx=ctx,
             )
             if not namespace_known:
                 raise BadRequest(
@@ -963,9 +1014,9 @@ class MilvusVectorAdapter(BaseVectorAdapter):
                 query_kwargs["partition_names"] = [spec.namespace]
 
             existing_rows = await self._call_milvus(
-                client.query,
-                "delete",
-                ctx,
+                op="delete",
+                func=client.query,
+                ctx=ctx,
                 **query_kwargs,
             )
 
@@ -1016,9 +1067,9 @@ class MilvusVectorAdapter(BaseVectorAdapter):
                 query_kwargs["partition_names"] = [spec.namespace]
 
             existing_rows = await self._call_milvus(
-                client.query,
-                "delete",
-                ctx,
+                op="delete",
+                func=client.query,
+                ctx=ctx,
                 **query_kwargs,
             )
 
@@ -1053,9 +1104,9 @@ class MilvusVectorAdapter(BaseVectorAdapter):
         kwargs["filter"] = expr
 
         await self._call_milvus(
-            client.delete,
-            "delete",
-            ctx,
+            op="delete",
+            func=client.delete,
+            ctx=ctx,
             **kwargs,
         )
 
@@ -1099,10 +1150,10 @@ class MilvusVectorAdapter(BaseVectorAdapter):
 
         try:
             partitions = await self._call_milvus(
-                client.list_partitions,
-                "create_namespace",
-                ctx,
-                self._collection_name,
+                op="create_namespace",
+                func=client.list_partitions,
+                ctx=ctx,
+                collection_name=self._collection_name,
             )
         except VectorAdapterError:
             logger.debug("list_partitions failed during create_namespace", exc_info=True)
@@ -1123,9 +1174,9 @@ class MilvusVectorAdapter(BaseVectorAdapter):
         created = False
         if spec.namespace not in existing_names:
             await self._call_milvus(
-                client.create_partition,
-                "create_namespace",
-                ctx,
+                op="create_namespace",
+                func=client.create_partition,
+                ctx=ctx,
                 collection_name=self._collection_name,
                 partition_name=spec.namespace,
             )
@@ -1155,9 +1206,9 @@ class MilvusVectorAdapter(BaseVectorAdapter):
         existed = False
         try:
             await self._call_milvus(
-                client.drop_partition,
-                "delete_namespace",
-                ctx,
+                op="delete_namespace",
+                func=client.drop_partition,
+                ctx=ctx,
                 collection_name=self._collection_name,
                 partition_name=namespace,
             )
@@ -1201,9 +1252,9 @@ class MilvusVectorAdapter(BaseVectorAdapter):
 
         try:
             stats = await self._call_milvus(
-                client.get_collection_stats,
-                "health",
-                ctx,
+                op="health",
+                func=client.get_collection_stats,
+                ctx=ctx,
                 collection_name=self._collection_name,
             )
             if isinstance(stats, Mapping):
@@ -1218,10 +1269,10 @@ class MilvusVectorAdapter(BaseVectorAdapter):
 
             try:
                 partitions = await self._call_milvus(
-                    client.list_partitions,
-                    "health",
-                    ctx,
-                    self._collection_name,
+                    op="health",
+                    func=client.list_partitions,
+                    ctx=ctx,
+                    collection_name=self._collection_name,
                 )
             except VectorAdapterError:
                 logger.debug("list_partitions failed during health", exc_info=True)
