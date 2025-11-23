@@ -50,14 +50,27 @@ from corpus_sdk.embedding.framework_adapters.common.embedding_translation import
     TextNormalizationConfig,
     create_embedding_translator,
 )
+from corpus_sdk.embedding.framework_adapters.common.framework_utils import (
+    CoercionErrorCodes,
+    coerce_embedding_matrix,
+    coerce_embedding_vector,
+    warn_if_extreme_batch,
+)
 
 logger = logging.getLogger(__name__)
 
 # Type variables for decorators
 T = TypeVar("T")
 
-# Error code constants
-class ErrorCodes:
+
+class ErrorCodes(CoercionErrorCodes):
+    """
+    Error code constants for CrewAI embedding adapter.
+
+    Inherits from CoercionErrorCodes so shared coercion utilities can
+    reference the same symbolic names while remaining framework-specific.
+    """
+
     INVALID_EMBEDDING_RESULT = "INVALID_EMBEDDING_RESULT"
     EMPTY_EMBEDDING_RESULT = "EMPTY_EMBEDDING_RESULT"
     EMBEDDING_CONVERSION_ERROR = "EMBEDDING_CONVERSION_ERROR"
@@ -111,6 +124,9 @@ def with_embedding_error_context(
 ) -> Callable[[Callable[..., T]], Callable[..., T]]:
     """
     Decorator to automatically attach error context to embedding exceptions.
+
+    Captures the framework name and a logical operation label so that
+    downstream logging/monitoring can distinguish CrewAI embedding failures.
     """
     def decorator(func: Callable[..., T]) -> Callable[..., T]:
         @wraps(func)
@@ -213,7 +229,7 @@ class CorpusCrewAIEmbeddings:
         )
     except Exception as e:
         # Rich error context automatically attached
-        logger.error(f"Embedding failed with context: {e.__corpus_context__}")
+        logger.error("Embedding failed with context", exc_info=e)
     ```
 
     Attributes
@@ -233,6 +249,15 @@ class CorpusCrewAIEmbeddings:
         text_normalization_config: Optional[TextNormalizationConfig] = None,
         crewai_config: Optional[CrewAIConfig] = None,
     ):
+        # Behavioral validation (duck-typed) instead of strict isinstance
+        if not hasattr(corpus_adapter, "embed") or not callable(
+            getattr(corpus_adapter, "embed", None)
+        ):
+            raise TypeError(
+                "corpus_adapter must implement an EmbeddingProtocolV1-compatible "
+                "interface with an 'embed' method"
+            )
+
         self.corpus_adapter = corpus_adapter
         self.model = model
         self.batch_config = batch_config
@@ -247,7 +272,7 @@ class CorpusCrewAIEmbeddings:
 
     def _validate_crewai_config(self, config: CrewAIConfig) -> CrewAIConfig:
         """Validate and normalize CrewAI configuration with sensible defaults."""
-        validated = config.copy()
+        validated: CrewAIConfig = config.copy()
 
         # Set defaults for missing values
         if "max_embedding_retries" not in validated:
@@ -278,13 +303,18 @@ class CorpusCrewAIEmbeddings:
         Uses `cached_property` for thread safety and optimal performance
         in multi-agent CrewAI environments.
         """
-        return create_embedding_translator(
+        translator = create_embedding_translator(
             adapter=self.corpus_adapter,
             framework="crewai",
             translator=None,
             batch_config=self.batch_config,
             text_normalization_config=self.text_normalization_config,
         )
+        logger.debug(
+            "EmbeddingTranslator initialized for CrewAI with model: %s",
+            self.model or "default",
+        )
+        return translator
 
     def _build_contexts(
         self,
@@ -386,12 +416,12 @@ class CorpusCrewAIEmbeddings:
 
         return core_ctx, framework_ctx
 
-    def _validate_crewai_context_structure(self, context: CrewAIContext) -> None:
+    def _validate_crewai_context_structure(self, context: Mapping[str, Any]) -> None:
         """Validate CrewAI context structure and log warnings for anomalies."""
-        if not isinstance(context, dict):
+        if not isinstance(context, Mapping):
             raise ValueError(
                 f"[{ErrorCodes.CREWAI_CONTEXT_INVALID}] "
-                f"CrewAI context must be a dictionary, got {type(context).__name__}"
+                f"CrewAI context must be a mapping, got {type(context).__name__}"
             )
 
         if not context.get("agent_role") and not context.get("task_id"):
@@ -404,120 +434,27 @@ class CorpusCrewAIEmbeddings:
         """
         Coerce translator result into embedding matrix with comprehensive validation.
 
-        Supports:
-        - {"embeddings": [[...], [...]], "model": "...", "usage": {...}}
-        - {"embedding": [...]} (single embedding vector)
-        - Direct matrix: [[...], [...]]
-        - EmbedResult-like with `.embeddings` or `.embedding` attribute
+        Delegates to the shared framework_utils implementation so behavior
+        is consistent across all framework adapters.
         """
-        if isinstance(result, Mapping):
-            if "embeddings" in result:
-                embeddings_obj: Any = result["embeddings"]
-            elif "embedding" in result:
-                embeddings_obj = [result["embedding"]]
-            else:
-                embeddings_obj = result
-        elif hasattr(result, "embeddings"):
-            embeddings_obj = getattr(result, "embeddings")
-        elif hasattr(result, "embedding"):
-            embeddings_obj = [getattr(result, "embedding")]
-        else:
-            embeddings_obj = result
-
-        if not isinstance(embeddings_obj, Sequence) or isinstance(
-            embeddings_obj, (str, bytes)
-        ):
-            raise TypeError(
-                f"[{ErrorCodes.INVALID_EMBEDDING_RESULT}] "
-                f"Translator result does not contain valid embeddings sequence: "
-                f"type={type(embeddings_obj).__name__}"
-            )
-
-        matrix: List[List[float]] = []
-        for i, row in enumerate(embeddings_obj):
-            if not isinstance(row, Sequence) or isinstance(row, (str, bytes)):
-                raise TypeError(
-                    f"[{ErrorCodes.INVALID_EMBEDDING_RESULT}] "
-                    f"Expected embedding row to be sequence, got {type(row).__name__} at index {i}"
-                )
-
-            if len(row) == 0:
-                logger.warning("Empty embedding row at index %d, skipping", i)
-                continue
-
-            try:
-                embedding_vector = [float(x) for x in row]
-                matrix.append(embedding_vector)
-            except (TypeError, ValueError) as e:
-                raise TypeError(
-                    f"[{ErrorCodes.EMBEDDING_CONVERSION_ERROR}] "
-                    f"Failed to convert embedding values to float at row {i}: {e}"
-                ) from e
-
-        if not matrix:
-            raise ValueError(
-                f"[{ErrorCodes.EMPTY_EMBEDDING_RESULT}] "
-                "Translator returned no valid embedding rows"
-            )
-
-        logger.debug("Successfully coerced embedding matrix with %d rows", len(matrix))
-        return matrix
+        return coerce_embedding_matrix(
+            result=result,
+            error_codes=ErrorCodes,
+            logger=logger,
+        )
 
     def _coerce_embedding_vector(self, result: Any) -> List[float]:
         """
         Coerce translator result for single-text embed with validation.
+
+        Delegates to the shared framework_utils implementation and preserves
+        the existing semantics (first row when multiple are returned).
         """
-        matrix = self._coerce_embedding_matrix(result)
-
-        if len(matrix) > 1:
-            logger.warning(
-                "Expected single embedding for query, got %d rows; using first row. "
-                "Context: %s",
-                len(matrix),
-                {"multiple_embeddings_received": len(matrix)},
-            )
-
-        return matrix[0]
-
-    def _warn_if_extreme_batch(
-        self,
-        texts: Sequence[str],
-        *,
-        op_name: str,
-    ) -> None:
-        """
-        Shared helper for large-batch warnings in CrewAI flows.
-
-        Uses CrewAI-aware thresholds while remaining non-fatal.
-        """
-        if isinstance(texts, (str, bytes)):
-            return
-
-        batch_size = len(texts)
-        if batch_size <= 10_000:
-            return
-
-        if batch_size > 10_000:
-            logger.warning(
-                "%s called with batch_size=%d; consider splitting across multiple "
-                "CrewAI tasks for better responsiveness",
-                op_name,
-                batch_size,
-            )
-
-        max_batch_size = (
-            None
-            if self.batch_config is None
-            else getattr(self.batch_config, "max_batch_size", None)
+        return coerce_embedding_vector(
+            result=result,
+            error_codes=ErrorCodes,
+            logger=logger,
         )
-        if batch_size > 50_000 and max_batch_size is None:
-            logger.warning(
-                "%s called with batch_size=%d and no batch_config.max_batch_size; "
-                "this may impact CrewAI agent responsiveness. You may also want to "
-                "enable task_aware_batching in crewai_config.",
-                op_name,
-                batch_size,
-            )
 
     # ------------------------------------------------------------------ #
     # Core Embedding API (CrewAI Compatible)
@@ -537,7 +474,13 @@ class CorpusCrewAIEmbeddings:
 
         Used by CrewAI agents during RAG operations and knowledge processing.
         """
-        self._warn_if_extreme_batch(texts, op_name="embed_documents")
+        warn_if_extreme_batch(
+            framework="crewai",
+            texts=texts,
+            op_name="embed_documents",
+            batch_config=self.batch_config,
+            logger=logger,
+        )
 
         core_ctx, framework_ctx = self._build_contexts(
             crewai_context=crewai_context,
@@ -545,15 +488,16 @@ class CorpusCrewAIEmbeddings:
             **kwargs,
         )
 
+        texts_list = list(texts)
         logger.debug(
             "Embedding %d documents for CrewAI agent: %s, task: %s",
-            len(texts),
+            len(texts_list),
             crewai_context.get("agent_role", "unknown") if crewai_context else "unknown",
             crewai_context.get("task_id", "unknown") if crewai_context else "unknown",
         )
 
         translated = self._translator.embed(
-            raw_texts=list(texts),
+            raw_texts=texts_list,
             op_ctx=core_ctx,
             framework_ctx=framework_ctx,
         )
@@ -609,7 +553,13 @@ class CorpusCrewAIEmbeddings:
 
         Designed for async CrewAI workflows and parallel agent execution.
         """
-        self._warn_if_extreme_batch(texts, op_name="aembed_documents")
+        warn_if_extreme_batch(
+            framework="crewai",
+            texts=texts,
+            op_name="aembed_documents",
+            batch_config=self.batch_config,
+            logger=logger,
+        )
 
         core_ctx, framework_ctx = self._build_contexts(
             crewai_context=crewai_context,
@@ -617,14 +567,15 @@ class CorpusCrewAIEmbeddings:
             **kwargs,
         )
 
+        texts_list = list(texts)
         logger.debug(
             "Async embedding %d documents for CrewAI task: %s",
-            len(texts),
+            len(texts_list),
             crewai_context.get("task_id", "unknown") if crewai_context else "unknown",
         )
 
         translated = await self._translator.arun_embed(
-            raw_texts=list(texts),
+            raw_texts=texts_list,
             op_ctx=core_ctx,
             framework_ctx=framework_ctx,
         )
