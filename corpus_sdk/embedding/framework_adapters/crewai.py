@@ -16,6 +16,8 @@ embedding services within CrewAI agents and workflows, with:
 
 The design follows CrewAI's adapter patterns while maintaining the
 protocol-first Corpus embedding stack.
+
+Resilience (retries, caching, rate limiting, etc.) is expected to be provided by the underlying adapter, typically a BaseEmbeddingAdapter subclass.
 """
 
 from __future__ import annotations
