@@ -23,7 +23,7 @@ It intentionally stays *framework-neutral* and uses only:
 
 Adapters remain responsible for:
 
-- Choosing framework names and passing them in
+- Choosing framework names and passing them in, when overriding defaults
 - Supplying appropriate error code bundles
 - Deciding which limits/flags to use per environment
 """
@@ -337,7 +337,7 @@ def _as_mapping(obj: Any) -> Optional[Mapping[str, Any]]:
 def coerce_nodes(
     result: Any,
     *,
-    framework: Optional[str],
+    framework: Optional[str] = None,
     error_codes: GraphCoercionErrorCodes,
     limits: Optional[GraphResourceLimits] = None,
     flags: Optional[GraphValidationFlags] = None,
@@ -351,7 +351,8 @@ def coerce_nodes(
     result:
         Arbitrary result returned by a graph runtime / adapter.
     framework:
-        Framework label for logging / diagnostics.
+        Optional framework label for logging / diagnostics. If not provided,
+        falls back to `error_codes.framework_label` and then "graph".
     error_codes:
         Bundle of error codes to embed in exception messages.
     limits:
@@ -451,7 +452,7 @@ def coerce_nodes(
 def coerce_edges(
     result: Any,
     *,
-    framework: Optional[str],
+    framework: Optional[str] = None,
     error_codes: GraphCoercionErrorCodes,
     limits: Optional[GraphResourceLimits] = None,
     flags: Optional[GraphValidationFlags] = None,
@@ -542,7 +543,7 @@ def coerce_edges(
 def coerce_graph(
     result: Any,
     *,
-    framework: Optional[str],
+    framework: Optional[str] = None,
     error_codes: GraphCoercionErrorCodes,
     limits: Optional[GraphResourceLimits] = None,
     flags: Optional[GraphValidationFlags] = None,
@@ -594,7 +595,7 @@ def warn_if_extreme_graph_size(
     nodes: Sequence[Any],
     edges: Sequence[Any],
     *,
-    framework: Optional[str],
+    framework: Optional[str] = None,
     op_name: str,
     limits: Optional[GraphResourceLimits] = None,
     logger: Optional[logging.Logger] = None,
@@ -632,7 +633,7 @@ def enforce_graph_limits(
     nodes: Sequence[Mapping[str, Any]],
     edges: Sequence[Mapping[str, Any]],
     *,
-    framework: Optional[str],
+    framework: Optional[str] = None,
     op_name: str,
     error_codes: GraphCoercionErrorCodes,
     limits: Optional[GraphResourceLimits],
@@ -690,7 +691,7 @@ def estimate_graph_depth(
     nodes: Sequence[Mapping[str, Any]],
     edges: Sequence[Mapping[str, Any]],
     *,
-    framework: Optional[str],
+    framework: Optional[str] = None,
     logger: Optional[logging.Logger] = None,
 ) -> int:
     """
@@ -745,9 +746,9 @@ def detect_cycles(
     nodes: Sequence[Mapping[str, Any]],
     edges: Sequence[Mapping[str, Any]],
     *,
-    framework: Optional[str],
+    framework: Optional[str] = None,
     error_codes: GraphCoercionErrorCodes,
-    limits: Optional[GraphResourceLimits] = None,
+    limits: Optional[GraphResourceLimits] = None,  # kept for API symmetry, unused
     flags: Optional[GraphValidationFlags] = None,
     logger: Optional[logging.Logger] = None,
 ) -> bool:
@@ -819,7 +820,7 @@ def detect_cycles(
 def validate_node_ids(
     nodes: Sequence[Mapping[str, Any]],
     *,
-    framework: Optional[str],
+    framework: Optional[str] = None,
     error_codes: GraphCoercionErrorCodes,
     flags: Optional[GraphValidationFlags] = None,
     logger: Optional[logging.Logger] = None,
@@ -847,7 +848,7 @@ def validate_node_ids(
 def validate_edge_ids(
     edges: Sequence[Mapping[str, Any]],
     *,
-    framework: Optional[str],
+    framework: Optional[str] = None,
     error_codes: GraphCoercionErrorCodes,
     flags: Optional[GraphValidationFlags] = None,
     logger: Optional[logging.Logger] = None,
@@ -937,7 +938,7 @@ def estimate_state_size_bytes(
 def enforce_state_size_limit(
     state: Any,
     *,
-    framework: Optional[str],
+    framework: Optional[str] = None,
     error_codes: GraphCoercionErrorCodes,
     limits: Optional[GraphResourceLimits],
     flags: Optional[GraphValidationFlags] = None,
@@ -983,7 +984,7 @@ def enforce_state_size_limit(
 def normalize_graph_context(
     graph_context: Optional[Mapping[str, Any]],
     *,
-    framework: Optional[str],
+    framework: Optional[str] = None,
     logger: Optional[logging.Logger] = None,
 ) -> Dict[str, Any]:
     """
@@ -1080,7 +1081,7 @@ def attach_graph_context_to_framework_ctx(
 def iter_graph_events(
     events: Iterable[Any],
     *,
-    framework: Optional[str],
+    framework: Optional[str] = None,
     op_name: str,
     limits: Optional[GraphResourceLimits] = None,
     flags: Optional[GraphValidationFlags] = None,
