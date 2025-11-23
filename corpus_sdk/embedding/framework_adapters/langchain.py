@@ -52,6 +52,12 @@ from corpus_sdk.embedding.framework_adapters.common.embedding_translation import
     TextNormalizationConfig,
     create_embedding_translator,
 )
+from corpus_sdk.embedding.framework_adapters.common.framework_utils import (
+    CoercionErrorCodes,
+    coerce_embedding_matrix,
+    coerce_embedding_vector,
+    warn_if_extreme_batch,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -59,8 +65,14 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 
-# Error code constants
-class ErrorCodes:
+class ErrorCodes(CoercionErrorCodes):
+    """
+    Error code constants for LangChain embedding adapter.
+
+    Inherits from CoercionErrorCodes so shared coercion utilities can
+    reference the same symbolic names while remaining framework-specific.
+    """
+
     INVALID_EMBEDDING_RESULT = "INVALID_EMBEDDING_RESULT"
     EMPTY_EMBEDDING_RESULT = "EMPTY_EMBEDDING_RESULT"
     EMBEDDING_CONVERSION_ERROR = "EMBEDDING_CONVERSION_ERROR"
@@ -364,90 +376,29 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
 
     def _coerce_embedding_matrix(self, result: Any) -> List[List[float]]:
         """
-        Coerce translator result into a List[List[float]] embedding matrix with comprehensive validation.
+        Coerce translator result into a List[List[float]] embedding matrix.
 
-        Supported shapes:
-        - {"embeddings": [[...], [...]], ...}
-        - {"embedding": [...], ...} (single embedding vector)
-        - Direct matrix: [[...], [...]]
-        - Objects with `.embeddings` or `.embedding` attributes
+        Delegates to the shared framework_utils implementation so behavior
+        is consistent across all framework adapters.
         """
-        if isinstance(result, Mapping):
-            if "embeddings" in result:
-                embeddings_obj: Any = result["embeddings"]
-            elif "embedding" in result:
-                embeddings_obj = [result["embedding"]]
-            else:
-                embeddings_obj = result
-        elif hasattr(result, "embeddings"):
-            embeddings_obj = getattr(result, "embeddings")
-        elif hasattr(result, "embedding"):
-            embeddings_obj = [getattr(result, "embedding")]
-        else:
-            embeddings_obj = result
-
-        if not isinstance(embeddings_obj, Sequence) or isinstance(
-            embeddings_obj, (str, bytes)
-        ):
-            raise TypeError(
-                f"[{ErrorCodes.INVALID_EMBEDDING_RESULT}] "
-                f"Translator result does not contain a valid embeddings sequence: "
-                f"type={type(embeddings_obj).__name__}"
-            )
-
-        matrix: List[List[float]] = []
-        for i, row in enumerate(embeddings_obj):
-            if not isinstance(row, Sequence) or isinstance(row, (str, bytes)):
-                raise TypeError(
-                    f"[{ErrorCodes.INVALID_EMBEDDING_RESULT}] "
-                    f"Expected each embedding row to be a sequence, "
-                    f"got {type(row).__name__} at index {i}"
-                )
-
-            if len(row) == 0:
-                logger.warning("Empty embedding row at index %d, skipping", i)
-                continue
-
-            try:
-                embedding_vector = [float(x) for x in row]
-                matrix.append(embedding_vector)
-            except (TypeError, ValueError) as e:
-                raise TypeError(
-                    f"[{ErrorCodes.EMBEDDING_CONVERSION_ERROR}] "
-                    f"Failed to convert embedding values to float at row {i}: {e}"
-                ) from e
-
-        if not matrix:
-            raise ValueError(
-                f"[{ErrorCodes.EMPTY_EMBEDDING_RESULT}] "
-                "Translator returned no valid embedding rows"
-            )
-
-        logger.debug(
-            "Successfully coerced embedding matrix with %d rows",
-            len(matrix),
+        return coerce_embedding_matrix(
+            result=result,
+            error_codes=ErrorCodes,
+            logger=logger,
         )
-        return matrix
 
     def _coerce_embedding_vector(self, result: Any) -> List[float]:
         """
-        Coerce translator result for a single-text embed into List[float] with validation.
+        Coerce translator result for a single-text embed into List[float].
 
-        Strategy:
-        - If the matrix is empty → _coerce_embedding_matrix raises
-        - If it has exactly one row → return that row
-        - If it has multiple rows → return the first row and log a warning
+        Delegates to the shared framework_utils implementation and preserves
+        the existing semantics (first row when multiple are returned).
         """
-        matrix = self._coerce_embedding_matrix(result)
-
-        if len(matrix) > 1:
-            logger.warning(
-                "Expected a single embedding for query, but got %d rows; "
-                "using the first row.",
-                len(matrix),
-            )
-
-        return matrix[0]
+        return coerce_embedding_vector(
+            result=result,
+            error_codes=ErrorCodes,
+            logger=logger,
+        )
 
     def _warn_if_extreme_batch(
         self,
@@ -459,25 +410,13 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         Soft warning for extremely large batches when no batch_config limit
         is configured. Actual batching / chunking is handled by the translator.
         """
-        if isinstance(texts, (str, bytes)):
-            return
-
-        batch_size = len(texts)
-        if batch_size <= 10_000:
-            return
-
-        max_batch_size = (
-            None
-            if self.batch_config is None
-            else getattr(self.batch_config, "max_batch_size", None)
+        warn_if_extreme_batch(
+            framework="langchain",
+            texts=texts,
+            op_name=op_name,
+            batch_config=self.batch_config,
+            logger=logger,
         )
-        if max_batch_size is None:
-            logger.warning(
-                "%s called with batch_size=%d and no explicit BatchConfig.max_batch_size; "
-                "ensure your adapter/translator can handle very large batches.",
-                op_name,
-                batch_size,
-            )
 
     # ------------------------------------------------------------------ #
     # Async API
