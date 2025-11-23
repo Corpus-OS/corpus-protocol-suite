@@ -18,25 +18,25 @@ Design goals
 ------------
 
 1. Protocol + translator first:
-   All calls go through the shared `LLMTranslator` with the `"semantic_kernel"`
+   All calls go through the shared `LLMTranslator` with the `"langchain"`
    framework, so message normalization, post-processing, tools, and error context
    are consistent across frameworks.
 
 2. Optional dependency safe:
-   Import of Langchain is guarded. Importing this module is safe even if
-   Langchain is not installed.
+   Import of LangChain is guarded. Importing this module is safe even if
+   LangChain is not installed.
 
 3. Simple & explicit interface:
-   Clean API that Langchain can use directly by plugging in this client
-   as a `ChatCompletionClientBase` implementation.
+   Clean API that LangChain can use directly by plugging in this client
+   as a `BaseChatModel` implementation.
 
 4. True streaming:
-   Streaming goes through `LLMTranslator.arun_stream`, so you get protocol-level
-   streaming semantics with Langchain–friendly outputs.
+   Streaming goes through `LLMTranslator.stream` / `LLMTranslator.arun_stream`,
+   so you get protocol-level streaming semantics with LangChain–friendly outputs.
 
 5. Context + observability:
-   - `OperationContext` built from Langchain prompt settings
-   - Rich error context attached via the framework-level error_context helpers
+   - `OperationContext` built from LangChain config via `ContextTranslator`
+   - Rich error context attached via core `attach_context`
 """
 
 from __future__ import annotations
@@ -67,9 +67,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, HumanMessage
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 
-from corpus_sdk.core.context_translation import (
-    from_langchain as context_from_langchain,
-)
+from corpus_sdk.core.context_translation import ContextTranslator
 from corpus_sdk.core.error_context import attach_context
 from corpus_sdk.llm.llm_base import (
     LLMProtocolV1,
@@ -83,6 +81,9 @@ from corpus_sdk.llm.framework_adapters.common.llm_translation import (
     SafetyFilter,
     create_llm_translator,
 )
+from corpus_sdk.llm.framework_adapters.common.framework_utils import (
+    CoercionErrorCodes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +92,19 @@ _FRAMEWORK_NAME = "langchain"
 
 T = TypeVar("T")
 
+# ---------------------------------------------------------------------------
+# Error-code bundle (CoercionErrorCodes alignment)
+# ---------------------------------------------------------------------------
+
+ERROR_CODES = CoercionErrorCodes(
+    invalid_result="LANGCHAIN_LLM_INVALID_RESULT",
+    empty_result="LANGCHAIN_LLM_EMPTY_RESULT",
+    conversion_error="LANGCHAIN_LLM_CONVERSION_ERROR",
+    framework_label=_FRAMEWORK_NAME,
+)
+
+# Symbolic code for init/config errors (for log/search friendliness)
+INIT_CONFIG_ERROR = "LANGCHAIN_LLM_BAD_INIT_CONFIG"
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -122,16 +136,18 @@ class LangChainLLMConfig:
         """Validate configuration immediately when constructed."""
         if not 0.0 <= self.temperature <= 2.0:
             raise ValueError(
+                f"{INIT_CONFIG_ERROR}: "
                 f"temperature must be between 0.0 and 2.0, got {self.temperature}"
             )
         if self.max_tokens is not None and self.max_tokens < 1:
             raise ValueError(
+                f"{INIT_CONFIG_ERROR}: "
                 f"max_tokens must be positive, got {self.max_tokens}"
             )
 
 
 # ---------------------------------------------------------------------------
-# Error context helpers (lazy, decorator-based)
+# Error context helpers (lazy, decorator-based, aligned)
 # ---------------------------------------------------------------------------
 
 
@@ -148,16 +164,15 @@ def _extract_dynamic_context(
     on successful calls.
     """
     dynamic_ctx: Dict[str, Any] = {
-        "framework": _FRAMEWORK_NAME,
-        "operation": operation,
+        "framework_name": _FRAMEWORK_NAME,
         "model": getattr(instance, "model", "unknown"),
         "temperature": getattr(instance, "temperature", 0.7),
+        # NOTE: ERROR_CODES is injected once in the decorator; no need here.
     }
 
     # Messages metrics
     if args:
         first_arg = args[0]
-        messages: Sequence[BaseMessage]
         if isinstance(first_arg, Sequence):
             messages = [m for m in first_arg if isinstance(m, BaseMessage)]
         elif isinstance(first_arg, BaseMessage):
@@ -201,7 +216,7 @@ def _create_error_context_decorator(
     Factory for creating error-context decorators with lazy dynamic context.
 
     Successful calls are unaffected; on exception we compute metrics and
-    attach them via `attach_context`.
+    attach them via `attach_context` with a consistent LLM-oriented operation.
     """
 
     def decorator_factory(
@@ -221,10 +236,15 @@ def _create_error_context_decorator(
                             kwargs,
                             operation,
                         )
-                        full_ctx = {**static_context, **dynamic_ctx}
+                        full_ctx = {
+                            "error_codes": ERROR_CODES,
+                            **static_context,
+                            **dynamic_ctx,
+                        }
                         attach_context(
                             exc,
                             framework=_FRAMEWORK_NAME,
+                            operation=f"llm_{operation}",
                             **full_ctx,
                         )
                         raise
@@ -243,10 +263,15 @@ def _create_error_context_decorator(
                             kwargs,
                             operation,
                         )
-                        full_ctx = {**static_context, **dynamic_ctx}
+                        full_ctx = {
+                            "error_codes": ERROR_CODES,
+                            **static_context,
+                            **dynamic_ctx,
+                        }
                         attach_context(
                             exc,
                             framework=_FRAMEWORK_NAME,
+                            operation=f"llm_{operation}",
                             **full_ctx,
                         )
                         raise
@@ -272,6 +297,60 @@ def with_async_llm_error_context(
 ) -> Callable[[Callable[..., T]], Callable[..., T]]:
     """Decorator for async LLM methods with rich dynamic context extraction."""
     return _create_error_context_decorator(operation, is_async=True)(**static_context)
+
+
+# ---------------------------------------------------------------------------
+# Context construction helper (defensive, ContextTranslator-based)
+# ---------------------------------------------------------------------------
+
+
+def _build_operation_context_from_config(
+    config: Any,
+    framework_version: Optional[str],
+) -> OperationContext:
+    """
+    Build an OperationContext from a LangChain config via ContextTranslator.
+
+    Defensive behavior:
+    - If `config` is already an OperationContext, return it.
+    - Else, call `ContextTranslator.from_langchain(config, ...)`.
+    - If that call fails, attach rich context and re-raise.
+    - If it returns a non-OperationContext, attach context and raise TypeError.
+    """
+    if isinstance(config, OperationContext):
+        return config
+
+    try:
+        ctx = ContextTranslator.from_langchain(
+            config=config,
+            framework_version=framework_version,
+        )
+    except Exception as exc:  # noqa: BLE001
+        attach_context(
+            exc,
+            framework=_FRAMEWORK_NAME,
+            operation="llm_context_translation",
+            framework_version=framework_version,
+            source="langchain_config",
+            config_type=type(config).__name__,
+        )
+        raise
+
+    if not isinstance(ctx, OperationContext):
+        exc = TypeError(
+            "ContextTranslator.from_langchain produced unsupported context type "
+            f"{type(ctx).__name__}"
+        )
+        attach_context(
+            exc,
+            framework=_FRAMEWORK_NAME,
+            operation="llm_context_translation",
+            framework_version=framework_version,
+            returned_type=type(ctx).__name__,
+        )
+        raise exc
+
+    return ctx
 
 
 # ---------------------------------------------------------------------------
@@ -331,7 +410,7 @@ class CorpusLangChainLLM(BaseChatModel):
     LangChain `BaseChatModel` implementation backed by a Corpus `LLMTranslator`.
 
     Key points:
-    - No direct `message_translation` usage; all message/format handling
+    - No direct message translation; all message/format handling
       is delegated to `LLMTranslator` with framework="langchain".
     - This class:
         * Validates inputs
@@ -347,10 +426,8 @@ class CorpusLangChainLLM(BaseChatModel):
         "protected_namespaces": (),
     }
 
-    # Underlying shared translator
     _translator: LLMTranslator
 
-    # Public defaults for LangChain introspection
     model: str = "default"
     temperature: float = 0.7
     max_tokens: Optional[int] = None
@@ -374,38 +451,7 @@ class CorpusLangChainLLM(BaseChatModel):
     ) -> None:
         """
         Initialize the LangChain adapter.
-
-        Parameters
-        ----------
-        llm_adapter : LLMProtocolV1
-            Corpus LLM protocol adapter instance.
-        model : str, optional
-            Default model identifier (used when config is not provided).
-        temperature : float, optional
-            Default sampling temperature (used when config is not provided).
-        max_tokens : Optional[int], optional
-            Default maximum tokens (used when config is not provided).
-        framework_version : Optional[str], optional
-            Optional LangChain framework version for context translation.
-        config : Optional[LangChainLLMConfig], optional
-            High-level configuration object. When supplied, this takes precedence
-            over individual model/temperature/max_tokens args.
-        translator : Optional[LLMFrameworkTranslator], optional
-            Optional framework-specific translator for `"langchain"`.
-        post_processing_config : Optional[LLMPostProcessingConfig], optional
-            Optional post-processing configuration; overrides config.post_processing_config.
-        safety_filter : Optional[SafetyFilter], optional
-            Optional safety filter; overrides config.safety_filter.
-        json_repair : Optional[JSONRepair], optional
-            Optional JSON repair; overrides config.json_repair.
         """
-        if not hasattr(llm_adapter, "complete") or not callable(
-            getattr(llm_adapter, "complete", None)
-        ):
-            raise TypeError(
-                "llm_adapter must implement LLMProtocolV1 with a 'complete' method"
-            )
-
         # Resolve configuration precedence: explicit config > individual params.
         if config is not None:
             self._config = config
@@ -420,16 +466,7 @@ class CorpusLangChainLLM(BaseChatModel):
             effective_safety_filter = safety_filter or config.safety_filter
             effective_json_repair = json_repair or config.json_repair
         else:
-            # Validate raw parameters in the same way as the config would.
-            if not 0.0 <= float(temperature) <= 2.0:
-                raise ValueError(
-                    f"temperature must be between 0.0 and 2.0, got {temperature}"
-                )
-            if max_tokens is not None and max_tokens < 1:
-                raise ValueError(
-                    f"max_tokens must be positive, got {max_tokens}"
-                )
-
+            # Let LangChainLLMConfig handle validation + error messages.
             self._config = LangChainLLMConfig(
                 model=model,
                 temperature=float(temperature),
@@ -445,6 +482,9 @@ class CorpusLangChainLLM(BaseChatModel):
             effective_safety_filter = safety_filter
             effective_json_repair = json_repair
 
+        # Validate adapter + config invariants in a single place.
+        self._validate_init_params(llm_adapter)
+
         super().__init__(**kwargs)
 
         # Build the shared LLMTranslator for the "langchain" framework.
@@ -458,12 +498,56 @@ class CorpusLangChainLLM(BaseChatModel):
         )
 
         logger.info(
-            "CorpusLangChainLLM initialized with model=%s, temperature=%.2f, max_tokens=%s, framework_version=%s",
+            "CorpusLangChainLLM initialized with model=%s, temperature=%.2f, "
+            "max_tokens=%s, framework_version=%s",
             self.model,
             self.temperature,
             self.max_tokens or "default",
             self._framework_version or "unknown",
         )
+
+    # ------------------------------------------------------------------ #
+    # Init validation helper (symbolic error codes for logs/search)
+    # ------------------------------------------------------------------ #
+
+    def _validate_init_params(self, llm_adapter: LLMProtocolV1) -> None:
+        """
+        Validate initialization parameters and adapter capabilities.
+
+        - Ensures the adapter exposes core `LLMProtocolV1` methods.
+        - Validates temperature and max_tokens constraints.
+        """
+        required_methods = (
+            "complete",
+            "stream",
+            "count_tokens",
+            "health",
+            "capabilities",
+        )
+        missing = [
+            m
+            for m in required_methods
+            if not callable(getattr(llm_adapter, m, None))
+        ]
+        if missing:
+            raise TypeError(
+                f"{INIT_CONFIG_ERROR}: "
+                "llm_adapter must implement LLMProtocolV1; missing methods: "
+                + ", ".join(missing)
+            )
+
+        if not isinstance(self.temperature, (int, float)) or not (
+            0.0 <= float(self.temperature) <= 2.0
+        ):
+            raise ValueError(
+                f"{INIT_CONFIG_ERROR}: temperature must be between 0.0 and 2.0"
+            )
+
+        if self.max_tokens is not None:
+            if not isinstance(self.max_tokens, int) or self.max_tokens < 1:
+                raise ValueError(
+                    f"{INIT_CONFIG_ERROR}: max_tokens must be a positive integer"
+                )
 
     # ------------------------------------------------------------------ #
     # LangChain-required properties
@@ -491,9 +575,6 @@ class CorpusLangChainLLM(BaseChatModel):
     def _validate_messages(self, messages: List[BaseMessage]) -> None:
         """
         Validate message structure before handing them to the translator.
-
-        This provides early, user-friendly errors rather than opaque failures
-        deeper in the stack.
         """
         if not self._config.validate_inputs:
             return
@@ -525,16 +606,14 @@ class CorpusLangChainLLM(BaseChatModel):
 
         Returns
         -------
-        tuple[OperationContext, Dict[str, Any], Dict[str, Any]]
-            (op_ctx, sampling_params, framework_ctx)
+        (op_ctx, sampling_params, framework_ctx)
         """
         config = kwargs.get("config")
-        ctx = context_from_langchain(
-            config,
+        ctx = _build_operation_context_from_config(
+            config=config,
             framework_version=self._framework_version,
         )
 
-        # Basic sampling params that the LLMTranslator understands.
         temperature = kwargs.get("temperature", self.temperature)
         max_tokens = kwargs.get("max_tokens", self.max_tokens)
 
@@ -548,10 +627,8 @@ class CorpusLangChainLLM(BaseChatModel):
             "stop_sequences": stop,
         }
 
-        # Drop None values so the translator sees a clean param set.
         clean_params = {k: v for k, v in params.items() if v is not None}
 
-        # Lightweight framework_ctx for the LangChain translator.
         framework_ctx: Dict[str, Any] = {
             "framework": _FRAMEWORK_NAME,
             "framework_version": self._framework_version,
@@ -570,14 +647,12 @@ class CorpusLangChainLLM(BaseChatModel):
         """
         Normalize translator output into a LangChain ChatResult.
 
-        The LangChain framework translator for `"langchain"` is expected to
-        return ChatResult directly. This helper provides a defensive fallback
-        for cases where the translator returns a dict-like structure.
+        The `"langchain"` framework translator is expected to return ChatResult
+        directly; this helper provides a defensive fallback for dict/string.
         """
         if isinstance(result, ChatResult):
             return result
 
-        # Fallback: minimal ChatResult from a dict or string.
         if isinstance(result, dict):
             text = str(
                 result.get("text")
@@ -595,10 +670,6 @@ class CorpusLangChainLLM(BaseChatModel):
     def _ensure_generation_chunk(chunk: Any) -> ChatGenerationChunk:
         """
         Normalize translator streaming output into ChatGenerationChunk.
-
-        The LangChain framework translator for `"langchain"` should return
-        ChatGenerationChunk objects. This helper provides a safe fallback
-        when a dict-like chunk is returned instead.
         """
         if isinstance(chunk, ChatGenerationChunk):
             return chunk
@@ -625,9 +696,6 @@ class CorpusLangChainLLM(BaseChatModel):
     ) -> ChatResult:
         """
         Async chat generation entrypoint used by LangChain.
-
-        Delegates to the shared LLMTranslator with framework="langchain"
-        and expects a ChatResult (or something convertible) in return.
         """
         self._validate_messages(messages)
 
@@ -637,7 +705,6 @@ class CorpusLangChainLLM(BaseChatModel):
         )
         model_for_context = params.get("model", self.model)
 
-        # Notify start of LLM call
         if run_manager is not None:
             await run_manager.on_llm_start(
                 self,
@@ -684,8 +751,6 @@ class CorpusLangChainLLM(BaseChatModel):
     ) -> AsyncIterator[ChatGenerationChunk]:
         """
         Async streaming entrypoint used by LangChain.
-
-        Delegates to LLMTranslator.arun_stream and yields ChatGenerationChunk.
         """
         self._validate_messages(messages)
 
@@ -695,7 +760,6 @@ class CorpusLangChainLLM(BaseChatModel):
         )
         model_for_context = params.get("model", self.model)
 
-        # Notify start of LLM call
         if run_manager is not None:
             await run_manager.on_llm_start(
                 self,
@@ -745,7 +809,6 @@ class CorpusLangChainLLM(BaseChatModel):
                 await run_manager.on_llm_error(exc)
             raise
         finally:
-            # Ensure streaming iterator is properly cleaned up
             if agen is not None and hasattr(agen, "aclose"):
                 try:
                     await agen.aclose()  # type: ignore[func-returns-value]
@@ -784,8 +847,6 @@ class CorpusLangChainLLM(BaseChatModel):
     ) -> ChatResult:
         """
         Sync chat generation entrypoint used by LangChain.
-
-        Delegates to LLMTranslator.complete and returns ChatResult.
         """
         self._validate_messages(messages)
 
@@ -795,7 +856,6 @@ class CorpusLangChainLLM(BaseChatModel):
         )
         model_for_context = params.get("model", self.model)
 
-        # Notify start of LLM call
         if run_manager is not None:
             run_manager.on_llm_start(
                 self,
@@ -842,8 +902,6 @@ class CorpusLangChainLLM(BaseChatModel):
     ) -> Iterator[ChatGenerationChunk]:
         """
         Sync streaming entrypoint used by LangChain.
-
-        Delegates to LLMTranslator.stream and yields ChatGenerationChunk.
         """
         self._validate_messages(messages)
 
@@ -853,7 +911,6 @@ class CorpusLangChainLLM(BaseChatModel):
         )
         model_for_context = params.get("model", self.model)
 
-        # Notify start of LLM call
         if run_manager is not None:
             run_manager.on_llm_start(
                 self,
@@ -903,7 +960,6 @@ class CorpusLangChainLLM(BaseChatModel):
                 run_manager.on_llm_error(exc)
             raise
         finally:
-            # Ensure iterator is properly closed when possible
             if iterator is not None and hasattr(iterator, "close"):
                 try:
                     iterator.close()  # type: ignore[func-returns-value]
@@ -915,7 +971,7 @@ class CorpusLangChainLLM(BaseChatModel):
 
             if run_manager is not None and not stream_canceled:
                 completion_result = ChatResult(
-                    generations[
+                    generations=[
                         ChatGeneration(
                             message=AIMessage(content=""),
                             generation_info={
@@ -946,8 +1002,8 @@ class CorpusLangChainLLM(BaseChatModel):
         if not messages:
             return 0
 
-        ctx = context_from_langchain(
-            None,
+        ctx = _build_operation_context_from_config(
+            config=None,
             framework_version=self._framework_version,
         )
         framework_ctx: Dict[str, Any] = {
@@ -972,11 +1028,11 @@ class CorpusLangChainLLM(BaseChatModel):
                         return value
         except Exception as exc:  # noqa: BLE001
             logger.debug(
-                "LLMTranslator.count_tokens_for_messages failed, falling back to heuristic: %s",
+                "LLMTranslator.count_tokens_for_messages failed, "
+                "falling back to heuristic: %s",
                 exc,
             )
 
-        # Heuristic fallback similar to earlier implementation.
         combined_text = self._combine_messages_for_counting(messages)
         if not combined_text:
             return 0
@@ -1011,4 +1067,5 @@ __all__ = [
     "CorpusLangChainLLM",
     "with_llm_error_context",
     "with_async_llm_error_context",
+    "ERROR_CODES",
 ]
