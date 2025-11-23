@@ -375,7 +375,7 @@ def _as_mapping(obj: Any) -> Optional[Mapping[str, Any]]:
 def coerce_vector_matrix(
     result: Any,
     *,
-    framework: Optional[str],
+    framework: Optional[str] = None,
     error_codes: VectorCoercionErrorCodes,
     limits: Optional[VectorResourceLimits] = None,
     flags: Optional[VectorValidationFlags] = None,
@@ -392,7 +392,8 @@ def coerce_vector_matrix(
     result:
         Arbitrary result returned by a vector store / translator.
     framework:
-        Framework label for logging / diagnostics.
+        Optional framework label for logging / diagnostics. If None, falls
+        back to `error_codes.framework_label` and then "vector".
     error_codes:
         Bundle of error codes to embed in exception messages.
     limits:
@@ -422,7 +423,7 @@ def coerce_vector_matrix(
     # Normalize to matrix-like structure
     if isinstance(vectors_obj, Sequence) and not isinstance(vectors_obj, (str, bytes)):
         if vectors_obj and isinstance(vectors_obj[0], Sequence) and not isinstance(
-            vectors_obj[0], (str, bytes)
+            vectors_obj[0], (str, bytes),
         ):
             raw_rows = vectors_obj  # matrix
         else:
@@ -538,7 +539,7 @@ def coerce_vector_matrix(
 def coerce_vector(
     result: Any,
     *,
-    framework: Optional[str],
+    framework: Optional[str] = None,
     error_codes: VectorCoercionErrorCodes,
     limits: Optional[VectorResourceLimits] = None,
     flags: Optional[VectorValidationFlags] = None,
@@ -551,6 +552,22 @@ def coerce_vector(
     - Use `coerce_vector_matrix` to normalize the result
     - If the matrix has exactly one row → return that row
     - If it has multiple rows → return the first row and log a warning
+
+    Parameters
+    ----------
+    result:
+        Arbitrary result returned by a vector store / translator.
+    framework:
+        Optional framework label for logging / diagnostics. If None, falls
+        back to `error_codes.framework_label` and then "vector".
+    error_codes:
+        Bundle of error codes to embed in exception messages.
+    limits:
+        Optional resource limits for dimension / total value caps.
+    flags:
+        Optional validation flags controlling strictness.
+    logger:
+        Optional logger; if omitted, the module-level logger is used.
     """
     flags = flags or VectorValidationFlags()
     log = logger or LOG
@@ -585,7 +602,7 @@ def coerce_vector(
 def warn_if_extreme_k(
     k: int,
     *,
-    framework: Optional[str],
+    framework: Optional[str] = None,
     op_name: str,
     warning_config: Optional[TopKWarningConfig] = None,
     logger: Optional[logging.Logger] = None,
@@ -595,6 +612,19 @@ def warn_if_extreme_k(
 
     This is used by adapters to surface potentially dangerous hit sizes while
     preserving existing behavior (no hard failures).
+
+    Parameters
+    ----------
+    k:
+        Requested top-k / hit count.
+    framework:
+        Optional framework name for logging (e.g. "langchain", "llamaindex").
+    op_name:
+        Name of the operation emitting the warning (e.g. "similarity_search").
+    warning_config:
+        Optional TopKWarningConfig; if omitted, a default is used.
+    logger:
+        Optional logger; if omitted, the module-level logger is used.
     """
     log = logger or LOG
     cfg = warning_config or TopKWarningConfig(
@@ -696,7 +726,7 @@ def _normalize_hit_score(
 def coerce_hits(
     result: Any,
     *,
-    framework: Optional[str],
+    framework: Optional[str] = None,
     error_codes: VectorCoercionErrorCodes,
     limits: Optional[VectorResourceLimits] = None,
     flags: Optional[VectorValidationFlags] = None,
@@ -712,6 +742,22 @@ def coerce_hits(
     - "vector": List[float] (if provided)
     - "metadata": Mapping[str, Any] (if provided)
     - Other provider-specific fields are preserved as-is.
+
+    Parameters
+    ----------
+    result:
+        Arbitrary result returned by a vector store / translator.
+    framework:
+        Optional framework label for logging / diagnostics. If None, falls
+        back to `error_codes.framework_label` and then "vector".
+    error_codes:
+        Bundle of error codes to embed in exception messages.
+    limits:
+        Optional resource limits for hit counts and vector dims.
+    flags:
+        Optional validation flags controlling strictness.
+    logger:
+        Optional logger; if omitted, the module-level logger is used.
     """
     flags = flags or VectorValidationFlags()
     log = logger or LOG
@@ -837,7 +883,7 @@ def coerce_hits(
 def enforce_hit_limits(
     hits: Sequence[Mapping[str, Any]],
     *,
-    framework: Optional[str],
+    framework: Optional[str] = None,
     op_name: str,
     error_codes: VectorCoercionErrorCodes,
     limits: Optional[VectorResourceLimits],
@@ -848,6 +894,24 @@ def enforce_hit_limits(
     Enforce global hit limits (max_total_hits) on a sequence of hits.
 
     Returns a truncated list when limits are exceeded (unless configured to fail).
+
+    Parameters
+    ----------
+    hits:
+        Sequence of hit mappings.
+    framework:
+        Optional framework label for logging / diagnostics. If None, falls
+        back to `error_codes.framework_label` and then "vector".
+    op_name:
+        Name of the operation enforcing the limits.
+    error_codes:
+        Error code bundle.
+    limits:
+        Optional VectorResourceLimits; if None, no limits are enforced.
+    flags:
+        Optional VectorValidationFlags controlling strictness.
+    logger:
+        Optional logger.
     """
     flags = flags or VectorValidationFlags()
     log = logger or LOG
@@ -879,7 +943,7 @@ def enforce_hit_limits(
 def normalize_vector_context(
     search_context: Optional[Mapping[str, Any]],
     *,
-    framework: Optional[str],
+    framework: Optional[str] = None,
     logger: Optional[logging.Logger] = None,
 ) -> Dict[str, Any]:
     """
@@ -888,6 +952,15 @@ def normalize_vector_context(
     This helper is tolerant of:
     - Missing or None context
     - Alternate key casing (indexName → index_name, etc.)
+
+    Parameters
+    ----------
+    search_context:
+        Optional mapping with vector-search context.
+    framework:
+        Optional framework label for logging / diagnostics.
+    logger:
+        Optional logger.
     """
     log = logger or LOG
     framework_name = (framework or "vector").lower()
@@ -974,7 +1047,7 @@ def attach_vector_context_to_framework_ctx(
 def iter_vector_events(
     events: Iterable[Any],
     *,
-    framework: Optional[str],
+    framework: Optional[str] = None,
     op_name: str,
     limits: Optional[VectorResourceLimits] = None,
     flags: Optional[VectorValidationFlags] = None,
@@ -986,6 +1059,21 @@ def iter_vector_events(
     - Counts events and enforces `max_total_stream_events` if configured.
     - Logs at most one warning when the limit is exceeded.
     - When `strict_stream_limits` is True, stops iteration after limit.
+
+    Parameters
+    ----------
+    events:
+        Iterable of vector-store events.
+    framework:
+        Optional framework label for logging / diagnostics.
+    op_name:
+        Name of the operation consuming the events.
+    limits:
+        Optional VectorResourceLimits; if None, a default is used.
+    flags:
+        Optional VectorValidationFlags controlling strictness.
+    logger:
+        Optional logger.
     """
     flags = flags or VectorValidationFlags()
     log = logger or LOG
