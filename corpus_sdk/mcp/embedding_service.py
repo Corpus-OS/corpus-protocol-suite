@@ -20,6 +20,11 @@ protocol-first Corpus embedding stack.
 Service-level limits (MCP-facing; adapter may impose stricter limits):
 - Maximum batch size: 1000 texts per request
 - Maximum total text size: 1,000,000 characters per request
+
+Resilience (rate limiting, circuit breaking, retries, deadlines, caching)
+is expected to be provided by the underlying adapter, which should
+typically subclass `BaseEmbeddingAdapter`. The MCP layer stays thin and
+only adds MCP-specific semantics and observability.
 """
 
 from __future__ import annotations
@@ -95,10 +100,8 @@ class ErrorCodes(CoercionErrorCodes):
 
     # Service / adapter level
     EMBEDDING_EXTRACTION_ERROR = "EMBEDDING_EXTRACTION_ERROR"
-    RATE_LIMIT_EXCEEDED = "RATE_LIMIT_EXCEEDED"
     REQUEST_TIMEOUT = "REQUEST_TIMEOUT"
     SERVICE_UNAVAILABLE = "SERVICE_UNAVAILABLE"
-    CIRCUIT_BREAKER_OPEN = "CIRCUIT_BREAKER_OPEN"
 
     # Coercion-level (used by framework_utils)
     INVALID_EMBEDDING_RESULT = "INVALID_EMBEDDING_RESULT"
@@ -182,14 +185,10 @@ def with_embedding_error_context(
 
 class MCPConfig(TypedDict, total=False):
     """Structured configuration for MCP-specific settings."""
-    max_embedding_retries: int
+    max_concurrent_requests: int
     fallback_to_simple_context: bool
     enable_session_context_propagation: bool
     tool_aware_batching: bool
-    max_concurrent_requests: int
-    rate_limit_per_minute: int
-    circuit_breaker_failure_threshold: int
-    circuit_breaker_reset_timeout: int  # seconds
 
 
 @dataclass
@@ -230,15 +229,15 @@ class CorpusMCPEmbeddings:
         * Normalize OperationContext from MCP context
         * Build `EmbedSpec` / `BatchEmbedSpec` from raw MCP text inputs
         * Translate results back into framework-level shapes
-    - It delegates resilience (deadlines, breaker, rate-limit, caching)
-      to the underlying adapter, which should typically subclass
-      `BaseEmbeddingAdapter`.
+    - Resilience (deadlines, circuit breaking, rate limiting, caching,
+      adapter-level retries) is owned by the embedding adapter itself
+      (typically `BaseEmbeddingAdapter`).
 
     This layer adds MCP-specific:
-    - Concurrency limiting (per-process semaphore)
-    - Sliding-window rate limiting (requests per minute)
-    - Retry loop tuned for EmbeddingAdapterError semantics
-    - Circuit breaker at the MCP endpoint level
+    - Per-process concurrency limiting (asyncio.Semaphore)
+    - MCP-specific request validation (batch/text size)
+    - Mapping from adapter errors to MCP service error codes
+    - Observability in terms of MCP tool/session IDs
     """
 
     def __init__(
@@ -258,17 +257,11 @@ class CorpusMCPEmbeddings:
         # Service state
         self._active_requests: int = 0
         self._active_requests_lock = asyncio.Lock()
-        self._rate_limit_lock = asyncio.Lock()
         self._request_semaphore = asyncio.Semaphore(
             self.mcp_config["max_concurrent_requests"]
         )
-        self._rate_limit_tracker: List[float] = []
 
-        # Circuit breaker state (service-level; adapter has its own)
-        self._circuit_failure_count: int = 0
-        self._circuit_open_until: float = 0.0
-
-        # Protocol-level metrics (approximate, via translator calls)
+        # Simple protocol metrics (for health/introspection)
         self._protocol_success_count: int = 0
         self._protocol_error_count: int = 0
         self._protocol_total_latency: float = 0.0  # seconds
@@ -309,7 +302,10 @@ class CorpusMCPEmbeddings:
             batch_config=self.batch_config,
             text_normalization_config=self.text_normalization_config,
         )
-        logger.debug("EmbeddingTranslator initialized for MCP with model=%s", self.model or "default")
+        logger.debug(
+            "EmbeddingTranslator initialized for MCP with model=%s",
+            self.model or "default",
+        )
         return translator
 
     # ------------------------------------------------------------------ #
@@ -320,40 +316,24 @@ class CorpusMCPEmbeddings:
         """Validate and normalize MCP configuration with sensible defaults."""
         validated: MCPConfig = dict(config)
 
-        # Defaults
-        validated.setdefault("max_embedding_retries", 3)
+        validated.setdefault("max_concurrent_requests", 100)
         validated.setdefault("fallback_to_simple_context", True)
         validated.setdefault("enable_session_context_propagation", True)
         validated.setdefault("tool_aware_batching", False)
-        validated.setdefault("max_concurrent_requests", 100)
-        validated.setdefault("rate_limit_per_minute", 1000)
-        validated.setdefault("circuit_breaker_failure_threshold", 5)
-        validated.setdefault("circuit_breaker_reset_timeout", 30)
 
-        # Coerce numeric fields to int and validate
-        numeric_keys = [
-            "max_embedding_retries",
-            "max_concurrent_requests",
-            "rate_limit_per_minute",
-            "circuit_breaker_failure_threshold",
-            "circuit_breaker_reset_timeout",
-        ]
-        for key in numeric_keys:
-            try:
-                validated[key] = int(validated[key])
-            except (TypeError, ValueError):
-                raise ValueError(f"{key} must be an integer") from None
+        try:
+            validated["max_concurrent_requests"] = int(
+                validated["max_concurrent_requests"]
+            )
+        except (TypeError, ValueError):
+            raise ValueError("max_concurrent_requests must be an integer") from None
 
         if validated["max_concurrent_requests"] <= 0:
             raise ValueError("max_concurrent_requests must be positive")
-        if validated["rate_limit_per_minute"] <= 0:
-            raise ValueError("rate_limit_per_minute must be positive")
-        if validated["max_embedding_retries"] < 0:
-            raise ValueError("max_embedding_retries cannot be negative")
-        if validated["circuit_breaker_failure_threshold"] <= 0:
-            raise ValueError("circuit_breaker_failure_threshold must be positive")
-        if validated["circuit_breaker_reset_timeout"] <= 0:
-            raise ValueError("circuit_breaker_reset_timeout must be positive")
+
+        # Bool coercion for robustness
+        for key in ("fallback_to_simple_context", "enable_session_context_propagation", "tool_aware_batching"):
+            validated[key] = bool(validated[key])
 
         return validated
 
@@ -467,168 +447,9 @@ class CorpusMCPEmbeddings:
             attrs={},
         )
 
-    async def _check_rate_limit(self) -> bool:
-        """
-        Check rate limiting with sliding window and thread-safe locking.
-
-        Returns True if the request is allowed, False if the rate limit is exceeded.
-        """
-        async with self._rate_limit_lock:
-            now = time.time()
-            window_start = now - 60  # 1 minute window
-
-            # Clean old requests
-            self._rate_limit_tracker = [
-                t for t in self._rate_limit_tracker if t > window_start
-            ]
-
-            if len(self._rate_limit_tracker) >= self.mcp_config["rate_limit_per_minute"]:
-                return False
-
-            self._rate_limit_tracker.append(now)
-            return True
-
     # ------------------------------------------------------------------ #
-    # Circuit breaker (service-level)
+    # Error mapping (adapter → MCP)
     # ------------------------------------------------------------------ #
-
-    def _is_circuit_open(self) -> bool:
-        """Return True if the circuit breaker is currently open."""
-        now = time.time()
-        if self._circuit_open_until == 0:
-            return False
-        if now >= self._circuit_open_until:
-            self._circuit_open_until = 0.0
-            self._circuit_failure_count = 0
-            return False
-        return True
-
-    def _record_success(self) -> None:
-        """Record a successful protocol call and reset circuit breaker failures."""
-        self._circuit_failure_count = 0
-        self._circuit_open_until = 0.0
-
-    def _record_failure(self) -> None:
-        """Record a failed protocol call and open circuit if threshold reached."""
-        self._circuit_failure_count += 1
-        threshold = self.mcp_config["circuit_breaker_failure_threshold"]
-        if self._circuit_failure_count >= threshold and self._circuit_open_until == 0.0:
-            reset_timeout = self.mcp_config["circuit_breaker_reset_timeout"]
-            self._circuit_open_until = time.time() + reset_timeout
-            logger.error(
-                "MCP circuit breaker opened after %d consecutive failures; cooldown=%ds",
-                self._circuit_failure_count,
-                reset_timeout,
-            )
-
-    # ------------------------------------------------------------------ #
-    # Retry & timeout logic
-    # ------------------------------------------------------------------ #
-
-    async def _execute_with_retries(
-        self,
-        operation: Callable[[], Awaitable[Any]],
-        request_id: str,
-        operation_name: str,
-    ) -> Any:
-        """
-        Execute embedding operation with retry logic for transient errors.
-
-        Retries are applied to the provided operation. Circuit breaker state is
-        updated based on success/failure outcomes.
-        """
-        max_retries = self.mcp_config["max_embedding_retries"]
-        last_exception: Optional[Exception] = None
-
-        for attempt in range(max_retries + 1):
-            try:
-                result = await operation()
-                self._record_success()
-                return result
-            except Exception as exc:  # noqa: BLE001
-                last_exception = exc
-
-                if not self._is_retryable_error(exc):
-                    break
-
-                if attempt < max_retries:
-                    wait_time = self._get_retry_delay(attempt)
-                    logger.warning(
-                        "Retryable error in %s (attempt %d/%d), retrying in %.2fs: %s",
-                        operation_name,
-                        attempt + 1,
-                        max_retries + 1,
-                        wait_time,
-                        str(exc),
-                    )
-                    await asyncio.sleep(wait_time)
-                else:
-                    logger.error(
-                        "All %d retries exhausted for %s (request_id=%s)",
-                        max_retries + 1,
-                        operation_name,
-                        request_id,
-                    )
-
-        if last_exception is None:
-            self._record_failure()
-            raise MCPEmbeddingServiceError(
-                "Unknown error in retry loop",
-                ErrorCodes.EMBEDDING_EXTRACTION_ERROR,
-                request_id,
-            )
-
-        self._record_failure()
-        raise self._map_adapter_error_to_service_error(last_exception, request_id)
-
-    def _is_retryable_error(self, exc: Exception) -> bool:
-        """
-        Determine if an error is retryable based on EmbeddingAdapterError semantics
-        and, as a fallback, string patterns.
-        """
-        if isinstance(exc, EmbeddingAdapterError):
-            code = (exc.code or "").upper()
-            retryable_codes = {
-                "RESOURCE_EXHAUSTED",
-                "RATE_LIMIT",
-                "RATE_LIMIT_EXCEEDED",
-                "TRANSIENT_NETWORK",
-                "UNAVAILABLE",
-                "SERVICE_UNAVAILABLE",
-            }
-            if code in retryable_codes:
-                return True
-            # If adapter provides an explicit retry_after_ms hint, treat as retryable
-            if exc.retry_after_ms is not None:
-                return True
-            # Deadline / bad-request style errors are not retryable
-            return False
-
-        # Fallback: string pattern matching for non-adapter exceptions
-        error_str = str(exc).lower()
-        retryable_patterns = [
-            "timeout",
-            "deadline",
-            "rate limit",
-            "rate_limit",
-            "too many requests",
-            "server error",
-            "service unavailable",
-            "temporary",
-            "retry",
-            "connection",
-            "network",
-            "gateway",
-        ]
-        return any(pattern in error_str for pattern in retryable_patterns)
-
-    def _get_retry_delay(self, attempt: int) -> float:
-        """Calculate exponential backoff with jitter."""
-        base_delay = 0.5
-        max_delay = 10.0
-        delay = min(base_delay * (2**attempt), max_delay)
-        jitter = 0.5 + (uuid.uuid4().int % 1000) / 1000.0
-        return delay * jitter
 
     def _map_adapter_error_to_service_error(
         self,
@@ -639,13 +460,13 @@ class CorpusMCPEmbeddings:
         Map adapter-level errors to service-level error codes.
 
         Prefer the structured `EmbeddingAdapterError` taxonomy when available,
-        falling back to string pattern matching otherwise.
+        falling back to a generic mapping otherwise.
         """
         if isinstance(exc, EmbeddingAdapterError):
             code = (exc.code or "").upper()
             message = exc.message or str(exc)
 
-            # Rate / quota / resource exhaustion
+            # Rate / quota / resource exhaustion → SERVICE_UNAVAILABLE (or caller can treat separately)
             if (
                 isinstance(exc, ResourceExhausted)
                 or code in {"RESOURCE_EXHAUSTED", "RATE_LIMIT", "RATE_LIMIT_EXCEEDED"}
@@ -653,11 +474,11 @@ class CorpusMCPEmbeddings:
             ):
                 return MCPEmbeddingServiceError(
                     f"Rate or resource limit exceeded: {message}",
-                    ErrorCodes.RATE_LIMIT_EXCEEDED,
+                    ErrorCodes.SERVICE_UNAVAILABLE,
                     request_id,
                 )
 
-            # Deadline / timeout
+            # Deadline / timeout → REQUEST_TIMEOUT
             if isinstance(exc, DeadlineExceeded) or code == "DEADLINE_EXCEEDED":
                 return MCPEmbeddingServiceError(
                     f"Request deadline exceeded: {message}",
@@ -665,7 +486,7 @@ class CorpusMCPEmbeddings:
                     request_id,
                 )
 
-            # Transient / service unavailability
+            # Transient / service unavailability → SERVICE_UNAVAILABLE
             if (
                 isinstance(exc, Unavailable)
                 or isinstance(exc, TransientNetwork)
@@ -684,28 +505,7 @@ class CorpusMCPEmbeddings:
                 request_id,
             )
 
-        # Non-EmbeddingAdapterError: string pattern fallback
-        error_str = str(exc).lower()
-
-        if any(p in error_str for p in ["rate limit", "rate_limit", "too many requests"]):
-            return MCPEmbeddingServiceError(
-                f"Rate limit exceeded: {str(exc)}",
-                ErrorCodes.RATE_LIMIT_EXCEEDED,
-                request_id,
-            )
-        if any(p in error_str for p in ["timeout", "deadline"]):
-            return MCPEmbeddingServiceError(
-                f"Request timeout: {str(exc)}",
-                ErrorCodes.REQUEST_TIMEOUT,
-                request_id,
-            )
-        if any(p in error_str for p in ["unavailable", "down", "maintenance"]):
-            return MCPEmbeddingServiceError(
-                f"Service unavailable: {str(exc)}",
-                ErrorCodes.SERVICE_UNAVAILABLE,
-                request_id,
-            )
-
+        # Non-EmbeddingAdapterError: treat as generic service error
         return MCPEmbeddingServiceError(
             f"Embedding service error: {str(exc)}",
             ErrorCodes.EMBEDDING_EXTRACTION_ERROR,
@@ -794,24 +594,8 @@ class CorpusMCPEmbeddings:
         request_id = f"embed_docs_{uuid.uuid4().hex[:8]}"
         start_time = time.time()
 
-        if self._is_circuit_open():
-            raise MCPEmbeddingServiceError(
-                "Embedding circuit breaker is open",
-                ErrorCodes.CIRCUIT_BREAKER_OPEN,
-                request_id,
-            )
-
-        if not await self._check_rate_limit():
-            raise MCPEmbeddingServiceError(
-                f"Rate limit exceeded: {self.mcp_config['rate_limit_per_minute']} "
-                "requests per minute",
-                ErrorCodes.RATE_LIMIT_EXCEEDED,
-                request_id,
-            )
-
         self._validate_embedding_request(texts, request_id)
 
-        # Batch size observability
         warn_if_extreme_batch(
             framework="mcp",
             texts=texts,
@@ -827,8 +611,8 @@ class CorpusMCPEmbeddings:
             **kwargs,
         )
 
-        if core_ctx is not None and self.mcp_config["enable_session_context_propagation"]:
-            framework_ctx["_operation_context"] = core_ctx
+        # Ensure translator has a non-None OperationContext
+        translation_ctx = self._get_translation_op_ctx(core_ctx, request_id)
 
         logger.debug(
             "Embedding %d documents for MCP tool=%s, session=%s, request=%s",
@@ -838,74 +622,47 @@ class CorpusMCPEmbeddings:
             request_id,
         )
 
-        timeout: Optional[float] = None
-        if core_ctx is not None and getattr(core_ctx, "deadline_ms", None):
-            timeout = core_ctx.deadline_ms / 1000.0
-
-        translation_ctx = self._get_translation_op_ctx(core_ctx, request_id)
-
         async with self._track_active_request():
-            try:
-                async with self._request_semaphore:
-
-                    async def embed_operation() -> Any:
-                        """
-                        Execute batch embedding via the EmbeddingTranslator.
-
-                        The translator decides between embed vs batch_embed;
-                        for a list of texts, it routes to batch_embed and
-                        returns a dict with "embeddings".
-                        """
-                        protocol_start = time.time()
-                        try:
-                            translated = await self._translator.arun_embed(
-                                raw_texts=texts,
-                                op_ctx=translation_ctx,
-                                framework_ctx=framework_ctx,
-                            )
-                        except Exception:
-                            self._protocol_error_count += 1
-                            self._protocol_batch_error_count += 1
-                            raise
-                        else:
-                            latency = time.time() - protocol_start
-                            self._protocol_success_count += 1
-                            self._protocol_total_latency += latency
-                            self._protocol_batch_success_count += 1
-                            self._protocol_batch_total_latency += latency
-                            return translated
-
-                    if timeout is not None:
-                        translated = await asyncio.wait_for(
-                            self._execute_with_retries(
-                                embed_operation,
-                                request_id,
-                                "embed_documents",
-                            ),
-                            timeout=timeout,
-                        )
-                    else:
-                        translated = await self._execute_with_retries(
-                            embed_operation,
-                            request_id,
-                            "embed_documents",
-                        )
-
-                    processing_time = time.time() - start_time
-                    logger.debug(
-                        "Embedding completed in %.3fs for request %s",
-                        processing_time,
-                        request_id,
+            async with self._request_semaphore:
+                try:
+                    protocol_start = time.time()
+                    translated = await self._translator.arun_embed(
+                        raw_texts=texts,
+                        op_ctx=translation_ctx,
+                        framework_ctx=framework_ctx,
                     )
+                except EmbeddingAdapterError as exc:
+                    self._protocol_error_count += 1
+                    self._protocol_batch_error_count += 1
+                    raise self._map_adapter_error_to_service_error(exc, request_id)
+                except asyncio.TimeoutError as exc:
+                    # In case underlying stack bubbles raw TimeoutError
+                    self._protocol_error_count += 1
+                    self._protocol_batch_error_count += 1
+                    raise MCPEmbeddingServiceError(
+                        "Embedding request timed out",
+                        ErrorCodes.REQUEST_TIMEOUT,
+                        request_id,
+                    ) from exc
+                except Exception as exc:  # noqa: BLE001
+                    self._protocol_error_count += 1
+                    self._protocol_batch_error_count += 1
+                    raise self._map_adapter_error_to_service_error(exc, request_id)
 
-                    return self._coerce_embedding_matrix(translated)
+                latency = time.time() - protocol_start
+                self._protocol_success_count += 1
+                self._protocol_total_latency += latency
+                self._protocol_batch_success_count += 1
+                self._protocol_batch_total_latency += latency
 
-            except asyncio.TimeoutError:
-                raise MCPEmbeddingServiceError(
-                    "Embedding request timed out",
-                    ErrorCodes.REQUEST_TIMEOUT,
+                processing_time = time.time() - start_time
+                logger.debug(
+                    "Embedding completed in %.3fs for request %s",
+                    processing_time,
                     request_id,
-                ) from None
+                )
+
+                return self._coerce_embedding_matrix(translated)
 
     @with_embedding_error_context("query")
     async def embed_query(
@@ -923,21 +680,7 @@ class CorpusMCPEmbeddings:
         """
         request_id = f"embed_query_{uuid.uuid4().hex[:8]}"
 
-        if self._is_circuit_open():
-            raise MCPEmbeddingServiceError(
-                "Embedding circuit breaker is open",
-                ErrorCodes.CIRCUIT_BREAKER_OPEN,
-                request_id,
-            )
-
-        if not await self._check_rate_limit():
-            raise MCPEmbeddingServiceError(
-                f"Rate limit exceeded: {self.mcp_config['rate_limit_per_minute']} "
-                "requests per minute",
-                ErrorCodes.RATE_LIMIT_EXCEEDED,
-                request_id,
-            )
-
+        # Reuse batch validator with length 1 for consistent limits
         self._validate_embedding_request([text], request_id)
 
         core_ctx, framework_ctx = self._build_contexts(
@@ -947,8 +690,7 @@ class CorpusMCPEmbeddings:
             **kwargs,
         )
 
-        if core_ctx is not None and self.mcp_config["enable_session_context_propagation"]:
-            framework_ctx["_operation_context"] = core_ctx
+        translation_ctx = self._get_translation_op_ctx(core_ctx, request_id)
 
         logger.debug(
             "Embedding query for MCP tool=%s, request=%s",
@@ -956,63 +698,39 @@ class CorpusMCPEmbeddings:
             request_id,
         )
 
-        timeout: Optional[float] = None
-        if core_ctx is not None and getattr(core_ctx, "deadline_ms", None):
-            timeout = core_ctx.deadline_ms / 1000.0
-
-        translation_ctx = self._get_translation_op_ctx(core_ctx, request_id)
-
         async with self._track_active_request():
-            try:
-                async with self._request_semaphore:
+            async with self._request_semaphore:
+                try:
+                    protocol_start = time.time()
+                    translated = await self._translator.arun_embed(
+                        raw_texts=text,
+                        op_ctx=translation_ctx,
+                        framework_ctx=framework_ctx,
+                    )
+                except EmbeddingAdapterError as exc:
+                    self._protocol_error_count += 1
+                    self._protocol_embed_error_count += 1
+                    raise self._map_adapter_error_to_service_error(exc, request_id)
+                except asyncio.TimeoutError as exc:
+                    self._protocol_error_count += 1
+                    self._protocol_embed_error_count += 1
+                    raise MCPEmbeddingServiceError(
+                        "Query embedding request timed out",
+                        ErrorCodes.REQUEST_TIMEOUT,
+                        request_id,
+                    ) from exc
+                except Exception as exc:  # noqa: BLE001
+                    self._protocol_error_count += 1
+                    self._protocol_embed_error_count += 1
+                    raise self._map_adapter_error_to_service_error(exc, request_id)
 
-                    async def embed_operation() -> Any:
-                        """
-                        Execute single-text embedding via the EmbeddingTranslator.
-                        """
-                        protocol_start = time.time()
-                        try:
-                            translated = await self._translator.arun_embed(
-                                raw_texts=text,
-                                op_ctx=translation_ctx,
-                                framework_ctx=framework_ctx,
-                            )
-                        except Exception:
-                            self._protocol_error_count += 1
-                            self._protocol_embed_error_count += 1
-                            raise
-                        else:
-                            latency = time.time() - protocol_start
-                            self._protocol_success_count += 1
-                            self._protocol_total_latency += latency
-                            self._protocol_embed_success_count += 1
-                            self._protocol_embed_total_latency += latency
-                            return translated
+                latency = time.time() - protocol_start
+                self._protocol_success_count += 1
+                self._protocol_total_latency += latency
+                self._protocol_embed_success_count += 1
+                self._protocol_embed_total_latency += latency
 
-                    if timeout is not None:
-                        translated = await asyncio.wait_for(
-                            self._execute_with_retries(
-                                embed_operation,
-                                request_id,
-                                "embed_query",
-                            ),
-                            timeout=timeout,
-                        )
-                    else:
-                        translated = await self._execute_with_retries(
-                            embed_operation,
-                            request_id,
-                            "embed_query",
-                        )
-
-                    return self._coerce_embedding_vector(translated)
-
-            except asyncio.TimeoutError:
-                raise MCPEmbeddingServiceError(
-                    "Query embedding request timed out",
-                    ErrorCodes.REQUEST_TIMEOUT,
-                    request_id,
-                ) from None
+                return self._coerce_embedding_vector(translated)
 
     # ------------------------------------------------------------------ #
     # Health check / introspection
@@ -1022,10 +740,6 @@ class CorpusMCPEmbeddings:
         """Comprehensive health check for MCP server integration."""
         async with self._active_requests_lock:
             active_requests = self._active_requests
-
-        rate_limit_remaining = (
-            self.mcp_config["rate_limit_per_minute"] - len(self._rate_limit_tracker)
-        )
 
         avg_protocol_latency_ms: Optional[float] = None
         if self._protocol_success_count > 0:
@@ -1052,7 +766,6 @@ class CorpusMCPEmbeddings:
         health_status: Dict[str, Any] = {
             "status": "healthy",
             "active_requests": active_requests,
-            "rate_limit_remaining": rate_limit_remaining,
             "protocol_success_count": self._protocol_success_count,
             "protocol_error_count": self._protocol_error_count,
             "avg_protocol_latency_ms": avg_protocol_latency_ms,
@@ -1062,11 +775,10 @@ class CorpusMCPEmbeddings:
             "protocol_batch_success_count": self._protocol_batch_success_count,
             "protocol_batch_error_count": self._protocol_batch_error_count,
             "avg_protocol_batch_latency_ms": avg_batch_latency_ms,
-            "circuit_open": self._is_circuit_open(),
-            "circuit_failure_count": self._circuit_failure_count,
+            "max_concurrent_requests": self.mcp_config["max_concurrent_requests"],
         }
 
-        # Smoke test with actual embedding
+        # Smoke test with actual embedding to surface adapter-level health
         try:
             test_embedding = await self.embed_query(
                 "health_check",
@@ -1105,9 +817,8 @@ def create_embedder(
         corpus_adapter=server_adapter,
         model="text-embedding-3-large",
         mcp_config={
-            "tool_aware_batching": True,
-            "max_embedding_retries": 3,
             "max_concurrent_requests": 50,
+            "enable_session_context_propagation": True,
         },
     )
     ```
