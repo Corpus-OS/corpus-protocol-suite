@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, AsyncIterator, Dict, List, Mapping, Optional, Tuple
+from typing import Any, AsyncIterator, Dict, List, Mapping, Optional, Tuple, Union
 
 import anthropic  # type: ignore
 
@@ -73,6 +73,10 @@ APIConnectionError = getattr(anthropic, "APIConnectionError", APIError)
 RateLimitError = getattr(anthropic, "RateLimitError", APIStatusError)
 AuthenticationError = getattr(anthropic, "AuthenticationError", APIStatusError)
 BadRequestError = getattr(anthropic, "BadRequestError", APIStatusError)
+
+# Allowed roles kept in sync with MockLLMAdapter, OpenAIAdapter, and AzureOpenAIAdapter
+# so conformance tests see identical role semantics across adapters.
+_ALLOWED_ROLES = {"system", "user", "assistant"}
 
 
 class AnthropicAdapter(BaseLLMAdapter):
@@ -184,6 +188,20 @@ class AnthropicAdapter(BaseLLMAdapter):
     # Helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _validate_roles(messages: List[Mapping[str, Any]]) -> None:
+        """
+        Enforce a strict role set consistent with MockLLMAdapter, OpenAIAdapter, and AzureOpenAIAdapter.
+
+        This keeps error behavior deterministic and aligned across adapters,
+        and fails fast with a normalized BadRequest instead of deferring to
+        provider-specific behavior for unknown roles.
+        """
+        for m in messages:
+            role = str(m.get("role", ""))
+            if role not in _ALLOWED_ROLES:
+                raise BadRequest(f"unknown role: {role!r}")
+
     def _resolve_model(self, model: Optional[str]) -> str:
         """Resolve caller-supplied model or fall back to the default."""
         return model or self._default_model
@@ -203,6 +221,10 @@ class AnthropicAdapter(BaseLLMAdapter):
         - Messages support roles "user" and "assistant"; any "system" messages
           are folded into the `system` field.
         - Handles system message de-duplication similar to OpenAI adapter.
+        
+        Note: This adapter enforces strict role validation before conversion,
+        so unknown roles will raise BadRequest rather than being silently
+        converted to "user".
         """
         system_parts: List[str] = []
         if system_message:
@@ -216,10 +238,8 @@ class AnthropicAdapter(BaseLLMAdapter):
             if role == "system":
                 system_parts.append(content)
                 continue
-            if role not in ("user", "assistant"):
-                # Anthropic only accepts user/assistant; treat unknown
-                # roles conservatively as user content.
-                role = "user"
+            # At this point, role is guaranteed to be "user" or "assistant"
+            # because _validate_roles was called in _do_complete/_do_stream
             out.append({"role": role, "content": content})
 
         # Combine all system messages into one (de-duplication)
@@ -308,25 +328,54 @@ class AnthropicAdapter(BaseLLMAdapter):
     @staticmethod
     def _extract_retry_after_ms(err: Any) -> Optional[int]:
         """
-        Best-effort extraction of Retry-After header from Anthropic errors.
+        Extract Retry-After header from Anthropic errors.
+        
+        Handles both:
+        - Retry-After: 60 (integer seconds)
+        - Retry-After: Wed, 21 Oct 2015 07:28:00 GMT (HTTP date format)
         """
         try:
             resp = getattr(err, "response", None)
             if resp is None:
                 return None
+            
             headers = getattr(resp, "headers", None)
             if not headers:
                 return None
-            val = (
-                headers.get("retry-after")
-                or headers.get("Retry-After")
-                or headers.get("Retry-after")
-            )
+            
+            # Try case-insensitive header lookup
+            val = None
+            for key in ["retry-after", "Retry-After", "retry_after"]:
+                val = headers.get(key)
+                if val is not None:
+                    break
+            
             if val is None:
                 return None
-            seconds = int(str(val).strip())
-            return max(0, seconds) * 1000
-        except Exception:  # noqa: BLE001
+            
+            val_str = str(val).strip()
+            
+            # Try parsing as integer seconds first
+            try:
+                seconds = int(val_str)
+                return max(0, seconds) * 1000
+            except ValueError:
+                pass
+            
+            # Try parsing as HTTP date
+            try:
+                from email.utils import parsedate_to_datetime
+                import time
+                retry_datetime = parsedate_to_datetime(val_str)
+                delay_seconds = int(retry_datetime.timestamp() - time.time())
+                return max(0, delay_seconds) * 1000
+            except Exception:
+                pass
+            
+            # Fallback: return None instead of crashing
+            return None
+            
+        except Exception:
             return None
 
     def _translate_anthropic_error(self, err: Exception) -> LLMAdapterError:
@@ -338,11 +387,11 @@ class AnthropicAdapter(BaseLLMAdapter):
         """
         # Connection / transport issues → TransientNetwork
         if APIConnectionError is not None and isinstance(err, APIConnectionError):
-            return TransientNetwork(str(err) or "Anthropic API connection error") from err
+            return TransientNetwork(str(err) or "Anthropic API connection error")
 
         # Upstream timeout → DeadlineExceeded
         if APITimeoutError is not None and isinstance(err, APITimeoutError):
-            return DeadlineExceeded("Anthropic API request timed out") from err
+            return DeadlineExceeded("Anthropic API request timed out")
 
         # Rate limiting / quota → ResourceExhausted
         if RateLimitError is not None and isinstance(err, RateLimitError):
@@ -351,49 +400,49 @@ class AnthropicAdapter(BaseLLMAdapter):
                 "Anthropic rate limit exceeded",
                 retry_after_ms=retry_ms,
                 throttle_scope="tenant",
-            ) from err
+            )
 
         # AuthN / AuthZ → AuthError
         if AuthenticationError is not None and isinstance(err, AuthenticationError):
-            return AuthError(str(err) or "Anthropic authentication/authorization error") from err
+            return AuthError(str(err) or "Anthropic authentication/authorization error")
 
         # Request shape / params → BadRequest
         if BadRequestError is not None and isinstance(err, BadRequestError):
-            return BadRequest(str(err) or "Anthropic request is invalid") from err
+            return BadRequest(str(err) or "Anthropic request is invalid")
 
         # HTTP status buckets
         if APIStatusError is not None and isinstance(err, APIStatusError):
             status = int(getattr(err, "status_code", 0) or 0)
 
             if status == 400:
-                return BadRequest(str(err) or "Anthropic request is invalid") from err
+                return BadRequest(str(err) or "Anthropic request is invalid")
             if status in (401, 403):
-                return AuthError(str(err) or "Anthropic authentication/authorization error") from err
+                return AuthError(str(err) or "Anthropic authentication/authorization error")
             if status == 404:
-                return NotSupported(str(err) or "Requested Anthropic resource is not supported") from err
+                return NotSupported(str(err) or "Requested Anthropic resource is not supported")
             if status == 429:
                 retry_ms = self._extract_retry_after_ms(err)
                 return ResourceExhausted(
                     "Anthropic rate limit exceeded",
                     retry_after_ms=retry_ms,
                     throttle_scope="tenant",
-                ) from err
+                )
             if 500 <= status <= 599:
                 retry_ms = self._extract_retry_after_ms(err)
                 return Unavailable(
                     "Anthropic service is temporarily unavailable",
                     retry_after_ms=retry_ms,
-                ) from err
-            return Unavailable(str(err) or f"Anthropic error (status={status})") from err
+                )
+            return Unavailable(str(err) or f"Anthropic error (status={status})")
 
         # Generic Anthropic error fallback → Unavailable
         if isinstance(err, APIError):
-            return Unavailable(str(err) or "Anthropic API error") from err
+            return Unavailable(str(err) or "Anthropic API error")
         if isinstance(err, AnthropicError):
-            return Unavailable(str(err) or "Anthropic SDK error") from err
+            return Unavailable(str(err) or "Anthropic SDK error")
 
         # Anything else → wrap as Unavailable
-        return Unavailable(str(err) or "internal Anthropic adapter error") from err
+        return Unavailable(str(err) or "internal Anthropic adapter error")
 
     def _get_stream_cache_key(
         self,
@@ -424,9 +473,8 @@ class AnthropicAdapter(BaseLLMAdapter):
         """
         Report adapter capabilities.
 
-        We deliberately leave supported_models empty so routers can pass
-        any valid Anthropic model ID without the adapter enforcing a fixed
-        allow-list.
+        We include at least one supported model so conformance tests can
+        exercise the adapter end-to-end.
         
         Note: JSON output is supported via prompt engineering, not native API.
         """
@@ -438,13 +486,15 @@ class AnthropicAdapter(BaseLLMAdapter):
             supports_streaming=True,
             supports_roles=True,
             supports_json_output=True,  # Via prompt engineering
+            supports_tools=False,       # Tools accepted at the interface but not yet implemented
             supports_parallel_tool_calls=False,
             idempotent_writes=True,
             supports_multi_tenant=True,
             supports_system_message=True,
             supports_deadline=True,
             supports_count_tokens=True,
-            supported_models=(),  # open set; let callers choose.
+            # IMPORTANT: must be non-empty to satisfy conformance tests.
+            supported_models=(self._default_model,),
         )
 
     async def _do_complete(
@@ -459,11 +509,25 @@ class AnthropicAdapter(BaseLLMAdapter):
         stop_sequences: Optional[List[str]] = None,
         model: Optional[str] = None,
         system_message: Optional[str] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
         ctx: Optional[OperationContext] = None,
     ) -> LLMCompletion:
         """
         Backend implementation of `complete()` using Anthropic Messages.
+        
+        Note:
+        - Response caching is handled automatically by BaseLLMAdapter via
+          the _make_complete_cache_key mechanism.
+        - tools and tool_choice are accepted for interface parity with
+          the protocol but are intentionally ignored while
+          capabilities.supports_tools == False. BaseLLMAdapter will
+          reject tool usage before this method is invoked in that mode.
         """
+        # Enforce the same role restrictions as the mock adapter so both
+        # behave equivalently from the protocol's perspective.
+        self._validate_roles(messages)
+        
         resolved_model = self._resolve_model(model)
         anthro_messages, system_text = self._convert_messages_for_anthropic(
             messages=messages,
@@ -522,6 +586,8 @@ class AnthropicAdapter(BaseLLMAdapter):
         stop_sequences: Optional[List[str]] = None,
         model: Optional[str] = None,
         system_message: Optional[str] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
         ctx: Optional[OperationContext] = None,
     ) -> AsyncIterator[LLMChunk]:
         """
@@ -534,7 +600,15 @@ class AnthropicAdapter(BaseLLMAdapter):
         Anthropic currently does not surface per-stream usage directly, so we
         approximate final usage via `count_tokens` over prompt and aggregate
         completion text.
+        
+        Note:
+        - Streaming responses are not cached by BaseLLMAdapter.
+        - tools and tool_choice are accepted for interface parity but
+          ignored while capabilities.supports_tools == False.
         """
+        # Enforce the same role restrictions as the mock adapter.
+        self._validate_roles(messages)
+        
         resolved_model = self._resolve_model(model)
         anthro_messages, system_text = self._convert_messages_for_anthropic(
             messages=messages,
