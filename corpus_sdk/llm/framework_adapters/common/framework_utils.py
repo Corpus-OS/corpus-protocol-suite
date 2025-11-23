@@ -1,15 +1,17 @@
-# SPDX-License-Identifier: Apache-2.0
 # corpus_sdk/llm/framework_adapters/common/framework_utils.py
+# SPDX-License-Identifier: Apache-2.0
 """
 Shared utilities for framework-specific LLM adapters.
 
 This module centralizes common logic used across all LLM framework adapters:
 
-- Coercing provider / translator results into canonical text or message shapes
+- Coercing provider / translator results into canonical **text** or **chat message**
+  shapes
 - Coercing token-usage structures safely
 - Emitting consistent, framework-aware warnings
-- Providing light security / resource limits (depth, size, token caps)
+- Providing light security / resource limits (depth, size, token caps, stream caps)
 - Inferring / normalizing framework names for observability
+- Best-effort streaming extraction for text and chat deltas
 
 It intentionally stays *framework-neutral* and uses only:
 
@@ -23,7 +25,16 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence
+from typing import (
+    Any,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+)
 
 LOG = logging.getLogger(__name__)
 
@@ -42,7 +53,7 @@ class CoercionErrorCodes:
     ----------
     invalid_result:
         Used when the result structure is not a valid container (e.g. no
-        usable text / usage fields found).
+        usable text / usage / message fields found).
 
     empty_result:
         Used when no meaningful content is present after processing (e.g.
@@ -160,10 +171,10 @@ def infer_framework_name(source: Any, default: str = "unknown") -> str:
 
     Examples
     --------
-    - "langchain"                 → "langchain"
-    - object from langchain_core  → "langchain"
-    - object from llama_index.core → "llamaindex"
-    - adapter in corpus_sdk       → "corpus"
+    - "langchain"                   → "langchain"
+    - object from langchain_core    → "langchain"
+    - object from llama_index.core  → "llamaindex"
+    - adapter in corpus_sdk         → "corpus"
 
     This is optional; callers can still pass an explicit framework label.
     """
@@ -234,10 +245,17 @@ def _flatten_content_blocks(
     """
     Flatten modern LLM content structures into a single string.
 
-    Supports:
-    - Raw strings
-    - Mappings with "text" or "content"
-    - Lists of content blocks (Anthropic-style, mixed tool/text, etc.)
+    Supported content patterns (best-effort):
+    - "simple text"
+    - {"text": "content"}
+    - {"content": "text"}
+    - [{"type": "text", "text": "part1"}, {"type": "text", "text": "part2"}]
+    - Mixed tool/text blocks, e.g.:
+        [
+            {"type": "text", "text": "Before tool"},
+            {"type": "tool_use", ...},
+            {"type": "text", "text": "After tool"},
+        ]
     - Arbitrary nested combinations of the above
 
     Resource limits (depth + max size) are enforced defensively.
@@ -269,7 +287,7 @@ def _flatten_content_blocks(
                     _depth=_depth + 1,
                 )
         else:
-            # Last-resort stringification
+            # Last-resort stringification for unknown shapes
             text = str(content)
     elif isinstance(content, Sequence) and not isinstance(content, (str, bytes)):
         parts: List[str] = []
@@ -416,6 +434,199 @@ def coerce_text_completion(
 
 
 # ---------------------------------------------------------------------------
+# Chat message coercion
+# ---------------------------------------------------------------------------
+
+
+def _coerce_single_chat_message(
+    raw: Any,
+    *,
+    framework_name: str,
+    error_codes: CoercionErrorCodes,
+    limits: ResourceLimits,
+    skip_invalid: bool,
+    logger: logging.Logger,
+) -> Optional[Dict[str, str]]:
+    """
+    Internal helper to coerce a single chat message-like object.
+
+    Returns a normalized {"role": ..., "content": ...} dict or None if
+    skip_invalid=True and the message is discarded.
+    """
+    role: str
+    content: Any
+
+    if isinstance(raw, Mapping):
+        role = raw.get("role", "assistant")
+        content = raw.get("content")
+    elif isinstance(raw, str):
+        # Treat a bare string as an assistant message
+        role = "assistant"
+        content = raw
+    else:
+        msg = (
+            f"[{error_codes.invalid_result}] "
+            f"{framework_name}: chat message is not a mapping or string "
+            f"(type={type(raw).__name__})"
+        )
+        if skip_invalid:
+            logger.warning("%s; skipping invalid message", msg)
+            return None
+        raise TypeError(msg)
+
+    if not validate_role(role):
+        msg = (
+            f"[{error_codes.invalid_result}] "
+            f"{framework_name}: invalid chat role {role!r}"
+        )
+        if skip_invalid:
+            logger.warning("%s; skipping invalid role", msg)
+            return None
+        raise ValueError(msg)
+
+    if content is None:
+        content_str = ""
+    elif isinstance(content, str):
+        content_str = content
+    else:
+        content_str = _flatten_content_blocks(content, limits=limits)
+
+    if content_str == "":
+        msg = (
+            f"[{error_codes.empty_result}] "
+            f"{framework_name}: empty content for role {role!r}"
+        )
+        if skip_invalid:
+            logger.debug("%s; skipping empty message", msg)
+            return None
+        raise ValueError(msg)
+
+    return {"role": role, "content": content_str}
+
+
+def coerce_chat_messages(
+    result: Any,
+    *,
+    framework: Optional[str],
+    error_codes: CoercionErrorCodes,
+    skip_invalid: bool = False,
+    logger: Optional[logging.Logger] = None,
+    limits: Optional[ResourceLimits] = None,
+) -> List[Dict[str, str]]:
+    """
+    Coerce an arbitrary chat result into a list of normalized messages.
+
+    Normalized shape
+    ----------------
+    Each message is a dict:
+        {"role": <str>, "content": <str>}
+
+    Supported input patterns (best-effort)
+    --------------------------------------
+    - List[{"role": ..., "content": ...}]
+    - {"messages": [...]}              # e.g. framework-specific histories
+    - {"role": ..., "content": ...}    # single message
+    - {"choices": [...]}               # OpenAI-style responses
+        * uses the first choice's message/delta/content by default
+    - "plain text"                     # treated as a single assistant message
+
+    Parameters
+    ----------
+    result:
+        Arbitrary provider / framework result object.
+    framework:
+        Framework label for logging / diagnostics.
+    error_codes:
+        Error code bundle (must be valid).
+    skip_invalid:
+        If True, invalid messages are logged-and-skipped instead of raising.
+    logger:
+        Optional logger.
+    limits:
+        Optional ResourceLimits for content flattening.
+
+    Returns
+    -------
+    List[Dict[str, str]]
+        Non-empty list of normalized chat messages.
+    """
+    _validate_error_codes(error_codes)
+    framework_name = _normalize_framework(framework, error_codes)
+    log = logger or LOG
+    limits = limits or ResourceLimits()
+
+    # Decide what we treat as the "message container"
+    messages_raw: List[Any]
+
+    if isinstance(result, Sequence) and not isinstance(result, (str, bytes)):
+        # Already a sequence of message-like objects
+        messages_raw = list(result)
+    elif isinstance(result, Mapping):
+        if "messages" in result and isinstance(result["messages"], Sequence):
+            messages_raw = list(result["messages"])
+        elif "choices" in result and isinstance(result["choices"], Sequence):
+            choices = result["choices"]
+            if not choices:
+                messages_raw = []
+            else:
+                first = choices[0]
+                if isinstance(first, Mapping):
+                    msg = (
+                        first.get("message")
+                        or first.get("delta")
+                        or first.get("content")
+                        or first
+                    )
+                    messages_raw = [msg]
+                else:
+                    messages_raw = [first]
+        elif "role" in result or "content" in result:
+            messages_raw = [result]
+        else:
+            raise TypeError(
+                f"[{error_codes.invalid_result}] "
+                f"{framework_name}: result does not contain recognizable "
+                f"chat message structures"
+            )
+    elif isinstance(result, str):
+        messages_raw = [result]
+    else:
+        raise TypeError(
+            f"[{error_codes.invalid_result}] "
+            f"{framework_name}: unsupported chat result type "
+            f"(type={type(result).__name__})"
+        )
+
+    normalized: List[Dict[str, str]] = []
+
+    for idx, raw in enumerate(messages_raw):
+        msg = _coerce_single_chat_message(
+            raw,
+            framework_name=framework_name,
+            error_codes=error_codes,
+            limits=limits,
+            skip_invalid=skip_invalid,
+            logger=log,
+        )
+        if msg is not None:
+            normalized.append(msg)
+
+    if not normalized:
+        raise ValueError(
+            f"[{error_codes.empty_result}] "
+            f"{framework_name}: no valid chat messages found"
+        )
+
+    log.debug(
+        "%s: coerced %d chat messages (origin_type=%s)",
+        framework_name,
+        len(normalized),
+        type(result).__name__,
+    )
+    return normalized
+
+
+# ---------------------------------------------------------------------------
 # Token usage coercion
 # ---------------------------------------------------------------------------
 
@@ -510,6 +721,219 @@ def coerce_token_usage(
     )
 
 
+# ---------------------------------------------------------------------------
+# Streaming helpers
+# ---------------------------------------------------------------------------
+
+
+def iter_text_from_stream_events(
+    events: Iterable[Any],
+    *,
+    framework: Optional[str],
+    error_codes: CoercionErrorCodes,
+    logger: Optional[logging.Logger] = None,
+    limits: Optional[ResourceLimits] = None,
+    skip_errors: bool = True,
+) -> Iterator[str]:
+    """
+    Iterate over a stream of provider events and yield text deltas.
+
+    This is a *best-effort* abstraction over common streaming patterns:
+    - OpenAI ChatCompletionChunk / CompletionChunk
+    - Anthropic-style content deltas
+    - Framework-specific wrappers that expose "text", "content", or "choices"
+
+    Behavior
+    --------
+    - Respects ResourceLimits.max_stream_events (if set)
+    - Uses `_extract_text_object` per event, then emits non-empty strings
+    - When `skip_errors=True`, logs-and-skips malformed events instead of raising
+
+    Parameters
+    ----------
+    events:
+        Iterable of provider-specific stream events.
+    framework:
+        Framework label for logging / diagnostics.
+    error_codes:
+        Error codes bundle for structured failures when skip_errors=False.
+    logger:
+        Optional logger.
+    limits:
+        Optional ResourceLimits for content flattening and stream caps.
+    skip_errors:
+        If True, individual event errors do not terminate the iterator.
+    """
+    _validate_error_codes(error_codes)
+    framework_name = _normalize_framework(framework, error_codes)
+    log = logger or LOG
+    limits = limits or ResourceLimits()
+
+    max_events = limits.max_stream_events
+    count = 0
+
+    for event in events:
+        count += 1
+
+        if max_events is not None and count > max_events:
+            log.warning(
+                "%s: max_stream_events=%d exceeded; stopping stream consumption",
+                framework_name,
+                max_events,
+            )
+            break
+
+        try:
+            obj = _extract_text_object(event, limits=limits)
+            if isinstance(obj, str):
+                if obj:
+                    yield obj
+            elif isinstance(obj, Sequence) and not isinstance(obj, (str, bytes)):
+                chunk = "".join(str(part) for part in obj)
+                if chunk:
+                    yield chunk
+            # else: ignore events with no textual content
+        except Exception as exc:  # noqa: BLE001
+            if skip_errors:
+                log.warning(
+                    "%s: skipping stream event %d due to extraction error: %s",
+                    framework_name,
+                    count,
+                    exc,
+                )
+                continue
+
+            raise TypeError(
+                f"[{error_codes.invalid_result}] "
+                f"{framework_name}: failed to extract text from stream event: {exc}"
+            ) from exc
+
+
+def _extract_message_like_from_event(event: Any) -> Any:
+    """
+    Best-effort extraction of a message-like object from a stream event.
+
+    This does *not* normalize the message – it just pulls out the most
+    likely message/delta payload for further coercion.
+    """
+    if isinstance(event, Mapping):
+        # OpenAI-like patterns
+        choices = event.get("choices")
+        if isinstance(choices, Sequence) and choices:
+            out: List[Any] = []
+            for ch in choices:
+                if not isinstance(ch, Mapping):
+                    out.append(ch)
+                    continue
+                msg = ch.get("delta") or ch.get("message") or ch.get("content") or ch
+                out.append(msg)
+            return out
+
+        if "message" in event:
+            return event["message"]
+        if "delta" in event:
+            return event["delta"]
+        if "role" in event or "content" in event:
+            return event
+
+    # Fall through: let caller decide
+    return event
+
+
+def iter_chat_messages_from_stream_events(
+    events: Iterable[Any],
+    *,
+    framework: Optional[str],
+    error_codes: CoercionErrorCodes,
+    logger: Optional[logging.Logger] = None,
+    limits: Optional[ResourceLimits] = None,
+    skip_errors: bool = True,
+) -> Iterator[Dict[str, str]]:
+    """
+    Iterate over a stream of provider events and yield **normalized chat messages**.
+
+    This is built on top of `coerce_chat_messages` and uses the same normalized
+    shape:
+
+        {"role": <str>, "content": <str>}
+
+    Behavior
+    --------
+    - Respects ResourceLimits.max_stream_events (if set)
+    - For each event, extracts message-like payload(s) and normalizes them
+    - When `skip_errors=True`, logs-and-skips invalid events / messages
+
+    Parameters
+    ----------
+    events:
+        Iterable of provider-specific stream events.
+    framework:
+        Framework label for logging / diagnostics.
+    error_codes:
+        Error codes bundle for structured failures when skip_errors=False.
+    logger:
+        Optional logger.
+    limits:
+        Optional ResourceLimits (used for content flattening).
+    skip_errors:
+        If True, invalid messages are logged-and-skipped.
+    """
+    _validate_error_codes(error_codes)
+    framework_name = _normalize_framework(framework, error_codes)
+    log = logger or LOG
+    limits = limits or ResourceLimits()
+
+    max_events = limits.max_stream_events
+    count = 0
+
+    for event in events:
+        count += 1
+
+        if max_events is not None and count > max_events:
+            log.warning(
+                "%s: max_stream_events=%d exceeded; stopping chat stream consumption",
+                framework_name,
+                max_events,
+            )
+            break
+
+        try:
+            msg_like = _extract_message_like_from_event(event)
+
+            # Normalize to a small container and reuse chat coercion
+            if isinstance(msg_like, Sequence) and not isinstance(
+                msg_like,
+                (str, bytes),
+            ):
+                container = msg_like
+            else:
+                container = [msg_like]
+
+            messages = coerce_chat_messages(
+                container,
+                framework=framework_name,
+                error_codes=error_codes,
+                skip_invalid=True,  # per-event invalids are fine to drop
+                logger=log,
+                limits=limits,
+            )
+
+            for msg in messages:
+                yield msg
+
+        except Exception as exc:  # noqa: BLE001
+            if skip_errors:
+                log.warning(
+                    "%s: skipping chat stream event %d due to error: %s",
+                    framework_name,
+                    count,
+                    exc,
+                )
+                continue
+
+            raise
+
+
 __all__ = [
     "CoercionErrorCodes",
     "TokenUsage",
@@ -519,5 +943,8 @@ __all__ = [
     "validate_role",
     "infer_framework_name",
     "coerce_text_completion",
+    "coerce_chat_messages",
     "coerce_token_usage",
+    "iter_text_from_stream_events",
+    "iter_chat_messages_from_stream_events",
 ]
