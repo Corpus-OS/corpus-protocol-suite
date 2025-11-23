@@ -52,6 +52,7 @@ from typing import (
     Mapping,
     Optional,
     Protocol,
+    Tuple,
     TypeVar,
     Callable,
     cast,
@@ -64,6 +65,10 @@ from corpus_sdk.core.error_context import attach_context
 from corpus_sdk.graph.framework_adapters.common.graph_translation import (
     DefaultGraphFrameworkTranslator,
     GraphTranslator,
+    create_graph_translator,
+)
+from corpus_sdk.graph.framework_adapters.common.framework_utils import (
+    CoercionErrorCodes,
 )
 from corpus_sdk.graph.graph_base import (
     BadRequest,
@@ -91,8 +96,25 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 R = TypeVar("R")
 
-# Error code constants
+# Keep a module-level alias to the base coercion error codes for alignment
+COERCION_ERROR_CODES_BASE = CoercionErrorCodes
+
+
+# ---------------------------------------------------------------------------
+# Error code constants (standalone, NOT subclassing CoercionErrorCodes)
+# ---------------------------------------------------------------------------
+
+
 class ErrorCodes:
+    """
+    Error code constants for AutoGen graph adapter.
+
+    This intentionally does not subclass `CoercionErrorCodes`. Shared utilities
+    that rely on symbolic names can still refer to this class explicitly while
+    the underlying CoercionErrorCodes remain available via
+    `COERCION_ERROR_CODES_BASE` for cross-framework alignment.
+    """
+
     BAD_OPERATION_CONTEXT = "BAD_OPERATION_CONTEXT"
     BAD_TRANSLATED_SCHEMA = "BAD_TRANSLATED_SCHEMA"
     BAD_HEALTH_RESULT = "BAD_HEALTH_RESULT"
@@ -105,70 +127,177 @@ class ErrorCodes:
     BAD_ADAPTER_RESULT = "BAD_ADAPTER_RESULT"
 
 
-def with_error_context(
+# ---------------------------------------------------------------------------
+# Error-context decorators with dynamic context extraction
+# ---------------------------------------------------------------------------
+
+
+def _extract_dynamic_context(
+    instance: Any,
+    args: Tuple[Any, ...],
+    kwargs: Dict[str, Any],
     operation: str,
-    **context_kwargs: Any,
+) -> Dict[str, Any]:
+    """
+    Extract rich dynamic context from an AutoGen graph client call.
+
+    Best-effort only (never raises); captures:
+
+    - client_class / adapter_type
+    - framework_version (if configured)
+    - query_len / query_preview for query / streaming operations
+    - batch_ops_count for batch operations
+    - basic query options (namespace / dialect / timeout_ms)
+    - presence / type hints for conversation / extra_context
+    """
+    dynamic_ctx: Dict[str, Any] = {
+        "client_class": type(instance).__name__,
+        "client_operation": operation,
+    }
+
+    # Adapter / framework metadata
+    try:
+        graph_adapter = getattr(instance, "_graph", None)
+        if graph_adapter is not None:
+            dynamic_ctx["adapter_type"] = type(graph_adapter).__name__
+    except Exception:  # noqa: BLE001
+        # Best-effort only; never let metadata extraction break user code.
+        pass
+
+    framework_version = getattr(instance, "_framework_version", None)
+    if framework_version is not None:
+        dynamic_ctx["framework_version"] = framework_version
+
+    # Query / streaming metrics
+    if operation.startswith(("query_", "stream_query_")):
+        query_arg: Optional[str] = None
+
+        # Common shape: first positional arg after self is the query string
+        if args and isinstance(args[0], str):
+            query_arg = args[0]
+        elif isinstance(kwargs.get("query"), str):
+            query_arg = kwargs["query"]
+
+        if isinstance(query_arg, str):
+            dynamic_ctx["query_len"] = len(query_arg)
+            dynamic_ctx["query_preview"] = query_arg[:200]
+
+    # Batch operation metrics
+    if operation.startswith("batch_"):
+        ops = None
+        if "ops" in kwargs and isinstance(kwargs["ops"], list):
+            ops = kwargs["ops"]
+        elif args and isinstance(args[0], list):
+            ops = args[0]
+        if ops is not None:
+            dynamic_ctx["batch_ops_count"] = len(ops)
+
+    # Common query options
+    for key in ("namespace", "dialect", "timeout_ms"):
+        if key in kwargs and kwargs[key] is not None:
+            dynamic_ctx[key] = kwargs[key]
+
+    # AutoGen conversation / extra_context hints (shape-level only)
+    conversation = kwargs.get("conversation")
+    if conversation is not None:
+        dynamic_ctx["has_conversation"] = True
+        dynamic_ctx["conversation_type"] = type(conversation).__name__
+
+    extra_context = kwargs.get("extra_context")
+    if isinstance(extra_context, Mapping):
+        dynamic_ctx["has_extra_context"] = True
+        dynamic_ctx["extra_context_keys"] = list(extra_context.keys())[:10]
+
+    return dynamic_ctx
+
+
+def _create_error_context_decorator(
+    operation: str,
+    is_async: bool = False,
 ) -> Callable[[Callable[..., T]], Callable[..., T]]:
     """
-    Decorator to automatically attach error context to exceptions.
-    
-    Args:
-        operation: The operation name for error context
-        **context_kwargs: Additional context to attach to errors
+    Factory for creating error-context decorators with rich per-call metrics.
+
+    This mirrors the pattern used in other framework adapters (LangChain,
+    LlamaIndex, Semantic Kernel) for consistent observability while keeping
+    the AutoGen layer thin and protocol-first.
     """
-    def decorator(func: Callable[..., T]) -> Callable[..., T]:
-        @wraps(func)
-        def wrapper(*args: Any, **kwargs: Any) -> T:
-            try:
-                return func(*args, **kwargs)
-            except Exception as exc:
-                # Extract additional context from function arguments if needed
-                enhanced_context = context_kwargs.copy()
-                
-                # For query operations, try to extract query info
-                if operation.startswith(("query_", "stream_query_")):
-                    if len(args) > 1 and isinstance(args[1], str):
-                        enhanced_context["query"] = args[1]
-                
-                attach_context(
-                    exc,
-                    framework="autogen",
-                    operation=operation,
-                    **enhanced_context,
-                )
-                raise
-        return wrapper
-    return decorator
+
+    def decorator_factory(
+        **static_context: Any,
+    ) -> Callable[[Callable[..., T]], Callable[..., T]]:
+        def decorator(func: Callable[..., T]) -> Callable[..., T]:
+            if is_async:
+
+                @wraps(func)
+                async def async_wrapper(self: Any, *args: Any, **kwargs: Any) -> T:
+                    dynamic_context = _extract_dynamic_context(
+                        self,
+                        args,
+                        kwargs,
+                        operation,
+                    )
+                    full_context = {**static_context, **dynamic_context}
+                    try:
+                        return await func(self, *args, **kwargs)
+                    except Exception as exc:  # noqa: BLE001
+                        attach_context(
+                            exc,
+                            framework="autogen",
+                            operation=f"graph_{operation}",
+                            **full_context,
+                        )
+                        raise
+
+                return async_wrapper
+            else:
+
+                @wraps(func)
+                def sync_wrapper(self: Any, *args: Any, **kwargs: Any) -> T:
+                    dynamic_context = _extract_dynamic_context(
+                        self,
+                        args,
+                        kwargs,
+                        operation,
+                    )
+                    full_context = {**static_context, **dynamic_context}
+                    try:
+                        return func(self, *args, **kwargs)
+                    except Exception as exc:  # noqa: BLE001
+                        attach_context(
+                            exc,
+                            framework="autogen",
+                            operation=f"graph_{operation}",
+                            **full_context,
+                        )
+                        raise
+
+                return sync_wrapper
+
+        return decorator
+
+    return decorator_factory
+
+
+def with_error_context(
+    operation: str,
+    **static_context: Any,
+) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    """Decorator for sync methods with rich dynamic context extraction."""
+    return _create_error_context_decorator(operation, is_async=False)(**static_context)
 
 
 def with_async_error_context(
     operation: str,
-    **context_kwargs: Any,
+    **static_context: Any,
 ) -> Callable[[Callable[..., T]], Callable[..., T]]:
-    """
-    Decorator to automatically attach error context to exceptions in async functions.
-    """
-    def decorator(func: Callable[..., T]) -> Callable[..., T]:
-        @wraps(func)
-        async def wrapper(*args: Any, **kwargs: Any) -> T:
-            try:
-                return await func(*args, **kwargs)
-            except Exception as exc:
-                enhanced_context = context_kwargs.copy()
-                
-                if operation.startswith(("query_", "stream_query_")):
-                    if len(args) > 1 and isinstance(args[1], str):
-                        enhanced_context["query"] = args[1]
-                
-                attach_context(
-                    exc,
-                    framework="autogen",
-                    operation=operation,
-                    **enhanced_context,
-                )
-                raise
-        return wrapper
-    return decorator
+    """Decorator for async methods with rich dynamic context extraction."""
+    return _create_error_context_decorator(operation, is_async=True)(**static_context)
+
+
+# ---------------------------------------------------------------------------
+# Public protocol
+# ---------------------------------------------------------------------------
 
 
 class AutoGenGraphClientProtocol(Protocol):
@@ -498,7 +627,7 @@ class CorpusAutoGenGraphClient:
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         """Clean up resources when exiting context."""
-        if hasattr(self._graph, 'close'):
+        if hasattr(self._graph, "close"):
             self._graph.close()
 
     async def __aenter__(self) -> CorpusAutoGenGraphClient:
@@ -507,11 +636,11 @@ class CorpusAutoGenGraphClient:
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         """Clean up resources when exiting async context."""
-        if hasattr(self._graph, 'aclose'):
+        if hasattr(self._graph, "aclose"):
             await self._graph.aclose()
 
     # ------------------------------------------------------------------ #
-    # Translator (lazy, cached) – mirrors embedding adapter pattern
+    # Translator (lazy, cached) – thin wrapper via create_graph_translator
     # ------------------------------------------------------------------ #
 
     @cached_property
@@ -519,11 +648,12 @@ class CorpusAutoGenGraphClient:
         """
         Lazily construct and cache the `GraphTranslator`.
 
-        Uses `cached_property` for thread safety and performance, mirroring
-        the embedding adapter pattern.
+        Uses `create_graph_translator` so registry-based per-framework
+        translators remain honored while still allowing our AutoGen-specific
+        pass-through translator to be supplied explicitly.
         """
         framework_translator = self._AutoGenGraphFrameworkTranslator()
-        return GraphTranslator(
+        return create_graph_translator(
             adapter=self._graph,
             framework="autogen",
             translator=framework_translator,
@@ -593,7 +723,7 @@ class CorpusAutoGenGraphClient:
         """Validate upsert specification before processing."""
         if not spec.nodes:
             raise BadRequest("UpsertNodesSpec must contain at least one node")
-        
+
         for node in spec.nodes:
             if not node.id:
                 raise BadRequest("All nodes must have an ID")
@@ -602,7 +732,7 @@ class CorpusAutoGenGraphClient:
         """Validate batch operations before processing."""
         if not ops:
             raise BadRequest("Batch operations list cannot be empty")
-        
+
         # Check against graph capabilities if available
         caps = self._graph.capabilities()
         max_ops = caps.max_batch_ops or 100
@@ -660,7 +790,11 @@ class CorpusAutoGenGraphClient:
         derive a preferred namespace when needed.
         """
         effective_namespace = namespace or self._default_namespace
-        return {"namespace": effective_namespace} if effective_namespace is not None else {}
+        return (
+            {"namespace": effective_namespace}
+            if effective_namespace is not None
+            else {}
+        )
 
     def _validate_result_type(
         self,
@@ -671,13 +805,13 @@ class CorpusAutoGenGraphClient:
     ) -> T:
         """
         Validate that a result is of the expected type.
-        
+
         Args:
             result: The result to validate
             expected_type: The expected type
             operation: Operation name for error message
             error_code: Error code for BadRequest
-            
+
         Returns:
             The validated result cast to expected type
         """
@@ -1028,7 +1162,7 @@ class CorpusAutoGenGraphClient:
         and passes the desired namespace via framework_ctx so that the
         translator can build the correct UpsertNodesSpec.
         """
-        self._validate_upsert_spec(spec)  # ESSENTIAL CHANGE: Added validation
+        self._validate_upsert_spec(spec)
 
         ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
         framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
@@ -1056,7 +1190,7 @@ class CorpusAutoGenGraphClient:
         """
         Async wrapper for upserting nodes.
         """
-        self._validate_upsert_spec(spec)  # ESSENTIAL CHANGE: Added validation
+        self._validate_upsert_spec(spec)
 
         ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
         framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
@@ -1349,7 +1483,7 @@ class CorpusAutoGenGraphClient:
         Translates `BatchOperation` dataclasses into the raw mapping shape
         expected by GraphTranslator and returns the underlying `BatchResult`.
         """
-        self._validate_batch_ops(ops)  # ESSENTIAL CHANGE: Added validation
+        self._validate_batch_ops(ops)
 
         ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
 
@@ -1380,7 +1514,7 @@ class CorpusAutoGenGraphClient:
         """
         Async wrapper for batch operations.
         """
-        self._validate_batch_ops(ops)  # ESSENTIAL CHANGE: Added validation
+        self._validate_batch_ops(ops)
 
         ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
 
@@ -1405,4 +1539,6 @@ __all__ = [
     "AutoGenGraphClientProtocol",
     "CorpusAutoGenGraphClient",
     "ErrorCodes",
+    "with_error_context",
+    "with_async_error_context",
 ]
