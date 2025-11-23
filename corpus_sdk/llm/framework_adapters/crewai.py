@@ -97,6 +97,9 @@ ERROR_CODES = CoercionErrorCodes(
     framework_label="crewai",
 )
 
+# Symbolic code for init/config errors (for log/search friendliness)
+INIT_CONFIG_ERROR = "CREWAI_LLM_BAD_INIT_CONFIG"
+
 # ---------------------------------------------------------------------------
 # Type definitions for CrewAI compatibility
 # ---------------------------------------------------------------------------
@@ -264,7 +267,7 @@ def _extract_dynamic_context(
         "model": getattr(instance, "model", "unknown"),
         "temperature": getattr(instance, "temperature", 0.7),
         "operation": operation,
-        "error_codes": ERROR_CODES,
+        # NOTE: ERROR_CODES will be added once in the decorator; no need here.
     }
 
     # Message metrics
@@ -643,7 +646,7 @@ class CorpusCrewAILLM:
     # Resource management (context managers) – aligned with other adapters
     # ------------------------------------------------------------------ #
 
-    def __enter__(self) -> CorpusCrewAILLM:
+    def __enter__(self) -> "CorpusCrewAILLM":
         """Support sync context manager protocol for resource cleanup."""
         return self
 
@@ -656,7 +659,7 @@ class CorpusCrewAILLM:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Error while closing LLM adapter: %s", exc)
 
-    async def __aenter__(self) -> CorpusCrewAILLM:
+    async def __aenter__(self) -> "CorpusCrewAILLM":
         """Support async context manager protocol."""
         return self
 
@@ -694,6 +697,7 @@ class CorpusCrewAILLM:
         ]
         if missing:
             raise TypeError(
+                f"{INIT_CONFIG_ERROR}: "
                 "llm_adapter must implement LLMProtocolV1; missing methods: "
                 + ", ".join(missing)
             )
@@ -701,11 +705,15 @@ class CorpusCrewAILLM:
         if not isinstance(self.temperature, (int, float)) or not (
             0.0 <= float(self.temperature) <= 2.0
         ):
-            raise ValueError("temperature must be between 0.0 and 2.0")
+            raise ValueError(
+                f"{INIT_CONFIG_ERROR}: temperature must be between 0.0 and 2.0"
+            )
 
         if self.max_tokens is not None:
             if not isinstance(self.max_tokens, int) or self.max_tokens < 1:
-                raise ValueError("max_tokens must be a positive integer")
+                raise ValueError(
+                    f"{INIT_CONFIG_ERROR}: max_tokens must be a positive integer"
+                )
 
     def _apply_instance_defaults(self, kwargs: Mapping[str, Any]) -> Dict[str, Any]:
         """
@@ -914,3 +922,4 @@ __all__ = [
     "with_async_llm_error_context",
     "ERROR_CODES",
 ]
+
