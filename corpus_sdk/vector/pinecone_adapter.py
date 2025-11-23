@@ -216,14 +216,14 @@ class PineconeVectorAdapter(BaseVectorAdapter):
         self._max_top_k = int(max_top_k)
         self._max_filter_terms = max_filter_terms
         self._text_storage_strategy = text_storage_strategy
-        self._index = None  # lazily initialized
+        self._index: Any = None  # lazily initialized
         self._batch_query_max_concurrency = (
             int(batch_query_max_concurrency)
             if batch_query_max_concurrency is not None and batch_query_max_concurrency > 0
             else None
         )
 
-        # Invoke BaseVectorAdapter init
+        # Invoke BaseVectorAdapter init (policies, metrics, docstore integration)
         super().__init__(
             metrics=metrics,
             mode=mode,
@@ -242,7 +242,7 @@ class PineconeVectorAdapter(BaseVectorAdapter):
     # Internal helpers
     # ------------------------------------------------------------------ #
 
-    def _get_index(self):
+    def _get_index(self) -> Any:
         """Lazily create and cache the Pinecone index handle."""
         if self._index is not None:
             return self._index
@@ -251,13 +251,14 @@ class PineconeVectorAdapter(BaseVectorAdapter):
             # Modern client: client.Index(name)
             index = self._client.Index(self._index_name)  # type: ignore[attr-defined]
         except Exception as exc:  # noqa: BLE001
-            raise self._translate_error(exc, op="init_index")
+            # No ctx available here (constructor-time); details will only include op.
+            raise self._translate_error(exc, op="init_index", ctx=None)
 
         self._index = index
         return index
 
     @staticmethod
-    async def _run_in_thread(func, *args, **kwargs):
+    async def _run_in_thread(func: Any, *args: Any, **kwargs: Any) -> Any:
         """Run blocking client calls on a worker thread."""
         return await asyncio.to_thread(func, *args, **kwargs)
 
@@ -267,6 +268,26 @@ class PineconeVectorAdapter(BaseVectorAdapter):
         if isinstance(obj, Mapping):
             return obj.get(key, default)
         return getattr(obj, key, default)
+
+    @staticmethod
+    def _attach_ctx_details(
+        base: Dict[str, Any],
+        ctx: Optional[OperationContext],
+    ) -> Dict[str, Any]:
+        """
+        Enrich error details with ctx fields when available.
+
+        This is how CTX is surfaced at the adapter layer in a SIEM-safe way:
+        we add request_id / traceparent (never tenant) into the error details
+        payload, while BaseVectorAdapter handles tenant hashing in metrics.
+        """
+        if ctx is None:
+            return base
+        if ctx.request_id:
+            base.setdefault("request_id", ctx.request_id)
+        if ctx.traceparent:
+            base.setdefault("traceparent", ctx.traceparent)
+        return base
 
     def _convert_score(self, raw_score: float) -> Tuple[float, float]:
         """
@@ -290,18 +311,28 @@ class PineconeVectorAdapter(BaseVectorAdapter):
         # Fallback
         return s, s
 
-    def _translate_error(self, err: Exception, *, op: str) -> VectorAdapterError:
+    def _translate_error(
+        self,
+        err: Exception,
+        *,
+        op: str,
+        ctx: Optional[OperationContext] = None,
+    ) -> VectorAdapterError:
         """
         Map Pinecone exceptions into normalized VectorAdapterError types.
 
-        Note:
-            We intentionally treat "no such index"/404 as IndexNotReady to keep
-            the error retryable in environments where index lifecycle may lag
-            behind adapter startup. Callers that want stricter behavior can
-            enforce index existence at provisioning time.
+        CTX USAGE:
+            - request_id and traceparent are attached to the `details` dict
+              so callers / logs can correlate failures without leaking tenant.
         """
         msg = str(err) or f"Pinecone error during {op}"
-        logger.debug("Pinecone error in %s: %r", op, err)
+        logger.debug(
+            "Pinecone error in %s (request_id=%s, traceparent=%s): %r",
+            op,
+            getattr(ctx, "request_id", None),
+            getattr(ctx, "traceparent", None),
+            err,
+        )
 
         # Specific Pinecone exception type (best-effort).
         if isinstance(err, PineconeException):
@@ -335,7 +366,7 @@ class PineconeVectorAdapter(BaseVectorAdapter):
                     "Pinecone rate limit exceeded",
                     code="RESOURCE_EXHAUSTED",
                     retry_after_ms=500,
-                    details={"op": op},
+                    details=self._attach_ctx_details({"op": op}, ctx),
                 )
 
             # Auth / permission
@@ -348,7 +379,7 @@ class PineconeVectorAdapter(BaseVectorAdapter):
                 return AuthError(
                     "Pinecone authentication/authorization error",
                     code="AUTH_ERROR",
-                    details={"op": op},
+                    details=self._attach_ctx_details({"op": op}, ctx),
                 )
 
             # Not found / index not ready
@@ -362,7 +393,7 @@ class PineconeVectorAdapter(BaseVectorAdapter):
                     "Pinecone index or data not ready",
                     code="INDEX_NOT_READY",
                     retry_after_ms=1000,
-                    details={"op": op},
+                    details=self._attach_ctx_details({"op": op}, ctx),
                 )
 
             # Timeouts / transient
@@ -376,7 +407,7 @@ class PineconeVectorAdapter(BaseVectorAdapter):
                     "Pinecone transient network error",
                     code="TRANSIENT_NETWORK",
                     retry_after_ms=500,
-                    details={"op": op},
+                    details=self._attach_ctx_details({"op": op}, ctx),
                 )
 
             # Validation / bad request
@@ -389,7 +420,7 @@ class PineconeVectorAdapter(BaseVectorAdapter):
                 return BadRequest(
                     msg,
                     code="BAD_REQUEST",
-                    details={"op": op},
+                    details=self._attach_ctx_details({"op": op}, ctx),
                 )
 
             # Server-side errors
@@ -398,14 +429,14 @@ class PineconeVectorAdapter(BaseVectorAdapter):
                     "Pinecone service unavailable",
                     code="UNAVAILABLE",
                     retry_after_ms=1000,
-                    details={"op": op},
+                    details=self._attach_ctx_details({"op": op}, ctx),
                 )
 
             # Generic PineconeException
             return Unavailable(
                 msg,
                 code="UNAVAILABLE",
-                details={"op": op},
+                details=self._attach_ctx_details({"op": op}, ctx),
             )
 
         # Generic transport/network issues
@@ -415,21 +446,21 @@ class PineconeVectorAdapter(BaseVectorAdapter):
                 "Pinecone network timeout",
                 code="TRANSIENT_NETWORK",
                 retry_after_ms=500,
-                details={"op": op},
+                details=self._attach_ctx_details({"op": op}, ctx),
             )
         if "connection" in lowered_generic:
             return TransientNetwork(
                 "Pinecone connection error",
                 code="TRANSIENT_NETWORK",
                 retry_after_ms=500,
-                details={"op": op},
+                details=self._attach_ctx_details({"op": op}, ctx),
             )
 
         # Fallback
         return Unavailable(
             msg,
             code="UNAVAILABLE",
-            details={"op": op},
+            details=self._attach_ctx_details({"op": op}, ctx),
         )
 
     # ------------------------------------------------------------------ #
@@ -442,8 +473,8 @@ class PineconeVectorAdapter(BaseVectorAdapter):
 
         Note:
             - `max_dimensions` is taken from configuration (if provided).
-            - `max_batch_size` is a soft planning hint, but we also enforce it
-              as a hard limit on upsert/delete batches to protect the backend.
+            - `max_batch_size` is surfaced here and used by BaseVectorAdapter
+              to enforce a hard batch limit for upsert/delete before this layer.
         """
         version = getattr(pinecone, "__version__", "unknown") if pinecone else "unknown"
         return VectorCapabilities(
@@ -474,20 +505,19 @@ class PineconeVectorAdapter(BaseVectorAdapter):
         *,
         ctx: Optional[OperationContext] = None,
     ) -> QueryResult:
+        """
+        Backend implementation for vector similarity search.
+
+        BaseVectorAdapter has already:
+          - validated the vector shape & numeric type
+          - enforced max_top_k via capabilities
+          - enforced supports_metadata_filtering
+        Here we enforce Pinecone-specific invariants (exact dimensions) and
+        map QuerySpec to Pinecone's `index.query()` call.
+        """
         index = self._get_index()
 
-        # Enforce top_k ceiling if configured.
-        if self._max_top_k and spec.top_k > self._max_top_k:
-            raise BadRequest(
-                f"top_k {spec.top_k} exceeds maximum of {self._max_top_k}",
-                code="BAD_REQUEST",
-                details={
-                    "max_top_k": self._max_top_k,
-                    "namespace": spec.namespace,
-                },
-            )
-
-        # Strict dimensionality check if configured.
+        # Strict dimensionality check if configured (Pinecone index has fixed dims).
         if self._dimensions and len(spec.vector) != self._dimensions:
             raise DimensionMismatch(
                 f"query vector dimension {len(spec.vector)} does not match configured "
@@ -499,20 +529,6 @@ class PineconeVectorAdapter(BaseVectorAdapter):
                 },
             )
 
-        # Optionally guard filter complexity
-        if self._max_filter_terms is not None and spec.filter:
-            if len(spec.filter) > self._max_filter_terms:
-                raise BadRequest(
-                    f"filter too complex: {len(spec.filter)} terms exceeds "
-                    f"{self._max_filter_terms}",
-                    code="BAD_REQUEST",
-                    details={
-                        "provided_terms": len(spec.filter),
-                        "max_terms": self._max_filter_terms,
-                        "namespace": spec.namespace,
-                    },
-                )
-
         kwargs: Dict[str, Any] = {
             "vector": list(map(float, spec.vector)),
             "top_k": spec.top_k,
@@ -521,12 +537,13 @@ class PineconeVectorAdapter(BaseVectorAdapter):
             "include_metadata": spec.include_metadata,
         }
         if spec.filter:
+            # Base has already validated JSON-serializability of the filter.
             kwargs["filter"] = dict(spec.filter)
 
         try:
             resp = await self._run_in_thread(index.query, **kwargs)
         except Exception as exc:  # noqa: BLE001
-            raise self._translate_error(exc, op="query") from exc
+            raise self._translate_error(exc, op="query", ctx=ctx) from exc
 
         raw_matches: Sequence[Any] = (
             getattr(resp, "matches", None) or resp.get("matches", [])  # type: ignore[call-arg]
@@ -544,15 +561,12 @@ class PineconeVectorAdapter(BaseVectorAdapter):
             values = self._safe_get(m, "values", []) if spec.include_vectors else []
             meta = self._safe_get(m, "metadata", None) if spec.include_metadata else None
 
-            # Vector.text is handled by BaseVectorAdapter when docstore is used.
-            # For text_storage_strategy == "metadata", upstream callers are
-            # expected to store text in metadata if desired.
             vector = Vector(
                 id=vid,
                 vector=list(values) if values else [],
                 metadata=dict(meta) if isinstance(meta, Mapping) else meta,
                 namespace=spec.namespace,
-                text=None,
+                text=None,  # BaseVectorAdapter handles text/docstore hydration.
             )
             matches.append(
                 VectorMatch(
@@ -562,8 +576,6 @@ class PineconeVectorAdapter(BaseVectorAdapter):
                 )
             )
 
-        # Empty results are treated as a normal condition; callers decide
-        # whether an empty result set is acceptable.
         return QueryResult(
             matches=matches,
             query_vector=list(spec.vector),
@@ -582,14 +594,13 @@ class PineconeVectorAdapter(BaseVectorAdapter):
         """
         Implement batch query via parallel fan-out of `_do_query`.
 
-        We deliberately bypass BaseVectorAdapter.query() to avoid double
+        We deliberately bypass BaseVectorAdapter.query() here to avoid double
         instrumentation / caching; deadline is enforced at the outer layer.
         """
-        # Reuse namespace for each individual QuerySpec if they did not set it.
+        # Normalize per-query namespace to the batch namespace if needed.
         queries: List[QuerySpec] = []
         for q in spec.queries:
             if q.namespace != spec.namespace:
-                # Normalize namespace to the batch namespace
                 queries.append(
                     QuerySpec(
                         vector=q.vector,
@@ -620,7 +631,7 @@ class PineconeVectorAdapter(BaseVectorAdapter):
             results = await asyncio.gather(*tasks)
         except Exception as exc:  # noqa: BLE001
             # Any unexpected error here is translated through the outer wrapper.
-            raise self._translate_error(exc, op="batch_query") from exc
+            raise self._translate_error(exc, op="batch_query", ctx=ctx) from exc
 
         return results
 
@@ -632,45 +643,61 @@ class PineconeVectorAdapter(BaseVectorAdapter):
         *,
         ctx: Optional[OperationContext] = None,
     ) -> UpsertResult:
+        """
+        Backend implementation for upserting vectors.
+
+        BaseVectorAdapter has already:
+          - validated vectors are non-empty numeric lists
+          - enforced max_batch_size via capabilities
+        Here we enforce Pinecone's exact dimension requirement and surface
+        partial failures for dimension mismatches while still upserting
+        valid vectors.
+        """
         index = self._get_index()
 
-        # Enforce batch size ceiling if configured.
-        if self._max_batch_size and len(spec.vectors) > self._max_batch_size:
-            raise BadRequest(
-                f"upsert batch size {len(spec.vectors)} exceeds maximum of {self._max_batch_size}",
-                code="BATCH_TOO_LARGE",
-                details={
-                    "max_batch_size": self._max_batch_size,
-                    "provided": len(spec.vectors),
-                    "suggested_batch_reduction": self._max_batch_size,
-                    "namespace": spec.namespace,
-                },
-            )
+        failures: List[Dict[str, Any]] = []
+        valid_vectors: List[Vector] = []
+        dims = self._dimensions
 
-        if self._dimensions:
-            for v in spec.vectors:
-                if len(v.vector) != self._dimensions:
-                    raise DimensionMismatch(
-                        f"vector dimension {len(v.vector)} does not match configured "
-                        f"dimensions {self._dimensions}",
-                        details={
-                            "expected": self._dimensions,
+        for idx, v in enumerate(spec.vectors):
+            if dims and len(v.vector) != dims:
+                failures.append(
+                    {
+                        "id": str(v.id),
+                        "index": idx,
+                        "code": "DIMENSION_MISMATCH",
+                        "message": (
+                            f"vector dimension {len(v.vector)} does not match configured "
+                            f"dimensions {dims}"
+                        ),
+                        "details": {
+                            "expected": dims,
                             "actual": len(v.vector),
                             "namespace": spec.namespace,
                         },
-                    )
+                    }
+                )
+                continue
+            valid_vectors.append(v)
+
+        # If nothing valid remains, skip the remote call entirely.
+        if not valid_vectors:
+            return UpsertResult(
+                upserted_count=0,
+                failed_count=len(failures),
+                failures=failures,
+            )
 
         payload: List[Dict[str, Any]] = []
-        for v in spec.vectors:
+        for v in valid_vectors:
             item: Dict[str, Any] = {
                 "id": str(v.id),
                 "values": [float(x) for x in v.vector],
             }
             if v.metadata is not None:
-                meta = dict(v.metadata)
                 # If caller wants text in metadata (strategy "metadata"), they can
-                # already include it; we don't mutate metadata here.
-                item["metadata"] = meta
+                # include it themselves; this adapter does not mutate metadata.
+                item["metadata"] = dict(v.metadata)
             payload.append(item)
 
         try:
@@ -680,10 +707,9 @@ class PineconeVectorAdapter(BaseVectorAdapter):
                 namespace=spec.namespace,
             )
         except Exception as exc:  # noqa: BLE001
-            raise self._translate_error(exc, op="upsert") from exc
+            raise self._translate_error(exc, op="upsert", ctx=ctx) from exc
 
-        # Pinecone usually returns {"upserted_count": N}, but we defensively handle
-        # missing fields.
+        # Pinecone usually returns {"upserted_count": N}; fall back to length.
         upserted = 0
         if isinstance(resp, Mapping):
             try:
@@ -691,12 +717,12 @@ class PineconeVectorAdapter(BaseVectorAdapter):
             except Exception:  # pragma: no cover - defensive
                 upserted = 0
         if upserted <= 0:
-            upserted = len(spec.vectors)
+            upserted = len(valid_vectors)
 
         return UpsertResult(
             upserted_count=upserted,
-            failed_count=0,
-            failures=[],
+            failed_count=len(failures),
+            failures=failures,
         )
 
     # ------------------------------ delete --------------------------------- #
@@ -707,44 +733,40 @@ class PineconeVectorAdapter(BaseVectorAdapter):
         *,
         ctx: Optional[OperationContext] = None,
     ) -> DeleteResult:
+        """
+        Backend implementation for delete operations.
+
+        BaseVectorAdapter has already:
+          - enforced max_batch_size for ids via capabilities
+          - validated filter JSON-serializability
+        Pinecone delete is idempotent; delete-by-IDs reports the number of
+        targeted IDs, and delete-by-filter reports 0 (count unknown).
+        """
         index = self._get_index()
 
         kwargs: Dict[str, Any] = {"namespace": spec.namespace}
+        deleted_count = 0
+
         if spec.ids:
-            # Enforce batch size ceiling if configured.
-            if self._max_batch_size and len(spec.ids) > self._max_batch_size:
-                raise BadRequest(
-                    f"delete batch size {len(spec.ids)} exceeds maximum of {self._max_batch_size}",
-                    code="BATCH_TOO_LARGE",
-                    details={
-                        "max_batch_size": self._max_batch_size,
-                        "provided": len(spec.ids),
-                        "suggested_batch_reduction": self._max_batch_size,
-                        "namespace": spec.namespace,
-                    },
-                )
             kwargs["ids"] = [str(i) for i in spec.ids]
+            deleted_count = len(spec.ids)
         elif spec.filter:
             kwargs["filter"] = dict(spec.filter)
+            # We intentionally report deleted_count=0 for filter deletes,
+            # since Pinecone does not return the exact number of rows deleted.
+            deleted_count = 0
         else:
-            # BaseVectorAdapter should already enforce ids|filter presence.
+            # BaseVectorAdapter should already enforce ids|filter presence,
+            # but we keep this as a defensive guard.
             raise BadRequest("must provide either ids or filter for deletion")
-
-        # For namespace-wide delete, callers should use filter or explicitly
-        # pass all ids; we intentionally do not expose delete_all here to avoid
-        # accidental mass deletes.
 
         try:
             await self._run_in_thread(index.delete, **kwargs)
         except Exception as exc:  # noqa: BLE001
-            raise self._translate_error(exc, op="delete") from exc
-
-        # Pinecone delete does not always return counts; for now we report
-        # "targeted" as deleted. This is SIEM-safe and stable.
-        targeted = len(spec.ids) if spec.ids else 0
+            raise self._translate_error(exc, op="delete", ctx=ctx) from exc
 
         return DeleteResult(
-            deleted_count=targeted,
+            deleted_count=deleted_count,
             failed_count=0,
             failures=[],
         )
@@ -797,9 +819,8 @@ class PineconeVectorAdapter(BaseVectorAdapter):
         We *do not* delete the index itself; only data under the namespace.
         """
         index = self._get_index()
+        existed = False
         try:
-            # Use delete_all=True scoped to the namespace so only that
-            # namespace's contents are removed.
             await self._run_in_thread(
                 index.delete,
                 namespace=namespace,
@@ -808,11 +829,12 @@ class PineconeVectorAdapter(BaseVectorAdapter):
             existed = True
         except Exception as exc:  # noqa: BLE001
             # If it's a "namespace not found" kind of error, treat as success
-            err = self._translate_error(exc, op="delete_namespace")
+            err = self._translate_error(exc, op="delete_namespace", ctx=ctx)
             if isinstance(err, IndexNotReady) or isinstance(err, BadRequest):
                 logger.debug(
-                    "delete_namespace(%s) treated as best-effort: %s",
+                    "delete_namespace(%s) treated as best-effort (request_id=%s): %s",
                     namespace,
+                    getattr(ctx, "request_id", None),
                     exc,
                 )
                 existed = False
@@ -876,8 +898,13 @@ class PineconeVectorAdapter(BaseVectorAdapter):
                 "namespaces": namespaces,
             }
         except Exception as exc:  # noqa: BLE001
-            err = self._translate_error(exc, op="health")
-            logger.warning("Pinecone health check failed: %s", err)
+            err = self._translate_error(exc, op="health", ctx=ctx)
+            logger.warning(
+                "Pinecone health check failed (request_id=%s, traceparent=%s): %s",
+                getattr(ctx, "request_id", None),
+                getattr(ctx, "traceparent", None),
+                err,
+            )
             return {
                 "ok": False,
                 "server": "pinecone",
