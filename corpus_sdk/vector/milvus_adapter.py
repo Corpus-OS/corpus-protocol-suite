@@ -47,7 +47,7 @@ Usage
             vector=[...],
             top_k=5,
             namespace="demo",
-            # NOTE: metadata filtering is not supported by this adapter.
+            filter={"category": "shoes"},  # example metadata filter
         )
     )
 """
@@ -57,7 +57,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+import json
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Set
 
 from corpus_sdk.vector.vector_base import (
     BaseVectorAdapter,
@@ -125,9 +126,21 @@ class MilvusVectorAdapter(BaseVectorAdapter):
 
     include_vectors
     ---------------
-    - Milvus search does not return the full vector by default.
-    - This adapter currently does *not* support returning vectors on query.
-    - If `include_vectors=True` in QuerySpec, a NotSupported error is raised.
+    - Milvus search does not always return the full vector by default.
+    - This adapter supports returning vectors on query when requested:
+        * If `include_vectors=True` in QuerySpec, the vector field is included
+          in Milvus output_fields and populated into results when available.
+        * If the schema or server does not return the vector field, an empty
+          vector is returned, preserving safety and avoiding extra round trips.
+
+    metadata filtering
+    ------------------
+    - This adapter now supports metadata filtering using a Mongo-style dict:
+        * Logical operators: $and, $or, $not
+        * Comparison operators: $eq, $ne, $gt, $gte, $lt, $lte, $in, $nin
+        * Implicit equality: {"color": "red"}
+    - These are translated into Milvus JSON expressions targeting the configured
+      JSON metadata field (e.g., metadata["color"] == "red").
     """
 
     _component = "vector_milvus"
@@ -148,7 +161,7 @@ class MilvusVectorAdapter(BaseVectorAdapter):
         # Soft limits / planning hints
         max_batch_size: int = 100,
         max_top_k: int = 100,
-        max_filter_terms: Optional[int] = None,  # accepted for API symmetry; ignored (no filtering support)
+        max_filter_terms: Optional[int] = None,
         text_storage_strategy: str = "metadata",  # "metadata", "docstore", or "none"
         batch_query_max_concurrency: Optional[int] = None,
         # BaseVectorAdapter infra
@@ -228,13 +241,25 @@ class MilvusVectorAdapter(BaseVectorAdapter):
         self._dimensions = int(dimensions) if dimensions is not None else 0
         self._max_batch_size = int(max_batch_size)
         self._max_top_k = int(max_top_k)
-        # max_filter_terms is intentionally not stored; filtering is not supported.
+        self._max_filter_terms = (
+            int(max_filter_terms)
+            if max_filter_terms is not None and max_filter_terms > 0
+            else None
+        )
         self._text_storage_strategy = text_storage_strategy
         self._batch_query_max_concurrency = (
             int(batch_query_max_concurrency)
             if batch_query_max_concurrency is not None and batch_query_max_concurrency > 0
             else None
         )
+
+        # Track known namespaces (partitions) and namespaces that have data.
+        # This allows us to:
+        #   - Distinguish "unknown namespace" (BadRequest) from
+        #     "known but empty namespace" (IndexNotReady).
+        #   - Avoid redundant list_partitions calls for the same namespace.
+        self._known_partitions: Set[str] = set()
+        self._namespaces_with_data: Set[str] = set()
 
         # Metric mapping: vector protocol → Milvus metric_type
         self._milvus_metric_type = {
@@ -418,6 +443,131 @@ class MilvusVectorAdapter(BaseVectorAdapter):
             details={"op": op},
         )
 
+    async def _ensure_namespace_known(self, namespace: str, *, op: str) -> bool:
+        """
+        Ensure that a namespace (partition) is known to this adapter.
+
+        Returns:
+            True if the namespace exists as a Milvus partition, False if it does not.
+
+        Raises:
+            VectorAdapterError via _translate_error on underlying Milvus failures.
+        """
+        if not namespace:
+            return True
+        if namespace in self._known_partitions:
+            return True
+
+        client = self._get_client()
+        try:
+            partitions = await self._run_in_thread(
+                client.list_partitions, self._collection_name
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise self._translate_error(exc, op=op) from exc
+
+        if isinstance(partitions, list):
+            for p in partitions:
+                if isinstance(p, Mapping):
+                    pname = p.get("partition_name")
+                else:
+                    pname = getattr(p, "partition_name", None)
+                if pname:
+                    self._known_partitions.add(str(pname))
+
+        return namespace in self._known_partitions
+
+    def _build_filter_expression(self, filters: Dict[str, Any]) -> str:
+        """
+        Translate a dictionary filter into a Milvus boolean expression.
+
+        Assumes Milvus 2.3+ JSON field capabilities where self._metadata_field
+        is a JSON field.
+
+        Supported operators:
+            - Logical: $and, $or, $not
+            - Comparison: $eq, $ne, $gt, $gte, $lt, $lte, $in, $nin
+            - Implicit equality: {"color": "red"}
+
+        Example Input:
+            {"category": "shoes", "price": {"$lt": 100}}
+
+        Example Output:
+            (metadata["category"] == "shoes") and (metadata["price"] < 100)
+        """
+        if not filters:
+            return ""
+
+        if not self._metadata_field:
+            raise NotSupported(
+                "Metadata filtering requires a configured `metadata_field`",
+                code="BAD_CONFIG",
+            )
+
+        conditions: List[str] = []
+
+        for key, value in filters.items():
+            # 1. Logical operators ($and, $or, $not)
+            if key == "$and":
+                if not isinstance(value, list):
+                    raise BadRequest("$and value must be a list")
+                sub_conds = [self._build_filter_expression(f) for f in value]
+                sub_conds = [c for c in sub_conds if c]
+                if sub_conds:
+                    conditions.append(f"({' and '.join(sub_conds)})")
+                continue
+
+            if key == "$or":
+                if not isinstance(value, list):
+                    raise BadRequest("$or value must be a list")
+                sub_conds = [self._build_filter_expression(f) for f in value]
+                sub_conds = [c for c in sub_conds if c]
+                if sub_conds:
+                    conditions.append(f"({' or '.join(sub_conds)})")
+                continue
+
+            if key == "$not":
+                if not isinstance(value, dict):
+                    raise BadRequest("$not value must be a dict")
+                sub_cond = self._build_filter_expression(value)
+                if sub_cond:
+                    conditions.append(f"not ({sub_cond})")
+                continue
+
+            # 2. Field access: metadata["field_name"]
+            milvus_field = f'{self._metadata_field}["{key}"]'
+
+            # 3. Comparison operators or implicit equality
+            if isinstance(value, dict):
+                for op, op_val in value.items():
+                    val_str = json.dumps(op_val)
+
+                    if op == "$eq":
+                        conditions.append(f"{milvus_field} == {val_str}")
+                    elif op == "$ne":
+                        conditions.append(f"{milvus_field} != {val_str}")
+                    elif op == "$gt":
+                        conditions.append(f"{milvus_field} > {val_str}")
+                    elif op == "$gte":
+                        conditions.append(f"{milvus_field} >= {val_str}")
+                    elif op == "$lt":
+                        conditions.append(f"{milvus_field} < {val_str}")
+                    elif op == "$lte":
+                        conditions.append(f"{milvus_field} <= {val_str}")
+                    elif op == "$in":
+                        conditions.append(f"{milvus_field} in {val_str}")
+                    elif op == "$nin":
+                        conditions.append(f"{milvus_field} not in {val_str}")
+                    else:
+                        # Unsupported operator; fail clearly.
+                        raise BadRequest(f"unsupported filter operator: {op}")
+            else:
+                # Implicit equality: {"color": "red"}
+                val_str = json.dumps(value)
+                conditions.append(f"{milvus_field} == {val_str}")
+
+        return " and ".join(c for c in conditions if c)
+
     # ------------------------------------------------------------------ #
     # BaseVectorAdapter backend hooks
     # ------------------------------------------------------------------ #
@@ -426,20 +576,24 @@ class MilvusVectorAdapter(BaseVectorAdapter):
         """
         Report Milvus-backed capabilities.
 
-        Note:
-            - `max_dimensions` is taken from configuration (if provided).
-            - `max_batch_size` is a soft planning hint, but we also enforce it
-              as a hard limit on upsert/delete batches to protect the backend.
-            - Metadata filtering is currently not supported by this adapter.
+        Notes:
+            - `max_dimensions` is set to 0 to avoid double-enforcement in the
+              BaseVectorAdapter; dimensionality is enforced explicitly in
+              this adapter using the configured `dimensions`.
+            - `max_batch_size` is advertised here and enforced by
+              BaseVectorAdapter for upsert/delete requests before they reach
+              this backend hook.
+            - Metadata filtering is supported via JSON expressions over the
+              configured metadata_field.
         """
         version = getattr(pymilvus, "__version__", "unknown") if pymilvus else "unknown"
         return VectorCapabilities(
             server="milvus",
             version=version,
-            max_dimensions=self._dimensions or 0,
+            max_dimensions=0,  # explicit per-namespace dimension checks are handled here
             supported_metrics=(self._metric,),
             supports_namespaces=True,  # mapped to partitions
-            supports_metadata_filtering=False,
+            supports_metadata_filtering=True,
             supports_batch_operations=True,
             max_batch_size=self._max_batch_size or None,
             supports_index_management=False,  # collection lifecycle managed externally
@@ -447,7 +601,7 @@ class MilvusVectorAdapter(BaseVectorAdapter):
             supports_multi_tenant=False,
             supports_deadline=True,
             max_top_k=self._max_top_k or None,
-            max_filter_terms=None,  # filtering not supported
+            max_filter_terms=self._max_filter_terms,
             text_storage_strategy=self._text_storage_strategy,
             max_text_length=None,
             supports_batch_queries=True,  # adapter fan-out
@@ -486,22 +640,39 @@ class MilvusVectorAdapter(BaseVectorAdapter):
                 },
             )
 
-        # Metadata filtering is not yet supported.
+        # Build metadata filter expression if provided.
+        filter_expr = ""
         if spec.filter:
-            raise NotSupported(
-                "metadata filtering is not supported by MilvusVectorAdapter",
-                code="NOT_SUPPORTED",
-                details={"op": "query"},
-            )
+            try:
+                filter_expr = self._build_filter_expression(spec.filter)
+            except VectorAdapterError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                raise BadRequest(
+                    f"Invalid filter expression: {e}",
+                    details={"filter": spec.filter},
+                )
 
-        # Returning full vectors on query is not supported for now.
-        if spec.include_vectors:
-            raise NotSupported(
-                "include_vectors is not supported by MilvusVectorAdapter "
-                "(Milvus search does not return vectors by default)",
-                code="NOT_SUPPORTED",
-                details={"op": "query"},
+        # Namespace existence & readiness semantics:
+        # - Unknown namespace -> BadRequest (non-retryable client error)
+        # - Known namespace with no data -> IndexNotReady (retryable)
+        if spec.namespace:
+            namespace_known = await self._ensure_namespace_known(
+                spec.namespace, op="query"
             )
+            if not namespace_known:
+                raise BadRequest(
+                    f"unknown namespace '{spec.namespace}'",
+                    details={"namespace": spec.namespace},
+                )
+            if spec.namespace not in self._namespaces_with_data:
+                # Namespace exists as a partition, but this adapter has not
+                # observed any successful upserts into it yet.
+                raise IndexNotReady(
+                    "index not ready (no data in namespace)",
+                    retry_after_ms=500,
+                    details={"namespace": spec.namespace},
+                )
 
         search_params: Dict[str, Any] = {
             "metric_type": self._milvus_metric_type,
@@ -522,7 +693,15 @@ class MilvusVectorAdapter(BaseVectorAdapter):
         output_fields = [self._id_field]
         if spec.include_metadata and self._metadata_field:
             output_fields.append(self._metadata_field)
+        # Support include_vectors by requesting the vector field when available.
+        if spec.include_vectors:
+            output_fields.append(self._vector_field)
         kwargs["output_fields"] = output_fields
+
+        # Attach scalar filter expression if any.
+        if filter_expr:
+            # MilvusClient.search uses `filter` for scalar conditions.
+            kwargs["filter"] = filter_expr
 
         try:
             # MilvusClient.search returns a list of hits per query vector.
@@ -548,6 +727,8 @@ class MilvusVectorAdapter(BaseVectorAdapter):
                 }
                 if self._metadata_field:
                     row[self._metadata_field] = getattr(h, self._metadata_field, None)
+                if spec.include_vectors:
+                    row[self._vector_field] = getattr(h, self._vector_field, None)
 
             vid = row.get(self._id_field)
             if vid is None:
@@ -559,8 +740,15 @@ class MilvusVectorAdapter(BaseVectorAdapter):
                 raw_distance = h.get("distance", 0.0)
             sim, dist = self._convert_score(float(raw_distance or 0.0))
 
-            # We don't return vectors on query for now; see include_vectors notes.
+            # Populate vector values if requested and available.
             values: Sequence[float] = []
+            if spec.include_vectors:
+                raw_vec = row.get(self._vector_field)
+                if isinstance(raw_vec, (list, tuple)):
+                    try:
+                        values = [float(x) for x in raw_vec]
+                    except Exception:
+                        values = []
 
             if spec.include_metadata and self._metadata_field:
                 meta = row.get(self._metadata_field)
@@ -569,7 +757,7 @@ class MilvusVectorAdapter(BaseVectorAdapter):
 
             vector = Vector(
                 id=str(vid),
-                vector=list(values) if values else [],
+                vector=list(values) if spec.include_vectors else [],
                 metadata=meta,
                 namespace=spec.namespace,
                 text=None,
@@ -652,34 +840,27 @@ class MilvusVectorAdapter(BaseVectorAdapter):
     ) -> UpsertResult:
         client = self._get_client()
 
-        # Enforce batch size ceiling if configured.
-        if self._max_batch_size and len(spec.vectors) > self._max_batch_size:
-            raise BadRequest(
-                f"upsert batch size {len(spec.vectors)} exceeds maximum of {self._max_batch_size}",
-                code="BATCH_TOO_LARGE",
-                details={
-                    "max_batch_size": self._max_batch_size,
-                    "provided": len(spec.vectors),
-                    "suggested_batch_reduction": self._max_batch_size,
-                    "namespace": spec.namespace,
-                },
-            )
+        # Per-item dimensionality check with partial failures.
+        failures: List[Dict[str, Any]] = []
+        rows: List[Dict[str, Any]] = []
 
-        if self._dimensions:
-            for v in spec.vectors:
-                if len(v.vector) != self._dimensions:
-                    raise DimensionMismatch(
-                        f"vector dimension {len(v.vector)} does not match configured "
-                        f"dimensions {self._dimensions}",
-                        details={
+        for index, v in enumerate(spec.vectors):
+            if self._dimensions and len(v.vector) != self._dimensions:
+                failures.append(
+                    {
+                        "id": str(v.id),
+                        "index": index,
+                        "code": "DIMENSION_MISMATCH",
+                        "message": f"expected {self._dimensions}, got {len(v.vector)}",
+                        "details": {
                             "expected": self._dimensions,
                             "actual": len(v.vector),
                             "namespace": spec.namespace,
                         },
-                    )
+                    }
+                )
+                continue
 
-        rows: List[Dict[str, Any]] = []
-        for v in spec.vectors:
             row: Dict[str, Any] = {
                 self._id_field: str(v.id),
                 self._vector_field: [float(x) for x in v.vector],
@@ -696,25 +877,31 @@ class MilvusVectorAdapter(BaseVectorAdapter):
         if spec.namespace:
             kwargs["partition_name"] = spec.namespace
 
-        try:
-            resp = await self._run_in_thread(client.insert, **kwargs)
-        except Exception as exc:  # noqa: BLE001
-            raise self._translate_error(exc, op="upsert") from exc
-
-        # Milvus insert returns ids and insert count; we primarily care about count.
         upserted = 0
-        if isinstance(resp, Mapping):
+        if rows:
             try:
-                upserted = int(resp.get("insert_count", 0) or 0)
-            except Exception:  # pragma: no cover - defensive
-                upserted = 0
-        if upserted <= 0:
-            upserted = len(spec.vectors)
+                resp = await self._run_in_thread(client.insert, **kwargs)
+            except Exception as exc:  # noqa: BLE001
+                raise self._translate_error(exc, op="upsert") from exc
+
+            # Milvus insert returns ids and insert count; we primarily care about count.
+            if isinstance(resp, Mapping):
+                try:
+                    upserted = int(resp.get("insert_count", 0) or 0)
+                except Exception:  # pragma: no cover - defensive
+                    upserted = 0
+            if upserted <= 0:
+                upserted = len(rows)
+
+            # Track that this namespace has data and is known.
+            if spec.namespace:
+                self._namespaces_with_data.add(spec.namespace)
+                self._known_partitions.add(spec.namespace)
 
         return UpsertResult(
             upserted_count=upserted,
-            failed_count=0,
-            failures=[],
+            failed_count=len(failures),
+            failures=failures,
         )
 
     # ------------------------------ delete --------------------------------- #
@@ -727,43 +914,128 @@ class MilvusVectorAdapter(BaseVectorAdapter):
     ) -> DeleteResult:
         client = self._get_client()
 
-        # We currently support delete-by-id; delete-by-filter on metadata is not
-        # implemented for Milvus due to the complexity of generic expression
-        # generation over arbitrary metadata.
-        if spec.filter:
-            raise NotSupported(
-                "delete by metadata filter is not supported by MilvusVectorAdapter",
-                code="NOT_SUPPORTED",
-                details={"op": "delete"},
+        # Namespace existence semantics for delete:
+        # Unknown namespace -> BadRequest.
+        if spec.namespace:
+            namespace_known = await self._ensure_namespace_known(
+                spec.namespace, op="delete"
             )
+            if not namespace_known:
+                raise BadRequest(
+                    f"unknown namespace '{spec.namespace}'",
+                    details={"namespace": spec.namespace},
+                )
 
         kwargs: Dict[str, Any] = {"collection_name": self._collection_name}
-        targeted = 0
+        deleted_count = 0
+
+        # Determine expression and deleted_count.
         if spec.ids:
-            # Enforce batch size ceiling if configured.
-            if self._max_batch_size and len(spec.ids) > self._max_batch_size:
-                raise BadRequest(
-                    f"delete batch size {len(spec.ids)} exceeds maximum of {self._max_batch_size}",
-                    code="BATCH_TOO_LARGE",
-                    details={
-                        "max_batch_size": self._max_batch_size,
-                        "provided": len(spec.ids),
-                        "suggested_batch_reduction": self._max_batch_size,
-                        "namespace": spec.namespace,
-                    },
+            # Determine which IDs actually exist so deleted_count reflects reality
+            # and delete operations are idempotent for missing IDs.
+            id_strings = [str(i) for i in spec.ids]
+            id_list_expr = ",".join(f'"{i}"' for i in id_strings)
+            query_expr = f'{self._id_field} in [{id_list_expr}]'
+
+            query_kwargs: Dict[str, Any] = {
+                "collection_name": self._collection_name,
+                "expr": query_expr,
+                "output_fields": [self._id_field],
+            }
+            if spec.namespace:
+                query_kwargs["partition_names"] = [spec.namespace]
+
+            try:
+                existing_rows = await self._run_in_thread(client.query, **query_kwargs)
+            except Exception as exc:  # noqa: BLE001
+                raise self._translate_error(exc, op="delete") from exc
+
+            existing_ids: List[str] = []
+            if isinstance(existing_rows, list):
+                for row in existing_rows:
+                    if isinstance(row, Mapping):
+                        rid = row.get(self._id_field)
+                    else:
+                        rid = getattr(row, self._id_field, None)
+                    if rid is not None:
+                        existing_ids.append(str(rid))
+
+            if not existing_ids:
+                # Nothing to delete; skip the delete call entirely.
+                return DeleteResult(
+                    deleted_count=0,
+                    failed_count=0,
+                    failures=[],
                 )
-            # Build a boolean expression on the primary key field.
-            # Example: id in ["a","b","c"]
-            id_list = ",".join(f'"{str(i)}"' for i in spec.ids)
-            expr = f'{self._id_field} in [{id_list}]'
-            kwargs["expr"] = expr
-            targeted = len(spec.ids)
+
+            existing_expr = ",".join(f'"{i}"' for i in existing_ids)
+            expr = f'{self._id_field} in [{existing_expr}]'
+            deleted_count = len(existing_ids)
+        elif spec.filter:
+            # Delete by metadata filter: translate filter, query first to determine
+            # which IDs exist, then delete using the same filter expression.
+            try:
+                filter_expr = self._build_filter_expression(spec.filter)
+            except VectorAdapterError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                raise BadRequest(
+                    f"Invalid filter for delete: {e}",
+                    details={"filter": spec.filter},
+                )
+
+            if not filter_expr:
+                return DeleteResult(
+                    deleted_count=0,
+                    failed_count=0,
+                    failures=[],
+                )
+
+            query_kwargs: Dict[str, Any] = {
+                "collection_name": self._collection_name,
+                "expr": filter_expr,
+                "output_fields": [self._id_field],
+            }
+            if spec.namespace:
+                query_kwargs["partition_names"] = [spec.namespace]
+
+            try:
+                existing_rows = await self._run_in_thread(client.query, **query_kwargs)
+            except Exception as exc:  # noqa: BLE001
+                raise self._translate_error(exc, op="delete") from exc
+
+            existing_ids: List[str] = []
+            if isinstance(existing_rows, list):
+                for row in existing_rows:
+                    if isinstance(row, Mapping):
+                        rid = row.get(self._id_field)
+                    else:
+                        rid = getattr(row, self._id_field, None)
+                    if rid is not None:
+                        existing_ids.append(str(rid))
+
+            if not existing_ids:
+                return DeleteResult(
+                    deleted_count=0,
+                    failed_count=0,
+                    failures=[],
+                )
+
+            # Use the same filter expression for the delete call.
+            expr = filter_expr
+            deleted_count = len(existing_ids)
         else:
             # BaseVectorAdapter should already enforce ids|filter presence.
-            raise BadRequest("must provide either ids or filter for deletion", code="BAD_REQUEST")
+            raise BadRequest(
+                "must provide either ids or filter for deletion",
+                code="BAD_REQUEST",
+            )
 
         if spec.namespace:
             kwargs["partition_name"] = spec.namespace
+
+        # MilvusClient.delete uses `filter` for scalar conditions.
+        kwargs["filter"] = expr
 
         try:
             await self._run_in_thread(client.delete, **kwargs)
@@ -771,7 +1043,7 @@ class MilvusVectorAdapter(BaseVectorAdapter):
             raise self._translate_error(exc, op="delete") from exc
 
         return DeleteResult(
-            deleted_count=targeted,
+            deleted_count=deleted_count,
             failed_count=0,
             failures=[],
         )
@@ -825,7 +1097,9 @@ class MilvusVectorAdapter(BaseVectorAdapter):
                 else:
                     pname = getattr(p, "partition_name", None)
                 if pname:
-                    existing_names.add(str(pname))
+                    pname_str = str(pname)
+                    existing_names.add(pname_str)
+                    self._known_partitions.add(pname_str)
 
         created = False
         if spec.namespace not in existing_names:
@@ -836,8 +1110,13 @@ class MilvusVectorAdapter(BaseVectorAdapter):
                     partition_name=spec.namespace,
                 )
                 created = True
+                # Track partition as known.
+                self._known_partitions.add(spec.namespace)
             except Exception as exc:  # noqa: BLE001
                 raise self._translate_error(exc, op="create_namespace") from exc
+        else:
+            # Already exists; ensure tracking is up to date.
+            self._known_partitions.add(spec.namespace)
 
         return NamespaceResult(
             success=True,
@@ -877,6 +1156,10 @@ class MilvusVectorAdapter(BaseVectorAdapter):
                 existed = False
             else:
                 raise err
+
+        # Keep local tracking in sync: namespace is no longer present or has no data.
+        self._known_partitions.discard(namespace)
+        self._namespaces_with_data.discard(namespace)
 
         return NamespaceResult(
             success=True,
@@ -936,12 +1219,15 @@ class MilvusVectorAdapter(BaseVectorAdapter):
                         pname = getattr(p, "partition_name", None)
                     if not pname:
                         continue
-                    namespaces[str(pname)] = {
+                    pname_str = str(pname)
+                    namespaces[pname_str] = {
                         "dimensions": self._dimensions,
                         "metric": self._metric,
                         "count": None,  # unknown per-partition count
                         "status": "ok",
                     }
+                    # Keep internal tracking aligned with observed partitions.
+                    self._known_partitions.add(pname_str)
 
             # Also provide an aggregate "*" namespace summary.
             namespaces.setdefault(
