@@ -7,18 +7,18 @@ LangChain adapter for Corpus Graph protocol.
 This module exposes a Corpus `GraphProtocolV1` implementation as a
 LangChain-friendly client, with:
 
-- Sync + async query APIs (mirroring the vector/LLM patterns)
+- Sync + async query APIs
 - Sync + async streaming query APIs
 - Proper integration with Corpus GraphProtocolV1
-- Namespace-aware behavior and OperationContext propagation
+- OperationContext propagation derived from LangChain config / metadata
 - Error-context enrichment for observability and debugging
 - Orchestration, translation, and async→sync bridging via GraphTranslator
 
 Design philosophy
 -----------------
 - Protocol-first: LangChain is a thin skin over the Corpus graph adapter.
-- All heavy lifting (deadlines, breaker, rate-limiter, caching) lives in
-  the underlying `BaseGraphAdapter` / `GraphProtocolV1` implementation.
+- All heavy lifting (deadlines, breakers, rate limiting, caching, etc.) lives
+  in the underlying `BaseGraphAdapter` / `GraphProtocolV1` implementation.
 - This layer focuses on:
     * Translating LangChain RunnableConfig / config → OperationContext
     * Building raw query / mutation shapes for GraphTranslator
@@ -42,7 +42,7 @@ Non-responsibilities
 from __future__ import annotations
 
 import logging
-from functools import cached_property, wraps
+from functools import cached_property
 from typing import (
     Any,
     AsyncIterator,
@@ -54,7 +54,6 @@ from typing import (
     Protocol,
     TypeVar,
     Callable,
-    cast,
 )
 
 from corpus_sdk.core.context_translation import (
@@ -64,6 +63,15 @@ from corpus_sdk.core.error_context import attach_context
 from corpus_sdk.graph.framework_adapters.common.graph_translation import (
     DefaultGraphFrameworkTranslator,
     GraphTranslator,
+    create_graph_translator,
+)
+from corpus_sdk.graph.framework_adapters.common.framework_utils import (
+    create_graph_error_context_decorator,
+    graph_capabilities_to_dict,
+    validate_graph_result_type,
+    validate_graph_query,
+    validate_upsert_nodes_spec,
+    validate_batch_operations,
 )
 from corpus_sdk.graph.graph_base import (
     BadRequest,
@@ -88,9 +96,9 @@ logger = logging.getLogger(__name__)
 
 # Type variables for decorators
 T = TypeVar("T")
-R = TypeVar("R")
 
-# Error code constants
+
+# Error code constants (flat, framework-specific)
 class ErrorCodes:
     BAD_OPERATION_CONTEXT = "BAD_OPERATION_CONTEXT"
     BAD_TRANSLATED_SCHEMA = "BAD_TRANSLATED_SCHEMA"
@@ -101,72 +109,49 @@ class ErrorCodes:
     BAD_DELETE_RESULT = "BAD_DELETE_RESULT"
     BAD_BULK_VERTICES_RESULT = "BAD_BULK_VERTICES_RESULT"
     BAD_BATCH_RESULT = "BAD_BATCH_RESULT"
+    BAD_ADAPTER_RESULT = "BAD_ADAPTER_RESULT"
 
 
-def with_error_context(
+# --------------------------------------------------------------------------- #
+# Error-context decorators (centralized via common framework utils)
+# --------------------------------------------------------------------------- #
+
+
+def with_graph_error_context(
     operation: str,
-    **context_kwargs: Any,
+    **static_context: Any,
 ) -> Callable[[Callable[..., T]], Callable[..., T]]:
     """
-    Decorator to automatically attach error context to exceptions.
-    
-    Args:
-        operation: The operation name for error context
-        **context_kwargs: Additional context to attach to errors
+    Decorator for sync methods with rich dynamic context extraction.
+
+    Thin wrapper over the shared `create_graph_error_context_decorator`
+    for the LangChain framework.
     """
-    def decorator(func: Callable[..., T]) -> Callable[..., T]:
-        @wraps(func)
-        def wrapper(*args: Any, **kwargs: Any) -> T:
-            try:
-                return func(*args, **kwargs)
-            except Exception as exc:
-                # Extract additional context from function arguments if needed
-                enhanced_context = context_kwargs.copy()
-                
-                # For query operations, try to extract query info
-                if operation.startswith(("query_", "stream_query_")):
-                    if len(args) > 1 and isinstance(args[1], str):
-                        enhanced_context["query"] = args[1]
-                
-                attach_context(
-                    exc,
-                    framework="langchain",
-                    operation=operation,
-                    **enhanced_context,
-                )
-                raise
-        return wrapper
-    return decorator
+    return create_graph_error_context_decorator(
+        framework="langchain",
+        is_async=False,
+    )(operation=operation, **static_context)
 
 
-def with_async_error_context(
+def with_async_graph_error_context(
     operation: str,
-    **context_kwargs: Any,
+    **static_context: Any,
 ) -> Callable[[Callable[..., T]], Callable[..., T]]:
     """
-    Decorator to automatically attach error context to exceptions in async functions.
+    Decorator for async methods with rich dynamic context extraction.
+
+    Thin wrapper over the shared `create_graph_error_context_decorator`
+    for the LangChain framework.
     """
-    def decorator(func: Callable[..., T]) -> Callable[..., T]:
-        @wraps(func)
-        async def wrapper(*args: Any, **kwargs: Any) -> T:
-            try:
-                return await func(*args, **kwargs)
-            except Exception as exc:
-                enhanced_context = context_kwargs.copy()
-                
-                if operation.startswith(("query_", "stream_query_")):
-                    if len(args) > 1 and isinstance(args[1], str):
-                        enhanced_context["query"] = args[1]
-                
-                attach_context(
-                    exc,
-                    framework="langchain",
-                    operation=operation,
-                    **enhanced_context,
-                )
-                raise
-        return wrapper
-    return decorator
+    return create_graph_error_context_decorator(
+        framework="langchain",
+        is_async=True,
+    )(operation=operation, **static_context)
+
+
+# Backwards-compatible aliases (for older imports)
+with_error_context = with_graph_error_context
+with_async_error_context = with_async_graph_error_context
 
 
 class LangChainGraphClientProtocol(Protocol):
@@ -393,8 +378,8 @@ class CorpusLangChainGraphClient:
 
     This is a thin integration layer that:
 
-    - Translates LangChain `RunnableConfig`-like config mappings into a
-      Corpus `OperationContext` using `core_ctx_from_langchain`.
+    - Translates LangChain config / metadata into a Corpus `OperationContext`
+      using `core_ctx_from_langchain`.
     - Uses `GraphTranslator` (with a LangChain-specific framework translator) to:
         * Build Graph*Spec objects from simple inputs
         * Execute sync + async graph operations
@@ -470,15 +455,34 @@ class CorpusLangChainGraphClient:
         graph_adapter: GraphProtocolV1,
         default_dialect: Optional[str] = None,
         default_namespace: Optional[str] = None,
-        default_timeout_ms: Optional[int] = None,  # ESSENTIAL CHANGE #1: Configurable timeout
+        default_timeout_ms: Optional[int] = None,
+        framework_version: Optional[str] = None,
     ) -> None:
+        """
+        Initialize a LangChain-oriented graph client.
+
+        Parameters
+        ----------
+        graph_adapter:
+            Underlying `GraphProtocolV1` implementation.
+        default_dialect:
+            Optional default query dialect to use when none is provided per call.
+        default_namespace:
+            Optional default namespace to use when none is provided per call.
+        default_timeout_ms:
+            Optional default per-query timeout in milliseconds. Used when
+            `timeout_ms` is not explicitly passed to query methods.
+        framework_version:
+            Optional framework version string for observability.
+        """
         self._graph: GraphProtocolV1 = graph_adapter
         self._default_dialect: Optional[str] = default_dialect
         self._default_namespace: Optional[str] = default_namespace
-        self._default_timeout_ms: Optional[int] = default_timeout_ms  # Store timeout
+        self._default_timeout_ms: Optional[int] = default_timeout_ms
+        self._framework_version: Optional[str] = framework_version
 
     # ------------------------------------------------------------------ #
-    # ESSENTIAL CHANGE #2: Resource Management (Context Managers)
+    # Resource Management (Context Managers)
     # ------------------------------------------------------------------ #
 
     def __enter__(self) -> CorpusLangChainGraphClient:
@@ -487,7 +491,7 @@ class CorpusLangChainGraphClient:
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         """Clean up resources when exiting context."""
-        if hasattr(self._graph, 'close'):
+        if hasattr(self._graph, "close"):
             self._graph.close()
 
     async def __aenter__(self) -> CorpusLangChainGraphClient:
@@ -496,11 +500,11 @@ class CorpusLangChainGraphClient:
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         """Clean up resources when exiting async context."""
-        if hasattr(self._graph, 'aclose'):
+        if hasattr(self._graph, "aclose"):
             await self._graph.aclose()
 
     # ------------------------------------------------------------------ #
-    # Translator (lazy, cached) – mirrors AutoGen / CrewAI adapter pattern
+    # Translator (lazy, cached) – mirrors CrewAI adapter pattern
     # ------------------------------------------------------------------ #
 
     @cached_property
@@ -508,10 +512,11 @@ class CorpusLangChainGraphClient:
         """
         Lazily construct and cache the `GraphTranslator`.
 
-        Uses `cached_property` for thread safety and performance.
+        Uses `cached_property` for thread safety and performance, mirroring
+        the CrewAI adapter patterns.
         """
         framework_translator = self._LangChainGraphFrameworkTranslator()
-        return GraphTranslator(
+        return create_graph_translator(
             adapter=self._graph,
             framework="langchain",
             translator=framework_translator,
@@ -538,7 +543,7 @@ class CorpusLangChainGraphClient:
         If both are None/empty, returns None and lets downstream helpers
         construct an "empty" OperationContext as needed.
         """
-        extra: Dict[str, Any] = dict(extra_context or {})
+        extra = dict(extra_context or {})
 
         if config is None and not extra:
             return None
@@ -546,6 +551,7 @@ class CorpusLangChainGraphClient:
         try:
             ctx = core_ctx_from_langchain(
                 config,
+                framework_version=self._framework_version,
                 **extra,
             )
         except Exception as exc:
@@ -563,38 +569,6 @@ class CorpusLangChainGraphClient:
             )
 
         return ctx
-
-    @staticmethod
-    def _validate_query(query: str) -> None:
-        """
-        Validate that a query string is non-empty and of the correct type.
-        """
-        if not isinstance(query, str) or not query.strip():
-            raise BadRequest("query must be a non-empty string")
-
-    # ------------------------------------------------------------------ #
-    # ESSENTIAL CHANGE #3: Enhanced Input Validation
-    # ------------------------------------------------------------------ #
-
-    def _validate_upsert_spec(self, spec: UpsertNodesSpec) -> None:
-        """Validate upsert specification before processing."""
-        if not spec.nodes:
-            raise BadRequest("UpsertNodesSpec must contain at least one node")
-        
-        for node in spec.nodes:
-            if not node.id:
-                raise BadRequest("All nodes must have an ID")
-
-    def _validate_batch_ops(self, ops: List[BatchOperation]) -> None:
-        """Validate batch operations before processing."""
-        if not ops:
-            raise BadRequest("Batch operations list cannot be empty")
-        
-        # Check against graph capabilities if available
-        caps = self._graph.capabilities()
-        max_ops = caps.max_batch_ops or 100
-        if len(ops) > max_ops:
-            raise BadRequest(f"Too many batch operations: {len(ops)} (max: {max_ops})")
 
     def _build_raw_query(
         self,
@@ -621,7 +595,7 @@ class CorpusLangChainGraphClient:
         """
         effective_dialect = dialect or self._default_dialect
         effective_namespace = namespace or self._default_namespace
-        effective_timeout = timeout_ms or self._default_timeout_ms  # Use default timeout
+        effective_timeout = timeout_ms or self._default_timeout_ms
 
         raw: Dict[str, Any] = {
             "text": query,
@@ -633,7 +607,7 @@ class CorpusLangChainGraphClient:
             raw["dialect"] = effective_dialect
         if effective_namespace is not None:
             raw["namespace"] = effective_namespace
-        if effective_timeout is not None:  # Include timeout if specified
+        if effective_timeout is not None:
             raw["timeout_ms"] = int(effective_timeout)
 
         return raw
@@ -649,62 +623,20 @@ class CorpusLangChainGraphClient:
         effective_namespace = namespace or self._default_namespace
         return {"namespace": effective_namespace} if effective_namespace is not None else {}
 
-    def _validate_result_type(
-        self,
-        result: Any,
-        expected_type: type[T],
-        operation: str,
-        error_code: str,
-    ) -> T:
-        """
-        Validate that a result is of the expected type.
-        
-        Args:
-            result: The result to validate
-            expected_type: The expected type
-            operation: Operation name for error message
-            error_code: Error code for BadRequest
-            
-        Returns:
-            The validated result cast to expected type
-        """
-        if not isinstance(result, expected_type):
-            raise BadRequest(
-                f"{operation} returned unsupported type: {type(result).__name__}",
-                code=error_code,
-            )
-        return cast(T, result)
-
     # ------------------------------------------------------------------ #
     # Capabilities / schema / health
     # ------------------------------------------------------------------ #
 
-    @with_error_context("capabilities_sync")
+    @with_graph_error_context("capabilities_sync")
     def capabilities(self) -> Mapping[str, Any]:
         """
         Sync wrapper around capabilities, delegating async→sync bridging
         to GraphTranslator.
         """
         caps = self._translator.capabilities()
-        # We normalize to a simple dict for LangChain consumption.
-        return {
-            "server": caps.server,
-            "version": caps.version,
-            "protocol": caps.protocol,
-            "supports_stream_query": caps.supports_stream_query,
-            "supported_query_dialects": list(caps.supported_query_dialects or ()),
-            "supports_namespaces": caps.supports_namespaces,
-            "supports_property_filters": caps.supports_property_filters,
-            "supports_bulk_vertices": caps.supports_bulk_vertices,
-            "supports_batch": caps.supports_batch,
-            "supports_schema": caps.supports_schema,
-            "idempotent_writes": caps.idempotent_writes,
-            "supports_multi_tenant": caps.supports_multi_tenant,
-            "supports_deadline": caps.supports_deadline,
-            "max_batch_ops": caps.max_batch_ops,
-        }
+        return graph_capabilities_to_dict(caps)
 
-    @with_async_error_context("capabilities_async")
+    @with_async_graph_error_context("capabilities_async")
     async def acapabilities(self) -> Mapping[str, Any]:
         """
         Async capabilities accessor.
@@ -713,24 +645,9 @@ class CorpusLangChainGraphClient:
         simple dict for LangChain consumption.
         """
         caps = await self._translator.arun_capabilities()
-        return {
-            "server": caps.server,
-            "version": caps.version,
-            "protocol": caps.protocol,
-            "supports_stream_query": caps.supports_stream_query,
-            "supported_query_dialects": list(caps.supported_query_dialects or ()),
-            "supports_namespaces": caps.supports_namespaces,
-            "supports_property_filters": caps.supports_property_filters,
-            "supports_bulk_vertices": caps.supports_bulk_vertices,
-            "supports_batch": caps.supports_batch,
-            "supports_schema": caps.supports_schema,
-            "idempotent_writes": caps.idempotent_writes,
-            "supports_multi_tenant": caps.supports_multi_tenant,
-            "supports_deadline": caps.supports_deadline,
-            "max_batch_ops": caps.max_batch_ops,
-        }
+        return graph_capabilities_to_dict(caps)
 
-    @with_error_context("get_schema_sync")
+    @with_graph_error_context("get_schema_sync")
     def get_schema(
         self,
         *,
@@ -748,14 +665,14 @@ class CorpusLangChainGraphClient:
             op_ctx=ctx,
             framework_ctx={},
         )
-        return self._validate_result_type(
+        return validate_graph_result_type(
             schema,
-            GraphSchema,
-            "GraphTranslator.get_schema",
-            ErrorCodes.BAD_TRANSLATED_SCHEMA,
+            expected_type=GraphSchema,
+            operation="GraphTranslator.get_schema",
+            error_code=ErrorCodes.BAD_TRANSLATED_SCHEMA,
         )
 
-    @with_async_error_context("get_schema_async")
+    @with_async_graph_error_context("get_schema_async")
     async def aget_schema(
         self,
         *,
@@ -772,14 +689,14 @@ class CorpusLangChainGraphClient:
             op_ctx=ctx,
             framework_ctx={},
         )
-        return self._validate_result_type(
+        return validate_graph_result_type(
             schema,
-            GraphSchema,
-            "GraphTranslator.arun_get_schema",
-            ErrorCodes.BAD_TRANSLATED_SCHEMA,
+            expected_type=GraphSchema,
+            operation="GraphTranslator.arun_get_schema",
+            error_code=ErrorCodes.BAD_TRANSLATED_SCHEMA,
         )
 
-    @with_error_context("health_sync")
+    @with_graph_error_context("health_sync")
     def health(
         self,
         *,
@@ -796,14 +713,14 @@ class CorpusLangChainGraphClient:
             op_ctx=ctx,
             framework_ctx={},
         )
-        return self._validate_result_type(
+        return validate_graph_result_type(
             health_result,
-            Mapping,
-            "GraphTranslator.health",
-            ErrorCodes.BAD_HEALTH_RESULT,
+            expected_type=Mapping,
+            operation="GraphTranslator.health",
+            error_code=ErrorCodes.BAD_HEALTH_RESULT,
         )
 
-    @with_async_error_context("health_async")
+    @with_async_graph_error_context("health_async")
     async def ahealth(
         self,
         *,
@@ -820,18 +737,18 @@ class CorpusLangChainGraphClient:
             op_ctx=ctx,
             framework_ctx={},
         )
-        return self._validate_result_type(
+        return validate_graph_result_type(
             health_result,
-            Mapping,
-            "GraphTranslator.arun_health",
-            ErrorCodes.BAD_HEALTH_RESULT,
+            expected_type=Mapping,
+            operation="GraphTranslator.arun_health",
+            error_code=ErrorCodes.BAD_HEALTH_RESULT,
         )
 
     # ------------------------------------------------------------------ #
     # Query (sync + async)
     # ------------------------------------------------------------------ #
 
-    @with_error_context("query_sync")
+    @with_graph_error_context("query_sync")
     def query(
         self,
         query: str,
@@ -848,7 +765,7 @@ class CorpusLangChainGraphClient:
 
         Returns the underlying `QueryResult` from the GraphProtocol adapter.
         """
-        self._validate_query(query)
+        validate_graph_query(query)
 
         ctx = self._build_ctx(config=config, extra_context=extra_context)
         raw_query = self._build_raw_query(
@@ -867,14 +784,14 @@ class CorpusLangChainGraphClient:
             framework_ctx=framework_ctx,
             mmr_config=None,
         )
-        return self._validate_result_type(
+        return validate_graph_result_type(
             result,
-            QueryResult,
-            "GraphTranslator.query",
-            ErrorCodes.BAD_TRANSLATED_RESULT,
+            expected_type=QueryResult,
+            operation="GraphTranslator.query",
+            error_code=ErrorCodes.BAD_TRANSLATED_RESULT,
         )
 
-    @with_async_error_context("query_async")
+    @with_async_graph_error_context("query_async")
     async def aquery(
         self,
         query: str,
@@ -891,7 +808,7 @@ class CorpusLangChainGraphClient:
 
         Returns the underlying `QueryResult`.
         """
-        self._validate_query(query)
+        validate_graph_query(query)
 
         ctx = self._build_ctx(config=config, extra_context=extra_context)
         raw_query = self._build_raw_query(
@@ -910,18 +827,18 @@ class CorpusLangChainGraphClient:
             framework_ctx=framework_ctx,
             mmr_config=None,
         )
-        return self._validate_result_type(
+        return validate_graph_result_type(
             result,
-            QueryResult,
-            "GraphTranslator.arun_query",
-            ErrorCodes.BAD_TRANSLATED_RESULT,
+            expected_type=QueryResult,
+            operation="GraphTranslator.arun_query",
+            error_code=ErrorCodes.BAD_TRANSLATED_RESULT,
         )
 
     # ------------------------------------------------------------------ #
     # Streaming query (sync + async)
     # ------------------------------------------------------------------ #
 
-    @with_error_context("stream_query_sync")
+    @with_graph_error_context("stream_query_sync")
     def stream_query(
         self,
         query: str,
@@ -940,7 +857,7 @@ class CorpusLangChainGraphClient:
         SyncStreamBridge under the hood. This method itself does not use
         any async→sync bridges directly.
         """
-        self._validate_query(query)
+        validate_graph_query(query)
 
         ctx = self._build_ctx(config=config, extra_context=extra_context)
         raw_query = self._build_raw_query(
@@ -958,14 +875,14 @@ class CorpusLangChainGraphClient:
             op_ctx=ctx,
             framework_ctx=framework_ctx,
         ):
-            yield self._validate_result_type(
+            yield validate_graph_result_type(
                 chunk,
-                QueryChunk,
-                "GraphTranslator.query_stream",
-                ErrorCodes.BAD_TRANSLATED_CHUNK,
+                expected_type=QueryChunk,
+                operation="GraphTranslator.query_stream",
+                error_code=ErrorCodes.BAD_TRANSLATED_CHUNK,
             )
 
-    @with_async_error_context("stream_query_async")
+    @with_async_graph_error_context("stream_query_async")
     async def astream_query(
         self,
         query: str,
@@ -980,7 +897,7 @@ class CorpusLangChainGraphClient:
         """
         Execute a streaming graph query (async), yielding `QueryChunk` items.
         """
-        self._validate_query(query)
+        validate_graph_query(query)
 
         ctx = self._build_ctx(config=config, extra_context=extra_context)
         raw_query = self._build_raw_query(
@@ -998,18 +915,18 @@ class CorpusLangChainGraphClient:
             op_ctx=ctx,
             framework_ctx=framework_ctx,
         ):
-            yield self._validate_result_type(
+            yield validate_graph_result_type(
                 chunk,
-                QueryChunk,
-                "GraphTranslator.arun_query_stream",
-                ErrorCodes.BAD_TRANSLATED_CHUNK,
+                expected_type=QueryChunk,
+                operation="GraphTranslator.arun_query_stream",
+                error_code=ErrorCodes.BAD_TRANSLATED_CHUNK,
             )
 
     # ------------------------------------------------------------------ #
     # Upsert nodes / edges (sync + async)
     # ------------------------------------------------------------------ #
 
-    @with_error_context("upsert_nodes_sync")
+    @with_graph_error_context("upsert_nodes_sync")
     def upsert_nodes(
         self,
         spec: UpsertNodesSpec,
@@ -1024,24 +941,26 @@ class CorpusLangChainGraphClient:
         and passes the desired namespace via framework_ctx so that the
         translator can build the correct UpsertNodesSpec.
         """
-        self._validate_upsert_spec(spec)  # ESSENTIAL CHANGE: Added validation
+        validate_upsert_nodes_spec(spec)
 
         ctx = self._build_ctx(config=config, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
+        framework_ctx = self._framework_ctx_for_namespace(
+            getattr(spec, "namespace", None),
+        )
 
         result = self._translator.upsert_nodes(
             spec.nodes,
             op_ctx=ctx,
             framework_ctx=framework_ctx,
         )
-        return self._validate_result_type(
+        return validate_graph_result_type(
             result,
-            UpsertResult,
-            "GraphTranslator.upsert_nodes",
-            ErrorCodes.BAD_UPSERT_RESULT,
+            expected_type=UpsertResult,
+            operation="GraphTranslator.upsert_nodes",
+            error_code=ErrorCodes.BAD_UPSERT_RESULT,
         )
 
-    @with_async_error_context("upsert_nodes_async")
+    @with_async_graph_error_context("upsert_nodes_async")
     async def aupsert_nodes(
         self,
         spec: UpsertNodesSpec,
@@ -1052,24 +971,26 @@ class CorpusLangChainGraphClient:
         """
         Async wrapper for upserting nodes.
         """
-        self._validate_upsert_spec(spec)  # ESSENTIAL CHANGE: Added validation
+        validate_upsert_nodes_spec(spec)
 
         ctx = self._build_ctx(config=config, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
+        framework_ctx = self._framework_ctx_for_namespace(
+            getattr(spec, "namespace", None),
+        )
 
         result = await self._translator.arun_upsert_nodes(
             spec.nodes,
             op_ctx=ctx,
             framework_ctx=framework_ctx,
         )
-        return self._validate_result_type(
+        return validate_graph_result_type(
             result,
-            UpsertResult,
-            "GraphTranslator.arun_upsert_nodes",
-            ErrorCodes.BAD_UPSERT_RESULT,
+            expected_type=UpsertResult,
+            operation="GraphTranslator.arun_upsert_nodes",
+            error_code=ErrorCodes.BAD_UPSERT_RESULT,
         )
 
-    @with_error_context("upsert_edges_sync")
+    @with_graph_error_context("upsert_edges_sync")
     def upsert_edges(
         self,
         spec: UpsertEdgesSpec,
@@ -1081,21 +1002,23 @@ class CorpusLangChainGraphClient:
         Sync wrapper for upserting edges.
         """
         ctx = self._build_ctx(config=config, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
+        framework_ctx = self._framework_ctx_for_namespace(
+            getattr(spec, "namespace", None),
+        )
 
         result = self._translator.upsert_edges(
             spec.edges,
             op_ctx=ctx,
             framework_ctx=framework_ctx,
         )
-        return self._validate_result_type(
+        return validate_graph_result_type(
             result,
-            UpsertResult,
-            "GraphTranslator.upsert_edges",
-            ErrorCodes.BAD_UPSERT_RESULT,
+            expected_type=UpsertResult,
+            operation="GraphTranslator.upsert_edges",
+            error_code=ErrorCodes.BAD_UPSERT_RESULT,
         )
 
-    @with_async_error_context("upsert_edges_async")
+    @with_async_graph_error_context("upsert_edges_async")
     async def aupsert_edges(
         self,
         spec: UpsertEdgesSpec,
@@ -1107,25 +1030,27 @@ class CorpusLangChainGraphClient:
         Async wrapper for upserting edges.
         """
         ctx = self._build_ctx(config=config, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
+        framework_ctx = self._framework_ctx_for_namespace(
+            getattr(spec, "namespace", None),
+        )
 
         result = await self._translator.arun_upsert_edges(
             spec.edges,
             op_ctx=ctx,
             framework_ctx=framework_ctx,
         )
-        return self._validate_result_type(
+        return validate_graph_result_type(
             result,
-            UpsertResult,
-            "GraphTranslator.arun_upsert_edges",
-            ErrorCodes.BAD_UPSERT_RESULT,
+            expected_type=UpsertResult,
+            operation="GraphTranslator.arun_upsert_edges",
+            error_code=ErrorCodes.BAD_UPSERT_RESULT,
         )
 
     # ------------------------------------------------------------------ #
     # Delete nodes / edges (sync + async)
     # ------------------------------------------------------------------ #
 
-    @with_error_context("delete_nodes_sync")
+    @with_graph_error_context("delete_nodes_sync")
     def delete_nodes(
         self,
         spec: DeleteNodesSpec,
@@ -1140,7 +1065,9 @@ class CorpusLangChainGraphClient:
         expression for the GraphTranslator.
         """
         ctx = self._build_ctx(config=config, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
+        framework_ctx = self._framework_ctx_for_namespace(
+            getattr(spec, "namespace", None),
+        )
 
         if spec.filter is not None:
             raw_filter_or_ids: Any = spec.filter
@@ -1152,14 +1079,14 @@ class CorpusLangChainGraphClient:
             op_ctx=ctx,
             framework_ctx=framework_ctx,
         )
-        return self._validate_result_type(
+        return validate_graph_result_type(
             result,
-            DeleteResult,
-            "GraphTranslator.delete_nodes",
-            ErrorCodes.BAD_DELETE_RESULT,
+            expected_type=DeleteResult,
+            operation="GraphTranslator.delete_nodes",
+            error_code=ErrorCodes.BAD_DELETE_RESULT,
         )
 
-    @with_async_error_context("delete_nodes_async")
+    @with_async_graph_error_context("delete_nodes_async")
     async def adelete_nodes(
         self,
         spec: DeleteNodesSpec,
@@ -1171,7 +1098,9 @@ class CorpusLangChainGraphClient:
         Async wrapper for deleting nodes.
         """
         ctx = self._build_ctx(config=config, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
+        framework_ctx = self._framework_ctx_for_namespace(
+            getattr(spec, "namespace", None),
+        )
 
         if spec.filter is not None:
             raw_filter_or_ids: Any = spec.filter
@@ -1183,14 +1112,14 @@ class CorpusLangChainGraphClient:
             op_ctx=ctx,
             framework_ctx=framework_ctx,
         )
-        return self._validate_result_type(
+        return validate_graph_result_type(
             result,
-            DeleteResult,
-            "GraphTranslator.arun_delete_nodes",
-            ErrorCodes.BAD_DELETE_RESULT,
+            expected_type=DeleteResult,
+            operation="GraphTranslator.arun_delete_nodes",
+            error_code=ErrorCodes.BAD_DELETE_RESULT,
         )
 
-    @with_error_context("delete_edges_sync")
+    @with_graph_error_context("delete_edges_sync")
     def delete_edges(
         self,
         spec: DeleteEdgesSpec,
@@ -1202,7 +1131,9 @@ class CorpusLangChainGraphClient:
         Sync wrapper for deleting edges.
         """
         ctx = self._build_ctx(config=config, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
+        framework_ctx = self._framework_ctx_for_namespace(
+            getattr(spec, "namespace", None),
+        )
 
         if spec.filter is not None:
             raw_filter_or_ids: Any = spec.filter
@@ -1214,14 +1145,14 @@ class CorpusLangChainGraphClient:
             op_ctx=ctx,
             framework_ctx=framework_ctx,
         )
-        return self._validate_result_type(
+        return validate_graph_result_type(
             result,
-            DeleteResult,
-            "GraphTranslator.delete_edges",
-            ErrorCodes.BAD_DELETE_RESULT,
+            expected_type=DeleteResult,
+            operation="GraphTranslator.delete_edges",
+            error_code=ErrorCodes.BAD_DELETE_RESULT,
         )
 
-    @with_async_error_context("delete_edges_async")
+    @with_async_graph_error_context("delete_edges_async")
     async def adelete_edges(
         self,
         spec: DeleteEdgesSpec,
@@ -1233,7 +1164,9 @@ class CorpusLangChainGraphClient:
         Async wrapper for deleting edges.
         """
         ctx = self._build_ctx(config=config, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(getattr(spec, "namespace", None))
+        framework_ctx = self._framework_ctx_for_namespace(
+            getattr(spec, "namespace", None),
+        )
 
         if spec.filter is not None:
             raw_filter_or_ids: Any = spec.filter
@@ -1245,18 +1178,18 @@ class CorpusLangChainGraphClient:
             op_ctx=ctx,
             framework_ctx=framework_ctx,
         )
-        return self._validate_result_type(
+        return validate_graph_result_type(
             result,
-            DeleteResult,
-            "GraphTranslator.arun_delete_edges",
-            ErrorCodes.BAD_DELETE_RESULT,
+            expected_type=DeleteResult,
+            operation="GraphTranslator.arun_delete_edges",
+            error_code=ErrorCodes.BAD_DELETE_RESULT,
         )
 
     # ------------------------------------------------------------------ #
     # Bulk vertices (sync + async)
     # ------------------------------------------------------------------ #
 
-    @with_error_context("bulk_vertices_sync")
+    @with_graph_error_context("bulk_vertices_sync")
     def bulk_vertices(
         self,
         spec: BulkVerticesSpec,
@@ -1286,14 +1219,14 @@ class CorpusLangChainGraphClient:
             op_ctx=ctx,
             framework_ctx=framework_ctx,
         )
-        return self._validate_result_type(
+        return validate_graph_result_type(
             result,
-            BulkVerticesResult,
-            "GraphTranslator.bulk_vertices",
-            ErrorCodes.BAD_BULK_VERTICES_RESULT,
+            expected_type=BulkVerticesResult,
+            operation="GraphTranslator.bulk_vertices",
+            error_code=ErrorCodes.BAD_BULK_VERTICES_RESULT,
         )
 
-    @with_async_error_context("bulk_vertices_async")
+    @with_async_graph_error_context("bulk_vertices_async")
     async def abulk_vertices(
         self,
         spec: BulkVerticesSpec,
@@ -1320,18 +1253,18 @@ class CorpusLangChainGraphClient:
             op_ctx=ctx,
             framework_ctx=framework_ctx,
         )
-        return self._validate_result_type(
+        return validate_graph_result_type(
             result,
-            BulkVerticesResult,
-            "GraphTranslator.arun_bulk_vertices",
-            ErrorCodes.BAD_BULK_VERTICES_RESULT,
+            expected_type=BulkVerticesResult,
+            operation="GraphTranslator.arun_bulk_vertices",
+            error_code=ErrorCodes.BAD_BULK_VERTICES_RESULT,
         )
 
     # ------------------------------------------------------------------ #
     # Batch (sync + async)
     # ------------------------------------------------------------------ #
 
-    @with_error_context("batch_sync")
+    @with_graph_error_context("batch_sync")
     def batch(
         self,
         ops: List[BatchOperation],
@@ -1345,7 +1278,7 @@ class CorpusLangChainGraphClient:
         Translates `BatchOperation` dataclasses into the raw mapping shape
         expected by GraphTranslator and returns the underlying `BatchResult`.
         """
-        self._validate_batch_ops(ops)  # ESSENTIAL CHANGE: Added validation
+        validate_batch_operations(self._graph, ops)
 
         ctx = self._build_ctx(config=config, extra_context=extra_context)
 
@@ -1358,14 +1291,14 @@ class CorpusLangChainGraphClient:
             op_ctx=ctx,
             framework_ctx={},
         )
-        return self._validate_result_type(
+        return validate_graph_result_type(
             result,
-            BatchResult,
-            "GraphTranslator.batch",
-            ErrorCodes.BAD_BATCH_RESULT,
+            expected_type=BatchResult,
+            operation="GraphTranslator.batch",
+            error_code=ErrorCodes.BAD_BATCH_RESULT,
         )
 
-    @with_async_error_context("batch_async")
+    @with_async_graph_error_context("batch_async")
     async def abatch(
         self,
         ops: List[BatchOperation],
@@ -1376,7 +1309,7 @@ class CorpusLangChainGraphClient:
         """
         Async wrapper for batch operations.
         """
-        self._validate_batch_ops(ops)  # ESSENTIAL CHANGE: Added validation
+        validate_batch_operations(self._graph, ops)
 
         ctx = self._build_ctx(config=config, extra_context=extra_context)
 
@@ -1389,11 +1322,11 @@ class CorpusLangChainGraphClient:
             op_ctx=ctx,
             framework_ctx={},
         )
-        return self._validate_result_type(
+        return validate_graph_result_type(
             result,
-            BatchResult,
-            "GraphTranslator.arun_batch",
-            ErrorCodes.BAD_BATCH_RESULT,
+            expected_type=BatchResult,
+            operation="GraphTranslator.arun_batch",
+            error_code=ErrorCodes.BAD_BATCH_RESULT,
         )
 
 
@@ -1401,4 +1334,8 @@ __all__ = [
     "LangChainGraphClientProtocol",
     "CorpusLangChainGraphClient",
     "ErrorCodes",
+    "with_graph_error_context",
+    "with_async_graph_error_context",
+    "with_error_context",
+    "with_async_error_context",
 ]
