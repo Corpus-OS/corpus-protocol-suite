@@ -452,7 +452,6 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
         """
         return coerce_embedding_matrix(
             result=result,
-            framework="semantic_kernel",
             error_codes=EMBEDDING_COERCION_ERROR_CODES,
             logger=logger,
         )
@@ -463,7 +462,6 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
         """
         return coerce_embedding_vector(
             result=result,
-            framework="semantic_kernel",
             error_codes=EMBEDDING_COERCION_ERROR_CODES,
             logger=logger,
         )
