@@ -37,23 +37,6 @@ Design principles
 - Rich error context:
     Exceptions are annotated via `attach_context` with framework-specific and
     per-call metadata, without mutating their messages or types.
-
-Config & behavior overrides
----------------------------
-AutoGen callers can customize behavior through `AutoGenClientConfig`:
-
-- model: default model identifier
-- temperature: default temperature (validated 0–2)
-- max_tokens: default max_tokens (must be positive if set)
-- framework_version: optional framework version tag
-- enable_metrics: reserved for future in-client metrics (currently unused)
-- validate_inputs: enable strict message validation before translation
-- timeout: reserved; prefer request_timeout for async calls
-- request_timeout: per-call timeout for async completions
-- max_retries: simple async retry count for transient failures
-
-These can be passed either as an `AutoGenClientConfig` instance or as
-keyword arguments to `CorpusAutoGenChatClient(...)`.
 """
 
 from __future__ import annotations
@@ -80,8 +63,14 @@ from typing import (
 )
 from uuid import uuid4
 
-from corpus_sdk.core.context_translation import ContextTranslator
+from corpus_sdk.core.context_translation import (
+    from_autogen as core_ctx_from_autogen,
+)
 from corpus_sdk.core.error_context import attach_context
+from corpus_sdk.llm.framework_adapters.common.framework_utils import (
+    CoercionErrorCodes,
+    coerce_token_usage,
+)
 from corpus_sdk.llm.framework_adapters.common.llm_translation import (
     LLMTranslator,
     LLMPostProcessingConfig,
@@ -94,8 +83,39 @@ from corpus_sdk.llm.llm_base import (
 
 logger = logging.getLogger(__name__)
 
-# Type variables for decorators
 T = TypeVar("T")
+
+# ---------------------------------------------------------------------------
+# Error codes / coercion config
+# ---------------------------------------------------------------------------
+
+
+class ErrorCodes:
+    """
+    Symbolic error codes for the AutoGen LLM adapter.
+
+    These are primarily for observability / correlation and are not tied to a
+    specific exception type.
+    """
+
+    BAD_OPERATION_CONTEXT = "BAD_OPERATION_CONTEXT"
+    BAD_INIT_CONFIG = "BAD_INIT_CONFIG"
+    BAD_COMPLETION_RESULT = "BAD_COMPLETION_RESULT"
+    BAD_STREAM_CHUNK = "BAD_STREAM_CHUNK"
+    BAD_USAGE_RESULT = "BAD_USAGE_RESULT"
+
+
+_USAGE_ERROR_CODES = CoercionErrorCodes(
+    invalid_result=ErrorCodes.BAD_USAGE_RESULT,
+    empty_result=ErrorCodes.BAD_USAGE_RESULT,
+    conversion_error=ErrorCodes.BAD_USAGE_RESULT,
+    framework_label="autogen",
+)
+
+
+# ---------------------------------------------------------------------------
+# Public protocol
+# ---------------------------------------------------------------------------
 
 
 class AutoGenLLMClientProtocol(Protocol):
@@ -130,36 +150,6 @@ class AutoGenClientConfig:
     This configuration centralizes all tunable parameters for the
     `CorpusAutoGenChatClient`. It can be constructed directly or via
     `from_dict` for convenient integration with config files.
-
-    Fields
-    ------
-    model:
-        Default model identifier used when AutoGen does not provide one.
-
-    temperature:
-        Default sampling temperature. Must be in the range [0, 2].
-
-    max_tokens:
-        Default max_tokens for completions (if provided, must be positive).
-
-    framework_version:
-        Optional framework version string propagated into context metadata.
-
-    enable_metrics:
-        Reserved for in-client metrics; currently not used directly.
-
-    validate_inputs:
-        If True, incoming message lists are strictly validated for
-        structure (`role` and `content` fields) before translation.
-
-    timeout:
-        Reserved for future use; prefer `request_timeout` for async calls.
-
-    max_retries:
-        Number of retry attempts for async non-streaming calls on failures.
-
-    request_timeout:
-        Per-call timeout (in seconds) for async non-streaming calls.
     """
 
     model: str = "default"
@@ -168,25 +158,24 @@ class AutoGenClientConfig:
     framework_version: Optional[str] = None
     enable_metrics: bool = True
     validate_inputs: bool = True
-    timeout: Optional[float] = None
+    timeout: Optional[float] = None  # Reserved
     max_retries: int = 0
     request_timeout: float = 60.0
 
     def __post_init__(self) -> None:
-        """
-        Auto-validate configuration when the dataclass is instantiated directly.
-
-        This ensures that even when callers construct the config themselves,
-        the key invariants are enforced consistently.
-        """
         if not (0.0 <= float(self.temperature) <= 2.0):
             raise ValueError(
+                f"{ErrorCodes.BAD_INIT_CONFIG}: "
                 f"temperature must be between 0.0 and 2.0, got {self.temperature}"
             )
         if self.max_tokens is not None and self.max_tokens < 1:
-            raise ValueError(f"max_tokens must be positive, got {self.max_tokens}")
+            raise ValueError(
+                f"{ErrorCodes.BAD_INIT_CONFIG}: "
+                f"max_tokens must be positive, got {self.max_tokens}"
+            )
         if self.request_timeout is None or self.request_timeout <= 0:
             raise ValueError(
+                f"{ErrorCodes.BAD_INIT_CONFIG}: "
                 f"request_timeout must be positive, got {self.request_timeout}"
             )
 
@@ -210,7 +199,7 @@ def _new_id(prefix: str = "chatcmpl") -> str:
 
 
 # ---------------------------------------------------------------------------
-# Error Context Decorators (with lazy, low-cost context extraction)
+# Error-context decorators (lazy, low-cost extraction)
 # ---------------------------------------------------------------------------
 
 
@@ -222,12 +211,6 @@ def _extract_basic_context(
 ) -> Dict[str, Any]:
     """
     Extract fast, low-cost context for error enrichment.
-
-    Only captures cheap fields that are safe to compute on every call:
-    - model name
-    - operation
-    - messages_count (if first arg is a sequence)
-    - stream flag, request_id, tenant (when present)
     """
     dynamic_ctx: Dict[str, Any] = {
         "model": getattr(instance, "model", "unknown"),
@@ -239,7 +222,6 @@ def _extract_basic_context(
         if args and isinstance(args[0], (list, tuple)):
             dynamic_ctx["messages_count"] = len(args[0])
     except Exception:
-        # Best-effort only; never fail here
         pass
 
     if "stream" in kwargs:
@@ -259,7 +241,7 @@ def _compute_detailed_context(
     """
     Compute richer, more expensive context details for error enrichment.
 
-    This is called only when an exception occurs to avoid hot-path overhead.
+    This is invoked only when an exception occurs to stay off the hot path.
     """
     detailed: Dict[str, Any] = {}
     try:
@@ -281,26 +263,24 @@ def _compute_detailed_context(
             detailed["roles_distribution"] = roles
             detailed["total_content_chars"] = total_chars
 
-        # AutoGen-specific context presence flags
+        # AutoGen-specific knobs
         if kwargs.get("conversation") is not None:
             detailed["has_conversation"] = True
         if kwargs.get("context") is not None:
             detailed["has_extra_context"] = True
 
-        # Sampling parameters (if provided)
-        sampling_params = [
+        # Sampling parameters
+        for param in (
             "temperature",
             "max_tokens",
             "top_p",
             "frequency_penalty",
             "presence_penalty",
-        ]
-        for param in sampling_params:
+        ):
             if param in kwargs:
                 detailed[param] = kwargs[param]
 
     except Exception as ctx_error:  # noqa: BLE001
-        # Never let context computation impact control flow
         logger.debug("Failed to compute detailed error context: %s", ctx_error)
 
     return detailed
@@ -311,7 +291,7 @@ def _create_error_context_decorator(
     is_async: bool = False,
 ) -> Callable[[Callable[..., T]], Callable[..., T]]:
     """
-    Factory for creating error context decorators with lazy context extraction.
+    Factory for creating error-context decorators with lazy context extraction.
     """
 
     def decorator_factory(
@@ -366,7 +346,6 @@ def _create_error_context_decorator(
     return decorator_factory
 
 
-# Convenience decorators with rich context extraction
 def with_llm_error_context(
     operation: str,
     **static_context: Any,
@@ -383,6 +362,11 @@ def with_async_llm_error_context(
     return _create_error_context_decorator(operation, is_async=True)(**static_context)
 
 
+# ---------------------------------------------------------------------------
+# Concrete AutoGen client
+# ---------------------------------------------------------------------------
+
+
 class CorpusAutoGenChatClient:
     """
     OpenAI-style chat client backed by a Corpus `LLMProtocolV1` via `LLMTranslator`.
@@ -394,74 +378,16 @@ class CorpusAutoGenChatClient:
         - `create(messages=[...], model="...", stream=False)`
         - `acreate(messages=[...], model="...", stream=True)`
 
-    Messages are expected to be OpenAI-style dicts:
-
-        {"role": "user", "content": "Hello"}
-
-    They are handed directly to the shared LLM translation layer, which
-    normalizes them into Corpus protocol messages before calling the
-    underlying `LLMProtocolV1` adapter.
-
-    Example
-    -------
-    ```python
-    from corpus_sdk.llm.framework_adapters.autogen import CorpusAutoGenChatClient
-    import autogen
-
-    # Initialize with any Corpus LLMProtocolV1 adapter
-    llm_client = CorpusAutoGenChatClient(
-        llm_adapter=my_adapter,
-        model="gpt-4",
-        temperature=0.7,
-    )
-
-    # Use with AutoGen agent configuration
-    agent = autogen.AssistantAgent(
-        name="assistant",
-        llm_config={
-            "config_list": [{
-                "model": "gpt-4",
-                "api_key": "sk-...",  # Not used by Corpus client
-                "client": llm_client  # Direct client assignment
-            }]
-        }
-    )
-    ```
-
-    Error Handling Example
-    ----------------------
-    ```python
-    try:
-        response = llm_client.create(
-            messages=[{"role": "user", "content": "Hello"}],
-            model="gpt-4",
-            temperature=0.7,
-            conversation=agent_conversation,
-        )
-    except Exception as e:
-        # Rich error context automatically attached with message counts,
-        # roles, and configuration details.
-        logger.error("LLM call failed with context", exc_info=e)
-    ```
-
-    Streaming
-    ---------
-    - Async streaming: `acreate(..., stream=True)` returns an async iterator
-      of OpenAI ChatCompletion chunk payloads.
-
-    - Sync streaming: `create(..., stream=True)` returns an iterator of
-      ChatCompletion chunk payloads.
-
-    Error context
-    -------------
-    All exceptions arising inside this adapter are enriched via
-    `attach_context(exc, framework="autogen", ...)`, making it easy for
-    higher-level handlers to inspect request-specific metadata without
-    modifying exception messages or types.
+    All protocol calls are delegated to `LLMTranslator`, keeping this layer
+    thin and focused on:
+    - AutoGen message / parameter handling
+    - Context construction
+    - OpenAI-style response shaping
+    - Error-context enrichment
     """
 
     # ------------------------------------------------------------------ #
-    # Construction
+    # Construction / resource management
     # ------------------------------------------------------------------ #
 
     def __init__(
@@ -505,10 +431,13 @@ class CorpusAutoGenChatClient:
         """
         self._config: AutoGenClientConfig = config or AutoGenClientConfig.from_dict(kwargs)
 
-        # Validate adapter and key configuration values
+        # Keep a direct reference to the underlying adapter for lifecycle.
+        self._adapter: LLMProtocolV1 = llm_adapter
+
+        # Validate adapter + key config invariants.
         self._validate_init_params(llm_adapter)
 
-        # Create or adopt LLMTranslator
+        # Create or adopt LLMTranslator (all protocol logic lives there).
         if translator is not None:
             self._translator: LLMTranslator = translator
         else:
@@ -519,7 +448,7 @@ class CorpusAutoGenChatClient:
                 post_processing_config=post_processing_config,
             )
 
-        # Convenience attributes preserved from prior interface
+        # Convenience attributes preserved for compatibility / logging.
         self.model: str = self._config.model
         self.temperature: float = float(self._config.temperature)
         self.max_tokens: Optional[int] = self._config.max_tokens
@@ -535,6 +464,27 @@ class CorpusAutoGenChatClient:
             self.temperature,
         )
 
+    # Context manager support to mirror graph / embedding adapters.
+    def __enter__(self) -> "CorpusAutoGenChatClient":
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        if hasattr(self._adapter, "close"):
+            try:
+                self._adapter.close()  # type: ignore[call-arg]
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Error while closing LLM adapter in __exit__: %s", exc)
+
+    async def __aenter__(self) -> "CorpusAutoGenChatClient":
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        if hasattr(self._adapter, "aclose"):
+            try:
+                await self._adapter.aclose()  # type: ignore[call-arg]
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Error while closing LLM adapter in __aexit__: %s", exc)
+
     # ------------------------------------------------------------------ #
     # Internal helpers: validation & context
     # ------------------------------------------------------------------ #
@@ -546,21 +496,32 @@ class CorpusAutoGenChatClient:
         - Ensures the adapter exposes core `LLMProtocolV1` methods.
         - Validates temperature and max_tokens constraints from config.
         """
-        # Duck-typed adapter validation instead of strict isinstance on Protocol
-        required_methods = ("complete", "stream", "count_tokens", "health", "capabilities")
+        required_methods = (
+            "complete",
+            "stream",
+            "count_tokens",
+            "health",
+            "capabilities",
+        )
         missing = [m for m in required_methods if not callable(getattr(llm_adapter, m, None))]
         if missing:
             raise TypeError(
-                f"llm_adapter must implement LLMProtocolV1; missing methods: {', '.join(missing)}"
+                f"{ErrorCodes.BAD_INIT_CONFIG}: "
+                f"llm_adapter must implement LLMProtocolV1; missing methods: "
+                f"{', '.join(missing)}"
             )
 
         temperature = self._config.temperature
         if not isinstance(temperature, (int, float)) or not (0.0 <= float(temperature) <= 2.0):
-            raise ValueError("temperature must be between 0 and 2")
+            raise ValueError(
+                f"{ErrorCodes.BAD_INIT_CONFIG}: temperature must be between 0 and 2"
+            )
 
         if self._config.max_tokens is not None:
             if not isinstance(self._config.max_tokens, int) or self._config.max_tokens < 1:
-                raise ValueError("max_tokens must be positive")
+                raise ValueError(
+                    f"{ErrorCodes.BAD_INIT_CONFIG}: max_tokens must be positive"
+                )
 
     def _validate_messages(self, messages: Sequence[Mapping[str, Any]]) -> None:
         """
@@ -590,7 +551,7 @@ class CorpusAutoGenChatClient:
         conversation: Optional[Any] = None,
         extra_context: Optional[Mapping[str, Any]] = None,
         **kwargs: Any,
-    ) -> Tuple[OperationContext, Dict[str, Any]]:
+    ) -> Tuple[Optional[OperationContext], Dict[str, Any]]:
         """
         Construct OperationContext and sampling params from kwargs.
 
@@ -605,22 +566,39 @@ class CorpusAutoGenChatClient:
             - system_message
             - request_id
             - tenant
-
-        Everything else is ignored at this layer. If additional data needs
-        to reach the protocol layer, it should be carried via the context
-        translator (conversation / extra_context) and OperationContext.attrs.
         """
-        ctx = ContextTranslator.from_autogen_context(
-            conversation=conversation,
-            extra=extra_context,
-            framework_version=self._framework_version,
-        )
+        extra: Dict[str, Any] = dict(extra_context or {})
+
+        # If no conversation/extra, let downstream create an "empty" context.
+        if conversation is None and not extra:
+            ctx: Optional[OperationContext] = None
+        else:
+            try:
+                ctx = core_ctx_from_autogen(
+                    conversation,
+                    framework_version=self._framework_version,
+                    **extra,
+                )
+            except Exception as exc:  # noqa: BLE001
+                attach_context(
+                    exc,
+                    framework="autogen",
+                    operation="context_translation",
+                )
+                raise
+
+            if not isinstance(ctx, OperationContext):
+                raise TypeError(
+                    f"{ErrorCodes.BAD_OPERATION_CONTEXT}: "
+                    f"from_autogen produced unsupported context type: "
+                    f"{type(ctx).__name__}"
+                )
 
         # Optional overrides for request_id / tenant.
         request_id = kwargs.pop("request_id", None)
         tenant = kwargs.pop("tenant", None)
 
-        if request_id is not None or tenant is not None:
+        if ctx is not None and (request_id is not None or tenant is not None):
             ctx = OperationContext(
                 request_id=request_id or ctx.request_id,
                 idempotency_key=ctx.idempotency_key,
@@ -638,7 +616,7 @@ class CorpusAutoGenChatClient:
         elif isinstance(stop_arg, (list, tuple)):
             stop_sequences = [str(s) for s in stop_arg]
 
-        # Sampling and routing params.
+        # Sampling and routing params (translator-facing).
         params: Dict[str, Any] = {
             "model": kwargs.pop("model", self.model),
             "temperature": kwargs.pop("temperature", self.temperature),
@@ -654,6 +632,10 @@ class CorpusAutoGenChatClient:
         params = {k: v for k, v in params.items() if v is not None}
         return ctx, params
 
+    # ------------------------------------------------------------------ #
+    # OpenAI-style shaping helpers (thin, usage via framework_utils)
+    # ------------------------------------------------------------------ #
+
     @staticmethod
     def _completion_to_openai(
         result: Any,
@@ -664,35 +646,23 @@ class CorpusAutoGenChatClient:
         """
         Convert a translator-level completion into an OpenAI ChatCompletion payload.
 
-        The LLMTranslator's default `from_completion` returns a dict:
+        Translator default `from_completion` returns a dict like:
 
             {
                 "text": ...,
                 "model": ...,
-                "model_family": ...,
-                "usage": {
-                    "prompt_tokens": ...,
-                    "completion_tokens": ...,
-                    "total_tokens": ...,
-                },
+                "usage": {...},
                 "finish_reason": ...,
-                "tool_calls": [...],
+                ...
             }
 
-        But we also support attribute-style objects for flexibility.
+        This function stays thin: it does not touch protocol logic, only
+        shapes the already-normalized result.
         """
         completion_id = completion_id or _new_id()
         created = created or _now_epoch_s()
 
-        text: str
-        model: str
-        finish_reason: Optional[str]
-        usage_dict: Dict[str, int] = {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0,
-        }
-
+        # Text / model / finish_reason best-effort extraction.
         if isinstance(result, Mapping):
             text = str(
                 result.get("text")
@@ -702,24 +672,42 @@ class CorpusAutoGenChatClient:
             )
             model = str(result.get("model") or "unknown")
             finish_reason = result.get("finish_reason")
-
-            usage = result.get("usage") or {}
-            if isinstance(usage, Mapping):
-                for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
-                    value = usage.get(key)
-                    if isinstance(value, int):
-                        usage_dict[key] = value
         else:
-            # Attribute-based object
             text = str(getattr(result, "text", "") or "")
             model = str(getattr(result, "model", "unknown"))
             finish_reason = getattr(result, "finish_reason", None)
-            usage = getattr(result, "usage", None)
-            if usage is not None:
-                for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
-                    value = getattr(usage, key, None)
-                    if isinstance(value, int):
-                        usage_dict[key] = value
+
+        # Usage: prefer shared coercion utility for consistency / bounds.
+        usage_dict: Dict[str, int] = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+        try:
+            token_usage = coerce_token_usage(
+                result,
+                framework="autogen",
+                error_codes=_USAGE_ERROR_CODES,
+                logger=logger,
+            )
+            usage_dict = {
+                "prompt_tokens": token_usage.prompt_tokens,
+                "completion_tokens": token_usage.completion_tokens,
+                "total_tokens": token_usage.total_tokens,
+            }
+        except Exception as exc:  # noqa: BLE001
+            # Fall back to simple mapping-based extraction if available.
+            logger.debug(
+                "AutoGen: failed to coerce token usage from completion: %s",
+                exc,
+            )
+            if isinstance(result, Mapping):
+                usage = result.get("usage") or {}
+                if isinstance(usage, Mapping):
+                    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                        value = usage.get(key)
+                        if isinstance(value, int):
+                            usage_dict[key] = value
 
         return {
             "id": completion_id,
@@ -751,23 +739,16 @@ class CorpusAutoGenChatClient:
         """
         Convert a translator-level streaming chunk into an OpenAI ChatCompletion chunk.
 
-        The default LLMTranslator `from_chunk` yields dicts of the form:
+        Translator `from_chunk` yields dicts of the form:
 
             {
                 "text": ...,
                 "is_final": bool,
                 "model": ...,
-                "usage_so_far": {
-                    "prompt_tokens": ...,
-                    "completion_tokens": ...,
-                    "total_tokens": ...,
-                } | None,
-                "tool_calls": [...],
+                "usage_so_far": {...} | None,
+                ...
             }
-
-        Attribute-style chunk objects are also supported.
         """
-        # Extract basic fields from dict or object
         if isinstance(chunk, Mapping):
             text = str(chunk.get("text") or chunk.get("delta") or "")
             is_final = bool(chunk.get("is_final", False))
@@ -780,11 +761,8 @@ class CorpusAutoGenChatClient:
             usage = getattr(chunk, "usage_so_far", None)
 
         delta: Dict[str, Any] = {}
-
-        # OpenAI typically sends role only on the first delta.
         if is_first:
             delta["role"] = "assistant"
-
         if text:
             delta["content"] = text
 
@@ -804,10 +782,29 @@ class CorpusAutoGenChatClient:
 
         if isinstance(usage, Mapping):
             usage_payload: Dict[str, int] = {}
-            for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
-                value = usage.get(key)
-                if isinstance(value, int):
-                    usage_payload[key] = value
+            # Best-effort reuse of shared coercion, but keep it soft-failing.
+            try:
+                token_usage = coerce_token_usage(
+                    {"usage": usage},
+                    framework="autogen",
+                    error_codes=_USAGE_ERROR_CODES,
+                    logger=logger,
+                )
+                usage_payload = {
+                    "prompt_tokens": token_usage.prompt_tokens,
+                    "completion_tokens": token_usage.completion_tokens,
+                    "total_tokens": token_usage.total_tokens,
+                }
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "AutoGen: failed to coerce token usage from stream chunk: %s",
+                    exc,
+                )
+                for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                    value = usage.get(key)
+                    if isinstance(value, int):
+                        usage_payload[key] = value
+
             if usage_payload:
                 payload["usage"] = usage_payload
 
@@ -832,7 +829,6 @@ class CorpusAutoGenChatClient:
                     return await asyncio.wait_for(func(), timeout=self._request_timeout)
                 return await func()
             except asyncio.CancelledError:
-                # Cancellation should always propagate immediately.
                 raise
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
@@ -845,10 +841,8 @@ class CorpusAutoGenChatClient:
                     self._max_retries,
                     exc,
                 )
-                # Simple backoff capped at 5s
-                await asyncio.sleep(min(2.0 ** attempts, 5.0))
+                await asyncio.sleep(min(2.0**attempts, 5.0))
 
-        # Should not be reachable, but keeps type checkers satisfied.
         if last_error is not None:
             raise last_error
 
@@ -868,28 +862,13 @@ class CorpusAutoGenChatClient:
         Usage:
             await client.acreate(messages=[...], model="...", stream=False)
             async for chunk in client.acreate(messages=[...], stream=True): ...
-
-        Parameters
-        ----------
-        messages:
-            OpenAI-style messages list.
-
-        kwargs:
-            - stream: bool (default False)
-            - model, temperature, max_tokens, top_p, frequency_penalty,
-              presence_penalty, stop, system_message, conversation, context,
-              request_id, tenant, etc.
-
-        Returns
-        -------
-        Dict[str, Any] | AsyncIterator[Dict[str, Any]]
         """
         if self._validate_inputs_flag:
             self._validate_messages(messages)
 
         stream = bool(kwargs.pop("stream", False))
 
-        # Extract AutoGen/extra context.
+        # Extract AutoGen / extra context (kept thin, passed to translator).
         conversation = kwargs.pop("conversation", None)
         extra_context = kwargs.pop("context", None)
         if extra_context is not None and not isinstance(extra_context, Mapping):
@@ -970,28 +949,13 @@ class CorpusAutoGenChatClient:
         Usage:
             client.create(messages=[...], model="...", stream=False)
             for chunk in client.create(messages=[...], stream=True): ...
-
-        Parameters
-        ----------
-        messages:
-            OpenAI-style messages list.
-
-        kwargs:
-            - stream: bool (default False)
-            - model, temperature, max_tokens, top_p, frequency_penalty,
-              presence_penalty, stop, system_message, conversation, context,
-              request_id, tenant, etc.
-
-        Returns
-        -------
-        Dict[str, Any] | Iterator[Dict[str, Any]]
         """
         if self._validate_inputs_flag:
             self._validate_messages(messages)
 
         stream = bool(kwargs.pop("stream", False))
 
-        # Extract AutoGen/extra context.
+        # Extract AutoGen / extra context.
         conversation = kwargs.pop("conversation", None)
         extra_context = kwargs.pop("context", None)
         if extra_context is not None and not isinstance(extra_context, Mapping):
@@ -1066,6 +1030,7 @@ __all__ = [
     "AutoGenClientConfig",
     "AutoGenLLMClientProtocol",
     "CorpusAutoGenChatClient",
+    "ErrorCodes",
     "with_llm_error_context",
     "with_async_llm_error_context",
 ]
