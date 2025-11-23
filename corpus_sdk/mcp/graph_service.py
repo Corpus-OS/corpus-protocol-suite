@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-MCP Graph Translation Service - 99.9% Production Ready Elite Code
+MCP Graph Translation Service 
 
 Enterprise-grade graph service with production hardening for MCP (Model Context Protocol).
 Uses Anthropic's MCP protocol for standardized graph operations.
