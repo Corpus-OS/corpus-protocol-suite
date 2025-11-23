@@ -1,908 +1,992 @@
-# corpus_sdk/llm/framework_adapters/llamaindex.py
+# corpus_sdk/llm/framework_adapters/autogen.py
 # SPDX-License-Identifier: Apache-2.0
 
 """
-LlamaIndex adapter for Corpus LLM protocol.
+AutoGen adapter for Corpus LLM protocol.
 
-This module exposes a Corpus `LLMProtocolV1` as a LlamaIndex `LLM`
-implementation, with:
+This module exposes a Corpus `LLMProtocolV1` implementation (via the
+framework-agnostic `LLMTranslator`) as an OpenAI-style chat client
+suitable for use with AutoGen's configuration system.
 
-- Async + sync chat generation
-- Async + sync streaming chat (true incremental streaming)
-- Context propagation via `OperationContext`
-- Protocol-first design: all calls go through the LLMTranslator layer
-- Rich, configurable error context for observability
+Key responsibilities
+--------------------
+- Accept OpenAI-style message dicts from AutoGen
+- Convert them to Corpus wire messages via the LLM translation layer
+- Build OperationContext from AutoGen conversation / metadata
+- Construct sampling / routing parameters (model, temperature, stop, etc.)
+- Delegate sync/async + streaming orchestration to `LLMTranslator`
+- Convert translator-level completions/streams into OpenAI-style
+  ChatCompletion / ChatCompletionChunk payloads
+- Enrich exceptions with AutoGen-specific debug metadata via `attach_context`
+
+Design principles
+-----------------
+- Protocol-first:
+    The Corpus `LLMProtocolV1` is the source of truth; this module is a thin
+    compatibility layer for AutoGen on top of the shared LLM translation layer.
+
+- LLMTranslator orchestration:
+    All message normalization and protocol calls go through `LLMTranslator`,
+    keeping framework-specific concerns localized and consistent.
+
+- Non-invasive:
+    No retries, circuit breaking, or deadlines are implemented here; the
+    underlying adapter or caller can still apply its own policies.
+
+- Rich error context:
+    Exceptions are annotated via `attach_context` with framework-specific and
+    per-call metadata, without mutating their messages or types.
 """
 
 from __future__ import annotations
 
 import logging
-from contextlib import asynccontextmanager, contextmanager
+import time
 from dataclasses import dataclass
+from functools import wraps
 from typing import (
     Any,
     AsyncIterator,
+    Callable,
     Dict,
     Iterator,
-    List,
+    Mapping,
     Optional,
     Protocol,
     Sequence,
-    Mapping,
+    Tuple,
+    TypeVar,
+    Union,
 )
+from uuid import uuid4
 
 from corpus_sdk.core.context_translation import (
-    from_llamaindex as context_from_llamaindex,
+    from_autogen as core_ctx_from_autogen,
 )
-from corpus_sdk.llm.llm_base import (
-    BadRequest,
-    LLMProtocolV1,
-    OperationContext,
+from corpus_sdk.core.error_context import attach_context
+from corpus_sdk.llm.framework_adapters.common.framework_utils import (
+    CoercionErrorCodes,
+    coerce_token_usage,
 )
-from corpus_sdk.llm.framework_adapters.common.error_context import attach_context
 from corpus_sdk.llm.framework_adapters.common.llm_translation import (
     LLMTranslator,
+    LLMPostProcessingConfig,
     create_llm_translator,
-    get_llm_translator_factory,
+)
+from corpus_sdk.llm.llm_base import (
+    LLMProtocolV1,
+    OperationContext,
 )
 
 logger = logging.getLogger(__name__)
 
+T = TypeVar("T")
+
+_FRAMEWORK_NAME = "autogen"
+
 # ---------------------------------------------------------------------------
-# Optional LlamaIndex imports
+# Error codes / coercion config
 # ---------------------------------------------------------------------------
 
-_LLAMAINDEX_IMPORT_ERROR: Optional[BaseException] = None
 
-try:  # pragma: no cover - optional dependency path
-    from llama_index.core.llms import (
-        LLM,
-        ChatMessage,
-        ChatResponse,
-        ChatResponseAsyncGen,
-        ChatResponseGen,
-        MessageRole,
-    )
-    from llama_index.core.callbacks import CallbackManager
-except BaseException as exc:  # pragma: no cover
-    _LLAMAINDEX_IMPORT_ERROR = exc
-    # Fallbacks for type checking and import-time safety
-    LLM = object  # type: ignore[assignment]
-    ChatMessage = object  # type: ignore[assignment]
-    ChatResponse = object  # type: ignore[assignment]
-    ChatResponseAsyncGen = AsyncIterator[Any]  # type: ignore[assignment]
-    ChatResponseGen = Iterator[Any]  # type: ignore[assignment]
-    MessageRole = object  # type: ignore[assignment]
-    CallbackManager = object  # type: ignore[assignment]
+class ErrorCodes:
+    """
+    Symbolic error codes for the AutoGen LLM adapter.
+
+    These are primarily for observability / correlation and are not tied to a
+    specific exception type.
+    """
+
+    BAD_OPERATION_CONTEXT = "AUTOGEN_LLM_BAD_OPERATION_CONTEXT"
+    BAD_INIT_CONFIG = "AUTOGEN_LLM_BAD_INIT_CONFIG"
+    BAD_COMPLETION_RESULT = "AUTOGEN_LLM_BAD_COMPLETION_RESULT"
+    BAD_STREAM_CHUNK = "AUTOGEN_LLM_BAD_STREAM_CHUNK"
+    BAD_USAGE_RESULT = "AUTOGEN_LLM_BAD_USAGE_RESULT"
 
 
-def _ensure_llamaindex_installed() -> None:
-    """Raise helpful error if LlamaIndex is not installed."""
-    if _LLAMAINDEX_IMPORT_ERROR is not None:
-        raise RuntimeError(
-            "LlamaIndex is required to use CorpusLlamaIndexLLM. "
-            "Install with: pip install 'llama-index-core>=0.10.0'"
-        ) from _LLAMAINDEX_IMPORT_ERROR
+ERROR_CODES = CoercionErrorCodes(
+    invalid_result="AUTOGEN_LLM_INVALID_RESULT",
+    empty_result="AUTOGEN_LLM_EMPTY_RESULT",
+    conversion_error="AUTOGEN_LLM_CONVERSION_ERROR",
+    framework_label=_FRAMEWORK_NAME,
+)
 
 
-class LlamaIndexLLMProtocol(Protocol):
-    """Structural protocol for LlamaIndex-compatible Corpus LLM."""
+# ---------------------------------------------------------------------------
+# Public protocol
+# ---------------------------------------------------------------------------
 
-    async def achat(self, messages: Sequence[ChatMessage], **kwargs: Any) -> ChatResponse:
+
+class AutoGenLLMClientProtocol(Protocol):
+    """
+    Protocol representing the minimal AutoGen-aware LLM client interface
+    implemented by this module.
+
+    This structural protocol allows callers to type against the chat client
+    without depending on the concrete `CorpusAutoGenChatClient` class.
+    """
+
+    async def acreate(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        **kwargs: Any,
+    ) -> Union[Dict[str, Any], AsyncIterator[Dict[str, Any]]]:
         ...
 
-    async def astream_chat(self, messages: Sequence[ChatMessage], **kwargs: Any) -> ChatResponseAsyncGen:
-        ...
-
-    def chat(self, messages: Sequence[ChatMessage], **kwargs: Any) -> ChatResponse:
-        ...
-
-    def stream_chat(self, messages: Sequence[ChatMessage], **kwargs: Any) -> ChatResponseGen:
-        ...
-
-    def count_tokens(self, messages: Sequence[ChatMessage], **kwargs: Any) -> int:
+    def create(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        **kwargs: Any,
+    ) -> Union[Dict[str, Any], Iterator[Dict[str, Any]]]:
         ...
 
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class LlamaIndexLLMConfig:
+@dataclass
+class AutoGenClientConfig:
     """
-    Configuration for the LlamaIndex adapter.
+    Configuration for AutoGen client behavior.
 
-    Attributes
-    ----------
-    enable_error_context:
-        Whether to attach rich error context with LlamaIndex-specific metadata.
-
-    include_message_metrics_on_error:
-        Whether to include per-message metrics (role distribution, char counts)
-        when attaching error context. This is evaluated lazily *only on errors*.
+    This configuration centralizes all tunable parameters for the
+    `CorpusAutoGenChatClient`. It can be constructed directly or via
+    `from_dict` for convenient integration with config files.
     """
 
-    enable_error_context: bool = True
-    include_message_metrics_on_error: bool = True
-
-
-# ---------------------------------------------------------------------------
-# ChatResponse builders
-# ---------------------------------------------------------------------------
-
-
-def _build_chat_response(
-    text: str,
-    *,
-    model: Optional[str] = None,
-    finish_reason: Optional[str] = None,
-    usage: Optional[Any] = None,
-) -> ChatResponse:
-    """
-    Construct a minimal LlamaIndex ChatResponse from completion-like data.
-
-    The caller is responsible for extracting the text/model/usage/finish_reason
-    from whatever the LLMTranslator returned.
-    """
-    try:
-        role_assistant = getattr(MessageRole, "ASSISTANT", "assistant")
-    except Exception:
-        role_assistant = "assistant"
-
-    msg = ChatMessage(
-        role=role_assistant,
-        content=text,
-    )
-
-    additional_kwargs: Dict[str, Any] = {}
-    if model is not None:
-        additional_kwargs["model"] = model
-    if finish_reason is not None:
-        additional_kwargs["finish_reason"] = finish_reason
-    if usage is not None:
-        additional_kwargs["usage"] = {
-            "prompt_tokens": getattr(usage, "prompt_tokens", None),
-            "completion_tokens": getattr(usage, "completion_tokens", None),
-            "total_tokens": getattr(usage, "total_tokens", None),
-        }
-
-    try:
-        return ChatResponse(message=msg, raw=None, additional_kwargs=additional_kwargs)
-    except TypeError:
-        # Older versions may not support additional_kwargs
-        return ChatResponse(message=msg)
-
-
-def _extract_completion_fields(
-    result: Any,
-) -> tuple[str, Optional[str], Optional[str], Optional[Any]]:
-    """
-    Extract (text, model, finish_reason, usage) from a completion-like object
-    returned by LLMTranslator.from_completion.
-
-    Supports:
-    - Mapping results: {"text", "model", "finish_reason", "usage"}
-    - Objects with .text / .model / .finish_reason / .usage
-    - Fallback: treat as plain text.
-    """
-    # Mapping-style (default LLMTranslator behavior)
-    if isinstance(result, Mapping):
-        text = str(
-            result.get("text")
-            or result.get("content")
-            or result.get("message", {}).get("content", "")
-            or ""
-        )
-        model = result.get("model")
-        finish_reason = result.get("finish_reason")
-        usage = result.get("usage")
-        return text, model, finish_reason, usage
-
-    # Attribute-style objects (custom translators)
-    if hasattr(result, "text"):
-        text = str(getattr(result, "text", "") or "")
-        model = getattr(result, "model", None)
-        finish_reason = getattr(result, "finish_reason", None)
-        usage = getattr(result, "usage", None)
-        return text, model, finish_reason, usage
-
-    # Fallback: treat as plain text
-    return str(result), None, None, None
-
-
-def _build_chat_response_from_translator_result(result: Any) -> ChatResponse:
-    """
-    Build ChatResponse from whatever LLMTranslator returned for a completion.
-    """
-    text, model, finish_reason, usage = _extract_completion_fields(result)
-    return _build_chat_response(
-        text=text,
-        model=model,
-        finish_reason=finish_reason,
-        usage=usage,
-    )
-
-
-def _extract_chunk_fields(
-    chunk_obj: Any,
-) -> tuple[str, Optional[str], Optional[Any], bool]:
-    """
-    Extract (text, model, usage_so_far, is_final) from streaming chunk-like objects
-    returned by LLMTranslator.from_chunk.
-
-    Supports:
-    - Mapping results: {"text", "model", "usage_so_far", "is_final"}
-    - Objects with .text / .model / .usage_so_far / .is_final
-    - Fallbacks using .delta or treating as plain text.
-    """
-    # Mapping-style (default LLMTranslator.from_chunk)
-    if isinstance(chunk_obj, Mapping):
-        text = str(chunk_obj.get("text") or chunk_obj.get("delta") or "")
-        model = chunk_obj.get("model")
-        usage = chunk_obj.get("usage_so_far")
-        is_final = bool(chunk_obj.get("is_final", False))
-        return text, model, usage, is_final
-
-    # Attribute-style
-    text = str(
-        getattr(chunk_obj, "text", "")
-        or getattr(chunk_obj, "delta", "")
-        or ""
-    )
-    model = getattr(chunk_obj, "model", None)
-    usage = getattr(chunk_obj, "usage_so_far", None)
-    is_final = bool(getattr(chunk_obj, "is_final", False))
-    return text, model, usage, is_final
-
-
-def _build_chat_response_from_chunk_like(chunk_obj: Any) -> ChatResponse:
-    """
-    Build a ChatResponse for streaming from a single chunk-like object.
-    """
-    try:
-        role_assistant = getattr(MessageRole, "ASSISTANT", "assistant")
-    except Exception:
-        role_assistant = "assistant"
-
-    text, model, usage, is_final = _extract_chunk_fields(chunk_obj)
-
-    msg = ChatMessage(
-        role=role_assistant,
-        content=text,
-    )
-
-    delta = text or ""
-
-    additional_kwargs: Dict[str, Any] = {
-        "is_final": is_final,
-        "model": model,
-    }
-    if usage is not None:
-        additional_kwargs["usage_so_far"] = {
-            "prompt_tokens": getattr(usage, "prompt_tokens", None),
-            "completion_tokens": getattr(usage, "completion_tokens", None),
-            "total_tokens": getattr(usage, "total_tokens", None),
-        }
-
-    try:
-        return ChatResponse(
-            message=msg,
-            delta=delta,
-            raw=None,
-            additional_kwargs=additional_kwargs,
-        )
-    except TypeError:
-        # Older versions without delta/additional_kwargs
-        return ChatResponse(message=msg)
-
-
-# ---------------------------------------------------------------------------
-# Internal metrics helpers for observability
-# ---------------------------------------------------------------------------
-
-
-def _analyze_messages_for_context(messages: Sequence[ChatMessage]) -> Dict[str, Any]:
-    """
-    Derive role distribution and content metrics for error context.
-
-    Only used lazily when an error actually occurs to avoid overhead on
-    successful calls.
-    """
-    roles: Dict[str, int] = {}
-    total_chars = 0
-
-    for msg in messages:
-        # LlamaIndex messages may expose `role` or `type`
-        role = getattr(msg, "role", getattr(msg, "type", "unknown"))
-        content = getattr(msg, "content", "")
-        roles[role] = roles.get(role, 0) + 1
-        if isinstance(content, str):
-            total_chars += len(content)
-
-    return {
-        "messages_count": len(messages),
-        "roles_distribution": roles,
-        "total_content_chars": total_chars,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Main adapter
-# ---------------------------------------------------------------------------
-
-
-class CorpusLlamaIndexLLM(LLM):
-    """
-    LlamaIndex `LLM` implementation backed by a Corpus `LLMProtocolV1`.
-
-    This integration is fully aligned with the LLMTranslator layer:
-
-    - All LLM calls go through `LLMTranslator` (no direct message_translation
-      or protocol calls in this file).
-    - Message normalization, system message handling, tools, safety, and
-      post-processing are handled centrally by the translator.
-    - This file focuses on:
-        * LlamaIndex-specific context building
-        * Error-context attachment
-        * Mapping translator results to `ChatResponse` / streaming responses.
-    """
-
-    llm_adapter: LLMProtocolV1
     model: str = "default"
     temperature: float = 0.7
     max_tokens: Optional[int] = None
     framework_version: Optional[str] = None
-    config: Optional[LlamaIndexLLMConfig] = None
+    enable_metrics: bool = True
+    validate_inputs: bool = True
 
-    model_config = {"arbitrary_types_allowed": True}
-
-    def __init__(self, **data: Any) -> None:
-        _ensure_llamaindex_installed()
-
-        if "llm_adapter" in data and not hasattr(data["llm_adapter"], "complete"):
-            raise TypeError("llm_adapter must implement LLMProtocolV1")
-
-        if "temperature" in data and not 0 <= data["temperature"] <= 2:
-            raise ValueError("temperature must be between 0 and 2")
-
-        if (
-            "max_tokens" in data
-            and data.get("max_tokens") is not None
-            and data["max_tokens"] < 1
-        ):
-            raise ValueError("max_tokens must be positive")
-
-        super().__init__(**data)
-
-        # Concrete config instance (immutable dataclass).
-        # Precedence is simple: if the user supplied a LlamaIndexLLMConfig,
-        # use it as-is; otherwise use defaults.
-        self._config: LlamaIndexLLMConfig = (
-            self.config
-            if isinstance(self.config, LlamaIndexLLMConfig)
-            else LlamaIndexLLMConfig()
-        )
-
-        # Fail fast if there is no registered translator factory for LlamaIndex.
-        # This prevents silently falling back to the default translator, which
-        # may not know how to handle ChatMessage objects.
-        factory = get_llm_translator_factory("llamaindex")
-        if factory is None:
-            raise RuntimeError(
-                "No LLMFrameworkTranslator registered for framework='llamaindex'. "
-                "Call register_llm_translator('llamaindex', factory) before "
-                "constructing CorpusLlamaIndexLLM."
+    def __post_init__(self) -> None:
+        if not (0.0 <= float(self.temperature) <= 2.0):
+            raise ValueError(
+                f"{ErrorCodes.BAD_INIT_CONFIG}: "
+                f"temperature must be between 0.0 and 2.0, got {self.temperature}"
+            )
+        if self.max_tokens is not None and self.max_tokens < 1:
+            raise ValueError(
+                f"{ErrorCodes.BAD_INIT_CONFIG}: "
+                f"max_tokens must be positive, got {self.max_tokens}"
             )
 
-        # LLMTranslator orchestrator for the LlamaIndex framework.
-        self._translator: LLMTranslator = create_llm_translator(
-            adapter=self.llm_adapter,
-            framework="llamaindex",
-        )
+    @classmethod
+    def from_dict(cls, config_dict: Mapping[str, Any]) -> "AutoGenClientConfig":
+        """
+        Create a configuration from a mapping, ignoring unknown keys.
+        """
+        filtered: Dict[str, Any] = {
+            key: value for key, value in config_dict.items() if key in cls.__annotations__
+        }
+        return cls(**filtered)
+
+
+def _now_epoch_s() -> int:
+    return int(time.time())
+
+
+def _new_id(prefix: str = "chatcmpl") -> str:
+    return f"{prefix}-{uuid4().hex}"
+
+
+# ---------------------------------------------------------------------------
+# Error-context decorators (lazy, low-cost extraction)
+# ---------------------------------------------------------------------------
+
+
+def _extract_basic_context(
+    instance: Any,
+    args: Tuple[Any, ...],
+    kwargs: Dict[str, Any],
+    operation: str,
+) -> Dict[str, Any]:
+    """
+    Extract fast, low-cost context for error enrichment.
+    """
+    dynamic_ctx: Dict[str, Any] = {
+        "framework_name": _FRAMEWORK_NAME,
+        "model": getattr(instance, "model", "unknown"),
+        "temperature": getattr(instance, "temperature", 0.7),
+        "operation": operation,
+        "error_codes": ERROR_CODES,
+    }
+
+    # Messages count (cheap length check)
+    try:
+        if args and isinstance(args[0], (list, tuple)):
+            dynamic_ctx["messages_count"] = len(args[0])
+    except Exception:
+        pass
+
+    if "stream" in kwargs:
+        dynamic_ctx["stream"] = bool(kwargs["stream"])
+    if "request_id" in kwargs:
+        dynamic_ctx["request_id"] = kwargs["request_id"]
+    if "tenant" in kwargs:
+        dynamic_ctx["tenant"] = kwargs["tenant"]
+
+    return dynamic_ctx
+
+
+def _compute_detailed_context(
+    args: Tuple[Any, ...],
+    kwargs: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Compute richer, more expensive context details for error enrichment.
+
+    This is invoked only when an exception occurs to stay off the hot path.
+    """
+    detailed: Dict[str, Any] = {}
+    try:
+        # Message-based metrics
+        if args and isinstance(args[0], (list, tuple)):
+            messages = args[0]
+            roles: Dict[str, int] = {}
+            total_chars = 0
+
+            for msg in messages:
+                if not isinstance(msg, Mapping):
+                    continue
+                role = msg.get("role", "unknown")
+                roles[role] = roles.get(role, 0) + 1
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    total_chars += len(content)
+
+            detailed["roles_distribution"] = roles
+            detailed["total_content_chars"] = total_chars
+
+        # AutoGen-specific knobs
+        if kwargs.get("conversation") is not None:
+            detailed["has_conversation"] = True
+        if kwargs.get("context") is not None:
+            detailed["has_extra_context"] = True
+
+        # Sampling parameters
+        for param in (
+            "temperature",
+            "max_tokens",
+            "top_p",
+            "frequency_penalty",
+            "presence_penalty",
+        ):
+            if param in kwargs:
+                detailed[param] = kwargs[param]
+
+    except Exception as ctx_error:  # noqa: BLE001
+        logger.debug("Failed to compute detailed error context: %s", ctx_error)
+
+    return detailed
+
+
+def _create_error_context_decorator(
+    operation: str,
+    is_async: bool = False,
+) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    """
+    Factory for creating error-context decorators with lazy context extraction.
+    """
+
+    def decorator_factory(
+        **static_context: Any,
+    ) -> Callable[[Callable[..., T]], Callable[..., T]]:
+        def decorator(func: Callable[..., T]) -> Callable[..., T]:
+            if is_async:
+
+                @wraps(func)
+                async def async_wrapper(self: Any, *args: Any, **kwargs: Any) -> T:
+                    basic_context = _extract_basic_context(self, args, kwargs, operation)
+                    base_context = {**static_context, **basic_context}
+
+                    try:
+                        return await func(self, *args, **kwargs)
+                    except Exception as exc:  # noqa: BLE001
+                        detailed = _compute_detailed_context(args, kwargs)
+                        full_context = {**base_context, **detailed}
+                        attach_context(
+                            exc,
+                            framework=_FRAMEWORK_NAME,
+                            operation=f"llm_{operation}",
+                            **full_context,
+                        )
+                        raise
+
+                return async_wrapper
+            else:
+
+                @wraps(func)
+                def sync_wrapper(self: Any, *args: Any, **kwargs: Any) -> T:
+                    basic_context = _extract_basic_context(self, args, kwargs, operation)
+                    base_context = {**static_context, **basic_context}
+
+                    try:
+                        return func(self, *args, **kwargs)
+                    except Exception as exc:  # noqa: BLE001
+                        detailed = _compute_detailed_context(args, kwargs)
+                        full_context = {**base_context, **detailed}
+                        attach_context(
+                            exc,
+                            framework=_FRAMEWORK_NAME,
+                            operation=f"llm_{operation}",
+                            **full_context,
+                        )
+                        raise
+
+                return sync_wrapper
+
+        return decorator
+
+    return decorator_factory
+
+
+def with_llm_error_context(
+    operation: str,
+    **static_context: Any,
+) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    """Decorator for sync LLM methods with lazy dynamic context extraction."""
+    return _create_error_context_decorator(operation, is_async=False)(**static_context)
+
+
+def with_async_llm_error_context(
+    operation: str,
+    **static_context: Any,
+) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    """Decorator for async LLM methods with lazy dynamic context extraction."""
+    return _create_error_context_decorator(operation, is_async=True)(**static_context)
+
+
+# ---------------------------------------------------------------------------
+# Concrete AutoGen client
+# ---------------------------------------------------------------------------
+
+
+class CorpusAutoGenChatClient:
+    """
+    OpenAI-style chat client backed by a Corpus `LLMProtocolV1` via `LLMTranslator`.
+
+    This class is intended to be dropped into AutoGen configs wherever an
+    OpenAI-compatible chat client is expected. It exposes `create` and
+    `acreate` methods with familiar semantics:
+
+        - `create(messages=[...], model="...", stream=False)`
+        - `acreate(messages=[...], model="...", stream=True)`
+
+    All protocol calls are delegated to `LLMTranslator`, keeping this layer
+    thin and focused on:
+    - AutoGen message / parameter handling
+    - Context construction
+    - OpenAI-style response shaping
+    - Error-context enrichment
+    """
+
+    # ------------------------------------------------------------------ #
+    # Construction / resource management
+    # ------------------------------------------------------------------ #
+
+    def __init__(
+        self,
+        *,
+        llm_adapter: LLMProtocolV1,
+        config: Optional[AutoGenClientConfig] = None,
+        framework: str = _FRAMEWORK_NAME,
+        translator: Optional[LLMTranslator] = None,
+        post_processing_config: Optional[LLMPostProcessingConfig] = None,
+        **kwargs: Any,
+    ) -> None:
+        """
+        Initialize the AutoGen chat client.
+
+        Parameters
+        ----------
+        llm_adapter:
+            An implementation of `LLMProtocolV1`, used by the shared
+            `LLMTranslator` orchestrator.
+
+        config:
+            Optional `AutoGenClientConfig` instance. If omitted, a config is
+            built from remaining keyword arguments.
+
+        framework:
+            Framework name forwarded to `create_llm_translator` (defaults
+            to "autogen").
+
+        translator:
+            Optional pre-constructed `LLMTranslator`. If provided, it is
+            used as-is instead of calling `create_llm_translator`.
+
+        post_processing_config:
+            Optional `LLMPostProcessingConfig` passed to `create_llm_translator`
+            when a translator is not supplied.
+
+        **kwargs:
+            Additional configuration keys used to construct
+            `AutoGenClientConfig` when `config` is None.
+        """
+        self._config: AutoGenClientConfig = config or AutoGenClientConfig.from_dict(kwargs)
+
+        # Keep a direct reference to the underlying adapter for lifecycle.
+        self._adapter: LLMProtocolV1 = llm_adapter
+
+        # Validate adapter + key config invariants.
+        self._validate_init_params(llm_adapter)
+
+        # Create or adopt LLMTranslator (all protocol logic lives there).
+        if translator is not None:
+            self._translator: LLMTranslator = translator
+        else:
+            self._translator = create_llm_translator(
+                adapter=llm_adapter,
+                framework=framework,
+                translator=None,
+                post_processing_config=post_processing_config,
+            )
+
+        # Convenience attributes preserved for compatibility / logging.
+        self.model: str = self._config.model
+        self.temperature: float = float(self._config.temperature)
+        self.max_tokens: Optional[int] = self._config.max_tokens
+        self._framework_version: Optional[str] = self._config.framework_version
+        self._validate_inputs_flag: bool = self._config.validate_inputs
+        self._enable_metrics_flag: bool = self._config.enable_metrics
 
         logger.info(
-            "CorpusLlamaIndexLLM initialized with model=%s, temperature=%.2f, max_tokens=%s",
+            "CorpusAutoGenChatClient initialized with model=%s, temperature=%.2f",
             self.model,
             self.temperature,
-            self.max_tokens or "default",
         )
 
-    # ------------------------------------------------------------------ #
-    # Error context management
-    # ------------------------------------------------------------------ #
+    # Context manager support to mirror graph / embedding adapters.
+    def __enter__(self) -> "CorpusAutoGenChatClient":
+        return self
 
-    def _build_error_context(
-        self,
-        operation: str,
-        stream: bool,
-        messages: Sequence[ChatMessage],
-        model: str,
-        ctx: OperationContext,
-        params: Mapping[str, Any],
-    ) -> Dict[str, Any]:
-        """
-        Build consistent, rich error context for observability.
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        if hasattr(self._adapter, "close"):
+            try:
+                self._adapter.close()  # type: ignore[call-arg]
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Error while closing LLM adapter in __exit__: %s", exc)
 
-        Metrics on messages are computed lazily and only when enabled
-        in config and when an error actually occurs.
-        """
-        base_ctx: Dict[str, Any] = {
-            "framework": "llamaindex",
-            "resource_type": "llm",
-            "operation": operation,
-            "model": model,
-            "temperature": params.get("temperature"),
-            "max_tokens": params.get("max_tokens"),
-            "top_p": params.get("top_p"),
-            "frequency_penalty": params.get("frequency_penalty"),
-            "presence_penalty": params.get("presence_penalty"),
-            "stop_sequences": params.get("stop_sequences"),
-            "request_id": ctx.request_id,
-            "tenant": ctx.tenant,
-            "stream": stream,
-        }
+    async def __aenter__(self) -> "CorpusAutoGenChatClient":
+        return self
 
-        if self._config.include_message_metrics_on_error:
-            msg_metrics = _analyze_messages_for_context(messages)
-            base_ctx.update(msg_metrics)
-
-        return base_ctx
-
-    @contextmanager
-    def _error_context(
-        self,
-        operation: str,
-        stream: bool,
-        messages: Sequence[ChatMessage],
-        model: str,
-        ctx: OperationContext,
-        params: Mapping[str, Any],
-    ):
-        """Sync error-context wrapper with lazy metrics."""
-        try:
-            yield
-        except BaseException as exc:  # noqa: BLE001
-            if self._config.enable_error_context:
-                error_ctx = self._build_error_context(
-                    operation,
-                    stream,
-                    messages,
-                    model,
-                    ctx,
-                    params,
-                )
-                attach_context(exc, **error_ctx)
-            raise
-
-    @asynccontextmanager
-    async def _error_context_async(
-        self,
-        operation: str,
-        stream: bool,
-        messages: Sequence[ChatMessage],
-        model: str,
-        ctx: OperationContext,
-        params: Mapping[str, Any],
-    ):
-        """Async error-context wrapper with lazy metrics."""
-        try:
-            yield
-        except BaseException as exc:  # noqa: BLE001
-            if self._config.enable_error_context:
-                error_ctx = self._build_error_context(
-                    operation,
-                    stream,
-                    messages,
-                    model,
-                    ctx,
-                    params,
-                )
-                attach_context(exc, **error_ctx)
-            raise
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        if hasattr(self._adapter, "aclose"):
+            try:
+                await self._adapter.aclose()  # type: ignore[call-arg]
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Error while closing LLM adapter in __aexit__: %s", exc)
 
     # ------------------------------------------------------------------ #
-    # Internal helpers
+    # Internal helpers: validation & context
     # ------------------------------------------------------------------ #
 
-    def _build_operation_context(self, kwargs: Mapping[str, Any]) -> OperationContext:
+    def _validate_init_params(self, llm_adapter: LLMProtocolV1) -> None:
         """
-        Build OperationContext from LlamaIndex kwargs via context_translation.
+        Validate initialization parameters and adapter capabilities.
 
-        This keeps all LLM-level context building centralized in the core
-        context translators instead of baking assumptions into this adapter.
+        - Ensures the adapter exposes core `LLMProtocolV1` methods.
+        - Validates temperature and max_tokens constraints from config.
         """
-        callback_manager = kwargs.get("callback_manager")
-        return context_from_llamaindex(
-            callback_manager,
-            framework_version=self.framework_version,
+        required_methods = (
+            "complete",
+            "stream",
+            "count_tokens",
+            "health",
+            "capabilities",
         )
-
-    def _extract_stop_sequences(self, kwargs: Mapping[str, Any]) -> Optional[List[str]]:
-        """
-        Extract stop sequences from kwargs (handles multiple LlamaIndex shapes).
-
-        Checks:
-        - kwargs["stop"]
-        - kwargs["stop_sequences"]
-        - kwargs["additional_kwargs"]["stop" or "stop_sequences"]
-        """
-        stop: Any = kwargs.get("stop") or kwargs.get("stop_sequences")
-
-        additional = kwargs.get("additional_kwargs")
-        if stop is None and isinstance(additional, Mapping):
-            stop = additional.get("stop") or additional.get("stop_sequences")
-
-        if stop is None:
-            return None
-        if isinstance(stop, str):
-            return [stop]
-        if isinstance(stop, (list, tuple)):
-            return [str(s) for s in stop]
-        return [str(stop)]
-
-    def _build_sampling_params(
-        self,
-        kwargs: Mapping[str, Any],
-    ) -> Dict[str, Any]:
-        """
-        Build sampling parameters from kwargs, with validation.
-
-        This is the single source of truth for how we derive sampling params
-        (including stop sequences) from LlamaIndex's kwargs.
-        """
-        stop_sequences = self._extract_stop_sequences(kwargs)
-
-        temperature = kwargs.get("temperature", self.temperature)
-        if not 0 <= temperature <= 2:
-            logger.warning("Temperature %s out of reasonable range 0-2", temperature)
-
-        params: Dict[str, Any] = {
-            "model": kwargs.get("model", self.model),
-            "temperature": temperature,
-            "max_tokens": kwargs.get("max_tokens", self.max_tokens),
-            "top_p": kwargs.get("top_p"),
-            "frequency_penalty": kwargs.get("frequency_penalty"),
-            "presence_penalty": kwargs.get("presence_penalty"),
-            "stop_sequences": stop_sequences,
-        }
-        # Strip None for a clean param set
-        clean = {k: v for k, v in params.items() if v is not None}
-
-        logger.debug(
-            "Built sampling params for LlamaIndex: model=%s, temperature=%.2f, max_tokens=%s",
-            clean.get("model", self.model),
-            clean.get("temperature", self.temperature),
-            clean.get("max_tokens", self.max_tokens),
-        )
-
-        return clean
-
-    def _build_framework_ctx(self, kwargs: Mapping[str, Any]) -> Dict[str, Any]:
-        """
-        Build a small framework_ctx payload for the LLMTranslator.
-
-        This allows the framework-specific LLMFrameworkTranslator to see
-        LlamaIndex-specific metadata if needed.
-        """
-        return {
-            "framework_version": self.framework_version,
-            "callback_manager": kwargs.get("callback_manager"),
-            "llamaindex_additional_kwargs": kwargs.get("additional_kwargs"),
-        }
-
-    # ------------------------------------------------------------------ #
-    # Async API
-    # ------------------------------------------------------------------ #
-
-    async def achat(
-        self,
-        messages: Sequence[ChatMessage],
-        **kwargs: Any,
-    ) -> ChatResponse:
-        """
-        Async chat entrypoint required by LlamaIndex.
-
-        The flow is:
-
-        - Build OperationContext from LlamaIndex callback/context info.
-        - Derive sampling params from kwargs.
-        - Call LLMTranslator.arun_complete with raw LlamaIndex messages.
-        - Convert translator result into ChatResponse.
-        """
-        if not messages:
-            raise BadRequest(
-                "Messages list cannot be empty",
-                code="BAD_MESSAGES",
+        missing = [m for m in required_methods if not callable(getattr(llm_adapter, m, None))]
+        if missing:
+            raise TypeError(
+                f"{ErrorCodes.BAD_INIT_CONFIG}: "
+                f"llm_adapter must implement LLMProtocolV1; missing methods: "
+                f"{', '.join(missing)}"
             )
 
-        ctx = self._build_operation_context(kwargs)
-        params = self._build_sampling_params(kwargs)
-        model_for_context = params.get("model", self.model)
-        framework_ctx = self._build_framework_ctx(kwargs)
+        temperature = self._config.temperature
+        if not isinstance(temperature, (int, float)) or not (0.0 <= float(temperature) <= 2.0):
+            raise ValueError(
+                f"{ErrorCodes.BAD_INIT_CONFIG}: temperature must be between 0 and 2"
+            )
 
-        async with self._error_context_async(
-            "achat",
-            stream=False,
-            messages=messages,
-            model=model_for_context,
-            ctx=ctx,
-            params=params,
-        ):
+        if self._config.max_tokens is not None:
+            if not isinstance(self._config.max_tokens, int) or self._config.max_tokens < 1:
+                raise ValueError(
+                    f"{ErrorCodes.BAD_INIT_CONFIG}: max_tokens must be positive"
+                )
+
+    def _validate_messages(self, messages: Sequence[Mapping[str, Any]]) -> None:
+        """
+        Validate message structure before processing.
+
+        Ensures:
+        - messages is non-empty
+        - each item is a Mapping
+        - each message has 'role' and 'content' keys
+        """
+        if not messages:
+            raise ValueError("messages list cannot be empty")
+
+        for index, msg in enumerate(messages):
+            if not isinstance(msg, Mapping):
+                raise TypeError(
+                    f"messages[{index}] must be a mapping, got {type(msg).__name__}"
+                )
+            if "role" not in msg:
+                raise ValueError(f"messages[{index}] is missing required 'role' field")
+            if "content" not in msg:
+                raise ValueError(f"messages[{index}] is missing required 'content' field")
+
+    def _build_ctx_and_params(
+        self,
+        *,
+        conversation: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Tuple[Optional[OperationContext], Dict[str, Any]]:
+        """
+        Construct OperationContext and sampling params from kwargs.
+
+        Recognized kwargs (removed from kwargs when processed):
+            - model
+            - temperature
+            - max_tokens
+            - top_p
+            - frequency_penalty
+            - presence_penalty
+            - stop  (str | list[str])
+            - system_message
+            - request_id
+            - tenant
+        """
+        extra: Dict[str, Any] = dict(extra_context or {})
+
+        # If no conversation/extra, let downstream create an "empty" context.
+        if conversation is None and not extra:
+            ctx: Optional[OperationContext] = None
+        else:
+            try:
+                ctx = core_ctx_from_autogen(
+                    conversation,
+                    framework_version=self._framework_version,
+                    **extra,
+                )
+            except Exception as exc:  # noqa: BLE001
+                attach_context(
+                    exc,
+                    framework=_FRAMEWORK_NAME,
+                    operation="llm_context_translation",
+                    error_codes=ERROR_CODES,
+                    framework_version=self._framework_version,
+                )
+                raise
+
+            if not isinstance(ctx, OperationContext):
+                raise TypeError(
+                    f"{ErrorCodes.BAD_OPERATION_CONTEXT}: "
+                    f"from_autogen produced unsupported context type: "
+                    f"{type(ctx).__name__}"
+                )
+
+        # Optional overrides for request_id / tenant.
+        request_id = kwargs.pop("request_id", None)
+        tenant = kwargs.pop("tenant", None)
+
+        if ctx is not None and (request_id is not None or tenant is not None):
+            ctx = OperationContext(
+                request_id=request_id or ctx.request_id,
+                idempotency_key=ctx.idempotency_key,
+                deadline_ms=ctx.deadline_ms,
+                traceparent=ctx.traceparent,
+                tenant=tenant or ctx.tenant,
+                attrs=ctx.attrs,
+            )
+
+        # Stop sequences: OpenAI uses "stop" (str or list[str]).
+        stop_arg = kwargs.pop("stop", None)
+        stop_sequences: Optional[list[str]] = None
+        if isinstance(stop_arg, str):
+            stop_sequences = [stop_arg]
+        elif isinstance(stop_arg, (list, tuple)):
+            stop_sequences = [str(s) for s in stop_arg]
+
+        # Sampling and routing params (translator-facing).
+        params: Dict[str, Any] = {
+            "model": kwargs.pop("model", self.model),
+            "temperature": kwargs.pop("temperature", self.temperature),
+            "max_tokens": kwargs.pop("max_tokens", self.max_tokens),
+            "top_p": kwargs.pop("top_p", None),
+            "frequency_penalty": kwargs.pop("frequency_penalty", None),
+            "presence_penalty": kwargs.pop("presence_penalty", None),
+            "stop_sequences": stop_sequences,
+            "system_message": kwargs.pop("system_message", None),
+        }
+
+        # Drop None values so the translator sees a clean param set.
+        params = {k: v for k, v in params.items() if v is not None}
+        return ctx, params
+
+    # ------------------------------------------------------------------ #
+    # OpenAI-style shaping helpers (thin, usage via framework_utils)
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _completion_to_openai(
+        result: Any,
+        *,
+        completion_id: Optional[str] = None,
+        created: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Convert a translator-level completion into an OpenAI ChatCompletion payload.
+
+        Translator default `from_completion` returns a dict like:
+
+            {
+                "text": ...,
+                "model": ...,
+                "usage": {...},
+                "finish_reason": ...,
+                ...
+            }
+
+        This function stays thin: it does not touch protocol logic, only
+        shapes the already-normalized result.
+        """
+        completion_id = completion_id or _new_id()
+        created = created or _now_epoch_s()
+
+        # Text / model / finish_reason best-effort extraction.
+        if isinstance(result, Mapping):
+            text = str(
+                result.get("text")
+                or result.get("content")
+                or (result.get("message") or {}).get("content", "")
+                or ""
+            )
+            model = str(result.get("model") or "unknown")
+            finish_reason = result.get("finish_reason")
+        else:
+            text = str(getattr(result, "text", "") or "")
+            model = str(getattr(result, "model", "unknown"))
+            finish_reason = getattr(result, "finish_reason", None)
+
+        # Usage: prefer shared coercion utility for consistency / bounds.
+        usage_dict: Dict[str, int] = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+        try:
+            token_usage = coerce_token_usage(
+                result,
+                framework=_FRAMEWORK_NAME,
+                error_codes=ERROR_CODES,
+                logger=logger,
+            )
+            usage_dict = {
+                "prompt_tokens": token_usage.prompt_tokens,
+                "completion_tokens": token_usage.completion_tokens,
+                "total_tokens": token_usage.total_tokens,
+            }
+        except Exception as exc:  # noqa: BLE001
+            # Fall back to simple mapping-based extraction if available.
+            logger.debug(
+                "AutoGen: failed to coerce token usage from completion: %s",
+                exc,
+            )
+            if isinstance(result, Mapping):
+                usage = result.get("usage") or {}
+                if isinstance(usage, Mapping):
+                    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                        value = usage.get(key)
+                        if isinstance(value, int):
+                            usage_dict[key] = value
+
+        return {
+            "id": completion_id,
+            "object": "chat.completion",
+            "created": created,
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": text,
+                    },
+                    "finish_reason": finish_reason,
+                }
+            ],
+            "usage": usage_dict,
+        }
+
+    @staticmethod
+    def _chunk_to_openai(
+        chunk: Any,
+        *,
+        stream_id: str,
+        created: int,
+        model_fallback: str,
+        is_first: bool,
+    ) -> Dict[str, Any]:
+        """
+        Convert a translator-level streaming chunk into an OpenAI ChatCompletion chunk.
+
+        Translator `from_chunk` yields dicts of the form:
+
+            {
+                "text": ...,
+                "is_final": bool,
+                "model": ...,
+                "usage_so_far": {...} | None,
+                ...
+            }
+        """
+        if isinstance(chunk, Mapping):
+            text = str(chunk.get("text") or chunk.get("delta") or "")
+            is_final = bool(chunk.get("is_final", False))
+            model = str(chunk.get("model") or model_fallback)
+            usage = chunk.get("usage_so_far") or chunk.get("usage")
+        else:
+            text = str(getattr(chunk, "text", "") or getattr(chunk, "delta", "") or "")
+            is_final = bool(getattr(chunk, "is_final", False))
+            model = str(getattr(chunk, "model", model_fallback))
+            usage = getattr(chunk, "usage_so_far", None)
+
+        delta: Dict[str, Any] = {}
+        if is_first:
+            delta["role"] = "assistant"
+        if text:
+            delta["content"] = text
+
+        choice: Dict[str, Any] = {
+            "index": 0,
+            "delta": delta,
+            "finish_reason": "stop" if is_final else None,
+        }
+
+        payload: Dict[str, Any] = {
+            "id": stream_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [choice],
+        }
+
+        if isinstance(usage, Mapping):
+            usage_payload: Dict[str, int] = {}
+            # Best-effort reuse of shared coercion, but keep it soft-failing.
+            try:
+                token_usage = coerce_token_usage(
+                    {"usage": usage},
+                    framework=_FRAMEWORK_NAME,
+                    error_codes=ERROR_CODES,
+                    logger=logger,
+                )
+                usage_payload = {
+                    "prompt_tokens": token_usage.prompt_tokens,
+                    "completion_tokens": token_usage.completion_tokens,
+                    "total_tokens": token_usage.total_tokens,
+                }
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "AutoGen: failed to coerce token usage from stream chunk: %s",
+                    exc,
+                )
+                for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                    value = usage.get(key)
+                    if isinstance(value, int):
+                        usage_payload[key] = value
+
+            if usage_payload:
+                payload["usage"] = usage_payload
+
+        return payload
+
+    # ------------------------------------------------------------------ #
+    # Public async API (AutoGen-facing)
+    # ------------------------------------------------------------------ #
+
+    @with_async_llm_error_context("acreate")
+    async def acreate(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        **kwargs: Any,
+    ) -> Union[Dict[str, Any], AsyncIterator[Dict[str, Any]]]:
+        """
+        AutoGen-style async entrypoint.
+
+        Usage:
+            await client.acreate(messages=[...], model="...", stream=False)
+            async for chunk in client.acreate(messages=[...], stream=True): ...
+        """
+        if self._validate_inputs_flag:
+            self._validate_messages(messages)
+
+        stream = bool(kwargs.pop("stream", False))
+
+        # Extract AutoGen / extra context (kept thin, passed to translator).
+        conversation = kwargs.pop("conversation", None)
+        extra_context = kwargs.pop("context", None)
+        if extra_context is not None and not isinstance(extra_context, Mapping):
+            extra_context = None
+
+        ctx, params = self._build_ctx_and_params(
+            conversation=conversation,
+            extra_context=extra_context,
+            **kwargs,
+        )
+
+        if not stream:
             result = await self._translator.arun_complete(
                 raw_messages=messages,
-                model=params.get("model"),
-                max_tokens=params.get("max_tokens"),
-                temperature=params.get("temperature"),
-                top_p=params.get("top_p"),
-                frequency_penalty=params.get("frequency_penalty"),
-                presence_penalty=params.get("presence_penalty"),
-                stop_sequences=params.get("stop_sequences"),
                 op_ctx=ctx,
-                framework_ctx=framework_ctx,
+                framework_ctx=None,
+                **params,
             )
+            return self._completion_to_openai(result)
 
-            return _build_chat_response_from_translator_result(result)
+        # Streaming: return async iterator of OpenAI-style chunks.
+        async def _gen() -> AsyncIterator[Dict[str, Any]]:
+            stream_id = _new_id()
+            created = _now_epoch_s()
+            is_first = True
+            chunk_iter: Optional[AsyncIterator[Any]] = None
 
-    async def astream_chat(
-        self,
-        messages: Sequence[ChatMessage],
-        **kwargs: Any,
-    ) -> ChatResponseAsyncGen:
-        """
-        Async streaming chat entrypoint required by LlamaIndex.
-
-        All streaming goes through `LLMTranslator.arun_stream`, and each
-        streaming chunk is converted into a `ChatResponse`.
-        """
-        if not messages:
-            raise BadRequest(
-                "Messages list cannot be empty",
-                code="BAD_MESSAGES",
-            )
-
-        ctx = self._build_operation_context(kwargs)
-        params = self._build_sampling_params(kwargs)
-        model_for_context = params.get("model", self.model)
-        framework_ctx = self._build_framework_ctx(kwargs)
-
-        async with self._error_context_async(
-            "astream_chat",
-            stream=True,
-            messages=messages,
-            model=model_for_context,
-            ctx=ctx,
-            params=params,
-        ):
-            async def _gen() -> AsyncIterator[ChatResponse]:
-                agen = await self._translator.arun_stream(
+            try:
+                chunk_iter = await self._translator.arun_stream(
                     raw_messages=messages,
-                    model=params.get("model"),
-                    max_tokens=params.get("max_tokens"),
-                    temperature=params.get("temperature"),
-                    top_p=params.get("top_p"),
-                    frequency_penalty=params.get("frequency_penalty"),
-                    presence_penalty=params.get("presence_penalty"),
-                    stop_sequences=params.get("stop_sequences"),
                     op_ctx=ctx,
-                    framework_ctx=framework_ctx,
+                    framework_ctx=None,
+                    **params,
                 )
 
-                try:
-                    async for chunk_obj in agen:
-                        yield _build_chat_response_from_chunk_like(chunk_obj)
-                finally:
-                    # Explicit cleanup of async generator if supported
-                    aclose = getattr(agen, "aclose", None)
+                async for chunk in chunk_iter:
+                    yield self._chunk_to_openai(
+                        chunk,
+                        stream_id=stream_id,
+                        created=created,
+                        model_fallback=params.get("model", self.model),
+                        is_first=is_first,
+                    )
+                    is_first = False
+            except Exception:  # noqa: BLE001
+                logger.error("Streaming iteration failed in acreate", exc_info=True)
+                raise
+            finally:
+                if chunk_iter is not None:
+                    aclose = getattr(chunk_iter, "aclose", None)
                     if callable(aclose):
                         try:
                             await aclose()
-                        except Exception as close_exc:  # noqa: BLE001
-                            logger.debug(
-                                "Failed to close async stream iterator: %s",
-                                close_exc,
+                        except Exception as cleanup_error:  # noqa: BLE001
+                            logger.warning(
+                                "Stream cleanup failed in acreate: %s",
+                                cleanup_error,
                             )
 
-            return _gen()
+        return _gen()
 
     # ------------------------------------------------------------------ #
-    # Sync API
+    # Public sync API (AutoGen-facing)
     # ------------------------------------------------------------------ #
 
-    def chat(
+    @with_llm_error_context("create")
+    def create(
         self,
-        messages: Sequence[ChatMessage],
+        messages: Sequence[Mapping[str, Any]],
         **kwargs: Any,
-    ) -> ChatResponse:
+    ) -> Union[Dict[str, Any], Iterator[Dict[str, Any]]]:
         """
-        Sync chat entrypoint required by LlamaIndex.
+        AutoGen-style sync entrypoint.
 
-        Uses LLMTranslator.complete under the hood (sync bridge).
+        Usage:
+            client.create(messages=[...], model="...", stream=False)
+            for chunk in client.create(messages=[...], stream=True): ...
         """
-        if not messages:
-            raise BadRequest(
-                "Messages list cannot be empty",
-                code="BAD_MESSAGES",
-            )
+        if self._validate_inputs_flag:
+            self._validate_messages(messages)
 
-        ctx = self._build_operation_context(kwargs)
-        params = self._build_sampling_params(kwargs)
-        model_for_context = params.get("model", self.model)
-        framework_ctx = self._build_framework_ctx(kwargs)
+        stream = bool(kwargs.pop("stream", False))
 
-        with self._error_context(
-            "chat",
-            stream=False,
-            messages=messages,
-            model=model_for_context,
-            ctx=ctx,
-            params=params,
-        ):
+        # Extract AutoGen / extra context.
+        conversation = kwargs.pop("conversation", None)
+        extra_context = kwargs.pop("context", None)
+        if extra_context is not None and not isinstance(extra_context, Mapping):
+            extra_context = None
+
+        ctx, params = self._build_ctx_and_params(
+            conversation=conversation,
+            extra_context=extra_context,
+            **kwargs,
+        )
+
+        if not stream:
             result = self._translator.complete(
                 raw_messages=messages,
-                model=params.get("model"),
-                max_tokens=params.get("max_tokens"),
-                temperature=params.get("temperature"),
-                top_p=params.get("top_p"),
-                frequency_penalty=params.get("frequency_penalty"),
-                presence_penalty=params.get("presence_penalty"),
-                stop_sequences=params.get("stop_sequences"),
                 op_ctx=ctx,
-                framework_ctx=framework_ctx,
+                framework_ctx=None,
+                **params,
             )
+            return self._completion_to_openai(result)
 
-            return _build_chat_response_from_translator_result(result)
+        # Streaming: sync path via translator streaming with proper cleanup.
+        def _iter() -> Iterator[Dict[str, Any]]:
+            stream_id = _new_id()
+            created = _now_epoch_s()
+            is_first = True
+            chunk_iter: Optional[Iterator[Any]] = None
 
-    def stream_chat(
-        self,
-        messages: Sequence[ChatMessage],
-        **kwargs: Any,
-    ) -> ChatResponseGen:
-        """
-        Sync streaming chat entrypoint required by LlamaIndex.
-
-        Uses LLMTranslator.stream, which bridges async streaming into sync.
-        """
-        if not messages:
-            raise BadRequest(
-                "Messages list cannot be empty",
-                code="BAD_MESSAGES",
-            )
-
-        ctx = self._build_operation_context(kwargs)
-        params = self._build_sampling_params(kwargs)
-        model_for_context = params.get("model", self.model)
-        framework_ctx = self._build_framework_ctx(kwargs)
-
-        with self._error_context(
-            "stream_chat",
-            stream=True,
-            messages=messages,
-            model=model_for_context,
-            ctx=ctx,
-            params=params,
-        ):
-            def _gen() -> Iterator[ChatResponse]:
-                stream_iter = self._translator.stream(
+            try:
+                chunk_iter = self._translator.stream(
                     raw_messages=messages,
-                    model=params.get("model"),
-                    max_tokens=params.get("max_tokens"),
-                    temperature=params.get("temperature"),
-                    top_p=params.get("top_p"),
-                    frequency_penalty=params.get("frequency_penalty"),
-                    presence_penalty=params.get("presence_penalty"),
-                    stop_sequences=params.get("stop_sequences"),
                     op_ctx=ctx,
-                    framework_ctx=framework_ctx,
+                    framework_ctx=None,
+                    **params,
                 )
 
-                try:
-                    for chunk_obj in stream_iter:
-                        yield _build_chat_response_from_chunk_like(chunk_obj)
-                finally:
-                    # Explicit cleanup of sync iterator if supported
-                    close = getattr(stream_iter, "close", None)
+                for chunk in chunk_iter:
+                    yield self._chunk_to_openai(
+                        chunk,
+                        stream_id=stream_id,
+                        created=created,
+                        model_fallback=params.get("model", self.model),
+                        is_first=is_first,
+                    )
+                    is_first = False
+            except Exception:  # noqa: BLE001
+                logger.error("Streaming iteration failed in create", exc_info=True)
+                raise
+            finally:
+                if chunk_iter is not None:
+                    close = getattr(chunk_iter, "close", None)
                     if callable(close):
                         try:
                             close()
-                        except Exception as close_exc:  # noqa: BLE001
-                            logger.debug(
-                                "Failed to close sync stream iterator: %s",
-                                close_exc,
+                        except Exception as cleanup_error:  # noqa: BLE001
+                            logger.warning(
+                                "Stream cleanup failed in create: %s",
+                                cleanup_error,
                             )
 
-            return _gen()
+        return _iter()
 
-    # ------------------------------------------------------------------ #
-    # Token counting
-    # ------------------------------------------------------------------ #
-
-    def count_tokens(
+    # Allow direct call usage: client(...) behaves like client.create(...)
+    def __call__(
         self,
-        messages: Sequence[ChatMessage],
+        messages: Sequence[Mapping[str, Any]],
         **kwargs: Any,
-    ) -> int:
-        """
-        Token counting helper.
-
-        Preferred path:
-        - Use LLMTranslator.count_tokens_for_messages so token counting
-          can use the same formatting and strategies as actual completions.
-
-        Fallbacks:
-        - If translator/adapter count fails, use improved char-based estimate.
-        - If that fails, use the simple character-based heuristic.
-        """
-        if not messages:
-            return 0
-
-        ctx = self._build_operation_context(kwargs)
-        model = kwargs.get("model", self.model)
-        framework_ctx = self._build_framework_ctx(kwargs)
-
-        # Preferred: translator-based token counting
-        try:
-            tokens_any = self._translator.count_tokens_for_messages(
-                raw_messages=messages,
-                model=model,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-            return int(tokens_any)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Translator-based token counting failed: %s", exc)
-
-        # Fall back to improved character-based estimate
-        try:
-            return self._estimate_tokens_from_messages(messages)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Token estimation failed: %s", exc)
-
-        # Ultimate fallback to simple character count
-        return self._simple_token_estimate(messages)
-
-    def _combine_messages_for_counting(
-        self,
-        messages: Sequence[ChatMessage],
-    ) -> str:
-        """Combine messages into a single string for token counting."""
-        parts: List[str] = []
-        for msg in messages:
-            role = getattr(msg, "type", getattr(msg, "role", "user"))
-            content = str(getattr(msg, "content", ""))
-            parts.append(f"{role}: {content}")
-        return "\n".join(parts)
-
-    def _estimate_tokens_from_messages(
-        self,
-        messages: Sequence[ChatMessage],
-    ) -> int:
-        """Improved token estimation with better heuristics."""
-        combined_text = self._combine_messages_for_counting(messages)
-
-        if not combined_text:
-            return 0
-
-        char_count = len(combined_text)
-        message_count = len(messages)
-
-        char_based = max(1, char_count // 4)
-        message_based = max(1, message_count)
-
-        return max(char_based, message_based)
-
-    def _simple_token_estimate(
-        self,
-        messages: Sequence[ChatMessage],
-    ) -> int:
-        """Simple fallback token estimation."""
-        combined_text = self._combine_messages_for_counting(messages)
-        return max(1, len(combined_text) // 4)
+    ) -> Union[Dict[str, Any], Iterator[Dict[str, Any]]]:
+        return self.create(messages, **kwargs)
 
 
 __all__ = [
-    "LlamaIndexLLMProtocol",
-    "CorpusLlamaIndexLLM",
-    "LlamaIndexLLMConfig",
+    "AutoGenClientConfig",
+    "AutoGenLLMClientProtocol",
+    "CorpusAutoGenChatClient",
+    "ErrorCodes",
+    "ERROR_CODES",
+    "with_llm_error_context",
+    "with_async_llm_error_context",
 ]
