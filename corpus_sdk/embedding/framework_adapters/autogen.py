@@ -11,7 +11,7 @@ use with Microsoft AutoGen multi-agent conversations, with:
 - Support for AutoGen's group chat and agent memory systems
 - Context normalization using existing `context_translation.from_autogen`
 - Framework-agnostic orchestration via `EmbeddingTranslator`
-- Async → sync bridging using `AsyncBridge`
+- Async → sync bridging handled in the common embedding layer
 - Rich error context attachment for observability
 
 The design integrates seamlessly with AutoGen's agent workflows while
@@ -24,15 +24,15 @@ import logging
 from functools import cached_property, wraps
 from typing import (
     Any,
+    Callable,
     Dict,
-    List,
     Mapping,
     Optional,
+    Protocol,
     Sequence,
     Tuple,
-    Protocol,
     TypeVar,
-    Callable,
+    List,
 )
 
 from corpus_sdk.core.context_translation import (
@@ -49,74 +49,34 @@ from corpus_sdk.embedding.framework_adapters.common.embedding_translation import
     TextNormalizationConfig,
     create_embedding_translator,
 )
+from corpus_sdk.embedding.framework_adapters.common.framework_utils import (
+    CoercionErrorCodes,
+    coerce_embedding_matrix,
+    coerce_embedding_vector,
+    warn_if_extreme_batch,
+)
 
 logger = logging.getLogger(__name__)
 
-# Type variables for decorators
 T = TypeVar("T")
 
 
-# Error code constants
-class ErrorCodes:
+# --------------------------------------------------------------------------- #
+# Error codes (aligned with other framework adapters)
+# --------------------------------------------------------------------------- #
+
+
+class ErrorCodes(CoercionErrorCodes):
+    """Error code constants for AutoGen embedding adapter."""
+
     INVALID_EMBEDDING_RESULT = "INVALID_EMBEDDING_RESULT"
     EMPTY_EMBEDDING_RESULT = "EMPTY_EMBEDDING_RESULT"
     EMBEDDING_CONVERSION_ERROR = "EMBEDDING_CONVERSION_ERROR"
 
 
-def with_embedding_error_context(
-    operation: str,
-    **context_kwargs: Any,
-) -> Callable[[Callable[..., T]], Callable[..., T]]:
-    """
-    Decorator to automatically attach error context to embedding exceptions.
-    """
-
-    def decorator(func: Callable[..., T]) -> Callable[..., T]:
-        @wraps(func)
-        def wrapper(*args: Any, **kwargs: Any) -> T:
-            try:
-                return func(*args, **kwargs)
-            except Exception as exc:
-                enhanced_context = context_kwargs.copy()
-                attach_context(
-                    exc,
-                    framework="autogen",
-                    operation=f"embedding_{operation}",
-                    **enhanced_context,
-                )
-                raise
-
-        return wrapper
-
-    return decorator
-
-
-def with_async_embedding_error_context(
-    operation: str,
-    **context_kwargs: Any,
-) -> Callable[[Callable[..., T]], Callable[..., T]]:
-    """
-    Decorator to automatically attach error context to async embedding exceptions.
-    """
-
-    def decorator(func: Callable[..., T]) -> Callable[..., T]:
-        @wraps(func)
-        async def wrapper(*args: Any, **kwargs: Any) -> T:
-            try:
-                return await func(*args, **kwargs)
-            except Exception as exc:
-                enhanced_context = context_kwargs.copy()
-                attach_context(
-                    exc,
-                    framework="autogen",
-                    operation=f"embedding_{operation}",
-                    **enhanced_context,
-                )
-                raise
-
-        return wrapper
-
-    return decorator
+# --------------------------------------------------------------------------- #
+# AutoGen retriever protocol
+# --------------------------------------------------------------------------- #
 
 
 class AutoGenRetriever(Protocol):
@@ -134,6 +94,76 @@ class AutoGenRetriever(Protocol):
     def retrieve(self, query: str, **kwargs: Any) -> Any:
         """Retrieve documents for the given query."""
         ...
+
+
+# --------------------------------------------------------------------------- #
+# Error-context decorators
+# --------------------------------------------------------------------------- #
+
+
+def with_embedding_error_context(
+    operation: str,
+    **static_context: Any,
+) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    """
+    Decorator to automatically attach error context to sync embedding exceptions.
+
+    We intentionally catch broad `Exception` at this layer because embedding
+    operations must not leak internal adapter errors without rich context.
+    """
+
+    def decorator(func: Callable[..., T]) -> Callable[..., T]:
+        @wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> T:
+            try:
+                return func(*args, **kwargs)
+            except Exception as exc:
+                attach_context(
+                    exc,
+                    framework="autogen",
+                    operation=f"embedding_{operation}",
+                    **static_context,
+                )
+                raise
+
+        return wrapper
+
+    return decorator
+
+
+def with_async_embedding_error_context(
+    operation: str,
+    **static_context: Any,
+) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    """
+    Decorator to automatically attach error context to async embedding exceptions.
+
+    We intentionally catch broad `Exception` at this layer to ensure that any
+    async embedding failure carries framework and operation metadata.
+    """
+
+    def decorator(func: Callable[..., T]) -> Callable[..., T]:
+        @wraps(func)
+        async def wrapper(*args: Any, **kwargs: Any) -> T:
+            try:
+                return await func(*args, **kwargs)
+            except Exception as exc:
+                attach_context(
+                    exc,
+                    framework="autogen",
+                    operation=f"embedding_{operation}",
+                    **static_context,
+                )
+                raise
+
+        return wrapper
+
+    return decorator
+
+
+# --------------------------------------------------------------------------- #
+# Core AutoGen EmbeddingFunction implementation
+# --------------------------------------------------------------------------- #
 
 
 class CorpusAutoGenEmbeddings:
@@ -185,31 +215,30 @@ class CorpusAutoGenEmbeddings:
         batch_config: Optional[BatchConfig] = None,
         text_normalization_config: Optional[TextNormalizationConfig] = None,
         autogen_config: Optional[Dict[str, Any]] = None,
-    ):
-        """
-        Initialize Corpus AutoGen Embeddings.
+    ) -> None:
+        # Behavioral validation (duck-typed) instead of strict isinstance
+        if not hasattr(corpus_adapter, "embed") or not callable(
+            getattr(corpus_adapter, "embed", None)
+        ):
+            raise TypeError(
+                "corpus_adapter must implement an EmbeddingProtocolV1-compatible "
+                "interface with an 'embed' method"
+            )
 
-        Parameters
-        ----------
-        corpus_adapter:
-            Corpus embedding protocol adapter
-        model:
-            Model identifier for embedding operations
-        batch_config:
-            Batching configuration for embedding requests
-        text_normalization_config:
-            Text normalization settings
-        autogen_config:
-            AutoGen-specific configuration for agent workflows
-        """
         self.corpus_adapter = corpus_adapter
         self.model = model
         self.batch_config = batch_config
         self.text_normalization_config = text_normalization_config
-        self.autogen_config = autogen_config or {}
+        self.autogen_config: Dict[str, Any] = autogen_config or {}
+
+        logger.info(
+            "CorpusAutoGenEmbeddings initialized with model=%s, autogen_config=%r",
+            self.model or "default",
+            self.autogen_config,
+        )
 
     # ------------------------------------------------------------------ #
-    # Core AutoGen EmbeddingFunction Protocol Implementation
+    # Internal helpers
     # ------------------------------------------------------------------ #
 
     @cached_property
@@ -219,13 +248,18 @@ class CorpusAutoGenEmbeddings:
 
         Uses `cached_property` for thread safety and performance.
         """
-        return create_embedding_translator(
+        translator = create_embedding_translator(
             adapter=self.corpus_adapter,
             framework="autogen",
             translator=None,  # use registry/default generic translator
             batch_config=self.batch_config,
             text_normalization_config=self.text_normalization_config,
         )
+        logger.debug(
+            "EmbeddingTranslator initialized for AutoGen with model=%s",
+            self.model or "default",
+        )
+        return translator
 
     def _build_contexts(
         self,
@@ -235,46 +269,70 @@ class CorpusAutoGenEmbeddings:
         **kwargs: Any,
     ) -> Tuple[Optional[OperationContext], Dict[str, Any]]:
         """
-        Build contexts for the AutoGen execution environment.
+        Build contexts for AutoGen execution environment.
 
         Returns
         -------
         Tuple of:
-        - core_ctx:
-            An `OperationContext` instance if successfully derived from
-            `autogen_context`, otherwise None (the translator will build
-            a fresh context when needed).
-        - framework_ctx:
-            AutoGen-specific framework context used by the translator
-            for model selection and observability.
+        - core_ctx: core OperationContext or None if no/invalid context
+        - framework_ctx: AutoGen-specific context for translator
         """
         core_ctx: Optional[OperationContext] = None
-        framework_ctx: Dict[str, Any] = {"framework": "autogen"}
+        framework_ctx: Dict[str, Any] = {
+            "framework": "autogen",
+            "autogen_config": dict(self.autogen_config),
+        }
 
+        # Validate and translate AutoGen context to OperationContext
         if autogen_context is not None:
-            try:
-                maybe_ctx = context_from_autogen(autogen_context)
-                if isinstance(maybe_ctx, OperationContext):
-                    core_ctx = maybe_ctx
-                else:
-                    logger.warning(
-                        "context_from_autogen returned non-OperationContext type: %s. "
-                        "Using empty OperationContext.",
-                        type(maybe_ctx).__name__,
-                    )
-            except Exception as e:
+            if not isinstance(autogen_context, Mapping):
                 logger.warning(
-                    "Failed to create OperationContext from autogen_context: %s. "
-                    "Falling back to None (translator will synthesize context).",
-                    e,
+                    "autogen_context should be a Mapping, got %s; ignoring context",
+                    type(autogen_context).__name__,
                 )
+            else:
+                try:
+                    core_candidate = context_from_autogen(autogen_context)
+                except Exception as exc:
+                    # We intentionally catch all exceptions from context translation:
+                    # context is best-effort and must never break embedding calls.
+                    logger.warning(
+                        "Failed to create OperationContext from autogen_context: %s. "
+                        "Proceeding without OperationContext.",
+                        exc,
+                    )
+                    try:
+                        snapshot = dict(autogen_context)
+                    except TypeError:
+                        snapshot = {"repr": repr(autogen_context)}
+                    attach_context(
+                        exc,
+                        framework="autogen",
+                        operation="context_build",
+                        autogen_context_snapshot=snapshot,
+                        autogen_config=self.autogen_config,
+                    )
+                else:
+                    if isinstance(core_candidate, OperationContext):
+                        core_ctx = core_candidate
+                        logger.debug(
+                            "Successfully created OperationContext from AutoGen context "
+                            "with conversation_id=%s",
+                            autogen_context.get("conversation_id", "unknown"),
+                        )
+                    else:
+                        logger.warning(
+                            "context_from_autogen returned non-OperationContext type: %s. "
+                            "Ignoring OperationContext.",
+                            type(core_candidate).__name__,
+                        )
 
-        # Add model information if available
+        # Framework-level context for AutoGen-specific hints
         effective_model = model or self.model
         if effective_model:
             framework_ctx["model"] = effective_model
 
-        # Add AutoGen-specific context for agent workflows
+        # Add AutoGen-specific context for observability and optimization
         if autogen_context:
             if "agent_name" in autogen_context:
                 framework_ctx["agent_name"] = autogen_context["agent_name"]
@@ -285,89 +343,34 @@ class CorpusAutoGenEmbeddings:
             if "retriever_name" in autogen_context:
                 framework_ctx["retriever_name"] = autogen_context["retriever_name"]
 
-        # Add any additional kwargs to framework context
+        # Include any extra call-specific hints
         framework_ctx.update(kwargs)
+
+        # Also expose the OperationContext itself for downstream inspection
+        if core_ctx is not None:
+            framework_ctx["_operation_context"] = core_ctx
 
         return core_ctx, framework_ctx
 
     def _coerce_embedding_matrix(self, result: Any) -> List[List[float]]:
         """
-        Coerce translator result into a List[List[float]] embedding matrix.
-
-        Supports result formats:
-        - {"embeddings": [[...], [...]], ...}
-        - {"embedding": [...], ...}  (single embedding)
-        - Direct matrix: [[...], [...]]
-        - Objects with `.embeddings` or `.embedding` attributes
-
-        This ensures consistency across all framework adapters while
-        retaining strict type validation and conversion.
+        Thin wrapper around shared coercion utility for matrix outputs.
         """
-        embeddings_obj: Any
-
-        if isinstance(result, Mapping):
-            if "embeddings" in result:
-                embeddings_obj = result["embeddings"]
-            elif "embedding" in result:
-                # Single embedding vector from unary translator
-                embeddings_obj = [result["embedding"]]
-            else:
-                embeddings_obj = result
-        elif hasattr(result, "embeddings"):
-            embeddings_obj = getattr(result, "embeddings")
-        elif hasattr(result, "embedding"):
-            # Raw EmbedResult-like object
-            embeddings_obj = [getattr(result, "embedding")]
-        else:
-            embeddings_obj = result
-
-        if not isinstance(embeddings_obj, Sequence) or isinstance(
-            embeddings_obj, (str, bytes)
-        ):
-            raise TypeError(
-                f"[{ErrorCodes.INVALID_EMBEDDING_RESULT}] Translator result does not contain a "
-                f"valid embeddings sequence: type={type(embeddings_obj).__name__}"
-            )
-
-        matrix: List[List[float]] = []
-        for i, row in enumerate(embeddings_obj):
-            if not isinstance(row, Sequence) or isinstance(row, (str, bytes)):
-                raise TypeError(
-                    f"[{ErrorCodes.INVALID_EMBEDDING_RESULT}] Expected each embedding row to be a "
-                    f"sequence, got {type(row).__name__} at index {i}"
-                )
-            try:
-                matrix.append([float(x) for x in row])
-            except (TypeError, ValueError) as e:
-                raise TypeError(
-                    f"[{ErrorCodes.EMBEDDING_CONVERSION_ERROR}] Failed to convert embedding values "
-                    f"to float at row {i}: {e}"
-                ) from e
-
-        return matrix
+        return coerce_embedding_matrix(
+            result=result,
+            error_codes=ErrorCodes,
+            logger=logger,
+        )
 
     def _coerce_embedding_vector(self, result: Any) -> List[float]:
         """
-        Coerce translator result for a single-text embed into List[float].
-
-        Normalizes via `_coerce_embedding_matrix` and handles single/multiple rows.
+        Thin wrapper around shared coercion utility for single-vector outputs.
         """
-        matrix = self._coerce_embedding_matrix(result)
-
-        if not matrix:
-            raise ValueError(
-                f"[{ErrorCodes.EMPTY_EMBEDDING_RESULT}] Translator returned no embeddings "
-                f"for single-text input"
-            )
-
-        if len(matrix) > 1:
-            logger.warning(
-                "Expected a single embedding for query, but got %d rows; "
-                "using the first row.",
-                len(matrix),
-            )
-
-        return matrix[0]
+        return coerce_embedding_vector(
+            result=result,
+            error_codes=ErrorCodes,
+            logger=logger,
+        )
 
     # ------------------------------------------------------------------ #
     # Core AutoGen EmbeddingFunction Interface
@@ -385,17 +388,8 @@ class CorpusAutoGenEmbeddings:
             ...
         )
         ```
-
-        Parameters
-        ----------
-        texts:
-            Sequence of texts to embed
-
-        Returns
-        -------
-        List[List[float]]
-            Batch of text embedding vectors
         """
+        # AutoGen generally passes a list, but Sequence[str] keeps us flexible.
         return self.embed_documents(list(texts))
 
     @with_embedding_error_context("documents")
@@ -412,30 +406,15 @@ class CorpusAutoGenEmbeddings:
 
         This is the primary method used by AutoGen's retrieval systems
         for document embedding and agent memory.
-
-        Parameters
-        ----------
-        texts:
-            Sequence of documents to embed
-        autogen_context:
-            Optional AutoGen context containing agent and conversation info
-        model:
-            Optional per-call model override
         """
-        if isinstance(texts, Sequence) and not isinstance(texts, (str, bytes)):
-            batch_size = len(texts)
-            if (
-                batch_size > 10_000
-                and (
-                    self.batch_config is None
-                    or getattr(self.batch_config, "max_batch_size", None) is None
-                )
-            ):
-                logger.warning(
-                    "embed_documents called with batch_size=%d and no batch_config.max_batch_size; "
-                    "ensure your adapter/translator can safely handle large batches.",
-                    batch_size,
-                )
+        texts_list = list(texts)
+        warn_if_extreme_batch(
+            framework="autogen",
+            texts=texts_list,
+            op_name="embed_documents",
+            batch_config=self.batch_config,
+            logger=logger,
+        )
 
         core_ctx, framework_ctx = self._build_contexts(
             autogen_context=autogen_context,
@@ -443,8 +422,14 @@ class CorpusAutoGenEmbeddings:
             **kwargs,
         )
 
+        logger.debug(
+            "Sync embedding %d documents for AutoGen conversation: %s",
+            len(texts_list),
+            framework_ctx.get("conversation_id", "unknown"),
+        )
+
         translated = self._translator.embed(
-            raw_texts=list(texts),
+            raw_texts=texts_list,
             op_ctx=core_ctx,
             framework_ctx=framework_ctx,
         )
@@ -464,20 +449,16 @@ class CorpusAutoGenEmbeddings:
 
         Used by AutoGen for query understanding and retrieval in
         multi-agent conversations.
-
-        Parameters
-        ----------
-        text:
-            Query text to embed
-        autogen_context:
-            Optional AutoGen context
-        model:
-            Optional per-call model override
         """
         core_ctx, framework_ctx = self._build_contexts(
             autogen_context=autogen_context,
             model=model,
             **kwargs,
+        )
+
+        logger.debug(
+            "Sync embedding query for AutoGen conversation: %s",
+            framework_ctx.get("conversation_id", "unknown"),
         )
 
         translated = self._translator.embed(
@@ -505,30 +486,15 @@ class CorpusAutoGenEmbeddings:
 
         Designed for use with AutoGen's async workflows and
         event-driven agent systems.
-
-        Parameters
-        ----------
-        texts:
-            Sequence of documents to embed
-        autogen_context:
-            Optional AutoGen context
-        model:
-            Optional per-call model override
         """
-        if isinstance(texts, Sequence) and not isinstance(texts, (str, bytes)):
-            batch_size = len(texts)
-            if (
-                batch_size > 10_000
-                and (
-                    self.batch_config is None
-                    or getattr(self.batch_config, "max_batch_size", None) is None
-                )
-            ):
-                logger.warning(
-                    "aembed_documents called with batch_size=%d and no batch_config.max_batch_size; "
-                    "ensure your adapter/translator can safely handle large batches.",
-                    batch_size,
-                )
+        texts_list = list(texts)
+        warn_if_extreme_batch(
+            framework="autogen",
+            texts=texts_list,
+            op_name="aembed_documents",
+            batch_config=self.batch_config,
+            logger=logger,
+        )
 
         core_ctx, framework_ctx = self._build_contexts(
             autogen_context=autogen_context,
@@ -536,8 +502,14 @@ class CorpusAutoGenEmbeddings:
             **kwargs,
         )
 
+        logger.debug(
+            "Async embedding %d documents for AutoGen conversation: %s",
+            len(texts_list),
+            framework_ctx.get("conversation_id", "unknown"),
+        )
+
         translated = await self._translator.arun_embed(
-            raw_texts=list(texts),
+            raw_texts=texts_list,
             op_ctx=core_ctx,
             framework_ctx=framework_ctx,
         )
@@ -557,20 +529,16 @@ class CorpusAutoGenEmbeddings:
 
         Used in AutoGen's asynchronous agent workflows and
         flow-based conversation systems.
-
-        Parameters
-        ----------
-        text:
-            Query text to embed
-        autogen_context:
-            Optional AutoGen context
-        model:
-            Optional per-call model override
         """
         core_ctx, framework_ctx = self._build_contexts(
             autogen_context=autogen_context,
             model=model,
             **kwargs,
+        )
+
+        logger.debug(
+            "Async embedding query for AutoGen conversation: %s",
+            framework_ctx.get("conversation_id", "unknown"),
         )
 
         translated = await self._translator.arun_embed(
@@ -581,9 +549,9 @@ class CorpusAutoGenEmbeddings:
         return self._coerce_embedding_vector(translated)
 
 
-# ------------------------------------------------------------------ #
+# --------------------------------------------------------------------------- #
 # AutoGen-Specific Helper Functions
-# ------------------------------------------------------------------ #
+# --------------------------------------------------------------------------- #
 
 
 def _validate_vector_store_for_autogen(vector_store: Any) -> None:
@@ -634,39 +602,16 @@ def create_retriever(
         vector_store=vectorstore,
         model="text-embedding-3-large"
     )
-
-    # Use with AutoGen agent
-    agent = AssistantAgent(
-        name="assistant",
-        system_message="You are a helpful assistant.",
-        retrieve_config={
-            "retriever": retriever,
-            "config_list": config_list,
-        },
-    )
-    ```
-
-    Parameters
-    ----------
-    corpus_adapter:
-        Corpus embedding protocol adapter
-    vector_store:
-        Vector store instance (Chroma, FAISS, etc.)
-    **kwargs:
-        Additional arguments for CorpusAutoGenEmbeddings
-
-    Returns
-    -------
-    AutoGenRetriever
-        AutoGen VectorStoreRetriever instance using Corpus embeddings.
     """
     try:
         from autogen.retrieve_utils import VectorStoreRetriever
-    except ImportError:
-        logger.error(
-            "AutoGen not installed. Please install with: pip install pyautogen"
+    except ImportError as exc:
+        message = (
+            "AutoGen is not installed. To use create_retriever, install the "
+            "AutoGen package, for example: 'pip install pyautogen'."
         )
-        raise
+        logger.error(message)
+        raise RuntimeError(message) from exc
 
     # Best-effort validation before mutating the vector store.
     _validate_vector_store_for_autogen(vector_store)
@@ -698,9 +643,7 @@ def create_retriever(
 
     retriever = VectorStoreRetriever(vectorstore=vector_store)
 
-    logger.info(
-        "AutoGen retriever created with Corpus embeddings"
-    )
+    logger.info("AutoGen retriever created with Corpus embeddings")
 
     return retriever
 
@@ -715,33 +658,6 @@ def register_embeddings(
 
     This function provides a centralized way to configure Corpus embeddings
     for multiple AutoGen agents and retrievers.
-
-    Example usage:
-    ```python
-    from corpus_sdk.embedding.framework_adapters.autogen import register_embeddings
-
-    # Register globally
-    embedder = register_embeddings(
-        corpus_adapter=my_adapter,
-        model="text-embedding-3-large"
-    )
-
-    # Use across multiple agents and retrievers
-    ```
-
-    Parameters
-    ----------
-    corpus_adapter:
-        Corpus embedding protocol adapter
-    model:
-        Model identifier for embedding operations
-    **kwargs:
-        Additional arguments for CorpusAutoGenEmbeddings
-
-    Returns
-    -------
-    CorpusAutoGenEmbeddings
-        Configured embedding function for AutoGen
     """
     embeddings = CorpusAutoGenEmbeddings(
         corpus_adapter=corpus_adapter,
