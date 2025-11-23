@@ -3,32 +3,50 @@
 """
 OpenAI LLM adapter for the Corpus LLM Protocol.
 
-This module implements a production-grade adapter on top of the
-`BaseLLMAdapter` / LLMProtocolV1 contract, targeting the official
-`openai` Python client (v1+ async API via `AsyncOpenAI`).
+ARCHITECTURE
+------------
+This adapter implements the Corpus LLMProtocolV1 contract by wrapping
+the official OpenAI Python client. Key design decisions:
 
-Goals
------
-- Map Corpus protocol → OpenAI Chat Completions.
-- Preserve async/streaming semantics.
-- Normalize provider errors into Corpus' error taxonomy.
-- Provide token usage accounting for cost/quota tracking.
-- Provide first-class tool calling support where the provider supports it.
-- Play nicely with higher-level framework adapters
-  (LangChain, LlamaIndex, Semantic Kernel, etc.).
+1. Error Translation: All OpenAI exceptions are mapped to Corpus error
+   taxonomy (see _translate_openai_error) for provider-agnostic handling.
 
-Usage
------
-    from openai import AsyncOpenAI
-    from corpus_sdk.llm.openai_adapter import OpenAIAdapter
+2. Token Counting: Uses tiktoken when available, falls back to heuristic.
+   Heuristic blends word-count and char-count estimates for robustness.
 
-    client = AsyncOpenAI(api_key="sk-...")
-    adapter = OpenAIAdapter(client=client, default_model="gpt-4.1-mini")
+3. System Message Merging: Multiple system messages are concatenated to
+   ensure OpenAI API compatibility (OpenAI requires single system message).
 
-    result = await adapter.complete(
-        messages=[{"role": "user", "content": "Hello!"}],
-    )
-    print(result.text)
+4. Streaming Usage: Leverages stream_options={"include_usage": True} to
+   provide accurate token counts in the final chunk.
+
+5. Tool Call Streaming: Reconstructs tool calls incrementally from streaming
+   deltas so callers can react to tool invocations in real time.
+
+EXTENSION POINTS
+----------------
+To build your own adapter:
+1. Inherit from BaseLLMAdapter
+2. Implement _do_complete, _do_stream, _do_capabilities, _do_health
+3. Use _translate_*_error pattern for error normalization
+4. See MockLLMAdapter for reference implementation
+
+DEBUGGING
+---------
+Enable debug logging:
+    logging.getLogger('corpus_sdk.llm.openai_adapter').setLevel(logging.DEBUG)
+
+This will log (without PII):
+- Request parameters (model, message count, token limits)
+- Response metadata (model ID, token usage)
+- Error details with stack traces
+
+COMPATIBILITY
+-------------
+Requires: openai>=1.0.0 (AsyncOpenAI API)
+Optional: tiktoken>=0.5.0 (accurate token counting)
+
+Tested with: openai==1.12.0, Python 3.9-3.12
 """
 
 from __future__ import annotations
@@ -454,6 +472,28 @@ class OpenAIAdapter(BaseLLMAdapter):
             logger.debug("Failed to get tokenizer for model %s", model, exc_info=True)
             return None
 
+    # Convenience wrapper so usages of _tenant_hash are obvious locally.
+    @staticmethod
+    def _tenant_hash(tenant: Optional[str]) -> Optional[str]:
+        # Delegate to BaseLLMAdapter's implementation to keep behavior consistent.
+        return BaseLLMAdapter._tenant_hash(tenant)  # type: ignore[attr-defined]
+
+    @staticmethod
+    def _compute_timeout(ctx: Optional[OperationContext]) -> Optional[float]:
+        """
+        Derive an OpenAI client-side timeout from ctx.deadline_ms.
+
+        Returns seconds (float) or None if no deadline is set.
+        """
+        if ctx is None or ctx.deadline_ms is None:
+            return None
+        now_ms = int(_time() * 1000)
+        remaining_ms = ctx.deadline_ms - now_ms
+        if remaining_ms <= 0:
+            # We still send a minimal timeout to avoid infinite wait at client.
+            return 1.0
+        return max(0.1, remaining_ms / 1000.0)
+
     # ------------------------------------------------------------------
     # BaseLLMAdapter backend hooks
     # ------------------------------------------------------------------
@@ -548,6 +588,34 @@ class OpenAIAdapter(BaseLLMAdapter):
             if tool_choice is not None:
                 request_params["tool_choice"] = tool_choice
 
+            # Context-driven enhancements: timeout, trace headers, user/tenant, extra params
+            timeout = self._compute_timeout(ctx)
+            if timeout is not None:
+                request_params["timeout"] = timeout
+
+            extra_headers: Dict[str, str] = {}
+            if ctx:
+                if ctx.request_id:
+                    extra_headers["X-Request-ID"] = ctx.request_id
+                if ctx.traceparent:
+                    extra_headers["traceparent"] = ctx.traceparent
+                if ctx.tenant:
+                    user_tag = self._tenant_hash(ctx.tenant)
+                    if user_tag:
+                        # OpenAI's 'user' field is a great place for a tenant hash
+                        request_params["user"] = user_tag
+
+            if extra_headers:
+                request_params["extra_headers"] = extra_headers
+
+            # Allow callers to pass through OpenAI-specific knobs via ctx.attrs["openai_extra"]
+            oai_extra = ctx.attrs.get("openai_extra") if ctx and getattr(ctx, "attrs", None) else None
+            if isinstance(oai_extra, dict):
+                # Shallow override only if not already set, to avoid breaking core semantics
+                for k, v in oai_extra.items():
+                    if k not in request_params:
+                        request_params[k] = v
+
             logger.debug(
                 "OpenAIAdapter.complete: model=%s, messages=%d, max_tokens=%s, tools=%d, tool_choice_type=%s",
                 resolved_model,
@@ -640,13 +708,10 @@ class OpenAIAdapter(BaseLLMAdapter):
         contains exact token usage; this is surfaced on the final chunk
         via `usage_so_far`.
 
-        Note:
-        - Streaming responses are not cached by BaseLLMAdapter.
-        - Tools and tool_choice are forwarded to OpenAI; this adapter
-          currently does not reconstruct tool_calls incrementally in
-          streaming mode and focuses on text and usage. Callers that
-          need full tool call streaming can interpret the OpenAI events
-          directly or build a higher-level aggregator.
+        Tool calls:
+        - Reconstructs tool calls incrementally from delta.tool_calls.
+        - Each chunk's `tool_calls` contains the current aggregated state
+          of all tool calls seen so far (partial or complete).
         """
         # Enforce the same role restrictions as the mock adapter.
         self._validate_roles(messages)
@@ -685,6 +750,31 @@ class OpenAIAdapter(BaseLLMAdapter):
             if tool_choice is not None:
                 request_params["tool_choice"] = tool_choice
 
+            # Context-driven enhancements: timeout, trace headers, user/tenant, extra params
+            timeout = self._compute_timeout(ctx)
+            if timeout is not None:
+                request_params["timeout"] = timeout
+
+            extra_headers: Dict[str, str] = {}
+            if ctx:
+                if ctx.request_id:
+                    extra_headers["X-Request-ID"] = ctx.request_id
+                if ctx.traceparent:
+                    extra_headers["traceparent"] = ctx.traceparent
+                if ctx.tenant:
+                    user_tag = self._tenant_hash(ctx.tenant)
+                    if user_tag:
+                        request_params["user"] = user_tag
+
+            if extra_headers:
+                request_params["extra_headers"] = extra_headers
+
+            oai_extra = ctx.attrs.get("openai_extra") if ctx and getattr(ctx, "attrs", None) else None
+            if isinstance(oai_extra, dict):
+                for k, v in oai_extra.items():
+                    if k not in request_params:
+                        request_params[k] = v
+
             logger.debug(
                 "OpenAIAdapter.stream: model=%s, messages=%d, max_tokens=%s, tools=%d, tool_choice_type=%s",
                 resolved_model,
@@ -705,6 +795,9 @@ class OpenAIAdapter(BaseLLMAdapter):
         last_model_id: Optional[str] = None
         final_usage: Optional[TokenUsage] = None
         received_chunks = 0
+
+        # Tool call reconstruction state: index → {id, type, name, arguments}
+        tool_call_state: Dict[int, Dict[str, str]] = {}
 
         try:
             async for event in stream:
@@ -737,7 +830,52 @@ class OpenAIAdapter(BaseLLMAdapter):
                         total_tokens=int(getattr(usage, "total_tokens", 0) or 0),
                     )
 
-                if text:
+                # --- Tool call delta handling --------------------------------
+                # delta.tool_calls is an array of per-index deltas
+                raw_tool_deltas = getattr(delta, "tool_calls", None) if delta is not None else None
+                if raw_tool_deltas:
+                    for tc_delta in raw_tool_deltas:
+                        idx = int(getattr(tc_delta, "index", 0) or 0)
+                        state = tool_call_state.setdefault(
+                            idx,
+                            {"id": "", "type": "function", "name": "", "arguments": ""},
+                        )
+
+                        tc_id = getattr(tc_delta, "id", None)
+                        if tc_id:
+                            state["id"] = tc_id
+
+                        tc_type = getattr(tc_delta, "type", None)
+                        if tc_type:
+                            state["type"] = tc_type
+
+                        fn_delta = getattr(tc_delta, "function", None)
+                        if fn_delta is not None:
+                            fn_name = getattr(fn_delta, "name", None)
+                            if fn_name:
+                                # Name is usually sent once, but we defensively append.
+                                state["name"] = (state["name"] or "") + fn_name
+                            fn_args = getattr(fn_delta, "arguments", None)
+                            if fn_args:
+                                # Arguments arrive as incremental chunks; we append.
+                                state["arguments"] = (state["arguments"] or "") + fn_args
+
+                # Build current tool call view (partial or complete) for this chunk
+                tool_calls: List[ToolCall] = []
+                if tool_call_state:
+                    for idx, s in sorted(tool_call_state.items()):
+                        tool_calls.append(
+                            ToolCall(
+                                id=s["id"] or f"call_{idx}",
+                                type=s["type"] or "function",
+                                function=ToolCallFunction(
+                                    name=s["name"],
+                                    arguments=s["arguments"],
+                                ),
+                            )
+                        )
+
+                if text or tool_calls:
                     # Emit delta chunks as we receive them. We intentionally
                     # do not attach usage_so_far here because OpenAI only
                     # provides usage reliably at the end of the stream and
@@ -747,6 +885,7 @@ class OpenAIAdapter(BaseLLMAdapter):
                         is_final=False,
                         model=last_model_id,
                         usage_so_far=None,
+                        tool_calls=tool_calls,
                     )
 
             # Handle case where stream ends with no chunks received
@@ -761,6 +900,7 @@ class OpenAIAdapter(BaseLLMAdapter):
                         completion_tokens=0,
                         total_tokens=0,
                     ),
+                    tool_calls=[],
                 )
                 return
 
@@ -770,11 +910,27 @@ class OpenAIAdapter(BaseLLMAdapter):
             raise self._translate_openai_error(exc) from exc
 
         # Emit a final sentinel chunk marking end-of-stream (with usage if available).
+        # Include any final tool call state (fully reconstructed).
+        final_tool_calls: List[ToolCall] = []
+        if tool_call_state:
+            for idx, s in sorted(tool_call_state.items()):
+                final_tool_calls.append(
+                    ToolCall(
+                        id=s["id"] or f"call_{idx}",
+                        type=s["type"] or "function",
+                        function=ToolCallFunction(
+                            name=s["name"],
+                            arguments=s["arguments"],
+                        ),
+                    )
+                )
+
         yield LLMChunk(
             text="",
             is_final=True,
             model=last_model_id or resolved_model,
             usage_so_far=final_usage,
+            tool_calls=final_tool_calls,
         )
 
     async def _do_count_tokens(
