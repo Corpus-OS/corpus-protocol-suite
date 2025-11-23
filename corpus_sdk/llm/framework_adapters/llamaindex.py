@@ -10,13 +10,15 @@ implementation, with:
 - Async + sync chat generation
 - Async + sync streaming chat (true incremental streaming)
 - Context propagation via `OperationContext`
-- Protocol-first design: Direct LLMProtocolV1 access with message translation
+- Protocol-first design: all calls go through the LLMTranslator layer
+- Rich, configurable error context for observability
 """
 
 from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager, contextmanager
+from dataclasses import dataclass
 from typing import (
     Any,
     AsyncIterator,
@@ -32,17 +34,16 @@ from typing import (
 from corpus_sdk.core.context_translation import (
     from_llamaindex as context_from_llamaindex,
 )
-from corpus_sdk.core.error_context import attach_context
-from corpus_sdk.llm.framework_adapters.common.message_translation import (
-    NormalizedMessage,
-    from_llamaindex,
-    to_corpus,
-)
 from corpus_sdk.llm.llm_base import (
-    LLMChunk,
-    LLMCompletion,
+    BadRequest,
     LLMProtocolV1,
     OperationContext,
+)
+from corpus_sdk.llm.framework_adapters.common.error_context import attach_context
+from corpus_sdk.llm.framework_adapters.common.llm_translation import (
+    LLMTranslator,
+    create_llm_translator,
+    get_llm_translator_factory,
 )
 
 logger = logging.getLogger(__name__)
@@ -53,7 +54,7 @@ logger = logging.getLogger(__name__)
 
 _LLAMAINDEX_IMPORT_ERROR: Optional[BaseException] = None
 
-try:
+try:  # pragma: no cover - optional dependency path
     from llama_index.core.llms import (
         LLM,
         ChatMessage,
@@ -63,7 +64,7 @@ try:
         MessageRole,
     )
     from llama_index.core.callbacks import CallbackManager
-except BaseException as exc:  # pragma: no cover - optional dependency path
+except BaseException as exc:  # pragma: no cover
     _LLAMAINDEX_IMPORT_ERROR = exc
     # Fallbacks for type checking and import-time safety
     LLM = object  # type: ignore[assignment]
@@ -104,6 +105,30 @@ class LlamaIndexLLMProtocol(Protocol):
 
 
 # ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class LlamaIndexLLMConfig:
+    """
+    Configuration for the LlamaIndex adapter.
+
+    Attributes
+    ----------
+    enable_error_context:
+        Whether to attach rich error context with LlamaIndex-specific metadata.
+
+    include_message_metrics_on_error:
+        Whether to include per-message metrics (role distribution, char counts)
+        when attaching error context. This is evaluated lazily *only on errors*.
+    """
+
+    enable_error_context: bool = True
+    include_message_metrics_on_error: bool = True
+
+
+# ---------------------------------------------------------------------------
 # ChatResponse builders
 # ---------------------------------------------------------------------------
 
@@ -116,12 +141,10 @@ def _build_chat_response(
     usage: Optional[Any] = None,
 ) -> ChatResponse:
     """
-    Construct a minimal LlamaIndex ChatResponse from a Corpus LLMCompletion.
+    Construct a minimal LlamaIndex ChatResponse from completion-like data.
 
-    Returns
-    -------
-    ChatResponse
-        LlamaIndex chat response with proper metadata.
+    The caller is responsible for extracting the text/model/usage/finish_reason
+    from whatever the LLMTranslator returned.
     """
     try:
         role_assistant = getattr(MessageRole, "ASSISTANT", "assistant")
@@ -152,31 +175,109 @@ def _build_chat_response(
         return ChatResponse(message=msg)
 
 
-def _build_chat_response_from_chunk(chunk: LLMChunk) -> ChatResponse:
+def _extract_completion_fields(
+    result: Any,
+) -> tuple[str, Optional[str], Optional[str], Optional[Any]]:
     """
-    Build a ChatResponse for streaming from a single LLMChunk.
+    Extract (text, model, finish_reason, usage) from a completion-like object
+    returned by LLMTranslator.from_completion.
 
-    Returns
-    -------
-    ChatResponse
-        LlamaIndex chat response with incremental content.
+    Supports:
+    - Mapping results: {"text", "model", "finish_reason", "usage"}
+    - Objects with .text / .model / .finish_reason / .usage
+    - Fallback: treat as plain text.
+    """
+    # Mapping-style (default LLMTranslator behavior)
+    if isinstance(result, Mapping):
+        text = str(
+            result.get("text")
+            or result.get("content")
+            or result.get("message", {}).get("content", "")
+            or ""
+        )
+        model = result.get("model")
+        finish_reason = result.get("finish_reason")
+        usage = result.get("usage")
+        return text, model, finish_reason, usage
+
+    # Attribute-style objects (custom translators)
+    if hasattr(result, "text"):
+        text = str(getattr(result, "text", "") or "")
+        model = getattr(result, "model", None)
+        finish_reason = getattr(result, "finish_reason", None)
+        usage = getattr(result, "usage", None)
+        return text, model, finish_reason, usage
+
+    # Fallback: treat as plain text
+    return str(result), None, None, None
+
+
+def _build_chat_response_from_translator_result(result: Any) -> ChatResponse:
+    """
+    Build ChatResponse from whatever LLMTranslator returned for a completion.
+    """
+    text, model, finish_reason, usage = _extract_completion_fields(result)
+    return _build_chat_response(
+        text=text,
+        model=model,
+        finish_reason=finish_reason,
+        usage=usage,
+    )
+
+
+def _extract_chunk_fields(
+    chunk_obj: Any,
+) -> tuple[str, Optional[str], Optional[Any], bool]:
+    """
+    Extract (text, model, usage_so_far, is_final) from streaming chunk-like objects
+    returned by LLMTranslator.from_chunk.
+
+    Supports:
+    - Mapping results: {"text", "model", "usage_so_far", "is_final"}
+    - Objects with .text / .model / .usage_so_far / .is_final
+    - Fallbacks using .delta or treating as plain text.
+    """
+    # Mapping-style (default LLMTranslator.from_chunk)
+    if isinstance(chunk_obj, Mapping):
+        text = str(chunk_obj.get("text") or chunk_obj.get("delta") or "")
+        model = chunk_obj.get("model")
+        usage = chunk_obj.get("usage_so_far")
+        is_final = bool(chunk_obj.get("is_final", False))
+        return text, model, usage, is_final
+
+    # Attribute-style
+    text = str(
+        getattr(chunk_obj, "text", "")
+        or getattr(chunk_obj, "delta", "")
+        or ""
+    )
+    model = getattr(chunk_obj, "model", None)
+    usage = getattr(chunk_obj, "usage_so_far", None)
+    is_final = bool(getattr(chunk_obj, "is_final", False))
+    return text, model, usage, is_final
+
+
+def _build_chat_response_from_chunk_like(chunk_obj: Any) -> ChatResponse:
+    """
+    Build a ChatResponse for streaming from a single chunk-like object.
     """
     try:
         role_assistant = getattr(MessageRole, "ASSISTANT", "assistant")
     except Exception:
         role_assistant = "assistant"
 
+    text, model, usage, is_final = _extract_chunk_fields(chunk_obj)
+
     msg = ChatMessage(
         role=role_assistant,
-        content=chunk.text,
+        content=text,
     )
 
-    delta = chunk.text or ""
-    usage = getattr(chunk, "usage_so_far", None)
+    delta = text or ""
 
     additional_kwargs: Dict[str, Any] = {
-        "is_final": getattr(chunk, "is_final", False),
-        "model": getattr(chunk, "model", None),
+        "is_final": is_final,
+        "model": model,
     }
     if usage is not None:
         additional_kwargs["usage_so_far"] = {
@@ -206,21 +307,14 @@ def _analyze_messages_for_context(messages: Sequence[ChatMessage]) -> Dict[str, 
     """
     Derive role distribution and content metrics for error context.
 
-    Parameters
-    ----------
-    messages : Sequence[ChatMessage]
-        LlamaIndex chat messages.
-
-    Returns
-    -------
-    Dict[str, Any]
-        Metrics including messages_count, roles_distribution and total_content_chars.
+    Only used lazily when an error actually occurs to avoid overhead on
+    successful calls.
     """
     roles: Dict[str, int] = {}
     total_chars = 0
 
     for msg in messages:
-        # LlamaIndex messages may expose `role` or `message.role`
+        # LlamaIndex messages may expose `role` or `type`
         role = getattr(msg, "role", getattr(msg, "type", "unknown"))
         content = getattr(msg, "content", "")
         roles[role] = roles.get(role, 0) + 1
@@ -243,15 +337,16 @@ class CorpusLlamaIndexLLM(LLM):
     """
     LlamaIndex `LLM` implementation backed by a Corpus `LLMProtocolV1`.
 
-    This is a thin integration layer with direct protocol access.
+    This integration is fully aligned with the LLMTranslator layer:
 
-    Usage:
-        llm = CorpusLlamaIndexLLM(
-            llm_adapter=adapter,
-            model="gpt-4",
-            temperature=0.7
-        )
-        response = llm.chat([ChatMessage(role="user", content="Hello!")])
+    - All LLM calls go through `LLMTranslator` (no direct message_translation
+      or protocol calls in this file).
+    - Message normalization, system message handling, tools, safety, and
+      post-processing are handled centrally by the translator.
+    - This file focuses on:
+        * LlamaIndex-specific context building
+        * Error-context attachment
+        * Mapping translator results to `ChatResponse` / streaming responses.
     """
 
     llm_adapter: LLMProtocolV1
@@ -259,6 +354,7 @@ class CorpusLlamaIndexLLM(LLM):
     temperature: float = 0.7
     max_tokens: Optional[int] = None
     framework_version: Optional[str] = None
+    config: Optional[LlamaIndexLLMConfig] = None
 
     model_config = {"arbitrary_types_allowed": True}
 
@@ -271,15 +367,46 @@ class CorpusLlamaIndexLLM(LLM):
         if "temperature" in data and not 0 <= data["temperature"] <= 2:
             raise ValueError("temperature must be between 0 and 2")
 
-        if "max_tokens" in data and data.get("max_tokens") is not None and data["max_tokens"] < 1:
+        if (
+            "max_tokens" in data
+            and data.get("max_tokens") is not None
+            and data["max_tokens"] < 1
+        ):
             raise ValueError("max_tokens must be positive")
 
         super().__init__(**data)
 
+        # Concrete config instance (immutable dataclass).
+        # Precedence is simple: if the user supplied a LlamaIndexLLMConfig,
+        # use it as-is; otherwise use defaults.
+        self._config: LlamaIndexLLMConfig = (
+            self.config
+            if isinstance(self.config, LlamaIndexLLMConfig)
+            else LlamaIndexLLMConfig()
+        )
+
+        # Fail fast if there is no registered translator factory for LlamaIndex.
+        # This prevents silently falling back to the default translator, which
+        # may not know how to handle ChatMessage objects.
+        factory = get_llm_translator_factory("llamaindex")
+        if factory is None:
+            raise RuntimeError(
+                "No LLMFrameworkTranslator registered for framework='llamaindex'. "
+                "Call register_llm_translator('llamaindex', factory) before "
+                "constructing CorpusLlamaIndexLLM."
+            )
+
+        # LLMTranslator orchestrator for the LlamaIndex framework.
+        self._translator: LLMTranslator = create_llm_translator(
+            adapter=self.llm_adapter,
+            framework="llamaindex",
+        )
+
         logger.info(
-            "CorpusLlamaIndexLLM initialized with model=%s, temperature=%.2f",
+            "CorpusLlamaIndexLLM initialized with model=%s, temperature=%.2f, max_tokens=%s",
             self.model,
             self.temperature,
+            self.max_tokens or "default",
         )
 
     # ------------------------------------------------------------------ #
@@ -293,16 +420,17 @@ class CorpusLlamaIndexLLM(LLM):
         messages: Sequence[ChatMessage],
         model: str,
         ctx: OperationContext,
-        params: Dict[str, Any],
+        params: Mapping[str, Any],
     ) -> Dict[str, Any]:
         """
         Build consistent, rich error context for observability.
 
-        Includes both sampling parameters and message-level metrics.
+        Metrics on messages are computed lazily and only when enabled
+        in config and when an error actually occurs.
         """
-        msg_metrics = _analyze_messages_for_context(messages)
-        return {
+        base_ctx: Dict[str, Any] = {
             "framework": "llamaindex",
+            "resource_type": "llm",
             "operation": operation,
             "model": model,
             "temperature": params.get("temperature"),
@@ -314,8 +442,13 @@ class CorpusLlamaIndexLLM(LLM):
             "request_id": ctx.request_id,
             "tenant": ctx.tenant,
             "stream": stream,
-            **msg_metrics,
         }
+
+        if self._config.include_message_metrics_on_error:
+            msg_metrics = _analyze_messages_for_context(messages)
+            base_ctx.update(msg_metrics)
+
+        return base_ctx
 
     @contextmanager
     def _error_context(
@@ -325,14 +458,22 @@ class CorpusLlamaIndexLLM(LLM):
         messages: Sequence[ChatMessage],
         model: str,
         ctx: OperationContext,
-        params: Dict[str, Any],
+        params: Mapping[str, Any],
     ):
-        """Sync error-context wrapper."""
-        error_ctx = self._build_error_context(operation, stream, messages, model, ctx, params)
+        """Sync error-context wrapper with lazy metrics."""
         try:
             yield
         except BaseException as exc:  # noqa: BLE001
-            attach_context(exc, **error_ctx)
+            if self._config.enable_error_context:
+                error_ctx = self._build_error_context(
+                    operation,
+                    stream,
+                    messages,
+                    model,
+                    ctx,
+                    params,
+                )
+                attach_context(exc, **error_ctx)
             raise
 
     @asynccontextmanager
@@ -343,35 +484,35 @@ class CorpusLlamaIndexLLM(LLM):
         messages: Sequence[ChatMessage],
         model: str,
         ctx: OperationContext,
-        params: Dict[str, Any],
+        params: Mapping[str, Any],
     ):
-        """Async error-context wrapper."""
-        error_ctx = self._build_error_context(operation, stream, messages, model, ctx, params)
+        """Async error-context wrapper with lazy metrics."""
         try:
             yield
         except BaseException as exc:  # noqa: BLE001
-            attach_context(exc, **error_ctx)
+            if self._config.enable_error_context:
+                error_ctx = self._build_error_context(
+                    operation,
+                    stream,
+                    messages,
+                    model,
+                    ctx,
+                    params,
+                )
+                attach_context(exc, **error_ctx)
             raise
 
     # ------------------------------------------------------------------ #
     # Internal helpers
     # ------------------------------------------------------------------ #
 
-    def _translate_messages(self, messages: Sequence[ChatMessage]) -> List[Dict[str, Any]]:
-        """LlamaIndex messages → Corpus wire format."""
-        if not messages:
-            logger.warning("Empty messages list provided to LlamaIndex adapter")
-            return []
-
-        try:
-            normalized: List[NormalizedMessage] = [from_llamaindex(m) for m in messages]
-            return [dict(m) for m in to_corpus(normalized)]
-        except Exception as e:  # noqa: BLE001
-            logger.error("Failed to translate LlamaIndex messages: %s", e)
-            raise ValueError(f"Message translation failed: {e}") from e
-
     def _build_operation_context(self, kwargs: Mapping[str, Any]) -> OperationContext:
-        """Build OperationContext from LlamaIndex kwargs."""
+        """
+        Build OperationContext from LlamaIndex kwargs via context_translation.
+
+        This keeps all LLM-level context building centralized in the core
+        context translators instead of baking assumptions into this adapter.
+        """
         callback_manager = kwargs.get("callback_manager")
         return context_from_llamaindex(
             callback_manager,
@@ -379,8 +520,20 @@ class CorpusLlamaIndexLLM(LLM):
         )
 
     def _extract_stop_sequences(self, kwargs: Mapping[str, Any]) -> Optional[List[str]]:
-        """Extract stop sequences from kwargs."""
-        stop = kwargs.get("stop") or kwargs.get("stop_sequences")
+        """
+        Extract stop sequences from kwargs (handles multiple LlamaIndex shapes).
+
+        Checks:
+        - kwargs["stop"]
+        - kwargs["stop_sequences"]
+        - kwargs["additional_kwargs"]["stop" or "stop_sequences"]
+        """
+        stop: Any = kwargs.get("stop") or kwargs.get("stop_sequences")
+
+        additional = kwargs.get("additional_kwargs")
+        if stop is None and isinstance(additional, Mapping):
+            stop = additional.get("stop") or additional.get("stop_sequences")
+
         if stop is None:
             return None
         if isinstance(stop, str):
@@ -391,10 +544,16 @@ class CorpusLlamaIndexLLM(LLM):
 
     def _build_sampling_params(
         self,
-        stop: Optional[List[str]],
         kwargs: Mapping[str, Any],
     ) -> Dict[str, Any]:
-        """Build sampling parameters from kwargs, with validation."""
+        """
+        Build sampling parameters from kwargs, with validation.
+
+        This is the single source of truth for how we derive sampling params
+        (including stop sequences) from LlamaIndex's kwargs.
+        """
+        stop_sequences = self._extract_stop_sequences(kwargs)
+
         temperature = kwargs.get("temperature", self.temperature)
         if not 0 <= temperature <= 2:
             logger.warning("Temperature %s out of reasonable range 0-2", temperature)
@@ -406,10 +565,32 @@ class CorpusLlamaIndexLLM(LLM):
             "top_p": kwargs.get("top_p"),
             "frequency_penalty": kwargs.get("frequency_penalty"),
             "presence_penalty": kwargs.get("presence_penalty"),
-            "stop_sequences": stop,
+            "stop_sequences": stop_sequences,
         }
         # Strip None for a clean param set
-        return {k: v for k, v in params.items() if v is not None}
+        clean = {k: v for k, v in params.items() if v is not None}
+
+        logger.debug(
+            "Built sampling params for LlamaIndex: model=%s, temperature=%.2f, max_tokens=%s",
+            clean.get("model", self.model),
+            clean.get("temperature", self.temperature),
+            clean.get("max_tokens", self.max_tokens),
+        )
+
+        return clean
+
+    def _build_framework_ctx(self, kwargs: Mapping[str, Any]) -> Dict[str, Any]:
+        """
+        Build a small framework_ctx payload for the LLMTranslator.
+
+        This allows the framework-specific LLMFrameworkTranslator to see
+        LlamaIndex-specific metadata if needed.
+        """
+        return {
+            "framework_version": self.framework_version,
+            "callback_manager": kwargs.get("callback_manager"),
+            "llamaindex_additional_kwargs": kwargs.get("additional_kwargs"),
+        }
 
     # ------------------------------------------------------------------ #
     # Async API
@@ -423,27 +604,23 @@ class CorpusLlamaIndexLLM(LLM):
         """
         Async chat entrypoint required by LlamaIndex.
 
-        Parameters
-        ----------
-        messages : Sequence[ChatMessage]
-            Sequence of LlamaIndex ChatMessage objects.
-        **kwargs : Any
-            LlamaIndex parameters including callback_manager and sampling params.
+        The flow is:
 
-        Returns
-        -------
-        ChatResponse
-            LlamaIndex chat response with message content and metadata.
+        - Build OperationContext from LlamaIndex callback/context info.
+        - Derive sampling params from kwargs.
+        - Call LLMTranslator.arun_complete with raw LlamaIndex messages.
+        - Convert translator result into ChatResponse.
         """
         if not messages:
-            raise ValueError("Messages list cannot be empty")
+            raise BadRequest(
+                "Messages list cannot be empty",
+                code="BAD_MESSAGES",
+            )
 
-        corpus_messages = self._translate_messages(messages)
-        stop_sequences = self._extract_stop_sequences(kwargs)
         ctx = self._build_operation_context(kwargs)
-        params = self._build_sampling_params(stop_sequences, kwargs)
-
+        params = self._build_sampling_params(kwargs)
         model_for_context = params.get("model", self.model)
+        framework_ctx = self._build_framework_ctx(kwargs)
 
         async with self._error_context_async(
             "achat",
@@ -453,18 +630,20 @@ class CorpusLlamaIndexLLM(LLM):
             ctx=ctx,
             params=params,
         ):
-            result: LLMCompletion = await self.llm_adapter.acomplete(
-                messages=corpus_messages,
-                ctx=ctx,
-                **params,
+            result = await self._translator.arun_complete(
+                raw_messages=messages,
+                model=params.get("model"),
+                max_tokens=params.get("max_tokens"),
+                temperature=params.get("temperature"),
+                top_p=params.get("top_p"),
+                frequency_penalty=params.get("frequency_penalty"),
+                presence_penalty=params.get("presence_penalty"),
+                stop_sequences=params.get("stop_sequences"),
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
             )
 
-            return _build_chat_response(
-                text=result.text,
-                model=getattr(result, "model", None),
-                finish_reason=getattr(result, "finish_reason", None),
-                usage=getattr(result, "usage", None),
-            )
+            return _build_chat_response_from_translator_result(result)
 
     async def astream_chat(
         self,
@@ -474,27 +653,19 @@ class CorpusLlamaIndexLLM(LLM):
         """
         Async streaming chat entrypoint required by LlamaIndex.
 
-        Parameters
-        ----------
-        messages : Sequence[ChatMessage]
-            Sequence of LlamaIndex ChatMessage objects.
-        **kwargs : Any
-            LlamaIndex parameters including callback_manager and sampling params.
-
-        Returns
-        -------
-        ChatResponseAsyncGen
-            Async generator of ChatResponse objects with incremental content.
+        All streaming goes through `LLMTranslator.arun_stream`, and each
+        streaming chunk is converted into a `ChatResponse`.
         """
         if not messages:
-            raise ValueError("Messages list cannot be empty")
+            raise BadRequest(
+                "Messages list cannot be empty",
+                code="BAD_MESSAGES",
+            )
 
-        corpus_messages = self._translate_messages(messages)
-        stop_sequences = self._extract_stop_sequences(kwargs)
         ctx = self._build_operation_context(kwargs)
-        params = self._build_sampling_params(stop_sequences, kwargs)
-
+        params = self._build_sampling_params(kwargs)
         model_for_context = params.get("model", self.model)
+        framework_ctx = self._build_framework_ctx(kwargs)
 
         async with self._error_context_async(
             "astream_chat",
@@ -505,13 +676,33 @@ class CorpusLlamaIndexLLM(LLM):
             params=params,
         ):
             async def _gen() -> AsyncIterator[ChatResponse]:
-                # Direct protocol access for streaming
-                async for chunk in self.llm_adapter.astream(
-                    messages=corpus_messages,
-                    ctx=ctx,
-                    **params,
-                ):
-                    yield _build_chat_response_from_chunk(chunk)
+                agen = await self._translator.arun_stream(
+                    raw_messages=messages,
+                    model=params.get("model"),
+                    max_tokens=params.get("max_tokens"),
+                    temperature=params.get("temperature"),
+                    top_p=params.get("top_p"),
+                    frequency_penalty=params.get("frequency_penalty"),
+                    presence_penalty=params.get("presence_penalty"),
+                    stop_sequences=params.get("stop_sequences"),
+                    op_ctx=ctx,
+                    framework_ctx=framework_ctx,
+                )
+
+                try:
+                    async for chunk_obj in agen:
+                        yield _build_chat_response_from_chunk_like(chunk_obj)
+                finally:
+                    # Explicit cleanup of async generator if supported
+                    aclose = getattr(agen, "aclose", None)
+                    if callable(aclose):
+                        try:
+                            await aclose()
+                        except Exception as close_exc:  # noqa: BLE001
+                            logger.debug(
+                                "Failed to close async stream iterator: %s",
+                                close_exc,
+                            )
 
             return _gen()
 
@@ -527,27 +718,18 @@ class CorpusLlamaIndexLLM(LLM):
         """
         Sync chat entrypoint required by LlamaIndex.
 
-        Parameters
-        ----------
-        messages : Sequence[ChatMessage]
-            Sequence of LlamaIndex ChatMessage objects.
-        **kwargs : Any
-            LlamaIndex parameters including callback_manager and sampling params.
-
-        Returns
-        -------
-        ChatResponse
-            LlamaIndex chat response with message content and metadata.
+        Uses LLMTranslator.complete under the hood (sync bridge).
         """
         if not messages:
-            raise ValueError("Messages list cannot be empty")
+            raise BadRequest(
+                "Messages list cannot be empty",
+                code="BAD_MESSAGES",
+            )
 
-        corpus_messages = self._translate_messages(messages)
-        stop_sequences = self._extract_stop_sequences(kwargs)
         ctx = self._build_operation_context(kwargs)
-        params = self._build_sampling_params(stop_sequences, kwargs)
-
+        params = self._build_sampling_params(kwargs)
         model_for_context = params.get("model", self.model)
+        framework_ctx = self._build_framework_ctx(kwargs)
 
         with self._error_context(
             "chat",
@@ -557,18 +739,20 @@ class CorpusLlamaIndexLLM(LLM):
             ctx=ctx,
             params=params,
         ):
-            result: LLMCompletion = self.llm_adapter.complete(
-                messages=corpus_messages,
-                ctx=ctx,
-                **params,
+            result = self._translator.complete(
+                raw_messages=messages,
+                model=params.get("model"),
+                max_tokens=params.get("max_tokens"),
+                temperature=params.get("temperature"),
+                top_p=params.get("top_p"),
+                frequency_penalty=params.get("frequency_penalty"),
+                presence_penalty=params.get("presence_penalty"),
+                stop_sequences=params.get("stop_sequences"),
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
             )
 
-            return _build_chat_response(
-                text=result.text,
-                model=getattr(result, "model", None),
-                finish_reason=getattr(result, "finish_reason", None),
-                usage=getattr(result, "usage", None),
-            )
+            return _build_chat_response_from_translator_result(result)
 
     def stream_chat(
         self,
@@ -578,27 +762,18 @@ class CorpusLlamaIndexLLM(LLM):
         """
         Sync streaming chat entrypoint required by LlamaIndex.
 
-        Parameters
-        ----------
-        messages : Sequence[ChatMessage]
-            Sequence of LlamaIndex ChatMessage objects.
-        **kwargs : Any
-            LlamaIndex parameters including callback_manager and sampling params.
-
-        Returns
-        -------
-        ChatResponseGen
-            Generator of ChatResponse objects with incremental content.
+        Uses LLMTranslator.stream, which bridges async streaming into sync.
         """
         if not messages:
-            raise ValueError("Messages list cannot be empty")
+            raise BadRequest(
+                "Messages list cannot be empty",
+                code="BAD_MESSAGES",
+            )
 
-        corpus_messages = self._translate_messages(messages)
-        stop_sequences = self._extract_stop_sequences(kwargs)
         ctx = self._build_operation_context(kwargs)
-        params = self._build_sampling_params(stop_sequences, kwargs)
-
+        params = self._build_sampling_params(kwargs)
         model_for_context = params.get("model", self.model)
+        framework_ctx = self._build_framework_ctx(kwargs)
 
         with self._error_context(
             "stream_chat",
@@ -609,13 +784,33 @@ class CorpusLlamaIndexLLM(LLM):
             params=params,
         ):
             def _gen() -> Iterator[ChatResponse]:
-                # Direct protocol access for streaming
-                for chunk in self.llm_adapter.stream(
-                    messages=corpus_messages,
-                    ctx=ctx,
-                    **params,
-                ):
-                    yield _build_chat_response_from_chunk(chunk)
+                stream_iter = self._translator.stream(
+                    raw_messages=messages,
+                    model=params.get("model"),
+                    max_tokens=params.get("max_tokens"),
+                    temperature=params.get("temperature"),
+                    top_p=params.get("top_p"),
+                    frequency_penalty=params.get("frequency_penalty"),
+                    presence_penalty=params.get("presence_penalty"),
+                    stop_sequences=params.get("stop_sequences"),
+                    op_ctx=ctx,
+                    framework_ctx=framework_ctx,
+                )
+
+                try:
+                    for chunk_obj in stream_iter:
+                        yield _build_chat_response_from_chunk_like(chunk_obj)
+                finally:
+                    # Explicit cleanup of sync iterator if supported
+                    close = getattr(stream_iter, "close", None)
+                    if callable(close):
+                        try:
+                            close()
+                        except Exception as close_exc:  # noqa: BLE001
+                            logger.debug(
+                                "Failed to close sync stream iterator: %s",
+                                close_exc,
+                            )
 
             return _gen()
 
@@ -631,36 +826,32 @@ class CorpusLlamaIndexLLM(LLM):
         """
         Token counting helper.
 
-        Parameters
-        ----------
-        messages : Sequence[ChatMessage]
-            Sequence of LlamaIndex ChatMessage objects.
-        **kwargs : Any
-            Additional parameters.
+        Preferred path:
+        - Use LLMTranslator.count_tokens_for_messages so token counting
+          can use the same formatting and strategies as actual completions.
 
-        Returns
-        -------
-        int
-            Estimated token count for the messages.
+        Fallbacks:
+        - If translator/adapter count fails, use improved char-based estimate.
+        - If that fails, use the simple character-based heuristic.
         """
         if not messages:
             return 0
 
         ctx = self._build_operation_context(kwargs)
         model = kwargs.get("model", self.model)
+        framework_ctx = self._build_framework_ctx(kwargs)
 
-        # Try protocol adapter counting first
-        if hasattr(self.llm_adapter, "count_tokens"):
-            try:
-                combined_text = self._combine_messages_for_counting(messages)
-                tokens = self.llm_adapter.count_tokens(
-                    text=combined_text,
-                    model=model,
-                    ctx=ctx,
-                )
-                return int(tokens)
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("Protocol count_tokens failed: %s", exc)
+        # Preferred: translator-based token counting
+        try:
+            tokens_any = self._translator.count_tokens_for_messages(
+                raw_messages=messages,
+                model=model,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+            return int(tokens_any)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Translator-based token counting failed: %s", exc)
 
         # Fall back to improved character-based estimate
         try:
@@ -671,7 +862,10 @@ class CorpusLlamaIndexLLM(LLM):
         # Ultimate fallback to simple character count
         return self._simple_token_estimate(messages)
 
-    def _combine_messages_for_counting(self, messages: Sequence[ChatMessage]) -> str:
+    def _combine_messages_for_counting(
+        self,
+        messages: Sequence[ChatMessage],
+    ) -> str:
         """Combine messages into a single string for token counting."""
         parts: List[str] = []
         for msg in messages:
@@ -680,7 +874,10 @@ class CorpusLlamaIndexLLM(LLM):
             parts.append(f"{role}: {content}")
         return "\n".join(parts)
 
-    def _estimate_tokens_from_messages(self, messages: Sequence[ChatMessage]) -> int:
+    def _estimate_tokens_from_messages(
+        self,
+        messages: Sequence[ChatMessage],
+    ) -> int:
         """Improved token estimation with better heuristics."""
         combined_text = self._combine_messages_for_counting(messages)
 
@@ -695,7 +892,10 @@ class CorpusLlamaIndexLLM(LLM):
 
         return max(char_based, message_based)
 
-    def _simple_token_estimate(self, messages: Sequence[ChatMessage]) -> int:
+    def _simple_token_estimate(
+        self,
+        messages: Sequence[ChatMessage],
+    ) -> int:
         """Simple fallback token estimation."""
         combined_text = self._combine_messages_for_counting(messages)
         return max(1, len(combined_text) // 4)
@@ -704,4 +904,5 @@ class CorpusLlamaIndexLLM(LLM):
 __all__ = [
     "LlamaIndexLLMProtocol",
     "CorpusLlamaIndexLLM",
+    "LlamaIndexLLMConfig",
 ]
