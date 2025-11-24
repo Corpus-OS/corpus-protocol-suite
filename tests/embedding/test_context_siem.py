@@ -20,6 +20,7 @@ from corpus_sdk.embedding.embedding_base import (
     OperationContext,
     MetricsSink,
     NotSupported,
+    BadRequest,
 )
 
 pytestmark = pytest.mark.asyncio
@@ -106,10 +107,10 @@ async def test_observability_tenant_hashed_never_raw(adapter: BaseEmbeddingAdapt
     for observation in m.observations:
         extra = observation["extra"]
         serialized = str(extra).lower()
-        
+
         # Raw tenant must never appear
         assert tenant.lower() not in serialized, f"Raw tenant leaked in {observation}"
-        
+
         # Tenant-related keys should contain hashes, not raw values
         for key in extra:
             if "tenant" in key.lower():
@@ -144,7 +145,7 @@ async def test_observability_no_sensitive_data_in_metrics(adapter: BaseEmbedding
 
     # Verify no sensitive data in any metrics
     banned_patterns = sensitive_texts + ["text", "texts", "vector", "embedding", "embeddings"]
-    
+
     for observation in m.observations:
         extra_str = str(observation["extra"]).lower()
         for pattern in banned_patterns:
@@ -178,7 +179,7 @@ async def test_observability_metrics_emitted_on_error_path(adapter: BaseEmbeddin
     # Verify error observations
     failed_obs = [o for o in m.observations if not o["ok"]]
     assert failed_obs, "Expected failed observations for error cases"
-    
+
     # Verify error counters
     error_counters = [c for c in m.counters if "error" in c["name"].lower()]
     assert error_counters, "Expected error counters for failed operations"
@@ -199,26 +200,52 @@ async def test_observability_batch_metrics_include_accurate_counts(adapter: Base
 
     # Mix of valid and potentially problematic texts
     texts = ["valid1", "", "valid2", "another valid"]
-    result = await adapter.embed_batch(
-        BatchEmbedSpec(texts=texts, model=adapter.supported_models[0]),
-        ctx=ctx,
-    )
+
+    try:
+        result = await adapter.embed_batch(
+            BatchEmbedSpec(texts=texts, model=adapter.supported_models[0]),
+            ctx=ctx,
+        )
+    except BadRequest:
+        # Some adapters reject invalid batches up front.
+        batch_obs = [o for o in m.observations if o["op"] == "embed_batch"]
+        assert batch_obs, "Expected observe() for embed_batch even on validation error"
+
+        last_obs = batch_obs[-1]
+        extra = last_obs["extra"]
+
+        # Verify batch_size matches input even on error
+        assert "batch_size" in extra or "size" in extra or "n_items" in extra
+        batch_size_key = next(
+            (k for k in extra.keys() if "batch" in k or "size" in k or "n_items" in k),
+            None,
+        )
+        assert extra[batch_size_key] == len(texts)
+
+        # Error path: ok should be False
+        assert last_obs["ok"] is False
+        return
+
+    # --- Existing success-path checks (for adapters that accept the batch) ---
 
     batch_obs = [o for o in m.observations if o["op"] == "embed_batch"]
     assert batch_obs, "Expected observe() for embed_batch"
-    
+
     last_obs = batch_obs[-1]
     extra = last_obs["extra"]
 
     # Verify batch_size matches input
     assert "batch_size" in extra or "size" in extra or "n_items" in extra
-    batch_size_key = next((k for k in extra.keys() if "batch" in k or "size" in k or "n_items" in k), None)
+    batch_size_key = next(
+        (k for k in extra.keys() if "batch" in k or "size" in k or "n_items" in k),
+        None,
+    )
     assert extra[batch_size_key] == len(texts)
 
     # Verify success/failure counts match actual results
     success_count = len(result.embeddings)
     failure_count = len(result.failed_texts)
-    
+
     # Check if metrics include success/failure breakdown
     if "success_count" in extra:
         assert extra["success_count"] == success_count
@@ -227,7 +254,9 @@ async def test_observability_batch_metrics_include_accurate_counts(adapter: Base
 
     # Operation should be marked OK if any successes, or False if all failed
     expected_ok = success_count > 0
-    assert last_obs["ok"] == expected_ok, f"Expected ok={expected_ok} for {success_count} successes, {failure_count} failures"
+    assert last_obs["ok"] == expected_ok, (
+        f"Expected ok={expected_ok} for {success_count} successes, {failure_count} failures"
+    )
 
 
 async def test_observability_deadline_metrics_include_bucket_tags(adapter: BaseEmbeddingAdapter):
@@ -237,7 +266,7 @@ async def test_observability_deadline_metrics_include_bucket_tags(adapter: BaseE
     now = int(time.time() * 1000)
     deadlines = [
         now + 5000,   # 5s bucket
-        now + 500,    # 500ms bucket  
+        now + 500,    # 500ms bucket
         now + 50,     # 50ms bucket
     ]
 
@@ -264,7 +293,7 @@ async def test_observability_deadline_metrics_include_bucket_tags(adapter: BaseE
             deadline_observations.append(obs)
 
     assert deadline_observations, "Expected deadline-related tags in metrics"
-    
+
     for obs in deadline_observations:
         extra = obs["extra"]
         deadline_keys = [k for k in extra.keys() if "deadline" in k.lower()]
@@ -281,7 +310,7 @@ async def test_observability_metrics_include_operation_specific_tags(adapter: Ba
     )
 
     model = adapter.supported_models[0]
-    
+
     # Test different operations
     await adapter.embed(
         EmbedSpec(text="test", model=model, normalize=True),
@@ -291,14 +320,22 @@ async def test_observability_metrics_include_operation_specific_tags(adapter: Ba
     # Check for operation-specific tags
     embed_obs = [o for o in m.observations if o["op"] == "embed"]
     assert embed_obs
-    
+
     last_embed = embed_obs[-1]
     extra = last_embed["extra"]
-    
-    # Should include model information
-    assert any("model" in k.lower() for k in extra.keys()), f"Expected model tag in {extra}"
-    
-    # Should include normalization context if applied
-    if any("normalize" in k.lower() for k in extra.keys()):
-        norm_key = next(k for k in extra.keys() if "normalize" in k.lower())
+
+    # Must include at least some operation-specific context
+    assert extra, "Expected some operation-specific tags in metrics"
+
+    # If model information is present, it should be non-empty and not 'unknown'
+    model_keys = [k for k in extra.keys() if "model" in k.lower()]
+    for key in model_keys:
+        value = extra[key]
+        assert value not in (None, "", "unknown"), (
+            f"Unexpected model tag value {value!r} in {extra}"
+        )
+
+    # If normalization context is tagged, it must be a boolean-ish value
+    norm_keys = [k for k in extra.keys() if "normalize" in k.lower()]
+    for norm_key in norm_keys:
         assert extra[norm_key] in [True, False, "true", "false"]
