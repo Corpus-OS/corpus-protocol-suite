@@ -1244,16 +1244,15 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
             str(getattr(n, "node_id", None) or getattr(n, "id_", None)) for n in nodes
         ]
 
+        raw_request, framework_ctx = self._build_upsert_request(
+            vectors,
+            namespace=namespace,
+        )
+
         result = await self._translator.arun_upsert(
-            raw_request := self._build_upsert_request(
-                vectors,
-                namespace=namespace,
-            )[0],
+            raw_request,
             op_ctx=ctx,
-            framework_ctx=self._build_upsert_request(
-                vectors,
-                namespace=namespace,
-            )[1],
+            framework_ctx=framework_ctx,
         )
 
         if isinstance(result, UpsertResult):
@@ -1675,8 +1674,18 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
         if k <= 0:
             return VectorStoreQueryResult(nodes=[], similarities=[], ids=[])
 
+        # Warn on user-visible top_k for MMR
+        warn_if_extreme_k(
+            k,
+            framework="llamaindex",
+            op_name="query_mmr_sync",
+            warning_config=TOPK_WARNING_CONFIG,
+            logger=logger,
+        )
+
         effective_fetch_k = int(fetch_k or max(k * 4, k + 5))
 
+        # Warn on internal fetch_k used for MMR candidate pool
         warn_if_extreme_k(
             effective_fetch_k,
             framework="llamaindex",
@@ -1785,8 +1794,18 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
         if k <= 0:
             return VectorStoreQueryResult(nodes=[], similarities=[], ids=[])
 
+        # Warn on user-visible top_k for MMR (async)
+        warn_if_extreme_k(
+            k,
+            framework="llamaindex",
+            op_name="query_mmr_async",
+            warning_config=TOPK_WARNING_CONFIG,
+            logger=logger,
+        )
+
         effective_fetch_k = int(fetch_k or max(k * 4, k + 5))
 
+        # Warn on internal fetch_k used for MMR candidate pool (async)
         warn_if_extreme_k(
             effective_fetch_k,
             framework="llamaindex",
