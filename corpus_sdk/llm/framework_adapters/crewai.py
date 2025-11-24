@@ -185,6 +185,7 @@ class CrewAILLMConfig:
     - Optional post-processing configuration
     - Optional safety / JSON repair behavior
     - Optional framework version tagging
+    - Optional observability / validation toggles
     """
 
     model: str = "default"
@@ -195,6 +196,10 @@ class CrewAILLMConfig:
     post_processing_config: Optional[LLMPostProcessingConfig] = None
     safety_filter: Optional[SafetyFilter] = None
     json_repair: Optional[JSONRepair] = None
+
+    # Alignment with other adapters: observability + validation flags
+    enable_metrics: bool = True
+    validate_inputs: bool = True
 
     def __post_init__(self) -> None:
         """
@@ -309,8 +314,10 @@ def _extract_dynamic_context(
         "operation": operation,
     }
 
-    # Extract message metrics
-    if args:
+    enable_metrics = getattr(instance, "_enable_metrics_flag", True)
+
+    # Extract message metrics (only when metrics are enabled)
+    if enable_metrics and args:
         messages = _extract_messages_from_args(args[0])
         if messages:
             dynamic_ctx["messages_count"] = len(messages)
@@ -318,8 +325,20 @@ def _extract_dynamic_context(
             dynamic_ctx["roles_distribution"] = roles
             dynamic_ctx["total_content_chars"] = total_chars
 
-    # Extract context from kwargs
-    _extract_kwargs_context(kwargs, dynamic_ctx)
+    # Extract context from kwargs (sampling, request_id, tenant, CrewAI fields)
+    if enable_metrics:
+        _extract_kwargs_context(kwargs, dynamic_ctx)
+    else:
+        # Even if metrics are disabled, still capture identifiers when present.
+        for key in ("request_id", "tenant"):
+            if key in kwargs:
+                dynamic_ctx[key] = kwargs[key]
+
+    # If a pre-built OperationContext was passed, surface its identifiers.
+    ctx_from_kwargs = kwargs.get("ctx")
+    if isinstance(ctx_from_kwargs, OperationContext):
+        dynamic_ctx.setdefault("request_id", getattr(ctx_from_kwargs, "request_id", None))
+        dynamic_ctx.setdefault("tenant", getattr(ctx_from_kwargs, "tenant", None))
 
     # Stream flag for streaming operations
     if operation in ("astream", "stream"):
@@ -669,6 +688,9 @@ class CorpusCrewAILLM:
             self.max_tokens = config.max_tokens
             self._framework_version = config.framework_version or framework_version
 
+            self._enable_metrics_flag = bool(config.enable_metrics)
+            self._validate_inputs_flag = bool(config.validate_inputs)
+
             effective_post_processing = (
                 post_processing_config or config.post_processing_config
             )
@@ -679,6 +701,10 @@ class CorpusCrewAILLM:
             self.temperature = float(temperature)
             self.max_tokens = max_tokens
             self._framework_version = framework_version
+
+            # Defaults when no explicit config object is provided
+            self._enable_metrics_flag = True
+            self._validate_inputs_flag = True
 
             effective_post_processing = post_processing_config
             effective_safety_filter = safety_filter
@@ -794,6 +820,66 @@ class CorpusCrewAILLM:
             updated["framework_version"] = self._framework_version
         return updated
 
+    def _validate_messages(
+        self,
+        messages: Union[CrewAIMessageInput, CrewAIMessageSequence],
+    ) -> None:
+        """
+        Basic input validation for messages, aligned with other adapters.
+
+        - Disallow None
+        - Disallow empty sequences
+        - Disallow empty/whitespace-only strings
+        """
+        if messages is None:
+            raise ValueError("messages cannot be None")
+
+        if isinstance(messages, (list, tuple)):
+            if not messages:
+                raise ValueError("messages list cannot be empty")
+            return
+
+        if isinstance(messages, str):
+            if not messages.strip():
+                raise ValueError("messages string cannot be empty")
+            return
+
+        # Mapping or CrewAIMessage-like objects are accepted as-is.
+
+    def _build_request_context(
+        self,
+        *,
+        operation: str,
+        stream: bool,
+        kwargs: Mapping[str, Any],
+    ) -> Tuple[OperationContext, Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+        """
+        Build (OperationContext, sampling params, framework_ctx, resolved_kwargs)
+        in a single place, mirroring other framework adapters.
+        """
+        resolved_kwargs = self._apply_instance_defaults(kwargs)
+        request_id = resolved_kwargs.get("request_id")
+        tenant = resolved_kwargs.get("tenant")
+
+        ctx = _build_operation_context_from_kwargs(resolved_kwargs)
+        params = _build_sampling_params(
+            default_model=self.model,
+            default_temperature=self.temperature,
+            default_max_tokens=self.max_tokens,
+            kwargs=resolved_kwargs,
+        )
+        framework_ctx = _build_framework_ctx(
+            resolved_kwargs.get("framework_version"),
+            operation=operation,
+            stream=stream,
+            model=params.get("model"),
+            request_id=request_id,
+            tenant=tenant,
+            kwargs=resolved_kwargs,
+        )
+
+        return ctx, params, framework_ctx, resolved_kwargs
+
     # ---------------------------------------------------------------------
     # Async completion
     # ---------------------------------------------------------------------
@@ -823,25 +909,12 @@ class CorpusCrewAILLM:
         Any
             Framework-level completion as produced by the CrewAI LLMFrameworkTranslator.
         """
-        kwargs = self._apply_instance_defaults(kwargs)
-        # Request identifiers are extracted once for both OperationContext and framework_ctx.
-        request_id = kwargs.get("request_id")
-        tenant = kwargs.get("tenant")
+        if getattr(self, "_validate_inputs_flag", True):
+            self._validate_messages(messages)
 
-        ctx = _build_operation_context_from_kwargs(kwargs)
-        params = _build_sampling_params(
-            default_model=self.model,
-            default_temperature=self.temperature,
-            default_max_tokens=self.max_tokens,
-            kwargs=kwargs,
-        )
-        framework_ctx = _build_framework_ctx(
-            kwargs.get("framework_version"),
+        ctx, params, framework_ctx, resolved_kwargs = self._build_request_context(
             operation="acomplete",
             stream=False,
-            model=params.get("model"),
-            request_id=request_id,
-            tenant=tenant,
             kwargs=kwargs,
         )
 
@@ -854,9 +927,9 @@ class CorpusCrewAILLM:
             frequency_penalty=params.get("frequency_penalty"),
             presence_penalty=params.get("presence_penalty"),
             stop_sequences=params.get("stop_sequences"),
-            tools=kwargs.get("tools"),
-            tool_choice=kwargs.get("tool_choice"),
-            system_message=kwargs.get("system_message"),
+            tools=resolved_kwargs.get("tools"),
+            tool_choice=resolved_kwargs.get("tool_choice"),
+            system_message=resolved_kwargs.get("system_message"),
             op_ctx=ctx,
             framework_ctx=framework_ctx,
         )
@@ -890,24 +963,12 @@ class CorpusCrewAILLM:
             Streaming chunks as produced by the CrewAI LLMFrameworkTranslator
             (typically text tokens for CrewAI).
         """
-        kwargs = self._apply_instance_defaults(kwargs)
-        request_id = kwargs.get("request_id")
-        tenant = kwargs.get("tenant")
+        if getattr(self, "_validate_inputs_flag", True):
+            self._validate_messages(messages)
 
-        ctx = _build_operation_context_from_kwargs(kwargs)
-        params = _build_sampling_params(
-            default_model=self.model,
-            default_temperature=self.temperature,
-            default_max_tokens=self.max_tokens,
-            kwargs=kwargs,
-        )
-        framework_ctx = _build_framework_ctx(
-            kwargs.get("framework_version"),
+        ctx, params, framework_ctx, resolved_kwargs = self._build_request_context(
             operation="astream",
             stream=True,
-            model=params.get("model"),
-            request_id=request_id,
-            tenant=tenant,
             kwargs=kwargs,
         )
 
@@ -920,16 +981,27 @@ class CorpusCrewAILLM:
             frequency_penalty=params.get("frequency_penalty"),
             presence_penalty=params.get("presence_penalty"),
             stop_sequences=params.get("stop_sequences"),
-            tools=kwargs.get("tools"),
-            tool_choice=kwargs.get("tool_choice"),
-            system_message=kwargs.get("system_message"),
+            tools=resolved_kwargs.get("tools"),
+            tool_choice=resolved_kwargs.get("tool_choice"),
+            system_message=resolved_kwargs.get("system_message"),
             op_ctx=ctx,
             framework_ctx=framework_ctx,
         )
 
-        async for chunk in agen:
-            # The CrewAI translator defines the chunk shape; usually a text token.
-            yield chunk
+        try:
+            async for chunk in agen:
+                # The CrewAI translator defines the chunk shape; usually a text token.
+                yield chunk
+        finally:
+            aclose = getattr(agen, "aclose", None)
+            if callable(aclose):
+                try:
+                    await aclose()
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(
+                        "Failed to close async stream iterator in CrewAI adapter: %s",
+                        exc,
+                    )
 
     # ---------------------------------------------------------------------
     # Sync completion
@@ -956,24 +1028,12 @@ class CorpusCrewAILLM:
         Any
             Framework-level completion as produced by the CrewAI LLMFrameworkTranslator.
         """
-        kwargs = self._apply_instance_defaults(kwargs)
-        request_id = kwargs.get("request_id")
-        tenant = kwargs.get("tenant")
+        if getattr(self, "_validate_inputs_flag", True):
+            self._validate_messages(messages)
 
-        ctx = _build_operation_context_from_kwargs(kwargs)
-        params = _build_sampling_params(
-            default_model=self.model,
-            default_temperature=self.temperature,
-            default_max_tokens=self.max_tokens,
-            kwargs=kwargs,
-        )
-        framework_ctx = _build_framework_ctx(
-            kwargs.get("framework_version"),
+        ctx, params, framework_ctx, resolved_kwargs = self._build_request_context(
             operation="complete",
             stream=False,
-            model=params.get("model"),
-            request_id=request_id,
-            tenant=tenant,
             kwargs=kwargs,
         )
 
@@ -986,9 +1046,9 @@ class CorpusCrewAILLM:
             frequency_penalty=params.get("frequency_penalty"),
             presence_penalty=params.get("presence_penalty"),
             stop_sequences=params.get("stop_sequences"),
-            tools=kwargs.get("tools"),
-            tool_choice=kwargs.get("tool_choice"),
-            system_message=kwargs.get("system_message"),
+            tools=resolved_kwargs.get("tools"),
+            tool_choice=resolved_kwargs.get("tool_choice"),
+            system_message=resolved_kwargs.get("system_message"),
             op_ctx=ctx,
             framework_ctx=framework_ctx,
         )
@@ -1024,24 +1084,12 @@ class CorpusCrewAILLM:
             Streaming chunks as produced by the CrewAI LLMFrameworkTranslator
             (typically text tokens for CrewAI).
         """
-        kwargs = self._apply_instance_defaults(kwargs)
-        request_id = kwargs.get("request_id")
-        tenant = kwargs.get("tenant")
+        if getattr(self, "_validate_inputs_flag", True):
+            self._validate_messages(messages)
 
-        ctx = _build_operation_context_from_kwargs(kwargs)
-        params = _build_sampling_params(
-            default_model=self.model,
-            default_temperature=self.temperature,
-            default_max_tokens=self.max_tokens,
-            kwargs=kwargs,
-        )
-        framework_ctx = _build_framework_ctx(
-            kwargs.get("framework_version"),
+        ctx, params, framework_ctx, resolved_kwargs = self._build_request_context(
             operation="stream",
             stream=True,
-            model=params.get("model"),
-            request_id=request_id,
-            tenant=tenant,
             kwargs=kwargs,
         )
 
@@ -1054,15 +1102,26 @@ class CorpusCrewAILLM:
             frequency_penalty=params.get("frequency_penalty"),
             presence_penalty=params.get("presence_penalty"),
             stop_sequences=params.get("stop_sequences"),
-            tools=kwargs.get("tools"),
-            tool_choice=kwargs.get("tool_choice"),
-            system_message=kwargs.get("system_message"),
+            tools=resolved_kwargs.get("tools"),
+            tool_choice=resolved_kwargs.get("tool_choice"),
+            system_message=resolved_kwargs.get("system_message"),
             op_ctx=ctx,
             framework_ctx=framework_ctx,
         )
 
-        for chunk in iterator:
-            yield chunk
+        try:
+            for chunk in iterator:
+                yield chunk
+        finally:
+            close = getattr(iterator, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(
+                        "Failed to close sync stream iterator in CrewAI adapter: %s",
+                        exc,
+                    )
 
 
 __all__ = [
