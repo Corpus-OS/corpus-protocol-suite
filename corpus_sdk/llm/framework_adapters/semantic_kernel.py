@@ -267,50 +267,72 @@ def _extract_dynamic_context(
         "operation": operation,
     }
 
-    # Chat history metrics
-    try:
-        if args:
-            chat_history = args[0]
-            try:
-                dynamic_ctx["messages_count"] = len(chat_history)  # type: ignore[arg-type]
-            except Exception:
-                pass
+    enable_metrics = getattr(instance, "_enable_metrics_flag", True)
 
-            metrics = _analyze_chat_history(chat_history)
-            dynamic_ctx.update(metrics)
-    except Exception as metrics_exc:  # pragma: no cover
-        logger.debug(
-            "Failed to compute Semantic Kernel message metrics for error context: %s",
-            metrics_exc,
-        )
+    if enable_metrics:
+        # Chat history metrics
+        try:
+            chat_history = None
+            if args:
+                chat_history = args[0]
+            elif "chat_history" in kwargs:
+                chat_history = kwargs["chat_history"]
 
-    # Try to include resolved sampling params + context identifiers
-    # by reusing the instance helpers on the error path.
-    try:
-        if len(args) >= 2:
-            settings = args[1]
-            ctx = instance._build_operation_context(settings)  # type: ignore[attr-defined]
-            params = instance._build_sampling_params(settings, kwargs)  # type: ignore[attr-defined]
+            if chat_history is not None:
+                try:
+                    dynamic_ctx["messages_count"] = len(chat_history)  # type: ignore[arg-type]
+                except Exception:
+                    pass
 
-            dynamic_ctx["request_id"] = getattr(ctx, "request_id", None)
-            dynamic_ctx["tenant"] = getattr(ctx, "tenant", None)
+                metrics = _analyze_chat_history(chat_history)
+                dynamic_ctx.update(metrics)
+        except Exception as metrics_exc:  # pragma: no cover
+            logger.debug(
+                "Failed to compute Semantic Kernel message metrics for error context: %s",
+                metrics_exc,
+            )
 
-            for key in (
-                "model",
-                "temperature",
-                "max_tokens",
-                "top_p",
-                "frequency_penalty",
-                "presence_penalty",
-                "stop_sequences",
-            ):
-                if key in params and params[key] is not None:
-                    dynamic_ctx[f"resolved_{key}"] = params[key]
-    except Exception as ctx_exc:  # pragma: no cover
-        logger.debug(
-            "Failed to compute Semantic Kernel context params for error context: %s",
-            ctx_exc,
-        )
+        # Try to include resolved sampling params + context identifiers
+        # by reusing the instance helpers on the error path.
+        try:
+            settings: Optional[Any] = None
+            if len(args) >= 2:
+                settings = args[1]
+            elif "settings" in kwargs:
+                settings = kwargs["settings"]
+
+            if settings is not None:
+                stream = operation in (
+                    "get_streaming_chat_message_content",
+                    "get_streaming_chat_message_contents",
+                )
+                ctx, params, model_for_context, _ = instance._build_request_context(  # type: ignore[attr-defined]
+                    settings,
+                    kwargs,
+                    operation=operation,
+                    stream=stream,
+                )
+
+                dynamic_ctx["resolved_model"] = model_for_context
+                dynamic_ctx["request_id"] = getattr(ctx, "request_id", None)
+                dynamic_ctx["tenant"] = getattr(ctx, "tenant", None)
+
+                for key in (
+                    "model",
+                    "temperature",
+                    "max_tokens",
+                    "top_p",
+                    "frequency_penalty",
+                    "presence_penalty",
+                    "stop_sequences",
+                ):
+                    if key in params and params[key] is not None:
+                        dynamic_ctx[f"resolved_{key}"] = params[key]
+        except Exception as ctx_exc:  # pragma: no cover
+            logger.debug(
+                "Failed to compute Semantic Kernel context params for error context: %s",
+                ctx_exc,
+            )
 
     return dynamic_ctx
 
@@ -411,7 +433,7 @@ def with_async_llm_error_context(
 # ---------------------------------------------------------------------------
 
 
-@dataclass
+@dataclass(frozen=True)
 class SemanticKernelChatConfig:
     """
     Configuration for `CorpusSemanticKernelChatCompletion`.
@@ -421,6 +443,7 @@ class SemanticKernelChatConfig:
     - Optional post-processing configuration
     - Optional safety / JSON repair behavior
     - Optional framework version tagging
+    - Optional metrics + input validation toggles
     """
 
     model: str = "default"
@@ -431,6 +454,10 @@ class SemanticKernelChatConfig:
     post_processing_config: Optional[LLMPostProcessingConfig] = None
     safety_filter: Optional[SafetyFilter] = None
     json_repair: Optional[JSONRepair] = None
+
+    # Behavior toggles (aligned with other adapters)
+    enable_metrics: bool = True
+    validate_inputs: bool = True
 
     def __post_init__(self) -> None:
         """
@@ -504,6 +531,9 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
             )
             effective_safety_filter = safety_filter or config.safety_filter
             effective_json_repair = json_repair or config.json_repair
+
+            self._enable_metrics_flag = config.enable_metrics
+            self._validate_inputs_flag = config.validate_inputs
         else:
             self.model = model
             self.temperature = float(temperature)
@@ -513,6 +543,10 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
             effective_post_processing = post_processing_config
             effective_safety_filter = safety_filter
             effective_json_repair = json_repair
+
+            # Defaults aligned with other adapters
+            self._enable_metrics_flag = True
+            self._validate_inputs_flag = True
 
         # Validate adapter + sampling defaults in a shared, symbolic way.
         self._validate_init_params(llm_adapter)
@@ -584,8 +618,31 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
                     f"{_INIT_ERROR_CODE}: max_tokens must be a positive integer"
                 )
 
+    def _validate_chat_history(self, chat_history: "ChatHistory") -> None:
+        """
+        Validate Semantic Kernel chat history structure before handing it
+        to the translator.
+
+        Ensures:
+        - chat_history is non-empty
+        - each message has a role/author_role
+        - each message exposes content or items
+        """
+        if not chat_history:
+            raise ValueError("Chat history cannot be empty")
+
+        for idx, msg in enumerate(chat_history):
+            if not (hasattr(msg, "role") or hasattr(msg, "author_role")):
+                raise TypeError(
+                    f"chat_history[{idx}] is missing 'role' or 'author_role'"
+                )
+            if not (hasattr(msg, "content") or hasattr(msg, "items")):
+                raise TypeError(
+                    f"chat_history[{idx}] is missing 'content' or 'items'"
+                )
+
     # ------------------------------------------------------------------ #
-    # Internal helpers: context, sampling, framework_ctx
+    # Internal helpers: context, sampling, framework_ctx, request_context
     # ------------------------------------------------------------------ #
 
     def _build_operation_context(
@@ -595,7 +652,8 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
         """
         Build OperationContext from Semantic Kernel prompt settings.
 
-        Delegates to `context_from_semantic_kernel` with defensive logging.
+        Delegates to `context_from_semantic_kernel` with defensive error
+        context attachment.
         """
         try:
             return context_from_semantic_kernel(
@@ -603,12 +661,14 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
                 framework_version=self.framework_version,
             )
         except Exception as ctx_exc:
-            logger.warning(
-                "Failed to build OperationContext from Semantic Kernel settings: %s",
+            attach_context(
                 ctx_exc,
+                framework=_FRAMEWORK_NAME,
+                operation="llm_context_translation",
+                error_codes=ERROR_CODES,
+                framework_version=self.framework_version,
+                settings_type=type(settings).__name__,
             )
-            # Let the context translator control default semantics; if it
-            # fails, we re-raise, as a partially-formed context is worse.
             raise
 
     def _build_sampling_params(
@@ -686,6 +746,9 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
         self,
         settings: "PromptExecutionSettings",
         kwargs: Mapping[str, Any],
+        *,
+        operation: str,
+        stream: bool,
     ) -> Dict[str, Any]:
         """
         Build a lightweight framework_ctx payload for the Semantic Kernel translator.
@@ -698,6 +761,8 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
             "framework_version": self.framework_version,
             "service_id": getattr(self, "service_id", None),
             "settings_type": type(settings).__name__,
+            "operation": operation,
+            "stream": stream,
         }
 
         # Include any explicitly passed tools / tool_choice / system_message
@@ -707,6 +772,29 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
                 framework_ctx[key] = kwargs[key]
 
         return framework_ctx
+
+    def _build_request_context(
+        self,
+        settings: "PromptExecutionSettings",
+        kwargs: Mapping[str, Any],
+        *,
+        operation: str,
+        stream: bool,
+    ) -> Tuple[OperationContext, Dict[str, Any], str, Dict[str, Any]]:
+        """
+        Build and bundle OperationContext, sampling params, model_for_context,
+        and framework_ctx for a single SK request.
+        """
+        ctx = self._build_operation_context(settings)
+        params = self._build_sampling_params(settings, kwargs)
+        model_for_context = params.get("model", self.model)
+        framework_ctx = self._build_framework_ctx(
+            settings,
+            kwargs,
+            operation=operation,
+            stream=stream,
+        )
+        return ctx, params, model_for_context, framework_ctx
 
     # ------------------------------------------------------------------ #
     # Semantic Kernel async API (via LLMTranslator)
@@ -725,12 +813,15 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
         The Semantic Kernel framework translator is responsible for turning
         the raw messages + completion into `ChatMessageContent`.
         """
-        if not chat_history:
-            raise ValueError("Chat history cannot be empty")
+        if getattr(self, "_validate_inputs_flag", True):
+            self._validate_chat_history(chat_history)
 
-        ctx = self._build_operation_context(settings)
-        params = self._build_sampling_params(settings, kwargs)
-        framework_ctx = self._build_framework_ctx(settings, kwargs)
+        ctx, params, model_for_context, framework_ctx = self._build_request_context(
+            settings,
+            kwargs,
+            operation="get_chat_message_content",
+            stream=False,
+        )
 
         result = await self._translator.arun_complete(
             raw_messages=chat_history,
@@ -777,12 +868,15 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
         with Semantic Kernel's streaming APIs. The SK framework translator
         defines the chunk shape.
         """
-        if not chat_history:
-            raise ValueError("Chat history cannot be empty")
+        if getattr(self, "_validate_inputs_flag", True):
+            self._validate_chat_history(chat_history)
 
-        ctx = self._build_operation_context(settings)
-        params = self._build_sampling_params(settings, kwargs)
-        framework_ctx = self._build_framework_ctx(settings, kwargs)
+        ctx, params, model_for_context, framework_ctx = self._build_request_context(
+            settings,
+            kwargs,
+            operation="get_streaming_chat_message_content",
+            stream=True,
+        )
 
         agen: Optional[AsyncIterator[Any]] = None
         try:
@@ -836,6 +930,92 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
             **kwargs,
         ):
             yield msg
+
+    # ------------------------------------------------------------------ #
+    # Token counting (translator + heuristic fallback, for parity)
+    # ------------------------------------------------------------------ #
+
+    def _combine_chat_history_for_counting(
+        self,
+        chat_history: "ChatHistory",
+    ) -> str:
+        """
+        Combine Semantic Kernel chat history into a single string for
+        heuristic token counting.
+        """
+        parts: List[str] = []
+        for msg in chat_history or []:
+            role = getattr(msg, "role", None)
+            if role is None and hasattr(msg, "author_role"):
+                role = getattr(msg, "author_role", None)
+            if role is None:
+                role = "user"
+
+            content = getattr(msg, "content", None)
+            if content is None and hasattr(msg, "items"):
+                try:
+                    content = "".join(str(item) for item in msg.items)  # type: ignore[attr-defined]
+                except Exception:
+                    content = str(getattr(msg, "items", ""))
+
+            if not isinstance(content, str):
+                content = str(content) if content is not None else ""
+
+            parts.append(f"{role}: {content}")
+        return "\n".join(parts)
+
+    def count_tokens(
+        self,
+        chat_history: "ChatHistory",
+        settings: "PromptExecutionSettings",
+        **kwargs: Any,
+    ) -> int:
+        """
+        Token counting helper for Semantic Kernel chat history.
+
+        Preferred path:
+        - Use LLMTranslator.count_tokens_for_messages so token counting
+          can use the same formatting and strategies as actual completions.
+
+        Fallbacks:
+        - If translator/adapter count fails, use char-based estimate.
+        """
+        if not chat_history:
+            return 0
+
+        ctx, params, model_for_context, framework_ctx = self._build_request_context(
+            settings,
+            kwargs,
+            operation="count_tokens",
+            stream=False,
+        )
+
+        # Preferred: translator-based token counting
+        try:
+            tokens_any = self._translator.count_tokens_for_messages(
+                raw_messages=chat_history,
+                model=model_for_context,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+            if isinstance(tokens_any, int):
+                return tokens_any
+            if isinstance(tokens_any, Mapping):
+                for key in ("tokens", "total_tokens", "count"):
+                    value = tokens_any.get(key)
+                    if isinstance(value, int):
+                        return value
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "Semantic Kernel translator-based token counting failed: %s",
+                exc,
+            )
+
+        # Fallback: simple character-based heuristic
+        combined = self._combine_chat_history_for_counting(chat_history)
+        if not combined:
+            return 0
+        return max(1, len(combined) // 4)
 
 
 __all__ = [
