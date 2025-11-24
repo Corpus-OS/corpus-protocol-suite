@@ -9,7 +9,7 @@ Spec refs:
 
 Covers:
   • Successful envelopes for all supported ops
-  • Canonical {ok, code, result, error} shape
+  • Canonical {ok, code, result, error, message} shape
   • Argument validation surfaced as BAD_REQUEST via wire
   • Unsupported / unknown ops surfaced as NOT_SUPPORTED
   • Model-not-available mapped to MODEL_NOT_AVAILABLE
@@ -40,15 +40,26 @@ def _assert_ok_envelope(out):
     assert out.get("ok") is True
     assert isinstance(out.get("code"), str)
     assert out["code"] == "OK"
+    # Success envelopes should not carry an error
     assert "error" not in out or out["error"] in (None, {})
 
 
-def _assert_error_envelope(out, *, code: str = None):
+def _assert_error_envelope(out, *, code: str | None = None):
     assert isinstance(out, dict)
     assert out.get("ok") is False
+
+    # Should not include a non-empty result payload on errors
     assert "result" not in out or out["result"] in (None, {})
+
+    # code must be a non-empty string
     assert "code" in out and isinstance(out["code"], str) and out["code"]
-    assert "error" in out and isinstance(out["error"], dict)
+
+    # error should be the error type name as a string
+    assert "error" in out and isinstance(out["error"], str) and out["error"]
+
+    # message must be present (may be empty string for some errors)
+    assert "message" in out and isinstance(out["message"], str)
+
     if code is not None:
         assert out["code"] == code
 
@@ -413,8 +424,9 @@ async def test_wire_contract_error_envelope_includes_message_and_type():
     )
 
     _assert_error_envelope(out, code="BAD_REQUEST")
-    err = out["error"]
-    assert "message" in err and isinstance(err["message"], str) and err["message"]
+    # error is the type name; message is top-level
+    assert out["error"] in ("BadRequest", "BAD_REQUEST")
+    assert isinstance(out["message"], str) and out["message"]
 
 
 async def test_wire_contract_text_too_long_maps_to_text_too_long_code_when_exposed():
@@ -471,5 +483,7 @@ async def test_wire_contract_unexpected_exception_maps_to_unavailable():
 
     _assert_error_envelope(out)
     assert out["code"] == "UNAVAILABLE"
-    assert out["error"].get("type") in ("RuntimeError", "UNAVAILABLE", "Unavailable")
-    assert "boom" in out["error"].get("message", "") or "boom" in out.get("message", "")
+    # error should be the underlying exception type name
+    assert out["error"] == "RuntimeError"
+    # message should surface the original message
+    assert "boom" in out.get("message", "")
