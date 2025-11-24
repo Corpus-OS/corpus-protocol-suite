@@ -196,6 +196,25 @@ class CrewAILLMConfig:
     safety_filter: Optional[SafetyFilter] = None
     json_repair: Optional[JSONRepair] = None
 
+    def __post_init__(self) -> None:
+        """
+        Validate configuration invariants for safety and correctness.
+
+        This mirrors the AutoGen adapter's config validation:
+        - Temperature must be within [0.0, 2.0].
+        - max_tokens, if set, must be a positive integer.
+        """
+        if not (0.0 <= float(self.temperature) <= 2.0):
+            raise ValueError(
+                f"{ErrorCodes.BAD_INIT_CONFIG}: "
+                f"temperature must be between 0.0 and 2.0, got {self.temperature}"
+            )
+        if self.max_tokens is not None and self.max_tokens < 1:
+            raise ValueError(
+                f"{ErrorCodes.BAD_INIT_CONFIG}: "
+                f"max_tokens must be positive, got {self.max_tokens}"
+            )
+
 
 # ---------------------------------------------------------------------------
 # Error Context Helpers (aligned with shared pattern)
@@ -242,7 +261,7 @@ def _extract_kwargs_context(kwargs: Dict[str, Any], target: Dict[str, Any]) -> N
         if key in kwargs:
             target[key] = kwargs[key]
 
-    # Sampling parameters
+    # Sampling parameters and request identifiers (for observability)
     sampling_params = [
         "temperature",
         "max_tokens",
@@ -252,6 +271,8 @@ def _extract_kwargs_context(kwargs: Dict[str, Any], target: Dict[str, Any]) -> N
         "stop",
         "stop_sequences",
         "seed",
+        "request_id",
+        "tenant",
     ]
     for param in sampling_params:
         if param in kwargs:
@@ -539,6 +560,12 @@ def _build_sampling_params(
 
 def _build_framework_ctx(
     framework_version: Optional[str],
+    *,
+    operation: str,
+    stream: bool,
+    model: Optional[str],
+    request_id: Optional[str],
+    tenant: Optional[str],
     kwargs: Mapping[str, Any],
 ) -> Dict[str, Any]:
     """
@@ -546,6 +573,12 @@ def _build_framework_ctx(
 
     This stays lightweight and purely informational; all "real" translation
     logic lives in the registered LLMFrameworkTranslator for "crewai".
+
+    The shape is aligned with the AutoGen LLM adapter:
+    - Includes framework, framework_version, operation, stream, model,
+      request_id, tenant.
+    - Nests CrewAI-specific contextual fields under `crewai_context`.
+    - Forwards tools / tool_choice / system_message as passthrough hints.
     """
     crewai_context_keys = [
         "agent_role",
@@ -565,8 +598,17 @@ def _build_framework_ctx(
     framework_ctx: Dict[str, Any] = {
         "framework": _FRAMEWORK_NAME,
         "framework_version": framework_version,
+        "operation": operation,
+        "stream": stream,
         "crewai_context": crewai_ctx,
     }
+
+    if model is not None:
+        framework_ctx["model"] = model
+    if request_id is not None:
+        framework_ctx["request_id"] = request_id
+    if tenant is not None:
+        framework_ctx["tenant"] = tenant
 
     # Include any explicitly passed tools / tool_choice / system_message
     for key in ("tools", "tool_choice", "system_message"):
@@ -782,6 +824,10 @@ class CorpusCrewAILLM:
             Framework-level completion as produced by the CrewAI LLMFrameworkTranslator.
         """
         kwargs = self._apply_instance_defaults(kwargs)
+        # Request identifiers are extracted once for both OperationContext and framework_ctx.
+        request_id = kwargs.get("request_id")
+        tenant = kwargs.get("tenant")
+
         ctx = _build_operation_context_from_kwargs(kwargs)
         params = _build_sampling_params(
             default_model=self.model,
@@ -791,7 +837,12 @@ class CorpusCrewAILLM:
         )
         framework_ctx = _build_framework_ctx(
             kwargs.get("framework_version"),
-            kwargs,
+            operation="acomplete",
+            stream=False,
+            model=params.get("model"),
+            request_id=request_id,
+            tenant=tenant,
+            kwargs=kwargs,
         )
 
         result = await self._translator.arun_complete(
@@ -840,6 +891,9 @@ class CorpusCrewAILLM:
             (typically text tokens for CrewAI).
         """
         kwargs = self._apply_instance_defaults(kwargs)
+        request_id = kwargs.get("request_id")
+        tenant = kwargs.get("tenant")
+
         ctx = _build_operation_context_from_kwargs(kwargs)
         params = _build_sampling_params(
             default_model=self.model,
@@ -849,7 +903,12 @@ class CorpusCrewAILLM:
         )
         framework_ctx = _build_framework_ctx(
             kwargs.get("framework_version"),
-            kwargs,
+            operation="astream",
+            stream=True,
+            model=params.get("model"),
+            request_id=request_id,
+            tenant=tenant,
+            kwargs=kwargs,
         )
 
         agen = await self._translator.arun_stream(
@@ -898,6 +957,9 @@ class CorpusCrewAILLM:
             Framework-level completion as produced by the CrewAI LLMFrameworkTranslator.
         """
         kwargs = self._apply_instance_defaults(kwargs)
+        request_id = kwargs.get("request_id")
+        tenant = kwargs.get("tenant")
+
         ctx = _build_operation_context_from_kwargs(kwargs)
         params = _build_sampling_params(
             default_model=self.model,
@@ -907,7 +969,12 @@ class CorpusCrewAILLM:
         )
         framework_ctx = _build_framework_ctx(
             kwargs.get("framework_version"),
-            kwargs,
+            operation="complete",
+            stream=False,
+            model=params.get("model"),
+            request_id=request_id,
+            tenant=tenant,
+            kwargs=kwargs,
         )
 
         result = self._translator.complete(
@@ -958,6 +1025,9 @@ class CorpusCrewAILLM:
             (typically text tokens for CrewAI).
         """
         kwargs = self._apply_instance_defaults(kwargs)
+        request_id = kwargs.get("request_id")
+        tenant = kwargs.get("tenant")
+
         ctx = _build_operation_context_from_kwargs(kwargs)
         params = _build_sampling_params(
             default_model=self.model,
@@ -967,7 +1037,12 @@ class CorpusCrewAILLM:
         )
         framework_ctx = _build_framework_ctx(
             kwargs.get("framework_version"),
-            kwargs,
+            operation="stream",
+            stream=True,
+            model=params.get("model"),
+            request_id=request_id,
+            tenant=tenant,
+            kwargs=kwargs,
         )
 
         iterator = self._translator.stream(
