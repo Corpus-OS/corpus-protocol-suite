@@ -75,7 +75,7 @@ from __future__ import annotations
 import logging
 import math
 import uuid
-from functools import cached_property
+from functools import cached_property, wraps
 from typing import (
     Any,
     Callable,
@@ -95,10 +95,11 @@ from langchain_core.retrievers import BaseRetriever
 from langchain_core.vectorstores import VectorStore
 
 from corpus_sdk.vector.vector_base import (
-    BaseVectorAdapter,
+    VectorProtocolV1,
     Vector,
     VectorMatch,
     QueryResult,
+    QueryChunk,
     UpsertResult,
     DeleteResult,
     OperationContext,
@@ -112,11 +113,21 @@ from corpus_sdk.vector.framework_adapters.common.vector_translation import (
     DefaultVectorFrameworkTranslator,
     VectorTranslator,
 )
-
-from corpus_sdk.llm.framework_adapters.common.context_translation import (
-    from_langchain as context_from_langchain,
+from corpus_sdk.vector.framework_adapters.common.framework_utils import (
+    VectorCoercionErrorCodes,
+    VectorResourceLimits,
+    VectorValidationFlags,
+    TopKWarningConfig,
+    warn_if_extreme_k,
+    normalize_vector_context,
+    attach_vector_context_to_framework_ctx,
 )
-from corpus_sdk.llm.framework_adapters.common.error_context import attach_context
+
+from corpus_sdk.core.context_translation import (
+    from_langchain as ctx_from_langchain,
+    from_dict as ctx_from_dict,
+)
+from corpus_sdk.core.error_context import attach_context
 
 logger = logging.getLogger(__name__)
 
@@ -124,9 +135,82 @@ Embeddings = Sequence[Sequence[float]]
 Metadata = Dict[str, Any]
 
 
+# --------------------------------------------------------------------------- #
+# Shared vector framework constants
+# --------------------------------------------------------------------------- #
+
+VECTOR_ERROR_CODES = VectorCoercionErrorCodes(
+    framework_label="langchain",
+)
+VECTOR_LIMITS = VectorResourceLimits()
+VECTOR_FLAGS = VectorValidationFlags()
+TOPK_WARNING_CONFIG = TopKWarningConfig(
+    framework_label="langchain",
+)
+
+
+# --------------------------------------------------------------------------- #
+# Error-context decorators (parallel to other framework adapters)
+# --------------------------------------------------------------------------- #
+
+
+def with_error_context(
+    operation: str,
+    **context_kwargs: Any,
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """
+    Decorator to automatically attach error context to synchronous exceptions.
+    """
+
+    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+        @wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return func(*args, **kwargs)
+            except Exception as exc:
+                attach_context(
+                    exc,
+                    framework="langchain",
+                    operation=operation,
+                    **context_kwargs,
+                )
+                raise
+
+        return wrapper
+
+    return decorator
+
+
+def with_async_error_context(
+    operation: str,
+    **context_kwargs: Any,
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """
+    Decorator to automatically attach error context to async exceptions.
+    """
+
+    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+        @wraps(func)
+        async def wrapper(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return await func(*args, **kwargs)
+            except Exception as exc:
+                attach_context(
+                    exc,
+                    framework="langchain",
+                    operation=operation,
+                    **context_kwargs,
+                )
+                raise
+
+        return wrapper
+
+    return decorator
+
+
 class CorpusLangChainVectorStore(VectorStore):
     """
-    LangChain `VectorStore` implementation backed by a Corpus `BaseVectorAdapter`.
+    LangChain `VectorStore` implementation backed by a Corpus `VectorProtocolV1`.
 
     This class is a thin integration layer:
     - Documents are mapped to Corpus VectorProtocol `Vector` objects.
@@ -182,10 +266,10 @@ class CorpusLangChainVectorStore(VectorStore):
         If not provided, cosine similarity is used.
 
     model_config:
-        Pydantic v2-style config: allow arbitrary types like BaseVectorAdapter.
+        Pydantic v2-style config: allow arbitrary types like VectorProtocolV1.
     """
 
-    corpus_adapter: BaseVectorAdapter
+    corpus_adapter: VectorProtocolV1
     namespace: Optional[str] = "default"
 
     id_field: str = "id"
@@ -285,11 +369,29 @@ class CorpusLangChainVectorStore(VectorStore):
         config = kwargs.get("config")
         if config is None:
             return None
+
+        # If caller passes an OperationContext directly, honor it
+        if isinstance(config, OperationContext):
+            return config
+
+        # Dict-like config: try the generic dict-based translator first
+        if isinstance(config, Mapping):
+            try:
+                ctx = ctx_from_dict(config)
+                if isinstance(ctx, OperationContext):
+                    return ctx
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("ctx_from_dict failed in _build_ctx: %s", exc)
+
+        # Fall back to LangChain-specific context translation
         try:
-            return context_from_langchain(config)
+            ctx = ctx_from_langchain(config)
+            if isinstance(ctx, OperationContext):
+                return ctx
         except Exception as exc:  # noqa: BLE001
-            logger.debug("context_from_langchain failed: %s", exc)
-            return None
+            logger.debug("ctx_from_langchain failed in _build_ctx: %s", exc)
+
+        return None
 
     def _effective_namespace(self, namespace: Optional[str]) -> Optional[str]:
         """
@@ -303,13 +405,34 @@ class CorpusLangChainVectorStore(VectorStore):
     def _framework_ctx_for_namespace(
         self,
         namespace: Optional[str],
-    ) -> Mapping[str, Any]:
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """
-        Build a minimal framework_ctx mapping that lets the translator know
-        which logical namespace is being targeted.
+        Build a framework_ctx carrying normalized vector context (namespace, etc.)
+        for the shared VectorTranslator and downstream adapters.
         """
         ns = self._effective_namespace(namespace)
-        return {"namespace": ns} if ns is not None else {}
+
+        raw_ctx: Dict[str, Any] = {}
+        if ns is not None:
+            raw_ctx["namespace"] = ns
+        if extra_context:
+            raw_ctx.update(extra_context)
+
+        vector_ctx = normalize_vector_context(
+            raw_ctx,
+            framework="langchain",
+            logger=logger,
+        )
+
+        framework_ctx: Dict[str, Any] = {}
+        attach_vector_context_to_framework_ctx(
+            framework_ctx,
+            vector_context=vector_ctx,
+            limits=VECTOR_LIMITS,
+            flags=VECTOR_FLAGS,
+        )
+        return framework_ctx
 
     # ------------------------------------------------------------------ #
     # Translation helpers: LC Documents ↔ Corpus Vector
@@ -575,7 +698,8 @@ class CorpusLangChainVectorStore(VectorStore):
             "vector": [float(x) for x in embedding],
             "top_k": int(k),
             "namespace": ns,
-            "filter": dict(filter) if filter else None,
+            # NOTE: vector/autogen contract uses "filters" for metadata constraints.
+            "filters": dict(filter) if filter else None,
             "include_metadata": True,
             "include_vectors": bool(include_vectors),
         }
@@ -642,6 +766,7 @@ class CorpusLangChainVectorStore(VectorStore):
     # LangChain VectorStore sync API
     # ------------------------------------------------------------------ #
 
+    @with_error_context("add_texts_sync")
     def add_texts(
         self,
         texts: Iterable[str],
@@ -697,6 +822,7 @@ class CorpusLangChainVectorStore(VectorStore):
 
         return ids_norm
 
+    @with_async_error_context("add_texts_async")
     async def aadd_texts(
         self,
         texts: Iterable[str],
@@ -819,6 +945,7 @@ class CorpusLangChainVectorStore(VectorStore):
             raise err
         return [float(x) for x in embs[0]]
 
+    @with_error_context("similarity_search_sync")
     def similarity_search(
         self,
         query: str,
@@ -835,6 +962,14 @@ class CorpusLangChainVectorStore(VectorStore):
 
         query_emb = self._embed_query(query, embedding=embedding)
         top_k = k or self.default_top_k
+
+        warn_if_extreme_k(
+            top_k,
+            framework="langchain",
+            op_name="similarity_search_sync",
+            warning_config=TOPK_WARNING_CONFIG,
+            logger=logger,
+        )
 
         raw_query, framework_ctx = self._build_query_request(
             query_emb,
@@ -870,6 +1005,7 @@ class CorpusLangChainVectorStore(VectorStore):
         docs_scores = self._from_corpus_matches(matches)
         return [doc for doc, _ in docs_scores]
 
+    @with_error_context("similarity_search_stream_sync")
     def similarity_search_stream(
         self,
         query: str,
@@ -893,6 +1029,14 @@ class CorpusLangChainVectorStore(VectorStore):
         query_emb = self._embed_query(query, embedding=embedding)
         top_k = k or self.default_top_k
 
+        warn_if_extreme_k(
+            top_k,
+            framework="langchain",
+            op_name="similarity_search_stream_sync",
+            warning_config=TOPK_WARNING_CONFIG,
+            logger=logger,
+        )
+
         raw_query, framework_ctx = self._build_query_request(
             query_emb,
             k=top_k,
@@ -901,15 +1045,15 @@ class CorpusLangChainVectorStore(VectorStore):
             include_vectors=False,
         )
 
-        for item in self._translator.query_stream(
+        for chunk in self._translator.query_stream(
             raw_query,
             op_ctx=ctx,
             framework_ctx=framework_ctx,
         ):
-            # The translator should stream VectorMatch items directly.
-            if not isinstance(item, VectorMatch):
+            # In the updated streaming contract, the translator yields QueryChunk
+            if not isinstance(chunk, QueryChunk):
                 err = VectorAdapterError(
-                    f"VectorTranslator.query_stream yielded unsupported type: {type(item).__name__}",
+                    f"VectorTranslator.query_stream yielded unsupported type: {type(chunk).__name__}",
                     code="BAD_TRANSLATED_CHUNK",
                 )
                 attach_context(
@@ -919,16 +1063,15 @@ class CorpusLangChainVectorStore(VectorStore):
                 )
                 raise err
 
-            match = item
-            # Client-side score thresholding per chunk
-            if self.score_threshold is not None:
-                if float(match.score) < float(self.score_threshold):
-                    continue
+            raw_matches = list(chunk.matches or [])
+            filtered_matches = self._apply_score_threshold(raw_matches)
 
-            docs_scores = self._from_corpus_matches([match])
-            if docs_scores:
-                yield docs_scores[0][0]
+            for match in filtered_matches:
+                docs_scores = self._from_corpus_matches([match])
+                if docs_scores:
+                    yield docs_scores[0][0]
 
+    @with_async_error_context("similarity_search_async")
     async def asimilarity_search(
         self,
         query: str,
@@ -945,6 +1088,14 @@ class CorpusLangChainVectorStore(VectorStore):
 
         query_emb = self._embed_query(query, embedding=embedding)
         top_k = k or self.default_top_k
+
+        warn_if_extreme_k(
+            top_k,
+            framework="langchain",
+            op_name="similarity_search_async",
+            warning_config=TOPK_WARNING_CONFIG,
+            logger=logger,
+        )
 
         raw_query, framework_ctx = self._build_query_request(
             query_emb,
@@ -976,6 +1127,7 @@ class CorpusLangChainVectorStore(VectorStore):
         docs_scores = self._from_corpus_matches(matches)
         return [doc for doc, _ in docs_scores]
 
+    @with_error_context("similarity_search_with_score_sync")
     def similarity_search_with_score(
         self,
         query: str,
@@ -992,6 +1144,14 @@ class CorpusLangChainVectorStore(VectorStore):
 
         query_emb = self._embed_query(query, embedding=embedding)
         top_k = k or self.default_top_k
+
+        warn_if_extreme_k(
+            top_k,
+            framework="langchain",
+            op_name="similarity_search_with_score_sync",
+            warning_config=TOPK_WARNING_CONFIG,
+            logger=logger,
+        )
 
         raw_query, framework_ctx = self._build_query_request(
             query_emb,
@@ -1022,6 +1182,7 @@ class CorpusLangChainVectorStore(VectorStore):
         matches = self._apply_score_threshold(list(result_any.matches or []))
         return self._from_corpus_matches(matches)
 
+    @with_async_error_context("similarity_search_with_score_async")
     async def asimilarity_search_with_score(
         self,
         query: str,
@@ -1038,6 +1199,14 @@ class CorpusLangChainVectorStore(VectorStore):
 
         query_emb = self._embed_query(query, embedding=embedding)
         top_k = k or self.default_top_k
+
+        warn_if_extreme_k(
+            top_k,
+            framework="langchain",
+            op_name="similarity_search_with_score_async",
+            warning_config=TOPK_WARNING_CONFIG,
+            logger=logger,
+        )
 
         raw_query, framework_ctx = self._build_query_request(
             query_emb,
@@ -1231,6 +1400,7 @@ class CorpusLangChainVectorStore(VectorStore):
 
         return selected
 
+    @with_error_context("mmr_search_sync")
     def max_marginal_relevance_search(
         self,
         query: str,
@@ -1276,6 +1446,15 @@ class CorpusLangChainVectorStore(VectorStore):
             raise err
 
         fetch_k: int = kwargs.get("fetch_k") or max(k * 4, k + 5)
+
+        warn_if_extreme_k(
+            fetch_k,
+            framework="langchain",
+            op_name="mmr_search_sync_fetch_k",
+            warning_config=TOPK_WARNING_CONFIG,
+            logger=logger,
+        )
+
         embedding: Optional[Sequence[float]] = kwargs.get("embedding")
         namespace: Optional[str] = kwargs.get("namespace")
         ctx = self._build_ctx(**kwargs)
@@ -1322,6 +1501,7 @@ class CorpusLangChainVectorStore(VectorStore):
         docs_scores = self._from_corpus_matches(candidate_matches)
         return [docs_scores[i][0] for i in indices]
 
+    @with_async_error_context("mmr_search_async")
     async def amax_marginal_relevance_search(
         self,
         query: str,
@@ -1350,6 +1530,15 @@ class CorpusLangChainVectorStore(VectorStore):
             raise err
 
         fetch_k: int = kwargs.get("fetch_k") or max(k * 4, k + 5)
+
+        warn_if_extreme_k(
+            fetch_k,
+            framework="langchain",
+            op_name="mmr_search_async_fetch_k",
+            warning_config=TOPK_WARNING_CONFIG,
+            logger=logger,
+        )
+
         embedding: Optional[Sequence[float]] = kwargs.get("embedding")
         namespace: Optional[str] = kwargs.get("namespace")
         ctx = self._build_ctx(**kwargs)
@@ -1400,6 +1589,7 @@ class CorpusLangChainVectorStore(VectorStore):
     # Delete API
     # ------------------------------------------------------------------ #
 
+    @with_error_context("delete_sync")
     def delete(
         self,
         ids: Optional[List[str]] = None,
@@ -1431,6 +1621,7 @@ class CorpusLangChainVectorStore(VectorStore):
             # Translator/adapter already annotated the error.
             raise
 
+    @with_async_error_context("delete_async")
     async def adelete(
         self,
         ids: Optional[List[str]] = None,
@@ -1465,7 +1656,7 @@ class CorpusLangChainVectorStore(VectorStore):
         cls,
         texts: List[str],
         *,
-        corpus_adapter: BaseVectorAdapter,
+        corpus_adapter: VectorProtocolV1,
         metadatas: Optional[List[Metadata]] = None,
         ids: Optional[List[str]] = None,
         **kwargs: Any,
@@ -1482,7 +1673,7 @@ class CorpusLangChainVectorStore(VectorStore):
         cls,
         documents: List[Document],
         *,
-        corpus_adapter: BaseVectorAdapter,
+        corpus_adapter: VectorProtocolV1,
         **kwargs: Any,
     ) -> "CorpusLangChainVectorStore":
         """
@@ -1514,6 +1705,7 @@ class CorpusLangChainRetriever(BaseRetriever):
     search_kwargs: Dict[str, Any] = {}
     model_config = {"arbitrary_types_allowed": True}
 
+    @with_error_context("retriever_sync")
     def _get_relevant_documents(
         self,
         query: str,
@@ -1541,6 +1733,7 @@ class CorpusLangChainRetriever(BaseRetriever):
                 pass
             raise
 
+    @with_async_error_context("retriever_async")
     async def _aget_relevant_documents(
         self,
         query: str,
@@ -1570,4 +1763,6 @@ class CorpusLangChainRetriever(BaseRetriever):
 __all__ = [
     "CorpusLangChainVectorStore",
     "CorpusLangChainRetriever",
+    "with_error_context",
+    "with_async_error_context",
 ]
