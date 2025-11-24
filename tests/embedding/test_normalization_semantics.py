@@ -28,15 +28,15 @@ def _norm(vec):
     return math.sqrt(sum(v * v for v in vec))
 
 
-def supports_normalization(adapter: BaseEmbeddingAdapter) -> bool:
+async def supports_normalization(adapter: BaseEmbeddingAdapter) -> bool:
     """Check normalization capability."""
-    caps = adapter.capabilities
+    caps = await adapter.capabilities()
     return getattr(caps, "supports_normalization", False)
 
 
 async def test_normalization_single_embed_normalize_true_produces_unit_vector(adapter: BaseEmbeddingAdapter):
     """§10.6: normalize=True must produce approximately unit vectors."""
-    if not supports_normalization(adapter):
+    if not await supports_normalization(adapter):
         pytest.skip("Adapter does not support normalization")
 
     ctx = OperationContext(request_id="t_norm_single_true", tenant="t")
@@ -56,10 +56,10 @@ async def test_normalization_single_embed_normalize_true_produces_unit_vector(ad
 
 async def test_normalization_single_embed_normalize_false_not_forced_unit_norm(adapter: BaseEmbeddingAdapter):
     """§10.6: normalize=False should not force unit norm when normalizes_at_source=False."""
-    if not supports_normalization(adapter):
+    if not await supports_normalization(adapter):
         pytest.skip("Adapter does not support normalization")
     
-    caps = adapter.capabilities
+    caps = await adapter.capabilities()
     if getattr(caps, "normalizes_at_source", False):
         pytest.skip("Adapter normalizes at source; cannot test non-unit norms")
 
@@ -80,7 +80,7 @@ async def test_normalization_single_embed_normalize_false_not_forced_unit_norm(a
 
 async def test_normalization_batch_embed_normalize_true_all_unit_vectors(adapter: BaseEmbeddingAdapter):
     """§10.6: Batch normalization must apply consistently to all vectors."""
-    if not supports_normalization(adapter):
+    if not await supports_normalization(adapter):
         pytest.skip("Adapter does not support normalization")
 
     ctx = OperationContext(request_id="t_norm_batch_true", tenant="t")
@@ -101,7 +101,7 @@ async def test_normalization_batch_embed_normalize_true_all_unit_vectors(adapter
 
 async def test_normalization_not_supported_raises_clear_error(adapter: BaseEmbeddingAdapter):
     """§10.4: Normalization requests must raise NotSupported when unsupported."""
-    if supports_normalization(adapter):
+    if await supports_normalization(adapter):
         pytest.skip("Adapter supports normalization")
 
     ctx = OperationContext(request_id="t_norm_nosupport", tenant="t")
@@ -122,9 +122,12 @@ async def test_normalization_not_supported_raises_clear_error(adapter: BaseEmbed
 
 async def test_normalization_normalizes_at_source_respected(adapter: BaseEmbeddingAdapter):
     """§10.6: normalizes_at_source=True adapters should work without double-normalization."""
-    caps = adapter.capabilities
+    caps = await adapter.capabilities()
     if not getattr(caps, "normalizes_at_source", False):
         pytest.skip("Adapter does not normalize at source")
+
+    if not await supports_normalization(adapter):
+        pytest.skip("Adapter does not support normalization")
 
     ctx = OperationContext(request_id="t_norm_source", tenant="t")
 
@@ -143,7 +146,7 @@ async def test_normalization_normalizes_at_source_respected(adapter: BaseEmbeddi
 
 async def test_normalization_consistency_across_calls(adapter: BaseEmbeddingAdapter):
     """§6.1: Normalization should be deterministic across identical calls."""
-    if not supports_normalization(adapter):
+    if not await supports_normalization(adapter):
         pytest.skip("Adapter does not support normalization")
 
     ctx = OperationContext(request_id="t_norm_consistent", tenant="t")
@@ -171,7 +174,7 @@ async def test_normalization_consistency_across_calls(adapter: BaseEmbeddingAdap
 
 async def test_normalization_different_texts_different_vectors(adapter: BaseEmbeddingAdapter):
     """§10.6: Different texts should produce different normalized vectors."""
-    if not supports_normalization(adapter):
+    if not await supports_normalization(adapter):
         pytest.skip("Adapter does not support normalization")
 
     ctx = OperationContext(request_id="t_norm_different", tenant="t")
@@ -195,7 +198,7 @@ async def test_normalization_different_texts_different_vectors(adapter: BaseEmbe
 
 async def test_normalization_small_vectors_handled(adapter: BaseEmbeddingAdapter):
     """§10.6: Normalization should handle very small input vectors correctly."""
-    if not supports_normalization(adapter):
+    if not await supports_normalization(adapter):
         pytest.skip("Adapter does not support normalization")
 
     ctx = OperationContext(request_id="t_norm_small", tenant="t")
@@ -214,7 +217,7 @@ async def test_normalization_small_vectors_handled(adapter: BaseEmbeddingAdapter
 
 async def test_normalization_batch_mixed_normalization(adapter: BaseEmbeddingAdapter):
     """§10.6: Batch should handle mixed normalization settings per spec."""
-    if not supports_normalization(adapter):
+    if not await supports_normalization(adapter):
         pytest.skip("Adapter does not support normalization")
 
     ctx = OperationContext(request_id="t_norm_batch_mixed", tenant="t")
@@ -242,7 +245,7 @@ async def test_normalization_batch_mixed_normalization(adapter: BaseEmbeddingAda
         assert 0.99 <= norm <= 1.01, f"Normalized batch vector should be unit norm, got {norm:.6f}"
     
     # Raw batch vectors might not be unit length
-    caps = adapter.capabilities
+    caps = await adapter.capabilities()
     if not getattr(caps, "normalizes_at_source", False):
         for embedding in result_raw.embeddings:
             norm = _norm(embedding.vector)
