@@ -2,10 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-AutoGen adapter fo# corpus_sdk/graph/framework_adapters/autogen.py
-# SPDX-License-Identifier: Apache-2.0
-
-"""
 AutoGen adapter for Corpus Graph protocol.
 
 This module exposes a Corpus `GraphProtocolV1` implementation as an
