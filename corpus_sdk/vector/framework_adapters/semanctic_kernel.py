@@ -4,12 +4,12 @@
 """
 Semantic Kernel adapter for Corpus Vector protocol.
 
-This module exposes Corpus `BaseVectorAdapter` implementations to
+This module exposes Corpus `VectorProtocolV1` implementations to
 Semantic Kernel in two layers:
 
 1. Core Python API:
    - `CorpusSemanticKernelVectorStore`: protocol-first vector store that
-     talks to a Corpus `BaseVectorAdapter` using VectorProtocolV1 via VectorTranslator.
+     talks to a Corpus `VectorProtocolV1` via VectorTranslator.
    - Sync + async add/search/delete APIs (mirroring Semantic Kernel patterns)
    - Proper integration with Corpus VectorProtocolV1 via VectorTranslator
    - Namespace + metadata filter handling (capability-aware)
@@ -43,8 +43,8 @@ Design philosophy
     * Providing AI-optimized functions for Semantic Kernel tool calling
     * Supporting SK-specific patterns (streaming, context propagation, memory)
 
-Usage
------
+Typical usage
+-------------
 
     from semantic_kernel import Kernel
     from semantic_kernel.functions import KernelPlugin
@@ -106,10 +106,11 @@ from corpus_sdk.core.context_translation import (
     from_dict as context_from_dict,
 )
 from corpus_sdk.vector.vector_base import (
-    BaseVectorAdapter,
+    VectorProtocolV1,
     Vector,
     VectorMatch,
     QueryResult,
+    QueryChunk,
     UpsertResult,
     DeleteResult,
     OperationContext,
@@ -122,6 +123,15 @@ from corpus_sdk.vector.vector_base import (
 from corpus_sdk.vector.framework_adapters.common.vector_translation import (
     DefaultVectorFrameworkTranslator,
     VectorTranslator,
+)
+from corpus_sdk.vector.framework_adapters.common.framework_utils import (
+    VectorCoercionErrorCodes,
+    VectorResourceLimits,
+    VectorValidationFlags,
+    TopKWarningConfig,
+    warn_if_extreme_k,
+    normalize_vector_context,
+    attach_vector_context_to_framework_ctx,
 )
 from corpus_sdk.core.error_context import attach_context
 
@@ -160,6 +170,16 @@ Embeddings = Sequence[Sequence[float]]
 Metadata = Dict[str, Any]
 
 
+# --------------------------------------------------------------------------- #
+# Shared vector framework configuration / limits
+# --------------------------------------------------------------------------- #
+
+VECTOR_ERROR_CODES = VectorCoercionErrorCodes(framework_label="semantic_kernel")
+VECTOR_LIMITS = VectorResourceLimits()
+VECTOR_FLAGS = VectorValidationFlags()
+TOPK_WARNING_CONFIG = TopKWarningConfig(framework_label="semantic_kernel")
+
+
 class CorpusSemanticKernelVectorStore:
     """
     Corpus vector store integration for Semantic Kernel.
@@ -172,6 +192,7 @@ class CorpusSemanticKernelVectorStore:
     - MMR search for balanced relevance and diversity
     - Comprehensive configuration validation with runtime enforcement
     - Graceful error recovery for batch operations
+    - Capability-aware operations respecting backend limits
 
     All heavy lifting is delegated to VectorTranslator for consistent
     orchestration across all framework adapters.
@@ -180,7 +201,7 @@ class CorpusSemanticKernelVectorStore:
     def __init__(
         self,
         *,
-        corpus_adapter: BaseVectorAdapter,
+        corpus_adapter: VectorProtocolV1,
         namespace: Optional[str] = "default",
         id_field: str = "id",
         text_field: str = "page_content",
@@ -191,7 +212,7 @@ class CorpusSemanticKernelVectorStore:
         embedding_function: Optional[Any] = None,
     ) -> None:
         # Validate and set configuration with runtime checks
-        self.corpus_adapter = corpus_adapter
+        self.corpus_adapter: VectorProtocolV1 = corpus_adapter
         self.namespace = namespace
 
         # Validate and set fields with uniqueness check
@@ -377,6 +398,36 @@ class CorpusSemanticKernelVectorStore:
 
         return None
 
+    def _framework_ctx_for_namespace(
+        self,
+        namespace: Optional[str],
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Build a framework_ctx enriched with normalized vector context.
+        """
+        ns = self._effective_namespace(namespace)
+        raw_ctx: Dict[str, Any] = {}
+        if ns is not None:
+            raw_ctx["namespace"] = ns
+        if extra_context:
+            raw_ctx.update(extra_context)
+
+        vector_ctx = normalize_vector_context(
+            raw_ctx,
+            framework="semantic_kernel",
+            logger=logger,
+        )
+
+        framework_ctx: Dict[str, Any] = {}
+        attach_vector_context_to_framework_ctx(
+            framework_ctx,
+            vector_context=vector_ctx,
+            limits=VECTOR_LIMITS,
+            flags=VECTOR_FLAGS,
+        )
+        return framework_ctx
+
     # ------------------------------------------------------------------ #
     # Translation helpers: text/embeddings ↔ Corpus Vector
     # ------------------------------------------------------------------ #
@@ -396,19 +447,34 @@ class CorpusSemanticKernelVectorStore:
         """
         if embeddings is not None:
             if len(embeddings) != len(texts):
-                raise BadRequest(
+                err = BadRequest(
                     f"embeddings length {len(embeddings)} does not match texts length {len(texts)}",
                     code="BAD_EMBEDDINGS",
                     details={"texts": len(texts), "embeddings": len(embeddings)},
                 )
+                attach_context(
+                    err,
+                    framework="semantic_kernel",
+                    operation="ensure_embeddings",
+                    texts_count=len(texts),
+                    embeddings_count=len(embeddings),
+                )
+                raise err
             return embeddings
 
         if self.embedding_function is None:
-            raise NotSupported(
+            err = NotSupported(
                 "No embedding_function configured; caller must supply embeddings",
                 code="NO_EMBEDDING_FUNCTION",
                 details={"texts": len(texts)},
             )
+            attach_context(
+                err,
+                framework="semantic_kernel",
+                operation="ensure_embeddings",
+                texts_count=len(texts),
+            )
+            raise err
 
         try:
             computed = self.embedding_function(texts)
@@ -418,15 +484,30 @@ class CorpusSemanticKernelVectorStore:
                 framework="semantic_kernel",
                 operation="embedding_function",
             )
-            raise BadRequest(
+            err = BadRequest(
                 f"embedding_function failed: {exc}",
                 code="EMBEDDING_ERROR",
             )
+            attach_context(
+                err,
+                framework="semantic_kernel",
+                operation="ensure_embeddings",
+                texts_count=len(texts),
+            )
+            raise err
         if len(computed) != len(texts):
-            raise BadRequest(
+            err = BadRequest(
                 f"embedding_function returned {len(computed)} embeddings for {len(texts)} texts",
                 code="BAD_EMBEDDINGS",
             )
+            attach_context(
+                err,
+                framework="semantic_kernel",
+                operation="ensure_embeddings",
+                texts_count=len(texts),
+                embeddings_count=len(computed),
+            )
+            raise err
         return computed
 
     def _normalize_metadatas(
@@ -453,11 +534,19 @@ class CorpusSemanticKernelVectorStore:
             base = dict(metadatas[0] or {})
             return [dict(base) for _ in range(n)]
 
-        raise BadRequest(
+        err = BadRequest(
             f"metadatas length {len(metadatas)} does not match texts length {n}",
             code="BAD_METADATA",
             details={"texts": n, "metadatas": len(metadatas)},
         )
+        attach_context(
+            err,
+            framework="semantic_kernel",
+            operation="normalize_metadatas",
+            texts_count=n,
+            metadatas_count=len(metadatas),
+        )
+        raise err
 
     def _normalize_ids(
         self,
@@ -475,11 +564,19 @@ class CorpusSemanticKernelVectorStore:
         if ids is None:
             return [uuid.uuid4().hex for _ in range(n)]
         if len(ids) != n:
-            raise BadRequest(
+            err = BadRequest(
                 f"ids length {len(ids)} does not match texts length {n}",
                 code="BAD_IDS",
                 details={"texts": n, "ids": len(ids)},
             )
+            attach_context(
+                err,
+                framework="semantic_kernel",
+                operation="normalize_ids",
+                texts_count=n,
+                ids_count=len(ids),
+            )
+            raise err
         return [str(i) for i in ids]
 
     def _to_corpus_vectors(
@@ -555,6 +652,18 @@ class CorpusSemanticKernelVectorStore:
             results.append((text, nested_meta, float(m.score)))
         return results
 
+    def _apply_score_threshold(
+        self,
+        matches: List[VectorMatch],
+    ) -> List[VectorMatch]:
+        """
+        Apply optional client-side score thresholding to a list of matches.
+        """
+        if self.score_threshold is None:
+            return matches
+        threshold = float(self.score_threshold)
+        return [m for m in matches if float(m.score) >= threshold]
+
     def _format_for_ai_model(self, matches: List[VectorMatch]) -> List[Dict[str, Any]]:
         """
         Format results for optimal consumption by AI models in SK.
@@ -600,7 +709,7 @@ class CorpusSemanticKernelVectorStore:
             "namespace": ns,
             "vectors": vectors,
         }
-        framework_ctx: Dict[str, Any] = {"namespace": ns} if ns is not None else {}
+        framework_ctx = self._framework_ctx_for_namespace(ns)
         return raw, framework_ctx
 
     def _build_query_request(
@@ -620,11 +729,11 @@ class CorpusSemanticKernelVectorStore:
             "vector": [float(x) for x in embedding],
             "top_k": int(top_k),
             "namespace": ns,
-            "filter": dict(filter) if filter else None,
+            "filters": dict(filter) if filter else None,
             "include_metadata": True,
             "include_vectors": bool(include_vectors),
         }
-        framework_ctx: Dict[str, Any] = {"namespace": ns} if ns is not None else {}
+        framework_ctx = self._framework_ctx_for_namespace(ns)
         return raw, framework_ctx
 
     def _build_delete_request(
@@ -643,7 +752,7 @@ class CorpusSemanticKernelVectorStore:
             "ids": [str(i) for i in ids] if ids else None,
             "filter": dict(filter) if filter else None,
         }
-        framework_ctx: Dict[str, Any] = {"namespace": ns} if ns is not None else {}
+        framework_ctx = self._framework_ctx_for_namespace(ns)
         return raw, framework_ctx
 
     # ------------------------------------------------------------------ #
@@ -1139,6 +1248,14 @@ class CorpusSemanticKernelVectorStore:
         top_k = k or self.default_top_k
         top_k = self._validate_query_params_sync(top_k, namespace, filter)
 
+        warn_if_extreme_k(
+            top_k,
+            framework="semantic_kernel",
+            op_name="similarity_search_sync",
+            warning_config=TOPK_WARNING_CONFIG,
+            logger=logger,
+        )
+
         raw_query, framework_ctx = self._build_query_request(
             query_emb,
             top_k=top_k,
@@ -1169,13 +1286,7 @@ class CorpusSemanticKernelVectorStore:
         )
 
         matches_list: List[VectorMatch] = list(result.matches or [])
-
-        # Apply client-side score thresholding
-        if self.score_threshold is not None:
-            threshold = float(self.score_threshold)
-            matches_list = [
-                m for m in matches_list if float(m.score) >= threshold
-            ]
+        matches_list = self._apply_score_threshold(matches_list)
 
         return self._format_for_ai_model(matches_list)
 
@@ -1203,6 +1314,14 @@ class CorpusSemanticKernelVectorStore:
         top_k = k or self.default_top_k
         top_k = self._validate_query_params_sync(top_k, namespace, filter)
 
+        warn_if_extreme_k(
+            top_k,
+            framework="semantic_kernel",
+            op_name="similarity_search_stream",
+            warning_config=TOPK_WARNING_CONFIG,
+            logger=logger,
+        )
+
         query_emb = self._embed_query(query, embedding=embedding)
 
         raw_query, framework_ctx = self._build_query_request(
@@ -1214,14 +1333,14 @@ class CorpusSemanticKernelVectorStore:
         )
 
         try:
-            for item in self._translator.query_stream(
+            for chunk in self._translator.query_stream(
                 raw_query,
                 op_ctx=ctx,
                 framework_ctx=framework_ctx,
             ):
-                if not isinstance(item, VectorMatch):
+                if not isinstance(chunk, QueryChunk):
                     err = VectorAdapterError(
-                        f"VectorTranslator.query_stream yielded unsupported type: {type(item).__name__}",
+                        f"VectorTranslator.query_stream yielded unsupported type: {type(chunk).__name__}",
                         code="BAD_STREAM_CHUNK",
                     )
                     attach_context(
@@ -1233,17 +1352,13 @@ class CorpusSemanticKernelVectorStore:
                     )
                     raise err
 
-                match = item
-                # Client-side score thresholding per chunk
-                if (
-                    self.score_threshold is not None
-                    and float(match.score) < float(self.score_threshold)
-                ):
-                    continue
+                raw_matches = list(chunk.matches or [])
+                filtered_matches = self._apply_score_threshold(raw_matches)
 
-                formatted = self._format_for_ai_model([match])
-                if formatted:
-                    yield formatted[0]
+                for match in filtered_matches:
+                    formatted = self._format_for_ai_model([match])
+                    if formatted:
+                        yield formatted[0]
         except Exception as exc:  # noqa: BLE001
             attach_context(
                 exc,
@@ -1283,6 +1398,14 @@ class CorpusSemanticKernelVectorStore:
         top_k = k or self.default_top_k
         top_k = await self._validate_query_params_async(top_k, namespace, filter)
 
+        warn_if_extreme_k(
+            top_k,
+            framework="semantic_kernel",
+            op_name="similarity_search_async",
+            warning_config=TOPK_WARNING_CONFIG,
+            logger=logger,
+        )
+
         raw_query, framework_ctx = self._build_query_request(
             query_emb,
             top_k=top_k,
@@ -1303,13 +1426,7 @@ class CorpusSemanticKernelVectorStore:
         )
 
         matches_list: List[VectorMatch] = list(result.matches or [])
-
-        # Apply client-side score thresholding
-        if self.score_threshold is not None:
-            threshold = float(self.score_threshold)
-            matches_list = [
-                m for m in matches_list if float(m.score) >= threshold
-            ]
+        matches_list = self._apply_score_threshold(matches_list)
 
         return self._format_for_ai_model(matches_list)
 
@@ -1365,6 +1482,7 @@ class CorpusSemanticKernelVectorStore:
 
     def _mmr_select_indices(
         self,
+        query_vec: Sequence[float],
         candidate_matches: List[VectorMatch],
         k: int,
         lambda_mult: float,
@@ -1373,6 +1491,7 @@ class CorpusSemanticKernelVectorStore:
         Improved MMR selector that respects original database scores and caches similarities.
 
         Args:
+            query_vec: The query embedding vector
             candidate_matches: Candidate matches with original scores and vectors
             k: Number of results to select
             lambda_mult: MMR lambda parameter (0-1), higher values favor relevance
@@ -1386,6 +1505,16 @@ class CorpusSemanticKernelVectorStore:
         k = min(k, len(candidate_matches))
         if k == 0:
             return []
+
+        # If lambda_mult == 1.0, pure relevance ranking
+        if lambda_mult >= 1.0:
+            scores = [float(m.score) for m in candidate_matches]
+            sorted_indices = sorted(
+                range(len(candidate_matches)),
+                key=lambda i: scores[i],
+                reverse=True,
+            )
+            return sorted_indices[:k]
 
         original_scores = [float(match.score) for match in candidate_matches]
         candidate_vecs = [match.vector.vector or [] for match in candidate_matches]
@@ -1485,6 +1614,22 @@ class CorpusSemanticKernelVectorStore:
         # Validate fetch_k against capabilities (treating it as top_k for the query)
         fetch_k = self._validate_query_params_sync(fetch_k, namespace, filter)
 
+        warn_if_extreme_k(
+            k,
+            framework="semantic_kernel",
+            op_name="mmr_search_sync",
+            warning_config=TOPK_WARNING_CONFIG,
+            logger=logger,
+        )
+
+        warn_if_extreme_k(
+            fetch_k,
+            framework="semantic_kernel",
+            op_name="mmr_search_sync_fetch_k",
+            warning_config=TOPK_WARNING_CONFIG,
+            logger=logger,
+        )
+
         query_emb = self._embed_query(query, embedding=embedding)
 
         raw_query, framework_ctx = self._build_query_request(
@@ -1507,18 +1652,13 @@ class CorpusSemanticKernelVectorStore:
         )
 
         matches_list: List[VectorMatch] = list(result.matches or [])
-
-        # Apply client-side score thresholding
-        if self.score_threshold is not None:
-            threshold = float(self.score_threshold)
-            matches_list = [
-                m for m in matches_list if float(m.score) >= threshold
-            ]
+        matches_list = self._apply_score_threshold(matches_list)
 
         if not matches_list:
             return []
 
         indices = self._mmr_select_indices(
+            query_vec=query_emb,
             candidate_matches=matches_list,
             k=k,
             lambda_mult=lambda_mult,
@@ -1564,6 +1704,22 @@ class CorpusSemanticKernelVectorStore:
         # Validate fetch_k against capabilities (treating it as top_k for the query)
         fetch_k = await self._validate_query_params_async(fetch_k, namespace, filter)
 
+        warn_if_extreme_k(
+            k,
+            framework="semantic_kernel",
+            op_name="mmr_search_async",
+            warning_config=TOPK_WARNING_CONFIG,
+            logger=logger,
+        )
+
+        warn_if_extreme_k(
+            fetch_k,
+            framework="semantic_kernel",
+            op_name="mmr_search_async_fetch_k",
+            warning_config=TOPK_WARNING_CONFIG,
+            logger=logger,
+        )
+
         query_emb = self._embed_query(query, embedding=embedding)
 
         raw_query, framework_ctx = self._build_query_request(
@@ -1586,18 +1742,13 @@ class CorpusSemanticKernelVectorStore:
         )
 
         matches_list: List[VectorMatch] = list(result.matches or [])
-
-        # Apply client-side score thresholding
-        if self.score_threshold is not None:
-            threshold = float(self.score_threshold)
-            matches_list = [
-                m for m in matches_list if float(m.score) >= threshold
-            ]
+        matches_list = self._apply_score_threshold(matches_list)
 
         if not matches_list:
             return []
 
         indices = self._mmr_select_indices(
+            query_vec=query_emb,
             candidate_matches=matches_list,
             k=k,
             lambda_mult=lambda_mult,
@@ -1685,7 +1836,7 @@ class CorpusSemanticKernelVectorStore:
         cls,
         texts: List[str],
         *,
-        corpus_adapter: BaseVectorAdapter,
+        corpus_adapter: VectorProtocolV1,
         metadatas: Optional[List[Metadata]] = None,
         ids: Optional[List[str]] = None,
         **kwargs: Any,
@@ -1702,7 +1853,7 @@ class CorpusSemanticKernelVectorStore:
         cls,
         documents: Iterable[Mapping[str, Any]],
         *,
-        corpus_adapter: BaseVectorAdapter,
+        corpus_adapter: VectorProtocolV1,
         **kwargs: Any,
     ) -> "CorpusSemanticKernelVectorStore":
         """
@@ -1725,7 +1876,7 @@ class CorpusSemanticKernelVectorPlugin:
     SK's function-calling / tool mechanisms.
 
     The plugin is intentionally thin; all heavy lifting is delegated to
-    the vector store, which talks to the underlying `BaseVectorAdapter`.
+    the vector store, which talks to the underlying `VectorProtocolV1`.
     """
 
     def __init__(
@@ -1997,7 +2148,7 @@ class CorpusSemanticKernelVectorPlugin:
         self,
         sk_context: Optional[Any] = None,
         sk_settings: Optional[Any] = None,
-    ) -> Dict[str, Any]]:
+    ) -> Dict[str, Any]:
         """
         Semantic Kernel-exposed capability query (async).
 
