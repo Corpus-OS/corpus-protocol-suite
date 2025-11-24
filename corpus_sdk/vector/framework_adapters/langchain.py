@@ -12,7 +12,7 @@ This module exposes Corpus `BaseVectorAdapter` implementations as
 - Namespace + metadata filter handling (capability-aware)
 - Batch upserts and deletes that respect backend limits (via VectorTranslator)
 - Optional client-side score thresholding
-- Optional embedding function integration
+- Optional embedding function integration (sync + async)
 - Optional max marginal relevance (MMR) search
 
 Design philosophy
@@ -72,12 +72,14 @@ Usage
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import uuid
 from functools import cached_property, wraps
 from typing import (
     Any,
+    Awaitable,
     Callable,
     Dict,
     Iterable,
@@ -254,19 +256,14 @@ class CorpusLangChainVectorStore(VectorStore):
         Default K used in `similarity_search` when the caller does not specify.
 
     embedding_function:
-        Optional function used to embed raw texts into vectors. If provided,
-        `add_texts` and `similarity_search` can accept raw strings. If not
-        provided, callers must supply embeddings explicitly via kwargs.
+        Optional synchronous function used to embed raw texts into vectors.
 
-        Signature:
-            embedding_function(texts: List[str]) -> List[List[float]]
+    async_embedding_function:
+        Optional async function to embed raw texts without blocking the event loop.
 
     mmr_similarity_fn:
         Optional custom similarity function for the MMR diversity term.
         If not provided, cosine similarity is used.
-
-    model_config:
-        Pydantic v2-style config: allow arbitrary types like VectorProtocolV1.
     """
 
     corpus_adapter: VectorProtocolV1
@@ -281,8 +278,11 @@ class CorpusLangChainVectorStore(VectorStore):
     max_query_batch_size: Optional[int] = None
     default_top_k: int = 4
 
-    # Optional embedding integration
+    # Optional embedding integration (sync + async)
     embedding_function: Optional[Callable[[List[str]], Embeddings]] = None
+    async_embedding_function: Optional[
+        Callable[[List[str]], Awaitable[Embeddings]]
+    ] = None
 
     # Optional custom similarity function for MMR diversity term
     mmr_similarity_fn: Optional[
@@ -444,7 +444,7 @@ class CorpusLangChainVectorStore(VectorStore):
         embeddings: Optional[Embeddings],
     ) -> Embeddings:
         """
-        Ensure embeddings are available for a batch of texts.
+        Ensure embeddings are available for a batch of texts (sync path).
 
         Behavior:
         - If embeddings are provided, verify length.
@@ -507,6 +507,99 @@ class CorpusLangChainVectorStore(VectorStore):
                 err,
                 framework="langchain",
                 operation="ensure_embeddings",
+                texts_count=len(texts),
+                embeddings_count=len(computed),
+            )
+            raise err
+        return computed
+
+    async def _ensure_embeddings_async(
+        self,
+        texts: List[str],
+        embeddings: Optional[Embeddings],
+    ) -> Embeddings:
+        """
+        Async-safe embedding helper for a batch of texts.
+
+        Behavior:
+        - If embeddings are provided, verify length.
+        - Else, if `async_embedding_function` is set, await it.
+        - Else, if `embedding_function` is set, run it in a worker thread.
+        - Else, raise NotSupported.
+        """
+        if embeddings is not None:
+            if len(embeddings) != len(texts):
+                err = BadRequest(
+                    f"embeddings length {len(embeddings)} does not match texts length {len(texts)}",
+                    code="BAD_EMBEDDINGS",
+                    details={"texts": len(texts), "embeddings": len(embeddings)},
+                )
+                attach_context(
+                    err,
+                    framework="langchain",
+                    operation="ensure_embeddings_async",
+                    texts_count=len(texts),
+                    embeddings_count=len(embeddings),
+                )
+                raise err
+            return embeddings
+
+        if self.async_embedding_function is not None:
+            try:
+                computed = await self.async_embedding_function(texts)
+            except Exception as exc:  # noqa: BLE001
+                err = BadRequest(
+                    f"async_embedding_function failed: {exc}",
+                    code="EMBEDDING_ERROR",
+                    details={"texts": len(texts)},
+                )
+                attach_context(
+                    err,
+                    framework="langchain",
+                    operation="ensure_embeddings_async",
+                    texts_count=len(texts),
+                )
+                raise err
+        else:
+            if self.embedding_function is None:
+                err = NotSupported(
+                    "No embedding_function/async_embedding_function configured; caller must supply embeddings",
+                    code="NO_EMBEDDING_FUNCTION",
+                    details={"texts": len(texts)},
+                )
+                attach_context(
+                    err,
+                    framework="langchain",
+                    operation="ensure_embeddings_async",
+                    texts_count=len(texts),
+                )
+                raise err
+            try:
+                computed = await asyncio.to_thread(self.embedding_function, texts)
+            except Exception as exc:  # noqa: BLE001
+                err = BadRequest(
+                    f"embedding_function failed: {exc}",
+                    code="EMBEDDING_ERROR",
+                    details={"texts": len(texts)},
+                )
+                attach_context(
+                    err,
+                    framework="langchain",
+                    operation="ensure_embeddings_async",
+                    texts_count=len(texts),
+                )
+                raise err
+
+        if len(computed) != len(texts):
+            err = BadRequest(
+                f"embedding function returned {len(computed)} embeddings for {len(texts)} texts",
+                code="BAD_EMBEDDINGS",
+                details={"texts": len(texts), "embeddings": len(computed)},
+            )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="ensure_embeddings_async",
                 texts_count=len(texts),
                 embeddings_count=len(computed),
             )
@@ -763,6 +856,54 @@ class CorpusLangChainVectorStore(VectorStore):
         return raw_request, framework_ctx
 
     # ------------------------------------------------------------------ #
+    # Graceful error recovery for batch operations (partial upserts)
+    # ------------------------------------------------------------------ #
+
+    def _handle_partial_upsert_failure(
+        self,
+        result: UpsertResult,
+        total_texts: int,
+        namespace: Optional[str],
+    ) -> None:
+        """
+        Handle partial failures in batch upsert operations gracefully.
+
+        - Log a warning when some items fail but others succeed.
+        - Log a few example failures at debug level for diagnosis.
+        - Only raise if *all* texts failed to upsert.
+        """
+        if result.failed_count and result.failed_count > 0:
+            successful = result.upserted_count or 0
+            failed = result.failed_count
+
+            logger.warning(
+                "Partial upsert failure: %d/%d texts succeeded, %d failed in namespace %s",
+                successful,
+                total_texts,
+                failed,
+                namespace or "default",
+            )
+
+            if result.failures:
+                for failure in result.failures[:5]:
+                    logger.debug("Upsert failure: %s", failure)
+                if len(result.failures) > 5:
+                    logger.debug(
+                        "... and %d more failures", len(result.failures) - 5
+                    )
+
+        if (result.upserted_count or 0) == 0 and total_texts > 0:
+            raise VectorAdapterError(
+                f"All {total_texts} texts failed to upsert",
+                code="BATCH_UPSERT_FAILED",
+                details={
+                    "total_texts": total_texts,
+                    "namespace": namespace,
+                    "failures": result.failures or [],
+                },
+            )
+
+    # ------------------------------------------------------------------ #
     # LangChain VectorStore sync API
     # ------------------------------------------------------------------ #
 
@@ -807,18 +948,18 @@ class CorpusLangChainVectorStore(VectorStore):
             namespace=namespace,
         )
 
-        try:
-            # All sync/async bridging and batching is inside the translator.
-            result: UpsertResult = self._translator.upsert(
-                raw_request,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
+        result = self._translator.upsert(
+            raw_request,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+
+        if isinstance(result, UpsertResult):
+            self._handle_partial_upsert_failure(
+                result,
+                total_texts=len(texts_list),
+                namespace=namespace,
             )
-            # We intentionally ignore result contents here; failures are surfaced
-            # via exceptions (with context) from the translator/adapter.
-        except Exception:
-            # Errors already have context attached by the translator.
-            raise
 
         return ids_norm
 
@@ -832,6 +973,11 @@ class CorpusLangChainVectorStore(VectorStore):
     ) -> List[str]:
         """
         Add texts to the vector store (async).
+
+        Uses async-safe embedding resolution that will either:
+        - Await `async_embedding_function`, or
+        - Run `embedding_function` in a worker thread, or
+        - Use provided `embeddings`.
         """
         texts_list = list(texts)
         if not texts_list:
@@ -843,7 +989,7 @@ class CorpusLangChainVectorStore(VectorStore):
 
         metadatas_norm = self._normalize_metadatas(len(texts_list), metadatas)
         ids_norm = self._normalize_ids(len(texts_list), ids)
-        emb = self._ensure_embeddings(texts_list, embeddings)
+        emb = await self._ensure_embeddings_async(texts_list, embeddings)
 
         vectors = self._to_corpus_vectors(
             texts=texts_list,
@@ -858,11 +1004,19 @@ class CorpusLangChainVectorStore(VectorStore):
             namespace=namespace,
         )
 
-        await self._translator.arun_upsert(
+        result = await self._translator.arun_upsert(
             raw_request,
             op_ctx=ctx,
             framework_ctx=framework_ctx,
         )
+
+        if isinstance(result, UpsertResult):
+            self._handle_partial_upsert_failure(
+                result,
+                total_texts=len(texts_list),
+                namespace=namespace,
+            )
+
         return ids_norm
 
     def add_documents(
@@ -896,7 +1050,7 @@ class CorpusLangChainVectorStore(VectorStore):
         embedding: Optional[Sequence[float]] = None,
     ) -> List[float]:
         """
-        Ensure a single query embedding is available.
+        Ensure a single query embedding is available (sync path).
 
         Behavior:
         - If `embedding` is provided, use it.
@@ -945,6 +1099,78 @@ class CorpusLangChainVectorStore(VectorStore):
             raise err
         return [float(x) for x in embs[0]]
 
+    async def _embed_query_async(
+        self,
+        query: str,
+        *,
+        embedding: Optional[Sequence[float]] = None,
+    ) -> List[float]:
+        """
+        Async-safe query embedding helper.
+
+        Behavior:
+        - If `embedding` is provided, use it.
+        - Else, if `async_embedding_function` is set, await it.
+        - Else, if `embedding_function` is set, run it in a worker thread.
+        - Else, raise NotSupported.
+        """
+        if embedding is not None:
+            return [float(x) for x in embedding]
+
+        if self.async_embedding_function is not None:
+            try:
+                embs = await self.async_embedding_function([query])
+            except Exception as exc:  # noqa: BLE001
+                err = BadRequest(
+                    f"async_embedding_function failed for query: {exc}",
+                    code="EMBEDDING_ERROR",
+                )
+                attach_context(
+                    err,
+                    framework="langchain",
+                    operation="embed_query_async",
+                )
+                raise err
+        else:
+            if self.embedding_function is None:
+                err = NotSupported(
+                    "No embedding_function/async_embedding_function configured; caller must supply query embedding",
+                    code="NO_EMBEDDING_FUNCTION",
+                )
+                attach_context(
+                    err,
+                    framework="langchain",
+                    operation="embed_query_async",
+                )
+                raise err
+            try:
+                embs = await asyncio.to_thread(self.embedding_function, [query])
+            except Exception as exc:  # noqa: BLE001
+                err = BadRequest(
+                    f"embedding_function failed for query: {exc}",
+                    code="EMBEDDING_ERROR",
+                )
+                attach_context(
+                    err,
+                    framework="langchain",
+                    operation="embed_query_async",
+                )
+                raise err
+
+        if not embs or len(embs) != 1:
+            err = BadRequest(
+                "embedding function must return exactly one embedding for a single query",
+                code="BAD_EMBEDDINGS",
+                details={"returned": len(embs) if embs is not None else 0},
+            )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="embed_query_async",
+            )
+            raise err
+        return [float(x) for x in embs[0]]
+
     @with_error_context("similarity_search_sync")
     def similarity_search(
         self,
@@ -979,15 +1205,11 @@ class CorpusLangChainVectorStore(VectorStore):
             include_vectors=False,
         )
 
-        try:
-            result_any = self._translator.query(
-                raw_query,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-        except Exception:
-            # Errors are already enriched by the translator.
-            raise
+        result_any = self._translator.query(
+            raw_query,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
 
         if not isinstance(result_any, QueryResult):
             err = VectorAdapterError(
@@ -1086,7 +1308,7 @@ class CorpusLangChainVectorStore(VectorStore):
         namespace: Optional[str] = kwargs.get("namespace")
         ctx = self._build_ctx(**kwargs)
 
-        query_emb = self._embed_query(query, embedding=embedding)
+        query_emb = await self._embed_query_async(query, embedding=embedding)
         top_k = k or self.default_top_k
 
         warn_if_extreme_k(
@@ -1197,7 +1419,7 @@ class CorpusLangChainVectorStore(VectorStore):
         namespace: Optional[str] = kwargs.get("namespace")
         ctx = self._build_ctx(**kwargs)
 
-        query_emb = self._embed_query(query, embedding=embedding)
+        query_emb = await self._embed_query_async(query, embedding=embedding)
         top_k = k or self.default_top_k
 
         warn_if_extreme_k(
@@ -1415,19 +1637,6 @@ class CorpusLangChainVectorStore(VectorStore):
         This runs a similarity search with a larger `fetch_k` and then
         selects a subset of results via MMR based on vector geometry and
         original database scores.
-
-        Args:
-            query: Query string
-            k: Number of results to return
-            lambda_mult: MMR lambda parameter (0-1), higher values favor relevance
-            filter: Optional metadata filter
-            **kwargs: Additional arguments including:
-                - fetch_k: Number of candidates to fetch for MMR selection
-                - embedding: Optional precomputed query embedding
-                - namespace: Optional namespace override
-
-        Returns:
-            List of Documents selected via MMR
         """
         if k <= 0:
             return []
@@ -1445,8 +1654,18 @@ class CorpusLangChainVectorStore(VectorStore):
             )
             raise err
 
+        # Warn on user-visible k
+        warn_if_extreme_k(
+            k,
+            framework="langchain",
+            op_name="mmr_search_sync",
+            warning_config=TOPK_WARNING_CONFIG,
+            logger=logger,
+        )
+
         fetch_k: int = kwargs.get("fetch_k") or max(k * 4, k + 5)
 
+        # Warn on internal fetch_k candidate pool
         warn_if_extreme_k(
             fetch_k,
             framework="langchain",
@@ -1529,8 +1748,18 @@ class CorpusLangChainVectorStore(VectorStore):
             )
             raise err
 
+        # Warn on user-visible k (async)
+        warn_if_extreme_k(
+            k,
+            framework="langchain",
+            op_name="mmr_search_async",
+            warning_config=TOPK_WARNING_CONFIG,
+            logger=logger,
+        )
+
         fetch_k: int = kwargs.get("fetch_k") or max(k * 4, k + 5)
 
+        # Warn on internal fetch_k candidate pool (async)
         warn_if_extreme_k(
             fetch_k,
             framework="langchain",
@@ -1543,7 +1772,7 @@ class CorpusLangChainVectorStore(VectorStore):
         namespace: Optional[str] = kwargs.get("namespace")
         ctx = self._build_ctx(**kwargs)
 
-        query_emb = self._embed_query(query, embedding=embedding)
+        query_emb = await self._embed_query_async(query, embedding=embedding)
 
         raw_query, framework_ctx = self._build_query_request(
             query_emb,
@@ -1609,17 +1838,11 @@ class CorpusLangChainVectorStore(VectorStore):
             filter=filter,
         )
 
-        try:
-            result: DeleteResult = self._translator.delete(
-                raw_request,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-            # Result is returned for completeness; current LangChain interface
-            # only requires that deletion executes or raises.
-        except Exception:
-            # Translator/adapter already annotated the error.
-            raise
+        self._translator.delete(
+            raw_request,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
 
     @with_async_error_context("delete_async")
     async def adelete(
