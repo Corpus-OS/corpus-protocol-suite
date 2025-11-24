@@ -15,7 +15,7 @@ Semantic Kernel in two layers:
    - Namespace + metadata filter handling (capability-aware)
    - Batch upserts and deletes that respect backend limits (enforced in translator)
    - Optional client-side score thresholding
-   - Optional embedding function integration
+   - Optional embedding function integration (Sync and Async support)
    - Optional streaming search via VectorTranslator.query_stream
    - Optional Maximal Marginal Relevance (MMR) search
    - Comprehensive configuration validation with runtime checks
@@ -60,12 +60,18 @@ Typical usage
         dimensions=1536,
     )
 
+    # Sync embedding function
     def embed_texts(texts: list[str]) -> list[list[float]]:
+        ...
+
+    # Async embedding function (optional)
+    async def aembed_texts(texts: list[str]) -> list[list[float]]:
         ...
 
     store = CorpusSemanticKernelVectorStore(
         corpus_adapter=adapter,
         embedding_function=embed_texts,
+        async_embedding_function=aembed_texts,  # Optional async support
         namespace="docs",
         default_top_k=4,
     )
@@ -85,12 +91,15 @@ Typical usage
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import uuid
 from functools import cached_property
 from typing import (
     Any,
+    Awaitable,
+    Callable,
     Dict,
     Iterable,
     Iterator,
@@ -193,6 +202,7 @@ class CorpusSemanticKernelVectorStore:
     - Comprehensive configuration validation with runtime enforcement
     - Graceful error recovery for batch operations
     - Capability-aware operations respecting backend limits
+    - Optional async embedding function support
 
     All heavy lifting is delegated to VectorTranslator for consistent
     orchestration across all framework adapters.
@@ -209,7 +219,8 @@ class CorpusSemanticKernelVectorStore:
         score_threshold: Optional[float] = None,
         batch_size: int = 100,
         default_top_k: int = 4,
-        embedding_function: Optional[Any] = None,
+        embedding_function: Optional[Callable[[List[str]], Embeddings]] = None,
+        async_embedding_function: Optional[Callable[[List[str]], Awaitable[Embeddings]]] = None,
     ) -> None:
         # Validate and set configuration with runtime checks
         self.corpus_adapter: VectorProtocolV1 = corpus_adapter
@@ -233,7 +244,10 @@ class CorpusSemanticKernelVectorStore:
         self.score_threshold = self._validate_score_threshold(score_threshold)
         self.batch_size = self._validate_batch_size(batch_size)
         self.default_top_k = self._validate_default_top_k(default_top_k)
+        
+        # Embedding integration - both sync and async supported
         self.embedding_function = embedding_function
+        self.async_embedding_function = async_embedding_function
 
         # Cached capabilities
         self._caps: Optional[VectorCapabilities] = None
@@ -509,6 +523,121 @@ class CorpusSemanticKernelVectorStore:
             )
             raise err
         return computed
+
+    async def _ensure_embeddings_async(
+        self,
+        texts: List[str],
+        embeddings: Optional[Embeddings],
+    ) -> Embeddings:
+        """
+        Ensure embeddings are available for a batch of texts (Async path).
+
+        Behavior:
+        - If embeddings are provided, verify length.
+        - Else, if `async_embedding_function` is set, await it.
+        - Else, if `embedding_function` is set, run in thread pool.
+        - Else, raise NotSupported.
+        """
+        if embeddings is not None:
+            if len(embeddings) != len(texts):
+                err = BadRequest(
+                    f"embeddings length {len(embeddings)} does not match texts length {len(texts)}",
+                    code="BAD_EMBEDDINGS",
+                    details={"texts": len(texts), "embeddings": len(embeddings)},
+                )
+                attach_context(
+                    err,
+                    framework="semantic_kernel",
+                    operation="ensure_embeddings_async",
+                    texts_count=len(texts),
+                    embeddings_count=len(embeddings),
+                )
+                raise err
+            return embeddings
+
+        if self.async_embedding_function is not None:
+            try:
+                computed = await self.async_embedding_function(texts)
+            except Exception as exc:  # noqa: BLE001
+                attach_context(
+                    exc,
+                    framework="semantic_kernel",
+                    operation="async_embedding_function",
+                )
+                err = BadRequest(
+                    f"async_embedding_function failed: {exc}",
+                    code="EMBEDDING_ERROR",
+                )
+                attach_context(
+                    err,
+                    framework="semantic_kernel",
+                    operation="ensure_embeddings_async",
+                    texts_count=len(texts),
+                )
+                raise err
+            if len(computed) != len(texts):
+                err = BadRequest(
+                    f"async_embedding_function returned {len(computed)} embeddings for {len(texts)} texts",
+                    code="BAD_EMBEDDINGS",
+                )
+                attach_context(
+                    err,
+                    framework="semantic_kernel",
+                    operation="ensure_embeddings_async",
+                    texts_count=len(texts),
+                    embeddings_count=len(computed),
+                )
+                raise err
+            return computed
+
+        if self.embedding_function is not None:
+            try:
+                # Run sync embedding function in thread pool to avoid blocking
+                computed = await asyncio.to_thread(self.embedding_function, texts)
+            except Exception as exc:  # noqa: BLE001
+                attach_context(
+                    exc,
+                    framework="semantic_kernel",
+                    operation="embedding_function_thread",
+                )
+                err = BadRequest(
+                    f"embedding_function failed in thread: {exc}",
+                    code="EMBEDDING_ERROR",
+                )
+                attach_context(
+                    err,
+                    framework="semantic_kernel",
+                    operation="ensure_embeddings_async",
+                    texts_count=len(texts),
+                )
+                raise err
+            if len(computed) != len(texts):
+                err = BadRequest(
+                    f"embedding_function returned {len(computed)} embeddings for {len(texts)} texts",
+                    code="BAD_EMBEDDINGS",
+                )
+                attach_context(
+                    err,
+                    framework="semantic_kernel",
+                    operation="ensure_embeddings_async",
+                    texts_count=len(texts),
+                    embeddings_count=len(computed),
+                )
+                raise err
+            return computed
+
+        err = NotSupported(
+            "No embedding_function or async_embedding_function configured; caller must supply embeddings",
+            code="NO_EMBEDDING_FUNCTION",
+            details={"texts": len(texts)},
+        )
+        attach_context(
+            err,
+            framework="semantic_kernel",
+            operation="ensure_embeddings_async",
+            texts_count=len(texts),
+        )
+        raise err
 
     def _normalize_metadatas(
         self,
@@ -1062,6 +1191,76 @@ class CorpusSemanticKernelVectorStore:
             )
         return [float(x) for x in embs[0]]
 
+    async def _embed_query_async(
+        self,
+        query: str,
+        *,
+        embedding: Optional[Sequence[float]] = None,
+    ) -> List[float]:
+        """
+        Async-safe query embedding helper.
+
+        Behavior:
+        - If `embedding` provided, use it.
+        - If `async_embedding_function` set, await it.
+        - If `embedding_function` set, run in thread pool.
+        - Else raise NotSupported.
+        """
+        if embedding is not None:
+            return [float(x) for x in embedding]
+
+        if self.async_embedding_function is not None:
+            try:
+                embs = await self.async_embedding_function([query])
+            except Exception as exc:  # noqa: BLE001
+                attach_context(
+                    exc,
+                    framework="semantic_kernel",
+                    operation="async_embed_query",
+                )
+                raise BadRequest(
+                    f"async_embedding_function failed for query: {exc}",
+                    code="EMBEDDING_ERROR",
+                )
+            if not embs or len(embs) != 1:
+                raise BadRequest(
+                    "async_embedding_function must return exactly one embedding for a single query",
+                    code="BAD_EMBEDDINGS",
+                )
+            return [float(x) for x in embs[0]]
+
+        if self.embedding_function is not None:
+            try:
+                # Run sync embedding function in thread pool
+                embs = await asyncio.to_thread(self.embedding_function, [query])
+            except Exception as exc:  # noqa: BLE001
+                attach_context(
+                    exc,
+                    framework="semantic_kernel",
+                    operation="embed_query_thread",
+                )
+                raise BadRequest(
+                    f"embedding_function failed for query: {exc}",
+                    code="EMBEDDING_ERROR",
+                )
+            if not embs or len(embs) != 1:
+                raise BadRequest(
+                    "embedding_function must return exactly one embedding for a single query",
+                    code="BAD_EMBEDDINGS",
+                )
+            return [float(x) for x in embs[0]]
+
+        exc = NotSupported(
+            "No embedding_function or async_embedding_function configured; caller must supply query embedding",
+            code="NO_EMBEDDING_FUNCTION",
+        )
+        attach_context(
+            exc,
+            framework="semantic_kernel",
+            operation="embed_query_async",
+        )
+        raise exc
+
     # ------------------------------------------------------------------ #
     # Public sync/async API using VectorTranslator
     # ------------------------------------------------------------------ #
@@ -1148,7 +1347,9 @@ class CorpusSemanticKernelVectorStore:
 
         metadatas_norm = self._normalize_metadatas(len(texts_list), metadatas)
         ids_norm = self._normalize_ids(len(texts_list), ids)
-        emb = self._ensure_embeddings(texts_list, embeddings)
+        
+        # Use async-safe embedding resolution
+        emb = await self._ensure_embeddings_async(texts_list, embeddings)
 
         vectors = self._to_corpus_vectors(
             texts=texts_list,
@@ -1394,7 +1595,7 @@ class CorpusSemanticKernelVectorStore:
         namespace: Optional[str] = kwargs.get("namespace")
         ctx = self._build_ctx(**kwargs)
 
-        query_emb = self._embed_query(query, embedding=embedding)
+        query_emb = await self._embed_query_async(query, embedding=embedding)
         top_k = k or self.default_top_k
         top_k = await self._validate_query_params_async(top_k, namespace, filter)
 
@@ -1720,7 +1921,7 @@ class CorpusSemanticKernelVectorStore:
             logger=logger,
         )
 
-        query_emb = self._embed_query(query, embedding=embedding)
+        query_emb = await self._embed_query_async(query, embedding=embedding)
 
         raw_query, framework_ctx = self._build_query_request(
             query_emb,
