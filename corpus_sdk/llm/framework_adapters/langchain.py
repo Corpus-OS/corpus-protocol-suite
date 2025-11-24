@@ -116,7 +116,11 @@ class LangChainLLMConfig:
     """
     Configuration for `CorpusLangChainLLM`.
 
-    Mirrors shared `LLMTranslator` knobs while remaining LangChain-specific.
+    Mirrors shared `LLMTranslator` knobs while remaining LangChain-specific,
+    and aligns validation with other framework adapters (e.g. AutoGen):
+
+    - temperature: must be between 0.0 and 2.0 (inclusive)
+    - max_tokens: if provided, must be a positive integer
     """
 
     model: str = "default"
@@ -161,13 +165,14 @@ def _extract_dynamic_context(
     Extract dynamic context for error attachment.
 
     Called *only* on the error path by the decorators below to avoid overhead
-    on successful calls.
+    on successful calls. Aligned with the richer context used in the AutoGen
+    and CrewAI LLM adapters (operation name, streaming flag, request/tenant).
     """
     dynamic_ctx: Dict[str, Any] = {
         "framework_name": _FRAMEWORK_NAME,
         "model": getattr(instance, "model", "unknown"),
         "temperature": getattr(instance, "temperature", 0.7),
-        # NOTE: ERROR_CODES is injected once in the decorator; no need here.
+        "operation": operation,
     }
 
     # Messages metrics
@@ -204,6 +209,15 @@ def _extract_dynamic_context(
     # LangChain config flag
     if "config" in kwargs:
         dynamic_ctx["has_config"] = True
+
+    # Request-scoped identifiers (for cross-framework observability alignment)
+    for key in ("request_id", "tenant"):
+        if key in kwargs:
+            dynamic_ctx[key] = kwargs[key]
+
+    # Streaming flag aligned to operation name
+    if operation in ("astream", "stream"):
+        dynamic_ctx["stream"] = True
 
     return dynamic_ctx
 
@@ -599,14 +613,13 @@ class CorpusLangChainLLM(BaseChatModel):
         *,
         stop: Optional[List[str]] = None,
         **kwargs: Any,
-    ) -> tuple[OperationContext, Dict[str, Any], Dict[str, Any]]:
+    ) -> tuple[OperationContext, Dict[str, Any]]:
         """
-        Extract OperationContext, sampling params, and framework_ctx
-        from LangChain kwargs.
+        Extract OperationContext and sampling params from LangChain kwargs.
 
         Returns
         -------
-        (op_ctx, sampling_params, framework_ctx)
+        (op_ctx, sampling_params)
         """
         config = kwargs.get("config")
         ctx = _build_operation_context_from_config(
@@ -628,15 +641,63 @@ class CorpusLangChainLLM(BaseChatModel):
         }
 
         clean_params = {k: v for k, v in params.items() if v is not None}
+        return ctx, clean_params
 
+    def _build_framework_ctx(
+        self,
+        *,
+        operation: str,
+        stream: bool,
+        model: Optional[str],
+        config: Any,
+        tools: Any = None,
+        tool_choice: Any = None,
+        system_message: Any = None,
+        request_id: Optional[str] = None,
+        tenant: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Build a framework_ctx payload for the LangChain translator.
+
+        This mirrors the richer framework_ctx used in the AutoGen and CrewAI
+        adapters, carrying:
+
+        - Framework identity + version
+        - Operation name and streaming flag
+        - Effective model used for routing
+        - Optional request/tenant identifiers
+        - LangChain config blob for observability
+        - Tooling + system message hints
+        """
         framework_ctx: Dict[str, Any] = {
             "framework": _FRAMEWORK_NAME,
             "framework_version": self._framework_version,
+            "operation": operation,
+            "stream": bool(stream),
         }
+
+        if model is not None:
+            framework_ctx["model"] = model
+
+        if request_id is not None:
+            framework_ctx["request_id"] = request_id
+        if tenant is not None:
+            framework_ctx["tenant"] = tenant
+
         if config is not None:
             framework_ctx["langchain_config"] = config
 
-        return ctx, clean_params, framework_ctx
+        if tools is not None:
+            framework_ctx["tools"] = tools
+        if tool_choice is not None:
+            framework_ctx["tool_choice"] = tool_choice
+        if system_message is not None:
+            framework_ctx["system_message"] = system_message
+
+        # Metrics toggle can be useful for downstream observers.
+        framework_ctx["enable_metrics"] = bool(self._config.enable_metrics)
+
+        return framework_ctx
 
     # ------------------------------------------------------------------ #
     # Result normalization helpers
@@ -699,11 +760,23 @@ class CorpusLangChainLLM(BaseChatModel):
         """
         self._validate_messages(messages)
 
-        ctx, params, framework_ctx = self._build_context_and_params(
+        ctx, params = self._build_context_and_params(
             stop=stop,
             **kwargs,
         )
         model_for_context = params.get("model", self.model)
+
+        framework_ctx = self._build_framework_ctx(
+            operation="agenerate",
+            stream=False,
+            model=model_for_context,
+            config=kwargs.get("config"),
+            tools=kwargs.get("tools"),
+            tool_choice=kwargs.get("tool_choice"),
+            system_message=kwargs.get("system_message"),
+            request_id=kwargs.get("request_id"),
+            tenant=kwargs.get("tenant"),
+        )
 
         if run_manager is not None:
             await run_manager.on_llm_start(
@@ -754,11 +827,23 @@ class CorpusLangChainLLM(BaseChatModel):
         """
         self._validate_messages(messages)
 
-        ctx, params, framework_ctx = self._build_context_and_params(
+        ctx, params = self._build_context_and_params(
             stop=stop,
             **kwargs,
         )
         model_for_context = params.get("model", self.model)
+
+        framework_ctx = self._build_framework_ctx(
+            operation="astream",
+            stream=True,
+            model=model_for_context,
+            config=kwargs.get("config"),
+            tools=kwargs.get("tools"),
+            tool_choice=kwargs.get("tool_choice"),
+            system_message=kwargs.get("system_message"),
+            request_id=kwargs.get("request_id"),
+            tenant=kwargs.get("tenant"),
+        )
 
         if run_manager is not None:
             await run_manager.on_llm_start(
@@ -850,11 +935,23 @@ class CorpusLangChainLLM(BaseChatModel):
         """
         self._validate_messages(messages)
 
-        ctx, params, framework_ctx = self._build_context_and_params(
+        ctx, params = self._build_context_and_params(
             stop=stop,
             **kwargs,
         )
         model_for_context = params.get("model", self.model)
+
+        framework_ctx = self._build_framework_ctx(
+            operation="generate",
+            stream=False,
+            model=model_for_context,
+            config=kwargs.get("config"),
+            tools=kwargs.get("tools"),
+            tool_choice=kwargs.get("tool_choice"),
+            system_message=kwargs.get("system_message"),
+            request_id=kwargs.get("request_id"),
+            tenant=kwargs.get("tenant"),
+        )
 
         if run_manager is not None:
             run_manager.on_llm_start(
@@ -905,11 +1002,23 @@ class CorpusLangChainLLM(BaseChatModel):
         """
         self._validate_messages(messages)
 
-        ctx, params, framework_ctx = self._build_context_and_params(
+        ctx, params = self._build_context_and_params(
             stop=stop,
             **kwargs,
         )
         model_for_context = params.get("model", self.model)
+
+        framework_ctx = self._build_framework_ctx(
+            operation="stream",
+            stream=True,
+            model=model_for_context,
+            config=kwargs.get("config"),
+            tools=kwargs.get("tools"),
+            tool_choice=kwargs.get("tool_choice"),
+            system_message=kwargs.get("system_message"),
+            request_id=kwargs.get("request_id"),
+            tenant=kwargs.get("tenant"),
+        )
 
         if run_manager is not None:
             run_manager.on_llm_start(
