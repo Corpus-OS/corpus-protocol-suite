@@ -4,7 +4,7 @@
 """
 LlamaIndex adapter for Corpus Vector protocol.
 
-This module exposes Corpus `BaseVectorAdapter` implementations as
+This module exposes Corpus `VectorProtocolV1` implementations as
 `llama_index.core.vector_stores.types.BasePydanticVectorStore` instances, with:
 
 - Sync + async add/query/delete APIs (matching and extending LlamaIndex expectations)
@@ -23,7 +23,7 @@ Design philosophy
 -----------------
 - Protocol-first: LlamaIndex is a thin skin over Corpus vector adapters.
 - All heavy lifting (backpressure, deadlines, breakers, etc.) lives in
-  the underlying `BaseVectorAdapter` / `VectorTranslator`, not here.
+  the underlying `VectorProtocolV1` / `VectorTranslator`, not here.
 - This layer focuses on:
     * Translating LlamaIndex Nodes ↔ Corpus Vector objects
     * Respecting VectorCapabilities (namespaces, filters, batch sizes)
@@ -84,7 +84,7 @@ from __future__ import annotations
 
 import logging
 import math
-from functools import cached_property
+from functools import cached_property, wraps
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from pydantic import Field, field_validator, model_validator
@@ -110,9 +110,10 @@ from llama_index.core.vector_stores.utils import (
 )
 
 from corpus_sdk.vector.vector_base import (
-    BaseVectorAdapter,
+    VectorProtocolV1,
     Vector,
     VectorMatch,
+    QueryChunk,
     QueryResult,
     DeleteResult,
     UpsertResult,
@@ -127,19 +128,91 @@ from corpus_sdk.vector.framework_adapters.common.vector_translation import (
     DefaultVectorFrameworkTranslator,
     VectorTranslator,
 )
+from corpus_sdk.vector.framework_adapters.common.framework_utils import (
+    VectorCoercionErrorCodes,
+    VectorResourceLimits,
+    VectorValidationFlags,
+    TopKWarningConfig,
+    warn_if_extreme_k,
+    normalize_vector_context,
+    attach_vector_context_to_framework_ctx,
+)
 
-from corpus_sdk.core.context_translation import from_llamaindex as context_from_llamaindex
+from corpus_sdk.core.context_translation import (
+    from_llamaindex as ctx_from_llamaindex,
+    from_dict as ctx_from_dict,
+)
 from corpus_sdk.core.error_context import attach_context
 
 logger = logging.getLogger(__name__)
 
 Metadata = Dict[str, Any]
 
+# --------------------------------------------------------------------------- #
+# Shared vector framework configuration / limits
+# --------------------------------------------------------------------------- #
+
+VECTOR_ERROR_CODES = VectorCoercionErrorCodes(framework_label="llamaindex")
+VECTOR_LIMITS = VectorResourceLimits()
+VECTOR_FLAGS = VectorValidationFlags()
+TOPK_WARNING_CONFIG = TopKWarningConfig(framework_label="llamaindex")
+
+
+# --------------------------------------------------------------------------- #
+# Error-context decorators (sync + async)
+# --------------------------------------------------------------------------- #
+
+
+def with_error_context(
+    operation: str,
+    **context_kwargs: Any,
+):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return func(*args, **kwargs)
+            except Exception as exc:  # noqa: BLE001
+                attach_context(
+                    exc,
+                    framework="llamaindex",
+                    operation=operation,
+                    **context_kwargs,
+                )
+                raise
+
+        return wrapper
+
+    return decorator
+
+
+def with_async_error_context(
+    operation: str,
+    **context_kwargs: Any,
+):
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return await func(*args, **kwargs)
+            except Exception as exc:  # noqa: BLE001
+                attach_context(
+                    exc,
+                    framework="llamaindex",
+                    operation=operation,
+                    **context_kwargs,
+                )
+                raise
+
+        return wrapper
+
+    return decorator
+
 
 class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
     """
     LlamaIndex `BasePydanticVectorStore` implementation backed by a Corpus
-    `BaseVectorAdapter` (VectorProtocolV1).
+    `VectorProtocolV1`.
 
     This class is a thin integration layer:
     - Nodes are mapped to Corpus VectorProtocol `Vector` objects.
@@ -165,53 +238,62 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
     flat_metadata: bool = True
 
     # Corpus integration fields with validation
-    corpus_adapter: BaseVectorAdapter = Field(
+    corpus_adapter: VectorProtocolV1 = Field(
         ...,
-        description="Underlying Corpus vector adapter implementing VectorProtocolV1"
+        description="Underlying Corpus vector adapter implementing VectorProtocolV1",
     )
-    
+
     namespace: Optional[str] = Field(
         "default",
-        description="Default namespace for all operations. Ignored if backend doesn't support namespaces."
+        description="Default namespace for all operations. Ignored if backend doesn't support namespaces.",
     )
-    
+
     batch_size: int = Field(
         default=100,
         ge=1,
         le=10000,
-        description="Planning hint for upsert/delete batches. Actual batch size is min(batch_size, backend_max_batch_size)"
+        description=(
+            "Planning hint for upsert/delete batches. Actual batch size is "
+            "min(batch_size, backend_max_batch_size)"
+        ),
     )
-    
+
     default_top_k: int = Field(
         default=4,
         ge=1,
         le=1000,
-        description="Default number of results returned when query doesn't specify similarity_top_k"
+        description=(
+            "Default number of results returned when query doesn't "
+            "specify similarity_top_k"
+        ),
     )
-    
+
     score_threshold: Optional[float] = Field(
         default=None,
         ge=0.0,
         le=1.0,
-        description="Optional minimum similarity score (0.0-1.0) for client-side filtering of results"
+        description=(
+            "Optional minimum similarity score (0.0-1.0) for client-side "
+            "filtering of results"
+        ),
     )
 
     # Reserved metadata keys for internal mapping
     id_field: str = Field(
         default="id",
-        description="Metadata key for storing the vector ID (maps to node_id)"
+        description="Metadata key for storing the vector ID (maps to node_id)",
     )
     text_field: str = Field(
-        default="text", 
-        description="Metadata key for storing node text content"
+        default="text",
+        description="Metadata key for storing node text content",
     )
     node_id_field: str = Field(
         default="node_id",
-        description="Metadata key for storing LlamaIndex node ID"
+        description="Metadata key for storing LlamaIndex node ID",
     )
     ref_doc_id_field: str = Field(
         default="ref_doc_id",
-        description="Metadata key for storing reference document ID"
+        description="Metadata key for storing reference document ID",
     )
 
     # Cached capabilities (lazy-loaded)
@@ -233,7 +315,7 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
         if v > 10000:
             logger.warning(
                 "batch_size %d is unusually large; consider reducing for better performance",
-                v
+                v,
             )
         return v
 
@@ -246,7 +328,7 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
         if v > 1000:
             logger.warning(
                 "default_top_k %d is unusually large; most applications use 4-100",
-                v
+                v,
             )
         return v
 
@@ -260,7 +342,7 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
             if v > 0.9:
                 logger.warning(
                     "score_threshold %.2f is very high; may filter out relevant results",
-                    v
+                    v,
                 )
         return v
 
@@ -268,10 +350,10 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
     def validate_reserved_fields(self) -> CorpusLlamaIndexVectorStore:
         """Ensure reserved metadata field names don't conflict."""
         reserved_fields = {
-            self.id_field, 
-            self.text_field, 
-            self.node_id_field, 
-            self.ref_doc_id_field
+            self.id_field,
+            self.text_field,
+            self.node_id_field,
+            self.ref_doc_id_field,
         }
         if len(reserved_fields) != 4:
             raise ValueError(
@@ -311,7 +393,7 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
         return "CorpusLlamaIndexVectorStore"
 
     @property
-    def client(self) -> BaseVectorAdapter:
+    def client(self) -> VectorProtocolV1:
         """Expose the underlying Corpus adapter as the 'client'."""
         return self.corpus_adapter
 
@@ -347,9 +429,6 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
     def _get_caps_sync(self) -> VectorCapabilities:
         """
         Synchronously fetch and cache VectorCapabilities via VectorTranslator.
-        
-        This method is called automatically during operations that need capability
-        checks. The result is cached for the lifetime of the vector store instance.
         """
         if self._caps is not None:
             return self._caps
@@ -364,9 +443,6 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
     async def _get_caps_async(self) -> VectorCapabilities:
         """
         Async capability fetch with caching via VectorTranslator.
-        
-        Used by async operations to ensure capability checks don't block the event loop.
-        The result is shared with sync operations via the cached _caps attribute.
         """
         if self._caps is not None:
             return self._caps
@@ -384,36 +460,70 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
 
         Priority:
         1. Explicit OperationContext via `ctx` or `operation_context`.
-        2. LlamaIndex CallbackManager via `callback_manager` using
-           `context_from_llamaindex`.
-        3. None (no context).
-
-        LlamaIndex typically provides callback managers for tracing and monitoring,
-        which we translate into Corpus OperationContext for distributed tracing.
+        2. Dict-like context via ctx_from_dict.
+        3. LlamaIndex CallbackManager via ctx_from_llamaindex.
+        4. None (no context).
         """
         ctx = kwargs.get("ctx") or kwargs.get("operation_context")
         if isinstance(ctx, OperationContext):
             return ctx
+
+        if isinstance(ctx, Mapping):
+            try:
+                maybe = ctx_from_dict(ctx)
+                if isinstance(maybe, OperationContext):
+                    return maybe
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("ctx_from_dict failed in _build_ctx: %s", exc)
 
         callback_manager = kwargs.get("callback_manager")
         if callback_manager is None:
             return None
 
         try:
-            return context_from_llamaindex(callback_manager)
+            maybe = ctx_from_llamaindex(callback_manager)
+            if isinstance(maybe, OperationContext):
+                return maybe
         except Exception as exc:  # noqa: BLE001
-            logger.debug("context_from_llamaindex failed: %s", exc)
-            return None
+            logger.debug("ctx_from_llamaindex failed: %s", exc)
+
+        return None
 
     def _effective_namespace(self, namespace: Optional[str]) -> Optional[str]:
         """
         Resolve namespace using explicit override or store default.
-
-        If the underlying adapter does not support namespaces, this value is
-        still passed down, but the adapter may ignore it. This allows the same
-        code to work with both namespace-aware and namespace-agnostic backends.
         """
         return namespace if namespace is not None else self.namespace
+
+    def _framework_ctx_for_namespace(
+        self,
+        namespace: Optional[str],
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Build a framework_ctx enriched with normalized vector context.
+        """
+        ns = self._effective_namespace(namespace)
+        raw_ctx: Dict[str, Any] = {}
+        if ns is not None:
+            raw_ctx["namespace"] = ns
+        if extra_context:
+            raw_ctx.update(extra_context)
+
+        vector_ctx = normalize_vector_context(
+            raw_ctx,
+            framework="llamaindex",
+            logger=logger,
+        )
+
+        framework_ctx: Dict[str, Any] = {}
+        attach_vector_context_to_framework_ctx(
+            framework_ctx,
+            vector_context=vector_ctx,
+            limits=VECTOR_LIMITS,
+            flags=VECTOR_FLAGS,
+        )
+        return framework_ctx
 
     # ------------------------------------------------------------------ #
     # Translation helpers: LlamaIndex Nodes ↔ Corpus Vector
@@ -426,22 +536,15 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
     ) -> List[Vector]:
         """
         Convert LlamaIndex nodes (with embeddings) into Corpus `Vector` objects.
-
-        Assumes:
-        - Each node has a non-empty embedding accessible via `get_embedding()`
-          or `.embedding` (LlamaIndex typically handles embedding computation)
-        - Metadata is flattened via `node_to_metadata_dict` for backend storage
-        - Node IDs are preserved and used as vector IDs for consistency
-
-        Raises BadRequest if any node lacks an embedding, as this indicates
-        a configuration issue in the LlamaIndex pipeline.
         """
         vectors: List[Vector] = []
         ns = self._effective_namespace(namespace)
 
         for node in nodes:
             # Extract embedding - LlamaIndex should have computed this already
-            embedding = node.get_embedding() if hasattr(node, "get_embedding") else None
+            embedding = (
+                node.get_embedding() if hasattr(node, "get_embedding") else None
+            )
             if embedding is None:
                 embedding = getattr(node, "embedding", None)
             if embedding is None:
@@ -492,17 +595,6 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
     ) -> List[NodeWithScore]:
         """
         Convert Corpus `VectorMatch` objects into LlamaIndex NodeWithScore.
-
-        The similarity score returned is `VectorMatch.score`, which is assumed
-        to be higher-is-better (normalized similarity as defined by the adapter).
-
-        Node reconstruction uses LlamaIndex's standard utilities with fallbacks:
-        1. Try `metadata_dict_to_node` (modern approach)
-        2. Try `legacy_metadata_dict_to_node` (backward compatibility)
-        3. Fall back to basic TextNode with preserved metadata
-
-        This ensures maximum compatibility with different LlamaIndex versions and
-        node types while preserving all original node attributes when possible.
         """
         results: List[NodeWithScore] = []
 
@@ -518,22 +610,24 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
             # Reconstruct node from metadata using LlamaIndex's utilities
             node: BaseNode
             try:
-                # First try modern node reconstruction
                 node = metadata_dict_to_node(meta, text=text, node_id=node_id)
             except Exception as exc:
                 logger.debug(
                     "metadata_dict_to_node failed for node %s: %s; trying legacy method",
-                    node_id, exc
+                    node_id,
+                    exc,
                 )
                 try:
-                    # Fall back to legacy reconstruction for older LlamaIndex versions
-                    node = legacy_metadata_dict_to_node(meta, text=text, node_id=node_id)
+                    node = legacy_metadata_dict_to_node(
+                        meta, text=text, node_id=node_id
+                    )
                 except Exception as exc2:
                     logger.debug(
                         "legacy_metadata_dict_to_node also failed for node %s: %s; "
-                        "falling back to TextNode", node_id, exc2
+                        "falling back to TextNode",
+                        node_id,
+                        exc2,
                     )
-                    # Final fallback: basic TextNode with preserved metadata
                     node = TextNode(
                         text=text or "",
                         id_=str(node_id),
@@ -545,9 +639,10 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
                 try:
                     node.ref_doc_id = ref_doc_id  # type: ignore[attr-defined]
                 except Exception:
-                    # If the node type does not support ref_doc_id, ignore silently
-                    # as this is not a critical failure for most operations
-                    logger.debug("Node type %s does not support ref_doc_id", type(node).__name__)
+                    logger.debug(
+                        "Node type %s does not support ref_doc_id",
+                        type(node).__name__,
+                    )
 
             results.append(
                 NodeWithScore(
@@ -564,10 +659,6 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
     ) -> List[VectorMatch]:
         """
         Optionally filter matches by a minimum score threshold.
-
-        This client-side filtering provides consistent behavior across different
-        backends that may have varying support for server-side score filtering.
-        Applied after query execution to ensure we respect backend result limits.
         """
         if self.score_threshold is None:
             return matches
@@ -588,25 +679,6 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
         """
         Translate LlamaIndex MetadataFilters + doc_ids/node_ids into a Corpus
         metadata filter dict.
-
-        Operator mapping (best-effort):
-        - EQ / ==        → {key: value}
-        - NE / !=        → {key: {"$ne": value}}
-        - IN / ANY       → {key: {"$in": [values...]}}
-        - NIN / NOT_IN   → {key: {"$nin": [values...]}}
-        - GT             → {key: {"$gt": value}}
-        - GTE            → {key: {"$gte": value}}
-        - LT             → {key: {"$lt": value}}
-        - LTE            → {key: {"$lte": value}}
-
-        doc_ids and node_ids are translated to `$in` constraints on
-        `self.ref_doc_id_field` and `self.node_id_field`, respectively.
-
-        Unknown operators are logged and skipped rather than causing errors,
-        ensuring forward compatibility with new LlamaIndex filter types.
-
-        Returns a filter dict suitable for backends that support metadata filtering,
-        or None if no filters are specified.
         """
         clauses: List[Dict[str, Any]] = []
 
@@ -651,7 +723,7 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
                         key,
                     )
 
-        # Restrict by ref_doc_id if doc_ids are provided (common LlamaIndex pattern)
+        # Restrict by ref_doc_id if doc_ids are provided
         if doc_ids:
             clauses.append(
                 {
@@ -674,19 +746,17 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
         if not clauses:
             return None
 
-        # Determine boolean condition if MetadataFilters exposes it.
-        # LlamaIndex typically uses AND semantics by default.
+        # Determine boolean condition
         condition = getattr(filters, "condition", None) if filters is not None else None
         cond_name = str(condition).upper() if condition is not None else "AND"
 
         if len(clauses) == 1:
-            # Single predicate; no need for $and/$or wrapping.
             return clauses[0]
 
         if cond_name in ("OR", "ANY"):
             return {"$or": clauses}
 
-        # Default: AND semantics (most common in LlamaIndex queries)
+        # Default: AND semantics
         return {"$and": clauses}
 
     # ------------------------------------------------------------------ #
@@ -701,16 +771,13 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """
         Build the raw upsert request + framework_ctx for VectorTranslator.
-
-        The VectorTranslator handles batching according to backend capabilities
-        and provides graceful error recovery for partial batch failures.
         """
         ns = self._effective_namespace(namespace)
         raw: Dict[str, Any] = {
             "namespace": ns,
             "vectors": vectors,
         }
-        framework_ctx: Dict[str, Any] = {"namespace": ns} if ns is not None else {}
+        framework_ctx = self._framework_ctx_for_namespace(ns)
         return raw, framework_ctx
 
     def _build_query_request(
@@ -724,20 +791,17 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """
         Build the raw query request + framework_ctx for VectorTranslator.
-
-        Used by both standard queries and MMR queries (when include_vectors=True).
-        The translator handles capability validation and query optimization.
         """
         ns = self._effective_namespace(namespace)
         raw: Dict[str, Any] = {
             "vector": [float(x) for x in embedding],
             "top_k": int(top_k),
             "namespace": ns,
-            "filter": dict(filter) if filter else None,
+            "filters": dict(filter) if filter else None,
             "include_metadata": True,
             "include_vectors": bool(include_vectors),
         }
-        framework_ctx: Dict[str, Any] = {"namespace": ns} if ns is not None else {}
+        framework_ctx = self._framework_ctx_for_namespace(ns)
         return raw, framework_ctx
 
     def _build_delete_request(
@@ -749,9 +813,6 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """
         Build the raw delete request + framework_ctx for VectorTranslator.
-
-        The translator handles capability validation and ensures delete operations
-        respect backend limits and authentication requirements.
         """
         ns = self._effective_namespace(namespace)
         raw: Dict[str, Any] = {
@@ -759,7 +820,7 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
             "ids": [str(i) for i in ids] if ids else None,
             "filter": dict(filter) if filter else None,
         }
-        framework_ctx: Dict[str, Any] = {"namespace": ns} if ns is not None else {}
+        framework_ctx = self._framework_ctx_for_namespace(ns)
         return raw, framework_ctx
 
     # ------------------------------------------------------------------ #
@@ -774,12 +835,6 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
     ) -> int:
         """
         Validate query parameters in a sync context against capabilities.
-
-        Ensures the requested top_k doesn't exceed backend limits and that
-        metadata filtering is supported if filters are provided. Returns the
-        validated top_k value for use in the actual query.
-
-        Raises NotSupported if the backend cannot handle the requested operation.
         """
         caps = self._get_caps_sync()
         ns = self._effective_namespace(namespace)
@@ -825,9 +880,6 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
     ) -> int:
         """
         Validate query parameters in an async context against capabilities.
-
-        Async version of _validate_query_params_sync for use in async operations.
-        Ensures non-blocking capability checks during async query execution.
         """
         caps = await self._get_caps_async()
         ns = self._effective_namespace(namespace)
@@ -874,10 +926,6 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
     ) -> None:
         """
         Validate delete parameters in a sync context against capabilities.
-
-        Ensures either ids or filter are provided and that metadata filter-based
-        deletes are supported by the backend. Prevents invalid delete operations
-        that would fail at the backend level.
         """
         caps = self._get_caps_sync()
         ns = self._effective_namespace(namespace)
@@ -920,8 +968,6 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
     ) -> None:
         """
         Validate delete parameters in an async context against capabilities.
-
-        Async version of _validate_delete_params_sync for use in async delete operations.
         """
         caps = await self._get_caps_async()
         ns = self._effective_namespace(namespace)
@@ -963,10 +1009,6 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
     ) -> QueryResult:
         """
         Ensure the translator returned a QueryResult.
-
-        Provides a safety check against translator misconfiguration or version
-        mismatches. Raises BadRequest with detailed context if the result type
-        is unexpected.
         """
         if isinstance(result, QueryResult):
             return result
@@ -994,28 +1036,27 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
     ) -> None:
         """
         Handle partial failures in batch upsert operations gracefully.
-
-        Logs warnings for partial failures but doesn't raise exceptions for
-        non-critical failures, allowing successful operations to proceed.
-        Only raises exceptions for complete failures or critical errors.
         """
         if result.failed_count and result.failed_count > 0:
             successful = result.upserted_count or 0
             failed = result.failed_count
-            
+
             logger.warning(
                 "Partial upsert failure: %d/%d nodes succeeded, %d failed in namespace %s",
-                successful, total_nodes, failed, namespace or "default"
+                successful,
+                total_nodes,
+                failed,
+                namespace or "default",
             )
-            
-            # Log details of individual failures for debugging
+
             if result.failures:
-                for failure in result.failures[:5]:  # Log first 5 failures
+                for failure in result.failures[:5]:
                     logger.debug("Upsert failure: %s", failure)
                 if len(result.failures) > 5:
-                    logger.debug("... and %d more failures", len(result.failures) - 5)
+                    logger.debug(
+                        "... and %d more failures", len(result.failures) - 5
+                    )
 
-        # Only raise exception if no nodes were upserted at all
         if (result.upserted_count or 0) == 0 and total_nodes > 0:
             raise VectorAdapterError(
                 f"All {total_nodes} nodes failed to upsert",
@@ -1024,7 +1065,7 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
                     "total_nodes": total_nodes,
                     "namespace": namespace,
                     "failures": result.failures or [],
-                }
+                },
             )
 
     # ------------------------------------------------------------------ #
@@ -1054,19 +1095,6 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
     ) -> List[int]:
         """
         Improved MMR selector that respects original database scores and caches similarities.
-
-        Args:
-            query_vec: The query embedding vector (used for consistency, though we use DB scores)
-            candidate_matches: Candidate matches with original scores and vectors
-            k: Number of results to select
-            lambda_mult: MMR lambda parameter (0-1), higher values favor relevance
-
-        Returns:
-            Indices into candidate_matches for selected results
-
-        Note: We use the original database similarity scores for relevance rather than
-        recomputing similarities, as these scores are typically more accurate and
-        consistent with the backend's similarity metric.
         """
         if not candidate_matches or k <= 0:
             return []
@@ -1075,18 +1103,35 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
         if k == 0:
             return []
 
+        # If lambda_mult == 1.0, pure relevance ranking
+        if lambda_mult >= 1.0:
+            scores = [float(m.score) for m in candidate_matches]
+            sorted_indices = sorted(
+                range(len(candidate_matches)),
+                key=lambda i: scores[i],
+                reverse=True,
+            )
+            return sorted_indices[:k]
+
         # Use original scores from database as relevance measure
         original_scores = [float(match.score) for match in candidate_matches]
-        candidate_vecs = [match.vector.vector or [] for match in candidate_matches]
+        dim = len(query_vec)
 
-        # Normalize original scores to 0-1 range for consistency
+        # Candidate vectors, tolerating missing/mismatched dims
+        candidate_vecs: List[List[float]] = []
+        for match in candidate_matches:
+            vec = match.vector.vector or []
+            if not vec or (dim > 0 and len(vec) != dim):
+                candidate_vecs.append([])
+            else:
+                candidate_vecs.append([float(x) for x in vec])
+
         max_orig_score = max(original_scores) if original_scores else 1.0
         if max_orig_score <= 0.0:
             normalized_scores = [0.0] * len(original_scores)
         else:
             normalized_scores = [score / max_orig_score for score in original_scores]
 
-        # Precompute all pairwise similarities with caching
         similarity_cache: Dict[Tuple[int, int], float] = {}
 
         def get_similarity(i: int, j: int) -> float:
@@ -1108,7 +1153,6 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
         selected: List[int] = []
         candidates = list(range(len(candidate_matches)))
 
-        # Start with the most relevant document based on original score
         if candidates:
             first_idx = max(candidates, key=lambda i: normalized_scores[i])
             selected.append(first_idx)
@@ -1144,6 +1188,7 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
     # LlamaIndex VectorStore sync API
     # ------------------------------------------------------------------ #
 
+    @with_error_context("add_sync")
     def add(
         self,
         nodes: Sequence[BaseNode],
@@ -1151,27 +1196,6 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
     ) -> List[str]:
         """
         Add LlamaIndex nodes to the vector store (sync).
-
-        Behavior:
-        - Expects nodes to already have embeddings (computed by LlamaIndex)
-        - Flattens node metadata and stores text alongside vectors
-        - Batch behavior is enforced by VectorTranslator according to capabilities
-        - Handles partial failures gracefully, logging warnings but not failing
-          entirely unless all operations fail
-
-        Args:
-            nodes: Sequence of BaseNode objects with pre-computed embeddings
-            **kwargs: Additional arguments including:
-                - namespace: Optional namespace override
-                - callback_manager: For context propagation
-                - ctx: Explicit OperationContext
-
-        Returns:
-            List of node IDs that were successfully added
-
-        Raises:
-            BadRequest: If nodes lack embeddings or other validation fails
-            VectorAdapterError: If all nodes fail to upsert
         """
         if not nodes:
             return []
@@ -1180,35 +1204,27 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
         ctx = self._build_ctx(**kwargs)
 
         vectors = self._nodes_to_corpus_vectors(nodes, namespace=namespace)
-        ids = [str(getattr(n, "node_id", None) or getattr(n, "id_", None)) for n in nodes]
+        ids = [
+            str(getattr(n, "node_id", None) or getattr(n, "id_", None)) for n in nodes
+        ]
 
         raw_request, framework_ctx = self._build_upsert_request(
             vectors,
             namespace=namespace,
         )
 
-        try:
-            result = self._translator.upsert(
-                raw_request,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-            
-            # Handle partial failures gracefully
-            if isinstance(result, UpsertResult):
-                self._handle_partial_upsert_failure(result, len(nodes), namespace)
-                
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="llamaindex",
-                operation="upsert_sync",
-                namespace=self._effective_namespace(namespace),
-            )
-            raise
+        result = self._translator.upsert(
+            raw_request,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+
+        if isinstance(result, UpsertResult):
+            self._handle_partial_upsert_failure(result, len(nodes), namespace)
 
         return ids
 
+    @with_async_error_context("add_async")
     async def aadd(
         self,
         nodes: Sequence[BaseNode],
@@ -1216,20 +1232,6 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
     ) -> List[str]:
         """
         Add LlamaIndex nodes to the vector store (async).
-
-        Async version of add() with the same behavior and error handling.
-        Uses async VectorTranslator methods for non-blocking operation.
-
-        Args:
-            nodes: Sequence of BaseNode objects with pre-computed embeddings
-            **kwargs: Additional arguments including namespace and context
-
-        Returns:
-            List of node IDs that were successfully added
-
-        Raises:
-            BadRequest: If nodes lack embeddings or other validation fails
-            VectorAdapterError: If all nodes fail to upsert
         """
         if not nodes:
             return []
@@ -1238,35 +1240,28 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
         ctx = self._build_ctx(**kwargs)
 
         vectors = self._nodes_to_corpus_vectors(nodes, namespace=namespace)
-        ids = [str(getattr(n, "node_id", None) or getattr(n, "id_", None)) for n in nodes]
+        ids = [
+            str(getattr(n, "node_id", None) or getattr(n, "id_", None)) for n in nodes
+        ]
 
-        raw_request, framework_ctx = self._build_upsert_request(
-            vectors,
-            namespace=namespace,
+        result = await self._translator.arun_upsert(
+            raw_request := self._build_upsert_request(
+                vectors,
+                namespace=namespace,
+            )[0],
+            op_ctx=ctx,
+            framework_ctx=self._build_upsert_request(
+                vectors,
+                namespace=namespace,
+            )[1],
         )
 
-        try:
-            result = await self._translator.arun_upsert(
-                raw_request,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-            
-            # Handle partial failures gracefully
-            if isinstance(result, UpsertResult):
-                self._handle_partial_upsert_failure(result, len(nodes), namespace)
-                
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="llamaindex",
-                operation="upsert_async",
-                namespace=self._effective_namespace(namespace),
-            )
-            raise
+        if isinstance(result, UpsertResult):
+            self._handle_partial_upsert_failure(result, len(nodes), namespace)
 
         return ids
 
+    @with_error_context("delete_sync")
     def delete(
         self,
         ref_doc_id: str,
@@ -1274,16 +1269,6 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
     ) -> None:
         """
         Delete vectors associated with a given ref_doc_id (sync).
-
-        This implements LlamaIndex's standard VectorStore contract for document
-        deletion. All nodes with the given ref_doc_id will be removed.
-
-        Args:
-            ref_doc_id: Reference document ID to delete
-            **kwargs: Additional arguments including namespace and context
-
-        Note: This operation is atomic at the backend level - either all matching
-        vectors are deleted or none are, ensuring consistency.
         """
         namespace: Optional[str] = kwargs.get("namespace")
         ctx = self._build_ctx(**kwargs)
@@ -1302,21 +1287,13 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
             filter=filter_dict,
         )
 
-        try:
-            self._translator.delete(
-                raw_request,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="llamaindex",
-                operation="delete_sync",
-                namespace=self._effective_namespace(namespace),
-            )
-            raise
+        self._translator.delete(
+            raw_request,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
 
+    @with_async_error_context("delete_async")
     async def adelete(
         self,
         ref_doc_id: str,
@@ -1324,12 +1301,6 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
     ) -> None:
         """
         Delete vectors associated with a given ref_doc_id (async).
-
-        Async version of delete() with the same behavior and error handling.
-
-        Args:
-            ref_doc_id: Reference document ID to delete
-            **kwargs: Additional arguments including namespace and context
         """
         namespace: Optional[str] = kwargs.get("namespace")
         ctx = self._build_ctx(**kwargs)
@@ -1348,21 +1319,13 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
             filter=filter_dict,
         )
 
-        try:
-            await self._translator.arun_delete(
-                raw_request,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="llamaindex",
-                operation="delete_async",
-                namespace=self._effective_namespace(namespace),
-            )
-            raise
+        await self._translator.arun_delete(
+            raw_request,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
 
+    @with_error_context("delete_nodes_sync")
     def delete_nodes(
         self,
         node_ids: Sequence[str],
@@ -1370,16 +1333,6 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
     ) -> None:
         """
         Delete vectors by node IDs (sync).
-
-        This is a convenience method some LlamaIndex components use. It maps
-        node IDs directly to vector IDs for precise deletion.
-
-        Args:
-            node_ids: Sequence of node IDs to delete
-            **kwargs: Additional arguments including namespace and context
-
-        Note: Unlike ref_doc_id deletion, this operates on specific node IDs
-        and is useful for targeted cleanup operations.
         """
         if not node_ids:
             return
@@ -1401,21 +1354,13 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
             filter=None,
         )
 
-        try:
-            self._translator.delete(
-                raw_request,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="llamaindex",
-                operation="delete_nodes_sync",
-                namespace=self._effective_namespace(namespace),
-            )
-            raise
+        self._translator.delete(
+            raw_request,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
 
+    @with_async_error_context("delete_nodes_async")
     async def adelete_nodes(
         self,
         node_ids: Sequence[str],
@@ -1423,12 +1368,6 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
     ) -> None:
         """
         Delete vectors by node IDs (async).
-
-        Async version of delete_nodes() with the same behavior and error handling.
-
-        Args:
-            node_ids: Sequence of node IDs to delete
-            **kwargs: Additional arguments including namespace and context
         """
         if not node_ids:
             return
@@ -1450,21 +1389,13 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
             filter=None,
         )
 
-        try:
-            await self._translator.arun_delete(
-                raw_request,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="llamaindex",
-                operation="delete_nodes_async",
-                namespace=self._effective_namespace(namespace),
-            )
-            raise
+        await self._translator.arun_delete(
+            raw_request,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
 
+    @with_error_context("query_sync")
     def query(
         self,
         query: VectorStoreQuery,
@@ -1472,20 +1403,6 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
     ) -> VectorStoreQueryResult:
         """
         Perform similarity query and return a VectorStoreQueryResult (sync).
-
-        Assumes `query.query_embedding` has already been computed by LlamaIndex.
-        This is the standard query method called by LlamaIndex during retrieval.
-
-        Args:
-            query: VectorStoreQuery with query_embedding, filters, and other parameters
-            **kwargs: Additional arguments including namespace and context
-
-        Returns:
-            VectorStoreQueryResult with nodes, similarities, and IDs
-
-        Raises:
-            NotSupported: If query_embedding is None
-            BadRequest: If query parameters exceed backend capabilities
         """
         if query.query_embedding is None:
             raise NotSupported(
@@ -1510,6 +1427,14 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
             filter=corpus_filter,
         )
 
+        warn_if_extreme_k(
+            top_k,
+            framework="llamaindex",
+            op_name="query_sync",
+            warning_config=TOPK_WARNING_CONFIG,
+            logger=logger,
+        )
+
         embedding = [float(x) for x in query.query_embedding]
 
         raw_query, framework_ctx = self._build_query_request(
@@ -1520,21 +1445,11 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
             include_vectors=False,
         )
 
-        try:
-            result_any = self._translator.query(
-                raw_query,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="llamaindex",
-                operation="query_sync",
-                namespace=self._effective_namespace(namespace),
-                top_k=top_k,
-            )
-            raise
+        result_any = self._translator.query(
+            raw_query,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
 
         result = self._validate_query_result_type(
             result_any,
@@ -1557,6 +1472,7 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
             ids=[str(i) if i is not None else "" for i in ids],
         )
 
+    @with_async_error_context("query_async")
     async def aquery(
         self,
         query: VectorStoreQuery,
@@ -1564,20 +1480,6 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
     ) -> VectorStoreQueryResult:
         """
         Perform similarity query and return a VectorStoreQueryResult (async).
-
-        Async version of query() with the same behavior and error handling.
-        Used by LlamaIndex's async query engines for non-blocking retrieval.
-
-        Args:
-            query: VectorStoreQuery with query_embedding, filters, and other parameters
-            **kwargs: Additional arguments including namespace and context
-
-        Returns:
-            VectorStoreQueryResult with nodes, similarities, and IDs
-
-        Raises:
-            NotSupported: If query_embedding is None
-            BadRequest: If query parameters exceed backend capabilities
         """
         if query.query_embedding is None:
             raise NotSupported(
@@ -1602,6 +1504,14 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
             filter=corpus_filter,
         )
 
+        warn_if_extreme_k(
+            top_k,
+            framework="llamaindex",
+            op_name="query_async",
+            warning_config=TOPK_WARNING_CONFIG,
+            logger=logger,
+        )
+
         embedding = [float(x) for x in query.query_embedding]
 
         raw_query, framework_ctx = self._build_query_request(
@@ -1612,21 +1522,11 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
             include_vectors=False,
         )
 
-        try:
-            result_any = await self._translator.arun_query(
-                raw_query,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="llamaindex",
-                operation="query_async",
-                namespace=self._effective_namespace(namespace),
-                top_k=top_k,
-            )
-            raise
+        result_any = await self._translator.arun_query(
+            raw_query,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
 
         result = self._validate_query_result_type(
             result_any,
@@ -1649,6 +1549,7 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
             ids=[str(i) if i is not None else "" for i in ids],
         )
 
+    @with_error_context("query_stream")
     def query_stream(
         self,
         query: VectorStoreQuery,
@@ -1656,21 +1557,6 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
     ) -> Iterator[NodeWithScore]:
         """
         Streaming similarity query (sync), yielding NodeWithScore one by one.
-
-        This uses VectorTranslator.query_stream to bridge async query into a
-        streaming sync iterator while keeping backend semantics identical.
-        Useful for responsive UIs and progressive result display.
-
-        Args:
-            query: VectorStoreQuery with query_embedding, filters, and other parameters
-            **kwargs: Additional arguments including namespace and context
-
-        Yields:
-            NodeWithScore objects one by one as they become available
-
-        Raises:
-            NotSupported: If query_embedding is None
-            BadRequest: If query parameters exceed backend capabilities
         """
         if query.query_embedding is None:
             raise NotSupported(
@@ -1695,6 +1581,14 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
             filter=corpus_filter,
         )
 
+        warn_if_extreme_k(
+            top_k,
+            framework="llamaindex",
+            op_name="query_stream",
+            warning_config=TOPK_WARNING_CONFIG,
+            logger=logger,
+        )
+
         embedding = [float(x) for x in query.query_embedding]
 
         raw_query, framework_ctx = self._build_query_request(
@@ -1705,48 +1599,43 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
             include_vectors=False,
         )
 
-        try:
-            for item in self._translator.query_stream(
-                raw_query,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            ):
-                if not isinstance(item, VectorMatch):
-                    err = VectorAdapterError(
-                        f"translator.query_stream returned unexpected type: {type(item).__name__}"
-                    )
-                    attach_context(
-                        err,
-                        framework="llamaindex",
-                        operation="query_stream",
-                        namespace=self._effective_namespace(namespace),
-                        top_k=top_k,
-                    )
-                    raise err
+        yielded = 0
 
-                match = item
-                if self.score_threshold is not None and float(match.score) < float(
-                    self.score_threshold
-                ):
-                    continue
+        for chunk in self._translator.query_stream(
+            raw_query,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        ):
+            if not isinstance(chunk, QueryChunk):
+                err = VectorAdapterError(
+                    f"translator.query_stream returned unexpected type: {type(chunk).__name__}",
+                    code="BAD_STREAM_CHUNK",
+                )
+                attach_context(
+                    err,
+                    framework="llamaindex",
+                    operation="query_stream",
+                    namespace=self._effective_namespace(namespace),
+                    top_k=top_k,
+                )
+                raise err
 
+            raw_matches = list(chunk.matches or [])
+            filtered_matches = self._apply_score_threshold(raw_matches)
+
+            for match in filtered_matches:
+                if yielded >= top_k:
+                    return
                 nodes_with_scores = self._matches_to_nodes([match])
                 if nodes_with_scores:
                     yield nodes_with_scores[0]
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="llamaindex",
-                operation="query_stream",
-                namespace=self._effective_namespace(namespace),
-                top_k=top_k,
-            )
-            raise
+                    yielded += 1
 
     # ------------------------------------------------------------------ #
     # MMR query APIs (sync + async)
     # ------------------------------------------------------------------ #
 
+    @with_error_context("query_mmr_sync")
     def query_mmr(
         self,
         query: VectorStoreQuery,
@@ -1757,24 +1646,6 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
     ) -> VectorStoreQueryResult:
         """
         Perform Maximal Marginal Relevance (MMR) query (sync).
-
-        This runs a similarity query with a larger `fetch_k` and then
-        selects a subset of results via MMR based on vector geometry and
-        original database scores. Provides a good balance between relevance
-        and diversity in retrieval results.
-
-        Args:
-            query: VectorStoreQuery with query_embedding and other parameters
-            lambda_mult: MMR lambda parameter (0-1), higher values favor relevance
-            fetch_k: Number of candidates to fetch for MMR selection (defaults to 4*k)
-            **kwargs: Additional arguments including namespace and context
-
-        Returns:
-            VectorStoreQueryResult with MMR-selected nodes and scores
-
-        Raises:
-            NotSupported: If query_embedding is None
-            BadRequest: If lambda_mult is invalid or parameters exceed capabilities
         """
         if query.query_embedding is None:
             raise NotSupported(
@@ -1806,13 +1677,20 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
 
         effective_fetch_k = int(fetch_k or max(k * 4, k + 5))
 
+        warn_if_extreme_k(
+            effective_fetch_k,
+            framework="llamaindex",
+            op_name="query_mmr_sync_fetch_k",
+            warning_config=TOPK_WARNING_CONFIG,
+            logger=logger,
+        )
+
         corpus_filter = self._metadata_filters_to_corpus_filter(
             query.filters,
             doc_ids=query.doc_ids,
             node_ids=query.node_ids,
         )
 
-        # Validate against capabilities using fetch_k
         top_k_fetch = self._validate_query_params_sync(
             top_k=effective_fetch_k,
             namespace=namespace,
@@ -1829,21 +1707,11 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
             include_vectors=True,
         )
 
-        try:
-            result_any = self._translator.query(
-                raw_query,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="llamaindex",
-                operation="query_mmr_sync",
-                namespace=self._effective_namespace(namespace),
-                top_k=top_k_fetch,
-            )
-            raise
+        result_any = self._translator.query(
+            raw_query,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
 
         result = self._validate_query_result_type(
             result_any,
@@ -1877,6 +1745,7 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
             ids=[str(i) if i is not None else "" for i in ids],
         )
 
+    @with_async_error_context("query_mmr_async")
     async def aquery_mmr(
         self,
         query: VectorStoreQuery,
@@ -1887,22 +1756,6 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
     ) -> VectorStoreQueryResult:
         """
         Perform Maximal Marginal Relevance (MMR) query (async).
-
-        Async version of query_mmr() with the same behavior and error handling.
-        Useful for non-blocking MMR retrieval in async LlamaIndex applications.
-
-        Args:
-            query: VectorStoreQuery with query_embedding and other parameters
-            lambda_mult: MMR lambda parameter (0-1), higher values favor relevance
-            fetch_k: Number of candidates to fetch for MMR selection (defaults to 4*k)
-            **kwargs: Additional arguments including namespace and context
-
-        Returns:
-            VectorStoreQueryResult with MMR-selected nodes and scores
-
-        Raises:
-            NotSupported: If query_embedding is None
-            BadRequest: If lambda_mult is invalid or parameters exceed capabilities
         """
         if query.query_embedding is None:
             raise NotSupported(
@@ -1934,6 +1787,14 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
 
         effective_fetch_k = int(fetch_k or max(k * 4, k + 5))
 
+        warn_if_extreme_k(
+            effective_fetch_k,
+            framework="llamaindex",
+            op_name="query_mmr_async_fetch_k",
+            warning_config=TOPK_WARNING_CONFIG,
+            logger=logger,
+        )
+
         corpus_filter = self._metadata_filters_to_corpus_filter(
             query.filters,
             doc_ids=query.doc_ids,
@@ -1956,21 +1817,11 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
             include_vectors=True,
         )
 
-        try:
-            result_any = await self._translator.arun_query(
-                raw_query,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="llamaindex",
-                operation="query_mmr_async",
-                namespace=self._effective_namespace(namespace),
-                top_k=top_k_fetch,
-            )
-            raise
+        result_any = await self._translator.arun_query(
+            raw_query,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
 
         result = self._validate_query_result_type(
             result_any,
@@ -2007,4 +1858,6 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
 
 __all__ = [
     "CorpusLlamaIndexVectorStore",
+    "with_error_context",
+    "with_async_error_context",
 ]
