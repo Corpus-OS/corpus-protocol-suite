@@ -30,9 +30,8 @@ Design principles
     keeping framework-specific concerns localized and consistent.
 
 - Non-invasive:
-    No retries, circuit breaking, or deadlines are implemented beyond what
-    this client explicitly configures; the underlying adapter can still apply
-    its own policies.
+    No retries, circuit breaking, or deadlines are implemented at this layer;
+    the underlying adapter can still apply its own policies.
 
 - Rich error context:
     Exceptions are annotated via `attach_context` with framework-specific and
@@ -41,7 +40,6 @@ Design principles
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
 from dataclasses import dataclass
@@ -49,7 +47,6 @@ from functools import wraps
 from typing import (
     Any,
     AsyncIterator,
-    Awaitable,
     Callable,
     Dict,
     Iterator,
@@ -890,42 +887,6 @@ class CorpusAutoGenChatClient:
 
         return payload
 
-    async def _run_with_retries_async(
-        self,
-        func: Callable[[], Awaitable[Any]],
-    ) -> Any:
-        """
-        Execute an async operation with simple retry and timeout semantics.
-
-        - Uses `self._config.request_timeout` for per-attempt timeout.
-        - Retries up to `self._config.max_retries` times.
-        """
-        attempts = 0
-        last_error: Optional[BaseException] = None
-
-        while attempts <= self._max_retries:
-            try:
-                if self._request_timeout and self._request_timeout > 0:
-                    return await asyncio.wait_for(func(), timeout=self._request_timeout)
-                return await func()
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001
-                last_error = exc
-                attempts += 1
-                if attempts > self._max_retries:
-                    raise
-                logger.warning(
-                    "AutoGen async LLM call failed (attempt %d/%d): %s",
-                    attempts,
-                    self._max_retries,
-                    exc,
-                )
-                await asyncio.sleep(min(2.0**attempts, 5.0))
-
-        if last_error is not None:
-            raise last_error
-
     # ------------------------------------------------------------------ #
     # Public async API (AutoGen-facing)
     # ------------------------------------------------------------------ #
@@ -963,15 +924,12 @@ class CorpusAutoGenChatClient:
         )
 
         if not stream:
-            async def _invoke() -> Any:
-                return await self._translator.arun_complete(
-                    raw_messages=messages,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                    **params,
-                )
-
-            result = await self._run_with_retries_async(_invoke)
+            result = await self._translator.arun_complete(
+                raw_messages=messages,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+                **params,
+            )
             return self._completion_to_openai(result)
 
         # Streaming: return async iterator of OpenAI-style chunks.
