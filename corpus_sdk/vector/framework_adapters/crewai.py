@@ -27,56 +27,6 @@ Design philosophy
       where available (async paths)
     * Propagating OperationContext when provided (crewai task or dict)
     * Using `VectorTranslator` for all sync/async query and streaming orchestration
-
-Typical usage
--------------
-
-    from crewai import Agent
-    from corpus_sdk.vector.pinecone_adapter import PineconeVectorAdapter
-    from corpus_sdk.vector.framework_adapters.crewai import (
-        CorpusCrewAIVectorSearchTool,
-    )
-
-    adapter = PineconeVectorAdapter(
-        index_name="my-index",
-        api_key="...",
-        dimensions=1536,
-    )
-
-    # Provide an embedding function that maps List[str] -> List[List[float]]
-    def embed_texts(texts: list[str]) -> list[list[float]]:
-        ...
-
-    search_tool = CorpusCrewAIVectorSearchTool(
-        corpus_adapter=adapter,
-        embedding_function=embed_texts,
-        namespace="docs",
-        default_top_k=4,
-        score_threshold=0.2,
-        use_mmr_by_default=True,
-        mmr_lambda=0.5,
-    )
-
-    researcher = Agent(
-        role="RAG Researcher",
-        goal="Find the most relevant documents for a query",
-        tools=[search_tool],
-    )
-
-    # Normal usage (sync via CrewAI)
-    results = search_tool.run(
-        query="what is corpus?",
-        k=5,
-        return_scores=True,
-    )
-
-    # Advanced streaming usage (manual, outside CrewAI's tool planner):
-    for item in search_tool.stream_search(
-        query="what is corpus?",
-        k=5,
-        return_scores=True,
-    ):
-        process(item)
 """
 
 from __future__ import annotations
@@ -111,6 +61,15 @@ from corpus_sdk.vector.vector_base import (
     BadRequest,
     NotSupported,
 )
+from corpus_sdk.vector.framework_adapters.common.framework_utils import (
+    VectorCoercionErrorCodes,
+    VectorResourceLimits,
+    VectorValidationFlags,
+    TopKWarningConfig,
+    warn_if_extreme_k,
+    normalize_vector_context,
+    attach_vector_context_to_framework_ctx,
+)
 from corpus_sdk.vector.framework_adapters.common.vector_translation import (
     DefaultVectorFrameworkTranslator,
     VectorTranslator,
@@ -125,6 +84,20 @@ logger = logging.getLogger(__name__)
 
 Embeddings = Sequence[Sequence[float]]
 Metadata = Dict[str, Any]
+
+
+# --------------------------------------------------------------------------- #
+# Vector framework-utils configuration for CrewAI adapter
+# --------------------------------------------------------------------------- #
+
+VECTOR_ERROR_CODES = VectorCoercionErrorCodes(
+    framework_label="crewai",
+)
+VECTOR_LIMITS = VectorResourceLimits()
+VECTOR_FLAGS = VectorValidationFlags()
+TOPK_WARNING_CONFIG = TopKWarningConfig(
+    framework_label="crewai",
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -489,13 +462,40 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
     def _framework_ctx_for_namespace(
         self,
         namespace: Optional[str],
-    ) -> Mapping[str, Any]:
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """
-        Build a minimal framework_ctx mapping that lets the common translator
-        derive a preferred namespace when needed.
+        Build a normalized framework_ctx mapping that is consistent with the
+        shared vector framework utilities.
+
+        This ensures:
+        - vector context keys (namespace, index_name, tenant_id, etc.) are
+          normalized via `normalize_vector_context`
+        - the resulting values are attached into a generic framework_ctx dict
+          via `attach_vector_context_to_framework_ctx`
         """
         ns = self._effective_namespace(namespace)
-        return {"namespace": ns} if ns is not None else {}
+
+        raw_ctx: Dict[str, Any] = {}
+        if ns is not None:
+            raw_ctx["namespace"] = ns
+        if extra_context:
+            raw_ctx.update(extra_context)
+
+        vector_ctx = normalize_vector_context(
+            raw_ctx,
+            framework="crewai",
+            logger=logger,
+        )
+
+        framework_ctx: Dict[str, Any] = {}
+        attach_vector_context_to_framework_ctx(
+            framework_ctx,
+            vector_context=vector_ctx,
+            limits=VECTOR_LIMITS,
+            flags=VECTOR_FLAGS,
+        )
+        return framework_ctx
 
     @staticmethod
     def _validate_query_result(
@@ -862,6 +862,15 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
                 code=ErrorCodes.BAD_TOP_K,
             )
 
+        # Soft warning for extreme top_k
+        warn_if_extreme_k(
+            top_k,
+            framework="crewai",
+            op_name="vector_search_async_simple",
+            warning_config=TOPK_WARNING_CONFIG,
+            logger=logger,
+        )
+
         ns = args.namespace
         ctx = self._resolve_operation_context(args.context)
 
@@ -912,6 +921,15 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
         if top_k <= 0:
             return []
 
+        # Soft warning for extreme user-visible k
+        warn_if_extreme_k(
+            top_k,
+            framework="crewai",
+            op_name="vector_search_async_mmr",
+            warning_config=TOPK_WARNING_CONFIG,
+            logger=logger,
+        )
+
         ns = args.namespace
         ctx = self._resolve_operation_context(args.context)
 
@@ -936,6 +954,15 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
                 f"fetch_k {fetch_k} exceeds maximum of {caps.max_top_k}",
                 code=ErrorCodes.BAD_TOP_K,
             )
+
+        # Soft warning for internal fetch_k as well
+        warn_if_extreme_k(
+            fetch_k,
+            framework="crewai",
+            op_name="vector_search_async_mmr_fetch",
+            warning_config=TOPK_WARNING_CONFIG,
+            logger=logger,
+        )
 
         query_emb = self._embed_query(args.query, embedding=args.embedding)
         raw_query = self._build_raw_query(
@@ -1013,6 +1040,15 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
         if top_k <= 0:
             return []
 
+        # Soft warning for extreme k in sync path as well
+        warn_if_extreme_k(
+            top_k,
+            framework="crewai",
+            op_name="vector_search_sync_simple",
+            warning_config=TOPK_WARNING_CONFIG,
+            logger=logger,
+        )
+
         ns = args.namespace
         ctx = self._resolve_operation_context(args.context)
 
@@ -1054,6 +1090,15 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
         if top_k <= 0:
             return []
 
+        # Soft warning for user-visible k
+        warn_if_extreme_k(
+            top_k,
+            framework="crewai",
+            op_name="vector_search_sync_mmr",
+            warning_config=TOPK_WARNING_CONFIG,
+            logger=logger,
+        )
+
         ns = args.namespace
         ctx = self._resolve_operation_context(args.context)
 
@@ -1065,6 +1110,15 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
         lambda_mult = max(0.0, min(1.0, lambda_mult))
 
         fetch_k = args.fetch_k or max(top_k * 4, top_k + 5)
+
+        # Soft warning for internal fetch_k as well
+        warn_if_extreme_k(
+            fetch_k,
+            framework="crewai",
+            op_name="vector_search_sync_mmr_fetch",
+            warning_config=TOPK_WARNING_CONFIG,
+            logger=logger,
+        )
 
         query_emb = self._embed_query(args.query, embedding=args.embedding)
         raw_query = self._build_raw_query(
@@ -1163,6 +1217,15 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
             # Empty iterator
             return iter(())
 
+        # Soft warning for streaming top_k
+        warn_if_extreme_k(
+            top_k,
+            framework="crewai",
+            op_name="vector_search_stream",
+            warning_config=TOPK_WARNING_CONFIG,
+            logger=logger,
+        )
+
         ns = args.namespace
         ctx = self._resolve_operation_context(args.context)
         return_scores = bool(args.return_scores)
@@ -1209,4 +1272,6 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
 __all__ = [
     "CorpusVectorSearchInput",
     "CorpusCrewAIVectorSearchTool",
+    "with_error_context",
+    "with_async_error_context",
 ]
