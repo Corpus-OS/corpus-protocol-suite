@@ -29,12 +29,15 @@ Design philosophy
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from functools import cached_property, wraps
 from typing import (
     Any,
     AsyncIterator,
+    Awaitable,
+    Callable,
     Dict,
     Iterable,
     Iterator,
@@ -53,6 +56,7 @@ from adapter_sdk.vector_base import (
     BadRequest,
     NotSupported,
     VectorAdapterError,
+    UpsertResult,
 )
 from corpus_sdk.core.context_translation import (
     from_autogen as core_ctx_from_autogen,
@@ -280,6 +284,12 @@ class CorpusAutoGenVectorStore:
 
         Signature:
             embedding_function(texts: List[str]) -> List[List[float]]
+
+    async_embedding_function:
+        Optional async embedding function for use in async flows.
+
+        Signature:
+            async_embedding_function(texts: List[str]) -> Awaitable[List[List[float]]]
     """
 
     def __init__(
@@ -292,7 +302,10 @@ class CorpusAutoGenVectorStore:
         metadata_field: Optional[str] = None,
         score_threshold: Optional[float] = None,
         default_top_k: int = 4,
-        embedding_function: Optional[Any] = None,  # Callable[[List[str]], Embeddings]
+        embedding_function: Optional[Callable[[List[str]], Embeddings]] = None,
+        async_embedding_function: Optional[
+            Callable[[List[str]], Awaitable[Embeddings]]
+        ] = None,
     ) -> None:
         self.corpus_adapter: VectorProtocolV1 = corpus_adapter
         self.namespace = namespace
@@ -304,7 +317,9 @@ class CorpusAutoGenVectorStore:
         self.score_threshold = score_threshold
         self.default_top_k = default_top_k
 
+        # Embedding integration
         self.embedding_function = embedding_function
+        self.async_embedding_function = async_embedding_function
 
     # ------------------------------------------------------------------ #
     # Translator (lazy, cached)
@@ -438,7 +453,7 @@ class CorpusAutoGenVectorStore:
         embeddings: Optional[Embeddings],
     ) -> Embeddings:
         """
-        Ensure embeddings are available for a batch of texts.
+        Ensure embeddings are available for a batch of texts (sync).
 
         Behavior:
         - If embeddings are provided, verify length.
@@ -482,6 +497,71 @@ class CorpusAutoGenVectorStore:
             )
         return computed
 
+    async def _ensure_embeddings_async(
+        self,
+        texts: List[str],
+        embeddings: Optional[Embeddings],
+    ) -> Embeddings:
+        """
+        Async-safe version of _ensure_embeddings.
+
+        Behavior:
+        - If embeddings are provided, verify length.
+        - Else, if async_embedding_function is set, await it.
+        - Else, if embedding_function is set, run it in a worker thread.
+        - Else, raise NotSupported.
+        """
+        if embeddings is not None:
+            if len(embeddings) != len(texts):
+                raise BadRequest(
+                    f"embeddings length {len(embeddings)} does not match texts length {len(texts)}",
+                    code=ErrorCodes.BAD_EMBEDDINGS,
+                    details={"texts": len(texts), "embeddings": len(embeddings)},
+                )
+            return embeddings
+
+        if self.async_embedding_function is not None:
+            try:
+                computed = await self.async_embedding_function(texts)
+            except Exception as exc:
+                err = BadRequest(
+                    f"async_embedding_function failed: {exc}",
+                    code=ErrorCodes.BAD_EMBEDDINGS,
+                )
+                attach_context(
+                    err,
+                    framework="autogen",
+                    operation="vector_embed_documents_async",
+                )
+                raise err
+        else:
+            if self.embedding_function is None:
+                raise NotSupported(
+                    "No embedding_function/async_embedding_function configured; caller must supply embeddings",
+                    code=ErrorCodes.NO_EMBEDDING_FUNCTION,
+                    details={"texts": len(texts)},
+                )
+            try:
+                computed = await asyncio.to_thread(self.embedding_function, texts)
+            except Exception as exc:
+                err = BadRequest(
+                    f"embedding_function failed: {exc}",
+                    code=ErrorCodes.BAD_EMBEDDINGS,
+                )
+                attach_context(
+                    err,
+                    framework="autogen",
+                    operation="vector_embed_documents_async",
+                )
+                raise err
+
+        if len(computed) != len(texts):
+            raise BadRequest(
+                f"embedding function returned {len(computed)} embeddings for {len(texts)} texts",
+                code=ErrorCodes.BAD_EMBEDDINGS,
+            )
+        return computed
+
     def _embed_query(
         self,
         query: str,
@@ -489,7 +569,7 @@ class CorpusAutoGenVectorStore:
         embedding: Optional[Sequence[float]] = None,
     ) -> List[float]:
         """
-        Ensure a single query embedding is available.
+        Ensure a single query embedding is available (sync).
 
         Behavior:
         - If `embedding` is provided, use it.
@@ -541,6 +621,131 @@ class CorpusAutoGenVectorStore:
             raise err
 
         return [float(x) for x in embs[0]]
+
+    async def _embed_query_async(
+        self,
+        query: str,
+        *,
+        embedding: Optional[Sequence[float]] = None,
+    ) -> List[float]:
+        """
+        Async-safe query embedding helper.
+
+        Behavior:
+        - If `embedding` is provided, use it.
+        - Else, if `async_embedding_function` is set, await it.
+        - Else, if `embedding_function` is set, run it in a worker thread.
+        - Else, raise NotSupported.
+        """
+        if embedding is not None:
+            return [float(x) for x in embedding]
+
+        if self.async_embedding_function is not None:
+            try:
+                embs = await self.async_embedding_function([query])
+            except Exception as exc:
+                err = BadRequest(
+                    f"async_embedding_function failed for query: {exc}",
+                    code=ErrorCodes.BAD_EMBEDDINGS,
+                )
+                attach_context(
+                    err,
+                    framework="autogen",
+                    operation="vector_embed_query_async",
+                    query=query,
+                )
+                raise err
+        else:
+            if self.embedding_function is None:
+                exc = NotSupported(
+                    "No embedding_function/async_embedding_function configured; caller must supply query embedding",
+                    code=ErrorCodes.NO_EMBEDDING_FUNCTION,
+                )
+                attach_context(
+                    exc,
+                    framework="autogen",
+                    operation="vector_embed_query_async",
+                    query=query,
+                )
+                raise exc
+            try:
+                embs = await asyncio.to_thread(self.embedding_function, [query])
+            except Exception as exc:
+                err = BadRequest(
+                    f"embedding_function failed for query: {exc}",
+                    code=ErrorCodes.BAD_EMBEDDINGS,
+                )
+                attach_context(
+                    err,
+                    framework="autogen",
+                    operation="vector_embed_query_async",
+                    query=query,
+                )
+                raise err
+
+        if not embs or len(embs) != 1:
+            err = BadRequest(
+                "embedding function must return exactly one embedding for a single query",
+                code=ErrorCodes.BAD_EMBEDDINGS,
+            )
+            attach_context(
+                err,
+                framework="autogen",
+                operation="vector_embed_query_async",
+                query=query,
+            )
+            raise err
+
+        return [float(x) for x in embs[0]]
+
+    # ------------------------------------------------------------------ #
+    # Partial upsert failure handling
+    # ------------------------------------------------------------------ #
+
+    def _handle_partial_upsert_failure(
+        self,
+        result: UpsertResult,
+        total_texts: int,
+        namespace: Optional[str],
+    ) -> None:
+        """
+        Best-effort partial failure handling for upserts.
+
+        - Logs a warning if some (but not all) records failed.
+        - Logs a debug sample of individual failures if available.
+        - Only raises if *all* records failed.
+        """
+        try:
+            upserted = int(getattr(result, "upserted_count", 0))
+            failed = int(getattr(result, "failed_count", 0))
+            failures = getattr(result, "failures", None) or []
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "UpsertResult introspection failed in AutoGen adapter: %r", exc
+            )
+            return
+
+        if total_texts <= 0:
+            return
+
+        if failed > 0:
+            logger.warning(
+                "CorpusAutoGenVectorStore upsert partial failure: %s/%s succeeded, %s failed (namespace=%r)",
+                upserted,
+                total_texts,
+                failed,
+                namespace,
+            )
+            for failure in list(failures)[:5]:
+                logger.debug("Upsert failure detail (sample): %r", failure)
+
+        if upserted == 0 and failed >= total_texts:
+            # Treat as hard failure: nothing made it into the index.
+            raise VectorAdapterError(
+                "All documents failed to upsert into vector index",
+                code=ErrorCodes.BAD_UPSERT_RESULT,
+                details={"namespace": namespace, "total": total_texts},
+            )
 
     # ------------------------------------------------------------------ #
     # Translation helpers: match records → AutoGenDocument
@@ -713,11 +918,15 @@ class CorpusAutoGenVectorStore:
             )
 
         # We intentionally ignore the returned ID list; we return our logical IDs.
-        self._translator.upsert(
+        result = self._translator.upsert(
             raw_documents=raw_documents,
             op_ctx=ctx,
             framework_ctx=self._framework_ctx_for_namespace(ns),
         )
+
+        if isinstance(result, UpsertResult):
+            self._handle_partial_upsert_failure(result, len(texts_list), ns)
+
         return ids_norm
 
     @with_async_error_context("add_texts_async")
@@ -742,7 +951,7 @@ class CorpusAutoGenVectorStore:
         ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
         metadatas_norm = self._normalize_metadatas(len(texts_list), metadatas)
         ids_norm = self._normalize_ids(len(texts_list), ids)
-        emb = self._ensure_embeddings(texts_list, embeddings)
+        emb = await self._ensure_embeddings_async(texts_list, embeddings)
 
         ns = self._effective_namespace(namespace)
 
@@ -769,11 +978,15 @@ class CorpusAutoGenVectorStore:
                 }
             )
 
-        await self._translator.arun_upsert(
+        result = await self._translator.arun_upsert(
             raw_documents=raw_documents,
             op_ctx=ctx,
             framework_ctx=self._framework_ctx_for_namespace(ns),
         )
+
+        if isinstance(result, UpsertResult):
+            self._handle_partial_upsert_failure(result, len(texts_list), ns)
+
         return ids_norm
 
     @with_error_context("add_documents_sync")
@@ -931,7 +1144,7 @@ class CorpusAutoGenVectorStore:
         Perform similarity search and return AutoGenDocuments (async).
         """
         ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
-        query_emb = self._embed_query(query, embedding=embedding)
+        query_emb = await self._embed_query_async(query, embedding=embedding)
 
         top_k = k or self.default_top_k
         _warn_if_extreme_k(top_k, op_name="asimilarity_search")
@@ -970,7 +1183,7 @@ class CorpusAutoGenVectorStore:
         Similarity search returning (AutoGenDocument, score) tuples (async).
         """
         ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
-        query_emb = self._embed_query(query, embedding=embedding)
+        query_emb = await self._embed_query_async(query, embedding=embedding)
 
         top_k = k or self.default_top_k
         _warn_if_extreme_k(top_k, op_name="asimilarity_search_with_score")
@@ -1148,7 +1361,8 @@ class CorpusAutoGenVectorStore:
         base_k = k or self.default_top_k
         actual_fetch_k = fetch_k or max(base_k * 4, base_k + 5)
 
-        _warn_if_extreme_k(actual_fetch_k, op_name="max_marginal_relevance_search")
+        _warn_if_extreme_k(base_k, op_name="max_marginal_relevance_search_k")
+        _warn_if_extreme_k(actual_fetch_k, op_name="max_marginal_relevance_search_fetch_k")
 
         raw_query = self._build_raw_query(
             embedding=query_emb,
@@ -1196,12 +1410,13 @@ class CorpusAutoGenVectorStore:
         Perform Maximal Marginal Relevance (MMR) search (async).
         """
         ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
-        query_emb = self._embed_query(query, embedding=embedding)
+        query_emb = await self._embed_query_async(query, embedding=embedding)
 
         base_k = k or self.default_top_k
         actual_fetch_k = fetch_k or max(base_k * 4, base_k + 5)
 
-        _warn_if_extreme_k(actual_fetch_k, op_name="amax_marginal_relevance_search")
+        _warn_if_extreme_k(base_k, op_name="amax_marginal_relevance_search_k")
+        _warn_if_extreme_k(actual_fetch_k, op_name="amax_marginal_relevance_search_fetch_k")
 
         raw_query = self._build_raw_query(
             embedding=query_emb,
@@ -1414,6 +1629,7 @@ class CorpusAutoGenRetrieverTool:
             }
             for d in docs
         ]
+
 
 __all__ = [
     "AutoGenDocument",
