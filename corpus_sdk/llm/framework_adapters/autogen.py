@@ -31,7 +31,8 @@ Design principles
 
 - Non-invasive:
     No retries, circuit breaking, or deadlines are implemented at this layer;
-    the underlying adapter can still apply its own policies.
+    the underlying adapter or caller can still apply its own policies even
+    though configuration fields for timeouts / retries may be present.
 
 - Rich error context:
     Exceptions are annotated via `attach_context` with framework-specific and
@@ -82,6 +83,8 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
+_FRAMEWORK_NAME = "autogen"
+
 # ---------------------------------------------------------------------------
 # Error codes / coercion config
 # ---------------------------------------------------------------------------
@@ -95,18 +98,18 @@ class ErrorCodes:
     specific exception type.
     """
 
-    BAD_OPERATION_CONTEXT = "BAD_OPERATION_CONTEXT"
-    BAD_INIT_CONFIG = "BAD_INIT_CONFIG"
-    BAD_COMPLETION_RESULT = "BAD_COMPLETION_RESULT"
-    BAD_STREAM_CHUNK = "BAD_STREAM_CHUNK"
-    BAD_USAGE_RESULT = "BAD_USAGE_RESULT"
+    BAD_OPERATION_CONTEXT = "AUTOGEN_LLM_BAD_OPERATION_CONTEXT"
+    BAD_INIT_CONFIG = "AUTOGEN_LLM_BAD_INIT_CONFIG"
+    BAD_COMPLETION_RESULT = "AUTOGEN_LLM_BAD_COMPLETION_RESULT"
+    BAD_STREAM_CHUNK = "AUTOGEN_LLM_BAD_STREAM_CHUNK"
+    BAD_USAGE_RESULT = "AUTOGEN_LLM_BAD_USAGE_RESULT"
 
 
-_USAGE_ERROR_CODES = CoercionErrorCodes(
-    invalid_result=ErrorCodes.BAD_USAGE_RESULT,
-    empty_result=ErrorCodes.BAD_USAGE_RESULT,
-    conversion_error=ErrorCodes.BAD_USAGE_RESULT,
-    framework_label="autogen",
+ERROR_CODES = CoercionErrorCodes(
+    invalid_result="AUTOGEN_LLM_INVALID_RESULT",
+    empty_result="AUTOGEN_LLM_EMPTY_RESULT",
+    conversion_error="AUTOGEN_LLM_CONVERSION_ERROR",
+    framework_label=_FRAMEWORK_NAME,
 )
 
 
@@ -153,9 +156,13 @@ class AutoGenClientConfig:
     temperature: float = 0.7
     max_tokens: Optional[int] = None
     framework_version: Optional[str] = None
+
+    # Observability + validation toggles (aligned with other adapters)
     enable_metrics: bool = True
     validate_inputs: bool = True
-    timeout: Optional[float] = None  # Reserved
+
+    # Reserved / pass-through knobs; not implemented at this layer.
+    timeout: Optional[float] = None
     max_retries: int = 0
     request_timeout: float = 60.0
 
@@ -210,7 +217,9 @@ def _extract_basic_context(
     Extract fast, low-cost context for error enrichment.
     """
     dynamic_ctx: Dict[str, Any] = {
+        "framework_name": _FRAMEWORK_NAME,
         "model": getattr(instance, "model", "unknown"),
+        "temperature": getattr(instance, "temperature", 0.7),
         "operation": operation,
     }
 
@@ -266,7 +275,7 @@ def _compute_detailed_context(
         if kwargs.get("context") is not None:
             detailed["has_extra_context"] = True
 
-        # Sampling parameters
+        # Sampling parameters (best-effort)
         for param in (
             "temperature",
             "max_tokens",
@@ -306,10 +315,21 @@ def _create_error_context_decorator(
                         return await func(self, *args, **kwargs)
                     except Exception as exc:  # noqa: BLE001
                         detailed = _compute_detailed_context(args, kwargs)
-                        full_context = {**base_context, **detailed}
+
+                        # Respect enable_metrics: strip message metrics if disabled.
+                        if not getattr(self, "_enable_metrics_flag", True):
+                            detailed.pop("roles_distribution", None)
+                            detailed.pop("total_content_chars", None)
+                            base_context.pop("messages_count", None)
+
+                        full_context = {
+                            "error_codes": ERROR_CODES,
+                            **base_context,
+                            **detailed,
+                        }
                         attach_context(
                             exc,
-                            framework="autogen",
+                            framework=_FRAMEWORK_NAME,
                             operation=f"llm_{operation}",
                             **full_context,
                         )
@@ -327,10 +347,20 @@ def _create_error_context_decorator(
                         return func(self, *args, **kwargs)
                     except Exception as exc:  # noqa: BLE001
                         detailed = _compute_detailed_context(args, kwargs)
-                        full_context = {**base_context, **detailed}
+
+                        if not getattr(self, "_enable_metrics_flag", True):
+                            detailed.pop("roles_distribution", None)
+                            detailed.pop("total_content_chars", None)
+                            base_context.pop("messages_count", None)
+
+                        full_context = {
+                            "error_codes": ERROR_CODES,
+                            **base_context,
+                            **detailed,
+                        }
                         attach_context(
                             exc,
-                            framework="autogen",
+                            framework=_FRAMEWORK_NAME,
                             operation=f"llm_{operation}",
                             **full_context,
                         )
@@ -392,7 +422,7 @@ class CorpusAutoGenChatClient:
         *,
         llm_adapter: LLMProtocolV1,
         config: Optional[AutoGenClientConfig] = None,
-        framework: str = "autogen",
+        framework: str = _FRAMEWORK_NAME,
         translator: Optional[LLMTranslator] = None,
         post_processing_config: Optional[LLMPostProcessingConfig] = None,
         **kwargs: Any,
@@ -452,6 +482,8 @@ class CorpusAutoGenChatClient:
         self._framework_version: Optional[str] = self._config.framework_version
         self._validate_inputs_flag: bool = self._config.validate_inputs
         self._enable_metrics_flag: bool = self._config.enable_metrics
+
+        # Reserved / passthrough config (not implemented here).
         self._request_timeout: float = self._config.request_timeout
         self._max_retries: int = self._config.max_retries
 
@@ -555,9 +587,10 @@ class CorpusAutoGenChatClient:
         """
         Construct an OperationContext from AutoGen-style inputs.
 
-        Context translation is best-effort: failures are logged and
-        annotated via attach_context, but we fall back to None so
-        protocol calls can still succeed without an OperationContext.
+        This is a fail-fast wrapper around the core context translator:
+        - Calls `from_autogen` with conversation + extra_context.
+        - Attaches rich error context and re-raises on failure.
+        - Validates the returned type is OperationContext.
         """
         extra: Dict[str, Any] = dict(extra_context or {})
 
@@ -573,24 +606,19 @@ class CorpusAutoGenChatClient:
         except Exception as exc:  # noqa: BLE001
             attach_context(
                 exc,
-                framework="autogen",
-                operation="context_translation",
+                framework=_FRAMEWORK_NAME,
+                operation="llm_context_translation",
+                error_codes=ERROR_CODES,
+                framework_version=self._framework_version,
             )
-            logger.warning(
-                "Failed to create OperationContext from AutoGen conversation/context: %s. "
-                "Proceeding without OperationContext.",
-                exc,
-            )
-            return None
+            raise
 
         if not isinstance(ctx, OperationContext):
-            logger.warning(
-                "%s: from_autogen produced unsupported context type: %s; "
-                "ignoring OperationContext.",
-                ErrorCodes.BAD_OPERATION_CONTEXT,
-                type(ctx).__name__,
+            raise TypeError(
+                f"{ErrorCodes.BAD_OPERATION_CONTEXT}: "
+                f"from_autogen produced unsupported context type: "
+                f"{type(ctx).__name__}"
             )
-            return None
 
         # Optional overrides for request_id / tenant.
         if request_id is not None or tenant is not None:
@@ -653,7 +681,7 @@ class CorpusAutoGenChatClient:
         separate from the protocol-level OperationContext.
         """
         ctx: Dict[str, Any] = {
-            "framework": "autogen",
+            "framework": _FRAMEWORK_NAME,
             "operation": operation,
             "stream": stream,
         }
@@ -763,8 +791,8 @@ class CorpusAutoGenChatClient:
         try:
             token_usage = coerce_token_usage(
                 result,
-                framework="autogen",
-                error_codes=_USAGE_ERROR_CODES,
+                framework=_FRAMEWORK_NAME,
+                error_codes=ERROR_CODES,
                 logger=logger,
             )
             usage_dict = {
@@ -863,8 +891,8 @@ class CorpusAutoGenChatClient:
             try:
                 token_usage = coerce_token_usage(
                     {"usage": usage},
-                    framework="autogen",
-                    error_codes=_USAGE_ERROR_CODES,
+                    framework=_FRAMEWORK_NAME,
+                    error_codes=ERROR_CODES,
                     logger=logger,
                 )
                 usage_payload = {
@@ -1073,6 +1101,7 @@ __all__ = [
     "AutoGenLLMClientProtocol",
     "CorpusAutoGenChatClient",
     "ErrorCodes",
+    "ERROR_CODES",
     "with_llm_error_context",
     "with_async_llm_error_context",
 ]
