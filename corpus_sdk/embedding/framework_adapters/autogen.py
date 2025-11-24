@@ -324,6 +324,21 @@ class CorpusAutoGenEmbeddings:
                 "interface with an 'embed' method",
             )
 
+        # Light config validation: fail fast on clearly wrong types.
+        if batch_config is not None and not isinstance(batch_config, BatchConfig):
+            raise TypeError(
+                f"batch_config must be a BatchConfig instance, "
+                f"got {type(batch_config).__name__}",
+            )
+        if (
+            text_normalization_config is not None
+            and not isinstance(text_normalization_config, TextNormalizationConfig)
+        ):
+            raise TypeError(
+                "text_normalization_config must be a TextNormalizationConfig instance, "
+                f"got {type(text_normalization_config).__name__}",
+            )
+
         self.corpus_adapter = corpus_adapter
         self.model = model
         self.batch_config = batch_config
@@ -360,6 +375,109 @@ class CorpusAutoGenEmbeddings:
         )
         return translator
 
+    # ---- context helpers ------------------------------------------------- #
+
+    def _build_core_context(
+        self,
+        autogen_context: Optional[Mapping[str, Any]],
+    ) -> Optional[OperationContext]:
+        """
+        Build an OperationContext from an AutoGen-style context mapping.
+
+        Context translation is *best-effort*: failures are logged and
+        attached to the exception, but embedding operations must still
+        succeed without an OperationContext.
+        """
+        if autogen_context is None:
+            return None
+
+        if not isinstance(autogen_context, Mapping):
+            logger.warning(
+                "[%s] autogen_context should be a Mapping, got %s; ignoring context",
+                ErrorCodes.AUTOGEN_CONTEXT_INVALID,
+                type(autogen_context).__name__,
+            )
+            return None
+
+        try:
+            core_candidate = context_from_autogen(autogen_context)
+        except Exception as exc:  # noqa: BLE001
+            # Context translation is best-effort and must never break embeddings.
+            logger.warning(
+                "Failed to create OperationContext from autogen_context: %s. "
+                "Proceeding without OperationContext.",
+                exc,
+            )
+            try:
+                snapshot = dict(autogen_context)
+            except TypeError:
+                snapshot = {"repr": str(autogen_context)}
+            attach_context(
+                exc,
+                framework="autogen",
+                operation="context_build",
+                autogen_context_snapshot=snapshot,
+                autogen_config=self.autogen_config,
+            )
+            return None
+
+        if isinstance(core_candidate, OperationContext):
+            logger.debug(
+                "Successfully created OperationContext from AutoGen context "
+                "with conversation_id=%s",
+                autogen_context.get("conversation_id", "unknown"),
+            )
+            return core_candidate
+
+        logger.warning(
+            "context_from_autogen returned non-OperationContext type: %s. "
+            "Ignoring OperationContext.",
+            type(core_candidate).__name__,
+        )
+        return None
+
+    def _build_framework_context(
+        self,
+        *,
+        autogen_context: Optional[Mapping[str, Any]],
+        model: Optional[str],
+        core_ctx: Optional[OperationContext],
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """
+        Build the framework-specific context mapping for the translator.
+
+        This carries observability hints and AutoGen-specific routing fields,
+        separate from the protocol-level OperationContext.
+        """
+        effective_model = model or self.model
+
+        base: Dict[str, Any] = {
+            "framework": "autogen",
+            "autogen_config": dict(self.autogen_config),
+        }
+        if effective_model:
+            base["model"] = effective_model
+
+        if autogen_context:
+            if "agent_name" in autogen_context:
+                base["agent_name"] = autogen_context["agent_name"]
+            if "conversation_id" in autogen_context:
+                base["conversation_id"] = autogen_context["conversation_id"]
+            if "workflow_type" in autogen_context:
+                base["workflow_type"] = autogen_context["workflow_type"]
+            if "retriever_name" in autogen_context:
+                base["retriever_name"] = autogen_context["retriever_name"]
+
+        # Include any extra call-specific hints.
+        base.update(kwargs)
+
+        # Also expose the OperationContext itself for downstream inspection.
+        if core_ctx is not None:
+            base["_operation_context"] = core_ctx
+
+        return base
+
     def _build_contexts(
         self,
         *,
@@ -368,87 +486,18 @@ class CorpusAutoGenEmbeddings:
         **kwargs: Any,
     ) -> Tuple[Optional[OperationContext], Dict[str, Any]]:
         """
-        Build contexts for AutoGen execution environment.
+        Build both OperationContext and framework_ctx for an embedding call.
 
-        Returns
-        -------
-        Tuple of:
-        - core_ctx: core OperationContext or None if no/invalid context
-        - framework_ctx: AutoGen-specific context for translator
+        This is a thin wrapper around `_build_core_context` and
+        `_build_framework_context` to keep call sites terse.
         """
-        core_ctx: Optional[OperationContext] = None
-        framework_ctx: Dict[str, Any] = {
-            "framework": "autogen",
-            "autogen_config": dict(self.autogen_config),
-        }
-
-        # Validate and translate AutoGen context to OperationContext
-        if autogen_context is not None:
-            if not isinstance(autogen_context, Mapping):
-                logger.warning(
-                    "[%s] autogen_context should be a Mapping, got %s; ignoring context",
-                    ErrorCodes.AUTOGEN_CONTEXT_INVALID,
-                    type(autogen_context).__name__,
-                )
-            else:
-                try:
-                    core_candidate = context_from_autogen(autogen_context)
-                except Exception as exc:  # noqa: BLE001
-                    # Context translation is best-effort and must never break embeddings
-                    logger.warning(
-                        "Failed to create OperationContext from autogen_context: %s. "
-                        "Proceeding without OperationContext.",
-                        exc,
-                    )
-                    try:
-                        snapshot = dict(autogen_context)
-                    except TypeError:
-                        snapshot = {"repr": repr(autogen_context)}
-                    attach_context(
-                        exc,
-                        framework="autogen",
-                        operation="context_build",
-                        autogen_context_snapshot=snapshot,
-                        autogen_config=self.autogen_config,
-                    )
-                else:
-                    if isinstance(core_candidate, OperationContext):
-                        core_ctx = core_candidate
-                        logger.debug(
-                            "Successfully created OperationContext from AutoGen context "
-                            "with conversation_id=%s",
-                            autogen_context.get("conversation_id", "unknown"),
-                        )
-                    else:
-                        logger.warning(
-                            "context_from_autogen returned non-OperationContext type: %s. "
-                            "Ignoring OperationContext.",
-                            type(core_candidate).__name__,
-                        )
-
-        # Framework-level context for AutoGen-specific hints
-        effective_model = model or self.model
-        if effective_model:
-            framework_ctx["model"] = effective_model
-
-        # Add AutoGen-specific context for observability and optimization
-        if autogen_context:
-            if "agent_name" in autogen_context:
-                framework_ctx["agent_name"] = autogen_context["agent_name"]
-            if "conversation_id" in autogen_context:
-                framework_ctx["conversation_id"] = autogen_context["conversation_id"]
-            if "workflow_type" in autogen_context:
-                framework_ctx["workflow_type"] = autogen_context["workflow_type"]
-            if "retriever_name" in autogen_context:
-                framework_ctx["retriever_name"] = autogen_context["retriever_name"]
-
-        # Include any extra call-specific hints
-        framework_ctx.update(kwargs)
-
-        # Also expose the OperationContext itself for downstream inspection
-        if core_ctx is not None:
-            framework_ctx["_operation_context"] = core_ctx
-
+        core_ctx = self._build_core_context(autogen_context)
+        framework_ctx = self._build_framework_context(
+            autogen_context=autogen_context,
+            model=model,
+            core_ctx=core_ctx,
+            **kwargs,
+        )
         return core_ctx, framework_ctx
 
     def _coerce_embedding_matrix(self, result: Any) -> List[List[float]]:
@@ -681,7 +730,11 @@ def _validate_vector_store_for_autogen(vector_store: Any) -> None:
 def create_retriever(
     corpus_adapter: EmbeddingProtocolV1,
     vector_store: Any,
-    **kwargs: Any,
+    *,
+    model: Optional[str] = None,
+    batch_config: Optional[BatchConfig] = None,
+    text_normalization_config: Optional[TextNormalizationConfig] = None,
+    autogen_config: Optional[Dict[str, Any]] = None,
 ) -> AutoGenRetriever:
     """
     Create an AutoGen VectorStoreRetriever with Corpus embeddings.
@@ -689,19 +742,33 @@ def create_retriever(
     This provides a convenient way to create AutoGen retrievers
     with Corpus embeddings in a single function call.
 
+    Parameters
+    ----------
+    corpus_adapter:
+        Underlying embedding adapter implementing `EmbeddingProtocolV1`.
+    vector_store:
+        Vector store instance compatible with AutoGen's VectorStoreRetriever.
+    model:
+        Optional model identifier to use for embeddings.
+    batch_config:
+        Optional batching configuration forwarded to `CorpusAutoGenEmbeddings`.
+    text_normalization_config:
+        Optional text normalization configuration forwarded to
+        `CorpusAutoGenEmbeddings`.
+    autogen_config:
+        Optional AutoGen-specific configuration for agent/workflow integration.
+
     Example usage:
     ```python
     from corpus_sdk.embedding.framework_adapters.autogen import create_retriever
     from chromadb import Chroma
 
-    # Create vector store
     vectorstore = Chroma(collection_name="autogen_docs")
 
-    # Create retriever with Corpus embeddings
     retriever = create_retriever(
         corpus_adapter=my_adapter,
         vector_store=vectorstore,
-        model="text-embedding-3-large"
+        model="text-embedding-3-large",
     )
     ```
     """
@@ -720,7 +787,10 @@ def create_retriever(
 
     embedding_function = CorpusAutoGenEmbeddings(
         corpus_adapter=corpus_adapter,
-        **kwargs,
+        model=model,
+        batch_config=batch_config,
+        text_normalization_config=text_normalization_config,
+        autogen_config=autogen_config,
     )
 
     # Configure the vector store with our embedding function.
@@ -753,7 +823,9 @@ def create_retriever(
 def register_embeddings(
     corpus_adapter: EmbeddingProtocolV1,
     model: Optional[str] = None,
-    **kwargs: Any,
+    batch_config: Optional[BatchConfig] = None,
+    text_normalization_config: Optional[TextNormalizationConfig] = None,
+    autogen_config: Optional[Dict[str, Any]] = None,
 ) -> CorpusAutoGenEmbeddings:
     """
     Register Corpus embeddings for global use in AutoGen workflows.
@@ -764,7 +836,9 @@ def register_embeddings(
     embeddings = CorpusAutoGenEmbeddings(
         corpus_adapter=corpus_adapter,
         model=model,
-        **kwargs,
+        batch_config=batch_config,
+        text_normalization_config=text_normalization_config,
+        autogen_config=autogen_config,
     )
 
     logger.info(
