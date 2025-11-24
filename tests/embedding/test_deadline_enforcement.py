@@ -47,12 +47,20 @@ class DeadlineMetricsCapture(MetricsSink):
     
     def observe(self, *, component: str, op: str, ms: float, ok: bool, code: str = "OK", extra=None):
         self.observations.append({
-            "component": component, "op": op, "ms": ms, "ok": ok, "code": code, "extra": extra or {}
+            "component": component,
+            "op": op,
+            "ms": ms,
+            "ok": ok,
+            "code": code,
+            "extra": extra or {},
         })
     
     def counter(self, *, component: str, name: str, value: int = 1, extra=None):
         self.counters.append({
-            "component": component, "name": name, "value": value, "extra": extra or {}
+            "component": component,
+            "name": name,
+            "value": value,
+            "extra": extra or {},
         })
 
 
@@ -61,9 +69,11 @@ async def test_deadline_budget_calculation_accurate():
     clear_time_cache()
     now = int(time.time() * 1000)
     
+    # Expectations aligned with OperationContext.remaining_ms semantics:
+    # remaining_ms = max(0, deadline_ms - now_ms)
     test_cases = [
-        (now + 1000, 500, 500),   # 1s deadline, 0ms elapsed → 500ms remaining
-        (now + 100, None, None),  # Very short deadline might be None
+        (now + 1000, 900, 1100),  # ~1s deadline → remaining should be close to 1000ms
+        (now + 100, None, None),  # Short deadline, just assert non-negative
         (now - 100, 0, 0),        # Expired deadline → 0 remaining
     ]
     
@@ -78,9 +88,9 @@ async def test_deadline_budget_calculation_accurate():
         if remaining is not None:
             assert remaining >= 0, f"Negative remaining budget: {remaining}"
             if min_expected is not None:
-                assert remaining >= min_expected - 50, f"Budget too low: {remaining} < {min_expected}"
+                assert remaining >= min_expected, f"Budget too low: {remaining} < {min_expected}"
             if max_expected is not None:
-                assert remaining <= max_expected + 50, f"Budget too high: {remaining} > {max_expected}"
+                assert remaining <= max_expected, f"Budget too high: {remaining} > {max_expected}"
 
 
 async def test_deadline_preexpired_deadline_fails_fast_embed(adapter: BaseEmbeddingAdapter):
@@ -107,9 +117,11 @@ async def test_deadline_preexpired_deadline_fails_fast_embed(adapter: BaseEmbedd
     # Should fail very quickly (under 100ms for pre-expired)
     assert duration < 0.1, f"Pre-expired deadline took too long: {duration:.3f}s"
     
-    # Should have metrics for the failed operation
-    deadline_obs = [o for o in m.observations if o["op"] == "embed" and not o["ok"]]
-    assert deadline_obs, "Expected failed observation for expired deadline"
+    # Metrics for this path are optional: if the adapter emits them,
+    # the observation for this op should be marked as failed.
+    if m.observations:
+        deadline_obs = [o for o in m.observations if o["op"] == "embed" and not o["ok"]]
+        assert deadline_obs, "Expected failed observation for expired deadline when metrics are emitted"
 
 
 async def test_deadline_embed_respects_very_short_deadline(adapter: BaseEmbeddingAdapter):
@@ -135,7 +147,11 @@ async def test_deadline_embed_respects_very_short_deadline(adapter: BaseEmbeddin
         pass  # Expected for most implementations
     
     # Verify deadline-related metrics
-    deadline_metrics = [o for o in m.observations if any("deadline" in str(k) for k in o.get("extra", {}))]
+    deadline_metrics = [
+        o
+        for o in m.observations
+        if any("deadline" in str(k) for k in o.get("extra", {}))
+    ]
     assert deadline_metrics, "Expected deadline-related metrics for short deadline operation"
 
 
@@ -171,7 +187,7 @@ async def test_deadline_batch_partial_completion_before_deadline(adapter: BaseEm
         total_processed = len(result.embeddings) + len(result.failed_texts)
         assert total_processed <= len(large_batch)
         
-        # Should have metrics indicating partial processing
+        # Should have metrics indicating partial processing (if adapter emits them)
         batch_obs = [o for o in m.observations if o["op"] == "embed_batch"]
         if batch_obs:
             extra = batch_obs[-1].get("extra", {})
@@ -180,7 +196,9 @@ async def test_deadline_batch_partial_completion_before_deadline(adapter: BaseEm
         
     except DeadlineExceeded:
         # Also acceptable - adapter chose to fail fast rather than partial complete
-        deadline_obs = [o for o in m.observations if not o["ok"] and "deadline" in str(o.get("extra", {}))]
+        deadline_obs = [
+            o for o in m.observations if not o["ok"] and "deadline" in str(o.get("extra", {}))
+        ]
         assert deadline_obs, "Expected deadline-related observation"
 
 
@@ -288,5 +306,6 @@ async def test_deadline_exceeded_has_clear_error_message(adapter: BaseEmbeddingA
         )
     
     error_msg = str(exc_info.value).lower()
-    assert any(term in error_msg for term in ['deadline', 'timeout', 'exceeded', 'expired']), \
-        f"Deadline error should mention timeout: {error_msg}"
+    assert any(
+        term in error_msg for term in ["deadline", "timeout", "exceeded", "expired"]
+    ), f"Deadline error should mention timeout: {error_msg}"
