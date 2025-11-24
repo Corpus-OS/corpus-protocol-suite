@@ -545,60 +545,58 @@ class CorpusAutoGenChatClient:
             if "content" not in msg:
                 raise ValueError(f"messages[{index}] is missing required 'content' field")
 
-    def _build_ctx_and_params(
+    # ---- context & params helpers ------------------------------------- #
+
+    def _build_core_context(
         self,
         *,
-        conversation: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-        **kwargs: Any,
-    ) -> Tuple[Optional[OperationContext], Dict[str, Any]]:
+        conversation: Optional[Any],
+        extra_context: Optional[Mapping[str, Any]],
+        request_id: Optional[str],
+        tenant: Optional[str],
+    ) -> Optional[OperationContext]:
         """
-        Construct OperationContext and sampling params from kwargs.
+        Construct an OperationContext from AutoGen-style inputs.
 
-        Recognized kwargs (removed from kwargs when processed):
-            - model
-            - temperature
-            - max_tokens
-            - top_p
-            - frequency_penalty
-            - presence_penalty
-            - stop  (str | list[str])
-            - system_message
-            - request_id
-            - tenant
+        Context translation is best-effort: failures are logged and
+        annotated via attach_context, but we fall back to None so
+        protocol calls can still succeed without an OperationContext.
         """
         extra: Dict[str, Any] = dict(extra_context or {})
 
-        # If no conversation/extra, let downstream create an "empty" context.
         if conversation is None and not extra:
-            ctx: Optional[OperationContext] = None
-        else:
-            try:
-                ctx = core_ctx_from_autogen(
-                    conversation,
-                    framework_version=self._framework_version,
-                    **extra,
-                )
-            except Exception as exc:  # noqa: BLE001
-                attach_context(
-                    exc,
-                    framework="autogen",
-                    operation="context_translation",
-                )
-                raise
+            return None
 
-            if not isinstance(ctx, OperationContext):
-                raise TypeError(
-                    f"{ErrorCodes.BAD_OPERATION_CONTEXT}: "
-                    f"from_autogen produced unsupported context type: "
-                    f"{type(ctx).__name__}"
-                )
+        try:
+            ctx = core_ctx_from_autogen(
+                conversation,
+                framework_version=self._framework_version,
+                **extra,
+            )
+        except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework="autogen",
+                operation="context_translation",
+            )
+            logger.warning(
+                "Failed to create OperationContext from AutoGen conversation/context: %s. "
+                "Proceeding without OperationContext.",
+                exc,
+            )
+            return None
+
+        if not isinstance(ctx, OperationContext):
+            logger.warning(
+                "%s: from_autogen produced unsupported context type: %s; "
+                "ignoring OperationContext.",
+                ErrorCodes.BAD_OPERATION_CONTEXT,
+                type(ctx).__name__,
+            )
+            return None
 
         # Optional overrides for request_id / tenant.
-        request_id = kwargs.pop("request_id", None)
-        tenant = kwargs.pop("tenant", None)
-
-        if ctx is not None and (request_id is not None or tenant is not None):
+        if request_id is not None or tenant is not None:
             ctx = OperationContext(
                 request_id=request_id or ctx.request_id,
                 idempotency_key=ctx.idempotency_key,
@@ -608,6 +606,18 @@ class CorpusAutoGenChatClient:
                 attrs=ctx.attrs,
             )
 
+        return ctx
+
+    def _build_sampling_params(
+        self,
+        *,
+        kwargs: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Extract sampling / routing parameters from kwargs.
+
+        Recognized keys are removed from kwargs; unknown keys are ignored.
+        """
         # Stop sequences: OpenAI uses "stop" (str or list[str]).
         stop_arg = kwargs.pop("stop", None)
         stop_sequences: Optional[list[str]] = None
@@ -616,7 +626,6 @@ class CorpusAutoGenChatClient:
         elif isinstance(stop_arg, (list, tuple)):
             stop_sequences = [str(s) for s in stop_arg]
 
-        # Sampling and routing params (translator-facing).
         params: Dict[str, Any] = {
             "model": kwargs.pop("model", self.model),
             "temperature": kwargs.pop("temperature", self.temperature),
@@ -629,8 +638,79 @@ class CorpusAutoGenChatClient:
         }
 
         # Drop None values so the translator sees a clean param set.
-        params = {k: v for k, v in params.items() if v is not None}
-        return ctx, params
+        return {k: v for k, v in params.items() if v is not None}
+
+    def _build_framework_ctx(
+        self,
+        *,
+        operation: str,
+        stream: bool,
+        model: Optional[str],
+        request_id: Optional[str],
+        tenant: Optional[str],
+    ) -> Dict[str, Any]:
+        """
+        Build a framework_ctx mapping for LLMTranslator calls.
+
+        Carries observability hints and AutoGen-specific routing fields,
+        separate from the protocol-level OperationContext.
+        """
+        ctx: Dict[str, Any] = {
+            "framework": "autogen",
+            "operation": operation,
+            "stream": stream,
+        }
+        if self._framework_version is not None:
+            ctx["framework_version"] = self._framework_version
+        if model is not None:
+            ctx["model"] = model
+        if request_id is not None:
+            ctx["request_id"] = request_id
+        if tenant is not None:
+            ctx["tenant"] = tenant
+        return ctx
+
+    def _build_ctx_and_params(
+        self,
+        *,
+        conversation: Optional[Any],
+        extra_context: Optional[Mapping[str, Any]],
+        stream: bool,
+        operation: str,
+        **kwargs: Any,
+    ) -> Tuple[Optional[OperationContext], Dict[str, Any], Dict[str, Any]]:
+        """
+        High-level helper to build:
+        - OperationContext
+        - sampling params
+        - framework_ctx for LLMTranslator
+
+        This keeps the public create/acreate methods thin and symmetric.
+        """
+        # Extract request-scoped identifiers early so both context and
+        # framework_ctx can see them.
+        request_id = kwargs.pop("request_id", None)
+        tenant = kwargs.pop("tenant", None)
+
+        ctx = self._build_core_context(
+            conversation=conversation,
+            extra_context=extra_context,
+            request_id=request_id,
+            tenant=tenant,
+        )
+
+        params = self._build_sampling_params(kwargs=kwargs)
+        model_for_ctx = str(params.get("model")) if "model" in params else None
+
+        framework_ctx = self._build_framework_ctx(
+            operation=operation,
+            stream=stream,
+            model=model_for_ctx,
+            request_id=request_id,
+            tenant=tenant,
+        )
+
+        return ctx, params, framework_ctx
 
     # ------------------------------------------------------------------ #
     # OpenAI-style shaping helpers (thin, usage via framework_utils)
@@ -868,15 +948,17 @@ class CorpusAutoGenChatClient:
 
         stream = bool(kwargs.pop("stream", False))
 
-        # Extract AutoGen / extra context (kept thin, passed to translator).
+        # Extract AutoGen / extra context (kept thin, passed through to context helpers).
         conversation = kwargs.pop("conversation", None)
         extra_context = kwargs.pop("context", None)
         if extra_context is not None and not isinstance(extra_context, Mapping):
             extra_context = None
 
-        ctx, params = self._build_ctx_and_params(
+        ctx, params, framework_ctx = self._build_ctx_and_params(
             conversation=conversation,
             extra_context=extra_context,
+            stream=stream,
+            operation="acreate_stream" if stream else "acreate",
             **kwargs,
         )
 
@@ -885,7 +967,7 @@ class CorpusAutoGenChatClient:
                 return await self._translator.arun_complete(
                     raw_messages=messages,
                     op_ctx=ctx,
-                    framework_ctx=None,
+                    framework_ctx=framework_ctx,
                     **params,
                 )
 
@@ -903,7 +985,7 @@ class CorpusAutoGenChatClient:
                 chunk_iter = await self._translator.arun_stream(
                     raw_messages=messages,
                     op_ctx=ctx,
-                    framework_ctx=None,
+                    framework_ctx=framework_ctx,
                     **params,
                 )
 
@@ -912,7 +994,7 @@ class CorpusAutoGenChatClient:
                         chunk,
                         stream_id=stream_id,
                         created=created,
-                        model_fallback=params.get("model", self.model),
+                        model_fallback=str(params.get("model", self.model)),
                         is_first=is_first,
                     )
                     is_first = False
@@ -961,9 +1043,11 @@ class CorpusAutoGenChatClient:
         if extra_context is not None and not isinstance(extra_context, Mapping):
             extra_context = None
 
-        ctx, params = self._build_ctx_and_params(
+        ctx, params, framework_ctx = self._build_ctx_and_params(
             conversation=conversation,
             extra_context=extra_context,
+            stream=stream,
+            operation="create_stream" if stream else "create",
             **kwargs,
         )
 
@@ -971,7 +1055,7 @@ class CorpusAutoGenChatClient:
             result = self._translator.complete(
                 raw_messages=messages,
                 op_ctx=ctx,
-                framework_ctx=None,
+                framework_ctx=framework_ctx,
                 **params,
             )
             return self._completion_to_openai(result)
@@ -987,7 +1071,7 @@ class CorpusAutoGenChatClient:
                 chunk_iter = self._translator.stream(
                     raw_messages=messages,
                     op_ctx=ctx,
-                    framework_ctx=None,
+                    framework_ctx=framework_ctx,
                     **params,
                 )
 
@@ -996,7 +1080,7 @@ class CorpusAutoGenChatClient:
                         chunk,
                         stream_id=stream_id,
                         created=created,
-                        model_fallback=params.get("model", self.model),
+                        model_fallback=str(params.get("model", self.model)),
                         is_first=is_first,
                     )
                     is_first = False
