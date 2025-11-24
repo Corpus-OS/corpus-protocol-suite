@@ -46,6 +46,7 @@ from functools import cached_property
 from typing import (
     Any,
     AsyncIterator,
+    Callable,
     Dict,
     Iterator,
     List,
@@ -53,7 +54,6 @@ from typing import (
     Optional,
     Protocol,
     TypeVar,
-    Callable,
 )
 
 from corpus_sdk.core.context_translation import (
@@ -68,10 +68,10 @@ from corpus_sdk.graph.framework_adapters.common.graph_translation import (
 from corpus_sdk.graph.framework_adapters.common.framework_utils import (
     create_graph_error_context_decorator,
     graph_capabilities_to_dict,
-    validate_graph_result_type,
-    validate_graph_query,
-    validate_upsert_nodes_spec,
     validate_batch_operations,
+    validate_graph_query,
+    validate_graph_result_type,
+    validate_upsert_nodes_spec,
 )
 from corpus_sdk.graph.graph_base import (
     BadRequest,
@@ -432,7 +432,7 @@ class CorpusAutoGenGraphClient:
             result: QueryResult,
             *,
             op_ctx: OperationContext,
-            framework_ctx: Optional[Any] = None,
+            framework_ctx: Optional[Mapping[str, Any]] = None,
         ) -> QueryResult:
             return result
 
@@ -441,7 +441,7 @@ class CorpusAutoGenGraphClient:
             chunk: QueryChunk,
             *,
             op_ctx: OperationContext,
-            framework_ctx: Optional[Any] = None,
+            framework_ctx: Optional[Mapping[str, Any]] = None,
         ) -> QueryChunk:
             return chunk
 
@@ -450,7 +450,7 @@ class CorpusAutoGenGraphClient:
             result: BulkVerticesResult,
             *,
             op_ctx: OperationContext,
-            framework_ctx: Optional[Any] = None,
+            framework_ctx: Optional[Mapping[str, Any]] = None,
         ) -> BulkVerticesResult:
             return result
 
@@ -459,7 +459,7 @@ class CorpusAutoGenGraphClient:
             result: BatchResult,
             *,
             op_ctx: OperationContext,
-            framework_ctx: Optional[Any] = None,
+            framework_ctx: Optional[Mapping[str, Any]] = None,
         ) -> BatchResult:
             return result
 
@@ -468,7 +468,7 @@ class CorpusAutoGenGraphClient:
             schema: GraphSchema,
             *,
             op_ctx: OperationContext,
-            framework_ctx: Optional[Any] = None,
+            framework_ctx: Optional[Mapping[str, Any]] = None,
         ) -> GraphSchema:
             return schema
 
@@ -584,7 +584,11 @@ class CorpusAutoGenGraphClient:
                 framework="autogen",
                 operation="context_translation",
             )
-            raise
+            # Surface a consistent BadRequest with symbolic error code.
+            raise BadRequest(
+                "Failed to build OperationContext from AutoGen inputs",
+                code=ErrorCodes.BAD_OPERATION_CONTEXT,
+            ) from exc
 
         if not isinstance(ctx, OperationContext):
             raise BadRequest(
@@ -636,20 +640,29 @@ class CorpusAutoGenGraphClient:
 
         return raw
 
-    def _framework_ctx_for_namespace(
+    def _framework_ctx(
         self,
-        namespace: Optional[str],
+        *,
+        operation: str,
+        namespace: Optional[str] = None,
     ) -> Mapping[str, Any]:
         """
-        Build a minimal framework_ctx mapping that lets the common translator
-        derive a preferred namespace when needed.
+        Build a framework_ctx mapping for GraphTranslator with basic
+        observability hints and the effective namespace.
         """
+        ctx: Dict[str, Any] = {
+            "framework": "autogen",
+            "operation": operation,
+        }
+
+        if self._framework_version is not None:
+            ctx["framework_version"] = self._framework_version
+
         effective_namespace = namespace or self._default_namespace
-        return (
-            {"namespace": effective_namespace}
-            if effective_namespace is not None
-            else {}
-        )
+        if effective_namespace is not None:
+            ctx["namespace"] = effective_namespace
+
+        return ctx
 
     def _validate_upsert_edges_spec(self, spec: UpsertEdgesSpec) -> None:
         """
@@ -657,12 +670,30 @@ class CorpusAutoGenGraphClient:
 
         (We still use shared validation helpers for node specs and batch ops.)
         """
-        if not spec.edges:
+        # Basic structural checks.
+        if spec.edges is None:
+            raise BadRequest("UpsertEdgesSpec.edges must not be None")
+
+        try:
+            edges_iter = list(spec.edges)
+        except TypeError as exc:
+            raise BadRequest(
+                "UpsertEdgesSpec.edges must be an iterable of edges",
+            ) from exc
+
+        if not edges_iter:
             raise BadRequest("UpsertEdgesSpec must contain at least one edge")
 
-        for edge in spec.edges:
+        for edge in edges_iter:
             if not getattr(edge, "id", None):
                 raise BadRequest("All edges must have an ID")
+            # Optional: tighten further if your schema requires it.
+            # Example (commented to avoid hard-coding schema assumptions):
+            # if not getattr(edge, "from_id", None) or not getattr(edge, "to_id", None):
+            #     raise BadRequest("All edges must have from_id and to_id")
+
+        # Mutate spec.edges to the list we just validated for consistency.
+        spec.edges = edges_iter  # type: ignore[assignment]
 
     # ------------------------------------------------------------------ #
     # Capabilities / schema / health
@@ -708,7 +739,7 @@ class CorpusAutoGenGraphClient:
         )
         schema = self._translator.get_schema(
             op_ctx=ctx,
-            framework_ctx={},
+            framework_ctx=self._framework_ctx(operation="get_schema"),
         )
         return validate_graph_result_type(
             schema,
@@ -735,7 +766,7 @@ class CorpusAutoGenGraphClient:
         )
         schema = await self._translator.arun_get_schema(
             op_ctx=ctx,
-            framework_ctx={},
+            framework_ctx=self._framework_ctx(operation="get_schema"),
         )
         return validate_graph_result_type(
             schema,
@@ -762,7 +793,7 @@ class CorpusAutoGenGraphClient:
         )
         health_result = self._translator.health(
             op_ctx=ctx,
-            framework_ctx={},
+            framework_ctx=self._framework_ctx(operation="health"),
         )
         return validate_graph_result_type(
             health_result,
@@ -789,7 +820,7 @@ class CorpusAutoGenGraphClient:
         )
         health_result = await self._translator.arun_health(
             op_ctx=ctx,
-            framework_ctx={},
+            framework_ctx=self._framework_ctx(operation="health"),
         )
         return validate_graph_result_type(
             health_result,
@@ -833,7 +864,10 @@ class CorpusAutoGenGraphClient:
             timeout_ms=timeout_ms,
             stream=False,
         )
-        framework_ctx = self._framework_ctx_for_namespace(namespace)
+        framework_ctx = self._framework_ctx(
+            operation="query",
+            namespace=namespace,
+        )
 
         result = self._translator.query(
             raw_query,
@@ -879,7 +913,10 @@ class CorpusAutoGenGraphClient:
             timeout_ms=timeout_ms,
             stream=False,
         )
-        framework_ctx = self._framework_ctx_for_namespace(namespace)
+        framework_ctx = self._framework_ctx(
+            operation="query",
+            namespace=namespace,
+        )
 
         result = await self._translator.arun_query(
             raw_query,
@@ -931,7 +968,10 @@ class CorpusAutoGenGraphClient:
             timeout_ms=timeout_ms,
             stream=True,
         )
-        framework_ctx = self._framework_ctx_for_namespace(namespace)
+        framework_ctx = self._framework_ctx(
+            operation="stream_query",
+            namespace=namespace,
+        )
 
         for chunk in self._translator.query_stream(
             raw_query,
@@ -974,7 +1014,10 @@ class CorpusAutoGenGraphClient:
             timeout_ms=timeout_ms,
             stream=True,
         )
-        framework_ctx = self._framework_ctx_for_namespace(namespace)
+        framework_ctx = self._framework_ctx(
+            operation="stream_query",
+            namespace=namespace,
+        )
 
         async for chunk in self._translator.arun_query_stream(
             raw_query,
@@ -1013,8 +1056,9 @@ class CorpusAutoGenGraphClient:
             conversation=conversation,
             extra_context=extra_context,
         )
-        framework_ctx = self._framework_ctx_for_namespace(
-            getattr(spec, "namespace", None),
+        framework_ctx = self._framework_ctx(
+            operation="upsert_nodes",
+            namespace=getattr(spec, "namespace", None),
         )
 
         result = self._translator.upsert_nodes(
@@ -1046,8 +1090,9 @@ class CorpusAutoGenGraphClient:
             conversation=conversation,
             extra_context=extra_context,
         )
-        framework_ctx = self._framework_ctx_for_namespace(
-            getattr(spec, "namespace", None),
+        framework_ctx = self._framework_ctx(
+            operation="upsert_nodes",
+            namespace=getattr(spec, "namespace", None),
         )
 
         result = await self._translator.arun_upsert_nodes(
@@ -1079,8 +1124,9 @@ class CorpusAutoGenGraphClient:
             conversation=conversation,
             extra_context=extra_context,
         )
-        framework_ctx = self._framework_ctx_for_namespace(
-            getattr(spec, "namespace", None),
+        framework_ctx = self._framework_ctx(
+            operation="upsert_edges",
+            namespace=getattr(spec, "namespace", None),
         )
 
         result = self._translator.upsert_edges(
@@ -1112,8 +1158,9 @@ class CorpusAutoGenGraphClient:
             conversation=conversation,
             extra_context=extra_context,
         )
-        framework_ctx = self._framework_ctx_for_namespace(
-            getattr(spec, "namespace", None),
+        framework_ctx = self._framework_ctx(
+            operation="upsert_edges",
+            namespace=getattr(spec, "namespace", None),
         )
 
         result = await self._translator.arun_upsert_edges(
@@ -1150,14 +1197,31 @@ class CorpusAutoGenGraphClient:
             conversation=conversation,
             extra_context=extra_context,
         )
-        framework_ctx = self._framework_ctx_for_namespace(
-            getattr(spec, "namespace", None),
+        namespace = getattr(spec, "namespace", None)
+        framework_ctx = self._framework_ctx(
+            operation="delete_nodes",
+            namespace=namespace,
         )
 
         if spec.filter is not None:
             raw_filter_or_ids: Any = spec.filter
+            logger.debug(
+                "delete_nodes using filter in namespace=%s",
+                namespace,
+            )
         else:
-            raw_filter_or_ids = list(spec.ids or [])
+            ids = list(spec.ids or [])
+            if not ids:
+                raise BadRequest(
+                    "DeleteNodesSpec must specify either filter or non-empty ids",
+                    code=ErrorCodes.BAD_ADAPTER_RESULT,
+                )
+            raw_filter_or_ids = ids
+            logger.debug(
+                "delete_nodes using %d ids in namespace=%s",
+                len(ids),
+                namespace,
+            )
 
         result = self._translator.delete_nodes(
             raw_filter_or_ids,
@@ -1186,14 +1250,31 @@ class CorpusAutoGenGraphClient:
             conversation=conversation,
             extra_context=extra_context,
         )
-        framework_ctx = self._framework_ctx_for_namespace(
-            getattr(spec, "namespace", None),
+        namespace = getattr(spec, "namespace", None)
+        framework_ctx = self._framework_ctx(
+            operation="delete_nodes",
+            namespace=namespace,
         )
 
         if spec.filter is not None:
             raw_filter_or_ids: Any = spec.filter
+            logger.debug(
+                "adelete_nodes using filter in namespace=%s",
+                namespace,
+            )
         else:
-            raw_filter_or_ids = list(spec.ids or [])
+            ids = list(spec.ids or [])
+            if not ids:
+                raise BadRequest(
+                    "DeleteNodesSpec must specify either filter or non-empty ids",
+                    code=ErrorCodes.BAD_ADAPTER_RESULT,
+                )
+            raw_filter_or_ids = ids
+            logger.debug(
+                "adelete_nodes using %d ids in namespace=%s",
+                len(ids),
+                namespace,
+            )
 
         result = await self._translator.arun_delete_nodes(
             raw_filter_or_ids,
@@ -1222,14 +1303,31 @@ class CorpusAutoGenGraphClient:
             conversation=conversation,
             extra_context=extra_context,
         )
-        framework_ctx = self._framework_ctx_for_namespace(
-            getattr(spec, "namespace", None),
+        namespace = getattr(spec, "namespace", None)
+        framework_ctx = self._framework_ctx(
+            operation="delete_edges",
+            namespace=namespace,
         )
 
         if spec.filter is not None:
             raw_filter_or_ids: Any = spec.filter
+            logger.debug(
+                "delete_edges using filter in namespace=%s",
+                namespace,
+            )
         else:
-            raw_filter_or_ids = list(spec.ids or [])
+            ids = list(spec.ids or [])
+            if not ids:
+                raise BadRequest(
+                    "DeleteEdgesSpec must specify either filter or non-empty ids",
+                    code=ErrorCodes.BAD_ADAPTER_RESULT,
+                )
+            raw_filter_or_ids = ids
+            logger.debug(
+                "delete_edges using %d ids in namespace=%s",
+                len(ids),
+                namespace,
+            )
 
         result = self._translator.delete_edges(
             raw_filter_or_ids,
@@ -1258,14 +1356,31 @@ class CorpusAutoGenGraphClient:
             conversation=conversation,
             extra_context=extra_context,
         )
-        framework_ctx = self._framework_ctx_for_namespace(
-            getattr(spec, "namespace", None),
+        namespace = getattr(spec, "namespace", None)
+        framework_ctx = self._framework_ctx(
+            operation="delete_edges",
+            namespace=namespace,
         )
 
         if spec.filter is not None:
             raw_filter_or_ids: Any = spec.filter
+            logger.debug(
+                "adelete_edges using filter in namespace=%s",
+                namespace,
+            )
         else:
-            raw_filter_or_ids = list(spec.ids or [])
+            ids = list(spec.ids or [])
+            if not ids:
+                raise BadRequest(
+                    "DeleteEdgesSpec must specify either filter or non-empty ids",
+                    code=ErrorCodes.BAD_ADAPTER_RESULT,
+                )
+            raw_filter_or_ids = ids
+            logger.debug(
+                "adelete_edges using %d ids in namespace=%s",
+                len(ids),
+                namespace,
+            )
 
         result = await self._translator.arun_delete_edges(
             raw_filter_or_ids,
@@ -1309,7 +1424,10 @@ class CorpusAutoGenGraphClient:
             "filter": spec.filter,
         }
 
-        framework_ctx = self._framework_ctx_for_namespace(spec.namespace)
+        framework_ctx = self._framework_ctx(
+            operation="bulk_vertices",
+            namespace=spec.namespace,
+        )
 
         result = self._translator.bulk_vertices(
             raw_request,
@@ -1346,7 +1464,10 @@ class CorpusAutoGenGraphClient:
             "filter": spec.filter,
         }
 
-        framework_ctx = self._framework_ctx_for_namespace(spec.namespace)
+        framework_ctx = self._framework_ctx(
+            operation="bulk_vertices",
+            namespace=spec.namespace,
+        )
 
         result = await self._translator.arun_bulk_vertices(
             raw_request,
@@ -1392,7 +1513,7 @@ class CorpusAutoGenGraphClient:
         result = self._translator.batch(
             raw_batch_ops,
             op_ctx=ctx,
-            framework_ctx={},
+            framework_ctx=self._framework_ctx(operation="batch"),
         )
         return validate_graph_result_type(
             result,
@@ -1426,7 +1547,7 @@ class CorpusAutoGenGraphClient:
         result = await self._translator.arun_batch(
             raw_batch_ops,
             op_ctx=ctx,
-            framework_ctx={},
+            framework_ctx=self._framework_ctx(operation="batch"),
         )
         return validate_graph_result_type(
             result,
@@ -1446,170 +1567,3 @@ __all__ = [
     "with_async_error_context",
 ]
 
-
-        result = await self._translator.arun_delete_edges(
-            raw_filter_or_ids,
-            op_ctx=ctx,
-            framework_ctx=framework_ctx,
-        )
-        return self._validate_result_type(
-            result,
-            DeleteResult,
-            "GraphTranslator.arun_delete_edges",
-            ErrorCodes.BAD_DELETE_RESULT,
-        )
-
-    # ------------------------------------------------------------------ #
-    # Bulk vertices (sync + async)
-    # ------------------------------------------------------------------ #
-
-    @with_graph_error_context("bulk_vertices_sync")
-    def bulk_vertices(
-        self,
-        spec: BulkVerticesSpec,
-        *,
-        conversation: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> BulkVerticesResult:
-        """
-        Sync wrapper for bulk_vertices.
-
-        Converts `BulkVerticesSpec` into the raw request shape expected by
-        GraphTranslator and returns the underlying `BulkVerticesResult`.
-        """
-        ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
-
-        raw_request: Mapping[str, Any] = {
-            "namespace": spec.namespace,
-            "limit": spec.limit,
-            "cursor": spec.cursor,
-            "filter": spec.filter,
-        }
-
-        framework_ctx = self._framework_ctx_for_namespace(spec.namespace)
-
-        result = self._translator.bulk_vertices(
-            raw_request,
-            op_ctx=ctx,
-            framework_ctx=framework_ctx,
-        )
-        return self._validate_result_type(
-            result,
-            BulkVerticesResult,
-            "GraphTranslator.bulk_vertices",
-            ErrorCodes.BAD_BULK_VERTICES_RESULT,
-        )
-
-    @with_async_graph_error_context("bulk_vertices_async")
-    async def abulk_vertices(
-        self,
-        spec: BulkVerticesSpec,
-        *,
-        conversation: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> BulkVerticesResult:
-        """
-        Async wrapper for bulk_vertices.
-        """
-        ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
-
-        raw_request: Mapping[str, Any] = {
-            "namespace": spec.namespace,
-            "limit": spec.limit,
-            "cursor": spec.cursor,
-            "filter": spec.filter,
-        }
-
-        framework_ctx = self._framework_ctx_for_namespace(spec.namespace)
-
-        result = await self._translator.arun_bulk_vertices(
-            raw_request,
-            op_ctx=ctx,
-            framework_ctx=framework_ctx,
-        )
-        return self._validate_result_type(
-            result,
-            BulkVerticesResult,
-            "GraphTranslator.arun_bulk_vertices",
-            ErrorCodes.BAD_BULK_VERTICES_RESULT,
-        )
-
-    # ------------------------------------------------------------------ #
-    # Batch (sync + async)
-    # ------------------------------------------------------------------ #
-
-    @with_graph_error_context("batch_sync")
-    def batch(
-        self,
-        ops: List[BatchOperation],
-        *,
-        conversation: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> BatchResult:
-        """
-        Sync wrapper for batch operations.
-
-        Translates `BatchOperation` dataclasses into the raw mapping shape
-        expected by GraphTranslator and returns the underlying `BatchResult`.
-        """
-        self._validate_batch_ops(ops)
-
-        ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
-
-        raw_batch_ops: List[Mapping[str, Any]] = [
-            {"op": op.op, "args": dict(op.args or {})} for op in ops
-        ]
-
-        result = self._translator.batch(
-            raw_batch_ops,
-            op_ctx=ctx,
-            framework_ctx={},
-        )
-        return self._validate_result_type(
-            result,
-            BatchResult,
-            "GraphTranslator.batch",
-            ErrorCodes.BAD_BATCH_RESULT,
-        )
-
-    @with_async_graph_error_context("batch_async")
-    async def abatch(
-        self,
-        ops: List[BatchOperation],
-        *,
-        conversation: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> BatchResult:
-        """
-        Async wrapper for batch operations.
-        """
-        self._validate_batch_ops(ops)
-
-        ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
-
-        raw_batch_ops: List[Mapping[str, Any]] = [
-            {"op": op.op, "args": dict(op.args or {})} for op in ops
-        ]
-
-        result = await self._translator.arun_batch(
-            raw_batch_ops,
-            op_ctx=ctx,
-            framework_ctx={},
-        )
-        return self._validate_result_type(
-            result,
-            BatchResult,
-            "GraphTranslator.arun_batch",
-            ErrorCodes.BAD_BATCH_RESULT,
-        )
-
-
-__all__ = [
-    "AutoGenGraphClientProtocol",
-    "CorpusAutoGenGraphClient",
-    "ErrorCodes",
-    "with_graph_error_context",
-    "with_async_graph_error_context",
-    "with_error_context",
-    "with_async_error_context",
-]
