@@ -47,6 +47,13 @@ from typing import (
     TypeVar,
 )
 
+from adapter_sdk.vector_base import (
+    VectorProtocolV1,
+    OperationContext,
+    BadRequest,
+    NotSupported,
+    VectorAdapterError,
+)
 from corpus_sdk.core.context_translation import (
     from_autogen as core_ctx_from_autogen,
 )
@@ -56,11 +63,12 @@ from corpus_sdk.vector.framework_adapters.common.vector_translation import (
     VectorTranslator,
     create_vector_translator,
 )
-from corpus_sdk.vector.vector_base import (
-    BadRequest,
-    NotSupported,
-    OperationContext,
-    VectorAdapterError,
+from corpus_sdk.vector.framework_adapters.common.framework_utils import (
+    VectorCoercionErrorCodes,
+    VectorResourceLimits,
+    VectorValidationFlags,
+    coerce_hits,
+    warn_if_extreme_k,
 )
 
 logger = logging.getLogger(__name__)
@@ -72,7 +80,7 @@ T = TypeVar("T")
 
 
 # --------------------------------------------------------------------------- #
-# Error codes & decorators
+# Error codes & coercion configuration
 # --------------------------------------------------------------------------- #
 
 
@@ -86,6 +94,64 @@ class ErrorCodes:
     BAD_METADATA = "BAD_METADATA"
     BAD_IDS = "BAD_IDS"
     NO_EMBEDDING_FUNCTION = "NO_EMBEDDING_FUNCTION"
+
+
+# Bundle of error codes for vector coercion utilities
+VECTOR_COERCION_ERROR_CODES: VectorCoercionErrorCodes = VectorCoercionErrorCodes(
+    invalid_vector_result="INVALID_VECTOR_RESULT",
+    invalid_hit_result="INVALID_VECTOR_HIT_RESULT",
+    empty_result="EMPTY_VECTOR_RESULT",
+    conversion_error="VECTOR_CONVERSION_ERROR",
+    score_out_of_range="VECTOR_SCORE_OUT_OF_RANGE",
+    vector_dimension_exceeded="VECTOR_DIMENSION_EXCEEDED",
+    vector_norm_invalid="VECTOR_NORM_INVALID",
+    framework_label="autogen",
+)
+
+# Defaults: we are mostly advisory here, not enforcing strict limits
+VECTOR_LIMITS: VectorResourceLimits = VectorResourceLimits()
+VECTOR_FLAGS: VectorValidationFlags = VectorValidationFlags()
+
+
+def _coerce_hits_safe(result: Any) -> List[Mapping[str, Any]]:
+    """
+    Thin wrapper around common coerce_hits with EMPTY_RESULT treated as [].
+
+    This allows us to use the shared vector coercion logic while preserving
+    the existing behavior of returning an empty list when there are no hits,
+    instead of raising.
+    """
+    try:
+        return coerce_hits(
+            result,
+            framework="autogen",
+            error_codes=VECTOR_COERCION_ERROR_CODES,
+            limits=VECTOR_LIMITS,
+            flags=VECTOR_FLAGS,
+            logger=logger,
+        )
+    except ValueError as exc:
+        msg = str(exc)
+        if VECTOR_COERCION_ERROR_CODES.empty_result in msg:
+            return []
+        raise
+
+
+def _warn_if_extreme_k(k: int, op_name: str) -> None:
+    """
+    Shared wrapper so all k-based operations emit consistent soft warnings.
+    """
+    warn_if_extreme_k(
+        k,
+        framework="autogen",
+        op_name=op_name,
+        logger=logger,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Error decorators
+# --------------------------------------------------------------------------- #
 
 
 def with_error_context(operation: str, **context_kwargs: Any):
@@ -219,7 +285,7 @@ class CorpusAutoGenVectorStore:
     def __init__(
         self,
         *,
-        corpus_adapter: Any,  # VectorProtocolV1, but we don't rely on concrete type here
+        corpus_adapter: VectorProtocolV1,
         namespace: Optional[str] = "default",
         id_field: str = "id",
         text_field: str = "page_content",
@@ -228,7 +294,7 @@ class CorpusAutoGenVectorStore:
         default_top_k: int = 4,
         embedding_function: Optional[Any] = None,  # Callable[[List[str]], Embeddings]
     ) -> None:
-        self.corpus_adapter = corpus_adapter
+        self.corpus_adapter: VectorProtocolV1 = corpus_adapter
         self.namespace = namespace
 
         self.id_field = id_field
@@ -485,15 +551,15 @@ class CorpusAutoGenVectorStore:
         matches: Sequence[Mapping[str, Any]],
     ) -> List[Tuple[AutoGenDocument, float]]:
         """
-        Convert generic match records (from VectorTranslator) into
+        Convert generic match records (from VectorTranslator/coerce_hits) into
         (AutoGenDocument, score) tuples.
 
-        Expected match shape (implementation-specific and adapter-dependent):
+        Expected match shape (canonicalized by coerce_hits):
             {
                 "id": str,
                 "score": float,
                 "metadata": { ... },
-                "embedding": [...],      # if include_vectors=True
+                "vector": [...],      # if include_vectors=True
                 ...
             }
         """
@@ -501,7 +567,6 @@ class CorpusAutoGenVectorStore:
 
         for m in matches:
             if not isinstance(m, Mapping):
-                # Be defensive; skip unexpected records
                 logger.debug("Skipping non-mapping match: %r", type(m).__name__)
                 continue
 
@@ -577,55 +642,17 @@ class CorpusAutoGenVectorStore:
 
     def _extract_matches_from_result(self, result: Any) -> List[Mapping[str, Any]]:
         """
-        Validate and extract matches from a translator query result.
-
-        DefaultVectorFrameworkTranslator returns:
-            {"matches": [...], "namespace": ..., "usage": ...}
+        Coerce translator query result into a canonical list of hit mappings.
         """
-        if not isinstance(result, Mapping):
-            raise BadRequest(
-                f"Translator query result must be a mapping, got {type(result).__name__}",
-                code=ErrorCodes.BAD_TRANSLATED_QUERY_RESULT,
-            )
-
-        matches = result.get("matches")
-        if matches is None:
-            return []
-
-        if not isinstance(matches, list):
-            raise BadRequest(
-                f"Translator query result 'matches' must be a list, got {type(matches).__name__}",
-                code=ErrorCodes.BAD_TRANSLATED_QUERY_RESULT,
-            )
-
-        # Ensure elements are mappings
-        out: List[Mapping[str, Any]] = []
-        for m in matches:
-            if isinstance(m, Mapping):
-                out.append(m)
-            else:
-                logger.debug("Skipping non-mapping match in result: %r", type(m).__name__)
-        return out
+        # result is typically {"matches": [...], "namespace": ..., ...}
+        return _coerce_hits_safe(result)
 
     def _extract_matches_from_chunk(self, chunk: Any) -> List[Mapping[str, Any]]:
         """
-        Validate and extract matches from a streaming query chunk.
-
-        DefaultVectorFrameworkTranslator returns chunks as:
-            {"matches": [...], "is_final": bool, "usage": ...}
+        Coerce translator streaming chunk into a canonical list of hit mappings.
         """
-        if not isinstance(chunk, Mapping):
-            raise BadRequest(
-                f"Translator query chunk must be a mapping, got {type(chunk).__name__}",
-                code=ErrorCodes.BAD_TRANSLATED_STREAM_CHUNK,
-            )
-        matches = chunk.get("matches") or []
-        if not isinstance(matches, list):
-            raise BadRequest(
-                f"Translator query chunk 'matches' must be a list, got {type(matches).__name__}",
-                code=ErrorCodes.BAD_TRANSLATED_STREAM_CHUNK,
-            )
-        return [m for m in matches if isinstance(m, Mapping)]
+        # chunk is typically {"matches": [...], "is_final": bool, ...}
+        return _coerce_hits_safe(chunk)
 
     # ------------------------------------------------------------------ #
     # Public add APIs (sync + async)
@@ -830,6 +857,8 @@ class CorpusAutoGenVectorStore:
         query_emb = self._embed_query(query, embedding=embedding)
 
         top_k = k or self.default_top_k
+        _warn_if_extreme_k(top_k, op_name="similarity_search")
+
         raw_query = self._build_raw_query(
             embedding=query_emb,
             k=top_k,
@@ -867,6 +896,8 @@ class CorpusAutoGenVectorStore:
         query_emb = self._embed_query(query, embedding=embedding)
 
         top_k = k or self.default_top_k
+        _warn_if_extreme_k(top_k, op_name="similarity_search_with_score")
+
         raw_query = self._build_raw_query(
             embedding=query_emb,
             k=top_k,
@@ -903,6 +934,8 @@ class CorpusAutoGenVectorStore:
         query_emb = self._embed_query(query, embedding=embedding)
 
         top_k = k or self.default_top_k
+        _warn_if_extreme_k(top_k, op_name="asimilarity_search")
+
         raw_query = self._build_raw_query(
             embedding=query_emb,
             k=top_k,
@@ -940,6 +973,8 @@ class CorpusAutoGenVectorStore:
         query_emb = self._embed_query(query, embedding=embedding)
 
         top_k = k or self.default_top_k
+        _warn_if_extreme_k(top_k, op_name="asimilarity_search_with_score")
+
         raw_query = self._build_raw_query(
             embedding=query_emb,
             k=top_k,
@@ -984,6 +1019,8 @@ class CorpusAutoGenVectorStore:
         query_emb = self._embed_query(query, embedding=embedding)
 
         top_k = k or self.default_top_k
+        _warn_if_extreme_k(top_k, op_name="similarity_search_stream")
+
         raw_query = self._build_raw_query(
             embedding=query_emb,
             k=top_k,
@@ -1025,6 +1062,7 @@ class CorpusAutoGenVectorStore:
         """
         ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
         top_k = k or self.default_top_k
+        _warn_if_extreme_k(top_k, op_name="query")
 
         raw_query = self._build_raw_query(
             embedding=embedding,
@@ -1062,6 +1100,7 @@ class CorpusAutoGenVectorStore:
         """
         ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
         top_k = k or self.default_top_k
+        _warn_if_extreme_k(top_k, op_name="aquery")
 
         raw_query = self._build_raw_query(
             embedding=embedding,
@@ -1108,6 +1147,8 @@ class CorpusAutoGenVectorStore:
 
         base_k = k or self.default_top_k
         actual_fetch_k = fetch_k or max(base_k * 4, base_k + 5)
+
+        _warn_if_extreme_k(actual_fetch_k, op_name="max_marginal_relevance_search")
 
         raw_query = self._build_raw_query(
             embedding=query_emb,
@@ -1159,6 +1200,8 @@ class CorpusAutoGenVectorStore:
 
         base_k = k or self.default_top_k
         actual_fetch_k = fetch_k or max(base_k * 4, base_k + 5)
+
+        _warn_if_extreme_k(actual_fetch_k, op_name="amax_marginal_relevance_search")
 
         raw_query = self._build_raw_query(
             embedding=query_emb,
@@ -1269,7 +1312,7 @@ class CorpusAutoGenVectorStore:
         cls,
         texts: List[str],
         *,
-        corpus_adapter: Any,
+        corpus_adapter: VectorProtocolV1,
         metadatas: Optional[List[Metadata]] = None,
         ids: Optional[List[str]] = None,
         **kwargs: Any,
@@ -1287,7 +1330,7 @@ class CorpusAutoGenVectorStore:
         cls,
         documents: List[AutoGenDocument],
         *,
-        corpus_adapter: Any,
+        corpus_adapter: VectorProtocolV1,
         **kwargs: Any,
     ) -> "CorpusAutoGenVectorStore":
         """
@@ -1372,10 +1415,11 @@ class CorpusAutoGenRetrieverTool:
             for d in docs
         ]
 
-
 __all__ = [
     "AutoGenDocument",
     "CorpusAutoGenVectorStore",
     "CorpusAutoGenRetrieverTool",
     "ErrorCodes",
+    "with_error_context",
+    "with_async_error_context",
 ]
