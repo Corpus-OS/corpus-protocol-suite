@@ -31,11 +31,13 @@ Design philosophy
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 from functools import cached_property, wraps
 from typing import (
     Any,
+    Awaitable,
     Dict,
     Iterator,
     List,
@@ -314,7 +316,10 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
     default_top_k: int = 4
 
     # Optional embedding integration
-    embedding_function: Optional[Any] = None  # Callable[[List[str]], Embeddings]
+    embedding_function: Optional[Callable[[List[str]], Embeddings]] = None
+    async_embedding_function: Optional[
+        Callable[[List[str]], Awaitable[Embeddings]]
+    ] = None
 
     # Optional MMR configuration
     use_mmr_by_default: bool = False
@@ -540,7 +545,7 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
         embedding: Optional[Sequence[float]] = None,
     ) -> List[float]:
         """
-        Ensure a single query embedding is available.
+        Ensure a single query embedding is available (sync path).
 
         Behavior:
         - If `embedding` is provided, coerce to float list.
@@ -575,6 +580,68 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
         if not embs or len(embs) != 1:
             raise BadRequest(
                 "embedding_function must return exactly one embedding for a single query",
+                code=ErrorCodes.BAD_EMBEDDINGS,
+            )
+
+        return [float(x) for x in embs[0]]
+
+    async def _embed_query_async(
+        self,
+        query: str,
+        *,
+        embedding: Optional[Sequence[float]] = None,
+    ) -> List[float]:
+        """
+        Async-safe query embedding helper.
+
+        Behavior:
+        - If `embedding` is provided, use it.
+        - Else, if `async_embedding_function` is set, await it.
+        - Else, if `embedding_function` is set, run it in a worker thread.
+        - Else, raise NotSupported.
+        """
+        if embedding is not None:
+            return [float(x) for x in embedding]
+
+        if self.async_embedding_function is not None:
+            try:
+                embs = await self.async_embedding_function([query])
+            except Exception as exc:  # noqa: BLE001
+                attach_context(
+                    exc,
+                    framework="crewai",
+                    operation="embed_query_async",
+                    query_preview=query[:128],
+                )
+                raise BadRequest(
+                    f"async_embedding_function failed for query: {exc}",
+                    code=ErrorCodes.EMBEDDING_ERROR,
+                )
+        else:
+            if self.embedding_function is None:
+                raise NotSupported(
+                    "No embedding_function/async_embedding_function configured; "
+                    "caller must supply query embedding",
+                    code=ErrorCodes.NO_EMBEDDING_FUNCTION,
+                    details={"framework": "crewai", "query_preview": query[:64]},
+                )
+            try:
+                embs = await asyncio.to_thread(self.embedding_function, [query])
+            except Exception as exc:  # noqa: BLE001
+                attach_context(
+                    exc,
+                    framework="crewai",
+                    operation="embed_query_async",
+                    query_preview=query[:128],
+                )
+                raise BadRequest(
+                    f"embedding_function failed for query: {exc}",
+                    code=ErrorCodes.EMBEDDING_ERROR,
+                )
+
+        if not embs or len(embs) != 1:
+            raise BadRequest(
+                "embedding function must return exactly one embedding for a single query",
                 code=ErrorCodes.BAD_EMBEDDINGS,
             )
 
@@ -771,6 +838,15 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
         if k == 0:
             return []
 
+        # Optimization: lambda=1.0 (or above) → pure relevance ranking, no diversity term.
+        if lambda_mult >= 1.0:
+            indices = sorted(
+                range(len(candidate_matches)),
+                key=lambda idx: self._get_match_score(candidate_matches[idx]),
+                reverse=True,
+            )
+            return indices[:k]
+
         # Use original scores from database as relevance measure
         original_scores = [self._get_match_score(m) for m in candidate_matches]
         candidate_vecs: List[List[float]] = [
@@ -881,7 +957,10 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
                 details={"namespace": self._effective_namespace(ns)},
             )
 
-        query_emb = self._embed_query(args.query, embedding=args.embedding)
+        query_emb = await self._embed_query_async(
+            args.query,
+            embedding=args.embedding,
+        )
         raw_query = self._build_raw_query(
             embedding=query_emb,
             k=top_k,
@@ -964,7 +1043,10 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
             logger=logger,
         )
 
-        query_emb = self._embed_query(args.query, embedding=args.embedding)
+        query_emb = await self._embed_query_async(
+            args.query,
+            embedding=args.embedding,
+        )
         raw_query = self._build_raw_query(
             embedding=query_emb,
             k=int(fetch_k),
