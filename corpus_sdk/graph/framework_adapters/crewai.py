@@ -46,6 +46,7 @@ from functools import cached_property
 from typing import (
     Any,
     AsyncIterator,
+    Callable,
     Dict,
     Iterator,
     List,
@@ -53,7 +54,6 @@ from typing import (
     Optional,
     Protocol,
     TypeVar,
-    Callable,
 )
 
 from corpus_sdk.core.context_translation import (
@@ -63,15 +63,16 @@ from corpus_sdk.core.error_context import attach_context
 from corpus_sdk.graph.framework_adapters.common.graph_translation import (
     DefaultGraphFrameworkTranslator,
     GraphTranslator,
+    GraphFrameworkTranslator,
     create_graph_translator,
 )
 from corpus_sdk.graph.framework_adapters.common.framework_utils import (
     create_graph_error_context_decorator,
     graph_capabilities_to_dict,
-    validate_graph_result_type,
-    validate_graph_query,
-    validate_upsert_nodes_spec,
     validate_batch_operations,
+    validate_graph_query,
+    validate_graph_result_type,
+    validate_upsert_nodes_spec,
 )
 from corpus_sdk.graph.graph_base import (
     BadRequest,
@@ -154,6 +155,72 @@ with_error_context = with_graph_error_context
 with_async_error_context = with_async_graph_error_context
 
 
+# --------------------------------------------------------------------------- #
+# Framework translator (public, reusable, overridable)
+# --------------------------------------------------------------------------- #
+
+
+class CrewAIGraphFrameworkTranslator(DefaultGraphFrameworkTranslator):
+    """
+    CrewAI-specific GraphFrameworkTranslator.
+
+    This translator reuses the common DefaultGraphFrameworkTranslator for
+    spec construction and context handling, but deliberately *does not*
+    reshape core protocol results:
+
+    - QueryResult is returned as-is
+    - QueryChunk is returned as-is
+    - BulkVerticesResult is returned as-is
+    - BatchResult is returned as-is
+    - GraphSchema is returned as-is
+    """
+
+    def translate_query_result(
+        self,
+        result: QueryResult,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Mapping[str, Any]] = None,
+    ) -> QueryResult:
+        return result
+
+    def translate_query_chunk(
+        self,
+        chunk: QueryChunk,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Mapping[str, Any]] = None,
+    ) -> QueryChunk:
+        return chunk
+
+    def translate_bulk_vertices_result(
+        self,
+        result: BulkVerticesResult,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Mapping[str, Any]] = None,
+    ) -> BulkVerticesResult:
+        return result
+
+    def translate_batch_result(
+        self,
+        result: BatchResult,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Mapping[str, Any]] = None,
+    ) -> BatchResult:
+        return result
+
+    def translate_schema(
+        self,
+        schema: GraphSchema,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Mapping[str, Any]] = None,
+    ) -> GraphSchema:
+        return schema
+
+
 class CrewAIGraphClientProtocol(Protocol):
     """
     Protocol representing the minimal CrewAI-aware graph client interface
@@ -165,10 +232,10 @@ class CrewAIGraphClientProtocol(Protocol):
 
     # Capabilities / schema / health -------------------------------------
 
-    def capabilities(self) -> Mapping[str, Any]:
+    def capabilities(self) -> Dict[str, Any]:
         ...
 
-    async def acapabilities(self) -> Mapping[str, Any]:
+    async def acapabilities(self) -> Dict[str, Any]:
         ...
 
     def get_schema(
@@ -192,7 +259,7 @@ class CrewAIGraphClientProtocol(Protocol):
         *,
         task: Optional[Any] = None,
         extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> Mapping[str, Any]:
+    ) -> Dict[str, Any]:
         ...
 
     async def ahealth(
@@ -200,7 +267,7 @@ class CrewAIGraphClientProtocol(Protocol):
         *,
         task: Optional[Any] = None,
         extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> Mapping[str, Any]:
+    ) -> Dict[str, Any]:
         ...
 
     # Query / streaming ---------------------------------------------------
@@ -389,66 +456,6 @@ class CorpusCrewAIGraphClient:
       CrewAI-specific hints when failures occur.
     """
 
-    class _CrewAIGraphFrameworkTranslator(DefaultGraphFrameworkTranslator):
-        """
-        CrewAI-specific GraphFrameworkTranslator.
-
-        This translator reuses the common DefaultGraphFrameworkTranslator for
-        spec construction and context handling, but deliberately *does not*
-        reshape core protocol results:
-
-        - QueryResult is returned as-is
-        - QueryChunk is returned as-is
-        - BulkVerticesResult is returned as-is
-        - BatchResult is returned as-is
-        - GraphSchema is returned as-is
-        """
-
-        def translate_query_result(
-            self,
-            result: QueryResult,
-            *,
-            op_ctx: OperationContext,
-            framework_ctx: Optional[Any] = None,
-        ) -> QueryResult:
-            return result
-
-        def translate_query_chunk(
-            self,
-            chunk: QueryChunk,
-            *,
-            op_ctx: OperationContext,
-            framework_ctx: Optional[Any] = None,
-        ) -> QueryChunk:
-            return chunk
-
-        def translate_bulk_vertices_result(
-            self,
-            result: BulkVerticesResult,
-            *,
-            op_ctx: OperationContext,
-            framework_ctx: Optional[Any] = None,
-        ) -> BulkVerticesResult:
-            return result
-
-        def translate_batch_result(
-            self,
-            result: BatchResult,
-            *,
-            op_ctx: OperationContext,
-            framework_ctx: Optional[Any] = None,
-        ) -> BatchResult:
-            return result
-
-        def translate_schema(
-            self,
-            schema: GraphSchema,
-            *,
-            op_ctx: OperationContext,
-            framework_ctx: Optional[Any] = None,
-        ) -> GraphSchema:
-            return schema
-
     def __init__(
         self,
         *,
@@ -457,6 +464,7 @@ class CorpusCrewAIGraphClient:
         default_namespace: Optional[str] = None,
         default_timeout_ms: Optional[int] = None,
         framework_version: Optional[str] = None,
+        framework_translator: Optional[GraphFrameworkTranslator] = None,
     ) -> None:
         """
         Initialize a CrewAI-oriented graph client.
@@ -474,12 +482,18 @@ class CorpusCrewAIGraphClient:
             `timeout_ms` is not explicitly passed to query methods.
         framework_version:
             Optional framework version string for observability.
+        framework_translator:
+            Optional GraphFrameworkTranslator override. When not provided,
+            `CrewAIGraphFrameworkTranslator` is used.
         """
         self._graph: GraphProtocolV1 = graph_adapter
         self._default_dialect: Optional[str] = default_dialect
         self._default_namespace: Optional[str] = default_namespace
         self._default_timeout_ms: Optional[int] = default_timeout_ms
         self._framework_version: Optional[str] = framework_version
+        self._framework_translator_override: Optional[
+            GraphFrameworkTranslator
+        ] = framework_translator
 
     # ------------------------------------------------------------------ #
     # Resource Management (Context Managers)
@@ -515,7 +529,9 @@ class CorpusCrewAIGraphClient:
         Uses `cached_property` for thread safety and performance, mirroring
         the embedding / AutoGen adapter patterns.
         """
-        framework_translator = self._CrewAIGraphFrameworkTranslator()
+        framework_translator: GraphFrameworkTranslator = (
+            self._framework_translator_override or CrewAIGraphFrameworkTranslator()
+        )
         return create_graph_translator(
             adapter=self._graph,
             framework="crewai",
@@ -560,7 +576,10 @@ class CorpusCrewAIGraphClient:
                 framework="crewai",
                 operation="context_translation",
             )
-            raise
+            raise BadRequest(
+                "Failed to build OperationContext from CrewAI inputs",
+                code=ErrorCodes.BAD_OPERATION_CONTEXT,
+            ) from exc
 
         if not isinstance(ctx, OperationContext):
             raise BadRequest(
@@ -612,23 +631,65 @@ class CorpusCrewAIGraphClient:
 
         return raw
 
-    def _framework_ctx_for_namespace(
+    def _framework_ctx(
         self,
-        namespace: Optional[str],
+        *,
+        operation: str,
+        namespace: Optional[str] = None,
     ) -> Mapping[str, Any]:
         """
-        Build a minimal framework_ctx mapping that lets the common translator
-        derive a preferred namespace when needed.
+        Build a framework_ctx mapping for GraphTranslator with basic
+        observability hints and the effective namespace.
         """
+        ctx: Dict[str, Any] = {
+            "framework": "crewai",
+            "operation": operation,
+        }
+
+        if self._framework_version is not None:
+            ctx["framework_version"] = self._framework_version
+
         effective_namespace = namespace or self._default_namespace
-        return {"namespace": effective_namespace} if effective_namespace is not None else {}
+        if effective_namespace is not None:
+            ctx["namespace"] = effective_namespace
+
+        return ctx
+
+    def _validate_upsert_edges_spec(self, spec: UpsertEdgesSpec) -> None:
+        """
+        CrewAI-local validation for edge upsert specs.
+
+        Similar to the AutoGen adapter:
+        - edges must not be None
+        - edges must be iterable and non-empty
+        - each edge must have an ID
+        """
+        if spec.edges is None:
+            raise BadRequest("UpsertEdgesSpec.edges must not be None")
+
+        try:
+            edges_iter = list(spec.edges)
+        except TypeError as exc:
+            raise BadRequest(
+                "UpsertEdgesSpec.edges must be an iterable of edges",
+            ) from exc
+
+        if not edges_iter:
+            raise BadRequest("UpsertEdgesSpec must contain at least one edge")
+
+        for edge in edges_iter:
+            if not getattr(edge, "id", None):
+                raise BadRequest("All edges must have an ID")
+
+        # Normalize spec.edges to the validated list
+        spec.edges = edges_iter  # type: ignore[assignment]
 
     # ------------------------------------------------------------------ #
     # Capabilities / schema / health
     # ------------------------------------------------------------------ #
 
     @with_graph_error_context("capabilities_sync")
-    def capabilities(self) -> Mapping[str, Any]:
+    def capabilities(self) -> Dict[str, Any]:
         """
         Sync wrapper around capabilities, delegating async→sync bridging
         to GraphTranslator.
@@ -637,7 +698,7 @@ class CorpusCrewAIGraphClient:
         return graph_capabilities_to_dict(caps)
 
     @with_async_graph_error_context("capabilities_async")
-    async def acapabilities(self) -> Mapping[str, Any]:
+    async def acapabilities(self) -> Dict[str, Any]:
         """
         Async capabilities accessor.
 
@@ -663,7 +724,7 @@ class CorpusCrewAIGraphClient:
         ctx = self._build_ctx(task=task, extra_context=extra_context)
         schema = self._translator.get_schema(
             op_ctx=ctx,
-            framework_ctx={},
+            framework_ctx=self._framework_ctx(operation="get_schema"),
         )
         return validate_graph_result_type(
             schema,
@@ -687,7 +748,7 @@ class CorpusCrewAIGraphClient:
         ctx = self._build_ctx(task=task, extra_context=extra_context)
         schema = await self._translator.arun_get_schema(
             op_ctx=ctx,
-            framework_ctx={},
+            framework_ctx=self._framework_ctx(operation="get_schema"),
         )
         return validate_graph_result_type(
             schema,
@@ -702,7 +763,7 @@ class CorpusCrewAIGraphClient:
         *,
         task: Optional[Any] = None,
         extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> Mapping[str, Any]:
+    ) -> Dict[str, Any]:
         """
         Health check (sync).
 
@@ -711,14 +772,15 @@ class CorpusCrewAIGraphClient:
         ctx = self._build_ctx(task=task, extra_context=extra_context)
         health_result = self._translator.health(
             op_ctx=ctx,
-            framework_ctx={},
+            framework_ctx=self._framework_ctx(operation="health"),
         )
-        return validate_graph_result_type(
+        mapping_result = validate_graph_result_type(
             health_result,
             expected_type=Mapping,
             operation="GraphTranslator.health",
             error_code=ErrorCodes.BAD_HEALTH_RESULT,
         )
+        return dict(mapping_result)
 
     @with_async_graph_error_context("health_async")
     async def ahealth(
@@ -726,7 +788,7 @@ class CorpusCrewAIGraphClient:
         *,
         task: Optional[Any] = None,
         extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> Mapping[str, Any]:
+    ) -> Dict[str, Any]:
         """
         Health check (async).
 
@@ -735,14 +797,15 @@ class CorpusCrewAIGraphClient:
         ctx = self._build_ctx(task=task, extra_context=extra_context)
         health_result = await self._translator.arun_health(
             op_ctx=ctx,
-            framework_ctx={},
+            framework_ctx=self._framework_ctx(operation="health"),
         )
-        return validate_graph_result_type(
+        mapping_result = validate_graph_result_type(
             health_result,
             expected_type=Mapping,
             operation="GraphTranslator.arun_health",
             error_code=ErrorCodes.BAD_HEALTH_RESULT,
         )
+        return dict(mapping_result)
 
     # ------------------------------------------------------------------ #
     # Query (sync + async)
@@ -776,7 +839,10 @@ class CorpusCrewAIGraphClient:
             timeout_ms=timeout_ms,
             stream=False,
         )
-        framework_ctx = self._framework_ctx_for_namespace(namespace)
+        framework_ctx = self._framework_ctx(
+            operation="query",
+            namespace=namespace,
+        )
 
         result = self._translator.query(
             raw_query,
@@ -819,7 +885,10 @@ class CorpusCrewAIGraphClient:
             timeout_ms=timeout_ms,
             stream=False,
         )
-        framework_ctx = self._framework_ctx_for_namespace(namespace)
+        framework_ctx = self._framework_ctx(
+            operation="query",
+            namespace=namespace,
+        )
 
         result = await self._translator.arun_query(
             raw_query,
@@ -868,7 +937,10 @@ class CorpusCrewAIGraphClient:
             timeout_ms=timeout_ms,
             stream=True,
         )
-        framework_ctx = self._framework_ctx_for_namespace(namespace)
+        framework_ctx = self._framework_ctx(
+            operation="stream_query",
+            namespace=namespace,
+        )
 
         for chunk in self._translator.query_stream(
             raw_query,
@@ -908,7 +980,10 @@ class CorpusCrewAIGraphClient:
             timeout_ms=timeout_ms,
             stream=True,
         )
-        framework_ctx = self._framework_ctx_for_namespace(namespace)
+        framework_ctx = self._framework_ctx(
+            operation="stream_query",
+            namespace=namespace,
+        )
 
         async for chunk in self._translator.arun_query_stream(
             raw_query,
@@ -944,8 +1019,9 @@ class CorpusCrewAIGraphClient:
         validate_upsert_nodes_spec(spec)
 
         ctx = self._build_ctx(task=task, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(
-            getattr(spec, "namespace", None),
+        framework_ctx = self._framework_ctx(
+            operation="upsert_nodes",
+            namespace=getattr(spec, "namespace", None),
         )
 
         result = self._translator.upsert_nodes(
@@ -974,8 +1050,9 @@ class CorpusCrewAIGraphClient:
         validate_upsert_nodes_spec(spec)
 
         ctx = self._build_ctx(task=task, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(
-            getattr(spec, "namespace", None),
+        framework_ctx = self._framework_ctx(
+            operation="upsert_nodes",
+            namespace=getattr(spec, "namespace", None),
         )
 
         result = await self._translator.arun_upsert_nodes(
@@ -1001,9 +1078,12 @@ class CorpusCrewAIGraphClient:
         """
         Sync wrapper for upserting edges.
         """
+        self._validate_upsert_edges_spec(spec)
+
         ctx = self._build_ctx(task=task, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(
-            getattr(spec, "namespace", None),
+        framework_ctx = self._framework_ctx(
+            operation="upsert_edges",
+            namespace=getattr(spec, "namespace", None),
         )
 
         result = self._translator.upsert_edges(
@@ -1029,9 +1109,12 @@ class CorpusCrewAIGraphClient:
         """
         Async wrapper for upserting edges.
         """
+        self._validate_upsert_edges_spec(spec)
+
         ctx = self._build_ctx(task=task, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(
-            getattr(spec, "namespace", None),
+        framework_ctx = self._framework_ctx(
+            operation="upsert_edges",
+            namespace=getattr(spec, "namespace", None),
         )
 
         result = await self._translator.arun_upsert_edges(
@@ -1065,14 +1148,21 @@ class CorpusCrewAIGraphClient:
         expression for the GraphTranslator.
         """
         ctx = self._build_ctx(task=task, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(
-            getattr(spec, "namespace", None),
+        framework_ctx = self._framework_ctx(
+            operation="delete_nodes",
+            namespace=getattr(spec, "namespace", None),
         )
 
         if spec.filter is not None:
             raw_filter_or_ids: Any = spec.filter
         else:
-            raw_filter_or_ids = list(spec.ids or [])
+            ids = list(spec.ids or [])
+            if not ids:
+                raise BadRequest(
+                    "DeleteNodesSpec must specify either filter or non-empty ids",
+                    code=ErrorCodes.BAD_ADAPTER_RESULT,
+                )
+            raw_filter_or_ids = ids
 
         result = self._translator.delete_nodes(
             raw_filter_or_ids,
@@ -1098,14 +1188,21 @@ class CorpusCrewAIGraphClient:
         Async wrapper for deleting nodes.
         """
         ctx = self._build_ctx(task=task, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(
-            getattr(spec, "namespace", None),
+        framework_ctx = self._framework_ctx(
+            operation="delete_nodes",
+            namespace=getattr(spec, "namespace", None),
         )
 
         if spec.filter is not None:
             raw_filter_or_ids: Any = spec.filter
         else:
-            raw_filter_or_ids = list(spec.ids or [])
+            ids = list(spec.ids or [])
+            if not ids:
+                raise BadRequest(
+                    "DeleteNodesSpec must specify either filter or non-empty ids",
+                    code=ErrorCodes.BAD_ADAPTER_RESULT,
+                )
+            raw_filter_or_ids = ids
 
         result = await self._translator.arun_delete_nodes(
             raw_filter_or_ids,
@@ -1131,14 +1228,21 @@ class CorpusCrewAIGraphClient:
         Sync wrapper for deleting edges.
         """
         ctx = self._build_ctx(task=task, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(
-            getattr(spec, "namespace", None),
+        framework_ctx = self._framework_ctx(
+            operation="delete_edges",
+            namespace=getattr(spec, "namespace", None),
         )
 
         if spec.filter is not None:
             raw_filter_or_ids: Any = spec.filter
         else:
-            raw_filter_or_ids = list(spec.ids or [])
+            ids = list(spec.ids or [])
+            if not ids:
+                raise BadRequest(
+                    "DeleteEdgesSpec must specify either filter or non-empty ids",
+                    code=ErrorCodes.BAD_ADAPTER_RESULT,
+                )
+            raw_filter_or_ids = ids
 
         result = self._translator.delete_edges(
             raw_filter_or_ids,
@@ -1164,14 +1268,21 @@ class CorpusCrewAIGraphClient:
         Async wrapper for deleting edges.
         """
         ctx = self._build_ctx(task=task, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(
-            getattr(spec, "namespace", None),
+        framework_ctx = self._framework_ctx(
+            operation="delete_edges",
+            namespace=getattr(spec, "namespace", None),
         )
 
         if spec.filter is not None:
             raw_filter_or_ids: Any = spec.filter
         else:
-            raw_filter_or_ids = list(spec.ids or [])
+            ids = list(spec.ids or [])
+            if not ids:
+                raise BadRequest(
+                    "DeleteEdgesSpec must specify either filter or non-empty ids",
+                    code=ErrorCodes.BAD_ADAPTER_RESULT,
+                )
+            raw_filter_or_ids = ids
 
         result = await self._translator.arun_delete_edges(
             raw_filter_or_ids,
@@ -1212,7 +1323,10 @@ class CorpusCrewAIGraphClient:
             "filter": spec.filter,
         }
 
-        framework_ctx = self._framework_ctx_for_namespace(spec.namespace)
+        framework_ctx = self._framework_ctx(
+            operation="bulk_vertices",
+            namespace=spec.namespace,
+        )
 
         result = self._translator.bulk_vertices(
             raw_request,
@@ -1246,7 +1360,10 @@ class CorpusCrewAIGraphClient:
             "filter": spec.filter,
         }
 
-        framework_ctx = self._framework_ctx_for_namespace(spec.namespace)
+        framework_ctx = self._framework_ctx(
+            operation="bulk_vertices",
+            namespace=spec.namespace,
+        )
 
         result = await self._translator.arun_bulk_vertices(
             raw_request,
@@ -1289,7 +1406,7 @@ class CorpusCrewAIGraphClient:
         result = self._translator.batch(
             raw_batch_ops,
             op_ctx=ctx,
-            framework_ctx={},
+            framework_ctx=self._framework_ctx(operation="batch"),
         )
         return validate_graph_result_type(
             result,
@@ -1320,7 +1437,7 @@ class CorpusCrewAIGraphClient:
         result = await self._translator.arun_batch(
             raw_batch_ops,
             op_ctx=ctx,
-            framework_ctx={},
+            framework_ctx=self._framework_ctx(operation="batch"),
         )
         return validate_graph_result_type(
             result,
@@ -1332,6 +1449,7 @@ class CorpusCrewAIGraphClient:
 
 __all__ = [
     "CrewAIGraphClientProtocol",
+    "CrewAIGraphFrameworkTranslator",
     "CorpusCrewAIGraphClient",
     "ErrorCodes",
     "with_graph_error_context",
