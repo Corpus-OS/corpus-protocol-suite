@@ -1,4 +1,4 @@
- # corpus_sdk/graph/framework_adapters/semantic_kernel.py
+# corpus_sdk/graph/framework_adapters/semantic_kernel.py
 # SPDX-License-Identifier: Apache-2.0
 
 """
@@ -389,6 +389,66 @@ class SemanticKernelGraphClientProtocol(Protocol):
         ...
 
 
+class SemanticKernelGraphFrameworkTranslator(DefaultGraphFrameworkTranslator):
+    """
+    Semantic Kernel–specific GraphFrameworkTranslator.
+
+    Reuses the default implementation for spec construction and filters,
+    but deliberately returns core protocol types unchanged:
+
+    - QueryResult is returned as-is
+    - QueryChunk is returned as-is
+    - BulkVerticesResult is returned as-is
+    - BatchResult is returned as-is
+    - GraphSchema is returned as-is
+    """
+
+    def translate_query_result(
+        self,
+        result: QueryResult,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Any] = None,
+    ) -> QueryResult:
+        return result
+
+    def translate_query_chunk(
+        self,
+        chunk: QueryChunk,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Any] = None,
+    ) -> QueryChunk:
+        return chunk
+
+    def translate_bulk_vertices_result(
+        self,
+        result: BulkVerticesResult,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Any] = None,
+    ) -> BulkVerticesResult:
+        return result
+
+    def translate_batch_result(
+        self,
+        result: BatchResult,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Any] = None,
+    ) -> BatchResult:
+        return result
+
+    def translate_schema(
+        self,
+        schema: GraphSchema,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Any] = None,
+    ) -> GraphSchema:
+        return schema
+
+
 class CorpusSemanticKernelGraphClient:
     """
     Semantic Kernel–oriented client wrapper around a Corpus `GraphProtocolV1`.
@@ -407,65 +467,6 @@ class CorpusSemanticKernelGraphClient:
       Semantic Kernel–specific hints when failures occur.
     """
 
-    class _SemanticKernelGraphFrameworkTranslator(DefaultGraphFrameworkTranslator):
-        """
-        Semantic Kernel–specific GraphFrameworkTranslator.
-
-        Reuses the default implementation for spec construction and filters,
-        but deliberately returns core protocol types unchanged:
-
-        - QueryResult is returned as-is
-        - QueryChunk is returned as-is
-        - BulkVerticesResult is returned as-is
-        - BatchResult is returned as-is
-        - GraphSchema is returned as-is
-        """
-
-        def translate_query_result(
-            self,
-            result: QueryResult,
-            *,
-            op_ctx: OperationContext,
-            framework_ctx: Optional[Any] = None,
-        ) -> QueryResult:
-            return result
-
-        def translate_query_chunk(
-            self,
-            chunk: QueryChunk,
-            *,
-            op_ctx: OperationContext,
-            framework_ctx: Optional[Any] = None,
-        ) -> QueryChunk:
-            return chunk
-
-        def translate_bulk_vertices_result(
-            self,
-            result: BulkVerticesResult,
-            *,
-            op_ctx: OperationContext,
-            framework_ctx: Optional[Any] = None,
-        ) -> BulkVerticesResult:
-            return result
-
-        def translate_batch_result(
-            self,
-            result: BatchResult,
-            *,
-            op_ctx: OperationContext,
-            framework_ctx: Optional[Any] = None,
-        ) -> BatchResult:
-            return result
-
-        def translate_schema(
-            self,
-            schema: GraphSchema,
-            *,
-            op_ctx: OperationContext,
-            framework_ctx: Optional[Any] = None,
-        ) -> GraphSchema:
-            return schema
-
     def __init__(
         self,
         *,
@@ -474,6 +475,7 @@ class CorpusSemanticKernelGraphClient:
         default_namespace: Optional[str] = None,
         default_timeout_ms: Optional[int] = None,
         framework_version: Optional[str] = None,
+        framework_translator: Optional[DefaultGraphFrameworkTranslator] = None,
     ) -> None:
         """
         Initialize a Semantic Kernel–oriented graph client.
@@ -491,12 +493,18 @@ class CorpusSemanticKernelGraphClient:
             `timeout_ms` is not explicitly passed to query methods.
         framework_version:
             Optional framework version string for observability.
+        framework_translator:
+            Optional framework-specific Graph translator. When not provided,
+            `SemanticKernelGraphFrameworkTranslator` is used by default.
         """
         self._graph: GraphProtocolV1 = graph_adapter
         self._default_dialect: Optional[str] = default_dialect
         self._default_namespace: Optional[str] = default_namespace
         self._default_timeout_ms: Optional[int] = default_timeout_ms
         self._framework_version: Optional[str] = framework_version
+        self._framework_translator: Optional[DefaultGraphFrameworkTranslator] = (
+            framework_translator
+        )
 
     # ------------------------------------------------------------------ #
     # Resource Management (Context Managers)
@@ -531,7 +539,9 @@ class CorpusSemanticKernelGraphClient:
 
         Uses `cached_property` for thread safety and performance.
         """
-        framework_translator = self._SemanticKernelGraphFrameworkTranslator()
+        framework_translator = (
+            self._framework_translator or SemanticKernelGraphFrameworkTranslator()
+        )
         return create_graph_translator(
             adapter=self._graph,
             framework="semantic_kernel",
@@ -579,7 +589,10 @@ class CorpusSemanticKernelGraphClient:
                 framework="semantic_kernel",
                 operation="context_translation",
             )
-            raise
+            raise BadRequest(
+                "Failed to build OperationContext from Semantic Kernel inputs",
+                code=ErrorCodes.BAD_OPERATION_CONTEXT,
+            ) from exc
 
         if not isinstance(ctx, OperationContext):
             raise BadRequest(
@@ -627,16 +640,50 @@ class CorpusSemanticKernelGraphClient:
             raw["timeout_ms"] = int(effective_timeout)
         return raw
 
-    def _framework_ctx_for_namespace(
+    def _framework_ctx(
         self,
-        namespace: Optional[str],
+        *,
+        operation: str,
+        namespace: Optional[str] = None,
     ) -> Mapping[str, Any]:
         """
-        Build a minimal framework_ctx mapping that lets the common translator
-        derive a preferred namespace when needed.
+        Build a framework_ctx mapping that lets the common translator derive
+        a preferred namespace and capture framework metadata for observability.
         """
+        ctx: Dict[str, Any] = {
+            "framework": "semantic_kernel",
+            "operation": operation,
+        }
+
+        if self._framework_version is not None:
+            ctx["framework_version"] = self._framework_version
+
         effective_namespace = namespace or self._default_namespace
-        return {"namespace": effective_namespace} if effective_namespace is not None else {}
+        if effective_namespace is not None:
+            ctx["namespace"] = effective_namespace
+
+        return ctx
+
+    def _validate_upsert_edges_spec(self, spec: UpsertEdgesSpec) -> None:
+        """
+        Basic structural validation for UpsertEdgesSpec.edges to provide
+        clearer errors before reaching the adapter / translator.
+        """
+        if spec.edges is None:
+            raise BadRequest("UpsertEdgesSpec.edges must not be None")
+
+        try:
+            edges_list = list(spec.edges)
+        except TypeError as exc:
+            raise BadRequest(
+                "UpsertEdgesSpec.edges must be an iterable of edges",
+            ) from exc
+
+        if not edges_list:
+            raise BadRequest("UpsertEdgesSpec must contain at least one edge")
+
+        # Normalize to list to avoid one-shot iterables.
+        spec.edges = edges_list  # type: ignore[assignment]
 
     # ------------------------------------------------------------------ #
     # Capabilities / schema / health
@@ -810,7 +857,10 @@ class CorpusSemanticKernelGraphClient:
             timeout_ms=timeout_ms,
             stream=False,
         )
-        framework_ctx = self._framework_ctx_for_namespace(namespace)
+        framework_ctx = self._framework_ctx(
+            operation="query",
+            namespace=namespace,
+        )
 
         result = self._translator.query(
             raw_query,
@@ -858,7 +908,10 @@ class CorpusSemanticKernelGraphClient:
             timeout_ms=timeout_ms,
             stream=False,
         )
-        framework_ctx = self._framework_ctx_for_namespace(namespace)
+        framework_ctx = self._framework_ctx(
+            operation="query",
+            namespace=namespace,
+        )
 
         result = await self._translator.arun_query(
             raw_query,
@@ -911,7 +964,10 @@ class CorpusSemanticKernelGraphClient:
             timeout_ms=timeout_ms,
             stream=True,
         )
-        framework_ctx = self._framework_ctx_for_namespace(namespace)
+        framework_ctx = self._framework_ctx(
+            operation="stream_query",
+            namespace=namespace,
+        )
 
         for chunk in self._translator.query_stream(
             raw_query,
@@ -956,7 +1012,10 @@ class CorpusSemanticKernelGraphClient:
             timeout_ms=timeout_ms,
             stream=True,
         )
-        framework_ctx = self._framework_ctx_for_namespace(namespace)
+        framework_ctx = self._framework_ctx(
+            operation="stream_query",
+            namespace=namespace,
+        )
 
         async for chunk in self._translator.arun_query_stream(
             raw_query,
@@ -993,8 +1052,9 @@ class CorpusSemanticKernelGraphClient:
             settings=settings,
             extra_context=extra_context,
         )
-        framework_ctx = self._framework_ctx_for_namespace(
-            getattr(spec, "namespace", None),
+        framework_ctx = self._framework_ctx(
+            operation="upsert_nodes",
+            namespace=getattr(spec, "namespace", None),
         )
 
         result = self._translator.upsert_nodes(
@@ -1028,8 +1088,9 @@ class CorpusSemanticKernelGraphClient:
             settings=settings,
             extra_context=extra_context,
         )
-        framework_ctx = self._framework_ctx_for_namespace(
-            getattr(spec, "namespace", None),
+        framework_ctx = self._framework_ctx(
+            operation="upsert_nodes",
+            namespace=getattr(spec, "namespace", None),
         )
 
         result = await self._translator.arun_upsert_nodes(
@@ -1056,13 +1117,16 @@ class CorpusSemanticKernelGraphClient:
         """
         Sync wrapper for upserting edges via GraphTranslator.
         """
+        self._validate_upsert_edges_spec(spec)
+
         ctx = self._build_ctx(
             context=context,
             settings=settings,
             extra_context=extra_context,
         )
-        framework_ctx = self._framework_ctx_for_namespace(
-            getattr(spec, "namespace", None),
+        framework_ctx = self._framework_ctx(
+            operation="upsert_edges",
+            namespace=getattr(spec, "namespace", None),
         )
 
         result = self._translator.upsert_edges(
@@ -1089,13 +1153,16 @@ class CorpusSemanticKernelGraphClient:
         """
         Async wrapper for upserting edges via GraphTranslator.
         """
+        self._validate_upsert_edges_spec(spec)
+
         ctx = self._build_ctx(
             context=context,
             settings=settings,
             extra_context=extra_context,
         )
-        framework_ctx = self._framework_ctx_for_namespace(
-            getattr(spec, "namespace", None),
+        framework_ctx = self._framework_ctx(
+            operation="upsert_edges",
+            namespace=getattr(spec, "namespace", None),
         )
 
         result = await self._translator.arun_upsert_edges(
@@ -1131,8 +1198,9 @@ class CorpusSemanticKernelGraphClient:
             settings=settings,
             extra_context=extra_context,
         )
-        framework_ctx = self._framework_ctx_for_namespace(
-            getattr(spec, "namespace", None),
+        framework_ctx = self._framework_ctx(
+            operation="delete_nodes",
+            namespace=getattr(spec, "namespace", None),
         )
 
         if spec.filter is not None:
@@ -1169,8 +1237,9 @@ class CorpusSemanticKernelGraphClient:
             settings=settings,
             extra_context=extra_context,
         )
-        framework_ctx = self._framework_ctx_for_namespace(
-            getattr(spec, "namespace", None),
+        framework_ctx = self._framework_ctx(
+            operation="delete_nodes",
+            namespace=getattr(spec, "namespace", None),
         )
 
         if spec.filter is not None:
@@ -1207,8 +1276,9 @@ class CorpusSemanticKernelGraphClient:
             settings=settings,
             extra_context=extra_context,
         )
-        framework_ctx = self._framework_ctx_for_namespace(
-            getattr(spec, "namespace", None),
+        framework_ctx = self._framework_ctx(
+            operation="delete_edges",
+            namespace=getattr(spec, "namespace", None),
         )
 
         if spec.filter is not None:
@@ -1245,8 +1315,9 @@ class CorpusSemanticKernelGraphClient:
             settings=settings,
             extra_context=extra_context,
         )
-        framework_ctx = self._framework_ctx_for_namespace(
-            getattr(spec, "namespace", None),
+        framework_ctx = self._framework_ctx(
+            operation="delete_edges",
+            namespace=getattr(spec, "namespace", None),
         )
 
         if spec.filter is not None:
@@ -1293,7 +1364,10 @@ class CorpusSemanticKernelGraphClient:
             "cursor": spec.cursor,
             "filter": spec.filter,
         }
-        framework_ctx = self._framework_ctx_for_namespace(spec.namespace)
+        framework_ctx = self._framework_ctx(
+            operation="bulk_vertices",
+            namespace=spec.namespace,
+        )
 
         result = self._translator.bulk_vertices(
             raw_request,
@@ -1330,7 +1404,10 @@ class CorpusSemanticKernelGraphClient:
             "cursor": spec.cursor,
             "filter": spec.filter,
         }
-        framework_ctx = self._framework_ctx_for_namespace(spec.namespace)
+        framework_ctx = self._framework_ctx(
+            operation="bulk_vertices",
+            namespace=spec.namespace,
+        )
 
         result = await self._translator.arun_bulk_vertices(
             raw_request,
@@ -1370,11 +1447,12 @@ class CorpusSemanticKernelGraphClient:
         raw_batch_ops: List[Mapping[str, Any]] = [
             {"op": op.op, "args": dict(op.args or {})} for op in ops
         ]
+        framework_ctx = self._framework_ctx(operation="batch")
 
         result = self._translator.batch(
             raw_batch_ops,
             op_ctx=ctx,
-            framework_ctx={},
+            framework_ctx=framework_ctx,
         )
         return validate_graph_result_type(
             result,
@@ -1405,11 +1483,12 @@ class CorpusSemanticKernelGraphClient:
         raw_batch_ops: List[Mapping[str, Any]] = [
             {"op": op.op, "args": dict(op.args or {})} for op in ops
         ]
+        framework_ctx = self._framework_ctx(operation="batch")
 
         result = await self._translator.arun_batch(
             raw_batch_ops,
             op_ctx=ctx,
-            framework_ctx={},
+            framework_ctx=framework_ctx,
         )
         return validate_graph_result_type(
             result,
@@ -1422,6 +1501,7 @@ class CorpusSemanticKernelGraphClient:
 __all__ = [
     "SemanticKernelGraphClientProtocol",
     "CorpusSemanticKernelGraphClient",
+    "SemanticKernelGraphFrameworkTranslator",
     "ErrorCodes",
     "with_graph_error_context",
     "with_async_graph_error_context",
