@@ -1476,11 +1476,244 @@ class CorpusLlamaIndexGraphClient:
             error_code=ErrorCodes.BAD_BATCH_RESULT,
         )
 
+from typing import TYPE_CHECKING
+
+try:
+    # Optional LlamaIndex dependency – only needed if you want CorpusGraphStore
+    from llama_index.core.graph_stores.types import GraphStore as _LlamaIndexGraphStore
+except ImportError:  # pragma: no cover - optional dependency
+    _LlamaIndexGraphStore = None  # type: ignore[assignment]
+
+
+# ------------------------------------------------------------------ #
+# Optional LlamaIndex GraphStore wrapper
+# ------------------------------------------------------------------ #
+
+if _LlamaIndexGraphStore is not None:
+
+    class CorpusGraphStore(_LlamaIndexGraphStore):  # type: ignore[misc]
+        """
+        LlamaIndex `GraphStore` implementation backed by CorpusLlamaIndexGraphClient.
+
+        This is a thin adapter that lets you plug a Corpus graph into
+        LlamaIndex's `KnowledgeGraphIndex` (and any other GraphStore consumers).
+
+        NOTE
+        ----
+        CorpusGraphStore is intentionally *lightly opinionated* and does **not**
+        assume a particular triple schema in your Corpus graph. You are expected
+        to either:
+
+        - Provide concrete query strings / functions that map:
+            (subj, rel, obj) <-> your graph schema
+        - Or subclass CorpusGraphStore and override the triplet methods.
+
+        The default implementations of `get`, `get_rel_map`, `upsert_triplet`
+        and `delete` raise NotImplementedError to force you to define the
+        mapping explicitly for your deployment.
+        """
+
+        schema: str = ""
+
+        def __init__(
+            self,
+            client: "CorpusLlamaIndexGraphClient",
+            *,
+            namespace: Optional[str] = None,
+            # Optional: basic triplet mapping hooks
+            get_query: Optional[str] = None,
+            get_rel_map_query: Optional[str] = None,
+            upsert_triplet_query: Optional[str] = None,
+            delete_triplet_query: Optional[str] = None,
+        ) -> None:
+            """
+            Parameters
+            ----------
+            client:
+                Underlying CorpusLlamaIndexGraphClient.
+            namespace:
+                Optional default namespace to use for all operations.
+            get_query / get_rel_map_query / upsert_triplet_query / delete_triplet_query:
+                Optional graph-query text for triplet-style operations.
+
+                These are deliberately free-form and depend on your graph
+                adapter / dialect. If omitted, the corresponding methods
+                will raise NotImplementedError and you should override
+                them in a subclass instead.
+            """
+            self._client = client
+            self._namespace = namespace
+
+            self._get_query = get_query
+            self._get_rel_map_query = get_rel_map_query
+            self._upsert_triplet_query = upsert_triplet_query
+            self._delete_triplet_query = delete_triplet_query
+
+        # ----------------------------- #
+        # GraphStore protocol methods   #
+        # ----------------------------- #
+
+        @property
+        def client(self) -> Any:
+            """Expose underlying client."""
+            return self._client
+
+        def query(
+            self,
+            query: str,
+            param_map: Optional[Dict[str, Any]] = None,
+        ) -> Any:
+            """
+            Generic query interface required by GraphStore.
+
+            This is a simple pass-through to CorpusLlamaIndexGraphClient.query,
+            using the configured namespace.
+            """
+            return self._client.query(
+                query,
+                params=param_map,
+                namespace=self._namespace,
+            )
+
+        def get(self, subj: str) -> List[List[str]]:
+            """
+            Get triplets for a given subject.
+
+            By default this requires `get_query` to be provided, and expects
+            the underlying graph adapter to return rows shaped as:
+                [[subj, rel, obj], ...].
+
+            Override this method in a subclass if your schema or query
+            mechanism differs.
+            """
+            if self._get_query is None:
+                raise NotImplementedError(
+                    "CorpusGraphStore.get requires a 'get_query' or an override. "
+                    "Provide a graph query that returns [[subj, rel, obj], ...]."
+                )
+
+            result = self._client.query(
+                self._get_query,
+                params={"subj": subj},
+                namespace=self._namespace,
+            )
+
+            # We deliberately do no strict shape enforcement here – callers
+            # can normalize in a subclass if needed.
+            return getattr(result, "rows", result)  # type: ignore[return-value]
+
+        def get_rel_map(
+            self,
+            subjs: Optional[List[str]] = None,
+            depth: int = 2,
+            limit: int = 30,
+        ) -> Dict[str, List[List[str]]]:
+            """
+            Get a depth-aware relation map.
+
+            Default implementation requires `get_rel_map_query` and expects
+            a mapping {subject: [[subj, rel, obj], ...]} from the graph.
+
+            If your adapter exposes something richer, override this method.
+            """
+            if self._get_rel_map_query is None:
+                raise NotImplementedError(
+                    "CorpusGraphStore.get_rel_map requires a 'get_rel_map_query' "
+                    "or an override."
+                )
+
+            params: Dict[str, Any] = {
+                "subjs": subjs,
+                "depth": depth,
+                "limit": limit,
+            }
+            result = self._client.query(
+                self._get_rel_map_query,
+                params=params,
+                namespace=self._namespace,
+            )
+            return getattr(result, "rel_map", result)  # type: ignore[return-value]
+
+        def upsert_triplet(self, subj: str, rel: str, obj: str) -> None:
+            """
+            Upsert a single (subject, relation, object) triplet.
+
+            Default implementation calls a user-supplied `upsert_triplet_query`.
+            For tighter integration (e.g., mapping directly to UpsertNodesSpec /
+            UpsertEdgesSpec), subclass and implement in terms of
+            CorpusLlamaIndexGraphClient.upsert_*.
+            """
+            if self._upsert_triplet_query is None:
+                raise NotImplementedError(
+                    "CorpusGraphStore.upsert_triplet requires an "
+                    "'upsert_triplet_query' or an override."
+                )
+
+            self._client.query(
+                self._upsert_triplet_query,
+                params={"subj": subj, "rel": rel, "obj": obj},
+                namespace=self._namespace,
+            )
+
+        def delete(self, subj: str, rel: str, obj: str) -> None:
+            """
+            Delete a single (subject, relation, object) triplet.
+
+            Default implementation calls a user-supplied `delete_triplet_query`.
+            Override to map directly onto graph delete APIs if desired.
+            """
+            if self._delete_triplet_query is None:
+                raise NotImplementedError(
+                    "CorpusGraphStore.delete requires a 'delete_triplet_query' "
+                    "or an override."
+                )
+
+            self._client.query(
+                self._delete_triplet_query,
+                params={"subj": subj, "rel": rel, "obj": obj},
+                namespace=self._namespace,
+            )
+
+        def persist(
+            self,
+            persist_path: str,
+            fs: Optional[Any] = None,
+        ) -> None:
+            """
+            Persist the graph store (no-op by default).
+
+            Corpus graphs are typically remote services; persistence is often
+            handled by the backend itself. Override this if you maintain a
+            local cache or export format.
+            """
+            return
+
+        def get_schema(self, refresh: bool = False) -> str:
+            """
+            Get the schema as a string.
+
+            Default implementation simply returns `str(GraphSchema)` from the
+            underlying Corpus graph. Override if you want a more structured
+            or Cypher-specific schema representation.
+            """
+            schema = self._client.get_schema()
+            return str(schema)
+
+else:
+    # LlamaIndex not installed – provide a stub that fails loudly at runtime
+    class CorpusGraphStore:  # type: ignore[misc]
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            raise ImportError(
+                "llama_index is not installed; CorpusGraphStore is unavailable. "
+                "Install llama-index to use this integration."
+            )
+
 
 __all__ = [
     "LlamaIndexGraphClientProtocol",
     "CorpusLlamaIndexGraphClient",
-    "LlamaIndexGraphFrameworkTranslator",
+    "LlamaIndexGraphFrameworkTranslator",  # if you made it public
+    "CorpusGraphStore",                    # <-- NEW
     "ErrorCodes",
     "with_graph_error_context",
     "with_async_graph_error_context",
