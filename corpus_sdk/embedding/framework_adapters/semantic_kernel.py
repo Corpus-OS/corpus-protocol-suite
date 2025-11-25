@@ -64,6 +64,23 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 # ---------------------------------------------------------------------------
+# Framework identity & version
+# ---------------------------------------------------------------------------
+
+_FRAMEWORK_NAME = "semantic_kernel"
+
+try:  # Best-effort Semantic Kernel version detection
+    import semantic_kernel as _semantic_kernel  # type: ignore
+
+    _FRAMEWORK_VERSION: Optional[str] = getattr(
+        _semantic_kernel,
+        "__version__",
+        None,
+    )
+except Exception:  # noqa: BLE001
+    _FRAMEWORK_VERSION = None
+
+# ---------------------------------------------------------------------------
 # Safe conditional import for Semantic Kernel base class
 # ---------------------------------------------------------------------------
 
@@ -77,6 +94,7 @@ except ImportError:  # pragma: no cover - only used when SK isn't installed
 
     class EmbeddingGeneratorBase:  # type: ignore[no-redef]
         """Fallback base class when Semantic Kernel is not installed."""
+
         pass
 
     SEMANTIC_KERNEL_AVAILABLE = False
@@ -107,7 +125,7 @@ EMBEDDING_COERCION_ERROR_CODES: CoercionErrorCodes = CoercionErrorCodes(
     invalid_result=ErrorCodes.INVALID_EMBEDDING_RESULT,
     empty_result=ErrorCodes.EMPTY_EMBEDDING_RESULT,
     conversion_error=ErrorCodes.EMBEDDING_CONVERSION_ERROR,
-    framework_label="semantic_kernel",
+    framework_label=_FRAMEWORK_NAME,
 )
 
 
@@ -155,7 +173,7 @@ def _create_error_context_decorator(
                     except Exception as exc:  # noqa: BLE001
                         attach_context(
                             exc,
-                            framework="semantic_kernel",
+                            framework=_FRAMEWORK_NAME,
                             operation=f"embedding_{operation}",
                             **full_context,
                         )
@@ -179,7 +197,7 @@ def _create_error_context_decorator(
                     except Exception as exc:  # noqa: BLE001
                         attach_context(
                             exc,
-                            framework="semantic_kernel",
+                            framework=_FRAMEWORK_NAME,
                             operation=f"embedding_{operation}",
                             **full_context,
                         )
@@ -203,6 +221,7 @@ def _extract_dynamic_context(
     """
     dynamic_ctx: Dict[str, Any] = {
         "model_id": getattr(instance, "model_id", "unknown"),
+        "framework_version": _FRAMEWORK_VERSION,
     }
 
     # Text / batch metrics
@@ -212,7 +231,7 @@ def _extract_dynamic_context(
         texts_seq = args[0]
         dynamic_ctx["texts_count"] = len(texts_seq)
         empty_count = sum(
-            1 for text in texts_seq if not isinstance(text, str) or not text.strip()
+            1 for text in texts_seq if not isinstance(text, str) or not text.strip(),
         )
         if empty_count > 0:
             dynamic_ctx["empty_texts_count"] = empty_count
@@ -281,17 +300,19 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
         batch_config: Optional[BatchConfig] = None,
         text_normalization_config: Optional[TextNormalizationConfig] = None,
         sk_config: Optional[Dict[str, Any]] = None,
+        *,
+        embedding_dimension: Optional[int] = None,
     ) -> None:
         """
         Initialize Corpus Semantic Kernel Embeddings.
         """
         # Behavioral validation (duck-typed) instead of strict isinstance
         if not hasattr(corpus_adapter, "embed") or not callable(
-            getattr(corpus_adapter, "embed", None)
+            getattr(corpus_adapter, "embed", None),
         ):
             raise TypeError(
                 "corpus_adapter must implement an EmbeddingProtocolV1-compatible "
-                "interface with an 'embed' method"
+                "interface with an 'embed' method",
             )
 
         if sk_config is not None and not isinstance(sk_config, dict):
@@ -304,10 +325,25 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
         self.batch_config = batch_config
         self.text_normalization_config = text_normalization_config
         self.sk_config: Dict[str, Any] = sk_config or {}
+        self._embedding_dimension_override = embedding_dimension
+
+        # Enforce known embedding dimension to avoid incorrect fallbacks
+        if (
+            not hasattr(self.corpus_adapter, "get_embedding_dimension")
+            and self._embedding_dimension_override is None
+        ):
+            raise ValueError(
+                "Embedding dimension is unknown. Either implement "
+                "`get_embedding_dimension()` on the corpus_adapter or pass "
+                "`embedding_dimension=...` to CorpusSemanticKernelEmbeddings.",
+            )
 
         logger.info(
-            "CorpusSemanticKernelEmbeddings initialized with model_id=%s",
+            "CorpusSemanticKernelEmbeddings initialized with model_id=%s, "
+            "framework_version=%s, embedding_dimension=%s",
             model_id or "default",
+            _FRAMEWORK_VERSION or "unknown",
+            self._embedding_dimension_override,
         )
 
     # ------------------------------------------------------------------ #
@@ -323,7 +359,7 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
         """
         translator = create_embedding_translator(
             adapter=self.corpus_adapter,
-            framework="semantic_kernel",
+            framework=_FRAMEWORK_NAME,
             translator=None,  # use registry/default generic translator
             batch_config=self.batch_config,
             text_normalization_config=self.text_normalization_config,
@@ -352,9 +388,11 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
         """
         core_ctx: Optional[OperationContext] = None
         framework_ctx: Dict[str, Any] = {
-            "framework": "semantic_kernel",
+            "framework": _FRAMEWORK_NAME,
             "sk_config": dict(self.sk_config),
         }
+        if _FRAMEWORK_VERSION is not None:
+            framework_ctx["framework_version"] = _FRAMEWORK_VERSION
 
         # Validate input type for sk_context
         if sk_context is not None:
@@ -373,12 +411,27 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
             try:
                 core_ctx_candidate = context_from_semantic_kernel(sk_context)
                 if isinstance(core_ctx_candidate, OperationContext):
-                    core_ctx = core_ctx_candidate
+                    # Enrich OperationContext with framework metadata
+                    attrs = dict(getattr(core_ctx_candidate, "attrs", {}) or {})
+                    attrs.setdefault("framework", _FRAMEWORK_NAME)
+                    if _FRAMEWORK_VERSION is not None:
+                        attrs.setdefault("framework_version", _FRAMEWORK_VERSION)
+
+                    core_ctx = OperationContext(
+                        request_id=core_ctx_candidate.request_id,
+                        idempotency_key=core_ctx_candidate.idempotency_key,
+                        deadline_ms=core_ctx_candidate.deadline_ms,
+                        traceparent=core_ctx_candidate.traceparent,
+                        tenant=core_ctx_candidate.tenant,
+                        attrs=attrs,
+                    )
+
                     logger.debug(
                         "Successfully created OperationContext from Semantic Kernel context "
-                        "with plugin: %s, function: %s",
+                        "with plugin: %s, function: %s (framework_version=%s)",
                         sk_context.get("plugin_name", "unknown"),
                         sk_context.get("function_name", "unknown"),
+                        _FRAMEWORK_VERSION or "unknown",
                     )
                 else:
                     logger.warning(
@@ -395,9 +448,10 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
                 try:
                     attach_context(
                         e,
-                        framework="semantic_kernel",
+                        framework=_FRAMEWORK_NAME,
                         operation="context_build",
                         context_snapshot=dict(sk_context),
+                        framework_version=_FRAMEWORK_VERSION,
                     )
                 except Exception:  # noqa: BLE001
                     # Do not mask original issues in context translation
@@ -424,7 +478,7 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
                 framework_ctx["user_id"] = sk_context["user_id"]
 
         # Include any extra call-specific hints
-        framework_ctx.update(kwargs)
+        framework_ctx.update({k: v for k, v in kwargs.items() if not k.startswith("_")})
 
         # Also expose the OperationContext itself
         if core_ctx is not None:
@@ -439,11 +493,17 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
         """Validate Semantic Kernel context structure and log warnings for anomalies."""
         if not any(
             key in context
-            for key in ("plugin_name", "function_name", "kernel_id", "memory_type", "request_id")
+            for key in (
+                "plugin_name",
+                "function_name",
+                "kernel_id",
+                "memory_type",
+                "request_id",
+            )
         ):
             logger.debug(
-                "Semantic Kernel context missing common fields (plugin_name, function_name, etc.) - "
-                "reduced context for embeddings",
+                "Semantic Kernel context missing common fields "
+                "(plugin_name, function_name, etc.) - reduced context for embeddings",
             )
 
     def _coerce_embedding_matrix(self, result: Any) -> List[List[float]]:
@@ -452,6 +512,7 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
         """
         return coerce_embedding_matrix(
             result=result,
+            framework=_FRAMEWORK_NAME,
             error_codes=EMBEDDING_COERCION_ERROR_CODES,
             logger=logger,
         )
@@ -462,6 +523,7 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
         """
         return coerce_embedding_vector(
             result=result,
+            framework=_FRAMEWORK_NAME,
             error_codes=EMBEDDING_COERCION_ERROR_CODES,
             logger=logger,
         )
@@ -470,30 +532,49 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
     def embedding_dimension(self) -> int:
         """
         Get embedding dimension for proper zero vector fallback.
+
+        Never guesses – requires either:
+        - adapter.get_embedding_dimension(), or
+        - explicit embedding_dimension override passed at init.
         """
         if hasattr(self.corpus_adapter, "get_embedding_dimension"):
             try:
                 return int(self.corpus_adapter.get_embedding_dimension())
             except Exception as e:  # noqa: BLE001
-                logger.debug("Failed to get embedding dimension from adapter: %s", e)
+                logger.debug(
+                    "Failed to get embedding dimension from adapter: %s", e,
+                )
+                if self._embedding_dimension_override is not None:
+                    return int(self._embedding_dimension_override)
+                raise
 
-        # Common fallback dimension
-        return 768
+        if self._embedding_dimension_override is not None:
+            return int(self._embedding_dimension_override)
+
+        # Should be unreachable due to __init__ guard, but keep a hard failure
+        raise RuntimeError(
+            "Embedding dimension is unknown. Adapter does not expose "
+            "`get_embedding_dimension()` and no `embedding_dimension` "
+            "override was provided.",
+        )
 
     def _handle_empty_text(self, text: str) -> List[float]:
         """
         Handle empty text by returning an appropriate zero vector.
         """
-        logger.warning("Empty text provided for embedding, returning zero vector")
-        dimension = self.embedding_dimension
-        return [0.0] * dimension
+        dim = self.embedding_dimension
+        logger.warning(
+            "Empty text provided for embedding, returning zero vector (dimension=%d)",
+            dim,
+        )
+        return [0.0] * dim
 
     def _warn_if_extreme_batch(self, texts: Sequence[str], *, op_name: str) -> None:
         """
         Soft warning for extremely large batches.
         """
         warn_if_extreme_batch(
-            framework="semantic_kernel",
+            framework=_FRAMEWORK_NAME,
             texts=texts,
             op_name=op_name,
             batch_config=self.batch_config,
@@ -579,13 +660,14 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
 
         non_empty_texts = [t for t in texts_list if isinstance(t, str) and t.strip()]
         empty_indices = [
-            i for i, t in enumerate(texts_list)
+            i
+            for i, t in enumerate(texts_list)
             if not isinstance(t, str) or not t.strip()
         ]
 
         if not non_empty_texts:
-            dimension = self.embedding_dimension
-            return [[0.0] * dimension for _ in texts_list]
+            dim = self.embedding_dimension
+            return [[0.0] * dim for _ in texts_list]
 
         core_ctx, framework_ctx = self._build_contexts(
             sk_context=sk_context,
@@ -608,12 +690,12 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
         embeddings = self._coerce_embedding_matrix(translated)
 
         if empty_indices:
-            dimension = len(embeddings[0]) if embeddings else self.embedding_dimension
+            dim = len(embeddings[0]) if embeddings else self.embedding_dimension
             result_embeddings: List[List[float]] = []
             non_empty_idx = 0
             for i in range(len(texts_list)):
                 if i in empty_indices:
-                    result_embeddings.append([0.0] * dimension)
+                    result_embeddings.append([0.0] * dim)
                 else:
                     result_embeddings.append(embeddings[non_empty_idx])
                     non_empty_idx += 1
@@ -640,13 +722,14 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
 
         non_empty_texts = [t for t in texts_list if isinstance(t, str) and t.strip()]
         empty_indices = [
-            i for i, t in enumerate(texts_list)
+            i
+            for i, t in enumerate(texts_list)
             if not isinstance(t, str) or not t.strip()
         ]
 
         if not non_empty_texts:
-            dimension = self.embedding_dimension
-            return [[0.0] * dimension for _ in texts_list]
+            dim = self.embedding_dimension
+            return [[0.0] * dim for _ in texts_list]
 
         core_ctx, framework_ctx = self._build_contexts(
             sk_context=sk_context,
@@ -669,12 +752,12 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
         embeddings = self._coerce_embedding_matrix(translated)
 
         if empty_indices:
-            dimension = len(embeddings[0]) if embeddings else self.embedding_dimension
+            dim = len(embeddings[0]) if embeddings else self.embedding_dimension
             result_embeddings: List[List[float]] = []
             non_empty_idx = 0
             for i in range(len(texts_list)):
                 if i in empty_indices:
-                    result_embeddings.append([0.0] * dimension)
+                    result_embeddings.append([0.0] * dim)
                 else:
                     result_embeddings.append(embeddings[non_empty_idx])
                     non_empty_idx += 1
@@ -863,7 +946,7 @@ def register_with_semantic_kernel(
         if not registration_successful:
             logger.warning(
                 "No compatible Semantic Kernel service registration method found. "
-                "Manual service configuration may be required."
+                "Manual service configuration may be required.",
             )
 
     except Exception as e:  # noqa: BLE001
