@@ -161,6 +161,9 @@ def _warn_if_extreme_k(k: int, op_name: str) -> None:
 def with_error_context(operation: str, **context_kwargs: Any):
     """
     Decorator to automatically attach error context to sync exceptions.
+
+    Adds some lightweight dynamic metadata (e.g., k, namespace, default_namespace,
+    framework_version) for better observability.
     """
 
     def decorator(fn: T) -> T:
@@ -170,10 +173,31 @@ def with_error_context(operation: str, **context_kwargs: Any):
                 return fn(*args, **kwargs)
             except Exception as exc:
                 extra = dict(context_kwargs)
+                # Best-effort dynamic context extraction
+                try:
+                    if "k" in kwargs:
+                        extra["k"] = kwargs["k"]
+                    if "namespace" in kwargs:
+                        extra["namespace"] = kwargs["namespace"]
+                    if "filter" in kwargs:
+                        extra["has_filter"] = kwargs["filter"] is not None
+
+                    if args:
+                        self_obj = args[0]
+                        default_ns = getattr(self_obj, "namespace", None)
+                        if default_ns is not None:
+                            extra.setdefault("default_namespace", default_ns)
+                        fv = getattr(self_obj, "_framework_version", None)
+                        if fv is not None:
+                            extra.setdefault("framework_version", fv)
+                except Exception:  # pragma: no cover - defensive only
+                    pass
+
                 attach_context(
                     exc,
                     framework="autogen",
                     operation=f"vector_{operation}",
+                    error_codes=VECTOR_COERCION_ERROR_CODES,
                     **extra,
                 )
                 raise
@@ -186,6 +210,9 @@ def with_error_context(operation: str, **context_kwargs: Any):
 def with_async_error_context(operation: str, **context_kwargs: Any):
     """
     Decorator to automatically attach error context to async exceptions.
+
+    Adds some lightweight dynamic metadata (e.g., k, namespace, default_namespace,
+    framework_version) for better observability.
     """
 
     def decorator(fn: T) -> T:
@@ -195,10 +222,31 @@ def with_async_error_context(operation: str, **context_kwargs: Any):
                 return await fn(*args, **kwargs)
             except Exception as exc:
                 extra = dict(context_kwargs)
+                # Best-effort dynamic context extraction
+                try:
+                    if "k" in kwargs:
+                        extra["k"] = kwargs["k"]
+                    if "namespace" in kwargs:
+                        extra["namespace"] = kwargs["namespace"]
+                    if "filter" in kwargs:
+                        extra["has_filter"] = kwargs["filter"] is not None
+
+                    if args:
+                        self_obj = args[0]
+                        default_ns = getattr(self_obj, "namespace", None)
+                        if default_ns is not None:
+                            extra.setdefault("default_namespace", default_ns)
+                        fv = getattr(self_obj, "_framework_version", None)
+                        if fv is not None:
+                            extra.setdefault("framework_version", fv)
+                except Exception:  # pragma: no cover - defensive only
+                    pass
+
                 attach_context(
                     exc,
                     framework="autogen",
                     operation=f"vector_{operation}",
+                    error_codes=VECTOR_COERCION_ERROR_CODES,
                     **extra,
                 )
                 raise
@@ -306,6 +354,7 @@ class CorpusAutoGenVectorStore:
         async_embedding_function: Optional[
             Callable[[List[str]], Awaitable[Embeddings]]
         ] = None,
+        framework_version: Optional[str] = None,
     ) -> None:
         self.corpus_adapter: VectorProtocolV1 = corpus_adapter
         self.namespace = namespace
@@ -320,6 +369,9 @@ class CorpusAutoGenVectorStore:
         # Embedding integration
         self.embedding_function = embedding_function
         self.async_embedding_function = async_embedding_function
+
+        # Observability / context
+        self._framework_version: Optional[str] = framework_version
 
     # ------------------------------------------------------------------ #
     # Translator (lazy, cached)
@@ -363,12 +415,18 @@ class CorpusAutoGenVectorStore:
             return None
 
         try:
-            ctx = core_ctx_from_autogen(conversation, **extra)
+            ctx = core_ctx_from_autogen(
+                conversation,
+                framework_version=self._framework_version,
+                **extra,
+            )
         except Exception as exc:
             attach_context(
                 exc,
                 framework="autogen",
                 operation="vector_context_translation",
+                framework_version=self._framework_version,
+                error_codes=VECTOR_COERCION_ERROR_CODES,
             )
             raise
 
@@ -487,6 +545,8 @@ class CorpusAutoGenVectorStore:
                 err,
                 framework="autogen",
                 operation="vector_embed_documents",
+                framework_version=self._framework_version,
+                error_codes=VECTOR_COERCION_ERROR_CODES,
             )
             raise err
 
@@ -532,6 +592,8 @@ class CorpusAutoGenVectorStore:
                     err,
                     framework="autogen",
                     operation="vector_embed_documents_async",
+                    framework_version=self._framework_version,
+                    error_codes=VECTOR_COERCION_ERROR_CODES,
                 )
                 raise err
         else:
@@ -552,6 +614,8 @@ class CorpusAutoGenVectorStore:
                     err,
                     framework="autogen",
                     operation="vector_embed_documents_async",
+                    framework_version=self._framework_version,
+                    error_codes=VECTOR_COERCION_ERROR_CODES,
                 )
                 raise err
 
@@ -589,6 +653,8 @@ class CorpusAutoGenVectorStore:
                 framework="autogen",
                 operation="vector_embed_query",
                 query=query,
+                framework_version=self._framework_version,
+                error_codes=VECTOR_COERCION_ERROR_CODES,
             )
             raise exc
 
@@ -604,6 +670,8 @@ class CorpusAutoGenVectorStore:
                 framework="autogen",
                 operation="vector_embed_query",
                 query=query,
+                framework_version=self._framework_version,
+                error_codes=VECTOR_COERCION_ERROR_CODES,
             )
             raise err
 
@@ -617,6 +685,8 @@ class CorpusAutoGenVectorStore:
                 framework="autogen",
                 operation="vector_embed_query",
                 query=query,
+                framework_version=self._framework_version,
+                error_codes=VECTOR_COERCION_ERROR_CODES,
             )
             raise err
 
@@ -653,6 +723,8 @@ class CorpusAutoGenVectorStore:
                     framework="autogen",
                     operation="vector_embed_query_async",
                     query=query,
+                    framework_version=self._framework_version,
+                    error_codes=VECTOR_COERCION_ERROR_CODES,
                 )
                 raise err
         else:
@@ -666,6 +738,8 @@ class CorpusAutoGenVectorStore:
                     framework="autogen",
                     operation="vector_embed_query_async",
                     query=query,
+                    framework_version=self._framework_version,
+                    error_codes=VECTOR_COERCION_ERROR_CODES,
                 )
                 raise exc
             try:
@@ -680,6 +754,8 @@ class CorpusAutoGenVectorStore:
                     framework="autogen",
                     operation="vector_embed_query_async",
                     query=query,
+                    framework_version=self._framework_version,
+                    error_codes=VECTOR_COERCION_ERROR_CODES,
                 )
                 raise err
 
@@ -693,6 +769,8 @@ class CorpusAutoGenVectorStore:
                 framework="autogen",
                 operation="vector_embed_query_async",
                 query=query,
+                framework_version=self._framework_version,
+                error_codes=VECTOR_COERCION_ERROR_CODES,
             )
             raise err
 
@@ -843,7 +921,12 @@ class CorpusAutoGenVectorStore:
         Minimal framework_ctx that hints preferred namespace to the translator.
         """
         ns = self._effective_namespace(namespace)
-        return {"namespace": ns} if ns is not None else {}
+        ctx: Dict[str, Any] = {}
+        if ns is not None:
+            ctx["namespace"] = ns
+        if self._framework_version is not None:
+            ctx["framework_version"] = self._framework_version
+        return ctx
 
     def _extract_matches_from_result(self, result: Any) -> List[Mapping[str, Any]]:
         """
@@ -1206,7 +1289,7 @@ class CorpusAutoGenVectorStore:
         return self._from_matches(matches)
 
     # ------------------------------------------------------------------ #
-    # Streaming similarity search (sync)
+    # Streaming similarity search (sync + async)
     # ------------------------------------------------------------------ #
 
     @with_error_context("similarity_search_stream_sync")
@@ -1243,6 +1326,46 @@ class CorpusAutoGenVectorStore:
         )
 
         for chunk in self._translator.query_stream(
+            raw_query,
+            op_ctx=ctx,
+            framework_ctx=self._framework_ctx_for_namespace(namespace),
+        ):
+            matches = self._extract_matches_from_chunk(chunk)
+            for doc, _ in self._from_matches(matches):
+                yield doc
+
+    @with_async_error_context("similarity_search_stream_async")
+    async def asimilarity_search_stream(
+        self,
+        query: str,
+        k: int = 4,
+        filter: Optional[Mapping[str, Any]] = None,
+        *,
+        conversation: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+        embedding: Optional[Sequence[float]] = None,
+        namespace: Optional[str] = None,
+    ) -> AsyncIterator[AutoGenDocument]:
+        """
+        Streaming similarity search (async), yielding AutoGenDocuments one by one.
+
+        Delegates streaming orchestration to `VectorTranslator.arun_query_stream`.
+        """
+        ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
+        query_emb = await self._embed_query_async(query, embedding=embedding)
+
+        top_k = k or self.default_top_k
+        _warn_if_extreme_k(top_k, op_name="asimilarity_search_stream")
+
+        raw_query = self._build_raw_query(
+            embedding=query_emb,
+            k=top_k,
+            namespace=namespace,
+            filter=filter,
+            include_vectors=False,
+        )
+
+        async for chunk in self._translator.arun_query_stream(
             raw_query,
             op_ctx=ctx,
             framework_ctx=self._framework_ctx_for_namespace(namespace),
@@ -1515,6 +1638,82 @@ class CorpusAutoGenVectorStore:
             raw_filter_or_ids,
             op_ctx=ctx,
             framework_ctx=self._framework_ctx_for_namespace(ns),
+        )
+
+    # ------------------------------------------------------------------ #
+    # Health / capabilities (thin pass-through)
+    # ------------------------------------------------------------------ #
+
+    @with_error_context("capabilities_sync")
+    def capabilities(self) -> Mapping[str, Any]:
+        """
+        Thin pass-through to the underlying adapter's capabilities().
+
+        If no capabilities method is exposed, raises NotSupported.
+        """
+        adapter = self.corpus_adapter
+        caps = getattr(adapter, "capabilities", None)
+        if callable(caps):
+            return caps()  # type: ignore[misc]
+        raise NotSupported(
+            "Underlying vector adapter does not expose capabilities()",
+        )
+
+    @with_async_error_context("capabilities_async")
+    async def acapabilities(self) -> Mapping[str, Any]:
+        """
+        Async capabilities accessor.
+
+        Prefers an async capabilities method; otherwise uses a thread pool
+        around the sync method, if available.
+        """
+        adapter = self.corpus_adapter
+        acaps = getattr(adapter, "acapabilities", None)
+        if callable(acaps):
+            return await acaps()  # type: ignore[misc]
+
+        caps = getattr(adapter, "capabilities", None)
+        if callable(caps):
+            return await asyncio.to_thread(caps)  # type: ignore[arg-type]
+
+        raise NotSupported(
+            "Underlying vector adapter does not expose capabilities()/acapabilities()",
+        )
+
+    @with_error_context("health_sync")
+    def health(self) -> Mapping[str, Any]:
+        """
+        Thin pass-through to the underlying adapter's health().
+
+        If no health method is exposed, raises NotSupported.
+        """
+        adapter = self.corpus_adapter
+        health_fn = getattr(adapter, "health", None)
+        if callable(health_fn):
+            return health_fn()  # type: ignore[misc]
+        raise NotSupported(
+            "Underlying vector adapter does not expose health()",
+        )
+
+    @with_async_error_context("health_async")
+    async def ahealth(self) -> Mapping[str, Any]:
+        """
+        Async health accessor.
+
+        Prefers an async health method; otherwise uses a thread pool
+        around the sync method, if available.
+        """
+        adapter = self.corpus_adapter
+        ahealth_fn = getattr(adapter, "ahealth", None)
+        if callable(ahealth_fn):
+            return await ahealth_fn()  # type: ignore[misc]
+
+        health_fn = getattr(adapter, "health", None)
+        if callable(health_fn):
+            return await asyncio.to_thread(health_fn)  # type: ignore[arg-type]
+
+        raise NotSupported(
+            "Underlying vector adapter does not expose health()/ahealth()",
         )
 
     # ------------------------------------------------------------------ #
