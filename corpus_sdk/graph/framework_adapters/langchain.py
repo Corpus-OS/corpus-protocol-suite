@@ -1376,7 +1376,7 @@ class CorpusLangChainGraphClient:
 
 
 # ---------------------------------------------------------------------------
-# Optional LangChain Tool wrapper
+# Optional LangChain Tool wrapper (old/simple design)
 # ---------------------------------------------------------------------------
 
 if LANGCHAIN_TOOL_AVAILABLE:  # pragma: no cover - optional feature
@@ -1385,17 +1385,17 @@ if LANGCHAIN_TOOL_AVAILABLE:  # pragma: no cover - optional feature
         """
         LangChain Tool wrapper for `CorpusLangChainGraphClient.query`.
 
-        This is intentionally minimal and opinionated:
+        This is intentionally small and generic:
+
         - Exposes graph querying as a LangChain Tool for agents.
         - Treats the Tool input as the raw query string.
-        - Returns the underlying `QueryResult` (or its dict form when available).
-
-        Recommended usage
-        -----------------
-        client = CorpusLangChainGraphClient(graph_adapter=...)
-        tool = CorpusLangChainGraphTool(client=client, name="corpus_graph", description="...")
-
-        Then register `tool` with your LC agent/tooling stack.
+        - Optional per-call overrides are passed via **kwargs:
+            * params
+            * dialect
+            * namespace
+            * timeout_ms
+            * config
+            * extra_context
         """
 
         client: CorpusLangChainGraphClient
@@ -1404,31 +1404,22 @@ if LANGCHAIN_TOOL_AVAILABLE:  # pragma: no cover - optional feature
             "Run graph queries against the Corpus graph via CorpusLangChainGraphClient."
         )
 
-        # Optional defaults for callers who want to bake these into the tool.
-        dialect: Optional[str] = None
-        namespace: Optional[str] = None
-        timeout_ms: Optional[int] = None
-        params: Optional[Mapping[str, Any]] = None
-        extra_context: Optional[Mapping[str, Any]] = None
-
         def _run(self, query: str, **kwargs: Any) -> Any:
             """
             Synchronous Tool execution.
 
             By default, this treats `query` as the raw graph query text and
-            ignores any extra kwargs except for an optional `config` mapping.
+            allows overrides via kwargs.
             """
-            config = kwargs.get("config")
             result = self.client.query(
                 query,
-                params=self.params,
-                dialect=self.dialect,
-                namespace=self.namespace,
-                timeout_ms=self.timeout_ms,
-                config=config,
-                extra_context=self.extra_context,
+                params=kwargs.get("params"),
+                dialect=kwargs.get("dialect"),
+                namespace=kwargs.get("namespace"),
+                timeout_ms=kwargs.get("timeout_ms"),
+                config=kwargs.get("config"),
+                extra_context=kwargs.get("extra_context"),
             )
-            # Best-effort conversion to a plain dict for agent-friendliness
             if hasattr(result, "to_dict"):
                 return result.to_dict()  # type: ignore[no-any-return]
             return result
@@ -1437,15 +1428,14 @@ if LANGCHAIN_TOOL_AVAILABLE:  # pragma: no cover - optional feature
             """
             Async Tool execution.
             """
-            config = kwargs.get("config")
             result = await self.client.aquery(
                 query,
-                params=self.params,
-                dialect=self.dialect,
-                namespace=self.namespace,
-                timeout_ms=self.timeout_ms,
-                config=config,
-                extra_context=self.extra_context,
+                params=kwargs.get("params"),
+                dialect=kwargs.get("dialect"),
+                namespace=kwargs.get("namespace"),
+                timeout_ms=kwargs.get("timeout_ms"),
+                config=kwargs.get("config"),
+                extra_context=kwargs.get("extra_context"),
             )
             if hasattr(result, "to_dict"):
                 return result.to_dict()  # type: ignore[no-any-return]
