@@ -167,6 +167,83 @@ with_async_error_context = with_async_graph_error_context
 
 
 # ---------------------------------------------------------------------------
+# Public AutoGen framework translator
+# ---------------------------------------------------------------------------
+
+
+class AutoGenGraphFrameworkTranslator(DefaultGraphFrameworkTranslator):
+    """
+    AutoGen-specific GraphFrameworkTranslator.
+
+    This translator reuses the common DefaultGraphFrameworkTranslator for
+    spec construction and context handling, but deliberately *does not*
+    reshape core protocol results:
+
+    - QueryResult is returned as-is
+    - QueryChunk is returned as-is
+    - BulkVerticesResult is returned as-is
+    - BatchResult is returned as-is
+    - GraphSchema is returned as-is
+
+    Exposed as a top-level class so users can easily subclass and override
+    just a subset of behaviors, e.g.:
+
+    ```python
+    class MyTranslator(AutoGenGraphFrameworkTranslator):
+        def translate_schema(...):
+            schema = super().translate_schema(...)
+            # tweak schema here
+            return schema
+    ```
+    """
+
+    def translate_query_result(
+        self,
+        result: QueryResult,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Mapping[str, Any]] = None,
+    ) -> QueryResult:
+        return result
+
+    def translate_query_chunk(
+        self,
+        chunk: QueryChunk,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Mapping[str, Any]] = None,
+    ) -> QueryChunk:
+        return chunk
+
+    def translate_bulk_vertices_result(
+        self,
+        result: BulkVerticesResult,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Mapping[str, Any]] = None,
+    ) -> BulkVerticesResult:
+        return result
+
+    def translate_batch_result(
+        self,
+        result: BatchResult,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Mapping[str, Any]] = None,
+    ) -> BatchResult:
+        return result
+
+    def translate_schema(
+        self,
+        schema: GraphSchema,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Mapping[str, Any]] = None,
+    ) -> GraphSchema:
+        return schema
+
+
+# ---------------------------------------------------------------------------
 # Public protocol
 # ---------------------------------------------------------------------------
 
@@ -413,66 +490,6 @@ class CorpusAutoGenGraphClient:
       exposes proper async methods for these calls.
     """
 
-    class _AutoGenGraphFrameworkTranslator(DefaultGraphFrameworkTranslator):
-        """
-        AutoGen-specific GraphFrameworkTranslator.
-
-        This translator reuses the common DefaultGraphFrameworkTranslator for
-        spec construction and context handling, but deliberately *does not*
-        reshape core protocol results:
-
-        - QueryResult is returned as-is
-        - QueryChunk is returned as-is
-        - BulkVerticesResult is returned as-is
-        - BatchResult is returned as-is
-        - GraphSchema is returned as-is
-        """
-
-        def translate_query_result(
-            self,
-            result: QueryResult,
-            *,
-            op_ctx: OperationContext,
-            framework_ctx: Optional[Mapping[str, Any]] = None,
-        ) -> QueryResult:
-            return result
-
-        def translate_query_chunk(
-            self,
-            chunk: QueryChunk,
-            *,
-            op_ctx: OperationContext,
-            framework_ctx: Optional[Mapping[str, Any]] = None,
-        ) -> QueryChunk:
-            return chunk
-
-        def translate_bulk_vertices_result(
-            self,
-            result: BulkVerticesResult,
-            *,
-            op_ctx: OperationContext,
-            framework_ctx: Optional[Mapping[str, Any]] = None,
-        ) -> BulkVerticesResult:
-            return result
-
-        def translate_batch_result(
-            self,
-            result: BatchResult,
-            *,
-            op_ctx: OperationContext,
-            framework_ctx: Optional[Mapping[str, Any]] = None,
-        ) -> BatchResult:
-            return result
-
-        def translate_schema(
-            self,
-            schema: GraphSchema,
-            *,
-            op_ctx: OperationContext,
-            framework_ctx: Optional[Mapping[str, Any]] = None,
-        ) -> GraphSchema:
-            return schema
-
     def __init__(
         self,
         *,
@@ -550,7 +567,7 @@ class CorpusAutoGenGraphClient:
         """
         framework_translator: GraphFrameworkTranslator = (
             self._framework_translator_override
-            or self._AutoGenGraphFrameworkTranslator()
+            or AutoGenGraphFrameworkTranslator()
         )
         return create_graph_translator(
             adapter=self._graph,
@@ -1575,6 +1592,7 @@ class CorpusAutoGenGraphClient:
 
 __all__ = [
     "AutoGenGraphClientProtocol",
+    "AutoGenGraphFrameworkTranslator",
     "CorpusAutoGenGraphClient",
     "ErrorCodes",
     "with_graph_error_context",
