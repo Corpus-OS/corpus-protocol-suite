@@ -63,6 +63,7 @@ from corpus_sdk.core.error_context import attach_context
 from corpus_sdk.graph.framework_adapters.common.graph_translation import (
     DefaultGraphFrameworkTranslator,
     GraphTranslator,
+    GraphFrameworkTranslator,
     create_graph_translator,
 )
 from corpus_sdk.graph.framework_adapters.common.framework_utils import (
@@ -480,6 +481,7 @@ class CorpusAutoGenGraphClient:
         default_namespace: Optional[str] = None,
         default_timeout_ms: Optional[int] = None,
         framework_version: Optional[str] = None,
+        framework_translator: Optional[GraphFrameworkTranslator] = None,
     ) -> None:
         """
         Initialize an AutoGen-oriented graph client.
@@ -497,12 +499,18 @@ class CorpusAutoGenGraphClient:
             `timeout_ms` is not explicitly passed to query methods.
         framework_version:
             Optional framework version string for observability.
+        framework_translator:
+            Optional custom GraphFrameworkTranslator to use instead of the
+            default AutoGen pass-through translator.
         """
         self._graph: GraphProtocolV1 = graph_adapter
         self._default_dialect: Optional[str] = default_dialect
         self._default_namespace: Optional[str] = default_namespace
         self._default_timeout_ms: Optional[int] = default_timeout_ms
         self._framework_version: Optional[str] = framework_version
+        self._framework_translator_override: Optional[
+            GraphFrameworkTranslator
+        ] = framework_translator
 
     # ------------------------------------------------------------------ #
     # Resource management (context managers)
@@ -537,9 +545,13 @@ class CorpusAutoGenGraphClient:
 
         Uses `create_graph_translator` so registry-based per-framework
         translators remain honored while still allowing our AutoGen-specific
-        pass-through translator to be supplied explicitly.
+        pass-through translator (or a caller-provided override) to be supplied
+        explicitly.
         """
-        framework_translator = self._AutoGenGraphFrameworkTranslator()
+        framework_translator: GraphFrameworkTranslator = (
+            self._framework_translator_override
+            or self._AutoGenGraphFrameworkTranslator()
+        )
         return create_graph_translator(
             adapter=self._graph,
             framework="autogen",
@@ -795,12 +807,14 @@ class CorpusAutoGenGraphClient:
             op_ctx=ctx,
             framework_ctx=self._framework_ctx(operation="health"),
         )
-        return validate_graph_result_type(
+        mapping_result = validate_graph_result_type(
             health_result,
             expected_type=Mapping,
             operation="GraphTranslator.health",
             error_code=ErrorCodes.BAD_HEALTH_RESULT,
         )
+        # Normalize to a plain dict to honor the return type annotation.
+        return dict(mapping_result)
 
     @with_async_graph_error_context("health_async")
     async def ahealth(
@@ -822,12 +836,14 @@ class CorpusAutoGenGraphClient:
             op_ctx=ctx,
             framework_ctx=self._framework_ctx(operation="health"),
         )
-        return validate_graph_result_type(
+        mapping_result = validate_graph_result_type(
             health_result,
             expected_type=Mapping,
             operation="GraphTranslator.arun_health",
             error_code=ErrorCodes.BAD_HEALTH_RESULT,
         )
+        # Normalize to a plain dict to honor the return type annotation.
+        return dict(mapping_result)
 
     # ------------------------------------------------------------------ #
     # Query (sync + async)
@@ -1566,4 +1582,3 @@ __all__ = [
     "with_error_context",
     "with_async_error_context",
 ]
-
