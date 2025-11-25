@@ -96,7 +96,7 @@ except ImportError:  # pragma: no cover - only used when LlamaIndex isn't instal
         LlamaIndex should be considered a misconfiguration.
         """
 
-        def __init__(self, *args: Any, **kwargs: Any) -> None:  # noqa: D401
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
             # Deliberately do nothing; real usage will fail earlier in practice.
             pass
 
@@ -588,13 +588,13 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         """
         Handle empty text by returning appropriate zero vector.
         """
+        dim = self.embedding_dimension
         logger.warning(
             "Empty text provided for embedding, returning zero vector "
             "(dimension=%d)",
-            self.embedding_dimension,
+            dim,
         )
-        dimension = self.embedding_dimension
-        return [0.0] * dimension
+        return [0.0] * dim
 
     def _warn_if_extreme_batch(self, texts: Sequence[str], *, op_name: str) -> None:
         """
@@ -673,8 +673,8 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         ]
 
         if not non_empty_texts:
-            dimension = self.embedding_dimension
-            return [[0.0] * dimension for _ in texts_list]
+            dim = self.embedding_dimension
+            return [[0.0] * dim for _ in texts_list]
 
         core_ctx, framework_ctx = self._build_contexts(
             llamaindex_context=llamaindex_context,
@@ -695,14 +695,14 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         embeddings = self._coerce_embedding_matrix(translated)
 
         if empty_indices:
-            dimension = (
+            dim = (
                 len(embeddings[0]) if embeddings else self.embedding_dimension
             )
             result_embeddings: List[List[float]] = []
             non_empty_idx = 0
             for i in range(len(texts_list)):
                 if i in empty_indices:
-                    result_embeddings.append([0.0] * dimension)
+                    result_embeddings.append([0.0] * dim)
                 else:
                     result_embeddings.append(embeddings[non_empty_idx])
                     non_empty_idx += 1
@@ -728,8 +728,8 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         ]
 
         if not non_empty_texts:
-            dimension = self.embedding_dimension
-            return [[0.0] * dimension for _ in texts_list]
+            dim = self.embedding_dimension
+            return [[0.0] * dim for _ in texts_list]
 
         core_ctx, framework_ctx = self._build_contexts(
             llamaindex_context=llamaindex_context,
@@ -750,14 +750,14 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         embeddings = self._coerce_embedding_matrix(translated)
 
         if empty_indices:
-            dimension = (
+            dim = (
                 len(embeddings[0]) if embeddings else self.embedding_dimension
             )
             result_embeddings: List[List[float]] = []
             non_empty_idx = 0
             for i in range(len(texts_list)):
                 if i in empty_indices:
-                    result_embeddings.append([0.0] * dimension)
+                    result_embeddings.append([0.0] * dim)
                 else:
                     result_embeddings.append(embeddings[non_empty_idx])
                     non_empty_idx += 1
