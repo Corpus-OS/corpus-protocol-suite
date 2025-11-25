@@ -11,13 +11,14 @@ embedding services within CrewAI agents and workflows, with:
 - Support for CrewAI knowledge sources and RAG workflows
 - Context normalization for CrewAI-specific execution context
 - Framework-agnostic orchestration via `EmbeddingTranslator`
-- Async → sync bridging using `AsyncBridge`
+- Async → sync bridging handled in the common embedding layer
 - Rich error context attachment for observability
 
 The design follows CrewAI's adapter patterns while maintaining the
 protocol-first Corpus embedding stack.
 
-Resilience (retries, caching, rate limiting, etc.) is expected to be provided by the underlying adapter, typically a BaseEmbeddingAdapter subclass.
+Resilience (retries, caching, rate limiting, etc.) is expected to be provided
+by the underlying adapter, typically a BaseEmbeddingAdapter subclass.
 """
 
 from __future__ import annotations
@@ -61,8 +62,9 @@ from corpus_sdk.embedding.framework_adapters.common.framework_utils import (
 
 logger = logging.getLogger(__name__)
 
-# Type variables for decorators
 T = TypeVar("T")
+
+_FRAMEWORK_NAME = "crewai"
 
 
 class ErrorCodes:
@@ -195,8 +197,8 @@ def _create_error_context_decorator(
     """
     Factory for creating error context decorators with rich per-call metrics.
 
-    Mirrors the pattern used in other framework adapters (LlamaIndex,
-    Semantic Kernel, AutoGen) for consistent observability.
+    Mirrors the pattern used in other framework adapters for consistent
+    observability.
     """
 
     def decorator_factory(
@@ -212,13 +214,18 @@ def _create_error_context_decorator(
                         kwargs,
                         operation,
                     )
-                    full_context = {**static_context, **dynamic_context}
+                    full_context = {
+                        **static_context,
+                        **dynamic_context,
+                        "error_codes": EMBEDDING_COERCION_ERROR_CODES,
+                        "framework_version": getattr(self, "_framework_version", None),
+                    }
                     try:
                         return await func(self, *args, **kwargs)
                     except Exception as exc:  # noqa: BLE001
                         attach_context(
                             exc,
-                            framework="crewai",
+                            framework=_FRAMEWORK_NAME,
                             operation=f"embedding_{operation}",
                             **full_context,
                         )
@@ -234,13 +241,18 @@ def _create_error_context_decorator(
                         kwargs,
                         operation,
                     )
-                    full_context = {**static_context, **dynamic_context}
+                    full_context = {
+                        **static_context,
+                        **dynamic_context,
+                        "error_codes": EMBEDDING_COERCION_ERROR_CODES,
+                        "framework_version": getattr(self, "_framework_version", None),
+                    }
                     try:
                         return func(self, *args, **kwargs)
                     except Exception as exc:  # noqa: BLE001
                         attach_context(
                             exc,
-                            framework="crewai",
+                            framework=_FRAMEWORK_NAME,
                             operation=f"embedding_{operation}",
                             **full_context,
                         )
@@ -291,6 +303,7 @@ class CorpusCrewAIEmbeddings:
         batch_config: Optional[BatchConfig] = None,
         text_normalization_config: Optional[TextNormalizationConfig] = None,
         crewai_config: Optional[CrewAIConfig] = None,
+        framework_version: Optional[str] = None,
     ):
         # Behavioral validation (duck-typed) instead of strict isinstance
         if not hasattr(corpus_adapter, "embed") or not callable(
@@ -301,17 +314,116 @@ class CorpusCrewAIEmbeddings:
                 "interface with an 'embed' method",
             )
 
+        # Light config validation: fail fast on clearly wrong types.
+        if batch_config is not None and not isinstance(batch_config, BatchConfig):
+            raise TypeError(
+                f"batch_config must be a BatchConfig instance, "
+                f"got {type(batch_config).__name__}",
+            )
+        if (
+            text_normalization_config is not None
+            and not isinstance(text_normalization_config, TextNormalizationConfig)
+        ):
+            raise TypeError(
+                "text_normalization_config must be a TextNormalizationConfig instance, "
+                f"got {type(text_normalization_config).__name__}",
+            )
+
         self.corpus_adapter = corpus_adapter
         self.model = model
         self.batch_config = batch_config
         self.text_normalization_config = text_normalization_config
         self.crewai_config = self._validate_crewai_config(crewai_config or {})
+        self._framework_version: Optional[str] = framework_version
 
         logger.info(
-            "CorpusCrewAIEmbeddings initialized with model: %s, config: %s",
+            "CorpusCrewAIEmbeddings initialized with model: %s, config: %s, framework_version=%s",
             model or "default",
             self.crewai_config,
+            self._framework_version,
         )
+
+    # ------------------------------------------------------------------ #
+    # Resource management (context managers)
+    # ------------------------------------------------------------------ #
+
+    def __enter__(self) -> "CorpusCrewAIEmbeddings":
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        if hasattr(self.corpus_adapter, "close"):
+            try:
+                self.corpus_adapter.close()  # type: ignore[call-arg]
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Error while closing embedding adapter in __exit__: %s", exc)
+
+    async def __aenter__(self) -> "CorpusCrewAIEmbeddings":
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        if hasattr(self.corpus_adapter, "aclose"):
+            try:
+                await self.corpus_adapter.aclose()  # type: ignore[call-arg]
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Error while closing embedding adapter in __aexit__: %s", exc)
+
+    # ------------------------------------------------------------------ #
+    # Health / capabilities passthrough
+    # ------------------------------------------------------------------ #
+
+    @with_embedding_error_context("capabilities")
+    def capabilities(self) -> Mapping[str, Any]:
+        """
+        Sync wrapper around underlying adapter capabilities, if available.
+        """
+        if hasattr(self.corpus_adapter, "capabilities"):
+            return self.corpus_adapter.capabilities()  # type: ignore[no-any-return]
+        raise NotImplementedError(
+            "Underlying embedding adapter does not implement capabilities()",
+        )
+
+    @with_async_embedding_error_context("capabilities")
+    async def acapabilities(self) -> Mapping[str, Any]:
+        """
+        Async wrapper around underlying adapter capabilities, if available.
+        """
+        if hasattr(self.corpus_adapter, "acapabilities"):
+            return await self.corpus_adapter.acapabilities()  # type: ignore[no-any-return]
+        if hasattr(self.corpus_adapter, "capabilities"):
+            # Fallback to sync in async context.
+            return self.corpus_adapter.capabilities()  # type: ignore[no-any-return]
+        raise NotImplementedError(
+            "Underlying embedding adapter does not implement capabilities()/acapabilities()",
+        )
+
+    @with_embedding_error_context("health")
+    def health(self) -> Mapping[str, Any]:
+        """
+        Sync wrapper around underlying adapter health, if available.
+        """
+        if hasattr(self.corpus_adapter, "health"):
+            return self.corpus_adapter.health()  # type: ignore[no-any-return]
+        raise NotImplementedError(
+            "Underlying embedding adapter does not implement health()",
+        )
+
+    @with_async_embedding_error_context("health")
+    async def ahealth(self) -> Mapping[str, Any]:
+        """
+        Async wrapper around underlying adapter health, if available.
+        """
+        if hasattr(self.corpus_adapter, "ahealth"):
+            return await self.corpus_adapter.ahealth()  # type: ignore[no-any-return]
+        if hasattr(self.corpus_adapter, "health"):
+            # Fallback to sync in async context.
+            return self.corpus_adapter.health()  # type: ignore[no-any-return]
+        raise NotImplementedError(
+            "Underlying embedding adapter does not implement health()/ahealth()",
+        )
+
+    # ------------------------------------------------------------------ #
+    # Internal helpers
+    # ------------------------------------------------------------------ #
 
     def _validate_crewai_config(self, config: CrewAIConfig) -> CrewAIConfig:
         """Validate and normalize CrewAI configuration with sensible defaults."""
@@ -331,10 +443,6 @@ class CorpusCrewAIEmbeddings:
 
         return validated
 
-    # ------------------------------------------------------------------ #
-    # Internal helpers
-    # ------------------------------------------------------------------ #
-
     @cached_property
     def _translator(self) -> EmbeddingTranslator:
         """
@@ -345,10 +453,11 @@ class CorpusCrewAIEmbeddings:
         """
         translator = create_embedding_translator(
             adapter=self.corpus_adapter,
-            framework="crewai",
+            framework=_FRAMEWORK_NAME,
             translator=None,
             batch_config=self.batch_config,
             text_normalization_config=self.text_normalization_config,
+            framework_version=self._framework_version,
         )
         logger.debug(
             "EmbeddingTranslator initialized for CrewAI with model: %s",
@@ -374,16 +483,21 @@ class CorpusCrewAIEmbeddings:
         """
         core_ctx: Optional[OperationContext] = None
         framework_ctx: Dict[str, Any] = {
-            "framework": "crewai",
+            "framework": _FRAMEWORK_NAME,
             "config": self.crewai_config,
         }
+        if self._framework_version is not None:
+            framework_ctx["framework_version"] = self._framework_version
 
         # Convert CrewAI context to core OperationContext with comprehensive error handling
         if crewai_context is not None:
             try:
                 self._validate_crewai_context_structure(crewai_context)
 
-                core_ctx_candidate = context_from_crewai(crewai_context)
+                core_ctx_candidate = context_from_crewai(
+                    crewai_context,
+                    framework_version=self._framework_version,
+                )
                 if isinstance(core_ctx_candidate, OperationContext):
                     core_ctx = core_ctx_candidate
                     logger.debug(
@@ -412,10 +526,11 @@ class CorpusCrewAIEmbeddings:
                     snapshot = {"repr": repr(crewai_context)}
                 attach_context(
                     e,
-                    framework="crewai",
+                    framework=_FRAMEWORK_NAME,
                     operation="context_build",
                     crewai_context_snapshot=snapshot,
                     config=self.crewai_config,
+                    framework_version=self._framework_version,
                 )
 
         # Framework-level context for CrewAI-specific optimizations
@@ -479,7 +594,7 @@ class CorpusCrewAIEmbeddings:
         """
         return coerce_embedding_matrix(
             result=result,
-            framework="crewai",
+            framework=_FRAMEWORK_NAME,
             error_codes=EMBEDDING_COERCION_ERROR_CODES,
             logger=logger,
         )
@@ -493,7 +608,7 @@ class CorpusCrewAIEmbeddings:
         """
         return coerce_embedding_vector(
             result=result,
-            framework="crewai",
+            framework=_FRAMEWORK_NAME,
             error_codes=EMBEDDING_COERCION_ERROR_CODES,
             logger=logger,
         )
@@ -517,7 +632,7 @@ class CorpusCrewAIEmbeddings:
         Used by CrewAI agents during RAG operations and knowledge processing.
         """
         warn_if_extreme_batch(
-            framework="crewai",
+            framework=_FRAMEWORK_NAME,
             texts=texts,
             op_name="embed_documents",
             batch_config=self.batch_config,
@@ -596,7 +711,7 @@ class CorpusCrewAIEmbeddings:
         Designed for async CrewAI workflows and parallel agent execution.
         """
         warn_if_extreme_batch(
-            framework="crewai",
+            framework=_FRAMEWORK_NAME,
             texts=texts,
             op_name="aembed_documents",
             batch_config=self.batch_config,
@@ -659,6 +774,8 @@ class CorpusCrewAIEmbeddings:
 def create_embedder(
     corpus_adapter: EmbeddingProtocolV1,
     model: Optional[str] = None,
+    *,
+    framework_version: Optional[str] = None,
     **kwargs: Any,
 ) -> CrewAIEmbedder:
     """
@@ -670,12 +787,14 @@ def create_embedder(
     embedder = CorpusCrewAIEmbeddings(
         corpus_adapter=corpus_adapter,
         model=model,
+        framework_version=framework_version,
         **kwargs,
     )
 
     logger.info(
-        "CrewAI embedder created successfully with model: %s",
+        "CrewAI embedder created successfully with model: %s, framework_version=%s",
         model or "default",
+        framework_version,
     )
 
     return embedder
@@ -685,6 +804,8 @@ def register_with_crewai(
     crew: Any,
     corpus_adapter: EmbeddingProtocolV1,
     model: Optional[str] = None,
+    *,
+    framework_version: Optional[str] = None,
     **kwargs: Any,
 ) -> CorpusCrewAIEmbeddings:
     """
@@ -694,24 +815,6 @@ def register_with_crewai(
     - Creates a `CorpusCrewAIEmbeddings` instance
     - Attempts to attach it as `embedder` on each agent in `crew.agents`
     - Logs warnings instead of failing hard if the shape is unexpected
-
-    Example
-    -------
-    ```python
-    from crewai import Agent, Task, Crew
-    from corpus_sdk.embedding.framework_adapters.crewai import register_with_crewai
-
-    researcher = Agent(...)
-    writer = Agent(...)
-    crew = Crew(agents=[researcher, writer], tasks=[...])
-
-    embedder = register_with_crewai(
-        crew=crew,
-        corpus_adapter=my_adapter,
-        model="text-embedding-3-large",
-        crewai_config={"task_aware_batching": True},
-    )
-    ```
     """
     if crew is None:
         raise ValueError("crew cannot be None")
@@ -719,6 +822,7 @@ def register_with_crewai(
     embedder = CorpusCrewAIEmbeddings(
         corpus_adapter=corpus_adapter,
         model=model,
+        framework_version=framework_version,
         **kwargs,
     )
 
