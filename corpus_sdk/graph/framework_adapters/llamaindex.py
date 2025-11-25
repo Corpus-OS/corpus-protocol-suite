@@ -17,7 +17,7 @@ LlamaIndex-friendly client, with:
 Design philosophy
 -----------------
 - Protocol-first: LlamaIndex is a thin skin over the Corpus graph adapter.
-- All heavy lifting (deadlines, breakers, rate limits, caching) stays in
+- All heavy lifting (deadlines, rate limits, caching, etc.) stays in
   the underlying `BaseGraphAdapter` / GraphProtocolV1 implementation.
 - This layer focuses on:
     * Translating LlamaIndex callback manager → OperationContext
@@ -46,6 +46,7 @@ from functools import cached_property
 from typing import (
     Any,
     AsyncIterator,
+    Callable,
     Dict,
     Iterator,
     List,
@@ -53,7 +54,6 @@ from typing import (
     Optional,
     Protocol,
     TypeVar,
-    Callable,
 )
 
 from corpus_sdk.core.context_translation import (
@@ -62,16 +62,17 @@ from corpus_sdk.core.context_translation import (
 from corpus_sdk.core.error_context import attach_context
 from corpus_sdk.graph.framework_adapters.common.graph_translation import (
     DefaultGraphFrameworkTranslator,
+    GraphFrameworkTranslator,
     GraphTranslator,
     create_graph_translator,
 )
 from corpus_sdk.graph.framework_adapters.common.framework_utils import (
     create_graph_error_context_decorator,
     graph_capabilities_to_dict,
-    validate_graph_result_type,
-    validate_graph_query,
-    validate_upsert_nodes_spec,
     validate_batch_operations,
+    validate_graph_query,
+    validate_graph_result_type,
+    validate_upsert_nodes_spec,
 )
 from corpus_sdk.graph.graph_base import (
     BadRequest,
@@ -151,6 +152,72 @@ def with_async_graph_error_context(
 # Backwards-compatible aliases (for older imports)
 with_error_context = with_graph_error_context
 with_async_error_context = with_async_graph_error_context
+
+
+# --------------------------------------------------------------------------- #
+# Public framework translator
+# --------------------------------------------------------------------------- #
+
+
+class LlamaIndexGraphFrameworkTranslator(DefaultGraphFrameworkTranslator):
+    """
+    LlamaIndex-specific GraphFrameworkTranslator.
+
+    This translator reuses the common DefaultGraphFrameworkTranslator for
+    spec construction and context handling, but deliberately *does not*
+    reshape core protocol results:
+
+    - QueryResult is returned as-is
+    - QueryChunk is returned as-is
+    - BulkVerticesResult is returned as-is
+    - BatchResult is returned as-is
+    - GraphSchema is returned as-is
+    """
+
+    def translate_query_result(
+        self,
+        result: QueryResult,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Mapping[str, Any]] = None,
+    ) -> QueryResult:
+        return result
+
+    def translate_query_chunk(
+        self,
+        chunk: QueryChunk,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Mapping[str, Any]] = None,
+    ) -> QueryChunk:
+        return chunk
+
+    def translate_bulk_vertices_result(
+        self,
+        result: BulkVerticesResult,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Mapping[str, Any]] = None,
+    ) -> BulkVerticesResult:
+        return result
+
+    def translate_batch_result(
+        self,
+        result: BatchResult,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Mapping[str, Any]] = None,
+    ) -> BatchResult:
+        return result
+
+    def translate_schema(
+        self,
+        schema: GraphSchema,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Mapping[str, Any]] = None,
+    ) -> GraphSchema:
+        return schema
 
 
 class LlamaIndexGraphClientProtocol(Protocol):
@@ -388,66 +455,6 @@ class CorpusLlamaIndexGraphClient:
       LlamaIndex-specific hints when failures occur.
     """
 
-    class _LlamaIndexGraphFrameworkTranslator(DefaultGraphFrameworkTranslator):
-        """
-        LlamaIndex-specific GraphFrameworkTranslator.
-
-        This translator reuses the common DefaultGraphFrameworkTranslator for
-        spec construction and context handling, but deliberately *does not*
-        reshape core protocol results:
-
-        - QueryResult is returned as-is
-        - QueryChunk is returned as-is
-        - BulkVerticesResult is returned as-is
-        - BatchResult is returned as-is
-        - GraphSchema is returned as-is
-        """
-
-        def translate_query_result(
-            self,
-            result: QueryResult,
-            *,
-            op_ctx: OperationContext,
-            framework_ctx: Optional[Any] = None,
-        ) -> QueryResult:
-            return result
-
-        def translate_query_chunk(
-            self,
-            chunk: QueryChunk,
-            *,
-            op_ctx: OperationContext,
-            framework_ctx: Optional[Any] = None,
-        ) -> QueryChunk:
-            return chunk
-
-        def translate_bulk_vertices_result(
-            self,
-            result: BulkVerticesResult,
-            *,
-            op_ctx: OperationContext,
-            framework_ctx: Optional[Any] = None,
-        ) -> BulkVerticesResult:
-            return result
-
-        def translate_batch_result(
-            self,
-            result: BatchResult,
-            *,
-            op_ctx: OperationContext,
-            framework_ctx: Optional[Any] = None,
-        ) -> BatchResult:
-            return result
-
-        def translate_schema(
-            self,
-            schema: GraphSchema,
-            *,
-            op_ctx: OperationContext,
-            framework_ctx: Optional[Any] = None,
-        ) -> GraphSchema:
-            return schema
-
     def __init__(
         self,
         *,
@@ -456,6 +463,7 @@ class CorpusLlamaIndexGraphClient:
         default_namespace: Optional[str] = None,
         default_timeout_ms: Optional[int] = None,
         framework_version: Optional[str] = None,
+        framework_translator: Optional[GraphFrameworkTranslator] = None,
     ) -> None:
         """
         Initialize a LlamaIndex-oriented graph client.
@@ -473,12 +481,16 @@ class CorpusLlamaIndexGraphClient:
             `timeout_ms` is not explicitly passed to query methods.
         framework_version:
             Optional framework version string for observability.
+        framework_translator:
+            Optional `GraphFrameworkTranslator` implementation. If not provided,
+            `LlamaIndexGraphFrameworkTranslator` is used by default.
         """
         self._graph: GraphProtocolV1 = graph_adapter
         self._default_dialect: Optional[str] = default_dialect
         self._default_namespace: Optional[str] = default_namespace
         self._default_timeout_ms: Optional[int] = default_timeout_ms
         self._framework_version: Optional[str] = framework_version
+        self._framework_translator: Optional[GraphFrameworkTranslator] = framework_translator
 
     # ------------------------------------------------------------------ #
     # Resource Management (Context Managers)
@@ -503,7 +515,7 @@ class CorpusLlamaIndexGraphClient:
             await self._graph.aclose()
 
     # ------------------------------------------------------------------ #
-    # Translator (lazy, cached) – mirrors CrewAI / LangChain adapters
+    # Translator (lazy, cached) – DI-aware
     # ------------------------------------------------------------------ #
 
     @cached_property
@@ -512,8 +524,12 @@ class CorpusLlamaIndexGraphClient:
         Lazily construct and cache the `GraphTranslator`.
 
         Uses `cached_property` for thread safety and performance.
+        Honors an injected `framework_translator` if provided; otherwise
+        falls back to the default `LlamaIndexGraphFrameworkTranslator`.
         """
-        framework_translator = self._LlamaIndexGraphFrameworkTranslator()
+        framework_translator: GraphFrameworkTranslator = (
+            self._framework_translator or LlamaIndexGraphFrameworkTranslator()
+        )
         return create_graph_translator(
             adapter=self._graph,
             framework="llamaindex",
@@ -558,7 +574,11 @@ class CorpusLlamaIndexGraphClient:
                 framework="llamaindex",
                 operation="context_translation",
             )
-            raise
+            # Surface a consistent BadRequest with symbolic error code.
+            raise BadRequest(
+                "Failed to build OperationContext from LlamaIndex inputs",
+                code=ErrorCodes.BAD_OPERATION_CONTEXT,
+            ) from exc
 
         if not isinstance(ctx, OperationContext):
             raise BadRequest(
@@ -610,16 +630,55 @@ class CorpusLlamaIndexGraphClient:
 
         return raw
 
-    def _framework_ctx_for_namespace(
+    def _framework_ctx(
         self,
-        namespace: Optional[str],
+        *,
+        operation: str,
+        namespace: Optional[str] = None,
     ) -> Mapping[str, Any]:
         """
-        Build a minimal framework_ctx mapping that lets the common translator
-        derive a preferred namespace when needed.
+        Build a framework_ctx mapping for GraphTranslator with basic
+        observability hints and the effective namespace.
         """
+        ctx: Dict[str, Any] = {
+            "framework": "llamaindex",
+            "operation": operation,
+        }
+
+        if self._framework_version is not None:
+            ctx["framework_version"] = self._framework_version
+
         effective_namespace = namespace or self._default_namespace
-        return {"namespace": effective_namespace} if effective_namespace is not None else {}
+        if effective_namespace is not None:
+            ctx["namespace"] = effective_namespace
+
+        return ctx
+
+    def _validate_upsert_edges_spec(self, spec: UpsertEdgesSpec) -> None:
+        """
+        LlamaIndex-local validation for edge upsert specs.
+
+        (We still use shared validation helpers for node specs and batch ops.)
+        """
+        if spec.edges is None:
+            raise BadRequest("UpsertEdgesSpec.edges must not be None")
+
+        try:
+            edges_iter = list(spec.edges)
+        except TypeError as exc:
+            raise BadRequest(
+                "UpsertEdgesSpec.edges must be an iterable of edges",
+            ) from exc
+
+        if not edges_iter:
+            raise BadRequest("UpsertEdgesSpec must contain at least one edge")
+
+        for edge in edges_iter:
+            if not getattr(edge, "id", None):
+                raise BadRequest("All edges must have an ID")
+
+        # Mutate spec.edges to the list we just validated for consistency.
+        spec.edges = edges_iter  # type: ignore[assignment]
 
     # ------------------------------------------------------------------ #
     # Capabilities / schema / health
@@ -664,7 +723,7 @@ class CorpusLlamaIndexGraphClient:
         )
         schema = self._translator.get_schema(
             op_ctx=ctx,
-            framework_ctx={},
+            framework_ctx=self._framework_ctx(operation="get_schema"),
         )
         return validate_graph_result_type(
             schema,
@@ -691,7 +750,7 @@ class CorpusLlamaIndexGraphClient:
         )
         schema = await self._translator.arun_get_schema(
             op_ctx=ctx,
-            framework_ctx={},
+            framework_ctx=self._framework_ctx(operation="get_schema"),
         )
         return validate_graph_result_type(
             schema,
@@ -718,7 +777,7 @@ class CorpusLlamaIndexGraphClient:
         )
         health_result = self._translator.health(
             op_ctx=ctx,
-            framework_ctx={},
+            framework_ctx=self._framework_ctx(operation="health"),
         )
         return validate_graph_result_type(
             health_result,
@@ -745,7 +804,7 @@ class CorpusLlamaIndexGraphClient:
         )
         health_result = await self._translator.arun_health(
             op_ctx=ctx,
-            framework_ctx={},
+            framework_ctx=self._framework_ctx(operation="health"),
         )
         return validate_graph_result_type(
             health_result,
@@ -789,7 +848,10 @@ class CorpusLlamaIndexGraphClient:
             timeout_ms=timeout_ms,
             stream=False,
         )
-        framework_ctx = self._framework_ctx_for_namespace(namespace)
+        framework_ctx = self._framework_ctx(
+            operation="query",
+            namespace=namespace,
+        )
 
         result = self._translator.query(
             raw_query,
@@ -835,7 +897,10 @@ class CorpusLlamaIndexGraphClient:
             timeout_ms=timeout_ms,
             stream=False,
         )
-        framework_ctx = self._framework_ctx_for_namespace(namespace)
+        framework_ctx = self._framework_ctx(
+            operation="query",
+            namespace=namespace,
+        )
 
         result = await self._translator.arun_query(
             raw_query,
@@ -887,7 +952,10 @@ class CorpusLlamaIndexGraphClient:
             timeout_ms=timeout_ms,
             stream=True,
         )
-        framework_ctx = self._framework_ctx_for_namespace(namespace)
+        framework_ctx = self._framework_ctx(
+            operation="stream_query",
+            namespace=namespace,
+        )
 
         for chunk in self._translator.query_stream(
             raw_query,
@@ -930,7 +998,10 @@ class CorpusLlamaIndexGraphClient:
             timeout_ms=timeout_ms,
             stream=True,
         )
-        framework_ctx = self._framework_ctx_for_namespace(namespace)
+        framework_ctx = self._framework_ctx(
+            operation="stream_query",
+            namespace=namespace,
+        )
 
         async for chunk in self._translator.arun_query_stream(
             raw_query,
@@ -969,8 +1040,9 @@ class CorpusLlamaIndexGraphClient:
             callback_manager=callback_manager,
             extra_context=extra_context,
         )
-        framework_ctx = self._framework_ctx_for_namespace(
-            getattr(spec, "namespace", None),
+        framework_ctx = self._framework_ctx(
+            operation="upsert_nodes",
+            namespace=getattr(spec, "namespace", None),
         )
 
         result = self._translator.upsert_nodes(
@@ -1002,8 +1074,9 @@ class CorpusLlamaIndexGraphClient:
             callback_manager=callback_manager,
             extra_context=extra_context,
         )
-        framework_ctx = self._framework_ctx_for_namespace(
-            getattr(spec, "namespace", None),
+        framework_ctx = self._framework_ctx(
+            operation="upsert_nodes",
+            namespace=getattr(spec, "namespace", None),
         )
 
         result = await self._translator.arun_upsert_nodes(
@@ -1029,12 +1102,15 @@ class CorpusLlamaIndexGraphClient:
         """
         Sync wrapper for upserting edges.
         """
+        self._validate_upsert_edges_spec(spec)
+
         ctx = self._build_ctx(
             callback_manager=callback_manager,
             extra_context=extra_context,
         )
-        framework_ctx = self._framework_ctx_for_namespace(
-            getattr(spec, "namespace", None),
+        framework_ctx = self._framework_ctx(
+            operation="upsert_edges",
+            namespace=getattr(spec, "namespace", None),
         )
 
         result = self._translator.upsert_edges(
@@ -1060,12 +1136,15 @@ class CorpusLlamaIndexGraphClient:
         """
         Async wrapper for upserting edges.
         """
+        self._validate_upsert_edges_spec(spec)
+
         ctx = self._build_ctx(
             callback_manager=callback_manager,
             extra_context=extra_context,
         )
-        framework_ctx = self._framework_ctx_for_namespace(
-            getattr(spec, "namespace", None),
+        framework_ctx = self._framework_ctx(
+            operation="upsert_edges",
+            namespace=getattr(spec, "namespace", None),
         )
 
         result = await self._translator.arun_upsert_edges(
@@ -1102,8 +1181,9 @@ class CorpusLlamaIndexGraphClient:
             callback_manager=callback_manager,
             extra_context=extra_context,
         )
-        framework_ctx = self._framework_ctx_for_namespace(
-            getattr(spec, "namespace", None),
+        framework_ctx = self._framework_ctx(
+            operation="delete_nodes",
+            namespace=getattr(spec, "namespace", None),
         )
 
         if spec.filter is not None:
@@ -1138,8 +1218,9 @@ class CorpusLlamaIndexGraphClient:
             callback_manager=callback_manager,
             extra_context=extra_context,
         )
-        framework_ctx = self._framework_ctx_for_namespace(
-            getattr(spec, "namespace", None),
+        framework_ctx = self._framework_ctx(
+            operation="delete_nodes",
+            namespace=getattr(spec, "namespace", None),
         )
 
         if spec.filter is not None:
@@ -1174,8 +1255,9 @@ class CorpusLlamaIndexGraphClient:
             callback_manager=callback_manager,
             extra_context=extra_context,
         )
-        framework_ctx = self._framework_ctx_for_namespace(
-            getattr(spec, "namespace", None),
+        framework_ctx = self._framework_ctx(
+            operation="delete_edges",
+            namespace=getattr(spec, "namespace", None),
         )
 
         if spec.filter is not None:
@@ -1210,8 +1292,9 @@ class CorpusLlamaIndexGraphClient:
             callback_manager=callback_manager,
             extra_context=extra_context,
         )
-        framework_ctx = self._framework_ctx_for_namespace(
-            getattr(spec, "namespace", None),
+        framework_ctx = self._framework_ctx(
+            operation="delete_edges",
+            namespace=getattr(spec, "namespace", None),
         )
 
         if spec.filter is not None:
@@ -1261,7 +1344,10 @@ class CorpusLlamaIndexGraphClient:
             "filter": spec.filter,
         }
 
-        framework_ctx = self._framework_ctx_for_namespace(spec.namespace)
+        framework_ctx = self._framework_ctx(
+            operation="bulk_vertices",
+            namespace=spec.namespace,
+        )
 
         result = self._translator.bulk_vertices(
             raw_request,
@@ -1298,7 +1384,10 @@ class CorpusLlamaIndexGraphClient:
             "filter": spec.filter,
         }
 
-        framework_ctx = self._framework_ctx_for_namespace(spec.namespace)
+        framework_ctx = self._framework_ctx(
+            operation="bulk_vertices",
+            namespace=spec.namespace,
+        )
 
         result = await self._translator.arun_bulk_vertices(
             raw_request,
@@ -1344,7 +1433,7 @@ class CorpusLlamaIndexGraphClient:
         result = self._translator.batch(
             raw_batch_ops,
             op_ctx=ctx,
-            framework_ctx={},
+            framework_ctx=self._framework_ctx(operation="batch"),
         )
         return validate_graph_result_type(
             result,
@@ -1378,7 +1467,7 @@ class CorpusLlamaIndexGraphClient:
         result = await self._translator.arun_batch(
             raw_batch_ops,
             op_ctx=ctx,
-            framework_ctx={},
+            framework_ctx=self._framework_ctx(operation="batch"),
         )
         return validate_graph_result_type(
             result,
@@ -1391,6 +1480,7 @@ class CorpusLlamaIndexGraphClient:
 __all__ = [
     "LlamaIndexGraphClientProtocol",
     "CorpusLlamaIndexGraphClient",
+    "LlamaIndexGraphFrameworkTranslator",
     "ErrorCodes",
     "with_graph_error_context",
     "with_async_graph_error_context",
