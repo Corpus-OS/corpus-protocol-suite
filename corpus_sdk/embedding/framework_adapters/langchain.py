@@ -63,6 +63,10 @@ from corpus_sdk.embedding.framework_adapters.common.framework_utils import (
 
 logger = logging.getLogger(__name__)
 
+T = TypeVar("T")
+
+_FRAMEWORK_NAME = "langchain"
+
 # ---------------------------------------------------------------------------
 # Safe conditional import for LangChain Embeddings
 # ---------------------------------------------------------------------------
@@ -84,10 +88,6 @@ except ImportError:  # pragma: no cover - only used when LangChain isn't install
         pass
 
     LANGCHAIN_AVAILABLE = False
-
-
-# Type variables for decorators
-T = TypeVar("T")
 
 
 class ErrorCodes:
@@ -113,7 +113,7 @@ EMBEDDING_COERCION_ERROR_CODES: CoercionErrorCodes = CoercionErrorCodes(
     invalid_result=ErrorCodes.INVALID_EMBEDDING_RESULT,
     empty_result=ErrorCodes.EMPTY_EMBEDDING_RESULT,
     conversion_error=ErrorCodes.EMBEDDING_CONVERSION_ERROR,
-    framework_label="langchain",
+    framework_label=_FRAMEWORK_NAME,
 )
 
 
@@ -150,12 +150,15 @@ def _extract_dynamic_context(
 
     Captures:
     - model identifier from the embedding instance
+    - framework_version if present
     - text_len for single-text operations
     - texts_count / empty_texts_count for batch operations
     - LangChain routing fields (run_id, run_name, tags)
     """
     dynamic_ctx: Dict[str, Any] = {
         "model": getattr(instance, "model", "unknown"),
+        "framework_version": getattr(instance, "framework_version", None),
+        "framework_name": _FRAMEWORK_NAME,
     }
 
     # Text / batch metrics
@@ -200,6 +203,7 @@ def _create_error_context_decorator(
     ) -> Callable[[Callable[..., T]], Callable[..., T]]:
         def decorator(func: Callable[..., T]) -> Callable[..., T]:
             if is_async:
+
                 @wraps(func)
                 async def async_wrapper(self: Any, *args: Any, **kwargs: Any) -> T:
                     dynamic_context = _extract_dynamic_context(
@@ -214,7 +218,7 @@ def _create_error_context_decorator(
                     except Exception as exc:  # noqa: BLE001
                         attach_context(
                             exc,
-                            framework="langchain",
+                            framework=_FRAMEWORK_NAME,
                             operation=f"embedding_{operation}",
                             **full_context,
                         )
@@ -222,6 +226,7 @@ def _create_error_context_decorator(
 
                 return async_wrapper
             else:
+
                 @wraps(func)
                 def sync_wrapper(self: Any, *args: Any, **kwargs: Any) -> T:
                     dynamic_context = _extract_dynamic_context(
@@ -236,7 +241,7 @@ def _create_error_context_decorator(
                     except Exception as exc:  # noqa: BLE001
                         attach_context(
                             exc,
-                            framework="langchain",
+                            framework=_FRAMEWORK_NAME,
                             operation=f"embedding_{operation}",
                             **full_context,
                         )
@@ -254,6 +259,8 @@ def with_embedding_error_context(
     **static_context: Any,
 ) -> Callable[[Callable[..., T]], Callable[..., T]]:
     """Decorator for sync methods with rich dynamic context extraction."""
+    # Always include coercion error codes in error context.
+    static_context.setdefault("error_codes", EMBEDDING_COERCION_ERROR_CODES)
     return _create_error_context_decorator(operation, is_async=False)(**static_context)
 
 
@@ -262,6 +269,7 @@ def with_async_embedding_error_context(
     **static_context: Any,
 ) -> Callable[[Callable[..., T]], Callable[..., T]]:
     """Decorator for async methods with rich dynamic context extraction."""
+    static_context.setdefault("error_codes", EMBEDDING_COERCION_ERROR_CODES)
     return _create_error_context_decorator(operation, is_async=True)(**static_context)
 
 
@@ -324,6 +332,10 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         passing `model=...` to `embed_documents` / `embed_query` or their
         async variants.
 
+    framework_version:
+        Optional framework version string for observability and context
+        translation (e.g., LangChain version).
+
     batch_config:
         Optional `BatchConfig` to control batching behavior. If None, the
         defaults in the common embedding layer are used.
@@ -335,6 +347,7 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
 
     corpus_adapter: EmbeddingProtocolV1
     model: Optional[str] = None
+    framework_version: Optional[str] = None
     batch_config: Optional[BatchConfig] = None
     text_normalization_config: Optional[TextNormalizationConfig] = None
 
@@ -360,6 +373,40 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         return v
 
     # ------------------------------------------------------------------ #
+    # Resource management / lifecycle helpers
+    # ------------------------------------------------------------------ #
+
+    def __enter__(self) -> "CorpusLangChainEmbeddings":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        adapter = self.corpus_adapter
+        close = getattr(adapter, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "Error while closing embedding adapter in __exit__: %s",
+                    e,
+                )
+
+    async def __aenter__(self) -> "CorpusLangChainEmbeddings":
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        adapter = self.corpus_adapter
+        aclose = getattr(adapter, "aclose", None)
+        if callable(aclose):
+            try:
+                await aclose()
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "Error while closing embedding adapter in __aexit__: %s",
+                    e,
+                )
+
+    # ------------------------------------------------------------------ #
     # Internal helpers
     # ------------------------------------------------------------------ #
 
@@ -373,7 +420,7 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         if self._translator_cache is None:
             self._translator_cache = create_embedding_translator(
                 adapter=self.corpus_adapter,
-                framework="langchain",
+                framework=_FRAMEWORK_NAME,
                 translator=None,  # use registry/default generic translator
                 batch_config=self.batch_config,
                 text_normalization_config=self.text_normalization_config,
@@ -402,15 +449,20 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         """
         core_ctx: Optional[OperationContext] = None
         framework_ctx: Dict[str, Any] = {
-            "framework": "langchain",
+            "framework": _FRAMEWORK_NAME,
         }
+        if self.framework_version is not None:
+            framework_ctx["framework_version"] = self.framework_version
 
         # Convert LangChain config to core OperationContext with defensive handling
         if config is not None:
             try:
                 self._validate_langchain_config_structure(config)
 
-                core_ctx_candidate = context_from_langchain(config)
+                core_ctx_candidate = context_from_langchain(
+                    config,
+                    framework_version=self.framework_version,
+                )
                 if isinstance(core_ctx_candidate, OperationContext):
                     core_ctx = core_ctx_candidate
                     logger.debug(
@@ -437,9 +489,10 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
                     snapshot = {"repr": repr(config)}
                 attach_context(
                     e,
-                    framework="langchain",
+                    framework=_FRAMEWORK_NAME,
                     operation="context_build",
                     config_snapshot=snapshot,
+                    framework_version=self.framework_version,
                 )
 
         # Framework-level context for LangChain-specific optimizations
@@ -510,6 +563,7 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         """
         return coerce_embedding_matrix(
             result=result,
+            framework=_FRAMEWORK_NAME,
             error_codes=EMBEDDING_COERCION_ERROR_CODES,
             logger=logger,
         )
@@ -523,6 +577,7 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         """
         return coerce_embedding_vector(
             result=result,
+            framework=_FRAMEWORK_NAME,
             error_codes=EMBEDDING_COERCION_ERROR_CODES,
             logger=logger,
         )
@@ -538,7 +593,7 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         is configured. Actual batching / chunking is handled by the translator.
         """
         warn_if_extreme_batch(
-            framework="langchain",
+            framework=_FRAMEWORK_NAME,
             texts=texts,
             op_name=op_name,
             batch_config=self.batch_config,
@@ -719,6 +774,7 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
 def configure_langchain_embeddings(
     corpus_adapter: EmbeddingProtocolV1,
     model: Optional[str] = None,
+    framework_version: Optional[str] = None,
     **kwargs: Any,
 ) -> CorpusLangChainEmbeddings:
     """
@@ -754,6 +810,8 @@ def configure_langchain_embeddings(
         Corpus embedding protocol adapter implementing `EmbeddingProtocolV1`.
     model:
         Optional default model identifier.
+    framework_version:
+        Optional framework version string (e.g. LangChain version).
     **kwargs:
         Additional arguments for `CorpusLangChainEmbeddings`
         (e.g. batch_config, text_normalization_config).
@@ -766,6 +824,7 @@ def configure_langchain_embeddings(
     embeddings = CorpusLangChainEmbeddings(
         corpus_adapter=corpus_adapter,
         model=model,
+        framework_version=framework_version,
         **kwargs,
     )
 
@@ -776,8 +835,9 @@ def configure_langchain_embeddings(
         )
     else:
         logger.info(
-            "Corpus LangChain embeddings configured with model=%s",
+            "Corpus LangChain embeddings configured with model=%s, framework_version=%s",
             model or "default",
+            framework_version or "unknown",
         )
 
     return embeddings
@@ -786,6 +846,7 @@ def configure_langchain_embeddings(
 def register_with_langchain(
     corpus_adapter: EmbeddingProtocolV1,
     model: Optional[str] = None,
+    framework_version: Optional[str] = None,
     **kwargs: Any,
 ) -> CorpusLangChainEmbeddings:
     """
@@ -799,6 +860,7 @@ def register_with_langchain(
     return configure_langchain_embeddings(
         corpus_adapter=corpus_adapter,
         model=model,
+        framework_version=framework_version,
         **kwargs,
     )
 
