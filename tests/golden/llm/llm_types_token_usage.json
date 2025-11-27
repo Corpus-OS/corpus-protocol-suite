@@ -1,0 +1,10 @@
+{
+  "prompt_tokens": 42,
+  "completion_tokens": 13,
+  "total_tokens": 55,
+  "by_type": {
+    "system": 5,
+    "user": 20,
+    "assistant": 30
+  }
+}
