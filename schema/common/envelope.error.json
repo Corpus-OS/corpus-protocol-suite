@@ -1,509 +1,134 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/common/envelope.error.json",
-  "title": "Corpus Error Envelope",
-  "description": "Canonical error envelope for non-streaming Corpus Protocol operations. Structured, SIEM-safe, and wire-stable across v1.x. Aligns with ERRORS.md taxonomy. This schema is authoritative for producer/consumer compatibility checks within the v1.x line.",
+  "$id": "https://corpusos.com/schemas/common/envelope.request.json",
+  "title": "Corpus Protocol — Request Envelope (v1.0)",
+  "description": "Canonical wire-level request envelope used across Graph, LLM, Vector, and Embedding protocols. Matches the '{op, ctx, args}' contract in the Corpus SDK Specification (§4.1.1).",
   "type": "object",
-
-  "required": ["ok", "error", "message", "code"],
-
+  "required": ["op", "ctx", "args"],
+  "additionalProperties": false,
   "properties": {
-    "ok": {
-      "type": "boolean",
-      "const": false,
-      "description": "Always false for error responses."
-    },
-
-    "error": {
-      "type": "string",
-      "description": "Canonical error class from ERRORS.md taxonomy.",
-      "enum": [
-        "BadRequest",
-        "AuthError",
-        "ResourceExhausted",
-        "TransientNetwork",
-        "Unavailable",
-        "NotSupported",
-        "DeadlineExceeded",
-        "DimensionMismatch",
-        "IndexNotReady",
-        "ModelOverloaded",
-        "ContentFiltered",
-        "TextTooLong"
-      ]
-    },
-
-    "message": {
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 2000,
-      "description": "Human-readable error summary. MUST be SIEM-safe (no secrets, prompts, vectors, or raw tenant IDs)."
-    },
-
-    "code": {
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 64,
-      "pattern": "^[A-Z0-9_]+$",
-      "description": "Short stable string for analytics/dashboards. MUST be a normalized error code (e.g., RATE_LIMIT, BAD_REQUEST)."
-    },
-
-    "http_status": {
-      "type": "integer",
-      "minimum": 400,
-      "maximum": 599,
-      "description": "Recommended HTTP status code mapping. Informative for clients."
-    },
-
-    "ms": {
-      "type": "number",
-      "minimum": 0,
-      "maximum": 3600000,
-      "description": "Elapsed processing time in milliseconds for the failing operation."
-    },
-
     "op": {
+      "title": "Operation",
+      "description": "Canonical operation string: '<component>.<operation>'. Components: graph, llm, vector, embedding. See §4.1.6 for the operation registry.",
       "type": "string",
-      "pattern": "^(graph|llm|vector|embedding)\\.[a-z0-9_.:-]+$",
-      "maxLength": 128,
-      "description": "Operation that failed, e.g., 'vector.upsert'."
+      "pattern": "^(graph|llm|vector|embedding)\\.[a-z][a-z0-9_]*$",
+      "$comment": "For stricter validation, combine with an op registry enum schema when available."
     },
-
-    "protocol": {
-      "type": "string",
-      "pattern": "^(graph|llm|vector|embedding)/v1\\.0$",
-      "description": "Protocol identity where error originated."
+    "ctx": {
+      "title": "Operation Context",
+      "description": "Context propagated end-to-end (request id, idempotency, deadlines, tracing, tenant, cache hints). See §6.1.",
+      "$ref": "https://corpusos.com/schemas/common/operation_context.json"
     },
-
-    "component": {
-      "type": "string",
-      "enum": ["graph", "llm", "vector", "embedding"],
-      "description": "Component that produced the error."
+    "args": {
+      "title": "Operation Arguments",
+      "description": "Operation-specific arguments payload. Shape depends on 'op'.",
+      "type": "object",
+      "additionalProperties": true
     },
-
-    "schema_version": {
-      "type": "string",
-      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
-      "description": "Authoritative envelope schema version (SemVer)."
+    "extensions": {
+      "title": "Namespaced Extensions (Optional)",
+      "description": "Top-level namespaced, vendor-specific extensions. Keys MUST be namespaced (e.g., 'vendor:feature.flag').",
+      "type": "object",
+      "additionalProperties": true,
+      "propertyNames": { "$ref": "#/$defs/namespaced_key" }
+    }
+  },
+  "$defs": {
+    "timestamp_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 253402300800000,
+      "description": "UNIX epoch time in milliseconds (non-negative, ≤ year 9999)."
     },
-
-    "schema_semver_range": {
-      "type": "string",
-      "maxLength": 64,
-      "description": "Producer-declared compatible schema range for consumers (e.g., '>=1.0.0 <2.0.0')."
+    "positive_int": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Positive integer (> 0)."
     },
-
-    "request_id": {
-      "type": "string",
-      "pattern": "^[A-Za-z0-9._~:-]{1,256}$",
-      "description": "Echo of request_id from incoming request for correlation."
-    },
-
     "traceparent": {
       "type": "string",
-      "maxLength": 128,
-      "description": "W3C trace context value (opaque validation; forwarded unchanged)."
+      "description": "W3C Trace Context header (version 00).",
+      "pattern": "^00-[0-9a-f]{32}-[0-9a-f]{16}-0[0-9a-f]$"
     },
-
-    "error_id": {
+    "namespaced_key": {
       "type": "string",
-      "description": "Unique error instance identifier for support correlation.",
-      "anyOf": [
-        { "format": "uuid" },
-        { "pattern": "^[A-F0-9]{8}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{12}$" }
-      ]
+      "description": "Namespaced extension key (e.g., 'vendor:feature.flag').",
+      "pattern": "^[a-z0-9]+:[a-z0-9_.-]+$"
     },
-
-    "timestamp": {
+    "small_label": {
       "type": "string",
-      "format": "date-time",
-      "description": "When the error occurred (ISO 8601)."
-    },
-
-    "retry_after_ms": {
-      "type": ["integer", "null"],
-      "minimum": 0,
-      "maximum": 86400000,
-      "description": "Non-negative delay in milliseconds before retrying. Null if not retryable or no specific delay."
-    },
-
-    "retryable": {
-      "type": "boolean",
-      "description": "Boolean retry hint. For conditional cases, see 'retryability'."
-    },
-
-    "retryability": {
-      "type": "string",
-      "enum": ["yes", "no", "conditional"],
-      "description": "Explicit retry classification. 'conditional' indicates retry is only appropriate if the client changes inputs (e.g., extends deadline or reduces work)."
-    },
-
-    "resource_scope": {
-      "type": ["string", "null"],
-      "enum": ["model", "token_limit", "rate_limit", "memory", "compute", "time_budget", null],
-      "description": "Scope of exhausted resource. Null if not applicable."
-    },
-
-    "throttle_scope": {
-      "type": ["string", "null"],
-      "maxLength": 256,
-      "pattern": "^[a-zA-Z0-9:._-]{1,256}$",
-      "description": "Bounded string identifying throttling scope (e.g., 'tenant:acme:llm')."
-    },
-
-    "suggested_batch_reduction": {
-      "type": ["integer", "null"],
-      "minimum": 0,
-      "maximum": 100,
-      "description": "Percentage [0-100] to reduce batch size when retrying. Null if not applicable."
-    },
-
-    "recovery_strategy": {
-      "type": "string",
-      "enum": [
-        "retry",
-        "modify_request",
-        "contact_support",
-        "check_documentation",
-        "wait",
-        "reduce_batch",
-        "adjust_parameters"
-      ],
-      "description": "Suggested recovery strategy for clients."
-    },
-
-    "documentation_url": {
-      "type": "string",
-      "format": "uri",
-      "maxLength": 2000,
-      "description": "Link to detailed error documentation."
-    },
-
-    "support_url": {
-      "type": "string",
-      "format": "uri",
-      "maxLength": 2000,
-      "description": "Optional end-user-facing support contact/link."
-    },
-
-    "details": {
-      "type": "object",
-      "description": "Low-cardinality, JSON-serializable context. MUST be SIEM-safe (no prompts, vectors, PII).",
-      "additionalProperties": true,
-      "properties": {
-        "expected": {
-          "type": "integer",
-          "minimum": 1,
-          "description": "For DimensionMismatch: expected vector dimensions."
-        },
-        "provided": {
-          "type": "integer",
-          "minimum": 1,
-          "description": "For DimensionMismatch: provided vector dimensions."
-        },
-        "namespace": {
-          "type": "string",
-          "maxLength": 256,
-          "description": "Namespace context for vector errors."
-        },
-        "max_batch_size": {
-          "type": "integer",
-          "minimum": 1,
-          "description": "Maximum allowed batch size when exceeded."
-        },
-        "provided_batch_size": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "Provided batch size that caused rejection."
-        },
-        "max_text_length": {
-          "type": "integer",
-          "minimum": 1,
-          "description": "For TextTooLong: maximum allowed text length."
-        },
-        "provided_length": {
-          "type": "integer",
-          "minimum": 1,
-          "description": "For TextTooLong: provided text length."
-        },
-        "policy_section": {
-          "type": "string",
-          "maxLength": 256,
-          "description": "For ContentFiltered: policy section that triggered filter."
-        },
-        "provider_code": {
-          "type": "string",
-          "maxLength": 256,
-          "description": "Original provider error code for debugging."
-        },
-        "provider_error_id": {
-          "type": "string",
-          "maxLength": 128,
-          "description": "Opaque provider error identifier."
-        },
-        "suggested_backoff_ms": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 600000,
-          "description": "Backoff hint when retry_after_ms is absent."
-        },
-        "suggested_concurrency": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 100000,
-          "description": "Suggested max concurrency for subsequent attempts."
-        },
-        "item_index": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "For batch-level rejections, the first offending item index (if known)."
-        },
-        "tenant_hash": {
-          "type": "string",
-          "maxLength": 128,
-          "description": "Privacy-preserving tenant hash (no raw tenant identifiers)."
-        }
-      }
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-zA-Z0-9_.:-]{1,64}$",
+      "description": "Small, low-cardinality label."
     }
   },
-
-  "additionalProperties": false,
-
-  "patternProperties": {
-    "^(vendor:)[a-z0-9_.:-]+$": {
-      "description": "Vendor/extension namespaced fields. Must not conflict with standardized keys.",
-      "type": ["string", "number", "boolean", "object", "array", "null"]
-    }
-  },
-
-  "allOf": [
-    {
-      "$comment": "----- Error-specific validation rules -----"
-    },
-    {
-      "if": {
-        "properties": { "error": { "const": "DimensionMismatch" } },
-        "required": ["error"]
-      },
-      "then": {
-        "properties": {
-          "details": {
-            "required": ["expected", "provided"]
-          }
-        }
-      }
-    },
-    {
-      "if": {
-        "properties": { "error": { "const": "TextTooLong" } },
-        "required": ["error"]
-      },
-      "then": {
-        "properties": {
-          "details": {
-            "required": ["max_text_length", "provided_length"]
-          }
-        }
-      }
-    },
-    {
-      "if": {
-        "properties": { "error": { "const": "ResourceExhausted" } },
-        "required": ["error"]
-      },
-      "then": {
-        "required": ["resource_scope"]
-      }
-    },
-
-    {
-      "$comment": "----- Retryability derivation (boolean + enum) -----"
-    },
-    {
-      "if": {
-        "properties": {
-          "error": {
-            "enum": ["BadRequest", "AuthError", "NotSupported", "DimensionMismatch", "ContentFiltered", "TextTooLong"]
-          }
-        },
-        "required": ["error"]
-      },
-      "then": {
-        "properties": {
-          "retryable": { "const": false },
-          "retryability": { "const": "no" },
-          "retry_after_ms": { "const": null }
-        }
-      }
-    },
-    {
-      "if": {
-        "properties": {
-          "error": {
-            "enum": ["ResourceExhausted", "TransientNetwork", "Unavailable", "IndexNotReady", "ModelOverloaded"]
-          }
-        },
-        "required": ["error"]
-      },
-      "then": {
-        "properties": {
-          "retryable": { "const": true },
-          "retryability": { "const": "yes" }
-        }
-      }
-    },
-    {
-      "if": {
-        "properties": { "error": { "const": "DeadlineExceeded" } },
-        "required": ["error"]
-      },
-      "then": {
-        "properties": {
-          "retryable": { "const": false },
-          "retryability": { "const": "conditional" },
-          "retry_after_ms": { "const": null },
-          "recovery_strategy": { "const": "adjust_parameters" }
-        }
-      }
-    }
-  ],
-
   "examples": [
     {
-      "ok": false,
-      "op": "llm.complete",
-      "protocol": "llm/v1.0",
-      "component": "llm",
-      "code": "RATE_LIMIT",
-      "error": "ResourceExhausted",
-      "message": "Rate limit exceeded for tenant",
-      "http_status": 429,
-      "ms": 12.4,
-      "retryable": true,
-      "retryability": "yes",
-      "retry_after_ms": 1200,
-      "resource_scope": "rate_limit",
-      "throttle_scope": "tenant:acme:llm",
-      "suggested_batch_reduction": 50,
-      "details": {
-        "max_batch_size": 1000,
-        "provided_batch_size": 2400,
-        "provider_code": "429",
-        "suggested_concurrency": 8,
-        "suggested_backoff_ms": 800,
-        "tenant_hash": "7d9f53d2f1ab"
-      },
-      "schema_version": "1.0.0",
-      "schema_semver_range": ">=1.0.0 <2.0.0",
-      "request_id": "req_01HJ2R4S6Z2R2V2Z6V",
-      "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
-      "error_id": "7d9f53d2-f1ab-4e77-8d9a-6e3e2b6f2c10",
-      "timestamp": "2025-11-12T10:30:00Z",
-      "documentation_url": "https://docs.adaptersdk.org/errors/rate-limits",
-      "recovery_strategy": "reduce_batch"
-    },
-    {
-      "ok": false,
       "op": "vector.query",
-      "protocol": "vector/v1.0",
-      "component": "vector",
-      "code": "DIMENSION_MISMATCH",
-      "error": "DimensionMismatch",
-      "message": "Vector dimension mismatch for namespace",
-      "http_status": 400,
-      "ms": 3.1,
-      "retryable": false,
-      "retryability": "no",
-      "retry_after_ms": null,
-      "resource_scope": null,
-      "details": {
-        "expected": 1536,
-        "provided": 1537,
-        "namespace": "acme.docs"
+      "ctx": {
+        "request_id": "req_01HJ2R4S6Z2R2V2Z6V",
+        "deadline_ms": 1730935200123,
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "tenant": "acme",
+        "cache_scope": "tenant",
+        "cache_tags": ["kb", "lang:en"]
       },
-      "schema_version": "1.0.0",
-      "request_id": "req_vec_123",
-      "recovery_strategy": "adjust_parameters"
+      "args": {
+        "vector": [0.12, 0.34, 0.56],
+        "top_k": 10,
+        "namespace": "acme.docs",
+        "filter": { "doc_type": "kb" },
+        "include_metadata": true,
+        "include_vectors": false
+      }
     },
     {
-      "ok": false,
       "op": "llm.complete",
-      "protocol": "llm/v1.0",
-      "component": "llm",
-      "code": "CONTENT_FILTERED",
-      "error": "ContentFiltered",
-      "message": "Input violates content policy",
-      "http_status": 400,
-      "ms": 24.7,
-      "retryable": false,
-      "retryability": "no",
-      "retry_after_ms": null,
-      "resource_scope": "model",
-      "details": {
-        "policy_section": "safety.v2",
-        "provider_code": "content_policy_violation"
+      "ctx": {
+        "request_id": "req_chat_9b2e",
+        "idempotency_key": "idem_9b2e_f7",
+        "deadline_ms": 1730935200123,
+        "traceparent": "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01",
+        "tenant": "acme",
+        "attrs": { "user": "u_123", "feature": "kb" }
       },
-      "recovery_strategy": "modify_request"
+      "args": {
+        "messages": [
+          { "role": "system", "content": "You are concise." },
+          { "role": "user", "content": "Summarize this document list..." }
+        ],
+        "model": "gpt-4.1-mini",
+        "temperature": 0.2,
+        "max_tokens": 256
+      }
     },
     {
-      "ok": false,
-      "op": "embedding.embed",
-      "protocol": "embedding/v1.0",
-      "component": "embedding",
-      "code": "TEXT_TOO_LONG",
-      "error": "TextTooLong",
-      "message": "Input exceeds maximum length and truncate=false",
-      "http_status": 400,
-      "ms": 9.5,
-      "retryable": false,
-      "retryability": "no",
-      "retry_after_ms": null,
-      "resource_scope": "token_limit",
-      "details": {
-        "max_text_length": 16000,
-        "provided_length": 24210
+      "op": "graph.query",
+      "ctx": {
+        "request_id": "gq_123",
+        "deadline_ms": 1730935200123
       },
-      "recovery_strategy": "adjust_parameters"
+      "args": {
+        "dialect": "cypher",
+        "text": "MATCH (n) RETURN n LIMIT 10",
+        "params": null
+      }
     },
     {
-      "ok": false,
-      "op": "vector.query",
-      "protocol": "vector/v1.0",
-      "component": "vector",
-      "code": "INDEX_NOT_READY",
-      "error": "IndexNotReady",
-      "message": "Index not ready (namespace initialized but empty)",
-      "http_status": 503,
-      "ms": 7.0,
-      "retryable": true,
-      "retryability": "yes",
-      "retry_after_ms": 2000,
-      "resource_scope": "compute",
-      "details": {
-        "namespace": "acme.docs"
+      "op": "embedding.embed_batch",
+      "ctx": {
+        "request_id": "emb_abc",
+        "deadline_ms": 1730935200123,
+        "tenant": "acme"
       },
-      "recovery_strategy": "retry"
-    },
-    {
-      "ok": false,
-      "op": "llm.complete",
-      "protocol": "llm/v1.0",
-      "component": "llm",
-      "code": "DEADLINE_EXCEEDED",
-      "error": "DeadlineExceeded",
-      "message": "Operation budget exhausted",
-      "http_status": 504,
-      "ms": 30005.1,
-      "retryable": false,
-      "retryability": "conditional",
-      "retry_after_ms": null,
-      "resource_scope": "time_budget",
-      "details": {
-        "suggested_backoff_ms": 500
-      },
-      "recovery_strategy": "adjust_parameters"
+      "args": {
+        "texts": ["alpha", "beta", "gamma"],
+        "model": "example-embed-1",
+        "normalize": true,
+        "truncate": true
+      }
     }
   ],
-
-  "$comment": "Compliance notes:\n• All errors MUST align with ERRORS.md taxonomy and retry semantics.\n• Message/details MUST be SIEM-safe (no prompts, vectors, raw tenant IDs, or secrets).\n• For retryable errors, prefer retry_after_ms; if absent, include details.suggested_backoff_ms.\n• Partial failures use the success envelope with code=PARTIAL_SUCCESS; do not use this error envelope for partials.\n• Include error_id for cross-system correlation; echo op, protocol, component, and request_id for analytics.\n• No pagination fields are valid on error envelopes."
+  "$comment": "This schema defines the generic Corpus Protocol request envelope shape: { op, ctx, args, extensions }. Component-specific envelopes (graph/llm/vector/embedding) bind concrete op values to concrete args schemas."
 }
