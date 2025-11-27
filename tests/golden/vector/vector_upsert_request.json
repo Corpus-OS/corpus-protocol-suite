@@ -1,0 +1,33 @@
+{
+  "op": "vector.upsert",
+  "ctx": {
+    "request_id": "req_vec_upsert_01",
+    "deadline_ms": 253402300800000,
+    "tenant": "acme"
+  },
+  "args": {
+    "namespace": "acme.docs",
+    "vectors": [
+      {
+        "id": "doc_1",
+        "vector": [0.11, 0.22, 0.33],
+        "dimensions": 3,
+        "metadata": {
+          "doc_type": "kb",
+          "lang": "en",
+          "title": "First document"
+        }
+      },
+      {
+        "id": "doc_2",
+        "vector": [0.21, 0.32, 0.43],
+        "dimensions": 3,
+        "metadata": {
+          "doc_type": "kb",
+          "lang": "en",
+          "title": "Second document"
+        }
+      }
+    ]
+  }
+}
