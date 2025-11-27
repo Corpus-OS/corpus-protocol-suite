@@ -1,0 +1,17 @@
+{
+  "op": "llm.count_tokens",
+  "ctx": {
+    "request_id": "req_llm_tokens_01",
+    "deadline_ms": 253402214400000,
+    "tenant": "acme"
+  },
+  "args": {
+    "model": "example-llm-1",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hello, how many tokens is this?"
+      }
+    ]
+  }
+}
