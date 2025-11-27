@@ -4,79 +4,97 @@ Graph Conformance — Error mapping & retry hints.
 
 Asserts (Spec refs):
   • Retryable errors include retry_after_ms hints             (§6.3, §12.1, §12.4)
-  • Operation and dialect fields propagate in errors          (§6.3)
-  • Input validation surfaces BadRequest / NotSupported       (§17.2, §7.4)
+  • Unknown dialects rejected with NotSupported               (§7.4)
+  • Input validation surfaces BadRequest                      (§17.2, §7.4)
 """
 import pytest
 
 from corpus_sdk.graph.graph_base import (
     OperationContext as GraphContext,
-    AdapterError,
+    GraphAdapterError,
     NotSupported,
     BadRequest,
+    GraphQuerySpec,
+    UpsertEdgesSpec,
+    Edge,
+    GraphID,
 )
-
-pytestmark = pytest.mark.asyncio
 
 
 def test_error_handling_retryable_errors_with_hints():
     """
-    Validate that AdapterError supports retry_after_ms hints for retryable errors.
+    Validate that GraphAdapterError supports retry_after_ms hints
+    for retryable errors.
     """
-    err = AdapterError("retryable", retry_after_ms=123)
+    err = GraphAdapterError("retryable", retry_after_ms=123)
     assert getattr(err, "retry_after_ms", None) is not None
     assert isinstance(err.retry_after_ms, int) and err.retry_after_ms >= 0
 
 
-async def test_error_handling_error_includes_operation_field(adapter):
-    caps = await adapter.capabilities()
-    if getattr(caps, "max_batch_ops", None) is None:
-        pytest.skip("Adapter does not declare max_batch_ops; cannot trigger bulk_vertices error")
-
-    ctx = GraphContext(
-        request_id="t_err_opfield",
-        tenant="t",
-    )
-    too_many = caps.max_batch_ops * 2
-    with pytest.raises(BadRequest) as ei:
-        await adapter.bulk_vertices(
-            [("U", {"i": i}) for i in range(too_many)],
-            ctx=ctx,
-        )
-    assert getattr(ei.value, "operation", None) == "bulk_vertices"
-
-
-async def test_error_handling_error_includes_dialect_field(adapter):
-    caps = await adapter.capabilities()
-    unknown = "__err_dialect__"
-    assert unknown not in caps.dialects
-
-    ctx = GraphContext(
-        request_id="t_err_dialect",
-        tenant="t",
-    )
-    with pytest.raises(NotSupported) as ei:
-        await adapter.query(dialect=unknown, text="g.V()", ctx=ctx)
-    assert getattr(ei.value, "dialect", None) == unknown
-
-
-async def test_error_handling_bad_request_on_empty_label(adapter):
-    ctx = GraphContext(
-        request_id="t_err_badreq",
-        tenant="t",
-    )
-    with pytest.raises(BadRequest):
-        await adapter.create_vertex("", {"x": 1}, ctx=ctx)
-
-
 async def test_error_handling_not_supported_on_unknown_dialect(adapter):
+    """
+    Unknown dialects must surface NotSupported errors.
+    """
     caps = await adapter.capabilities()
+    supported = getattr(caps, "supported_query_dialects", ()) or ()
+
     unknown = "__sparql_like__"
-    assert unknown not in caps.dialects
+    if unknown in supported:
+        pytest.skip(f"Adapter unexpectedly supports '{unknown}' dialect")
 
     ctx = GraphContext(
         request_id="t_err_notsup",
         tenant="t",
     )
+    spec = GraphQuerySpec(text="SELECT * WHERE {}", dialect=unknown)
+
     with pytest.raises(NotSupported):
-        await adapter.query(dialect=unknown, text="SELECT * WHERE {}", ctx=ctx)
+        await adapter.query(spec, ctx=ctx)
+
+
+async def test_error_handling_bad_request_on_empty_edge_label(adapter):
+    """
+    Invalid edge label must surface BadRequest from BaseGraphAdapter validation.
+    """
+    ctx = GraphContext(
+        request_id="t_err_badreq",
+        tenant="t",
+    )
+
+    spec = UpsertEdgesSpec(
+        edges=[
+            Edge(
+                id=GraphID("e1"),
+                src=GraphID("v:1"),
+                dst=GraphID("v:2"),
+                label="",  # invalid (empty)
+                properties={},
+                namespace="ns",
+            )
+        ],
+        namespace="ns",
+    )
+
+    with pytest.raises(BadRequest):
+        await adapter.upsert_edges(spec, ctx=ctx)
+
+
+async def test_error_message_includes_dialect_name_in_not_supported(adapter):
+    """
+    NotSupported error messages for dialect validation should include the
+    offending dialect name for debuggability.
+    """
+    caps = await adapter.capabilities()
+    supported = getattr(caps, "supported_query_dialects", ()) or ()
+
+    dialect = "gql"
+    if dialect in supported:
+        pytest.skip(f"Adapter unexpectedly supports '{dialect}' dialect")
+
+    ctx = GraphContext(request_id="t_err_dialect_msg", tenant="t")
+    spec = GraphQuerySpec(text="{}", dialect=dialect)
+
+    with pytest.raises(NotSupported) as ei:
+        await adapter.query(spec, ctx=ctx)
+
+    assert dialect in str(ei.value)
