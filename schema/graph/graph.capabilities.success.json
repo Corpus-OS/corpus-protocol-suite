@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/graph/graph.capabilities.success.json",
-  "title": "Graph Capabilities",
+  "$id": "https://corpusos.com/schemas/graph/graph.capabilities.success.json",
+  "title": "graph.capabilities Result",
   "type": "object",
   "additionalProperties": false,
   "required": ["protocol", "server", "version", "features", "limits"],
