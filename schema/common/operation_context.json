@@ -1,11 +1,10 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/common/operation_context.json",
+  "$id": "https://corpusos.com/schemas/common/operation_context.json",
   "title": "Operation Context",
   "description": "Canonical context envelope carried on every request (and echoed in responses) for tracing, deadlines, idempotency, tenancy, and cache hints. Authoritative for v1.x compatibility checks. See spec §6.1 (Operation Context), §12 (Resilience), §13 (Observability).",
   "type": "object",
   "additionalProperties": false,
-
   "properties": {
     "request_id": {
       "type": "string",
@@ -15,7 +14,6 @@
       "maxLength": 256,
       "examples": ["req_01HJ2R4S6Z2R2V2Z6V", "c9d1a2b0-1f92-4b08-8e67-2b7d3c0e9f7a"]
     },
-
     "idempotency_key": {
       "type": "string",
       "description": "Client-provided token enabling exactly-once semantics for mutating operations. Scope is (tenant, op, args-hash). Servers MUST dedupe for ≥24h.",
@@ -24,7 +22,6 @@
       "maxLength": 256,
       "examples": ["idem_64f0c2a9b1", "PUT:vector.upsert:sha256:1fe3..."]
     },
-
     "deadline_ms": {
       "type": "integer",
       "description": "Absolute UNIX epoch in milliseconds when the operation budget expires. Servers compute remaining_ms=deadline_ms-now(); if remaining_ms<=0 → fail fast with DeadlineExceeded.",
@@ -32,7 +29,6 @@
       "maximum": 253402300800000,
       "examples": [1730312345123]
     },
-
     "traceparent": {
       "type": "string",
       "description": "W3C Trace Context (propagated unchanged across hops).",
@@ -50,7 +46,6 @@
       ],
       "examples": ["00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"]
     },
-
     "tenant": {
       "type": "string",
       "description": "Tenant identity for isolation and policy enforcement. MUST NOT be logged raw; use hashed forms in telemetry.",
@@ -58,7 +53,6 @@
       "maxLength": 256,
       "examples": ["acme-corp", "tenant_12345"]
     },
-
     "attrs": {
       "type": "object",
       "description": "Free-form, low-cardinality, SIEM-safe attributes (e.g., {\"user\":\"u_123\"}). Values MUST be JSON-serializable and non-sensitive.",
@@ -79,14 +73,12 @@
         { "user": "u_12345", "feature": "kb", "experiment": "expA" }
       ]
     },
-
     "cache_scope": {
       "type": "string",
       "description": "Advisory cache isolation hint. MUST NOT weaken tenant isolation.",
       "enum": ["tenant", "global", "session"],
       "default": "tenant"
     },
-
     "cache_tags": {
       "type": "array",
       "description": "Advisory tags for cache keying/invalidation. MUST NOT contain secrets or raw tenant IDs.",
@@ -100,7 +92,6 @@
       "maxItems": 32,
       "examples": [["kb", "user:u_12345"]]
     },
-
     "locale": {
       "type": "string",
       "description": "Advisory locale (BCP 47) for client/runtime hints.",
@@ -108,7 +99,6 @@
       "maxLength": 32,
       "examples": ["en-US", "fr-FR"]
     },
-
     "client": {
       "type": "object",
       "description": "Producer identity for debugging/analytics. Informative only.",
@@ -128,7 +118,6 @@
       "required": ["name"],
       "examples": [{ "name": "corpus-sdk-python", "version": "1.4.2" }]
     },
-
     "priority": {
       "type": "string",
       "description": "Advisory priority hint. Servers MAY ignore.",
@@ -136,7 +125,6 @@
       "default": "normal"
     }
   },
-
   "patternProperties": {
     "^(vendor:)[a-z0-9_.:-]+$": {
       "description": "Vendor/extension namespaced fields. Must not conflict with standardized keys; MUST remain SIEM-safe.",
@@ -147,22 +135,16 @@
       "type": ["string", "number", "boolean", "object", "array", "null"]
     }
   },
-
   "required": [],
-
   "allOf": [
     {
-      "$comment": "----- Semantic guidance (non-enforceable) -----\n• Servers MUST compute remaining_ms = deadline_ms - now(); if ≤ 0 → DeadlineExceeded.\n• If idempotency_key is present, deduplicate by (tenant, op, args-hash) for ≥ 24h.\n• Raw tenant MUST NOT be logged; derive tenant_hash for telemetry.\n• cache_scope and cache_tags are advisory; MUST NOT cause cross-tenant sharing unless explicitly configured outside this spec."
-    },
-    {
-      "$comment": "If cache_tags is present, cache_scope SHOULD default to 'tenant' (already modeled via default)."
+      "$comment": "Semantic guidance (non-enforceable):\n• Servers MUST compute remaining_ms = deadline_ms - now(); if ≤ 0 → DeadlineExceeded.\n• If idempotency_key is present, deduplicate by (tenant, op, args-hash) for ≥ 24h.\n• Raw tenant MUST NOT be logged; derive tenant_hash for telemetry.\n• cache_scope and cache_tags are advisory; MUST NOT cause cross-tenant sharing unless explicitly configured outside this spec."
     }
   ],
-
   "examples": [
     {
       "$comment": "1) Minimal (allowed)",
-      "obj": { }
+      "obj": {}
     },
     {
       "$comment": "2) Tracing only",
@@ -206,13 +188,5 @@
       }
     }
   ],
-
-  "$comment": [
-    "Operation Context Compliance (v1.x):",
-    "• This schema is authoritative for v1.x compatibility checks.",
-    "• Unknown fields MUST be ignored by clients/servers except where disallowed by additionalProperties:false.",
-    "• Privacy: Never place prompts, source texts, raw vectors, or PII in attrs/cache_tags/extensions.",
-    "• Telemetry: derive tenant_hash and do not log raw tenant. Keep labels low-cardinality.",
-    "• Interop: Fields are optional; individual operation schemas may add their own requirements."
-  ].join("\\n")
+  "$comment": "Operation Context Compliance (v1.x):\n• This schema is authoritative for v1.x compatibility checks.\n• Unknown fields MUST be ignored by clients/servers except where disallowed by additionalProperties:false.\n• Privacy: Never place prompts, source texts, raw vectors, or PII in attrs/cache_tags/extensions.\n• Telemetry: derive tenant_hash and do not log raw tenant. Keep labels low-cardinality.\n• Interop: Fields are optional; individual operation schemas may add their own requirements."
 }
