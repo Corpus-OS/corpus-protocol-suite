@@ -1,0 +1,19 @@
+{
+  "op": "vector.query",
+  "ctx": {
+    "request_id": "req_vec_query_01",
+    "deadline_ms": 253402300800000,
+    "tenant": "acme"
+  },
+  "args": {
+    "namespace": "acme.docs",
+    "vector": [0.12, 0.34, 0.56],
+    "top_k": 10,
+    "filter": {
+      "doc_type": "kb",
+      "lang": "en"
+    },
+    "include_metadata": true,
+    "include_vectors": false
+  }
+}
