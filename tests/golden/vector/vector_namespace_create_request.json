@@ -1,0 +1,13 @@
+{
+  "op": "vector.create_namespace",
+  "ctx": {
+    "request_id": "req_vec_ns_create_01",
+    "deadline_ms": 253402300800000,
+    "tenant": "acme"
+  },
+  "args": {
+    "name": "acme.docs",
+    "dimensions": 1536,
+    "metric": "cosine"
+  }
+}
