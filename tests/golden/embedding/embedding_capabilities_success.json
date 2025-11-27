@@ -1,0 +1,46 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 7.4,
+  "result": {
+    "protocol": "embedding/v1.0",
+    "server": "test-embedding-server",
+    "version": "1.0.0",
+    "supported_models": [
+      "example-embed-1",
+      {
+        "name": "example-embed-2",
+        "dimensions": 1536,
+        "context_window": 8192,
+        "description": "High-dimensional embedding model.",
+        "vendor:internal_tier": "beta"
+      }
+    ],
+    "max_batch_size": 1000,
+    "max_text_length": 200000,
+    "max_dimensions": 4096,
+    "supports_normalization": true,
+    "normalizes_at_source": false,
+    "supports_truncation": true,
+    "supports_token_counting": true,
+    "supports_deadline": true,
+    "idempotent_operations": true,
+    "supports_multi_tenant": true,
+    "cache": {
+      "supports_tags": true,
+      "max_ttl_ms": 3600000
+    },
+    "limits": {
+      "concurrency": 64,
+      "rate_limit_qps": 1000
+    },
+    "extensions": {
+      "vendor:example_capability": true
+    }
+  },
+  "protocol": "embedding/v1.0",
+  "component": "embedding",
+  "schema_version": "1.0.0",
+  "request_id": "req_emb_capabilities_001",
+  "result_hash": "1111111111111111111111111111111111111111111111111111111111111111"
+}
