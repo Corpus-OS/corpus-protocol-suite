@@ -1,11 +1,31 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/embedding/embedding.embed.success.json",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.embed.success.json",
   "title": "embedding.embed Result",
   "type": "object",
-  "allOf": [
-    { "$ref": "https://adaptersdk.org/schemas/embedding/embedding.types.result.json" }
-  ],
   "additionalProperties": false,
-  "$comment": "Semantic: embeddings.length MUST equal 1 for single embed."
+  "required": ["embedding", "model", "text"],
+  "properties": {
+    "embedding": {
+      "$ref": "https://corpusos.com/schemas/embedding/embedding.types.vector.json"
+    },
+    "model": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2000000
+    },
+    "tokens_used": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "truncated": {
+      "type": "boolean"
+    }
+  },
+  "$comment": "EmbedResult per PROTOCOLS.md §18.3. 'text' MAY be truncated when 'truncated' is true."
 }
