@@ -1,0 +1,13 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 5.1,
+  "result": {
+    "ok": true,
+    "status": "deleted"
+  },
+  "protocol": "graph/v1.0",
+  "component": "graph",
+  "schema_version": "1.0.0",
+  "request_id": "req_graph_vertex_delete_001"
+}
