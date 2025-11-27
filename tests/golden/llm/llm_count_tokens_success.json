@@ -1,0 +1,21 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 3.8,
+  "protocol": "llm/v1.0",
+  "component": "llm",
+  "schema_version": "1.0.0",
+  "result": {
+    "model": "example-llm-1",
+    "prompt_tokens": 11,
+    "completion_tokens": 0,
+    "total_tokens": 11,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hello, how many tokens is this?",
+        "tokens": 11
+      }
+    ]
+  }
+}
