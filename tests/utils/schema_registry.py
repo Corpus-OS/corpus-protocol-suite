@@ -402,6 +402,21 @@ def preload_all_schemas() -> None:
                 ) from e
 
 
+def load_all_schemas_into_registry(schemas_root: Optional[Path] = None) -> None:
+    """
+    Test helper used by golden/schema tests.
+
+    If schemas_root is provided, it will:
+      • set CORPUS_SCHEMAS_ROOT to that path for this process
+      • preload and validate all schemas
+
+    Otherwise it just behaves like preload_all_schemas().
+    """
+    if schemas_root is not None:
+        os.environ[_SCHEMAS_ROOT_ENV] = str(schemas_root)
+    preload_all_schemas()
+
+
 def list_schemas() -> Dict[str, str]:
     """
     Get mapping of all schema IDs to their file paths.
@@ -474,11 +489,12 @@ Environment:
             schemas = list_schemas()
             print(f"Available schemas ({len(schemas)}):")
             for schema_id, file_path in sorted(schemas.items()):
-                rel_path = (
-                    Path(file_path).relative_to(_schemas_root())
-                    if Path(file_path).is_relative_to(_schemas_root())
-                    else file_path
-                )
+                rel_root = _schemas_root()
+                path_obj = Path(file_path)
+                try:
+                    rel_path = path_obj.relative_to(rel_root)
+                except ValueError:
+                    rel_path = file_path
                 print(f"  {schema_id} -> {rel_path}")
             sys.exit(0)
 
