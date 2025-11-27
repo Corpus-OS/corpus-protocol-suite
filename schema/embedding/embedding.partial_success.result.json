@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/embedding/embedding.partial_success.result.json",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.partial_success.result.json",
   "title": "Embedding Partial-Success Result",
-  "description": "Result payload for transport-level partial success (code=PARTIAL_SUCCESS) per §12.5. Captures per-item outcomes for embed_batch with stable, machine-actionable fields.",
+  "description": "Result payload for transport-level partial success (code=PARTIAL_SUCCESS) per §23.4. Captures per-item outcomes for embed_batch with stable, machine-actionable fields.",
   "type": "object",
   "additionalProperties": false,
   "required": ["successes", "failures", "items"],
@@ -38,7 +38,7 @@
           },
           "result": {
             "description": "Present when ok=true: the computed embedding vector and metadata.",
-            "$ref": "https://adaptersdk.org/schemas/embedding/embedding.types.vector.json"
+            "$ref": "https://corpusos.com/schemas/embedding/embedding.types.vector.json"
           },
           "code": {
             "type": "string",
@@ -56,9 +56,18 @@
             "description": "Optional, SIEM-safe structured context for failures (e.g., max_text_length, provided_length, provider_code).",
             "additionalProperties": true,
             "properties": {
-              "max_text_length": { "type": "integer", "minimum": 1 },
-              "provided_length": { "type": "integer", "minimum": 0 },
-              "provider_code": { "type": "string", "maxLength": 128 },
+              "max_text_length": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "provided_length": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "provider_code": {
+                "type": "string",
+                "maxLength": 128
+              },
               "validation_errors": {
                 "type": "array",
                 "maxItems": 256,
@@ -67,9 +76,18 @@
                   "additionalProperties": false,
                   "required": ["field", "reason"],
                   "properties": {
-                    "field": { "type": "string", "maxLength": 256 },
-                    "reason": { "type": "string", "maxLength": 512 },
-                    "constraint": { "type": "string", "maxLength": 128 }
+                    "field": {
+                      "type": "string",
+                      "maxLength": 256
+                    },
+                    "reason": {
+                      "type": "string",
+                      "maxLength": 512
+                    },
+                    "constraint": {
+                      "type": "string",
+                      "maxLength": 128
+                    }
                   }
                 }
               }
@@ -79,19 +97,37 @@
             "type": "array",
             "maxItems": 100,
             "items": {
-              "$ref": "https://adaptersdk.org/schemas/embedding/embedding.types.warning.json"
+              "$ref": "https://corpusos.com/schemas/embedding/embedding.types.warning.json"
             },
             "description": "Optional non-fatal warnings associated with this item."
           }
         },
         "allOf": [
           {
-            "if": { "properties": { "ok": { "const": true } }, "required": ["ok"] },
-            "then": { "required": ["result"] }
+            "if": {
+              "properties": {
+                "ok": {
+                  "const": true
+                }
+              },
+              "required": ["ok"]
+            },
+            "then": {
+              "required": ["result"]
+            }
           },
           {
-            "if": { "properties": { "ok": { "const": false } }, "required": ["ok"] },
-            "then": { "required": ["code", "message"] }
+            "if": {
+              "properties": {
+                "ok": {
+                  "const": false
+                }
+              },
+              "required": ["ok"]
+            },
+            "then": {
+              "required": ["code", "message"]
+            }
           }
         ]
       }
@@ -100,7 +136,7 @@
       "type": "array",
       "maxItems": 100,
       "items": {
-        "$ref": "https://adaptersdk.org/schemas/embedding/embedding.types.warning.json"
+        "$ref": "https://corpusos.com/schemas/embedding/embedding.types.warning.json"
       },
       "description": "Optional batch-level warnings (e.g., truncation applied to some items)."
     }
@@ -111,12 +147,5 @@
       "type": ["string", "number", "boolean", "object", "array", "null"]
     }
   },
-  "$comment": [
-    "Invariants (not enforceable in pure JSON Schema):",
-    "- successes + failures == items.length",
-    "- successes >= 1 AND failures >= 1 for transport-level PARTIAL_SUCCESS",
-    "- Items preserve input order by index",
-    "Security/Privacy:",
-    "- All messages/details MUST be SIEM-safe: no raw texts beyond allowed fields, no secrets, no raw tenant IDs"
-  ].join("\\n")
+  "$comment": "Invariants (not enforceable in pure JSON Schema): successes + failures == items.length; successes >= 1 AND failures >= 1 for transport-level PARTIAL_SUCCESS; items preserve input order by index. Security/Privacy: messages/details MUST be SIEM-safe (no raw texts, no secrets, no raw tenant IDs)."
 }
