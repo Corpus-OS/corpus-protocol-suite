@@ -1,0 +1,8 @@
+{
+  "op": "create_vertex",
+  "label": "User",
+  "props": {
+    "name": "Alice",
+    "active": true
+  }
+}
