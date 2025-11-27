@@ -1,0 +1,4 @@
+{
+  "code": "EMBEDDING_TRUNCATED",
+  "message": "Input was truncated to max_text_length."
+}
