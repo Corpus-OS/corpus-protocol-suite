@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/graph/graph.stream_query.request.json",
+  "$id": "https://corpusos.com/schemas/graph/graph.stream_query.request.json",
   "title": "graph.stream_query Args",
   "type": "object",
   "additionalProperties": false,
@@ -8,6 +8,10 @@
   "properties": {
     "dialect": { "type": "string", "minLength": 1, "maxLength": 64 },
     "text": { "type": "string", "minLength": 1, "maxLength": 100000 },
-    "params": { "type": "object", "maxProperties": 256, "additionalProperties": true }
+    "params": {
+      "type": "object",
+      "maxProperties": 256,
+      "additionalProperties": true
+    }
   }
 }
