@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/graph/graph.types.partial_success_result.json",
+  "$id": "https://corpusos.com/schemas/graph/graph.types.partial_success_result.json",
   "title": "Graph Partial Success Result",
   "description": "Canonical transport-level partial-success payload for non-atomic Graph batch operations. Used with success envelopes that set code=\"PARTIAL_SUCCESS\".",
   "type": "object",
@@ -39,10 +39,19 @@
           "result": {
             "description": "Item-specific success payload (e.g., created IDs, rows). Shape depends on the batch op.",
             "oneOf": [
-              { "$ref": "https://adaptersdk.org/schemas/graph/graph.types.batch_op.json" },
-              { "$ref": "https://adaptersdk.org/schemas/graph/graph.types.row.json" },
-              { "$ref": "https://adaptersdk.org/schemas/graph/graph.id.success.json" },
-              { "type": "object", "additionalProperties": true }
+              {
+                "$ref": "https://corpusos.com/schemas/graph/graph.types.batch_op.json"
+              },
+              {
+                "$ref": "https://corpusos.com/schemas/graph/graph.types.row.json"
+              },
+              {
+                "$ref": "https://corpusos.com/schemas/graph/graph.id.success.json"
+              },
+              {
+                "type": "object",
+                "additionalProperties": true
+              }
             ]
           },
           "code": {
@@ -64,12 +73,29 @@
         },
         "allOf": [
           {
-            "if": { "properties": { "ok": { "const": true } }, "required": ["ok"] },
-            "then": { "required": ["result"], "properties": { "code": { "not": {} }, "message": { "not": {} } } }
+            "if": {
+              "properties": { "ok": { "const": true } },
+              "required": ["ok"]
+            },
+            "then": {
+              "required": ["result"],
+              "properties": {
+                "code": { "not": {} },
+                "message": { "not": {} }
+              }
+            }
           },
           {
-            "if": { "properties": { "ok": { "const": false } }, "required": ["ok"] },
-            "then": { "required": ["code", "message"], "properties": { "result": { "not": {} } } }
+            "if": {
+              "properties": { "ok": { "const": false } },
+              "required": ["ok"]
+            },
+            "then": {
+              "required": ["code", "message"],
+              "properties": {
+                "result": { "not": {} }
+              }
+            }
           }
         ],
         "patternProperties": {
