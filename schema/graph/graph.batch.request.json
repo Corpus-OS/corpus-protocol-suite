@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/graph/graph.batch.request.json",
+  "$id": "https://corpusos.com/schemas/graph/graph.batch.request.json",
   "title": "graph.batch Args",
   "type": "object",
   "additionalProperties": false,
@@ -10,7 +10,9 @@
       "type": "array",
       "minItems": 1,
       "maxItems": 5000,
-      "items": { "$ref": "https://adaptersdk.org/schemas/graph/graph.types.batch_op.json" }
+      "items": {
+        "$ref": "https://corpusos.com/schemas/graph/graph.types.batch_op.json"
+      }
     }
   }
 }
