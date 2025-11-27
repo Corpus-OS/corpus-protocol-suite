@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/graph/graph.health.success.json",
-  "title": "Graph Health",
+  "$id": "https://corpusos.com/schemas/graph/graph.health.success.json",
+  "title": "graph.health Result",
   "type": "object",
   "additionalProperties": false,
   "required": ["ok", "status"],
