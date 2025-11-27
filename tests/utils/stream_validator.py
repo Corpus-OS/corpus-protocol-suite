@@ -37,10 +37,14 @@ class StreamFormat(Enum):
 
 class ValidationMode(Enum):
     """Validation strictness modes."""
-    STRICT = "strict"  # Validate every frame
-    SAMPLED = "sampled"  # Validate sample of frames
-    LAZY = "lazy"  # Validate only protocol rules, skip schema validation
+    STRICT = "strict"              # Validate every frame
+    SAMPLED = "sampled"            # Validate sample of frames
+    LAZY = "lazy"                  # Validate only protocol rules, skip schema validation
     COLLECT_ERRORS = "collect_errors"  # Collect all errors instead of failing fast
+
+
+# Protocol-allowed success codes for envelopes (kept in sync with envelope tests)
+ALLOWED_SUCCESS_CODES: set[str] = {"OK", "PARTIAL_SUCCESS", "ACCEPTED"}
 
 
 @dataclass(frozen=True)
@@ -80,16 +84,25 @@ class StreamValidationReport:
         seconds = self.validation_time_ms / 1000.0
         
         # Bytes per second
-        object.__setattr__(self, 'bytes_per_second', 
-                          self.total_bytes / seconds if seconds > 0 else float('inf'))
+        object.__setattr__(
+            self,
+            "bytes_per_second",
+            self.total_bytes / seconds if seconds > 0 else float("inf"),
+        )
         
         # Frames per second  
-        object.__setattr__(self, 'frames_per_second',
-                          self.total_frames / seconds if seconds > 0 else float('inf'))
+        object.__setattr__(
+            self,
+            "frames_per_second",
+            self.total_frames / seconds if seconds > 0 else float("inf"),
+        )
         
         # Validation coverage
-        object.__setattr__(self, 'validation_coverage',
-                          self.frames_validated / self.total_frames if self.total_frames > 0 else 1.0)
+        object.__setattr__(
+            self,
+            "validation_coverage",
+            self.frames_validated / self.total_frames if self.total_frames > 0 else 1.0,
+        )
     
     @property
     def is_valid(self) -> bool:
@@ -173,7 +186,9 @@ class NDJSONParser(StreamParser):
             try:
                 frame = json.loads(line)
                 if not isinstance(frame, dict):
-                    raise StreamProtocolError(f"Frame #{i} must be a JSON object, got {type(frame).__name__}")
+                    raise StreamProtocolError(
+                        f"Frame #{i} must be a JSON object, got {type(frame).__name__}"
+                    )
                 
                 # Extract protocol envelope - ignore transport-specific fields
                 envelope = self._extract_protocol_envelope(frame, i)
@@ -186,7 +201,17 @@ class NDJSONParser(StreamParser):
         """Extract protocol envelope from transport frame."""
         # For NDJSON, the frame should already be the protocol envelope
         # But handle cases where transport adds wrapper fields
-        protocol_fields = {"ok", "code", "ms", "result", "chunk", "error", "message", "retry_after_ms", "details"}
+        protocol_fields = {
+            "ok",
+            "code",
+            "ms",
+            "result",
+            "chunk",
+            "error",
+            "message",
+            "retry_after_ms",
+            "details",
+        }
         
         # If frame contains only protocol fields, return as-is
         if set(frame.keys()).issubset(protocol_fields):
@@ -195,7 +220,9 @@ class NDJSONParser(StreamParser):
         # If frame has extra fields, extract protocol envelope
         envelope = {k: v for k, v in frame.items() if k in protocol_fields}
         if not envelope:
-            raise StreamProtocolError(f"Frame #{frame_num} contains no protocol envelope fields")
+            raise StreamProtocolError(
+                f"Frame #{frame_num} contains no protocol envelope fields"
+            )
         
         return envelope
     
@@ -215,12 +242,16 @@ class NDJSONParser(StreamParser):
             try:
                 frame = json.loads(line)
                 if not isinstance(frame, dict):
-                    raise StreamProtocolError(f"Frame #{line_num} must be a JSON object, got {type(frame).__name__}")
+                    raise StreamProtocolError(
+                        f"Frame #{line_num} must be a JSON object, got {type(frame).__name__}"
+                    )
                 
                 envelope = self._extract_protocol_envelope(frame, line_num)
                 yield envelope
             except json.JSONDecodeError as e:
-                raise StreamProtocolError(f"Invalid NDJSON at line #{line_num}: {e}") from e
+                raise StreamProtocolError(
+                    f"Invalid NDJSON at line #{line_num}: {e}"
+                ) from e
 
 
 class SSEParser(StreamParser):
@@ -241,7 +272,9 @@ class SSEParser(StreamParser):
                     # Parse the protocol envelope from SSE data
                     envelope = json.loads(data_content)
                     if not isinstance(envelope, dict):
-                        raise StreamProtocolError(f"SSE data must contain JSON object, got {type(envelope).__name__}")
+                        raise StreamProtocolError(
+                            f"SSE data must contain JSON object, got {type(envelope).__name__}"
+                        )
                     frames.append(envelope)
             except json.JSONDecodeError as e:
                 raise StreamProtocolError(f"Invalid JSON in SSE data: {e}") from e
@@ -249,7 +282,7 @@ class SSEParser(StreamParser):
                 current_data_lines = []
 
         for line_num, raw_line in enumerate(sse_text.splitlines(), 1):
-            line = raw_line.rstrip('\n\r')
+            line = raw_line.rstrip("\n\r")
             
             if not line:
                 flush()
@@ -285,7 +318,9 @@ class SSEParser(StreamParser):
                 if data_content:
                     envelope = json.loads(data_content)
                     if not isinstance(envelope, dict):
-                        raise StreamProtocolError(f"SSE data must contain JSON object, got {type(envelope).__name__}")
+                        raise StreamProtocolError(
+                            f"SSE data must contain JSON object, got {type(envelope).__name__}"
+                        )
                     yield envelope
             except json.JSONDecodeError as e:
                 raise StreamProtocolError(f"Invalid JSON in SSE data: {e}") from e
@@ -293,7 +328,7 @@ class SSEParser(StreamParser):
                 current_data_lines = []
 
         async for raw_line in lines:
-            line = raw_line.rstrip('\n\r')
+            line = raw_line.rstrip("\n\r")
             
             if not line:
                 async for frame in flush():
@@ -317,10 +352,16 @@ class FrameValidator:
     @staticmethod
     def estimate_frame_size(frame: dict[str, Any]) -> int:
         """Efficient frame size estimation."""
-        return len(json.dumps(frame, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+        return len(
+            json.dumps(frame, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        )
     
     @staticmethod
-    def check_frame_size(frame: dict[str, Any], frame_num: int, max_frame_bytes: Optional[int]) -> None:
+    def check_frame_size(
+        frame: dict[str, Any],
+        frame_num: int,
+        max_frame_bytes: Optional[int],
+    ) -> None:
         """Check frame size against limits."""
         if max_frame_bytes is None:
             return
@@ -335,34 +376,67 @@ class FrameValidator:
     @staticmethod
     def validate_protocol_envelope(frame: dict[str, Any], frame_num: int) -> None:
         """Validate protocol §2.4 envelope structure."""
-        # Check required success envelope fields
-        if frame.get("ok") is True:
+        # 'ok' is required on all envelopes
+        if "ok" not in frame:
+            raise StreamProtocolError(f"Frame #{frame_num}: missing 'ok' field")
+        if not isinstance(frame["ok"], bool):
+            raise StreamProtocolError(
+                f"Frame #{frame_num}: 'ok' must be a boolean, got {type(frame['ok']).__name__}"
+            )
+
+        # Success envelopes
+        if frame["ok"] is True:
             if "code" not in frame:
                 raise StreamProtocolError(f"Frame #{frame_num}: missing 'code' field")
-            if frame.get("code") != "OK":
-                raise StreamProtocolError(f"Frame #{frame_num}: code must be 'OK', got '{frame.get('code')}'")
+            code = frame.get("code")
+            if code not in ALLOWED_SUCCESS_CODES:
+                raise StreamProtocolError(
+                    f"Frame #{frame_num}: code must be one of "
+                    f"{sorted(ALLOWED_SUCCESS_CODES)}, got {code!r}"
+                )
             if "ms" not in frame:
                 raise StreamProtocolError(f"Frame #{frame_num}: missing 'ms' field")
             if not (isinstance(frame.get("ms"), (int, float)) and frame["ms"] >= 0):
-                raise StreamProtocolError(f"Frame #{frame_num}: 'ms' must be non-negative number")
+                raise StreamProtocolError(
+                    f"Frame #{frame_num}: 'ms' must be non-negative number"
+                )
             
             # Must have either result or chunk, not both
             has_result = "result" in frame
             has_chunk = "chunk" in frame
             if not (has_result or has_chunk):
-                raise StreamProtocolError(f"Frame #{frame_num}: must have either 'result' or 'chunk' field")
+                raise StreamProtocolError(
+                    f"Frame #{frame_num}: must have either 'result' or 'chunk' field"
+                )
             if has_result and has_chunk:
-                raise StreamProtocolError(f"Frame #{frame_num}: cannot have both 'result' and 'chunk' fields")
+                raise StreamProtocolError(
+                    f"Frame #{frame_num}: cannot have both 'result' and 'chunk' fields"
+                )
         
-        # Check error envelope fields
-        elif frame.get("ok") is False:
+        # Error envelopes
+        elif frame["ok"] is False:
             required_fields = {"code", "error", "message", "ms"}
             for field in required_fields:
                 if field not in frame:
-                    raise StreamProtocolError(f"Frame #{frame_num}: error envelope missing '{field}' field")
+                    raise StreamProtocolError(
+                        f"Frame #{frame_num}: error envelope missing '{field}' field"
+                    )
+            if not (isinstance(frame.get("ms"), (int, float)) and frame["ms"] >= 0):
+                raise StreamProtocolError(
+                    f"Frame #{frame_num}: 'ms' must be non-negative number"
+                )
+        else:
+            # This should be unreachable due to the bool check above, but keep as guardrail
+            raise StreamProtocolError(
+                f"Frame #{frame_num}: 'ok' must be true or false, got {frame['ok']!r}"
+            )
     
     @staticmethod
-    def should_validate_frame(frame_num: int, mode: ValidationMode, sample_rate: float) -> bool:
+    def should_validate_frame(
+        frame_num: int,
+        mode: ValidationMode,
+        sample_rate: float,
+    ) -> bool:
         """Determine if frame should be validated based on mode and sampling."""
         if mode in (ValidationMode.STRICT, ValidationMode.COLLECT_ERRORS):
             return True
@@ -409,7 +483,7 @@ class StreamValidationEngine:
         frame_num: int, 
         error_type: str,
         collect_errors: bool,
-        validation_errors: list[ValidationError]
+        validation_errors: list[ValidationError],
     ) -> None:
         """Handle validation error based on collection mode."""
         validation_error = ValidationError(frame_num, error_type, str(error), error)
@@ -423,7 +497,7 @@ class StreamValidationEngine:
     def validate_frames(
         self, 
         frames: Iterable[dict[str, Any]],
-        format: StreamFormat = StreamFormat.RAW_JSON
+        format: StreamFormat = StreamFormat.RAW_JSON,
     ) -> StreamValidationReport:
         """Validate protocol envelope frames synchronously."""
         start_time = time.time()
@@ -449,9 +523,13 @@ class StreamValidationEngine:
                 frame_size = FrameValidator.estimate_frame_size(frame)
                 total_bytes += frame_size
                 max_frame_size = max(max_frame_size, frame_size)
-                FrameValidator.check_frame_size(frame, frame_num, self.config.max_frame_bytes)
+                FrameValidator.check_frame_size(
+                    frame, frame_num, self.config.max_frame_bytes
+                )
             except (FrameSizeExceededError, StreamProtocolError) as e:
-                self._handle_validation_error(e, frame_num, "size_exceeded", collect_errors, validation_errors)
+                self._handle_validation_error(
+                    e, frame_num, "size_exceeded", collect_errors, validation_errors
+                )
                 if collect_errors:
                     continue
                 else:
@@ -461,7 +539,13 @@ class StreamValidationEngine:
             try:
                 FrameValidator.validate_protocol_envelope(frame, frame_num)
             except StreamProtocolError as e:
-                self._handle_validation_error(e, frame_num, "protocol_envelope", collect_errors, validation_errors)
+                self._handle_validation_error(
+                    e,
+                    frame_num,
+                    "protocol_envelope",
+                    collect_errors,
+                    validation_errors,
+                )
                 if collect_errors:
                     continue
                 else:
@@ -479,11 +563,17 @@ class StreamValidationEngine:
                         self.config.envelope_schema_id, 
                         frame, 
                         context=f"{self.config.component}.stream frame #{frame_num}",
-                        registry=self.config.schema_registry
+                        registry=self.config.schema_registry,
                     )
                     self._emit_frame_validated(frame, frame_num)
                 except AssertionError as e:
-                    self._handle_validation_error(e, frame_num, "schema_validation", collect_errors, validation_errors)
+                    self._handle_validation_error(
+                        e,
+                        frame_num,
+                        "schema_validation",
+                        collect_errors,
+                        validation_errors,
+                    )
                     if collect_errors:
                         continue
                     else:
@@ -499,25 +589,31 @@ class StreamValidationEngine:
                         f"(terminal was at frame #{terminal_frame_position})"
                     )
 
-                # Check if this is a data frame
+                # Data frame (streaming chunk)
                 if frame.get("ok") is True and "chunk" in frame:
                     data_count += 1
                     
                     # Check if this is a terminal success frame
                     chunk = frame["chunk"]
-                    if chunk.get("is_final") is True:
+                    if isinstance(chunk, dict) and chunk.get("is_final") is True:
                         terminal_seen = True
                         ended_ok = True
                         terminal_frame_position = frame_num
                 
-                # Check if this is a terminal error frame
+                # Terminal error frame
                 elif frame.get("ok") is False:
                     terminal_seen = True
                     errored = True
                     terminal_frame_position = frame_num
                     
             except StreamProtocolError as e:
-                self._handle_validation_error(e, frame_num, "protocol_violation", collect_errors, validation_errors)
+                self._handle_validation_error(
+                    e,
+                    frame_num,
+                    "protocol_violation",
+                    collect_errors,
+                    validation_errors,
+                )
                 if collect_errors:
                     continue
                 else:
@@ -532,14 +628,19 @@ class StreamValidationEngine:
                     f"Stream completed without terminal frame. Processed {total} frames."
                 )
         except StreamProtocolError as e:
-            self._handle_validation_error(e, total, "stream_integrity", collect_errors, validation_errors)
+            self._handle_validation_error(
+                e, total, "stream_integrity", collect_errors, validation_errors
+            )
 
         # Performance warnings
-        if (total > self.config.large_stream_threshold and 
-            validation_time_ms > self.config.performance_warning_threshold_ms):
+        if (
+            total > self.config.large_stream_threshold
+            and validation_time_ms > self.config.performance_warning_threshold_ms
+        ):
+            coverage = frames_validated / total if total > 0 else 0.0
             self._emit_performance_warning(
                 f"Large stream validation took {validation_time_ms:.0f}ms for {total} frames "
-                f"(mode={self.config.mode.value}, coverage={frames_validated/total:.1%})"
+                f"(mode={self.config.mode.value}, coverage={coverage:.1%})"
             )
 
         return StreamValidationReport(
@@ -562,7 +663,7 @@ class StreamValidationEngine:
     async def validate_frames_async(
         self, 
         frames: AsyncIterable[dict[str, Any]],
-        format: StreamFormat = StreamFormat.RAW_JSON
+        format: StreamFormat = StreamFormat.RAW_JSON,
     ) -> StreamValidationReport:
         """Validate protocol envelope frames asynchronously."""
         start_time = time.time()
@@ -589,9 +690,13 @@ class StreamValidationEngine:
                 frame_size = FrameValidator.estimate_frame_size(frame)
                 total_bytes += frame_size
                 max_frame_size = max(max_frame_size, frame_size)
-                FrameValidator.check_frame_size(frame, frame_num, self.config.max_frame_bytes)
+                FrameValidator.check_frame_size(
+                    frame, frame_num, self.config.max_frame_bytes
+                )
             except (FrameSizeExceededError, StreamProtocolError) as e:
-                self._handle_validation_error(e, frame_num, "size_exceeded", collect_errors, validation_errors)
+                self._handle_validation_error(
+                    e, frame_num, "size_exceeded", collect_errors, validation_errors
+                )
                 if collect_errors:
                     continue
                 else:
@@ -601,7 +706,13 @@ class StreamValidationEngine:
             try:
                 FrameValidator.validate_protocol_envelope(frame, frame_num)
             except StreamProtocolError as e:
-                self._handle_validation_error(e, frame_num, "protocol_envelope", collect_errors, validation_errors)
+                self._handle_validation_error(
+                    e,
+                    frame_num,
+                    "protocol_envelope",
+                    collect_errors,
+                    validation_errors,
+                )
                 if collect_errors:
                     continue
                 else:
@@ -618,17 +729,23 @@ class StreamValidationEngine:
                     # Run schema validation in thread pool since it's likely CPU-bound
                     loop = asyncio.get_event_loop()
                     await loop.run_in_executor(
-                        None, 
+                        None,
                         lambda f=frame, n=frame_num: assert_valid(
                             self.config.envelope_schema_id,
                             f,
                             context=f"{self.config.component}.stream frame #{n}",
-                            registry=self.config.schema_registry
-                        )
+                            registry=self.config.schema_registry,
+                        ),
                     )
                     self._emit_frame_validated(frame, frame_num)
                 except AssertionError as e:
-                    self._handle_validation_error(e, frame_num, "schema_validation", collect_errors, validation_errors)
+                    self._handle_validation_error(
+                        e,
+                        frame_num,
+                        "schema_validation",
+                        collect_errors,
+                        validation_errors,
+                    )
                     if collect_errors:
                         continue
                     else:
@@ -648,7 +765,7 @@ class StreamValidationEngine:
                     data_count += 1
                     
                     chunk = frame["chunk"]
-                    if chunk.get("is_final") is True:
+                    if isinstance(chunk, dict) and chunk.get("is_final") is True:
                         terminal_seen = True
                         ended_ok = True
                         terminal_frame_position = frame_num
@@ -659,7 +776,13 @@ class StreamValidationEngine:
                     terminal_frame_position = frame_num
                     
             except StreamProtocolError as e:
-                self._handle_validation_error(e, frame_num, "protocol_violation", collect_errors, validation_errors)
+                self._handle_validation_error(
+                    e,
+                    frame_num,
+                    "protocol_violation",
+                    collect_errors,
+                    validation_errors,
+                )
                 if collect_errors:
                     continue
                 else:
@@ -670,16 +793,23 @@ class StreamValidationEngine:
         # Final stream integrity checks
         try:
             if not terminal_seen:
-                raise StreamProtocolError(f"Stream completed without terminal frame. Processed {total} frames.")
+                raise StreamProtocolError(
+                    f"Stream completed without terminal frame. Processed {total} frames."
+                )
         except StreamProtocolError as e:
-            self._handle_validation_error(e, total, "stream_integrity", collect_errors, validation_errors)
+            self._handle_validation_error(
+                e, total, "stream_integrity", collect_errors, validation_errors
+            )
 
         # Performance warnings
-        if (total > self.config.large_stream_threshold and 
-            validation_time_ms > self.config.performance_warning_threshold_ms):
+        if (
+            total > self.config.large_stream_threshold
+            and validation_time_ms > self.config.performance_warning_threshold_ms
+        ):
+            coverage = frames_validated / total if total > 0 else 0.0
             self._emit_performance_warning(
                 f"Large async stream validation took {validation_time_ms:.0f}ms for {total} frames "
-                f"(mode={self.config.mode.value}, coverage={frames_validated/total:.1%})"
+                f"(mode={self.config.mode.value}, coverage={coverage:.1%})"
             )
 
         return StreamValidationReport(
@@ -715,17 +845,21 @@ class StreamValidationEngine:
         """Validate NDJSON text asynchronously."""
         parser = self._parsers[StreamFormat.NDJSON]
         frames = await parser.parse_async(ndjson_text)
-        return await self.validate_frames_async(self._to_async_iterable(frames), StreamFormat.NDJSON)
+        return await self.validate_frames_async(
+            self._to_async_iterable(frames), StreamFormat.NDJSON
+        )
     
     async def validate_sse_async(self, sse_text: str) -> StreamValidationReport:
         """Validate SSE text asynchronously."""
         parser = self._parsers[StreamFormat.SSE]
         frames = await parser.parse_async(sse_text)
-        return await self.validate_frames_async(self._to_async_iterable(frames), StreamFormat.SSE)
+        return await self.validate_frames_async(
+            self._to_async_iterable(frames), StreamFormat.SSE
+        )
     
     async def validate_ndjson_streaming(
         self, 
-        lines: AsyncIterable[str]
+        lines: AsyncIterable[str],
     ) -> StreamValidationReport:
         """Validate NDJSON in true streaming fashion for unbounded streams."""
         parser = self._parsers[StreamFormat.NDJSON]
@@ -734,7 +868,7 @@ class StreamValidationEngine:
     
     async def validate_sse_streaming(
         self, 
-        lines: AsyncIterable[str]
+        lines: AsyncIterable[str],
     ) -> StreamValidationReport:
         """Validate SSE in true streaming fashion for unbounded streams."""
         parser = self._parsers[StreamFormat.SSE]
@@ -742,7 +876,9 @@ class StreamValidationEngine:
         return await self.validate_frames_async(frames, StreamFormat.SSE)
     
     @staticmethod
-    async def _to_async_iterable(frames: list[dict[str, Any]]) -> AsyncIterator[dict[str, Any]]:
+    async def _to_async_iterable(
+        frames: list[dict[str, Any]],
+    ) -> AsyncIterator[dict[str, Any]]:
         """Convert list to async iterable."""
         for frame in frames:
             yield frame
@@ -754,10 +890,14 @@ def validate_ndjson_stream(
     ndjson_text: str,
     envelope_schema_id: str,
     component: str,
-    **kwargs: Any
+    **kwargs: Any,
 ) -> StreamValidationReport:
     """Convenience function for simple NDJSON validation."""
-    config = ValidationConfig(envelope_schema_id=envelope_schema_id, component=component, **kwargs)
+    config = ValidationConfig(
+        envelope_schema_id=envelope_schema_id,
+        component=component,
+        **kwargs,
+    )
     engine = StreamValidationEngine(config)
     return engine.validate_ndjson(ndjson_text)
 
@@ -766,10 +906,14 @@ def validate_sse_stream(
     sse_text: str,
     envelope_schema_id: str,
     component: str,
-    **kwargs: Any
+    **kwargs: Any,
 ) -> StreamValidationReport:
     """Convenience function for simple SSE validation."""
-    config = ValidationConfig(envelope_schema_id=envelope_schema_id, component=component, **kwargs)
+    config = ValidationConfig(
+        envelope_schema_id=envelope_schema_id,
+        component=component,
+        **kwargs,
+    )
     engine = StreamValidationEngine(config)
     return engine.validate_sse(sse_text)
 
@@ -778,10 +922,14 @@ async def validate_ndjson_stream_async(
     ndjson_text: str,
     envelope_schema_id: str,
     component: str,
-    **kwargs: Any
+    **kwargs: Any,
 ) -> StreamValidationReport:
     """Convenience function for simple async NDJSON validation."""
-    config = ValidationConfig(envelope_schema_id=envelope_schema_id, component=component, **kwargs)
+    config = ValidationConfig(
+        envelope_schema_id=envelope_schema_id,
+        component=component,
+        **kwargs,
+    )
     engine = StreamValidationEngine(config)
     return await engine.validate_ndjson_async(ndjson_text)
 
@@ -790,9 +938,13 @@ async def validate_sse_stream_async(
     sse_text: str,
     envelope_schema_id: str,
     component: str,
-    **kwargs: Any
+    **kwargs: Any,
 ) -> StreamValidationReport:
     """Convenience function for simple async SSE validation."""
-    config = ValidationConfig(envelope_schema_id=envelope_schema_id, component=component, **kwargs)
+    config = ValidationConfig(
+        envelope_schema_id=envelope_schema_id,
+        component=component,
+        **kwargs,
+    )
     engine = StreamValidationEngine(config)
     return await engine.validate_sse_async(sse_text)
