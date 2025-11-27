@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/graph/graph.capabilities.request.json",
+  "$id": "https://corpusos.com/schemas/graph/graph.capabilities.request.json",
   "title": "graph.capabilities Args",
   "description": "Explicit empty-args schema for graph.capabilities(). Improves validation clarity and doc generation.",
   "type": "object",
