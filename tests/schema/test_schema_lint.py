@@ -204,12 +204,12 @@ def _validate_protocol_const(schema: dict, path: Path) -> List[str]:
     issues = []
     props = schema.get("properties", {})
     proto = props.get("protocol", {})
-    
+
     if isinstance(proto, dict) and "const" in proto:
         const_value = proto["const"]
         if not isinstance(const_value, str) or const_value not in SUPPORTED_PROTOCOLS:
             issues.append(f"Invalid protocol constant: {const_value}")
-    
+
     return issues
 
 
@@ -231,6 +231,15 @@ def _check_enum_size(schema: dict, path: Path) -> List[str]:
     return issues
 
 
+def _fail_with_bullets(problems: List[str], context: str | None = None) -> None:
+    """Helper to render a list of problems as a bullet list failure."""
+    if not problems:
+        return
+    header = f"{context}:\n" if context else ""
+    msg = header + "- " + "\n- ".join(problems)
+    pytest.fail(msg)
+
+
 # --------------------------------------------------------------------------------------
 # Test 1: Load + $schema + unique $id + store build
 # --------------------------------------------------------------------------------------
@@ -244,7 +253,7 @@ def test_all_schemas_load_and_have_unique_ids():
     for path in files:
         # Check file size first
         _validate_schema_size(path)
-        
+
         schema = _load_json(path)
 
         # $schema presence and value
@@ -285,8 +294,7 @@ def test_id_path_convention_matches_filesystem():
         if not sid.endswith(expected_suffix):
             problems.append(f"{path}: $id should end with {expected_suffix}, got {sid}")
 
-    if problems:
-        pytest.fail("ID/path mismatches:\n- " + "\n- ".join(problems))
+    _fail_with_bullets(problems, "ID/path mismatches")
 
 
 def test_schema_file_organization():
@@ -319,8 +327,7 @@ def test_schema_file_organization():
             if item.is_file() and item.suffix not in {".json", ".md"}:
                 problems.append(f"Non-schema file in component directory: {item}")
 
-    if problems:
-        pytest.fail("Schema organization issues:\n- " + "\n- ".join(problems))
+    _fail_with_bullets(problems, "Schema organization issues")
 
 
 # --------------------------------------------------------------------------------------
@@ -356,13 +363,11 @@ def test_metaschema_conformance_and_basic_hygiene():
 
         # 3d) Check enum size limits
         enum_issues = _check_enum_size(schema, path)
-        if enum_issues:
-            pytest.fail(f"{path}: " + "; ".join(enum_issues))
+        _fail_with_bullets(enum_issues, f"{path} enum size issues")
 
         # 3e) Check reserved property usage
         reserved_issues = _check_reserved_property_usage(schema, path)
-        if reserved_issues:
-            pytest.fail(f"{path}: " + "; ".join(reserved_issues))
+        _fail_with_bullets(reserved_issues, f"{path} reserved-property issues")
 
 
 # --------------------------------------------------------------------------------------
@@ -406,8 +411,7 @@ def test_cross_file_refs_resolve_and_local_fragments_exist():
             else:
                 problems.append(f"{path}: non-absolute and non-local $ref not allowed: {val}")
 
-    if problems:
-        pytest.fail("Unresolved $ref issues:\n- " + "\n- ".join(problems))
+    _fail_with_bullets(problems, "Unresolved $ref issues")
 
 
 # --------------------------------------------------------------------------------------
@@ -453,12 +457,10 @@ def test_no_dangling_defs_globally():
     # Any def anchors never referenced anywhere?
     dangling = sorted(a for a in def_anchors if a not in used_refs)
 
-    # Allow some schemas to intentionally export $defs for external use.
-    # If you want to allow-list certain files, add logic here.
     if dangling:
-        pytest.fail(
-            "Dangling $defs (exported but never referenced globally):\n- "
-            + "\n- ".join(dangling)
+        _fail_with_bullets(
+            dangling,
+            "Dangling $defs (exported but never referenced globally)",
         )
 
 
@@ -470,10 +472,9 @@ def test_defs_size_limits():
     for path in files:
         schema = _load_json(path)
         defs_issues = _check_defs_size(schema, path)
-        problems.extend(defs_issues)
+        problems.extend([f"{path}: {msg}" for msg in defs_issues])
 
-    if problems:
-        pytest.fail("$defs size issues:\n- " + "\n- ".join(problems))
+    _fail_with_bullets(problems, "$defs size issues")
 
 
 # --------------------------------------------------------------------------------------
@@ -515,11 +516,6 @@ def test_envelope_role_sanity_and_consts():
             sv = props.get("schema_version")
             if not isinstance(sv, dict):
                 problems.append(f"{path}: success envelope should define 'schema_version' property")
-            else:
-                pat = sv.get("pattern")
-                if pat and not re.fullmatch(r"^\^\d\+\\\.\d\+\\\.\d\+\$$".replace("\\", ""), pat):
-                    # don't be overly strict on exact regex text—just check it's present in any form
-                    pass
 
         # Error envelope basics
         if _is_envelope_error(fname):
@@ -540,13 +536,63 @@ def test_envelope_role_sanity_and_consts():
             comp_prop = props.get("component")
             if not isinstance(comp_prop, dict) or "const" not in comp_prop:
                 problems.append(f"{path}: envelopes should const-bind 'component'")
-            
+
             # Validate protocol constant value
             proto_issues = _validate_protocol_const(schema, path)
-            problems.extend(proto_issues)
+            problems.extend([f"{path}: {msg}" for msg in proto_issues])
 
-    if problems:
-        pytest.fail("Envelope/const issues:\n- " + "\n- ".join(problems))
+    _fail_with_bullets(problems, "Envelope/const issues")
+
+
+def test_protocol_constants_match_component():
+    """
+    Ensure protocol consts match component directory, e.g.:
+      schemas/llm/... → protocol: 'llm/v1.0'
+    """
+    for path in _iter_schema_files():
+        schema = _load_json(path)
+        comp = _component_for_path(path)
+        if comp not in {"llm", "vector", "embedding", "graph"}:
+            continue
+
+        props = schema.get("properties", {})
+        proto = props.get("protocol", {})
+
+        if not isinstance(proto, dict) or "const" not in proto:
+            continue
+
+        value = proto["const"]
+        expected_prefix = f"{comp}/v"
+        assert isinstance(value, str) and value.startswith(expected_prefix), (
+            f"{path}: protocol const {value!r} does not match component {comp!r}"
+        )
+
+
+def test_schema_version_pattern_accepts_semver_examples():
+    """Ensure schema_version patterns are compatible with simple SemVer strings."""
+    examples = ["0.0.1", "1.0.0", "2.1.3"]
+
+    for path in _iter_schema_files():
+        schema = _load_json(path)
+        props = schema.get("properties", {})
+        sv = props.get("schema_version")
+        if not isinstance(sv, dict):
+            continue
+
+        pattern = sv.get("pattern")
+        if not isinstance(pattern, str):
+            continue
+
+        try:
+            rx = re.compile(pattern)
+        except re.error as e:
+            pytest.fail(f"{path}: invalid schema_version pattern {pattern!r}: {e}")
+
+        for ver in examples:
+            if not rx.match(ver):
+                pytest.fail(
+                    f"{path}: schema_version pattern {pattern!r} does not match example {ver!r}"
+                )
 
 
 # --------------------------------------------------------------------------------------
@@ -602,8 +648,23 @@ def test_stream_frame_files_are_union_or_frames():
             if schema.get("type") != "object":
                 problems.append(f"{path}: stream frame schema should be type=object")
 
-    if problems:
-        pytest.fail("Stream frame schema issues:\n- " + "\n- ".join(problems))
+    _fail_with_bullets(problems, "Stream frame schema issues")
+
+
+def test_stream_frames_have_event_property():
+    """Ensure individual stream frame schemas expose an 'event' discriminator."""
+    for path in _iter_schema_files():
+        fname = path.name
+        if not _is_stream_frame(fname):
+            continue
+
+        # Skip NDJSON union wrapper
+        if fname.endswith(".stream.frames.ndjson.schema.json"):
+            continue
+
+        schema = _load_json(path)
+        props = schema.get("properties", {})
+        assert "event" in props, f"{path}: stream frame schema missing 'event' property"
 
 
 # --------------------------------------------------------------------------------------
@@ -613,11 +674,11 @@ def test_stream_frame_files_are_union_or_frames():
 def test_schema_loading_performance():
     """Test that all schemas can be loaded quickly."""
     import time
-    
+
     files = _iter_schema_files()
     max_load_time = 1.0  # seconds per schema
     slow_files: List[Tuple[Path, float]] = []
-    
+
     for path in files:
         start = time.time()
         try:
@@ -627,9 +688,9 @@ def test_schema_loading_performance():
                 slow_files.append((path, load_time))
         except Exception:
             continue  # Loading errors are caught in other tests
-    
+
     if slow_files:
-        slow_info = ", ".join(f"{path.name}({time:.2f}s)" for path, time in slow_files)
+        slow_info = ", ".join(f"{path.name}({t:.2f}s)" for path, t in slow_files)
         pytest.skip(f"Slow schema loading detected: {slow_info}")
 
 
@@ -637,21 +698,21 @@ def test_schema_complexity_metrics():
     """Test schema complexity metrics for maintainability."""
     files = _iter_schema_files()
     high_complexity: List[Tuple[Path, int]] = []
-    
+
     for path in files:
         schema = _load_json(path)
-        
+
         # Count total number of properties as complexity metric
         prop_count = 0
         for key, value in _walk(schema):
             if key in {"properties", "patternProperties", "additionalProperties"}:
                 if isinstance(value, dict):
                     prop_count += len(value)
-        
+
         # Arbitrary threshold - adjust based on your needs
         if prop_count > 100:
             high_complexity.append((path, prop_count))
-    
+
     if high_complexity:
         complexity_info = ", ".join(f"{path.name}({count})" for path, count in high_complexity)
         pytest.skip(f"High complexity schemas detected: {complexity_info}")
@@ -664,27 +725,31 @@ def test_schema_complexity_metrics():
 def test_schema_registry_health_summary():
     """Provide a comprehensive health summary of the schema registry."""
     files = _iter_schema_files()
-    
+
     # Collect metrics
     total_schemas = len(files)
     components = set()
     envelope_schemas = 0
     stream_schemas = 0
     total_defs = 0
-    
+
     for path in files:
         schema = _load_json(path)
         components.add(_component_for_path(path))
-        
+
         fname = path.name
-        if any(_is_envelope_request(fname), _is_envelope_success(fname), _is_envelope_error(fname)):
+        if any([
+            _is_envelope_request(fname),
+            _is_envelope_success(fname),
+            _is_envelope_error(fname),
+        ]):
             envelope_schemas += 1
         if _is_stream_frame(fname):
             stream_schemas += 1
-            
+
         defs = schema.get("$defs") or schema.get("definitions") or {}
         total_defs += len(defs)
-    
+
     # Log health summary (doesn't fail test)
     print(f"\nSchema Registry Health Summary:")
     print(f"  Total schemas: {total_schemas}")
@@ -692,7 +757,7 @@ def test_schema_registry_health_summary():
     print(f"  Envelope schemas: {envelope_schemas}")
     print(f"  Stream schemas: {stream_schemas}")
     print(f"  Total definitions: {total_defs}")
-    
+
     # Basic sanity checks
     assert total_schemas > 0, "No schemas found"
     assert len(components) >= len(COMPONENTS), f"Missing components: {COMPONENTS - components}"
