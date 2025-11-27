@@ -29,7 +29,6 @@ async def test_capabilities_identity_fields(adapter):
 
 async def test_capabilities_dialects_tuple(adapter):
     caps = await adapter.capabilities()
-    # New field name: supported_query_dialects
     assert isinstance(caps.supported_query_dialects, tuple)
     assert len(caps.supported_query_dialects) > 0
     assert all(isinstance(d, str) for d in caps.supported_query_dialects)
@@ -37,7 +36,6 @@ async def test_capabilities_dialects_tuple(adapter):
 
 async def test_capabilities_feature_flags_are_boolean(adapter):
     caps = await adapter.capabilities()
-    # Updated field names + additional boolean flags
     flags = [
         caps.supports_stream_query,
         caps.supports_namespaces,
@@ -63,7 +61,6 @@ async def test_capabilities_max_batch_ops_valid(adapter):
 
 
 async def test_capabilities_protocol(adapter):
-    # Replace old rate_limit_unit check with protocol sanity check
     caps = await adapter.capabilities()
     assert isinstance(caps.protocol, str) and caps.protocol
     assert caps.protocol == GRAPH_PROTOCOL_ID
@@ -72,7 +69,11 @@ async def test_capabilities_protocol(adapter):
 async def test_capabilities_idempotency(adapter):
     c1 = await adapter.capabilities()
     c2 = await adapter.capabilities()
-    assert (c1.server, c1.version, c1.supported_query_dialects) == (
+    assert (
+        c1.server,
+        c1.version,
+        c1.supported_query_dialects,
+    ) == (
         c2.server,
         c2.version,
         c2.supported_query_dialects,
