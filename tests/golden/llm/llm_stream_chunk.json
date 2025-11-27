@@ -1,0 +1,14 @@
+{
+  "event": "data",
+  "data": {
+    "id": "cmpl_01J0STREAM",
+    "model": "example-llm-1",
+    "index": 0,
+    "delta": {
+      "role": "assistant",
+      "content": "This is a streamed chunk."
+    },
+    "finish_reason": null,
+    "logprobs": null
+  }
+}
