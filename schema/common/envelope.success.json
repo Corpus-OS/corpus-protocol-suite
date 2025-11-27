@@ -1,52 +1,48 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/common/envelope.success.json",
+  "$id": "https://corpusos.com/schemas/common/envelope.success.json",
   "title": "Corpus Success Envelope",
   "description": "Canonical success envelope for non-streaming Corpus Protocol operations. Additive, SIEM-safe, and wire-stable across v1.x.",
   "type": "object",
-
-  "required": ["ok", "code", "result"],
+  "required": ["ok", "code", "ms", "result"],
   "properties": {
-    "ok": { "type": "boolean", "const": true, "description": "Always true for success responses." },
-
+    "ok": {
+      "type": "boolean",
+      "const": true,
+      "description": "Always true for success responses."
+    },
     "code": {
       "type": "string",
       "description": "Normalized status code: 'OK', 'PARTIAL_SUCCESS', or 'ACCEPTED'.",
       "enum": ["OK", "PARTIAL_SUCCESS", "ACCEPTED"]
     },
-
     "ms": {
       "type": "number",
       "minimum": 0,
       "maximum": 3600000,
       "description": "Elapsed wall-clock time in milliseconds (≤ 1 hour)."
     },
-
     "protocol": {
       "type": "string",
       "description": "Protocol identity, e.g., 'vector/v1.0', 'llm/v1.0', 'graph/v1.0', 'embedding/v1.0'.",
       "pattern": "^(graph|llm|vector|embedding)/v1\\.0$"
     },
-
     "component": {
       "type": "string",
       "enum": ["graph", "llm", "vector", "embedding"],
       "description": "Component that produced the result."
     },
-
     "schema_version": {
       "type": "string",
       "description": "Authoritative SemVer for this envelope schema as produced by the server (used by clients for compatibility checks).",
       "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
       "$comment": "Producers MUST bump on backward-incompatible changes to envelope shape; minor/patch for additive/clarifications."
     },
-
     "schema_semver_range": {
       "type": "string",
       "description": "Optional SemVer range the producer asserts as compatible (e.g., '>=1.0.0 <2.0.0').",
       "maxLength": 64
     },
-
     "result": {
       "description": "Component-specific result payload (JSON-serializable and SIEM-safe).",
       "oneOf": [
@@ -54,7 +50,6 @@
         { "$ref": "#/$defs/partialSuccessResult" }
       ]
     },
-
     "page": {
       "type": "object",
       "description": "Structured pagination container (preferred to legacy next_page_token).",
@@ -67,13 +62,19 @@
           "pattern": "^[A-Za-z0-9_=-]{1,4096}$",
           "description": "Opaque, base64url-safe continuation token."
         },
-        "has_more": { "type": "boolean", "description": "True if additional pages exist." },
-        "estimated_total": { "type": "integer", "minimum": 0, "description": "Optional soft estimate of total records." }
+        "has_more": {
+          "type": "boolean",
+          "description": "True if additional pages exist."
+        },
+        "estimated_total": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Optional soft estimate of total records."
+        }
       },
       "required": ["has_more"],
       "additionalProperties": false
     },
-
     "next_page_token": {
       "type": "string",
       "minLength": 1,
@@ -82,7 +83,6 @@
       "pattern": "^[A-Za-z0-9+/=_-]{1,4096}$",
       "description": "LEGACY opaque pagination token. Prefer 'page.next_token' when available."
     },
-
     "warnings": {
       "type": "array",
       "description": "Non-fatal SIEM-safe notices (no raw tenants/prompts/vectors).",
@@ -123,7 +123,6 @@
         "additionalProperties": false
       }
     },
-
     "cache": {
       "type": "object",
       "description": "Advisory cache disposition (must not weaken tenant isolation).",
@@ -138,7 +137,6 @@
       },
       "additionalProperties": false
     },
-
     "links": {
       "type": "array",
       "description": "Optional hypermedia links for discoverability.",
@@ -152,19 +150,25 @@
             "maxLength": 64,
             "pattern": "^[a-z0-9._-]{1,64}$"
           },
-          "href": { "type": "string", "format": "uri", "maxLength": 2000 },
-          "type": { "type": "string", "minLength": 1, "maxLength": 128 }
+          "href": {
+            "type": "string",
+            "format": "uri",
+            "maxLength": 2000
+          },
+          "type": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          }
         },
         "additionalProperties": false
       }
     },
-
     "deprecated": {
       "type": "boolean",
       "description": "LEGACY boolean. Prefer the structured 'deprecation' object.",
       "default": false
     },
-
     "replacement_op": {
       "type": "string",
       "minLength": 1,
@@ -172,7 +176,6 @@
       "pattern": "^[a-z]+\\.[a-z0-9_\\.:-]+$",
       "description": "LEGACY single replacement suggestion (e.g., 'vector.query_v2'). Prefer 'deprecation.replacements[]'."
     },
-
     "deprecation": {
       "type": "object",
       "description": "Structured deprecation metadata (additive to legacy fields).",
@@ -204,7 +207,11 @@
                 "description": "Target op, e.g., 'vector.query_v2'."
               },
               "rationale": { "type": "string", "maxLength": 1000 },
-              "migration_guide": { "type": "string", "format": "uri", "maxLength": 2000 },
+              "migration_guide": {
+                "type": "string",
+                "format": "uri",
+                "maxLength": 2000
+              },
               "min_version": {
                 "type": "string",
                 "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
@@ -218,22 +225,19 @@
       },
       "additionalProperties": false
     },
-
     "result_hash": {
       "type": "string",
-      "maxLength": 96,
-      "pattern": "^sha256:[A-Fa-f0-9]{64}$",
-      "description": "Deterministic hash. By default: sha256 of the canonical JSON (UTF-8, sorted keys, no whitespace changes) of the 'result' field ONLY.",
-      "$comment": "Default scope is 'result'. For hashing the entire envelope, set result_hash_scope='envelope'."
+      "maxLength": 64,
+      "pattern": "^[A-Fa-f0-9]{64}$",
+      "description": "SHA-256 of canonical JSON (UTF-8, sorted keys) of the 'result' field ONLY.",
+      "$comment": "Default scope is 'result'. For hashing the entire envelope, use hashes[] with scope='envelope'."
     },
-
     "result_hash_scope": {
       "type": "string",
       "enum": ["result", "envelope"],
       "default": "result",
       "description": "Specifies what was hashed for 'result_hash'."
     },
-
     "hashes": {
       "type": "array",
       "description": "Optional multi-hash list for future-proofing (e.g., blake3).",
@@ -262,22 +266,18 @@
       }
     }
   },
-
   "additionalProperties": false,
-
   "patternProperties": {
     "^(vendor:)[a-z0-9_.:-]+$": {
       "description": "Vendor/extension namespaced fields. Must not conflict with standardized keys.",
       "type": ["string", "number", "boolean", "object", "array", "null"]
     }
   },
-
   "$defs": {
     "genericResult": {
       "description": "Opaque success payload for non-batch or fully successful batch operations.",
       "type": ["object", "array", "string", "number", "boolean", "null"]
     },
-
     "partialSuccessItem": {
       "type": "object",
       "description": "Per-item status for partial success.",
@@ -294,16 +294,33 @@
           "pattern": "^[A-Z0-9_]+$",
           "description": "Normalized error code when ok=false."
         },
-        "message": { "type": "string", "maxLength": 2000 },
-        "details": { "type": "object", "additionalProperties": true }
+        "message": {
+          "type": "string",
+          "maxLength": 2000
+        },
+        "details": {
+          "type": "object",
+          "additionalProperties": true
+        }
       },
       "allOf": [
-        { "if": { "properties": { "ok": { "const": true } }, "required": ["ok"] }, "then": { "required": ["result"] } },
-        { "if": { "properties": { "ok": { "const": false } }, "required": ["ok"] }, "then": { "required": ["code"] } }
+        {
+          "if": {
+            "properties": { "ok": { "const": true } },
+            "required": ["ok"]
+          },
+          "then": { "required": ["result"] }
+        },
+        {
+          "if": {
+            "properties": { "ok": { "const": false } },
+            "required": ["ok"]
+          },
+          "then": { "required": ["code"] }
+        }
       ],
       "additionalProperties": false
     },
-
     "partialSuccessResult": {
       "type": "object",
       "description": "Batch result where at least one item succeeded and at least one failed.",
@@ -322,7 +339,6 @@
       "$comment": "Invariant: successes + failures == items.length; successes >= 1; failures >= 1. Enforce in application logic or custom validators."
     }
   },
-
   "examples": [
     {
       "ok": true,
@@ -339,7 +355,7 @@
       },
       "page": { "has_more": false },
       "cache": { "hit": false, "scope": "tenant" },
-      "result_hash": "sha256:9f2c7e6c3f4f...deadbeef",
+      "result_hash": "9f2c7e6c3f4f0000000000000000000000000000000000000000000000000000",
       "result_hash_scope": "result"
     },
     {
