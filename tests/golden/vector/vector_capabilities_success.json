@@ -1,0 +1,25 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 4.9,
+  "protocol": "vector/v1.0",
+  "component": "vector",
+  "schema_version": "1.0.0",
+  "request_id": "req_vec_capabilities_01",
+  "result": {
+    "protocol": "vector/v1.0",
+    "server": "vecd-01",
+    "version": "1.2.3",
+    "namespaces": {
+      "acme.docs": {
+        "ready": true,
+        "vector_count": 12345,
+        "dimensions": 1536,
+        "index_status": "ready",
+        "read_only": false
+      }
+    },
+    "total_vector_count": 12345,
+    "message": "OK"
+  }
+}
