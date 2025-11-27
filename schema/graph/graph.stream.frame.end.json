@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/graph/graph.stream.frame.end.json",
+  "$id": "https://corpusos.com/schemas/graph/graph.stream.frame.end.json",
   "title": "Graph Stream Frame (end)",
   "type": "object",
   "additionalProperties": false,
