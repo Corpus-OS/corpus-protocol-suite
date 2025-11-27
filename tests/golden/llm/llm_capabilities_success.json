@@ -1,0 +1,37 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 5.1,
+  "protocol": "llm/v1.0",
+  "component": "llm",
+  "schema_version": "1.0.0",
+  "result": {
+    "server": "example-llm-server",
+    "version": "1.2.3",
+    "models": [
+      {
+        "name": "example-llm-1",
+        "max_context_tokens": 8192,
+        "supports_streaming": true,
+        "supports_tools": true,
+        "supports_logprobs": true,
+        "description": "General-purpose text and chat model."
+      },
+      {
+        "name": "example-llm-1-mini",
+        "max_context_tokens": 4096,
+        "supports_streaming": true,
+        "supports_tools": false,
+        "supports_logprobs": false,
+        "description": "Latency-optimized variant."
+      }
+    ],
+    "limits": {
+      "max_batch_size": 32,
+      "max_requests_per_second": 100
+    },
+    "extensions": {
+      "vendor:max_temperature": 2.0
+    }
+  }
+}
