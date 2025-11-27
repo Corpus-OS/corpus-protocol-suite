@@ -1,0 +1,13 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 6.2,
+  "protocol": "vector/v1.0",
+  "component": "vector",
+  "schema_version": "1.0.0",
+  "request_id": "req_vec_ns_delete_01",
+  "result": {
+    "name": "acme.docs",
+    "deleted": true
+  }
+}
