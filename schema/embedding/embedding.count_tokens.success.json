@@ -1,56 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/embedding/embedding.count_tokens.success.json",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.count_tokens.success.json",
   "title": "embedding.count_tokens Result",
-  "type": "object",
-  "oneOf": [
-    {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["count"],
-      "properties": {
-        "count": { "type": "integer", "minimum": 0 },
-        "model": { "type": "string", "maxLength": 128 },
-        "breakdown": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "system": { "type": "integer", "minimum": 0 },
-            "user": { "type": "integer", "minimum": 0 },
-            "assistant": { "type": "integer", "minimum": 0 },
-            "tool": { "type": "integer", "minimum": 0 }
-          }
-        }
-      }
-    },
-    {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["counts"],
-      "properties": {
-        "counts": {
-          "type": "array",
-          "minItems": 1,
-          "maxItems": 100000,
-          "items": { "type": "integer", "minimum": 0 }
-        },
-        "model": { "type": "string", "maxLength": 128 },
-        "breakdowns": {
-          "type": "array",
-          "minItems": 1,
-          "maxItems": 100000,
-          "items": {
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-              "system": { "type": "integer", "minimum": 0 },
-              "user": { "type": "integer", "minimum": 0 },
-              "assistant": { "type": "integer", "minimum": 0 },
-              "tool": { "type": "integer", "minimum": 0 }
-            }
-          }
-        }
-      }
-    }
-  ]
+  "type": "integer",
+  "minimum": 0
 }
