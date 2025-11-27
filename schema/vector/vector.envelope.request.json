@@ -22,9 +22,11 @@
       "$ref": "https://corpusos.com/schemas/common/operation_context.json"
     },
     "args": {
-      "type": "object"
+      "type": "object",
+      "description": "Operation-specific arguments payload. Shape is determined by the vector operation type.",
+      "additionalProperties": true
     }
   },
   "required": ["op", "ctx", "args"],
-  "$comment": "Follows common envelope.request shape; specialized here for vector operations. Args validation determined by operation type."
+  "$comment": "Follows common envelope.request shape per §2.4; args validation is delegated to per-operation schemas."
 }
