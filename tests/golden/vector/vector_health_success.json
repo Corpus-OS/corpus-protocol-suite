@@ -1,0 +1,33 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 3.5,
+  "protocol": "vector/v1.0",
+  "component": "vector",
+  "schema_version": "1.0.0",
+  "request_id": "req_vec_health_01",
+  "result": {
+    "ok": true,
+    "status": "ok",
+    "server": "vecd-01",
+    "version": "1.2.3",
+    "namespaces": {
+      "acme.docs": {
+        "ready": true,
+        "vector_count": 12345,
+        "dimensions": 1536,
+        "index_status": "ready",
+        "read_only": false
+      },
+      "acme.logs": {
+        "ready": false,
+        "vector_count": 0,
+        "dimensions": 1536,
+        "index_status": "initializing",
+        "read_only": false
+      }
+    },
+    "total_vector_count": 12345,
+    "message": "All healthy except acme.logs initializing"
+  }
+}
