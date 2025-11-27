@@ -1,0 +1,3 @@
+{"event":"data","data":{"id":"cmpl_01J0NDJSON","model":"example-llm-1","index":0,"delta":{"role":"assistant","content":"Hello"},"finish_reason":null,"logprobs":null}}
+{"event":"data","data":{"id":"cmpl_01J0NDJSON","model":"example-llm-1","index":1,"delta":{"content":", world!"},"finish_reason":null,"logprobs":null}}
+{"event":"end","code":"OK"}
