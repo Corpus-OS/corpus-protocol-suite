@@ -1,0 +1,15 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 15.4,
+  "protocol": "vector/v1.0",
+  "component": "vector",
+  "schema_version": "1.0.0",
+  "request_id": "req_vec_ns_create_01",
+  "result": {
+    "name": "acme.docs",
+    "dimensions": 1536,
+    "metric": "cosine",
+    "created": true
+  }
+}
