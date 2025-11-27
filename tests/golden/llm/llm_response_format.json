@@ -1,0 +1,16 @@
+{
+  "type": "json_object",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "summary": { "type": "string" },
+      "bullets": {
+        "type": "array",
+        "items": { "type": "string" },
+        "maxItems": 5
+      }
+    },
+    "required": ["summary"],
+    "additionalProperties": false
+  }
+}
