@@ -1,0 +1,16 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 8.3,
+  "protocol": "vector/v1.0",
+  "component": "vector",
+  "schema_version": "1.0.0",
+  "request_id": "req_vec_upsert_01",
+  "result": {
+    "namespace": "acme.docs",
+    "upserted": 2,
+    "updated": 0,
+    "failed": 0,
+    "failures": []
+  }
+}
