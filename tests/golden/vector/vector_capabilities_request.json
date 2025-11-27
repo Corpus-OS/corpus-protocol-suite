@@ -1,0 +1,9 @@
+{
+  "op": "vector.capabilities",
+  "ctx": {
+    "request_id": "req_vec_capabilities_01",
+    "deadline_ms": 253402300800000,
+    "tenant": "acme"
+  },
+  "args": {}
+}
