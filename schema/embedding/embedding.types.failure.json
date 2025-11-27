@@ -1,36 +1,58 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/embedding/embedding.types.failure.json",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.types.failure.json",
   "title": "Embedding Failure (Per-Item)",
   "type": "object",
   "additionalProperties": false,
   "required": ["index", "error"],
   "properties": {
-    "index": { "type": "integer", "minimum": 0 },
+    "index": {
+      "type": "integer",
+      "minimum": 0
+    },
     "error": {
       "type": "string",
       "enum": [
-        "BadRequest",
         "AuthError",
-        "ResourceExhausted",
-        "TransientNetwork",
-        "Unavailable",
-        "NotSupported",
+        "BadRequest",
         "DeadlineExceeded",
+        "ModelNotAvailable",
+        "NotSupported",
+        "ResourceExhausted",
         "TextTooLong",
-        "ModelNotAvailable"
+        "TransientNetwork",
+        "Unavailable"
       ]
     },
-    "code": { "type": "string", "pattern": "^[A-Z0-9_]{1,64}$" },
-    "message": { "type": "string", "minLength": 1, "maxLength": 2000 },
+    "code": {
+      "type": "string",
+      "pattern": "^[A-Z0-9_]{1,64}$"
+    },
+    "message": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2000
+    },
     "details": {
       "type": "object",
       "additionalProperties": true,
       "properties": {
-        "max_text_length": { "type": "integer", "minimum": 1 },
-        "provided_length": { "type": "integer", "minimum": 0 },
-        "provider_code": { "type": "string", "maxLength": 256 },
-        "namespace": { "type": "string", "maxLength": 256 }
+        "max_text_length": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "provided_length": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "provider_code": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "namespace": {
+          "type": "string",
+          "maxLength": 256
+        }
       }
     },
     "validation_errors": {
@@ -41,14 +63,25 @@
         "additionalProperties": false,
         "required": ["field", "reason"],
         "properties": {
-          "field": { "type": "string", "maxLength": 256 },
-          "reason": { "type": "string", "maxLength": 512 },
-          "constraint": { "type": "string", "maxLength": 256 }
+          "field": {
+            "type": "string",
+            "maxLength": 256
+          },
+          "reason": {
+            "type": "string",
+            "maxLength": 512
+          },
+          "constraint": {
+            "type": "string",
+            "maxLength": 256
+          }
         }
       }
     }
   },
   "patternProperties": {
-    "^(vendor:)[a-z0-9_.:-]+$": { "type": ["string", "number", "boolean", "object", "array", "null"] }
+    "^(vendor:)[a-z0-9_.:-]+$": {
+      "type": ["string", "number", "boolean", "object", "array", "null"]
+    }
   }
 }
