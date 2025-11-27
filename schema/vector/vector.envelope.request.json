@@ -1,32 +1,60 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://corpusos.com/schemas/vector/vector.envelope.request.json",
-  "title": "Vector Request Envelope",
-  "description": "Wire-first canonical request envelope for vector component operations.",
+  "$id": "https://corpusos.com/schemas/vector/vector.health.success.json",
+  "title": "vector.health result",
+  "description": "Health status for vector component per protocol §15.7 (VectorHealthStatus).",
   "type": "object",
   "additionalProperties": false,
   "properties": {
-    "op": {
+    "ok": {
+      "type": "boolean",
+      "description": "Overall health of the vector subsystem."
+    },
+    "status": {
       "type": "string",
-      "enum": [
-        "vector.query",
-        "vector.upsert",
-        "vector.delete",
-        "vector.create_namespace",
-        "vector.delete_namespace",
-        "vector.capabilities",
-        "vector.health"
-      ]
+      "enum": ["ok", "degraded"]
     },
-    "ctx": {
-      "$ref": "https://corpusos.com/schemas/common/operation_context.json"
+    "server": {
+      "type": "string"
     },
-    "args": {
+    "version": {
+      "type": "string"
+    },
+    "namespaces": {
       "type": "object",
-      "description": "Operation-specific arguments payload. Shape is determined by the vector operation type.",
-      "additionalProperties": true
+      "description": "Per-namespace health status keyed by namespace name.",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "ready": {
+            "type": "boolean"
+          },
+          "vector_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "dimensions": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "index_status": {
+            "type": "string"
+          },
+          "read_only": {
+            "type": "boolean"
+          }
+        },
+        "required": ["ready", "vector_count", "dimensions"]
+      }
+    },
+    "total_vector_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "message": {
+      "type": "string"
     }
   },
-  "required": ["op", "ctx", "args"],
-  "$comment": "Follows common envelope.request shape per §2.4; args validation is delegated to per-operation schemas."
+  "required": ["ok", "server", "version", "namespaces"]
 }
