@@ -1,0 +1,16 @@
+{
+  "op": "graph.query",
+  "ctx": {
+    "request_id": "req_graph_query_001",
+    "deadline_ms": 253402214400000,
+    "tenant": "acme-corp"
+  },
+  "args": {
+    "dialect": "cypher",
+    "text": "MATCH (n:User) RETURN n LIMIT 10",
+    "params": {
+      "limit": 10
+    },
+    "page_size": 100
+  }
+}
