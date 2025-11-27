@@ -1,0 +1,9 @@
+{
+  "op": "graph.capabilities",
+  "ctx": {
+    "request_id": "req_graph_capabilities_001",
+    "deadline_ms": 253402214400000,
+    "tenant": "acme-corp"
+  },
+  "args": {}
+}
