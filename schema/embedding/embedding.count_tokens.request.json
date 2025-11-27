@@ -1,24 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/embedding/embedding.count_tokens.request.json",
-  "title": "embedding.count_tokens Args",
-  "type": "object",
-  "additionalProperties": false,
-  "properties": {
-    "text": { "type": "string", "minLength": 0, "maxLength": 2000000 },
-    "texts": {
-      "type": "array",
-      "minItems": 1,
-      "maxItems": 100000,
-      "items": { "type": "string", "minLength": 0, "maxLength": 2000000 }
-    },
-    "model": { "type": "string", "maxLength": 128 }
-  },
-  "oneOf": [
-    { "required": ["text"] },
-    { "required": ["texts"] }
-  ],
-  "patternProperties": {
-    "^(vendor:)[a-z0-9_.:-]+$": { "type": ["string", "number", "boolean", "object", "array", "null"] }
-  }
+  "$id": "https://corpusos.com/schemas/embedding/embedding.count_tokens.success.json",
+  "title": "embedding.count_tokens Result",
+  "type": "integer",
+  "minimum": 0
 }
