@@ -1,0 +1,48 @@
+{
+  "ok": true,
+  "code": "PARTIAL_SUCCESS",
+  "ms": 21.4,
+  "result": {
+    "successes": 2,
+    "failures": 1,
+    "items": [
+      {
+        "index": 0,
+        "ok": true,
+        "result": {
+          "id": "user:123",
+          "entity": {
+            "kind": "vertex",
+            "id": "user:123",
+            "label": "User",
+            "props": {
+              "name": "Alice",
+              "active": true
+            }
+          }
+        }
+      },
+      {
+        "index": 1,
+        "ok": true,
+        "result": {
+          "ok": true,
+          "status": "ack"
+        }
+      },
+      {
+        "index": 2,
+        "ok": false,
+        "code": "GRAPH_BAD_REQUEST",
+        "message": "Query text failed validation",
+        "details": {
+          "provider_code": "SYNTAX_ERROR"
+        }
+      }
+    ]
+  },
+  "protocol": "graph/v1.0",
+  "component": "graph",
+  "schema_version": "1.0.0",
+  "request_id": "req_graph_batch_001"
+}
