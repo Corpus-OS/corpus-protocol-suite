@@ -1,0 +1,19 @@
+{
+  "index": 2,
+  "error": "TextTooLong",
+  "code": "TEXT_TOO_LONG",
+  "message": "Input text exceeds max_text_length for namespace acme.docs",
+  "details": {
+    "max_text_length": 16000,
+    "provided_length": 24000,
+    "namespace": "acme.docs",
+    "provider_code": "TEXT_TOO_LONG"
+  },
+  "validation_errors": [
+    {
+      "field": "texts[2]",
+      "reason": "length > max_text_length",
+      "constraint": "maxLength"
+    }
+  ]
+}
