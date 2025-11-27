@@ -1,14 +1,19 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/graph/graph.types.entity.json",
+  "$id": "https://corpusos.com/schemas/graph/graph.types.entity.json",
   "title": "Graph Entity",
   "description": "Generic entity shape: vertex or edge. Used for create responses/echo.",
   "type": "object",
   "additionalProperties": false,
   "required": ["kind", "label", "props"],
   "properties": {
-    "kind": { "type": "string", "enum": ["vertex", "edge"] },
-    "id": { "$ref": "https://adaptersdk.org/schemas/graph/graph.types.id.json" },
+    "kind": {
+      "type": "string",
+      "enum": ["vertex", "edge"]
+    },
+    "id": {
+      "$ref": "https://corpusos.com/schemas/graph/graph.types.id.json"
+    },
     "label": {
       "type": "string",
       "minLength": 1,
@@ -26,17 +31,32 @@
           { "type": "integer" },
           { "type": "boolean" },
           { "type": "null" },
-          { "type": "array", "maxItems": 128, "items": { "type": ["string","number","integer","boolean","null"] } }
+          {
+            "type": "array",
+            "maxItems": 128,
+            "items": {
+              "type": ["string", "number", "integer", "boolean", "null"]
+            }
+          }
         ]
       }
     },
-    "from_id": { "$ref": "https://adaptersdk.org/schemas/graph/graph.types.id.json" },
-    "to_id": { "$ref": "https://adaptersdk.org/schemas/graph/graph.types.id.json" }
+    "from_id": {
+      "$ref": "https://corpusos.com/schemas/graph/graph.types.id.json"
+    },
+    "to_id": {
+      "$ref": "https://corpusos.com/schemas/graph/graph.types.id.json"
+    }
   },
   "allOf": [
     {
-      "if": { "properties": { "kind": { "const": "edge" } }, "required": ["kind"] },
-      "then": { "required": ["from_id", "to_id"] }
+      "if": {
+        "properties": { "kind": { "const": "edge" } },
+        "required": ["kind"]
+      },
+      "then": {
+        "required": ["from_id", "to_id"]
+      }
     }
   ],
   "patternProperties": {
