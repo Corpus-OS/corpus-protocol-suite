@@ -1,0 +1,9 @@
+{
+  "event": "data",
+  "data": {
+    "id": "user:789",
+    "label": "User",
+    "name": "Carol",
+    "friend_count": 2
+  }
+}
