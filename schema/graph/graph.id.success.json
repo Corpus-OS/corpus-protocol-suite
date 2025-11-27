@@ -1,12 +1,16 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/graph/graph.id.success.json",
+  "$id": "https://corpusos.com/schemas/graph/graph.id.success.json",
   "title": "Graph ID Result",
   "type": "object",
   "additionalProperties": false,
   "required": ["id"],
   "properties": {
-    "id": { "$ref": "https://adaptersdk.org/schemas/graph/graph.types.id.json" },
-    "entity": { "$ref": "https://adaptersdk.org/schemas/graph/graph.types.entity.json" }
+    "id": {
+      "$ref": "https://corpusos.com/schemas/graph/graph.types.id.json"
+    },
+    "entity": {
+      "$ref": "https://corpusos.com/schemas/graph/graph.types.entity.json"
+    }
   }
 }
