@@ -1,0 +1,21 @@
+{
+  "ok": false,
+  "error": "Unavailable",
+  "message": "Graph backend temporarily unavailable",
+  "code": "UNAVAILABLE",
+  "http_status": 503,
+  "ms": 3.5,
+  "op": "graph.query",
+  "protocol": "graph/v1.0",
+  "component": "graph",
+  "schema_version": "1.0.0",
+  "request_id": "req_graph_query_001",
+  "retry_after_ms": 2000,
+  "retryable": true,
+  "retryability": "yes",
+  "resource_scope": "compute",
+  "details": {
+    "provider_code": "BACKEND_UNAVAILABLE",
+    "tenant_hash": "c0ffee1234"
+  }
+}
