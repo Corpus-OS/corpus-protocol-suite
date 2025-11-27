@@ -1,17 +1,32 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/embedding/embedding.envelope.error.json",
-  "title": "Embedding Error Envelope",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.envelope.error.json",
+  "title": "embedding.envelope.error",
   "type": "object",
+  "additionalProperties": false,
+  "required": ["ok", "error", "message", "protocol", "component"],
+  "properties": {
+    "ok": {
+      "type": "boolean"
+    },
+    "error": {
+      "type": "string"
+    },
+    "message": {
+      "type": "string"
+    },
+    "protocol": {
+      "type": "string",
+      "const": "embedding/v1.0"
+    },
+    "component": {
+      "type": "string",
+      "const": "embedding"
+    }
+  },
   "allOf": [
-    { "$ref": "https://adaptersdk.org/schemas/common/envelope.error.json" },
     {
-      "type": "object",
-      "required": ["protocol", "component"],
-      "properties": {
-        "protocol": { "const": "embedding/v1.0" },
-        "component": { "const": "embedding" }
-      }
+      "$ref": "https://corpusos.com/schemas/common/envelope.error.json"
     }
   ]
 }
