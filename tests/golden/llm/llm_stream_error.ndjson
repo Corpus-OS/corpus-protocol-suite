@@ -1,0 +1,2 @@
+{"event":"data","data":{"id":"cmpl_01J0ERR","model":"example-llm-1","index":0,"delta":{"role":"assistant","content":"Partial response"},"finish_reason":null,"logprobs":null}}
+{"event":"error","code":"UNAVAILABLE","error":"Unavailable","message":"Backend temporarily unavailable","retry_after_ms":2000}
