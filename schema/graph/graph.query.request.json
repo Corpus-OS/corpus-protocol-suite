@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/graph/graph.query.request.json",
+  "$id": "https://corpusos.com/schemas/graph/graph.query.request.json",
   "title": "graph.query Args",
   "type": "object",
   "additionalProperties": false,
@@ -8,8 +8,19 @@
   "properties": {
     "dialect": { "type": "string", "minLength": 1, "maxLength": 64 },
     "text": { "type": "string", "minLength": 1, "maxLength": 100000 },
-    "params": { "type": "object", "maxProperties": 256, "additionalProperties": true },
-    "page_size": { "type": "integer", "minimum": 1, "maximum": 10000 },
-    "page_token": { "type": "string", "pattern": "^[A-Za-z0-9+/=_-]{1,4096}$" }
+    "params": {
+      "type": "object",
+      "maxProperties": 256,
+      "additionalProperties": true
+    },
+    "page_size": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 10000
+    },
+    "page_token": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9+/=_-]{1,4096}$"
+    }
   }
 }
