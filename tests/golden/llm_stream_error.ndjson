@@ -1,2 +1,0 @@
-{"event":"data","data":{"text":"...","is_final":false,"usage_so_far":{"prompt_tokens":50,"completion_tokens":1,"total_tokens":51}}}
-{"event":"error","code":"RATE_LIMIT","error":"ResourceExhausted","message":"Rate limit exceeded","retry_after_ms":1200}
