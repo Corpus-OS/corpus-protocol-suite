@@ -1,0 +1,32 @@
+{
+  "tools": [
+    {
+      "name": "lookup_customer",
+      "description": "Lookup a customer by id.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "customer_id": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": ["customer_id"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "create_ticket",
+      "description": "Create a support ticket.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "subject": { "type": "string" },
+          "priority": { "type": "string", "enum": ["low", "normal", "high"] }
+        },
+        "required": ["subject"],
+        "additionalProperties": false
+      }
+    }
+  ]
+}
