@@ -1,0 +1,17 @@
+{
+  "doc_type": "kb",
+  "lang": "en",
+  "tags": {
+    "$in": ["ai", "sdk"]
+  },
+  "$and": [
+    {
+      "published_at": {
+        "$gte": 1700000000
+      }
+    },
+    {
+      "region": "us"
+    }
+  ]
+}
