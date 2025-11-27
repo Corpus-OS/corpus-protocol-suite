@@ -63,10 +63,12 @@ def _canon_json(obj: Any) -> bytes:
     """Generate canonical JSON representation for hashing."""
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
+
 def _read_text_if_exists(rel: str) -> str | None:
     """Read file if it exists, return None otherwise."""
     p = GOLDEN / rel
     return p.read_text(encoding="utf-8") if p.exists() else None
+
 
 def _load_golden_if_exists(fname: str) -> dict | None:
     """Load golden file if it exists, return None otherwise."""
@@ -74,6 +76,7 @@ def _load_golden_if_exists(fname: str) -> dict | None:
     if not p.exists():
         return None
     return json.loads(p.read_text(encoding="utf-8"))
+
 
 def _get_component_from_schema_id(schema_id: str) -> str:
     """Extract component name from schema ID."""
@@ -84,6 +87,7 @@ def _get_component_from_schema_id(schema_id: str) -> str:
     except (ValueError, IndexError):
         return "unknown"
 
+
 def _get_golden_files_by_component() -> Dict[str, List[Tuple[str, str]]]:
     """Organize test cases by component for better test reporting."""
     by_component: Dict[str, List[Tuple[str, str]]] = {}
@@ -93,6 +97,7 @@ def _get_golden_files_by_component() -> Dict[str, List[Tuple[str, str]]]:
             by_component[component] = []
         by_component[component].append((fname, schema_id))
     return by_component
+
 
 def _validate_string_field_size(obj: Any, path: str = "", issues: List[str] | None = None) -> List[str]:
     """
@@ -248,6 +253,7 @@ def test_all_success_envelopes_follow_protocol_format():
         extra_fields = set(doc.keys()) - allowed_fields
         assert not extra_fields, f"{fname}: contains non-protocol fields: {extra_fields}"
 
+
 def test_all_error_envelopes_follow_protocol_format():
     """Test ALL error envelopes use protocol error format exactly per §2.4."""
     for fname, schema_id in CASES:
@@ -273,6 +279,7 @@ def test_all_error_envelopes_follow_protocol_format():
         allowed_fields = {"ok", "code", "error", "message", "retry_after_ms", "details", "ms"}
         extra_fields = set(doc.keys()) - allowed_fields
         assert not extra_fields, f"{fname}: contains non-protocol fields: {extra_fields}"
+
 
 def test_all_batch_operations_use_protocol_batchresult_pattern():
     """Test batch operations use {processed_count, failed_count, failures[]} pattern per §3.4."""
@@ -301,6 +308,7 @@ def test_all_batch_operations_use_protocol_batchresult_pattern():
             assert "error" in failure, f"{fname}: failure missing 'error' field"
             assert "detail" in failure, f"{fname}: failure missing 'detail' field"
             # id and index are optional per protocol
+
 
 def test_batch_operations_track_failures_in_result():
     """Test batch operations track failures via failed_count > 0, not envelope codes per §3.4."""
@@ -331,6 +339,7 @@ def test_batch_operations_track_failures_in_result():
             assert len(failures) > 0, f"{fname}: failed_count > 0 but failures array is empty"
             assert failed_count == len(failures), f"{fname}: failed_count doesn't match failures array length"
 
+
 def test_capabilities_use_flat_structure():
     """Test capabilities use flat structure per protocol §9.1, §13.1, §17.1."""
     capabilities_files = [
@@ -358,6 +367,7 @@ def test_capabilities_use_flat_structure():
         assert "protocol" in result, f"{fname}: missing 'protocol' field"
         assert "server" in result, f"{fname}: missing 'server' field"
         assert "version" in result, f"{fname}: missing 'version' field"
+
 
 def test_streaming_uses_protocol_envelope():
     """Test streaming operations use protocol envelope with chunk field per §2.4."""
@@ -391,6 +401,36 @@ def test_streaming_uses_protocol_envelope():
             assert "records" in chunk, f"{fname}: Graph chunk missing 'records' field"
             assert "is_final" in chunk, f"{fname}: Graph chunk missing 'is_final' field"
 
+
+# NEW: NDJSON streaming validation using stream_validator
+STREAM_NDJSON_CASES: List[Tuple[str, str, str]] = [
+    # (golden NDJSON file name, envelope schema id, component name)
+    ("llm_stream_chunk.ndjson",   "https://corpusos.com/schemas/llm/llm.envelope.success.json",   "llm"),
+    ("graph_stream_chunk.ndjson", "https://corpusos.com/schemas/graph/graph.envelope.success.json", "graph"),
+]
+
+
+@pytest.mark.parametrize("fname,schema_id,component", STREAM_NDJSON_CASES)
+def test_streaming_ndjson_validates_with_stream_validator(fname: str, schema_id: str, component: str):
+    """
+    Validate NDJSON streaming golden fixtures via the protocol-compliant stream validator.
+    This checks:
+      • protocol envelope shape on every frame (§2.4, §2.7)
+      • schema validity for sampled/all frames (via assert_valid)
+    """
+    p = GOLDEN / fname
+    if not p.exists():
+        pytest.skip(f"{fname} NDJSON fixture not present")
+
+    ndjson_text = p.read_text(encoding="utf-8")
+    report = validate_ndjson_stream(
+        ndjson_text,
+        envelope_schema_id=schema_id,
+        component=component,
+    )
+
+    assert report.is_valid, report.error_summary
+
 # ------------------------------------------------------------------------------
 # Cross-schema invariants & heuristics
 # ------------------------------------------------------------------------------
@@ -408,6 +448,7 @@ def test_llm_token_totals_invariant():
     
     assert usage["total_tokens"] == usage["prompt_tokens"] + usage.get("completion_tokens", 0), \
         "total_tokens must equal prompt_tokens + completion_tokens"
+
 
 def test_vector_dimension_invariants():
     """Test that all vectors in a response have consistent dimensions per §16.1."""
@@ -442,6 +483,7 @@ def test_vector_dimension_invariants():
     if mismatches:
         mism = ", ".join(f"match[{i}]={d} dims" for i, d in mismatches)
         pytest.fail(f"Vector dimension mismatch: expected {ref_dim}; got {mism}")
+
 
 def test_vector_dimension_limits():
     """Test that all vectors respect dimension limits."""
@@ -480,6 +522,7 @@ def test_vector_dimension_limits():
                 f"{vf} vector #{i} has {len(v)} dims; exceeds {MAX_VECTOR_DIMENSIONS}"
             )
 
+
 def test_timestamp_and_id_validation():
     """Test timestamp and ID field formatting across all golden files."""
     for fname, _ in CASES:
@@ -498,6 +541,7 @@ def test_timestamp_and_id_validation():
             if field in doc and doc[field]:
                 assert isinstance(doc[field], str) and ID_PATTERN.match(doc[field]), \
                     f"{fname}: invalid ID in '{field}': {doc[field]}"
+
 
 def test_large_fixture_performance():
     """Test fixture size limits and large string validation."""
@@ -526,6 +570,7 @@ def test_all_listed_golden_files_exist():
     if missing:
         pytest.skip(f"CASES contains missing fixtures (ok while landing): {missing}")
 
+
 def test_no_orphaned_golden_files():
     """Test that no golden files exist without CASES entries."""
     golden_files = {p.name for p in GOLDEN.glob("*.json") if p.is_file()}
@@ -534,6 +579,7 @@ def test_no_orphaned_golden_files():
     
     if orphaned:
         pytest.skip(f"Golden files without CASES entries: {sorted(orphaned)}")
+
 
 def test_golden_files_have_consistent_naming():
     """Test that golden files follow consistent naming conventions."""
@@ -549,6 +595,7 @@ def test_golden_files_have_consistent_naming():
     
     if naming_issues:
         pytest.skip(f"Files with non-standard naming: {naming_issues}")
+
 
 def test_request_response_pairs():
     """
@@ -568,6 +615,7 @@ def test_request_response_pairs():
     
     if missing_responses:
         pytest.skip(f"Requests missing *_success/_error: {missing_responses}")
+
 
 def test_component_coverage():
     """Test that all supported components have golden file coverage."""
@@ -589,6 +637,7 @@ def test_all_schemas_load_and_refs_resolve():
     # load_all_schemas_into_registry() already ran via session fixture;
     # if loading failed it would have raised. This test simply asserts the tree exists.
     assert SCHEMAS_ROOT.exists(), "schemas/ directory must exist"
+
 
 def test_schema_registry_health():
     """Test comprehensive schema registry health and statistics."""
@@ -624,6 +673,7 @@ def test_golden_file_loading_performance():
     if slow_files:
         slow_info = ", ".join(f"{fname}({time:.2f}s)" for fname, time in slow_files)
         pytest.skip(f"Slow golden file loading: {slow_info}")
+
 
 def test_golden_file_unique_checksums():
     """Test that golden files have unique content (detect duplicates)."""
