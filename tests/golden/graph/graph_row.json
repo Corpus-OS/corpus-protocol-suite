@@ -1,0 +1,7 @@
+{
+  "id": "user:123",
+  "label": "User",
+  "name": "Alice",
+  "friend_count": 3,
+  "vendor:shard": "r2"
+}
