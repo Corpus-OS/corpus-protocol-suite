@@ -1,11 +1,14 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/graph/graph.ack.success.json",
-  "title": "Graph Ack Result",
+  "$id": "https://corpusos.com/schemas/graph/graph.ack.success.json",
+  "title": "graph.ack Result",
   "type": "object",
   "additionalProperties": false,
+  "required": ["status"],
   "properties": {
-    "ok": { "type": "boolean", "const": true },
-    "status": { "type": "string", "enum": ["deleted", "noop", "ack"] }
+    "status": {
+      "type": "string",
+      "enum": ["deleted", "noop", "ack"]
+    }
   }
 }
