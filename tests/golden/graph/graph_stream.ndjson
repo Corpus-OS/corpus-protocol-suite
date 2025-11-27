@@ -1,0 +1,3 @@
+{"event":"data","data":{"id":"user:123","label":"User","name":"Alice","friend_count":3}}
+{"event":"data","data":{"id":"user:456","label":"User","name":"Bob","friend_count":1}}
+{"event":"end","code":"OK"}
