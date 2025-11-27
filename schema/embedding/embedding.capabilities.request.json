@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/embedding/embedding.capabilities.request.json",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.capabilities.request.json",
   "title": "embedding.capabilities Args",
   "description": "Empty argument object for embedding.capabilities. Present for documentation and explicit validation symmetry.",
   "type": "object",
