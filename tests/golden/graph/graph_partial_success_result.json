@@ -1,0 +1,30 @@
+{
+  "successes": 1,
+  "failures": 1,
+  "items": [
+    {
+      "index": 0,
+      "ok": true,
+      "result": {
+        "id": "user:123",
+        "entity": {
+          "kind": "vertex",
+          "id": "user:123",
+          "label": "User",
+          "props": {
+            "name": "Alice"
+          }
+        }
+      }
+    },
+    {
+      "index": 1,
+      "ok": false,
+      "code": "GRAPH_CONFLICT",
+      "message": "Vertex with this id already exists",
+      "details": {
+        "provider_code": "CONFLICT"
+      }
+    }
+  ]
+}
