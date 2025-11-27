@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/graph/graph.types.row.json",
+  "$id": "https://corpusos.com/schemas/graph/graph.types.row.json",
   "title": "Graph Query Row",
   "description": "Single query result row. Arbitrary JSON object; SIEM-safe guidance applies.",
   "type": "object",
