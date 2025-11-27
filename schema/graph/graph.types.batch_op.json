@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/graph/graph.types.batch_op.json",
+  "$id": "https://corpusos.com/schemas/graph/graph.types.batch_op.json",
   "title": "Graph Batch Operation",
   "type": "object",
   "oneOf": [
@@ -10,8 +10,15 @@
       "required": ["op", "label", "props"],
       "properties": {
         "op": { "type": "string", "const": "create_vertex" },
-        "label": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]{1,128}$" },
-        "props": { "$ref": "https://adaptersdk.org/schemas/graph/graph.types.entity.json#/properties/props" }
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._:-]{1,128}$"
+        },
+        "props": {
+          "$ref": "https://corpusos.com/schemas/graph/graph.types.entity.json#/properties/props"
+        }
       }
     },
     {
@@ -20,7 +27,9 @@
       "required": ["op", "id"],
       "properties": {
         "op": { "type": "string", "const": "delete_vertex" },
-        "id": { "$ref": "https://adaptersdk.org/schemas/graph/graph.types.id.json" }
+        "id": {
+          "$ref": "https://corpusos.com/schemas/graph/graph.types.id.json"
+        }
       }
     },
     {
@@ -29,10 +38,21 @@
       "required": ["op", "label", "from_id", "to_id", "props"],
       "properties": {
         "op": { "type": "string", "const": "create_edge" },
-        "label": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]{1,128}$" },
-        "from_id": { "$ref": "https://adaptersdk.org/schemas/graph/graph.types.id.json" },
-        "to_id": { "$ref": "https://adaptersdk.org/schemas/graph/graph.types.id.json" },
-        "props": { "$ref": "https://adaptersdk.org/schemas/graph/graph.types.entity.json#/properties/props" }
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._:-]{1,128}$"
+        },
+        "from_id": {
+          "$ref": "https://corpusos.com/schemas/graph/graph.types.id.json"
+        },
+        "to_id": {
+          "$ref": "https://corpusos.com/schemas/graph/graph.types.id.json"
+        },
+        "props": {
+          "$ref": "https://corpusos.com/schemas/graph/graph.types.entity.json#/properties/props"
+        }
       }
     },
     {
@@ -41,7 +61,9 @@
       "required": ["op", "id"],
       "properties": {
         "op": { "type": "string", "const": "delete_edge" },
-        "id": { "$ref": "https://adaptersdk.org/schemas/graph/graph.types.id.json" }
+        "id": {
+          "$ref": "https://corpusos.com/schemas/graph/graph.types.id.json"
+        }
       }
     },
     {
@@ -52,7 +74,11 @@
         "op": { "type": "string", "const": "query" },
         "dialect": { "type": "string", "minLength": 1, "maxLength": 64 },
         "text": { "type": "string", "minLength": 1, "maxLength": 100000 },
-        "params": { "type": "object", "additionalProperties": true, "maxProperties": 256 }
+        "params": {
+          "type": "object",
+          "additionalProperties": true,
+          "maxProperties": 256
+        }
       }
     }
   ]
