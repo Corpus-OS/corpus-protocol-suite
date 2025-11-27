@@ -1,0 +1,10 @@
+{
+  "kind": "edge",
+  "id": "edge:user:123->user:456",
+  "label": "FRIEND",
+  "props": {
+    "since": "2021-01-01"
+  },
+  "from_id": "user:123",
+  "to_id": "user:456"
+}
