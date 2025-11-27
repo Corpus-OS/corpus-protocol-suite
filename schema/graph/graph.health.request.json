@@ -1,15 +1,9 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://corpusos.com/schemas/graph/graph.health.success.json",
-  "title": "graph.health Result",
+  "$id": "https://corpusos.com/schemas/graph/graph.health.request.json",
+  "title": "graph.health Args",
+  "description": "Explicit empty-args schema for graph.health().",
   "type": "object",
   "additionalProperties": false,
-  "required": ["ok", "status"],
-  "properties": {
-    "ok": { "type": "boolean" },
-    "status": { "type": "string", "enum": ["ok", "degraded", "down"] },
-    "reason": { "type": "string", "maxLength": 512 },
-    "server": { "type": "string", "maxLength": 128 },
-    "version": { "type": "string", "maxLength": 64 }
-  }
+  "maxProperties": 0
 }
