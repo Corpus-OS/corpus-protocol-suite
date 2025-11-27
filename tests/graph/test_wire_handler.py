@@ -10,20 +10,11 @@ Asserts (SPECIFICATION.md refs):
   • §6.1         — OperationContext constructed from wire ctx (ignore unknowns)
   • §6.3, §12.4  — Normalized error envelopes for GraphAdapterError subclasses
   • §11.2, §13   — SIEM-safe behavior (no tenant leakage via Wire handler)
-
-Covers:
-  • graph.capabilities → success envelope
-  • graph.query / upsert_* / delete_* / bulk_vertices / batch / get_schema / health → success envelopes
-  • graph.stream_query via handle_stream() → chunk envelopes
-  • Context translation: ctx → OperationContext passed into BaseGraphAdapter
-  • Unknown op → NotSupported → normalized error envelope
-  • Missing/invalid op → BadRequest → normalized error envelope
-  • GraphAdapterError → mapped with correct code/error/message/details
-  • Unexpected Exception → mapped to UNAVAILABLE per common error taxonomy
 """
 
-import pytest
 from typing import Any, AsyncIterator, Dict, List, Mapping, Optional
+
+import pytest
 
 from corpus_sdk.graph.graph_base import (
     GRAPH_PROTOCOL_ID,
@@ -36,6 +27,7 @@ from corpus_sdk.graph.graph_base import (
     DeleteNodesSpec,
     DeleteEdgesSpec,
     BulkVerticesSpec,
+    BulkVerticesResult,
     BatchOperation,
     BatchResult,
     GraphSchema,
@@ -58,7 +50,11 @@ pytestmark = pytest.mark.asyncio
 class TrackingMockGraphAdapter(BaseGraphAdapter):
     """
     Mock adapter for exercising WireGraphHandler with tracking capabilities.
+
+    Implements the internal *_do_* hooks and returns dataclasses so that
+    WireGraphHandler's asdict()-based wiring works as intended.
     """
+
     def __init__(self) -> None:
         super().__init__()
         self.last_ctx: Optional[OperationContext] = None
@@ -70,69 +66,103 @@ class TrackingMockGraphAdapter(BaseGraphAdapter):
         self.last_ctx = ctx
         self.last_args = dict(kwargs)
 
-    async def capabilities(self):
+    async def _do_capabilities(self) -> GraphCapabilities:
+        from corpus_sdk.graph.graph_base import GraphCapabilities
+
+        caps = GraphCapabilities(
+            server="tracking-mock",
+            version="1.0.0",
+            supported_query_dialects=("cypher", "gremlin"),
+            supports_stream_query=True,
+            supports_namespaces=True,
+            supports_property_filters=True,
+            supports_bulk_vertices=True,
+            supports_batch=True,
+            supports_schema=True,
+            idempotent_writes=True,
+            supports_multi_tenant=True,
+            supports_deadline=True,
+            max_batch_ops=100,
+        )
         self._track("capabilities", None)
-        return {
-            "protocol": GRAPH_PROTOCOL_ID,
-            "server": "tracking-mock",
-            "version": "1.0.0",
-            "dialects": ("cypher", "gremlin"),
-            "supports_txn": True,
-            "supports_schema_ops": True,
-            "idempotent_writes": True,
-            "supports_multi_tenant": True,
-            "supports_streaming": True,
-            "supports_bulk_ops": True,
-            "supports_deadline": True,
-            "max_batch_ops": 100,
-            "rate_limit_unit": "requests_per_second",
-        }
+        return caps
 
-    async def query(self, spec: GraphQuerySpec, *, ctx: Optional[OperationContext] = None) -> QueryResult:
+    async def _do_query(
+        self, spec: GraphQuerySpec, *, ctx: Optional[OperationContext] = None
+    ) -> QueryResult:
         self._track("query", ctx, spec=spec)
-        return {"records": [{"n": 1}], "dialect": spec.dialect, "namespace": spec.namespace}
+        return QueryResult(
+            records=[{"n": 1}],
+            summary={},
+            dialect=spec.dialect,
+            namespace=spec.namespace,
+        )
 
-    async def stream_query(self, spec: GraphQuerySpec, *, ctx: Optional[OperationContext] = None) -> AsyncIterator[QueryChunk]:
+    async def _do_stream_query(
+        self, spec: GraphQuerySpec, *, ctx: Optional[OperationContext] = None
+    ) -> AsyncIterator[QueryChunk]:
         self._track("stream_query", ctx, spec=spec)
-        yield {"records": [{"n": 1}]}
-        yield {"records": [{"n": 2}]}
+        yield QueryChunk(records=[{"n": 1}], is_final=False)
+        yield QueryChunk(records=[{"n": 2}], is_final=True, summary={"total": 2})
 
-    async def upsert_nodes(self, spec: UpsertNodesSpec, *, ctx: Optional[OperationContext] = None) -> UpsertResult:
+    async def _do_upsert_nodes(
+        self, spec: UpsertNodesSpec, *, ctx: Optional[OperationContext] = None
+    ) -> UpsertResult:
         self._track("upsert_nodes", ctx, spec=spec)
-        return {"upserted_count": len(spec.nodes)}
+        return UpsertResult(
+            upserted_count=len(spec.nodes), failed_count=0, failures=[]
+        )
 
-    async def upsert_edges(self, spec: UpsertEdgesSpec, *, ctx: Optional[OperationContext] = None) -> UpsertResult:
+    async def _do_upsert_edges(
+        self, spec: UpsertEdgesSpec, *, ctx: Optional[OperationContext] = None
+    ) -> UpsertResult:
         self._track("upsert_edges", ctx, spec=spec)
-        return {"upserted_count": len(spec.edges)}
+        return UpsertResult(
+            upserted_count=len(spec.edges), failed_count=0, failures=[]
+        )
 
-    async def delete_nodes(self, spec: DeleteNodesSpec, *, ctx: Optional[OperationContext] = None) -> DeleteResult:
+    async def _do_delete_nodes(
+        self, spec: DeleteNodesSpec, *, ctx: Optional[OperationContext] = None
+    ) -> DeleteResult:
         self._track("delete_nodes", ctx, spec=spec)
-        return {"deleted_count": len(spec.ids)}
+        return DeleteResult(deleted_count=len(spec.ids), failed_count=0, failures=[])
 
-    async def delete_edges(self, spec: DeleteEdgesSpec, *, ctx: Optional[OperationContext] = None) -> DeleteResult:
+    async def _do_delete_edges(
+        self, spec: DeleteEdgesSpec, *, ctx: Optional[OperationContext] = None
+    ) -> DeleteResult:
         self._track("delete_edges", ctx, spec=spec)
-        return {"deleted_count": len(spec.ids)}
+        return DeleteResult(deleted_count=len(spec.ids), failed_count=0, failures=[])
 
-    async def bulk_vertices(self, spec: BulkVerticesSpec, *, ctx: Optional[OperationContext] = None):
+    async def _do_bulk_vertices(
+        self, spec: BulkVerticesSpec, *, ctx: Optional[OperationContext] = None
+    ) -> BulkVerticesResult:
         self._track("bulk_vertices", ctx, spec=spec)
-        return {"nodes": [], "edges": []}
+        return BulkVerticesResult(nodes=[], next_cursor=None, has_more=False)
 
-    async def batch(self, ops: List[BatchOperation], *, ctx: Optional[OperationContext] = None) -> BatchResult:
+    async def _do_batch(
+        self, ops: List[BatchOperation], *, ctx: Optional[OperationContext] = None
+    ) -> BatchResult:
         self._track("batch", ctx, ops=ops)
-        return {"results": [{"ok": True} for _ in ops]}
+        return BatchResult(results=[{"ok": True} for _ in ops])
 
-    async def get_schema(self, *, ctx: Optional[OperationContext] = None) -> GraphSchema:
+    async def _do_get_schema(
+        self, *, ctx: Optional[OperationContext] = None
+    ) -> GraphSchema:
         self._track("get_schema", ctx)
-        return {"nodes": {}, "edges": {}}
+        return GraphSchema(nodes={}, edges={}, metadata={})
 
-    async def health(self, *, ctx: Optional[OperationContext] = None) -> Mapping[str, Any]:
+    async def _do_health(
+        self, *, ctx: Optional[OperationContext] = None
+    ) -> Mapping[str, Any]:
         self._track("health", ctx)
         return {
+            "ok": True,
             "status": "ok",
             "server": "tracking-mock",
             "version": "1.0.0",
+            "namespaces": {},
             "read_only": False,
-            "degraded": False
+            "degraded": False,
         }
 
 
@@ -140,11 +170,14 @@ class ErrorAdapter(TrackingMockGraphAdapter):
     """
     Adapter that always raises a specific GraphAdapterError for testing mapping.
     """
+
     def __init__(self, exc: GraphAdapterError):
         super().__init__()
         self._exc = exc
 
-    async def query(self, spec: GraphQuerySpec, *, ctx: Optional[OperationContext] = None) -> QueryResult:
+    async def _do_query(
+        self, spec: GraphQuerySpec, *, ctx: Optional[OperationContext] = None
+    ) -> QueryResult:
         raise self._exc
 
 
@@ -212,7 +245,7 @@ async def test_wire_contract_query_roundtrip_and_context_plumbing():
     assert out.get("namespace") in (None, "demo")
     assert out.get("dialect") in (None, "cypher")
 
-    # Context propagation via BaseGraphAdapter -> TrackingMockGraphAdapter
+    # Context propagation
     assert a.last_call == "query"
     assert isinstance(a.last_ctx, OperationContext)
     assert a.last_ctx.request_id == "req_wire_graph"
@@ -408,7 +441,6 @@ async def test_wire_contract_stream_query_success_chunks_and_context():
     async for envelope in h.handle_stream(env):
         chunks.append(envelope)
 
-    # Expect at least one chunk
     assert len(chunks) >= 1
 
     for env_out in chunks:
@@ -418,7 +450,6 @@ async def test_wire_contract_stream_query_success_chunks_and_context():
         ch = env_out["chunk"]
         assert isinstance(ch.get("records"), list)
 
-    # Ensure context was passed to streaming path
     assert a.last_call == "stream_query"
     assert isinstance(a.last_ctx, OperationContext)
     assert a.last_ctx.request_id == "stream-1"
@@ -446,7 +477,7 @@ async def test_wire_contract_unknown_op_maps_to_not_supported():
     assert res["code"] in ("NOT_SUPPORTED", "NOTSUPPORTED")
     assert res["error"] == "NotSupported"
     error_msg = res["message"].lower()
-    assert any(term in error_msg for term in ['unknown', 'support', 'operation'])
+    assert any(term in error_msg for term in ["unknown", "support", "operation"])
 
 
 async def test_wire_contract_missing_or_invalid_op_maps_to_bad_request():
@@ -465,7 +496,7 @@ async def test_wire_contract_missing_or_invalid_op_maps_to_bad_request():
     assert res["code"] == "BAD_REQUEST"
     assert res["error"] == "BadRequest"
     error_msg = res["message"].lower()
-    assert any(term in error_msg for term in ['missing', 'invalid', 'op', 'operation'])
+    assert any(term in error_msg for term in ["missing", "invalid", "op", "operation"])
 
 
 async def test_wire_contract_query_missing_required_fields_maps_to_bad_request():
@@ -477,7 +508,7 @@ async def test_wire_contract_query_missing_required_fields_maps_to_bad_request()
         {
             "op": "graph.query",
             "ctx": {},
-            "args": {},  # missing required 'text'
+            "args": {},  # missing 'text'
         }
     )
 
@@ -485,7 +516,7 @@ async def test_wire_contract_query_missing_required_fields_maps_to_bad_request()
     assert res["code"] == "BAD_REQUEST"
     assert res["error"] == "BadRequest"
     error_msg = res["message"].lower()
-    assert any(term in error_msg for term in ['text', 'missing', 'required'])
+    assert any(term in error_msg for term in ["text", "missing", "required"])
 
 
 async def test_wire_contract_maps_graph_adapter_error_to_normalized_envelope():
@@ -510,7 +541,7 @@ async def test_wire_contract_maps_graph_adapter_error_to_normalized_envelope():
     assert res["code"] == "BAD_REQUEST"
     assert res["error"] == "BadRequest"
     assert res["message"] == "bad graph op"
-    assert "details" in res  # JSON-safe details present (may be null)
+    assert "details" in res
 
 
 async def test_wire_contract_maps_notsupported_adapter_error_to_not_supported_code():
@@ -535,7 +566,7 @@ async def test_wire_contract_maps_notsupported_adapter_error_to_not_supported_co
     assert res["code"] == "NOT_SUPPORTED"
     assert res["error"] == "NotSupported"
     error_msg = res["message"].lower()
-    assert any(term in error_msg for term in ['nope', 'support', 'implement'])
+    assert any(term in error_msg for term in ["nope", "support", "implement"])
 
 
 async def test_wire_contract_error_envelope_includes_message_and_type():
@@ -557,15 +588,18 @@ async def test_wire_contract_error_envelope_includes_message_and_type():
     )
 
     assert res["ok"] is False
-    assert "code" in res and isinstance(res["code"], str) and res["code"]
-    assert "error" in res and isinstance(res["error"], str) and res["error"]
-    assert "message" in res and isinstance(res["message"], str) and res["message"]
+    assert isinstance(res.get("code"), str) and res["code"]
+    assert isinstance(res.get("error"), str) and res["error"]
+    assert isinstance(res.get("message"), str) and res["message"]
 
 
 async def test_wire_contract_maps_unexpected_exception_to_unavailable():
     """§12.4: Unexpected exceptions must be mapped to UNAVAILABLE."""
+
     class BoomAdapter(TrackingMockGraphAdapter):
-        async def query(self, spec: GraphQuerySpec, *, ctx: Optional[OperationContext] = None) -> QueryResult:
+        async def _do_query(
+            self, spec: GraphQuerySpec, *, ctx: Optional[OperationContext] = None
+        ) -> QueryResult:
             raise RuntimeError("boom")
 
     a = BoomAdapter()
@@ -587,4 +621,4 @@ async def test_wire_contract_maps_unexpected_exception_to_unavailable():
     assert res["code"] == "UNAVAILABLE"
     assert res["error"] == "RuntimeError"
     error_msg = res["message"].lower()
-    assert any(term in error_msg for term in ['boom', 'unavailable', 'error'])
+    assert any(term in error_msg for term in ["boom", "unavailable", "error"])
