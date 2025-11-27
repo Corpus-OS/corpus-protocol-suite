@@ -1,0 +1,37 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 18.9,
+  "result": {
+    "embeddings": [
+      {
+        "vector": [0.11, 0.12, 0.13],
+        "model": "example-embed-1",
+        "dimensions": 3,
+        "text": "alpha"
+      },
+      {
+        "vector": [0.21, 0.22, 0.23],
+        "model": "example-embed-1",
+        "dimensions": 3,
+        "text": "beta"
+      },
+      {
+        "vector": [0.31, 0.32, 0.33],
+        "model": "example-embed-1",
+        "dimensions": 3,
+        "text": "gamma-too-long"
+      }
+    ],
+    "model": "example-embed-1",
+    "total_tokens": 9,
+    "processing_time_ms": 17.4,
+    "failures": [],
+    "warnings": []
+  },
+  "protocol": "embedding/v1.0",
+  "component": "embedding",
+  "schema_version": "1.0.0",
+  "request_id": "req_emb_batch_001",
+  "result_hash": "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+}
