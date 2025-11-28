@@ -11,6 +11,8 @@ protocol operation (`op`):
      JSON Schema via the shared SchemaRegistry
   3. Operation-specific invariants on `args` are satisfied
      (e.g. shape of texts/text, vector dimensions, etc.)
+  4. The envelope survives a standard JSON serialization round-trip
+     unchanged, approximating the actual HTTP wire JSON.
 
 It complements:
 
@@ -31,6 +33,7 @@ actually match the protocol?”
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List
 
@@ -290,7 +293,9 @@ def _assert_envelope_common(envelope: Dict[str, Any], case: WireRequestCase) -> 
     ctx = envelope["ctx"]
     assert isinstance(ctx, dict), f"{case.id}: ctx must be object, got {type(ctx)}"
     assert "request_id" in ctx, f"{case.id}: ctx.request_id required"
-    assert isinstance(ctx["request_id"], str) and ctx["request_id"], f"{case.id}: ctx.request_id must be non-empty string"
+    assert isinstance(ctx["request_id"], str) and ctx["request_id"], (
+        f"{case.id}: ctx.request_id must be non-empty string"
+    )
 
     if "deadline_ms" in ctx:
         dm = ctx["deadline_ms"]
@@ -302,6 +307,24 @@ def _assert_envelope_common(envelope: Dict[str, Any], case: WireRequestCase) -> 
     # args
     args = envelope["args"]
     assert isinstance(args, dict), f"{case.id}: args must be object, got {type(args)}"
+
+
+def _json_roundtrip(obj: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Approximate the actual HTTP wire JSON by forcing a standard-library
+    JSON serialization + parse.
+
+    This:
+      * Ensures everything is JSON-serializable
+      * Catches hidden types (e.g. datetimes, Decimals, custom classes)
+      * Mirrors what a typical `json=` HTTP client path would do
+    """
+    payload = json.dumps(
+        obj,
+        ensure_ascii=False,
+        separators=(",", ":"),  # compact, deterministic wrt content
+    )
+    return json.loads(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -391,7 +414,9 @@ def _assert_vector_query_args(args: Dict[str, Any], case: WireRequestCase) -> No
     assert isinstance(namespace, str) and namespace, f"{case.id}: query.namespace must be non-empty string"
     vector = query.get("vector")
     assert isinstance(vector, list) and vector, f"{case.id}: query.vector must be non-empty list"
-    assert all(isinstance(x, (int, float)) for x in vector), f"{case.id}: query.vector must be numeric list"
+    assert all(isinstance(x, (int, float)) for x in vector), (
+        f"{case.id}: query.vector must be numeric list"
+    )
 
 
 def _assert_vector_upsert_args(args: Dict[str, Any], case: WireRequestCase) -> None:
@@ -458,8 +483,9 @@ def test_wire_request_envelopes_protocol_and_schema(case: WireRequestCase, adapt
 
       * Call the adapter's builder (e.g. build_llm_complete_envelope)
       * Assert protocol-level envelope shape (op/ctx/args)
-      * Validate against the *.envelope.request JSON Schema
-      * Run operation-specific arg validation
+      * Serialize + deserialize via standard JSON to approximate HTTP wire JSON
+      * Validate the wire-level envelope against the *.envelope.request JSON Schema
+      * Run operation-specific arg validation on the wire-level args
 
     This is the bridge between "what a user actually sends" and the
     schema/golden tests.
@@ -467,11 +493,20 @@ def test_wire_request_envelopes_protocol_and_schema(case: WireRequestCase, adapt
     builder = _get_builder(adapter, case)
     envelope = builder()
 
-    # 1) Envelope shape + ctx invariants
+    # 1) Envelope shape + ctx invariants (pre-serialization)
     _assert_envelope_common(envelope, case)
 
-    # 2) Schema validation against canonical *.envelope.request
-    assert_valid(case.schema_id, envelope, context=f"wire:{case.id}")
+    # 2) Force a JSON round-trip to approximate actual HTTP wire JSON
+    wire_envelope = _json_roundtrip(envelope)
 
-    # 3) Operation-specific args invariants
-    _assert_args_for_case(envelope["args"], case)
+    # Strict: serialization must not mutate the envelope shape/content
+    # (catches e.g. non-JSON types, custom encoders, etc.)
+    assert wire_envelope == envelope, (
+        f"{case.id}: envelope mutated by JSON serialization round-trip"
+    )
+
+    # 3) Schema validation against canonical *.envelope.request (wire-level)
+    assert_valid(case.schema_id, wire_envelope, context=f"wire:{case.id}")
+
+    # 4) Operation-specific args invariants on the wire-level payload
+    _assert_args_for_case(wire_envelope["args"], case)
