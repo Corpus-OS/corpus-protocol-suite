@@ -24,7 +24,7 @@ import math
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Dict, List, Mapping, Optional, Tuple
 
-from adapter_sdk.graph_base import (
+from corpus_sdk.graph.graph_base import (
     BaseGraphAdapter,
     GraphCapabilities,
     OperationContext,
@@ -70,6 +70,9 @@ class MockGraphAdapter(BaseGraphAdapter):
     failure_rate: float = 0.0  # keep 0.0 for conformance (can be raised for demos)
 
     def __post_init__(self) -> None:
+        # Initialize the base class
+        super().__init__()
+        
         # Configuration validation
         if not isinstance(self.supported_dialects, tuple) or not self.supported_dialects:
             raise ValueError("supported_dialects must be a non-empty tuple of strings")

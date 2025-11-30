@@ -1570,18 +1570,19 @@ class BaseGraphAdapter(GraphProtocolV1):
               is set, it MUST be a member.
             - If dialect is None, adapter may treat text as backend-native.
         """
-        if not isinstance(spec.text, str) or not spec.text.strip():
-            raise BadRequest("query.text must be a non-empty string")
-
-        caps = await self.capabilities()
-        if spec.dialect and caps.supported_query_dialects:
-            if spec.dialect not in caps.supported_query_dialects:
-                raise NotSupported(
-                    f"dialect '{spec.dialect}' not supported",
-                    details={"supported_query_dialects": caps.supported_query_dialects},
-                )
-
         async def _call() -> QueryResult:
+            # Validate query spec (inside gate wrapper for metrics)
+            if not isinstance(spec.text, str) or not spec.text.strip():
+                raise BadRequest("query.text must be a non-empty string")
+
+            caps = await self.capabilities()
+            if spec.dialect and caps.supported_query_dialects:
+                if spec.dialect not in caps.supported_query_dialects:
+                    raise NotSupported(
+                        f"dialect '{spec.dialect}' not supported",
+                        details={"supported_query_dialects": caps.supported_query_dialects},
+                    )
+
             # Use pluggable cache interface for read-only, non-streaming queries
             if not isinstance(self._cache, NoopCache) and not spec.stream:
                 key = self._make_cache_key(op="query", spec=spec, ctx=ctx)
@@ -1606,7 +1607,7 @@ class BaseGraphAdapter(GraphProtocolV1):
             metric_extra={"dialect": spec.dialect or "none"},
         )
 
-    async def stream_query(
+    def stream_query(
         self,
         spec: GraphQuerySpec,
         *,
@@ -1617,29 +1618,33 @@ class BaseGraphAdapter(GraphProtocolV1):
 
         For large result sets; preferred over `query` when supported.
         """
-        if not isinstance(spec.text, str) or not spec.text.strip():
-            raise BadRequest("query.text must be a non-empty string")
+        async def _stream_impl() -> AsyncIterator[QueryChunk]:
+            if not isinstance(spec.text, str) or not spec.text.strip():
+                raise BadRequest("query.text must be a non-empty string")
 
-        caps = await self.capabilities()
-        if not caps.supports_stream_query:
-            raise NotSupported("stream_query is not supported by this adapter")
-        if spec.dialect and caps.supported_query_dialects:
-            if spec.dialect not in caps.supported_query_dialects:
-                raise NotSupported(
-                    f"dialect '{spec.dialect}' not supported",
-                    details={"supported_query_dialects": caps.supported_query_dialects},
-                )
+            caps = await self.capabilities()
+            if not caps.supports_stream_query:
+                raise NotSupported("stream_query is not supported by this adapter")
+            if spec.dialect and caps.supported_query_dialects:
+                if spec.dialect not in caps.supported_query_dialects:
+                    raise NotSupported(
+                        f"dialect '{spec.dialect}' not supported",
+                        details={"supported_query_dialects": caps.supported_query_dialects},
+                    )
 
-        async def agen_factory() -> AsyncIterator[QueryChunk]:
-            async for chunk in self._do_stream_query(spec, ctx=ctx):
+            async def agen_factory() -> AsyncIterator[QueryChunk]:
+                async for chunk in self._do_stream_query(spec, ctx=ctx):
+                    yield chunk
+
+            async for chunk in await self._with_gates_stream(
+                op="stream_query",
+                ctx=ctx,
+                agen_factory=lambda: agen_factory(),
+                metric_extra={"dialect": spec.dialect or "none"},
+            ):
                 yield chunk
-
-        return await self._with_gates_stream(
-            op="stream_query",
-            ctx=ctx,
-            agen_factory=lambda: agen_factory(),
-            metric_extra={"dialect": spec.dialect or "none"},
-        )
+        
+        return _stream_impl()
 
     async def upsert_nodes(
         self,
@@ -1650,8 +1655,12 @@ class BaseGraphAdapter(GraphProtocolV1):
         """Batch upsert nodes with validation, gates, and optional timestamp management."""
         if not spec.nodes:
             raise BadRequest("nodes must not be empty")
+        # Validate that properties are JSON-serializable (hard requirement)
         for n in spec.nodes:
-            self._validate_node(n)
+            if n.properties is not None:
+                self._validate_properties_map(n.properties)
+        # Note: Other node validation (labels, etc.) is delegated to the adapter
+        # to allow for soft failures and per-node error reporting
 
         async def _call() -> UpsertResult:
             if self._auto_timestamp_writes:
@@ -1706,8 +1715,16 @@ class BaseGraphAdapter(GraphProtocolV1):
         """Batch upsert edges with validation, gates, and optional timestamp management."""
         if not spec.edges:
             raise BadRequest("edges must not be empty")
+        # Validate critical fields that would break graph integrity
         for e in spec.edges:
-            self._validate_edge(e)
+            if not isinstance(e.label, str) or not e.label:
+                raise BadRequest("edge.label must be a non-empty string")
+            if not e.src or not isinstance(e.src, str):
+                raise BadRequest("edge.src must be a non-empty string")
+            if not e.dst or not isinstance(e.dst, str):
+                raise BadRequest("edge.dst must be a non-empty string")
+            if e.properties is not None:
+                self._validate_properties_map(e.properties)
 
         async def _call() -> UpsertResult:
             if self._auto_timestamp_writes:
@@ -2439,7 +2456,10 @@ class WireGraphHandler:
                 return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
 
             if op == "graph.query":
-                spec = GraphQuerySpec(**args)
+                try:
+                    spec = GraphQuerySpec(**args)
+                except (TypeError, ValueError) as spec_err:
+                    raise BadRequest(f"Invalid query spec: {spec_err}") from spec_err
                 res = await self._adapter.query(spec, ctx=ctx)
                 return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
 

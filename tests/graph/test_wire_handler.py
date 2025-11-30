@@ -31,6 +31,7 @@ from corpus_sdk.graph.graph_base import (
     BatchOperation,
     BatchResult,
     GraphSchema,
+    GraphCapabilities,
     QueryResult,
     QueryChunk,
     UpsertResult,
@@ -67,8 +68,6 @@ class TrackingMockGraphAdapter(BaseGraphAdapter):
         self.last_args = dict(kwargs)
 
     async def _do_capabilities(self) -> GraphCapabilities:
-        from corpus_sdk.graph.graph_base import GraphCapabilities
-
         caps = GraphCapabilities(
             server="tracking-mock",
             version="1.0.0",

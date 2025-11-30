@@ -36,7 +36,7 @@ async def test_crud_upsert_node_returns_success(adapter: BaseGraphAdapter):
     assert isinstance(res, UpsertResult)
     assert res.upserted_count == 1
     assert res.failed_count == 0
-    assert isinstance(node.id, GraphID)
+    assert isinstance(node.id, str)  # GraphID is a NewType alias for str
 
 
 async def test_crud_upsert_edge_returns_success(adapter: BaseGraphAdapter):
@@ -54,7 +54,7 @@ async def test_crud_upsert_edge_returns_success(adapter: BaseGraphAdapter):
     assert isinstance(res, UpsertResult)
     assert res.upserted_count == 1
     assert res.failed_count == 0
-    assert isinstance(edge.id, GraphID)
+    assert isinstance(edge.id, str)  # GraphID is a NewType alias for str
 
 
 async def test_crud_validation_node_labels_and_props(adapter: BaseGraphAdapter):
@@ -80,17 +80,17 @@ async def test_crud_validation_node_labels_and_props(adapter: BaseGraphAdapter):
 async def test_crud_validation_edge_requires_src_dst_label(adapter: BaseGraphAdapter):
     ctx = GraphContext(request_id="t_crud_req2", tenant="t1")
 
-    # Invalid label
-    bad_edge1 = Edge(
-        id=GraphID("e:bad:1"),
-        src=GraphID("v:1"),
-        dst=GraphID("v:2"),
-        label="",
-        properties={},
-    )
-    spec1 = UpsertEdgesSpec(edges=[bad_edge1], namespace="t1")
-    res1 = await adapter.upsert_edges(spec1, ctx=ctx)
-    assert res1.failed_count == 1
+    # Invalid label must raise at validation level
+    with pytest.raises(BadRequest):
+        bad_edge1 = Edge(
+            id=GraphID("e:bad:1"),
+            src=GraphID("v:1"),
+            dst=GraphID("v:2"),
+            label="",
+            properties={},
+        )
+        spec1 = UpsertEdgesSpec(edges=[bad_edge1], namespace="t1")
+        await adapter.upsert_edges(spec1, ctx=ctx)
 
     # Invalid src/dst must raise at validation level
     with pytest.raises(BadRequest):
