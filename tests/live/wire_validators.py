@@ -1172,6 +1172,275 @@ def validate_graph_traverse_args(args: ArgsDict, case_id: Optional[str] = None) 
             )
 
 
+def validate_llm_stream_args(args: ArgsDict, case_id: Optional[str] = None) -> None:
+    """Validate llm.stream operation arguments."""
+    # Same validation as llm.complete
+    validate_llm_complete_args(args, case_id)
+
+
+def validate_vector_namespace_args(args: ArgsDict, case_id: Optional[str] = None) -> None:
+    """Validate vector.create_namespace and vector.delete_namespace arguments."""
+    if "namespace" not in args:
+        raise ArgsValidationError(
+            "Namespace operation requires 'namespace'",
+            case_id=case_id,
+            field="args.namespace",
+        )
+    
+    namespace = args["namespace"]
+    if not isinstance(namespace, str):
+        raise ArgsValidationError(
+            "'args.namespace' must be string",
+            case_id=case_id,
+            field="args.namespace",
+        )
+    
+    if not namespace:
+        raise ArgsValidationError(
+            "'args.namespace' must not be empty",
+            case_id=case_id,
+            field="args.namespace",
+        )
+
+
+def validate_embedding_embed_batch_args(args: ArgsDict, case_id: Optional[str] = None) -> None:
+    """Validate embedding.embed_batch operation arguments."""
+    if "texts" not in args:
+        raise ArgsValidationError(
+            "embedding.embed_batch requires 'texts'",
+            case_id=case_id,
+            field="args.texts",
+        )
+    
+    texts = args["texts"]
+    if not isinstance(texts, list):
+        raise ArgsValidationError(
+            f"'args.texts' must be array, got {type(texts).__name__}",
+            case_id=case_id,
+            field="args.texts",
+        )
+    
+    if len(texts) == 0:
+        raise ArgsValidationError(
+            "'args.texts' must not be empty",
+            case_id=case_id,
+            field="args.texts",
+        )
+    
+    if len(texts) > MAX_BATCH_SIZE:
+        raise ArgsValidationError(
+            f"'args.texts' exceeds max batch size {MAX_BATCH_SIZE}",
+            case_id=case_id,
+            field="args.texts",
+        )
+    
+    for i, t in enumerate(texts):
+        if not isinstance(t, str):
+            raise ArgsValidationError(
+                f"'args.texts[{i}]' must be string",
+                case_id=case_id,
+                field=f"args.texts[{i}]",
+            )
+    
+    if "model" in args and args["model"] is not None:
+        if not isinstance(args["model"], str):
+            raise ArgsValidationError(
+                "'args.model' must be string",
+                case_id=case_id,
+                field="args.model",
+            )
+
+
+def validate_embedding_count_tokens_args(args: ArgsDict, case_id: Optional[str] = None) -> None:
+    """Validate embedding.count_tokens operation arguments."""
+    if "text" not in args:
+        raise ArgsValidationError(
+            "embedding.count_tokens requires 'text'",
+            case_id=case_id,
+            field="args.text",
+        )
+    
+    text = args["text"]
+    if not isinstance(text, str):
+        raise ArgsValidationError(
+            f"'args.text' must be string, got {type(text).__name__}",
+            case_id=case_id,
+            field="args.text",
+        )
+    
+    if "model" in args and args["model"] is not None:
+        if not isinstance(args["model"], str):
+            raise ArgsValidationError(
+                "'args.model' must be string",
+                case_id=case_id,
+                field="args.model",
+            )
+
+
+def validate_graph_upsert_nodes_args(args: ArgsDict, case_id: Optional[str] = None) -> None:
+    """Validate graph.upsert_nodes operation arguments."""
+    if "nodes" not in args:
+        raise ArgsValidationError(
+            "graph.upsert_nodes requires 'nodes'",
+            case_id=case_id,
+            field="args.nodes",
+        )
+    
+    nodes = args["nodes"]
+    if not isinstance(nodes, list):
+        raise ArgsValidationError(
+            f"'args.nodes' must be array, got {type(nodes).__name__}",
+            case_id=case_id,
+            field="args.nodes",
+        )
+    
+    if len(nodes) == 0:
+        raise ArgsValidationError(
+            "'args.nodes' must not be empty",
+            case_id=case_id,
+            field="args.nodes",
+        )
+    
+    for i, node in enumerate(nodes):
+        if not isinstance(node, dict):
+            raise ArgsValidationError(
+                f"'args.nodes[{i}]' must be object",
+                case_id=case_id,
+                field=f"args.nodes[{i}]",
+            )
+        if "id" not in node:
+            raise ArgsValidationError(
+                f"'args.nodes[{i}].id' is required",
+                case_id=case_id,
+                field=f"args.nodes[{i}].id",
+            )
+
+
+def validate_graph_upsert_edges_args(args: ArgsDict, case_id: Optional[str] = None) -> None:
+    """Validate graph.upsert_edges operation arguments."""
+    if "edges" not in args:
+        raise ArgsValidationError(
+            "graph.upsert_edges requires 'edges'",
+            case_id=case_id,
+            field="args.edges",
+        )
+    
+    edges = args["edges"]
+    if not isinstance(edges, list):
+        raise ArgsValidationError(
+            f"'args.edges' must be array, got {type(edges).__name__}",
+            case_id=case_id,
+            field="args.edges",
+        )
+    
+    if len(edges) == 0:
+        raise ArgsValidationError(
+            "'args.edges' must not be empty",
+            case_id=case_id,
+            field="args.edges",
+        )
+    
+    for i, edge in enumerate(edges):
+        if not isinstance(edge, dict):
+            raise ArgsValidationError(
+                f"'args.edges[{i}]' must be object",
+                case_id=case_id,
+                field=f"args.edges[{i}]",
+            )
+        
+        required_fields = ["source", "target", "type"]
+        for field in required_fields:
+            if field not in edge:
+                raise ArgsValidationError(
+                    f"'args.edges[{i}].{field}' is required",
+                    case_id=case_id,
+                    field=f"args.edges[{i}].{field}",
+                )
+
+
+def validate_graph_delete_nodes_args(args: ArgsDict, case_id: Optional[str] = None) -> None:
+    """Validate graph.delete_nodes operation arguments."""
+    if "ids" not in args and "label" not in args:
+        raise ArgsValidationError(
+            "graph.delete_nodes requires 'ids' or 'label'",
+            case_id=case_id,
+            field="args",
+        )
+    
+    if "ids" in args:
+        ids = args["ids"]
+        if not isinstance(ids, list):
+            raise ArgsValidationError(
+                "'args.ids' must be array",
+                case_id=case_id,
+                field="args.ids",
+            )
+        if not all(isinstance(id_, str) for id_ in ids):
+            raise ArgsValidationError(
+                "'args.ids' must contain only strings",
+                case_id=case_id,
+                field="args.ids",
+            )
+
+
+def validate_graph_delete_edges_args(args: ArgsDict, case_id: Optional[str] = None) -> None:
+    """Validate graph.delete_edges operation arguments."""
+    if "ids" not in args and "type" not in args:
+        raise ArgsValidationError(
+            "graph.delete_edges requires 'ids' or 'type'",
+            case_id=case_id,
+            field="args",
+        )
+    
+    if "ids" in args:
+        ids = args["ids"]
+        if not isinstance(ids, list):
+            raise ArgsValidationError(
+                "'args.ids' must be array",
+                case_id=case_id,
+                field="args.ids",
+            )
+        if not all(isinstance(id_, str) for id_ in ids):
+            raise ArgsValidationError(
+                "'args.ids' must contain only strings",
+                case_id=case_id,
+                field="args.ids",
+            )
+
+
+def validate_graph_bulk_vertices_args(args: ArgsDict, case_id: Optional[str] = None) -> None:
+    """Validate graph.bulk_vertices operation arguments."""
+    if "source" not in args:
+        raise ArgsValidationError(
+            "graph.bulk_vertices requires 'source'",
+            case_id=case_id,
+            field="args.source",
+        )
+    
+    source = args["source"]
+    if not isinstance(source, dict):
+        raise ArgsValidationError(
+            "'args.source' must be object",
+            case_id=case_id,
+            field="args.source",
+        )
+    
+    if "type" not in source:
+        raise ArgsValidationError(
+            "'args.source.type' is required",
+            case_id=case_id,
+            field="args.source.type",
+        )
+    
+    valid_source_types = {"csv", "json", "parquet", "url"}
+    if source["type"] not in valid_source_types:
+        raise ArgsValidationError(
+            f"'args.source.type' must be one of {sorted(valid_source_types)}",
+            case_id=case_id,
+            field="args.source.type",
+        )
+
+
 # ---------------------------------------------------------------------------
 # Helper Validators
 # ---------------------------------------------------------------------------
@@ -1390,17 +1659,30 @@ def _validate_bool(value: Any, field_name: str, case_id: Optional[str]) -> None:
 # ---------------------------------------------------------------------------
 
 ARGS_VALIDATORS: Dict[str, ArgsValidator] = {
+    # LLM
     "validate_llm_complete_args": validate_llm_complete_args,
     "validate_llm_chat_args": validate_llm_chat_args,
+    "validate_llm_stream_args": validate_llm_stream_args,
     "validate_llm_count_tokens_args": validate_llm_count_tokens_args,
+    # Vector
     "validate_vector_query_args": validate_vector_query_args,
     "validate_vector_upsert_args": validate_vector_upsert_args,
     "validate_vector_delete_args": validate_vector_delete_args,
     "validate_vector_fetch_args": validate_vector_fetch_args,
+    "validate_vector_namespace_args": validate_vector_namespace_args,
+    # Embedding
     "validate_embedding_embed_args": validate_embedding_embed_args,
+    "validate_embedding_embed_batch_args": validate_embedding_embed_batch_args,
+    "validate_embedding_count_tokens_args": validate_embedding_count_tokens_args,
+    # Graph
     "validate_graph_query_args": validate_graph_query_args,
     "validate_graph_mutate_args": validate_graph_mutate_args,
     "validate_graph_traverse_args": validate_graph_traverse_args,
+    "validate_graph_upsert_nodes_args": validate_graph_upsert_nodes_args,
+    "validate_graph_upsert_edges_args": validate_graph_upsert_edges_args,
+    "validate_graph_delete_nodes_args": validate_graph_delete_nodes_args,
+    "validate_graph_delete_edges_args": validate_graph_delete_edges_args,
+    "validate_graph_bulk_vertices_args": validate_graph_bulk_vertices_args,
 }
 
 
