@@ -4,6 +4,7 @@
 Corpus SDK CLI
 
 Complete protocol conformance testing with full Makefile parity.
+Includes wire-level envelope validation for protocol conformance.
 """
 
 from __future__ import annotations
@@ -11,7 +12,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import subprocess
 import sys
 import time
 from datetime import datetime
@@ -35,6 +35,7 @@ PROTOCOL_PATHS: Dict[str, str] = {
     "embedding": "tests/embedding",
     "schema": "tests/schema",
     "golden": "tests/golden",
+    "wire": "tests/conformance",  # Wire-level envelope conformance
 }
 
 # Configuration from environment
@@ -66,11 +67,9 @@ def _repo_root() -> str:
 
 
 def _validate_paths(paths: List[str]) -> bool:
-    """Validate that each path we intend pytest to run exists."""
+    """Validate that each test path exists before invoking pytest."""
     ok = True
     for p in paths:
-        if p.startswith("-"):
-            continue
         if not (os.path.isdir(p) or os.path.isfile(p)):
             print(f"error: test path does not exist: {p}", file=sys.stderr)
             ok = False
@@ -79,7 +78,7 @@ def _validate_paths(paths: List[str]) -> bool:
 
 def _validate_environment() -> Tuple[bool, str]:
     """Validate test environment like make validate-env."""
-    issues = []
+    issues: List[str] = []
     
     if not os.getenv("CORPUS_TEST_ENV"):
         issues.append("CORPUS_TEST_ENV not set, using default")
@@ -100,14 +99,17 @@ def _build_pytest_args(
     fast_mode: bool = False,
     quiet_mode: bool = False,
     verbose_mode: bool = False,
-    passthrough_args: List[str] = None,
+    passthrough_args: Optional[List[str]] = None,
     junit_report: Optional[str] = None,
+    markers: Optional[List[str]] = None,
+    adapter: Optional[str] = None,
+    skip_schema: bool = False,
 ) -> List[str]:
     """Build standardized pytest arguments with consistent configuration."""
     if passthrough_args is None:
         passthrough_args = []
 
-    args = [
+    args: List[str] = [
         *test_paths,
         *PYTEST_EXTRA_ARGS,
         *passthrough_args,
@@ -127,8 +129,25 @@ def _build_pytest_args(
 
     # Fast mode: skip slow tests and coverage
     if fast_mode:
-        args.append("-m")
-        args.append("not slow")
+        args.extend(["-m", "not slow"])
+
+    # Marker filtering (for wire conformance)
+    if markers:
+        # Allow complex expressions by letting each marker be a full -m expression,
+        # but keep the common simple case of multiple markers joined with " or ".
+        if len(markers) == 1:
+            marker_expr = markers[0]
+        else:
+            marker_expr = " or ".join(markers)
+        args.extend(["-m", marker_expr])
+
+    # Adapter selection (for wire conformance)
+    if adapter:
+        args.extend(["--adapter", adapter])
+
+    # Skip schema validation (for wire conformance fast iteration)
+    if skip_schema:
+        args.append("--skip-schema")
 
     # JUnit XML output (for CI)
     if JUNIT_OUTPUT and junit_report and not fast_mode:
@@ -144,7 +163,7 @@ def _build_pytest_args(
         if report_name:
             args.extend([
                 f"--cov-report=html:{report_name}",
-                "--cov-report=xml:coverage.xml"
+                "--cov-report=xml:coverage.xml",
             ])
 
     return args
@@ -155,11 +174,6 @@ def _run_pytest(args: List[str]) -> tuple[int, float]:
     _ensure_pytest()
     root = _repo_root()
     os.chdir(root)
-
-    # Validate paths before invoking pytest
-    path_like = [a for a in args if not a.startswith("-")]
-    if not _validate_paths(path_like):
-        return 2, 0.0
 
     start_time = time.time()
     
@@ -186,14 +200,14 @@ def _print_config(quiet: bool = False) -> None:
 
 def _print_success_stats(protocols: List[str], elapsed: float, test_count: int = 0) -> None:
     """Print success statistics."""
-    print(f"✅ All selected protocols are 100% conformant.")
+    print("✅ All selected protocols are 100% conformant.")
     print(f"   Protocols: {', '.join(protocols)}")
     if test_count:
         print(f"   Tests: {test_count} passed")
     print(f"   Completed in {elapsed:.1f}s")
 
 
-def _run_watch_mode(test_paths: List[str], passthrough_args: List[str] = None) -> int:
+def _run_watch_mode(test_paths: List[str], passthrough_args: Optional[List[str]] = None) -> int:
     """Run pytest in watch mode for TDD workflows."""
     if pytest_watch is None:
         print(
@@ -208,7 +222,7 @@ def _run_watch_mode(test_paths: List[str], passthrough_args: List[str] = None) -
     print("   Watching for file changes in:", ", ".join(test_paths))
     
     # Convert our test paths to watch paths (parent directories)
-    watch_paths = list(set(os.path.dirname(p) for p in test_paths))
+    watch_paths = list({os.path.dirname(p.rstrip(os.sep)) or "." for p in test_paths})
     
     try:
         return pytest_watch.watch(
@@ -230,9 +244,13 @@ def _generate_conformance_report(test_paths: List[str], elapsed: float, rc: int)
         total_failures = 0
         total_errors = 0
         
-        for xml_file in ["conformance_results.xml", "llm_results.xml", "vector_results.xml", 
-                         "graph_results.xml", "embedding_results.xml", "schema_results.xml", 
-                         "golden_results.xml"]:
+        xml_files = [
+            "conformance_results.xml", "llm_results.xml", "vector_results.xml", 
+            "graph_results.xml", "embedding_results.xml", "schema_results.xml", 
+            "golden_results.xml", "wire_results.xml",
+        ]
+        
+        for xml_file in xml_files:
             if os.path.exists(xml_file):
                 try:
                     import xml.etree.ElementTree as ET
@@ -242,12 +260,13 @@ def _generate_conformance_report(test_paths: List[str], elapsed: float, rc: int)
                     total_failures += int(root.get("failures", 0))
                     total_errors += int(root.get("errors", 0))
                 except Exception:
+                    # Ignore malformed or unexpected XML
                     pass
         
         status = "PASS" if rc == 0 and total_failures == 0 and total_errors == 0 else "FAIL"
         
         # Get protocol names from paths
-        protocols = []
+        protocols: List[str] = []
         path_to_proto = {v: k for k, v in PROTOCOL_PATHS.items()}
         for p in test_paths:
             if p in path_to_proto:
@@ -264,11 +283,11 @@ def _generate_conformance_report(test_paths: List[str], elapsed: float, rc: int)
                 "total_tests": total_tests,
                 "failures": total_failures,
                 "errors": total_errors,
-                "duration_seconds": round(elapsed, 3)
+                "duration_seconds": round(elapsed, 3),
             },
             "coverage_threshold": int(COV_FAIL_UNDER),
-            "test_suites": ["schema", "golden", "llm", "vector", "graph", "embedding"],
-            "environment": os.getenv("CORPUS_TEST_ENV", "default")
+            "test_suites": ["schema", "golden", "wire", "llm", "vector", "graph", "embedding"],
+            "environment": os.getenv("CORPUS_TEST_ENV", "default"),
         }
         
         with open("conformance_report.json", "w", encoding="utf-8") as f:
@@ -289,8 +308,7 @@ def _upload_results() -> bool:
     
     try:
         print("📤 Uploading conformance results...")
-        # This would be the actual upload logic
-        # For now, just simulate success
+        # TODO: Implement actual upload logic
         print("✅ Results uploaded successfully")
         return True
     except Exception as e:
@@ -307,7 +325,7 @@ def _setup_test_env() -> bool:
         key = input("API key [test-key]: ").strip() 
         key = key or "test-key"
         
-        with open(".testenv", "w") as f:
+        with open(".testenv", "w", encoding="utf-8") as f:
             f.write(f"CORPUS_ENDPOINT={endpoint}\n")
             f.write(f"CORPUS_API_KEY={key}\n")
         
@@ -326,7 +344,7 @@ def _setup_test_env() -> bool:
 def _check_dependencies() -> bool:
     """Check test dependencies like make check-deps."""
     try:
-        import corpus_sdk
+        import corpus_sdk  # noqa: F401
         print("✅ Dependencies OK")
         return True
     except ImportError:
@@ -336,6 +354,59 @@ def _check_dependencies() -> bool:
             file=sys.stderr,
         )
         return False
+
+
+def _list_wire_cases(component: Optional[str] = None, tag: Optional[str] = None) -> int:
+    """List wire conformance test cases."""
+    try:
+        from wire_cases import get_registry
+        registry = get_registry()
+        
+        cases = registry.filter(component=component, tag=tag)
+        
+        print(f"{'ID':<40} {'Component':<12} {'Tags'}")
+        print("-" * 80)
+        for case in cases:
+            tags = ", ".join(sorted(case.tags)[:3])
+            if len(case.tags) > 3:
+                tags += f" (+{len(case.tags) - 3})"
+            print(f"{case.id:<40} {case.component:<12} {tags}")
+        
+        print(f"\nTotal: {len(cases)} cases")
+        return 0
+        
+    except ImportError:
+        print("❌ Wire conformance modules not found")
+        print("   Ensure wire_cases.py is in your Python path")
+        return 1
+
+
+def _print_wire_coverage() -> int:
+    """Print wire conformance coverage summary."""
+    try:
+        from wire_cases import get_registry
+        registry = get_registry()
+        summary = registry.get_coverage_summary()
+        
+        print("Wire Conformance Coverage Summary")
+        print("=" * 40)
+        print(f"Total cases:        {summary['total_cases']}")
+        print(f"Operations covered: {summary['operations_covered']}")
+        print(f"Components covered: {', '.join(summary['components_covered'])}")
+        print()
+        print("Cases by component:")
+        for comp, count in summary["cases_by_component"].items():
+            print(f"  {comp}: {count}")
+        print()
+        print("Cases by tag:")
+        for tag, count in sorted(summary["cases_by_tag"].items()):
+            print(f"  {tag}: {count}")
+        
+        return 0
+        
+    except ImportError:
+        print("❌ Wire conformance modules not found")
+        return 1
 
 
 def _run_suite(
@@ -350,6 +421,9 @@ def _run_suite(
     report_name: Optional[str] = None,
     generate_report: bool = False,
     junit_report: Optional[str] = None,
+    markers: Optional[List[str]] = None,
+    adapter: Optional[str] = None,
+    skip_schema: bool = False,
 ) -> int:
     """Consolidated function to run any test suite."""
     
@@ -359,14 +433,22 @@ def _run_suite(
             print(f"👀 Starting watch mode for {title}...")
         return _run_watch_mode(test_paths, passthrough_args)
 
+    # Validate test paths before invoking pytest
+    if not _validate_paths(test_paths):
+        return 2
+
     # Standard run
     if not quiet_mode:
         print(f"🚀 Running {title}...")
         _print_config(quiet_mode)
         if passthrough_args:
             print(f"   Passthrough args: {' '.join(passthrough_args)}")
+        if markers:
+            print(f"   Markers: {', '.join(markers)}")
+        if adapter:
+            print(f"   Adapter: {adapter}")
 
-    # Validate environment for full conformance runs
+    # Validate environment for full conformance runs (coverage-enabled)
     if not fast_mode and cov_module:
         env_ok, env_msg = _validate_environment()
         if not env_ok:
@@ -374,7 +456,7 @@ def _run_suite(
             return 1
 
     args = _build_pytest_args(
-        test_paths,
+        test_paths=test_paths,
         cov_module=cov_module,
         report_name=report_name,
         fast_mode=fast_mode,
@@ -382,17 +464,20 @@ def _run_suite(
         verbose_mode=verbose_mode,
         passthrough_args=passthrough_args,
         junit_report=junit_report,
+        markers=markers,
+        adapter=adapter,
+        skip_schema=skip_schema,
     )
     
     rc, elapsed = _run_pytest(args)
     
-    report_data = {}
+    report_data: Dict = {}
     if generate_report and not fast_mode:
         report_data = _generate_conformance_report(test_paths, elapsed, rc)
     
     if rc == 0 and not quiet_mode:
         # Get protocol names from paths for the stats message
-        protocols = []
+        protocols: List[str] = []
         path_to_proto = {v: k for k, v in PROTOCOL_PATHS.items()}
         for p in test_paths:
             if p in path_to_proto:
@@ -406,7 +491,7 @@ def _run_suite(
         _print_success_stats(protocols, elapsed, test_count)
         
         if generate_report and report_data:
-            print(f"📊 Report: conformance_report.json")
+            print("📊 Report: conformance_report.json")
             
     elif rc != 0 and not quiet_mode:
         print("\n❌ Conformance failures detected.")
@@ -423,7 +508,7 @@ def _run_suite(
 def main() -> int:
     # Manually split passthrough args
     cli_args = sys.argv[1:]
-    passthrough_args = []
+    passthrough_args: List[str] = []
     if "--" in cli_args:
         split_index = cli_args.index("--")
         passthrough_args = cli_args[split_index + 1:]
@@ -442,6 +527,15 @@ Examples:
   corpus-sdk test-llm-conformance -- -x --tb=short
   corpus-sdk test-ci --upload
   corpus-sdk setup-env
+  
+  # Wire conformance (envelope validation)
+  corpus-sdk test-wire                    # All wire tests
+  corpus-sdk test-wire -m core            # Only core operations
+  corpus-sdk test-wire -m "llm and chat"  # LLM chat operations
+  corpus-sdk test-wire --adapter openai   # Test specific adapter
+  corpus-sdk wire-list                    # List all wire test cases
+  corpus-sdk wire-coverage                # Show wire test coverage
+
   PYTEST_JOBS=1 corpus-sdk test-conformance
 
 Configuration (environment variables):
@@ -459,23 +553,23 @@ Notes:
     # Global flags
     parser.add_argument(
         "-q", "--quiet", action="store_true", 
-        help="Minimal output (quiet mode)"
+        help="Minimal output (quiet mode)",
     )
     parser.add_argument(
         "-v", "--verbose", action="store_true", 
-        help="Detailed output (-vv)"
+        help="Detailed output (-vv)",
     )
     parser.add_argument(
         "-w", "--watch", action="store_true", 
-        help="Run in watch mode (TDD)"
+        help="Run in watch mode (TDD)",
     )
     parser.add_argument(
         "--report", action="store_true",
-        help="Generate conformance report after run"
+        help="Generate conformance report after run",
     )
     parser.add_argument(
         "--upload", action="store_true",
-        help="Upload results to conformance service (requires --report)"
+        help="Upload results to conformance service (requires --report)",
     )
 
     # Subparsers for each command
@@ -483,55 +577,96 @@ Notes:
         dest="command", 
         required=True, 
         help="command to execute",
-        metavar="COMMAND"
+        metavar="COMMAND",
     )
 
     # test-all-conformance / test-conformance
-    all_parser = subparsers.add_parser(
+    subparsers.add_parser(
         "test-all-conformance", 
-        help="Run all protocol conformance suites"
+        help="Run all protocol conformance suites",
     )
     subparsers.add_parser(
         "test-conformance", 
-        help="Alias for test-all-conformance"
+        help="Alias for test-all-conformance",
     )
 
     # test-fast
     subparsers.add_parser(
         "test-fast", 
-        help="Run all tests quickly (no coverage, skip slow tests)"
+        help="Run all tests quickly (no coverage, skip slow tests)",
     )
 
     # Per-protocol commands
     subparsers.add_parser(
         "test-llm-conformance", 
-        help="Run only LLM Protocol conformance tests"
+        help="Run only LLM Protocol conformance tests",
     )
     subparsers.add_parser(
         "test-vector-conformance", 
-        help="Run only Vector Protocol conformance tests"
+        help="Run only Vector Protocol conformance tests",
     )
     subparsers.add_parser(
         "test-graph-conformance", 
-        help="Run only Graph Protocol conformance tests"
+        help="Run only Graph Protocol conformance tests",
     )
     subparsers.add_parser(
         "test-embedding-conformance", 
-        help="Run only Embedding Protocol conformance tests"
+        help="Run only Embedding Protocol conformance tests",
     )
     
     # Schema & Golden commands
     subparsers.add_parser(
         "test-schema",
-        help="Run schema meta-lint (JSON Schema Draft 2020-12)"
+        help="Run schema meta-lint (JSON Schema Draft 2020-12)",
     )
     subparsers.add_parser(
         "test-golden", 
-        help="Validate golden wire messages"
+        help="Validate golden wire messages",
     )
     subparsers.add_parser(
         "verify-schema",
-        help="Run schema meta-lint + golden validation"
+        help="Run schema meta-lint + golden validation",
+    )
+    
+    # Wire conformance commands
+    wire_parser = subparsers.add_parser(
+        "test-wire",
+        help="Run wire-level envelope conformance tests",
+    )
+    wire_parser.add_argument(
+        "-m", "--marker",
+        action="append",
+        dest="markers",
+        help="Filter by pytest marker expression (e.g. 'llm', 'core', 'llm and not streaming')",
+    )
+    wire_parser.add_argument(
+        "--adapter",
+        type=str,
+        help="Test specific adapter implementation",
+    )
+    wire_parser.add_argument(
+        "--skip-schema",
+        action="store_true",
+        help="Skip JSON Schema validation (faster iteration)",
+    )
+    
+    wire_list_parser = subparsers.add_parser(
+        "wire-list",
+        help="List wire conformance test cases",
+    )
+    wire_list_parser.add_argument(
+        "-c", "--component",
+        choices=["llm", "vector", "embedding", "graph"],
+        help="Filter by component",
+    )
+    wire_list_parser.add_argument(
+        "-t", "--tag",
+        help="Filter by tag",
+    )
+    
+    subparsers.add_parser(
+        "wire-coverage",
+        help="Show wire conformance test coverage summary",
     )
     
     # verify / check / validate
@@ -551,23 +686,23 @@ Notes:
     # CI & Advanced commands
     subparsers.add_parser(
         "test-ci",
-        help="Full CI pipeline (deps check + conformance tests + report)"
+        help="Full CI pipeline (deps check + wire + conformance + report)",
     )
     subparsers.add_parser(
         "conformance-report",
-        help="Generate detailed conformance report from last run"
+        help="Generate detailed conformance report from last run",
     )
     subparsers.add_parser(
         "setup-env",
-        help="Interactive test environment configuration"
+        help="Interactive test environment configuration",
     )
     subparsers.add_parser(
         "check-deps",
-        help="Verify test dependencies are installed"
+        help="Verify test dependencies are installed",
     )
     subparsers.add_parser(
         "quick-check",
-        help="Quick health check (smoke test)"
+        help="Quick health check (smoke test)",
     )
 
     # Parse the args
@@ -588,6 +723,16 @@ Notes:
         if args.upload:
             _upload_results()
         return 0 if report_data else 1
+    
+    # Wire utility commands
+    if args.command == "wire-list":
+        return _list_wire_cases(
+            component=getattr(args, "component", None),
+            tag=getattr(args, "tag", None),
+        )
+    
+    if args.command == "wire-coverage":
+        return _print_wire_coverage()
 
     # Common args for _run_suite
     run_kwargs = {
@@ -624,6 +769,19 @@ Notes:
         if not _check_dependencies():
             return 1
         print("🏗️  Running CI-optimized conformance suite...")
+        
+        # Run wire conformance first (fast, catches protocol issues early)
+        wire_rc = _run_suite(
+            title="wire envelope conformance",
+            test_paths=[PROTOCOL_PATHS["wire"]],
+            junit_report="wire_results.xml",
+            **{**run_kwargs, "quiet_mode": False},
+        )
+        if wire_rc != 0:
+            print("❌ Wire conformance failed - stopping CI pipeline")
+            return wire_rc
+        
+        # Then run full conformance suite
         rc = _run_suite(
             title="CI conformance suite",
             test_paths=[PROTOCOL_PATHS[p] for p in ["llm", "vector", "graph", "embedding"]],
@@ -631,7 +789,7 @@ Notes:
             report_name="conformance_coverage_report",
             junit_report="conformance_results.xml",
             generate_report=True,
-            **{**run_kwargs, "quiet_mode": False},  # Force output in CI
+            **{**run_kwargs, "quiet_mode": False},
         )
         if rc == 0:
             _upload_results()
@@ -692,6 +850,18 @@ Notes:
             title="golden wire message validation",
             test_paths=[PROTOCOL_PATHS["golden"]], 
             passthrough_args=[],
+            **run_kwargs,
+        )
+    
+    # Wire conformance command
+    if args.command == "test-wire":
+        return _run_suite(
+            title="wire envelope conformance",
+            test_paths=[PROTOCOL_PATHS["wire"]],
+            junit_report="wire_results.xml",
+            markers=getattr(args, "markers", None),
+            adapter=getattr(args, "adapter", None),
+            skip_schema=getattr(args, "skip_schema", False),
             **run_kwargs,
         )
     
