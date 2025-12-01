@@ -41,9 +41,16 @@ except ImportError:
 
 VALID_COMPONENTS: FrozenSet[str] = frozenset({"llm", "vector", "embedding", "graph"})
 
-PROTOCOL_VERSION = "1.0.0"
+# Corpus Protocol spec version
+PROTOCOL_VERSION = "1.0"
+
+# Schema version segment derived from protocol version (v1, v2, ...)
+SCHEMA_VERSION_SEGMENT = f"v{PROTOCOL_VERSION.split('.')[0]}"
 
 DEFAULT_SCHEMA_BASE_URL = "https://corpusos.com/schemas"
+
+# Default schema_versions tuple (override per-case as needed)
+DEFAULT_SCHEMA_VERSIONS: tuple[str, ...] = (SCHEMA_VERSION_SEGMENT,)
 
 
 # ---------------------------------------------------------------------------
@@ -55,7 +62,7 @@ class CasesConfig:
     """Configuration for case registry loading."""
     
     schema_base_url: str = DEFAULT_SCHEMA_BASE_URL
-    config_paths: tuple = (
+    config_paths: tuple[str, ...] = (
         "config/wire_test_cases.yaml",
         "config/wire_test_cases.yml",
         "config/wire_test_cases.json",
@@ -67,7 +74,7 @@ class CasesConfig:
         base_url = os.environ.get("CORPUS_SCHEMA_BASE_URL", DEFAULT_SCHEMA_BASE_URL)
         
         env_config = os.environ.get("CORPUS_TEST_CASES_CONFIG")
-        paths = (env_config,) if env_config else cls.config_paths
+        paths: tuple[str, ...] = (env_config,) if env_config else cls.config_paths
         
         return cls(schema_base_url=base_url, config_paths=paths)
 
@@ -98,7 +105,7 @@ class WireRequestCase:
     op: str
     build_method: str
     schema_id: str
-    schema_versions: tuple[str, ...] = ("v1",)
+    schema_versions: tuple[str, ...] = DEFAULT_SCHEMA_VERSIONS
     args_validator: Optional[str] = None
     description: str = ""
     tags: FrozenSet[str] = field(default_factory=frozenset)
@@ -140,7 +147,7 @@ class WireRequestCase:
             op=data["op"],
             build_method=data["build_method"],
             schema_id=data.get("schema_id", ""),
-            schema_versions=tuple(data.get("schema_versions", ["v1"])),
+            schema_versions=tuple(data.get("schema_versions", DEFAULT_SCHEMA_VERSIONS)),
             args_validator=data.get("args_validator"),
             description=data.get("description", ""),
             tags=frozenset(data.get("tags", [])),
@@ -166,7 +173,7 @@ class WireRequestCase:
         tag: Optional[str] = None,
         op_prefix: Optional[str] = None,
     ) -> bool:
-        """Check if case matches filter criteria."""
+        """Check if case matches basic filter criteria."""
         if component and self.component != component:
             return False
         if tag and tag not in self.tags:
@@ -204,7 +211,7 @@ def _load_json_file(path: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def load_external_config(paths: Optional[tuple] = None) -> Optional[Dict[str, Any]]:
+def load_external_config(paths: Optional[tuple[str, ...]] = None) -> Optional[Dict[str, Any]]:
     """
     Load test case configuration from external files.
     
@@ -247,96 +254,127 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
     Build the default registry of wire request test cases.
     
     This is the canonical set of protocol operations that should be tested
-    for wire-level conformance.
+    for wire-level conformance. Matches the Operation Registry in the
+    Corpus Protocol Specification v1.0 (keep in sync when the spec changes).
     """
+    v = SCHEMA_VERSION_SEGMENT  # e.g., "v1"
+
     return [
         # ========================== LLM ========================== #
-        WireRequestCase(
-            id="llm_complete",
-            component="llm",
-            op="llm.complete",
-            build_method="build_llm_complete_envelope",
-            schema_id=f"{base_url}/llm/v1/llm.envelope.request.json",
-            schema_versions=("v1", "v0.9"),
-            args_validator="validate_llm_complete_args",
-            description="Text completion request",
-            tags=frozenset({"core", "llm", "completion"}),
-        ),
-        WireRequestCase(
-            id="llm_complete_streaming",
-            component="llm",
-            op="llm.complete",
-            build_method="build_llm_complete_streaming_envelope",
-            schema_id=f"{base_url}/llm/v1/llm.envelope.request.json",
-            schema_versions=("v1",),
-            args_validator="validate_llm_complete_args",
-            description="Streaming text completion request",
-            tags=frozenset({"core", "llm", "completion", "streaming"}),
-        ),
-        WireRequestCase(
-            id="llm_chat",
-            component="llm",
-            op="llm.chat",
-            build_method="build_llm_chat_envelope",
-            schema_id=f"{base_url}/llm/v1/llm.envelope.request.json",
-            schema_versions=("v1",),
-            args_validator="validate_llm_chat_args",
-            description="Chat completion with message history",
-            tags=frozenset({"core", "llm", "chat"}),
-        ),
-        WireRequestCase(
-            id="llm_chat_with_tools",
-            component="llm",
-            op="llm.chat",
-            build_method="build_llm_chat_with_tools_envelope",
-            schema_id=f"{base_url}/llm/v1/llm.envelope.request.json",
-            schema_versions=("v1",),
-            args_validator="validate_llm_chat_args",
-            description="Chat completion with tool/function calling",
-            tags=frozenset({"core", "llm", "chat", "tools"}),
-        ),
-        WireRequestCase(
-            id="llm_count_tokens",
-            component="llm",
-            op="llm.count_tokens",
-            build_method="build_llm_count_tokens_envelope",
-            schema_id=f"{base_url}/llm/v1/llm.envelope.request.json",
-            schema_versions=("v1", "v0.9"),
-            args_validator="validate_llm_count_tokens_args",
-            description="Token counting request",
-            tags=frozenset({"llm", "tokens"}),
-        ),
+        # §11.1 capabilities
         WireRequestCase(
             id="llm_capabilities",
             component="llm",
             op="llm.capabilities",
             build_method="build_llm_capabilities_envelope",
-            schema_id=f"{base_url}/llm/v1/llm.envelope.request.json",
-            schema_versions=("v1", "v0.9"),
-            description="Model capabilities discovery",
-            tags=frozenset({"llm", "discovery"}),
+            schema_id=f"{base_url}/llm/{v}/llm.envelope.request.json",
+            schema_versions=(v, "v1.0"),
+            description="Discover supported LLM features and models",
+            tags=frozenset({"llm", "discovery", "capabilities"}),
         ),
+        # §11.2 complete
+        WireRequestCase(
+            id="llm_complete",
+            component="llm",
+            op="llm.complete",
+            build_method="build_llm_complete_envelope",
+            schema_id=f"{base_url}/llm/{v}/llm.envelope.request.json",
+            schema_versions=(v, "v1.0"),
+            args_validator="validate_llm_complete_args",
+            description="Generate LLM completion for given messages",
+            tags=frozenset({"core", "llm", "completion"}),
+        ),
+        WireRequestCase(
+            id="llm_complete_with_tools",
+            component="llm",
+            op="llm.complete",
+            build_method="build_llm_complete_with_tools_envelope",
+            schema_id=f"{base_url}/llm/{v}/llm.envelope.request.json",
+            schema_versions=(v,),
+            args_validator="validate_llm_complete_args",
+            description="LLM completion with tool/function calling",
+            tags=frozenset({"core", "llm", "completion", "tools"}),
+        ),
+        WireRequestCase(
+            id="llm_complete_json_mode",
+            component="llm",
+            op="llm.complete",
+            build_method="build_llm_complete_json_mode_envelope",
+            schema_id=f"{base_url}/llm/{v}/llm.envelope.request.json",
+            schema_versions=(v,),
+            args_validator="validate_llm_complete_args",
+            description="LLM completion with JSON output mode",
+            tags=frozenset({"llm", "completion", "json_mode"}),
+        ),
+        # §11.3 stream
+        WireRequestCase(
+            id="llm_stream",
+            component="llm",
+            op="llm.stream",
+            build_method="build_llm_stream_envelope",
+            schema_id=f"{base_url}/llm/{v}/llm.envelope.request.json",
+            schema_versions=(v,),
+            args_validator="validate_llm_stream_args",
+            description="Stream LLM completion incrementally",
+            tags=frozenset({"core", "llm", "streaming"}),
+        ),
+        WireRequestCase(
+            id="llm_stream_with_tools",
+            component="llm",
+            op="llm.stream",
+            build_method="build_llm_stream_with_tools_envelope",
+            schema_id=f"{base_url}/llm/{v}/llm.envelope.request.json",
+            schema_versions=(v,),
+            args_validator="validate_llm_stream_args",
+            description="Stream LLM completion with tool calling",
+            tags=frozenset({"llm", "streaming", "tools"}),
+        ),
+        # §11.4 count_tokens
+        WireRequestCase(
+            id="llm_count_tokens",
+            component="llm",
+            op="llm.count_tokens",
+            build_method="build_llm_count_tokens_envelope",
+            schema_id=f"{base_url}/llm/{v}/llm.envelope.request.json",
+            schema_versions=(v, "v1.0"),
+            args_validator="validate_llm_count_tokens_args",
+            description="Count tokens in text for a specific model",
+            tags=frozenset({"llm", "tokens"}),
+        ),
+        # §11.5 health
         WireRequestCase(
             id="llm_health",
             component="llm",
             op="llm.health",
             build_method="build_llm_health_envelope",
-            schema_id=f"{base_url}/llm/v1/llm.envelope.request.json",
-            schema_versions=("v1", "v0.9"),
-            description="Health check request",
+            schema_id=f"{base_url}/llm/{v}/llm.envelope.request.json",
+            schema_versions=(v, "v1.0"),
+            description="Check LLM provider health and model availability",
             tags=frozenset({"llm", "health", "operational"}),
         ),
 
         # ======================== VECTOR ========================= #
+        # §15.1 capabilities
+        WireRequestCase(
+            id="vector_capabilities",
+            component="vector",
+            op="vector.capabilities",
+            build_method="build_vector_capabilities_envelope",
+            schema_id=f"{base_url}/vector/{v}/vector.envelope.request.json",
+            schema_versions=(v,),
+            description="Discover vector database capabilities and limits",
+            tags=frozenset({"vector", "discovery", "capabilities"}),
+        ),
+        # §15.2 query
         WireRequestCase(
             id="vector_query",
             component="vector",
             op="vector.query",
             build_method="build_vector_query_envelope",
-            schema_id=f"{base_url}/vector/v1/vector.envelope.request.json",
-            schema_versions=("v1", "v0.9"),
+            schema_id=f"{base_url}/vector/{v}/vector.envelope.request.json",
+            schema_versions=(v, "v1.0"),
             args_validator="validate_vector_query_args",
-            description="Vector similarity search",
+            description="Vector similarity search query",
             tags=frozenset({"core", "vector", "query"}),
         ),
         WireRequestCase(
@@ -344,260 +382,435 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             component="vector",
             op="vector.query",
             build_method="build_vector_query_with_filter_envelope",
-            schema_id=f"{base_url}/vector/v1/vector.envelope.request.json",
-            schema_versions=("v1",),
+            schema_id=f"{base_url}/vector/{v}/vector.envelope.request.json",
+            schema_versions=(v,),
             args_validator="validate_vector_query_args",
             description="Vector query with metadata filtering",
             tags=frozenset({"core", "vector", "query", "filter"}),
         ),
         WireRequestCase(
-            id="vector_query_hybrid",
+            id="vector_query_by_text",
             component="vector",
             op="vector.query",
-            build_method="build_vector_query_hybrid_envelope",
-            schema_id=f"{base_url}/vector/v1/vector.envelope.request.json",
-            schema_versions=("v1",),
+            build_method="build_vector_query_by_text_envelope",
+            schema_id=f"{base_url}/vector/{v}/vector.envelope.request.json",
+            schema_versions=(v,),
             args_validator="validate_vector_query_args",
-            description="Hybrid vector + keyword search",
-            tags=frozenset({"vector", "query", "hybrid"}),
+            description="Vector query using text (auto-embedded)",
+            tags=frozenset({"vector", "query", "text"}),
         ),
+        # §15.3 upsert
         WireRequestCase(
             id="vector_upsert",
             component="vector",
             op="vector.upsert",
             build_method="build_vector_upsert_envelope",
-            schema_id=f"{base_url}/vector/v1/vector.envelope.request.json",
-            schema_versions=("v1", "v0.9"),
+            schema_id=f"{base_url}/vector/{v}/vector.envelope.request.json",
+            schema_versions=(v, "v1.0"),
             args_validator="validate_vector_upsert_args",
-            description="Vector upsert (insert or update)",
-            tags=frozenset({"core", "vector", "write"}),
+            description="Upsert vectors (insert or update)",
+            tags=frozenset({"core", "vector", "write", "upsert"}),
         ),
         WireRequestCase(
             id="vector_upsert_batch",
             component="vector",
             op="vector.upsert",
             build_method="build_vector_upsert_batch_envelope",
-            schema_id=f"{base_url}/vector/v1/vector.envelope.request.json",
-            schema_versions=("v1",),
+            schema_id=f"{base_url}/vector/{v}/vector.envelope.request.json",
+            schema_versions=(v,),
             args_validator="validate_vector_upsert_args",
             description="Batch vector upsert",
-            tags=frozenset({"vector", "write", "batch"}),
+            tags=frozenset({"vector", "write", "upsert", "batch"}),
         ),
+        WireRequestCase(
+            id="vector_upsert_with_metadata",
+            component="vector",
+            op="vector.upsert",
+            build_method="build_vector_upsert_with_metadata_envelope",
+            schema_id=f"{base_url}/vector/{v}/vector.envelope.request.json",
+            schema_versions=(v,),
+            args_validator="validate_vector_upsert_args",
+            description="Vector upsert with metadata",
+            tags=frozenset({"vector", "write", "upsert", "metadata"}),
+        ),
+        # §15.4 delete
         WireRequestCase(
             id="vector_delete",
             component="vector",
             op="vector.delete",
             build_method="build_vector_delete_envelope",
-            schema_id=f"{base_url}/vector/v1/vector.envelope.request.json",
-            schema_versions=("v1",),
+            schema_id=f"{base_url}/vector/{v}/vector.envelope.request.json",
+            schema_versions=(v,),
             args_validator="validate_vector_delete_args",
-            description="Vector deletion by ID",
-            tags=frozenset({"vector", "write", "delete"}),
+            description="Delete vectors by ID",
+            tags=frozenset({"core", "vector", "write", "delete"}),
         ),
         WireRequestCase(
             id="vector_delete_by_filter",
             component="vector",
             op="vector.delete",
             build_method="build_vector_delete_by_filter_envelope",
-            schema_id=f"{base_url}/vector/v1/vector.envelope.request.json",
-            schema_versions=("v1",),
+            schema_id=f"{base_url}/vector/{v}/vector.envelope.request.json",
+            schema_versions=(v,),
             args_validator="validate_vector_delete_args",
-            description="Vector deletion by metadata filter",
+            description="Delete vectors by metadata filter",
             tags=frozenset({"vector", "write", "delete", "filter"}),
         ),
         WireRequestCase(
-            id="vector_fetch",
+            id="vector_delete_all",
             component="vector",
-            op="vector.fetch",
-            build_method="build_vector_fetch_envelope",
-            schema_id=f"{base_url}/vector/v1/vector.envelope.request.json",
-            schema_versions=("v1",),
-            args_validator="validate_vector_fetch_args",
-            description="Fetch vectors by ID",
-            tags=frozenset({"vector", "read"}),
+            op="vector.delete",
+            build_method="build_vector_delete_all_envelope",
+            schema_id=f"{base_url}/vector/{v}/vector.envelope.request.json",
+            schema_versions=(v,),
+            args_validator="validate_vector_delete_args",
+            description="Delete all vectors in namespace",
+            tags=frozenset({"vector", "write", "delete"}),
         ),
+        # §15.5 create_namespace
         WireRequestCase(
-            id="vector_list",
+            id="vector_create_namespace",
             component="vector",
-            op="vector.list",
-            build_method="build_vector_list_envelope",
-            schema_id=f"{base_url}/vector/v1/vector.envelope.request.json",
-            schema_versions=("v1",),
-            description="List vectors with pagination",
-            tags=frozenset({"vector", "read", "list"}),
+            op="vector.create_namespace",
+            build_method="build_vector_create_namespace_envelope",
+            schema_id=f"{base_url}/vector/{v}/vector.envelope.request.json",
+            schema_versions=(v,),
+            args_validator="validate_vector_namespace_args",
+            description="Create a new vector namespace",
+            tags=frozenset({"vector", "namespace", "write"}),
         ),
+        # §15.6 delete_namespace
         WireRequestCase(
-            id="vector_describe_index",
+            id="vector_delete_namespace",
             component="vector",
-            op="vector.describe_index",
-            build_method="build_vector_describe_index_envelope",
-            schema_id=f"{base_url}/vector/v1/vector.envelope.request.json",
-            schema_versions=("v1",),
-            description="Describe vector index metadata",
-            tags=frozenset({"vector", "discovery"}),
+            op="vector.delete_namespace",
+            build_method="build_vector_delete_namespace_envelope",
+            schema_id=f"{base_url}/vector/{v}/vector.envelope.request.json",
+            schema_versions=(v,),
+            args_validator="validate_vector_namespace_args",
+            description="Delete a vector namespace",
+            tags=frozenset({"vector", "namespace", "write", "delete"}),
         ),
+        # §15.7 health
         WireRequestCase(
             id="vector_health",
             component="vector",
             op="vector.health",
             build_method="build_vector_health_envelope",
-            schema_id=f"{base_url}/vector/v1/vector.envelope.request.json",
-            schema_versions=("v1",),
-            description="Vector service health check",
+            schema_id=f"{base_url}/vector/{v}/vector.envelope.request.json",
+            schema_versions=(v,),
+            description="Check vector database health",
             tags=frozenset({"vector", "health", "operational"}),
         ),
 
         # ======================= EMBEDDING ======================= #
-        WireRequestCase(
-            id="embedding_embed_single",
-            component="embedding",
-            op="embedding.embed",
-            build_method="build_embedding_embed_single_envelope",
-            schema_id=f"{base_url}/embedding/v1/embedding.envelope.request.json",
-            schema_versions=("v1", "v0.9"),
-            args_validator="validate_embedding_embed_args",
-            description="Single text embedding",
-            tags=frozenset({"core", "embedding"}),
-        ),
-        WireRequestCase(
-            id="embedding_embed_batch",
-            component="embedding",
-            op="embedding.embed",
-            build_method="build_embedding_embed_batch_envelope",
-            schema_id=f"{base_url}/embedding/v1/embedding.envelope.request.json",
-            schema_versions=("v1",),
-            args_validator="validate_embedding_embed_args",
-            description="Batch text embedding",
-            tags=frozenset({"core", "embedding", "batch"}),
-        ),
-        WireRequestCase(
-            id="embedding_embed_with_dimensions",
-            component="embedding",
-            op="embedding.embed",
-            build_method="build_embedding_embed_with_dimensions_envelope",
-            schema_id=f"{base_url}/embedding/v1/embedding.envelope.request.json",
-            schema_versions=("v1",),
-            args_validator="validate_embedding_embed_args",
-            description="Embedding with explicit dimensions",
-            tags=frozenset({"embedding", "dimensions"}),
-        ),
+        # §19.1 capabilities
         WireRequestCase(
             id="embedding_capabilities",
             component="embedding",
             op="embedding.capabilities",
             build_method="build_embedding_capabilities_envelope",
-            schema_id=f"{base_url}/embedding/v1/embedding.envelope.request.json",
-            schema_versions=("v1",),
-            description="Embedding model capabilities",
-            tags=frozenset({"embedding", "discovery"}),
+            schema_id=f"{base_url}/embedding/{v}/embedding.envelope.request.json",
+            schema_versions=(v,),
+            description="Discover embedding model capabilities",
+            tags=frozenset({"embedding", "discovery", "capabilities"}),
         ),
+        # §19.2 embed
+        WireRequestCase(
+            id="embedding_embed",
+            component="embedding",
+            op="embedding.embed",
+            build_method="build_embedding_embed_envelope",
+            schema_id=f"{base_url}/embedding/{v}/embedding.envelope.request.json",
+            schema_versions=(v, "v1.0"),
+            args_validator="validate_embedding_embed_args",
+            description="Generate embedding for single text",
+            tags=frozenset({"core", "embedding", "embed"}),
+        ),
+        WireRequestCase(
+            id="embedding_embed_with_model",
+            component="embedding",
+            op="embedding.embed",
+            build_method="build_embedding_embed_with_model_envelope",
+            schema_id=f"{base_url}/embedding/{v}/embedding.envelope.request.json",
+            schema_versions=(v,),
+            args_validator="validate_embedding_embed_args",
+            description="Generate embedding with explicit model selection",
+            tags=frozenset({"embedding", "embed", "model"}),
+        ),
+        WireRequestCase(
+            id="embedding_embed_truncate",
+            component="embedding",
+            op="embedding.embed",
+            build_method="build_embedding_embed_truncate_envelope",
+            schema_id=f"{base_url}/embedding/{v}/embedding.envelope.request.json",
+            schema_versions=(v,),
+            args_validator="validate_embedding_embed_args",
+            description="Generate embedding with truncation enabled",
+            tags=frozenset({"embedding", "embed", "truncate"}),
+        ),
+        WireRequestCase(
+            id="embedding_embed_normalized",
+            component="embedding",
+            op="embedding.embed",
+            build_method="build_embedding_embed_normalized_envelope",
+            schema_id=f"{base_url}/embedding/{v}/embedding.envelope.request.json",
+            schema_versions=(v,),
+            args_validator="validate_embedding_embed_args",
+            description="Generate normalized embedding",
+            tags=frozenset({"embedding", "embed", "normalize"}),
+        ),
+        # §19.3 embed_batch
+        WireRequestCase(
+            id="embedding_embed_batch",
+            component="embedding",
+            op="embedding.embed_batch",
+            build_method="build_embedding_embed_batch_envelope",
+            schema_id=f"{base_url}/embedding/{v}/embedding.envelope.request.json",
+            schema_versions=(v,),
+            args_validator="validate_embedding_embed_batch_args",
+            description="Generate embeddings for multiple texts",
+            tags=frozenset({"core", "embedding", "batch"}),
+        ),
+        WireRequestCase(
+            id="embedding_embed_batch_large",
+            component="embedding",
+            op="embedding.embed_batch",
+            build_method="build_embedding_embed_batch_large_envelope",
+            schema_id=f"{base_url}/embedding/{v}/embedding.envelope.request.json",
+            schema_versions=(v,),
+            args_validator="validate_embedding_embed_batch_args",
+            description="Large batch embedding request",
+            tags=frozenset({"embedding", "batch", "large"}),
+        ),
+        # §19.4 count_tokens
+        WireRequestCase(
+            id="embedding_count_tokens",
+            component="embedding",
+            op="embedding.count_tokens",
+            build_method="build_embedding_count_tokens_envelope",
+            schema_id=f"{base_url}/embedding/{v}/embedding.envelope.request.json",
+            schema_versions=(v,),
+            args_validator="validate_embedding_count_tokens_args",
+            description="Count tokens for embedding model",
+            tags=frozenset({"embedding", "tokens"}),
+        ),
+        # §19.5 health
         WireRequestCase(
             id="embedding_health",
             component="embedding",
             op="embedding.health",
             build_method="build_embedding_health_envelope",
-            schema_id=f"{base_url}/embedding/v1/embedding.envelope.request.json",
-            schema_versions=("v1",),
-            description="Embedding service health check",
+            schema_id=f"{base_url}/embedding/{v}/embedding.envelope.request.json",
+            schema_versions=(v,),
+            description="Check embedding service health",
             tags=frozenset({"embedding", "health", "operational"}),
         ),
 
         # ========================= GRAPH ========================= #
+        # §7.1 capabilities
         WireRequestCase(
-            id="graph_query_cypher",
+            id="graph_capabilities",
             component="graph",
-            op="graph.query",
-            build_method="build_graph_query_cypher_envelope",
-            schema_id=f"{base_url}/graph/v1/graph.envelope.request.json",
-            schema_versions=("v1",),
-            args_validator="validate_graph_query_args",
-            description="Cypher graph query",
-            tags=frozenset({"core", "graph", "query", "cypher"}),
+            op="graph.capabilities",
+            build_method="build_graph_capabilities_envelope",
+            schema_id=f"{base_url}/graph/{v}/graph.envelope.request.json",
+            schema_versions=(v,),
+            description="Discover graph database capabilities",
+            tags=frozenset({"graph", "discovery", "capabilities"}),
         ),
+        # §7.2 upsert_nodes
+        WireRequestCase(
+            id="graph_upsert_nodes",
+            component="graph",
+            op="graph.upsert_nodes",
+            build_method="build_graph_upsert_nodes_envelope",
+            schema_id=f"{base_url}/graph/{v}/graph.envelope.request.json",
+            schema_versions=(v,),
+            args_validator="validate_graph_upsert_nodes_args",
+            description="Upsert graph nodes/vertices",
+            tags=frozenset({"core", "graph", "write", "nodes"}),
+        ),
+        WireRequestCase(
+            id="graph_upsert_nodes_batch",
+            component="graph",
+            op="graph.upsert_nodes",
+            build_method="build_graph_upsert_nodes_batch_envelope",
+            schema_id=f"{base_url}/graph/{v}/graph.envelope.request.json",
+            schema_versions=(v,),
+            args_validator="validate_graph_upsert_nodes_args",
+            description="Batch upsert graph nodes",
+            tags=frozenset({"graph", "write", "nodes", "batch"}),
+        ),
+        # §7.3 upsert_edges
+        WireRequestCase(
+            id="graph_upsert_edges",
+            component="graph",
+            op="graph.upsert_edges",
+            build_method="build_graph_upsert_edges_envelope",
+            schema_id=f"{base_url}/graph/{v}/graph.envelope.request.json",
+            schema_versions=(v,),
+            args_validator="validate_graph_upsert_edges_args",
+            description="Upsert graph edges/relationships",
+            tags=frozenset({"core", "graph", "write", "edges"}),
+        ),
+        WireRequestCase(
+            id="graph_upsert_edges_batch",
+            component="graph",
+            op="graph.upsert_edges",
+            build_method="build_graph_upsert_edges_batch_envelope",
+            schema_id=f"{base_url}/graph/{v}/graph.envelope.request.json",
+            schema_versions=(v,),
+            args_validator="validate_graph_upsert_edges_args",
+            description="Batch upsert graph edges",
+            tags=frozenset({"graph", "write", "edges", "batch"}),
+        ),
+        # §7.4 delete_nodes
+        WireRequestCase(
+            id="graph_delete_nodes",
+            component="graph",
+            op="graph.delete_nodes",
+            build_method="build_graph_delete_nodes_envelope",
+            schema_id=f"{base_url}/graph/{v}/graph.envelope.request.json",
+            schema_versions=(v,),
+            args_validator="validate_graph_delete_nodes_args",
+            description="Delete graph nodes by ID",
+            tags=frozenset({"core", "graph", "write", "delete", "nodes"}),
+        ),
+        WireRequestCase(
+            id="graph_delete_nodes_by_label",
+            component="graph",
+            op="graph.delete_nodes",
+            build_method="build_graph_delete_nodes_by_label_envelope",
+            schema_id=f"{base_url}/graph/{v}/graph.envelope.request.json",
+            schema_versions=(v,),
+            args_validator="validate_graph_delete_nodes_args",
+            description="Delete graph nodes by label",
+            tags=frozenset({"graph", "write", "delete", "nodes", "label"}),
+        ),
+        # §7.5 delete_edges
+        WireRequestCase(
+            id="graph_delete_edges",
+            component="graph",
+            op="graph.delete_edges",
+            build_method="build_graph_delete_edges_envelope",
+            schema_id=f"{base_url}/graph/{v}/graph.envelope.request.json",
+            schema_versions=(v,),
+            args_validator="validate_graph_delete_edges_args",
+            description="Delete graph edges by ID",
+            tags=frozenset({"core", "graph", "write", "delete", "edges"}),
+        ),
+        WireRequestCase(
+            id="graph_delete_edges_by_type",
+            component="graph",
+            op="graph.delete_edges",
+            build_method="build_graph_delete_edges_by_type_envelope",
+            schema_id=f"{base_url}/graph/{v}/graph.envelope.request.json",
+            schema_versions=(v,),
+            args_validator="validate_graph_delete_edges_args",
+            description="Delete graph edges by type",
+            tags=frozenset({"graph", "write", "delete", "edges", "type"}),
+        ),
+        # §7.6 query
         WireRequestCase(
             id="graph_query_gremlin",
             component="graph",
             op="graph.query",
             build_method="build_graph_query_gremlin_envelope",
-            schema_id=f"{base_url}/graph/v1/graph.envelope.request.json",
-            schema_versions=("v1",),
+            schema_id=f"{base_url}/graph/{v}/graph.envelope.request.json",
+            schema_versions=(v,),
             args_validator="validate_graph_query_args",
-            description="Gremlin graph traversal",
-            tags=frozenset({"graph", "query", "gremlin"}),
+            description="Execute Gremlin graph query",
+            tags=frozenset({"core", "graph", "query", "gremlin"}),
+        ),
+        WireRequestCase(
+            id="graph_query_cypher",
+            component="graph",
+            op="graph.query",
+            build_method="build_graph_query_cypher_envelope",
+            schema_id=f"{base_url}/graph/{v}/graph.envelope.request.json",
+            schema_versions=(v,),
+            args_validator="validate_graph_query_args",
+            description="Execute Cypher graph query",
+            tags=frozenset({"graph", "query", "cypher"}),
         ),
         WireRequestCase(
             id="graph_query_sparql",
             component="graph",
             op="graph.query",
             build_method="build_graph_query_sparql_envelope",
-            schema_id=f"{base_url}/graph/v1/graph.envelope.request.json",
-            schema_versions=("v1",),
+            schema_id=f"{base_url}/graph/{v}/graph.envelope.request.json",
+            schema_versions=(v,),
             args_validator="validate_graph_query_args",
-            description="SPARQL RDF query",
+            description="Execute SPARQL RDF query",
             tags=frozenset({"graph", "query", "sparql"}),
         ),
         WireRequestCase(
-            id="graph_mutate_create_node",
+            id="graph_query_with_params",
             component="graph",
-            op="graph.mutate",
-            build_method="build_graph_mutate_create_node_envelope",
-            schema_id=f"{base_url}/graph/v1/graph.envelope.request.json",
-            schema_versions=("v1",),
-            args_validator="validate_graph_mutate_args",
-            description="Create graph node",
-            tags=frozenset({"core", "graph", "write", "node"}),
+            op="graph.query",
+            build_method="build_graph_query_with_params_envelope",
+            schema_id=f"{base_url}/graph/{v}/graph.envelope.request.json",
+            schema_versions=(v,),
+            args_validator="validate_graph_query_args",
+            description="Graph query with parameterized bindings",
+            tags=frozenset({"graph", "query", "parameters"}),
+        ),
+        # §7.7 stream_query
+        WireRequestCase(
+            id="graph_stream_query",
+            component="graph",
+            op="graph.stream_query",
+            build_method="build_graph_stream_query_envelope",
+            schema_id=f"{base_url}/graph/{v}/graph.envelope.request.json",
+            schema_versions=(v,),
+            args_validator="validate_graph_query_args",
+            description="Stream graph query results incrementally",
+            tags=frozenset({"core", "graph", "query", "streaming"}),
         ),
         WireRequestCase(
-            id="graph_mutate_create_edge",
+            id="graph_stream_query_gremlin",
             component="graph",
-            op="graph.mutate",
-            build_method="build_graph_mutate_create_edge_envelope",
-            schema_id=f"{base_url}/graph/v1/graph.envelope.request.json",
-            schema_versions=("v1",),
-            args_validator="validate_graph_mutate_args",
-            description="Create graph edge/relationship",
-            tags=frozenset({"core", "graph", "write", "edge"}),
+            op="graph.stream_query",
+            build_method="build_graph_stream_query_gremlin_envelope",
+            schema_id=f"{base_url}/graph/{v}/graph.envelope.request.json",
+            schema_versions=(v,),
+            args_validator="validate_graph_query_args",
+            description="Stream Gremlin query results",
+            tags=frozenset({"graph", "query", "streaming", "gremlin"}),
         ),
+        # §7.8 bulk_vertices
         WireRequestCase(
-            id="graph_mutate_batch",
+            id="graph_bulk_vertices",
             component="graph",
-            op="graph.mutate",
-            build_method="build_graph_mutate_batch_envelope",
-            schema_id=f"{base_url}/graph/v1/graph.envelope.request.json",
-            schema_versions=("v1",),
-            args_validator="validate_graph_mutate_args",
-            description="Batch graph mutations",
-            tags=frozenset({"graph", "write", "batch"}),
+            op="graph.bulk_vertices",
+            build_method="build_graph_bulk_vertices_envelope",
+            schema_id=f"{base_url}/graph/{v}/graph.envelope.request.json",
+            schema_versions=(v,),
+            args_validator="validate_graph_bulk_vertices_args",
+            description="Bulk load vertices from external source",
+            tags=frozenset({"graph", "write", "bulk", "nodes"}),
         ),
+        # §7.9 get_schema
         WireRequestCase(
-            id="graph_schema_get",
+            id="graph_get_schema",
             component="graph",
-            op="graph.schema",
-            build_method="build_graph_schema_get_envelope",
-            schema_id=f"{base_url}/graph/v1/graph.envelope.request.json",
-            schema_versions=("v1",),
-            description="Get graph schema",
+            op="graph.get_schema",
+            build_method="build_graph_get_schema_envelope",
+            schema_id=f"{base_url}/graph/{v}/graph.envelope.request.json",
+            schema_versions=(v,),
+            description="Retrieve graph schema (node labels, edge types, properties)",
             tags=frozenset({"graph", "schema", "discovery"}),
         ),
-        WireRequestCase(
-            id="graph_traverse",
-            component="graph",
-            op="graph.traverse",
-            build_method="build_graph_traverse_envelope",
-            schema_id=f"{base_url}/graph/v1/graph.envelope.request.json",
-            schema_versions=("v1",),
-            args_validator="validate_graph_traverse_args",
-            description="Graph traversal from starting node",
-            tags=frozenset({"graph", "query", "traverse"}),
-        ),
+        # §7.10 health
         WireRequestCase(
             id="graph_health",
             component="graph",
             op="graph.health",
             build_method="build_graph_health_envelope",
-            schema_id=f"{base_url}/graph/v1/graph.envelope.request.json",
-            schema_versions=("v1",),
-            description="Graph service health check",
+            schema_id=f"{base_url}/graph/{v}/graph.envelope.request.json",
+            schema_versions=(v,),
+            description="Check graph database health",
             tags=frozenset({"graph", "health", "operational"}),
         ),
     ]
@@ -722,19 +935,11 @@ class WireRequestCaseRegistry:
         Returns:
             List of matching cases.
         """
-        result = []
+        result: List[WireRequestCase] = []
         
         for case in self._cases:
-            # Component filter
-            if component and case.component != component:
-                continue
-            
-            # Operation prefix filter
-            if op_prefix and not case.op.startswith(op_prefix):
-                continue
-            
-            # Single tag filter (legacy/shorthand)
-            if tag and tag not in case.tags:
+            # Basic filters: component, tag, op_prefix
+            if not case.matches_filter(component=component, tag=tag, op_prefix=op_prefix):
                 continue
             
             # All tags filter
@@ -772,6 +977,7 @@ class WireRequestCaseRegistry:
             Dictionary with coverage statistics.
         """
         return {
+            "protocol_version": PROTOCOL_VERSION,
             "total_cases": len(self._cases),
             "cases_by_component": {
                 comp: len(cases) for comp, cases in self._by_component.items()
@@ -935,9 +1141,10 @@ def main() -> None:
         else:
             output = f"""Wire Request Case Coverage Summary
 ===================================
-Total cases:        {summary['total_cases']}
-Operations covered: {summary['operations_covered']}
-Components covered: {', '.join(summary['components_covered'])}
+Protocol version:  {summary['protocol_version']}
+Total cases:       {summary['total_cases']}
+Operations covered:{summary['operations_covered']}
+Components covered:{', '.join(summary['components_covered'])}
 
 Cases by component:
 {chr(10).join(f"  {k}: {v}" for k, v in summary['cases_by_component'].items())}
