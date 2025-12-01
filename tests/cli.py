@@ -35,7 +35,7 @@ PROTOCOL_PATHS: Dict[str, str] = {
     "embedding": "tests/embedding",
     "schema": "tests/schema",
     "golden": "tests/golden",
-    "wire": "tests/conformance",  # Wire-level envelope conformance
+    "wire": "tests/live",  # Wire-level envelope conformance
 }
 
 # Configuration from environment
