@@ -46,12 +46,12 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pytest
 
-from wire_cases import (
+from tests.live.wire_cases import (
     WireRequestCase,
     get_pytest_params,
     get_registry,
 )
-from wire_validators import (
+from tests.live.wire_validators import (
     ValidationError,
     EnvelopeShapeError,
     EnvelopeTypeError,
