@@ -825,7 +825,9 @@ class TestCategorizer:
         # The file path will look like tests/live/test_wire_conformance.py,
         # so we infer the protocol from the parametrized ID, which includes
         # operation names like llm.complete, vector.query, etc.
-        if protocol == "other" and "tests/live" in nodeid_lower:
+        if protocol == "other" and (
+            "tests/live" in nodeid_lower or "tests\\live" in nodeid_lower
+        ):
             for proto in ("llm", "vector", "graph", "embedding"):
                 bracket_token = f"[{proto}."
                 if bracket_token in nodeid_lower or f"{proto}." in nodeid_lower:
