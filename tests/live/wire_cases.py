@@ -591,7 +591,7 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             build_method="build_graph_upsert_nodes_envelope",
             schema_id=f"{base_url}/graph/{v}/graph.envelope.request.json",
             args_validator="validate_graph_upsert_nodes_args",
-            description="Upsert graph nodes/vertices",
+            description="Upsert graph nodes",
             tags=frozenset({"core", "graph", "write", "nodes"}),
         ),
         WireRequestCase(
@@ -737,7 +737,7 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             build_method="build_graph_bulk_vertices_envelope",
             schema_id=f"{base_url}/graph/{v}/graph.envelope.request.json",
             args_validator="validate_graph_bulk_vertices_args",
-            description="Bulk load vertices from external source",
+            description="Scan or page through graph nodes in bulk",
             tags=frozenset({"graph", "write", "bulk", "nodes"}),
         ),
         # §7.9 get_schema
