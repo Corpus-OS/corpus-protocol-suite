@@ -691,10 +691,33 @@ def _get_adapter_class() -> type:
     return _ADAPTER_CLASS
 
 
-@pytest.fixture
+def _apply_pytest_adapter_option(config: pytest.Config) -> None:
+    """
+    Bridge pytest's --adapter option (used by wire tests in tests/live)
+    into the CORPUS_ADAPTER environment that this plugin uses.
+
+    This keeps a single source of truth for adapter selection without
+    duplicating command-line flags.
+    """
+    adapter_opt = getattr(getattr(config, "option", None), "adapter", None)
+    if not adapter_opt or adapter_opt == "default":
+        # Either the option wasn't provided, or the caller wants the default.
+        return
+
+    # Only set env var if user explicitly requested an adapter on the CLI.
+    # This ensures existing CORPUS_ADAPTER env config is preserved unless
+    # the --adapter flag is used.
+    os.environ[ADAPTER_ENV] = adapter_opt
+
+
+@pytest.fixture(scope="session")
 def adapter():
     """
     Generic, pluggable adapter fixture with enhanced validation.
+
+    The adapter class is resolved from CORPUS_ADAPTER (or the default mock
+    adapter), and an optional CORPUS_ENDPOINT is passed into the constructor
+    using common parameter names.
     """
     Adapter = _get_adapter_class()
     endpoint = os.getenv(ENDPOINT_ENV)
@@ -749,10 +772,10 @@ class TestCategorizer:
         self._cache_misses = 0
     
     def _build_protocol_patterns(self) -> Dict[str, re.Pattern]:
-        """Compile regex patterns for protocol detection."""
+        """Compile regex patterns for protocol detection based on directory."""
         patterns = {}
         for proto in PROTOCOLS:
-            # Match both POSIX and Windows paths
+            # Match both POSIX and Windows paths, e.g. "tests/llm/", "tests\\llm\\"
             pattern = re.compile(rf'tests[\\/]{re.escape(proto)}[\\/]', re.IGNORECASE)
             patterns[proto] = pattern
         return patterns
@@ -776,6 +799,10 @@ class TestCategorizer:
     def categorize_test(self, nodeid: str) -> Tuple[str, str]:
         """
         Categorize test by protocol and category with caching.
+
+        This works for the per-protocol suites in tests/<proto>/ as well as the
+        shared wire conformance suite in tests/live by inspecting parametrized
+        IDs like [llm.complete.*], [vector.query.*], etc.
         """
         nodeid_lower = (nodeid or "").lower()
         
@@ -787,12 +814,23 @@ class TestCategorizer:
         
         self._cache_misses += 1
 
-        # Protocol detection
+        # First, try to infer protocol from directory (tests/llm, tests/vector, ...)
         protocol = "other"
         for proto, pattern in self._protocol_patterns.items():
             if pattern.search(nodeid_lower):
                 protocol = proto
                 break
+
+        # Special handling for shared wire tests under tests/live.
+        # The file path will look like tests/live/test_wire_conformance.py,
+        # so we infer the protocol from the parametrized ID, which includes
+        # operation names like llm.complete, vector.query, etc.
+        if protocol == "other" and "tests/live" in nodeid_lower:
+            for proto in ("llm", "vector", "graph", "embedding"):
+                bracket_token = f"[{proto}."
+                if bracket_token in nodeid_lower or f"{proto}." in nodeid_lower:
+                    protocol = proto
+                    break
         
         if protocol == "other":
             result = ("other", "unknown")
@@ -1435,8 +1473,12 @@ def pytest_configure(config):
     for marker in markers:
         config.addinivalue_line("markers", marker)
     
+    # If the wire suite added a --adapter option, mirror that into CORPUS_ADAPTER
+    # so the shared adapter() fixture and wire tests stay in sync.
+    _apply_pytest_adapter_option(config)
+    
     # Validate adapter configuration early (best-effort)
-    if config.option.verbose:
+    if getattr(config, "option", None) and getattr(config.option, "verbose", False):
         try:
             _get_adapter_class()
             print("✅ Adapter configuration validated successfully")
