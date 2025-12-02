@@ -601,7 +601,121 @@ PROTOCOLS_CONFIG = {
                 }
             }
         }
-    )
+    ),
+
+    # NEW: Embedding framework adapter suite
+    "embedding_frameworks": ProtocolConfig(
+        name="embedding_frameworks",
+        display_name="Embedding Framework Adapters V1.0",
+        # Actual test count from analysis: 121 tests (reference)
+        conformance_levels={"gold": 121, "silver": 97, "development": 60},
+        test_categories={
+            "framework_specific": "Framework-Specific Adapters",
+            "contract_interface": "Cross-Framework Interface Conformance",
+            "contract_shapes": "Cross-Framework Shape & Batching",
+            "contract_context": "Cross-Framework Context & Error Handling",
+            "registry_infra": "Registry Infrastructure",
+            "robustness": "Robustness & Evil Backend Tests",
+        },
+        spec_sections={
+            "framework_specific": "§10.3 Operations + Framework Integration",
+            "contract_interface": "§10.3, §10.6, §7.2",
+            "contract_shapes": "§10.6, §12.5",
+            "contract_context": "§6.3, §13, §10.4",
+            "registry_infra": "§6.1 Framework Registration",
+            "robustness": "§6.3, §12.1, §12.5",
+        },
+        error_guidance={
+            "framework_specific": {
+                "test_constructor_rejects_adapter_without_embed": {
+                    "error_patterns": {
+                        "missing_embed_method": "Corpus adapter must implement embed() method per §10.3",
+                        "invalid_adapter_type": "Adapter doesn't conform to EmbeddingProtocolV1 interface",
+                    },
+                    "quick_fix": "Ensure corpus adapter implements the required EmbeddingProtocolV1 interface and exposes embed()/aembed() as expected.",
+                    "examples": "See §10.3 for required embedding protocol methods and framework adapter examples in tests/frameworks/embedding/.",
+                },
+            },
+            "contract_interface": {
+                "test_sync_embedding_interface_conformance": {
+                    "error_patterns": {
+                        "missing_method": "Framework adapter missing required embedding methods",
+                        "signature_mismatch": "Method signatures don't match framework expectations",
+                    },
+                    "quick_fix": "Ensure all required sync/async embedding methods are implemented with correct signatures for the framework (e.g., embed_documents, embed_query, async variants).",
+                    "examples": "See test_contract_interface_conformance.py for interface requirements.",
+                },
+            },
+            "contract_shapes": {
+                "test_batch_output_row_count_matches_input_length": {
+                    "error_patterns": {
+                        "row_count_mismatch": "Batch embedding returned wrong number of rows",
+                        "shape_validation_failed": "Embedding matrix shape doesn't match input length",
+                    },
+                    "quick_fix": "Ensure embed() returns exactly N vectors for N input texts, and that each vector has consistent dimension.",
+                    "examples": "See test_contract_shapes_and_batching.py for shape validation details.",
+                },
+            },
+            "contract_context": {
+                "test_error_context_is_attached_on_sync_batch_failure": {
+                    "error_patterns": {
+                        "missing_error_context": "Errors not decorated with framework/operation metadata",
+                        "context_attachment_failed": "attach_context() not called on error path",
+                    },
+                    "quick_fix": "Decorate public embedding methods with @error_context(framework='<name>') and ensure failures attach OperationContext.",
+                    "examples": "See §6.3 and test_contract_context_and_error_context.py for error context requirements.",
+                },
+            },
+            # registry_infra and robustness fall back to generic guidance
+        }
+    ),
+
+    # NEW: Graph framework adapter suite
+    "graph_frameworks": ProtocolConfig(
+        name="graph_frameworks",
+        display_name="Graph Framework Adapters V1.0",
+        # From graph framework conformance doc: 184 tests (reference)
+        conformance_levels={"gold": 184, "silver": 147, "development": 92},
+        test_categories={
+            "framework_specific": "Framework-Specific Graph Adapters",
+            "contract_interface": "Cross-Framework Interface Conformance",
+            "contract_shapes": "Cross-Framework Shape & Batch Semantics",
+            "contract_context": "Cross-Framework Context & Error Handling",
+            "registry_infra": "Registry Infrastructure",
+            "robustness": "Robustness & Evil Backend Tests",
+        },
+        spec_sections={
+            "framework_specific": "§7.3 Operations + Framework Integration",
+            "contract_interface": "§7.3, §7.2",
+            "contract_shapes": "§7.3.3, §12.5",
+            "contract_context": "§6.3, §13",
+            "registry_infra": "§6.1 Framework Registration",
+            "robustness": "§6.3, §12.1, §12.5",
+        },
+        error_guidance={
+            "contract_shapes": {
+                "test_batch_result_length_matches_ops_when_supported": {
+                    "error_patterns": {
+                        "length_mismatch": "Batch result length does not match number of operations",
+                        "batch_shape_invalid": "Batch result structure is inconsistent across calls",
+                    },
+                    "quick_fix": "Ensure batch() / abatch() return one result per operation in order, with a stable result type/shape.",
+                    "examples": "See test_contract_shapes_and_batching.py for batch semantics and shape validation.",
+                },
+            },
+            "contract_context": {
+                "test_error_context_is_attached_on_sync_query_failure": {
+                    "error_patterns": {
+                        "missing_error_context": "Errors not decorated with framework/operation metadata",
+                        "context_attachment_failed": "Context not attached when backend query fails",
+                    },
+                    "quick_fix": "Decorate public graph methods with @error_context(framework='<name>') and attach OperationContext on failures.",
+                    "examples": "See §6.3 and test_contract_context_and_error_context.py for error context requirements.",
+                },
+            },
+            # Other categories fall back to generic guidance in plugin
+        }
+    ),
 }
 
 # Register all protocols
@@ -617,7 +731,17 @@ PROTOCOL_DISPLAY_NAMES = {
 }
 
 # Explicit, stable protocol order for summaries / UX
-PROTOCOLS = ["llm", "vector", "graph", "embedding", "wire", "schema", "golden"]
+PROTOCOLS = [
+    "llm",
+    "vector",
+    "graph",
+    "embedding",
+    "embedding_frameworks",
+    "graph_frameworks",
+    "wire",
+    "schema",
+    "golden",
+]
 CONFIG_PROTOCOLS = set(PROTOCOLS_CONFIG.keys())
 if CONFIG_PROTOCOLS != set(PROTOCOLS):
     raise ValueError(
@@ -813,18 +937,31 @@ class TestCategorizer:
     
     def _build_protocol_patterns(self) -> Dict[str, re.Pattern]:
         """Compile regex patterns for protocol detection based on directory."""
-        patterns = {}
+        patterns: Dict[str, re.Pattern] = {}
+
         for proto in PROTOCOLS:
-            # Match both POSIX and Windows paths, e.g. "tests/llm/", "tests\\llm\\"
-            pattern = re.compile(rf'tests[\\/]{re.escape(proto)}[\\/]', re.IGNORECASE)
-            patterns[proto] = pattern
+            # Framework adapter suites live under tests/frameworks/<kind>/
+            if proto == "embedding_frameworks":
+                patterns[proto] = re.compile(
+                    r'tests[\\/]frameworks[\\/]embedding[\\/]', re.IGNORECASE
+                )
+            elif proto == "graph_frameworks":
+                patterns[proto] = re.compile(
+                    r'tests[\\/]frameworks[\\/]graph[\\/]', re.IGNORECASE
+                )
+            else:
+                # Match both POSIX and Windows paths, e.g. "tests/llm/", "tests\\llm\\"
+                patterns[proto] = re.compile(
+                    rf'tests[\\/]{re.escape(proto)}[\\/]', re.IGNORECASE
+                )
+
         return patterns
     
     def _build_category_patterns(self) -> Dict[str, Dict[re.Pattern, str]]:
         """Compile regex patterns for category detection."""
-        category_patterns = {}
+        category_patterns: Dict[str, Dict[re.Pattern, str]] = {}
         for proto, config in PROTOCOLS_CONFIG.items():
-            proto_patterns = {}
+            proto_patterns: Dict[re.Pattern, str] = {}
             for category_key, category_name in config.test_categories.items():
                 # Create patterns for both category key and display name
                 patterns = [
@@ -844,6 +981,10 @@ class TestCategorizer:
         shared wire conformance suite in tests/live. Wire tests are *not* counted
         towards the llm/vector/graph/embedding adapter suites; they are grouped
         under the dedicated 'wire' protocol.
+
+        Framework adapter suites under tests/frameworks/<kind>/ are mapped to
+        embedding_frameworks / graph_frameworks and then categorized by filename
+        (framework-specific vs contract vs registry vs robustness).
         """
         nodeid_lower = (nodeid or "").lower()
         
@@ -855,7 +996,7 @@ class TestCategorizer:
         
         self._cache_misses += 1
 
-        # First, try to infer protocol from directory (tests/llm, tests/vector, ...)
+        # --- 1. Detect protocol via directory patterns ---
         protocol = "other"
         for proto, pattern in self._protocol_patterns.items():
             if pattern.search(nodeid_lower):
@@ -863,9 +1004,6 @@ class TestCategorizer:
                 break
 
         # Special handling for shared wire tests under tests/live.
-        # They live in tests/live/test_wire_conformance.py and should all be
-        # treated as protocol 'wire', independent of which operation (llm/vector/...)
-        # they're exercising.
         if protocol == "other" and (
             "tests/live" in nodeid_lower or "tests\\live" in nodeid_lower
         ):
@@ -877,13 +1015,33 @@ class TestCategorizer:
             result = ("wire", "wire")
             self._cache[nodeid_lower] = result
             return result
-        
+
+        # --- 2. Framework adapter suites: derive category from filename ---
+        if protocol in {"embedding_frameworks", "graph_frameworks"}:
+            # Note: we map based on file naming conventions from the coverage docs.
+            if "test_contract_interface" in nodeid_lower:
+                category = "contract_interface"
+            elif "test_contract_shapes_and_batching" in nodeid_lower or "test_contract_shapes" in nodeid_lower:
+                category = "contract_shapes"
+            elif "test_contract_context_and_error_context" in nodeid_lower or "test_contract_context" in nodeid_lower:
+                category = "contract_context"
+            elif "registry_self_check" in nodeid_lower or "test_graph_registry_self_check" in nodeid_lower or "test_embedding_registry_self_check" in nodeid_lower or "test_registry" in nodeid_lower:
+                category = "registry_infra"
+            elif "test_with_mock_backends" in nodeid_lower or "test_with_mock_" in nodeid_lower:
+                category = "robustness"
+            else:
+                category = "framework_specific"
+
+            result = (protocol, category)
+            self._cache[nodeid_lower] = result
+            return result
+
         if protocol == "other":
             result = ("other", "unknown")
             self._cache[nodeid_lower] = result
             return result
         
-        # Category detection with cached patterns
+        # --- 3. Category detection with cached patterns for core protocol suites ---
         category = "unknown"
         proto_patterns = self._category_patterns.get(protocol, {})
         
@@ -1247,13 +1405,17 @@ class CorpusProtocolPlugin:
 
         terminalreporter.write_sep("=", self._fmt("🏆", "CORPUS PROTOCOL SUITE - PLATINUM CERTIFIED"))
         terminalreporter.write_line(
-            f"All {total_tests} conformance tests passed across {len(PROTOCOLS)} protocol suites"
+            f"All {total_tests} conformance tests passed across {len(PROTOCOLS)} protocol and adapter suites"
         )
         terminalreporter.write_line("")
 
         # Show protocol breakdown
         terminalreporter.write_line("Protocol Conformance Status:")
         for proto in PROTOCOLS:
+            # Skip framework adapter suites here; they get a dedicated section below
+            if proto in {"embedding_frameworks", "graph_frameworks"}:
+                continue
+
             config = protocol_registry.get(proto)
             if not config:
                 continue
@@ -1265,6 +1427,23 @@ class CorpusProtocolPlugin:
             terminalreporter.write_line(
                 f"  {self._fmt('✅', 'PASS')} {config.display_name}: {level} "
                 f"({passed}/{total} tests passing)"
+            )
+
+        # Framework adapter suites
+        terminalreporter.write_line("")
+        terminalreporter.write_line("Framework Adapter Status:")
+        for proto in ("embedding_frameworks", "graph_frameworks"):
+            config = protocol_registry.get(proto)
+            if not config:
+                continue
+            total = ctx.protocol_total.get(proto, 0)
+            if total == 0:
+                continue
+            passed = ctx.protocol_passed.get(proto, 0)
+            level, _ = self._calculate_conformance_level(proto, passed, total)
+            terminalreporter.write_line(
+                f"  {self._fmt('✅', 'PASS')} {config.display_name}: {level} "
+                f"({passed}/{total} framework adapter tests passing)"
             )
 
         terminalreporter.write_line("")
@@ -1318,13 +1497,21 @@ class CorpusProtocolPlugin:
             passed = ctx.protocol_passed.get(proto, 0)
             level, needed = self._calculate_conformance_level(proto, passed, total)
 
+            label_prefix = "PASS"
+            emoji = "✅"
+            if "Gold" not in level:
+                platinum_ready = False
+                label_prefix = "WARN"
+                emoji = "⚠️"
+
+            # For both protocol and adapter suites, show the same style line here;
+            # we differentiate in the text below.
             if "Gold" in level:
                 terminalreporter.write_line(
                     f"  {self._fmt('✅', 'PASS')} {config.display_name}: {level} "
                     f"({passed}/{total} tests passing)"
                 )
             else:
-                platinum_ready = False
                 if "Silver" in level:
                     next_label = "Gold"
                 elif "Development" in level:
@@ -1339,13 +1526,13 @@ class CorpusProtocolPlugin:
         terminalreporter.write_line("")
         if platinum_ready:
             terminalreporter.write_line(
-                self._fmt("🎯", "All protocols at Gold level - Platinum certification available!")
+                self._fmt("🎯", "All protocols and adapter suites at Gold level - Platinum certification available!")
             )
         else:
             terminalreporter.write_line(
                 self._fmt(
                     "🎯",
-                    "Focus on protocols below Gold level to reach Platinum certification (100% passing)."
+                    "Focus on suites below Gold level to reach Platinum certification (100% passing across all suites)."
                 )
             )
 
@@ -1361,6 +1548,35 @@ class CorpusProtocolPlugin:
         terminalreporter.write_line(
             self._fmt("📚", "Review CONFORMANCE.md for detailed test-to-spec mapping")
         )
+
+        # Framework adapter suites explicit recap
+        terminalreporter.write_line("")
+        terminalreporter.write_line("Framework Adapter Status:")
+        for proto in ("embedding_frameworks", "graph_frameworks"):
+            config = protocol_registry.get(proto)
+            if not config:
+                continue
+            total = ctx.protocol_total.get(proto, 0)
+            if total == 0:
+                continue
+            passed = ctx.protocol_passed.get(proto, 0)
+            level, needed = self._calculate_conformance_level(proto, passed, total)
+            if "Gold" in level:
+                terminalreporter.write_line(
+                    f"  {self._fmt('✅', 'PASS')} {config.display_name}: {level} "
+                    f"({passed}/{total} framework adapter tests passing)"
+                )
+            else:
+                if "Silver" in level:
+                    next_label = "Gold"
+                elif "Development" in level:
+                    next_label = "Silver"
+                else:
+                    next_label = "Development"
+                terminalreporter.write_line(
+                    f"  {self._fmt('⚠️', 'WARN')} {config.display_name}: {level} "
+                    f"({passed}/{total} framework adapter tests passing; {needed} test(s) to {next_label})"
+                )
 
         cache_stats = test_categorizer.get_cache_stats()
         terminalreporter.write_line(
@@ -1391,7 +1607,7 @@ class CorpusProtocolPlugin:
                 total_failures += len(reports_list)
 
         terminalreporter.write_line(
-            f"Found {total_failures} conformance issue(s) across protocols:"
+            f"Found {total_failures} conformance issue(s) across protocols and adapter suites:"
         )
         terminalreporter.write_line("")
 
@@ -1510,6 +1726,8 @@ def pytest_configure(config):
         "vector: Vector Protocol V1.0 conformance tests", 
         "graph: Graph Protocol V1.0 conformance tests",
         "embedding: Embedding Protocol V1.0 conformance tests",
+        "embedding_frameworks: Embedding framework adapter tests",
+        "graph_frameworks: Graph framework adapter tests",
         "wire: Wire Request Conformance tests (tests/live)",
         "schema: Schema conformance validation tests",
         "golden: Golden wire message validation tests",
