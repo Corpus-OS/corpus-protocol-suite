@@ -6,7 +6,8 @@
 
 > This document defines the schema architecture for the Corpus Protocol Suite. It establishes the normative JSON Schema definitions for all protocol operations, types, and wire formats while maintaining cross-protocol consistency and validation guarantees.
 
-> **Schema Precedence:** When this document and PROTOCOLS.md disagree on **schema structure or field constraints**, this document is authoritative for validation. PROTOCOLS.md defines operational semantics and wire format requirements.
+> **Schema Precedence:** For field names, types, required/optional status, enums, and constraints, SCHEMA.md is normative.
+For operation semantics, lifecycle, and behavior, PROTOCOLS.md is normative..
 
 > **Schema Validation Convention:** All schemas use JSON Schema Draft 2020-12 with strict validation. Type definitions use `$defs` for reuse and `$id`-based resolution. Python, Go, etc. bindings are reference implementations.
 
