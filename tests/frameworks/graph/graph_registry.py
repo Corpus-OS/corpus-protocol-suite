@@ -1,4 +1,6 @@
 # tests/frameworks/registries/graph_registry.py
+
+# tests/frameworks/registries/graph_registry.py
 """
 Registry of graph framework adapters used by the conformance test suite.
 
@@ -103,16 +105,16 @@ class GraphFrameworkDescriptor:
     adapter_class: str
 
     query_method: str
-    async_query_method: Optional[str]
+    async_query_method: Optional[str] = None
 
-    stream_query_method: Optional[str]
-    async_stream_query_method: Optional[str]
+    stream_query_method: Optional[str] = None
+    async_stream_query_method: Optional[str] = None
 
-    bulk_vertices_method: Optional[str]
-    async_bulk_vertices_method: Optional[str]
+    bulk_vertices_method: Optional[str] = None
+    async_bulk_vertices_method: Optional[str] = None
 
-    batch_method: Optional[str]
-    async_batch_method: Optional[str]
+    batch_method: Optional[str] = None
+    async_batch_method: Optional[str] = None
 
     context_kwarg: Optional[str] = None
 
@@ -134,7 +136,6 @@ class GraphFrameworkDescriptor:
         This will raise early for obviously invalid descriptors (e.g. missing
         method names) and emit non-fatal warnings for softer issues.
         """
-        # Since the dataclass is frozen, we must not mutate; validation is read-only.
         self.validate()
 
     @property
@@ -174,13 +175,10 @@ class GraphFrameworkDescriptor:
             return None
 
         if self.minimum_framework_version and self.tested_up_to_version:
-            return (
-                f">={self.minimum_framework_version}, "
-                f"<= {self.tested_up_to_version}"
-            )
+            return f">={self.minimum_framework_version}, <={self.tested_up_to_version}"
         if self.minimum_framework_version:
             return f">={self.minimum_framework_version}"
-        return f"<= {self.tested_up_to_version}"
+        return f"<={self.tested_up_to_version}"
 
     def validate(self) -> None:
         """
@@ -189,11 +187,12 @@ class GraphFrameworkDescriptor:
         Raises
         ------
         ValueError
-            If required fields like query_method are missing.
+            If required fields like query_method/stream_query_method are missing.
         """
-        if not self.query_method:
+        # Required methods
+        if not self.query_method or not self.stream_query_method:
             raise ValueError(
-                f"{self.name}: query_method must be set",
+                f"{self.name}: query_method and stream_query_method must both be set",
             )
 
         # Async consistency warning (soft)
@@ -238,8 +237,6 @@ class GraphFrameworkDescriptor:
                 RuntimeWarning,
                 stacklevel=2,
             )
-
-        # Version ordering remains informational for now.
 
 
 # ---------------------------------------------------------------------------
@@ -391,11 +388,16 @@ def get_graph_framework_descriptor_safe(
     return GRAPH_FRAMEWORKS.get(name)
 
 
-def has_framework(name: str) -> bool:
+def has_graph_framework(name: str) -> bool:
     """
     Return True if a framework with the given name is registered.
     """
     return name in GRAPH_FRAMEWORKS
+
+
+# Backwards-compatible alias, if anything still uses the old name.
+def has_framework(name: str) -> bool:
+    return has_graph_framework(name)
 
 
 def iter_graph_framework_descriptors() -> Iterable[GraphFrameworkDescriptor]:
@@ -445,6 +447,7 @@ __all__ = [
     "GRAPH_FRAMEWORKS",
     "get_graph_framework_descriptor",
     "get_graph_framework_descriptor_safe",
+    "has_graph_framework",
     "has_framework",
     "iter_graph_framework_descriptors",
     "iter_available_graph_framework_descriptors",
