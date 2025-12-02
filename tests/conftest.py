@@ -299,7 +299,7 @@ PROTOCOLS_CONFIG = {
         spec_sections={
             "wire_contract": "§4.1 Wire-First Canonical Form",
             "core_ops": "§7.3 Operations",
-            "crud_validation": "§7.3.1 Vertex/Edge CRUD",
+            "crud_validation": "§7.3.1 Node/Edge CRUD",
             "query_ops": "§7.3.2 Queries",
             "dialect_validation": "§7.4 Dialects",
             "streaming": "§7.3.2 Streaming Finalization & §4.1.3 Streaming Frames",
@@ -333,13 +333,13 @@ PROTOCOLS_CONFIG = {
                 }
             },
             "crud_validation": {
-                "test_vertex_lifecycle": {
+                "test_node_lifecycle": {
                     "error_patterns": {
-                        "duplicate_vertex": "Vertex creation with duplicate ID violated constraints",
-                        "invalid_properties": "Vertex properties violate schema constraints"
+                        "duplicate_node": "Node creation with duplicate ID violated constraints",
+                        "invalid_properties": "Node properties violate schema constraints"
                     },
-                    "quick_fix": "Check vertex ID uniqueness and property schema compliance",
-                    "examples": "See §7.3.1 for vertex CRUD operations and constraints"
+                    "quick_fix": "Check node ID uniqueness and property schema compliance",
+                    "examples": "See §7.3.1 for node CRUD operations and constraints"
                 }
             }
         }
