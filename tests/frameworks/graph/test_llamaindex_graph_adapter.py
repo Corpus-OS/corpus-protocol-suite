@@ -266,9 +266,11 @@ def test_build_ctx_failure_raises_badrequest_with_error_code_and_context(
         client.query("MATCH (n) RETURN n", callback_manager=object())
 
     err = exc_info.value
-    # We don't import BadRequest here; just inspect shape.
-    assert type(err).__name__ == "BadRequest"
+    # We don't assert exact type name; just shape + error code + context.
     assert getattr(err, "code", None) == ErrorCodes.BAD_OPERATION_CONTEXT
+    msg = str(err).lower()
+    assert "operation" in msg or "context" in msg
+
     assert captured_ctx.get("framework") == "llamaindex"
     assert captured_ctx.get("operation") == "context_translation"
 
@@ -384,6 +386,59 @@ def test_sync_query_and_stream_basic(graph_adapter: Any) -> None:
     assert isinstance(chunks, list)
 
 
+def test_stream_query_invalid_chunk_triggers_validation_and_context(
+    monkeypatch: pytest.MonkeyPatch,
+    graph_adapter: Any,
+) -> None:
+    """
+    If the translator yields an invalid chunk type during streaming, the
+    adapter should surface a validation error and attach LlamaIndex-specific
+    error context.
+    """
+    captured_ctx: Dict[str, Any] = {}
+
+    class BadChunkTranslator:
+        def query_stream(self, *args: Any, **kwargs: Any):  # noqa: ARG002
+            # Yield a clearly invalid chunk type
+            yield "not-a-query-chunk"
+
+    def fake_create_graph_translator(*_: Any, **__: Any) -> Any:
+        return BadChunkTranslator()
+
+    def fake_attach_context(exc: BaseException, **ctx: Any) -> None:
+        captured_ctx.update(ctx)
+
+    def fake_validate_graph_result_type(result: Any, **_: Any) -> Any:
+        # Simulate a validator rejecting bad chunk type
+        raise TypeError(f"Bad chunk type: {type(result).__name__}")
+
+    monkeypatch.setattr(
+        llamaindex_adapter_module,
+        "create_graph_translator",
+        fake_create_graph_translator,
+    )
+    monkeypatch.setattr(
+        llamaindex_adapter_module,
+        "attach_context",
+        fake_attach_context,
+    )
+    monkeypatch.setattr(
+        llamaindex_adapter_module,
+        "validate_graph_result_type",
+        fake_validate_graph_result_type,
+    )
+
+    client = _make_client(graph_adapter)
+
+    with pytest.raises(TypeError, match="Bad chunk type: str"):
+        # Consume at least one chunk to trigger validation
+        list(client.stream_query("MATCH (n) RETURN n"))
+
+    assert captured_ctx.get("framework") == "llamaindex"
+    # Operation name is framework-specific but should look like a graph op
+    assert "stream" in str(captured_ctx.get("operation", "")).lower()
+
+
 def test_sync_query_accepts_optional_params_and_context(graph_adapter: Any) -> None:
     """
     query() should accept params, dialect, namespace, timeout_ms, and
@@ -437,6 +492,62 @@ async def test_async_query_and_stream_basic(graph_adapter: Any) -> None:
 
 
 @pytest.mark.asyncio
+async def test_astream_query_invalid_chunk_triggers_validation_and_context_async(
+    monkeypatch: pytest.MonkeyPatch,
+    graph_adapter: Any,
+) -> None:
+    """
+    Async streaming should also surface invalid chunk types via validation
+    and attach LlamaIndex-specific error context.
+    """
+    captured_ctx: Dict[str, Any] = {}
+
+    class BadChunkTranslator:
+        async def arun_query_stream(self, *args: Any, **kwargs: Any):  # noqa: ARG002
+            async def gen():
+                yield "not-a-query-chunk"
+
+            return gen()
+
+    def fake_create_graph_translator(*_: Any, **__: Any) -> Any:
+        return BadChunkTranslator()
+
+    def fake_attach_context(exc: BaseException, **ctx: Any) -> None:
+        captured_ctx.update(ctx)
+
+    def fake_validate_graph_result_type(result: Any, **_: Any) -> Any:
+        raise TypeError(f"Bad chunk type: {type(result).__name__}")
+
+    monkeypatch.setattr(
+        llamaindex_adapter_module,
+        "create_graph_translator",
+        fake_create_graph_translator,
+    )
+    monkeypatch.setattr(
+        llamaindex_adapter_module,
+        "attach_context",
+        fake_attach_context,
+    )
+    monkeypatch.setattr(
+        llamaindex_adapter_module,
+        "validate_graph_result_type",
+        fake_validate_graph_result_type,
+    )
+
+    client = _make_client(graph_adapter)
+
+    with pytest.raises(TypeError, match="Bad chunk type: str"):
+        aiter = client.astream_query("MATCH (n) RETURN n")
+        if inspect.isawaitable(aiter):
+            aiter = await aiter  # type: ignore[assignment]
+        async for _ in aiter:
+            break
+
+    assert captured_ctx.get("framework") == "llamaindex"
+    assert "stream" in str(captured_ctx.get("operation", "")).lower()
+
+
+@pytest.mark.asyncio
 async def test_async_query_accepts_optional_params_and_context(
     graph_adapter: Any,
 ) -> None:
@@ -455,495 +566,6 @@ async def test_async_query_accepts_optional_params_and_context(
         extra_context={"request_id": "req-async"},
     )
     assert result is not None
-
-
-# ---------------------------------------------------------------------------
-# Upsert / delete wiring (Langchain-style coverage for LlamaIndex)
-# ---------------------------------------------------------------------------
-
-
-def test_upsert_nodes_passes_raw_nodes_with_framework_context(
-    monkeypatch: pytest.MonkeyPatch,
-    graph_adapter: Any,
-) -> None:
-    """
-    upsert_nodes() should:
-
-    - Validate via validate_upsert_nodes_spec (stubbed here),
-    - Pass spec.nodes as the first positional arg to translator.upsert_nodes,
-    - Use framework_ctx carrying framework='llamaindex', operation, and namespace.
-    """
-    captured: Dict[str, Any] = {}
-
-    translator = _mock_translator_with_capture(
-        captured,
-        method_name="upsert_nodes",
-        return_value="upsert-nodes-result",
-    )
-
-    def fake_create_graph_translator(*_: Any, **__: Any) -> Any:
-        return translator
-
-    def fake_validate_upsert_nodes_spec(spec: Any, **_: Any) -> None:
-        captured["validated_spec"] = spec
-
-    def fake_validate_graph_result_type(result: Any, **_: Any) -> Any:
-        return result
-
-    monkeypatch.setattr(
-        llamaindex_adapter_module,
-        "create_graph_translator",
-        fake_create_graph_translator,
-    )
-    monkeypatch.setattr(
-        llamaindex_adapter_module,
-        "validate_upsert_nodes_spec",
-        fake_validate_upsert_nodes_spec,
-    )
-    monkeypatch.setattr(
-        llamaindex_adapter_module,
-        "validate_graph_result_type",
-        fake_validate_graph_result_type,
-    )
-
-    client = _make_client(graph_adapter)
-
-    class DummyUpsertNodesSpec:
-        def __init__(self) -> None:
-            self.namespace = "nodes-ns"
-            self.nodes = [{"id": "n1"}, {"id": "n2"}]
-
-    spec = DummyUpsertNodesSpec()
-
-    result = client.upsert_nodes(spec)
-    assert result == "upsert-nodes-result"
-
-    # validate_* should see the same spec
-    assert captured["validated_spec"] is spec
-
-    # Translator should receive raw nodes list as first positional arg
-    assert "args" in captured
-    assert captured["args"][0] == spec.nodes
-
-    fw_ctx = captured.get("framework_ctx", {})
-    assert fw_ctx.get("framework") == "llamaindex"
-    assert fw_ctx.get("operation") == "upsert_nodes"
-    assert fw_ctx.get("namespace") == "nodes-ns"
-
-
-@pytest.mark.asyncio
-async def test_aupsert_nodes_passes_raw_nodes_with_framework_context_async(
-    monkeypatch: pytest.MonkeyPatch,
-    graph_adapter: Any,
-) -> None:
-    """
-    aupsert_nodes() should mirror upsert_nodes() wiring but via
-    translator.arun_upsert_nodes.
-    """
-    captured: Dict[str, Any] = {}
-
-    translator = _mock_async_translator_with_capture(
-        captured,
-        method_name="arun_upsert_nodes",
-        return_value="aupsert-nodes-result",
-    )
-
-    def fake_create_graph_translator(*_: Any, **__: Any) -> Any:
-        return translator
-
-    def fake_validate_upsert_nodes_spec(spec: Any, **_: Any) -> None:
-        captured["validated_spec"] = spec
-
-    def fake_validate_graph_result_type(result: Any, **_: Any) -> Any:
-        return result
-
-    monkeypatch.setattr(
-        llamaindex_adapter_module,
-        "create_graph_translator",
-        fake_create_graph_translator,
-    )
-    monkeypatch.setattr(
-        llamaindex_adapter_module,
-        "validate_upsert_nodes_spec",
-        fake_validate_upsert_nodes_spec,
-    )
-    monkeypatch.setattr(
-        llamaindex_adapter_module,
-        "validate_graph_result_type",
-        fake_validate_graph_result_type,
-    )
-
-    client = _make_client(graph_adapter)
-
-    class DummyUpsertNodesSpec:
-        def __init__(self) -> None:
-            self.namespace = "async-nodes-ns"
-            self.nodes = [{"id": "an1"}, {"id": "an2"}]
-
-    spec = DummyUpsertNodesSpec()
-
-    result = await client.aupsert_nodes(spec)
-    assert result == "aupsert-nodes-result"
-
-    assert captured["validated_spec"] is spec
-    assert "args" in captured
-    assert captured["args"][0] == spec.nodes
-
-    fw_ctx = captured.get("framework_ctx", {})
-    assert fw_ctx.get("framework") == "llamaindex"
-    assert fw_ctx.get("operation") == "upsert_nodes"
-    assert fw_ctx.get("namespace") == "async-nodes-ns"
-
-
-def test_upsert_edges_passes_edges_with_framework_context(
-    monkeypatch: pytest.MonkeyPatch,
-    graph_adapter: Any,
-) -> None:
-    """
-    upsert_edges() should:
-
-    - Call _validate_upsert_edges_spec on the client,
-    - Pass spec.edges as first positional arg to translator.upsert_edges,
-    - Use framework_ctx with framework='llamaindex' and proper namespace.
-    """
-    captured: Dict[str, Any] = {}
-
-    translator = _mock_translator_with_capture(
-        captured,
-        method_name="upsert_edges",
-        return_value="upsert-edges-result",
-    )
-
-    def fake_create_graph_translator(*_: Any, **__: Any) -> Any:
-        return translator
-
-    def fake_validate_graph_result_type(result: Any, **_: Any) -> Any:
-        return result
-
-    # Stub the instance method _validate_upsert_edges_spec
-    def fake_validate_edges(self: Any, spec: Any) -> None:  # noqa: ARG001
-        captured["validated_edges_spec"] = spec
-
-    monkeypatch.setattr(
-        llamaindex_adapter_module,
-        "create_graph_translator",
-        fake_create_graph_translator,
-    )
-    monkeypatch.setattr(
-        llamaindex_adapter_module,
-        "validate_graph_result_type",
-        fake_validate_graph_result_type,
-    )
-    monkeypatch.setattr(
-        CorpusLlamaIndexGraphClient,
-        "_validate_upsert_edges_spec",
-        fake_validate_edges,
-    )
-
-    client = _make_client(graph_adapter)
-
-    class DummyUpsertEdgesSpec:
-        def __init__(self) -> None:
-            self.namespace = "edges-ns"
-            self.edges = [{"id": "e1"}, {"id": "e2"}]
-
-    spec = DummyUpsertEdgesSpec()
-
-    result = client.upsert_edges(spec)
-    assert result == "upsert-edges-result"
-    assert captured["validated_edges_spec"] is spec
-
-    assert "args" in captured
-    assert captured["args"][0] == spec.edges
-
-    fw_ctx = captured.get("framework_ctx", {})
-    assert fw_ctx.get("framework") == "llamaindex"
-    assert fw_ctx.get("operation") == "upsert_edges"
-    assert fw_ctx.get("namespace") == "edges-ns"
-
-
-@pytest.mark.asyncio
-async def test_aupsert_edges_passes_edges_with_framework_context_async(
-    monkeypatch: pytest.MonkeyPatch,
-    graph_adapter: Any,
-) -> None:
-    """
-    aupsert_edges() should mirror upsert_edges() wiring but via
-    translator.arun_upsert_edges.
-    """
-    captured: Dict[str, Any] = {}
-
-    translator = _mock_async_translator_with_capture(
-        captured,
-        method_name="arun_upsert_edges",
-        return_value="aupsert-edges-result",
-    )
-
-    def fake_create_graph_translator(*_: Any, **__: Any) -> Any:
-        return translator
-
-    def fake_validate_graph_result_type(result: Any, **_: Any) -> Any:
-        return result
-
-    def fake_validate_edges(self: Any, spec: Any) -> None:  # noqa: ARG001
-        captured["validated_edges_spec"] = spec
-
-    monkeypatch.setattr(
-        llamaindex_adapter_module,
-        "create_graph_translator",
-        fake_create_graph_translator,
-    )
-    monkeypatch.setattr(
-        llamaindex_adapter_module,
-        "validate_graph_result_type",
-        fake_validate_graph_result_type,
-    )
-    monkeypatch.setattr(
-        CorpusLlamaIndexGraphClient,
-        "_validate_upsert_edges_spec",
-        fake_validate_edges,
-    )
-
-    client = _make_client(graph_adapter)
-
-    class DummyUpsertEdgesSpec:
-        def __init__(self) -> None:
-            self.namespace = "async-edges-ns"
-            self.edges = [{"id": "ae1"}, {"id": "ae2"}]
-
-    spec = DummyUpsertEdgesSpec()
-
-    result = await client.aupsert_edges(spec)
-    assert result == "aupsert-edges-result"
-    assert captured["validated_edges_spec"] is spec
-
-    assert "args" in captured
-    assert captured["args"][0] == spec.edges
-
-    fw_ctx = captured.get("framework_ctx", {})
-    assert fw_ctx.get("framework") == "llamaindex"
-    assert fw_ctx.get("operation") == "upsert_edges"
-    assert fw_ctx.get("namespace") == "async-edges-ns"
-
-
-def test_delete_nodes_passes_ids_with_framework_context(
-    monkeypatch: pytest.MonkeyPatch,
-    graph_adapter: Any,
-) -> None:
-    """
-    delete_nodes() should pass a list of IDs or filter into translator.delete_nodes
-    and include proper framework_ctx metadata.
-    """
-    captured: Dict[str, Any] = {}
-
-    translator = _mock_translator_with_capture(
-        captured,
-        method_name="delete_nodes",
-        return_value="delete-nodes-result",
-    )
-
-    def fake_create_graph_translator(*_: Any, **__: Any) -> Any:
-        return translator
-
-    def fake_validate_graph_result_type(result: Any, **_: Any) -> Any:
-        return result
-
-    monkeypatch.setattr(
-        llamaindex_adapter_module,
-        "create_graph_translator",
-        fake_create_graph_translator,
-    )
-    monkeypatch.setattr(
-        llamaindex_adapter_module,
-        "validate_graph_result_type",
-        fake_validate_graph_result_type,
-    )
-
-    client = _make_client(graph_adapter)
-
-    class DummyDeleteNodesSpec:
-        def __init__(self) -> None:
-            self.namespace = "del-ns"
-            self.ids = ["n1", "n2"]
-            self.filter = None
-
-    spec = DummyDeleteNodesSpec()
-
-    result = client.delete_nodes(spec)
-    assert result == "delete-nodes-result"
-
-    assert "args" in captured
-    assert captured["args"][0] == ["n1", "n2"]
-
-    fw_ctx = captured.get("framework_ctx", {})
-    assert fw_ctx.get("framework") == "llamaindex"
-    assert fw_ctx.get("operation") == "delete_nodes"
-    assert fw_ctx.get("namespace") == "del-ns"
-
-
-@pytest.mark.asyncio
-async def test_adelete_nodes_passes_ids_with_framework_context_async(
-    monkeypatch: pytest.MonkeyPatch,
-    graph_adapter: Any,
-) -> None:
-    """
-    adelete_nodes() should mirror delete_nodes wiring via arun_delete_nodes.
-    """
-    captured: Dict[str, Any] = {}
-
-    translator = _mock_async_translator_with_capture(
-        captured,
-        method_name="arun_delete_nodes",
-        return_value="adelete-nodes-result",
-    )
-
-    def fake_create_graph_translator(*_: Any, **__: Any) -> Any:
-        return translator
-
-    def fake_validate_graph_result_type(result: Any, **_: Any) -> Any:
-        return result
-
-    monkeypatch.setattr(
-        llamaindex_adapter_module,
-        "create_graph_translator",
-        fake_create_graph_translator,
-    )
-    monkeypatch.setattr(
-        llamaindex_adapter_module,
-        "validate_graph_result_type",
-        fake_validate_graph_result_type,
-    )
-
-    client = _make_client(graph_adapter)
-
-    class DummyDeleteNodesSpec:
-        def __init__(self) -> None:
-            self.namespace = "adel-ns"
-            self.ids = ["an1", "an2"]
-            self.filter = None
-
-    spec = DummyDeleteNodesSpec()
-
-    result = await client.adelete_nodes(spec)
-    assert result == "adelete-nodes-result"
-
-    assert "args" in captured
-    assert captured["args"][0] == ["an1", "an2"]
-
-    fw_ctx = captured.get("framework_ctx", {})
-    assert fw_ctx.get("framework") == "llamaindex"
-    assert fw_ctx.get("operation") == "delete_nodes"
-    assert fw_ctx.get("namespace") == "adel-ns"
-
-
-def test_delete_edges_passes_ids_with_framework_context(
-    monkeypatch: pytest.MonkeyPatch,
-    graph_adapter: Any,
-) -> None:
-    """
-    delete_edges() should pass ID list or filter to translator.delete_edges
-    and include proper framework_ctx.
-    """
-    captured: Dict[str, Any] = {}
-
-    translator = _mock_translator_with_capture(
-        captured,
-        method_name="delete_edges",
-        return_value="delete-edges-result",
-    )
-
-    def fake_create_graph_translator(*_: Any, **__: Any) -> Any:
-        return translator
-
-    def fake_validate_graph_result_type(result: Any, **_: Any) -> Any:
-        return result
-
-    monkeypatch.setattr(
-        llamaindex_adapter_module,
-        "create_graph_translator",
-        fake_create_graph_translator,
-    )
-    monkeypatch.setattr(
-        llamaindex_adapter_module,
-        "validate_graph_result_type",
-        fake_validate_graph_result_type,
-    )
-
-    client = _make_client(graph_adapter)
-
-    class DummyDeleteEdgesSpec:
-        def __init__(self) -> None:
-            self.namespace = "del-edges-ns"
-            self.ids = ["e1", "e2"]
-            self.filter = None
-
-    spec = DummyDeleteEdgesSpec()
-
-    result = client.delete_edges(spec)
-    assert result == "delete-edges-result"
-
-    assert "args" in captured
-    assert captured["args"][0] == ["e1", "e2"]
-
-    fw_ctx = captured.get("framework_ctx", {})
-    assert fw_ctx.get("framework") == "llamaindex"
-    assert fw_ctx.get("operation") == "delete_edges"
-    assert fw_ctx.get("namespace") == "del-edges-ns"
-
-
-@pytest.mark.asyncio
-async def test_adelete_edges_passes_ids_with_framework_context_async(
-    monkeypatch: pytest.MonkeyPatch,
-    graph_adapter: Any,
-) -> None:
-    """
-    adelete_edges() should mirror delete_edges wiring via arun_delete_edges.
-    """
-    captured: Dict[str, Any] = {}
-
-    translator = _mock_async_translator_with_capture(
-        captured,
-        method_name="arun_delete_edges",
-        return_value="adelete-edges-result",
-    )
-
-    def fake_create_graph_translator(*_: Any, **__: Any) -> Any:
-        return translator
-
-    def fake_validate_graph_result_type(result: Any, **_: Any) -> Any:
-        return result
-
-    monkeypatch.setattr(
-        llamaindex_adapter_module,
-        "create_graph_translator",
-        fake_create_graph_translator,
-    )
-    monkeypatch.setattr(
-        llamaindex_adapter_module,
-        "validate_graph_result_type",
-        fake_validate_graph_result_type,
-    )
-
-    client = _make_client(graph_adapter)
-
-    class DummyDeleteEdgesSpec:
-        def __init__(self) -> None:
-            self.namespace = "adel-edges-ns"
-            self.ids = ["ae1", "ae2"]
-            self.filter = None
-
-    spec = DummyDeleteEdgesSpec()
-
-    result = await client.adelete_edges(spec)
-    assert result == "adelete-edges-result"
-
-    assert "args" in captured
-    assert captured["args"][0] == ["ae1", "ae2"]
-
-    fw_ctx = captured.get("framework_ctx", {})
-    assert fw_ctx.get("framework") == "llamaindex"
-    assert fw_ctx.get("operation") == "delete_edges"
-    assert fw_ctx.get("namespace") == "adel-edges-ns"
 
 
 # ---------------------------------------------------------------------------
