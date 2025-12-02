@@ -1,5 +1,3 @@
-# tests/frameworks/graph/test_autogen_graph_adapter.py
-
 from __future__ import annotations
 
 import asyncio
@@ -12,6 +10,7 @@ import corpus_sdk.graph.framework_adapters.autogen as autogen_adapter_module
 from corpus_sdk.graph.framework_adapters.autogen import (
     AutoGenGraphFrameworkTranslator,
     CorpusAutoGenGraphClient,
+    ErrorCodes,
 )
 
 
@@ -187,6 +186,57 @@ def test_autogen_conversation_and_extra_context_passed_to_core_ctx(
     assert captured.get("extra") == extra_ctx
 
 
+def test_build_ctx_failure_raises_badrequest_with_error_code_and_attaches_context(
+    monkeypatch: pytest.MonkeyPatch,
+    graph_adapter: Any,
+) -> None:
+    """
+    If core_ctx_from_autogen fails, _build_ctx should:
+
+    - Attach error context via attach_context(framework="autogen", operation="context_translation")
+    - Re-raise as a BadRequest-like error with code=ErrorCodes.BAD_OPERATION_CONTEXT
+    """
+    captured_ctx: Dict[str, Any] = {}
+
+    def fake_attach_context(exc: BaseException, **ctx: Any) -> None:
+        captured_ctx.update(ctx)
+
+    def fake_core_ctx_from_autogen(*args: Any, **kwargs: Any) -> Any:  # noqa: ARG001
+        raise RuntimeError("boom from autogen ctx")
+
+    monkeypatch.setattr(
+        autogen_adapter_module,
+        "attach_context",
+        fake_attach_context,
+    )
+    monkeypatch.setattr(
+        autogen_adapter_module,
+        "core_ctx_from_autogen",
+        fake_core_ctx_from_autogen,
+    )
+
+    client = _make_client(
+        graph_adapter,
+        framework_version="autogen-fw-test",
+    )
+
+    with pytest.raises(Exception) as exc_info:
+        client.query(
+            "MATCH (n) RETURN n",
+            conversation={"conversation_id": "conv-fail"},
+        )
+
+    err = exc_info.value
+    # We don't care about the concrete exception type, just the semantic code.
+    assert getattr(err, "code", None) == ErrorCodes.BAD_OPERATION_CONTEXT
+    msg = str(err).lower()
+    assert "operation" in msg or "context" in msg
+
+    # Ensure error context was attached with framework metadata.
+    assert captured_ctx.get("framework") == "autogen"
+    assert captured_ctx.get("operation") == "context_translation"
+
+
 # ---------------------------------------------------------------------------
 # Error-context decorator behavior
 # ---------------------------------------------------------------------------
@@ -290,6 +340,178 @@ async def test_error_context_includes_autogen_metadata_async(
         assert captured_context["conversation_id"] == "conv-ctx-async"
     if "agent_name" in captured_context:
         assert captured_context["agent_name"] == "tester-async"
+
+
+# ---------------------------------------------------------------------------
+# Streaming validation / error paths
+# ---------------------------------------------------------------------------
+
+
+def test_stream_query_invalid_chunk_triggers_validation_and_context(
+    monkeypatch: pytest.MonkeyPatch,
+    graph_adapter: Any,
+) -> None:
+    """
+    stream_query() should validate each chunk via validate_graph_result_type.
+
+    If a non-QueryChunk-like value is produced, validate_graph_result_type
+    should raise, and the error-context decorator should attach framework
+    metadata before re-raising.
+    """
+    captured_ctx: Dict[str, Any] = {}
+
+    def fake_attach_context(exc: BaseException, **ctx: Any) -> None:
+        captured_ctx.update(ctx)
+
+    monkeypatch.setattr(
+        autogen_adapter_module,
+        "attach_context",
+        fake_attach_context,
+    )
+
+    class DummyTranslator:
+        def query_stream(
+            self,
+            raw_query: Mapping[str, Any],
+            *,
+            op_ctx: Any = None,  # noqa: ARG002
+            framework_ctx: Mapping[str, Any] | None = None,
+        ):
+            # Yield a clearly-invalid "chunk" to trigger validation.
+            yield {"not": "a-query-chunk"}
+
+    def fake_create_graph_translator(*_: Any, **__: Any) -> Any:
+        return DummyTranslator()
+
+    class FakeValidationError(Exception):
+        def __init__(self, message: str, code: Any | None = None) -> None:
+            super().__init__(message)
+            self.code = code
+
+    def fake_validate_graph_result_type(
+        result: Any,
+        *,
+        expected_type: Any,
+        operation: str,
+        error_code: Any,
+        **_: Any,
+    ) -> Any:
+        # We only care about the streaming chunk path, which uses
+        # BAD_TRANSLATED_CHUNK as the error_code.
+        if error_code == ErrorCodes.BAD_TRANSLATED_CHUNK:
+            raise FakeValidationError("invalid chunk", code=error_code)
+        return result
+
+    monkeypatch.setattr(
+        autogen_adapter_module,
+        "create_graph_translator",
+        fake_create_graph_translator,
+    )
+    monkeypatch.setattr(
+        autogen_adapter_module,
+        "validate_graph_result_type",
+        fake_validate_graph_result_type,
+    )
+
+    client = _make_client(graph_adapter)
+
+    it = client.stream_query("MATCH (n) RETURN n LIMIT 2")
+
+    with pytest.raises(FakeValidationError, match="invalid chunk") as exc_info:
+        # Force consumption of the first (invalid) chunk.
+        next(it)
+
+    err = exc_info.value
+    assert getattr(err, "code", None) == ErrorCodes.BAD_TRANSLATED_CHUNK
+
+    # Error-context decorator should have attached framework metadata.
+    assert captured_ctx.get("framework") == "autogen"
+    assert str(captured_ctx.get("operation", "")).startswith("graph_")
+
+
+@pytest.mark.asyncio
+async def test_astream_query_invalid_chunk_triggers_validation_and_context_async(
+    monkeypatch: pytest.MonkeyPatch,
+    graph_adapter: Any,
+) -> None:
+    """
+    astream_query() should also validate chunks via validate_graph_result_type.
+
+    If an invalid chunk is produced, validation should raise and the
+    async error-context decorator should attach framework metadata.
+    """
+    captured_ctx: Dict[str, Any] = {}
+
+    def fake_attach_context(exc: BaseException, **ctx: Any) -> None:
+        captured_ctx.update(ctx)
+
+    monkeypatch.setattr(
+        autogen_adapter_module,
+        "attach_context",
+        fake_attach_context,
+    )
+
+    class DummyTranslator:
+        async def arun_query_stream(
+            self,
+            raw_query: Mapping[str, Any],
+            *,
+            op_ctx: Any = None,  # noqa: ARG002
+            framework_ctx: Mapping[str, Any] | None = None,
+        ):
+            # Async generator yielding an invalid chunk.
+            async def _gen():
+                yield {"not": "a-query-chunk"}
+
+            return _gen()
+
+    def fake_create_graph_translator(*_: Any, **__: Any) -> Any:
+        return DummyTranslator()
+
+    class FakeValidationError(Exception):
+        def __init__(self, message: str, code: Any | None = None) -> None:
+            super().__init__(message)
+            self.code = code
+
+    def fake_validate_graph_result_type(
+        result: Any,
+        *,
+        expected_type: Any,
+        operation: str,
+        error_code: Any,
+        **_: Any,
+    ) -> Any:
+        if error_code == ErrorCodes.BAD_TRANSLATED_CHUNK:
+            raise FakeValidationError("invalid chunk async", code=error_code)
+        return result
+
+    monkeypatch.setattr(
+        autogen_adapter_module,
+        "create_graph_translator",
+        fake_create_graph_translator,
+    )
+    monkeypatch.setattr(
+        autogen_adapter_module,
+        "validate_graph_result_type",
+        fake_validate_graph_result_type,
+    )
+
+    client = _make_client(graph_adapter)
+
+    aiter = client.astream_query("MATCH (n) RETURN n LIMIT 2")
+    if inspect.isawaitable(aiter):
+        aiter = await aiter  # type: ignore[assignment]
+
+    with pytest.raises(FakeValidationError, match="invalid chunk async") as exc_info:
+        async for _ in aiter:  # noqa: B007
+            # First iteration should raise from validation.
+            break
+
+    err = exc_info.value
+    assert getattr(err, "code", None) == ErrorCodes.BAD_TRANSLATED_CHUNK
+
+    assert captured_ctx.get("framework") == "autogen"
+    assert str(captured_ctx.get("operation", "")).startswith("graph_")
 
 
 # ---------------------------------------------------------------------------
@@ -759,6 +981,12 @@ async def test_context_manager_closes_underlying_graph_adapter() -> None:
         def health(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:  # noqa: ARG002
             return {}
 
+        def close(self) -> None:
+            self.closed = True
+
+        async def aclose(self) -> None:
+            self.aclosed = True
+
     adapter = ClosingGraphAdapter()
 
     # Sync context manager: should call close() if present
@@ -780,4 +1008,3 @@ async def test_context_manager_closes_underlying_graph_adapter() -> None:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
-
