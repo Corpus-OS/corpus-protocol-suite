@@ -359,7 +359,7 @@ def _check_dependencies() -> bool:
 def _list_wire_cases(component: Optional[str] = None, tag: Optional[str] = None) -> int:
     """List wire conformance test cases."""
     try:
-        from wire_cases import get_registry
+        from tests.live.wire_cases import get_registry
         registry = get_registry()
         
         cases = registry.filter(component=component, tag=tag)
@@ -384,7 +384,7 @@ def _list_wire_cases(component: Optional[str] = None, tag: Optional[str] = None)
 def _print_wire_coverage() -> int:
     """Print wire conformance coverage summary."""
     try:
-        from wire_cases import get_registry
+        from tests.live.wire_cases import get_registry
         registry = get_registry()
         summary = registry.get_coverage_summary()
         
