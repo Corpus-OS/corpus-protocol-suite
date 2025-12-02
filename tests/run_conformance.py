@@ -23,6 +23,10 @@ Usage:
     # Wire conformance (envelope validation)
     python -m tests.run_conformance --protocol wire
 
+    # Framework adapter suites
+    python -m tests.run_conformance --protocol embedding_frameworks
+    python -m tests.run_conformance --protocol graph_frameworks
+
     # CI mode with reporting
     python -m tests.run_conformance --ci --report
 
@@ -52,7 +56,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
 
@@ -72,9 +76,13 @@ PROTOCOL_PATHS: Dict[str, str] = {
     "golden": "tests/golden",
     # Wire-level envelope conformance suite
     "wire": "tests/live",
+    # Framework adapter suites
+    "embedding_frameworks": "tests/frameworks/embedding",
+    "graph_frameworks": "tests/frameworks/graph",
 }
 
 # Core protocol set used when no explicit protocols are passed.
+# Intentionally only the core protocol conformance suites (framework adapters are opt-in).
 PROTOCOLS: List[str] = ["llm", "vector", "graph", "embedding", "schema", "golden"]
 
 # All known protocol-like suites this runner understands.
@@ -88,6 +96,8 @@ PROTOCOL_DISPLAY_NAMES = {
     "schema": "Schema Conformance",
     "golden": "Golden Wire Validation",
     "wire": "Wire Envelope Conformance",
+    "embedding_frameworks": "Embedding Framework Adapters V1.0",
+    "graph_frameworks": "Graph Framework Adapters V1.0",
 }
 
 # Reference conformance levels (used for reporting only).
@@ -103,8 +113,10 @@ CONFORMANCE_LEVELS: Dict[str, Dict[str, int]] = {
     "schema": {"gold": 13, "silver": 10, "development": 7},
     # 78 golden tests (55 parametrized + 23 standalone)
     "golden": {"gold": 78, "silver": 62, "development": 39},
-    # Wire suite is dynamic; we treat its thresholds as "total collected" at runtime.
-    # No static entry needed here.
+    # Framework adapter suites (from conformance docs)
+    "embedding_frameworks": {"gold": 121, "silver": 97, "development": 60},
+    "graph_frameworks": {"gold": 184, "silver": 147, "development": 92},
+    # Wire suite is dynamic; thresholds are effectively "total collected" at runtime.
 }
 
 
@@ -150,7 +162,7 @@ def _validate_test_dirs(protocols: List[str]) -> bool:
     return True
 
 
-def _validate_environment() -> tuple[bool, str]:
+def _validate_environment() -> Tuple[bool, str]:
     """Validate test environment for safety checks."""
     issues: List[str] = []
 
@@ -194,7 +206,7 @@ def _calculate_conformance_level(
     protocol: str,
     passed_count: int,
     total_collected: int,
-) -> tuple[str, int]:
+) -> Tuple[str, int]:
     """
     Dynamically calculate level based on percentage of collected tests.
 
@@ -287,6 +299,16 @@ def _parse_junit_results() -> Dict[str, Any]:
                                 "tests.live.",
                                 "tests/live/",
                                 "test_wire_conformance",
+                            ]
+                        elif proto == "embedding_frameworks":
+                            patterns = [
+                                "tests.frameworks.embedding.",
+                                "tests/frameworks/embedding/",
+                            ]
+                        elif proto == "graph_frameworks":
+                            patterns = [
+                                "tests.frameworks.graph.",
+                                "tests/frameworks/graph/",
                             ]
                         else:
                             patterns = [
@@ -546,8 +568,18 @@ def _generate_conformance_report(
             "environment": os.getenv("CORPUS_TEST_ENV", "default"),
         }
 
-        # Stable suite ordering, including wire if present
-        ordered_suites = ["schema", "golden", "wire", "llm", "vector", "graph", "embedding"]
+        # Stable suite ordering, including framework adapter suites
+        ordered_suites = [
+            "schema",
+            "golden",
+            "wire",
+            "llm",
+            "vector",
+            "graph",
+            "embedding",
+            "embedding_frameworks",
+            "graph_frameworks",
+        ]
         seen = set(protocols) | set(junit_data.get("protocol_results", {}).keys())
         report["test_suites"] = [p for p in ordered_suites if p in seen]
 
@@ -918,7 +950,7 @@ def _handle_ci_mode() -> int:
     if env_msg != "Environment OK":
         print(f"ℹ️  Environment: {env_msg}")
 
-    # CI defaults to core protocols only here; wire is handled separately via CLI if desired.
+    # CI defaults to core protocols only here; wire and frameworks are handled separately via CLI if desired.
     return run_all_tests(
         fast=False,
         verbose=False,
