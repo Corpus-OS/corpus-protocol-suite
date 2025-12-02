@@ -1,5 +1,5 @@
 {
-  "op": "create_vertex",
+  "op": "create_node",
   "label": "User",
   "props": {
     "name": "Alice",
