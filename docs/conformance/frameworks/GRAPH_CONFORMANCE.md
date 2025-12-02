@@ -660,36 +660,102 @@ Use this when implementing a **new framework graph adapter**.
 
 ---
 
-## Conformance Badge
+# Framework Graph Adapter Conformance Report
 
-```text
-✅ Framework Graph Protocol Adapters - 100% Conformant
-   184/184 tests passing · 5 frameworks supported
+## 📊 Overall Status
+**Total Tests:** 184 ✅ **Full Compliance:** 100%
 
-   ✅ Framework-Specific Adapters: 130/130 (100%)
-      • LangChain:       25/25 ✅
-      • LlamaIndex:      28/28 ✅ (GraphStore)
-      • Semantic Kernel: 28/28 ✅
-      • AutoGen:         25/25 ✅
-      • CrewAI:          24/24 ✅
+## 🎯 5 Framework Adapters Supported
 
-   ✅ Cross-Framework Contracts:  31/31 (100%)
-      • Interface:       11/11 ✅
-      • Shapes:          12/12 ✅
-      • Context/Error:    8/8 ✅
+| Framework | Tests | Status | Key Features |
+|-----------|-------|--------|--------------|
+| **LangChain** | 25/25 ✅ | Production Ready | GraphTool integration, config context |
+| **LlamaIndex** | 28/28 ✅ | Production Ready | GraphStore, callback manager context |
+| **Semantic Kernel** | 28/28 ✅ | Production Ready | Context/settings translation, streaming |
+| **AutoGen** | 25/25 ✅ | Production Ready | Conversation context, bulk operations |
+| **CrewAI** | 24/24 ✅ | Production Ready | Task context, resource management |
 
-   ✅ Registry Infrastructure:    13/13 (100%)
-      • Descriptor:      10/10 ✅
-      • Registry Ops:     3/3 ✅
+**Total Framework Tests:** 130/130 ✅
 
-   ✅ Robustness & Evil Backends: 10/10 (100%)
-      • Validation:       6/6 ✅
-      • Error Prop:       4/4 ✅
+## 📋 Cross-Framework Contracts
 
-   Status: Production Ready · Full V1.0 Protocol Compliance
+| Category | Tests | What It Validates |
+|----------|-------|-------------------|
+| **Interface Conformance** | 11/11 ✅ | All adapters expose same API methods |
+| **Shapes & Batching** | 12/12 ✅ | Consistent return types, batch semantics |
+| **Context & Error Handling** | 8/8 ✅ | SIEM-safe observability, error metadata |
+
+**Total Contract Tests:** 31/31 ✅
+
+## 🏗️ Infrastructure & Robustness
+
+| Category | Tests | Purpose |
+|----------|-------|---------|
+| **Registry System** | 13/13 ✅ | Framework discovery & registration |
+| **Robustness Tests** | 10/10 ✅ | Handling misbehaving backends |
+
+**Total Infrastructure Tests:** 23/23 ✅
+
+## 🚀 Quick Start Commands
+
+### Check Single Framework (Fastest)
+```bash
+# Test just LangChain (25 tests)
+pytest tests/frameworks/graph/test_langchain_graph_adapter.py -v
+
+# Test just LlamaIndex (28 tests)
+pytest tests/frameworks/graph/test_llamaindex_graph_adapter.py -v
 ```
 
-Implementations that pass all `tests/frameworks/graph/` tests MAY display this badge.
+### Validate Protocol Compliance
+```bash
+# All contract tests (31 tests, ~2 minutes)
+pytest tests/frameworks/graph/test_contract_*.py -v
+```
+
+### Full Test Suite (Comprehensive)
+```bash
+# Everything (184 tests, ~10 minutes)
+pytest tests/frameworks/graph/ -v
+```
+
+## 📈 Test Coverage Breakdown
+
+```
+Framework Adapters:     130 tests  (71%)
+Contract Validation:     31 tests  (17%)
+Infrastructure:          23 tests  (12%)
+                        ─────────
+Total:                  184 tests  (100%)
+```
+
+## 🔧 For Implementers
+
+### Minimum Requirements (31 tests)
+```bash
+# Pass these to claim protocol compliance
+pytest tests/frameworks/graph/test_contract_*.py
+```
+
+### Add a Framework (~35 tests per framework)
+1. Implement adapter class
+2. Register in `graph_registry.py`
+3. Run: `pytest test_contract_interface_conformance.py`
+4. Add framework-specific features
+
+### Production Checklist
+- [ ] Pass all contract tests (31/31)
+- [ ] Pass framework adapter tests (25-28 per framework)
+- [ ] Pass robustness tests (10/10)
+- [ ] Include in registry (auto-discovered)
+
+## 🛡️ Quality Guarantees
+
+✅ **SIEM-Safe:** No sensitive data in logs/metrics  
+✅ **Sync/Async Parity:** Consistent API across modes  
+✅ **Error Context:** Framework metadata in all errors  
+✅ **Resource Cleanup:** Proper close()/aclose() handling  
+✅ **Type Safety:** Consistent return types across calls  
 
 ---
 
