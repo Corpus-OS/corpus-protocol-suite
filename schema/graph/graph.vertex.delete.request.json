@@ -1,13 +1,31 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://corpusos.com/schemas/graph/graph.vertex.delete.request.json",
-  "title": "graph.delete_vertex Args",
+  "$id": "https://corpusos.com/schemas/graph/graph.delete_nodes.request.json",
+  "title": "graph.delete_nodes Args",
   "type": "object",
   "additionalProperties": false,
-  "required": ["vertex_id"],
   "properties": {
-    "vertex_id": {
-      "$ref": "https://corpusos.com/schemas/graph/graph.types.id.json"
+    "ids": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "https://corpusos.com/schemas/graph/graph.types.id.json"
+      }
+    },
+    "label": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._:-]{1,128}$"
+    },
+    "namespace": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
     }
-  }
+  },
+  "oneOf": [
+    { "required": ["ids"] },
+    { "required": ["label"] }
+  ]
 }
