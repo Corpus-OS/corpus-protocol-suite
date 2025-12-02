@@ -5,10 +5,6 @@ Pytest plugin: comprehensive terminal summary for Corpus Protocol conformance.
 Drop this into `tests/conftest.py` (or any file auto-discovered by pytest)
 to get detailed per-protocol conformance reporting with certification levels,
 failure analysis, and actionable guidance.
-
-NOTE: The live wire conformance suite in tests/live is treated as its own
-"wire" protocol, separate from llm/vector/graph/embedding adapter tests,
-schema lint tests, and golden samples.
 """
 
 from __future__ import annotations
@@ -119,7 +115,7 @@ PROTOCOLS_CONFIG = {
     "llm": ProtocolConfig(
         name="llm",
         display_name="LLM Protocol V1.0",
-        # Reference: currently 111 llm tests in the suite
+        # Reference: currently ~111 llm tests in the suite
         conformance_levels={"gold": 111, "silver": 89, "development": 56},
         test_categories={
             "wire_contract": "Wire Contract & Routing",
@@ -203,7 +199,7 @@ PROTOCOLS_CONFIG = {
     "vector": ProtocolConfig(
         name="vector",
         display_name="Vector Protocol V1.0",
-        # Reference: 73 vector tests
+        # Reference: ~73 vector tests (adapter + protocol-level)
         conformance_levels={"gold": 73, "silver": 58, "development": 36},
         test_categories={
             "wire_contract": "Wire Contract & Routing",
@@ -414,6 +410,46 @@ PROTOCOLS_CONFIG = {
             }
         }
     ),
+
+    # NEW: Dedicated protocol entry for the wire conformance suite (tests/live)
+    "wire": ProtocolConfig(
+        name="wire",
+        display_name="Wire Request Conformance Suite",
+        # Authoritative numbers from wire_cases.py + edge-case tests:
+        # 48 parametrized request cases + 25 edge/validator tests = 73
+        conformance_levels={"gold": 73, "silver": 58, "development": 37},
+        test_categories={
+            # We treat all tests in tests/live as belonging to this single category.
+            "wire": "Wire Request Envelope Conformance",
+        },
+        spec_sections={
+            "wire": "Wire Request Conformance Suite (tests/live/test_wire_conformance.py)",
+        },
+        error_guidance={
+            "wire": {
+                # Main parametrized wire test
+                "test_wire_request_envelope": {
+                    "error_patterns": {
+                        "schema validation failed": (
+                            "Envelope does not validate against the JSON Schemas resolved by the schema registry"
+                        ),
+                        "validationerror": (
+                            "Envelope fails structural or args validation in tests.live.wire_validators"
+                        ),
+                    },
+                    "quick_fix": (
+                        "Ensure your adapter's build_*_envelope methods produce envelopes that match the "
+                        "CORPUS Protocol wire envelope schemas and the constraints enforced in "
+                        "tests/live/wire_validators.py."
+                    ),
+                    "examples": (
+                        "See tests/live/wire_cases.py for the canonical WireRequestCase definitions and "
+                        "tests/live/wire_validators.py for the validation pipeline."
+                    ),
+                },
+            }
+        }
+    ),
     
     "schema": ProtocolConfig(
         name="schema",
@@ -565,35 +601,7 @@ PROTOCOLS_CONFIG = {
                 }
             }
         }
-    ),
-    
-    "wire": ProtocolConfig(
-        name="wire",
-        display_name="Wire Conformance Suite",
-        # Reference levels are placeholders; dynamic scoring is used in practice
-        conformance_levels={"gold": 0, "silver": 0, "development": 0},
-        test_categories={
-            "wire": "Wire Conformance",
-        },
-        spec_sections={
-            "wire": "Wire Conformance Suite - Wire Envelope Contract & Live Adapter Coverage",
-        },
-        error_guidance={
-            "wire": {
-                "test_wire_request_envelope": {
-                    "error_patterns": {
-                        "missing required keys": "Wire envelope missing op/ctx/args or required fields",
-                        "schema validation failed": "Envelope does not match component envelope schema",
-                    },
-                    "quick_fix": (
-                        "Ensure adapter build_*_envelope methods produce envelopes that match the "
-                        "CORPUS wire envelope schemas for llm/vector/graph/embedding."
-                    ),
-                    "examples": "See wire conformance documentation for example envelopes and schemas.",
-                }
-            }
-        }
-    ),
+    )
 }
 
 # Register all protocols
@@ -833,7 +841,9 @@ class TestCategorizer:
         Categorize test by protocol and category with caching.
 
         This works for the per-protocol suites in tests/<proto>/ as well as the
-        shared wire conformance suite in tests/live.
+        shared wire conformance suite in tests/live. Wire tests are *not* counted
+        towards the llm/vector/graph/embedding adapter suites; they are grouped
+        under the dedicated 'wire' protocol.
         """
         nodeid_lower = (nodeid or "").lower()
         
@@ -845,18 +855,28 @@ class TestCategorizer:
         
         self._cache_misses += 1
 
+        # First, try to infer protocol from directory (tests/llm, tests/vector, ...)
+        protocol = "other"
+        for proto, pattern in self._protocol_patterns.items():
+            if pattern.search(nodeid_lower):
+                protocol = proto
+                break
+
         # Special handling for shared wire tests under tests/live.
-        # These are structurally different from adapter/unit/golden/schema tests
-        # and are treated as their own "wire" protocol suite.
-        if "tests/live" in nodeid_lower or "tests\\live" in nodeid_lower:
+        # They live in tests/live/test_wire_conformance.py and should all be
+        # treated as protocol 'wire', independent of which operation (llm/vector/...)
+        # they're exercising.
+        if protocol == "other" and (
+            "tests/live" in nodeid_lower or "tests\\live" in nodeid_lower
+        ):
             protocol = "wire"
-        else:
-            # Infer protocol from directory (tests/llm, tests/vector, ...)
-            protocol = "other"
-            for proto, pattern in self._protocol_patterns.items():
-                if pattern.search(nodeid_lower):
-                    protocol = proto
-                    break
+
+        # For the dedicated wire suite, we keep categorization simple: everything
+        # is considered part of the 'wire' category.
+        if protocol == "wire":
+            result = ("wire", "wire")
+            self._cache[nodeid_lower] = result
+            return result
         
         if protocol == "other":
             result = ("other", "unknown")
@@ -930,7 +950,7 @@ class CorpusProtocolPlugin:
         self._protocol_results_cache = None
         self._protocol_totals_cache = None
         self.plain_output = self._use_plain_output()
-               self.verbose = bool(getattr(session.config, "option", None) and session.config.option.verbose)
+        self.verbose = bool(getattr(session.config, "option", None) and session.config.option.verbose)
         self.unmapped_categories.clear()
         
         if session.config.option.verbose:
@@ -983,8 +1003,6 @@ class CorpusProtocolPlugin:
             nodeid = getattr(rep, "nodeid", "") or ""
             proto, category = test_categorizer.categorize_test(nodeid)
             
-            if proto not in by_protocol:
-                by_protocol[proto] = {}
             if category not in by_protocol[proto]:
                 by_protocol[proto][category] = []
             
@@ -1492,9 +1510,9 @@ def pytest_configure(config):
         "vector: Vector Protocol V1.0 conformance tests", 
         "graph: Graph Protocol V1.0 conformance tests",
         "embedding: Embedding Protocol V1.0 conformance tests",
+        "wire: Wire Request Conformance tests (tests/live)",
         "schema: Schema conformance validation tests",
         "golden: Golden wire message validation tests",
-        "wire: Wire conformance tests (tests/live)",
         "slow: Tests that take longer to run (skip with -m 'not slow')",
         "conformance: All protocol conformance tests",
     ]
