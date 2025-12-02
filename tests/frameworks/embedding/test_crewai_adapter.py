@@ -177,6 +177,48 @@ def test_crewai_context_passed_to_context_translation(
     assert captured["framework_version"] == "crewai-test-version"
 
 
+def test_error_context_includes_crewai_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When an error occurs during CrewAI embedding, error context should include
+    CrewAI-specific metadata (e.g., agent_role, task_id) via attach_context().
+    """
+    captured_context: Dict[str, Any] = {}
+
+    def fake_attach_context(exc: BaseException, **ctx: Any) -> None:
+        captured_context.update(ctx)
+
+    monkeypatch.setattr(
+        crewai_adapter_module,
+        "attach_context",
+        fake_attach_context,
+    )
+
+    class FailingAdapter:
+        def embed(self, *args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("test error from crewai adapter")
+
+    embeddings = CorpusCrewAIEmbeddings(corpus_adapter=FailingAdapter())
+
+    crew_ctx = {"agent_role": "tester", "task_id": "task-123"}
+
+    with pytest.raises(RuntimeError, match="test error from crewai adapter"):
+        embeddings.embed_documents(["text"], crewai_context=crew_ctx)
+
+    # Verify some context was attached
+    assert captured_context, "attach_context was not called"
+
+    # Framework tagging should be present
+    assert "framework" in captured_context
+    # If your adapter uses a different tag, tweak this accordingly:
+    assert captured_context.get("framework") == "crewai"
+
+    # CrewAI-specific fields should be present in the context
+    assert captured_context.get("agent_role") == "tester"
+    assert captured_context.get("task_id") == "task-123"
+
+
 # ---------------------------------------------------------------------------
 # Sync semantics
 # ---------------------------------------------------------------------------
@@ -275,6 +317,31 @@ async def test_async_and_sync_same_dimension(adapter: Any) -> None:
     assert len(sync_q) == len(async_q)
 
 
+def test_crewai_interface_compatibility(adapter: Any) -> None:
+    """
+    Verify that CorpusCrewAIEmbeddings implements the expected CrewAI
+    Embeddings interface when CrewAI is available.
+    """
+    embeddings = _make_embeddings(adapter)
+
+    # Core methods should always exist
+    assert hasattr(embeddings, "embed_documents")
+    assert hasattr(embeddings, "embed_query")
+    assert hasattr(embeddings, "aembed_documents")
+    assert hasattr(embeddings, "aembed_query")
+
+    # Try to import CrewAI's Embeddings base class if available
+    try:
+        from crewai.embeddings import Embeddings  # type: ignore[import]
+    except ImportError:
+        pytest.skip("CrewAI is not installed; cannot assert interface compatibility")
+
+    assert isinstance(
+        embeddings,
+        Embeddings,
+    ), "CorpusCrewAIEmbeddings should subclass CrewAI Embeddings when available"
+
+
 # ---------------------------------------------------------------------------
 # Capabilities / health passthrough
 # ---------------------------------------------------------------------------
@@ -298,9 +365,6 @@ def test_capabilities_passthrough_when_underlying_provides() -> None:
     caps = embeddings.capabilities()
     assert isinstance(caps, dict)
     assert caps.get("ok") is True
-
-    # acapabilities should fall back to sync capabilities if only sync is present
-    acaps = pytest.run(asyncio=True, func=embeddings.acapabilities)  # type: ignore[no-redef]
 
 
 @pytest.mark.asyncio
@@ -341,7 +405,6 @@ def test_capabilities_raises_when_missing() -> None:
 
     # acapabilities should also raise
     with pytest.raises(NotImplementedError):
-        # acapabilities is async; call via event loop
         import asyncio
 
         asyncio.run(embeddings.acapabilities())
@@ -469,4 +532,3 @@ def test_register_with_crewai_no_agents_attribute(adapter: Any) -> None:
         corpus_adapter=adapter,
     )
     assert isinstance(emb, CorpusCrewAIEmbeddings)
-
