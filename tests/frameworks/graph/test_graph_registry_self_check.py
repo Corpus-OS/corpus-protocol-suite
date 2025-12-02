@@ -152,6 +152,31 @@ def test_supports_async_property(all_descriptors) -> None:
         )
 
 
+def test_bulk_vertices_and_batch_properties(all_descriptors) -> None:
+    """
+    Test supports_bulk_vertices and supports_batch properties.
+
+    Ensures the flags correctly reflect whether bulk/batch methods
+    are actually declared on the descriptor.
+    """
+    for descriptor in all_descriptors:
+        has_bulk = (
+            descriptor.bulk_vertices_method is not None
+            or descriptor.async_bulk_vertices_method is not None
+        )
+        assert descriptor.supports_bulk_vertices == has_bulk, (
+            f"{descriptor.name}: supports_bulk_vertices property mismatch"
+        )
+
+        has_batch = (
+            descriptor.batch_method is not None
+            or descriptor.async_batch_method is not None
+        )
+        assert descriptor.supports_batch == has_batch, (
+            f"{descriptor.name}: supports_batch property mismatch"
+        )
+
+
 def test_register_graph_framework_descriptor() -> None:
     """
     Test dynamic registration functionality for graph frameworks.
@@ -349,4 +374,3 @@ def test_descriptor_validation_edge_cases() -> None:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
-
