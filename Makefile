@@ -5,11 +5,15 @@
 	test-vector-conformance \
 	test-graph-conformance \
 	test-embedding-conformance \
+	test-embedding-frameworks \
+	test-graph-frameworks \
 	test-fast \
 	test-fast-llm \
 	test-fast-vector \
 	test-fast-graph \
 	test-fast-embedding \
+	test-fast-embedding-frameworks \
+	test-fast-graph-frameworks \
 	test-schema \
 	test-schema-fast \
 	test-golden \
@@ -40,7 +44,8 @@ PYTEST_ARGS ?= -v
 PYTEST_JOBS ?= auto
 COV_FAIL_UNDER ?= 80
 
-# Protocols and directories (consistent with Python code PROTOCOL_PATHS)
+# Protocols and directories (core protocol conformance suites)
+# Keep in sync with Python PROTOCOL_PATHS core entries
 PROTOCOLS := llm vector graph embedding
 TEST_DIRS := $(foreach p,$(PROTOCOLS),tests/$(p))
 
@@ -52,18 +57,24 @@ SCHEMA_TEST_DIR := tests/schema
 GOLDEN_TEST_DIR := tests/golden
 WIRE_TEST_DIR := tests/live
 
+# Framework adapter test directories (optional)
+EMBEDDING_FRAMEWORKS_DIR := tests/frameworks/embedding
+GRAPH_FRAMEWORKS_DIR := tests/frameworks/graph
+
 # Derived configuration
 PYTEST_PARALLEL := $(if $(filter-out 1,$(PYTEST_JOBS)),-n $(PYTEST_JOBS),)
 COV_REPORT_TERM := --cov-report=term
 COV_THRESHOLD := --cov-fail-under=$(COV_FAIL_UNDER)
 
-# Validate per-protocol test directories exist
+# Validate per-protocol test directories exist (hard failure)
 $(foreach dir,$(TEST_DIRS),$(if $(wildcard $(dir)),,$(error Test directory $(dir) not found)))
 
-# Soft-guard: warn (do not fail) if schema/golden/wire dirs are missing
+# Soft-guard: warn (do not fail) if schema/golden/wire/framework dirs are missing
 $(if $(wildcard $(SCHEMA_TEST_DIR)),,$(warning ⚠️  Schema test directory '$(SCHEMA_TEST_DIR)' not found))
 $(if $(wildcard $(GOLDEN_TEST_DIR)),,$(warning ⚠️  Golden test directory '$(GOLDEN_TEST_DIR)' not found))
 $(if $(wildcard $(WIRE_TEST_DIR)),,$(warning ⚠️  Wire test directory '$(WIRE_TEST_DIR)' not found))
+$(if $(wildcard $(EMBEDDING_FRAMEWORKS_DIR)),,$(warning ⚠️  Embedding framework test directory '$(EMBEDDING_FRAMEWORKS_DIR)' not found))
+$(if $(wildcard $(GRAPH_FRAMEWORKS_DIR)),,$(warning ⚠️  Graph framework test directory '$(GRAPH_FRAMEWORKS_DIR)' not found))
 
 # Dependency check
 check-deps:
@@ -135,6 +146,7 @@ safety-check: validate-env
 # --------------------------------------------------------------------------- #
 # Run ALL protocol conformance suites (LLM + Vector + Graph + Embedding)
 # + top-level orchestration/CLI tests
+# NOTE: Framework adapter suites are opt-in via their own targets.
 # --------------------------------------------------------------------------- #
 test-conformance test-all-conformance: check-deps safety-check
 	@echo "🚀 Running ALL protocol conformance suites..."
@@ -171,6 +183,31 @@ test-%-conformance: check-deps
 		$(COV_REPORT_TERM) \
 		--cov-report=html:$*_coverage_report \
 		--junitxml=$*_results.xml
+
+# Framework adapter suites: explicit targets (paths differ from tests/$*)
+test-embedding-frameworks: check-deps
+	@echo "🚀 Running Embedding Framework Adapters conformance tests..."
+	@echo "   Directory: $(EMBEDDING_FRAMEWORKS_DIR)"
+	@echo "   Parallel jobs: $(PYTEST_JOBS)"
+	@echo "   Coverage threshold: $(COV_FAIL_UNDER)%"
+	$(PYTEST) $(EMBEDDING_FRAMEWORKS_DIR) $(PYTEST_ARGS) $(PYTEST_PARALLEL) \
+		--cov=corpus_sdk.embedding.framework_adapters \
+		$(COV_THRESHOLD) \
+		$(COV_REPORT_TERM) \
+		--cov-report=html:embedding_frameworks_coverage_report \
+		--junitxml=embedding_frameworks_results.xml
+
+test-graph-frameworks: check-deps
+	@echo "🚀 Running Graph Framework Adapters conformance tests..."
+	@echo "   Directory: $(GRAPH_FRAMEWORKS_DIR)"
+	@echo "   Parallel jobs: $(PYTEST_JOBS)"
+	@echo "   Coverage threshold: $(COV_FAIL_UNDER)%"
+	$(PYTEST) $(GRAPH_FRAMEWORKS_DIR) $(PYTEST_ARGS) $(PYTEST_PARALLEL) \
+		--cov=corpus_sdk.graph.framework_adapters \
+		$(COV_THRESHOLD) \
+		$(COV_REPORT_TERM) \
+		--cov-report=html:graph_frameworks_coverage_report \
+		--junitxml=graph_frameworks_results.xml
 
 # --------------------------------------------------------------------------- #
 # Schema / Golden Conformance (Additive Targets)
@@ -252,10 +289,10 @@ conformance-report: test-conformance
 	@echo "📊 Generating detailed conformance report..."
 	@python - <<'PY'
 try:
-    import json, datetime, os, glob, re
+    import json, datetime, os, glob
     from xml.etree import ElementTree
     
-    # All possible test suites (matches Python PROTOCOL_PATHS)
+    # All possible test suites (keep in sync with Python run_conformance + CLI)
     ALL_TEST_SUITES = {
         "schema": "Schema Conformance",
         "golden": "Golden Wire Validation",
@@ -264,6 +301,8 @@ try:
         "vector": "Vector Protocol V1.0",
         "graph": "Graph Protocol V1.0",
         "embedding": "Embedding Protocol V1.0",
+        "embedding_frameworks": "Embedding Framework Adapters V1.0",
+        "graph_frameworks": "Graph Framework Adapters V1.0",
         "cli": "CLI Tests",
         "root_conformance": "Conformance Runner Tests",
         "conformance": "Full Conformance Suite"
@@ -280,12 +319,14 @@ try:
     suites_ran = []
     protocols_ran = []
     
-    # Protocol detection mapping
+    # Protocol detection mapping (for protocols field in report)
     protocol_map = {
         "llm": "LLM",
         "vector": "Vector", 
         "graph": "Graph",
-        "embedding": "Embedding"
+        "embedding": "Embedding",
+        "embedding_frameworks": "Embedding Framework Adapters",
+        "graph_frameworks": "Graph Framework Adapters",
     }
     
     for xml_file in xml_files:
@@ -296,7 +337,10 @@ try:
                 total_tests += int(root.get("tests", 0))
                 total_failures += int(root.get("failures", 0))
                 total_errors += int(root.get("errors", 0))
-                total_time += float(root.get("time", 0))
+                try:
+                    total_time += float(root.get("time", 0))
+                except (TypeError, ValueError):
+                    pass
                 
                 # Determine which suite this is
                 if xml_file == "conformance_results.xml":
@@ -305,10 +349,11 @@ try:
                 elif xml_file.endswith("_results.xml"):
                     suite_name = xml_file.replace("_results.xml", "")
                     if suite_name in ALL_TEST_SUITES:
-                        suites_ran.append(suite_name)
+                        if suite_name not in suites_ran:
+                            suites_ran.append(suite_name)
                         
                         # Check if it's a protocol suite
-                        if suite_name in protocol_map:
+                        if suite_name in protocol_map and suite_name not in protocols_ran:
                             protocols_ran.append(suite_name)
                 
             except Exception as e:
@@ -316,18 +361,40 @@ try:
     
     status = "PASS" if total_failures == 0 and total_errors == 0 else "FAIL"
     
-    # If no protocols detected from XML, use defaults
-    if not protocols_ran:
+    # If no protocols detected from XML, use core defaults
+    if not protocols_ran and total_tests > 0:
         protocols_ran = ["llm", "vector", "graph", "embedding"]
     
     # Filter test_suites to only include those that actually ran
-    test_suites_ran = [suite for suite in [
-        "schema", "golden", "wire", "llm", "vector", "graph", "embedding", "cli", "root_conformance"
-    ] if suite in suites_ran or suite in protocols_ran]
+    test_suites_order = [
+        "schema",
+        "golden",
+        "wire",
+        "llm",
+        "vector",
+        "graph",
+        "embedding",
+        "embedding_frameworks",
+        "graph_frameworks",
+        "cli",
+        "root_conformance",
+    ]
+    test_suites_ran = [
+        suite for suite in test_suites_order
+        if suite in suites_ran or suite in protocols_ran
+    ]
     
-    # Fallback: if we have tests but no suites detected, include all
+    # Fallback: if we have tests but no suites detected, include core protocols
     if total_tests > 0 and not test_suites_ran:
-        test_suites_ran = ["schema", "golden", "wire", "llm", "vector", "graph", "embedding"]
+        test_suites_ran = [
+            "schema",
+            "golden",
+            "wire",
+            "llm",
+            "vector",
+            "graph",
+            "embedding",
+        ]
     
     results = {
         "protocols": protocols_ran,
@@ -433,6 +500,15 @@ test-fast-%: check-deps
 	@echo "⚡ Running fast $(shell echo $* | tr 'a-z' 'A-Z') tests (no coverage, skipping slow)..."
 	$(PYTEST) tests/$* $(PYTEST_ARGS) $(PYTEST_PARALLEL) -m "not slow" --no-cov
 
+# Fast framework adapter suites
+test-fast-embedding-frameworks: check-deps
+	@echo "⚡ Running fast Embedding Framework Adapters tests (no coverage, skipping slow)..."
+	$(PYTEST) $(EMBEDDING_FRAMEWORKS_DIR) $(PYTEST_ARGS) $(PYTEST_PARALLEL) -m "not slow" --no-cov
+
+test-fast-graph-frameworks: check-deps
+	@echo "⚡ Running fast Graph Framework Adapters tests (no coverage, skipping slow)..."
+	$(PYTEST) $(GRAPH_FRAMEWORKS_DIR) $(PYTEST_ARGS) $(PYTEST_PARALLEL) -m "not slow" --no-cov
+
 # --------------------------------------------------------------------------- #
 # Verification & Utilities
 # --------------------------------------------------------------------------- #
@@ -483,73 +559,83 @@ help:
 	@echo "  verify                     Alias for test-conformance with verification messaging"
 	@echo ""
 	@echo "Per-Protocol Conformance:"
-	@echo "  test-llm-conformance       Run only LLM Protocol V1 tests (tests/llm)"
-	@echo "  test-vector-conformance    Run only Vector Protocol V1 tests (tests/vector)"
-	@echo "  test-graph-conformance     Run only Graph Protocol V1 tests (tests/graph)"
-	@echo "  test-embedding-conformance Run only Embedding Protocol V1 tests (tests/embedding)"
+	@echo "  test-llm-conformance              Run only LLM Protocol V1 tests (tests/llm)"
+	@echo "  test-vector-conformance           Run only Vector Protocol V1 tests (tests/vector)"
+	@echo "  test-graph-conformance            Run only Graph Protocol V1 tests (tests/graph)"
+	@echo "  test-embedding-conformance        Run only Embedding Protocol V1 tests (tests/embedding)"
+	@echo ""
+	@echo "Framework Adapter Suites:"
+	@echo "  test-embedding-frameworks         Run Embedding Framework Adapters tests (tests/frameworks/embedding)"
+	@echo "  test-graph-frameworks             Run Graph Framework Adapters tests (tests/frameworks/graph)"
+	@echo "  test-fast-embedding-frameworks    Fast Embedding Framework Adapters tests (no coverage, skip slow)"
+	@echo "  test-fast-graph-frameworks        Fast Graph Framework Adapters tests (no coverage, skip slow)"
 	@echo ""
 	@echo "Schema & Golden Conformance:"
-	@echo "  test-schema                Run schema meta-lint (Draft 2020-12, \$id/\$ref checks)"
-	@echo "  test-golden                Validate golden wire messages (envelopes/streams/invariants)"
-	@echo "  verify-schema              Run schema meta-lint + golden validation"
-	@echo "  test-schema-fast           Fast schema meta-lint (no coverage, skip slow)"
-	@echo "  test-golden-fast           Fast golden validation (no coverage, skip slow)"
+	@echo "  test-schema                       Run schema meta-lint (Draft 2020-12, \$id/\$ref checks)"
+	@echo "  test-golden                       Validate golden wire messages (envelopes/streams/invariants)"
+	@echo "  verify-schema                     Run schema meta-lint + golden validation"
+	@echo "  test-schema-fast                  Fast schema meta-lint (no coverage, skip slow)"
+	@echo "  test-golden-fast                  Fast golden validation (no coverage, skip slow)"
 	@echo ""
 	@echo "Wire Envelope Conformance:"
-	@echo "  test-wire                  Run wire-level envelope conformance (tests/live/test_wire_conformance.py)"
-	@echo "  test-wire-fast             Fast wire conformance (no coverage, skip slow)"
+	@echo "  test-wire                         Run wire-level envelope conformance (tests/live/test_wire_conformance.py)"
+	@echo "  test-wire-fast                    Fast wire conformance (no coverage, skip slow)"
 	@echo ""
 	@echo "Extra Top-Level Tests:"
-	@echo "  test-cli                   Run CLI wrapper tests (tests/cli.py)"
-	@echo "  test-root-conformance      Run top-level conformance runner tests (tests/run_conformance.py)"
+	@echo "  test-cli                          Run CLI wrapper tests (tests/cli.py)"
+	@echo "  test-root-conformance             Run top-level conformance runner tests (tests/run_conformance.py)"
 	@echo ""
 	@echo "CI & Automation:"
-	@echo "  test-ci                    Full CI pipeline (wire + conformance + report)"
-	@echo "  test-ci-fast               Fast CI pipeline (wire-fast + test-fast)"
-	@echo "  conformance-report         Generate JSON summary with JUnit XML parsing"
-	@echo "  upload-results             Upload results to conformance service"
-	@echo "  setup-test-env             Interactive test environment configuration"
+	@echo "  test-ci                           Full CI pipeline (wire + conformance + report)"
+	@echo "  test-ci-fast                      Fast CI pipeline (wire-fast + test-fast)"
+	@echo "  conformance-report                Generate JSON summary with JUnit XML parsing"
+	@echo "  upload-results                    Upload results to conformance service"
+	@echo "  setup-test-env                    Interactive test environment configuration"
 	@echo ""
 	@echo "Quick / Docker / Environment:"
-	@echo "  quick-check                Smoke test subset (schema+golden)"
-	@echo "  test-docker                Build and run tests inside Docker"
-	@echo "  validate-env               Validate required environment variables"
-	@echo "  safety-check               Block full runs in production envs (use quick-check)"
-	@echo "  check-versions             Print key dependency versions"
+	@echo "  quick-check                       Smoke test subset (schema+golden)"
+	@echo "  test-docker                       Build and run tests inside Docker"
+	@echo "  validate-env                      Validate required environment variables"
+	@echo "  safety-check                      Block full runs in production envs (use quick-check)"
+	@echo "  check-versions                    Print key dependency versions"
 	@echo ""
 	@echo "Fast Testing (No Coverage):"
-	@echo "  test-fast                  Run all tests quickly (protocol + wire + extra, no coverage, skip slow)"
-	@echo "  test-fast-llm              Run only LLM tests quickly"
-	@echo "  test-fast-vector           Run Vector tests quickly"
-	@echo "  test-fast-graph            Run Graph tests quickly"
-	@echo "  test-fast-embedding        Run Embedding tests quickly"
-	@echo "  test-wire-fast             Run wire tests quickly (also included in test-fast)"
+	@echo "  test-fast                         Run all tests quickly (protocol + wire + extra, no coverage, skip slow)"
+	@echo "  test-fast-llm                     Run only LLM tests quickly"
+	@echo "  test-fast-vector                  Run Vector tests quickly"
+	@echo "  test-fast-graph                   Run Graph tests quickly"
+	@echo "  test-fast-embedding               Run Embedding tests quickly"
+	@echo "  test-fast-embedding-frameworks    Run Embedding Framework Adapters tests quickly"
+	@echo "  test-fast-graph-frameworks        Run Graph Framework Adapters tests quickly"
+	@echo "  test-wire-fast                    Run wire tests quickly (also available via test-fast)"
 	@echo ""
 	@echo "Utilities:"
-	@echo "  check-deps                 Verify test dependencies are installed"
-	@echo "  clean                      Remove all generated files and caches"
-	@echo "  help                       Show this help message"
+	@echo "  check-deps                        Verify test dependencies are installed"
+	@echo "  clean                             Remove all generated files and caches"
+	@echo "  help                              Show this help message"
 	@echo ""
 	@echo "Configuration (override via environment/make args):"
-	@echo "  PYTEST_ARGS=-x             Stop on first failure"
-	@echo "  PYTEST_ARGS=--tb=short     Shorter tracebacks"
-	@echo "  PYTEST_JOBS=4              Run 4 parallel jobs"
-	@echo "  PYTEST_JOBS=1              Disable parallel execution"
-	@echo "  COV_FAIL_UNDER=90          Require 90% coverage"
+	@echo "  PYTEST_ARGS=-x                    Stop on first failure"
+	@echo "  PYTEST_ARGS=--tb=short            Shorter tracebacks"
+	@echo "  PYTEST_JOBS=4                     Run 4 parallel jobs"
+	@echo "  PYTEST_JOBS=1                     Disable parallel execution"
+	@echo "  COV_FAIL_UNDER=90                 Require 90% coverage"
 	@echo ""
 	@echo "Examples:"
 	@echo "  make test-conformance                      # Run all protocol + extra tests"
-	@echo "  make test-llm-conformance                 # Run only LLM tests"
-	@echo "  make test-wire                            # Run wire envelope conformance"
-	@echo "  make test-fast                            # Run all tests quickly (protocol + wire + extra)"
-	@echo "  make test-ci                              # Full CI pipeline (wire + conformance)"
-	@echo "  make setup-test-env                       # Configure test environment"
-	@echo "  make test-ci-fast                         # Fast CI pipeline"
-	@echo "  make conformance-report upload-results    # Generate and upload report"
-	@echo "  make test-docker                          # Run in Docker"
-	@echo "  make PYTEST_JOBS=4 test-conformance       # Run with 4 parallel jobs"
-	@echo "  make COV_FAIL_UNDER=90 verify             # Verify with 90% coverage"
-	@echo "  make clean test-vector-conformance        # Clean then run Vector tests"
+	@echo "  make test-llm-conformance                  # Run only LLM tests"
+	@echo "  make test-wire                             # Run wire envelope conformance"
+	@echo "  make test-embedding-frameworks             # Run all embedding framework adapter tests"
+	@echo "  make test-graph-frameworks                 # Run all graph framework adapter tests"
+	@echo "  make test-fast                             # Run all tests quickly (protocol + wire + extra)"
+	@echo "  make test-ci                               # Full CI pipeline (wire + conformance)"
+	@echo "  make setup-test-env                        # Configure test environment"
+	@echo "  make test-ci-fast                          # Fast CI pipeline"
+	@echo "  make conformance-report upload-results     # Generate and upload report"
+	@echo "  make test-docker                           # Run in Docker"
+	@echo "  make PYTEST_JOBS=4 test-conformance        # Run with 4 parallel jobs"
+	@echo "  make COV_FAIL_UNDER=90 verify              # Verify with 90% coverage"
+	@echo "  make clean test-vector-conformance         # Clean then run Vector tests"
 	@echo ""
 	@echo "For advanced wire testing with adapter selection, filtering, and watch mode:"
 	@echo "  Use the corpus-sdk CLI:"
