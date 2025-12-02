@@ -5,6 +5,10 @@ Pytest plugin: comprehensive terminal summary for Corpus Protocol conformance.
 Drop this into `tests/conftest.py` (or any file auto-discovered by pytest)
 to get detailed per-protocol conformance reporting with certification levels,
 failure analysis, and actionable guidance.
+
+NOTE: The live wire conformance suite in tests/live is treated as its own
+"wire" protocol, separate from llm/vector/graph/embedding adapter tests,
+schema lint tests, and golden samples.
 """
 
 from __future__ import annotations
@@ -561,7 +565,35 @@ PROTOCOLS_CONFIG = {
                 }
             }
         }
-    )
+    ),
+    
+    "wire": ProtocolConfig(
+        name="wire",
+        display_name="Wire Conformance Suite",
+        # Reference levels are placeholders; dynamic scoring is used in practice
+        conformance_levels={"gold": 0, "silver": 0, "development": 0},
+        test_categories={
+            "wire": "Wire Conformance",
+        },
+        spec_sections={
+            "wire": "Wire Conformance Suite - Wire Envelope Contract & Live Adapter Coverage",
+        },
+        error_guidance={
+            "wire": {
+                "test_wire_request_envelope": {
+                    "error_patterns": {
+                        "missing required keys": "Wire envelope missing op/ctx/args or required fields",
+                        "schema validation failed": "Envelope does not match component envelope schema",
+                    },
+                    "quick_fix": (
+                        "Ensure adapter build_*_envelope methods produce envelopes that match the "
+                        "CORPUS wire envelope schemas for llm/vector/graph/embedding."
+                    ),
+                    "examples": "See wire conformance documentation for example envelopes and schemas.",
+                }
+            }
+        }
+    ),
 }
 
 # Register all protocols
@@ -577,7 +609,7 @@ PROTOCOL_DISPLAY_NAMES = {
 }
 
 # Explicit, stable protocol order for summaries / UX
-PROTOCOLS = ["llm", "vector", "graph", "embedding", "schema", "golden"]
+PROTOCOLS = ["llm", "vector", "graph", "embedding", "wire", "schema", "golden"]
 CONFIG_PROTOCOLS = set(PROTOCOLS_CONFIG.keys())
 if CONFIG_PROTOCOLS != set(PROTOCOLS):
     raise ValueError(
@@ -801,8 +833,7 @@ class TestCategorizer:
         Categorize test by protocol and category with caching.
 
         This works for the per-protocol suites in tests/<proto>/ as well as the
-        shared wire conformance suite in tests/live by inspecting parametrized
-        IDs like [llm.complete.*], [vector.query.*], etc.
+        shared wire conformance suite in tests/live.
         """
         nodeid_lower = (nodeid or "").lower()
         
@@ -814,23 +845,16 @@ class TestCategorizer:
         
         self._cache_misses += 1
 
-        # First, try to infer protocol from directory (tests/llm, tests/vector, ...)
-        protocol = "other"
-        for proto, pattern in self._protocol_patterns.items():
-            if pattern.search(nodeid_lower):
-                protocol = proto
-                break
-
         # Special handling for shared wire tests under tests/live.
-        # The file path will look like tests/live/test_wire_conformance.py,
-        # so we infer the protocol from the parametrized ID, which includes
-        # operation names like llm.complete, vector.query, etc.
-        if protocol == "other" and (
-            "tests/live" in nodeid_lower or "tests\\live" in nodeid_lower
-        ):
-            for proto in ("llm", "vector", "graph", "embedding"):
-                bracket_token = f"[{proto}."
-                if bracket_token in nodeid_lower or f"{proto}." in nodeid_lower:
+        # These are structurally different from adapter/unit/golden/schema tests
+        # and are treated as their own "wire" protocol suite.
+        if "tests/live" in nodeid_lower or "tests\\live" in nodeid_lower:
+            protocol = "wire"
+        else:
+            # Infer protocol from directory (tests/llm, tests/vector, ...)
+            protocol = "other"
+            for proto, pattern in self._protocol_patterns.items():
+                if pattern.search(nodeid_lower):
                     protocol = proto
                     break
         
@@ -906,7 +930,7 @@ class CorpusProtocolPlugin:
         self._protocol_results_cache = None
         self._protocol_totals_cache = None
         self.plain_output = self._use_plain_output()
-        self.verbose = bool(getattr(session.config, "option", None) and session.config.option.verbose)
+               self.verbose = bool(getattr(session.config, "option", None) and session.config.option.verbose)
         self.unmapped_categories.clear()
         
         if session.config.option.verbose:
@@ -959,6 +983,8 @@ class CorpusProtocolPlugin:
             nodeid = getattr(rep, "nodeid", "") or ""
             proto, category = test_categorizer.categorize_test(nodeid)
             
+            if proto not in by_protocol:
+                by_protocol[proto] = {}
             if category not in by_protocol[proto]:
                 by_protocol[proto][category] = []
             
@@ -1468,6 +1494,7 @@ def pytest_configure(config):
         "embedding: Embedding Protocol V1.0 conformance tests",
         "schema: Schema conformance validation tests",
         "golden: Golden wire message validation tests",
+        "wire: Wire conformance tests (tests/live)",
         "slow: Tests that take longer to run (skip with -m 'not slow')",
         "conformance: All protocol conformance tests",
     ]
