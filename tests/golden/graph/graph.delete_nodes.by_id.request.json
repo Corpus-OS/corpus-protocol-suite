@@ -1,0 +1,11 @@
+{
+  "op": "graph.delete_nodes",
+  "ctx": {
+    "request_id": "req_graph_delete_nodes_001",
+    "deadline_ms": 253402214400000,
+    "tenant": "acme-corp"
+  },
+  "args": {
+    "ids": ["user:123"]
+  }
+}
