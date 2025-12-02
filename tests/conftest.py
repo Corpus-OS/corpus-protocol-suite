@@ -488,11 +488,11 @@ PROTOCOLS_CONFIG: Dict[str, ProtocolConfig] = {
                 "test_unique_ids": {
                     "error_patterns": {
                         "duplicate_id": "Duplicate $id found across schema files",
-                        "invalid_id_format": "$id does not follow https://adaptersdk.org/schemas/ format",
+                        "invalid_id_format": "$id does not follow https://corpusos.com/schemas/ format",
                     },
                     "quick_fix": (
                         "Ensure each schema has unique $id following convention: "
-                        "https://adaptersdk.org/schemas/<component>/<file>.json"
+                        "https://corpusos.com/schemas/<component>/<file>.json"
                     ),
                     "examples": "See SCHEMA_CONFORMANCE.md - $id hygiene requirements",
                 },
