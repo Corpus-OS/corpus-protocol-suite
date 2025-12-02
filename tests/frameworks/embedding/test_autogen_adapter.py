@@ -90,6 +90,41 @@ def test_register_embeddings_returns_instance(adapter: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
+# AutoGen interface compatibility
+# ---------------------------------------------------------------------------
+
+
+def test_autogen_interface_compatibility(adapter: Any) -> None:
+    """
+    Verify that CorpusAutoGenEmbeddings implements the expected AutoGen
+    EmbeddingFunction-style interface when AutoGen is available.
+    """
+    embeddings = _make_embeddings(adapter)
+
+    # Core methods should always exist
+    assert hasattr(embeddings, "embed_documents")
+    assert hasattr(embeddings, "embed_query")
+    assert hasattr(embeddings, "aembed_documents")
+    assert hasattr(embeddings, "aembed_query")
+    assert callable(embeddings)  # __call__ for EmbeddingFunction protocol
+
+    try:
+        from autogen.agentchat.contrib.retrieve_assistant_agent import (  # type: ignore[import]
+            EmbeddingFunction,
+        )
+    except ImportError:
+        # AutoGen not installed - nothing more to assert.
+        pytest.skip("AutoGen is not installed; cannot assert EmbeddingFunction compatibility")
+
+    # We can't reliably assert isinstance(...) if EmbeddingFunction is a Protocol,
+    # but we can assert that our implementation is structurally compatible:
+    assert hasattr(embeddings, "__call__")
+    # And that calling __call__ with texts works as EmbeddingFunction expects.
+    result = embeddings(["if-this-fails-we-are-not-compatible"])
+    _assert_embedding_matrix_shape(result, expected_rows=1)
+
+
+# ---------------------------------------------------------------------------
 # Context translation / AutoGenContext mapping
 # ---------------------------------------------------------------------------
 
@@ -138,6 +173,44 @@ def test_autogen_context_passed_to_context_translation(
     assert captured.get("ctx") is not None
     assert captured["ctx"] == auto_ctx
     assert captured["framework_version"] == "autogen-test-version"
+
+
+def test_error_context_includes_autogen_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When an error occurs during AutoGen embedding, error context should include
+    AutoGen-specific metadata via attach_context().
+    """
+    captured_context: Dict[str, Any] = {}
+
+    def fake_attach_context(exc: BaseException, **ctx: Any) -> None:
+        captured_context.update(ctx)
+
+    monkeypatch.setattr(
+        autogen_adapter_module,
+        "attach_context",
+        fake_attach_context,
+    )
+
+    class FailingAdapter:
+        def embed(self, *args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("test error from autogen adapter")
+
+    embeddings = CorpusAutoGenEmbeddings(corpus_adapter=FailingAdapter())
+
+    auto_ctx = {"conversation_id": "conv-ctx", "agent_name": "tester"}
+
+    with pytest.raises(RuntimeError, match="test error from autogen adapter"):
+        embeddings.embed_documents(["text"], autogen_context=auto_ctx)
+
+    # Verify some context was attached
+    assert captured_context, "attach_context was not called"
+    assert "framework" in captured_context
+    assert captured_context.get("framework") == "autogen"
+    # AutoGen-specific fields should be present
+    assert captured_context.get("conversation_id") == "conv-ctx"
+    assert captured_context.get("agent_name") == "tester"
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +352,7 @@ def test_capabilities_and_health_passthrough_when_underlying_provides() -> None:
 
     embeddings = CorpusAutoGenEmbeddings(corpus_adapter=FullAdapter())
 
+    # Sync passthrough
     caps = embeddings.capabilities()
     assert isinstance(caps, dict)
     assert caps.get("ok") is True
@@ -287,8 +361,14 @@ def test_capabilities_and_health_passthrough_when_underlying_provides() -> None:
     assert isinstance(health, dict)
     assert health.get("status") == "healthy"
 
-    # Async variants via event loop
-    acaps = asyncio.run(embeddings.ahealth().__class__.__mro__[0].__call__(embeddings.ahealth()))  # type: ignore[misc]  # noqa: E501  # pragma: no cover
+    # Async passthrough via event loop
+    acaps = asyncio.run(embeddings.acapabilities())
+    assert isinstance(acaps, dict)
+    assert acaps.get("ok_async") is True
+
+    ahealth = asyncio.run(embeddings.ahealth())
+    assert isinstance(ahealth, dict)
+    assert ahealth.get("status_async") == "healthy"
 
 
 @pytest.mark.asyncio
@@ -512,4 +592,3 @@ def test_create_retriever_configures_private_embedding_function_when_only_privat
 
     assert isinstance(vs._embedding_function, CorpusAutoGenEmbeddings)
     assert vs._embedding_function.corpus_adapter is adapter
-
