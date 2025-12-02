@@ -413,7 +413,7 @@ def test_bulk_vertices_builds_raw_request_and_calls_translator(
 
     - Build the correct raw_request mapping from the spec, and
     - Call the underlying translator.bulk_vertices with that mapping and
-      appropriate framework_ctx (namespace).
+      appropriate framework_ctx (namespace, framework, operation).
     """
     captured: Dict[str, Any] = {}
 
@@ -470,6 +470,8 @@ def test_bulk_vertices_builds_raw_request_and_calls_translator(
     }
 
     fw_ctx = captured["framework_ctx"]
+    assert fw_ctx.get("framework") == "langchain"
+    assert fw_ctx.get("operation") == "bulk_vertices"
     assert fw_ctx.get("namespace") == "ns-bulk"
     assert captured["op_ctx"] is None
 
@@ -538,6 +540,8 @@ async def test_abulk_vertices_builds_raw_request_and_calls_translator_async(
     }
 
     fw_ctx = captured["framework_ctx"]
+    assert fw_ctx.get("framework") == "langchain"
+    assert fw_ctx.get("operation") == "bulk_vertices"
     assert fw_ctx.get("namespace") == "ns-abulk"
     assert captured["op_ctx"] is None
 
@@ -549,9 +553,10 @@ def test_batch_builds_raw_batch_ops_and_calls_translator(
     """
     batch() should:
 
-    - Validate batch operations (we stub validation here), and
+    - Validate batch operations (we stub validation here),
     - Translate BatchOperation-like objects into raw_batch_ops mappings
-      passed to translator.batch().
+      passed to translator.batch(),
+    - Pass a framework_ctx containing framework='langchain' and operation='batch'.
     """
     captured: Dict[str, Any] = {}
 
@@ -615,7 +620,8 @@ def test_batch_builds_raw_batch_ops_and_calls_translator(
     ]
 
     fw_ctx = captured["framework_ctx"]
-    assert fw_ctx == {}
+    assert fw_ctx.get("framework") == "langchain"
+    assert fw_ctx.get("operation") == "batch"
     assert captured["op_ctx"] is None
 
 
@@ -625,7 +631,7 @@ async def test_abatch_builds_raw_batch_ops_and_calls_translator_async(
     graph_adapter: Any,
 ) -> None:
     """
-    abatch() should mirror batch wiring but via translator.arun_batch().
+    abatch() should mirror batch wiring but via translator.arun_batch.
     """
     captured: Dict[str, Any] = {}
 
@@ -689,7 +695,8 @@ async def test_abatch_builds_raw_batch_ops_and_calls_translator_async(
     ]
 
     fw_ctx = captured["framework_ctx"]
-    assert fw_ctx == {}
+    assert fw_ctx.get("framework") == "langchain"
+    assert fw_ctx.get("operation") == "batch"
     assert captured["op_ctx"] is None
 
 
@@ -923,4 +930,3 @@ def test_create_corpus_graph_tool_wraps_client_and_adapter(
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
-
