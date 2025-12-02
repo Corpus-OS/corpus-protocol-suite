@@ -29,6 +29,8 @@
 	verify \
 	test-cli \
 	test-root-conformance \
+	test-wire \
+	test-wire-fast \
 	clean \
 	help
 
@@ -49,6 +51,9 @@ EXTRA_TEST_FILES := tests/cli.py tests/run_conformance.py
 SCHEMA_TEST_DIR := tests/schema
 GOLDEN_TEST_DIR := tests/golden
 
+# Wire-level envelope conformance tests
+WIRE_TEST_DIR := tests/live
+
 # Derived configuration
 PYTEST_PARALLEL := $(if $(filter-out 1,$(PYTEST_JOBS)),-n $(PYTEST_JOBS),)
 COV_REPORT_TERM := --cov-report=term
@@ -57,9 +62,10 @@ COV_THRESHOLD := --cov-fail-under=$(COV_FAIL_UNDER)
 # Validate per-protocol test directories exist
 $(foreach dir,$(TEST_DIRS),$(if $(wildcard $(dir)),,$(error Test directory $(dir) not found)))
 
-# Soft-guard: warn (do not fail) if schema/golden dirs are missing
+# Soft-guard: warn (do not fail) if schema/golden/wire dirs are missing
 $(if $(wildcard $(SCHEMA_TEST_DIR)),,$(warning ⚠️  Schema test directory '$(SCHEMA_TEST_DIR)' not found))
 $(if $(wildcard $(GOLDEN_TEST_DIR)),,$(warning ⚠️  Golden test directory '$(GOLDEN_TEST_DIR)' not found))
+$(if $(wildcard $(WIRE_TEST_DIR)),,$(warning ⚠️  Wire test directory '$(WIRE_TEST_DIR)' not found))
 
 # Dependency check
 check-deps:
@@ -112,7 +118,7 @@ setup-test-env:
 		echo "CORPUS_ENDPOINT=$$endpoint" > .testenv; \
 		echo "CORPUS_API_KEY=$$key" >> .testenv; \
 		echo "✅ Test environment saved to .testenv"; \
-		echo "   Load with: export \$$(cat .testenv | xargs)"; \
+		echo "   Load with: export $$\(\)cat .testenv | xargs)"; \
 	else \
 		echo "❌ 'read' command not available - manual setup required"; \
 		echo "   Create .testenv with:"; \
@@ -199,6 +205,26 @@ verify-schema: check-deps
 	$(PYTEST) $(GOLDEN_TEST_DIR) $(PYTEST_ARGS) $(PYTEST_PARALLEL) --no-cov
 
 # --------------------------------------------------------------------------- #
+# Wire Envelope Conformance (separate suite)
+# --------------------------------------------------------------------------- #
+
+test-wire: check-deps
+	@echo "🧪 Running Wire Envelope Conformance tests (tests/live/test_wire_conformance.py)..."
+	$(PYTEST) $(WIRE_TEST_DIR)/test_wire_conformance.py \
+		$(PYTEST_ARGS) \
+		$(PYTEST_PARALLEL) \
+		--no-cov \
+		--junitxml=wire_results.xml
+
+test-wire-fast: check-deps
+	@echo "⚡ Running fast Wire Envelope Conformance tests (no coverage, skipping slow)..."
+	$(PYTEST) $(WIRE_TEST_DIR)/test_wire_conformance.py \
+		$(PYTEST_ARGS) \
+		$(PYTEST_PARALLEL) \
+		-m "not slow" \
+		--no-cov
+
+# --------------------------------------------------------------------------- #
 # Quick Verification / Smoke
 # --------------------------------------------------------------------------- #
 
@@ -261,7 +287,7 @@ try:
             "duration_seconds": round(total_time, 3)
         },
         "coverage_threshold": $(COV_FAIL_UNDER),
-        "test_suites": ["schema", "golden", "llm", "vector", "graph", "embedding", "cli", "root_conformance"],
+        "test_suites": ["schema", "golden", "wire", "llm", "vector", "graph", "embedding", "cli", "root_conformance"],
         "environment": os.getenv("CORPUS_TEST_ENV", "default")
     }
     
@@ -299,6 +325,13 @@ upload-results:
 # Full CI pipeline
 test-ci: check-deps validate-env
 	@echo "🏗️  Running CI-optimized conformance suite..."
+	@echo "   Step 1: Wire envelope conformance"
+	$(PYTEST) $(WIRE_TEST_DIR)/test_wire_conformance.py \
+		$(PYTEST_ARGS) \
+		$(PYTEST_PARALLEL) \
+		--no-cov \
+		--junitxml=wire_results.xml || exit $$?
+	@echo "   Step 2: Protocol conformance suites"
 	@make test-conformance
 	@make conformance-report
 	@echo "✅ CI conformance suite complete"
@@ -399,12 +432,16 @@ help:
 	@echo "  test-schema-fast           Fast schema meta-lint (no coverage, skip slow)"
 	@echo "  test-golden-fast           Fast golden validation (no coverage, skip slow)"
 	@echo ""
+	@echo "Wire Envelope Conformance:"
+	@echo "  test-wire                  Run wire-level envelope conformance (tests/live/test_wire_conformance.py)"
+	@echo "  test-wire-fast             Fast wire conformance (no coverage, skip slow)"
+	@echo ""
 	@echo "Extra Top-Level Tests:"
 	@echo "  test-cli                   Run CLI wrapper tests (tests/cli.py)"
 	@echo "  test-root-conformance      Run top-level conformance runner tests (tests/run_conformance.py)"
 	@echo ""
 	@echo "CI & Automation:"
-	@echo "  test-ci                    Full CI pipeline (deps+env+test+report)"
+	@echo "  test-ci                    Full CI pipeline (wire + conformance + report)"
 	@echo "  test-ci-fast               Fast CI pipeline for PR validation"
 	@echo "  conformance-report         Generate JSON summary with JUnit XML parsing"
 	@echo "  upload-results             Upload results to conformance service"
