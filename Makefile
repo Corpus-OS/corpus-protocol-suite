@@ -40,18 +40,16 @@ PYTEST_ARGS ?= -v
 PYTEST_JOBS ?= auto
 COV_FAIL_UNDER ?= 80
 
-# Protocols and directories
+# Protocols and directories (consistent with Python code PROTOCOL_PATHS)
 PROTOCOLS := llm vector graph embedding
 TEST_DIRS := $(foreach p,$(PROTOCOLS),tests/$(p))
 
 # Extra non-protocol conformance/CLI tests
 EXTRA_TEST_FILES := tests/cli.py tests/run_conformance.py
 
-# Schema / Golden directories
+# Schema / Golden / Wire directories (matches Python PROTOCOL_PATHS)
 SCHEMA_TEST_DIR := tests/schema
 GOLDEN_TEST_DIR := tests/golden
-
-# Wire-level envelope conformance tests
 WIRE_TEST_DIR := tests/live
 
 # Derived configuration
@@ -118,7 +116,7 @@ setup-test-env:
 		echo "CORPUS_ENDPOINT=$$endpoint" > .testenv; \
 		echo "CORPUS_API_KEY=$$key" >> .testenv; \
 		echo "✅ Test environment saved to .testenv"; \
-		echo "   Load with: export $$\(\)cat .testenv | xargs)"; \
+		echo "   Load with: export $$(cat .testenv | xargs)"; \
 	else \
 		echo "❌ 'read' command not available - manual setup required"; \
 		echo "   Create .testenv with:"; \
@@ -257,27 +255,82 @@ try:
     import json, datetime, os, glob, re
     from xml.etree import ElementTree
     
+    # All possible test suites (matches Python PROTOCOL_PATHS)
+    ALL_TEST_SUITES = {
+        "schema": "Schema Conformance",
+        "golden": "Golden Wire Validation",
+        "wire": "Wire Envelope Conformance",
+        "llm": "LLM Protocol V1.0",
+        "vector": "Vector Protocol V1.0",
+        "graph": "Graph Protocol V1.0",
+        "embedding": "Embedding Protocol V1.0",
+        "cli": "CLI Tests",
+        "root_conformance": "Conformance Runner Tests",
+        "conformance": "Full Conformance Suite"
+    }
+    
     # Aggregate results from JUnit XML files
     total_tests = 0
     total_failures = 0
     total_errors = 0
     total_time = 0.0
     
-    for xml_file in glob.glob("*_results.xml"):
-        try:
-            tree = ElementTree.parse(xml_file)
-            root = tree.getroot()
-            total_tests += int(root.get("tests", 0))
-            total_failures += int(root.get("failures", 0))
-            total_errors += int(root.get("errors", 0))
-            total_time += float(root.get("time", 0))
-        except Exception as e:
-            print(f"⚠️  Could not parse {xml_file}: {e}")
+    # Deduplicate XML files to avoid double-counting (e.g. conformance_results.xml)
+    xml_files = sorted(set(glob.glob("*_results.xml") + ["conformance_results.xml"]))
+    suites_ran = []
+    protocols_ran = []
+    
+    # Protocol detection mapping
+    protocol_map = {
+        "llm": "LLM",
+        "vector": "Vector", 
+        "graph": "Graph",
+        "embedding": "Embedding"
+    }
+    
+    for xml_file in xml_files:
+        if os.path.exists(xml_file):
+            try:
+                tree = ElementTree.parse(xml_file)
+                root = tree.getroot()
+                total_tests += int(root.get("tests", 0))
+                total_failures += int(root.get("failures", 0))
+                total_errors += int(root.get("errors", 0))
+                total_time += float(root.get("time", 0))
+                
+                # Determine which suite this is
+                if xml_file == "conformance_results.xml":
+                    if "conformance" not in suites_ran:
+                        suites_ran.append("conformance")
+                elif xml_file.endswith("_results.xml"):
+                    suite_name = xml_file.replace("_results.xml", "")
+                    if suite_name in ALL_TEST_SUITES:
+                        suites_ran.append(suite_name)
+                        
+                        # Check if it's a protocol suite
+                        if suite_name in protocol_map:
+                            protocols_ran.append(suite_name)
+                
+            except Exception as e:
+                print(f"⚠️  Could not parse {xml_file}: {e}")
     
     status = "PASS" if total_failures == 0 and total_errors == 0 else "FAIL"
     
+    # If no protocols detected from XML, use defaults
+    if not protocols_ran:
+        protocols_ran = ["llm", "vector", "graph", "embedding"]
+    
+    # Filter test_suites to only include those that actually ran
+    test_suites_ran = [suite for suite in [
+        "schema", "golden", "wire", "llm", "vector", "graph", "embedding", "cli", "root_conformance"
+    ] if suite in suites_ran or suite in protocols_ran]
+    
+    # Fallback: if we have tests but no suites detected, include all
+    if total_tests > 0 and not test_suites_ran:
+        test_suites_ran = ["schema", "golden", "wire", "llm", "vector", "graph", "embedding"]
+    
     results = {
-        "protocols": "$(PROTOCOLS)",
+        "protocols": protocols_ran,
         "status": status,
         "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
         "summary": {
@@ -287,7 +340,7 @@ try:
             "duration_seconds": round(total_time, 3)
         },
         "coverage_threshold": $(COV_FAIL_UNDER),
-        "test_suites": ["schema", "golden", "wire", "llm", "vector", "graph", "embedding", "cli", "root_conformance"],
+        "test_suites": test_suites_ran,
         "environment": os.getenv("CORPUS_TEST_ENV", "default")
     }
     
@@ -298,6 +351,8 @@ try:
     print(f"📈 Summary: {total_tests} tests, {total_failures} failures, {total_errors} errors")
     print(f"⏱️  Duration: {round(total_time, 3)}s")
     print(f"🎯 Status: {status}")
+    if test_suites_ran:
+        print(f"📋 Test suites ran: {', '.join(test_suites_ran)}")
     
 except Exception as e:
     print(f"❌ Failed to generate report: {e}")
@@ -322,10 +377,10 @@ upload-results:
 # CI-Optimized Targets
 # --------------------------------------------------------------------------- #
 
-# Full CI pipeline
+# Full CI pipeline (wire tests first for fast feedback, then full conformance)
 test-ci: check-deps validate-env
 	@echo "🏗️  Running CI-optimized conformance suite..."
-	@echo "   Step 1: Wire envelope conformance"
+	@echo "   Step 1: Wire envelope conformance (fast feedback)"
 	$(PYTEST) $(WIRE_TEST_DIR)/test_wire_conformance.py \
 		$(PYTEST_ARGS) \
 		$(PYTEST_PARALLEL) \
@@ -336,9 +391,10 @@ test-ci: check-deps validate-env
 	@make conformance-report
 	@echo "✅ CI conformance suite complete"
 
-# Fast CI pipeline (for PR validation)
+# Fast CI pipeline (for PR validation) - includes wire tests
 test-ci-fast: check-deps
-	@echo "⚡ Running fast CI validation..."
+	@echo "⚡ Running fast CI validation (includes wire tests)..."
+	@make test-wire-fast
 	@make test-fast
 	@echo "✅ Fast CI validation complete"
 
@@ -360,12 +416,19 @@ test-docker:
 # Fast Test Runs (No Coverage)
 # --------------------------------------------------------------------------- #
 
-# Fast all tests (protocol suites + extra test files)
+# Fast all tests (protocol suites + wire tests + extra test files)
 test-fast: check-deps
 	@echo "⚡ Running fast tests (no coverage, skipping slow tests)..."
-	$(PYTEST) $(TEST_DIRS) $(EXTRA_TEST_FILES) $(PYTEST_ARGS) $(PYTEST_PARALLEL) -m "not slow" --no-cov
+	$(PYTEST) \
+		$(TEST_DIRS) \
+		$(WIRE_TEST_DIR)/test_wire_conformance.py \
+		$(EXTRA_TEST_FILES) \
+		$(PYTEST_ARGS) \
+		$(PYTEST_PARALLEL) \
+		-m "not slow" \
+		--no-cov
 
-# Fast per-protocol tests
+# Fast per-protocol tests (explicit wire test still available via test-wire-fast)
 test-fast-%: check-deps
 	@echo "⚡ Running fast $(shell echo $* | tr 'a-z' 'A-Z') tests (no coverage, skipping slow)..."
 	$(PYTEST) tests/$* $(PYTEST_ARGS) $(PYTEST_PARALLEL) -m "not slow" --no-cov
@@ -442,10 +505,10 @@ help:
 	@echo ""
 	@echo "CI & Automation:"
 	@echo "  test-ci                    Full CI pipeline (wire + conformance + report)"
-	@echo "  test-ci-fast               Fast CI pipeline for PR validation"
+	@echo "  test-ci-fast               Fast CI pipeline (wire-fast + test-fast)"
 	@echo "  conformance-report         Generate JSON summary with JUnit XML parsing"
 	@echo "  upload-results             Upload results to conformance service"
-	@echo "  setup-test-env             Interactive environment configuration"
+	@echo "  setup-test-env             Interactive test environment configuration"
 	@echo ""
 	@echo "Quick / Docker / Environment:"
 	@echo "  quick-check                Smoke test subset (schema+golden)"
@@ -455,11 +518,12 @@ help:
 	@echo "  check-versions             Print key dependency versions"
 	@echo ""
 	@echo "Fast Testing (No Coverage):"
-	@echo "  test-fast                  Run all tests quickly (protocol + extra, no coverage, skip slow)"
+	@echo "  test-fast                  Run all tests quickly (protocol + wire + extra, no coverage, skip slow)"
 	@echo "  test-fast-llm              Run only LLM tests quickly"
 	@echo "  test-fast-vector           Run Vector tests quickly"
 	@echo "  test-fast-graph            Run Graph tests quickly"
 	@echo "  test-fast-embedding        Run Embedding tests quickly"
+	@echo "  test-wire-fast             Run wire tests quickly (also included in test-fast)"
 	@echo ""
 	@echo "Utilities:"
 	@echo "  check-deps                 Verify test dependencies are installed"
@@ -476,14 +540,22 @@ help:
 	@echo "Examples:"
 	@echo "  make test-conformance                      # Run all protocol + extra tests"
 	@echo "  make test-llm-conformance                 # Run only LLM tests"
-	@echo "  make test-ci                              # Full CI pipeline"
+	@echo "  make test-wire                            # Run wire envelope conformance"
+	@echo "  make test-fast                            # Run all tests quickly (protocol + wire + extra)"
+	@echo "  make test-ci                              # Full CI pipeline (wire + conformance)"
 	@echo "  make setup-test-env                       # Configure test environment"
-	@echo "  make test-ci-fast                         # Fast CI for PRs"
+	@echo "  make test-ci-fast                         # Fast CI pipeline"
 	@echo "  make conformance-report upload-results    # Generate and upload report"
 	@echo "  make test-docker                          # Run in Docker"
 	@echo "  make PYTEST_JOBS=4 test-conformance       # Run with 4 parallel jobs"
 	@echo "  make COV_FAIL_UNDER=90 verify             # Verify with 90% coverage"
 	@echo "  make clean test-vector-conformance        # Clean then run Vector tests"
+	@echo ""
+	@echo "For advanced wire testing with adapter selection, filtering, and watch mode:"
+	@echo "  Use the corpus-sdk CLI:"
+	@echo "    corpus-sdk test-wire --adapter=openai"
+	@echo "    corpus-sdk test-wire --watch"
+	@echo "    corpus-sdk wire-list --component llm"
 
 # Default target
 .DEFAULT_GOAL := help
