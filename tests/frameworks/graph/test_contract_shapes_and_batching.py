@@ -16,6 +16,31 @@ from tests.frameworks.registries.graph_registry import (
 
 
 # ---------------------------------------------------------------------------
+# Constants (shared test inputs)
+# ---------------------------------------------------------------------------
+
+QUERY_TEXT_FOR_TYPE = "graph-shape-type-test"
+STREAM_TEXT_FOR_TYPE = "graph-stream-type-test"
+ASYNC_QUERY_TEXT_FOR_TYPE = "graph-shape-async-query-test"
+ASYNC_STREAM_TEXT_FOR_TYPE = "graph-shape-async-stream-test"
+
+BULK_NAMESPACE_DEFAULT: str | None = None
+BULK_NAMESPACE_EXPLICIT = "tenant-A"
+BULK_LIMIT_SMALL = 5
+BULK_LIMIT_ZERO = 0
+
+BATCH_QUERIES_DEFAULT = [
+    "batch-op-alpha",
+    "batch-op-beta",
+    "batch-op-gamma",
+]
+BATCH_QUERIES_ALT = [
+    "batch-op-delta",
+    "batch-op-epsilon",
+]
+
+
+# ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 
@@ -143,6 +168,22 @@ def _build_bulk_spec(namespace: str | None, limit: int) -> BulkVerticesSpec:
     )
 
 
+def _build_batch_ops(queries: list[str]) -> list[BatchOperation]:
+    """
+    Helper to construct a list of BatchOperation(query=...) entries from
+    simple query strings.
+
+    Centralizing this keeps batch test data consistent and easy to tweak.
+    """
+    return [
+        BatchOperation(
+            op="query",
+            args={"query": q},
+        )
+        for q in queries
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Query / stream shape + type contracts
 # ---------------------------------------------------------------------------
@@ -168,12 +209,12 @@ def test_query_result_type_stable_across_calls(
     result1 = _maybe_call_with_context(
         framework_descriptor,
         query_fn,
-        "shape-type-query-1",
+        QUERY_TEXT_FOR_TYPE,
     )
     result2 = _maybe_call_with_context(
         framework_descriptor,
         query_fn,
-        "shape-type-query-2",
+        QUERY_TEXT_FOR_TYPE + "-again",
     )
 
     assert result1 is not None
@@ -210,7 +251,7 @@ def test_stream_chunk_type_consistent_within_stream_when_declared(
     iterator = _maybe_call_with_context(
         framework_descriptor,
         stream_fn,
-        "shape-stream-query",
+        STREAM_TEXT_FOR_TYPE,
     )
 
     _assert_iterable(iterator)
@@ -254,7 +295,7 @@ async def test_async_stream_chunk_type_consistent_within_stream_when_supported(
     aiter = _maybe_call_with_context(
         framework_descriptor,
         astream_fn,
-        "shape-async-stream-query",
+        ASYNC_STREAM_TEXT_FOR_TYPE,
     )
 
     # Allow both: awaitable -> async iterator, or async iterator directly.
@@ -275,7 +316,7 @@ async def test_async_stream_chunk_type_consistent_within_stream_when_supported(
 
 
 # ---------------------------------------------------------------------------
-# Bulk vertices: basic shape + async/sync parity
+# Bulk vertices: basic shape + edge cases + async/sync parity
 # ---------------------------------------------------------------------------
 
 
@@ -302,8 +343,8 @@ def test_bulk_vertices_result_type_stable_when_supported(
         framework_descriptor.bulk_vertices_method,
     )
 
-    spec1 = _build_bulk_spec(namespace=None, limit=5)
-    spec2 = _build_bulk_spec(namespace=None, limit=3)
+    spec1 = _build_bulk_spec(namespace=BULK_NAMESPACE_DEFAULT, limit=BULK_LIMIT_SMALL)
+    spec2 = _build_bulk_spec(namespace=BULK_NAMESPACE_DEFAULT, limit=BULK_LIMIT_SMALL - 2)
 
     result1 = bulk_fn(spec1)
     result2 = bulk_fn(spec2)
@@ -316,6 +357,58 @@ def test_bulk_vertices_result_type_stable_when_supported(
         "bulk_vertices returned different result types across calls: "
         f"{type(result1).__name__} vs {type(result2).__name__}"
     )
+
+
+def test_bulk_vertices_limit_zero_when_supported(
+    framework_descriptor: GraphFrameworkDescriptor,
+    graph_client_instance: Any,
+) -> None:
+    """
+    limit=0 is a valid edge case and should not cause errors.
+
+    We don't assert specific result semantics here (empty vs non-empty),
+    just that the call is accepted and returns a value.
+    """
+    if not framework_descriptor.supports_bulk_vertices:
+        pytest.skip(
+            f"Framework '{framework_descriptor.name}' does not declare bulk_vertices support",
+        )
+
+    assert framework_descriptor.bulk_vertices_method is not None
+
+    bulk_fn = _get_method(
+        graph_client_instance,
+        framework_descriptor.bulk_vertices_method,
+    )
+
+    spec = _build_bulk_spec(namespace=BULK_NAMESPACE_DEFAULT, limit=BULK_LIMIT_ZERO)
+    result = bulk_fn(spec)
+    assert result is not None
+
+
+def test_bulk_vertices_with_explicit_namespace_when_supported(
+    framework_descriptor: GraphFrameworkDescriptor,
+    graph_client_instance: Any,
+) -> None:
+    """
+    Using an explicit namespace should be supported wherever bulk_vertices
+    is declared. This is important for multi-tenant / multi-dataset setups.
+    """
+    if not framework_descriptor.supports_bulk_vertices:
+        pytest.skip(
+            f"Framework '{framework_descriptor.name}' does not declare bulk_vertices support",
+        )
+
+    assert framework_descriptor.bulk_vertices_method is not None
+
+    bulk_fn = _get_method(
+        graph_client_instance,
+        framework_descriptor.bulk_vertices_method,
+    )
+
+    spec = _build_bulk_spec(namespace=BULK_NAMESPACE_EXPLICIT, limit=BULK_LIMIT_SMALL)
+    result = bulk_fn(spec)
+    assert result is not None
 
 
 @pytest.mark.asyncio
@@ -351,7 +444,7 @@ async def test_async_bulk_vertices_type_matches_sync_when_supported(
         framework_descriptor.async_bulk_vertices_method,
     )
 
-    spec = _build_bulk_spec(namespace=None, limit=4)
+    spec = _build_bulk_spec(namespace=BULK_NAMESPACE_DEFAULT, limit=BULK_LIMIT_SMALL)
 
     sync_result = bulk_fn(spec)
     assert sync_result is not None
@@ -373,7 +466,7 @@ async def test_async_bulk_vertices_type_matches_sync_when_supported(
 
 
 # ---------------------------------------------------------------------------
-# Batch: length + type contracts
+# Batch: length + type contracts + edge cases
 # ---------------------------------------------------------------------------
 
 
@@ -401,13 +494,7 @@ def test_batch_result_length_matches_ops_when_supported(
         framework_descriptor.batch_method,
     )
 
-    ops = [
-        BatchOperation(
-            op="query",
-            args={"query": f"shape-batch-op-{i}"},
-        )
-        for i in range(3)
-    ]
+    ops = _build_batch_ops(BATCH_QUERIES_DEFAULT)
 
     result = batch_fn(ops)
     assert result is not None
@@ -416,6 +503,37 @@ def test_batch_result_length_matches_ops_when_supported(
         assert len(result) == len(
             ops,
         ), "BatchResult length does not match number of operations"
+
+
+def test_empty_batch_handling_when_supported(
+    framework_descriptor: GraphFrameworkDescriptor,
+    graph_client_instance: Any,
+) -> None:
+    """
+    Batch methods should gracefully handle an empty list of operations.
+
+    We don't require any particular result shape here, but if the result is
+    sequence-like, we expect it to have length 0.
+    """
+    if not framework_descriptor.supports_batch:
+        pytest.skip(
+            f"Framework '{framework_descriptor.name}' does not declare batch support",
+        )
+
+    assert framework_descriptor.batch_method is not None
+
+    batch_fn = _get_method(
+        graph_client_instance,
+        framework_descriptor.batch_method,
+    )
+
+    ops: list[BatchOperation] = []
+
+    result = batch_fn(ops)
+    assert result is not None
+
+    if hasattr(result, "__len__"):
+        assert len(result) == 0, "BatchResult for empty ops list should be length 0"
 
 
 def test_batch_result_type_stable_across_calls_when_supported(
@@ -438,18 +556,8 @@ def test_batch_result_type_stable_across_calls_when_supported(
         framework_descriptor.batch_method,
     )
 
-    ops1 = [
-        BatchOperation(
-            op="query",
-            args={"query": "shape-batch-op-1"},
-        ),
-    ]
-    ops2 = [
-        BatchOperation(
-            op="query",
-            args={"query": "shape-batch-op-2"},
-        ),
-    ]
+    ops1 = _build_batch_ops([BATCH_QUERIES_DEFAULT[0]])
+    ops2 = _build_batch_ops([BATCH_QUERIES_ALT[0]])
 
     result1 = batch_fn(ops1)
     result2 = batch_fn(ops2)
@@ -494,13 +602,7 @@ async def test_async_batch_type_matches_sync_when_supported(
         framework_descriptor.async_batch_method,
     )
 
-    ops = [
-        BatchOperation(
-            op="query",
-            args={"query": f"shape-abatch-op-{i}"},
-        )
-        for i in range(2)
-    ]
+    ops = _build_batch_ops(BATCH_QUERIES_DEFAULT[:2])
 
     sync_result = batch_fn(ops)
     assert sync_result is not None
@@ -521,4 +623,3 @@ async def test_async_batch_type_matches_sync_when_supported(
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
-
