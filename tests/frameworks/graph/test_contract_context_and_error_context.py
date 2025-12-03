@@ -57,25 +57,25 @@ def framework_descriptor_fixture(
 @pytest.fixture
 def graph_client_instance(
     framework_descriptor: GraphFrameworkDescriptor,
-    graph_adapter: Any,
+    adapter: Any,
 ) -> Any:
     """
     Construct a concrete graph client instance for the given descriptor.
 
     Mirrors the construction pattern used in the other graph contract tests:
-    each framework adapter is expected to take a `graph_adapter` kwarg that
+    each framework adapter is expected to take a `adapter` kwarg that
     wraps a Corpus GraphProtocolV1 implementation.
     """
     module = importlib.import_module(framework_descriptor.adapter_module)
     client_cls = getattr(module, framework_descriptor.adapter_class)
 
-    init_kwargs: dict[str, Any] = {"graph_adapter": graph_adapter}
+    init_kwargs: dict[str, Any] = {"adapter": adapter}
     instance = client_cls(**init_kwargs)
     return instance
 
 
 @pytest.fixture
-def failing_graph_adapter() -> Any:
+def failing_adapter() -> Any:
     """
     A minimal graph adapter whose query methods always fail.
 
@@ -130,7 +130,7 @@ def _maybe_call_with_context(
 
 def _build_error_wrapped_client_instance(
     framework_descriptor: GraphFrameworkDescriptor,
-    failing_graph_adapter: Any,
+    failing_adapter: Any,
 ) -> Any:
     """
     Construct a graph client instance wired to a failing graph adapter.
@@ -140,7 +140,7 @@ def _build_error_wrapped_client_instance(
     module = importlib.import_module(framework_descriptor.adapter_module)
     client_cls = getattr(module, framework_descriptor.adapter_class)
 
-    init_kwargs: dict[str, Any] = {"graph_adapter": failing_graph_adapter}
+    init_kwargs: dict[str, Any] = {"adapter": failing_adapter}
     return client_cls(**init_kwargs)
 
 
@@ -261,7 +261,7 @@ def test_context_is_optional_and_omitting_it_still_works(
 
 def test_error_context_is_attached_on_sync_query_failure(
     framework_descriptor: GraphFrameworkDescriptor,
-    failing_graph_adapter: Any,
+    failing_adapter: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
@@ -279,7 +279,7 @@ def test_error_context_is_attached_on_sync_query_failure(
 
     instance = _build_error_wrapped_client_instance(
         framework_descriptor,
-        failing_graph_adapter,
+        failing_adapter,
     )
 
     query_method = _get_method(instance, framework_descriptor.query_method)
@@ -305,7 +305,7 @@ def test_error_context_is_attached_on_sync_query_failure(
 
 def test_error_context_is_attached_on_sync_stream_failure_when_supported(
     framework_descriptor: GraphFrameworkDescriptor,
-    failing_graph_adapter: Any,
+    failing_adapter: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
@@ -322,7 +322,7 @@ def test_error_context_is_attached_on_sync_stream_failure_when_supported(
 
     instance = _build_error_wrapped_client_instance(
         framework_descriptor,
-        failing_graph_adapter,
+        failing_adapter,
     )
 
     stream_method = _get_method(instance, framework_descriptor.stream_query_method)
@@ -352,7 +352,7 @@ def test_error_context_is_attached_on_sync_stream_failure_when_supported(
 @pytest.mark.asyncio
 async def test_error_context_is_attached_on_async_query_failure_when_supported(
     framework_descriptor: GraphFrameworkDescriptor,
-    failing_graph_adapter: Any,
+    failing_adapter: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
@@ -369,7 +369,7 @@ async def test_error_context_is_attached_on_async_query_failure_when_supported(
 
     instance = _build_error_wrapped_client_instance(
         framework_descriptor,
-        failing_graph_adapter,
+        failing_adapter,
     )
 
     aquery_method = _get_method(instance, framework_descriptor.async_query_method)
@@ -399,7 +399,7 @@ async def test_error_context_is_attached_on_async_query_failure_when_supported(
 @pytest.mark.asyncio
 async def test_error_context_is_attached_on_async_stream_failure_when_supported(
     framework_descriptor: GraphFrameworkDescriptor,
-    failing_graph_adapter: Any,
+    failing_adapter: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
@@ -416,7 +416,7 @@ async def test_error_context_is_attached_on_async_stream_failure_when_supported(
 
     instance = _build_error_wrapped_client_instance(
         framework_descriptor,
-        failing_graph_adapter,
+        failing_adapter,
     )
 
     astream_method = _get_method(
