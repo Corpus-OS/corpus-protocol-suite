@@ -1,5 +1,5 @@
 {
-  "kind": "vertex",
+  "kind": "node",
   "id": "user:123",
   "label": "User",
   "props": {

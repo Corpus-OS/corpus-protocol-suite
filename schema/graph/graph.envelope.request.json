@@ -19,6 +19,14 @@
         "graph.create_vertex",
         "graph.delete_edge",
         "graph.delete_vertex",
+        "graph.upsert_nodes",
+        "graph.delete_nodes",
+        "graph.upsert_edges",
+        "graph.delete_edges",
+        "graph.query",
+        "graph.stream_query",
+        "graph.bulk_vertices",
+        "graph.get_schema",
         "graph.health",
         "graph.query",
         "graph.stream_query"
@@ -30,16 +38,16 @@
     "args": {
       "oneOf": [
         {
-          "$ref": "https://corpusos.com/schemas/graph/graph.vertex.create.request.json"
+          "$ref": "https://corpusos.com/schemas/graph/graph.upsert_nodes.request.json"
         },
         {
-          "$ref": "https://corpusos.com/schemas/graph/graph.vertex.delete.request.json"
+          "$ref": "https://corpusos.com/schemas/graph/graph.delete_nodes.request.json"
         },
         {
-          "$ref": "https://corpusos.com/schemas/graph/graph.edge.create.request.json"
+          "$ref": "https://corpusos.com/schemas/graph/graph.upsert_edges.request.json"
         },
         {
-          "$ref": "https://corpusos.com/schemas/graph/graph.edge.delete.request.json"
+          "$ref": "https://corpusos.com/schemas/graph/graph.delete_edges.request.json"
         },
         {
           "$ref": "https://corpusos.com/schemas/graph/graph.query.request.json"
@@ -48,7 +56,10 @@
           "$ref": "https://corpusos.com/schemas/graph/graph.stream_query.request.json"
         },
         {
-          "$ref": "https://corpusos.com/schemas/graph/graph.batch.request.json"
+          "$ref": "https://corpusos.com/schemas/graph/graph.bulk_vertices.request.json"
+        },
+        {
+          "$ref": "https://corpusos.com/schemas/graph/graph.get_schema.request.json"
         },
         {
           "type": "object",

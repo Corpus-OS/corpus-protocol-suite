@@ -14,7 +14,7 @@ import time
 import importlib
 import re
 import inspect
-from typing import Dict, List, Optional, Tuple, Any, Set
+from typing import Dict, List, Optional, Tuple, Any, Set, Iterable
 from dataclasses import dataclass
 
 import pytest
@@ -35,31 +35,31 @@ class ProtocolConfig:
     test_categories: Dict[str, str]
     spec_sections: Dict[str, str]
     error_guidance: Dict[str, Dict[str, Any]]
-    
+
     def validate(self) -> None:
         """Validate protocol configuration for consistency."""
         if not self.display_name:
             raise ValueError(f"Protocol {self.name}: display_name cannot be empty")
-        
+
         required_levels = {"gold", "silver", "development"}
         if not required_levels.issubset(self.conformance_levels.keys()):
             raise ValueError(
                 f"Protocol {self.name}: missing required conformance levels: {required_levels}"
             )
-        
+
         for level_name, threshold in self.conformance_levels.items():
             if not isinstance(threshold, int) or threshold < 0:
                 raise ValueError(
                     f"Protocol {self.name}: conformance level {level_name} must be positive integer"
                 )
-        
+
         # Validate that all categories have spec sections
         for category in self.test_categories:
             if category not in self.spec_sections:
                 raise ValueError(
                     f"Protocol {self.name}: category '{category}' missing spec section mapping"
                 )
-        
+
         # Validate error guidance structure
         for category, tests in self.error_guidance.items():
             if category not in self.test_categories:
@@ -75,26 +75,26 @@ class ProtocolConfig:
 
 class ProtocolRegistry:
     """Central registry for protocol configurations with validation."""
-    
+
     def __init__(self):
         self._protocols: Dict[str, ProtocolConfig] = {}
         self._category_cache: Dict[str, Set[str]] = {}
-    
+
     def register(self, config: ProtocolConfig) -> None:
         """Register and validate a protocol configuration."""
         config.validate()
         self._protocols[config.name] = config
         # Precompute category sets for fast lookups
         self._category_cache[config.name] = set(config.test_categories.keys())
-    
+
     def get(self, protocol: str) -> Optional[ProtocolConfig]:
         """Get protocol configuration."""
         return self._protocols.get(protocol)
-    
+
     def get_category_names(self, protocol: str) -> Set[str]:
         """Get category names for fast membership testing."""
         return self._category_cache.get(protocol, set())
-    
+
     def validate_all(self) -> None:
         """Validate all registered protocols."""
         for protocol in self._protocols.values():
@@ -111,11 +111,11 @@ protocol_registry = ProtocolRegistry()
 
 # NOTE: conformance_levels remain as reference values, but certification scoring
 # is computed dynamically based on collected tests per protocol.
-PROTOCOLS_CONFIG = {
+PROTOCOLS_CONFIG: Dict[str, ProtocolConfig] = {
     "llm": ProtocolConfig(
         name="llm",
         display_name="LLM Protocol V1.0",
-        # Reference: currently 111 llm tests in the suite
+        # Reference: currently ~111 llm tests in the suite
         conformance_levels={"gold": 111, "silver": 89, "development": 56},
         test_categories={
             "wire_contract": "Wire Contract & Routing",
@@ -128,7 +128,7 @@ PROTOCOLS_CONFIG = {
             "observability": "Observability & Privacy",
             "deadline": "Deadline Semantics",
             "token_counting": "Token Counting",
-            "health": "Health Endpoint"
+            "health": "Health Endpoint",
         },
         spec_sections={
             "wire_contract": "§4.1 Wire-First Canonical Form",
@@ -141,17 +141,17 @@ PROTOCOLS_CONFIG = {
             "observability": "§6.4 Observability Interfaces & §13 Observability and Monitoring",
             "deadline": "§4.3 Deadline Propagation & §6.1 Operation Context",
             "token_counting": "§8.3 Operations",
-            "health": "§8.3 Operations"
+            "health": "§8.3 Operations",
         },
         error_guidance={
             "wire_contract": {
                 "test_wire_envelope_validation": {
                     "error_patterns": {
                         "missing_required_fields": "Wire envelope missing required fields per §4.1",
-                        "invalid_field_types": "Field types don't match canonical form requirements"
+                        "invalid_field_types": "Field types don't match canonical form requirements",
                     },
                     "quick_fix": "Ensure all wire envelopes include required fields with correct types",
-                    "examples": "See §4.1 for wire envelope format and field requirements"
+                    "examples": "See §4.1 for wire envelope format and field requirements",
                 }
             },
             "streaming": {
@@ -159,47 +159,46 @@ PROTOCOLS_CONFIG = {
                     "error_patterns": {
                         "missing_final_chunk": "Ensure stream ends with terminal frame per §4.1.3",
                         "premature_close": "Connection must remain open until terminal frame per §7.3.2 Streaming Finalization",
-                        "chunk_format": "Each frame must follow §4.1.3 Streaming Frames format"
+                        "chunk_format": "Each frame must follow §4.1.3 Streaming Frames format",
                     },
                     "quick_fix": "Add terminal frame (event: 'end' or event: 'error') after all data frames",
-                    "examples": "See §4.1.3 for frame format and §7.3.2 for streaming finalization rules"
+                    "examples": "See §4.1.3 for frame format and §7.3.2 for streaming finalization rules",
                 }
             },
             "sampling_params": {
                 "test_temperature_validation": {
                     "error_patterns": {
                         "invalid_range": "Temperature must be between 0.0 and 2.0 per §8.3",
-                        "type_error": "Temperature must be float, not string per §4.1 Numeric Types"
+                        "type_error": "Temperature must be float, not string per §4.1 Numeric Types",
                     },
                     "quick_fix": "Clamp temperature values to valid range [0.0, 2.0] and ensure numeric types",
-                    "examples": "See §8.3 for parameter validation and §4.1 for numeric type rules"
+                    "examples": "See §8.3 for parameter validation and §4.1 for numeric type rules",
                 },
                 "test_top_p_validation": {
                     "error_patterns": {
                         "invalid_range": "top_p must be between 0.0 and 1.0 per §8.3",
-                        "exclusive_range": "top_p=0.0 and top_p=1.0 have special semantics per §8.3.2"
+                        "exclusive_range": "top_p=0.0 and top_p=1.0 have special semantics per §8.3.2",
                     },
                     "quick_fix": "Validate top_p range and handle edge cases appropriately",
-                    "examples": "See §8.3.2 for top_p semantics and validation rules"
-                }
+                    "examples": "See §8.3.2 for top_p semantics and validation rules",
+                },
             },
             "core_ops": {
                 "test_chat_completion": {
                     "error_patterns": {
                         "invalid_message_roles": "Message roles must conform to §8.3.1 allowed values",
-                        "missing_messages": "Request must contain non-empty messages array per §8.3"
+                        "missing_messages": "Request must contain non-empty messages array per §8.3",
                     },
                     "quick_fix": "Validate message structure and role enumeration before processing",
-                    "examples": "See §8.3.1 for message format and role requirements"
+                    "examples": "See §8.3.1 for message format and role requirements",
                 }
-            }
-        }
+            },
+        },
     ),
-    
     "vector": ProtocolConfig(
         name="vector",
         display_name="Vector Protocol V1.0",
-        # Reference: 73 vector tests
+        # Reference: ~73 vector tests (adapter + protocol-level)
         conformance_levels={"gold": 73, "silver": 58, "development": 36},
         test_categories={
             "wire_contract": "Wire Contract & Routing",
@@ -215,7 +214,7 @@ PROTOCOLS_CONFIG = {
             "deadline": "Deadline Semantics",
             "health": "Health Endpoint",
             "observability": "Observability & Privacy",
-            "batch_limits": "Batch Size Limits"
+            "batch_limits": "Batch Size Limits",
         },
         spec_sections={
             "wire_contract": "§4.1 Wire-First Canonical Form",
@@ -231,52 +230,51 @@ PROTOCOLS_CONFIG = {
             "deadline": "§4.3 Deadline Propagation & §6.1 Operation Context",
             "health": "§9.3 Operations",
             "observability": "§6.4 Observability Interfaces & §13 Observability and Monitoring",
-            "batch_limits": "§9.3 Operations & §12.5 Partial Failure Contracts"
+            "batch_limits": "§9.3 Operations & §12.5 Partial Failure Contracts",
         },
         error_guidance={
             "wire_contract": {
                 "test_wire_envelope_validation": {
                     "error_patterns": {
                         "missing_required_fields": "Wire envelope missing required fields per §4.1",
-                        "invalid_field_types": "Field types don't match canonical form requirements"
+                        "invalid_field_types": "Field types don't match canonical form requirements",
                     },
                     "quick_fix": "Ensure all wire envelopes include required fields with correct types",
-                    "examples": "See §4.1 for wire envelope format and field requirements"
+                    "examples": "See §4.1 for wire envelope format and field requirements",
                 }
             },
             "namespace": {
                 "test_namespace_isolation": {
                     "error_patterns": {
                         "cross_namespace_leak": "Data must be strictly isolated per §14.1 Tenant Isolation",
-                        "invalid_namespace": "Namespace must follow §9.3 Operations requirements"
+                        "invalid_namespace": "Namespace must follow §9.3 Operations requirements",
                     },
                     "quick_fix": "Validate namespace format and enforce isolation at storage layer",
-                    "examples": "See §9.3 for namespace operations and §14.1 for tenant isolation requirements"
+                    "examples": "See §9.3 for namespace operations and §14.1 for tenant isolation requirements",
                 }
             },
             "dimension_validation": {
                 "test_dimension_mismatch": {
                     "error_patterns": {
                         "dimension_mismatch": "Vector dimensions must match index dimensions per §9.5",
-                        "invalid_dimension": "Dimensions must be positive integers per §4.1 Numeric Types"
+                        "invalid_dimension": "Dimensions must be positive integers per §4.1 Numeric Types",
                     },
                     "quick_fix": "Validate vector dimensions before upsert operations",
-                    "examples": "See §9.5 for dimension handling and §4.1 for numeric validation"
+                    "examples": "See §9.5 for dimension handling and §4.1 for numeric validation",
                 }
             },
             "batch_limits": {
                 "test_batch_size_limits": {
                     "error_patterns": {
                         "batch_too_large": "Batch size exceeds maximum allowed per §9.3",
-                        "partial_failure_handling": "Partial failures not properly reported per §12.5"
+                        "partial_failure_handling": "Partial failures not properly reported per §12.5",
                     },
                     "quick_fix": "Implement batch size validation and partial success reporting",
-                    "examples": "See §9.3 for batch limits and §12.5 for partial failure contracts"
+                    "examples": "See §9.3 for batch limits and §12.5 for partial failure contracts",
                 }
-            }
-        }
+            },
+        },
     ),
-    
     "graph": ProtocolConfig(
         name="graph",
         display_name="Graph Protocol V1.0",
@@ -294,12 +292,12 @@ PROTOCOLS_CONFIG = {
             "capabilities": "Capabilities Discovery",
             "observability": "Observability & Privacy",
             "deadline": "Deadline Semantics",
-            "health": "Health Endpoint"
+            "health": "Health Endpoint",
         },
         spec_sections={
             "wire_contract": "§4.1 Wire-First Canonical Form",
             "core_ops": "§7.3 Operations",
-            "crud_validation": "§7.3.1 Vertex/Edge CRUD",
+            "crud_validation": "§7.3.1 Node/Edge CRUD",
             "query_ops": "§7.3.2 Queries",
             "dialect_validation": "§7.4 Dialects",
             "streaming": "§7.3.2 Streaming Finalization & §4.1.3 Streaming Frames",
@@ -309,42 +307,41 @@ PROTOCOLS_CONFIG = {
             "capabilities": "§7.3 Operations & §6.2 Capability Discovery",
             "observability": "§6.4 Observability Interfaces & §13 Observability and Monitoring",
             "deadline": "§4.3 Deadline Propagation & §6.1 Operation Context",
-            "health": "§7.6 Health"
+            "health": "§7.6 Health",
         },
         error_guidance={
             "wire_contract": {
                 "test_wire_envelope_validation": {
                     "error_patterns": {
                         "missing_required_fields": "Wire envelope missing required fields per §4.1",
-                        "invalid_field_types": "Field types don't match canonical form requirements"
+                        "invalid_field_types": "Field types don't match canonical form requirements",
                     },
                     "quick_fix": "Ensure all wire envelopes include required fields with correct types",
-                    "examples": "See §4.1 for wire envelope format and field requirements"
+                    "examples": "See §4.1 for wire envelope format and field requirements",
                 }
             },
             "query_ops": {
                 "test_cypher_query_validation": {
                     "error_patterns": {
                         "invalid_cypher": "Cypher query syntax validation failed per §7.4.1",
-                        "unsupported_clause": "Query uses unsupported Cypher clauses per dialect"
+                        "unsupported_clause": "Query uses unsupported Cypher clauses per dialect",
                     },
                     "quick_fix": "Validate Cypher syntax and check supported features in capabilities",
-                    "examples": "See §7.4.1 for Cypher dialect requirements and validation"
+                    "examples": "See §7.4.1 for Cypher dialect requirements and validation",
                 }
             },
             "crud_validation": {
-                "test_vertex_lifecycle": {
+                "test_node_lifecycle": {
                     "error_patterns": {
-                        "duplicate_vertex": "Vertex creation with duplicate ID violated constraints",
-                        "invalid_properties": "Vertex properties violate schema constraints"
+                        "duplicate_node": "Node creation with duplicate ID violated constraints",
+                        "invalid_properties": "Node properties violate schema constraints",
                     },
-                    "quick_fix": "Check vertex ID uniqueness and property schema compliance",
-                    "examples": "See §7.3.1 for vertex CRUD operations and constraints"
+                    "quick_fix": "Check node ID uniqueness and property schema compliance",
+                    "examples": "See §7.3.1 for node CRUD operations and constraints",
                 }
-            }
-        }
+            },
+        },
     ),
-    
     "embedding": ProtocolConfig(
         name="embedding",
         display_name="Embedding Protocol V1.0",
@@ -361,7 +358,7 @@ PROTOCOLS_CONFIG = {
             "deadline": "Deadline Semantics",
             "health": "Health Endpoint",
             "observability": "Observability & Privacy",
-            "caching": "Caching & Idempotency"
+            "caching": "Caching & Idempotency",
         },
         spec_sections={
             "wire_contract": "§4.1 Wire-First Canonical Form",
@@ -375,42 +372,80 @@ PROTOCOLS_CONFIG = {
             "deadline": "§4.3 Deadline Propagation & §6.1 Operation Context",
             "health": "§10.3 Operations",
             "observability": "§6.4 Observability Interfaces & §13 Observability and Monitoring",
-            "caching": "§11.6 Caching (Implementation Guidance)"
+            "caching": "§11.6 Caching (Implementation Guidance)",
         },
         error_guidance={
             "wire_contract": {
                 "test_wire_envelope_validation": {
                     "error_patterns": {
                         "missing_required_fields": "Wire envelope missing required fields per §4.1",
-                        "invalid_field_types": "Field types don't match canonical form requirements"
+                        "invalid_field_types": "Field types don't match canonical form requirements",
                     },
                     "quick_fix": "Ensure all wire envelopes include required fields with correct types",
-                    "examples": "See §4.1 for wire envelope format and field requirements"
+                    "examples": "See §4.1 for wire envelope format and field requirements",
                 }
             },
             "batch_partial": {
                 "test_partial_batch_failures": {
                     "error_patterns": {
                         "inconsistent_reporting": "Partial success counts don't match input batch size",
-                        "missing_failure_details": "Failure objects missing required error details per §12.5"
+                        "missing_failure_details": "Failure objects missing required error details per §12.5",
                     },
                     "quick_fix": "Ensure partial success response matches input batch size with proper error indexing",
-                    "examples": "See §12.5 for partial failure contract requirements"
+                    "examples": "See §12.5 for partial failure contract requirements",
                 }
             },
             "truncation": {
                 "test_auto_truncation": {
                     "error_patterns": {
                         "truncation_not_supported": "Model doesn't support truncation but input exceeds limits",
-                        "invalid_truncation_parameter": "truncation parameter not in allowed values"
+                        "invalid_truncation_parameter": "truncation parameter not in allowed values",
                     },
                     "quick_fix": "Implement truncation strategy or validate input length against model limits",
-                    "examples": "See §10.6 for truncation semantics and parameter validation"
+                    "examples": "See §10.6 for truncation semantics and parameter validation",
                 }
-            }
-        }
+            },
+        },
     ),
-    
+    # Dedicated protocol entry for the wire conformance suite (tests/live)
+    "wire": ProtocolConfig(
+        name="wire",
+        display_name="Wire Request Conformance Suite",
+        # Authoritative numbers from wire_cases.py + edge-case tests:
+        # 48 parametrized request cases + 25 edge/validator tests = 73
+        conformance_levels={"gold": 73, "silver": 58, "development": 37},
+        test_categories={
+            # We treat all tests in tests/live as belonging to this single category.
+            "wire": "Wire Request Envelope Conformance",
+        },
+        spec_sections={
+            "wire": "Wire Request Conformance Suite (tests/live/test_wire_conformance.py)",
+        },
+        error_guidance={
+            "wire": {
+                # Main parametrized wire test
+                "test_wire_request_envelope": {
+                    "error_patterns": {
+                        "schema validation failed": (
+                            "Envelope does not validate against the JSON Schemas resolved by the schema registry"
+                        ),
+                        "validationerror": (
+                            "Envelope fails structural or args validation in tests.live.wire_validators"
+                        ),
+                    },
+                    "quick_fix": (
+                        "Ensure your adapter's build_*_envelope methods produce envelopes that match the "
+                        "CORPUS Protocol wire envelope schemas and the constraints enforced in "
+                        "tests/live/wire_validators.py."
+                    ),
+                    "examples": (
+                        "See tests/live/wire_cases.py for the canonical WireRequestCase definitions and "
+                        "tests/live/wire_validators.py for the validation pipeline."
+                    ),
+                },
+            }
+        },
+    ),
     "schema": ProtocolConfig(
         name="schema",
         display_name="CORPUS Schema Conformance Suite",
@@ -424,7 +459,7 @@ PROTOCOLS_CONFIG = {
             "contract_constants": "Contract & Constants",
             "examples_validation": "Examples Validation",
             "stream_frames": "Stream Frames",
-            "performance_metrics": "Performance & Metrics"
+            "performance_metrics": "Performance & Metrics",
         },
         spec_sections={
             "schema_loading": "Schema Meta-Lint Suite - Schema Loading & IDs",
@@ -435,73 +470,72 @@ PROTOCOLS_CONFIG = {
             "contract_constants": "Schema Meta-Lint Suite - Contract & Constants",
             "examples_validation": "Schema Meta-Lint Suite - Examples Validation",
             "stream_frames": "Schema Meta-Lint Suite - Stream Frames",
-            "performance_metrics": "Schema Meta-Lint Suite - Performance & Metrics"
+            "performance_metrics": "Schema Meta-Lint Suite - Performance & Metrics",
         },
         error_guidance={
             "schema_loading": {
                 "test_schema_loading": {
                     "error_patterns": {
                         "invalid_schema": "Schema file failed to load or parse",
-                        "missing_schema": "Required $schema field missing or invalid"
+                        "missing_schema": "Required $schema field missing or invalid",
                     },
                     "quick_fix": (
                         "Ensure all schema files are valid JSON and include "
                         "$schema: 'https://json-schema.org/draft/2020-12/schema'"
                     ),
-                    "examples": "See SCHEMA_CONFORMANCE.md - Schema Loading & IDs section"
+                    "examples": "See SCHEMA_CONFORMANCE.md - Schema Loading & IDs section",
                 },
                 "test_unique_ids": {
                     "error_patterns": {
                         "duplicate_id": "Duplicate $id found across schema files",
-                        "invalid_id_format": "$id does not follow https://adaptersdk.org/schemas/ format"
+                        "invalid_id_format": "$id does not follow https://corpusos.com/schemas/ format",
                     },
                     "quick_fix": (
                         "Ensure each schema has unique $id following convention: "
-                        "https://adaptersdk.org/schemas/<component>/<file>.json"
+                        "https://corpusos.com/schemas/<component>/<file>.json"
                     ),
-                    "examples": "See SCHEMA_CONFORMANCE.md - $id hygiene requirements"
-                }
+                    "examples": "See SCHEMA_CONFORMANCE.md - $id hygiene requirements",
+                },
             },
             "metaschema_hygiene": {
                 "test_metaschema_compliance": {
                     "error_patterns": {
                         "draft_2020_12_violation": "Schema violates JSON Schema Draft 2020-12",
-                        "invalid_keywords": "Unknown or invalid JSON Schema keywords used"
+                        "invalid_keywords": "Unknown or invalid JSON Schema keywords used",
                     },
                     "quick_fix": (
                         "Validate schema against Draft 2020-12 metaschema and remove unsupported keywords"
                     ),
-                    "examples": "See SCHEMA_CONFORMANCE.md - Metaschema & Hygiene section"
+                    "examples": "See SCHEMA_CONFORMANCE.md - Metaschema & Hygiene section",
                 },
                 "test_regex_patterns": {
                     "error_patterns": {
                         "invalid_regex": "Regular expression pattern does not compile",
-                        "unsupported_regex_flags": "Regex uses unsupported flags"
+                        "unsupported_regex_flags": "Regex uses unsupported flags",
                     },
                     "quick_fix": (
                         "Fix regex patterns to use supported ECMA 262 syntax without flags"
                     ),
-                    "examples": "See SCHEMA_CONFORMANCE.md - Pattern hygiene requirements"
-                }
+                    "examples": "See SCHEMA_CONFORMANCE.md - Pattern hygiene requirements",
+                },
             },
             "cross_references": {
                 "test_ref_resolution": {
                     "error_patterns": {
                         "unresolved_ref": "$ref cannot be resolved to known schema $id",
-                        "invalid_fragment": "Fragment (#/definitions/...) points to non-existent definition"
+                        "invalid_fragment": "Fragment (#/definitions/...) points to non-existent definition",
                     },
                     "quick_fix": (
                         "Ensure all $ref values point to valid $ids or internal fragments"
                     ),
-                    "examples": "See SCHEMA_CONFORMANCE.md - Cross-References section"
+                    "examples": "See SCHEMA_CONFORMANCE.md - Cross-References section",
                 }
-            }
-        }
+            },
+        },
     ),
-    
     "golden": ProtocolConfig(
         name="golden",
-        display_name="CORPUS Golden Wire Suite", 
+        display_name="CORPUS Golden Wire Suite",
         conformance_levels={"gold": 78, "silver": 62, "development": 39},
         test_categories={
             "core_validation": "Core Schema Validation",
@@ -510,7 +544,7 @@ PROTOCOLS_CONFIG = {
             "version_format": "Schema Version & Format",
             "drift_detection": "Drift Detection",
             "performance_reliability": "Performance & Reliability",
-            "component_coverage": "Component Coverage"
+            "component_coverage": "Component Coverage",
         },
         spec_sections={
             "core_validation": "Golden Samples Suite - Core Schema Validation",
@@ -519,7 +553,7 @@ PROTOCOLS_CONFIG = {
             "version_format": "Schema Version & Format",
             "drift_detection": "Golden Samples Suite - Drift Detection",
             "performance_reliability": "Golden Samples Suite - Performance & Reliability",
-            "component_coverage": "Golden Samples Suite - Component Coverage"
+            "component_coverage": "Golden Samples Suite - Component Coverage",
         },
         error_guidance={
             "core_validation": {
@@ -528,22 +562,22 @@ PROTOCOLS_CONFIG = {
                         "schema_validation_failed": (
                             "Golden sample does not validate against its declared schema"
                         ),
-                        "missing_schema_reference": "Golden file missing $schema reference"
+                        "missing_schema_reference": "Golden file missing $schema reference",
                     },
                     "quick_fix": "Update golden sample to match schema or fix schema definition",
-                    "examples": "See SCHEMA_CONFORMANCE.md - Golden Samples Suite section"
+                    "examples": "See SCHEMA_CONFORMANCE.md - Golden Samples Suite section",
                 }
             },
             "ndjson_stream": {
                 "test_llm_stream_ndjson_union_validates": {
                     "error_patterns": {
                         "invalid_frame_sequence": "Stream frames violate terminal frame rules",
-                        "missing_terminal_frame": "Stream missing required end or error frame"
+                        "missing_terminal_frame": "Stream missing required end or error frame",
                     },
                     "quick_fix": (
                         "Ensure streams have exactly one terminal frame (end/error) after data frames"
                     ),
-                    "examples": "See SCHEMA_CONFORMANCE.md - NDJSON Stream Validation"
+                    "examples": "See SCHEMA_CONFORMANCE.md - NDJSON Stream Validation",
                 }
             },
             "cross_invariants": {
@@ -552,16 +586,198 @@ PROTOCOLS_CONFIG = {
                         "count_mismatch": (
                             "successes + failures ≠ total items in partial success"
                         ),
-                        "invalid_indexing": "Failure indices out of bounds"
+                        "invalid_indexing": "Failure indices out of bounds",
                     },
                     "quick_fix": (
                         "Ensure partial success counts are mathematically consistent"
                     ),
-                    "examples": "See SCHEMA_CONFORMANCE.md - Cross-Schema Invariants"
+                    "examples": "See SCHEMA_CONFORMANCE.md - Cross-Schema Invariants",
                 }
-            }
-        }
-    )
+            },
+        },
+    ),
+    # NEW: Embedding framework adapter suite
+    "embedding_frameworks": ProtocolConfig(
+        name="embedding_frameworks",
+        display_name="Embedding Framework Adapters V1.0",
+        # Actual test count from analysis: 121 tests
+        conformance_levels={"gold": 121, "silver": 97, "development": 60},
+        test_categories={
+            "framework_specific": "Framework-Specific Adapters",
+            "contract_interface": "Cross-Framework Interface Conformance",
+            "contract_shapes": "Cross-Framework Shape & Batching",
+            "contract_context": "Cross-Framework Context & Error Handling",
+            "registry_infra": "Registry Infrastructure",
+            "robustness": "Robustness & Evil Backend Tests",
+        },
+        spec_sections={
+            "framework_specific": "§10.3 Operations + Framework Integration",
+            "contract_interface": "§10.3, §10.6, §7.2",
+            "contract_shapes": "§10.6, §12.5",
+            "contract_context": "§6.3, §13, §10.4",
+            "registry_infra": "§6.1 Framework Registration",
+            "robustness": "§6.3, §12.1, §12.5",
+        },
+        error_guidance={
+            "framework_specific": {
+                "test_constructor_rejects_adapter_without_embed": {
+                    "error_patterns": {
+                        "missing_embed_method": "Corpus adapter must implement embed() method per §10.3",
+                        "invalid_adapter_type": "Adapter doesn't conform to EmbeddingProtocolV1 interface",
+                    },
+                    "quick_fix": "Ensure corpus adapter implements the required EmbeddingProtocolV1 interface",
+                    "examples": "See §10.3 for required embedding protocol methods",
+                }
+            },
+            "contract_interface": {
+                "test_sync_embedding_interface_conformance": {
+                    "error_patterns": {
+                        "missing_method": "Framework adapter missing required embedding methods",
+                        "signature_mismatch": "Method signatures don't match framework expectations",
+                    },
+                    "quick_fix": "Ensure all required sync/async embedding methods are implemented with correct signatures",
+                    "examples": "See test_contract_interface_conformance.py for interface requirements",
+                }
+            },
+            "contract_shapes": {
+                "test_batch_output_row_count_matches_input_length": {
+                    "error_patterns": {
+                        "row_count_mismatch": "Batch embedding returned wrong number of rows",
+                        "shape_validation_failed": "Embedding matrix shape doesn't match input length",
+                    },
+                    "quick_fix": "Ensure embed() returns exactly N vectors for N input texts",
+                    "examples": "See test_contract_shapes_and_batching.py for shape validation details",
+                }
+            },
+            "contract_context": {
+                "test_error_context_is_attached_on_sync_batch_failure": {
+                    "error_patterns": {
+                        "missing_error_context": "Errors not decorated with framework/operation metadata",
+                        "context_attachment_failed": "attach_context() not called on error path",
+                    },
+                    "quick_fix": "Add @error_context decorator to all public embedding methods",
+                    "examples": "See §6.3 for error context requirements",
+                }
+            },
+        },
+    ),
+    # NEW: Graph framework adapter suite
+    "graph_frameworks": ProtocolConfig(
+        name="graph_frameworks",
+        display_name="Graph Framework Adapters V1.0",
+        # From the graph framework conformance doc: 184 tests
+        conformance_levels={"gold": 184, "silver": 147, "development": 92},
+        test_categories={
+            "framework_specific": "Framework-Specific Graph Adapters",
+            "contract_interface": "Cross-Framework Interface Conformance",
+            "contract_shapes": "Cross-Framework Shape & Batch Semantics",
+            "contract_context": "Cross-Framework Context & Error Handling",
+            "registry_infra": "Registry Infrastructure",
+            "robustness": "Robustness & Evil Backend Tests",
+        },
+        spec_sections={
+            "framework_specific": "§7.3 Operations + Framework Integration",
+            "contract_interface": "§7.3, §7.2",
+            "contract_shapes": "§7.3.3, §12.5",
+            "contract_context": "§6.3, §13",
+            "registry_infra": "§6.1 Framework Registration",
+            "robustness": "§6.3, §12.1, §12.5",
+        },
+        error_guidance={
+            "framework_specific": {
+                "test_context_manager_closes_underlying_graph_adapter": {
+                    "error_patterns": {
+                        "missing_close": "Underlying graph adapter.close()/aclose() is never called",
+                        "resource_leak": "Connections or sessions remain open after context manager exits",
+                    },
+                    "quick_fix": (
+                        "Ensure your framework adapter implements __enter__/__exit__ (and async variants) "
+                        "and delegates cleanup to the underlying Corpus graph adapter."
+                    ),
+                    "examples": (
+                        "See tests/frameworks/graph/test_*_graph_adapter.py "
+                        "for context manager expectations."
+                    ),
+                }
+            },
+            "contract_shapes": {
+                "test_batch_result_length_matches_ops_when_supported": {
+                    "error_patterns": {
+                        "length_mismatch": "Batch() returned a different number of results than operations submitted",
+                        "silent_drop": "Some operations appear to be silently dropped from the response",
+                    },
+                    "quick_fix": (
+                        "Ensure that for N batch operations your adapter returns exactly N results, "
+                        "in the same order, even when some operations fail."
+                    ),
+                    "examples": (
+                        "See tests/frameworks/graph/test_contract_shapes_and_batching.py "
+                        "and §7.3.3 + §12.5 for batch semantics."
+                    ),
+                },
+                "test_bulk_vertices_result_type_stable_when_supported": {
+                    "error_patterns": {
+                        "type_instability": "bulk_vertices() result type changes across calls",
+                        "wrong_shape": "Result does not match the expected vertex collection shape",
+                    },
+                    "quick_fix": (
+                        "Normalize bulk_vertices() return type to a consistent collection "
+                        "(e.g. list of vertex objects) and keep it stable across calls."
+                    ),
+                    "examples": (
+                        "See tests/frameworks/graph/test_contract_shapes_and_batching.py "
+                        "for expected bulk_vertices() behavior."
+                    ),
+                },
+            },
+            "contract_context": {
+                "test_error_context_is_attached_on_sync_query_failure": {
+                    "error_patterns": {
+                        "missing_error_context": "Exceptions raised from query() lack framework/operation metadata",
+                        "lost_context": "Framework-specific context (config, conversation, task) is not attached on error",
+                    },
+                    "quick_fix": (
+                        "Wrap public methods with the @error_context decorator and ensure that your "
+                        "_build_ctx() logic attaches framework and operation metadata to the OperationContext."
+                    ),
+                    "examples": (
+                        "See tests/frameworks/graph/test_contract_context_and_error_context.py "
+                        "and §6.3 + §13 for error context requirements."
+                    ),
+                }
+            },
+            "robustness": {
+                "test_wrong_batch_length_from_backend_causes_error_or_obvious_mismatch": {
+                    "error_patterns": {
+                        "batch_mismatch_ignored": "Adapter passes through backend batch length mismatches silently",
+                        "no_validation": "No validation of translator/backend batch result length vs input ops",
+                    },
+                    "quick_fix": (
+                        "Validate that the backend/translator returns the same number of batch results as "
+                        "operations submitted; raise a clear error (with context) if they differ."
+                    ),
+                    "examples": (
+                        "See tests/frameworks/graph/test_with_mock_backends.py and §12.5 "
+                        "for partial failure and batch validation guidance."
+                    ),
+                },
+                "test_invalid_backend_result_causes_errors_for_sync_query": {
+                    "error_patterns": {
+                        "invalid_result_shape": "Adapter accepts backend results of the wrong type/shape",
+                        "silent_accept": "Adapter does not surface schema/shape issues from backends",
+                    },
+                    "quick_fix": (
+                        "Add strict validation layers around backend/translator output, ensuring it matches "
+                        "the expected Graph Protocol result schema and raising a descriptive error otherwise."
+                    ),
+                    "examples": (
+                        "See tests/frameworks/graph/test_with_mock_backends.py and §6.3 + §12.1 "
+                        "for robustness expectations."
+                    ),
+                },
+            },
+        },
+    ),
 }
 
 # Register all protocols
@@ -577,7 +793,17 @@ PROTOCOL_DISPLAY_NAMES = {
 }
 
 # Explicit, stable protocol order for summaries / UX
-PROTOCOLS = ["llm", "vector", "graph", "embedding", "schema", "golden"]
+PROTOCOLS: List[str] = [
+    "llm",
+    "vector",
+    "graph",
+    "embedding",
+    "embedding_frameworks",
+    "graph_frameworks",
+    "wire",
+    "schema",
+    "golden",
+]
 CONFIG_PROTOCOLS = set(PROTOCOLS_CONFIG.keys())
 if CONFIG_PROTOCOLS != set(PROTOCOLS):
     raise ValueError(
@@ -611,10 +837,13 @@ ADAPTER_ENV = "CORPUS_ADAPTER"
 DEFAULT_ADAPTER = "tests.mock.mock_llm_adapter:MockLLMAdapter"
 ENDPOINT_ENV = "CORPUS_ENDPOINT"
 
-# NOTE: adapter class caching uses module-level globals for performance.
-# Pytest executes collection and fixture construction on a single main thread,
-# so this is safe in typical usage. If this code is adapted for multi-threaded
-# plugin execution, wrap _get_adapter_class() in a threading.Lock.
+# NOTE:
+#   Adapter class caching uses module-level globals for performance.
+#   Pytest executes collection and fixture construction on a single main
+#   thread per worker process (even when using xdist), so this cache is
+#   process-local and does not require locking. If this plugin is ever
+#   adapted to a truly multi-threaded execution model, wrap _get_adapter_class()
+#   in a threading.Lock.
 _ADAPTER_CLASS: Optional[type] = None
 _ADAPTER_SPEC_USED: Optional[str] = None
 _ADAPTER_VALIDATED: bool = False
@@ -639,7 +868,7 @@ def _load_class_from_spec(spec: str) -> type:
     """
     Load and validate a class from a 'package.module:ClassName' string.
     """
-    module_name, _, class_name = spec.partition(':')
+    module_name, _, class_name = spec.partition(":")
     if not module_name or not class_name:
         raise AdapterValidationError(
             f"Invalid adapter spec '{spec}'. Expected 'package.module:ClassName'."
@@ -662,7 +891,7 @@ def _load_class_from_spec(spec: str) -> type:
 
     # Validate the loaded class
     _validate_adapter_class(cls)
-    
+
     return cls
 
 
@@ -677,7 +906,7 @@ def _get_adapter_class() -> type:
 
     spec = os.getenv(ADAPTER_ENV, DEFAULT_ADAPTER)
     _ADAPTER_SPEC_USED = spec
-    
+
     try:
         _ADAPTER_CLASS = _load_class_from_spec(spec)
         _ADAPTER_VALIDATED = True
@@ -691,10 +920,33 @@ def _get_adapter_class() -> type:
     return _ADAPTER_CLASS
 
 
-@pytest.fixture
+def _apply_pytest_adapter_option(config: pytest.Config) -> None:
+    """
+    Bridge pytest's --adapter option (used by wire tests in tests/live)
+    into the CORPUS_ADAPTER environment that this plugin uses.
+
+    This keeps a single source of truth for adapter selection without
+    duplicating command-line flags.
+    """
+    adapter_opt = getattr(getattr(config, "option", None), "adapter", None)
+    if not adapter_opt or adapter_opt == "default":
+        # Either the option wasn't provided, or the caller wants the default.
+        return
+
+    # Only set env var if user explicitly requested an adapter on the CLI.
+    # This ensures existing CORPUS_ADAPTER env config is preserved unless
+    # the --adapter flag is used.
+    os.environ[ADAPTER_ENV] = adapter_opt
+
+
+@pytest.fixture(scope="session")
 def adapter():
     """
     Generic, pluggable adapter fixture with enhanced validation.
+
+    The adapter class is resolved from CORPUS_ADAPTER (or the default mock
+    adapter), and an optional CORPUS_ENDPOINT is passed into the constructor
+    using common parameter names.
     """
     Adapter = _get_adapter_class()
     endpoint = os.getenv(ENDPOINT_ENV)
@@ -703,7 +955,7 @@ def adapter():
         # Enhanced parameter injection with better error reporting
         param_names = ["endpoint", "base_url", "url"]
         attempted_params = []
-        
+
         for kw in param_names:
             attempted_params.append(kw)
             try:
@@ -740,69 +992,104 @@ class TestCategorizer:
     """
     High-performance test categorization with caching and pattern matching.
     """
-    
+
     def __init__(self):
         self._protocol_patterns = self._build_protocol_patterns()
         self._category_patterns = self._build_category_patterns()
         self._cache: Dict[str, Tuple[str, str]] = {}
         self._cache_hits = 0
         self._cache_misses = 0
-    
+
     def _build_protocol_patterns(self) -> Dict[str, re.Pattern]:
-        """Compile regex patterns for protocol detection."""
-        patterns = {}
-        for proto in PROTOCOLS:
-            # Match both POSIX and Windows paths
-            pattern = re.compile(rf'tests[\\/]{re.escape(proto)}[\\/]', re.IGNORECASE)
-            patterns[proto] = pattern
+        """Compile regex patterns for protocol detection based on directory."""
+        patterns: Dict[str, re.Pattern] = {}
+
+        # Explicit mapping keeps intent clear:
+        base_patterns = {
+            "llm": r"tests[\\/]llm[\\/]",
+            "vector": r"tests[\\/]vector[\\/]",
+            "graph": r"tests[\\/]graph[\\/]",
+            "embedding": r"tests[\\/]embedding[\\/]",
+            "schema": r"tests[\\/]schema[\\/]",
+            "golden": r"tests[\\/]golden[\\/]",
+            # Framework adapter suites
+            "embedding_frameworks": r"tests[\\/]frameworks[\\/]embedding[\\/]",
+            "graph_frameworks": r"tests[\\/]frameworks[\\/]graph[\\/]",
+            # Wire suite (live)
+            "wire": r"tests[\\/]live[\\/]",
+        }
+
+        for proto, pattern_str in base_patterns.items():
+            patterns[proto] = re.compile(pattern_str, re.IGNORECASE)
+
         return patterns
-    
+
     def _build_category_patterns(self) -> Dict[str, Dict[re.Pattern, str]]:
         """Compile regex patterns for category detection."""
-        category_patterns = {}
+        category_patterns: Dict[str, Dict[re.Pattern, str]] = {}
         for proto, config in PROTOCOLS_CONFIG.items():
-            proto_patterns = {}
+            proto_patterns: Dict[re.Pattern, str] = {}
             for category_key, category_name in config.test_categories.items():
                 # Create patterns for both category key and display name
                 patterns = [
-                    re.compile(rf'\b{re.escape(category_key)}\b', re.IGNORECASE),
-                    re.compile(rf'\b{re.escape(category_name.lower())}\b', re.IGNORECASE),
+                    re.compile(rf"\b{re.escape(category_key)}\b", re.IGNORECASE),
+                    re.compile(rf"\b{re.escape(category_name.lower())}\b", re.IGNORECASE),
                 ]
                 for pattern in patterns:
                     proto_patterns[pattern] = category_key
             category_patterns[proto] = proto_patterns
         return category_patterns
-    
+
     def categorize_test(self, nodeid: str) -> Tuple[str, str]:
         """
         Categorize test by protocol and category with caching.
+
+        This works for the per-protocol suites in tests/<proto>/ as well as:
+        - shared wire conformance suite in tests/live (protocol 'wire')
+        - framework adapter suites in tests/frameworks/embedding and tests/frameworks/graph
         """
         nodeid_lower = (nodeid or "").lower()
-        
+
         # Cache lookup
         cached = self._cache.get(nodeid_lower)
         if cached is not None:
             self._cache_hits += 1
             return cached
-        
+
         self._cache_misses += 1
 
-        # Protocol detection
-        protocol = "other"
-        for proto, pattern in self._protocol_patterns.items():
-            if pattern.search(nodeid_lower):
-                protocol = proto
-                break
-        
+        # Framework adapter tests take precedence based on path
+        if "tests/frameworks/embedding/" in nodeid_lower or "tests\\frameworks\\embedding\\" in nodeid_lower:
+            protocol = "embedding_frameworks"
+        elif "tests/frameworks/graph/" in nodeid_lower or "tests\\frameworks\\graph\\" in nodeid_lower:
+            protocol = "graph_frameworks"
+        # Wire suite in tests/live
+        elif "tests/live/" in nodeid_lower or "tests\\live\\" in nodeid_lower:
+            protocol = "wire"
+        else:
+            # Infer protocol from directory using explicit patterns
+            protocol = "other"
+            for proto, pattern in self._protocol_patterns.items():
+                if pattern.search(nodeid_lower):
+                    protocol = proto
+                    break
+
+        # For the dedicated wire suite, we keep categorization simple:
+        # everything is considered part of the 'wire' category.
+        if protocol == "wire":
+            result = ("wire", "wire")
+            self._cache[nodeid_lower] = result
+            return result
+
         if protocol == "other":
             result = ("other", "unknown")
             self._cache[nodeid_lower] = result
             return result
-        
+
         # Category detection with cached patterns
         category = "unknown"
         proto_patterns = self._category_patterns.get(protocol, {})
-        
+
         for pattern, category_key in proto_patterns.items():
             if pattern.search(nodeid_lower):
                 category = category_key
@@ -811,7 +1098,7 @@ class TestCategorizer:
         result = (protocol, category)
         self._cache[nodeid_lower] = result
         return result
-    
+
     def get_cache_stats(self) -> Dict[str, int]:
         """Get cache statistics for performance monitoring."""
         return {
@@ -841,7 +1128,7 @@ class CorpusProtocolPlugin:
         self.plain_output: bool = False
         self.verbose: bool = False
         self.unmapped_categories: Set[Tuple[str, str]] = set()
-        
+
     # -------- Emoji / plain output helpers --------
 
     def _use_plain_output(self) -> bool:
@@ -857,7 +1144,7 @@ class CorpusProtocolPlugin:
 
     # -------- Session bookkeeping --------
 
-    def pytest_sessionstart(self, session):
+    def pytest_sessionstart(self, session: pytest.Session) -> None:
         """Record session start time and initialize tracking."""
         self.start_time = time.time()
         self.test_reports = {proto: [] for proto in PROTOCOLS}
@@ -866,9 +1153,12 @@ class CorpusProtocolPlugin:
         self._protocol_results_cache = None
         self._protocol_totals_cache = None
         self.plain_output = self._use_plain_output()
-        self.verbose = bool(getattr(session.config, "option", None) and session.config.option.verbose)
+        self.verbose = bool(
+            getattr(session.config, "option", None)
+            and session.config.option.verbose
+        )
         self.unmapped_categories.clear()
-        
+
         if session.config.option.verbose:
             print(
                 self._fmt("🔧", "CORPUS Protocol Plugin: Performance optimizations enabled - ")
@@ -900,30 +1190,30 @@ class CorpusProtocolPlugin:
 
     # -------- Failure categorization --------
 
-    def _categorize_failures(self, failed_reports: List) -> Dict[str, Dict[str, List[Any]]]:
+    def _categorize_failures(self, failed_reports: List[Any]) -> Dict[str, Dict[str, List[Any]]]:
         """
         High-performance failure categorization.
-        
+
         Optimized for large test suites by using cached categorization
         and minimizing redundant computations.
         """
         by_protocol: Dict[str, Dict[str, List[Any]]] = {}
-        
+
         # Pre-initialize structure
         for proto in PROTOCOLS:
             by_protocol[proto] = {}
         by_protocol["other"] = {}
-        
+
         # Single-pass categorization with caching
         for rep in failed_reports:
             nodeid = getattr(rep, "nodeid", "") or ""
             proto, category = test_categorizer.categorize_test(nodeid)
-            
+
             if category not in by_protocol[proto]:
                 by_protocol[proto][category] = []
-            
+
             by_protocol[proto][category].append(rep)
-        
+
         # Remove empty categories for cleaner output
         return {
             proto: {cat: reports for cat, reports in categories.items() if reports}
@@ -955,7 +1245,7 @@ class CorpusProtocolPlugin:
         # strict 100% for Gold
         if passed_count == total_collected:
             return self._fmt("🥇", "Gold"), 0
-        
+
         # 80% for Silver
         silver_threshold = int(total_collected * 0.80)
         if passed_count >= silver_threshold:
@@ -977,7 +1267,7 @@ class CorpusProtocolPlugin:
     def _get_spec_section(self, protocol: str, category: str) -> str:
         """
         Get specification section for a test category.
-        
+
         Unmapped categories are explicitly called out to help catch drift
         between config and the actual test surface.
         """
@@ -996,7 +1286,7 @@ class CorpusProtocolPlugin:
             base += f" [UNMAPPED {protocol}:{category}]"
         return base
 
-    def _get_error_guidance(self, protocol: str, category: str, test_name: str) -> Dict[str, str]:
+    def _get_error_guidance(self, protocol: str, category: str, test_name: str) -> Dict[str, Any]:
         """Get specific error guidance for a test failure."""
         config = protocol_registry.get(protocol)
         if not config:
@@ -1005,10 +1295,10 @@ class CorpusProtocolPlugin:
                 "quick_fix": "Review specification section above",
                 "examples": "See specification for implementation details",
             }
-            
+
         category_guidance = config.error_guidance.get(category, {})
         test_guidance = category_guidance.get(test_name, {})
-        
+
         # Fallback guidance for uncovered tests
         if not test_guidance:
             test_guidance = {
@@ -1110,7 +1400,9 @@ class CorpusProtocolPlugin:
 
             if proto == "other":
                 category_name = (
-                    category.replace("_", " ").title() if category != "unknown" else "Unknown Category"
+                    category.replace("_", " ").title()
+                    if category != "unknown"
+                    else "Unknown Category"
                 )
                 spec_section = "Not part of CORPUS certification suite"
             else:
@@ -1122,7 +1414,9 @@ class CorpusProtocolPlugin:
                     )
                 spec_section = self._get_spec_section(proto, category)
 
-            terminalreporter.write_line(f"  {self._fmt('❌', 'Failure')} {category_name}: {count} failure(s)")
+            terminalreporter.write_line(
+                f"  {self._fmt('❌', 'Failure')} {category_name}: {count} failure(s)"
+            )
             terminalreporter.write_line(f"      Specification: {spec_section}")
 
             # Show specific guidance for each failed test
@@ -1149,27 +1443,26 @@ class CorpusProtocolPlugin:
                     for pattern_key, pattern_desc in error_patterns.items():
                         if pattern_key.lower() in error_msg:
                             matched_patterns.append(pattern_desc)
-                    
+
                     if matched_patterns:
-                        terminalreporter.write_line(f"      Detected: {', '.join(matched_patterns)}")
+                        terminalreporter.write_line(
+                            f"      Detected: {', '.join(matched_patterns)}"
+                        )
 
         terminalreporter.write_line("")
 
-    # -------- Top-level summary printers --------
+    # -------- Shared protocol status iterator (DRY) --------
 
-    def _print_platinum_certification(self, terminalreporter, ctx: SummaryContext):
-        """Print Platinum certification summary."""
-        total_tests = self._get_total_tests(ctx.outcome_counts)
+    def _iter_protocol_status(
+        self,
+        ctx: SummaryContext,
+        protocols: Optional[Iterable[str]] = None,
+    ):
+        """Yield (proto, config, total, passed, level, needed) for protocols with tests."""
+        if protocols is None:
+            protocols = PROTOCOLS
 
-        terminalreporter.write_sep("=", self._fmt("🏆", "CORPUS PROTOCOL SUITE - PLATINUM CERTIFIED"))
-        terminalreporter.write_line(
-            f"All {total_tests} conformance tests passed across {len(PROTOCOLS)} protocol suites"
-        )
-        terminalreporter.write_line("")
-
-        # Show protocol breakdown
-        terminalreporter.write_line("Protocol Conformance Status:")
-        for proto in PROTOCOLS:
+        for proto in protocols:
             config = protocol_registry.get(proto)
             if not config:
                 continue
@@ -1177,7 +1470,26 @@ class CorpusProtocolPlugin:
             if total == 0:
                 continue
             passed = ctx.protocol_passed.get(proto, 0)
-            level, _ = self._calculate_conformance_level(proto, passed, total)
+            level, needed = self._calculate_conformance_level(proto, passed, total)
+            yield proto, config, total, passed, level, needed
+
+    # -------- Top-level summary printers --------
+
+    def _print_platinum_certification(self, terminalreporter, ctx: SummaryContext) -> None:
+        """Print Platinum certification summary."""
+        total_tests = self._get_total_tests(ctx.outcome_counts)
+
+        terminalreporter.write_sep(
+            "=", self._fmt("🏆", "CORPUS PROTOCOL SUITE - PLATINUM CERTIFIED")
+        )
+        terminalreporter.write_line(
+            f"All {total_tests} conformance tests passed across {len(PROTOCOLS)} protocol suites"
+        )
+        terminalreporter.write_line("")
+
+        # Show protocol breakdown (protocol + framework adapter suites)
+        terminalreporter.write_line("Protocol & Framework Conformance Status:")
+        for proto, config, total, passed, level, _needed in self._iter_protocol_status(ctx):
             terminalreporter.write_line(
                 f"  {self._fmt('✅', 'PASS')} {config.display_name}: {level} "
                 f"({passed}/{total} tests passing)"
@@ -1188,15 +1500,18 @@ class CorpusProtocolPlugin:
             self._fmt("🎯", "Status: Ready for production deployment")
         )
         terminalreporter.write_line(
-            self._fmt("📚", "Specification: All requirements met per CORPUS Protocol Suite V1.0")
+            self._fmt(
+                "📚",
+                "Specification: All requirements met per CORPUS Protocol Suite V1.0",
+            )
         )
         terminalreporter.write_line(
             self._fmt(
                 "ℹ️",
-                "Tests not under a known protocol directory are reported as 'other' and do not affect certification."
+                "Tests not under a known protocol directory are reported as 'other' and do not affect certification.",
             )
         )
-        
+
         # Performance stats
         cache_stats = test_categorizer.get_cache_stats()
         terminalreporter.write_line(
@@ -1215,25 +1530,17 @@ class CorpusProtocolPlugin:
             for proto, cat in sorted(self.unmapped_categories):
                 terminalreporter.write_line(f"  - {proto}:{cat}")
 
-    def _print_gold_certification(self, terminalreporter, ctx: SummaryContext):
+    def _print_gold_certification(self, terminalreporter, ctx: SummaryContext) -> None:
         """Print Gold certification summary with progress to Platinum."""
-        terminalreporter.write_sep("=", self._fmt("🥇", "CORPUS PROTOCOL SUITE - GOLD CERTIFIED"))
+        terminalreporter.write_sep(
+            "=", self._fmt("🥇", "CORPUS PROTOCOL SUITE - GOLD CERTIFIED")
+        )
 
-        terminalreporter.write_line("Protocol Conformance Status:")
+        terminalreporter.write_line("Protocol & Framework Conformance Status:")
+
         platinum_ready = True
-
-        for proto in PROTOCOLS:
-            config = protocol_registry.get(proto)
-            if not config:
-                continue
-
-            total = ctx.protocol_total.get(proto, 0)
-            if total == 0:
-                continue
-                
-            passed = ctx.protocol_passed.get(proto, 0)
-            level, needed = self._calculate_conformance_level(proto, passed, total)
-
+        for proto, config, total, passed, level, needed in self._iter_protocol_status(ctx):
+            # Determine next label for non-gold levels
             if "Gold" in level:
                 terminalreporter.write_line(
                     f"  {self._fmt('✅', 'PASS')} {config.display_name}: {level} "
@@ -1255,20 +1562,23 @@ class CorpusProtocolPlugin:
         terminalreporter.write_line("")
         if platinum_ready:
             terminalreporter.write_line(
-                self._fmt("🎯", "All protocols at Gold level - Platinum certification available!")
+                self._fmt(
+                    "🎯",
+                    "All protocols at Gold level - Platinum certification available!",
+                )
             )
         else:
             terminalreporter.write_line(
                 self._fmt(
                     "🎯",
-                    "Focus on protocols below Gold level to reach Platinum certification (100% passing)."
+                    "Focus on protocols below Gold level to reach Platinum certification (100% passing).",
                 )
             )
 
         terminalreporter.write_line(
             self._fmt(
                 "ℹ️",
-                "Tests not under a known protocol directory are reported as 'other' and do not affect certification."
+                "Tests not under a known protocol directory are reported as 'other' and do not affect certification.",
             )
         )
         terminalreporter.write_line(
@@ -1297,9 +1607,11 @@ class CorpusProtocolPlugin:
         terminalreporter,
         ctx: SummaryContext,
         by_protocol: Dict[str, Dict[str, List[Any]]],
-    ):
+    ) -> None:
         """Print detailed failure analysis with actionable guidance."""
-        terminalreporter.write_sep("=", self._fmt("❌", "CORPUS PROTOCOL CONFORMANCE ANALYSIS"))
+        terminalreporter.write_sep(
+            "=", self._fmt("❌", "CORPUS PROTOCOL CONFORMANCE ANALYSIS")
+        )
 
         total_failures = 0
         for proto_failures in by_protocol.values():
@@ -1319,7 +1631,9 @@ class CorpusProtocolPlugin:
 
         # Certification impact
         terminalreporter.write_line("Certification Impact:")
-        failing_protocols = [p for p, cats in by_protocol.items() if cats and p != "other"]
+        failing_protocols = [
+            p for p, cats in by_protocol.items() if cats and p != "other"
+        ]
 
         if failing_protocols:
             terminalreporter.write_line(
@@ -1339,10 +1653,18 @@ class CorpusProtocolPlugin:
 
         terminalreporter.write_line("")
         terminalreporter.write_line("Next Steps:")
-        terminalreporter.write_line("  1. Review failing tests above with spec section references")
-        terminalreporter.write_line("  2. Check SPECIFICATION.md for detailed requirements") 
-        terminalreporter.write_line("  3. Run individual protocol tests: make test-{protocol}-conformance")
-        terminalreporter.write_line("  4. Review error guidance in test output for specific fixes")
+        terminalreporter.write_line(
+            "  1. Review failing tests above with spec section references"
+        )
+        terminalreporter.write_line(
+            "  2. Check SPECIFICATION.md for detailed requirements"
+        )
+        terminalreporter.write_line(
+            "  3. Run individual protocol tests: make test-{protocol}-conformance"
+        )
+        terminalreporter.write_line(
+            "  4. Review error guidance in test output for specific fixes"
+        )
 
         cache_stats = test_categorizer.get_cache_stats()
         terminalreporter.write_line(
@@ -1363,10 +1685,10 @@ class CorpusProtocolPlugin:
 
     # -------- Main terminal summary hook --------
 
-    def pytest_terminal_summary(self, terminalreporter, exitstatus, config):
+    def pytest_terminal_summary(self, terminalreporter, exitstatus, config) -> None:
         """Generate comprehensive CORPUS Protocol conformance summary."""
         # Collect both test failures and internal errors
-        failed_reports = []
+        failed_reports: List[Any] = []
         for key in ("failed", "error"):
             failed_reports.extend(terminalreporter.stats.get(key, []))
 
@@ -1394,38 +1716,31 @@ class CorpusProtocolPlugin:
         by_protocol = self._categorize_failures(failed_reports)
         self._print_failure_analysis(terminalreporter, ctx, by_protocol)
 
-    def pytest_runtest_logstart(self, nodeid, location):
-        """Show protocol being tested for better progress visibility (optional)."""
-        proto, category = test_categorizer.categorize_test(nodeid)
-        # Hook point for future progress reporting; intentionally quiet for now.
-        _ = (proto, category)
-
 
 # Instantiate the plugin
 corpus_protocol_plugin = CorpusProtocolPlugin()
 
 
 # Pytest hook functions
-def pytest_sessionstart(session):
+def pytest_sessionstart(session: pytest.Session) -> None:
     corpus_protocol_plugin.pytest_sessionstart(session)
 
 
-def pytest_terminal_summary(terminalreporter, exitstatus, config):
+def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
     corpus_protocol_plugin.pytest_terminal_summary(terminalreporter, exitstatus, config)
 
 
-def pytest_runtest_logstart(nodeid, location):
-    corpus_protocol_plugin.pytest_runtest_logstart(nodeid, location)
-
-
 # Enhanced configuration with validation
-def pytest_configure(config):
+def pytest_configure(config: pytest.Config) -> None:
     """Register custom markers and validate plugin configuration."""
     markers = [
         "llm: LLM Protocol V1.0 conformance tests",
-        "vector: Vector Protocol V1.0 conformance tests", 
+        "vector: Vector Protocol V1.0 conformance tests",
         "graph: Graph Protocol V1.0 conformance tests",
         "embedding: Embedding Protocol V1.0 conformance tests",
+        "embedding_frameworks: Embedding framework adapter conformance tests",
+        "graph_frameworks: Graph framework adapter conformance tests",
+        "wire: Wire Request Conformance tests (tests/live)",
         "schema: Schema conformance validation tests",
         "golden: Golden wire message validation tests",
         "slow: Tests that take longer to run (skip with -m 'not slow')",
@@ -1434,9 +1749,13 @@ def pytest_configure(config):
 
     for marker in markers:
         config.addinivalue_line("markers", marker)
-    
+
+    # If the wire suite added a --adapter option, mirror that into CORPUS_ADAPTER
+    # so the shared adapter() fixture and wire tests stay in sync.
+    _apply_pytest_adapter_option(config)
+
     # Validate adapter configuration early (best-effort)
-    if config.option.verbose:
+    if getattr(config, "option", None) and getattr(config.option, "verbose", False):
         try:
             _get_adapter_class()
             print("✅ Adapter configuration validated successfully")
