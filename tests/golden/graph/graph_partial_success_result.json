@@ -1,6 +1,14 @@
 {
+  "processed_count": 2,
+  "failed_count": 1,
   "successes": 1,
-  "failures": 1,
+  "failures": [
+    {
+      "index": 1,
+      "error": "GRAPH_CONFLICT",
+      "detail": "Vertex with this id already exists"
+    }
+  ],
   "items": [
     {
       "index": 0,

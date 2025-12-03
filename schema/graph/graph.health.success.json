@@ -7,7 +7,7 @@
   "required": ["ok", "status"],
   "properties": {
     "ok": { "type": "boolean" },
-    "status": { "type": "string", "enum": ["ok", "degraded", "down"] },
+    "status": { "type": "string", "enum": ["degraded", "down", "ok"] },
     "reason": { "type": "string", "maxLength": 512 },
     "server": { "type": "string", "maxLength": 128 },
     "version": { "type": "string", "maxLength": 64 }

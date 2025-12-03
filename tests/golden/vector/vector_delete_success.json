@@ -8,6 +8,9 @@
   "request_id": "req_vec_delete_01",
   "result": {
     "namespace": "acme.docs",
-    "deleted_count": 2
+    "deleted_count": 2,
+    "processed_count": 2,
+    "failed_count": 0,
+    "failures": []
   }
 }

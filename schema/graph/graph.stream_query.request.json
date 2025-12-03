@@ -13,5 +13,11 @@
       "maxProperties": 256,
       "additionalProperties": true
     }
+  },
+  "not": {
+    "anyOf": [
+      {"required": ["page_size"]},
+      {"required": ["page_token"]}
+    ]
   }
 }

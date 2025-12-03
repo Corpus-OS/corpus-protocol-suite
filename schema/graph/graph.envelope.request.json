@@ -4,20 +4,24 @@
   "title": "Graph Request Envelope",
   "type": "object",
   "additionalProperties": false,
-  "required": ["op", "ctx", "args"],
+  "required": [
+    "op",
+    "ctx",
+    "args"
+  ],
   "properties": {
     "op": {
       "type": "string",
       "enum": [
-        "graph.create_vertex",
-        "graph.delete_vertex",
-        "graph.create_edge",
-        "graph.delete_edge",
-        "graph.query",
-        "graph.stream_query",
         "graph.batch",
+        "graph.capabilities",
+        "graph.create_edge",
+        "graph.create_vertex",
+        "graph.delete_edge",
+        "graph.delete_vertex",
         "graph.health",
-        "graph.capabilities"
+        "graph.query",
+        "graph.stream_query"
       ]
     },
     "ctx": {
@@ -49,14 +53,18 @@
         {
           "type": "object",
           "additionalProperties": false,
-          "maxProperties": 0
-        },
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "maxProperties": 0
+          "maxProperties": 0,
+          "description": "Empty args for health and capabilities operations"
         }
       ]
+    },
+    "protocol": {
+      "type": "string",
+      "const": "graph/v1.0"
+    },
+    "component": {
+      "type": "string",
+      "const": "graph"
     }
   }
 }

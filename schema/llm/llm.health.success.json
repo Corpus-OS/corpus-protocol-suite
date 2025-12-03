@@ -9,7 +9,7 @@
     "ok": { "type": "boolean" },
     "server": { "type": "string" },
     "version": { "type": "string" },
-    "status": { "type": "string", "enum": ["ok", "degraded"] },
+    "status": { "type": "string", "enum": ["degraded", "ok"] },
     "models": {
       "type": "object",
       "additionalProperties": {

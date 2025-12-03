@@ -9,7 +9,11 @@
     "id": { "type": ["string", "null"] },
     "index": { "type": ["integer", "null"] },
     "error": { "type": "string" },
-    "detail": { "type": "string" }
+    "detail": { "type": "string" },
+    "code": { "type": "string" },
+    "message": { "type": "string" },
+    "details": { "type": "object" },
+    "validation_errors": { "type": "array" }
   },
-  "required": ["error", "detail"]
+  "required": ["error"]
 }

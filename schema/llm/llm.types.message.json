@@ -9,7 +9,7 @@
   "properties": {
     "role": {
       "type": "string",
-      "enum": ["system", "user", "assistant", "tool"]
+      "enum": ["assistant", "system", "tool", "user"]
     },
     "content": {
       "type": "string"

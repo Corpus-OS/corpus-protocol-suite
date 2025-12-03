@@ -9,7 +9,11 @@
     "text": { "type": "string" },
     "is_final": { "type": "boolean" },
     "model": { "type": "string" },
+    "id": { "type": "string" },
+    "index": { "type": "integer", "minimum": 0 },
+    "delta": { "type": "object" },
+    "finish_reason": { "type": ["string", "null"] },
+    "logprobs": { "type": ["object", "null"] },
     "usage_so_far": { "$ref": "https://corpusos.com/schemas/llm/llm.types.token_usage.json" }
-  },
-  "required": ["text", "is_final"]
+  }
 }

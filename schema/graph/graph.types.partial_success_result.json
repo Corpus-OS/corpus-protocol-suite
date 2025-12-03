@@ -5,17 +5,50 @@
   "description": "Canonical transport-level partial-success payload for non-atomic Graph batch operations. Used with success envelopes that set code=\"PARTIAL_SUCCESS\".",
   "type": "object",
   "additionalProperties": false,
-  "required": ["successes", "failures", "items"],
+  "required": ["processed_count", "failed_count", "failures", "successes", "items"],
   "properties": {
+    "processed_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total number of items processed (per §3.4 BatchResult pattern)."
+    },
+    "failed_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of items that failed (per §3.4 BatchResult pattern)."
+    },
     "successes": {
       "type": "integer",
       "minimum": 0,
       "description": "Number of successful items."
     },
     "failures": {
-      "type": "integer",
-      "minimum": 0,
-      "description": "Number of failed items."
+      "type": "array",
+      "description": "Array of failure details (per §3.4 BatchResult pattern).",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "error": {
+            "type": "string",
+            "description": "Error code for the failed item."
+          },
+          "detail": {
+            "type": "string",
+            "description": "Human-readable detail about the failure."
+          },
+          "index": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Optional zero-based index of the failed item."
+          },
+          "id": {
+            "type": "string",
+            "description": "Optional ID of the failed item."
+          }
+        },
+        "required": ["error", "detail"]
+      }
     },
     "items": {
       "type": "array",
@@ -49,8 +82,18 @@
                 "$ref": "https://corpusos.com/schemas/graph/graph.id.success.json"
               },
               {
+                "$ref": "https://corpusos.com/schemas/graph/graph.ack.success.json"
+              },
+              {
                 "type": "object",
-                "additionalProperties": true
+                "additionalProperties": true,
+                "not": {
+                  "anyOf": [
+                    {"required": ["id"]},
+                    {"required": ["status"]},
+                    {"required": ["rows"]}
+                  ]
+                }
               }
             ]
           },
@@ -107,5 +150,5 @@
       }
     }
   },
-  "$comment": "Invariants (enforced in tests/logic, not JSON Schema): (1) successes + failures == items.length; (2) successes >= 1 AND failures >= 1 for PARTIAL_SUCCESS; (3) Items preserve input order; (4) No silent drops of failed items."
+  "$comment": "Invariants (enforced in tests/logic, not JSON Schema): (1) processed_count == items.length; (2) failed_count == failures.length; (3) successes + failed_count == processed_count; (4) Items preserve input order; (5) No silent drops of failed items."
 }

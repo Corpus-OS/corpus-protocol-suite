@@ -12,6 +12,7 @@
       }
     ],
     "model": "example-embed-1",
+    "total_texts": 1,
     "total_tokens": 3,
     "processing_time_ms": 10.5,
     "failures": [],

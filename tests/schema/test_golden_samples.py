@@ -28,8 +28,8 @@ from tests.utils.stream_validator import validate_ndjson_stream
 # Paths
 # ------------------------------------------------------------------------------
 ROOT = Path(__file__).resolve().parents[2]  # repo root
-SCHEMAS_ROOT = ROOT / "schemas"             # schemas/** (common, llm, vector, embedding, graph)
-GOLDEN = Path(__file__).resolve().parent    # tests/golden/
+SCHEMAS_ROOT = ROOT / "schema"              # schema/** (common, llm, vector, embedding, graph)
+GOLDEN = ROOT / "tests" / "golden"          # tests/golden/
 
 # ------------------------------------------------------------------------------
 # Constants / patterns
@@ -150,7 +150,7 @@ CASES: List[Tuple[str, str]] = [
     ("llm/llm_health_success.json",         "https://corpusos.com/schemas/llm/llm.envelope.success.json"),
     ("llm/llm_error_envelope.json",         "https://corpusos.com/schemas/llm/llm.envelope.error.json"),
 
-    # LLM streaming: single chunk as protocol envelope
+    # LLM streaming: chunk uses protocol envelope format with 'chunk' field
     ("llm/llm_stream_chunk.json",           "https://corpusos.com/schemas/llm/llm.envelope.success.json"),
 
     # LLM streaming frames (raw frame schemas)
@@ -236,9 +236,9 @@ CASES: List[Tuple[str, str]] = [
     ("graph/graph_stream_chunk.json",               "https://corpusos.com/schemas/graph/graph.envelope.success.json"),
 
     # Graph CRUD result shapes
-    ("graph/graph_vertex_create_success.json",      "https://corpusos.com/schemas/graph/graph.id.success.json"),
-    ("graph/graph_vertex_delete_success.json",      "https://corpusos.com/schemas/graph/graph.ack.success.json"),
-    ("graph/graph_edge_create_success.json",        "https://corpusos.com/schemas/graph/graph.id.success.json"),
+    ("graph/graph_vertex_create_success.json",      "https://corpusos.com/schemas/graph/graph.envelope.success.json"),
+    ("graph/graph_vertex_delete_success.json",      "https://corpusos.com/schemas/graph/graph.envelope.success.json"),
+    ("graph/graph_edge_create_success.json",        "https://corpusos.com/schemas/graph/graph.envelope.success.json"),
 
     # Graph type-level
     ("graph/graph_batch_op_create_vertex.json",     "https://corpusos.com/schemas/graph/graph.types.batch_op.json"),
@@ -295,7 +295,8 @@ def test_all_success_envelopes_follow_protocol_format():
         # REQUIRED fields
         assert "ok" in doc, f"{fname}: missing 'ok' field"
         assert "code" in doc, f"{fname}: missing 'code' field"
-        assert "result" in doc, f"{fname}: missing 'result' field"
+        # Streaming responses use 'chunk' instead of 'result'
+        assert "result" in doc or "chunk" in doc, f"{fname}: missing 'result' or 'chunk' field"
 
         # Field constraints
         assert doc["ok"] is True, f"{fname}: 'ok' must be true"

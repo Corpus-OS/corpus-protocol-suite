@@ -6,9 +6,12 @@
   "additionalProperties": false,
   "required": ["status"],
   "properties": {
+    "ok": {
+      "type": "boolean"
+    },
     "status": {
       "type": "string",
-      "enum": ["deleted", "noop", "ack"]
+      "enum": ["ack", "deleted", "noop"]
     }
   }
 }

@@ -3,12 +3,27 @@
   "$id": "https://corpusos.com/schemas/graph/graph.envelope.success.json",
   "title": "Graph Success Envelope",
   "type": "object",
-  "additionalProperties": false,
-  "required": ["ok", "code", "ms", "result"],
+  "required": [
+    "ok",
+    "code",
+    "ms"
+  ],
   "properties": {
-    "ok": { "type": "boolean", "const": true },
-    "code": { "type": "string", "enum": ["OK", "PARTIAL_SUCCESS"] },
-    "ms": { "type": "number", "minimum": 0 },
+    "ok": {
+      "type": "boolean",
+      "const": true
+    },
+    "code": {
+      "type": "string",
+      "enum": [
+        "OK",
+        "PARTIAL_SUCCESS"
+      ]
+    },
+    "ms": {
+      "type": "number",
+      "minimum": 0
+    },
     "result": {
       "oneOf": [
         {
@@ -31,8 +46,18 @@
         }
       ]
     },
-    "protocol": { "type": "string", "const": "graph/v1.0" },
-    "component": { "type": "string", "const": "graph" },
+    "chunk": {
+      "type": "object",
+      "description": "Streaming chunk data (mutually exclusive with result)"
+    },
+    "protocol": {
+      "type": "string",
+      "const": "graph/v1.0"
+    },
+    "component": {
+      "type": "string",
+      "const": "graph"
+    },
     "schema_version": {
       "type": "string",
       "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
@@ -76,18 +101,38 @@
       }
     }
   },
+  "oneOf": [
+    {
+      "required": [
+        "result"
+      ]
+    },
+    {
+      "required": [
+        "chunk"
+      ]
+    }
+  ],
   "allOf": [
     {
       "if": {
         "properties": {
-          "code": { "const": "PARTIAL_SUCCESS" }
+          "code": {
+            "const": "PARTIAL_SUCCESS"
+          }
         },
-        "required": ["code"]
+        "required": [
+          "code"
+        ]
       },
       "then": {
         "properties": {
           "result": {
-            "required": ["successes", "failures", "items"]
+            "required": [
+              "successes",
+              "failures",
+              "items"
+            ]
           }
         }
       }

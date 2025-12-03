@@ -19,6 +19,9 @@
       "maxLength": 256,
       "pattern": "^[A-Za-z0-9._:-]{1,256}$"
     },
+    "dimensions": { "type": "integer", "minimum": 1 },
+    "id": { "type": "string" },
+    "metadata": { "type": "object" },
     "total_matches": { "type": "integer", "minimum": 0 }
   },
   "required": ["matches", "query_vector", "namespace", "total_matches"]

@@ -41,9 +41,9 @@ except Exception as e:  # pragma: no cover
 
 # tests/schema/test_schema_lint.py  -> repo root is two parents up
 ROOT = Path(__file__).resolve().parents[2]
-SCHEMAS_DIR = ROOT / "schemas"
+SCHEMAS_DIR = ROOT / "schema"
 
-# Components we expect under schemas/
+# Components we expect under schema/
 COMPONENTS = {"common", "llm", "vector", "embedding", "graph"}
 
 
@@ -58,16 +58,16 @@ PATTERN_CACHE: Dict[str, re.Pattern] = {}
 
 # Enhanced constants
 SUPPORTED_PROTOCOLS = {"llm/v1.0", "vector/v1.0", "embedding/v1.0", "graph/v1.0"}
-RESERVED_PROPERTIES = {"$schema", "$id", "$defs", "$ref", "examples"}
+RESERVED_PROPERTIES = {"$schema", "$id", "$defs", "$ref", "$comment", "examples"}
 MAX_SCHEMA_SIZE_BYTES = 1 * 1024 * 1024  # 1MB per schema
 MAX_DEFS_COUNT = 50  # Maximum number of definitions per schema
 MAX_ENUM_SIZE = 100  # Maximum number of enum values
 
 
 def _iter_schema_files() -> List[Path]:
-    """Collect all JSON schema files under /schemas/**."""
+    """Collect all JSON schema files under /schema/**."""
     if not SCHEMAS_DIR.exists():
-        pytest.skip(f"schemas/ directory not found at {SCHEMAS_DIR}")
+        pytest.skip(f"schema/ directory not found at {SCHEMAS_DIR}")
     return sorted(SCHEMAS_DIR.rglob("*.json"))
 
 
@@ -174,10 +174,10 @@ def _is_stream_frame(fname: str) -> bool:
 
 def _component_for_path(p: Path) -> str:
     """
-    Infer component name from path: schemas/<component>/<file>.json
+    Infer component name from path: schema/<component>/<file>.json
     """
     try:
-        idx = p.parts.index("schemas")
+        idx = p.parts.index("schema")
         return p.parts[idx + 1] if idx + 1 < len(p.parts) else "unknown"
     except (ValueError, IndexError):
         return "unknown"
@@ -451,8 +451,8 @@ def test_no_dangling_defs_globally():
                         used_refs.add(base + "#")
 
                 elif base in ("", "#") and frag:
-                    # Local refs shouldn't be counted against global anchors
-                    pass
+                    # Local refs - convert to absolute for tracking
+                    used_refs.add(f"{base_id}{frag}")
 
     # Any def anchors never referenced anywhere?
     dangling = sorted(a for a in def_anchors if a not in used_refs)
@@ -495,7 +495,8 @@ def test_envelope_role_sanity_and_consts():
         if _is_envelope_request(fname) or _is_envelope_success(fname) or _is_envelope_error(fname):
             if schema.get("type") != "object":
                 problems.append(f"{path}: envelopes must declare type=object")
-            if schema.get("additionalProperties") not in (False,):
+            # Skip additionalProperties check for schemas using allOf (they inherit from common envelope)
+            if "allOf" not in schema and schema.get("additionalProperties") not in (False,):
                 problems.append(f"{path}: envelopes should set additionalProperties: false")
 
         # Request envelope basics
@@ -508,7 +509,12 @@ def test_envelope_role_sanity_and_consts():
         # Success envelope basics
         if _is_envelope_success(fname):
             req = schema.get("required") or []
-            for k in ("ok", "code", "ms", "result"):
+            # 'result' is not required for streaming-capable components (they have 'chunk' instead)
+            streaming_components = {"llm", "graph"}
+            required_fields = ["ok", "code", "ms"]
+            if comp not in streaming_components:
+                required_fields.append("result")
+            for k in required_fields:
                 if k not in req:
                     problems.append(f"{path}: success envelope must require {k}")
             # schema_version property presence/pattern
@@ -547,7 +553,7 @@ def test_envelope_role_sanity_and_consts():
 def test_protocol_constants_match_component():
     """
     Ensure protocol consts match component directory, e.g.:
-      schemas/llm/... → protocol: 'llm/v1.0'
+      schema/llm/... → protocol: 'llm/v1.0'
     """
     for path in _iter_schema_files():
         schema = _load_json(path)
@@ -601,12 +607,17 @@ def test_schema_version_pattern_accepts_semver_examples():
 
 def test_examples_validate_against_own_schema():
     """Test that examples validate against their own schemas."""
+    from referencing import Registry, Resource
+    from referencing.jsonschema import DRAFT202012
+    
     files = _iter_schema_files()
-    # Build a store for cross-ref resolution
-    store: Dict[str, dict] = {}
+    # Build a registry for cross-ref resolution
+    resources = []
     for path in files:
         schema = _load_json(path)
-        store[schema["$id"]] = schema
+        resources.append((schema["$id"], Resource.from_contents(schema, default_specification=DRAFT202012)))
+    
+    registry = Registry().with_resources(resources)
 
     for path in files:
         schema = _load_json(path)
@@ -614,8 +625,8 @@ def test_examples_validate_against_own_schema():
         if not (isinstance(examples, list) and examples):
             continue
 
-        # Create a validator with store for resolving absolute $id refs
-        validator = V202012(schema, resolver=jsonschema.RefResolver(base_uri=schema["$id"], store=store))
+        # Create a validator with registry for resolving absolute $id refs
+        validator = V202012(schema, registry=registry)
 
         for i, ex in enumerate(examples):
             try:

@@ -3,8 +3,16 @@
   "code": "PARTIAL_SUCCESS",
   "ms": 21.4,
   "result": {
+    "processed_count": 3,
+    "failed_count": 1,
     "successes": 2,
-    "failures": 1,
+    "failures": [
+      {
+        "index": 2,
+        "error": "GRAPH_BAD_REQUEST",
+        "detail": "Query text failed validation"
+      }
+    ],
     "items": [
       {
         "index": 0,

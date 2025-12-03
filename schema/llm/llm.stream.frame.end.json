@@ -1,1 +1,12 @@
-delete
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/llm/llm.stream.frame.end.json",
+  "title": "LLM Stream Frame (end)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["event", "code"],
+  "properties": {
+    "event": { "type": "string", "const": "end" },
+    "code": { "type": "string", "const": "OK" }
+  }
+}

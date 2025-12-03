@@ -12,12 +12,7 @@
       "type": "array",
       "items": {
         "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "token": { "type": "string" },
-          "logprob": { "type": "number" }
-        },
-        "required": ["token", "logprob"]
+        "additionalProperties": { "type": "number" }
       }
     }
   }

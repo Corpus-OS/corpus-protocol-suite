@@ -24,8 +24,11 @@
       }
     ],
     "model": "example-embed-1",
+    "total_texts": 3,
     "total_tokens": 9,
     "processing_time_ms": 17.4,
+    "processed_count": 3,
+    "failed_count": 0,
     "failures": [],
     "warnings": []
   },

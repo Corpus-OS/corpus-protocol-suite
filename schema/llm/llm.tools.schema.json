@@ -1,17 +1,27 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://corpusos.com/schemas/llm/llm.tools.schema.json",
-  "title": "Tool Definition",
-  "description": "Tool definition for function calling - used when capabilities.supports_function_calling = true",
+  "title": "Tools Schema",
+  "description": "Tool definitions for function calling - used when capabilities.supports_function_calling = true",
   "type": "object",
   "additionalProperties": false,
   "properties": {
-    "name": { "type": "string" },
-    "description": { "type": "string" },
-    "input_schema": {
-      "type": "object",
-      "additionalProperties": true
+    "tools": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": { "type": "string" },
+          "description": { "type": "string" },
+          "parameters": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "required": ["name"]
+      }
     }
   },
-  "required": ["name"]
+  "required": ["tools"]
 }

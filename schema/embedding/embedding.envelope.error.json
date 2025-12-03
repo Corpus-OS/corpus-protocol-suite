@@ -3,8 +3,13 @@
   "$id": "https://corpusos.com/schemas/embedding/embedding.envelope.error.json",
   "title": "embedding.envelope.error",
   "type": "object",
-  "additionalProperties": false,
-  "required": ["ok", "error", "message", "protocol", "component"],
+  "required": [
+    "ok",
+    "error",
+    "message",
+    "protocol",
+    "component"
+  ],
   "properties": {
     "ok": {
       "type": "boolean"

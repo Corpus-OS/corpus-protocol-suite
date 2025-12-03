@@ -8,6 +8,7 @@
     "max_tokens": { "type": "integer", "minimum": 1 },
     "temperature": { "type": "number", "minimum": 0.0, "maximum": 2.0 },
     "top_p": { "type": "number", "exclusiveMinimum": 0.0, "maximum": 1.0 },
+    "top_k": { "type": "integer", "minimum": 1 },
     "frequency_penalty": { "type": "number", "minimum": -2.0, "maximum": 2.0 },
     "presence_penalty": { "type": "number", "minimum": -2.0, "maximum": 2.0 },
     "stop_sequences": {
