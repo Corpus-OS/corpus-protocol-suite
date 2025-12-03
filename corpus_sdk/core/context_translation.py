@@ -72,7 +72,7 @@ import logging
 import re
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, TypeVar, Union
 
-from corpus_sdk.core.operation_context import OperationContext
+from corpus_sdk.core.operational_context import OperationContext
 
 logger = logging.getLogger(__name__)
 
