@@ -17,25 +17,26 @@ test = [
   "pytest>=7.0.0,<9.0.0",
   "pytest-asyncio>=0.21.0,<0.24.0",
   "pytest-cov>=4.0.0,<6.0.0",
+  "langchain-core>=0.1.0",
+  "llama-index-core>=0.10.0",
+  "semantic-kernel>=0.9.0",
+  "pyautogen>=0.2.0",
+  "crewai>=0.1.0",
 ]
 
 # Per-framework extras
 langchain = [
   "langchain-core>=0.1.0",
 ]
-
 llamaindex = [
   "llama-index-core>=0.10.0",
 ]
-
 semantic-kernel = [
   "semantic-kernel>=0.9.0",
 ]
-
 autogen = [
   "pyautogen>=0.2.0",
 ]
-
 crewai = [
   "crewai>=0.1.0",
 ]
