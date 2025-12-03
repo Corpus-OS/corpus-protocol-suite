@@ -31,6 +31,11 @@
       "maxLength": 256,
       "pattern": "^[A-Za-z0-9._:-]{1,256}$",
       "description": "Optional per-item namespace; if provided, MUST equal request-level namespace."
+    },
+    "dimensions": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Number of dimensions in the vector"
     }
   },
   "required": ["id", "vector"],

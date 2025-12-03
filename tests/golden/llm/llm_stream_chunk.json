@@ -1,9 +1,13 @@
 {
-  "event": "data",
-  "data": {
+  "ok": true,
+  "code": "OK",
+  "ms": 0.5,
+  "chunk": {
     "id": "cmpl_01J0STREAM",
     "model": "example-llm-1",
     "index": 0,
+    "text": "This is a streamed chunk.",
+    "is_final": false,
     "delta": {
       "role": "assistant",
       "content": "This is a streamed chunk."

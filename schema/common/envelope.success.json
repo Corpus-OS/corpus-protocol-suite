@@ -14,7 +14,7 @@
     "code": {
       "type": "string",
       "description": "Normalized status code: 'OK', 'PARTIAL_SUCCESS', or 'ACCEPTED'.",
-      "enum": ["OK", "PARTIAL_SUCCESS", "ACCEPTED"]
+      "enum": ["ACCEPTED", "OK", "PARTIAL_SUCCESS"]
     },
     "ms": {
       "type": "number",
@@ -29,7 +29,7 @@
     },
     "component": {
       "type": "string",
-      "enum": ["graph", "llm", "vector", "embedding"],
+      "enum": ["embedding", "graph", "llm", "vector"],
       "description": "Component that produced the result."
     },
     "schema_version": {
@@ -130,7 +130,7 @@
         "hit": { "type": "boolean" },
         "scope": {
           "type": "string",
-          "enum": ["tenant", "global", "session"],
+          "enum": ["global", "session", "tenant"],
           "default": "tenant",
           "description": "Cache scope used by the producer."
         }
@@ -234,7 +234,7 @@
     },
     "result_hash_scope": {
       "type": "string",
-      "enum": ["result", "envelope"],
+      "enum": ["envelope", "result"],
       "default": "result",
       "description": "Specifies what was hashed for 'result_hash'."
     },
@@ -248,12 +248,12 @@
         "properties": {
           "alg": {
             "type": "string",
-            "enum": ["sha256", "sha512", "blake3"],
+            "enum": ["blake3", "sha256", "sha512"],
             "description": "Hash algorithm."
           },
           "scope": {
             "type": "string",
-            "enum": ["result", "envelope"],
+            "enum": ["envelope", "result"],
             "description": "What portion was hashed."
           },
           "value": {
@@ -276,7 +276,11 @@
   "$defs": {
     "genericResult": {
       "description": "Opaque success payload for non-batch or fully successful batch operations.",
-      "type": ["object", "array", "string", "number", "boolean", "null"]
+      "type": ["object", "array", "string", "number", "boolean", "null"],
+      "not": {
+        "description": "Exclude partialSuccessResult shape",
+        "required": ["successes", "failures", "items"]
+      }
     },
     "partialSuccessItem": {
       "type": "object",

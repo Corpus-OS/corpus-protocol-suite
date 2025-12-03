@@ -10,7 +10,8 @@
     "namespace": "acme.docs",
     "upserted": 2,
     "updated": 0,
-    "failed": 0,
+    "processed_count": 2,
+    "failed_count": 0,
     "failures": []
   }
 }

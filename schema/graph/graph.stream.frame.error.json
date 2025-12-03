@@ -14,13 +14,13 @@
     "error": {
       "type": "string",
       "enum": [
-        "BadRequest",
         "AuthError",
+        "BadRequest",
+        "DeadlineExceeded",
+        "NotSupported",
         "ResourceExhausted",
         "TransientNetwork",
-        "Unavailable",
-        "NotSupported",
-        "DeadlineExceeded"
+        "Unavailable"
       ]
     },
     "message": {

@@ -18,18 +18,18 @@
       "type": "string",
       "description": "Canonical error class from ERRORS.md taxonomy.",
       "enum": [
-        "BadRequest",
         "AuthError",
-        "ResourceExhausted",
-        "TransientNetwork",
-        "Unavailable",
-        "NotSupported",
+        "BadRequest",
+        "ContentFiltered",
         "DeadlineExceeded",
         "DimensionMismatch",
         "IndexNotReady",
         "ModelOverloaded",
-        "ContentFiltered",
-        "TextTooLong"
+        "NotSupported",
+        "ResourceExhausted",
+        "TextTooLong",
+        "TransientNetwork",
+        "Unavailable"
       ]
     },
 
@@ -77,7 +77,7 @@
 
     "component": {
       "type": "string",
-      "enum": ["graph", "llm", "vector", "embedding"],
+      "enum": ["embedding", "graph", "llm", "vector"],
       "description": "Component that produced the error."
     },
 
@@ -134,13 +134,13 @@
 
     "retryability": {
       "type": "string",
-      "enum": ["yes", "no", "conditional"],
+      "enum": ["conditional", "no", "yes"],
       "description": "Explicit retry classification. 'conditional' indicates retry is only appropriate if the client changes inputs (e.g., extends deadline or reduces work)."
     },
 
     "resource_scope": {
       "type": ["string", "null"],
-      "enum": ["model", "token_limit", "rate_limit", "memory", "compute", "time_budget", null],
+      "enum": ["compute", "memory", "model", "rate_limit", "time_budget", "token_limit", null],
       "description": "Scope of exhausted resource. Null if not applicable."
     },
 
@@ -161,13 +161,13 @@
     "recovery_strategy": {
       "type": "string",
       "enum": [
-        "retry",
-        "modify_request",
-        "contact_support",
+        "adjust_parameters",
         "check_documentation",
-        "wait",
+        "contact_support",
+        "modify_request",
         "reduce_batch",
-        "adjust_parameters"
+        "retry",
+        "wait"
       ],
       "description": "Suggested recovery strategy for clients."
     },
@@ -323,7 +323,7 @@
       "if": {
         "properties": {
           "error": {
-            "enum": ["BadRequest", "AuthError", "NotSupported", "DimensionMismatch", "ContentFiltered", "TextTooLong"]
+            "enum": ["AuthError", "BadRequest", "ContentFiltered", "DimensionMismatch", "NotSupported", "TextTooLong"]
           }
         },
         "required": ["error"]
@@ -340,7 +340,7 @@
       "if": {
         "properties": {
           "error": {
-            "enum": ["ResourceExhausted", "TransientNetwork", "Unavailable", "IndexNotReady", "ModelOverloaded"]
+            "enum": ["IndexNotReady", "ModelOverloaded", "ResourceExhausted", "TransientNetwork", "Unavailable"]
           }
         },
         "required": ["error"]

@@ -6,7 +6,11 @@
   "type": "object",
   "additionalProperties": false,
   "properties": {
-    "type": { "type": "string", "enum": ["json_object"] }
+    "type": { "type": "string", "enum": ["json_object"] },
+    "schema": {
+      "type": "object",
+      "description": "Optional JSON Schema to validate the response against"
+    }
   },
   "required": ["type"]
 }

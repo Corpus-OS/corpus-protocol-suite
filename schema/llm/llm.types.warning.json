@@ -7,7 +7,8 @@
   "additionalProperties": false,
   "properties": {
     "code": { "type": "string" },
-    "message": { "type": "string" }
+    "message": { "type": "string" },
+    "details": { "type": "object" }
   },
   "required": ["code", "message"]
 }

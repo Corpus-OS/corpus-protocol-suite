@@ -12,7 +12,7 @@
       "pattern": "^[A-Za-z0-9._:-]{1,256}$"
     },
     "dimensions": { "type": "integer", "minimum": 1 },
-    "distance_metric": { "type": "string", "enum": ["cosine", "euclidean", "dotproduct"] }
+    "distance_metric": { "type": "string", "enum": ["cosine", "dotproduct", "euclidean"] }
   },
   "required": ["namespace", "dimensions", "distance_metric"],
   "$comment": "Namespaces MUST be created explicitly; other operations MUST NOT create implicitly."

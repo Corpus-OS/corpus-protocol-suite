@@ -6,6 +6,12 @@
   "type": "object",
   "maxProperties": 512,
   "additionalProperties": true,
+  "not": {
+    "anyOf": [
+      {"required": ["id", "entity"]},
+      {"required": ["status"]}
+    ]
+  },
   "patternProperties": {
     "^(vendor:)[a-z0-9_.:-]+$": {
       "type": ["string", "number", "boolean", "object", "array", "null"]

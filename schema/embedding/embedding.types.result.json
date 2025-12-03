@@ -17,7 +17,7 @@
     "model": {
       "type": "string",
       "minLength": 1,
-      "maxLength": 128"
+      "maxLength": 128
     },
     "total_texts": {
       "type": "integer",
@@ -26,6 +26,16 @@
     "total_tokens": {
       "type": "integer",
       "minimum": 0
+    },
+    "processed_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total number of items processed (per §3.4 BatchResult pattern)."
+    },
+    "failed_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of items that failed (per §3.4 BatchResult pattern)."
     },
     "failed_texts": {
       "type": "array",
@@ -82,5 +92,5 @@
       "type": ["string", "number", "boolean", "object", "array", "null"]
     }
   },
-  "$comment": "EmbedBatchResult per PROTOCOLS.md §18.4, with additional 'failures' for normalized error details. Invariants (semantic): embeddings.length + failed_texts.length == total_texts."
+  "$comment": "EmbedBatchResult per PROTOCOLS.md §18.4, with additional 'failures' for normalized error details and §3.4 BatchResult pattern fields. Invariants (semantic): embeddings.length + failed_texts.length == total_texts; processed_count == total_texts; failed_count == failures.length."
 }

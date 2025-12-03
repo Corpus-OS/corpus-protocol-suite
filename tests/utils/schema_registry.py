@@ -28,7 +28,7 @@ from jsonschema.exceptions import RefResolutionError, ValidationError
 
 
 _SCHEMAS_ROOT_ENV = "CORPUS_SCHEMAS_ROOT"
-_DEFAULT_SCHEMAS_DIR = Path(__file__).resolve().parents[2] / "schemas"
+_DEFAULT_SCHEMAS_DIR = Path(__file__).resolve().parents[2] / "schema"
 
 # Global, thread-safe singletons with loaded state tracking
 _STORE_LOCK = threading.RLock()

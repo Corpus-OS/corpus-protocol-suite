@@ -7,7 +7,16 @@
   "additionalProperties": false,
   "properties": {
     "vector": {
-      "$ref": "https://corpusos.com/schemas/vector/vector.types.vector.json"
+      "oneOf": [
+        {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "number" }
+        },
+        {
+          "$ref": "https://corpusos.com/schemas/vector/vector.types.vector.json"
+        }
+      ]
     },
     "score": {
       "type": "number",
@@ -16,7 +25,11 @@
     "distance": {
       "type": "number",
       "description": "Raw distance metric (lower = more similar)."
-    }
+    },
+    "id": { "type": "string" },
+    "dimensions": { "type": "integer", "minimum": 1 },
+    "namespace": { "type": "string" },
+    "metadata": { "type": "object" }
   },
-  "required": ["vector", "score", "distance"]
+  "required": ["vector", "score"]
 }

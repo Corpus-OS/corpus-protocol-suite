@@ -1,9 +1,16 @@
 {
-  "event": "data",
-  "data": {
-    "id": "user:789",
-    "label": "User",
-    "name": "Carol",
-    "friend_count": 2
+  "ok": true,
+  "code": "OK",
+  "ms": 0.3,
+  "chunk": {
+    "records": [
+      {
+        "id": "user:789",
+        "label": "User",
+        "name": "Carol",
+        "friend_count": 2
+      }
+    ],
+    "is_final": false
   }
 }

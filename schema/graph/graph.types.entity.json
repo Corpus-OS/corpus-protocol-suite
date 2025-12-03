@@ -9,7 +9,7 @@
   "properties": {
     "kind": {
       "type": "string",
-      "enum": ["vertex", "edge"]
+      "enum": ["edge", "vertex"]
     },
     "id": {
       "$ref": "https://corpusos.com/schemas/graph/graph.types.id.json"
@@ -28,14 +28,13 @@
         "oneOf": [
           { "type": "string", "maxLength": 1024 },
           { "type": "number" },
-          { "type": "integer" },
           { "type": "boolean" },
           { "type": "null" },
           {
             "type": "array",
             "maxItems": 128,
             "items": {
-              "type": ["string", "number", "integer", "boolean", "null"]
+              "type": ["string", "number", "boolean", "null"]
             }
           }
         ]

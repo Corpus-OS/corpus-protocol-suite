@@ -21,6 +21,10 @@
       "type": "string",
       "enum": ["degraded", "ok"]
     },
+    "reason": {
+      "type": "string",
+      "maxLength": 512
+    },
     "message": {
       "type": "string",
       "maxLength": 512

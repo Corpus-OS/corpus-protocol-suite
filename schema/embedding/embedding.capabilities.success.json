@@ -14,9 +14,7 @@
     "supports_token_counting",
     "supports_multi_tenant",
     "supports_deadline",
-    "normalizes_at_source",
-    "idempotent_writes",
-    "truncation_mode"
+    "normalizes_at_source"
   ],
   "properties": {
     "protocol": {
@@ -104,6 +102,9 @@
       "type": "boolean"
     },
     "idempotent_writes": {
+      "type": "boolean"
+    },
+    "idempotent_operations": {
       "type": "boolean"
     },
     "supports_multi_tenant": {

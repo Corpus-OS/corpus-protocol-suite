@@ -1,6 +1,6 @@
 {
   "kind": "edge",
-  "id": "edge:user:123->user:456",
+  "id": "edge:user:123_user:456",
   "label": "FRIEND",
   "props": {
     "since": "2021-01-01"

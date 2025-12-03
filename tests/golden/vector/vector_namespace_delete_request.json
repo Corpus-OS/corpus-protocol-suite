@@ -1,5 +1,5 @@
 {
-  "op": "vector.delete_namespace",
+  "op": "vector.namespace_delete",
   "ctx": {
     "request_id": "req_vec_ns_delete_01",
     "deadline_ms": 253402300800000,

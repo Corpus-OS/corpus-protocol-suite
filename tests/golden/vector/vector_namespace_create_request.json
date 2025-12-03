@@ -1,5 +1,5 @@
 {
-  "op": "vector.create_namespace",
+  "op": "vector.namespace_create",
   "ctx": {
     "request_id": "req_vec_ns_create_01",
     "deadline_ms": 253402300800000,

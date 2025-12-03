@@ -42,8 +42,7 @@
         },
         "traceparent": {
           "type": ["string", "null"],
-          "description": "W3C Trace Context header value (00-<traceId>-<spanId>-<flags>). Forward unchanged per hop.",
-          "$ref": "#/$defs/traceparent"
+          "description": "W3C Trace Context header value (00-<traceId>-<spanId>-<flags>). Forward unchanged per hop."
         },
         "tenant": {
           "type": ["string", "null"],
@@ -71,7 +70,7 @@
         "cache_scope": {
           "type": ["string", "null"],
           "description": "Advisory cache scope. MUST NOT weaken tenant isolation. If unset, receivers SHOULD treat as \"tenant\" (§6.1 Cache Coordination).",
-          "enum": ["tenant", "global", "session", null],
+          "enum": ["global", "session", "tenant", null],
           "default": "tenant"
         },
         "cache_tags": {
@@ -99,98 +98,12 @@
       "description": "Top-level namespaced, vendor-specific extensions. Keys MUST be namespaced (e.g., 'vendor:feature.flag').",
       "type": "object",
       "additionalProperties": true,
-      "propertyNames": { "$ref": "#/$defs/namespaced_key" }
+      "propertyNames": {
+        "type": "string",
+        "pattern": "^[a-z0-9]+:[a-z0-9_.-]+$"
+      }
     }
   },
-  "$defs": {
-    "timestamp_ms": {
-      "type": "integer",
-      "minimum": 0,
-      "maximum": 253402300800000,
-      "description": "UNIX epoch time in milliseconds (non-negative, ≤ year 9999)."
-    },
-    "positive_int": {
-      "type": "integer",
-      "minimum": 1,
-      "description": "Positive integer (> 0)."
-    },
-    "traceparent": {
-      "type": "string",
-      "description": "W3C Trace Context header (version 00).",
-      "pattern": "^00-[0-9a-f]{32}-[0-9a-f]{16}-0[0-9a-f]$"
-    },
-    "namespaced_key": {
-      "type": "string",
-      "description": "Namespaced extension key (e.g., 'vendor:feature.flag').",
-      "pattern": "^[a-z0-9]+:[a-z0-9_.-]+$"
-    },
-    "small_label": {
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 64,
-      "pattern": "^[a-zA-Z0-9_.:-]{1,64}$",
-      "description": "Small, low-cardinality label"
-    }
-  },
-  "allOf": [
-    { "$comment": "----- Per-operation arg bindings (non-breaking hooks) -----" },
-    {
-      "if": { "properties": { "op": { "const": "vector.query" } }, "required": ["op"] },
-      "then": { "properties": { "args": { "$ref": "https://schemas.adaptersdk.org/corpus/vector/query.args.v1.json" } } }
-    },
-    {
-      "if": { "properties": { "op": { "const": "vector.upsert" } }, "required": ["op"] },
-      "then": { "properties": { "args": { "$ref": "https://schemas.adaptersdk.org/corpus/vector/upsert.args.v1.json" } } }
-    },
-    {
-      "if": { "properties": { "op": { "const": "vector.delete" } }, "required": ["op"] },
-      "then": { "properties": { "args": { "$ref": "https://schemas.adaptersdk.org/corpus/vector/delete.args.v1.json" } } }
-    },
-    {
-      "if": { "properties": { "op": { "const": "vector.create_namespace" } }, "required": ["op"] },
-      "then": { "properties": { "args": { "$ref": "https://schemas.adaptersdk.org/corpus/vector/create_namespace.args.v1.json" } } }
-    },
-    {
-      "if": { "properties": { "op": { "const": "vector.delete_namespace" } }, "required": ["op"] },
-      "then": { "properties": { "args": { "$ref": "https://schemas.adaptersdk.org/corpus/vector/delete_namespace.args.v1.json" } } }
-    },
-    {
-      "if": { "properties": { "op": { "const": "llm.complete" } }, "required": ["op"] },
-      "then": { "properties": { "args": { "$ref": "https://schemas.adaptersdk.org/corpus/llm/complete.args.v1.json" } } }
-    },
-    {
-      "if": { "properties": { "op": { "const": "llm.stream" } }, "required": ["op"] },
-      "then": { "properties": { "args": { "$ref": "https://schemas.adaptersdk.org/corpus/llm/stream.args.v1.json" } } }
-    },
-    {
-      "if": { "properties": { "op": { "const": "llm.count_tokens" } }, "required": ["op"] },
-      "then": { "properties": { "args": { "$ref": "https://schemas.adaptersdk.org/corpus/llm/count_tokens.args.v1.json" } } }
-    },
-    {
-      "if": { "properties": { "op": { "const": "graph.query" } }, "required": ["op"] },
-      "then": { "properties": { "args": { "$ref": "https://schemas.adaptersdk.org/corpus/graph/query.args.v1.json" } } }
-    },
-    {
-      "if": { "properties": { "op": { "const": "graph.stream_query" } }, "required": ["op"] },
-      "then": { "properties": { "args": { "$ref": "https://schemas.adaptersdk.org/corpus/graph/stream_query.args.v1.json" } } }
-    },
-    {
-      "if": { "properties": { "op": { "pattern": "^graph\\.(create_vertex|delete_vertex|create_edge|delete_edge)$" } }, "required": ["op"] },
-      "then": { "properties": { "args": { "$ref": "https://schemas.adaptersdk.org/corpus/graph/crud.args.v1.json" } } }
-    },
-    {
-      "if": { "properties": { "op": { "const": "embedding.embed" } }, "required": ["op"] },
-      "then": { "properties": { "args": { "$ref": "https://schemas.adaptersdk.org/corpus/embedding/embed.args.v1.json" } } }
-    },
-    {
-      "if": { "properties": { "op": { "const": "embedding.embed_batch" } }, "required": ["op"] },
-      "then": { "properties": { "args": { "$ref": "https://schemas.adaptersdk.org/corpus/embedding/embed_batch.args.v1.json" } } }
-    },
-    {
-      "if": { "properties": { "op": { "const": "embedding.count_tokens" } }, "required": ["op"] },
-      "then": { "properties": { "args": { "$ref": "https://schemas.adaptersdk.org/corpus/embedding/count_tokens.args.v1.json" } } }
-    }
-  ],
   "examples": [
     {
       "op": "vector.query",

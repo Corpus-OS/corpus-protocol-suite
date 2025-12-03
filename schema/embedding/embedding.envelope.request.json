@@ -4,15 +4,19 @@
   "title": "embedding.envelope.request",
   "type": "object",
   "additionalProperties": false,
-  "required": ["op", "ctx", "args"],
+  "required": [
+    "op",
+    "ctx",
+    "args"
+  ],
   "properties": {
     "op": {
       "type": "string",
       "enum": [
+        "embedding.capabilities",
+        "embedding.count_tokens",
         "embedding.embed",
         "embedding.embed_batch",
-        "embedding.count_tokens",
-        "embedding.capabilities",
         "embedding.health"
       ]
     },
@@ -21,6 +25,14 @@
     },
     "args": {
       "type": "object"
+    },
+    "protocol": {
+      "type": "string",
+      "const": "embedding/v1.0"
+    },
+    "component": {
+      "type": "string",
+      "const": "embedding"
     }
   }
 }

@@ -22,5 +22,9 @@
       "type": "string",
       "pattern": "^[A-Za-z0-9+/=_-]{1,4096}$"
     }
-  }
+  },
+  "anyOf": [
+    {"required": ["page_size"]},
+    {"required": ["page_token"]}
+  ]
 }

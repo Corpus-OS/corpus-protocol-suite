@@ -3,8 +3,12 @@
   "$id": "https://corpusos.com/schemas/embedding/embedding.envelope.success.json",
   "title": "embedding.envelope.success",
   "type": "object",
-  "additionalProperties": false,
-  "required": ["ok", "code", "ms", "result"],
+  "required": [
+    "ok",
+    "code",
+    "ms",
+    "result"
+  ],
   "properties": {
     "ok": {
       "type": "boolean",
@@ -12,7 +16,10 @@
     },
     "code": {
       "type": "string",
-      "enum": ["OK", "PARTIAL_SUCCESS"]
+      "enum": [
+        "OK",
+        "PARTIAL_SUCCESS"
+      ]
     },
     "ms": {
       "type": "number",
@@ -96,7 +103,9 @@
             "const": "PARTIAL_SUCCESS"
           }
         },
-        "required": ["code"]
+        "required": [
+          "code"
+        ]
       },
       "then": {
         "properties": {
@@ -106,7 +115,9 @@
                 "minItems": 1
               }
             },
-            "required": ["failures"]
+            "required": [
+              "failures"
+            ]
           }
         }
       }
