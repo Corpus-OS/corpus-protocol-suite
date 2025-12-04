@@ -12,8 +12,8 @@ Provide a high-level orchestration and translation layer between:
 
 This module is intentionally *framework-neutral* and focuses on:
 
-- Building `VectorQuerySpec` / upsert specs from framework-level inputs
-- Translating `QueryResult` / `QueryChunk` / upsert results back to framework-facing shapes
+- Building `VectorQuerySpec` / mutation specs from framework-level inputs
+- Translating `QueryResult` / `QueryChunk` / mutation results back to framework-facing shapes
 - Applying optional MMR / diversification on query results (CRITICAL for vector search)
 - Handling rich metadata filters (including $and / $or / range operators)
 - Providing sync + async APIs, including streaming via a sync bridge
@@ -77,10 +77,12 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 from dataclasses import dataclass
 from typing import (
     Any,
     AsyncIterator,
+    Awaitable,
     Callable,
     Dict,
     Iterable,
@@ -97,7 +99,6 @@ from typing import (
 
 from corpus_sdk.vector.vector_base import (
     VectorProtocolV1,
-    OperationContext,
     VectorQuerySpec,
     VectorUpsertSpec,
     VectorDeleteSpec,
@@ -109,18 +110,18 @@ from corpus_sdk.vector.vector_base import (
     UpdateResult,
     VectorStats,
     VectorAdapterError,
+    OperationContext,
     BadRequest,
-    NotSupported,
 )
 
 from corpus_sdk.core.context_translation import from_dict as ctx_from_dict
-from corpus_sdk.core.sync_stream_bridge import SyncStreamBridge
+from corpus_sdk.core.sync_bridge import SyncStreamBridge
 from corpus_sdk.core.async_bridge import AsyncBridge
 from corpus_sdk.core.error_context import attach_context
 
 LOG = logging.getLogger(__name__)
 
-T = TypeVar("T")
+R = TypeVar("R")
 Record = Mapping[str, Any]
 
 
@@ -140,11 +141,6 @@ def _ensure_operation_context(
         - OperationContext: returned as-is
         - Mapping[str, Any]: interpreted via context_translation.from_dict,
           then adapted into a vector OperationContext.
-
-    This keeps responsibilities clean:
-        - Framework-native → Normalized dict/OperationContext happens in
-          corpus_sdk.core.context_translation (from_langchain, from_llamaindex, etc.)
-        - This helper simply ensures the vector adapter receives the right type.
     """
     if ctx is None:
         core_ctx = ctx_from_dict({})
@@ -180,12 +176,7 @@ SimilarityFn = Callable[[Sequence[float], Sequence[float]], float]
 @dataclass(frozen=True)
 class MMRConfig:
     """
-    Configuration for Maximal Marginal Relevance re-ranking.
-
-    MMR is CRITICAL for vector search quality:
-    - Reduces redundancy in retrieved documents
-    - Balances relevance (from vector similarity) vs diversity
-    - Especially important for RAG applications where diverse context is valuable
+    Configuration for Maximal Marginal Relevance (MMR) re-ranking.
 
     Attributes:
         enabled:
@@ -197,27 +188,27 @@ class MMRConfig:
 
         lambda_mult:
             Tradeoff between relevance and diversity, in [0, 1].
-            Higher (e.g. 0.9) → more weight on original relevance scores
-            Lower (e.g. 0.3)  → more weight on diversity between results
-            Default 0.5 balances both equally.
+            - Higher (e.g. 0.9) -> More weight on original relevance scores.
+            - Lower (e.g. 0.3)  -> More weight on diversity between results.
+            - Default 0.5 balances both equally.
 
         score_key:
             Record field name containing the original relevance score.
-            Common values: "score", "distance", "similarity", "relevance"
+            Common values: "score", "distance", "similarity".
             Must be convertible to float.
 
         vector_key:
             Record field name containing the embedding vector for diversity.
-            Common values: "embedding", "vector", "dense_vector"
+            Common values: "embedding", "vector".
             Must be a sequence of floats.
 
         similarity_fn:
             Optional custom similarity metric between two embedding vectors.
             If None, cosine similarity is used (standard for vector search).
-            
+
         invert_score:
-            If True, treat lower scores as better (e.g., L2 distance).
-            If False, treat higher scores as better (e.g., cosine similarity).
+            If True, treats lower scores as better (e.g., L2 distance).
+            If False, treats higher scores as better (e.g., cosine similarity).
             Default False assumes higher = more similar.
     """
 
@@ -230,7 +221,7 @@ class MMRConfig:
     invert_score: bool = False
 
     def __post_init__(self):
-        """Validate MMR configuration parameters."""
+        """Validate MMR configuration parameters on initialization."""
         if self.enabled:
             if not (0.0 <= self.lambda_mult <= 1.0):
                 raise ValueError(f"lambda_mult must be in [0, 1], got {self.lambda_mult}")
@@ -260,12 +251,9 @@ class FilterTranslator:
         - {"field": "value"}
         - {"$and": [ {...}, {...} ]}
         - {"$or":  [ {...}, {...} ]}
-        - ["field", ">", 10]          → {"field": {"$gt": 10}}
+        - ["field", ">", 10]          -> {"field": {"$gt": 10}}
         - [ ["age", ">", 18], ["age", "<", 65] ]
-        - [{"field": "v1"}, {"field": "v2"}]  → {"$and": [...]}
-
-    This module intentionally does not enforce the semantics of these operators;
-    adapters can interpret or restrict them as needed.
+        - [{"field": "v1"}, {"field": "v2"}]  -> {"$and": [...]}
     """
 
     _RANGE_OP_MAP: Mapping[str, str] = {
@@ -283,7 +271,7 @@ class FilterTranslator:
         if raw is None:
             return None
 
-        # Already a mapping: shallow-copy to avoid mutating caller state.
+        # Already a mapping: normalize nested structures (e.g. AND/OR)
         if isinstance(raw, Mapping):
             return self._normalize_mapping(raw)
 
@@ -292,6 +280,7 @@ class FilterTranslator:
             return self._normalize_sequence(raw)
 
         # Anything else is unsupported.
+        LOG.warning("FilterTranslator: unsupported type %s, ignoring.", type(raw))
         raise BadRequest(
             f"Unsupported filter type: {type(raw).__name__}",
             code="BAD_FILTER",
@@ -304,7 +293,19 @@ class FilterTranslator:
             out: Dict[str, Any] = {}
             for key, value in raw.items():
                 if key in ("$and", "$or") and isinstance(value, (list, tuple)):
-                    out[key] = [self.normalize(v) for v in value]
+                    normalized_parts: List[Mapping[str, Any]] = []
+                    for idx, v in enumerate(value):
+                        nv = self.normalize(v)
+                        if nv is None:
+                            continue
+                        if not isinstance(nv, Mapping):
+                            raise BadRequest(
+                                f"Nested filter at index {idx} must be a mapping",
+                                code="BAD_FILTER",
+                                details={"index": idx},
+                            )
+                        normalized_parts.append(nv)
+                    out[key] = normalized_parts
                 else:
                     out[key] = value
             return out
@@ -333,19 +334,31 @@ class FilterTranslator:
 
     def _normalize_sequence(self, raw: Sequence[Any]) -> Mapping[str, Any]:
         # Tuple condition: ["age", ">", 18]
-        if len(raw) == 3 and not isinstance(raw[0], (list, tuple, Mapping)):
+        # Explicitly check if the middle element is a known string operator
+        # to safely distinguish from data lists [1, 2, 3].
+        if (
+            len(raw) == 3
+            and isinstance(raw[1], str)
+            and raw[1] in self._RANGE_OP_MAP
+            and not isinstance(raw[0], (list, tuple, Mapping))
+        ):
             field, op, value = raw
             mapped = self._RANGE_OP_MAP.get(str(op))
-            if not mapped:
-                raise BadRequest(
-                    f"Unsupported filter operator: {op!r}",
-                    code="BAD_FILTER_OPERATOR",
-                    details={"operator": op},
-                )
             return {str(field): {mapped: value}}
 
         # Otherwise, assume a list of filters combined via AND.
-        parts = [self.normalize(part) for part in raw]
+        parts: List[Mapping[str, Any]] = []
+        for idx, part in enumerate(raw):
+            nv = self.normalize(part)
+            if nv is None:
+                continue
+            if not isinstance(nv, Mapping):
+                raise BadRequest(
+                    f"Filter at index {idx} in sequence must be a mapping",
+                    code="BAD_FILTER",
+                    details={"index": idx, "type": type(part).__name__},
+                )
+            parts.append(nv)
         return {"$and": parts}
 
 
@@ -363,11 +376,6 @@ class VectorFrameworkTranslator(Protocol):
         - Converting Vector results into framework-level outputs
         - (Optionally) applying MMR or other post-processing steps
         - (Optionally) mapping VectorAdapterError into framework-specific errors
-
-    The default implementation provided here is generic and treats inputs as
-    dicts/arrays that already closely match VectorSpec shapes. Frameworks with
-    richer abstractions (LangChain VectorStore, LlamaIndex VectorIndex, etc.) 
-    can provide their own implementations and register them via the registry.
     """
 
     # ---- query translation ----
@@ -525,15 +533,12 @@ class DefaultVectorFrameworkTranslator:
             * sequences of already-built Document-compatible mappings
 
         - For results:
-            * QueryResult → list of matches with scores
-            * QueryChunk  → list of matches per chunk
-            * UpsertResult → list of IDs
-            * DeleteResult → count
-            * UpdateResult → count
-            * VectorStats → underlying stats object
-
-    Frameworks with richer abstractions (LangChain Document, LlamaIndex Node, etc.)
-    are expected to provide their own VectorFrameworkTranslator implementation.
+            * QueryResult -> list of matches with scores
+            * QueryChunk  -> list of matches per chunk
+            * UpsertResult -> list of IDs
+            * DeleteResult -> count
+            * UpdateResult -> count
+            * VectorStats -> underlying stats object
     """
 
     def __init__(self) -> None:
@@ -783,7 +788,7 @@ class DefaultVectorFrameworkTranslator:
         ids: List[str] = []
         filter_expr: Optional[Mapping[str, Any]] = None
 
-        # Mapping → filter-based delete
+        # Mapping -> filter-based delete
         if isinstance(raw_filter_or_ids, Mapping):
             filter_expr = self._filter_translator.normalize(raw_filter_or_ids)
         # Iterable of IDs or filters
@@ -913,10 +918,6 @@ class VectorTranslator:
         - Attaches rich error context for diagnostics
 
     Sync methods use AsyncBridge to call async adapters from sync contexts.
-
-    It does *not*:
-        - Know anything about framework-native context objects (RunnableConfig, etc.)
-        - Implement any backend-specific logic (that lives in BaseVectorAdapter subclasses)
     """
 
     def __init__(
@@ -928,7 +929,9 @@ class VectorTranslator:
     ) -> None:
         self._adapter = adapter
         self._framework = framework
-        self._translator: VectorFrameworkTranslator = translator or DefaultVectorFrameworkTranslator()
+        self._translator: VectorFrameworkTranslator = (
+            translator or DefaultVectorFrameworkTranslator()
+        )
 
     # --------------------------------------------------------------------- #
     # Internal MMR helpers
@@ -1017,7 +1020,7 @@ class VectorTranslator:
             if max_score <= 0.0:
                 normalized_scores = [1.0 for _ in scores]
             else:
-                # Invert: high distance → low score
+                # Invert: high distance -> low score (0 to 1)
                 normalized_scores = [(max_score - s) / max_score for s in scores]
         else:
             # Higher is better (e.g., cosine similarity) - normalize to [0, 1]
@@ -1085,7 +1088,7 @@ class VectorTranslator:
             reordered.extend(remaining)
 
         LOG.info(
-            "MMR applied: %d matches → %d selected with lambda=%.2f (invert_score=%s)",
+            "MMR applied: %d matches -> %d selected with lambda=%.2f (invert_score=%s)",
             n,
             len(selected_indices),
             lambda_mult,
@@ -1099,7 +1102,99 @@ class VectorTranslator:
         )
 
     # --------------------------------------------------------------------- #
-    # Sync Query APIs (use AsyncBridge)
+    # Internal executor helpers (Executor Pattern)
+    # --------------------------------------------------------------------- #
+
+    def _run_operation(
+        self,
+        *,
+        op_name: str,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]],
+        sync: bool,
+        logic: Callable[[OperationContext], Awaitable[R]],
+    ) -> Union[R, Awaitable[R]]:
+        """Centralized execution for non-streaming operations."""
+        ctx = _ensure_operation_context(op_ctx)
+
+        async def _wrapped() -> R:
+            try:
+                return await logic(ctx)
+            except Exception as exc:
+                attach_context(
+                    exc,
+                    framework=self._framework,
+                    operation=f"vector.{op_name}",
+                    request_id=ctx.request_id,
+                    tenant=ctx.tenant,
+                )
+                raise
+
+        if sync:
+            timeout = ctx.deadline_ms / 1000.0 if ctx.deadline_ms else None
+            return AsyncBridge.run_async(_wrapped(), timeout=timeout)
+        return _wrapped()
+
+    def _run_stream_operation(
+        self,
+        *,
+        op_name: str,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]],
+        sync: bool,
+        factory: Callable[[OperationContext], AsyncIterator[R]],
+    ) -> Union[Iterator[R], AsyncIterator[R]]:
+        """Centralized execution for streaming operations."""
+        ctx = _ensure_operation_context(op_ctx)
+
+        async def _async_gen() -> AsyncIterator[R]:
+            try:
+                # Call factory to get generator (do NOT await factory)
+                async for chunk in factory(ctx):
+                    yield chunk
+            except Exception as exc:
+                attach_context(
+                    exc,
+                    framework=self._framework,
+                    operation=f"vector.{op_name}",
+                    request_id=ctx.request_id,
+                    tenant=ctx.tenant,
+                )
+                raise
+
+        if sync:
+            return SyncStreamBridge(
+                coro_factory=_async_gen,
+                framework=self._framework,
+                error_context={
+                    "operation": f"vector.{op_name}",
+                    "request_id": ctx.request_id,
+                    "tenant": ctx.tenant,
+                },
+            ).run()
+        return _async_gen()
+
+    def _prepare_query_stream_factory(
+        self,
+        raw_query: Any,
+        framework_ctx: Any,
+    ) -> Callable[[OperationContext], AsyncIterator[Any]]:
+        """Shared logic to prepare the query stream generator."""
+        async def _factory(ctx: OperationContext) -> AsyncIterator[Any]:
+            spec = self._translator.build_query_spec(
+                raw_query,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+                stream=True,
+            )
+            async for chunk in self._adapter.stream_query(spec, ctx=ctx):
+                yield self._translator.translate_query_chunk(
+                    chunk,
+                    op_ctx=ctx,
+                    framework_ctx=framework_ctx,
+                )
+        return _factory
+
+    # --------------------------------------------------------------------- #
+    # API Implementations (DRY via Executor)
     # --------------------------------------------------------------------- #
 
     def query(
@@ -1114,65 +1209,41 @@ class VectorTranslator:
         Synchronous query API.
 
         Uses AsyncBridge to call the async adapter from a sync context.
-
-        Steps:
-            - Normalize OperationContext
-            - Build VectorQuerySpec via translator
-            - Call adapter.query(...) via AsyncBridge
-            - Apply MMR (CRITICAL for vector quality)
-            - Translate result back to framework-level shape
+        Supports optional MMR re-ranking.
         """
-
-        async def _query_coro():
-            ctx = _ensure_operation_context(op_ctx)
+        async def _logic(ctx: OperationContext) -> Any:
+            spec = self._translator.build_query_spec(
+                raw_query,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+                stream=False,
+            )
             try:
-                spec = self._translator.build_query_spec(
-                    raw_query,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                    stream=False,
-                )
                 result = await self._adapter.query(spec, ctx=ctx)
-
-                if not isinstance(result, QueryResult):
-                    raise BadRequest(
-                        f"adapter.query returned unsupported type: {type(result).__name__}",
-                        code="BAD_ADAPTER_RESULT",
-                    )
-
-                # Apply MMR - CRITICAL for vector search quality
-                result_mmr = self._apply_mmr_to_query_result(result, mmr_config=mmr_config)
-                return self._translator.translate_query_result(
-                    result_mmr,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
+            except VectorAdapterError as e:
+                raise self._translator.map_adapter_error(
+                    e, op_ctx=ctx, framework_ctx=framework_ctx
+                ) from e
+            
+            if not isinstance(result, QueryResult):
+                raise BadRequest(
+                    f"Invalid result type: {type(result)}",
+                    code="BAD_ADAPTER_RESULT",
                 )
-            except VectorAdapterError as adapter_error:
-                mapped_error = self._translator.map_adapter_error(
-                    adapter_error, op_ctx=ctx, framework_ctx=framework_ctx
-                )
-                if mapped_error is not adapter_error:
-                    raise mapped_error from adapter_error
-                raise
-            except Exception as exc:
-                # Attach error context to all exceptions
-                attach_context(
-                    exc,
-                    framework=self._framework,
-                    vector_operation="query",
-                    request_id=ctx.request_id,
-                    tenant=ctx.tenant,
-                )
-                raise
+            
+            result = self._apply_mmr_to_query_result(result, mmr_config)
+            return self._translator.translate_query_result(
+                result,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
 
-        # Use AsyncBridge with deadline from context
-        ctx = _ensure_operation_context(op_ctx)
-        timeout = ctx.deadline_ms / 1000.0 if ctx.deadline_ms else None
-        return AsyncBridge.run_async(_query_coro(), timeout=timeout)
-
-    # --------------------------------------------------------------------- #
-    # Async Query APIs
-    # --------------------------------------------------------------------- #
+        return self._run_operation(
+            op_name="query",
+            op_ctx=op_ctx,
+            sync=True,
+            logic=_logic,
+        )
 
     async def arun_query(
         self,
@@ -1185,53 +1256,41 @@ class VectorTranslator:
         """
         Async query API (preferred for async applications).
 
-        Fully async:
-            - await adapter.query(...)
-            - MMR re-ranking
-            - result translation
+        Fully async flow: adapter.query -> MMR -> translation.
         """
-        ctx = _ensure_operation_context(op_ctx)
-        try:
+        async def _logic(ctx: OperationContext) -> Any:
             spec = self._translator.build_query_spec(
                 raw_query,
                 op_ctx=ctx,
                 framework_ctx=framework_ctx,
                 stream=False,
             )
-            result = await self._adapter.query(spec, ctx=ctx)
+            try:
+                result = await self._adapter.query(spec, ctx=ctx)
+            except VectorAdapterError as e:
+                raise self._translator.map_adapter_error(
+                    e, op_ctx=ctx, framework_ctx=framework_ctx
+                ) from e
 
             if not isinstance(result, QueryResult):
                 raise BadRequest(
-                    f"adapter.query returned unsupported type: {type(result).__name__}",
+                    f"Invalid result type: {type(result)}",
                     code="BAD_ADAPTER_RESULT",
                 )
 
-            result_mmr = self._apply_mmr_to_query_result(result, mmr_config=mmr_config)
+            result = self._apply_mmr_to_query_result(result, mmr_config)
             return self._translator.translate_query_result(
-                result_mmr,
+                result,
                 op_ctx=ctx,
                 framework_ctx=framework_ctx,
             )
-        except VectorAdapterError as adapter_error:
-            mapped_error = self._translator.map_adapter_error(
-                adapter_error, op_ctx=ctx, framework_ctx=framework_ctx
-            )
-            if mapped_error is not adapter_error:
-                raise mapped_error from adapter_error
-            raise
-        except Exception as exc:
-            attach_context(
-                exc,
-                framework=self._framework,
-                vector_operation="query",
-                request_id=ctx.request_id,
-                tenant=ctx.tenant,
-            )
-            raise
 
-    # --------------------------------------------------------------------- #
-    # Streaming Query APIs
-    # --------------------------------------------------------------------- #
+        return await self._run_operation(
+            op_name="query",
+            op_ctx=op_ctx,
+            sync=False,
+            logic=_logic,
+        )
 
     def query_stream(
         self,
@@ -1243,60 +1302,17 @@ class VectorTranslator:
         """
         Synchronous streaming query API.
 
-        Exposes a sync iterator that yields framework-level chunks by
-        bridging the async adapter.stream_query(...) via SyncStreamBridge.
-
-        Note: MMR cannot be applied to streaming results since we need
-        the full result set for diversity calculation. Use non-streaming
-        query() with MMR for best quality.
+        Returns a sync iterator yielding framework-level chunks.
+        MMR is not supported in streaming mode.
         """
-        ctx = _ensure_operation_context(op_ctx)
-
-        async def _stream_factory() -> AsyncIterator[Any]:
-            """Factory that creates the async stream."""
-            spec = self._translator.build_query_spec(
-                raw_query,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-                stream=True,
-            )
-            try:
-                async for chunk in self._adapter.stream_query(spec, ctx=ctx):
-                    yield self._translator.translate_query_chunk(
-                        chunk,
-                        op_ctx=ctx,
-                        framework_ctx=framework_ctx,
-                    )
-            except VectorAdapterError as adapter_error:
-                mapped_error = self._translator.map_adapter_error(
-                    adapter_error, op_ctx=ctx, framework_ctx=framework_ctx
-                )
-                if mapped_error is not adapter_error:
-                    raise mapped_error from adapter_error
-                raise
-            except Exception as exc:
-                attach_context(
-                    exc,
-                    framework=self._framework,
-                    vector_operation="stream_query",
-                    request_id=ctx.request_id,
-                    tenant=ctx.tenant,
-                )
-                raise
-
-        # Use SyncStreamBridge for sync streaming
-        bridge = SyncStreamBridge(
-            coro_factory=_stream_factory,
-            framework=self._framework,
-            error_context={
-                "operation": "vector.query_stream",
-                "request_id": ctx.request_id,
-                "tenant": ctx.tenant,
-            },
+        return self._run_stream_operation(
+            op_name="query_stream",
+            op_ctx=op_ctx,
+            sync=True,
+            factory=self._prepare_query_stream_factory(raw_query, framework_ctx),
         )
-        return bridge.run()
 
-    async def arun_query_stream(
+    def arun_query_stream(
         self,
         raw_query: Any,
         *,
@@ -1306,45 +1322,16 @@ class VectorTranslator:
         """
         Async streaming query API.
 
-        Returns an async iterator yielding framework-level chunks.
-
-        Note: MMR cannot be applied to streaming results.
+        Returns an AsyncIterator yielding framework-level chunks.
+        MMR is not supported in streaming mode.
         """
-        ctx = _ensure_operation_context(op_ctx)
-        spec = self._translator.build_query_spec(
-            raw_query,
-            op_ctx=ctx,
-            framework_ctx=framework_ctx,
-            stream=True,
+        # Returns AsyncIterator directly (not a coroutine)
+        return self._run_stream_operation(
+            op_name="query_stream",
+            op_ctx=op_ctx,
+            sync=False,
+            factory=self._prepare_query_stream_factory(raw_query, framework_ctx),
         )
-
-        try:
-            async for chunk in self._adapter.stream_query(spec, ctx=ctx):
-                yield self._translator.translate_query_chunk(
-                    chunk,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
-        except VectorAdapterError as adapter_error:
-            mapped_error = self._translator.map_adapter_error(
-                adapter_error, op_ctx=ctx, framework_ctx=framework_ctx
-            )
-            if mapped_error is not adapter_error:
-                raise mapped_error from adapter_error
-            raise
-        except Exception as exc:
-            attach_context(
-                exc,
-                framework=self._framework,
-                vector_operation="stream_query",
-                request_id=ctx.request_id,
-                tenant=ctx.tenant,
-            )
-            raise
-
-    # --------------------------------------------------------------------- #
-    # Sync mutation APIs (use AsyncBridge)
-    # --------------------------------------------------------------------- #
 
     def upsert(
         self,
@@ -1353,49 +1340,35 @@ class VectorTranslator:
         op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
         framework_ctx: Optional[Any] = None,
     ) -> Any:
-        """Synchronous upsert (uses AsyncBridge)."""
+        """
+        Synchronous upsert API.
 
-        async def _upsert_coro():
-            ctx = _ensure_operation_context(op_ctx)
+        Takes either a single document (dict) or a list of documents.
+        """
+        async def _logic(ctx: OperationContext) -> Any:
+            spec = self._translator.build_upsert_spec(
+                raw_documents,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
             try:
-                spec = self._translator.build_upsert_spec(
-                    raw_documents,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
                 result = await self._adapter.upsert(spec, ctx=ctx)
+            except VectorAdapterError as e:
+                raise self._translator.map_adapter_error(
+                    e, op_ctx=ctx, framework_ctx=framework_ctx
+                ) from e
+            return self._translator.translate_upsert_result(
+                result,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
 
-                if not isinstance(result, UpsertResult):
-                    raise BadRequest(
-                        f"adapter.upsert returned unsupported type: {type(result).__name__}",
-                        code="BAD_ADAPTER_RESULT",
-                    )
-
-                return self._translator.translate_upsert_result(
-                    result,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
-            except VectorAdapterError as adapter_error:
-                mapped_error = self._translator.map_adapter_error(
-                    adapter_error, op_ctx=ctx, framework_ctx=framework_ctx
-                )
-                if mapped_error is not adapter_error:
-                    raise mapped_error from adapter_error
-                raise
-            except Exception as exc:
-                attach_context(
-                    exc,
-                    framework=self._framework,
-                    vector_operation="upsert",
-                    request_id=ctx.request_id,
-                    tenant=ctx.tenant,
-                )
-                raise
-
-        ctx = _ensure_operation_context(op_ctx)
-        timeout = ctx.deadline_ms / 1000.0 if ctx.deadline_ms else None
-        return AsyncBridge.run_async(_upsert_coro(), timeout=timeout)
+        return self._run_operation(
+            op_name="upsert",
+            op_ctx=op_ctx,
+            sync=True,
+            logic=_logic,
+        )
 
     async def arun_upsert(
         self,
@@ -1404,43 +1377,31 @@ class VectorTranslator:
         op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
         framework_ctx: Optional[Any] = None,
     ) -> Any:
-        """Async upsert."""
-        ctx = _ensure_operation_context(op_ctx)
-        try:
+        """Async upsert API."""
+        async def _logic(ctx: OperationContext) -> Any:
             spec = self._translator.build_upsert_spec(
                 raw_documents,
                 op_ctx=ctx,
                 framework_ctx=framework_ctx,
             )
-            result = await self._adapter.upsert(spec, ctx=ctx)
-
-            if not isinstance(result, UpsertResult):
-                raise BadRequest(
-                    f"adapter.upsert returned unsupported type: {type(result).__name__}",
-                    code="BAD_ADAPTER_RESULT",
-                )
-
+            try:
+                result = await self._adapter.upsert(spec, ctx=ctx)
+            except VectorAdapterError as e:
+                raise self._translator.map_adapter_error(
+                    e, op_ctx=ctx, framework_ctx=framework_ctx
+                ) from e
             return self._translator.translate_upsert_result(
                 result,
                 op_ctx=ctx,
                 framework_ctx=framework_ctx,
             )
-        except VectorAdapterError as adapter_error:
-            mapped_error = self._translator.map_adapter_error(
-                adapter_error, op_ctx=ctx, framework_ctx=framework_ctx
-            )
-            if mapped_error is not adapter_error:
-                raise mapped_error from adapter_error
-            raise
-        except Exception as exc:
-            attach_context(
-                exc,
-                framework=self._framework,
-                vector_operation="upsert",
-                request_id=ctx.request_id,
-                tenant=ctx.tenant,
-            )
-            raise
+
+        return await self._run_operation(
+            op_name="upsert",
+            op_ctx=op_ctx,
+            sync=False,
+            logic=_logic,
+        )
 
     def delete(
         self,
@@ -1449,49 +1410,38 @@ class VectorTranslator:
         op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
         framework_ctx: Optional[Any] = None,
     ) -> Any:
-        """Synchronous delete (uses AsyncBridge)."""
+        """
+        Synchronous delete API.
 
-        async def _delete_coro():
-            ctx = _ensure_operation_context(op_ctx)
+        Accepts:
+            - Single ID (str/int)
+            - List of IDs
+            - Filter dictionary
+        """
+        async def _logic(ctx: OperationContext) -> Any:
+            spec = self._translator.build_delete_spec(
+                raw_filter_or_ids,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
             try:
-                spec = self._translator.build_delete_spec(
-                    raw_filter_or_ids,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
                 result = await self._adapter.delete(spec, ctx=ctx)
+            except VectorAdapterError as e:
+                raise self._translator.map_adapter_error(
+                    e, op_ctx=ctx, framework_ctx=framework_ctx
+                ) from e
+            return self._translator.translate_delete_result(
+                result,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
 
-                if not isinstance(result, DeleteResult):
-                    raise BadRequest(
-                        f"adapter.delete returned unsupported type: {type(result).__name__}",
-                        code="BAD_ADAPTER_RESULT",
-                    )
-
-                return self._translator.translate_delete_result(
-                    result,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
-            except VectorAdapterError as adapter_error:
-                mapped_error = self._translator.map_adapter_error(
-                    adapter_error, op_ctx=ctx, framework_ctx=framework_ctx
-                )
-                if mapped_error is not adapter_error:
-                    raise mapped_error from adapter_error
-                raise
-            except Exception as exc:
-                attach_context(
-                    exc,
-                    framework=self._framework,
-                    vector_operation="delete",
-                    request_id=ctx.request_id,
-                    tenant=ctx.tenant,
-                )
-                raise
-
-        ctx = _ensure_operation_context(op_ctx)
-        timeout = ctx.deadline_ms / 1000.0 if ctx.deadline_ms else None
-        return AsyncBridge.run_async(_delete_coro(), timeout=timeout)
+        return self._run_operation(
+            op_name="delete",
+            op_ctx=op_ctx,
+            sync=True,
+            logic=_logic,
+        )
 
     async def arun_delete(
         self,
@@ -1500,43 +1450,31 @@ class VectorTranslator:
         op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
         framework_ctx: Optional[Any] = None,
     ) -> Any:
-        """Async delete."""
-        ctx = _ensure_operation_context(op_ctx)
-        try:
+        """Async delete API."""
+        async def _logic(ctx: OperationContext) -> Any:
             spec = self._translator.build_delete_spec(
                 raw_filter_or_ids,
                 op_ctx=ctx,
                 framework_ctx=framework_ctx,
             )
-            result = await self._adapter.delete(spec, ctx=ctx)
-
-            if not isinstance(result, DeleteResult):
-                raise BadRequest(
-                    f"adapter.delete returned unsupported type: {type(result).__name__}",
-                    code="BAD_ADAPTER_RESULT",
-                )
-
+            try:
+                result = await self._adapter.delete(spec, ctx=ctx)
+            except VectorAdapterError as e:
+                raise self._translator.map_adapter_error(
+                    e, op_ctx=ctx, framework_ctx=framework_ctx
+                ) from e
             return self._translator.translate_delete_result(
                 result,
                 op_ctx=ctx,
                 framework_ctx=framework_ctx,
             )
-        except VectorAdapterError as adapter_error:
-            mapped_error = self._translator.map_adapter_error(
-                adapter_error, op_ctx=ctx, framework_ctx=framework_ctx
-            )
-            if mapped_error is not adapter_error:
-                raise mapped_error from adapter_error
-            raise
-        except Exception as exc:
-            attach_context(
-                exc,
-                framework=self._framework,
-                vector_operation="delete",
-                request_id=ctx.request_id,
-                tenant=ctx.tenant,
-            )
-            raise
+
+        return await self._run_operation(
+            op_name="delete",
+            op_ctx=op_ctx,
+            sync=False,
+            logic=_logic,
+        )
 
     def update(
         self,
@@ -1545,49 +1483,31 @@ class VectorTranslator:
         op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
         framework_ctx: Optional[Any] = None,
     ) -> Any:
-        """Synchronous update (uses AsyncBridge)."""
-
-        async def _update_coro():
-            ctx = _ensure_operation_context(op_ctx)
+        """Synchronous update API."""
+        async def _logic(ctx: OperationContext) -> Any:
+            spec = self._translator.build_update_spec(
+                raw_updates,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
             try:
-                spec = self._translator.build_update_spec(
-                    raw_updates,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
                 result = await self._adapter.update(spec, ctx=ctx)
+            except VectorAdapterError as e:
+                raise self._translator.map_adapter_error(
+                    e, op_ctx=ctx, framework_ctx=framework_ctx
+                ) from e
+            return self._translator.translate_update_result(
+                result,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
 
-                if not isinstance(result, UpdateResult):
-                    raise BadRequest(
-                        f"adapter.update returned unsupported type: {type(result).__name__}",
-                        code="BAD_ADAPTER_RESULT",
-                    )
-
-                return self._translator.translate_update_result(
-                    result,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
-            except VectorAdapterError as adapter_error:
-                mapped_error = self._translator.map_adapter_error(
-                    adapter_error, op_ctx=ctx, framework_ctx=framework_ctx
-                )
-                if mapped_error is not adapter_error:
-                    raise mapped_error from adapter_error
-                raise
-            except Exception as exc:
-                attach_context(
-                    exc,
-                    framework=self._framework,
-                    vector_operation="update",
-                    request_id=ctx.request_id,
-                    tenant=ctx.tenant,
-                )
-                raise
-
-        ctx = _ensure_operation_context(op_ctx)
-        timeout = ctx.deadline_ms / 1000.0 if ctx.deadline_ms else None
-        return AsyncBridge.run_async(_update_coro(), timeout=timeout)
+        return self._run_operation(
+            op_name="update",
+            op_ctx=op_ctx,
+            sync=True,
+            logic=_logic,
+        )
 
     async def arun_update(
         self,
@@ -1596,47 +1516,31 @@ class VectorTranslator:
         op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
         framework_ctx: Optional[Any] = None,
     ) -> Any:
-        """Async update."""
-        ctx = _ensure_operation_context(op_ctx)
-        try:
+        """Async update API."""
+        async def _logic(ctx: OperationContext) -> Any:
             spec = self._translator.build_update_spec(
                 raw_updates,
                 op_ctx=ctx,
                 framework_ctx=framework_ctx,
             )
-            result = await self._adapter.update(spec, ctx=ctx)
-
-            if not isinstance(result, UpdateResult):
-                raise BadRequest(
-                    f"adapter.update returned unsupported type: {type(result).__name__}",
-                    code="BAD_ADAPTER_RESULT",
-                )
-
+            try:
+                result = await self._adapter.update(spec, ctx=ctx)
+            except VectorAdapterError as e:
+                raise self._translator.map_adapter_error(
+                    e, op_ctx=ctx, framework_ctx=framework_ctx
+                ) from e
             return self._translator.translate_update_result(
                 result,
                 op_ctx=ctx,
                 framework_ctx=framework_ctx,
             )
-        except VectorAdapterError as adapter_error:
-            mapped_error = self._translator.map_adapter_error(
-                adapter_error, op_ctx=ctx, framework_ctx=framework_ctx
-            )
-            if mapped_error is not adapter_error:
-                raise mapped_error from adapter_error
-            raise
-        except Exception as exc:
-            attach_context(
-                exc,
-                framework=self._framework,
-                vector_operation="update",
-                request_id=ctx.request_id,
-                tenant=ctx.tenant,
-            )
-            raise
 
-    # --------------------------------------------------------------------- #
-    # Stats / Inspection
-    # --------------------------------------------------------------------- #
+        return await self._run_operation(
+            op_name="update",
+            op_ctx=op_ctx,
+            sync=False,
+            logic=_logic,
+        )
 
     def get_stats(
         self,
@@ -1644,44 +1548,27 @@ class VectorTranslator:
         op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
         framework_ctx: Optional[Any] = None,
     ) -> Any:
-        """Synchronous get_stats (uses AsyncBridge)."""
+        """Synchronous get_stats API."""
 
-        async def _stats_coro():
-            ctx = _ensure_operation_context(op_ctx)
+        async def _logic(ctx: OperationContext) -> Any:
             try:
                 stats = await self._adapter.get_stats(ctx=ctx)
+            except VectorAdapterError as e:
+                raise self._translator.map_adapter_error(
+                    e, op_ctx=ctx, framework_ctx=framework_ctx
+                ) from e
+            return self._translator.translate_stats(
+                stats,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
 
-                if not isinstance(stats, VectorStats):
-                    raise BadRequest(
-                        f"adapter.get_stats returned unsupported type: {type(stats).__name__}",
-                        code="BAD_ADAPTER_RESULT",
-                    )
-
-                return self._translator.translate_stats(
-                    stats,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
-            except VectorAdapterError as adapter_error:
-                mapped_error = self._translator.map_adapter_error(
-                    adapter_error, op_ctx=ctx, framework_ctx=framework_ctx
-                )
-                if mapped_error is not adapter_error:
-                    raise mapped_error from adapter_error
-                raise
-            except Exception as exc:
-                attach_context(
-                    exc,
-                    framework=self._framework,
-                    vector_operation="get_stats",
-                    request_id=ctx.request_id,
-                    tenant=ctx.tenant,
-                )
-                raise
-
-        ctx = _ensure_operation_context(op_ctx)
-        timeout = ctx.deadline_ms / 1000.0 if ctx.deadline_ms else None
-        return AsyncBridge.run_async(_stats_coro(), timeout=timeout)
+        return self._run_operation(
+            op_name="get_stats",
+            op_ctx=op_ctx,
+            sync=True,
+            logic=_logic,
+        )
 
     async def arun_get_stats(
         self,
@@ -1689,38 +1576,27 @@ class VectorTranslator:
         op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
         framework_ctx: Optional[Any] = None,
     ) -> Any:
-        """Async get_stats."""
-        ctx = _ensure_operation_context(op_ctx)
-        try:
-            stats = await self._adapter.get_stats(ctx=ctx)
+        """Async get_stats API."""
 
-            if not isinstance(stats, VectorStats):
-                raise BadRequest(
-                    f"adapter.get_stats returned unsupported type: {type(stats).__name__}",
-                    code="BAD_ADAPTER_RESULT",
-                )
-
+        async def _logic(ctx: OperationContext) -> Any:
+            try:
+                stats = await self._adapter.get_stats(ctx=ctx)
+            except VectorAdapterError as e:
+                raise self._translator.map_adapter_error(
+                    e, op_ctx=ctx, framework_ctx=framework_ctx
+                ) from e
             return self._translator.translate_stats(
                 stats,
                 op_ctx=ctx,
                 framework_ctx=framework_ctx,
             )
-        except VectorAdapterError as adapter_error:
-            mapped_error = self._translator.map_adapter_error(
-                adapter_error, op_ctx=ctx, framework_ctx=framework_ctx
-            )
-            if mapped_error is not adapter_error:
-                raise mapped_error from adapter_error
-            raise
-        except Exception as exc:
-            attach_context(
-                exc,
-                framework=self._framework,
-                vector_operation="get_stats",
-                request_id=ctx.request_id,
-                tenant=ctx.tenant,
-            )
-            raise
+
+        return await self._run_operation(
+            op_name="get_stats",
+            op_ctx=op_ctx,
+            sync=False,
+            logic=_logic,
+        )
 
 
 # =============================================================================
@@ -1730,6 +1606,7 @@ class VectorTranslator:
 
 _TranslatorFactory = Callable[[VectorProtocolV1], VectorFrameworkTranslator]
 _VECTOR_TRANSLATOR_FACTORIES: Dict[str, _TranslatorFactory] = {}
+_REGISTRY_LOCK = threading.Lock()
 
 
 def register_vector_translator(
@@ -1741,7 +1618,9 @@ def register_vector_translator(
 
     Example
     -------
-        def make_langchain_translator(adapter: VectorProtocolV1) -> VectorFrameworkTranslator:
+        def make_langchain_translator(
+            adapter: VectorProtocolV1,
+        ) -> VectorFrameworkTranslator:
             return LangChainVectorTranslator(adapter=adapter)
 
         register_vector_translator("langchain", make_langchain_translator)
@@ -1756,13 +1635,15 @@ def register_vector_translator(
             "translator factory must be callable",
             code="BAD_TRANSLATOR_REGISTRATION",
         )
-    _VECTOR_TRANSLATOR_FACTORIES[framework] = factory
+    with _REGISTRY_LOCK:
+        _VECTOR_TRANSLATOR_FACTORIES[framework] = factory
     LOG.debug("Registered vector translator factory for framework=%s", framework)
 
 
 def get_vector_translator_factory(framework: str) -> Optional[_TranslatorFactory]:
     """Return a previously registered translator factory for a framework, if any."""
-    return _VECTOR_TRANSLATOR_FACTORIES.get(framework)
+    with _REGISTRY_LOCK:
+        return _VECTOR_TRANSLATOR_FACTORIES.get(framework)
 
 
 def create_vector_translator(
@@ -1785,7 +1666,11 @@ def create_vector_translator(
             translator = factory(adapter)
         else:
             translator = DefaultVectorFrameworkTranslator()
-    return VectorTranslator(adapter=adapter, framework=framework, translator=translator)
+    return VectorTranslator(
+        adapter=adapter,
+        framework=framework,
+        translator=translator,
+    )
 
 
 __all__ = [
