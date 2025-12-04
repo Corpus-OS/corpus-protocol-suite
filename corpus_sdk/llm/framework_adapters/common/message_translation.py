@@ -72,15 +72,30 @@ if TYPE_CHECKING:  # pragma: no cover
     from langchain_core.messages import BaseMessage  # type: ignore
     from llama_index.core.llms import ChatMessage  # type: ignore
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    """
+    Parse a boolean-ish environment variable in a consistent, case-insensitive way.
+
+    Truthy values: "1", "true", "yes", "on" (any case, with surrounding whitespace allowed).
+    Everything else is treated as False.
+    """
+    val = os.getenv(name, default)
+    if not isinstance(val, str):
+        return False
+    return val.strip().lower() in {"1", "true", "yes", "on"}
+
+
 # ---------------------------------------------------------------------------
 # Configuration (context-local for thread/async safety)
 # ---------------------------------------------------------------------------
 
-_STRICT_ROLE_VALIDATION_DEFAULT: bool = os.getenv("CORPUS_STRICT_ROLES", "0") in {
-    "1",
-    "true",
-    "TRUE",
-}
+_STRICT_ROLE_VALIDATION_DEFAULT: bool = _env_flag("CORPUS_STRICT_ROLES", "0")
 
 _UNKNOWN_ROLE_FALLBACK_DEFAULT: str = os.getenv(
     "CORPUS_UNKNOWN_ROLE",
@@ -228,6 +243,10 @@ def _normalize_role(raw_role: Optional[str]) -> Tuple[str, Optional[str]]:
 
     Returns:
         (canonical_role, original_role_if_changed)
+
+    May raise:
+        ValueError: if strict role validation is enabled for the current context
+        and the role is not recognized.
     """
     if raw_role is None:
         return "user", None
@@ -317,6 +336,37 @@ def _stringify_content(content: Any) -> Tuple[str, Optional[Any]]:
 
 
 # ---------------------------------------------------------------------------
+# NormalizedMessage construction helper
+# ---------------------------------------------------------------------------
+
+
+def _build_normalized_message(
+    raw_role: Any,
+    raw_content: Any,
+    base_metadata: Optional[Mapping[str, Any]] = None,
+) -> NormalizedMessage:
+    """
+    Shared helper to construct a NormalizedMessage from raw role/content.
+
+    - Normalizes the role using `_normalize_role`
+    - Stringifies content using `_stringify_content`
+    - Adds `corpus_original_role` and `corpus_raw_content` when applicable
+    - Starts from an optional base metadata mapping
+    """
+    role, original_role = _normalize_role(raw_role)
+    content, structured = _stringify_content(raw_content)
+
+    metadata: Dict[str, Any] = dict(base_metadata or {})
+
+    if original_role is not None:
+        metadata["corpus_original_role"] = original_role
+    if structured is not None:
+        metadata["corpus_raw_content"] = structured
+
+    return NormalizedMessage(role=role, content=content, metadata=metadata)
+
+
+# ---------------------------------------------------------------------------
 # Corpus wire format
 # ---------------------------------------------------------------------------
 
@@ -340,17 +390,17 @@ def from_corpus(payload: Mapping[str, Any]) -> NormalizedMessage:
 
     Returns:
         NormalizedMessage
+
+    May raise:
+        ValueError: if strict role validation is enabled and the role is unknown.
     """
-    role, original_role = _normalize_role(str(payload.get("role", "user")))
-    content, structured = _stringify_content(payload.get("content", ""))
+    base_metadata: Dict[str, Any] = {"corpus_raw": payload}
 
-    metadata: Dict[str, Any] = {"corpus_raw": payload}
-    if original_role is not None:
-        metadata["corpus_original_role"] = original_role
-    if structured is not None:
-        metadata["corpus_raw_content"] = structured
-
-    return NormalizedMessage(role=role, content=content, metadata=metadata)
+    return _build_normalized_message(
+        raw_role=payload.get("role", "user"),
+        raw_content=payload.get("content", ""),
+        base_metadata=base_metadata,
+    )
 
 
 def from_corpus_many(payloads: Iterable[Mapping[str, Any]]) -> List[NormalizedMessage]:
@@ -382,12 +432,12 @@ def from_generic_dict(msg: Mapping[str, Any]) -> NormalizedMessage:
     - Uses `msg["role"]` and `msg["content"]` if present, with defaults.
     - Copies any `msg["metadata"]` (if a mapping) into `metadata`.
     - Preserves the original dict as metadata["corpus_raw"].
+
+    May raise:
+        ValueError: if strict role validation is enabled and the role is unknown.
     """
     raw_role = msg.get("role", "user")
     raw_content = msg.get("content", "")
-
-    role, original_role = _normalize_role(raw_role)
-    content, structured = _stringify_content(raw_content)
 
     metadata: Dict[str, Any] = {"corpus_raw": msg}
 
@@ -396,12 +446,11 @@ def from_generic_dict(msg: Mapping[str, Any]) -> NormalizedMessage:
     if isinstance(user_meta, Mapping):
         metadata.update(dict(user_meta))
 
-    if original_role is not None:
-        metadata["corpus_original_role"] = original_role
-    if structured is not None:
-        metadata["corpus_raw_content"] = structured
-
-    return NormalizedMessage(role=role, content=content, metadata=metadata)
+    return _build_normalized_message(
+        raw_role=raw_role,
+        raw_content=raw_content,
+        base_metadata=metadata,
+    )
 
 
 def to_generic_dict(msg: NormalizedMessage) -> Dict[str, Any]:
@@ -453,25 +502,25 @@ def from_langchain(msg: "BaseMessage") -> NormalizedMessage:
 
     Returns:
         NormalizedMessage
+
+    May raise:
+        ValueError: if strict role validation is enabled and the role is unknown.
     """
     raw_role = getattr(msg, "type", None) or getattr(msg, "role", None)
     raw_content = getattr(msg, "content", "")
 
-    role, original_role = _normalize_role(raw_role)
-    content, structured = _stringify_content(raw_content)
-
     metadata: Dict[str, Any] = {"corpus_raw": msg}
-    if original_role is not None:
-        metadata["corpus_original_role"] = original_role
-    if structured is not None:
-        metadata["corpus_raw_content"] = structured
 
     # Preserve additional_kwargs
     additional = getattr(msg, "additional_kwargs", None)
     if isinstance(additional, Mapping):
         metadata.update(dict(additional))
 
-    return NormalizedMessage(role=role, content=content, metadata=metadata)
+    return _build_normalized_message(
+        raw_role=raw_role,
+        raw_content=raw_content,
+        base_metadata=metadata,
+    )
 
 
 def to_langchain(msg: NormalizedMessage) -> Any:
@@ -545,6 +594,9 @@ def from_llamaindex(msg: "ChatMessage") -> NormalizedMessage:
 
     Returns:
         NormalizedMessage
+
+    May raise:
+        ValueError: if strict role validation is enabled and the role is unknown.
     """
     raw_role = getattr(msg, "role", None)
     if hasattr(raw_role, "value"):
@@ -552,21 +604,18 @@ def from_llamaindex(msg: "ChatMessage") -> NormalizedMessage:
 
     raw_content = getattr(msg, "content", "")
 
-    role, original_role = _normalize_role(raw_role)
-    content, structured = _stringify_content(raw_content)
-
     metadata: Dict[str, Any] = {"corpus_raw": msg}
-    if original_role is not None:
-        metadata["corpus_original_role"] = original_role
-    if structured is not None:
-        metadata["corpus_raw_content"] = structured
 
     # Preserve additional_kwargs
     additional = getattr(msg, "additional_kwargs", None)
     if isinstance(additional, Mapping):
         metadata.update(dict(additional))
 
-    return NormalizedMessage(role=role, content=content, metadata=metadata)
+    return _build_normalized_message(
+        raw_role=raw_role,
+        raw_content=raw_content,
+        base_metadata=metadata,
+    )
 
 
 def to_llamaindex(msg: NormalizedMessage) -> Any:
@@ -627,25 +676,25 @@ def from_semantic_kernel(msg: Mapping[str, Any]) -> NormalizedMessage:
 
     Returns:
         NormalizedMessage
+
+    May raise:
+        ValueError: if strict role validation is enabled and the role is unknown.
     """
     raw_role = msg.get("role", "user")
     raw_content = msg.get("content", "")
 
-    role, original_role = _normalize_role(raw_role)
-    content, structured = _stringify_content(raw_content)
-
     metadata: Dict[str, Any] = {"corpus_raw": msg}
-    if original_role is not None:
-        metadata["corpus_original_role"] = original_role
-    if structured is not None:
-        metadata["corpus_raw_content"] = structured
 
     # Preserve SK metadata
     sk_metadata = msg.get("metadata", {})
     if isinstance(sk_metadata, Mapping):
         metadata.update(dict(sk_metadata))
 
-    return NormalizedMessage(role=role, content=content, metadata=metadata)
+    return _build_normalized_message(
+        raw_role=raw_role,
+        raw_content=raw_content,
+        base_metadata=metadata,
+    )
 
 
 def to_semantic_kernel(msg: NormalizedMessage) -> Dict[str, Any]:
@@ -677,7 +726,7 @@ def to_semantic_kernel(msg: NormalizedMessage) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def from_autogen(msg: Any) -> NormalizedMessage:
+def from_autogen(msg: Mapping[str, Any] | object) -> NormalizedMessage:
     """
     AutoGen message → NormalizedMessage.
 
@@ -690,33 +739,33 @@ def from_autogen(msg: Any) -> NormalizedMessage:
 
     Returns:
         NormalizedMessage
+
+    May raise:
+        ValueError: if strict role validation is enabled and the role is unknown.
     """
     if isinstance(msg, Mapping):
         raw_role = msg.get("role", "user")
         raw_content = msg.get("content", "")
-        content, structured = _stringify_content(raw_content)
 
         metadata: Dict[str, Any] = {"corpus_raw": msg}
         for k, v in msg.items():
             if k not in {"role", "content"}:
                 metadata[k] = v
+
     else:
         raw_role = getattr(msg, "role", "user")
         raw_content = getattr(msg, "content", "")
-        content, structured = _stringify_content(raw_content)
 
         metadata = {"corpus_raw": msg}
         for attr in ("name", "tool_calls", "function_call"):
             if hasattr(msg, attr):
                 metadata[attr] = getattr(msg, attr)
 
-    role, original_role = _normalize_role(raw_role)
-    if original_role is not None:
-        metadata["corpus_original_role"] = original_role
-    if structured is not None:
-        metadata["corpus_raw_content"] = structured
-
-    return NormalizedMessage(role=role, content=content, metadata=metadata)
+    return _build_normalized_message(
+        raw_role=raw_role,
+        raw_content=raw_content,
+        base_metadata=metadata,
+    )
 
 
 def to_autogen(msg: NormalizedMessage) -> Dict[str, Any]:
@@ -748,7 +797,7 @@ def to_autogen(msg: NormalizedMessage) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def from_crewai(msg: Any) -> NormalizedMessage:
+def from_crewai(msg: Mapping[str, Any] | object) -> NormalizedMessage:
     """
     CrewAI message → NormalizedMessage.
 
@@ -761,11 +810,13 @@ def from_crewai(msg: Any) -> NormalizedMessage:
 
     Returns:
         NormalizedMessage
+
+    May raise:
+        ValueError: if strict role validation is enabled and the role is unknown.
     """
     if isinstance(msg, Mapping):
         raw_role = msg.get("role", "user")
         raw_content = msg.get("content", "")
-        content, structured = _stringify_content(raw_content)
 
         metadata: Dict[str, Any] = {"corpus_raw": msg}
         for k, v in msg.items():
@@ -774,20 +825,17 @@ def from_crewai(msg: Any) -> NormalizedMessage:
     else:
         raw_role = getattr(msg, "role", "user")
         raw_content = getattr(msg, "content", "")
-        content, structured = _stringify_content(raw_content)
 
         metadata = {"corpus_raw": msg}
         for attr in ("name", "agent", "tool_calls", "function_call"):
             if hasattr(msg, attr):
                 metadata[attr] = getattr(msg, attr)
 
-    role, original_role = _normalize_role(raw_role)
-    if original_role is not None:
-        metadata["corpus_original_role"] = original_role
-    if structured is not None:
-        metadata["corpus_raw_content"] = structured
-
-    return NormalizedMessage(role=role, content=content, metadata=metadata)
+    return _build_normalized_message(
+        raw_role=raw_role,
+        raw_content=raw_content,
+        base_metadata=metadata,
+    )
 
 
 def to_crewai(msg: NormalizedMessage) -> Dict[str, Any]:
@@ -819,7 +867,7 @@ def to_crewai(msg: NormalizedMessage) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def from_mcp(msg: Mapping[str, Any] | Any) -> NormalizedMessage:
+def from_mcp(msg: Mapping[str, Any] | object) -> NormalizedMessage:
     """
     MCP message → NormalizedMessage.
 
@@ -848,11 +896,13 @@ def from_mcp(msg: Mapping[str, Any] | Any) -> NormalizedMessage:
     - If a `metadata` field is present but is **not** a Mapping, it is kept
       as-is and additionally stored as `metadata["mcp_metadata_raw"]` to avoid
       losing shape information.
+
+    May raise:
+        ValueError: if strict role validation is enabled and the role is unknown.
     """
     if isinstance(msg, Mapping):
         raw_role = msg.get("role", "user")
         raw_content = msg.get("content", "")
-        content, structured = _stringify_content(raw_content)
 
         metadata: Dict[str, Any] = {"corpus_raw": msg}
         # Preserve all other top-level keys besides role/content
@@ -871,7 +921,6 @@ def from_mcp(msg: Mapping[str, Any] | Any) -> NormalizedMessage:
     else:
         raw_role = getattr(msg, "role", "user")
         raw_content = getattr(msg, "content", "")
-        content, structured = _stringify_content(raw_content)
 
         metadata = {"corpus_raw": msg}
         # Preserve common MCP-style attributes when present
@@ -897,13 +946,11 @@ def from_mcp(msg: Mapping[str, Any] | Any) -> NormalizedMessage:
             else:
                 metadata[attr] = value
 
-    role, original_role = _normalize_role(raw_role)
-    if original_role is not None:
-        metadata["corpus_original_role"] = original_role
-    if structured is not None:
-        metadata["corpus_raw_content"] = structured
-
-    return NormalizedMessage(role=role, content=content, metadata=metadata)
+    return _build_normalized_message(
+        raw_role=raw_role,
+        raw_content=raw_content,
+        base_metadata=metadata,
+    )
 
 
 def to_mcp(msg: NormalizedMessage) -> Dict[str, Any]:
