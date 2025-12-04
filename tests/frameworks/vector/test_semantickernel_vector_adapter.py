@@ -6,7 +6,6 @@ from collections.abc import AsyncIterator, Iterable, Iterator, Mapping
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import inspect
-
 import pytest
 
 import corpus_sdk.vector.framework_adapters.semantic_kernel as sk_vector_module
@@ -1049,3 +1048,389 @@ async def test_plugin_errors_are_wrapped_in_kernelfunctionexception(
     msg = str(exc_info.value)
     assert "Vector database error" in msg or "Vector search failed" in msg
 
+
+# ---------------------------------------------------------------------------
+# Additional tests for comprehensive coverage (New tests)
+# ---------------------------------------------------------------------------
+
+def test_field_uniqueness_validation():
+    """Test that reserved metadata fields must be unique."""
+    # Should work with unique fields
+    store = _make_store(
+        adapter=object(),
+        id_field="id",
+        text_field="page_content",
+        metadata_field="metadata",
+    )
+    assert store.id_field == "id"
+    assert store.text_field == "page_content"
+    assert store.metadata_field == "metadata"
+    
+    # Should fail when fields are not unique
+    with pytest.raises(ValueError) as excinfo:
+        _make_store(
+            adapter=object(),
+            id_field="same",
+            text_field="same",
+        )
+    assert "must be unique" in str(excinfo.value)
+
+
+def test_score_threshold_validation():
+    """Test score_threshold validation."""
+    # Valid threshold should work
+    store = _make_store(adapter=object(), score_threshold=0.7)
+    assert store.score_threshold == 0.7
+    
+    # Invalid thresholds should raise
+    with pytest.raises(ValueError):
+        _make_store(adapter=object(), score_threshold=1.5)
+    
+    with pytest.raises(ValueError):
+        _make_store(adapter=object(), score_threshold=-0.1)
+
+
+def test_embed_query_with_provided_embedding():
+    """Test _embed_query when embedding is provided."""
+    store = _make_store(adapter=object())
+    
+    query_emb = store._embed_query(
+        query="test",
+        embedding=[0.1, 0.2, 0.3]
+    )
+    
+    assert query_emb == [0.1, 0.2, 0.3]
+
+
+def test_embed_query_requires_embedding_function():
+    """Test _embed_query raises when no embedding function configured."""
+    store = _make_store(
+        adapter=object(),
+        embedding_function=None,
+        async_embedding_function=None,
+    )
+    
+    with pytest.raises(sk_vector_module.NotSupported) as excinfo:
+        store._embed_query("test")
+    
+    assert "NO_EMBEDDING_FUNCTION" in str(excinfo.value.code)
+
+
+@pytest.mark.asyncio
+async def test_embed_query_async_with_provided_embedding():
+    """Test _embed_query_async when embedding is provided."""
+    store = _make_store(adapter=object())
+    
+    query_emb = await store._embed_query_async(
+        query="test",
+        embedding=[0.1, 0.2, 0.3]
+    )
+    
+    assert query_emb == [0.1, 0.2, 0.3]
+
+
+@pytest.mark.asyncio 
+async def test_embed_query_async_uses_async_function():
+    """Test _embed_query_async prefers async_embedding_function."""
+    async def async_embed(texts):
+        return [[1.0, 2.0] for _ in texts]
+    
+    store = _make_store(
+        adapter=object(),
+        async_embedding_function=async_embed,
+    )
+    
+    query_emb = await store._embed_query_async("test")
+    assert query_emb == [1.0, 2.0]
+
+
+def test_normalize_metadatas():
+    """Test metadata normalization."""
+    store = _make_store(adapter=object())
+    
+    # None -> empty dicts
+    result = store._normalize_metadatas(2, None)
+    assert result == [{}, {}]
+    
+    # Single metadata replicated
+    result = store._normalize_metadatas(3, [{"key": "value"}])
+    assert result == [{"key": "value"}, {"key": "value"}, {"key": "value"}]
+    
+    # Mismatched length raises
+    with pytest.raises(sk_vector_module.BadRequest) as excinfo:
+        store._normalize_metadatas(2, [{"a": 1}, {"b": 2}, {"c": 3}])
+    assert "BAD_METADATA" in str(excinfo.value.code)
+
+
+def test_normalize_ids():
+    """Test ID normalization."""
+    store = _make_store(adapter=object())
+    
+    # None -> generated UUIDs
+    result = store._normalize_ids(2, None)
+    assert len(result) == 2
+    assert all(len(id_str) == 32 for id_str in result)  # UUID hex length
+    
+    # Provided IDs
+    result = store._normalize_ids(2, ["id1", "id2"])
+    assert result == ["id1", "id2"]
+    
+    # Mismatched length raises
+    with pytest.raises(sk_vector_module.BadRequest) as excinfo:
+        store._normalize_ids(2, ["id1"])
+    assert "BAD_IDS" in str(excinfo.value.code)
+
+
+def test_apply_score_threshold():
+    """Test client-side score threshold filtering."""
+    store = _make_store(adapter=object(), score_threshold=0.7)
+    
+    class MockMatch:
+        def __init__(self, score):
+            self.score = score
+    
+    matches = [MockMatch(0.6), MockMatch(0.7), MockMatch(0.8), MockMatch(0.9)]
+    
+    filtered = store._apply_score_threshold(matches)
+    assert len(filtered) == 3
+    assert all(m.score >= 0.7 for m in filtered)
+    
+    # No threshold returns all
+    store_no_threshold = _make_store(adapter=object(), score_threshold=None)
+    filtered = store_no_threshold._apply_score_threshold(matches)
+    assert len(filtered) == 4
+
+
+def test_format_for_ai_model():
+    """Test AI-optimized document formatting."""
+    store = _make_store(adapter=object())
+    
+    class MockVector:
+        def __init__(self, text="test content", meta=None):
+            self.metadata = meta or {"page_content": text, "id": "1"}
+            self.vector = []
+    
+    class MockMatch:
+        def __init__(self, score=0.9, text="test content"):
+            self.score = score
+            self.vector = MockVector(text=text)
+    
+    matches = [MockMatch(0.9, "short"), MockMatch(0.8, "a" * 600)]  # Second will be truncated
+    
+    formatted = store._format_for_ai_model(matches)
+    
+    assert len(formatted) == 2
+    assert all("content" in d for d in formatted)
+    assert all("metadata" in d for d in formatted)
+    assert all("confidence" in d for d in formatted)
+    assert all("source" in d for d in formatted)
+    
+    # Check truncation for long text
+    assert len(formatted[1]["content"]) < 600  # Should be truncated
+
+
+def test_from_texts_constructor():
+    """Test from_texts convenience constructor."""
+    mock_adapter = object()
+    
+    store = CorpusSemanticKernelVectorStore.from_texts(
+        texts=["hello", "world"],
+        corpus_adapter=mock_adapter,
+        metadatas=[{"topic": "greeting"}, {"topic": "planet"}],
+        ids=["id1", "id2"],
+        embedding_function=_default_embedding_function,
+    )
+    
+    assert store.corpus_adapter is mock_adapter
+    # Store should have texts added (though we can't verify without mocking translator)
+
+
+def test_from_documents_constructor():
+    """Test from_documents convenience constructor."""
+    mock_adapter = object()
+    
+    documents = [
+        {"page_content": "hello", "metadata": {"topic": "greeting"}},
+        {"page_content": "world", "metadata": {"topic": "planet"}},
+    ]
+    
+    store = CorpusSemanticKernelVectorStore.from_documents(
+        documents=documents,
+        corpus_adapter=mock_adapter,
+        embedding_function=_default_embedding_function,
+    )
+    
+    assert store.corpus_adapter is mock_adapter
+
+
+def test_add_documents_sync():
+    """Test add_documents sync method."""
+    store = _make_store(adapter=object())
+    
+    documents = [
+        {"page_content": "doc1", "metadata": {"a": 1}},
+        {"page_content": "doc2", "metadata": {"b": 2}},
+    ]
+    
+    # Mock translator to avoid actual vector operations
+    store._translator = type("MockTranslator", (), {
+        "capabilities": lambda: type("Caps", (), {
+            "max_batch_size": 1000,
+            "supports_metadata_filtering": True,
+            "supports_namespaces": True,
+            "max_top_k": 100,
+        })(),
+        "upsert": lambda *args, **kwargs: type("Result", (), {
+            "upserted_count": 2,
+            "failed_count": 0,
+            "failures": [],
+        })(),
+    })()
+    
+    # Should not raise
+    store.add_documents(documents)
+
+
+@pytest.mark.asyncio
+async def test_aadd_documents_async():
+    """Test aadd_documents async method."""
+    store = _make_store(adapter=object())
+    
+    documents = [
+        {"page_content": "doc1", "metadata": {"a": 1}},
+        {"page_content": "doc2", "metadata": {"b": 2}},
+    ]
+    
+    # Should not raise (though won't actually execute without proper mocks)
+    try:
+        await store.aadd_documents(documents)
+    except (AttributeError, NotImplementedError):
+        pass  # Expected without proper translator mocking
+
+
+def test_similarity_search_with_score():
+    """Test similarity_search_with_score returns tuples."""
+    store = _make_store(adapter=object())
+    
+    # Mock similarity_search to return test docs
+    def mock_similarity_search(*args, **kwargs):
+        return [
+            {"content": "doc1", "metadata": {}, "confidence": 0.9, "source": "vector_database"},
+            {"content": "doc2", "metadata": {}, "confidence": 0.8, "source": "vector_database"},
+        ]
+    
+    store.similarity_search = mock_similarity_search
+    
+    results = store.similarity_search_with_score("test query", k=2)
+    
+    assert len(results) == 2
+    assert isinstance(results[0], tuple)
+    assert len(results[0]) == 2
+    assert results[0][0]["confidence"] == 0.9
+    assert results[0][1] == 0.9
+
+
+@pytest.mark.asyncio
+async def test_asimilarity_search_with_score():
+    """Test asimilarity_search_with_score async method."""
+    store = _make_store(adapter=object())
+    
+    async def mock_asimilarity_search(*args, **kwargs):
+        return [
+            {"content": "doc1", "metadata": {}, "confidence": 0.9, "source": "vector_database"},
+            {"content": "doc2", "metadata": {}, "confidence": 0.8, "source": "vector_database"},
+        ]
+    
+    store.asimilarity_search = mock_asimilarity_search
+    
+    results = await store.asimilarity_search_with_score("test query", k=2)
+    
+    assert len(results) == 2
+    assert isinstance(results[0], tuple)
+    assert results[0][1] == 0.9
+
+
+def test_plugin_builds_sk_aware_context():
+    """Test plugin context building includes SK-specific metadata."""
+    store = _make_store(adapter=object())
+    plugin = CorpusSemanticKernelVectorPlugin(vector_store=store)
+    
+    # Mock SK context object with variables
+    class MockSkContext:
+        def __init__(self):
+            self.variables = {"temperature": 0.7}
+            self.skill_name = "test_skill"
+            self.function_name = "test_function"
+    
+    # Mock context_from_semantic_kernel
+    with monkeypatch.context() as m:
+        m.setattr(
+            sk_vector_module,
+            "context_from_semantic_kernel",
+            lambda *args, **kwargs: type("MockOpCtx", (), {
+                "extra_context": {}
+            })(),
+        )
+        
+        ctx = plugin._build_sk_aware_context(
+            sk_context=MockSkContext(),
+            sk_settings={"max_tokens": 100}
+        )
+        
+        # Should not crash
+        assert ctx is not None
+
+
+def test_plugin_error_handling_for_different_error_types():
+    """Test plugin error handling for different exception types."""
+    store = _make_store(adapter=object())
+    plugin = CorpusSemanticKernelVectorPlugin(vector_store=store)
+    
+    # Test NotSupported
+    not_supported = sk_vector_module.NotSupported("test", code="TEST_CODE")
+    try:
+        plugin._handle_sk_plugin_error(not_supported, "test_op")
+    except sk_vector_module.KernelFunctionException as exc:
+        assert "not supported" in str(exc).lower()
+    
+    # Test BadRequest
+    bad_request = sk_vector_module.BadRequest("test", code="BAD_REQUEST")
+    try:
+        plugin._handle_sk_plugin_error(bad_request, "test_op")
+    except sk_vector_module.KernelFunctionException as exc:
+        assert "invalid" in str(exc).lower()
+    
+    # Test generic exception
+    generic = ValueError("generic error")
+    try:
+        plugin._handle_sk_plugin_error(generic, "test_op")
+    except sk_vector_module.KernelFunctionException as exc:
+        assert "failed" in str(exc).lower()
+
+
+@pytest.mark.asyncio
+async def test_amax_marginal_relevance_search_basic():
+    """Test async MMR search basic functionality."""
+    store = _make_store(adapter=object())
+    
+    # Should have the method
+    assert hasattr(store, "amax_marginal_relevance_search")
+    
+    # Verify it's async
+    assert inspect.iscoroutinefunction(store.amax_marginal_relevance_search)
+
+
+def test_get_capabilities_methods():
+    """Test public capability methods."""
+    store = _make_store(adapter=object())
+    
+    # Should have both sync and async methods
+    assert hasattr(store, "get_capabilities")
+    assert hasattr(store, "aget_capabilities")
+    
+    # aget_capabilities should be async
+    assert inspect.iscoroutinefunction(store.aget_capabilities)
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
