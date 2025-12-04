@@ -41,26 +41,17 @@ def test_vector_registry_keys_match_descriptor_name(all_descriptors) -> None:
         assert VECTOR_FRAMEWORKS[descriptor.name] is descriptor
 
 
-def test_vector_registry_descriptors_validate_cleanly(all_descriptors) -> None:
+def test_registered_descriptors_validate_cleanly(all_descriptors) -> None:
     """
-    Run the descriptor-level validation hook to catch obvious inconsistencies
-    (e.g. async stream defined without async query).
+    Smoke test: all descriptors currently registered in VECTOR_FRAMEWORKS
+    should validate without raising.
+
+    This is about the *current registry contents* being internally consistent,
+    not about edge-case behavior of VectorFrameworkDescriptor.validate itself.
     """
     for descriptor in all_descriptors:
         # validate() may emit warnings but should not raise
         descriptor.validate()
-
-
-def test_descriptor_is_available_does_not_raise(all_descriptors) -> None:
-    """
-    Ensure is_available() doesn't crash for any registered descriptor.
-
-    This is a smoke test that verifies the availability check doesn't raise
-    unexpected exceptions (ImportError, AttributeError) when called.
-    """
-    for descriptor in all_descriptors:
-        result = descriptor.is_available()
-        assert isinstance(result, bool)
 
 
 @pytest.mark.parametrize(
@@ -90,6 +81,18 @@ def test_version_range_formatting(name, minimum, tested_up_to, expected) -> None
     assert desc.version_range() == expected
 
 
+def test_descriptor_is_available_does_not_raise(all_descriptors) -> None:
+    """
+    Ensure is_available() doesn't crash for any registered descriptor.
+
+    This is a smoke test that verifies the availability check doesn't raise
+    unexpected exceptions (ImportError, AttributeError) when called.
+    """
+    for descriptor in all_descriptors:
+        result = descriptor.is_available()
+        assert isinstance(result, bool)
+
+
 def test_async_method_consistency(all_descriptors) -> None:
     """
     Check that async core vector support is properly declared.
@@ -109,10 +112,10 @@ def test_async_method_consistency(all_descriptors) -> None:
 
 def test_streaming_support_property(all_descriptors) -> None:
     """
-    Test the supports_streaming property logic.
+    Test the supports_streaming property/flag logic.
 
-    Ensures the property correctly reflects whether ANY streaming method
-    is declared (sync or async).
+    Ensures the flag correctly reflects whether ANY streaming method
+    is declared (sync or async) for the registered descriptors.
     """
     for descriptor in all_descriptors:
         has_streaming = (
@@ -126,10 +129,10 @@ def test_streaming_support_property(all_descriptors) -> None:
 
 def test_mmr_support_property(all_descriptors) -> None:
     """
-    Test the supports_mmr property logic.
+    Test the supports_mmr property/flag logic.
 
-    Ensures the property correctly reflects whether ANY MMR method
-    is declared (sync or async).
+    Ensures the flag correctly reflects whether ANY MMR method
+    is declared (sync or async) for the registered descriptors.
     """
     for descriptor in all_descriptors:
         has_mmr = (
@@ -332,9 +335,12 @@ def test_iterator_functions() -> None:
         assert desc.is_available()
 
 
-def test_descriptor_validation_edge_cases() -> None:
+def test_vector_descriptor_validate_edge_cases() -> None:
     """
-    Test descriptor validation with edge cases, including version ordering.
+    Unit tests for VectorFrameworkDescriptor.validate edge cases.
+
+    This focuses on descriptor *behavior* (warnings/errors for bad inputs),
+    independent of the concrete registry contents.
     """
     # Missing required methods
     with pytest.raises(
@@ -428,9 +434,3 @@ def test_descriptor_validation_edge_cases() -> None:
                 minimum_framework_version="2.0.0",
                 tested_up_to_version="1.0.0",
             )
-
-
-if __name__ == "__main__":
-    # Allow running as a standalone script
-    pytest.main([__file__, "-v"])
-
