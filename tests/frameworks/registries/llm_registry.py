@@ -18,9 +18,10 @@ framework-agnostic. Adding a new LLM framework typically means:
 
 Version fields
 --------------
-`minimum_framework_version` and `tested_up_to_version` are currently informational.
-In the future, tests may use them to conditionally skip or adjust expectations
-based on the installed framework version.
+`minimum_framework_version` and `tested_up_to_version` are currently informational,
+but we validate that the range is coherent when possible. In the future, tests may
+use them to conditionally skip or adjust expectations based on the installed
+framework version.
 """
 
 from __future__ import annotations
@@ -30,11 +31,19 @@ from typing import Dict, Iterable, Literal, Optional
 import importlib
 import warnings
 
+try:  # Optional, used only for version ordering validation
+    from packaging.version import Version
+except Exception:  # pragma: no cover - packaging may not be installed
+    Version = None  # type: ignore[assignment]
+
+# Simple in-memory cache to avoid repeatedly importing modules for availability checks.
+_AVAILABILITY_CACHE: Dict[str, bool] = {}
+
 
 @dataclass(frozen=True)
 class LLMFrameworkDescriptor:
     """
-    Description of an LLM framework adapter.
+    Description of an LLM framework adapter (TEST-ONLY).
 
     Fields
     ------
@@ -43,7 +52,7 @@ class LLMFrameworkDescriptor:
     adapter_module:
         Dotted import path for the adapter module.
     adapter_class:
-        Name of the adapter class within adapter_module.
+        Name of the adapter class within adapter_module (bare class name).
 
     completion_method:
         Name of the *sync* completion method, or None if not supported.
@@ -96,11 +105,11 @@ class LLMFrameworkDescriptor:
 
     minimum_framework_version:
         Optional minimum framework version (string) this adapter/registry entry
-        has been validated against. Informational for now.
+        has been validated against.
 
     tested_up_to_version:
         Optional maximum framework version (string) this adapter/registry entry
-        is known to work with. Informational for now.
+        is known to work with.
     """
 
     name: str
@@ -155,16 +164,38 @@ class LLMFrameworkDescriptor:
 
         If availability_attr is set, this checks that boolean on the adapter
         module. Otherwise assumes the framework is available.
+
+        Results are cached per-descriptor name to avoid repeated imports in
+        large test suites.
         """
+        cache_key = self.name
+        if cache_key in _AVAILABILITY_CACHE:
+            return _AVAILABILITY_CACHE[cache_key]
+
         if not self.availability_attr:
+            _AVAILABILITY_CACHE[cache_key] = True
             return True
 
         try:
             module = importlib.import_module(self.adapter_module)
         except ImportError:
+            _AVAILABILITY_CACHE[cache_key] = False
             return False
 
-        return bool(getattr(module, self.availability_attr, False))
+        attr_value = getattr(module, self.availability_attr, None)
+        if attr_value is None:
+            warnings.warn(
+                f"{self.name}: availability_attr {self.availability_attr!r} not found on "
+                f"module {self.adapter_module!r}; treating framework as unavailable",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            available = False
+        else:
+            available = bool(attr_value)
+
+        _AVAILABILITY_CACHE[cache_key] = available
+        return available
 
     def version_range(self) -> Optional[str]:
         """
@@ -176,10 +207,10 @@ class LLMFrameworkDescriptor:
             return None
 
         if self.minimum_framework_version and self.tested_up_to_version:
-            return f">={self.minimum_framework_version}, <={self.tested_up_to_version}"
+            return f">={self.minimum_framework_version}, <= {self.tested_up_to_version}"
         if self.minimum_framework_version:
             return f">={self.minimum_framework_version}"
-        return f"<={self.tested_up_to_version}"
+        return f"<= {self.tested_up_to_version}"
 
     def validate(self) -> None:
         """
@@ -189,7 +220,7 @@ class LLMFrameworkDescriptor:
         ------
         ValueError
             If required fields like completion_method/async_completion_method
-            are missing.
+            are missing, or when version bounds are obviously inconsistent.
         """
         # At least one completion entrypoint must exist.
         if not (self.completion_method or self.async_completion_method):
@@ -300,6 +331,42 @@ class LLMFrameworkDescriptor:
                 RuntimeWarning,
                 stacklevel=2,
             )
+
+        # Version ordering validation (best-effort)
+        if self.minimum_framework_version and self.tested_up_to_version:
+            if Version is None:
+                # packaging not installed; we can't validate ordering robustly
+                warnings.warn(
+                    f"{self.name}: cannot validate version range ordering because "
+                    "'packaging' is not installed "
+                    f"(min={self.minimum_framework_version!r}, "
+                    f"max={self.tested_up_to_version!r})",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            else:
+                try:
+                    min_v = Version(self.minimum_framework_version)
+                    max_v = Version(self.tested_up_to_version)
+                except Exception:
+                    warnings.warn(
+                        f"{self.name}: could not parse version range "
+                        f"(min={self.minimum_framework_version!r}, "
+                        f"max={self.tested_up_to_version!r}) for ordering validation",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                else:
+                    if min_v > max_v:
+                        raise ValueError(
+                            f"{self.name}: minimum_framework_version "
+                            f"{self.minimum_framework_version!r} "
+                            f"is greater than tested_up_to_version "
+                            f"{self.tested_up_to_version!r}",
+                        )
+
+        # If only one bound is set, there's nothing to order-check; they remain
+        # informational for tests.
 
 
 # ---------------------------------------------------------------------------
@@ -502,12 +569,45 @@ def register_llm_framework_descriptor(
     overwrite:
         If False (default), attempting to overwrite an existing entry will
         raise KeyError. If True, an existing entry with the same name is
-        replaced.
+        replaced (with a warning).
     """
     if descriptor.name in LLM_FRAMEWORKS and not overwrite:
         raise KeyError(f"Framework {descriptor.name!r} is already registered")
 
+    if descriptor.name in LLM_FRAMEWORKS and overwrite:
+        warnings.warn(
+            f"Framework {descriptor.name!r} is being overwritten in the LLM registry",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
     LLM_FRAMEWORKS[descriptor.name] = descriptor
+    # Reset availability cache for this descriptor so future checks re-evaluate.
+    _AVAILABILITY_CACHE.pop(descriptor.name, None)
+
+
+def unregister_llm_framework_descriptor(
+    name: str,
+    ignore_missing: bool = True,
+) -> None:
+    """
+    Unregister an LLM framework descriptor dynamically (TEST-ONLY).
+
+    Useful for tests that temporarily override or replace registry entries.
+
+    Parameters
+    ----------
+    name:
+        Name of the framework to unregister.
+    ignore_missing:
+        If False, raise KeyError when the framework is not registered.
+        If True (default), missing entries are ignored.
+    """
+    if name in LLM_FRAMEWORKS:
+        del LLM_FRAMEWORKS[name]
+        _AVAILABILITY_CACHE.pop(name, None)
+    elif not ignore_missing:
+        raise KeyError(f"Framework {name!r} is not registered")
 
 
 __all__ = [
@@ -520,4 +620,5 @@ __all__ = [
     "iter_llm_framework_descriptors",
     "iter_available_llm_framework_descriptors",
     "register_llm_framework_descriptor",
+    "unregister_llm_framework_descriptor",
 ]
