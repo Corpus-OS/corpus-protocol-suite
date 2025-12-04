@@ -6,8 +6,10 @@ This module is TEST-ONLY. It provides lightweight metadata describing how to:
 - Import each LLM framework adapter
 - Construct its client
 - Call its sync / async completion & streaming methods
-- Pass framework-specific context or config
-- Know which extra semantics (token counting, health, capabilities) to expect
+- Pass framework-specific context
+- Handle streaming styles (dedicated methods vs `stream=True` kwarg)
+- Use framework-specific token counting where available
+- Know which extra semantics (health, capabilities) to expect
 
 Contract tests in tests/frameworks/llm/ use this registry to stay
 framework-agnostic. Adding a new LLM framework typically means:
@@ -15,12 +17,6 @@ framework-agnostic. Adding a new LLM framework typically means:
 1. Implement the adapter under corpus_sdk.llm.framework_adapters.*.
 2. Add a new LLMFrameworkDescriptor entry here (or register dynamically).
 3. Run the LLM contract tests.
-
-Version fields
---------------
-`minimum_framework_version` and `tested_up_to_version` are currently informational.
-In the future, tests may use them to conditionally skip or adjust expectations
-based on the installed framework version.
 """
 
 from __future__ import annotations
@@ -40,35 +36,69 @@ class LLMFrameworkDescriptor:
     ------
     name:
         Short, stable identifier (e.g. "autogen", "langchain").
+
     adapter_module:
         Dotted import path for the adapter module.
+
     adapter_class:
         Name of the adapter class within adapter_module.
 
     completion_method:
-        Name of the *sync* completion / generation method.
-        (For frameworks that only expose async APIs, leave this None.)
+        Name of the *sync* completion/generation method, or None if not supported.
+        Examples:
+            - "create"          (AutoGen-style)
+            - "complete"        (CrewAI-style)
+            - "_generate"       (LangChain internal)
+            - "chat"            (LlamaIndex)
+            - None              (Semantic Kernel is async-only)
+
     async_completion_method:
-        Name of the *async* completion / generation method, or None.
+        Name of the *async* completion/generation method, or None if not supported.
+        Examples:
+            - "acreate"
+            - "acomplete"
+            - "_agenerate"
+            - "achat"
+            - "get_chat_message_content"
 
     streaming_method:
-        Name of the *sync* streaming method, or None.
-        For frameworks that re-use completion_method with a streaming kwarg,
-        leave this as None and set streaming_kwarg instead.
+        Name of the *sync* streaming method, or None if streaming is either
+        async-only or done via a kwarg on completion_method.
+        Examples:
+            - "stream"
+            - "_stream"
+            - "stream_chat"
+
     async_streaming_method:
-        Name of the *async* streaming method, or None.
+        Name of the *async* streaming method, or None if not supported.
+        Examples:
+            - "astream"
+            - "_astream"
+            - "astream_chat"
+            - "get_streaming_chat_message_content"
 
     streaming_kwarg:
-        Name of the kwarg that toggles streaming on completion_method /
-        async_completion_method (e.g. "stream" for AutoGen), or None.
+        Name of a boolean kwarg used to request streaming on the completion
+        methods (sync/async), e.g. "stream" for AutoGen:
+            client.create(..., stream=True)
+            await client.acreate(..., stream=True)
+
+        For frameworks that have dedicated streaming methods (CrewAI, LangChain,
+        LlamaIndex, Semantic Kernel), this should be None.
 
     token_count_method:
-        Name of the token-counting method (sync), or None if not exposed.
+        Name of a sync method that can count tokens given framework-native
+        messages, or None if not supported. Examples:
+            - "count_tokens"
+            - "get_num_tokens_from_messages"
 
     context_kwarg:
-        Name of the kwargs parameter used for framework-specific context /
-        configuration (e.g. "conversation", "task", "config", "callback_manager",
-        "ctx"), or None if not applicable or positional.
+        Name of the keyword argument used to pass a framework-specific context
+        object into the adapter (if any). Examples:
+            - "config"          (LangChain config)
+            - "callback_manager" (LlamaIndex)
+            - None              (AutoGen/CrewAI/Semantic Kernel build context
+                                 from other fields or positional args)
 
     has_capabilities:
         True if the adapter exposes a capabilities()/acapabilities() surface.
@@ -77,23 +107,16 @@ class LLMFrameworkDescriptor:
         True if the adapter exposes a health()/ahealth() surface.
 
     supports_streaming:
-        True if the adapter is expected to support streaming (sync or async).
+        True if the adapter is expected to support streaming.
 
     supports_token_counting:
-        True if the adapter exposes a public token-counting helper.
+        True if the adapter is expected to support token counting via
+        token_count_method.
 
     availability_attr:
         Optional module-level boolean that indicates whether the underlying
         framework is actually installed, e.g. "LANGCHAIN_LLM_AVAILABLE".
         Tests can skip or adjust expectations when this is False.
-
-    minimum_framework_version:
-        Optional minimum framework version (string) this adapter/registry entry
-        has been validated against. Informational for now.
-
-    tested_up_to_version:
-        Optional maximum framework version (string) this adapter/registry entry
-        is known to work with. Informational for now.
     """
 
     name: str
@@ -101,7 +124,7 @@ class LLMFrameworkDescriptor:
     adapter_class: str
 
     completion_method: Optional[str]
-    async_completion_method: Optional[str] = None
+    async_completion_method: Optional[str]
 
     streaming_method: Optional[str] = None
     async_streaming_method: Optional[str] = None
@@ -109,6 +132,7 @@ class LLMFrameworkDescriptor:
     streaming_kwarg: Optional[str] = None
 
     token_count_method: Optional[str] = None
+
     context_kwarg: Optional[str] = None
 
     has_capabilities: bool = False
@@ -118,15 +142,13 @@ class LLMFrameworkDescriptor:
     supports_token_counting: bool = False
 
     availability_attr: Optional[str] = None
-    minimum_framework_version: Optional[str] = None
-    tested_up_to_version: Optional[str] = None
 
     def __post_init__(self) -> None:
         """
         Run basic consistency checks after dataclass initialization.
 
-        This will raise early for obviously invalid descriptors (e.g. missing
-        method names) and emit non-fatal warnings for softer issues.
+        This will raise early for obviously invalid descriptors and emit
+        non-fatal warnings for softer issues.
         """
         self.validate()
 
@@ -140,7 +162,8 @@ class LLMFrameworkDescriptor:
         Check if the underlying framework appears available for testing.
 
         If availability_attr is set, this checks that boolean on the adapter
-        module. Otherwise assumes the framework is available.
+        module. Otherwise assumes the framework is available (import errors
+        will still surface when tests try to import the module).
         """
         if not self.availability_attr:
             return True
@@ -152,21 +175,6 @@ class LLMFrameworkDescriptor:
 
         return bool(getattr(module, self.availability_attr, False))
 
-    def version_range(self) -> Optional[str]:
-        """
-        Return a human-readable version range string, if any.
-
-        Example: ">=0.1.0, <=0.3.5" or None if no constraints are set.
-        """
-        if not self.minimum_framework_version and not self.tested_up_to_version:
-            return None
-
-        if self.minimum_framework_version and self.tested_up_to_version:
-            return f">={self.minimum_framework_version}, <={self.tested_up_to_version}"
-        if self.minimum_framework_version:
-            return f">={self.minimum_framework_version}"
-        return f"<={self.tested_up_to_version}"
-
     def validate(self) -> None:
         """
         Perform basic consistency checks on this descriptor.
@@ -174,27 +182,58 @@ class LLMFrameworkDescriptor:
         Raises
         ------
         ValueError
-            If required fields like completion_method are missing.
+            If required fields like completion_method/async_completion_method
+            are missing.
         """
-        # Required completion method (unless this is explicitly async-only)
+        # Required: at least one completion entrypoint
         if not self.completion_method and not self.async_completion_method:
             raise ValueError(
                 f"{self.name}: at least one of completion_method or "
                 f"async_completion_method must be set",
             )
 
-        # Async streaming without any async completion or streaming kwarg
-        if self.async_streaming_method and not (
-            self.async_completion_method or self.streaming_kwarg
-        ):
+        # Async streaming usually pairs with async completion
+        if self.async_streaming_method and not self.async_completion_method:
             warnings.warn(
-                f"{self.name}: async_streaming_method is set but no "
-                f"async_completion_method or streaming_kwarg is declared",
+                f"{self.name}: async_streaming_method is set but "
+                f"async_completion_method is None (async streaming usually "
+                f"has an async completion counterpart)",
                 RuntimeWarning,
                 stacklevel=2,
             )
 
-        # Streaming flags vs method names (soft warnings)
+        # Sync streaming without sync completion is odd (but not illegal)
+        if self.streaming_method and not self.completion_method:
+            warnings.warn(
+                f"{self.name}: streaming_method is set but completion_method is None "
+                f"(streaming normally pairs with a sync completion method)",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+        # If the framework is async-capable, having only sync streaming is unusual
+        if (
+            self.streaming_method
+            and self.supports_async
+            and not self.async_streaming_method
+        ):
+            warnings.warn(
+                f"{self.name}: streaming_method is set but async_streaming_method is None "
+                f"(async-capable frameworks usually expose both sync and async streaming)",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+        # And the mirror case: async streaming without sync streaming
+        if self.async_streaming_method and not self.streaming_method:
+            warnings.warn(
+                f"{self.name}: async_streaming_method is set but streaming_method is None "
+                f"(sync + async streaming pairs are the common pattern)",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+        # Streaming flags vs method names / kwarg (soft warning)
         if self.supports_streaming and not (
             self.streaming_method
             or self.async_streaming_method
@@ -232,20 +271,19 @@ class LLMFrameworkDescriptor:
 
 LLM_FRAMEWORKS: Dict[str, LLMFrameworkDescriptor] = {
     # ------------------------------------------------------------------ #
-    # AutoGen LLM
+    # AutoGen
     # ------------------------------------------------------------------ #
     "autogen": LLMFrameworkDescriptor(
         name="autogen",
         adapter_module="corpus_sdk.llm.framework_adapters.autogen",
         adapter_class="CorpusAutoGenChatClient",
-        # OpenAI-style create/acreate with stream=True for streaming.
         completion_method="create",
         async_completion_method="acreate",
         streaming_method=None,
         async_streaming_method=None,
-        streaming_kwarg="stream",
-        token_count_method=None,  # token counting is via underlying adapter, not exposed here
-        context_kwarg="conversation",  # primary framework-specific context kwarg
+        streaming_kwarg="stream",  # client.create(..., stream=True)
+        token_count_method=None,   # no explicit count_tokens API on this wrapper
+        context_kwarg="conversation",
         has_capabilities=False,
         has_health=False,
         supports_streaming=True,
@@ -254,7 +292,7 @@ LLM_FRAMEWORKS: Dict[str, LLMFrameworkDescriptor] = {
     ),
 
     # ------------------------------------------------------------------ #
-    # CrewAI LLM
+    # CrewAI
     # ------------------------------------------------------------------ #
     "crewai": LLMFrameworkDescriptor(
         name="crewai",
@@ -265,25 +303,22 @@ LLM_FRAMEWORKS: Dict[str, LLMFrameworkDescriptor] = {
         streaming_method="stream",
         async_streaming_method="astream",
         streaming_kwarg=None,
-        token_count_method=None,
-        # Primary OperationContext override kwarg; other CrewAI-specific
-        # context (agent_role, crew_id, etc.) is passed via kwargs as well.
-        context_kwarg="ctx",
+        token_count_method="count_tokens",
+        context_kwarg=None,  # ctx + CrewAI fields are in **kwargs, not a single object
         has_capabilities=False,
         has_health=False,
         supports_streaming=True,
-        supports_token_counting=False,
+        supports_token_counting=True,
         availability_attr=None,
     ),
 
     # ------------------------------------------------------------------ #
-    # LangChain LLM
+    # LangChain
     # ------------------------------------------------------------------ #
     "langchain": LLMFrameworkDescriptor(
         name="langchain",
         adapter_module="corpus_sdk.llm.framework_adapters.langchain",
         adapter_class="CorpusLangChainLLM",
-        # LangChain calls these internally; tests may call them directly.
         completion_method="_generate",
         async_completion_method="_agenerate",
         streaming_method="_stream",
@@ -295,13 +330,11 @@ LLM_FRAMEWORKS: Dict[str, LLMFrameworkDescriptor] = {
         has_health=False,
         supports_streaming=True,
         supports_token_counting=True,
-        availability_attr="LANGCHAIN_LLM_AVAILABLE"
-        if hasattr(importlib, "import_module")
-        else None,  # can be wired up in the adapter module, if present
+        availability_attr=None,  # no LANGCHAIN_LLM_AVAILABLE flag defined (yet)
     ),
 
     # ------------------------------------------------------------------ #
-    # LlamaIndex LLM
+    # LlamaIndex
     # ------------------------------------------------------------------ #
     "llamaindex": LLMFrameworkDescriptor(
         name="llamaindex",
@@ -322,20 +355,19 @@ LLM_FRAMEWORKS: Dict[str, LLMFrameworkDescriptor] = {
     ),
 
     # ------------------------------------------------------------------ #
-    # Semantic Kernel LLM
+    # Semantic Kernel
     # ------------------------------------------------------------------ #
     "semantic_kernel": LLMFrameworkDescriptor(
         name="semantic_kernel",
         adapter_module="corpus_sdk.llm.framework_adapters.semantic_kernel",
         adapter_class="CorpusSemanticKernelChatCompletion",
-        # Semantic Kernel adapter is async-only for completions.
-        completion_method=None,
+        completion_method=None,  # async-only surface
         async_completion_method="get_chat_message_content",
         streaming_method=None,
         async_streaming_method="get_streaming_chat_message_content",
         streaming_kwarg=None,
         token_count_method="count_tokens",
-        context_kwarg=None,  # context is derived from PromptExecutionSettings
+        context_kwarg=None,  # settings is positional, not kwarg-named context
         has_capabilities=False,
         has_health=False,
         supports_streaming=True,
@@ -369,12 +401,12 @@ def get_llm_framework_descriptor_safe(
 
 def has_llm_framework(name: str) -> bool:
     """
-    Return True if an LLM framework with the given name is registered.
+    Return True if a framework with the given name is registered.
     """
     return name in LLM_FRAMEWORKS
 
 
-# Backwards-compatible alias, if anything still uses the old generic name.
+# Backwards-compatible alias, if anything still uses the old name.
 def has_framework(name: str) -> bool:
     return has_llm_framework(name)
 
@@ -388,7 +420,7 @@ def iter_llm_framework_descriptors() -> Iterable[LLMFrameworkDescriptor]:
 
 def iter_available_llm_framework_descriptors() -> Iterable[LLMFrameworkDescriptor]:
     """
-    Iterate over descriptors for LLM frameworks that appear available.
+    Iterate over descriptors for frameworks that appear available.
 
     This is useful for tests that should only run when the underlying
     framework (LangChain, LlamaIndex, Semantic Kernel, etc.) is installed.
@@ -432,4 +464,3 @@ __all__ = [
     "iter_available_llm_framework_descriptors",
     "register_llm_framework_descriptor",
 ]
-
