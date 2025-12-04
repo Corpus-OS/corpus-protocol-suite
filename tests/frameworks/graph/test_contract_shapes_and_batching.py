@@ -70,19 +70,19 @@ def framework_descriptor_fixture(
 @pytest.fixture
 def graph_client_instance(
     framework_descriptor: GraphFrameworkDescriptor,
-    graph_adapter: Any,
+    adapter: Any,
 ) -> Any:
     """
     Construct a concrete graph client instance for the given descriptor.
 
     Mirrors the construction pattern used in the interface-conformance tests:
-    each framework adapter is expected to take a `graph_adapter` kwarg that
+    each framework adapter is expected to take a `adapter` kwarg that
     wraps a Corpus GraphProtocolV1 implementation.
     """
     module = importlib.import_module(framework_descriptor.adapter_module)
     client_cls = getattr(module, framework_descriptor.adapter_class)
 
-    init_kwargs: dict[str, Any] = {"graph_adapter": graph_adapter}
+    init_kwargs: dict[str, Any] = {"adapter": adapter}
     instance = client_cls(**init_kwargs)
     return instance
 
