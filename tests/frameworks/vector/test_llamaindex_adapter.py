@@ -3,34 +3,25 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import Any, Dict
-
+from typing import Any, Dict, List, Optional, Set
 import inspect
 import pytest
+from unittest.mock import Mock, AsyncMock, patch, call
 
 import corpus_sdk.vector.framework_adapters.llamaindex as llamaindex_adapter_module
 from corpus_sdk.vector.framework_adapters.llamaindex import (
     CorpusLlamaIndexVectorStore,
+    with_error_context,
+    with_async_error_context,
 )
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Test Fixtures and Helpers
 # ---------------------------------------------------------------------------
 
-
 class DummyVectorStoreQuery:
-    """
-    Minimal stand-in for llama_index.core.vector_stores.types.VectorStoreQuery.
-
-    The adapter only relies on these attributes:
-    - query_embedding
-    - similarity_top_k
-    - filters
-    - doc_ids
-    - node_ids
-    """
-
+    """Minimal stand-in for llama_index.core.vector_stores.types.VectorStoreQuery."""
     def __init__(
         self,
         query_embedding: Sequence[float] | None = None,
@@ -46,799 +37,934 @@ class DummyVectorStoreQuery:
         self.node_ids = list(node_ids) if node_ids is not None else None
 
 
-def _make_store(adapter: Any, **kwargs: Any) -> CorpusLlamaIndexVectorStore:
-    """
-    Construct a CorpusLlamaIndexVectorStore instance from the generic adapter.
-    """
+class DummyMetadataFilter:
+    """Minimal stand-in for llama_index.core.vector_stores.types.MetadataFilter."""
+    def __init__(
+        self,
+        key: str,
+        value: Any,
+        operator: str = "==",
+    ) -> None:
+        self.key = key
+        self.value = value
+        self.operator = operator
+
+
+class DummyMetadataFilters:
+    """Minimal stand-in for llama_index.core.vector_stores.types.MetadataFilters."""
+    def __init__(
+        self,
+        filters: list[DummyMetadataFilter] | None = None,
+        condition: str = "AND",
+    ) -> None:
+        self.filters = filters or []
+        self.condition = condition
+
+
+def _make_store(adapter: Any = None, **kwargs: Any) -> CorpusLlamaIndexVectorStore:
+    """Construct a CorpusLlamaIndexVectorStore instance."""
+    if adapter is None:
+        adapter = Mock()
+        adapter.capabilities = Mock(return_value=_make_dummy_caps())
     return CorpusLlamaIndexVectorStore(corpus_adapter=adapter, **kwargs)
 
 
-def _make_fake_node(
-    node_id: str = "n-1",
-    ref_doc_id: str = "doc-1",
-    embedding: Sequence[float] | None = None,
-    text: str = "node-text",
-    metadata: dict[str, Any] | None = None,
-) -> Any:
-    """
-    Minimal BaseNode-like object for add()/aadd() tests.
-    """
+def _make_dummy_caps(**overrides: Any) -> Any:
+    """Create dummy VectorCapabilities."""
+    caps = Mock()
+    caps.max_top_k = 1000
+    caps.supports_metadata_filtering = True
+    caps.supports_namespaces = True
+    caps.max_batch_size = 1000
+    for key, value in overrides.items():
+        setattr(caps, key, value)
+    return caps
 
-    class FakeNode:
-        def __init__(self) -> None:
-            self.node_id = node_id
-            self.ref_doc_id = ref_doc_id
-            self._embedding = list(embedding or [0.1, 0.2, 0.3])
-            self._text = text
-            self.metadata = dict(metadata or {})
 
-        def get_embedding(self) -> Sequence[float]:
-            return self._embedding
-
-        def get_content(self, metadata_mode: Any | None = None) -> str:  # noqa: ARG002
-            return self._text
-
-    return FakeNode()
+def _make_dummy_node(node_id: str = "test-node", ref_doc_id: Optional[str] = "doc-123") -> Any:
+    """Create a dummy LlamaIndex node."""
+    node = Mock()
+    node.node_id = node_id
+    node.ref_doc_id = ref_doc_id
+    node.get_embedding = Mock(return_value=[0.1, 0.2, 0.3])
+    node.get_content = Mock(return_value="Test content")
+    node.metadata = {"topic": "science"}
+    return node
 
 
 # ---------------------------------------------------------------------------
-# 1. Translator wiring / default construction
+# Test Suite: 40 Comprehensive Tests
 # ---------------------------------------------------------------------------
 
-
-def test_default_translator_constructed_with_llamaindex_framework(adapter: Any) -> None:
-    """
-    CorpusLlamaIndexVectorStore should construct a VectorTranslator with
-    framework='llamaindex' and the given corpus adapter.
-    """
-    captured: Dict[str, Any] = {}
-
-    # Patch VectorTranslator.__init__ inside the adapter module.
-    VectorTranslator = llamaindex_adapter_module.VectorTranslator  # type: ignore[attr-defined]
-
-    def fake_init(self, adapter: Any, framework: str, translator: Any) -> None:  # noqa: D401, ANN001
-        captured["adapter"] = adapter
-        captured["framework"] = framework
-        captured["translator"] = translator
-        # No need to call the real __init__ for this test.
-
-    orig_init = VectorTranslator.__init__
-    try:
-        VectorTranslator.__init__ = fake_init  # type: ignore[assignment]
-        store = _make_store(adapter)
-        _ = store._translator  # noqa: SLF001 - trigger cached_property
-    finally:
-        VectorTranslator.__init__ = orig_init  # type: ignore[assignment]
-
-    assert captured["adapter"] is adapter
-    assert captured["framework"] == "llamaindex"
-    # Translator should be some framework translator instance
-    assert captured["translator"] is not None
-
-
-# ---------------------------------------------------------------------------
-# 2. Context building & framework_ctx wiring
-# ---------------------------------------------------------------------------
-
-
-def test_build_ctx_uses_dict_via_ctx_from_dict(monkeypatch: pytest.MonkeyPatch, adapter: Any) -> None:
-    """
-    When ctx is a dict, _build_ctx should call ctx_from_dict and use its return
-    value as the OperationContext.
-    """
-    captured: Dict[str, Any] = {}
-
-    class DummyOperationContext:
-        def __init__(self, **kwargs: Any) -> None:
-            self.attrs = kwargs
-
-    monkeypatch.setattr(
-        llamaindex_adapter_module,
-        "OperationContext",
-        DummyOperationContext,
+# 1. Framework-specific metadata field handling
+def test_llamaindex_reserved_metadata_fields_are_unique_and_configurable():
+    """Test that reserved metadata fields are configurable and unique."""
+    store = _make_store()
+    reserved_fields = {
+        store.id_field,
+        store.text_field,
+        store.node_id_field,
+        store.ref_doc_id_field,
+    }
+    assert len(reserved_fields) == 4, "Reserved metadata fields must be unique"
+    
+    store_custom = _make_store(
+        id_field="doc_id",
+        text_field="content",
+        node_id_field="llama_node_id",
+        ref_doc_id_field="ref_doc",
     )
-
-    def fake_ctx_from_dict(d: Mapping[str, Any]) -> DummyOperationContext:
-        captured["from_dict"] = dict(d)
-        return DummyOperationContext(source="from_dict")
-
-    monkeypatch.setattr(
-        llamaindex_adapter_module,
-        "ctx_from_dict",
-        fake_ctx_from_dict,
-    )
-
-    store = _make_store(adapter)
-
-    # Use private helper directly to avoid translator side-effects.
-    ctx = store._build_ctx(ctx={"request_id": "req-1"})  # noqa: SLF001
-    assert isinstance(ctx, DummyOperationContext)
-    assert captured["from_dict"] == {"request_id": "req-1"}
-
-
-def test_build_ctx_uses_callback_manager_when_no_ctx(monkeypatch: pytest.MonkeyPatch, adapter: Any) -> None:
-    """
-    When ctx is not provided but callback_manager is, _build_ctx should call
-    ctx_from_llamaindex.
-    """
-    captured: Dict[str, Any] = {}
-
-    class DummyOperationContext:
-        def __init__(self, **kwargs: Any) -> None:
-            self.attrs = kwargs
-
-    monkeypatch.setattr(
-        llamaindex_adapter_module,
-        "OperationContext",
-        DummyOperationContext,
-    )
-
-    def fake_ctx_from_llamaindex(callback_manager: Any) -> DummyOperationContext:
-        captured["callback_manager"] = callback_manager
-        return DummyOperationContext(source="from_llamaindex")
-
-    monkeypatch.setattr(
-        llamaindex_adapter_module,
-        "ctx_from_llamaindex",
-        fake_ctx_from_llamaindex,
-    )
-
-    store = _make_store(adapter)
-
-    cb_manager = object()
-    ctx = store._build_ctx(callback_manager=cb_manager)  # noqa: SLF001
-    assert isinstance(ctx, DummyOperationContext)
-    assert captured["callback_manager"] is cb_manager
-
-
-def test_framework_ctx_for_namespace_uses_normalize_and_attach(monkeypatch: pytest.MonkeyPatch, adapter: Any) -> None:
-    """
-    _framework_ctx_for_namespace should normalize vector context and then
-    attach it to framework_ctx via attach_vector_context_to_framework_ctx.
-    """
-    captured: Dict[str, Any] = {}
-
-    def fake_normalize_vector_context(raw_ctx: Mapping[str, Any], framework: str, logger: Any) -> Dict[str, Any]:  # noqa: ARG001
-        captured["raw_ctx"] = dict(raw_ctx)
-        captured["framework"] = framework
-        # Inject an extra flag into the normalized context.
-        return {"normalized": True, **raw_ctx}
-
-    def fake_attach_vector_context_to_framework_ctx(
-        framework_ctx: Dict[str, Any],
-        *,
-        vector_context: Mapping[str, Any],
-        limits: Any,  # noqa: ARG001
-        flags: Any,  # noqa: ARG001
-    ) -> None:
-        framework_ctx.update(vector_context)
-        captured["framework_ctx_after_attach"] = dict(framework_ctx)
-
-    monkeypatch.setattr(
-        llamaindex_adapter_module,
-        "normalize_vector_context",
-        fake_normalize_vector_context,
-    )
-    monkeypatch.setattr(
-        llamaindex_adapter_module,
-        "attach_vector_context_to_framework_ctx",
-        fake_attach_vector_context_to_framework_ctx,
-    )
-
-    store = _make_store(adapter, namespace="default-ns")
-
-    fw_ctx = store._framework_ctx_for_namespace("explicit-ns")  # noqa: SLF001
-
-    assert captured["framework"] == "llamaindex"
-    assert captured["raw_ctx"] == {"namespace": "explicit-ns"}
-    assert fw_ctx["normalized"] is True
-    assert fw_ctx["namespace"] == "explicit-ns"
-
-
-# ---------------------------------------------------------------------------
-# 3. Capabilities validation (top_k, filters)
-# ---------------------------------------------------------------------------
-
-
-def test_sync_query_top_k_exceeds_caps_raises_badrequest_with_context(
-    monkeypatch: pytest.MonkeyPatch,
-    adapter: Any,
-) -> None:
-    """
-    If top_k exceeds caps.max_top_k, query() should raise BadRequest and call
-    attach_context with useful metadata.
-    """
-    captured_ctx: Dict[str, Any] = {}
-
-    class DummyTranslator:
-        def capabilities(self) -> Any:
-            class Caps:
-                max_top_k = 10
-                supports_metadata_filtering = True
-
-            return Caps()
-
-    def fake_attach_context(exc: BaseException, **ctx: Any) -> None:
-        captured_ctx.update(ctx)
-
-    monkeypatch.setattr(
-        llamaindex_adapter_module,
-        "attach_context",
-        fake_attach_context,
-    )
-
-    store = _make_store(adapter)
-    # Override translator instance.
-    store._translator = DummyTranslator()  # type: ignore[assignment, attr-defined]  # noqa: SLF001
-
-    query = DummyVectorStoreQuery(
-        query_embedding=[0.1, 0.2, 0.3],
-        similarity_top_k=100,  # exceeds max_top_k
-    )
-
-    with pytest.raises(Exception) as exc_info:
-        store.query(query)
-
-    err = exc_info.value
-    # Don't assert exact type, but it should look like a BadRequest-style error.
-    assert "BAD_TOP_K" in getattr(err, "code", "") or "top_k" in str(err).lower()
-
-    assert captured_ctx.get("framework") == "llamaindex"
-    assert captured_ctx.get("operation") == "query_sync"
-    assert captured_ctx.get("top_k") == 100
-
-
-def test_sync_query_metadata_filter_not_supported_raises_notsupported(
-    monkeypatch: pytest.MonkeyPatch,
-    adapter: Any,
-) -> None:
-    """
-    If metadata filters are provided but capabilities say filtering is not
-    supported, query() should raise NotSupported and attach context.
-    """
-    captured_ctx: Dict[str, Any] = {}
-
-    class DummyTranslator:
-        def capabilities(self) -> Any:
-            class Caps:
-                max_top_k = None
-                supports_metadata_filtering = False
-
-            return Caps()
-
-    def fake_attach_context(exc: BaseException, **ctx: Any) -> None:
-        captured_ctx.update(ctx)
-
-    monkeypatch.setattr(
-        llamaindex_adapter_module,
-        "attach_context",
-        fake_attach_context,
-    )
-
-    store = _make_store(adapter)
-    store._translator = DummyTranslator()  # type: ignore[assignment, attr-defined]  # noqa: SLF001
-
-    # Minimal filter object with .filters list and .condition.
-    class DummyFilters:
-        def __init__(self) -> None:
-            self.filters = []
-            self.condition = None
-
-    q = DummyVectorStoreQuery(
-        query_embedding=[0.1, 0.2],
-        similarity_top_k=4,
-        filters=DummyFilters(),
-    )
-
-    with pytest.raises(Exception) as exc_info:
-        store.query(q, namespace="ns-filters")
-
-    err = exc_info.value
-    assert "FILTER_NOT_SUPPORTED" in getattr(err, "code", "") or "filter" in str(err).lower()
-
-    assert captured_ctx.get("framework") == "llamaindex"
-    assert captured_ctx.get("operation") == "query_sync"
-    assert captured_ctx.get("namespace") == "ns-filters"
-
-
-# ---------------------------------------------------------------------------
-# 4. Delete validation (ids / filters)
-# ---------------------------------------------------------------------------
-
-
-def test_delete_by_ref_doc_id_respects_filter_capabilities(
-    monkeypatch: pytest.MonkeyPatch,
-    adapter: Any,
-) -> None:
-    """
-    delete(ref_doc_id=...) internally uses a metadata filter; if the backend
-    does not support metadata filtering, it should raise NotSupported and
-    attach context.
-    """
-    captured_ctx: Dict[str, Any] = {}
-
-    class DummyTranslator:
-        def capabilities(self) -> Any:
-            class Caps:
-                max_top_k = None
-                supports_metadata_filtering = False
-
-            return Caps()
-
-        def delete(self, *args: Any, **kwargs: Any) -> Any:  # noqa: ARG002
-            pytest.fail("translator.delete should not be called when validation fails")
-
-    def fake_attach_context(exc: BaseException, **ctx: Any) -> None:
-        captured_ctx.update(ctx)
-
-    monkeypatch.setattr(
-        llamaindex_adapter_module,
-        "attach_context",
-        fake_attach_context,
-    )
-
-    store = _make_store(adapter)
-    store._translator = DummyTranslator()  # type: ignore[assignment, attr-defined]  # noqa: SLF001
-
-    with pytest.raises(Exception) as exc_info:
-        store.delete("doc-xyz", namespace="del-ns")
-
-    err = exc_info.value
-    assert "FILTER_NOT_SUPPORTED" in getattr(err, "code", "") or "filter" in str(err).lower()
-
-    assert captured_ctx.get("framework") == "llamaindex"
-    assert captured_ctx.get("operation") == "delete_sync"
-    assert captured_ctx.get("namespace") == "del-ns"
-
-
-def test_delete_nodes_empty_noop(adapter: Any) -> None:
-    """
-    delete_nodes([]) should be a no-op and must not raise.
-    """
-    store = _make_store(adapter)
-    store.delete_nodes([])  # Should not raise.
-
-
-# ---------------------------------------------------------------------------
-# 5. Upsert / add behavior
-# ---------------------------------------------------------------------------
-
-
-def test_add_builds_vectors_and_calls_translator(monkeypatch: pytest.MonkeyPatch, adapter: Any) -> None:
-    """
-    add() should:
-
-    - Translate nodes into Vector objects via _nodes_to_corpus_vectors,
-    - Build an upsert request mapping with namespace and vectors,
-    - Call translator.upsert with op_ctx/framework_ctx, and
-    - Return node IDs as strings.
-    """
-    captured: Dict[str, Any] = {}
-
-    class DummyTranslator:
-        def upsert(self, raw_request: Mapping[str, Any], *, op_ctx: Any, framework_ctx: Mapping[str, Any]) -> Any:  # noqa: D401, ARG001
-            captured["raw_request"] = dict(raw_request)
-            captured["op_ctx"] = op_ctx
-            captured["framework_ctx"] = dict(framework_ctx)
-            # Return something that is not an UpsertResult so _handle_partial_upsert_failure is skipped.
-            return object()
-
-    store = _make_store(adapter, namespace="default-ns")
-    store._translator = DummyTranslator()  # type: ignore[assignment, attr-defined]  # noqa: SLF001
-
-    node1 = _make_fake_node(node_id="n1", text="t1")
-    node2 = _make_fake_node(node_id="n2", text="t2")
-    ids = store.add([node1, node2], namespace="add-ns")
-
-    assert ids == ["n1", "n2"]
-
-    raw = captured["raw_request"]
-    assert raw["namespace"] == "add-ns"
-    assert isinstance(raw["vectors"], list)
-    assert len(raw["vectors"]) == 2
-
-    fw_ctx = captured["framework_ctx"]
-    assert fw_ctx.get("framework") == "llamaindex"
-    assert fw_ctx.get("namespace") == "add-ns"
-
-
-def test_add_raises_badrequest_when_node_missing_embedding(adapter: Any) -> None:
-    """
-    If a node has no embedding, add() should raise a BadRequest-like error
-    with code NO_EMBEDDING.
-    """
-
-    class NodeWithoutEmbedding:
-        def __init__(self) -> None:
-            self.node_id = "missing-emb"
-
-        def get_content(self, metadata_mode: Any | None = None) -> str:  # noqa: ARG002
-            return "text"
-
-    store = _make_store(adapter)
-
-    with pytest.raises(Exception) as exc_info:
-        store.add([NodeWithoutEmbedding()])
-
-    err = exc_info.value
-    assert "NO_EMBEDDING" in getattr(err, "code", "") or "embedding" in str(err).lower()
-
-
-def test_handle_partial_upsert_failure_raises_vectoradaptererror() -> None:
-    """
-    _handle_partial_upsert_failure should raise VectorAdapterError when all
-    nodes fail to upsert.
-    """
-    store = _make_store(adapter=object())  # adapter not used here
-
-    class DummyResult:
-        def __init__(self) -> None:
-            self.upserted_count = 0
-            self.failed_count = 3
-            self.failures = [{"id": "n1"}, {"id": "n2"}, {"id": "n3"}]
-
-    result = DummyResult()
-
-    with pytest.raises(Exception) as exc_info:
-        store._handle_partial_upsert_failure(result, total_nodes=3, namespace="ns")  # noqa: SLF001
-
-    err = exc_info.value
-    assert "BATCH_UPSERT_FAILED" in getattr(err, "code", "") or "upsert" in str(err).lower()
-
-
-# ---------------------------------------------------------------------------
-# 6. Query / stream / MMR wiring + error context
-# ---------------------------------------------------------------------------
-
-
-def test_sync_query_basic_smoke_uses_translator(monkeypatch: pytest.MonkeyPatch, adapter: Any) -> None:
-    """
-    Basic smoke test that query() calls translator.query with a raw request and
-    returns a VectorStoreQueryResult-like object via a stubbed validator.
-    """
-    captured: Dict[str, Any] = {}
-
-    class DummyTranslator:
-        def capabilities(self) -> Any:
-            class Caps:
-                max_top_k = None
-                supports_metadata_filtering = True
-
-            return Caps()
-
-        def query(self, raw_request: Mapping[str, Any], *, op_ctx: Any, framework_ctx: Mapping[str, Any]) -> Any:  # noqa: D401, ARG001
-            captured["raw_request"] = dict(raw_request)
-            captured["op_ctx"] = op_ctx
-            captured["framework_ctx"] = dict(framework_ctx)
-
-            class DummyResult:
-                def __init__(self) -> None:
-                    self.matches = []
-
-            return DummyResult()
-
-    def fake_validate(self, result: Any, *, operation: str) -> Any:  # noqa: D401, ARG002
-        # Return the result unchanged so query() can proceed.
-        return result
-
-    monkeypatch.setattr(
-        CorpusLlamaIndexVectorStore,
-        "_validate_query_result_type",
-        fake_validate,
-    )
-
-    store = _make_store(adapter, namespace="store-ns")
-    store._translator = DummyTranslator()  # type: ignore[assignment, attr-defined]  # noqa: SLF001
-
-    q = DummyVectorStoreQuery(query_embedding=[0.1, 0.2, 0.3], similarity_top_k=4)
-    result = store.query(q, namespace="q-ns")
-
-    # We don't assert exact type, but it should have basic VectorStoreQueryResult attrs.
-    assert hasattr(result, "nodes")
-    assert hasattr(result, "similarities")
-    assert hasattr(result, "ids")
-
-    raw = captured["raw_request"]
-    assert raw["namespace"] == "q-ns"
-    assert raw["top_k"] == 4
-    assert raw["include_metadata"] is True
-    assert raw["include_vectors"] is False
-
-
-def test_query_stream_invalid_chunk_type_raises_vectoradaptererror_with_context(
-    monkeypatch: pytest.MonkeyPatch,
-    adapter: Any,
-) -> None:
-    """
-    If translator.query_stream yields a non-QueryChunk object, query_stream()
-    should raise a VectorAdapterError and attach context via attach_context.
-    """
-    captured_ctx: Dict[str, Any] = {}
-
-    class BadChunkTranslator:
-        def capabilities(self) -> Any:
-            class Caps:
-                max_top_k = None
-                supports_metadata_filtering = True
-
-            return Caps()
-
-        def query_stream(self, raw_request: Mapping[str, Any], *, op_ctx: Any, framework_ctx: Mapping[str, Any]):  # noqa: D401, ARG001
-            # Emit a blatantly wrong type as the first "chunk".
-            yield "not-a-query-chunk"
-
-    def fake_attach_context(exc: BaseException, **ctx: Any) -> None:
-        captured_ctx.update(ctx)
-
-    # We don't need validator for stream chunks here; the adapter itself
-    # does the isinstance(QueryChunk) check.
-    monkeypatch.setattr(
-        llamaindex_adapter_module,
-        "attach_context",
-        fake_attach_context,
-    )
-
-    store = _make_store(adapter, namespace="stream-ns")
-    store._translator = BadChunkTranslator()  # type: ignore[assignment, attr-defined]  # noqa: SLF001
-
-    q = DummyVectorStoreQuery(query_embedding=[0.1, 0.2], similarity_top_k=2)
-
-    with pytest.raises(Exception) as exc_info:
-        for _ in store.query_stream(q, namespace="stream-ns"):  # consume one chunk
-            break
-
-    err = exc_info.value
-    assert "BAD_STREAM_CHUNK" in getattr(err, "code", "") or "chunk" in str(err).lower()
-
-    assert captured_ctx.get("framework") == "llamaindex"
-    assert captured_ctx.get("operation") == "query_stream"
-    assert captured_ctx.get("namespace") == "stream-ns"
-
-
-def test_query_mmr_rejects_invalid_lambda_and_attaches_context(
-    monkeypatch: pytest.MonkeyPatch,
-    adapter: Any,
-) -> None:
-    """
-    query_mmr() should validate lambda_mult in [0, 1] and attach context when
-    invalid.
-    """
-    captured_ctx: Dict[str, Any] = {}
-
-    def fake_attach_context(exc: BaseException, **ctx: Any) -> None:
-        captured_ctx.update(ctx)
-
-    monkeypatch.setattr(
-        llamaindex_adapter_module,
-        "attach_context",
-        fake_attach_context,
-    )
-
-    store = _make_store(adapter)
-
-    q = DummyVectorStoreQuery(query_embedding=[0.1, 0.2, 0.3], similarity_top_k=4)
-
-    with pytest.raises(Exception) as exc_info:
-        store.query_mmr(q, lambda_mult=2.0)  # invalid
-
-    err = exc_info.value
-    assert "BAD_MMR_LAMBDA" in getattr(err, "code", "") or "lambda" in str(err).lower()
-
-    assert captured_ctx.get("framework") == "llamaindex"
-    assert captured_ctx.get("operation") == "query_mmr_sync"
-    assert captured_ctx.get("lambda_mult") == 2.0
-
-
-# ---------------------------------------------------------------------------
-# 7. Score threshold behavior
-# ---------------------------------------------------------------------------
-
-
-def test_score_threshold_filters_matches_after_query_validation(
-    monkeypatch: pytest.MonkeyPatch,
-    adapter: Any,
-) -> None:
-    """
-    When score_threshold is set, results below the threshold should be filtered
-    out after translator.query returns.
-    """
-    class DummyMatch:
-        def __init__(self, score: float) -> None:
-            self.score = score
-
-            class DummyVector:
-                def __init__(self) -> None:
-                    self.metadata = {}
-                    self.id = "id"
-
-                vector = []
-
-            self.vector = DummyVector()
-
-    class DummyResult:
-        def __init__(self) -> None:
-            self.matches = [DummyMatch(0.2), DummyMatch(0.5), DummyMatch(0.9)]
-
-    class DummyTranslator:
-        def capabilities(self) -> Any:
-            class Caps:
-                max_top_k = None
-                supports_metadata_filtering = True
-
-            return Caps()
-
-        def query(self, raw_request: Mapping[str, Any], *, op_ctx: Any, framework_ctx: Mapping[str, Any]) -> Any:  # noqa: D401, ARG001
-            return DummyResult()
-
-    def fake_validate(self, result: Any, *, operation: str) -> Any:  # noqa: D401, ARG002
-        return result
-
-    monkeypatch.setattr(
-        CorpusLlamaIndexVectorStore,
-        "_validate_query_result_type",
-        fake_validate,
-    )
-
-    # Only keep scores >= 0.6
-    store = _make_store(adapter, score_threshold=0.6)
-    store._translator = DummyTranslator()  # type: ignore[assignment, attr-defined]  # noqa: SLF001
-
-    q = DummyVectorStoreQuery(query_embedding=[0.1, 0.2, 0.3], similarity_top_k=10)
-    result = store.query(q)
-
-    # Only the 0.9 match should survive; Node reconstruction is stubbed via TextNode fallback,
-    # but we only care about similarities length here.
-    assert len(result.similarities) == 1
-
-
-# ---------------------------------------------------------------------------
-# 8. Node ↔ Vector translation
-# ---------------------------------------------------------------------------
-
-
-def test_nodes_to_corpus_vectors_populates_reserved_metadata(
-    monkeypatch: pytest.MonkeyPatch,
-    adapter: Any,
-) -> None:
-    """
-    _nodes_to_corpus_vectors should:
-
-    - Call node_to_metadata_dict,
-    - Populate node_id_field/ref_doc_id_field/text_field/id_field,
-    - Use effective namespace.
-    """
-    captured: Dict[str, Any] = {}
-
-    def fake_node_to_metadata_dict(node: Any, remove_text: bool, mode: Any) -> Dict[str, Any]:  # noqa: ARG002
-        captured["node"] = node
-        return {"custom": "value"}
-
-    monkeypatch.setattr(
-        llamaindex_adapter_module,
-        "node_to_metadata_dict",
-        fake_node_to_metadata_dict,
-    )
-
-    store = _make_store(
-        adapter,
-        namespace="store-ns",
-        id_field="id",
-        text_field="text",
-        node_id_field="node_id",
-        ref_doc_id_field="ref_doc_id",
-    )
-
-    node = _make_fake_node(node_id="node-123", ref_doc_id="doc-abc", text="hello")
-    vectors = store._nodes_to_corpus_vectors([node], namespace="ns-override")  # noqa: SLF001
-
+    assert store_custom.id_field == "doc_id"
+    assert store_custom.text_field == "content"
+    assert store_custom.node_id_field == "llama_node_id"
+    assert store_custom.ref_doc_id_field == "ref_doc"
+
+
+def test_vector_store_info_includes_llamaindex_metadata_fields():
+    """Test that VectorStoreInfo includes LlamaIndex-specific metadata fields."""
+    store = _make_store()
+    info = store.vector_store_info
+    
+    assert info.name == "corpus"
+    assert "Corpus VectorProtocol" in info.description
+    
+    field_names = {mi.name for mi in info.metadata_info}
+    assert store.node_id_field in field_names
+    assert store.ref_doc_id_field in field_names
+
+
+def test_reserved_fields_conflict_validation():
+    """Test validation fails when reserved fields are not unique."""
+    with pytest.raises(ValueError) as excinfo:
+        _make_store(
+            id_field="same",
+            text_field="same",
+            node_id_field="node_id",
+            ref_doc_id_field="ref_doc_id",
+        )
+    assert "must be unique" in str(excinfo.value)
+
+
+# 2. Node translation and reconstruction
+def test_node_translation_preserves_llamaindex_specific_fields():
+    """Test that node translation preserves LlamaIndex-specific fields."""
+    store = _make_store()
+    node = _make_dummy_node()
+    
+    vectors = store._nodes_to_corpus_vectors([node], namespace="test-ns")
+    
     assert len(vectors) == 1
     v = vectors[0]
-    assert v.namespace == "ns-override"
-    assert v.id == "node-123"
-
-    meta = v.metadata or {}
-    assert meta["custom"] == "value"
-    assert meta["node_id"] == "node-123"
-    assert meta["ref_doc_id"] == "doc-abc"
-    assert meta["text"] == "hello"
-    assert meta["id"] == "node-123"
+    meta = v.metadata
+    
+    assert meta[store.node_id_field] == "test-node"
+    assert meta[store.ref_doc_id_field] == "doc-123"
+    assert meta[store.text_field] == "Test content"
+    assert meta[store.id_field] == "test-node"
+    assert meta["topic"] == "science"
 
 
-def test_matches_to_nodes_uses_metadata_dict_to_node_fallbacks(
-    monkeypatch: pytest.MonkeyPatch,
-    adapter: Any,
-) -> None:
-    """
-    _matches_to_nodes should reconstruct nodes from metadata via
-    metadata_dict_to_node / legacy_metadata_dict_to_node / TextNode fallback.
-    """
-    captured: Dict[str, Any] = {}
+def test_node_translation_handles_missing_ref_doc_id():
+    """Test node translation when ref_doc_id is None."""
+    store = _make_store()
+    node = _make_dummy_node(ref_doc_id=None)
+    
+    vectors = store._nodes_to_corpus_vectors([node], namespace="test-ns")
+    meta = vectors[0].metadata
+    
+    assert store.ref_doc_id_field not in meta
 
-    class DummyNode:
-        def __init__(self, text: str, node_id: str) -> None:
-            self.text = text
-            self.node_id = node_id
 
-    def fake_metadata_dict_to_node(meta: Mapping[str, Any], *, text: str | None, node_id: str) -> Any:  # noqa: D401
-        captured["meta"] = dict(meta)
-        captured["text"] = text
-        captured["node_id"] = node_id
-        return DummyNode(text=text or "", node_id=node_id)
+def test_node_translation_requires_embedding():
+    """Test that node translation requires embeddings."""
+    store = _make_store()
+    node = Mock()
+    node.node_id = "test-node"
+    node.get_embedding = Mock(return_value=None)
+    node.embedding = None
+    
+    with pytest.raises(Exception) as excinfo:
+        store._nodes_to_corpus_vectors([node], namespace="test-ns")
+    assert "NO_EMBEDDING" in str(excinfo.value.code) or "embedding" in str(excinfo.value)
 
-    # Ensure legacy path is not used in this test.
-    def fake_legacy_metadata_dict_to_node(*args: Any, **kwargs: Any) -> Any:  # noqa: ARG001
-        pytest.fail("legacy_metadata_dict_to_node should not be called in this test")
 
-    monkeypatch.setattr(
-        llamaindex_adapter_module,
-        "metadata_dict_to_node",
-        fake_metadata_dict_to_node,
-    )
-    monkeypatch.setattr(
-        llamaindex_adapter_module,
-        "legacy_metadata_dict_to_node",
-        fake_legacy_metadata_dict_to_node,
-    )
-
-    store = _make_store(
-        adapter,
-        text_field="text",
-        node_id_field="node_id",
-        ref_doc_id_field="ref_doc_id",
-    )
-
-    class DummyVector:
-        def __init__(self) -> None:
-            self.id = "node-xyz"
-            self.metadata = {
-                "text": "hello-world",
-                "node_id": "node-xyz",
-                "ref_doc_id": "doc-123",
-                "foo": "bar",
+def test_node_reconstruction_uses_llamaindex_utilities():
+    """Test that node reconstruction uses LlamaIndex utilities."""
+    store = _make_store()
+    
+    with patch('corpus_sdk.vector.framework_adapters.llamaindex.metadata_dict_to_node') as mock_modern:
+        with patch('corpus_sdk.vector.framework_adapters.llamaindex.legacy_metadata_dict_to_node') as mock_legacy:
+            mock_modern.return_value = Mock()
+            
+            vector_match = Mock()
+            vector_match.vector = Mock()
+            vector_match.vector.id = "vec-123"
+            vector_match.vector.metadata = {
+                store.node_id_field: "node-123",
+                store.text_field: "Test text",
+                store.id_field: "vec-123",
             }
-
-    class DummyMatch:
-        def __init__(self) -> None:
-            self.vector = DummyVector()
-            self.score = 0.99
-
-    nodes_with_scores = store._matches_to_nodes([DummyMatch()])  # noqa: SLF001
-    assert len(nodes_with_scores) == 1
-    nws = nodes_with_scores[0]
-
-    assert isinstance(nws.node, DummyNode)
-    assert nws.score == pytest.approx(0.99)
-
-    assert captured["node_id"] == "node-xyz"
-    assert captured["text"] == "hello-world"
+            vector_match.score = 0.9
+            
+            store._matches_to_nodes([vector_match])
+            
+            mock_modern.assert_called_once()
+            mock_legacy.assert_not_called()
 
 
-# ---------------------------------------------------------------------------
-# 9. Async vs sync parity (basic)
-# ---------------------------------------------------------------------------
+def test_node_reconstruction_falls_back_to_legacy():
+    """Test that node reconstruction falls back to legacy utility."""
+    store = _make_store()
+    
+    with patch('corpus_sdk.vector.framework_adapters.llamaindex.metadata_dict_to_node', side_effect=Exception("modern failed")):
+        with patch('corpus_sdk.vector.framework_adapters.llamaindex.legacy_metadata_dict_to_node') as mock_legacy:
+            mock_legacy.return_value = Mock()
+            
+            vector_match = Mock()
+            vector_match.vector = Mock()
+            vector_match.vector.id = "vec-123"
+            vector_match.vector.metadata = {
+                store.node_id_field: "node-123",
+                store.text_field: "Test text",
+                store.id_field: "vec-123",
+            }
+            vector_match.score = 0.9
+            
+            store._matches_to_nodes([vector_match])
+            
+            mock_legacy.assert_called_once()
+
+
+def test_node_reconstruction_falls_back_to_textnode():
+    """Test that node reconstruction falls back to TextNode when all else fails."""
+    store = _make_store()
+    
+    with patch('corpus_sdk.vector.framework_adapters.llamaindex.metadata_dict_to_node', side_effect=Exception("modern failed")):
+        with patch('corpus_sdk.vector.framework_adapters.llamaindex.legacy_metadata_dict_to_node', side_effect=Exception("legacy failed")):
+            
+            vector_match = Mock()
+            vector_match.vector = Mock()
+            vector_match.vector.id = "vec-123"
+            vector_match.vector.metadata = {
+                store.node_id_field: "node-123",
+                store.text_field: "Test text",
+                store.id_field: "vec-123",
+            }
+            vector_match.score = 0.9
+            
+            nodes = store._matches_to_nodes([vector_match])
+            
+            assert len(nodes) == 1
+            assert nodes[0].node.id_ == "node-123"
+            assert nodes[0].node.text == "Test text"
+
+
+# 3. Metadata filter translation
+def test_metadata_filters_translation_supports_llamaindex_operators():
+    """Test metadata filter operator translation."""
+    store = _make_store()
+    
+    # Test EQ operator
+    filters = DummyMetadataFilters([
+        DummyMetadataFilter("topic", "science", "==")
+    ])
+    result = store._metadata_filters_to_corpus_filter(filters)
+    assert result == {"topic": "science"}
+    
+    # Test NE operator
+    filters = DummyMetadataFilters([
+        DummyMetadataFilter("status", "archived", "!=")
+    ])
+    result = store._metadata_filters_to_corpus_filter(filters)
+    assert result == {"status": {"$ne": "archived"}}
+    
+    # Test IN operator
+    filters = DummyMetadataFilters([
+        DummyMetadataFilter("category", ["a", "b", "c"], "in")
+    ])
+    result = store._metadata_filters_to_corpus_filter(filters)
+    assert result == {"category": {"$in": ["a", "b", "c"]}}
+    
+    # Test GT operator
+    filters = DummyMetadataFilters([
+        DummyMetadataFilter("year", 2020, ">")
+    ])
+    result = store._metadata_filters_to_corpus_filter(filters)
+    assert result == {"year": {"$gt": 2020}}
+
+
+def test_metadata_filters_with_doc_ids_and_node_ids():
+    """Test integration of doc_ids and node_ids into metadata filters."""
+    store = _make_store()
+    
+    # Test with doc_ids only
+    result = store._metadata_filters_to_corpus_filter(
+        None,
+        doc_ids=["doc-1", "doc-2"],
+        node_ids=None,
+    )
+    assert result == {store.ref_doc_id_field: {"$in": ["doc-1", "doc-2"]}}
+    
+    # Test with node_ids only
+    result = store._metadata_filters_to_corpus_filter(
+        None,
+        doc_ids=None,
+        node_ids=["node-1", "node-2"],
+    )
+    assert result == {store.node_id_field: {"$in": ["node-1", "node-2"]}}
+
+
+def test_metadata_filter_condition_handling():
+    """Test AND/OR condition handling in metadata filters."""
+    store = _make_store()
+    
+    # Test AND condition (default)
+    filters = DummyMetadataFilters([
+        DummyMetadataFilter("topic", "science", "=="),
+        DummyMetadataFilter("year", 2023, ">="),
+    ], condition="AND")
+    result = store._metadata_filters_to_corpus_filter(filters)
+    assert result == {
+        "$and": [
+            {"topic": "science"},
+            {"year": {"$gte": 2023}}
+        ]
+    }
+    
+    # Test OR condition
+    filters = DummyMetadataFilters([
+        DummyMetadataFilter("topic", "science", "=="),
+        DummyMetadataFilter("topic", "technology", "=="),
+    ], condition="OR")
+    result = store._metadata_filters_to_corpus_filter(filters)
+    assert result == {
+        "$or": [
+            {"topic": "science"},
+            {"topic": "technology"}
+        ]
+    }
+
+
+def test_metadata_filter_skips_unsupported_operators():
+    """Test that unsupported operators are skipped with warning."""
+    store = _make_store()
+    
+    with patch.object(store, 'logger') as mock_logger:
+        filters = DummyMetadataFilters([
+            DummyMetadataFilter("field", "value", "UNSUPPORTED")
+        ])
+        result = store._metadata_filters_to_corpus_filter(filters)
+        
+        # Should skip unsupported operator
+        assert result is None
+        mock_logger.debug.assert_called()
+
+
+# 4. Query validation and execution
+def test_query_requires_llamaindex_embedding():
+    """Test that query requires VectorStoreQuery.query_embedding."""
+    store = _make_store()
+    query = DummyVectorStoreQuery(query_embedding=None)
+    
+    with pytest.raises(Exception) as excinfo:
+        store.query(query)
+    assert "NO_QUERY_EMBEDDING" in str(excinfo.value.code)
+
+
+def test_query_uses_llamaindex_similarity_top_k():
+    """Test that query respects similarity_top_k or uses default."""
+    store = _make_store(default_top_k=10)
+    
+    # Mock translator to capture parameters
+    mock_translator = Mock()
+    mock_translator.capabilities.return_value = _make_dummy_caps()
+    mock_translator.query.return_value = Mock(matches=[])
+    store._translator = mock_translator
+    
+    # Test explicit similarity_top_k
+    query = DummyVectorStoreQuery(
+        query_embedding=[0.1, 0.2, 0.3],
+        similarity_top_k=5,
+    )
+    store.query(query)
+    
+    # Check top_k was passed correctly
+    call_args = mock_translator.query.call_args[0][0]
+    assert call_args["top_k"] == 5
+
+
+def test_query_validates_against_capabilities():
+    """Test that query validates against backend capabilities."""
+    store = _make_store()
+    
+    # Mock capabilities with low max_top_k
+    mock_caps = _make_dummy_caps(max_top_k=10)
+    store._get_caps_sync = Mock(return_value=mock_caps)
+    
+    query = DummyVectorStoreQuery(
+        query_embedding=[0.1, 0.2, 0.3],
+        similarity_top_k=20,
+    )
+    
+    with pytest.raises(Exception) as excinfo:
+        store.query(query)
+    assert "BAD_TOP_K" in str(excinfo.value.code)
+
+
+def test_query_with_unsupported_filtering():
+    """Test query fails when backend doesn't support filtering."""
+    store = _make_store()
+    
+    # Mock capabilities without filtering support
+    mock_caps = _make_dummy_caps(supports_metadata_filtering=False)
+    store._get_caps_sync = Mock(return_value=mock_caps)
+    
+    filters = DummyMetadataFilters([
+        DummyMetadataFilter("topic", "science", "==")
+    ])
+    query = DummyVectorStoreQuery(
+        query_embedding=[0.1, 0.2, 0.3],
+        similarity_top_k=5,
+        filters=filters,
+    )
+    
+    with pytest.raises(Exception) as excinfo:
+        store.query(query)
+    assert "FILTER_NOT_SUPPORTED" in str(excinfo.value.code)
+
+
+# 5. Error context and framework labeling
+def test_error_context_includes_llamaindex_framework_label():
+    """Test that errors include framework="llamaindex" in context."""
+    captured_context = []
+    
+    def fake_attach_context(exc: BaseException, **ctx: Any) -> None:
+        captured_context.append(ctx)
+    
+    with patch('corpus_sdk.vector.framework_adapters.llamaindex.attach_context', fake_attach_context):
+        store = _make_store()
+        query = DummyVectorStoreQuery(query_embedding=None)
+        
+        try:
+            store.query(query)
+        except Exception:
+            pass
+        
+        assert captured_context
+        assert any(ctx.get("framework") == "llamaindex" for ctx in captured_context)
+
+
+def test_operation_names_are_llamaindex_specific():
+    """Test that operation names are specific to LlamaIndex."""
+    captured_operations = []
+    
+    def fake_attach_context(exc: BaseException, **ctx: Any) -> None:
+        if "operation" in ctx:
+            captured_operations.append(ctx["operation"])
+    
+    with patch('corpus_sdk.vector.framework_adapters.llamaindex.attach_context', fake_attach_context):
+        store = _make_store()
+        
+        # Trigger query error
+        query = DummyVectorStoreQuery(query_embedding=None)
+        try:
+            store.query(query)
+        except Exception:
+            pass
+        
+        # Check for LlamaIndex-specific operation names
+        llama_ops = {"query_sync", "add_sync", "delete_sync"}
+        assert any(op in captured_operations for op in llama_ops)
+
+
+def test_error_context_decorators_work():
+    """Test that error context decorators properly wrap methods."""
+    # Test sync decorator
+    @with_error_context("test_operation", test_key="test_value")
+    def failing_func():
+        raise ValueError("Test error")
+    
+    with patch('corpus_sdk.vector.framework_adapters.llamaindex.attach_context') as mock_attach:
+        try:
+            failing_func()
+        except ValueError:
+            pass
+        
+        mock_attach.assert_called_once()
+        call_kwargs = mock_attach.call_args[1]
+        assert call_kwargs["operation"] == "test_operation"
+        assert call_kwargs["test_key"] == "test_value"
+        assert call_kwargs["framework"] == "llamaindex"
+
+
+# 6. Async API parity
+@pytest.mark.asyncio
+async def test_async_methods_exist_and_return_correct_types():
+    """Test that all required async methods exist."""
+    store = _make_store()
+    
+    assert hasattr(store, "aadd")
+    assert hasattr(store, "adelete")
+    assert hasattr(store, "adelete_nodes")
+    assert hasattr(store, "aquery")
+    assert hasattr(store, "aquery_mmr")
+    
+    assert inspect.iscoroutinefunction(store.aadd)
+    assert inspect.iscoroutinefunction(store.adelete)
+    assert inspect.iscoroutinefunction(store.adelete_nodes)
+    assert inspect.iscoroutinefunction(store.aquery)
+    assert inspect.iscoroutinefunction(store.aquery_mmr)
 
 
 @pytest.mark.asyncio
-async def test_async_and_sync_query_return_compatible_shapes(adapter: Any) -> None:
-    """
-    Basic parity check that query() and aquery() both succeed and return
-    VectorStoreQueryResult-like objects for the same input.
-    """
-    store = _make_store(adapter)
+async def test_async_query_requires_llamaindex_embedding():
+    """Test that aquery() requires query embedding."""
+    store = _make_store()
+    query = DummyVectorStoreQuery(query_embedding=None)
+    
+    with pytest.raises(Exception) as excinfo:
+        await store.aquery(query)
+    assert "NO_QUERY_EMBEDDING" in str(excinfo.value.code)
 
-    # We rely on the real translator + test adapter here; generic contract
-    # tests already validate deep semantics, so this is just a smoke check.
-    q = DummyVectorStoreQuery(query_embedding=[0.1, 0.2, 0.3], similarity_top_k=2)
 
-    sync_result = store.query(q)
-    assert hasattr(sync_result, "nodes")
+@pytest.mark.asyncio
+async def test_async_capabilities_caching():
+    """Test that capabilities are cached for async operations."""
+    store = _make_store()
+    
+    mock_caps = _make_dummy_caps()
+    store._translator = Mock()
+    store._translator.arun_capabilities = AsyncMock(return_value=mock_caps)
+    
+    # First call should fetch
+    caps1 = await store._get_caps_async()
+    assert caps1 is mock_caps
+    store._translator.arun_capabilities.assert_called_once()
+    
+    # Second call should use cache
+    caps2 = await store._get_caps_async()
+    assert caps2 is mock_caps
+    assert store._translator.arun_capabilities.call_count == 1
 
-    coro = store.aquery(q)
-    assert inspect.isawaitable(coro)
-    async_result = await coro
-    assert hasattr(async_result, "nodes")
 
-    # At minimum, both should expose .ids with the same length.
-    assert isinstance(sync_result.ids, Sequence)
-    assert isinstance(async_result.ids, Sequence)
-    assert len(sync_result.ids) == len(async_result.ids)
+# 7. MMR integration
+def test_mmr_query_uses_llamaindex_parameters():
+    """Test that MMR query integrates with LlamaIndex parameters."""
+    store = _make_store()
+    
+    query = DummyVectorStoreQuery(
+        query_embedding=[0.1, 0.2, 0.3],
+        similarity_top_k=4,
+        filters=DummyMetadataFilters([
+            DummyMetadataFilter("topic", "science", "==")
+        ]),
+        doc_ids=["doc-1"],
+    )
+    
+    # Mock translator
+    mock_translator = Mock()
+    mock_translator.capabilities.return_value = _make_dummy_caps()
+    mock_translator.query.return_value = Mock(matches=[Mock()] * 10)
+    store._translator = mock_translator
+    
+    result = store.query_mmr(query, lambda_mult=0.7, fetch_k=20)
+    
+    # Verify translator was called with correct parameters
+    call_args = mock_translator.query.call_args[0][0]
+    assert call_args["top_k"] == 20  # fetch_k
+    assert call_args["filters"] is not None
+
+
+def test_mmr_algorithm_edge_cases():
+    """Test MMR algorithm with edge cases."""
+    store = _make_store()
+    
+    # Test with empty candidates
+    indices = store._mmr_select_indices(
+        query_vec=[0.1, 0.2, 0.3],
+        candidate_matches=[],
+        k=5,
+        lambda_mult=0.5,
+    )
+    assert indices == []
+    
+    # Test with lambda_mult=1.0 (pure relevance)
+    mock_matches = [Mock() for _ in range(5)]
+    for i, match in enumerate(mock_matches):
+        match.score = 1.0 - (i * 0.1)  # Decreasing scores
+        match.vector = Mock()
+        match.vector.vector = [float(i)] * 3
+    
+    indices = store._mmr_select_indices(
+        query_vec=[0.1, 0.2, 0.3],
+        candidate_matches=mock_matches,
+        k=3,
+        lambda_mult=1.0,
+    )
+    # Should select first 3 (highest scores)
+    assert indices == [0, 1, 2]
+
+
+def test_mmr_validation():
+    """Test MMR parameter validation."""
+    store = _make_store()
+    
+    query = DummyVectorStoreQuery(
+        query_embedding=[0.1, 0.2, 0.3],
+        similarity_top_k=4,
+    )
+    
+    # Invalid lambda_mult
+    with pytest.raises(Exception) as excinfo:
+        store.query_mmr(query, lambda_mult=1.5)
+    assert "BAD_MMR_LAMBDA" in str(excinfo.value.code)
+
+
+# 8. Configuration validation
+def test_configuration_validation():
+    """Test configuration validation for LlamaIndex usage."""
+    # Valid configurations should work
+    store1 = _make_store(batch_size=50, default_top_k=20, score_threshold=0.8)
+    assert store1.batch_size == 50
+    assert store1.default_top_k == 20
+    assert store1.score_threshold == 0.8
+    
+    # Invalid configurations should raise
+    with pytest.raises(ValueError):
+        _make_store(batch_size=0)
+    
+    with pytest.raises(ValueError):
+        _make_store(default_top_k=0)
+    
+    with pytest.raises(ValueError):
+        _make_store(score_threshold=1.5)
+
+
+def test_configuration_warnings():
+    """Test configuration warnings for extreme values."""
+    import logging
+    
+    with patch.object(logging.getLogger('corpus_sdk.vector.framework_adapters.llamaindex'), 'warning') as mock_warning:
+        _make_store(batch_size=15000)  # Unusually large
+        mock_warning.assert_called()
+        
+    with patch.object(logging.getLogger('corpus_sdk.vector.framework_adapters.llamaindex'), 'warning') as mock_warning:
+        _make_store(default_top_k=1500)  # Unusually large
+        mock_warning.assert_called()
+        
+    with patch.object(logging.getLogger('corpus_sdk.vector.framework_adapters.llamaindex'), 'warning') as mock_warning:
+        _make_store(score_threshold=0.95)  # Very high
+        mock_warning.assert_called()
+
+
+# 9. Streaming queries
+def test_streaming_query_yields_node_with_score_format():
+    """Test that streaming query yields NodeWithScore objects."""
+    store = _make_store()
+    
+    # Mock translator stream
+    mock_translator = Mock()
+    mock_translator.capabilities.return_value = _make_dummy_caps()
+    
+    class MockChunk:
+        def __init__(self):
+            self.matches = []
+    
+    mock_chunk = MockChunk()
+    mock_match = Mock()
+    mock_match.vector = Mock()
+    mock_match.vector.id = "vec-1"
+    mock_match.vector.metadata = {
+        store.node_id_field: "node-1",
+        store.text_field: "Streamed text",
+        store.id_field: "vec-1",
+    }
+    mock_match.score = 0.85
+    mock_chunk.matches.append(mock_match)
+    
+    mock_translator.query_stream.return_value = [mock_chunk]
+    store._translator = mock_translator
+    
+    query = DummyVectorStoreQuery(
+        query_embedding=[0.1, 0.2, 0.3],
+        similarity_top_k=5,
+    )
+    
+    results = list(store.query_stream(query))
+    
+    assert len(results) == 1
+    assert hasattr(results[0], "node")
+    assert hasattr(results[0], "score")
+    assert results[0].score == 0.85
+
+
+def test_streaming_query_respects_top_k():
+    """Test that streaming query stops after yielding top_k results."""
+    store = _make_store()
+    
+    mock_translator = Mock()
+    mock_translator.capabilities.return_value = _make_dummy_caps()
+    
+    # Create stream with more matches than top_k
+    class MockChunk:
+        def __init__(self, num_matches: int):
+            self.matches = [Mock() for _ in range(num_matches)]
+            for i, match in enumerate(self.matches):
+                match.vector = Mock()
+                match.vector.id = f"vec-{i}"
+                match.vector.metadata = {
+                    store.node_id_field: f"node-{i}",
+                    store.text_field: f"Text {i}",
+                    store.id_field: f"vec-{i}",
+                }
+                match.score = 0.9 - (i * 0.1)
+    
+    mock_translator.query_stream.return_value = [MockChunk(10)]
+    store._translator = mock_translator
+    
+    query = DummyVectorStoreQuery(
+        query_embedding=[0.1, 0.2, 0.3],
+        similarity_top_k=3,  # Only want 3 results
+    )
+    
+    results = list(store.query_stream(query))
+    assert len(results) == 3  # Should stop at top_k
+
+
+# 10. Context building
+def test_context_building_from_llamaindex_callback_manager():
+    """Test context building from LlamaIndex callback manager."""
+    store = _make_store()
+    
+    mock_callback_manager = Mock()
+    mock_operation_context = Mock()
+    
+    with patch('corpus_sdk.vector.framework_adapters.llamaindex.ctx_from_llamaindex', return_value=mock_operation_context):
+        ctx = store._build_ctx(callback_manager=mock_callback_manager)
+        assert ctx is mock_operation_context
+
+
+def test_context_building_priority():
+    """Test context building priority (OperationContext > dict > callback_manager)."""
+    store = _make_store()
+    
+    # Priority 1: OperationContext
+    mock_op_ctx = Mock(spec=llamaindex_adapter_module.OperationContext)
+    ctx1 = store._build_ctx(ctx=mock_op_ctx)
+    assert ctx1 is mock_op_ctx
+    
+    # Priority 2: Dict context
+    mock_from_dict_result = Mock()
+    with patch('corpus_sdk.vector.framework_adapters.llamaindex.ctx_from_dict', return_value=mock_from_dict_result):
+        ctx2 = store._build_ctx(ctx={"key": "value"})
+        assert ctx2 is mock_from_dict_result
+    
+    # Priority 3: Callback manager
+    mock_callback_manager = Mock()
+    mock_from_llamaindex_result = Mock()
+    with patch('corpus_sdk.vector.framework_adapters.llamaindex.ctx_from_llamaindex', return_value=mock_from_llamaindex_result):
+        ctx3 = store._build_ctx(callback_manager=mock_callback_manager)
+        assert ctx3 is mock_from_llamaindex_result
+
+
+# 11. Delete operations
+def test_delete_by_ref_doc_id_uses_llamaindex_field():
+    """Test delete uses configured ref_doc_id_field."""
+    store = _make_store(ref_doc_id_field="llama_ref_doc")
+    
+    mock_translator = Mock()
+    mock_translator.capabilities.return_value = _make_dummy_caps(supports_metadata_filtering=True)
+    store._translator = mock_translator
+    
+    store.delete("doc-123")
+    
+    # Verify filter uses correct field name
+    call_args = mock_translator.delete.call_args[0][0]
+    assert call_args["filter"] == {"llama_ref_doc": "doc-123"}
+
+
+def test_delete_nodes_handles_empty_list():
+    """Test delete_nodes handles empty list gracefully."""
+    store = _make_store()
+    store.delete_nodes([])  # Should not raise
+
+
+def test_delete_validation_requires_ids_or_filter():
+    """Test delete validation requires ids or filter."""
+    store = _make_store()
+    
+    # Mock capabilities
+    mock_caps = _make_dummy_caps(supports_metadata_filtering=True)
+    store._get_caps_sync = Mock(return_value=mock_caps)
+    
+    with pytest.raises(Exception) as excinfo:
+        store._validate_delete_params_sync(ids=None, namespace=None, filter=None)
+    assert "BAD_DELETE" in str(excinfo.value.code)
+
+
+# 12. Score threshold filtering
+def test_score_threshold_filtering():
+    """Test client-side score threshold filtering."""
+    store = _make_store(score_threshold=0.7)
+    
+    mock_matches = []
+    for i in range(5):
+        match = Mock()
+        match.score = 0.6 + (i * 0.1)  # Scores: 0.6, 0.7, 0.8, 0.9, 1.0
+        mock_matches.append(match)
+    
+    filtered = store._apply_score_threshold(mock_matches)
+    
+    # Should filter out scores < 0.7
+    assert len(filtered) == 4  # 0.7, 0.8, 0.9, 1.0
+    assert all(m.score >= 0.7 for m in filtered)
+
+
+def test_no_score_threshold_returns_all():
+    """Test that no threshold returns all matches."""
+    store = _make_store(score_threshold=None)
+    
+    mock_matches = [Mock(score=0.5), Mock(score=0.8)]
+    filtered = store._apply_score_threshold(mock_matches)
+    
+    assert len(filtered) == 2
+
+
+# 13. Framework utilities
+def test_uses_llamaindex_framework_utilities_for_warnings():
+    """Test framework utilities are called with framework="llamaindex"."""
+    store = _make_store()
+    
+    with patch('corpus_sdk.vector.framework_adapters.llamaindex.warn_if_extreme_k') as mock_warn:
+        query = DummyVectorStoreQuery(
+            query_embedding=[0.1, 0.2, 0.3],
+            similarity_top_k=1000,
+        )
+        
+        # Mock translator to avoid actual query
+        mock_translator = Mock()
+        mock_translator.capabilities.return_value = _make_dummy_caps()
+        mock_translator.query.return_value = Mock(matches=[])
+        store._translator = mock_translator
+        
+        try:
+            store.query(query)
+        except Exception:
+            pass
+        
+        mock_warn.assert_called()
+        call_kwargs = mock_warn.call_args[1]
+        assert call_kwargs["framework"] == "llamaindex"
+        assert call_kwargs["op_name"] == "query_sync"
+
+
+# 14. Partial batch failure handling
+def test_partial_upsert_failure_handling():
+    """Test graceful handling of partial batch failures."""
+    store = _make_store()
+    
+    mock_result = Mock()
+    mock_result.failed_count = 2
+    mock_result.upserted_count = 3
+    mock_result.failures = ["err1", "err2"]
+    
+    # Should log warning but not raise
+    with patch.object(store.logger, 'warning') as mock_warning:
+        store._handle_partial_upsert_failure(mock_result, total_nodes=5, namespace="test")
+        mock_warning.assert_called()
+
+
+def test_complete_upsert_failure_raises():
+    """Test that complete batch failure raises exception."""
+    store = _make_store()
+    
+    mock_result = Mock()
+    mock_result.failed_count = 5
+    mock_result.upserted_count = 0
+    mock_result.failures = ["err1", "err2", "err3", "err4", "err5"]
+    
+    with pytest.raises(Exception) as excinfo:
+        store._handle_partial_upsert_failure(mock_result, total_nodes=5, namespace="test")
+    assert "BATCH_UPSERT_FAILED" in str(excinfo.value.code)
+
+
+# 15. Client property exposure
+def test_client_property_exposes_corpus_adapter():
+    """Test that client property exposes the underlying adapter."""
+    mock_adapter = Mock()
+    store = _make_store(adapter=mock_adapter)
+    
+    assert store.client is mock_adapter
+
+
+# 16. Namespace handling
+def test_effective_namespace_resolution():
+    """Test namespace resolution with overrides."""
+    store = _make_store(namespace="default-ns")
+    
+    # Use store default
+    assert store._effective_namespace(None) == "default-ns"
+    
+    # Use explicit override
+    assert store._effective_namespace("custom-ns") == "custom-ns"
+
+
+def test_framework_context_includes_namespace():
+    """Test that framework context includes namespace."""
+    store = _make_store(namespace="test-ns")
+    
+    framework_ctx = store._framework_ctx_for_namespace(None)
+    
+    # Should include namespace in vector context
+    assert "vector_context" in framework_ctx
+    assert framework_ctx["vector_context"]["namespace"] == "test-ns"
+
+
+# 17. Translator integration
+def test_translator_is_cached_property():
+    """Test that translator is a cached property."""
+    mock_adapter = Mock()
+    store = _make_store(adapter=mock_adapter)
+    
+    translator1 = store._translator
+    translator2 = store._translator
+    
+    assert translator1 is translator2
+    assert translator1.adapter is mock_adapter
+
+
+# 18. VectorStoreInfo completeness
+def test_vector_store_info_has_correct_structure():
+    """Test that VectorStoreInfo has complete structure."""
+    store = _make_store()
+    info = store.vector_store_info
+    
+    assert hasattr(info, "name")
+    assert hasattr(info, "description")
+    assert hasattr(info, "metadata_info")
+    assert isinstance(info.metadata_info, list)
+    
+    # Check all metadata info items have required fields
+    for mi in info.metadata_info:
+        assert hasattr(mi, "name")
+        assert hasattr(mi, "description")
+        assert hasattr(mi, "type")
+
+
+# 19. Class name identification
+def test_class_name_is_correct():
+    """Test that class_name() returns correct identifier."""
+    assert CorpusLlamaIndexVectorStore.class_name() == "CorpusLlamaIndexVectorStore"
+
+
+# 20. VectorStore flags
+def test_vector_store_flags_are_set():
+    """Test that LlamaIndex VectorStore flags are properly set."""
+    store = _make_store()
+    
+    assert store.stores_text is True
+    assert store.flat_metadata is True
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
