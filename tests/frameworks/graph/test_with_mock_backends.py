@@ -9,6 +9,7 @@ from typing import Any, Callable, Type
 
 import pytest
 
+from corpus_sdk.graph.graph_base import BulkVerticesSpec
 from tests.frameworks.registries.graph_registry import (
     GraphFrameworkDescriptor,
     iter_graph_framework_descriptors,
@@ -56,6 +57,8 @@ class InvalidResultGraphAdapter:
 
     - query() returns a non-graph scalar value
     - stream_query() returns a non-iterable
+    - bulk_vertices() returns a non-bulk result
+    - batch() returns a non-batch result
     - async variants mirror the same shape errors
 
     Framework adapters should surface coercion / validation errors rather than
@@ -99,7 +102,7 @@ class EmptyResultGraphAdapter:
     Backend that always returns obviously empty results.
 
     Used to verify that adapters do not silently treat empty backend responses
-    as fully valid results, particularly for batch() surfaces.
+    as fully valid results, particularly for batch() and bulk_vertices().
     """
 
     def query(self, *args: Any, **kwargs: Any) -> Any:
@@ -249,6 +252,32 @@ def _call_batch(
     return batch_fn(operations)
 
 
+def _call_bulk(
+    descriptor: GraphFrameworkDescriptor,
+    instance: Any,
+    spec: BulkVerticesSpec,
+) -> Any:
+    assert descriptor.bulk_vertices_method is not None
+    bulk_fn = _get_method(instance, descriptor.bulk_vertices_method)
+    if descriptor.context_kwarg:
+        return bulk_fn(spec, **{descriptor.context_kwarg: {}})
+    return bulk_fn(spec)
+
+
+def _build_bulk_spec(limit: int = 5) -> BulkVerticesSpec:
+    """
+    Helper to construct a BulkVerticesSpec with explicit cursor/filter.
+
+    Keeps this test agnostic to any internal defaulting behavior.
+    """
+    return BulkVerticesSpec(
+        namespace=None,
+        limit=limit,
+        cursor=None,
+        filter=None,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Invalid result behavior
 # ---------------------------------------------------------------------------
@@ -373,6 +402,122 @@ async def test_async_invalid_backend_result_causes_errors_for_stream_when_suppor
 
         async for _ in aiter:  # noqa: B007
             pass
+
+
+# ---------------------------------------------------------------------------
+# Bulk vertices result behavior
+# ---------------------------------------------------------------------------
+
+
+def test_invalid_backend_bulk_vertices_result_causes_errors_when_supported(
+    framework_descriptor: GraphFrameworkDescriptor,
+) -> None:
+    """
+    When bulk_vertices is supported, a clearly invalid backend result type
+    should surface as an error rather than a valid-looking bulk result.
+    """
+    if not framework_descriptor.supports_bulk_vertices:
+        pytest.skip(
+            f"Framework '{framework_descriptor.name}' does not declare bulk_vertices support",
+        )
+
+    if not framework_descriptor.bulk_vertices_method:
+        pytest.skip(
+            f"Framework '{framework_descriptor.name}' does not expose bulk_vertices_method",
+        )
+
+    instance = _make_client_with_evil_backend(
+        framework_descriptor,
+        InvalidResultGraphAdapter,
+    )
+
+    spec = _build_bulk_spec(limit=5)
+
+    with pytest.raises(Exception):  # noqa: BLE001
+        _call_bulk(framework_descriptor, instance, spec)
+
+
+@pytest.mark.asyncio
+async def test_async_invalid_backend_bulk_vertices_result_causes_errors_when_supported(
+    framework_descriptor: GraphFrameworkDescriptor,
+) -> None:
+    """
+    When async bulk_vertices is supported, invalid backend results should
+    also surface as errors.
+    """
+    if not framework_descriptor.supports_bulk_vertices:
+        pytest.skip(
+            f"Framework '{framework_descriptor.name}' does not declare bulk_vertices support",
+        )
+
+    if not framework_descriptor.async_bulk_vertices_method:
+        pytest.skip(
+            f"Framework '{framework_descriptor.name}' does not declare async bulk_vertices",
+        )
+
+    assert framework_descriptor.bulk_vertices_method is not None
+
+    instance = _make_client_with_evil_backend(
+        framework_descriptor,
+        InvalidResultGraphAdapter,
+    )
+
+    abulk_fn = _get_method(
+        instance,
+        framework_descriptor.async_bulk_vertices_method,
+    )
+
+    spec = _build_bulk_spec(limit=5)
+
+    with pytest.raises(Exception):  # noqa: BLE001
+        coro = abulk_fn(spec)
+        assert inspect.isawaitable(coro), (
+            "Async bulk_vertices method must return an awaitable",
+        )
+        await coro  # noqa: PT018
+
+
+def test_empty_backend_bulk_vertices_result_is_not_silently_treated_as_valid(
+    framework_descriptor: GraphFrameworkDescriptor,
+) -> None:
+    """
+    When the backend returns an empty bulk_vertices result, the adapter should
+    not silently treat it as a fully valid response with the requested limit.
+
+    Acceptable behaviors:
+    - Raise an Exception (preferred), or
+    - Return a sequence whose length != requested limit.
+    """
+    if not framework_descriptor.supports_bulk_vertices:
+        pytest.skip(
+            f"Framework '{framework_descriptor.name}' does not declare bulk_vertices support",
+        )
+
+    if not framework_descriptor.bulk_vertices_method:
+        pytest.skip(
+            f"Framework '{framework_descriptor.name}' does not expose bulk_vertices_method",
+        )
+
+    instance = _make_client_with_evil_backend(
+        framework_descriptor,
+        EmptyResultGraphAdapter,
+    )
+
+    limit = 3
+    spec = _build_bulk_spec(limit=limit)
+
+    try:
+        result = _call_bulk(framework_descriptor, instance, spec)
+    except Exception:  # noqa: BLE001
+        # Raising is acceptable / preferred.
+        return
+
+    if isinstance(result, Sequence):
+        assert len(result) != limit, (
+            "Empty backend bulk_vertices result unexpectedly produced a sequence "
+            "whose length matches the requested limit; adapters should treat "
+            "empty backend results as errors or obvious mismatches."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -510,6 +655,46 @@ def test_backend_exception_is_wrapped_with_error_context_on_query(
     assert str(ctx["operation"]).startswith(GRAPH_OPERATION_PREFIX)
 
 
+def test_backend_exception_is_wrapped_with_error_context_on_stream_when_supported(
+    framework_descriptor: GraphFrameworkDescriptor,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Same as the query error-context test, but for the sync streaming surface
+    when declared.
+    """
+    if not framework_descriptor.stream_query_method:
+        pytest.skip(
+            f"Framework '{framework_descriptor.name}' does not declare sync streaming",
+        )
+
+    module = importlib.import_module(framework_descriptor.adapter_module)
+    calls = _patch_attach_context(monkeypatch, module)
+
+    instance = _make_client_with_evil_backend(
+        framework_descriptor,
+        RaisingGraphAdapter,
+    )
+
+    with pytest.raises(RuntimeError, match="backend failure"):
+        iterator = _call_stream(
+            framework_descriptor,
+            instance,
+            "err-stream",
+        )
+        for _ in iterator:  # noqa: B007
+            pass
+
+    assert calls, "attach_context was not called for backend stream failure"
+
+    exc, ctx = calls[-1]
+    assert isinstance(exc, RuntimeError)
+    assert "framework" in ctx
+    assert "operation" in ctx
+    assert ctx["framework"] == framework_descriptor.name
+    assert str(ctx["operation"]).startswith(GRAPH_OPERATION_PREFIX)
+
+
 def test_backend_exception_is_wrapped_with_error_context_on_batch_when_supported(
     framework_descriptor: GraphFrameworkDescriptor,
     monkeypatch: pytest.MonkeyPatch,
@@ -588,6 +773,58 @@ async def test_async_backend_exception_is_wrapped_with_error_context_when_suppor
         await coro  # noqa: PT018
 
     assert calls, "attach_context was not called for async backend failures"
+
+    exc, ctx = calls[-1]
+    assert isinstance(exc, RuntimeError)
+    assert "framework" in ctx
+    assert "operation" in ctx
+    assert ctx["framework"] == framework_descriptor.name
+    assert str(ctx["operation"]).startswith(GRAPH_OPERATION_PREFIX)
+
+
+@pytest.mark.asyncio
+async def test_async_backend_exception_is_wrapped_with_error_context_on_stream_when_supported(
+    framework_descriptor: GraphFrameworkDescriptor,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When async streaming is supported, backend exceptions in async streaming
+    should also go through the error-context decorators and call attach_context().
+    """
+    if not framework_descriptor.async_stream_query_method:
+        pytest.skip(
+            f"Framework '{framework_descriptor.name}' does not declare async streaming",
+        )
+
+    module = importlib.import_module(framework_descriptor.adapter_module)
+    calls = _patch_attach_context(monkeypatch, module)
+
+    instance = _make_client_with_evil_backend(
+        framework_descriptor,
+        RaisingGraphAdapter,
+    )
+
+    astream_fn = _get_method(
+        instance,
+        framework_descriptor.async_stream_query_method,
+    )
+
+    with pytest.raises(RuntimeError, match="backend failure"):
+        if framework_descriptor.context_kwarg:
+            aiter = astream_fn(
+                "err-async-stream",
+                **{framework_descriptor.context_kwarg: {}},
+            )
+        else:
+            aiter = astream_fn("err-async-stream")
+
+        if inspect.isawaitable(aiter):
+            aiter = await aiter  # type: ignore[assignment]
+
+        async for _ in aiter:  # noqa: B007
+            pass
+
+    assert calls, "attach_context was not called for async backend stream failures"
 
     exc, ctx = calls[-1]
     assert isinstance(exc, RuntimeError)
