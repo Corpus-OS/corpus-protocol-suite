@@ -21,9 +21,9 @@ from corpus_sdk.graph.framework_adapters.langchain import (
 # ---------------------------------------------------------------------------
 
 
-def _make_client(graph_adapter: Any, **kwargs: Any) -> CorpusLangChainGraphClient:
+def _make_client(adapter: Any, **kwargs: Any) -> CorpusLangChainGraphClient:
     """Construct a CorpusLangChainGraphClient instance from the generic adapter."""
-    return CorpusLangChainGraphClient(graph_adapter=graph_adapter, **kwargs)
+    return CorpusLangChainGraphClient(adapter=adapter, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -33,7 +33,7 @@ def _make_client(graph_adapter: Any, **kwargs: Any) -> CorpusLangChainGraphClien
 
 def test_default_translator_uses_langchain_framework_translator(
     monkeypatch: pytest.MonkeyPatch,
-    graph_adapter: Any,
+    adapter: Any,
 ) -> None:
     """
     By default, CorpusLangChainGraphClient should:
@@ -58,7 +58,7 @@ def test_default_translator_uses_langchain_framework_translator(
         fake_create_graph_translator,
     )
 
-    client = _make_client(graph_adapter)
+    client = _make_client(adapter)
 
     # Trigger lazy translator construction
     _ = client._translator  # noqa: SLF001
@@ -73,7 +73,7 @@ def test_default_translator_uses_langchain_framework_translator(
 
 def test_framework_translator_override_is_respected(
     monkeypatch: pytest.MonkeyPatch,
-    graph_adapter: Any,
+    adapter: Any,
 ) -> None:
     """
     If framework_translator is provided, CorpusLangChainGraphClient should pass
@@ -103,7 +103,7 @@ def test_framework_translator_override_is_respected(
     )
 
     client = _make_client(
-        graph_adapter,
+        adapter,
         framework_translator=custom,
         framework_version="lc-fw-1.2.3",
     )
@@ -122,7 +122,7 @@ def test_framework_translator_override_is_respected(
 
 def test_langchain_config_and_extra_context_passed_to_core_ctx(
     monkeypatch: pytest.MonkeyPatch,
-    graph_adapter: Any,
+    adapter: Any,
 ) -> None:
     """
     Verify that config and extra_context are passed through to
@@ -160,7 +160,7 @@ def test_langchain_config_and_extra_context_passed_to_core_ctx(
     )
 
     client = _make_client(
-        graph_adapter,
+        adapter,
         framework_version="langchain-test-version",
     )
 
@@ -196,7 +196,7 @@ def test_langchain_config_and_extra_context_passed_to_core_ctx(
 
 def test_error_context_includes_langchain_metadata_sync(
     monkeypatch: pytest.MonkeyPatch,
-    graph_adapter: Any,
+    adapter: Any,
 ) -> None:
     """
     When an error occurs during a sync graph operation, error context should
@@ -226,7 +226,7 @@ def test_error_context_includes_langchain_metadata_sync(
         fake_create_graph_translator,
     )
 
-    client = _make_client(graph_adapter)
+    client = _make_client(adapter)
 
     config = {"configurable": {"user_id": "u-sync"}}
 
@@ -241,7 +241,7 @@ def test_error_context_includes_langchain_metadata_sync(
 @pytest.mark.asyncio
 async def test_error_context_includes_langchain_metadata_async(
     monkeypatch: pytest.MonkeyPatch,
-    graph_adapter: Any,
+    adapter: Any,
 ) -> None:
     """
     Same as the sync error-context test but for the async query path.
@@ -270,7 +270,7 @@ async def test_error_context_includes_langchain_metadata_async(
         fake_create_graph_translator,
     )
 
-    client = _make_client(graph_adapter)
+    client = _make_client(adapter)
 
     config = {"configurable": {"user_id": "u-async"}}
 
@@ -287,7 +287,7 @@ async def test_error_context_includes_langchain_metadata_async(
 # ---------------------------------------------------------------------------
 
 
-def test_sync_query_and_stream_basic(graph_adapter: Any) -> None:
+def test_sync_query_and_stream_basic(adapter: Any) -> None:
     """
     Basic smoke test for sync query / stream_query behavior: methods should
     accept text input and not crash, returning protocol-level shapes.
@@ -295,7 +295,7 @@ def test_sync_query_and_stream_basic(graph_adapter: Any) -> None:
     Detailed QueryResult / QueryChunk semantics are covered by the generic
     graph contract tests.
     """
-    client = _make_client(graph_adapter, default_namespace="lc-ns")
+    client = _make_client(adapter, default_namespace="lc-ns")
 
     # Non-streaming query
     result = client.query("MATCH (n) RETURN n LIMIT 1")
@@ -306,12 +306,12 @@ def test_sync_query_and_stream_basic(graph_adapter: Any) -> None:
     assert isinstance(chunks, list)
 
 
-def test_sync_query_accepts_optional_params_and_config(graph_adapter: Any) -> None:
+def test_sync_query_accepts_optional_params_and_config(adapter: Any) -> None:
     """
     query() should accept params, dialect, namespace, timeout_ms, and
     config/extra_context kwargs without raising.
     """
-    client = _make_client(graph_adapter, default_dialect="cypher")
+    client = _make_client(adapter, default_dialect="cypher")
 
     result = client.query(
         "MATCH (n) RETURN n LIMIT $limit",
@@ -331,7 +331,7 @@ def test_sync_query_accepts_optional_params_and_config(graph_adapter: Any) -> No
 
 
 @pytest.mark.asyncio
-async def test_async_query_and_stream_basic(graph_adapter: Any) -> None:
+async def test_async_query_and_stream_basic(adapter: Any) -> None:
     """
     Async aquery / astream_query should exist and produce results compatible
     with the sync API (non-None result / async-iterable of chunks).
@@ -340,7 +340,7 @@ async def test_async_query_and_stream_basic(graph_adapter: Any) -> None:
     - aquery() returns the same *type* as query()
     - astream_query() returns an async-iterable object (after any awaiting).
     """
-    client = _make_client(graph_adapter)
+    client = _make_client(adapter)
 
     assert hasattr(client, "aquery")
     assert hasattr(client, "astream_query")
@@ -380,12 +380,12 @@ async def test_async_query_and_stream_basic(graph_adapter: Any) -> None:
 
 @pytest.mark.asyncio
 async def test_async_query_accepts_optional_params_and_config(
-    graph_adapter: Any,
+    adapter: Any,
 ) -> None:
     """
     aquery() should accept the same optional params and context as query().
     """
-    client = _make_client(graph_adapter, default_namespace="async-ns")
+    client = _make_client(adapter, default_namespace="async-ns")
 
     result = await client.aquery(
         "MATCH (n) RETURN n LIMIT $limit",
@@ -406,7 +406,7 @@ async def test_async_query_accepts_optional_params_and_config(
 
 def test_bulk_vertices_builds_raw_request_and_calls_translator(
     monkeypatch: pytest.MonkeyPatch,
-    graph_adapter: Any,
+    adapter: Any,
 ) -> None:
     """
     bulk_vertices() should:
@@ -447,7 +447,7 @@ def test_bulk_vertices_builds_raw_request_and_calls_translator(
         fake_validate_graph_result_type,
     )
 
-    client = _make_client(graph_adapter)
+    client = _make_client(adapter)
 
     class DummyBulkSpec:
         def __init__(self) -> None:
@@ -479,7 +479,7 @@ def test_bulk_vertices_builds_raw_request_and_calls_translator(
 @pytest.mark.asyncio
 async def test_abulk_vertices_builds_raw_request_and_calls_translator_async(
     monkeypatch: pytest.MonkeyPatch,
-    graph_adapter: Any,
+    adapter: Any,
 ) -> None:
     """
     abulk_vertices() should mirror bulk_vertices wiring but via the async
@@ -517,7 +517,7 @@ async def test_abulk_vertices_builds_raw_request_and_calls_translator_async(
         fake_validate_graph_result_type,
     )
 
-    client = _make_client(graph_adapter)
+    client = _make_client(adapter)
 
     class DummyBulkSpec:
         def __init__(self) -> None:
@@ -548,7 +548,7 @@ async def test_abulk_vertices_builds_raw_request_and_calls_translator_async(
 
 def test_batch_builds_raw_batch_ops_and_calls_translator(
     monkeypatch: pytest.MonkeyPatch,
-    graph_adapter: Any,
+    adapter: Any,
 ) -> None:
     """
     batch() should:
@@ -598,7 +598,7 @@ def test_batch_builds_raw_batch_ops_and_calls_translator(
         fake_validate_batch_operations,
     )
 
-    client = _make_client(graph_adapter)
+    client = _make_client(adapter)
 
     class DummyBatchOp:
         def __init__(self, op: str, args: Mapping[str, Any]) -> None:
@@ -628,7 +628,7 @@ def test_batch_builds_raw_batch_ops_and_calls_translator(
 @pytest.mark.asyncio
 async def test_abatch_builds_raw_batch_ops_and_calls_translator_async(
     monkeypatch: pytest.MonkeyPatch,
-    graph_adapter: Any,
+    adapter: Any,
 ) -> None:
     """
     abatch() should mirror batch wiring but via translator.arun_batch.
@@ -673,7 +673,7 @@ async def test_abatch_builds_raw_batch_ops_and_calls_translator_async(
         fake_validate_batch_operations,
     )
 
-    client = _make_client(graph_adapter)
+    client = _make_client(adapter)
 
     class DummyBatchOp:
         def __init__(self, op: str, args: Mapping[str, Any]) -> None:
@@ -705,7 +705,7 @@ async def test_abatch_builds_raw_batch_ops_and_calls_translator_async(
 # ---------------------------------------------------------------------------
 
 
-def test_capabilities_and_health_basic(graph_adapter: Any) -> None:
+def test_capabilities_and_health_basic(adapter: Any) -> None:
     """
     Capabilities and health should be surfaced as mappings.
 
@@ -713,7 +713,7 @@ def test_capabilities_and_health_basic(graph_adapter: Any) -> None:
     tests; here we only assert that the LangChain adapter normalizes to
     mapping-like results.
     """
-    client = _make_client(graph_adapter)
+    client = _make_client(adapter)
 
     caps = client.capabilities()
     assert isinstance(caps, Mapping)
@@ -723,12 +723,12 @@ def test_capabilities_and_health_basic(graph_adapter: Any) -> None:
 
 
 @pytest.mark.asyncio
-async def test_async_capabilities_and_health_basic(graph_adapter: Any) -> None:
+async def test_async_capabilities_and_health_basic(adapter: Any) -> None:
     """
     Async capabilities/health should also return mappings compatible with
     the sync variants, and expose the same key sets for basic parity.
     """
-    client = _make_client(graph_adapter)
+    client = _make_client(adapter)
 
     # Sync values for comparison
     caps = client.capabilities()
@@ -755,7 +755,7 @@ async def test_async_capabilities_and_health_basic(graph_adapter: Any) -> None:
 
 
 @pytest.mark.asyncio
-async def test_context_manager_closes_underlying_graph_adapter() -> None:
+async def test_context_manager_closes_underlying_adapter() -> None:
     """
     __enter__/__exit__ and __aenter__/__aexit__ should call close/aclose on
     the underlying graph adapter when those methods exist.
@@ -781,14 +781,14 @@ async def test_context_manager_closes_underlying_graph_adapter() -> None:
     adapter = ClosingGraphAdapter()
 
     # Sync context manager
-    with CorpusLangChainGraphClient(graph_adapter=adapter) as client:
+    with CorpusLangChainGraphClient(adapter=adapter) as client:
         assert client is not None
 
     assert adapter.closed is True
 
     # Async context manager
     adapter2 = ClosingGraphAdapter()
-    client2 = CorpusLangChainGraphClient(graph_adapter=adapter2)
+    client2 = CorpusLangChainGraphClient(adapter=adapter2)
 
     async with client2:
         assert client2 is not None
@@ -802,7 +802,7 @@ async def test_context_manager_closes_underlying_graph_adapter() -> None:
 
 
 def test_corpus_graph_tool_parses_string_and_mapping_input(
-    graph_adapter: Any,
+    adapter: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
@@ -895,7 +895,7 @@ async def test_corpus_graph_tool_async_delegates_to_aquery() -> None:
 
 
 def test_create_corpus_graph_tool_wraps_client_and_adapter(
-    graph_adapter: Any,
+    adapter: Any,
 ) -> None:
     """
     create_corpus_graph_tool should:
@@ -905,7 +905,7 @@ def test_create_corpus_graph_tool_wraps_client_and_adapter(
     - Propagate default namespace/dialect into the client.
     """
     tool = create_corpus_graph_tool(
-        graph_adapter=graph_adapter,
+        adapter=adapter,
         default_dialect="cypher",
         default_namespace="prod",
         default_timeout_ms=9999,
@@ -921,7 +921,7 @@ def test_create_corpus_graph_tool_wraps_client_and_adapter(
     client = tool._graph_client
     assert isinstance(client, CorpusLangChainGraphClient)
     # Inspect private attributes to ensure wiring is correct
-    assert getattr(client, "_graph") is graph_adapter
+    assert getattr(client, "_graph") is adapter
     assert getattr(client, "_default_dialect") == "cypher"
     assert getattr(client, "_default_namespace") == "prod"
     assert getattr(client, "_default_timeout_ms") == 9999
