@@ -5,6 +5,8 @@
 	test-vector-conformance \
 	test-graph-conformance \
 	test-embedding-conformance \
+	test-llm-frameworks \
+	test-vector-frameworks \
 	test-embedding-frameworks \
 	test-graph-frameworks \
 	test-fast \
@@ -12,6 +14,8 @@
 	test-fast-vector \
 	test-fast-graph \
 	test-fast-embedding \
+	test-fast-llm-frameworks \
+	test-fast-vector-frameworks \
 	test-fast-embedding-frameworks \
 	test-fast-graph-frameworks \
 	test-schema \
@@ -58,6 +62,8 @@ GOLDEN_TEST_DIR := tests/golden
 WIRE_TEST_DIR := tests/live
 
 # Framework adapter test directories (optional)
+LLM_FRAMEWORKS_DIR := tests/frameworks/llm
+VECTOR_FRAMEWORKS_DIR := tests/frameworks/vector
 EMBEDDING_FRAMEWORKS_DIR := tests/frameworks/embedding
 GRAPH_FRAMEWORKS_DIR := tests/frameworks/graph
 
@@ -73,6 +79,8 @@ $(foreach dir,$(TEST_DIRS),$(if $(wildcard $(dir)),,$(error Test directory $(dir
 $(if $(wildcard $(SCHEMA_TEST_DIR)),,$(warning ⚠️  Schema test directory '$(SCHEMA_TEST_DIR)' not found))
 $(if $(wildcard $(GOLDEN_TEST_DIR)),,$(warning ⚠️  Golden test directory '$(GOLDEN_TEST_DIR)' not found))
 $(if $(wildcard $(WIRE_TEST_DIR)),,$(warning ⚠️  Wire test directory '$(WIRE_TEST_DIR)' not found))
+$(if $(wildcard $(LLM_FRAMEWORKS_DIR)),,$(warning ⚠️  LLM framework test directory '$(LLM_FRAMEWORKS_DIR)' not found))
+$(if $(wildcard $(VECTOR_FRAMEWORKS_DIR)),,$(warning ⚠️  Vector framework test directory '$(VECTOR_FRAMEWORKS_DIR)' not found))
 $(if $(wildcard $(EMBEDDING_FRAMEWORKS_DIR)),,$(warning ⚠️  Embedding framework test directory '$(EMBEDDING_FRAMEWORKS_DIR)' not found))
 $(if $(wildcard $(GRAPH_FRAMEWORKS_DIR)),,$(warning ⚠️  Graph framework test directory '$(GRAPH_FRAMEWORKS_DIR)' not found))
 
@@ -185,6 +193,30 @@ test-%-conformance: check-deps
 		--junitxml=$*_results.xml
 
 # Framework adapter suites: explicit targets (paths differ from tests/$*)
+test-llm-frameworks: check-deps
+	@echo "🚀 Running LLM Framework Adapters conformance tests..."
+	@echo "   Directory: $(LLM_FRAMEWORKS_DIR)"
+	@echo "   Parallel jobs: $(PYTEST_JOBS)"
+	@echo "   Coverage threshold: $(COV_FAIL_UNDER)%"
+	$(PYTEST) $(LLM_FRAMEWORKS_DIR) $(PYTEST_ARGS) $(PYTEST_PARALLEL) \
+		--cov=corpus_sdk.llm.framework_adapters \
+		$(COV_THRESHOLD) \
+		$(COV_REPORT_TERM) \
+		--cov-report=html:llm_frameworks_coverage_report \
+		--junitxml=llm_frameworks_results.xml
+
+test-vector-frameworks: check-deps
+	@echo "🚀 Running Vector Framework Adapters conformance tests..."
+	@echo "   Directory: $(VECTOR_FRAMEWORKS_DIR)"
+	@echo "   Parallel jobs: $(PYTEST_JOBS)"
+	@echo "   Coverage threshold: $(COV_FAIL_UNDER)%"
+	$(PYTEST) $(VECTOR_FRAMEWORKS_DIR) $(PYTEST_ARGS) $(PYTEST_PARALLEL) \
+		--cov=corpus_sdk.vector.framework_adapters \
+		$(COV_THRESHOLD) \
+		$(COV_REPORT_TERM) \
+		--cov-report=html:vector_frameworks_coverage_report \
+		--junitxml=vector_frameworks_results.xml
+
 test-embedding-frameworks: check-deps
 	@echo "🚀 Running Embedding Framework Adapters conformance tests..."
 	@echo "   Directory: $(EMBEDDING_FRAMEWORKS_DIR)"
@@ -301,6 +333,8 @@ try:
         "vector": "Vector Protocol V1.0",
         "graph": "Graph Protocol V1.0",
         "embedding": "Embedding Protocol V1.0",
+        "llm_frameworks": "LLM Framework Adapters V1.0",
+        "vector_frameworks": "Vector Framework Adapters V1.0",
         "embedding_frameworks": "Embedding Framework Adapters V1.0",
         "graph_frameworks": "Graph Framework Adapters V1.0",
         "cli": "CLI Tests",
@@ -325,6 +359,8 @@ try:
         "vector": "Vector", 
         "graph": "Graph",
         "embedding": "Embedding",
+        "llm_frameworks": "LLM Framework Adapters",
+        "vector_frameworks": "Vector Framework Adapters",
         "embedding_frameworks": "Embedding Framework Adapters",
         "graph_frameworks": "Graph Framework Adapters",
     }
@@ -374,6 +410,8 @@ try:
         "vector",
         "graph",
         "embedding",
+        "llm_frameworks",
+        "vector_frameworks",
         "embedding_frameworks",
         "graph_frameworks",
         "cli",
@@ -501,6 +539,14 @@ test-fast-%: check-deps
 	$(PYTEST) tests/$* $(PYTEST_ARGS) $(PYTEST_PARALLEL) -m "not slow" --no-cov
 
 # Fast framework adapter suites
+test-fast-llm-frameworks: check-deps
+	@echo "⚡ Running fast LLM Framework Adapters tests (no coverage, skipping slow)..."
+	$(PYTEST) $(LLM_FRAMEWORKS_DIR) $(PYTEST_ARGS) $(PYTEST_PARALLEL) -m "not slow" --no-cov
+
+test-fast-vector-frameworks: check-deps
+	@echo "⚡ Running fast Vector Framework Adapters tests (no coverage, skipping slow)..."
+	$(PYTEST) $(VECTOR_FRAMEWORKS_DIR) $(PYTEST_ARGS) $(PYTEST_PARALLEL) -m "not slow" --no-cov
+
 test-fast-embedding-frameworks: check-deps
 	@echo "⚡ Running fast Embedding Framework Adapters tests (no coverage, skipping slow)..."
 	$(PYTEST) $(EMBEDDING_FRAMEWORKS_DIR) $(PYTEST_ARGS) $(PYTEST_PARALLEL) -m "not slow" --no-cov
@@ -565,8 +611,12 @@ help:
 	@echo "  test-embedding-conformance        Run only Embedding Protocol V1 tests (tests/embedding)"
 	@echo ""
 	@echo "Framework Adapter Suites:"
+	@echo "  test-llm-frameworks               Run LLM Framework Adapters tests (tests/frameworks/llm)"
+	@echo "  test-vector-frameworks            Run Vector Framework Adapters tests (tests/frameworks/vector)"
 	@echo "  test-embedding-frameworks         Run Embedding Framework Adapters tests (tests/frameworks/embedding)"
 	@echo "  test-graph-frameworks             Run Graph Framework Adapters tests (tests/frameworks/graph)"
+	@echo "  test-fast-llm-frameworks          Fast LLM Framework Adapters tests (no coverage, skip slow)"
+	@echo "  test-fast-vector-frameworks       Fast Vector Framework Adapters tests (no coverage, skip slow)"
 	@echo "  test-fast-embedding-frameworks    Fast Embedding Framework Adapters tests (no coverage, skip slow)"
 	@echo "  test-fast-graph-frameworks        Fast Graph Framework Adapters tests (no coverage, skip slow)"
 	@echo ""
@@ -605,6 +655,8 @@ help:
 	@echo "  test-fast-vector                  Run Vector tests quickly"
 	@echo "  test-fast-graph                   Run Graph tests quickly"
 	@echo "  test-fast-embedding               Run Embedding tests quickly"
+	@echo "  test-fast-llm-frameworks          Run LLM Framework Adapters tests quickly"
+	@echo "  test-fast-vector-frameworks       Run Vector Framework Adapters tests quickly"
 	@echo "  test-fast-embedding-frameworks    Run Embedding Framework Adapters tests quickly"
 	@echo "  test-fast-graph-frameworks        Run Graph Framework Adapters tests quickly"
 	@echo "  test-wire-fast                    Run wire tests quickly (also available via test-fast)"
@@ -625,6 +677,8 @@ help:
 	@echo "  make test-conformance                      # Run all protocol + extra tests"
 	@echo "  make test-llm-conformance                  # Run only LLM tests"
 	@echo "  make test-wire                             # Run wire envelope conformance"
+	@echo "  make test-llm-frameworks                   # Run all LLM framework adapter tests"
+	@echo "  make test-vector-frameworks                # Run all Vector framework adapter tests"
 	@echo "  make test-embedding-frameworks             # Run all embedding framework adapter tests"
 	@echo "  make test-graph-frameworks                 # Run all graph framework adapter tests"
 	@echo "  make test-fast                             # Run all tests quickly (protocol + wire + extra)"
