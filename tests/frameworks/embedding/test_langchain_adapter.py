@@ -1,10 +1,9 @@
-# tests/frameworks/embedding/test_langchain_adapter.py
-
 from __future__ import annotations
 
 from collections.abc import Sequence
 from typing import Any, Dict
 
+import asyncio
 import inspect
 import pytest
 from pydantic import ValidationError
@@ -214,6 +213,54 @@ def test_runnable_config_passed_to_context_translation(
 
 
 # ---------------------------------------------------------------------------
+# Error-context decorator behavior
+# ---------------------------------------------------------------------------
+
+
+def test_error_context_includes_langchain_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When an error occurs during LangChain embedding, error context should
+    include LangChain-specific metadata via attach_context().
+    """
+    captured_context: Dict[str, Any] = {}
+
+    def fake_attach_context(exc: BaseException, **ctx: Any) -> None:
+        captured_context.update(ctx)
+
+    monkeypatch.setattr(
+        langchain_adapter_module,
+        "attach_context",
+        fake_attach_context,
+    )
+
+    class FailingAdapter:
+        def embed(self, *args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("test error from langchain adapter")
+
+    embeddings = CorpusLangChainEmbeddings(
+        corpus_adapter=FailingAdapter(),
+        model="err-model",
+    )
+
+    config = {
+        "run_id": "run-ctx",
+        "run_name": "error-test",
+    }
+
+    with pytest.raises(RuntimeError, match="test error from langchain adapter"):
+        embeddings.embed_documents(["x", "y"], config=config)
+
+    # Verify some context was attached
+    assert captured_context, "attach_context was not called"
+    assert captured_context.get("framework") == "langchain"
+    # Best-effort propagation of config metadata
+    if "run_id" in captured_context:
+        assert captured_context["run_id"] == "run-ctx"
+
+
+# ---------------------------------------------------------------------------
 # Sync / async semantics
 # ---------------------------------------------------------------------------
 
@@ -311,3 +358,161 @@ def test_large_batch_sync_shape(adapter: Any) -> None:
     result = embeddings.embed_documents(texts)
     _assert_embedding_matrix_shape(result, expected_rows=len(texts))
 
+
+# ---------------------------------------------------------------------------
+# Capabilities / health passthrough
+# ---------------------------------------------------------------------------
+
+
+def test_capabilities_and_health_passthrough_when_underlying_provides() -> None:
+    """
+    When the underlying adapter implements capabilities/acapabilities and
+    health/ahealth, CorpusLangChainEmbeddings should surface them.
+    """
+
+    class FullAdapter:
+        def embed(self, texts: Sequence[str], **_: Any) -> list[list[float]]:
+            return [[0.0, 1.0] for _ in texts]
+
+        def capabilities(self) -> Dict[str, Any]:
+            return {"ok": True}
+
+        async def acapabilities(self) -> Dict[str, Any]:
+            return {"ok_async": True}
+
+        def health(self) -> Dict[str, Any]:
+            return {"status": "healthy"}
+
+        async def ahealth(self) -> Dict[str, Any]:
+            return {"status_async": "healthy"}
+
+    embeddings = CorpusLangChainEmbeddings(
+        corpus_adapter=FullAdapter(),
+        model="cap-model",
+    )
+
+    # Sync passthrough
+    caps = embeddings.capabilities()
+    assert isinstance(caps, dict)
+    assert caps.get("ok") is True
+
+    health = embeddings.health()
+    assert isinstance(health, dict)
+    assert health.get("status") == "healthy"
+
+    # Async passthrough via event loop
+    acaps = asyncio.run(embeddings.acapabilities())
+    assert isinstance(acaps, dict)
+    assert acaps.get("ok_async") is True
+
+    ahealth = asyncio.run(embeddings.ahealth())
+    assert isinstance(ahealth, dict)
+    assert ahealth.get("status_async") == "healthy"
+
+
+@pytest.mark.asyncio
+async def test_async_capabilities_and_health_fallback_to_sync() -> None:
+    """
+    acapabilities/ahealth should fall back to sync capabilities()/health()
+    when only sync methods are implemented on the underlying adapter.
+    """
+
+    class CapHealthAdapter:
+        def embed(self, texts: Sequence[str], **_: Any) -> list[list[float]]:
+            return [[0.0, 1.0] for _ in texts]
+
+        def capabilities(self) -> Dict[str, Any]:
+            return {"via_sync_caps": True}
+
+        def health(self) -> Dict[str, Any]:
+            return {"via_sync_health": True}
+
+    embeddings = CorpusLangChainEmbeddings(
+        corpus_adapter=CapHealthAdapter(),
+        model="cap-fallback-model",
+    )
+
+    acaps = await embeddings.acapabilities()
+    assert isinstance(acaps, dict)
+    assert acaps.get("via_sync_caps") is True
+
+    ahealth = await embeddings.ahealth()
+    assert isinstance(ahealth, dict)
+    assert ahealth.get("via_sync_health") is True
+
+
+def test_capabilities_and_health_return_empty_when_missing() -> None:
+    """
+    If the underlying adapter has no capabilities()/health(), the LangChain
+    adapter should return an empty dict rather than raising.
+    """
+
+    class NoCapHealthAdapter:
+        def embed(self, texts: Sequence[str], **_: Any) -> list[list[float]]:
+            return [[0.0] * 3 for _ in texts]
+
+    embeddings = CorpusLangChainEmbeddings(
+        corpus_adapter=NoCapHealthAdapter(),
+        model="no-cap-health-model",
+    )
+
+    caps = embeddings.capabilities()
+    assert isinstance(caps, dict)
+    assert caps == {}
+
+    health = embeddings.health()
+    assert isinstance(health, dict)
+    assert health == {}
+
+    # Async variants should also return empty mapping
+    acaps = asyncio.run(embeddings.acapabilities())
+    assert isinstance(acaps, dict)
+    assert acaps == {}
+
+    ahealth = asyncio.run(embeddings.ahealth())
+    assert isinstance(ahealth, dict)
+    assert ahealth == {}
+
+
+# ---------------------------------------------------------------------------
+# Resource management (context managers)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_context_manager_closes_underlying_adapter() -> None:
+    """
+    __enter__/__exit__ and __aenter__/__aexit__ should call close/aclose on
+    the underlying adapter when those methods exist.
+    """
+
+    class ClosingAdapter:
+        def __init__(self) -> None:
+            self.closed = False
+            self.aclosed = False
+
+        def embed(self, texts: Sequence[str], **_: Any) -> list[list[float]]:
+            return [[0.0] * 2 for _ in texts]
+
+        def close(self) -> None:
+            self.closed = True
+
+        async def aclose(self) -> None:
+            self.aclosed = True
+
+    adapter = ClosingAdapter()
+
+    # Sync context manager
+    with CorpusLangChainEmbeddings(corpus_adapter=adapter, model="ctx-model") as emb:
+        _ = emb.embed_documents(["x"])  # smoke
+
+    assert adapter.closed is True
+
+    # Async context manager
+    adapter2 = ClosingAdapter()
+    emb2 = CorpusLangChainEmbeddings(corpus_adapter=adapter2, model="ctx-model-2")
+
+    async with emb2:
+        _ = await emb2.aembed_documents(["y"])
+
+    assert adapter2.aclosed is True
