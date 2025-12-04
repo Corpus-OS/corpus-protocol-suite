@@ -20,9 +20,9 @@ from corpus_sdk.graph.framework_adapters.crewai import (
 # ---------------------------------------------------------------------------
 
 
-def _make_client(graph_adapter: Any, **kwargs: Any) -> CorpusCrewAIGraphClient:
+def _make_client(adapter: Any, **kwargs: Any) -> CorpusCrewAIGraphClient:
     """Construct a CorpusCrewAIGraphClient instance from the generic adapter."""
-    return CorpusCrewAIGraphClient(graph_adapter=graph_adapter, **kwargs)
+    return CorpusCrewAIGraphClient(adapter=adapter, **kwargs)
 
 
 def _patch_create_graph_translator(
@@ -91,7 +91,7 @@ class DummyBatchOp:
 
 def test_default_translator_uses_crewai_framework_translator(
     monkeypatch: pytest.MonkeyPatch,
-    graph_adapter: Any,
+    adapter: Any,
 ) -> None:
     """
     By default, CorpusCrewAIGraphClient should:
@@ -116,7 +116,7 @@ def test_default_translator_uses_crewai_framework_translator(
         fake_create_graph_translator,
     )
 
-    client = _make_client(graph_adapter)
+    client = _make_client(adapter)
 
     # Trigger lazy translator construction
     _ = client._translator  # noqa: SLF001
@@ -131,7 +131,7 @@ def test_default_translator_uses_crewai_framework_translator(
 
 def test_framework_translator_override_is_respected(
     monkeypatch: pytest.MonkeyPatch,
-    graph_adapter: Any,
+    adapter: Any,
 ) -> None:
     """
     If framework_translator is provided, CorpusCrewAIGraphClient should pass
@@ -161,7 +161,7 @@ def test_framework_translator_override_is_respected(
     )
 
     client = _make_client(
-        graph_adapter,
+        adapter,
         framework_translator=custom,
         framework_version="crewai-fw-1.2.3",
     )
@@ -180,7 +180,7 @@ def test_framework_translator_override_is_respected(
 
 def test_crewai_task_and_extra_context_passed_to_core_ctx(
     monkeypatch: pytest.MonkeyPatch,
-    graph_adapter: Any,
+    adapter: Any,
 ) -> None:
     """
     Verify that task and extra_context are passed through to core_ctx_from_crewai
@@ -216,7 +216,7 @@ def test_crewai_task_and_extra_context_passed_to_core_ctx(
     )
 
     client = _make_client(
-        graph_adapter,
+        adapter,
         framework_version="crewai-test-version",
     )
 
@@ -244,7 +244,7 @@ def test_crewai_task_and_extra_context_passed_to_core_ctx(
 
 def test_build_ctx_failure_raises_bad_request_like_error_and_attaches_context(
     monkeypatch: pytest.MonkeyPatch,
-    graph_adapter: Any,
+    adapter: Any,
 ) -> None:
     """
     _build_ctx should wrap failures from core_ctx_from_crewai in an error that:
@@ -280,7 +280,7 @@ def test_build_ctx_failure_raises_bad_request_like_error_and_attaches_context(
         fake_core_ctx_from_crewai,
     )
 
-    client = _make_client(graph_adapter, framework_version="ctx-fw")
+    client = _make_client(adapter, framework_version="ctx-fw")
 
     with pytest.raises(Exception) as exc_info:  # noqa: BLE001
         client._build_ctx(  # noqa: SLF001
@@ -304,7 +304,7 @@ def test_build_ctx_failure_raises_bad_request_like_error_and_attaches_context(
 
 def test_error_context_includes_crewai_metadata_sync(
     monkeypatch: pytest.MonkeyPatch,
-    graph_adapter: Any,
+    adapter: Any,
 ) -> None:
     """
     When an error occurs during a sync graph operation, error context should
@@ -334,7 +334,7 @@ def test_error_context_includes_crewai_metadata_sync(
         fake_create_graph_translator,
     )
 
-    client = _make_client(graph_adapter)
+    client = _make_client(adapter)
 
     with pytest.raises(RuntimeError, match="test error from crewai graph adapter"):
         client.query("MATCH (n) RETURN n")
@@ -348,7 +348,7 @@ def test_error_context_includes_crewai_metadata_sync(
 @pytest.mark.asyncio
 async def test_error_context_includes_crewai_metadata_async(
     monkeypatch: pytest.MonkeyPatch,
-    graph_adapter: Any,
+    adapter: Any,
 ) -> None:
     """
     Same as the sync error-context test but for the async query path.
@@ -377,7 +377,7 @@ async def test_error_context_includes_crewai_metadata_async(
         fake_create_graph_translator,
     )
 
-    client = _make_client(graph_adapter)
+    client = _make_client(adapter)
 
     with pytest.raises(RuntimeError, match="test error from crewai graph adapter"):
         await client.aquery("MATCH (n) RETURN n")
@@ -392,7 +392,7 @@ async def test_error_context_includes_crewai_metadata_async(
 # ---------------------------------------------------------------------------
 
 
-def test_sync_query_and_stream_basic(graph_adapter: Any) -> None:
+def test_sync_query_and_stream_basic(adapter: Any) -> None:
     """
     Basic smoke test for sync query / stream_query behavior: methods should
     accept text input and not crash, returning protocol-level shapes.
@@ -400,7 +400,7 @@ def test_sync_query_and_stream_basic(graph_adapter: Any) -> None:
     Detailed QueryResult / QueryChunk semantics are covered by the generic
     graph contract tests.
     """
-    client = _make_client(graph_adapter, default_namespace="crewai-ns")
+    client = _make_client(adapter, default_namespace="crewai-ns")
 
     # Non-streaming query
     result = client.query("MATCH (n) RETURN n LIMIT 1")
@@ -411,12 +411,12 @@ def test_sync_query_and_stream_basic(graph_adapter: Any) -> None:
     assert isinstance(chunks, list)
 
 
-def test_sync_query_accepts_optional_params_and_context(graph_adapter: Any) -> None:
+def test_sync_query_accepts_optional_params_and_context(adapter: Any) -> None:
     """
     query() should accept params, dialect, namespace, timeout_ms, and
     task/extra_context kwargs without raising.
     """
-    client = _make_client(graph_adapter, default_dialect="cypher")
+    client = _make_client(adapter, default_dialect="cypher")
 
     result = client.query(
         "MATCH (n) RETURN n LIMIT $limit",
@@ -436,12 +436,12 @@ def test_sync_query_accepts_optional_params_and_context(graph_adapter: Any) -> N
 
 
 @pytest.mark.asyncio
-async def test_async_query_and_stream_basic(graph_adapter: Any) -> None:
+async def test_async_query_and_stream_basic(adapter: Any) -> None:
     """
     Async aquery / astream_query should exist and produce results compatible
     with the sync API (non-None result / async-iterable of chunks).
     """
-    client = _make_client(graph_adapter)
+    client = _make_client(adapter)
 
     assert hasattr(client, "aquery")
     assert hasattr(client, "astream_query")
@@ -465,12 +465,12 @@ async def test_async_query_and_stream_basic(graph_adapter: Any) -> None:
 
 @pytest.mark.asyncio
 async def test_async_query_accepts_optional_params_and_context(
-    graph_adapter: Any,
+    adapter: Any,
 ) -> None:
     """
     aquery() should accept the same optional params and context as query().
     """
-    client = _make_client(graph_adapter, default_namespace="async-ns")
+    client = _make_client(adapter, default_namespace="async-ns")
 
     result = await client.aquery(
         "MATCH (n) RETURN n LIMIT $limit",
@@ -491,7 +491,7 @@ async def test_async_query_accepts_optional_params_and_context(
 
 def test_stream_query_invalid_chunk_triggers_validation(
     monkeypatch: pytest.MonkeyPatch,
-    graph_adapter: Any,
+    adapter: Any,
 ) -> None:
     """
     If the translator yields invalid chunks, stream_query should pass them
@@ -524,7 +524,7 @@ def test_stream_query_invalid_chunk_triggers_validation(
         fake_validate_graph_result_type,
     )
 
-    client = _make_client(graph_adapter)
+    client = _make_client(adapter)
 
     iterator = client.stream_query("MATCH (n) RETURN n")
     with pytest.raises(RuntimeError, match="forced validation failure for chunk"):
@@ -537,7 +537,7 @@ def test_stream_query_invalid_chunk_triggers_validation(
 @pytest.mark.asyncio
 async def test_astream_query_invalid_chunk_triggers_validation_async(
     monkeypatch: pytest.MonkeyPatch,
-    graph_adapter: Any,
+    adapter: Any,
 ) -> None:
     """
     Async streaming path should also exercise validate_graph_result_type when
@@ -572,7 +572,7 @@ async def test_astream_query_invalid_chunk_triggers_validation_async(
         fake_validate_graph_result_type,
     )
 
-    client = _make_client(graph_adapter)
+    client = _make_client(adapter)
 
     aiter = await client.astream_query("MATCH (n) RETURN n")
     with pytest.raises(RuntimeError, match="forced validation failure for async chunk"):
@@ -590,7 +590,7 @@ async def test_astream_query_invalid_chunk_triggers_validation_async(
 
 def test_bulk_vertices_builds_raw_request_and_calls_translator(
     monkeypatch: pytest.MonkeyPatch,
-    graph_adapter: Any,
+    adapter: Any,
 ) -> None:
     """
     bulk_vertices() should:
@@ -617,7 +617,7 @@ def test_bulk_vertices_builds_raw_request_and_calls_translator(
     _patch_create_graph_translator(monkeypatch, DummyTranslator)
     _patch_validate_graph_result_type_passthrough(monkeypatch)
 
-    client = _make_client(graph_adapter, framework_version="fw-bulk-1")
+    client = _make_client(adapter, framework_version="fw-bulk-1")
 
     spec = DummyBulkSpec(
         namespace="ns-bulk",
@@ -648,7 +648,7 @@ def test_bulk_vertices_builds_raw_request_and_calls_translator(
 @pytest.mark.asyncio
 async def test_abulk_vertices_builds_raw_request_and_calls_translator_async(
     monkeypatch: pytest.MonkeyPatch,
-    graph_adapter: Any,
+    adapter: Any,
 ) -> None:
     """
     abulk_vertices() should mirror bulk_vertices wiring but via the async
@@ -672,7 +672,7 @@ async def test_abulk_vertices_builds_raw_request_and_calls_translator_async(
     _patch_create_graph_translator(monkeypatch, DummyTranslator)
     _patch_validate_graph_result_type_passthrough(monkeypatch)
 
-    client = _make_client(graph_adapter, framework_version="fw-abulk-1")
+    client = _make_client(adapter, framework_version="fw-abulk-1")
 
     spec = DummyBulkSpec(
         namespace="ns-abulk",
@@ -702,7 +702,7 @@ async def test_abulk_vertices_builds_raw_request_and_calls_translator_async(
 
 def test_batch_builds_raw_batch_ops_and_calls_translator(
     monkeypatch: pytest.MonkeyPatch,
-    graph_adapter: Any,
+    adapter: Any,
 ) -> None:
     """
     batch() should:
@@ -738,7 +738,7 @@ def test_batch_builds_raw_batch_ops_and_calls_translator(
         fake_validate_batch_operations,
     )
 
-    client = _make_client(graph_adapter, framework_version="fw-batch-1")
+    client = _make_client(adapter, framework_version="fw-batch-1")
 
     ops = [
         DummyBatchOp("upsert_nodes", {"id": "1"}),
@@ -764,7 +764,7 @@ def test_batch_builds_raw_batch_ops_and_calls_translator(
 @pytest.mark.asyncio
 async def test_abatch_builds_raw_batch_ops_and_calls_translator_async(
     monkeypatch: pytest.MonkeyPatch,
-    graph_adapter: Any,
+    adapter: Any,
 ) -> None:
     """
     abatch() should mirror batch wiring but via translator.arun_batch().
@@ -796,7 +796,7 @@ async def test_abatch_builds_raw_batch_ops_and_calls_translator_async(
         fake_validate_batch_operations,
     )
 
-    client = _make_client(graph_adapter, framework_version="fw-abatch-1")
+    client = _make_client(adapter, framework_version="fw-abatch-1")
 
     ops = [
         DummyBatchOp("upsert_edges", {"id": "e-1"}),
@@ -824,7 +824,7 @@ async def test_abatch_builds_raw_batch_ops_and_calls_translator_async(
 # ---------------------------------------------------------------------------
 
 
-def test_capabilities_and_health_basic(graph_adapter: Any) -> None:
+def test_capabilities_and_health_basic(adapter: Any) -> None:
     """
     Capabilities and health should be surfaced as mappings.
 
@@ -832,7 +832,7 @@ def test_capabilities_and_health_basic(graph_adapter: Any) -> None:
     tests; here we only assert that the CrewAI adapter normalizes to
     mapping-like results.
     """
-    client = _make_client(graph_adapter)
+    client = _make_client(adapter)
 
     caps = client.capabilities()
     assert isinstance(caps, Mapping)
@@ -842,12 +842,12 @@ def test_capabilities_and_health_basic(graph_adapter: Any) -> None:
 
 
 @pytest.mark.asyncio
-async def test_async_capabilities_and_health_basic(graph_adapter: Any) -> None:
+async def test_async_capabilities_and_health_basic(adapter: Any) -> None:
     """
     Async capabilities/health should also return mappings compatible with
     the sync variants.
     """
-    client = _make_client(graph_adapter)
+    client = _make_client(adapter)
 
     acaps = await client.acapabilities()
     assert isinstance(acaps, Mapping)
@@ -862,7 +862,7 @@ async def test_async_capabilities_and_health_basic(graph_adapter: Any) -> None:
 
 
 @pytest.mark.asyncio
-async def test_context_manager_closes_underlying_graph_adapter() -> None:
+async def test_context_manager_closes_underlying_adapter() -> None:
     """
     __enter__/__exit__ and __aenter__/__aexit__ should call close/aclose on
     the underlying graph adapter when those methods exist.
@@ -888,14 +888,14 @@ async def test_context_manager_closes_underlying_graph_adapter() -> None:
     adapter = ClosingGraphAdapter()
 
     # Sync context manager
-    with CorpusCrewAIGraphClient(graph_adapter=adapter) as client:
+    with CorpusCrewAIGraphClient(adapter=adapter) as client:
         assert client is not None
 
     assert adapter.closed is True
 
     # Async context manager
     adapter2 = ClosingGraphAdapter()
-    client2 = CorpusCrewAIGraphClient(graph_adapter=adapter2)
+    client2 = CorpusCrewAIGraphClient(adapter=adapter2)
 
     async with client2:
         assert client2 is not None
