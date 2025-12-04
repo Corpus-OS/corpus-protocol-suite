@@ -26,6 +26,8 @@ Usage:
     # Framework adapter suites
     python -m tests.run_conformance --protocol embedding_frameworks
     python -m tests.run_conformance --protocol graph_frameworks
+    python -m tests.run_conformance --protocol llm_frameworks
+    python -m tests.run_conformance --protocol vector_frameworks
 
     # CI mode with reporting
     python -m tests.run_conformance --ci --report
@@ -77,6 +79,8 @@ PROTOCOL_PATHS: Dict[str, str] = {
     # Wire-level envelope conformance suite
     "wire": "tests/live",
     # Framework adapter suites
+    "llm_frameworks": "tests/frameworks/llm",
+    "vector_frameworks": "tests/frameworks/vector",
     "embedding_frameworks": "tests/frameworks/embedding",
     "graph_frameworks": "tests/frameworks/graph",
 }
@@ -96,6 +100,8 @@ PROTOCOL_DISPLAY_NAMES = {
     "schema": "Schema Conformance",
     "golden": "Golden Wire Validation",
     "wire": "Wire Envelope Conformance",
+    "llm_frameworks": "LLM Framework Adapters V1.0",
+    "vector_frameworks": "Vector Framework Adapters V1.0",
     "embedding_frameworks": "Embedding Framework Adapters V1.0",
     "graph_frameworks": "Graph Framework Adapters V1.0",
 }
@@ -116,6 +122,9 @@ CONFORMANCE_LEVELS: Dict[str, Dict[str, int]] = {
     # Framework adapter suites (from conformance docs)
     "embedding_frameworks": {"gold": 121, "silver": 97, "development": 60},
     "graph_frameworks": {"gold": 184, "silver": 147, "development": 92},
+    # New framework suites – thresholds are placeholders; real scoring is dynamic.
+    "llm_frameworks": {"gold": 0, "silver": 0, "development": 0},
+    "vector_frameworks": {"gold": 0, "silver": 0, "development": 0},
     # Wire suite is dynamic; thresholds are effectively "total collected" at runtime.
 }
 
@@ -309,6 +318,16 @@ def _parse_junit_results() -> Dict[str, Any]:
                             patterns = [
                                 "tests.frameworks.graph.",
                                 "tests/frameworks/graph/",
+                            ]
+                        elif proto == "llm_frameworks":
+                            patterns = [
+                                "tests.frameworks.llm.",
+                                "tests/frameworks/llm/",
+                            ]
+                        elif proto == "vector_frameworks":
+                            patterns = [
+                                "tests.frameworks.vector.",
+                                "tests/frameworks/vector/",
                             ]
                         else:
                             patterns = [
@@ -577,6 +596,8 @@ def _generate_conformance_report(
             "vector",
             "graph",
             "embedding",
+            "llm_frameworks",
+            "vector_frameworks",
             "embedding_frameworks",
             "graph_frameworks",
         ]
