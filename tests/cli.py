@@ -63,6 +63,8 @@ _STATIC_PROTOCOL_PATHS: Dict[str, str] = {
     # Framework adapter suites
     "embedding_frameworks": "tests/frameworks/embedding",
     "graph_frameworks": "tests/frameworks/graph",
+    "llm_frameworks": "tests/frameworks/llm",
+    "vector_frameworks": "tests/frameworks/vector",
 }
 
 
@@ -731,6 +733,14 @@ Notes:
         "test-graph-frameworks",
         help="Run Graph Framework Adapter conformance tests",
     )
+    subparsers.add_parser(
+        "test-llm-frameworks",
+        help="Run LLM Framework Adapter conformance tests",
+    )
+    subparsers.add_parser(
+        "test-vector-frameworks",
+        help="Run Vector Framework Adapter conformance tests",
+    )
 
     # Schema & Golden commands
     subparsers.add_parser(
@@ -885,13 +895,16 @@ Notes:
             "vector",
             "graph",
             "embedding",
+            "llm_frameworks",
+            "vector_frameworks",
             "embedding_frameworks",
             "graph_frameworks",
         ]
         rc = _run_suite(
             title=(
                 "ALL protocol and framework adapter conformance suites "
-                "(LLM, Vector, Graph, Embedding, Embedding Frameworks, Graph Frameworks)"
+                "(LLM, Vector, Graph, Embedding, LLM Frameworks, Vector Frameworks, "
+                "Embedding Frameworks, Graph Frameworks)"
             ),
             test_paths=[PROTOCOL_PATHS[p] for p in suite_keys],
             cov_module="corpus_sdk",
@@ -945,6 +958,8 @@ Notes:
             "vector",
             "graph",
             "embedding",
+            "llm_frameworks",
+            "vector_frameworks",
             "embedding_frameworks",
             "graph_frameworks",
         ]
@@ -1082,6 +1097,20 @@ Notes:
             "corpus_sdk.graph.framework_adapters",
             "graph_frameworks_coverage_report",
             "graph_frameworks_results.xml",
+        ),
+        "test-llm-frameworks": (
+            "LLM Framework Adapters V1",
+            "llm_frameworks",
+            "corpus_sdk.llm.framework_adapters",
+            "llm_frameworks_coverage_report",
+            "llm_frameworks_results.xml",
+        ),
+        "test-vector-frameworks": (
+            "Vector Framework Adapters V1",
+            "vector_frameworks",
+            "corpus_sdk.vector.framework_adapters",
+            "vector_frameworks_coverage_report",
+            "vector_frameworks_results.xml",
         ),
     }
 
