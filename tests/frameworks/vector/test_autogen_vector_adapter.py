@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections.abc import Mapping, AsyncIterator
 from typing import Any, Dict, List, Mapping as TMapping, Sequence, Tuple
 import inspect
+import asyncio
 
 import pytest
 
@@ -13,6 +14,8 @@ from corpus_sdk.vector.framework_adapters.autogen import (
     CorpusAutoGenRetrieverTool,
     CorpusAutoGenVectorStore,
     ErrorCodes,
+    with_error_context,
+    with_async_error_context,
 )
 
 
@@ -29,16 +32,40 @@ def _simple_embedding_fn(texts: List[str]) -> List[List[float]]:
     return embs
 
 
+async def _simple_async_embedding_fn(texts: List[str]) -> List[List[float]]:
+    """Async version of simple embedding function."""
+    await asyncio.sleep(0.001)  # Simulate async work
+    return _simple_embedding_fn(texts)
+
+
+def _failing_embedding_fn(texts: List[str]) -> List[List[float]]:
+    """Embedding function that always fails."""
+    raise RuntimeError("Embedding function failed")
+
+
+async def _failing_async_embedding_fn(texts: List[str]) -> List[List[float]]:
+    """Async embedding function that always fails."""
+    await asyncio.sleep(0.001)
+    raise RuntimeError("Async embedding function failed")
+
+
 def _make_store(
     adapter: Any,
     *,
     with_embeddings: bool = True,
     framework_version: str | None = "autogen-fw-test",
+    metadata_field: str | None = None,
+    score_threshold: float | None = None,
 ) -> CorpusAutoGenVectorStore:
     """Construct a CorpusAutoGenVectorStore with a simple embedding function."""
     kwargs: Dict[str, Any] = {"corpus_adapter": adapter, "framework_version": framework_version}
     if with_embeddings:
         kwargs["embedding_function"] = _simple_embedding_fn
+        kwargs["async_embedding_function"] = _simple_async_embedding_fn
+    if metadata_field is not None:
+        kwargs["metadata_field"] = metadata_field
+    if score_threshold is not None:
+        kwargs["score_threshold"] = score_threshold
     return CorpusAutoGenVectorStore(**kwargs)
 
 
@@ -88,10 +115,46 @@ def _mock_async_translator_with_capture(
     return MockTranslator()
 
 
-# ---------------------------------------------------------------------------
-# Translator wiring
-# ---------------------------------------------------------------------------
+class MockUpsertResult:
+    """Mock upsert result for testing partial failures."""
+    def __init__(self, upserted_count: int = 0, failed_count: int = 0, failures: List[Any] = None):
+        self.upserted_count = upserted_count
+        self.failed_count = failed_count
+        self.failures = failures or []
 
+
+class DummyAdapter:
+    """Dummy adapter for testing."""
+    def __init__(self, has_capabilities: bool = True, has_health: bool = True):
+        self.has_capabilities = has_capabilities
+        self.has_health = has_health
+    
+    def capabilities(self) -> Dict[str, Any]:
+        if self.has_capabilities:
+            return {"features": ["x", "y"]}
+        raise AttributeError("No capabilities method")
+    
+    def health(self) -> Dict[str, Any]:
+        if self.has_health:
+            return {"status": "ok"}
+        raise AttributeError("No health method")
+    
+    async def acapabilities(self) -> Dict[str, Any]:
+        if self.has_capabilities:
+            await asyncio.sleep(0.001)
+            return {"async_features": True}
+        raise AttributeError("No acapabilities method")
+    
+    async def ahealth(self) -> Dict[str, Any]:
+        if self.has_health:
+            await asyncio.sleep(0.001)
+            return {"async_status": "ok"}
+        raise AttributeError("No ahealth method")
+
+
+# ---------------------------------------------------------------------------
+# Existing tests (1-23)
+# ---------------------------------------------------------------------------
 
 def test_default_translator_uses_autogen_framework_label(
     monkeypatch: pytest.MonkeyPatch,
@@ -125,11 +188,6 @@ def test_default_translator_uses_autogen_framework_label(
     assert kwargs.get("framework") == "autogen"
     # translator=None is expected (DefaultVectorFrameworkTranslator fallback)
     assert "translator" in kwargs
-
-
-# ---------------------------------------------------------------------------
-# Context translation / from_autogen mapping
-# ---------------------------------------------------------------------------
 
 
 def test_autogen_conversation_and_extra_context_passed_to_core_ctx(
@@ -283,11 +341,6 @@ def test_build_ctx_translation_failure_attaches_context(
     assert captured.get("operation") == "vector_context_translation"
 
 
-# ---------------------------------------------------------------------------
-# Error-context decorators (sync + async)
-# ---------------------------------------------------------------------------
-
-
 def test_sync_errors_include_autogen_metadata_in_context(
     monkeypatch: pytest.MonkeyPatch,
     adapter: Any,
@@ -363,12 +416,7 @@ async def test_async_errors_include_autogen_metadata_in_context(
 
     assert captured_ctx
     assert captured_ctx.get("framework") == "autogen"
-    assert str(captured_ctx.get("operation", "")).startswith("vector_")
-
-
-# ---------------------------------------------------------------------------
-# _from_matches / score-threshold behavior
-# ---------------------------------------------------------------------------
+    assert str(captured_ctx.get("operation", "")) == "vector_similarity_search_async"
 
 
 def test_from_matches_converts_hits_to_documents_and_respects_score_threshold(
@@ -413,11 +461,6 @@ def test_from_matches_converts_hits_to_documents_and_respects_score_threshold(
     assert store.text_field not in doc.metadata
     assert doc.metadata == {"baz": 42}
     assert score == pytest.approx(0.95)
-
-
-# ---------------------------------------------------------------------------
-# Similarity search (sync + async)
-# ---------------------------------------------------------------------------
 
 
 def test_similarity_search_uses_translator_and_coerce_hits(
@@ -592,11 +635,6 @@ def test_similarity_search_with_score_returns_tuples(
     assert isinstance(score, float)
 
 
-# ---------------------------------------------------------------------------
-# Streaming similarity search (sync + async)
-# ---------------------------------------------------------------------------
-
-
 def test_similarity_search_stream_yields_documents(
     monkeypatch: pytest.MonkeyPatch,
     adapter: Any,
@@ -658,11 +696,9 @@ async def test_async_similarity_search_stream_yields_documents(
 
     class AsyncStreamTranslator:
         async def arun_query_stream(self, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:  # noqa: ARG002
-            async def gen():
-                captured["args"] = args
-                captured.update(kwargs)
-                yield {"matches": "ignored-async"}
-            return gen()
+            captured["args"] = args
+            captured.update(kwargs)
+            yield {"matches": "ignored-async"}
 
     def fake_coerce_hits_safe(chunk: Any) -> List[TMapping[str, Any]]:
         assert isinstance(chunk, dict)
@@ -699,11 +735,6 @@ async def test_async_similarity_search_stream_yields_documents(
     assert seen
     assert isinstance(seen[0], AutoGenDocument)
     assert seen[0].page_content == "astream"
-
-
-# ---------------------------------------------------------------------------
-# Low-level query (precomputed embeddings)
-# ---------------------------------------------------------------------------
 
 
 def test_low_level_query_returns_raw_hit_mappings(
@@ -746,11 +777,6 @@ def test_low_level_query_returns_raw_hit_mappings(
     raw_query = captured["args"][0]
     assert raw_query["include_vectors"] is True
     assert raw_query["top_k"] == 5
-
-
-# ---------------------------------------------------------------------------
-# MMR search (sync + async)
-# ---------------------------------------------------------------------------
 
 
 def test_mmr_search_builds_mmr_config_and_calls_translator(
@@ -875,11 +901,6 @@ async def test_async_mmr_search_builds_mmr_config_and_calls_translator(
     assert getattr(mmr_config, "lambda_mult", None) == 0.3
 
 
-# ---------------------------------------------------------------------------
-# Delete API (sync + async)
-# ---------------------------------------------------------------------------
-
-
 def test_delete_requires_ids_or_filter(
     adapter: Any,
 ) -> None:
@@ -965,24 +986,12 @@ async def test_async_delete_prefers_filter_and_calls_translator(
     assert captured["framework_ctx"]["namespace"] == "ns-adel"
 
 
-# ---------------------------------------------------------------------------
-# Capabilities / health passthrough
-# ---------------------------------------------------------------------------
-
-
 def test_capabilities_and_health_basic() -> None:
     """
     capabilities() and health() should thinly delegate to the underlying adapter.
     """
-
-    class DummyAdapter:
-        def capabilities(self) -> Dict[str, Any]:
-            return {"features": ["x", "y"]}
-
-        def health(self) -> Dict[str, Any]:
-            return {"status": "ok"}
-
-    store = _make_store(DummyAdapter(), with_embeddings=False)
+    adapter = DummyAdapter()
+    store = _make_store(adapter, with_embeddings=False)
 
     caps = store.capabilities()
     health = store.health()
@@ -999,26 +1008,14 @@ async def test_async_capabilities_and_health_basic() -> None:
     acapabilities() and ahealth() should use async adapter methods when available,
     otherwise fall back to wrapping sync methods.
     """
-
-    class DummyAdapter:
-        async def acapabilities(self) -> Dict[str, Any]:
-            return {"async_features": True}
-
-        async def ahealth(self) -> Dict[str, Any]:
-            return {"async_status": "ok"}
-
-    store = _make_store(DummyAdapter(), with_embeddings=False)
+    adapter = DummyAdapter()
+    store = _make_store(adapter, with_embeddings=False)
 
     acaps = await store.acapabilities()
     ahealth = await store.ahealth()
 
     assert acaps.get("async_features") is True
     assert ahealth.get("async_status") == "ok"
-
-
-# ---------------------------------------------------------------------------
-# Convenience constructors
-# ---------------------------------------------------------------------------
 
 
 def test_from_texts_constructs_store_and_adds_texts(
@@ -1099,11 +1096,6 @@ def test_from_documents_constructs_store_and_adds_documents(
     assert raw_docs[0]["metadata"]["page_content"] == "d1"
 
 
-# ---------------------------------------------------------------------------
-# CorpusAutoGenRetrieverTool behavior
-# ---------------------------------------------------------------------------
-
-
 def test_retriever_tool_delegates_to_vector_store_and_shapes_output(
     adapter: Any,
 ) -> None:
@@ -1173,6 +1165,665 @@ def test_retriever_tool_delegates_to_vector_store_and_shapes_output(
     assert result and isinstance(result[0], dict)
     assert result[0]["page_content"] == "doc-1"
     assert result[0]["metadata"] == {"foo": "bar"}
+
+
+# ---------------------------------------------------------------------------
+# NEW TESTS FOR BETTER COVERAGE (24-46)
+# ---------------------------------------------------------------------------
+
+def test_embedding_function_required_when_no_explicit_embeddings(
+    adapter: Any,
+) -> None:
+    """
+    When no explicit embeddings provided and no embedding_function configured,
+    similarity_search should raise NotSupported with NO_EMBEDDING_FUNCTION.
+    """
+    store = CorpusAutoGenVectorStore(
+        corpus_adapter=adapter,
+        embedding_function=None,
+        async_embedding_function=None,
+    )
+    
+    with pytest.raises(Exception) as exc_info:
+        store.similarity_search("query")
+    
+    err = exc_info.value
+    assert getattr(err, "code", None) == ErrorCodes.NO_EMBEDDING_FUNCTION
+
+
+def test_sync_embedding_function_failure_handling(
+    adapter: Any,
+) -> None:
+    """
+    When sync embedding function fails, should raise BadRequest with BAD_EMBEDDINGS.
+    """
+    store = CorpusAutoGenVectorStore(
+        corpus_adapter=adapter,
+        embedding_function=_failing_embedding_fn,
+    )
+    
+    with pytest.raises(Exception) as exc_info:
+        store.similarity_search("query")
+    
+    err = exc_info.value
+    assert getattr(err, "code", None) == ErrorCodes.BAD_EMBEDDINGS
+
+
+@pytest.mark.asyncio
+async def test_async_embedding_function_failure_handling(
+    adapter: Any,
+) -> None:
+    """
+    When async embedding function fails, should raise BadRequest with BAD_EMBEDDINGS.
+    """
+    store = CorpusAutoGenVectorStore(
+        corpus_adapter=adapter,
+        async_embedding_function=_failing_async_embedding_fn,
+    )
+    
+    with pytest.raises(Exception) as exc_info:
+        await store.asimilarity_search("query")
+    
+    err = exc_info.value
+    assert getattr(err, "code", None) == ErrorCodes.BAD_EMBEDDINGS
+
+
+@pytest.mark.asyncio
+async def test_async_embedding_falls_back_to_sync_via_thread_pool(
+    adapter: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When no async_embedding_function but sync embedding_function exists,
+    should use asyncio.to_thread to call sync function.
+    """
+    captured = []
+    
+    def sync_embedding_fn(texts: List[str]) -> List[List[float]]:
+        captured.append(texts)
+        return [[1.0, 2.0, 3.0, 4.0] for _ in texts]
+    
+    store = CorpusAutoGenVectorStore(
+        corpus_adapter=adapter,
+        embedding_function=sync_embedding_fn,
+        async_embedding_function=None,
+    )
+    
+    # Mock translator to avoid actual query
+    class MockTranslator:
+        async def arun_query(self, *args, **kwargs):
+            return {"matches": []}
+    
+    monkeypatch.setattr(store, "_translator", MockTranslator())
+    
+    await store.asimilarity_search("test query")
+    
+    assert len(captured) == 1
+    assert captured[0] == ["test query"]
+
+
+def test_normalize_metadatas_single_metadata_for_multiple_texts(
+    adapter: Any,
+) -> None:
+    """
+    _normalize_metadatas should replicate single metadata for multiple texts.
+    """
+    store = _make_store(adapter, with_embeddings=False)
+    
+    metadatas = [{"common": "data"}]
+    normalized = store._normalize_metadatas(3, metadatas)  # noqa: SLF001
+    
+    assert len(normalized) == 3
+    assert all(m == {"common": "data"} for m in normalized)
+
+
+def test_normalize_metadatas_mismatched_lengths_raises_error(
+    adapter: Any,
+) -> None:
+    """
+    _normalize_metadatas should raise BadRequest when lengths don't match.
+    """
+    store = _make_store(adapter, with_embeddings=False)
+    
+    metadatas = [{"a": 1}, {"b": 2}]  # length 2
+    with pytest.raises(Exception) as exc_info:
+        store._normalize_metadatas(3, metadatas)  # noqa: SLF001
+    
+    err = exc_info.value
+    assert getattr(err, "code", None) == ErrorCodes.BAD_METADATA
+
+
+def test_normalize_ids_with_custom_ids(
+    adapter: Any,
+) -> None:
+    """
+    _normalize_ids should use custom IDs when provided.
+    """
+    store = _make_store(adapter, with_embeddings=False)
+    
+    custom_ids = ["id-1", "id-2", "id-3"]
+    normalized = store._normalize_ids(3, custom_ids)  # noqa: SLF001
+    
+    assert normalized == custom_ids
+
+
+def test_normalize_ids_generates_ids_when_none(
+    adapter: Any,
+) -> None:
+    """
+    _normalize_ids should generate IDs when None provided.
+    """
+    store = _make_store(adapter, with_embeddings=False)
+    
+    normalized = store._normalize_ids(3, None)  # noqa: SLF001
+    
+    assert len(normalized) == 3
+    assert all(isinstance(id_, str) for id_ in normalized)
+    assert normalized[0].startswith("doc-")
+
+
+def test_effective_namespace_with_explicit_override(
+    adapter: Any,
+) -> None:
+    """
+    _effective_namespace should use explicit namespace override when provided.
+    """
+    store = CorpusAutoGenVectorStore(
+        corpus_adapter=adapter,
+        namespace="default-ns",
+    )
+    
+    # Should use explicit override
+    result = store._effective_namespace("custom-ns")  # noqa: SLF001
+    assert result == "custom-ns"
+    
+    # Should use default when None
+    result = store._effective_namespace(None)  # noqa: SLF001
+    assert result == "default-ns"
+
+
+def test_framework_ctx_includes_namespace_and_version(
+    adapter: Any,
+) -> None:
+    """
+    _framework_ctx_for_namespace should include namespace and framework_version.
+    """
+    store = CorpusAutoGenVectorStore(
+        corpus_adapter=adapter,
+        namespace="default-ns",
+        framework_version="1.2.3",
+    )
+    
+    ctx = store._framework_ctx_for_namespace("custom-ns")  # noqa: SLF001
+    
+    assert ctx["namespace"] == "custom-ns"
+    assert ctx["framework_version"] == "1.2.3"
+
+
+def test_partial_upsert_failure_logs_warning(
+    adapter: Any,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    _handle_partial_upsert_failure should log warning for partial failures.
+    """
+    store = _make_store(adapter, with_embeddings=False)
+    
+    result = MockUpsertResult(
+        upserted_count=2,
+        failed_count=1,
+        failures=[{"id": "failed-1", "error": "test error"}]
+    )
+    
+    with caplog.at_level("WARNING"):
+        store._handle_partial_upsert_failure(result, 3, "test-ns")  # noqa: SLF001
+    
+    # Should log warning
+    assert "partial failure" in caplog.text.lower()
+    assert "2/3 succeeded" in caplog.text
+
+
+def test_partial_upsert_complete_failure_raises_error(
+    adapter: Any,
+) -> None:
+    """
+    _handle_partial_upsert_failure should raise when all documents fail.
+    """
+    store = _make_store(adapter, with_embeddings=False)
+    
+    result = MockUpsertResult(
+        upserted_count=0,
+        failed_count=3,
+        failures=[{"id": f"failed-{i}", "error": "test"} for i in range(3)]
+    )
+    
+    with pytest.raises(Exception) as exc_info:
+        store._handle_partial_upsert_failure(result, 3, "test-ns")  # noqa: SLF001
+    
+    err = exc_info.value
+    assert getattr(err, "code", None) == ErrorCodes.BAD_UPSERT_RESULT
+
+
+def test_metadata_field_envelope_handling(
+    adapter: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When metadata_field is set, user metadata should be nested under that key.
+    """
+    captured_docs = []
+    
+    class CaptureTranslator:
+        def upsert(self, *, raw_documents, **kwargs):
+            captured_docs.extend(raw_documents)
+            return MockUpsertResult(upserted_count=len(raw_documents), failed_count=0)
+    
+    store = CorpusAutoGenVectorStore(
+        corpus_adapter=adapter,
+        metadata_field="user_metadata",
+        embedding_function=_simple_embedding_fn,
+    )
+    
+    monkeypatch.setattr(store, "_translator", CaptureTranslator())
+    
+    store.add_texts(
+        ["test text"],
+        metadatas=[{"custom": "data", "extra": "field"}],
+        ids=["test-id"]
+    )
+    
+    assert len(captured_docs) == 1
+    metadata = captured_docs[0]["metadata"]
+    assert "user_metadata" in metadata
+    assert metadata["user_metadata"] == {"custom": "data", "extra": "field"}
+    assert metadata["page_content"] == "test text"
+    assert metadata["id"] == "test-id"
+
+
+def test_add_documents_with_autogen_documents(
+    adapter: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    add_documents should work with AutoGenDocument objects.
+    """
+    captured_docs = []
+    
+    class CaptureTranslator:
+        def upsert(self, *, raw_documents, **kwargs):
+            captured_docs.extend(raw_documents)
+            return MockUpsertResult(upserted_count=len(raw_documents), failed_count=0)
+    
+    store = _make_store(adapter)
+    monkeypatch.setattr(store, "_translator", CaptureTranslator())
+    
+    documents = [
+        AutoGenDocument(page_content="doc1", metadata={"a": 1}),
+        AutoGenDocument(page_content="doc2", metadata={"b": 2}),
+    ]
+    
+    ids = store.add_documents(documents)
+    
+    assert len(ids) == 2
+    assert len(captured_docs) == 2
+    assert captured_docs[0]["metadata"]["page_content"] == "doc1"
+    assert captured_docs[1]["metadata"]["page_content"] == "doc2"
+
+
+@pytest.mark.asyncio
+async def test_aadd_documents_async(
+    adapter: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    aadd_documents should work with AutoGenDocument objects async.
+    """
+    captured_docs = []
+    
+    class CaptureTranslator:
+        async def arun_upsert(self, *, raw_documents, **kwargs):
+            captured_docs.extend(raw_documents)
+            return MockUpsertResult(upserted_count=len(raw_documents), failed_count=0)
+    
+    store = _make_store(adapter)
+    monkeypatch.setattr(store, "_translator", CaptureTranslator())
+    
+    documents = [
+        AutoGenDocument(page_content="async-doc1", metadata={"x": 1}),
+        AutoGenDocument(page_content="async-doc2", metadata={"y": 2}),
+    ]
+    
+    ids = await store.aadd_documents(documents)
+    
+    assert len(ids) == 2
+    assert len(captured_docs) == 2
+    assert captured_docs[0]["metadata"]["page_content"] == "async-doc1"
+
+
+def test_similarity_search_with_explicit_embedding(
+    adapter: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    similarity_search should accept explicit embedding parameter.
+    """
+    captured = []
+    
+    class CaptureTranslator:
+        def query(self, raw_query, **kwargs):
+            captured.append(raw_query)
+            return {"matches": []}
+    
+    store = CorpusAutoGenVectorStore(
+        corpus_adapter=adapter,
+        embedding_function=None,  # No embedding function to force use of explicit embedding
+    )
+    
+    monkeypatch.setattr(store, "_translator", CaptureTranslator())
+    
+    explicit_embedding = [1.0, 2.0, 3.0, 4.0]
+    store.similarity_search("query", embedding=explicit_embedding)
+    
+    assert len(captured) == 1
+    assert captured[0]["vector"] == explicit_embedding
+
+
+@pytest.mark.asyncio
+async def test_stream_with_empty_results(
+    adapter: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Streaming similarity search should handle empty results.
+    """
+    class EmptyStreamTranslator:
+        def query_stream(self, *args, **kwargs):
+            yield {"matches": []}
+            yield {"matches": []}
+    
+    store = _make_store(adapter)
+    monkeypatch.setattr(store, "_translator", EmptyStreamTranslator())
+    
+    iterator = store.similarity_search_stream("query")
+    results = list(iterator)
+    
+    assert len(results) == 0  # No documents from empty matches
+
+
+def test_capabilities_when_adapter_lacks_method(
+    adapter: Any,
+) -> None:
+    """
+    capabilities() should raise NotSupported when adapter lacks the method.
+    """
+    class NoCapabilitiesAdapter:
+        """Adapter without capabilities method."""
+        pass
+    
+    store = CorpusAutoGenVectorStore(
+        corpus_adapter=NoCapabilitiesAdapter(),
+        embedding_function=_simple_embedding_fn,
+    )
+    
+    with pytest.raises(Exception) as exc_info:
+        store.capabilities()
+    
+    err = exc_info.value
+    # Should raise NotSupported (though exact type may vary)
+    assert "not expose capabilities" in str(err).lower()
+
+
+def test_health_when_adapter_lacks_method(
+    adapter: Any,
+) -> None:
+    """
+    health() should raise NotSupported when adapter lacks the method.
+    """
+    class NoHealthAdapter:
+        """Adapter without health method."""
+        pass
+    
+    store = CorpusAutoGenVectorStore(
+        corpus_adapter=NoHealthAdapter(),
+        embedding_function=_simple_embedding_fn,
+    )
+    
+    with pytest.raises(Exception) as exc_info:
+        store.health()
+    
+    err = exc_info.value
+    assert "not expose health" in str(err).lower()
+
+
+def test_retriever_tool_with_merged_search_kwargs(
+    adapter: Any,
+) -> None:
+    """
+    Retriever tool should properly merge search_kwargs with call-time kwargs.
+    """
+    captured = {}
+    
+    class FakeStore(CorpusAutoGenVectorStore):
+        def __init__(self) -> None:
+            pass
+        
+        def similarity_search(self, query, **kwargs):
+            captured.update(kwargs)
+            return []
+    
+    store = FakeStore()
+    tool = CorpusAutoGenRetrieverTool(
+        vector_store=store,
+        search_kwargs={"k": 10, "filter": {"type": "article"}}
+    )
+    
+    # Call with additional kwargs
+    tool("query", filter={"type": "blog"}, extra_param="value")
+    
+    # Should merge: filter from call-time overrides, k from search_kwargs, extra_param added
+    assert captured["k"] == 10
+    assert captured["filter"] == {"type": "blog"}
+    assert captured["extra_param"] == "value"
+
+
+def test_score_threshold_with_various_scores(
+    adapter: Any,
+) -> None:
+    """
+    _from_matches should respect score_threshold with various match scores.
+    """
+    store = _make_store(adapter, score_threshold=0.7)
+    
+    matches = [
+        {"id": "1", "score": 0.5, "metadata": {"page_content": "low"}},
+        {"id": "2", "score": 0.7, "metadata": {"page_content": "edge"}},
+        {"id": "3", "score": 0.9, "metadata": {"page_content": "high"}},
+        {"id": "4", "score": 0.6, "metadata": {"page_content": "too low"}},
+    ]
+    
+    results = store._from_matches(matches)  # noqa: SLF001
+    
+    # Should include scores >= 0.7
+    assert len(results) == 2
+    scores = [score for _, score in results]
+    assert all(score >= 0.7 for score in scores)
+    assert 0.7 in scores
+    assert 0.9 in scores
+
+
+def test_error_context_includes_dynamic_fields(
+    adapter: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Error context decorator should include dynamic fields like k and namespace.
+    """
+    captured_context = {}
+    
+    def fake_attach_context(exc, **context):
+        captured_context.update(context)
+    
+    monkeypatch.setattr(
+        autogen_module,
+        "attach_context",
+        fake_attach_context,
+    )
+    
+    class FailingStore(CorpusAutoGenVectorStore):
+        @with_error_context("test_operation")
+        def failing_method(self, k=None, namespace=None, **kwargs):
+            raise RuntimeError("Test error")
+    
+    store = FailingStore(
+        corpus_adapter=adapter,
+        framework_version="test-version",
+        namespace="default-ns",
+    )
+    
+    with pytest.raises(RuntimeError):
+        store.failing_method(k=5, namespace="custom-ns", filter={"x": 1})
+    
+    # Should include dynamic fields in context
+    assert captured_context.get("framework") == "autogen"
+    assert captured_context.get("operation") == "vector_test_operation"
+    assert captured_context.get("k") == 5
+    assert captured_context.get("namespace") == "custom-ns"
+    assert captured_context.get("has_filter") is True
+    assert captured_context.get("default_namespace") == "default-ns"
+    assert captured_context.get("framework_version") == "test-version"
+
+
+def test_query_with_include_vectors_true(
+    adapter: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Low-level query with include_vectors=True should include vectors in result.
+    """
+    captured = []
+    
+    class CaptureTranslator:
+        def query(self, raw_query, **kwargs):
+            captured.append(raw_query)
+            return {
+                "matches": [
+                    {
+                        "id": "vec-1",
+                        "score": 0.8,
+                        "vector": [1.0, 2.0, 3.0, 4.0],
+                        "metadata": {}
+                    }
+                ]
+            }
+    
+    store = _make_store(adapter, with_embeddings=False)
+    monkeypatch.setattr(store, "_translator", CaptureTranslator())
+    
+    results = store.query([0.1, 0.2, 0.3, 0.4], k=3, include_vectors=True)
+    
+    assert len(results) == 1
+    assert "vector" in results[0]
+    assert results[0]["vector"] == [1.0, 2.0, 3.0, 4.0]
+    assert captured[0]["include_vectors"] is True
+
+
+def test_add_texts_with_explicit_embeddings(
+    adapter: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    add_texts should accept explicit embeddings instead of computing them.
+    """
+    captured_docs = []
+    
+    class CaptureTranslator:
+        def upsert(self, *, raw_documents, **kwargs):
+            captured_docs.extend(raw_documents)
+            return MockUpsertResult(upserted_count=len(raw_documents), failed_count=0)
+    
+    store = CorpusAutoGenVectorStore(
+        corpus_adapter=adapter,
+        embedding_function=None,  # No embedding function to force use of explicit embeddings
+    )
+    
+    monkeypatch.setattr(store, "_translator", CaptureTranslator())
+    
+    texts = ["text1", "text2"]
+    embeddings = [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]]
+    
+    ids = store.add_texts(texts, embeddings=embeddings)
+    
+    assert len(ids) == 2
+    assert len(captured_docs) == 2
+    assert captured_docs[0]["vector"] == [1.0, 2.0, 3.0, 4.0]
+    assert captured_docs[1]["vector"] == [5.0, 6.0, 7.0, 8.0]
+
+
+@pytest.mark.asyncio
+async def test_aadd_texts_with_explicit_embeddings(
+    adapter: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    aadd_texts should accept explicit embeddings instead of computing them.
+    """
+    captured_docs = []
+    
+    class CaptureTranslator:
+        async def arun_upsert(self, *, raw_documents, **kwargs):
+            captured_docs.extend(raw_documents)
+            return MockUpsertResult(upserted_count=len(raw_documents), failed_count=0)
+    
+    store = CorpusAutoGenVectorStore(
+        corpus_adapter=adapter,
+        embedding_function=None,
+        async_embedding_function=None,
+    )
+    
+    monkeypatch.setattr(store, "_translator", CaptureTranslator())
+    
+    texts = ["async-text1", "async-text2"]
+    embeddings = [[1.0, 1.0, 1.0, 1.0], [2.0, 2.0, 2.0, 2.0]]
+    
+    ids = await store.aadd_texts(texts, embeddings=embeddings)
+    
+    assert len(ids) == 2
+    assert len(captured_docs) == 2
+    assert captured_docs[0]["vector"] == [1.0, 1.0, 1.0, 1.0]
+    assert captured_docs[1]["vector"] == [2.0, 2.0, 2.0, 2.0]
+
+
+def test_from_matches_with_metadata_field_envelope(
+    adapter: Any,
+) -> None:
+    """
+    _from_matches should correctly extract metadata when metadata_field is used.
+    """
+    store = CorpusAutoGenVectorStore(
+        corpus_adapter=adapter,
+        metadata_field="user_metadata",
+        embedding_function=_simple_embedding_fn,
+    )
+    
+    matches = [
+        {
+            "id": "1",
+            "score": 0.9,
+            "metadata": {
+                "user_metadata": {"custom": "data", "extra": "field"},
+                "page_content": "test content",
+                "id": "1"
+            }
+        }
+    ]
+    
+    results = store._from_matches(matches)  # noqa: SLF001
+    
+    assert len(results) == 1
+    doc, score = results[0]
+    assert doc.page_content == "test content"
+    assert doc.metadata == {"custom": "data", "extra": "field"}  # Extracted from envelope
+    assert score == 0.9
 
 
 if __name__ == "__main__":
