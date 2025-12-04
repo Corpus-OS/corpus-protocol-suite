@@ -778,6 +778,102 @@ PROTOCOLS_CONFIG: Dict[str, ProtocolConfig] = {
             },
         },
     ),
+    # NEW: LLM framework adapter suite
+    "llm_frameworks": ProtocolConfig(
+        name="llm_frameworks",
+        display_name="LLM Framework Adapters V1.0",
+        # Reference numbers are advisory; scoring is dynamic
+        conformance_levels={"gold": 150, "silver": 120, "development": 75},
+        test_categories={
+            "framework_specific": "Framework-Specific LLM Adapters",
+            "contract_interface": "Cross-Framework Interface Conformance",
+            "contract_shapes": "Cross-Framework Shape & Batching",
+            "contract_context": "Cross-Framework Context & Error Handling",
+            "registry_infra": "Registry Infrastructure",
+            "robustness": "Robustness & Evil Backend Tests",
+        },
+        spec_sections={
+            "framework_specific": "§8.3 Operations + Framework Integration",
+            "contract_interface": "§8.3, §8.6, §7.2",
+            "contract_shapes": "§8.3, §12.5",
+            "contract_context": "§6.3, §13, §8.5",
+            "registry_infra": "§6.1 Framework Registration",
+            "robustness": "§6.3, §12.1, §12.5",
+        },
+        error_guidance={
+            "contract_interface": {
+                "test_sync_llm_interface_conformance": {
+                    "error_patterns": {
+                        "missing_method": "Framework adapter missing required LLM methods (e.g. chat, completion).",
+                        "signature_mismatch": "LLM method signatures don't match framework expectations.",
+                    },
+                    "quick_fix": "Ensure all required sync/async LLM methods are implemented with correct signatures.",
+                    "examples": "See tests/frameworks/llm/test_contract_interface_conformance.py for requirements.",
+                }
+            },
+            "contract_shapes": {
+                "test_batch_output_length_matches_input_length": {
+                    "error_patterns": {
+                        "length_mismatch": "Batch LLM call returned a different number of results than requests submitted.",
+                    },
+                    "quick_fix": "Ensure batch APIs return exactly N results for N inputs, preserving order.",
+                    "examples": "See tests/frameworks/llm/test_contract_shapes_and_batching.py for details.",
+                }
+            },
+            "contract_context": {
+                "test_error_context_is_attached_on_sync_batch_failure": {
+                    "error_patterns": {
+                        "missing_error_context": "Exceptions from LLM methods lack framework/operation metadata.",
+                    },
+                    "quick_fix": "Wrap public LLM entrypoints with @error_context and attach operation metadata.",
+                    "examples": "See §6.3 for error context and tests/frameworks/llm/test_contract_context_and_error_context.py.",
+                }
+            },
+        },
+    ),
+    # NEW: Vector framework adapter suite
+    "vector_frameworks": ProtocolConfig(
+        name="vector_frameworks",
+        display_name="Vector Framework Adapters V1.0",
+        # Reference only; certification is dynamic
+        conformance_levels={"gold": 130, "silver": 104, "development": 65},
+        test_categories={
+            "framework_specific": "Framework-Specific Vector Adapters",
+            "contract_interface": "Cross-Framework Interface Conformance",
+            "contract_shapes": "Cross-Framework Shape & Batch Semantics",
+            "contract_context": "Cross-Framework Context & Error Handling",
+            "registry_infra": "Registry Infrastructure",
+            "robustness": "Robustness & Evil Backend Tests",
+        },
+        spec_sections={
+            "framework_specific": "§9.3 Operations + Framework Integration",
+            "contract_interface": "§9.3, §7.2",
+            "contract_shapes": "§9.3, §12.5",
+            "contract_context": "§6.3, §13, §9.5",
+            "registry_infra": "§6.1 Framework Registration",
+            "robustness": "§6.3, §12.1, §12.5",
+        },
+        error_guidance={
+            "contract_shapes": {
+                "test_batch_result_length_matches_input_length": {
+                    "error_patterns": {
+                        "length_mismatch": "Batch() returned a different number of results than vectors submitted.",
+                    },
+                    "quick_fix": "Ensure that for N input vectors you return exactly N results, in order.",
+                    "examples": "See tests/frameworks/vector/test_contract_shapes_and_batching.py.",
+                }
+            },
+            "contract_interface": {
+                "test_sync_vector_interface_conformance": {
+                    "error_patterns": {
+                        "missing_method": "Framework adapter missing required vector index methods.",
+                    },
+                    "quick_fix": "Implement all required sync/async vector operations with correct signatures.",
+                    "examples": "See tests/frameworks/vector/test_contract_interface_conformance.py.",
+                }
+            },
+        },
+    ),
 }
 
 # Register all protocols
@@ -798,6 +894,8 @@ PROTOCOLS: List[str] = [
     "vector",
     "graph",
     "embedding",
+    "llm_frameworks",
+    "vector_frameworks",
     "embedding_frameworks",
     "graph_frameworks",
     "wire",
@@ -1013,6 +1111,8 @@ class TestCategorizer:
             "schema": r"tests[\\/]schema[\\/]",
             "golden": r"tests[\\/]golden[\\/]",
             # Framework adapter suites
+            "llm_frameworks": r"tests[\\/]frameworks[\\/]llm[\\/]",
+            "vector_frameworks": r"tests[\\/]frameworks[\\/]vector[\\/]",
             "embedding_frameworks": r"tests[\\/]frameworks[\\/]embedding[\\/]",
             "graph_frameworks": r"tests[\\/]frameworks[\\/]graph[\\/]",
             # Wire suite (live)
@@ -1046,7 +1146,7 @@ class TestCategorizer:
 
         This works for the per-protocol suites in tests/<proto>/ as well as:
         - shared wire conformance suite in tests/live (protocol 'wire')
-        - framework adapter suites in tests/frameworks/embedding and tests/frameworks/graph
+        - framework adapter suites in tests/frameworks/*/
         """
         nodeid_lower = (nodeid or "").lower()
 
@@ -1059,7 +1159,11 @@ class TestCategorizer:
         self._cache_misses += 1
 
         # Framework adapter tests take precedence based on path
-        if "tests/frameworks/embedding/" in nodeid_lower or "tests\\frameworks\\embedding\\" in nodeid_lower:
+        if "tests/frameworks/llm/" in nodeid_lower or "tests\\frameworks\\llm\\" in nodeid_lower:
+            protocol = "llm_frameworks"
+        elif "tests/frameworks/vector/" in nodeid_lower or "tests\\frameworks\\vector\\" in nodeid_lower:
+            protocol = "vector_frameworks"
+        elif "tests/frameworks/embedding/" in nodeid_lower or "tests\\frameworks\\embedding\\" in nodeid_lower:
             protocol = "embedding_frameworks"
         elif "tests/frameworks/graph/" in nodeid_lower or "tests\\frameworks\\graph\\" in nodeid_lower:
             protocol = "graph_frameworks"
@@ -1738,6 +1842,8 @@ def pytest_configure(config: pytest.Config) -> None:
         "vector: Vector Protocol V1.0 conformance tests",
         "graph: Graph Protocol V1.0 conformance tests",
         "embedding: Embedding Protocol V1.0 conformance tests",
+        "llm_frameworks: LLM framework adapter conformance tests",
+        "vector_frameworks: Vector framework adapter conformance tests",
         "embedding_frameworks: Embedding framework adapter conformance tests",
         "graph_frameworks: Graph framework adapter conformance tests",
         "wire: Wire Request Conformance tests (tests/live)",
