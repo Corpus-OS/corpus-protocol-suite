@@ -68,10 +68,12 @@ import json
 import logging
 import re
 import time
-from dataclasses import asdict, dataclass
+import threading
+from dataclasses import asdict, dataclass, field, replace
 from typing import (
     Any,
     AsyncIterator,
+    Awaitable,
     Callable,
     Dict,
     Iterable,
@@ -82,6 +84,7 @@ from typing import (
     Protocol,
     Sequence,
     Tuple,
+    TypeVar,
     Union,
 )
 
@@ -104,6 +107,8 @@ from corpus_sdk.core.error_context import attach_context
 from corpus_sdk.core.sync_bridge import SyncStreamBridge
 
 LOG = logging.getLogger(__name__)
+
+R = TypeVar("R")
 
 
 # =============================================================================
@@ -377,6 +382,7 @@ class TranslatorMetrics:
 
     Tracks framework-specific translation patterns and error rates
     for better monitoring and debugging.
+    Thread-safe.
     """
 
     # Translation operation counts
@@ -397,40 +403,44 @@ class TranslatorMetrics:
     # Framework-specific usage
     framework_specific_paths_used: int = 0
 
+    # Internal lock for thread safety
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
     def record_translation(self, duration: float, success: bool = True) -> None:
         """Record a translation operation with timing."""
-        self.total_translation_time += duration
-        self.message_translations += 1
-        if not success:
-            self.translation_errors += 1
-        if self.message_translations > 0:
-            self.avg_translation_time = (
-                self.total_translation_time / self.message_translations
-            )
+        with self._lock:
+            self.total_translation_time += duration
+            self.message_translations += 1
+            if not success:
+                self.translation_errors += 1
+            if self.message_translations > 0:
+                self.avg_translation_time = (
+                    self.total_translation_time / self.message_translations
+                )
 
     def record_validation_error(self) -> None:
-        """Record a validation error."""
-        self.validation_errors += 1
+        with self._lock:
+            self.validation_errors += 1
 
     def record_normalization_error(self) -> None:
-        """Record a normalization error."""
-        self.normalization_errors += 1
+        with self._lock:
+            self.normalization_errors += 1
 
     def record_framework_path_usage(self) -> None:
-        """Record usage of framework-specific translation path."""
-        self.framework_specific_paths_used += 1
+        with self._lock:
+            self.framework_specific_paths_used += 1
 
     def record_tool_translation(self) -> None:
-        """Record a tool translation operation."""
-        self.tool_translations += 1
+        with self._lock:
+            self.tool_translations += 1
 
     def record_completion_translation(self) -> None:
-        """Record a completion translation operation."""
-        self.completion_translations += 1
+        with self._lock:
+            self.completion_translations += 1
 
     def record_chunk_translation(self) -> None:
-        """Record a chunk translation operation."""
-        self.chunk_translations += 1
+        with self._lock:
+            self.chunk_translations += 1
 
 
 # =============================================================================
@@ -446,13 +456,11 @@ class SafetyFilter:
     profanity filtering, PII detection, and content moderation.
     """
 
-    # Common profanity patterns (simplified for example)
     PROFANITY_PATTERNS = [
         r"\b(asshole|bastard|bitch|damn|fuck|shit)\b",
         r"\b(cunt|dick|piss|whore)\b",
     ]
 
-    # PII patterns (simplified)
     PII_PATTERNS = [
         r"\b\d{3}-\d{2}-\d{4}\b",  # SSN
         r"\b\d{16}\b",  # Credit card
@@ -460,7 +468,6 @@ class SafetyFilter:
         r"\b\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b",  # Phone
     ]
 
-    # Compile regexes once at class-definition time for performance
     _PROFANITY_REGEX = re.compile("|".join(PROFANITY_PATTERNS), re.IGNORECASE)
     _PII_REGEX = re.compile("|".join(PII_PATTERNS))
 
@@ -469,12 +476,6 @@ class SafetyFilter:
         self.filter_pii = filter_pii
 
     def filter_content(self, text: str) -> Tuple[str, List[str]]:
-        """
-        Filter content for safety issues.
-
-        Returns:
-            Tuple of (filtered_text, list_of_violations)
-        """
         violations: List[str] = []
         filtered_text = text
 
@@ -510,25 +511,13 @@ class JSONRepair:
 
     @staticmethod
     def repair_json(text: str) -> str:
-        """
-        Attempt to repair common JSON formatting issues.
-
-        Handles:
-        - Unclosed brackets and braces
-        - Trailing commas
-        - Missing quotes around keys
-        - (Optionally) unescaped quotes in strings
-        """
         stripped = text.strip()
         if not stripped:
             return text
 
-        # Fast-path exit: if there are no obvious JSON structural characters,
-        # there is nothing to repair.
         if "{" not in stripped and "[" not in stripped:
             return text
 
-        # Try parsing first - if it works, return as-is
         try:
             json.loads(stripped)
             return stripped
@@ -537,7 +526,7 @@ class JSONRepair:
 
         repaired = stripped
 
-        # Balance braces and brackets
+        # Balance braces/brackets
         open_braces = repaired.count("{") - repaired.count("}")
         open_brackets = repaired.count("[") - repaired.count("]")
 
@@ -551,42 +540,36 @@ class JSONRepair:
         elif open_brackets < 0:
             repaired = "[" * (-open_brackets) + repaired
 
-        # Remove trailing commas before closing braces/brackets
+        # Remove trailing commas
         repaired = re.sub(r",\s*([}\]])", r"\1", repaired)
 
-        # Add missing quotes around keys (simple heuristic)
+        # Add missing quotes around keys
         repaired = re.sub(
             r"(\{|,)\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:",
             r'\1 "\2":',
             repaired,
         )
 
-        # After structural fixes, try parsing again
         try:
             json.loads(repaired)
             return repaired
         except json.JSONDecodeError:
             pass
 
-        # Detect obviously suspicious quotes (e.g., odd number of quotes)
+        # Last resort: fix odd number of quotes
         quote_count = repaired.count('"')
         if quote_count % 2 != 0:
-            # Only in this suspicious case do we attempt a more invasive
-            # escape of quotes inside string-like regions.
             def _escape_quotes(match: re.Match) -> str:
                 inner_text = match.group(1)
                 escaped = inner_text.replace('"', '\\"')
                 return f'"{escaped}"'
 
-            repaired_with_escaped = re.sub(
+            repaired = re.sub(
                 r'(?<!\\)"([^"\\]*(\\.[^"\\]*)*)"',
                 _escape_quotes,
                 repaired,
             )
-            return repaired_with_escaped
-
-        # If still not parseable and quotes look sane, return the structurally
-        # repaired version without further modifications.
+        
         return repaired
 
     @staticmethod
@@ -595,11 +578,6 @@ class JSONRepair:
         opener: str,
         closer: str,
     ) -> Optional[Any]:
-        """
-        Extract first balanced JSON fragment using the given opener/closer.
-
-        Returns parsed JSON (dict or list) or None if extraction/parse fails.
-        """
         stack: List[str] = []
         start_index = -1
 
@@ -620,59 +598,39 @@ class JSONRepair:
                             start_index = -1
                 else:
                     start_index = -1
-
         return None
 
     @staticmethod
     def extract_and_repair_json(text: str) -> Optional[Any]:
-        """
-        Extract JSON from text and repair it if necessary.
-
-        Returns parsed JSON (dict or list) or None if repair fails.
-        """
-        # Try to extract objects first
         if "{" in text:
             obj = JSONRepair._extract_first_balanced(text, "{", "}")
             if obj is not None:
                 return obj
-
-        # Fallback: try to extract arrays
         if "[" in text:
             arr = JSONRepair._extract_first_balanced(text, "[", "]")
             if arr is not None:
                 return arr
-
         return None
 
 
 # =============================================================================
-# Completion Post-Processor (extracted for complexity management)
+# Completion Post-Processor
 # =============================================================================
 
 
 @dataclass
 class LLMCompletionPostProcessor:
     """
-    Encapsulates completion post-processing logic (safety, JSON repair,
-    formatting, truncation) so that LLMTranslator remains focused on
-    orchestration concerns.
+    Encapsulates completion post-processing logic.
 
     This class is stateless with respect to individual requests; per-request
     overrides are derived from OperationContext.attrs.
-
-    Per-request override keys in OperationContext.attrs:
-        - llm_postprocess_enabled
-        - llm_postprocess_safety_filter
-        - llm_postprocess_json_repair
-        - llm_postprocess_output_format
-        - llm_postprocess_max_length
     """
 
     base_config: LLMPostProcessingConfig
     safety_filter: SafetyFilter
     json_repair: JSONRepair
 
-    # Attribute keys for per-request overrides
     ATTR_ENABLED = "llm_postprocess_enabled"
     ATTR_SAFETY_FILTER = "llm_postprocess_safety_filter"
     ATTR_JSON_REPAIR = "llm_postprocess_json_repair"
@@ -684,10 +642,6 @@ class LLMCompletionPostProcessor:
         completion: LLMCompletion,
         ctx: OperationContext,
     ) -> LLMCompletion:
-        """
-        Apply post-processing to a completion using the base configuration
-        and any per-request overrides present in ctx.attrs.
-        """
         config = self._resolve_config(ctx)
 
         if not config.enabled:
@@ -695,44 +649,32 @@ class LLMCompletionPostProcessor:
 
         result = completion
 
-        # Apply safety filtering
         if config.safety_filter:
-            result = self._apply_safety_filtering(result)
+            result = self._apply_safety_filtering(result, ctx)
 
-        # Apply JSON repair for tool calls/content
         if config.json_repair:
             result = self._apply_json_repair(result)
 
-        # Apply output formatting
         if config.output_format:
             result = self._apply_output_formatting(result, config)
 
-        # Apply length truncation
         if config.max_length is not None:
             result = self._apply_length_truncation(result, config.max_length)
 
-        # Apply any custom processors last
         if config.custom_processors:
             for processor in config.custom_processors:
                 try:
                     result = processor(result)
-                except Exception as processor_exc:  # noqa: BLE001
+                except Exception as processor_exc:
                     LOG.debug(
                         "Custom post-processing processor failed: %s",
                         processor_exc,
+                        extra={"request_id": ctx.request_id, "tenant": ctx.tenant}
                     )
 
         return result
 
-    # ----- configuration resolution -------------------------------------------------
-
     def _resolve_config(self, ctx: OperationContext) -> LLMPostProcessingConfig:
-        """
-        Resolve the effective post-processing configuration for this request.
-
-        If no override-related attributes are present, the base configuration
-        is returned directly to avoid unnecessary allocations.
-        """
         attrs = ctx.attrs or {}
         override_keys = {
             self.ATTR_ENABLED,
@@ -747,14 +689,11 @@ class LLMCompletionPostProcessor:
 
         enabled = self._coerce_bool(attrs.get(self.ATTR_ENABLED), self.base_config.enabled)
         safety_filter = self._coerce_bool(
-            attrs.get(self.ATTR_SAFETY_FILTER),
-            self.base_config.safety_filter,
+            attrs.get(self.ATTR_SAFETY_FILTER), self.base_config.safety_filter
         )
         json_repair = self._coerce_bool(
-            attrs.get(self.ATTR_JSON_REPAIR),
-            self.base_config.json_repair,
+            attrs.get(self.ATTR_JSON_REPAIR), self.base_config.json_repair
         )
-
         output_format = attrs.get(self.ATTR_OUTPUT_FORMAT, self.base_config.output_format)
         max_length_raw = attrs.get(self.ATTR_MAX_LENGTH, self.base_config.max_length)
         max_length = self._coerce_int(max_length_raw)
@@ -773,179 +712,108 @@ class LLMCompletionPostProcessor:
 
     @staticmethod
     def _coerce_bool(value: Any, default: bool) -> bool:
-        if value is None:
-            return default
-        if isinstance(value, bool):
-            return value
+        if value is None: return default
+        if isinstance(value, bool): return value
         if isinstance(value, str):
             lowered = value.strip().lower()
-            if lowered in {"true", "1", "yes", "y", "on"}:
-                return True
-            if lowered in {"false", "0", "no", "n", "off"}:
-                return False
+            if lowered in {"true", "1", "yes", "y", "on"}: return True
+            if lowered in {"false", "0", "no", "n", "off"}: return False
         return bool(value)
 
     @staticmethod
     def _coerce_int(value: Any) -> Optional[int]:
-        if value is None:
-            return None
-        if isinstance(value, int):
-            return value
+        if value is None: return None
+        if isinstance(value, int): return value
         try:
             return int(str(value).strip())
         except (TypeError, ValueError):
             return None
 
-    # ----- concrete processing steps ------------------------------------------------
-
-    def _apply_safety_filtering(self, completion: LLMCompletion) -> LLMCompletion:
-        """Apply comprehensive safety/content filtering."""
+    def _apply_safety_filtering(self, completion: LLMCompletion, ctx: OperationContext) -> LLMCompletion:
         filtered_text, violations = self.safety_filter.filter_content(completion.text)
-
         if violations:
             LOG.warning(
-                "Safety filtering applied to completion: %s",
-                "; ".join(violations),
+                "safety_filtering_applied",
+                extra={
+                    "violations": violations,
+                    "request_id": ctx.request_id,
+                    "tenant": ctx.tenant,
+                }
             )
-
-        repaired_tool_calls = completion.tool_calls
-        if violations and completion.tool_calls:
-            # Keep the original tool calls; we don't mutate them based on
-            # safety filtering alone at this layer.
-            repaired_tool_calls = completion.tool_calls
-
-        return LLMCompletion(
-            text=filtered_text,
-            model=completion.model,
-            model_family=completion.model_family,
-            usage=completion.usage,
-            finish_reason=completion.finish_reason,
-            tool_calls=repaired_tool_calls,
-        )
+        
+        # Use dataclasses.replace to preserve other fields (e.g. metadata from adapter)
+        return replace(completion, text=filtered_text)
 
     def _apply_json_repair(self, completion: LLMCompletion) -> LLMCompletion:
-        """Attempt to repair malformed JSON in tool calls and content."""
         repaired_tool_calls: List[Any] = []
-
-        # Repair tool calls
         for tool_call in completion.tool_calls:
             try:
                 original_args = tool_call.function.arguments
-
-                # Only attempt repair if arguments are a string-like JSON payload
-                if not isinstance(original_args, str):
+                if isinstance(original_args, str):
+                    repaired_args = self.json_repair.repair_json(original_args)
+                    # Validate it is valid JSON
+                    parsed = json.loads(repaired_args)
+                    # Re-serialize minified
+                    
+                    # Deep copy via replace to preserve other fields
+                    new_func = replace(tool_call.function, arguments=json.dumps(parsed))
+                    repaired_tool_call = replace(tool_call, function=new_func)
+                    
+                    repaired_tool_calls.append(repaired_tool_call)
+                else:
                     repaired_tool_calls.append(tool_call)
-                    continue
-
-                repaired_args = self.json_repair.repair_json(original_args)
-                parsed_args = json.loads(repaired_args)
-
-                repaired_tool_call = type(tool_call)(
-                    id=tool_call.id,
-                    type=tool_call.type,
-                    function=type(tool_call.function)(
-                        name=tool_call.function.name,
-                        arguments=json.dumps(parsed_args),
-                    ),
-                )
-                repaired_tool_calls.append(repaired_tool_call)
-            except (json.JSONDecodeError, AttributeError, TypeError) as exc:
-                # Non-fatal: keep the original tool call, just log at debug.
-                LOG.debug(
-                    "Failed to repair JSON in tool call %s: %s",
-                    getattr(tool_call, "id", "<unknown>"),
-                    exc,
-                )
+            except Exception as exc:
+                LOG.debug("Failed to repair tool call JSON: %s", exc)
                 repaired_tool_calls.append(tool_call)
 
-        # Repair JSON in text content if it appears to be JSON
         repaired_text = completion.text
         stripped = completion.text.strip()
         if stripped.startswith(("{", "[")):
             try:
                 json.loads(stripped)
             except json.JSONDecodeError:
-                repaired_json = self.json_repair.repair_json(stripped)
+                repaired = self.json_repair.repair_json(stripped)
                 try:
-                    json.loads(repaired_json)
-                    repaired_text = repaired_json
+                    json.loads(repaired)
+                    repaired_text = repaired
                     LOG.info("Repaired JSON in completion text")
                 except json.JSONDecodeError:
-                    LOG.warning("Failed to repair JSON in completion text")
+                    pass
 
-        return LLMCompletion(
-            text=repaired_text,
-            model=completion.model,
-            model_family=completion.model_family,
-            usage=completion.usage,
-            finish_reason=completion.finish_reason,
-            tool_calls=repaired_tool_calls,
-        )
+        return replace(completion, text=repaired_text, tool_calls=repaired_tool_calls)
 
-    def _apply_output_formatting(
-        self,
-        completion: LLMCompletion,
-        config: LLMPostProcessingConfig,
-    ) -> LLMCompletion:
-        """Apply output format constraints."""
+    def _apply_output_formatting(self, completion: LLMCompletion, config: LLMPostProcessingConfig) -> LLMCompletion:
         if config.output_format == "json":
             stripped = completion.text.strip()
             if not stripped.startswith(("{", "[")):
-                extracted_json = self.json_repair.extract_and_repair_json(stripped)
-                if extracted_json is not None:
-                    formatted_text = json.dumps(extracted_json, indent=2)
+                extracted = self.json_repair.extract_and_repair_json(stripped)
+                if extracted is not None:
+                    formatted = json.dumps(extracted, indent=2)
                 else:
-                    formatted_text = json.dumps({"text": completion.text}, indent=2)
-                return LLMCompletion(
-                    text=formatted_text,
-                    model=completion.model,
-                    model_family=completion.model_family,
-                    usage=completion.usage,
-                    finish_reason=completion.finish_reason,
-                    tool_calls=completion.tool_calls,
-                )
+                    formatted = json.dumps({"text": completion.text}, indent=2)
+                
+                return replace(completion, text=formatted)
 
         elif config.output_format == "markdown":
-            if not any(ch in completion.text for ch in "#*`["):
-                formatted_text = f"```text\n{completion.text}\n```"
-                return LLMCompletion(
-                    text=formatted_text,
-                    model=completion.model,
-                    model_family=completion.model_family,
-                    usage=completion.usage,
-                    finish_reason=completion.finish_reason,
-                    tool_calls=completion.tool_calls,
-                )
-
+            if "```" not in completion.text:
+                return replace(completion, text=f"```text\n{completion.text}\n```")
+        
         return completion
 
     @staticmethod
-    def _apply_length_truncation(
-        completion: LLMCompletion,
-        max_length: int,
-    ) -> LLMCompletion:
-        """Truncate completion if it exceeds max length."""
+    def _apply_length_truncation(completion: LLMCompletion, max_length: int) -> LLMCompletion:
         if max_length <= 0 or len(completion.text) <= max_length:
             return completion
 
-        truncated_text = completion.text[:max_length]
-        last_period = truncated_text.rfind(".")
-        last_newline = truncated_text.rfind("\n")
-        cutoff = max(last_period, last_newline)
-
+        truncated = completion.text[:max_length]
+        cutoff = max(truncated.rfind("."), truncated.rfind("\n"))
+        
         if cutoff > max_length * 0.7:
-            truncated_text = truncated_text[: cutoff + 1] + " [truncated]"
+            truncated = truncated[:cutoff + 1] + " [truncated]"
         else:
-            truncated_text = truncated_text + " [truncated]"
+            truncated += " [truncated]"
 
-        return LLMCompletion(
-            text=truncated_text,
-            model=completion.model,
-            model_family=completion.model_family,
-            usage=completion.usage,
-            finish_reason="length",
-            tool_calls=completion.tool_calls,
-        )
+        return replace(completion, text=truncated, finish_reason="length")
 
 
 # =============================================================================
@@ -956,25 +824,7 @@ class LLMCompletionPostProcessor:
 def _ensure_llm_operation_context(
     ctx: Optional[Union[OperationContext, Mapping[str, Any]]],
 ) -> OperationContext:
-    """
-    Normalize various context shapes into an LLM OperationContext.
-
-    Accepts:
-        - None:
-            Uses context_translation.from_dict({}) to construct an "empty"
-            core OperationContext, then adapts it into the LLM OperationContext.
-        - OperationContext:
-            Returned as-is.
-        - Mapping[str, Any]:
-            Interpreted via context_translation.from_dict, then adapted into
-            an LLM OperationContext.
-
-    This mirrors the graph translation layer and keeps responsibilities clean:
-        - Framework-native → normalized core context happens in
-          corpus_sdk.core.context_translation.
-        - This helper simply ensures the LLM adapter receives the right type
-          and shape for its OperationContext.
-    """
+    """Normalize various context shapes into an LLM OperationContext."""
     if ctx is None:
         core_ctx = ctx_from_dict({})
     elif isinstance(ctx, OperationContext):
@@ -1005,7 +855,7 @@ def _ensure_llm_operation_context(
 class LLMFrameworkTranslator(Protocol):
     """
     Per-framework translator contract for LLM operations.
-
+    
     Implementations are responsible for:
         - Converting framework-level message inputs into NormalizedMessage[]
         - Deciding how system messages are handled
@@ -1013,221 +863,26 @@ class LLMFrameworkTranslator(Protocol):
           Corpus wire-compatible shapes
         - Translating LLMCompletion / LLMChunk / capabilities / health /
           token counts back into framework-level outputs
-        - Optionally decorating messages before send (guardrails, tags, etc.)
-        - Optionally suggesting a preferred model when none is specified
     """
 
-    # ---- input translation ----
+    def to_normalized_messages(self, raw_messages: Any, *, op_ctx: OperationContext, framework_ctx: Optional[Any] = None) -> List[NormalizedMessage]: ...
+    def build_system_message(self, normalized_messages: List[NormalizedMessage], *, op_ctx: OperationContext, framework_ctx: Optional[Any] = None) -> Tuple[Optional[str], List[NormalizedMessage]]: ...
+    def build_tools(self, raw_tools: Optional[Any], *, op_ctx: OperationContext, framework_ctx: Optional[Any] = None) -> Optional[List[Dict[str, Any]]]: ...
+    def build_tool_choice(self, raw_tool_choice: Optional[Any], *, op_ctx: OperationContext, framework_ctx: Optional[Any] = None) -> Optional[Union[str, Dict[str, Any]]]: ...
+    
+    def from_completion(self, completion: LLMCompletion, *, op_ctx: OperationContext, framework_ctx: Optional[Any] = None) -> Any: ...
+    def from_chunk(self, chunk: LLMChunk, *, op_ctx: OperationContext, framework_ctx: Optional[Any] = None) -> Any: ...
+    def from_count_tokens(self, token_count: int, *, op_ctx: OperationContext, framework_ctx: Optional[Any] = None) -> Any: ...
+    def from_health(self, health: Mapping[str, Any], *, op_ctx: OperationContext, framework_ctx: Optional[Any] = None) -> Any: ...
+    def from_capabilities(self, caps: LLMCapabilities, *, op_ctx: OperationContext, framework_ctx: Optional[Any] = None) -> Any: ...
 
-    def to_normalized_messages(
-        self,
-        raw_messages: Any,
-        *,
-        op_ctx: OperationContext,
-        framework_ctx: Optional[Any] = None,
-    ) -> List[NormalizedMessage]:
-        """
-        Translate framework-native messages into a list of NormalizedMessage.
+    def translate_tool_calls_to_framework(self, tool_calls: List[Dict[str, Any]], *, op_ctx: OperationContext, framework_ctx: Optional[Any] = None) -> Any: ...
+    def translate_tool_outputs_from_framework(self, tool_outputs: Any, *, op_ctx: OperationContext, framework_ctx: Optional[Any] = None) -> List[Dict[str, Any]]: ...
 
-        raw_messages may be:
-            - List[NormalizedMessage]
-            - List[Mapping[str, Any]]
-            - Single Mapping[str, Any] (treated as length-1 list)
-            - Framework-specific message objects (LangChain, LlamaIndex, etc.)
-        """
-        ...
-
-    def build_system_message(
-        self,
-        normalized_messages: List[NormalizedMessage],
-        *,
-        op_ctx: OperationContext,
-        framework_ctx: Optional[Any] = None,
-    ) -> Tuple[Optional[str], List[NormalizedMessage]]:
-        """
-        Decide how to handle system messages.
-
-        Enhanced behavior preserves message ordering while extracting system content.
-        Returns:
-            (system_message_text, remaining_messages_preserving_order)
-        """
-        ...
-
-    def build_tools(
-        self,
-        raw_tools: Optional[Any],
-        *,
-        op_ctx: OperationContext,
-        framework_ctx: Optional[Any] = None,
-    ) -> Optional[List[Dict[str, Any]]]:
-        """
-        Translate framework-native tool definitions into Corpus tool schema.
-
-        Returned structure should match the LLMProtocolV1 expectations:
-            [ {"type": "function", "function": { ... }}, ... ] or None
-
-        Enhanced with validation and framework-specific tool translation.
-        """
-        ...
-
-    def build_tool_choice(
-        self,
-        raw_tool_choice: Optional[Any],
-        *,
-        op_ctx: OperationContext,
-        framework_ctx: Optional[Any] = None,
-    ) -> Optional[Union[str, Dict[str, Any]]]:
-        """
-        Translate framework-native tool_choice into the Corpus wire format.
-
-        Typical values:
-            - "auto", "none", "required"
-            - A specific tool descriptor as a dict
-            - None (adapter chooses)
-
-        Enhanced with validation.
-        """
-        ...
-
-    # ---- output translation ----
-
-    def from_completion(
-        self,
-        completion: LLMCompletion,
-        *,
-        op_ctx: OperationContext,
-        framework_ctx: Optional[Any] = None,
-    ) -> Any:
-        """
-        Convert an LLMCompletion into a framework-level result object.
-        """
-        ...
-
-    def from_chunk(
-        self,
-        chunk: LLMChunk,
-        *,
-        op_ctx: OperationContext,
-        framework_ctx: Optional[Any] = None,
-    ) -> Any:
-        """
-        Convert a streaming LLMChunk into a framework-level chunk representation.
-        """
-        ...
-
-    def from_count_tokens(
-        self,
-        token_count: int,
-        *,
-        op_ctx: OperationContext,
-        framework_ctx: Optional[Any] = None,
-    ) -> Any:
-        """
-        Convert raw token count into a framework-level count response.
-        """
-        ...
-
-    def from_health(
-        self,
-        health: Mapping[str, Any],
-        *,
-        op_ctx: OperationContext,
-        framework_ctx: Optional[Any] = None,
-    ) -> Any:
-        """
-        Convert adapter health mapping into a framework-facing health result.
-        """
-        ...
-
-    def from_capabilities(
-        self,
-        caps: LLMCapabilities,
-        *,
-        op_ctx: OperationContext,
-        framework_ctx: Optional[Any] = None,
-    ) -> Any:
-        """
-        Convert LLMCapabilities into a framework-facing capabilities structure.
-        """
-        ...
-
-    # ---- enhanced tool call translation ----
-
-    def translate_tool_calls_to_framework(
-        self,
-        tool_calls: List[Dict[str, Any]],
-        *,
-        op_ctx: OperationContext,
-        framework_ctx: Optional[Any] = None,
-    ) -> Any:
-        """
-        Convert protocol tool calls into framework-native tool call objects.
-
-        This enables frameworks to work with their native tool call representations
-        rather than raw dictionaries.
-        """
-        ...
-
-    def translate_tool_outputs_from_framework(
-        self,
-        tool_outputs: Any,
-        *,
-        op_ctx: OperationContext,
-        framework_ctx: Optional[Any] = None,
-    ) -> List[Dict[str, Any]]:
-        """
-        Convert framework-native tool outputs back to protocol format.
-
-        Used for subsequent LLM calls with tool execution results.
-        """
-        ...
-
-    # ---- optional hooks ----
-
-    def preferred_model(
-        self,
-        *,
-        op_ctx: OperationContext,
-        framework_ctx: Optional[Any] = None,
-    ) -> Optional[str]:
-        """
-        Optional hook for translators to derive a default model identifier.
-
-        This can come from:
-            - framework_ctx (e.g., configured model for a given index/router)
-            - op_ctx.attrs (e.g., "llm_model" key)
-        """
-        ...
-
-    def decorate_messages_before_send(
-        self,
-        messages: List[NormalizedMessage],
-        *,
-        op_ctx: OperationContext,
-        framework_ctx: Optional[Any] = None,
-    ) -> List[NormalizedMessage]:
-        """
-        Optional hook that can inject guardrails, additional context, or
-        other framework-specific message transformations before calling
-        the adapter.
-
-        Default behavior is to return messages unchanged.
-        """
-        ...
-
-    def get_token_counting_config(
-        self,
-        *,
-        op_ctx: OperationContext,
-        framework_ctx: Optional[Any] = None,
-    ) -> TokenCountingConfig:
-        """
-        Optional hook for framework-specific token counting strategies.
-
-        Returns a TokenCountingConfig that defines how messages should be
-        formatted for accurate token counting with specific LLM providers.
-        """
-        ...
+    def preferred_model(self, *, op_ctx: OperationContext, framework_ctx: Optional[Any] = None) -> Optional[str]: ...
+    def decorate_messages_before_send(self, messages: List[NormalizedMessage], *, op_ctx: OperationContext, framework_ctx: Optional[Any] = None) -> List[NormalizedMessage]: ...
+    def get_token_counting_config(self, *, op_ctx: OperationContext, framework_ctx: Optional[Any] = None) -> TokenCountingConfig: ...
+    def get_metrics(self) -> TranslatorMetrics: ...
 
 
 # =============================================================================
@@ -1236,77 +891,41 @@ class LLMFrameworkTranslator(Protocol):
 
 
 class DefaultLLMFrameworkTranslator:
-    """
-    Generic, framework-neutral translator implementation.
-
-    Enhanced with:
-        - Sophisticated token counting strategies
-        - Tool validation
-        - Message ordering preservation
-        - Tool call translation hooks
-    """
+    """Generic, framework-neutral translator implementation."""
 
     def __init__(self) -> None:
         self._tool_validator = ToolValidator()
         self._metrics = TranslatorMetrics()
 
-    def to_normalized_messages(
-        self,
-        raw_messages: Any,
-        *,
-        op_ctx: OperationContext,  # noqa: ARG002
-        framework_ctx: Optional[Any] = None,  # noqa: ARG002
-    ) -> List[NormalizedMessage]:
+    def to_normalized_messages(self, raw_messages: Any, *, op_ctx: OperationContext, framework_ctx: Optional[Any] = None) -> List[NormalizedMessage]:
         start_time = time.time()
         try:
-            # Accept a single mapping as a single message
             if isinstance(raw_messages, Mapping):
-                raw_seq: Iterable[Any] = [raw_messages]
+                raw_seq = [raw_messages]
             else:
                 raw_seq = raw_messages
 
-            if not isinstance(raw_seq, Iterable) or isinstance(
-                raw_seq, (str, bytes)
-            ):
+            if not isinstance(raw_seq, Iterable) or isinstance(raw_seq, (str, bytes)):
                 self._metrics.record_validation_error()
-                raise BadRequest(
-                    "raw_messages must be a mapping or iterable of messages",
-                    code="BAD_MESSAGES",
-                    details={"received_type": type(raw_seq).__name__},
-                )
+                raise BadRequest("raw_messages must be a mapping or iterable", code="BAD_MESSAGES")
 
-            messages: List[NormalizedMessage] = []
-
+            messages = []
             for idx, m in enumerate(raw_seq):
                 if isinstance(m, NormalizedMessage):
                     messages.append(m)
-                    continue
-
-                if isinstance(m, Mapping):
+                elif isinstance(m, Mapping):
                     try:
                         messages.append(from_generic_dict(m))
                     except Exception:
                         self._metrics.record_normalization_error()
-                        raise BadRequest(
-                            f"raw_messages[{idx}] could not be normalized",
-                            code="BAD_MESSAGE_FORMAT",
-                            details={"index": idx, "type": type(m).__name__},
-                        )
-                    continue
-
-                self._metrics.record_validation_error()
-                raise BadRequest(
-                    f"raw_messages[{idx}] must be a NormalizedMessage or mapping",
-                    code="BAD_MESSAGES",
-                    details={"index": idx, "type": type(m).__name__},
-                )
+                        raise BadRequest(f"raw_messages[{idx}] malformed", code="BAD_MESSAGE_FORMAT", details={"index": idx})
+                else:
+                    self._metrics.record_validation_error()
+                    raise BadRequest(f"raw_messages[{idx}] must be mapping or NormalizedMessage", code="BAD_MESSAGES")
 
             if not messages:
                 self._metrics.record_validation_error()
-                raise BadRequest(
-                    "raw_messages must contain at least one message",
-                    code="BAD_MESSAGES",
-                )
+                raise BadRequest("raw_messages must contain at least one message", code="BAD_MESSAGES")
 
             self._metrics.record_translation(time.time() - start_time, success=True)
             return messages
@@ -1314,279 +933,106 @@ class DefaultLLMFrameworkTranslator:
             self._metrics.record_translation(time.time() - start_time, success=False)
             raise
 
-    def build_system_message(
-        self,
-        normalized_messages: List[NormalizedMessage],
-        *,
-        op_ctx: OperationContext,  # noqa: ARG002
-        framework_ctx: Optional[Any] = None,  # noqa: ARG002
-    ) -> Tuple[Optional[str], List[NormalizedMessage]]:
-        """
-        Enhanced system message extraction that preserves message ordering.
-
-        Only extracts system messages that appear at the beginning of the
-        conversation, maintaining the semantic structure for models that
-        care about message order.
-        """
-        system_message: Optional[str] = None
-        remaining: List[NormalizedMessage] = []
-
-        extracting_system = True
+    def build_system_message(self, normalized_messages: List[NormalizedMessage], *, op_ctx: OperationContext, framework_ctx: Optional[Any] = None) -> Tuple[Optional[str], List[NormalizedMessage]]:
+        system_message = None
+        remaining = []
+        extracting = True
         for msg in normalized_messages:
-            if extracting_system and msg.role == "system":
-                if system_message is None:
-                    system_message = msg.content
-                else:
-                    system_message += "\n" + msg.content
+            if extracting and msg.role == "system":
+                if system_message is None: system_message = msg.content
+                else: system_message += "\n" + msg.content
             else:
-                extracting_system = False
+                extracting = False
                 remaining.append(msg)
-
         return system_message, remaining
 
-    def build_tools(
-        self,
-        raw_tools: Optional[Any],
-        *,
-        op_ctx: OperationContext,  # noqa: ARG002
-        framework_ctx: Optional[Any] = None,  # noqa: ARG002
-    ) -> Optional[List[Dict[str, Any]]]:
-        if raw_tools is None:
-            return None
-
-        if isinstance(raw_tools, Mapping):
-            raw_tools = [raw_tools]
-
+    def build_tools(self, raw_tools: Optional[Any], *, op_ctx: OperationContext, framework_ctx: Optional[Any] = None) -> Optional[List[Dict[str, Any]]]:
+        if raw_tools is None: return None
+        if isinstance(raw_tools, Mapping): raw_tools = [raw_tools]
+        
         if not isinstance(raw_tools, Sequence):
             self._metrics.record_validation_error()
-            raise BadRequest(
-                "tools must be a mapping or a sequence of mappings",
-                code="BAD_TOOLS",
-                details={"received_type": type(raw_tools).__name__},
-            )
+            raise BadRequest("tools must be a sequence or mapping", code="BAD_TOOLS")
 
-        tools: List[Dict[str, Any]] = []
+        tools = []
         for idx, t in enumerate(raw_tools):
             if not isinstance(t, Mapping):
                 self._metrics.record_validation_error()
-                raise BadRequest(
-                    f"tools[{idx}] must be a mapping",
-                    code="BAD_TOOLS",
-                    details={"index": idx, "type": type(t).__name__},
-                )
-
+                raise BadRequest(f"tools[{idx}] must be a mapping", code="BAD_TOOLS")
             try:
                 self._tool_validator.validate_tool_schema(dict(t))
                 self._metrics.record_tool_translation()
+                tools.append(dict(t))
             except ToolValidationError as exc:
                 self._metrics.record_validation_error()
-                exc.details = exc.details or {}
-                exc.details.setdefault("tool_index", idx)
                 raise
-
-            tools.append(dict(t))
-
         return tools
 
-    def build_tool_choice(
-        self,
-        raw_tool_choice: Optional[Any],
-        *,
-        op_ctx: OperationContext,  # noqa: ARG002
-        framework_ctx: Optional[Any] = None,  # noqa: ARG002
-    ) -> Optional[Union[str, Dict[str, Any]]]:
-        if raw_tool_choice is None:
-            return None
-
+    def build_tool_choice(self, raw_tool_choice: Optional[Any], *, op_ctx: OperationContext, framework_ctx: Optional[Any] = None) -> Optional[Union[str, Dict[str, Any]]]:
+        if raw_tool_choice is None: return None
         try:
             self._tool_validator.validate_tool_choice(raw_tool_choice)
         except ToolValidationError:
             self._metrics.record_validation_error()
             raise
-
-        if isinstance(raw_tool_choice, str):
-            return raw_tool_choice
-
-        if isinstance(raw_tool_choice, Mapping):
-            return dict(raw_tool_choice)
-
+        
+        if isinstance(raw_tool_choice, (str, Mapping)):
+            return raw_tool_choice if isinstance(raw_tool_choice, str) else dict(raw_tool_choice)
+            
         self._metrics.record_validation_error()
-        raise BadRequest(
-            "tool_choice must be a string or mapping",
-            code="BAD_TOOL_CHOICE",
-            details={"type": type(raw_tool_choice).__name__},
-        )
+        raise BadRequest("tool_choice must be string or mapping", code="BAD_TOOL_CHOICE")
 
-    def from_completion(
-        self,
-        completion: LLMCompletion,
-        *,
-        op_ctx: OperationContext,  # noqa: ARG002
-        framework_ctx: Optional[Any] = None,  # noqa: ARG002
-    ) -> Any:
-        """
-        Default: return a neutral dict compatible with JSON.
-        """
+    def from_completion(self, completion: LLMCompletion, *, op_ctx: OperationContext, framework_ctx: Optional[Any] = None) -> Any:
         self._metrics.record_completion_translation()
         return {
             "text": completion.text,
             "model": completion.model,
             "model_family": completion.model_family,
-            "usage": {
-                "prompt_tokens": completion.usage.prompt_tokens,
-                "completion_tokens": completion.usage.completion_tokens,
-                "total_tokens": completion.usage.total_tokens,
-            },
+            "usage": asdict(completion.usage) if completion.usage else None,
             "finish_reason": completion.finish_reason,
             "tool_calls": [asdict(tc) for tc in completion.tool_calls],
         }
 
-    def from_chunk(
-        self,
-        chunk: LLMChunk,
-        *,
-        op_ctx: OperationContext,  # noqa: ARG002
-        framework_ctx: Optional[Any] = None,  # noqa: ARG002
-    ) -> Any:
-        """
-        Default: return a neutral dict per streaming chunk.
-        """
+    def from_chunk(self, chunk: LLMChunk, *, op_ctx: OperationContext, framework_ctx: Optional[Any] = None) -> Any:
         self._metrics.record_chunk_translation()
-        usage = chunk.usage_so_far
         return {
             "text": chunk.text,
             "is_final": chunk.is_final,
             "model": chunk.model,
-            "usage_so_far": (
-                {
-                    "prompt_tokens": usage.prompt_tokens,
-                    "completion_tokens": usage.completion_tokens,
-                    "total_tokens": usage.total_tokens,
-                }
-                if usage is not None
-                else None
-            ),
+            "usage_so_far": asdict(chunk.usage_so_far) if chunk.usage_so_far else None,
             "tool_calls": [asdict(tc) for tc in chunk.tool_calls],
         }
 
-    def from_count_tokens(
-        self,
-        token_count: int,
-        *,
-        op_ctx: OperationContext,  # noqa: ARG002
-        framework_ctx: Optional[Any] = None,  # noqa: ARG002
-    ) -> Any:
-        """
-        Default: return the integer count directly.
-        """
+    def from_count_tokens(self, token_count: int, *, op_ctx: OperationContext, framework_ctx: Optional[Any] = None) -> Any:
         return int(token_count)
 
-    def from_health(
-        self,
-        health: Mapping[str, Any],
-        *,
-        op_ctx: OperationContext,  # noqa: ARG002
-        framework_ctx: Optional[Any] = None,  # noqa: ARG002
-    ) -> Any:
-        """
-        Default: shallow copy of health mapping.
-        """
+    def from_health(self, health: Mapping[str, Any], *, op_ctx: OperationContext, framework_ctx: Optional[Any] = None) -> Any:
         return dict(health)
 
-    def from_capabilities(
-        self,
-        caps: LLMCapabilities,
-        *,
-        op_ctx: OperationContext,  # noqa: ARG002
-        framework_ctx: Optional[Any] = None,  # noqa: ARG002
-    ) -> Any:
-        """
-        Default: capabilities as a plain dict via asdict().
-        """
+    def from_capabilities(self, caps: LLMCapabilities, *, op_ctx: OperationContext, framework_ctx: Optional[Any] = None) -> Any:
         return asdict(caps)
 
-    def translate_tool_calls_to_framework(
-        self,
-        tool_calls: List[Dict[str, Any]],
-        *,
-        op_ctx: OperationContext,  # noqa: ARG002
-        framework_ctx: Optional[Any] = None,  # noqa: ARG002
-    ) -> Any:
-        """
-        Default: return tool calls as-is (list of dicts).
-        Framework-specific translators can convert to native objects.
-        """
+    def translate_tool_calls_to_framework(self, tool_calls: List[Dict[str, Any]], *, op_ctx: OperationContext, framework_ctx: Optional[Any] = None) -> Any:
         return tool_calls
 
-    def translate_tool_outputs_from_framework(
-        self,
-        tool_outputs: Any,
-        *,
-        op_ctx: OperationContext,  # noqa: ARG002
-        framework_ctx: Optional[Any] = None,  # noqa: ARG002
-    ) -> List[Dict[str, Any]]:
-        """
-        Default: assume tool_outputs is already in protocol format.
-        Framework-specific translators can convert from native objects.
-        """
-        if tool_outputs is None:
-            return []
-        if isinstance(tool_outputs, list):
-            return tool_outputs
-        if isinstance(tool_outputs, dict):
-            return [tool_outputs]
+    def translate_tool_outputs_from_framework(self, tool_outputs: Any, *, op_ctx: OperationContext, framework_ctx: Optional[Any] = None) -> List[Dict[str, Any]]:
+        if tool_outputs is None: return []
+        if isinstance(tool_outputs, list): return tool_outputs
+        if isinstance(tool_outputs, dict): return [tool_outputs]
+        raise BadRequest("tool_outputs must be list or dict", code="BAD_TOOL_OUTPUTS")
 
-        # Stricter behavior: surface mis-typed tool outputs early.
-        raise BadRequest(
-            "tool_outputs must be a list or dict when not None",
-            code="BAD_TOOL_OUTPUTS",
-            details={"received_type": type(tool_outputs).__name__},
-        )
-
-    def preferred_model(
-        self,
-        *,
-        op_ctx: OperationContext,
-        framework_ctx: Optional[Any] = None,  # noqa: ARG002
-    ) -> Optional[str]:
-        """
-        Default: derive model from context attrs if present, else None.
-        """
+    def preferred_model(self, *, op_ctx: OperationContext, framework_ctx: Optional[Any] = None) -> Optional[str]:
         attrs = op_ctx.attrs or {}
         candidate = attrs.get("llm_model") or attrs.get("model")
-        if candidate is None:
-            return None
-        value = str(candidate).strip()
-        return value or None
+        return str(candidate).strip() if candidate else None
 
-    def decorate_messages_before_send(
-        self,
-        messages: List[NormalizedMessage],
-        *,
-        op_ctx: OperationContext,  # noqa: ARG002
-        framework_ctx: Optional[Any] = None,  # noqa: ARG002
-    ) -> List[NormalizedMessage]:
-        """
-        Default: no-op, return messages unchanged.
-        """
+    def decorate_messages_before_send(self, messages: List[NormalizedMessage], *, op_ctx: OperationContext, framework_ctx: Optional[Any] = None) -> List[NormalizedMessage]:
         return list(messages)
 
-    def get_token_counting_config(
-        self,
-        *,
-        op_ctx: OperationContext,  # noqa: ARG002
-        framework_ctx: Optional[Any] = None,  # noqa: ARG002
-    ) -> TokenCountingConfig:
-        """
-        Default: use simple token counting strategy.
-        Framework-specific translators can override for provider-specific formats.
-        """
+    def get_token_counting_config(self, *, op_ctx: OperationContext, framework_ctx: Optional[Any] = None) -> TokenCountingConfig:
         return TokenCountingConfig()
 
     def get_metrics(self) -> TranslatorMetrics:
-        """
-        Get current translation metrics for observability.
-        """
         return self._metrics
 
 
@@ -1599,12 +1045,15 @@ class LLMTranslator:
     """
     Framework-agnostic orchestrator for LLM operations.
 
-    Enhanced with:
-        - Sophisticated token counting with multiple strategies
-        - LLM post-processing (safety filtering, JSON repair, etc.)
-        - Comprehensive metrics collection
-        - Enhanced tool validation and translation
-        - Improved streaming ergonomics
+    This class:
+        - Accepts framework-level inputs and a normalized OperationContext
+        - Delegates to an LLMFrameworkTranslator to build specs and translate results
+        - Calls into an LLMProtocolV1 adapter to execute operations
+        - Provides sync + async variants for all core operations
+        - Handles streaming via SyncStreamBridge for sync callers
+        - Attaches rich error context for diagnostics
+
+    Sync methods use AsyncBridge to call async adapters from sync contexts.
     """
 
     def __init__(
@@ -1619,14 +1068,171 @@ class LLMTranslator:
     ) -> None:
         self._adapter = adapter
         self._framework = framework
-        self._translator: LLMFrameworkTranslator = (
-            translator or DefaultLLMFrameworkTranslator()
-        )
+        self._translator = translator or DefaultLLMFrameworkTranslator()
         self._post_processing_config = post_processing_config or LLMPostProcessingConfig()
         self._post_processor = LLMCompletionPostProcessor(
             base_config=self._post_processing_config,
             safety_filter=safety_filter or SafetyFilter(),
             json_repair=json_repair or JSONRepair(),
+        )
+
+    def __enter__(self) -> "LLMTranslator":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        close = getattr(self._adapter, "close", None)
+        if callable(close):
+            close()
+
+    async def __aenter__(self) -> "LLMTranslator":
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        aclose = getattr(self._adapter, "aclose", None)
+        if callable(aclose):
+            await aclose()
+
+    # --------------------------------------------------------------------- #
+    # Internal execution helpers (Executor Pattern)
+    # --------------------------------------------------------------------- #
+
+    def _run_operation(
+        self,
+        *,
+        op_name: str,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]],
+        sync: bool,
+        logic: Callable[[OperationContext], Awaitable[R]],
+    ) -> Union[R, Awaitable[R]]:
+        """
+        Centralized execution for non-streaming operations.
+
+        - Normalizes OperationContext
+        - Wraps logic with consistent error-context attachment
+        - Uses AsyncBridge for sync variants, returns coroutine for async variants
+        """
+        ctx = _ensure_llm_operation_context(op_ctx)
+
+        async def _wrapped() -> R:
+            try:
+                return await logic(ctx)
+            except Exception as exc:
+                attach_context(
+                    exc,
+                    framework=self._framework,
+                    resource_type="llm",
+                    operation=f"llm.{op_name}",
+                    request_id=ctx.request_id,
+                    tenant=ctx.tenant,
+                )
+                raise
+
+        if sync:
+            timeout = ctx.deadline_ms / 1000.0 if ctx.deadline_ms else None
+            return AsyncBridge.run_async(_wrapped(), timeout=timeout)
+        return _wrapped()
+
+    def _run_stream_operation(
+        self,
+        *,
+        op_name: str,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]],
+        sync: bool,
+        factory: Callable[[OperationContext], AsyncIterator[R]],
+    ) -> Union[Iterator[R], AsyncIterator[R]]:
+        """
+        Centralized execution for streaming operations.
+        
+        Args:
+            factory: A function that takes context and returns an AsyncIterator.
+                     (Note: AsyncGenerator functions return AsyncIterator immediately,
+                      no await required to get the iterator).
+        """
+        ctx = _ensure_llm_operation_context(op_ctx)
+
+        async def _async_gen() -> AsyncIterator[R]:
+            try:
+                # FIX: Calling factory(ctx) returns the async generator immediately.
+                # Do NOT await factory(ctx).
+                async for chunk in factory(ctx):
+                    yield chunk
+            except Exception as exc:
+                attach_context(
+                    exc,
+                    framework=self._framework,
+                    resource_type="llm",
+                    operation=f"llm.{op_name}",
+                    request_id=ctx.request_id,
+                    tenant=ctx.tenant,
+                )
+                raise
+
+        if sync:
+            return SyncStreamBridge(
+                coro_factory=_async_gen,
+                framework=self._framework,
+                error_context={
+                    "operation": f"llm.{op_name}",
+                    "request_id": ctx.request_id,
+                    "tenant": ctx.tenant,
+                },
+            ).run()
+        return _async_gen()
+
+    def _prepare_stream_factory(self, raw_messages, **kwargs) -> Callable[[OperationContext], AsyncIterator[Any]]:
+        """Shared logic to prepare the stream generator."""
+        
+        async def _factory(ctx: OperationContext) -> AsyncIterator[Any]:
+            normalized = self._translator.to_normalized_messages(raw_messages, op_ctx=ctx, framework_ctx=kwargs.get('framework_ctx'))
+            normalized = self._translator.decorate_messages_before_send(normalized, op_ctx=ctx, framework_ctx=kwargs.get('framework_ctx'))
+            
+            auto_system, remaining = self._translator.build_system_message(normalized, op_ctx=ctx, framework_ctx=kwargs.get('framework_ctx'))
+            effective_system = kwargs.get('system_message') if kwargs.get('system_message') is not None else auto_system
+            
+            tools_corpus = self._translator.build_tools(kwargs.get('tools'), op_ctx=ctx, framework_ctx=kwargs.get('framework_ctx'))
+            tool_choice_corpus = self._translator.build_tool_choice(kwargs.get('tool_choice'), op_ctx=ctx, framework_ctx=kwargs.get('framework_ctx'))
+            
+            wire_messages = to_corpus(remaining)
+            effective_model = kwargs.get('model') or self._translator.preferred_model(op_ctx=ctx, framework_ctx=kwargs.get('framework_ctx'))
+
+            # Call stream on adapter
+            agen = self._adapter.stream(
+                messages=wire_messages,
+                max_tokens=kwargs.get('max_tokens'),
+                temperature=kwargs.get('temperature'),
+                top_p=kwargs.get('top_p'),
+                frequency_penalty=kwargs.get('frequency_penalty'),
+                presence_penalty=kwargs.get('presence_penalty'),
+                stop_sequences=kwargs.get('stop_sequences'),
+                model=effective_model,
+                system_message=effective_system,
+                tools=tools_corpus,
+                tool_choice=tool_choice_corpus,
+                ctx=ctx,
+            )
+            
+            async for chunk in agen:
+                if not isinstance(chunk, LLMChunk):
+                     raise BadRequest(f"adapter.stream yielded invalid type: {type(chunk)}", code="BAD_ADAPTER_RESULT")
+                yield self._translator.from_chunk(chunk, op_ctx=ctx, framework_ctx=kwargs.get('framework_ctx'))
+        
+        return _factory
+
+    @staticmethod
+    def _coerce_token_count(result: Any) -> int:
+        """Robustly coerce token count result to int."""
+        try:
+            if isinstance(result, (int, float)):
+                return int(result)
+            if isinstance(result, str):
+                return int(float(str(result).strip()))
+        except (TypeError, ValueError):
+            pass
+        
+        raise BadRequest(
+            "count_tokens returned non-numeric value",
+            code="BAD_ADAPTER_COUNT",
+            details={"received_type": type(result).__name__}
         )
 
     # --------------------------------------------------------------------- #
@@ -1641,17 +1247,15 @@ class LLMTranslator:
     ) -> str:
         """
         Format messages for token counting using sophisticated strategies.
-
-        Supports multiple formatting approaches for different LLM providers.
         """
         parts: List[str] = []
 
         special_tokens_overhead = 0
         if token_config.add_special_tokens:
             if token_config.format_strategy == "openai_chatml":
-                special_tokens_overhead = 20  # Approximate ChatML overhead
+                special_tokens_overhead = 20
             elif token_config.format_strategy == "anthropic":
-                special_tokens_overhead = 10  # Approximate Anthropic overhead
+                special_tokens_overhead = 10
 
         if token_config.format_strategy == "simple":
             if system_message and token_config.include_system_in_messages:
@@ -1682,39 +1286,60 @@ class LLMTranslator:
             for msg in normalized_messages:
                 parts.append(template.format(role=msg.role, content=msg.content))
 
-        else:
-            if system_message and token_config.include_system_in_messages:
-                parts.append(f"system:{system_message}")
-            for msg in normalized_messages:
-                parts.append(f"{msg.role}:{msg.content}")
-
         formatted_text = "\n".join(parts)
-
         if token_config.add_special_tokens and special_tokens_overhead > 0:
             formatted_text += " " * special_tokens_overhead
 
         return formatted_text
 
-    @staticmethod
-    def _coerce_token_count(result: Any) -> int:
-        """
-        Coerce adapter.count_tokens result into an int, or raise BadRequest.
-        """
-        if isinstance(result, (int, float)):
-            return int(result)
-        if isinstance(result, str):
-            try:
-                return int(float(result.strip()))
-            except ValueError:
-                pass
-        raise BadRequest(
-            "adapter.count_tokens returned non-numeric value",
-            code="BAD_ADAPTER_COUNT",
-            details={"received_type": type(result).__name__},
-        )
+    def count_tokens_for_messages(
+        self,
+        raw_messages: Any,
+        *,
+        model: Optional[str] = None,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        """Enhanced synchronous helper to count tokens for chat messages."""
+        
+        async def _logic(ctx):
+            normalized = self._translator.to_normalized_messages(raw_messages, op_ctx=ctx, framework_ctx=framework_ctx)
+            auto_system, remaining = self._translator.build_system_message(normalized, op_ctx=ctx, framework_ctx=framework_ctx)
+            token_config = self._translator.get_token_counting_config(op_ctx=ctx, framework_ctx=framework_ctx)
+            
+            combined = self._format_messages_for_token_counting(remaining, auto_system, token_config)
+            
+            res = await self._adapter.count_tokens(text=combined, model=model, ctx=ctx)
+            numeric = self._coerce_token_count(res)
+            return self._translator.from_count_tokens(numeric, op_ctx=ctx, framework_ctx=framework_ctx)
+
+        return self._run_operation(op_name="count_tokens_for_messages", op_ctx=op_ctx, sync=True, logic=_logic)
+
+    async def arun_count_tokens_for_messages(
+        self,
+        raw_messages: Any,
+        *,
+        model: Optional[str] = None,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        """Enhanced async helper to count tokens for chat messages."""
+        
+        async def _logic(ctx):
+            normalized = self._translator.to_normalized_messages(raw_messages, op_ctx=ctx, framework_ctx=framework_ctx)
+            auto_system, remaining = self._translator.build_system_message(normalized, op_ctx=ctx, framework_ctx=framework_ctx)
+            token_config = self._translator.get_token_counting_config(op_ctx=ctx, framework_ctx=framework_ctx)
+            
+            combined = self._format_messages_for_token_counting(remaining, auto_system, token_config)
+            
+            res = await self._adapter.count_tokens(text=combined, model=model, ctx=ctx)
+            numeric = self._coerce_token_count(res)
+            return self._translator.from_count_tokens(numeric, op_ctx=ctx, framework_ctx=framework_ctx)
+
+        return await self._run_operation(op_name="count_tokens_for_messages", op_ctx=op_ctx, sync=False, logic=_logic)
 
     # --------------------------------------------------------------------- #
-    # Sync Complete (uses AsyncBridge)
+    # Public APIs
     # --------------------------------------------------------------------- #
 
     def complete(
@@ -1738,94 +1363,46 @@ class LLMTranslator:
         Synchronous complete API.
 
         Uses AsyncBridge to call the async adapter from a sync context.
+        Supports post-processing of results (safety, JSON repair).
         """
-        ctx = _ensure_llm_operation_context(op_ctx)
-        timeout = ctx.deadline_ms / 1000.0 if ctx.deadline_ms else None
+        async def _logic(ctx):
+            # Normalize & decorate
+            normalized = self._translator.to_normalized_messages(raw_messages, op_ctx=ctx, framework_ctx=framework_ctx)
+            normalized = self._translator.decorate_messages_before_send(normalized, op_ctx=ctx, framework_ctx=framework_ctx)
+            
+            # System message & Tools
+            auto_system, remaining = self._translator.build_system_message(normalized, op_ctx=ctx, framework_ctx=framework_ctx)
+            effective_system = system_message if system_message is not None else auto_system
+            tools_corpus = self._translator.build_tools(tools, op_ctx=ctx, framework_ctx=framework_ctx)
+            tool_choice_corpus = self._translator.build_tool_choice(tool_choice, op_ctx=ctx, framework_ctx=framework_ctx)
 
-        async def _complete_coro() -> Any:
-            try:
-                normalized = self._translator.to_normalized_messages(
-                    raw_messages,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
-                normalized = self._translator.decorate_messages_before_send(
-                    normalized,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
+            wire_messages = to_corpus(remaining)
+            effective_model = model or self._translator.preferred_model(op_ctx=ctx, framework_ctx=framework_ctx)
 
-                auto_system, remaining = self._translator.build_system_message(
-                    normalized,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
+            # Call Adapter
+            result = await self._adapter.complete(
+                messages=wire_messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                frequency_penalty=frequency_penalty,
+                presence_penalty=presence_penalty,
+                stop_sequences=stop_sequences,
+                model=effective_model,
+                system_message=effective_system,
+                tools=tools_corpus,
+                tool_choice=tool_choice_corpus,
+                ctx=ctx,
+            )
 
-                effective_system = (
-                    system_message if system_message is not None else auto_system
-                )
-                tools_corpus = self._translator.build_tools(
-                    tools,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
-                tool_choice_corpus = self._translator.build_tool_choice(
-                    tool_choice,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
+            if not isinstance(result, LLMCompletion):
+                raise BadRequest(f"adapter.complete returned invalid type: {type(result)}", code="BAD_ADAPTER_RESULT")
 
-                wire_messages = to_corpus(remaining)
-                effective_model = model or self._translator.preferred_model(
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
+            # Post-process
+            result_processed = self._post_processor.apply(result, ctx)
+            return self._translator.from_completion(result_processed, op_ctx=ctx, framework_ctx=framework_ctx)
 
-                result = await self._adapter.complete(
-                    messages=wire_messages,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    frequency_penalty=frequency_penalty,
-                    presence_penalty=presence_penalty,
-                    stop_sequences=stop_sequences,
-                    model=effective_model,
-                    system_message=effective_system,
-                    tools=tools_corpus,
-                    tool_choice=tool_choice_corpus,
-                    ctx=ctx,
-                )
-
-                if not isinstance(result, LLMCompletion):
-                    raise BadRequest(
-                        f"adapter.complete returned unsupported type: {type(result).__name__}",
-                        code="BAD_ADAPTER_RESULT",
-                    )
-
-                result_processed = self._post_processor.apply(result, ctx)
-
-                return self._translator.from_completion(
-                    result_processed,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
-            except Exception as exc:
-                attach_context(
-                    exc,
-                    framework=self._framework,
-                    resource_type="llm",
-                    operation="complete",
-                    llm_operation="complete",
-                    request_id=ctx.request_id,
-                    tenant=ctx.tenant,
-                )
-                raise
-
-        return AsyncBridge.run_async(_complete_coro(), timeout=timeout)
-
-    # --------------------------------------------------------------------- #
-    # Async Complete
-    # --------------------------------------------------------------------- #
+        return self._run_operation(op_name="complete", op_ctx=op_ctx, sync=True, logic=_logic)
 
     async def arun_complete(
         self,
@@ -1845,50 +1422,25 @@ class LLMTranslator:
         framework_ctx: Optional[Any] = None,
     ) -> Any:
         """
-        Async complete API.
+        Async complete API (preferred for async applications).
 
-        Preferred for async applications and services.
+        Fully async flow: adapter.complete -> post-processing -> translation.
         """
-        ctx = _ensure_llm_operation_context(op_ctx)
-
-        try:
-            normalized = self._translator.to_normalized_messages(
-                raw_messages,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-            normalized = self._translator.decorate_messages_before_send(
-                normalized,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-
-            auto_system, remaining = self._translator.build_system_message(
-                normalized,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-
-            effective_system = (
-                system_message if system_message is not None else auto_system
-            )
-            tools_corpus = self._translator.build_tools(
-                tools,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-            tool_choice_corpus = self._translator.build_tool_choice(
-                tool_choice,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
+        async def _logic(ctx):
+            # Normalize & decorate
+            normalized = self._translator.to_normalized_messages(raw_messages, op_ctx=ctx, framework_ctx=framework_ctx)
+            normalized = self._translator.decorate_messages_before_send(normalized, op_ctx=ctx, framework_ctx=framework_ctx)
+            
+            # System message & Tools
+            auto_system, remaining = self._translator.build_system_message(normalized, op_ctx=ctx, framework_ctx=framework_ctx)
+            effective_system = system_message if system_message is not None else auto_system
+            tools_corpus = self._translator.build_tools(tools, op_ctx=ctx, framework_ctx=framework_ctx)
+            tool_choice_corpus = self._translator.build_tool_choice(tool_choice, op_ctx=ctx, framework_ctx=framework_ctx)
 
             wire_messages = to_corpus(remaining)
-            effective_model = model or self._translator.preferred_model(
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
+            effective_model = model or self._translator.preferred_model(op_ctx=ctx, framework_ctx=framework_ctx)
 
+            # Call Adapter
             result = await self._adapter.complete(
                 messages=wire_messages,
                 max_tokens=max_tokens,
@@ -1905,33 +1457,13 @@ class LLMTranslator:
             )
 
             if not isinstance(result, LLMCompletion):
-                raise BadRequest(
-                    f"adapter.complete returned unsupported type: {type(result).__name__}",
-                    code="BAD_ADAPTER_RESULT",
-                )
+                raise BadRequest(f"adapter.complete returned invalid type: {type(result)}", code="BAD_ADAPTER_RESULT")
 
+            # Post-process
             result_processed = self._post_processor.apply(result, ctx)
+            return self._translator.from_completion(result_processed, op_ctx=ctx, framework_ctx=framework_ctx)
 
-            return self._translator.from_completion(
-                result_processed,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-        except Exception as exc:
-            attach_context(
-                exc,
-                framework=self._framework,
-                resource_type="llm",
-                operation="complete",
-                llm_operation="complete",
-                request_id=ctx.request_id,
-                tenant=ctx.tenant,
-            )
-            raise
-
-    # --------------------------------------------------------------------- #
-    # Enhanced Sync Stream (uses SyncStreamBridge)
-    # --------------------------------------------------------------------- #
+        return await self._run_operation(op_name="complete", op_ctx=op_ctx, sync=False, logic=_logic)
 
     def stream(
         self,
@@ -1951,107 +1483,31 @@ class LLMTranslator:
         framework_ctx: Optional[Any] = None,
     ) -> Iterator[Any]:
         """
-        Enhanced synchronous streaming API.
+        Synchronous streaming API.
 
-        Returns a sync iterator that yields framework-level streaming chunks
-        by bridging the async adapter.stream(...) via SyncStreamBridge.
-        Provides better ergonomics and error handling.
+        Returns a sync iterator yielding framework-level streaming chunks.
         """
-        ctx = _ensure_llm_operation_context(op_ctx)
-
-        async def _stream_factory() -> AsyncIterator[Any]:
-            try:
-                normalized = self._translator.to_normalized_messages(
-                    raw_messages,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
-                normalized = self._translator.decorate_messages_before_send(
-                    normalized,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
-
-                auto_system, remaining = self._translator.build_system_message(
-                    normalized,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
-
-                effective_system = (
-                    system_message if system_message is not None else auto_system
-                )
-                tools_corpus = self._translator.build_tools(
-                    tools,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
-                tool_choice_corpus = self._translator.build_tool_choice(
-                    tool_choice,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
-
-                wire_messages = to_corpus(remaining)
-                effective_model = model or self._translator.preferred_model(
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
-
-                agen = self._adapter.stream(
-                    messages=wire_messages,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    frequency_penalty=frequency_penalty,
-                    presence_penalty=presence_penalty,
-                    stop_sequences=stop_sequences,
-                    model=effective_model,
-                    system_message=effective_system,
-                    tools=tools_corpus,
-                    tool_choice=tool_choice_corpus,
-                    ctx=ctx,
-                )
-
-                async for chunk in agen:
-                    if not isinstance(chunk, LLMChunk):
-                        raise BadRequest(
-                            f"adapter.stream yielded unsupported type: {type(chunk).__name__}",
-                            code="BAD_ADAPTER_RESULT",
-                        )
-                    yield self._translator.from_chunk(
-                        chunk,
-                        op_ctx=ctx,
-                        framework_ctx=framework_ctx,
-                    )
-            except Exception as exc:
-                attach_context(
-                    exc,
-                    framework=self._framework,
-                    resource_type="llm",
-                    operation="stream",
-                    llm_operation="stream",
-                    request_id=ctx.request_id,
-                    tenant=ctx.tenant,
-                )
-                raise
-
-        bridge = SyncStreamBridge(
-            coro_factory=_stream_factory,
-            framework=self._framework,
-            error_context={
-                "operation": "llm.stream",
-                "request_id": ctx.request_id,
-                "tenant": ctx.tenant,
-            },
+        return self._run_stream_operation(
+            op_name="stream",
+            op_ctx=op_ctx,
+            sync=True,
+            factory=self._prepare_stream_factory(
+                raw_messages,
+                model=model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                frequency_penalty=frequency_penalty,
+                presence_penalty=presence_penalty,
+                stop_sequences=stop_sequences,
+                tools=tools,
+                tool_choice=tool_choice,
+                system_message=system_message,
+                framework_ctx=framework_ctx,
+            )
         )
-        return bridge.run()
 
-    # --------------------------------------------------------------------- #
-    # Async Stream
-    # --------------------------------------------------------------------- #
-
-    async def arun_stream(
+    def arun_stream(
         self,
         raw_messages: Any,
         *,
@@ -2073,87 +1529,26 @@ class LLMTranslator:
 
         Returns an async iterator yielding framework-level streaming chunks.
         """
-        ctx = _ensure_llm_operation_context(op_ctx)
-
-        try:
-            normalized = self._translator.to_normalized_messages(
+        # Returns AsyncIterator directly (not a coroutine)
+        return self._run_stream_operation(
+            op_name="stream",
+            op_ctx=op_ctx,
+            sync=False,
+            factory=self._prepare_stream_factory(
                 raw_messages,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-            normalized = self._translator.decorate_messages_before_send(
-                normalized,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-
-            auto_system, remaining = self._translator.build_system_message(
-                normalized,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-
-            effective_system = (
-                system_message if system_message is not None else auto_system
-            )
-            tools_corpus = self._translator.build_tools(
-                tools,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-            tool_choice_corpus = self._translator.build_tool_choice(
-                tool_choice,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-
-            wire_messages = to_corpus(remaining)
-            effective_model = model or self._translator.preferred_model(
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-
-            agen = self._adapter.stream(
-                messages=wire_messages,
+                model=model,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_p=top_p,
                 frequency_penalty=frequency_penalty,
                 presence_penalty=presence_penalty,
                 stop_sequences=stop_sequences,
-                model=effective_model,
-                system_message=effective_system,
-                tools=tools_corpus,
-                tool_choice=tool_choice_corpus,
-                ctx=ctx,
+                tools=tools,
+                tool_choice=tool_choice,
+                system_message=system_message,
+                framework_ctx=framework_ctx,
             )
-
-            async for chunk in agen:
-                if not isinstance(chunk, LLMChunk):
-                    raise BadRequest(
-                        f"adapter.stream yielded unsupported type: {type(chunk).__name__}",
-                        code="BAD_ADAPTER_RESULT",
-                    )
-                yield self._translator.from_chunk(
-                    chunk,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
-        except Exception as exc:
-            attach_context(
-                exc,
-                framework=self._framework,
-                resource_type="llm",
-                operation="stream",
-                llm_operation="stream",
-                request_id=ctx.request_id,
-                tenant=ctx.tenant,
-            )
-            raise
-
-    # --------------------------------------------------------------------- #
-    # Enhanced Token Counting with Sophisticated Formatting
-    # --------------------------------------------------------------------- #
+        )
 
     def count_tokens(
         self,
@@ -2163,38 +1558,13 @@ class LLMTranslator:
         op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
         framework_ctx: Optional[Any] = None,
     ) -> Any:
-        """
-        Synchronous count_tokens wrapper around adapter.count_tokens().
-        """
-        ctx = _ensure_llm_operation_context(op_ctx)
-        timeout = ctx.deadline_ms / 1000.0 if ctx.deadline_ms else None
+        """Synchronous count_tokens wrapper."""
+        async def _logic(ctx):
+            res = await self._adapter.count_tokens(text=text, model=model, ctx=ctx)
+            numeric = self._coerce_token_count(res)
+            return self._translator.from_count_tokens(numeric, op_ctx=ctx, framework_ctx=framework_ctx)
 
-        async def _count_coro() -> Any:
-            try:
-                result = await self._adapter.count_tokens(
-                    text=text,
-                    model=model,
-                    ctx=ctx,
-                )
-                numeric = self._coerce_token_count(result)
-                return self._translator.from_count_tokens(
-                    numeric,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
-            except Exception as exc:
-                attach_context(
-                    exc,
-                    framework=self._framework,
-                    resource_type="llm",
-                    operation="count_tokens",
-                    llm_operation="count_tokens",
-                    request_id=ctx.request_id,
-                    tenant=ctx.tenant,
-                )
-                raise
-
-        return AsyncBridge.run_async(_count_coro(), timeout=timeout)
+        return self._run_operation(op_name="count_tokens", op_ctx=op_ctx, sync=True, logic=_logic)
 
     async def arun_count_tokens(
         self,
@@ -2204,167 +1574,65 @@ class LLMTranslator:
         op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
         framework_ctx: Optional[Any] = None,
     ) -> Any:
-        """
-        Async count_tokens wrapper.
-        """
-        ctx = _ensure_llm_operation_context(op_ctx)
+        """Async count_tokens wrapper."""
+        async def _logic(ctx):
+            res = await self._adapter.count_tokens(text=text, model=model, ctx=ctx)
+            numeric = self._coerce_token_count(res)
+            return self._translator.from_count_tokens(numeric, op_ctx=ctx, framework_ctx=framework_ctx)
 
-        try:
-            result = await self._adapter.count_tokens(
-                text=text,
-                model=model,
-                ctx=ctx,
-            )
-            numeric = self._coerce_token_count(result)
-            return self._translator.from_count_tokens(
-                numeric,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-        except Exception as exc:
-            attach_context(
-                exc,
-                framework=self._framework,
-                resource_type="llm",
-                operation="count_tokens",
-                llm_operation="count_tokens",
-                request_id=ctx.request_id,
-                tenant=ctx.tenant,
-            )
-            raise
+        return await self._run_operation(op_name="count_tokens", op_ctx=op_ctx, sync=False, logic=_logic)
 
-    # --------------------------------------------------------------------- #
-    # Enhanced Helper: count_tokens for messages with sophisticated formatting
-    # --------------------------------------------------------------------- #
-
-    def count_tokens_for_messages(
+    def health(
         self,
-        raw_messages: Any,
         *,
-        model: Optional[str] = None,
         op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
         framework_ctx: Optional[Any] = None,
     ) -> Any:
-        """
-        Enhanced synchronous helper to count tokens for chat messages.
+        """Synchronous health check wrapper."""
+        async def _logic(ctx):
+            res = await self._adapter.health(ctx=ctx)
+            return self._translator.from_health(res, op_ctx=ctx, framework_ctx=framework_ctx)
+        return self._run_operation(op_name="health", op_ctx=op_ctx, sync=True, logic=_logic)
 
-        Uses sophisticated formatting strategies for accurate token counting
-        across different LLM providers.
-        """
-        ctx = _ensure_llm_operation_context(op_ctx)
-        timeout = ctx.deadline_ms / 1000.0 if ctx.deadline_ms else None
-
-        async def _count_msgs_coro() -> Any:
-            try:
-                normalized = self._translator.to_normalized_messages(
-                    raw_messages,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
-                auto_system, remaining = self._translator.build_system_message(
-                    normalized,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
-
-                token_config = self._translator.get_token_counting_config(
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
-
-                combined = self._format_messages_for_token_counting(
-                    remaining,
-                    auto_system,
-                    token_config,
-                )
-
-                result = await self._adapter.count_tokens(
-                    text=combined,
-                    model=model,
-                    ctx=ctx,
-                )
-                numeric = self._coerce_token_count(result)
-                return self._translator.from_count_tokens(
-                    numeric,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
-            except Exception as exc:
-                attach_context(
-                    exc,
-                    framework=self._framework,
-                    resource_type="llm",
-                    operation="count_tokens_for_messages",
-                    llm_operation="count_tokens_for_messages",
-                    request_id=ctx.request_id,
-                    tenant=ctx.tenant,
-                )
-                raise
-
-        return AsyncBridge.run_async(_count_msgs_coro(), timeout=timeout)
-
-    async def arun_count_tokens_for_messages(
+    async def arun_health(
         self,
-        raw_messages: Any,
         *,
-        model: Optional[str] = None,
         op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
         framework_ctx: Optional[Any] = None,
     ) -> Any:
-        """
-        Enhanced async helper to count tokens for chat messages.
-        """
-        ctx = _ensure_llm_operation_context(op_ctx)
+        """Async health check wrapper."""
+        async def _logic(ctx):
+            res = await self._adapter.health(ctx=ctx)
+            return self._translator.from_health(res, op_ctx=ctx, framework_ctx=framework_ctx)
+        return await self._run_operation(op_name="health", op_ctx=op_ctx, sync=False, logic=_logic)
 
-        try:
-            normalized = self._translator.to_normalized_messages(
-                raw_messages,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-            auto_system, remaining = self._translator.build_system_message(
-                normalized,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
+    def capabilities(
+        self,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        """Synchronous capabilities wrapper."""
+        async def _logic(ctx):
+            res = await self._adapter.capabilities()
+            return self._translator.from_capabilities(res, op_ctx=ctx, framework_ctx=framework_ctx)
+        return self._run_operation(op_name="capabilities", op_ctx=op_ctx, sync=True, logic=_logic)
 
-            token_config = self._translator.get_token_counting_config(
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
+    async def arun_capabilities(
+        self,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        """Async capabilities wrapper."""
+        async def _logic(ctx):
+            res = await self._adapter.capabilities()
+            return self._translator.from_capabilities(res, op_ctx=ctx, framework_ctx=framework_ctx)
+        return await self._run_operation(op_name="capabilities", op_ctx=op_ctx, sync=False, logic=_logic)
 
-            combined = self._format_messages_for_token_counting(
-                remaining,
-                auto_system,
-                token_config,
-            )
-
-            result = await self._adapter.count_tokens(
-                text=combined,
-                model=model,
-                ctx=ctx,
-            )
-            numeric = self._coerce_token_count(result)
-            return self._translator.from_count_tokens(
-                numeric,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-        except Exception as exc:
-            attach_context(
-                exc,
-                framework=self._framework,
-                resource_type="llm",
-                operation="count_tokens_for_messages",
-                llm_operation="count_tokens_for_messages",
-                request_id=ctx.request_id,
-                tenant=ctx.tenant,
-            )
-            raise
-
-    # --------------------------------------------------------------------- #
-    # Enhanced Tool Call Translation Methods
-    # --------------------------------------------------------------------- #
+    def get_metrics(self) -> Optional[TranslatorMetrics]:
+        """Get current translation metrics for observability."""
+        return self._translator.get_metrics() if hasattr(self._translator, "get_metrics") else None
 
     def translate_tool_calls_to_framework(
         self,
@@ -2373,15 +1641,9 @@ class LLMTranslator:
         op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
         framework_ctx: Optional[Any] = None,
     ) -> Any:
-        """
-        Convert protocol tool calls to framework-native representations.
-        """
+        """Helper to access translator's tool call translation logic."""
         ctx = _ensure_llm_operation_context(op_ctx)
-        return self._translator.translate_tool_calls_to_framework(
-            tool_calls,
-            op_ctx=ctx,
-            framework_ctx=framework_ctx,
-        )
+        return self._translator.translate_tool_calls_to_framework(tool_calls, op_ctx=ctx, framework_ctx=framework_ctx)
 
     def translate_tool_outputs_from_framework(
         self,
@@ -2390,214 +1652,32 @@ class LLMTranslator:
         op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
         framework_ctx: Optional[Any] = None,
     ) -> List[Dict[str, Any]]:
-        """
-        Convert framework-native tool outputs back to protocol format.
-        """
+        """Helper to access translator's tool output translation logic."""
         ctx = _ensure_llm_operation_context(op_ctx)
-        return self._translator.translate_tool_outputs_from_framework(
-            tool_outputs,
-            op_ctx=ctx,
-            framework_ctx=framework_ctx,
-        )
-
-    # --------------------------------------------------------------------- #
-    # Health (sync + async)
-    # --------------------------------------------------------------------- #
-
-    def health(
-        self,
-        *,
-        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
-        framework_ctx: Optional[Any] = None,
-    ) -> Any:
-        """
-        Synchronous health check wrapper.
-        """
-        ctx = _ensure_llm_operation_context(op_ctx)
-        timeout = ctx.deadline_ms / 1000.0 if ctx.deadline_ms else None
-
-        async def _health_coro() -> Any:
-            try:
-                h = await self._adapter.health(ctx=ctx)
-                return self._translator.from_health(
-                    h,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
-            except Exception as exc:
-                attach_context(
-                    exc,
-                    framework=self._framework,
-                    resource_type="llm",
-                    operation="health",
-                    llm_operation="health",
-                    request_id=ctx.request_id,
-                    tenant=ctx.tenant,
-                )
-                raise
-
-        return AsyncBridge.run_async(_health_coro(), timeout=timeout)
-
-    async def arun_health(
-        self,
-        *,
-        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
-        framework_ctx: Optional[Any] = None,
-    ) -> Any:
-        """
-        Async health check wrapper.
-        """
-        ctx = _ensure_llm_operation_context(op_ctx)
-
-        try:
-            h = await self._adapter.health(ctx=ctx)
-            return self._translator.from_health(
-                h,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-        except Exception as exc:
-            attach_context(
-                exc,
-                framework=self._framework,
-                resource_type="llm",
-                operation="health",
-                llm_operation="health",
-                request_id=ctx.request_id,
-                tenant=ctx.tenant,
-            )
-            raise
-
-    # --------------------------------------------------------------------- #
-    # Capabilities (sync + async)
-    # --------------------------------------------------------------------- #
-
-    def capabilities(
-        self,
-        *,
-        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
-        framework_ctx: Optional[Any] = None,
-    ) -> Any:
-        """
-        Synchronous capabilities wrapper.
-
-        Returns framework-level capabilities derived from LLMCapabilities.
-        """
-        ctx = _ensure_llm_operation_context(op_ctx)
-        timeout = ctx.deadline_ms / 1000.0 if ctx.deadline_ms else None
-
-        async def _caps_coro() -> Any:
-            try:
-                caps = await self._adapter.capabilities()
-                return self._translator.from_capabilities(
-                    caps,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
-            except Exception as exc:
-                attach_context(
-                    exc,
-                    framework=self._framework,
-                    resource_type="llm",
-                    operation="capabilities",
-                    llm_operation="capabilities",
-                    request_id=ctx.request_id,
-                    tenant=ctx.tenant,
-                )
-                raise
-
-        return AsyncBridge.run_async(_caps_coro(), timeout=timeout)
-
-    async def arun_capabilities(
-        self,
-        *,
-        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
-        framework_ctx: Optional[Any] = None,
-    ) -> Any:
-        """
-        Async capabilities wrapper.
-        """
-        ctx = _ensure_llm_operation_context(op_ctx)
-
-        try:
-            caps = await self._adapter.capabilities()
-            return self._translator.from_capabilities(
-                caps,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-        except Exception as exc:
-            attach_context(
-                exc,
-                framework=self._framework,
-                resource_type="llm",
-                operation="capabilities",
-                llm_operation="capabilities",
-                request_id=ctx.request_id,
-                tenant=ctx.tenant,
-            )
-            raise
-
-    # --------------------------------------------------------------------- #
-    # Metrics Access
-    # --------------------------------------------------------------------- #
-
-    def get_metrics(self) -> Optional[TranslatorMetrics]:
-        """
-        Get translation metrics for observability.
-
-        Returns metrics if the translator supports metrics collection.
-        """
-        if hasattr(self._translator, "get_metrics"):
-            return self._translator.get_metrics()
-        return None
+        return self._translator.translate_tool_outputs_from_framework(tool_outputs, op_ctx=ctx, framework_ctx=framework_ctx)
 
 
 # =============================================================================
-# Comprehensive Registry for per-framework translators
+# Registry
 # =============================================================================
-
 
 _TranslatorFactory = Callable[[LLMProtocolV1], LLMFrameworkTranslator]
 _LLM_TRANSLATOR_FACTORIES: Dict[str, _TranslatorFactory] = {}
+_REGISTRY_LOCK = threading.Lock()
 
-
-def register_llm_translator(
-    framework: str,
-    factory: _TranslatorFactory,
-) -> None:
-    """
-    Register or override an LLMFrameworkTranslator factory for a given framework.
-
-    Example
-    -------
-        def make_langchain_llm_translator(
-            adapter: LLMProtocolV1,
-        ) -> LLMFrameworkTranslator:
-            return LangChainLLMTranslator(adapter=adapter)
-
-        register_llm_translator("langchain", make_langchain_llm_translator)
-    """
+def register_llm_translator(framework: str, factory: _TranslatorFactory) -> None:
     if not framework or not isinstance(framework, str):
-        raise BadRequest(
-            "framework name must be a non-empty string",
-            code="BAD_TRANSLATOR_REGISTRATION",
-        )
+        raise BadRequest("framework name must be a non-empty string", code="BAD_TRANSLATOR_REGISTRATION")
     if not callable(factory):
-        raise BadRequest(
-            "translator factory must be callable",
-            code="BAD_TRANSLATOR_REGISTRATION",
-        )
-    _LLM_TRANSLATOR_FACTORIES[framework] = factory
+        raise BadRequest("translator factory must be callable", code="BAD_TRANSLATOR_REGISTRATION")
+    
+    with _REGISTRY_LOCK:
+        _LLM_TRANSLATOR_FACTORIES[framework] = factory
     LOG.debug("Registered LLM translator factory for framework=%s", framework)
 
-
 def get_llm_translator_factory(framework: str) -> Optional[_TranslatorFactory]:
-    """
-    Return a previously registered LLMFrameworkTranslator factory for a framework, if any.
-    """
-    return _LLM_TRANSLATOR_FACTORIES.get(framework)
-
+    with _REGISTRY_LOCK:
+        return _LLM_TRANSLATOR_FACTORIES.get(framework)
 
 def create_llm_translator(
     *,
@@ -2608,22 +1688,13 @@ def create_llm_translator(
     safety_filter: Optional[SafetyFilter] = None,
     json_repair: Optional[JSONRepair] = None,
 ) -> LLMTranslator:
-    """
-    Convenience helper to construct an LLMTranslator for a given framework.
-
-    Enhanced with post-processing configuration support.
-
-    Behavior:
-        - If `translator` is provided explicitly, it is used as-is.
-        - Else, if a factory is registered for `framework`, it is used.
-        - Else, DefaultLLMFrameworkTranslator is used.
-    """
     if translator is None:
         factory = get_llm_translator_factory(framework)
         if factory is not None:
             translator = factory(adapter)
         else:
             translator = DefaultLLMFrameworkTranslator()
+            
     return LLMTranslator(
         adapter=adapter,
         framework=framework,
@@ -2632,7 +1703,6 @@ def create_llm_translator(
         safety_filter=safety_filter,
         json_repair=json_repair,
     )
-
 
 __all__ = [
     "TokenCountingConfig",
