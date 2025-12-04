@@ -1,6 +1,4 @@
 # tests/frameworks/registries/graph_registry.py
-
-# tests/frameworks/registries/graph_registry.py
 """
 Registry of graph framework adapters used by the conformance test suite.
 
@@ -189,17 +187,36 @@ class GraphFrameworkDescriptor:
         ValueError
             If required fields like query_method/stream_query_method are missing.
         """
-        # Required methods
+        # Required methods: query_method and stream_query_method
+        # (All current graph adapters support both)
         if not self.query_method or not self.stream_query_method:
             raise ValueError(
                 f"{self.name}: query_method and stream_query_method must both be set",
             )
 
-        # Async consistency warning (soft)
-        if self.async_stream_query_method and not self.async_query_method:
+        # Async consistency warnings (soft)
+        # FIXED: Check async_stream_query_method against stream_query_method (not async_query_method)
+        if self.async_stream_query_method and not self.stream_query_method:
             warnings.warn(
                 f"{self.name}: async_stream_query_method is set but "
-                f"async_query_method is None",
+                f"stream_query_method is None (async should have a sync counterpart)",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+        # Additional async-sync consistency checks
+        if self.async_bulk_vertices_method and not self.bulk_vertices_method:
+            warnings.warn(
+                f"{self.name}: async_bulk_vertices_method is set but "
+                f"bulk_vertices_method is None (async should have a sync counterpart)",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+        if self.async_batch_method and not self.batch_method:
+            warnings.warn(
+                f"{self.name}: async_batch_method is set but "
+                f"batch_method is None (async should have a sync counterpart)",
                 RuntimeWarning,
                 stacklevel=2,
             )
