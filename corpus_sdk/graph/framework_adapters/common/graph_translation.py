@@ -74,10 +74,12 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 from dataclasses import dataclass
 from typing import (
     Any,
     AsyncIterator,
+    Awaitable,
     Callable,
     Dict,
     Iterable,
@@ -87,7 +89,6 @@ from typing import (
     Optional,
     Protocol,
     Sequence,
-    Tuple,
     TypeVar,
     Union,
 )
@@ -99,23 +100,18 @@ from corpus_sdk.graph.graph_base import (
     BulkVerticesSpec,
     DeleteEdgesSpec,
     DeleteNodesSpec,
-    GraphAdapterError,
-    GraphCapabilities,
     GraphQuerySpec,
     GraphSchema,
     GraphProtocolV1,
+    GraphTraversalSpec,
     OperationContext,
     QueryChunk,
     QueryResult,
+    TraversalResult,
     UpsertEdgesSpec,
     UpsertNodesSpec,
-    GraphTransaction,
-    GraphTraversalSpec,
-    TraversalResult,
     BadRequest,
-    NotSupported,
 )
-
 from corpus_sdk.core.context_translation import from_dict as ctx_from_dict
 from corpus_sdk.core.sync_bridge import SyncStreamBridge
 from corpus_sdk.core.async_bridge import AsyncBridge
@@ -123,7 +119,7 @@ from corpus_sdk.core.error_context import attach_context
 
 LOG = logging.getLogger(__name__)
 
-T = TypeVar("T")
+R = TypeVar("R")
 Record = Mapping[str, Any]
 
 
@@ -143,11 +139,6 @@ def _ensure_operation_context(
         - OperationContext: returned as-is
         - Mapping[str, Any]: interpreted via context_translation.from_dict,
           then adapted into a graph OperationContext.
-
-    This keeps responsibilities clean:
-        - Framework-native → Normalized dict/OperationContext happens in
-          corpus_sdk.core.context_translation (from_langchain, from_llamaindex, etc.)
-        - This helper simply ensures the graph adapter receives the right type.
     """
     if ctx is None:
         core_ctx = ctx_from_dict({})
@@ -218,7 +209,7 @@ class MMRConfig:
     vector_key: str = "embedding"
     similarity_fn: Optional[SimilarityFn] = None
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         """Validate MMR configuration parameters."""
         if self.enabled:
             if not (0.0 <= self.lambda_mult <= 1.0):
@@ -249,9 +240,9 @@ class FilterTranslator:
         - {"field": "value"}
         - {"$and": [ {...}, {...} ]}
         - {"$or":  [ {...}, {...} ]}
-        - ["field", ">", 10]          → {"field": {"$gt": 10}}
+        - ["field", ">", 10]          -> {"field": {"$gt": 10}}
         - [ ["age", ">", 18], ["age", "<", 65] ]
-        - [{"field": "v1"}, {"field": "v2"}]  → {"$and": [...]}
+        - [{"field": "v1"}, {"field": "v2"}]  -> {"$and": [...]}
 
     This module intentionally does not enforce the semantics of these operators;
     adapters can interpret or restrict them as needed.
@@ -272,69 +263,87 @@ class FilterTranslator:
         if raw is None:
             return None
 
-        # Already a mapping: shallow-copy to avoid mutating caller state.
         if isinstance(raw, Mapping):
             return self._normalize_mapping(raw)
 
-        # Sequence of filters or single tuple condition.
         if isinstance(raw, (list, tuple)):
             return self._normalize_sequence(raw)
 
-        # Anything else is unsupported.
         raise BadRequest(
             f"Unsupported filter type: {type(raw).__name__}",
             code="BAD_FILTER",
         )
 
     def _normalize_mapping(self, raw: Mapping[str, Any]) -> Mapping[str, Any]:
-        # If it already looks like a logical combinator or range structure,
-        # we keep it as-is but ensure nested filters are normalized.
+        # Logical combinators
         if "$and" in raw or "$or" in raw:
             out: Dict[str, Any] = {}
             for key, value in raw.items():
                 if key in ("$and", "$or") and isinstance(value, (list, tuple)):
-                    out[key] = [self.normalize(v) for v in value]
+                    normalized_parts: List[Mapping[str, Any]] = []
+                    for idx, v in enumerate(value):
+                        nv = self.normalize(v)
+                        if nv is None:
+                            continue
+                        if not isinstance(nv, Mapping):
+                            raise BadRequest(
+                                f"Nested filter at index {idx} must be a mapping",
+                                code="BAD_FILTER",
+                                details={"index": idx},
+                            )
+                        normalized_parts.append(nv)
+                    out[key] = normalized_parts
                 else:
                     out[key] = value
             return out
 
-        # Otherwise, treat as a simple equality / basic range map.
-        out: Dict[str, Any] = {}
+        # Simple equality / basic range map
+        out2: Dict[str, Any] = {}
         for key, value in raw.items():
             if isinstance(value, (list, tuple)) and len(value) == 2:
-                # Example: {"age": (">", 18)} -> {"age": {"$gt": 18}}
                 op, v = value
                 mapped = self._RANGE_OP_MAP.get(str(op))
                 if mapped:
-                    out[key] = {mapped: v}
+                    out2[key] = {mapped: v}
                 else:
-                    # Unrecognized operator - log warning and keep as-is
                     LOG.warning(
                         "FilterTranslator: unrecognized range operator %r for field %r; "
                         "keeping original value",
                         op,
                         key,
                     )
-                    out[key] = value
+                    out2[key] = value
             else:
-                out[key] = value
-        return out
+                out2[key] = value
+        return out2
 
     def _normalize_sequence(self, raw: Sequence[Any]) -> Mapping[str, Any]:
         # Tuple condition: ["age", ">", 18]
-        if len(raw) == 3 and not isinstance(raw[0], (list, tuple, Mapping)):
+        # FIX: Explicitly check if the middle element is a known string operator
+        # to distinguish from data lists.
+        if (
+            len(raw) == 3
+            and isinstance(raw[1], str)
+            and raw[1] in self._RANGE_OP_MAP
+            and not isinstance(raw[0], (list, tuple, Mapping))
+        ):
             field, op, value = raw
-            mapped = self._RANGE_OP_MAP.get(str(op))
-            if not mapped:
-                raise BadRequest(
-                    f"Unsupported filter operator: {op!r}",
-                    code="BAD_FILTER_OPERATOR",
-                    details={"operator": op},
-                )
+            mapped = self._RANGE_OP_MAP[str(op)]
             return {str(field): {mapped: value}}
 
         # Otherwise, assume a list of filters combined via AND.
-        parts = [self.normalize(part) for part in raw]
+        parts: List[Mapping[str, Any]] = []
+        for idx, part in enumerate(raw):
+            nv = self.normalize(part)
+            if nv is None:
+                continue
+            if not isinstance(nv, Mapping):
+                raise BadRequest(
+                    f"Filter at index {idx} must be a mapping",
+                    code="BAD_FILTER",
+                    details={"index": idx},
+                )
+            parts.append(nv)
         return {"$and": parts}
 
 
@@ -351,11 +360,6 @@ class GraphFrameworkTranslator(Protocol):
         - Converting framework-level query/mutation inputs into Graph*Spec types
         - Converting Graph results into framework-level outputs
         - (Optionally) applying MMR or other post-processing steps
-
-    The default implementation provided here is generic and treats inputs as
-    dicts/strings that already closely match GraphSpec shapes. Frameworks with
-    richer abstractions (LangChain, LlamaIndex, etc.) can provide their own
-    implementations and register them via the registry.
     """
 
     # ---- query translation ----
@@ -539,24 +543,6 @@ class GraphFrameworkTranslator(Protocol):
 class DefaultGraphFrameworkTranslator:
     """
     Generic, framework-neutral translator implementation.
-
-    Behaviors:
-        - Treats raw_query as either:
-            * a string (query text), or
-            * a mapping with GraphQuerySpec-like keys
-        - Treats mutation inputs as:
-            * sequences of dicts with Node/Edge fields, or
-            * sequences of already-built Node/Edge-compatible mappings
-
-        - For results:
-            * QueryResult → list of records
-            * QueryChunk  → list of records per chunk
-            * BulkVerticesResult → same structure
-            * BatchResult → underlying results list
-            * GraphSchema → underlying schema object
-
-    Frameworks with richer abstractions are expected to provide their own
-    GraphFrameworkTranslator implementation, but this default is fully usable.
     """
 
     def __init__(self) -> None:
@@ -575,18 +561,17 @@ class DefaultGraphFrameworkTranslator:
             ns = framework_ctx.get("namespace")
             if ns is not None and str(ns).strip():
                 return str(ns)
-        
+
         attrs = op_ctx.attrs or {}
-        # Try graph_namespace first (more specific)
+
         ns = attrs.get("graph_namespace")
         if ns is not None and str(ns).strip():
             return str(ns)
-        
-        # Fall back to generic namespace
+
         ns = attrs.get("namespace")
         if ns is not None and str(ns).strip():
             return str(ns)
-        
+
         return None
 
     # ---- query translation ----
@@ -645,7 +630,6 @@ class DefaultGraphFrameworkTranslator:
         op_ctx: OperationContext,  # noqa: ARG002
         framework_ctx: Optional[Any] = None,  # noqa: ARG002
     ) -> Any:
-        # Generic behavior: return the records list, plus summary as metadata.
         return {
             "records": list(result.records or []),
             "summary": dict(result.summary or {}),
@@ -660,7 +644,6 @@ class DefaultGraphFrameworkTranslator:
         op_ctx: OperationContext,  # noqa: ARG002
         framework_ctx: Optional[Any] = None,  # noqa: ARG002
     ) -> Any:
-        # Generic behavior: return the chunk as a simple dict.
         return {
             "records": list(chunk.records or []),
             "is_final": bool(chunk.is_final),
@@ -676,8 +659,6 @@ class DefaultGraphFrameworkTranslator:
         op_ctx: OperationContext,
         framework_ctx: Optional[Any] = None,
     ) -> List[BatchOperation]:
-        """Build transaction spec from raw transaction operations."""
-        # Transactions are essentially batch operations with atomic guarantees
         return self.build_batch_ops(
             raw_transaction,
             op_ctx=op_ctx,
@@ -691,11 +672,10 @@ class DefaultGraphFrameworkTranslator:
         op_ctx: OperationContext,  # noqa: ARG002
         framework_ctx: Optional[Any] = None,  # noqa: ARG002
     ) -> Any:
-        """Translate transaction result to framework format."""
         return {
-            "success": bool(result.success),
+            "success": bool(getattr(result, "success", True)),
             "results": list(result.results or []),
-            "error": result.error,
+            "error": getattr(result, "error", None),
             "transaction_id": getattr(result, "transaction_id", None),
         }
 
@@ -708,11 +688,9 @@ class DefaultGraphFrameworkTranslator:
         op_ctx: OperationContext,
         framework_ctx: Optional[Any] = None,
     ) -> GraphTraversalSpec:
-        """Build traversal spec from raw traversal request."""
         namespace = self.preferred_namespace(op_ctx=op_ctx, framework_ctx=framework_ctx)
 
         if isinstance(raw_traversal, Mapping):
-            # Extract traversal parameters
             start_nodes = raw_traversal.get("start_nodes", [])
             max_depth = raw_traversal.get("max_depth", 1)
             direction = raw_traversal.get("direction", "OUTGOING")
@@ -722,18 +700,27 @@ class DefaultGraphFrameworkTranslator:
             return_properties = raw_traversal.get("return_properties")
             traversal_namespace = raw_traversal.get("namespace", namespace)
 
-            # Normalize filters
-            normalized_node_filters = self._filter_translator.normalize(node_filters) if node_filters else None
-            normalized_rel_filters = self._filter_translator.normalize(relationship_filters) if relationship_filters else None
+            normalized_node_filters = (
+                self._filter_translator.normalize(node_filters) if node_filters else None
+            )
+            normalized_rel_filters = (
+                self._filter_translator.normalize(relationship_filters)
+                if relationship_filters
+                else None
+            )
 
             return GraphTraversalSpec(
                 start_nodes=[str(node_id) for node_id in start_nodes],
                 max_depth=int(max_depth),
                 direction=str(direction),
-                relationship_types=tuple(relationship_types) if relationship_types else None,
+                relationship_types=tuple(relationship_types)
+                if relationship_types
+                else None,
                 node_filters=normalized_node_filters,
                 relationship_filters=normalized_rel_filters,
-                return_properties=tuple(return_properties) if return_properties else None,
+                return_properties=tuple(return_properties)
+                if return_properties
+                else None,
                 namespace=str(traversal_namespace) if traversal_namespace else namespace,
             )
 
@@ -749,7 +736,6 @@ class DefaultGraphFrameworkTranslator:
         op_ctx: OperationContext,  # noqa: ARG002
         framework_ctx: Optional[Any] = None,  # noqa: ARG002
     ) -> Any:
-        """Translate traversal result to framework format."""
         return {
             "nodes": list(result.nodes or []),
             "relationships": list(result.relationships or []),
@@ -862,23 +848,19 @@ class DefaultGraphFrameworkTranslator:
         ids: List[GraphID] = []
         filter_expr: Optional[Mapping[str, Any]] = None
 
-        # Mapping → filter-based delete
         if isinstance(raw_filter_or_ids, Mapping):
             filter_expr = self._filter_translator.normalize(raw_filter_or_ids)
-        # Iterable of IDs or filters
         elif isinstance(raw_filter_or_ids, (list, tuple)):
             if not raw_filter_or_ids:
                 ids = []
                 filter_expr = None
             else:
                 first = raw_filter_or_ids[0]
-                # If first element is mapping, treat as list of filters AND'ed together
                 if isinstance(first, Mapping):
                     filter_expr = self._filter_translator.normalize(raw_filter_or_ids)
                 else:
                     ids = [GraphID(str(x)) for x in raw_filter_or_ids]
         else:
-            # Single scalar ID
             ids = [GraphID(str(raw_filter_or_ids))]
 
         return DeleteNodesSpec(ids=ids, namespace=namespace, filter=filter_expr)
@@ -1039,12 +1021,6 @@ class GraphTranslator:
         - Handles streaming via SyncStreamBridge for sync callers
         - Optionally applies MMR re-ranking before returning results
         - Attaches rich error context for diagnostics
-
-    Sync methods use AsyncBridge to call async adapters from sync contexts.
-
-    It does *not*:
-        - Know anything about framework-native context objects (RunnableConfig, etc.)
-        - Implement any backend-specific logic (that lives in BaseGraphAdapter subclasses)
     """
 
     def __init__(
@@ -1056,7 +1032,9 @@ class GraphTranslator:
     ) -> None:
         self._adapter = adapter
         self._framework = framework
-        self._translator: GraphFrameworkTranslator = translator or DefaultGraphFrameworkTranslator()
+        self._translator: GraphFrameworkTranslator = (
+            translator or DefaultGraphFrameworkTranslator()
+        )
 
     # --------------------------------------------------------------------- #
     # Internal MMR helpers
@@ -1068,7 +1046,7 @@ class GraphTranslator:
         dot = sum(x * y for x, y in zip(a, b))
         na = math.sqrt(sum(x * x for x in a))
         nb = math.sqrt(sum(y * y for y in b))
-        
+
         if na <= 0.0 or nb <= 0.0:
             return 0.0
         return float(dot / (na * nb))
@@ -1080,13 +1058,6 @@ class GraphTranslator:
     ) -> QueryResult:
         """
         Apply Maximal Marginal Relevance re-ranking to a QueryResult.
-
-        MMR is only applied if:
-            - mmr_config is not None and enabled is True
-            - There are at least 2 records
-            - Each record contains:
-                * a numeric score field (mmr_config.score_key), and
-                * a vector field (mmr_config.vector_key) with equal dimensions
         """
         if mmr_config is None or not mmr_config.enabled:
             return result
@@ -1096,7 +1067,6 @@ class GraphTranslator:
         if n <= 1:
             return result
 
-        # Extract scores and vectors
         scores: List[float] = []
         vectors: List[List[float]] = []
 
@@ -1129,22 +1099,18 @@ class GraphTranslator:
                 return result
             vectors.append(vec)
 
-        # Check dimension consistency
         dim = len(vectors[0])
         if dim == 0 or any(len(v) != dim for v in vectors):
             LOG.debug("MMR skipped: inconsistent or zero-length vector dimensions")
             return result
 
-        # Normalize scores - handle negative scores properly
         min_score = min(scores)
         max_score = max(scores)
         score_range = max_score - min_score
-        
+
         if score_range <= 0.0:
-            # All scores identical
             normalized_scores = [1.0 for _ in scores]
         else:
-            # Normalize to [0, 1] preserving relative differences
             normalized_scores = [(s - min_score) / score_range for s in scores]
 
         sim_fn: SimilarityFn = mmr_config.similarity_fn or self._cosine_similarity
@@ -1153,24 +1119,20 @@ class GraphTranslator:
 
         selected_indices: List[int] = []
         candidates: List[int] = list(range(n))
-        
-        # Optimized similarity cache with canonical key ordering
-        similarity_cache: Dict[Tuple[int, int], float] = {}
+
+        similarity_cache: Dict[tuple[int, int], float] = {}
 
         def get_similarity(i: int, j: int) -> float:
-            """Get similarity with efficient caching using canonical keys."""
             key = (min(i, j), max(i, j))
             if key not in similarity_cache:
                 similarity_cache[key] = sim_fn(vectors[i], vectors[j])
             return similarity_cache[key]
 
-        # Seed with most relevant by original score
         if candidates:
             best_first = max(candidates, key=lambda idx: normalized_scores[idx])
             selected_indices.append(best_first)
             candidates.remove(best_first)
 
-        # Greedy MMR selection
         while candidates and len(selected_indices) < k:
             best_idx: Optional[int] = None
             best_mmr_score = -float("inf")
@@ -1193,13 +1155,12 @@ class GraphTranslator:
             selected_indices.append(best_idx)
             candidates.remove(best_idx)
 
-        # Reorder: selected items first, then remaining in original order
         reordered: List[Record] = [records[i] for i in selected_indices]
         if k < n:
             remaining = [records[i] for i in range(n) if i not in selected_indices]
             reordered.extend(remaining)
 
-        LOG.info(
+        LOG.debug(
             "MMR applied: %d records → %d selected with lambda=%.2f",
             n,
             len(selected_indices),
@@ -1214,7 +1175,107 @@ class GraphTranslator:
         )
 
     # --------------------------------------------------------------------- #
-    # Sync Query APIs (use AsyncBridge)
+    # Internal executor helpers
+    # --------------------------------------------------------------------- #
+
+    def _run_operation(
+        self,
+        *,
+        op_name: str,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]],
+        sync: bool,
+        logic: Callable[[OperationContext], Awaitable[R]],
+    ) -> Union[R, Awaitable[R]]:
+        """Centralized execution for non-streaming operations."""
+        ctx = _ensure_operation_context(op_ctx)
+
+        async def _wrapped() -> R:
+            try:
+                return await logic(ctx)
+            except Exception as exc:
+                attach_context(
+                    exc,
+                    framework=self._framework,
+                    operation=f"graph.{op_name}",
+                    request_id=ctx.request_id,
+                    tenant=ctx.tenant,
+                )
+                raise
+
+        if sync:
+            timeout = ctx.deadline_ms / 1000.0 if ctx.deadline_ms else None
+            return AsyncBridge.run_async(_wrapped(), timeout=timeout)
+        return _wrapped()
+
+    def _run_stream_operation(
+        self,
+        *,
+        op_name: str,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]],
+        sync: bool,
+        factory: Callable[[OperationContext], AsyncIterator[R]],
+    ) -> Union[Iterator[R], AsyncIterator[R]]:
+        """
+        Centralized execution for streaming operations.
+        
+        Args:
+            factory: A function that takes context and returns an AsyncIterator.
+        """
+        ctx = _ensure_operation_context(op_ctx)
+
+        async def _async_gen() -> AsyncIterator[R]:
+            try:
+                # Factory returns async iterator directly (no await)
+                aiter = factory(ctx)
+                async for chunk in aiter:
+                    yield chunk
+            except Exception as exc:
+                attach_context(
+                    exc,
+                    framework=self._framework,
+                    operation=f"graph.{op_name}",
+                    request_id=ctx.request_id,
+                    tenant=ctx.tenant,
+                )
+                raise
+
+        if sync:
+            return SyncStreamBridge(
+                coro_factory=_async_gen,
+                framework=self._framework,
+                error_context={
+                    "operation": f"graph.{op_name}",
+                    "request_id": ctx.request_id,
+                    "tenant": ctx.tenant,
+                },
+            ).run()
+        return _async_gen()
+
+    # Helper to build a query-stream factory
+    def _prepare_query_stream_factory(
+        self,
+        raw_query: Any,
+        framework_ctx: Any,
+    ) -> Callable[[OperationContext], AsyncIterator[Any]]:
+        
+        async def _factory(ctx: OperationContext) -> AsyncIterator[Any]:
+            spec = self._translator.build_query_spec(
+                raw_query,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+                stream=True,
+            )
+            async for chunk in self._adapter.stream_query(spec, ctx=ctx):
+                yield self._translator.translate_query_chunk(
+                    chunk,
+                    op_ctx=ctx,
+                    framework_ctx=framework_ctx,
+                )
+
+        return _factory
+
+    # --------------------------------------------------------------------- #
+    # Sync Query APIs
     # --------------------------------------------------------------------- #
 
     def query(
@@ -1225,57 +1286,36 @@ class GraphTranslator:
         framework_ctx: Optional[Any] = None,
         mmr_config: Optional[MMRConfig] = None,
     ) -> Any:
-        """
-        Synchronous query API.
+        """Synchronous query API."""
 
-        Uses AsyncBridge to call the async adapter from a sync context.
+        async def _logic(ctx: OperationContext) -> Any:
+            spec = self._translator.build_query_spec(
+                raw_query,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+                stream=False,
+            )
+            result = await self._adapter.query(spec, ctx=ctx)
 
-        Steps:
-            - Normalize OperationContext
-            - Build GraphQuerySpec via translator
-            - Call adapter.query(...) via AsyncBridge
-            - Optionally apply MMR
-            - Translate result back to framework-level shape
-        """
-        async def _query_coro():
-            ctx = _ensure_operation_context(op_ctx)
-            try:
-                spec = self._translator.build_query_spec(
-                    raw_query,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                    stream=False,
+            if not isinstance(result, QueryResult):
+                raise BadRequest(
+                    f"adapter.query returned unsupported type: {type(result).__name__}",
+                    code="BAD_ADAPTER_RESULT",
                 )
-                result = await self._adapter.query(spec, ctx=ctx)
-                
-                if not isinstance(result, QueryResult):
-                    raise BadRequest(
-                        f"adapter.query returned unsupported type: {type(result).__name__}",
-                        code="BAD_ADAPTER_RESULT",
-                    )
 
-                # Apply MMR if requested
-                result_mmr = self._apply_mmr_to_query_result(result, mmr_config=mmr_config)
-                return self._translator.translate_query_result(
-                    result_mmr,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
-            except Exception as exc:
-                # Attach error context to all exceptions
-                attach_context(
-                    exc,
-                    framework=self._framework,
-                    graph_operation="query",
-                    request_id=ctx.request_id,
-                    tenant=ctx.tenant,
-                )
-                raise
+            result_mmr = self._apply_mmr_to_query_result(result, mmr_config=mmr_config)
+            return self._translator.translate_query_result(
+                result_mmr,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
 
-        # Use AsyncBridge with deadline from context
-        ctx = _ensure_operation_context(op_ctx)
-        timeout = ctx.deadline_ms / 1000.0 if ctx.deadline_ms else None
-        return AsyncBridge.run_async(_query_coro(), timeout=timeout)
+        return self._run_operation(
+            op_name="query",
+            op_ctx=op_ctx,
+            sync=True,
+            logic=_logic,
+        )
 
     # --------------------------------------------------------------------- #
     # Async Query APIs
@@ -1289,16 +1329,9 @@ class GraphTranslator:
         framework_ctx: Optional[Any] = None,
         mmr_config: Optional[MMRConfig] = None,
     ) -> Any:
-        """
-        Async query API (preferred for async applications).
+        """Async query API."""
 
-        Fully async:
-            - await adapter.query(...)
-            - optional MMR
-            - result translation
-        """
-        ctx = _ensure_operation_context(op_ctx)
-        try:
+        async def _logic(ctx: OperationContext) -> Any:
             spec = self._translator.build_query_spec(
                 raw_query,
                 op_ctx=ctx,
@@ -1306,7 +1339,7 @@ class GraphTranslator:
                 stream=False,
             )
             result = await self._adapter.query(spec, ctx=ctx)
-            
+
             if not isinstance(result, QueryResult):
                 raise BadRequest(
                     f"adapter.query returned unsupported type: {type(result).__name__}",
@@ -1319,15 +1352,13 @@ class GraphTranslator:
                 op_ctx=ctx,
                 framework_ctx=framework_ctx,
             )
-        except Exception as exc:
-            attach_context(
-                exc,
-                framework=self._framework,
-                graph_operation="query",
-                request_id=ctx.request_id,
-                tenant=ctx.tenant,
-            )
-            raise
+
+        return await self._run_operation(
+            op_name="query",
+            op_ctx=op_ctx,
+            sync=False,
+            logic=_logic,
+        )
 
     # --------------------------------------------------------------------- #
     # Transaction APIs
@@ -1340,41 +1371,34 @@ class GraphTranslator:
         op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
         framework_ctx: Optional[Any] = None,
     ) -> Any:
-        """Synchronous transaction API (uses AsyncBridge)."""
-        async def _transaction_coro():
-            ctx = _ensure_operation_context(op_ctx)
-            try:
-                ops = self._translator.build_transaction_spec(
-                    raw_transaction,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
-                result = await self._adapter.transaction(ops, ctx=ctx)
-                
-                if not isinstance(result, BatchResult):
-                    raise BadRequest(
-                        f"adapter.transaction returned unsupported type: {type(result).__name__}",
-                        code="BAD_ADAPTER_RESULT",
-                    )
-                
-                return self._translator.translate_transaction_result(
-                    result,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
-            except Exception as exc:
-                attach_context(
-                    exc,
-                    framework=self._framework,
-                    graph_operation="transaction",
-                    request_id=ctx.request_id,
-                    tenant=ctx.tenant,
-                )
-                raise
+        """Synchronous transaction API."""
 
-        ctx = _ensure_operation_context(op_ctx)
-        timeout = ctx.deadline_ms / 1000.0 if ctx.deadline_ms else None
-        return AsyncBridge.run_async(_transaction_coro(), timeout=timeout)
+        async def _logic(ctx: OperationContext) -> Any:
+            ops = self._translator.build_transaction_spec(
+                raw_transaction,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+            result = await self._adapter.transaction(ops, ctx=ctx)
+
+            if not isinstance(result, BatchResult):
+                raise BadRequest(
+                    f"adapter.transaction returned unsupported type: {type(result).__name__}",
+                    code="BAD_ADAPTER_RESULT",
+                )
+
+            return self._translator.translate_transaction_result(
+                result,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+
+        return self._run_operation(
+            op_name="transaction",
+            op_ctx=op_ctx,
+            sync=True,
+            logic=_logic,
+        )
 
     async def arun_transaction(
         self,
@@ -1384,35 +1408,33 @@ class GraphTranslator:
         framework_ctx: Optional[Any] = None,
     ) -> Any:
         """Async transaction API."""
-        ctx = _ensure_operation_context(op_ctx)
-        try:
+
+        async def _logic(ctx: OperationContext) -> Any:
             ops = self._translator.build_transaction_spec(
                 raw_transaction,
                 op_ctx=ctx,
                 framework_ctx=framework_ctx,
             )
             result = await self._adapter.transaction(ops, ctx=ctx)
-            
+
             if not isinstance(result, BatchResult):
                 raise BadRequest(
                     f"adapter.transaction returned unsupported type: {type(result).__name__}",
                     code="BAD_ADAPTER_RESULT",
                 )
-            
+
             return self._translator.translate_transaction_result(
                 result,
                 op_ctx=ctx,
                 framework_ctx=framework_ctx,
             )
-        except Exception as exc:
-            attach_context(
-                exc,
-                framework=self._framework,
-                graph_operation="transaction",
-                request_id=ctx.request_id,
-                tenant=ctx.tenant,
-            )
-            raise
+
+        return await self._run_operation(
+            op_name="transaction",
+            op_ctx=op_ctx,
+            sync=False,
+            logic=_logic,
+        )
 
     # --------------------------------------------------------------------- #
     # Traversal APIs
@@ -1425,41 +1447,34 @@ class GraphTranslator:
         op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
         framework_ctx: Optional[Any] = None,
     ) -> Any:
-        """Synchronous traversal API (uses AsyncBridge)."""
-        async def _traversal_coro():
-            ctx = _ensure_operation_context(op_ctx)
-            try:
-                spec = self._translator.build_traversal_spec(
-                    raw_traversal,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
-                result = await self._adapter.traversal(spec, ctx=ctx)
-                
-                if not isinstance(result, TraversalResult):
-                    raise BadRequest(
-                        f"adapter.traversal returned unsupported type: {type(result).__name__}",
-                        code="BAD_ADAPTER_RESULT",
-                    )
-                
-                return self._translator.translate_traversal_result(
-                    result,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
-            except Exception as exc:
-                attach_context(
-                    exc,
-                    framework=self._framework,
-                    graph_operation="traversal",
-                    request_id=ctx.request_id,
-                    tenant=ctx.tenant,
-                )
-                raise
+        """Synchronous traversal API."""
 
-        ctx = _ensure_operation_context(op_ctx)
-        timeout = ctx.deadline_ms / 1000.0 if ctx.deadline_ms else None
-        return AsyncBridge.run_async(_traversal_coro(), timeout=timeout)
+        async def _logic(ctx: OperationContext) -> Any:
+            spec = self._translator.build_traversal_spec(
+                raw_traversal,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+            result = await self._adapter.traversal(spec, ctx=ctx)
+
+            if not isinstance(result, TraversalResult):
+                raise BadRequest(
+                    f"adapter.traversal returned unsupported type: {type(result).__name__}",
+                    code="BAD_ADAPTER_RESULT",
+                )
+
+            return self._translator.translate_traversal_result(
+                result,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+
+        return self._run_operation(
+            op_name="traversal",
+            op_ctx=op_ctx,
+            sync=True,
+            logic=_logic,
+        )
 
     async def arun_traversal(
         self,
@@ -1469,35 +1484,33 @@ class GraphTranslator:
         framework_ctx: Optional[Any] = None,
     ) -> Any:
         """Async traversal API."""
-        ctx = _ensure_operation_context(op_ctx)
-        try:
+
+        async def _logic(ctx: OperationContext) -> Any:
             spec = self._translator.build_traversal_spec(
                 raw_traversal,
                 op_ctx=ctx,
                 framework_ctx=framework_ctx,
             )
             result = await self._adapter.traversal(spec, ctx=ctx)
-            
+
             if not isinstance(result, TraversalResult):
                 raise BadRequest(
                     f"adapter.traversal returned unsupported type: {type(result).__name__}",
                     code="BAD_ADAPTER_RESULT",
                 )
-            
+
             return self._translator.translate_traversal_result(
                 result,
                 op_ctx=ctx,
                 framework_ctx=framework_ctx,
             )
-        except Exception as exc:
-            attach_context(
-                exc,
-                framework=self._framework,
-                graph_operation="traversal",
-                request_id=ctx.request_id,
-                tenant=ctx.tenant,
-            )
-            raise
+
+        return await self._run_operation(
+            op_name="traversal",
+            op_ctx=op_ctx,
+            sync=False,
+            logic=_logic,
+        )
 
     # --------------------------------------------------------------------- #
     # Streaming Query APIs
@@ -1510,52 +1523,15 @@ class GraphTranslator:
         op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
         framework_ctx: Optional[Any] = None,
     ) -> Iterator[Any]:
-        """
-        Synchronous streaming query API.
-
-        Exposes a sync iterator that yields framework-level chunks by
-        bridging the async adapter.stream_query(...) via SyncStreamBridge.
-        """
-        ctx = _ensure_operation_context(op_ctx)
-
-        async def _stream_factory() -> AsyncIterator[Any]:
-            """Factory that creates the async stream."""
-            spec = self._translator.build_query_spec(
-                raw_query,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-                stream=True,
-            )
-            try:
-                async for chunk in self._adapter.stream_query(spec, ctx=ctx):
-                    yield self._translator.translate_query_chunk(
-                        chunk,
-                        op_ctx=ctx,
-                        framework_ctx=framework_ctx,
-                    )
-            except Exception as exc:
-                attach_context(
-                    exc,
-                    framework=self._framework,
-                    graph_operation="stream_query",
-                    request_id=ctx.request_id,
-                    tenant=ctx.tenant,
-                )
-                raise
-
-        # Use SyncStreamBridge for sync streaming
-        bridge = SyncStreamBridge(
-            coro_factory=_stream_factory,
-            framework=self._framework,
-            error_context={
-                "operation": "graph.query_stream",
-                "request_id": ctx.request_id,
-                "tenant": ctx.tenant,
-            },
+        """Synchronous streaming query API."""
+        return self._run_stream_operation(
+            op_name="query_stream",
+            op_ctx=op_ctx,
+            sync=True,
+            factory=self._prepare_query_stream_factory(raw_query, framework_ctx),
         )
-        return bridge.run()
 
-    async def arun_query_stream(
+    def arun_query_stream(
         self,
         raw_query: Any,
         *,
@@ -1564,36 +1540,18 @@ class GraphTranslator:
     ) -> AsyncIterator[Any]:
         """
         Async streaming query API.
-
-        Returns an async iterator yielding framework-level chunks.
+        Returns an AsyncIterator yielding framework-level chunks.
         """
-        ctx = _ensure_operation_context(op_ctx)
-        spec = self._translator.build_query_spec(
-            raw_query,
-            op_ctx=ctx,
-            framework_ctx=framework_ctx,
-            stream=True,
+        # Note: This returns the AsyncIterator directly (no await)
+        return self._run_stream_operation(
+            op_name="query_stream",
+            op_ctx=op_ctx,
+            sync=False,
+            factory=self._prepare_query_stream_factory(raw_query, framework_ctx),
         )
 
-        try:
-            async for chunk in self._adapter.stream_query(spec, ctx=ctx):
-                yield self._translator.translate_query_chunk(
-                    chunk,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
-        except Exception as exc:
-            attach_context(
-                exc,
-                framework=self._framework,
-                graph_operation="stream_query",
-                request_id=ctx.request_id,
-                tenant=ctx.tenant,
-            )
-            raise
-
     # --------------------------------------------------------------------- #
-    # Sync mutation APIs (use AsyncBridge)
+    # Mutation APIs
     # --------------------------------------------------------------------- #
 
     def upsert_nodes(
@@ -1603,29 +1561,22 @@ class GraphTranslator:
         op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
         framework_ctx: Optional[Any] = None,
     ) -> Any:
-        """Synchronous upsert_nodes (uses AsyncBridge)."""
-        async def _upsert_coro():
-            ctx = _ensure_operation_context(op_ctx)
-            try:
-                spec = self._translator.build_upsert_nodes_spec(
-                    raw_nodes,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
-                return await self._adapter.upsert_nodes(spec, ctx=ctx)
-            except Exception as exc:
-                attach_context(
-                    exc,
-                    framework=self._framework,
-                    graph_operation="upsert_nodes",
-                    request_id=ctx.request_id,
-                    tenant=ctx.tenant,
-                )
-                raise
+        """Synchronous upsert_nodes API."""
 
-        ctx = _ensure_operation_context(op_ctx)
-        timeout = ctx.deadline_ms / 1000.0 if ctx.deadline_ms else None
-        return AsyncBridge.run_async(_upsert_coro(), timeout=timeout)
+        async def _logic(ctx: OperationContext) -> Any:
+            spec = self._translator.build_upsert_nodes_spec(
+                raw_nodes,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+            return await self._adapter.upsert_nodes(spec, ctx=ctx)
+
+        return self._run_operation(
+            op_name="upsert_nodes",
+            op_ctx=op_ctx,
+            sync=True,
+            logic=_logic,
+        )
 
     async def arun_upsert_nodes(
         self,
@@ -1634,24 +1585,22 @@ class GraphTranslator:
         op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
         framework_ctx: Optional[Any] = None,
     ) -> Any:
-        """Async upsert_nodes."""
-        ctx = _ensure_operation_context(op_ctx)
-        try:
+        """Async upsert_nodes API."""
+
+        async def _logic(ctx: OperationContext) -> Any:
             spec = self._translator.build_upsert_nodes_spec(
                 raw_nodes,
                 op_ctx=ctx,
                 framework_ctx=framework_ctx,
             )
             return await self._adapter.upsert_nodes(spec, ctx=ctx)
-        except Exception as exc:
-            attach_context(
-                exc,
-                framework=self._framework,
-                graph_operation="upsert_nodes",
-                request_id=ctx.request_id,
-                tenant=ctx.tenant,
-            )
-            raise
+
+        return await self._run_operation(
+            op_name="upsert_nodes",
+            op_ctx=op_ctx,
+            sync=False,
+            logic=_logic,
+        )
 
     def upsert_edges(
         self,
@@ -1660,29 +1609,22 @@ class GraphTranslator:
         op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
         framework_ctx: Optional[Any] = None,
     ) -> Any:
-        """Synchronous upsert_edges (uses AsyncBridge)."""
-        async def _upsert_coro():
-            ctx = _ensure_operation_context(op_ctx)
-            try:
-                spec = self._translator.build_upsert_edges_spec(
-                    raw_edges,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
-                return await self._adapter.upsert_edges(spec, ctx=ctx)
-            except Exception as exc:
-                attach_context(
-                    exc,
-                    framework=self._framework,
-                    graph_operation="upsert_edges",
-                    request_id=ctx.request_id,
-                    tenant=ctx.tenant,
-                )
-                raise
+        """Synchronous upsert_edges API."""
 
-        ctx = _ensure_operation_context(op_ctx)
-        timeout = ctx.deadline_ms / 1000.0 if ctx.deadline_ms else None
-        return AsyncBridge.run_async(_upsert_coro(), timeout=timeout)
+        async def _logic(ctx: OperationContext) -> Any:
+            spec = self._translator.build_upsert_edges_spec(
+                raw_edges,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+            return await self._adapter.upsert_edges(spec, ctx=ctx)
+
+        return self._run_operation(
+            op_name="upsert_edges",
+            op_ctx=op_ctx,
+            sync=True,
+            logic=_logic,
+        )
 
     async def arun_upsert_edges(
         self,
@@ -1691,24 +1633,22 @@ class GraphTranslator:
         op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
         framework_ctx: Optional[Any] = None,
     ) -> Any:
-        """Async upsert_edges."""
-        ctx = _ensure_operation_context(op_ctx)
-        try:
+        """Async upsert_edges API."""
+
+        async def _logic(ctx: OperationContext) -> Any:
             spec = self._translator.build_upsert_edges_spec(
                 raw_edges,
                 op_ctx=ctx,
                 framework_ctx=framework_ctx,
             )
             return await self._adapter.upsert_edges(spec, ctx=ctx)
-        except Exception as exc:
-            attach_context(
-                exc,
-                framework=self._framework,
-                graph_operation="upsert_edges",
-                request_id=ctx.request_id,
-                tenant=ctx.tenant,
-            )
-            raise
+
+        return await self._run_operation(
+            op_name="upsert_edges",
+            op_ctx=op_ctx,
+            sync=False,
+            logic=_logic,
+        )
 
     def delete_nodes(
         self,
@@ -1717,29 +1657,22 @@ class GraphTranslator:
         op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
         framework_ctx: Optional[Any] = None,
     ) -> Any:
-        """Synchronous delete_nodes (uses AsyncBridge)."""
-        async def _delete_coro():
-            ctx = _ensure_operation_context(op_ctx)
-            try:
-                spec = self._translator.build_delete_nodes_spec(
-                    raw_filter_or_ids,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
-                return await self._adapter.delete_nodes(spec, ctx=ctx)
-            except Exception as exc:
-                attach_context(
-                    exc,
-                    framework=self._framework,
-                    graph_operation="delete_nodes",
-                    request_id=ctx.request_id,
-                    tenant=ctx.tenant,
-                )
-                raise
+        """Synchronous delete_nodes API."""
 
-        ctx = _ensure_operation_context(op_ctx)
-        timeout = ctx.deadline_ms / 1000.0 if ctx.deadline_ms else None
-        return AsyncBridge.run_async(_delete_coro(), timeout=timeout)
+        async def _logic(ctx: OperationContext) -> Any:
+            spec = self._translator.build_delete_nodes_spec(
+                raw_filter_or_ids,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+            return await self._adapter.delete_nodes(spec, ctx=ctx)
+
+        return self._run_operation(
+            op_name="delete_nodes",
+            op_ctx=op_ctx,
+            sync=True,
+            logic=_logic,
+        )
 
     async def arun_delete_nodes(
         self,
@@ -1748,24 +1681,22 @@ class GraphTranslator:
         op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
         framework_ctx: Optional[Any] = None,
     ) -> Any:
-        """Async delete_nodes."""
-        ctx = _ensure_operation_context(op_ctx)
-        try:
+        """Async delete_nodes API."""
+
+        async def _logic(ctx: OperationContext) -> Any:
             spec = self._translator.build_delete_nodes_spec(
                 raw_filter_or_ids,
                 op_ctx=ctx,
                 framework_ctx=framework_ctx,
             )
             return await self._adapter.delete_nodes(spec, ctx=ctx)
-        except Exception as exc:
-            attach_context(
-                exc,
-                framework=self._framework,
-                graph_operation="delete_nodes",
-                request_id=ctx.request_id,
-                tenant=ctx.tenant,
-            )
-            raise
+
+        return await self._run_operation(
+            op_name="delete_nodes",
+            op_ctx=op_ctx,
+            sync=False,
+            logic=_logic,
+        )
 
     def delete_edges(
         self,
@@ -1774,29 +1705,22 @@ class GraphTranslator:
         op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
         framework_ctx: Optional[Any] = None,
     ) -> Any:
-        """Synchronous delete_edges (uses AsyncBridge)."""
-        async def _delete_coro():
-            ctx = _ensure_operation_context(op_ctx)
-            try:
-                spec = self._translator.build_delete_edges_spec(
-                    raw_filter_or_ids,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
-                return await self._adapter.delete_edges(spec, ctx=ctx)
-            except Exception as exc:
-                attach_context(
-                    exc,
-                    framework=self._framework,
-                    graph_operation="delete_edges",
-                    request_id=ctx.request_id,
-                    tenant=ctx.tenant,
-                )
-                raise
+        """Synchronous delete_edges API."""
 
-        ctx = _ensure_operation_context(op_ctx)
-        timeout = ctx.deadline_ms / 1000.0 if ctx.deadline_ms else None
-        return AsyncBridge.run_async(_delete_coro(), timeout=timeout)
+        async def _logic(ctx: OperationContext) -> Any:
+            spec = self._translator.build_delete_edges_spec(
+                raw_filter_or_ids,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+            return await self._adapter.delete_edges(spec, ctx=ctx)
+
+        return self._run_operation(
+            op_name="delete_edges",
+            op_ctx=op_ctx,
+            sync=True,
+            logic=_logic,
+        )
 
     async def arun_delete_edges(
         self,
@@ -1805,24 +1729,22 @@ class GraphTranslator:
         op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
         framework_ctx: Optional[Any] = None,
     ) -> Any:
-        """Async delete_edges."""
-        ctx = _ensure_operation_context(op_ctx)
-        try:
+        """Async delete_edges API."""
+
+        async def _logic(ctx: OperationContext) -> Any:
             spec = self._translator.build_delete_edges_spec(
                 raw_filter_or_ids,
                 op_ctx=ctx,
                 framework_ctx=framework_ctx,
             )
             return await self._adapter.delete_edges(spec, ctx=ctx)
-        except Exception as exc:
-            attach_context(
-                exc,
-                framework=self._framework,
-                graph_operation="delete_edges",
-                request_id=ctx.request_id,
-                tenant=ctx.tenant,
-            )
-            raise
+
+        return await self._run_operation(
+            op_name="delete_edges",
+            op_ctx=op_ctx,
+            sync=False,
+            logic=_logic,
+        )
 
     # --------------------------------------------------------------------- #
     # Bulk vertices / batch / schema
@@ -1835,59 +1757,16 @@ class GraphTranslator:
         op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
         framework_ctx: Optional[Any] = None,
     ) -> Any:
-        """Synchronous bulk_vertices (uses AsyncBridge)."""
-        async def _bulk_coro():
-            ctx = _ensure_operation_context(op_ctx)
-            try:
-                spec = self._translator.build_bulk_vertices_spec(
-                    raw_request,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
-                result = await self._adapter.bulk_vertices(spec, ctx=ctx)
-                
-                if not isinstance(result, BulkVerticesResult):
-                    raise BadRequest(
-                        f"adapter.bulk_vertices returned unsupported type: {type(result).__name__}",
-                        code="BAD_ADAPTER_RESULT",
-                    )
+        """Synchronous bulk_vertices API."""
 
-                return self._translator.translate_bulk_vertices_result(
-                    result,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
-            except Exception as exc:
-                attach_context(
-                    exc,
-                    framework=self._framework,
-                    graph_operation="bulk_vertices",
-                    request_id=ctx.request_id,
-                    tenant=ctx.tenant,
-                )
-                raise
-
-        ctx = _ensure_operation_context(op_ctx)
-        timeout = ctx.deadline_ms / 1000.0 if ctx.deadline_ms else None
-        return AsyncBridge.run_async(_bulk_coro(), timeout=timeout)
-
-    async def arun_bulk_vertices(
-        self,
-        raw_request: Any,
-        *,
-        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
-        framework_ctx: Optional[Any] = None,
-    ) -> Any:
-        """Async bulk_vertices."""
-        ctx = _ensure_operation_context(op_ctx)
-        try:
+        async def _logic(ctx: OperationContext) -> Any:
             spec = self._translator.build_bulk_vertices_spec(
                 raw_request,
                 op_ctx=ctx,
                 framework_ctx=framework_ctx,
             )
             result = await self._adapter.bulk_vertices(spec, ctx=ctx)
-            
+
             if not isinstance(result, BulkVerticesResult):
                 raise BadRequest(
                     f"adapter.bulk_vertices returned unsupported type: {type(result).__name__}",
@@ -1899,15 +1778,49 @@ class GraphTranslator:
                 op_ctx=ctx,
                 framework_ctx=framework_ctx,
             )
-        except Exception as exc:
-            attach_context(
-                exc,
-                framework=self._framework,
-                graph_operation="bulk_vertices",
-                request_id=ctx.request_id,
-                tenant=ctx.tenant,
+
+        return self._run_operation(
+            op_name="bulk_vertices",
+            op_ctx=op_ctx,
+            sync=True,
+            logic=_logic,
+        )
+
+    async def arun_bulk_vertices(
+        self,
+        raw_request: Any,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        """Async bulk_vertices API."""
+
+        async def _logic(ctx: OperationContext) -> Any:
+            spec = self._translator.build_bulk_vertices_spec(
+                raw_request,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
             )
-            raise
+            result = await self._adapter.bulk_vertices(spec, ctx=ctx)
+
+            if not isinstance(result, BulkVerticesResult):
+                raise BadRequest(
+                    f"adapter.bulk_vertices returned unsupported type: {type(result).__name__}",
+                    code="BAD_ADAPTER_RESULT",
+                )
+
+            return self._translator.translate_bulk_vertices_result(
+                result,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+
+        return await self._run_operation(
+            op_name="bulk_vertices",
+            op_ctx=op_ctx,
+            sync=False,
+            logic=_logic,
+        )
 
     def batch(
         self,
@@ -1916,41 +1829,34 @@ class GraphTranslator:
         op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
         framework_ctx: Optional[Any] = None,
     ) -> Any:
-        """Synchronous batch (uses AsyncBridge)."""
-        async def _batch_coro():
-            ctx = _ensure_operation_context(op_ctx)
-            try:
-                ops = self._translator.build_batch_ops(
-                    raw_batch_ops,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
-                result = await self._adapter.batch(ops, ctx=ctx)
-                
-                if not isinstance(result, BatchResult):
-                    raise BadRequest(
-                        f"adapter.batch returned unsupported type: {type(result).__name__}",
-                        code="BAD_ADAPTER_RESULT",
-                    )
-                
-                return self._translator.translate_batch_result(
-                    result,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
-            except Exception as exc:
-                attach_context(
-                    exc,
-                    framework=self._framework,
-                    graph_operation="batch",
-                    request_id=ctx.request_id,
-                    tenant=ctx.tenant,
-                )
-                raise
+        """Synchronous batch API."""
 
-        ctx = _ensure_operation_context(op_ctx)
-        timeout = ctx.deadline_ms / 1000.0 if ctx.deadline_ms else None
-        return AsyncBridge.run_async(_batch_coro(), timeout=timeout)
+        async def _logic(ctx: OperationContext) -> Any:
+            ops = self._translator.build_batch_ops(
+                raw_batch_ops,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+            result = await self._adapter.batch(ops, ctx=ctx)
+
+            if not isinstance(result, BatchResult):
+                raise BadRequest(
+                    f"adapter.batch returned unsupported type: {type(result).__name__}",
+                    code="BAD_ADAPTER_RESULT",
+                )
+
+            return self._translator.translate_batch_result(
+                result,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+
+        return self._run_operation(
+            op_name="batch",
+            op_ctx=op_ctx,
+            sync=True,
+            logic=_logic,
+        )
 
     async def arun_batch(
         self,
@@ -1959,36 +1865,34 @@ class GraphTranslator:
         op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
         framework_ctx: Optional[Any] = None,
     ) -> Any:
-        """Async batch."""
-        ctx = _ensure_operation_context(op_ctx)
-        try:
+        """Async batch API."""
+
+        async def _logic(ctx: OperationContext) -> Any:
             ops = self._translator.build_batch_ops(
                 raw_batch_ops,
                 op_ctx=ctx,
                 framework_ctx=framework_ctx,
             )
             result = await self._adapter.batch(ops, ctx=ctx)
-            
+
             if not isinstance(result, BatchResult):
                 raise BadRequest(
                     f"adapter.batch returned unsupported type: {type(result).__name__}",
                     code="BAD_ADAPTER_RESULT",
                 )
-            
+
             return self._translator.translate_batch_result(
                 result,
                 op_ctx=ctx,
                 framework_ctx=framework_ctx,
             )
-        except Exception as exc:
-            attach_context(
-                exc,
-                framework=self._framework,
-                graph_operation="batch",
-                request_id=ctx.request_id,
-                tenant=ctx.tenant,
-            )
-            raise
+
+        return await self._run_operation(
+            op_name="batch",
+            op_ctx=op_ctx,
+            sync=False,
+            logic=_logic,
+        )
 
     def get_schema(
         self,
@@ -1996,48 +1900,11 @@ class GraphTranslator:
         op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
         framework_ctx: Optional[Any] = None,
     ) -> Any:
-        """Synchronous get_schema (uses AsyncBridge)."""
-        async def _schema_coro():
-            ctx = _ensure_operation_context(op_ctx)
-            try:
-                schema = await self._adapter.get_schema(ctx=ctx)
-                
-                if not isinstance(schema, GraphSchema):
-                    raise BadRequest(
-                        f"adapter.get_schema returned unsupported type: {type(schema).__name__}",
-                        code="BAD_ADAPTER_RESULT",
-                    )
+        """Synchronous get_schema API."""
 
-                return self._translator.translate_schema(
-                    schema,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
-            except Exception as exc:
-                attach_context(
-                    exc,
-                    framework=self._framework,
-                    graph_operation="get_schema",
-                    request_id=ctx.request_id,
-                    tenant=ctx.tenant,
-                )
-                raise
-
-        ctx = _ensure_operation_context(op_ctx)
-        timeout = ctx.deadline_ms / 1000.0 if ctx.deadline_ms else None
-        return AsyncBridge.run_async(_schema_coro(), timeout=timeout)
-
-    async def arun_get_schema(
-        self,
-        *,
-        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
-        framework_ctx: Optional[Any] = None,
-    ) -> Any:
-        """Async get_schema."""
-        ctx = _ensure_operation_context(op_ctx)
-        try:
+        async def _logic(ctx: OperationContext) -> Any:
             schema = await self._adapter.get_schema(ctx=ctx)
-            
+
             if not isinstance(schema, GraphSchema):
                 raise BadRequest(
                     f"adapter.get_schema returned unsupported type: {type(schema).__name__}",
@@ -2049,15 +1916,43 @@ class GraphTranslator:
                 op_ctx=ctx,
                 framework_ctx=framework_ctx,
             )
-        except Exception as exc:
-            attach_context(
-                exc,
-                framework=self._framework,
-                graph_operation="get_schema",
-                request_id=ctx.request_id,
-                tenant=ctx.tenant,
+
+        return self._run_operation(
+            op_name="get_schema",
+            op_ctx=op_ctx,
+            sync=True,
+            logic=_logic,
+        )
+
+    async def arun_get_schema(
+        self,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        """Async get_schema API."""
+
+        async def _logic(ctx: OperationContext) -> Any:
+            schema = await self._adapter.get_schema(ctx=ctx)
+
+            if not isinstance(schema, GraphSchema):
+                raise BadRequest(
+                    f"adapter.get_schema returned unsupported type: {type(schema).__name__}",
+                    code="BAD_ADAPTER_RESULT",
+                )
+
+            return self._translator.translate_schema(
+                schema,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
             )
-            raise
+
+        return await self._run_operation(
+            op_name="get_schema",
+            op_ctx=op_ctx,
+            sync=False,
+            logic=_logic,
+        )
 
 
 # =============================================================================
@@ -2067,6 +1962,7 @@ class GraphTranslator:
 
 _TranslatorFactory = Callable[[GraphProtocolV1], GraphFrameworkTranslator]
 _GRAPH_TRANSLATOR_FACTORIES: Dict[str, _TranslatorFactory] = {}
+_REGISTRY_LOCK = threading.Lock()
 
 
 def register_graph_translator(
@@ -2075,13 +1971,6 @@ def register_graph_translator(
 ) -> None:
     """
     Register or override a GraphFrameworkTranslator factory for a given framework.
-
-    Example
-    -------
-        def make_langchain_translator(adapter: GraphProtocolV1) -> GraphFrameworkTranslator:
-            return LangChainGraphTranslator(adapter=adapter)
-
-        register_graph_translator("langchain", make_langchain_translator)
     """
     if not framework or not isinstance(framework, str):
         raise BadRequest(
@@ -2093,13 +1982,15 @@ def register_graph_translator(
             "translator factory must be callable",
             code="BAD_TRANSLATOR_REGISTRATION",
         )
-    _GRAPH_TRANSLATOR_FACTORIES[framework] = factory
+    with _REGISTRY_LOCK:
+        _GRAPH_TRANSLATOR_FACTORIES[framework] = factory
     LOG.debug("Registered graph translator factory for framework=%s", framework)
 
 
 def get_graph_translator_factory(framework: str) -> Optional[_TranslatorFactory]:
     """Return a previously registered translator factory for a framework, if any."""
-    return _GRAPH_TRANSLATOR_FACTORIES.get(framework)
+    with _REGISTRY_LOCK:
+        return _GRAPH_TRANSLATOR_FACTORIES.get(framework)
 
 
 def create_graph_translator(
