@@ -23,11 +23,11 @@ from corpus_sdk.graph.framework_adapters.semantic_kernel import (
 
 
 def _make_client(
-    graph_adapter: Any,
+    adapter: Any,
     **kwargs: Any,
 ) -> CorpusSemanticKernelGraphClient:
     """Construct a CorpusSemanticKernelGraphClient instance from the generic adapter."""
-    return CorpusSemanticKernelGraphClient(graph_adapter=graph_adapter, **kwargs)
+    return CorpusSemanticKernelGraphClient(adapter=adapter, **kwargs)
 
 
 def _mock_translator_with_capture(
@@ -83,7 +83,7 @@ def _mock_async_translator_with_capture(
 
 def test_default_translator_uses_semantickernel_framework_translator(
     monkeypatch: pytest.MonkeyPatch,
-    graph_adapter: Any,
+    adapter: Any,
 ) -> None:
     """
     By default, CorpusSemanticKernelGraphClient should:
@@ -108,7 +108,7 @@ def test_default_translator_uses_semantickernel_framework_translator(
         fake_create_graph_translator,
     )
 
-    client = _make_client(graph_adapter)
+    client = _make_client(adapter)
 
     # Trigger lazy translator construction
     _ = client._translator  # noqa: SLF001
@@ -121,7 +121,7 @@ def test_default_translator_uses_semantickernel_framework_translator(
 
 def test_framework_translator_override_is_respected(
     monkeypatch: pytest.MonkeyPatch,
-    graph_adapter: Any,
+    adapter: Any,
 ) -> None:
     """
     If framework_translator is provided, CorpusSemanticKernelGraphClient should pass
@@ -151,7 +151,7 @@ def test_framework_translator_override_is_respected(
     )
 
     client = _make_client(
-        graph_adapter,
+        adapter,
         framework_translator=custom,
         framework_version="sk-fw-1.2.3",
     )
@@ -170,7 +170,7 @@ def test_framework_translator_override_is_respected(
 
 def test_semantickernel_context_and_extra_context_passed_to_core_ctx(
     monkeypatch: pytest.MonkeyPatch,
-    graph_adapter: Any,
+    adapter: Any,
 ) -> None:
     """
     Verify that context/settings and extra_context are passed through to
@@ -222,7 +222,7 @@ def test_semantickernel_context_and_extra_context_passed_to_core_ctx(
     )
 
     client = _make_client(
-        graph_adapter,
+        adapter,
         framework_version="semantic-kernel-test-version",
     )
 
@@ -246,7 +246,7 @@ def test_semantickernel_context_and_extra_context_passed_to_core_ctx(
 
 def test_build_ctx_failure_raises_badrequest_with_error_code_and_context(
     monkeypatch: pytest.MonkeyPatch,
-    graph_adapter: Any,
+    adapter: Any,
 ) -> None:
     """
     If core_ctx_from_semantic_kernel raises, _build_ctx should wrap it in a
@@ -284,7 +284,7 @@ def test_build_ctx_failure_raises_badrequest_with_error_code_and_context(
         fake_create_graph_translator,
     )
 
-    client = _make_client(graph_adapter)
+    client = _make_client(adapter)
 
     with pytest.raises(Exception) as exc_info:
         client.query("MATCH (n) RETURN n", context=object())
@@ -308,7 +308,7 @@ def test_build_ctx_failure_raises_badrequest_with_error_code_and_context(
 
 def test_sync_errors_include_semantickernel_metadata_in_context(
     monkeypatch: pytest.MonkeyPatch,
-    graph_adapter: Any,
+    adapter: Any,
 ) -> None:
     """
     When an error occurs during a sync graph operation, error context should
@@ -338,7 +338,7 @@ def test_sync_errors_include_semantickernel_metadata_in_context(
         fake_create_graph_translator,
     )
 
-    client = _make_client(graph_adapter)
+    client = _make_client(adapter)
 
     with pytest.raises(RuntimeError, match="test error from semantic_kernel graph adapter"):
         client.query("MATCH (n) RETURN n", context={"user_id": "u-sync"})
@@ -351,7 +351,7 @@ def test_sync_errors_include_semantickernel_metadata_in_context(
 @pytest.mark.asyncio
 async def test_async_errors_include_semantickernel_metadata_in_context(
     monkeypatch: pytest.MonkeyPatch,
-    graph_adapter: Any,
+    adapter: Any,
 ) -> None:
     """
     Same as the sync error-context test but for the async query path.
@@ -380,7 +380,7 @@ async def test_async_errors_include_semantickernel_metadata_in_context(
         fake_create_graph_translator,
     )
 
-    client = _make_client(graph_adapter)
+    client = _make_client(adapter)
 
     with pytest.raises(RuntimeError, match="test error from semantic_kernel graph adapter"):
         await client.aquery("MATCH (n) RETURN n", context={"user_id": "u-async"})
@@ -395,7 +395,7 @@ async def test_async_errors_include_semantickernel_metadata_in_context(
 # ---------------------------------------------------------------------------
 
 
-def test_sync_query_and_stream_basic(graph_adapter: Any) -> None:
+def test_sync_query_and_stream_basic(adapter: Any) -> None:
     """
     Basic smoke test for sync query / stream_query behavior: methods should
     accept text input and not crash, returning protocol-level shapes.
@@ -403,7 +403,7 @@ def test_sync_query_and_stream_basic(graph_adapter: Any) -> None:
     Detailed QueryResult / QueryChunk semantics are covered by the generic
     graph contract tests.
     """
-    client = _make_client(graph_adapter, default_namespace="sk-ns")
+    client = _make_client(adapter, default_namespace="sk-ns")
 
     # Non-streaming query
     result = client.query("MATCH (n) RETURN n LIMIT 1")
@@ -414,12 +414,12 @@ def test_sync_query_and_stream_basic(graph_adapter: Any) -> None:
     assert isinstance(chunks, list)
 
 
-def test_sync_query_accepts_optional_params_and_context(graph_adapter: Any) -> None:
+def test_sync_query_accepts_optional_params_and_context(adapter: Any) -> None:
     """
     query() should accept params, dialect, namespace, timeout_ms, and
     context/settings/extra_context kwargs without raising.
     """
-    client = _make_client(graph_adapter, default_dialect="cypher")
+    client = _make_client(adapter, default_dialect="cypher")
 
     result = client.query(
         "MATCH (n) RETURN n LIMIT $limit",
@@ -440,12 +440,12 @@ def test_sync_query_accepts_optional_params_and_context(graph_adapter: Any) -> N
 
 
 @pytest.mark.asyncio
-async def test_async_query_and_stream_basic(graph_adapter: Any) -> None:
+async def test_async_query_and_stream_basic(adapter: Any) -> None:
     """
     Async aquery / astream_query should exist and produce results compatible
     with the sync API (non-None result / async-iterable of chunks).
     """
-    client = _make_client(graph_adapter)
+    client = _make_client(adapter)
 
     assert hasattr(client, "aquery")
     assert hasattr(client, "astream_query")
@@ -469,12 +469,12 @@ async def test_async_query_and_stream_basic(graph_adapter: Any) -> None:
 
 @pytest.mark.asyncio
 async def test_async_query_accepts_optional_params_and_context(
-    graph_adapter: Any,
+    adapter: Any,
 ) -> None:
     """
     aquery() should accept the same optional params and context as query().
     """
-    client = _make_client(graph_adapter, default_namespace="async-sk-ns")
+    client = _make_client(adapter, default_namespace="async-sk-ns")
 
     result = await client.aquery(
         "MATCH (n) RETURN n LIMIT $limit",
@@ -496,7 +496,7 @@ async def test_async_query_accepts_optional_params_and_context(
 
 def test_stream_query_invalid_chunk_triggers_validation_and_context(
     monkeypatch: pytest.MonkeyPatch,
-    graph_adapter: Any,
+    adapter: Any,
 ) -> None:
     """
     stream_query() should pass each chunk through validate_graph_result_type
@@ -547,7 +547,7 @@ def test_stream_query_invalid_chunk_triggers_validation_and_context(
         fake_attach_context,
     )
 
-    client = _make_client(graph_adapter)
+    client = _make_client(adapter)
 
     stream = client.stream_query("MATCH (n) RETURN n")
 
@@ -567,7 +567,7 @@ def test_stream_query_invalid_chunk_triggers_validation_and_context(
 @pytest.mark.asyncio
 async def test_astream_query_invalid_chunk_triggers_validation_and_context_async(
     monkeypatch: pytest.MonkeyPatch,
-    graph_adapter: Any,
+    adapter: Any,
 ) -> None:
     """
     astream_query() should also validate chunks and attach Semantic Kernel
@@ -632,7 +632,7 @@ async def test_astream_query_invalid_chunk_triggers_validation_and_context_async
         fake_attach_context,
     )
 
-    client = _make_client(graph_adapter)
+    client = _make_client(adapter)
 
     aiter = client.astream_query("MATCH (n) RETURN n")
     if inspect.isawaitable(aiter):
@@ -655,7 +655,7 @@ async def test_astream_query_invalid_chunk_triggers_validation_and_context_async
 
 def test_bulk_vertices_builds_raw_request_and_calls_translator(
     monkeypatch: pytest.MonkeyPatch,
-    graph_adapter: Any,
+    adapter: Any,
 ) -> None:
     """
     bulk_vertices() should:
@@ -688,7 +688,7 @@ def test_bulk_vertices_builds_raw_request_and_calls_translator(
         fake_validate_graph_result_type,
     )
 
-    client = _make_client(graph_adapter)
+    client = _make_client(adapter)
 
     class DummyBulkSpec:
         def __init__(self) -> None:
@@ -721,7 +721,7 @@ def test_bulk_vertices_builds_raw_request_and_calls_translator(
 @pytest.mark.asyncio
 async def test_abulk_vertices_builds_raw_request_and_calls_translator_async(
     monkeypatch: pytest.MonkeyPatch,
-    graph_adapter: Any,
+    adapter: Any,
 ) -> None:
     """
     abulk_vertices() should mirror bulk_vertices wiring but via
@@ -752,7 +752,7 @@ async def test_abulk_vertices_builds_raw_request_and_calls_translator_async(
         fake_validate_graph_result_type,
     )
 
-    client = _make_client(graph_adapter)
+    client = _make_client(adapter)
 
     class DummyBulkSpec:
         def __init__(self) -> None:
@@ -784,7 +784,7 @@ async def test_abulk_vertices_builds_raw_request_and_calls_translator_async(
 
 def test_batch_builds_raw_batch_ops_and_calls_translator(
     monkeypatch: pytest.MonkeyPatch,
-    graph_adapter: Any,
+    adapter: Any,
 ) -> None:
     """
     batch() should:
@@ -826,7 +826,7 @@ def test_batch_builds_raw_batch_ops_and_calls_translator(
         fake_validate_batch_operations,
     )
 
-    client = _make_client(graph_adapter)
+    client = _make_client(adapter)
 
     class DummyBatchOp:
         def __init__(self, op: str, args: Mapping[str, Any]) -> None:
@@ -858,7 +858,7 @@ def test_batch_builds_raw_batch_ops_and_calls_translator(
 @pytest.mark.asyncio
 async def test_abatch_builds_raw_batch_ops_and_calls_translator_async(
     monkeypatch: pytest.MonkeyPatch,
-    graph_adapter: Any,
+    adapter: Any,
 ) -> None:
     """
     abatch() should mirror batch wiring via translator.arun_batch.
@@ -896,7 +896,7 @@ async def test_abatch_builds_raw_batch_ops_and_calls_translator_async(
         fake_validate_batch_operations,
     )
 
-    client = _make_client(graph_adapter)
+    client = _make_client(adapter)
 
     class DummyBatchOp:
         def __init__(self, op: str, args: Mapping[str, Any]) -> None:
@@ -930,7 +930,7 @@ async def test_abatch_builds_raw_batch_ops_and_calls_translator_async(
 # ---------------------------------------------------------------------------
 
 
-def test_capabilities_and_health_basic(graph_adapter: Any) -> None:
+def test_capabilities_and_health_basic(adapter: Any) -> None:
     """
     Capabilities and health should be surfaced as mappings.
 
@@ -938,7 +938,7 @@ def test_capabilities_and_health_basic(graph_adapter: Any) -> None:
     tests; here we only assert that the Semantic Kernel adapter normalizes to
     mapping-like results.
     """
-    client = _make_client(graph_adapter)
+    client = _make_client(adapter)
 
     caps = client.capabilities()
     assert isinstance(caps, Mapping)
@@ -948,12 +948,12 @@ def test_capabilities_and_health_basic(graph_adapter: Any) -> None:
 
 
 @pytest.mark.asyncio
-async def test_async_capabilities_and_health_basic(graph_adapter: Any) -> None:
+async def test_async_capabilities_and_health_basic(adapter: Any) -> None:
     """
     Async capabilities/health should also return mappings compatible with
     the sync variants.
     """
-    client = _make_client(graph_adapter)
+    client = _make_client(adapter)
 
     acaps = await client.acapabilities()
     assert isinstance(acaps, Mapping)
@@ -968,7 +968,7 @@ async def test_async_capabilities_and_health_basic(graph_adapter: Any) -> None:
 
 
 @pytest.mark.asyncio
-async def test_context_manager_closes_underlying_graph_adapter() -> None:
+async def test_context_manager_closes_underlying_adapter() -> None:
     """
     __enter__/__exit__ and __aenter__/__aexit__ should call close/aclose on
     the underlying graph adapter when those methods exist.
@@ -994,14 +994,14 @@ async def test_context_manager_closes_underlying_graph_adapter() -> None:
     adapter = ClosingGraphAdapter()
 
     # Sync context manager
-    with CorpusSemanticKernelGraphClient(graph_adapter=adapter) as client:
+    with CorpusSemanticKernelGraphClient(adapter=adapter) as client:
         assert client is not None
 
     assert adapter.closed is True
 
     # Async context manager
     adapter2 = ClosingGraphAdapter()
-    client2 = CorpusSemanticKernelGraphClient(graph_adapter=adapter2)
+    client2 = CorpusSemanticKernelGraphClient(adapter=adapter2)
 
     async with client2:
         assert client2 is not None
