@@ -200,17 +200,17 @@ def _make_client_with_evil_backend(
     """
     Instantiate the framework graph client with an 'evil' backend.
 
-    This bypasses the normal graph_adapter fixture wiring and lets us simulate
+    This bypasses the normal adapter fixture wiring and lets us simulate
     misbehaving backends in a controlled way.
     """
     module = importlib.import_module(framework_descriptor.adapter_module)
     client_cls = getattr(module, framework_descriptor.adapter_class)
 
     backend = backend_cls()
-    instance = client_cls(graph_adapter=backend)
+    instance = client_cls(adapter=backend)
 
     # If adapters cache the backend under a different attribute, they should
-    # still be referencing the same object we passed as graph_adapter.
+    # still be referencing the same object we passed as adapter.
     return instance
 
 
