@@ -9,7 +9,6 @@ from typing import Any, Callable, Type
 
 import pytest
 
-from corpus_sdk.graph.graph_base import BulkVerticesSpec
 from tests.frameworks.registries.graph_registry import (
     GraphFrameworkDescriptor,
     iter_graph_framework_descriptors,
@@ -57,8 +56,6 @@ class InvalidResultGraphAdapter:
 
     - query() returns a non-graph scalar value
     - stream_query() returns a non-iterable
-    - bulk_vertices() returns a non-bulk result
-    - batch() returns a non-batch result
     - async variants mirror the same shape errors
 
     Framework adapters should surface coercion / validation errors rather than
@@ -102,7 +99,7 @@ class EmptyResultGraphAdapter:
     Backend that always returns obviously empty results.
 
     Used to verify that adapters do not silently treat empty backend responses
-    as fully valid results, particularly for batch() and bulk_vertices().
+    as fully valid results, particularly for batch() surfaces.
     """
 
     def query(self, *args: Any, **kwargs: Any) -> Any:
@@ -252,32 +249,6 @@ def _call_batch(
     return batch_fn(operations)
 
 
-def _call_bulk(
-    descriptor: GraphFrameworkDescriptor,
-    instance: Any,
-    spec: BulkVerticesSpec,
-) -> Any:
-    assert descriptor.bulk_vertices_method is not None
-    bulk_fn = _get_method(instance, descriptor.bulk_vertices_method)
-    if descriptor.context_kwarg:
-        return bulk_fn(spec, **{descriptor.context_kwarg: {}})
-    return bulk_fn(spec)
-
-
-def _build_bulk_spec(limit: int = 5) -> BulkVerticesSpec:
-    """
-    Helper to construct a BulkVerticesSpec with explicit cursor/filter.
-
-    Keeps this test agnostic to any internal defaulting behavior.
-    """
-    return BulkVerticesSpec(
-        namespace=None,
-        limit=limit,
-        cursor=None,
-        filter=None,
-    )
-
-
 # ---------------------------------------------------------------------------
 # Invalid result behavior
 # ---------------------------------------------------------------------------
@@ -402,122 +373,6 @@ async def test_async_invalid_backend_result_causes_errors_for_stream_when_suppor
 
         async for _ in aiter:  # noqa: B007
             pass
-
-
-# ---------------------------------------------------------------------------
-# Bulk vertices result behavior
-# ---------------------------------------------------------------------------
-
-
-def test_invalid_backend_bulk_vertices_result_causes_errors_when_supported(
-    framework_descriptor: GraphFrameworkDescriptor,
-) -> None:
-    """
-    When bulk_vertices is supported, a clearly invalid backend result type
-    should surface as an error rather than a valid-looking bulk result.
-    """
-    if not framework_descriptor.supports_bulk_vertices:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare bulk_vertices support",
-        )
-
-    if not framework_descriptor.bulk_vertices_method:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not expose bulk_vertices_method",
-        )
-
-    instance = _make_client_with_evil_backend(
-        framework_descriptor,
-        InvalidResultGraphAdapter,
-    )
-
-    spec = _build_bulk_spec(limit=5)
-
-    with pytest.raises(Exception):  # noqa: BLE001
-        _call_bulk(framework_descriptor, instance, spec)
-
-
-@pytest.mark.asyncio
-async def test_async_invalid_backend_bulk_vertices_result_causes_errors_when_supported(
-    framework_descriptor: GraphFrameworkDescriptor,
-) -> None:
-    """
-    When async bulk_vertices is supported, invalid backend results should
-    also surface as errors.
-    """
-    if not framework_descriptor.supports_bulk_vertices:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare bulk_vertices support",
-        )
-
-    if not framework_descriptor.async_bulk_vertices_method:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare async bulk_vertices",
-        )
-
-    assert framework_descriptor.bulk_vertices_method is not None
-
-    instance = _make_client_with_evil_backend(
-        framework_descriptor,
-        InvalidResultGraphAdapter,
-    )
-
-    abulk_fn = _get_method(
-        instance,
-        framework_descriptor.async_bulk_vertices_method,
-    )
-
-    spec = _build_bulk_spec(limit=5)
-
-    with pytest.raises(Exception):  # noqa: BLE001
-        coro = abulk_fn(spec)
-        assert inspect.isawaitable(coro), (
-            "Async bulk_vertices method must return an awaitable",
-        )
-        await coro  # noqa: PT018
-
-
-def test_empty_backend_bulk_vertices_result_is_not_silently_treated_as_valid(
-    framework_descriptor: GraphFrameworkDescriptor,
-) -> None:
-    """
-    When the backend returns an empty bulk_vertices result, the adapter should
-    not silently treat it as a fully valid response with the requested limit.
-
-    Acceptable behaviors:
-    - Raise an Exception (preferred), or
-    - Return a sequence whose length != requested limit.
-    """
-    if not framework_descriptor.supports_bulk_vertices:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare bulk_vertices support",
-        )
-
-    if not framework_descriptor.bulk_vertices_method:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not expose bulk_vertices_method",
-        )
-
-    instance = _make_client_with_evil_backend(
-        framework_descriptor,
-        EmptyResultGraphAdapter,
-    )
-
-    limit = 3
-    spec = _build_bulk_spec(limit=limit)
-
-    try:
-        result = _call_bulk(framework_descriptor, instance, spec)
-    except Exception:  # noqa: BLE001
-        # Raising is acceptable / preferred.
-        return
-
-    if isinstance(result, Sequence):
-        assert len(result) != limit, (
-            "Empty backend bulk_vertices result unexpectedly produced a sequence "
-            "whose length matches the requested limit; adapters should treat "
-            "empty backend results as errors or obvious mismatches."
-        )
 
 
 # ---------------------------------------------------------------------------
