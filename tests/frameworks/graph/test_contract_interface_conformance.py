@@ -54,7 +54,7 @@ def framework_descriptor_fixture(
 @pytest.fixture
 def graph_client_instance(
     framework_descriptor: GraphFrameworkDescriptor,
-    graph_adapter: Any,
+    adapter: Any,
 ) -> Any:
     """
     Construct a concrete graph client instance for the given descriptor.
@@ -68,9 +68,9 @@ def graph_client_instance(
     module = importlib.import_module(framework_descriptor.adapter_module)
     client_cls = getattr(module, framework_descriptor.adapter_class)
 
-    # All graph framework adapters take a graph_adapter implementing the
-    # GraphProtocolV1 surface. The global `graph_adapter` fixture is pluggable.
-    init_kwargs: dict[str, Any] = {"graph_adapter": graph_adapter}
+    # All graph framework adapters take a adapter implementing the
+    # GraphProtocolV1 surface. The global `adapter` fixture is pluggable.
+    init_kwargs: dict[str, Any] = {"adapter": adapter}
 
     # Additional framework-specific kwargs can be added here if needed.
 
