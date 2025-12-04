@@ -167,10 +167,8 @@ def test_runnable_config_passed_to_context_translation(
     adapter: Any,
 ) -> None:
     """
-    Verify that the `config` kwarg is passed through to context_from_langchain.
-
-    We patch context_from_langchain inside the langchain adapter module to
-    capture the config object that is passed in.
+    Verify that the `config` kwarg is passed through to context_from_langchain
+    for embed_documents().
     """
     captured: Dict[str, Any] = {}
 
@@ -210,6 +208,48 @@ def test_runnable_config_passed_to_context_translation(
 
     assert captured.get("config") is config
     assert captured.get("framework_version") == "lc-test-version"
+
+
+def test_runnable_config_passed_to_context_translation_for_embed_query(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: Any,
+) -> None:
+    """
+    Verify that the `config` kwarg is also passed through to context_from_langchain
+    for embed_query(), not just embed_documents().
+    """
+    captured: Dict[str, Any] = {}
+
+    def fake_from_langchain(
+        config: Dict[str, Any],
+        framework_version: str | None = None,
+    ) -> None:
+        captured["config"] = config
+        captured["framework_version"] = framework_version
+        return None
+
+    monkeypatch.setattr(
+        langchain_adapter_module,
+        "context_from_langchain",
+        fake_from_langchain,
+    )
+
+    embeddings = CorpusLangChainEmbeddings(
+        corpus_adapter=adapter,
+        model="cfg-model-query",
+        framework_version="lc-test-version-query",
+    )
+
+    config = {
+        "run_id": "run-query-1",
+        "run_name": "test-run-query",
+    }
+
+    result = embeddings.embed_query("some query text", config=config)
+    _assert_embedding_vector_shape(result)
+
+    assert captured.get("config") is config
+    assert captured.get("framework_version") == "lc-test-version-query"
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +300,51 @@ def test_error_context_includes_langchain_metadata(
         assert captured_context["run_id"] == "run-ctx"
 
 
+@pytest.mark.asyncio
+async def test_async_error_context_includes_langchain_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Async embedding errors should also attach LangChain-specific metadata
+    via attach_context(), mirroring the sync error-context behavior.
+    """
+    captured_context: Dict[str, Any] = {}
+
+    def fake_attach_context(exc: BaseException, **ctx: Any) -> None:
+        captured_context.update(ctx)
+
+    monkeypatch.setattr(
+        langchain_adapter_module,
+        "attach_context",
+        fake_attach_context,
+    )
+
+    class FailingAsyncAdapter:
+        def embed(self, *args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("sync embed should not be called in this test")
+
+        async def aembed(self, *args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("async test error from langchain adapter")
+
+    embeddings = CorpusLangChainEmbeddings(
+        corpus_adapter=FailingAsyncAdapter(),
+        model="err-async-model",
+    )
+
+    config = {
+        "run_id": "run-ctx-async",
+        "run_name": "error-test-async",
+    }
+
+    with pytest.raises(RuntimeError, match="async test error from langchain adapter"):
+        await embeddings.aembed_documents(["x", "y"], config=config)
+
+    assert captured_context, "attach_context was not called"
+    assert captured_context.get("framework") == "langchain"
+    if "run_id" in captured_context:
+        assert captured_context["run_id"] == "run-ctx-async"
+
+
 # ---------------------------------------------------------------------------
 # Sync / async semantics
 # ---------------------------------------------------------------------------
@@ -283,6 +368,42 @@ def test_sync_embed_documents_and_query_basic(adapter: Any) -> None:
 
     query_result = embeddings.embed_query(query_text)
     _assert_embedding_vector_shape(query_result)
+
+
+def test_empty_texts_embed_documents_returns_empty_matrix(adapter: Any) -> None:
+    """
+    embed_documents([]) should be a no-op and return an empty sequence,
+    not raise.
+    """
+    embeddings = configure_langchain_embeddings(
+        corpus_adapter=adapter,
+        model="empty-list-model",
+    )
+
+    result = embeddings.embed_documents([])
+    assert isinstance(result, Sequence)
+    assert len(result) == 0
+
+
+def test_empty_string_embed_query_has_consistent_dimension(adapter: Any) -> None:
+    """
+    Embedding an empty string should still return a numeric vector, and its
+    dimensionality should match that of a non-empty query.
+    """
+    embeddings = configure_langchain_embeddings(
+        corpus_adapter=adapter,
+        model="empty-string-model",
+    )
+
+    empty_vec = embeddings.embed_query("")
+    non_empty_vec = embeddings.embed_query("non-empty query")
+
+    _assert_embedding_vector_shape(empty_vec)
+    _assert_embedding_vector_shape(non_empty_vec)
+
+    # If both are non-empty, assert same dimensionality.
+    if empty_vec and non_empty_vec:
+        assert len(empty_vec) == len(non_empty_vec)
 
 
 @pytest.mark.asyncio
