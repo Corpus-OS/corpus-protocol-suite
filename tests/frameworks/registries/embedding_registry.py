@@ -182,10 +182,10 @@ class EmbeddingFrameworkDescriptor:
             return None
 
         if self.minimum_framework_version and self.tested_up_to_version:
-            return f">={self.minimum_framework_version}, <= {self.tested_up_to_version}"
+            return f">={self.minimum_framework_version}, <={self.tested_up_to_version}"
         if self.minimum_framework_version:
             return f">={self.minimum_framework_version}"
-        return f"<= {self.tested_up_to_version}"
+        return f"<={self.tested_up_to_version}"
 
     def validate(self) -> None:
         """

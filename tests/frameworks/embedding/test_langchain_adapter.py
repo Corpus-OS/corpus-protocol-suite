@@ -278,6 +278,9 @@ def test_error_context_includes_langchain_metadata(
     class FailingAdapter:
         def embed(self, *args: Any, **kwargs: Any) -> Any:
             raise RuntimeError("test error from langchain adapter")
+        
+        async def embed_batch(self, *args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("test error from langchain adapter")
 
     embeddings = CorpusLangChainEmbeddings(
         corpus_adapter=FailingAdapter(),
@@ -323,7 +326,13 @@ async def test_async_error_context_includes_langchain_metadata(
         def embed(self, *args: Any, **kwargs: Any) -> Any:
             raise RuntimeError("sync embed should not be called in this test")
 
+        async def embed_batch(self, *args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("async test error from langchain adapter")
+
         async def aembed(self, *args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("async test error from langchain adapter")
+
+        async def aembed_batch(self, *args: Any, **kwargs: Any) -> Any:
             raise RuntimeError("async test error from langchain adapter")
 
     embeddings = CorpusLangChainEmbeddings(
@@ -614,6 +623,14 @@ async def test_context_manager_closes_underlying_adapter() -> None:
 
         def embed(self, texts: Sequence[str], **_: Any) -> list[list[float]]:
             return [[0.0] * 2 for _ in texts]
+        
+        async def embed_batch(self, spec: Any, **_: Any) -> Any:
+            from corpus_sdk.embedding.embedding_base import BatchEmbedResult, EmbeddingVector
+            return BatchEmbedResult(
+                embeddings=[EmbeddingVector(vector=[0.0] * 2, text=t, model="test", dimensions=2) for t in spec.texts],
+                model="test",
+                total_texts=len(spec.texts)
+            )
 
         def close(self) -> None:
             self.closed = True

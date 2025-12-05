@@ -18,7 +18,7 @@ import asyncio
 import hashlib
 import math
 import random
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple, Union
 
 from corpus_sdk.embedding.embedding_base import (
     BaseEmbeddingAdapter,
@@ -28,6 +28,7 @@ from corpus_sdk.embedding.embedding_base import (
     EmbedResult,
     BatchEmbedResult,
     EmbeddingVector,
+    EmbedChunk,
     OperationContext as EmbeddingContext,
     # Canonical error types for correct wire codes
     BadRequest,
@@ -83,7 +84,19 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
         cache_caps_ttl_s: int = 30,
         # Mock-specific knobs
         name: str = "mock-embedding",
-        supported_models: Tuple[str, ...] = ("mock-embed-512", "mock-embed-1024"),
+        supported_models: Tuple[str, ...] = (
+            "mock-embed-512", 
+            "mock-embed-1024",
+            "sync-model",
+            "async-model",
+            "test-model",
+            "cfg-model",
+            "cfg-model-query",
+            "dim-model",
+            "large-batch-model",
+            "empty-list-model",
+            "empty-string-model",
+        ),
         dimensions_by_model: Optional[Dict[str, int]] = None,
         max_text_length: int = 4000,
         max_batch_size: int = 128,
@@ -113,7 +126,19 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
         self.name = name
         self.supported_models = tuple(supported_models)
         self.dimensions_by_model = dict(
-            dimensions_by_model or {"mock-embed-512": 512, "mock-embed-1024": 1024}
+            dimensions_by_model or {
+                "mock-embed-512": 512, 
+                "mock-embed-1024": 1024,
+                "sync-model": 768,
+                "async-model": 768,
+                "test-model": 768,
+                "cfg-model": 768,
+                "cfg-model-query": 768,
+                "dim-model": 12,
+                "large-batch-model": 768,
+                "empty-list-model": 768,
+                "empty-string-model": 768,
+            }
         )
         self.max_text_length = int(max_text_length)
         self.max_batch_size = int(max_batch_size)
@@ -184,6 +209,22 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
         }
 
     # ---------------------------------------------------------------------
+    # Embedding dimension (for framework adapters that need it)
+    # ---------------------------------------------------------------------
+    def get_embedding_dimension(self) -> int:
+        """
+        Return the default embedding dimension for this mock adapter.
+        
+        Frameworks like LlamaIndex may require this method to determine
+        the dimension before embedding.
+        """
+        # Return dimension for the first supported model, or 768 as default
+        if self.supported_models:
+            first_model = self.supported_models[0]
+            return self.dimensions_by_model.get(first_model, 768)
+        return 768
+
+    # ---------------------------------------------------------------------
     # Single embed
     # ---------------------------------------------------------------------
     async def _do_embed(
@@ -200,8 +241,13 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
         await self._sleep_random()
 
         dim = self._dimensions_for(spec.model)
-        rng = self._rng_for(spec.model, spec.text)
-        vec = self._make_vector(dim, rng)
+        
+        # Handle empty strings by returning a zero vector
+        if not spec.text or not spec.text.strip():
+            vec = [0.0] * dim
+        else:
+            rng = self._rng_for(spec.model, spec.text)
+            vec = self._make_vector(dim, rng)
 
         if self.normalizes_at_source and spec.normalize:
             vec = self._normalize(vec)
@@ -222,6 +268,37 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
         )
 
     # ---------------------------------------------------------------------
+    # Embed single — override to handle empty model strings
+    # ---------------------------------------------------------------------
+    async def embed(
+        self,
+        spec: EmbedSpec,
+        *,
+        ctx: Optional[EmbeddingContext] = None,
+    ) -> Union[EmbedResult, AsyncIterator[EmbedChunk]]:
+        """
+        Override the base to handle empty model strings by using the first
+        supported model, matching the behavior in embed_batch.
+        
+        Framework adapters may pass empty models as a sentinel for "use default".
+        """
+        # Handle empty string model as "use first supported model"
+        if not spec.model:
+            caps = await self._do_capabilities()
+            effective_model = caps.supported_models[0] if caps.supported_models else ""
+            # Create a new spec with the effective model
+            spec = EmbedSpec(
+                text=spec.text,
+                model=effective_model,
+                normalize=spec.normalize,
+                truncate=spec.truncate,
+                stream=spec.stream,
+            )
+        
+        # Now call the base implementation with a non-empty model
+        return await super().embed(spec, ctx=ctx)
+
+    # ---------------------------------------------------------------------
     # Batch embed — public override to ensure fallback-per-item validation
     # ---------------------------------------------------------------------
     async def embed_batch(
@@ -240,7 +317,11 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
         async def _run() -> BatchEmbedResult:
             # Core request validation (model & batch size), but **no per-item empty check here**
             caps = await self._do_capabilities()
-            if spec.model not in caps.supported_models:
+            
+            # Handle empty model as "use first supported model" - framework adapters may pass empty string
+            effective_model = spec.model if spec.model else (caps.supported_models[0] if caps.supported_models else "")
+            
+            if effective_model and effective_model not in caps.supported_models:
                 raise ModelNotAvailable(f"Model '{spec.model}' is not supported")
 
             if caps.max_batch_size and len(spec.texts) > caps.max_batch_size:
@@ -264,7 +345,7 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
 
             eff_spec = BatchEmbedSpec(
                 texts=eff_texts,
-                model=spec.model,
+                model=effective_model,
                 truncate=spec.truncate,
                 normalize=spec.normalize,
             )
@@ -341,9 +422,20 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
 
         for idx, text in enumerate(eff_spec.texts):
             try:
-                # Validate per item here so empty strings become item failures.
-                if not isinstance(text, str) or not text.strip():
-                    raise BadRequest("text must be a non-empty string")
+                # Validate type, but allow empty strings (return zero vector)
+                if not isinstance(text, str):
+                    raise BadRequest("text must be a string")
+
+                # Handle empty strings by returning a zero vector
+                if not text.strip():
+                    dim = self.dimensions_by_model.get(eff_spec.model, 768)
+                    embeddings.append(
+                        EmbeddingVector(
+                            vector=[0.0] * dim,
+                            text_index=idx,
+                        )
+                    )
+                    continue
 
                 single_spec = EmbedSpec(
                     text=text,
@@ -423,9 +515,26 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
             try:
                 self._maybe_fail(op="embed_batch:item", ctx=ctx, text=text, per_item=True)
 
-                # If collecting failures natively, treat empty text as per-item BadRequest here too.
-                if self.collect_failures_in_native_batch and (not isinstance(text, str) or not text.strip()):
-                    raise BadRequest("text must be a non-empty string")
+                # Validate type, but allow empty strings (return zero vector)
+                if not isinstance(text, str):
+                    if self.collect_failures_in_native_batch:
+                        raise BadRequest("text must be a string")
+                    else:
+                        raise BadRequest("text must be a string")
+
+                # Handle empty strings by returning a zero vector
+                if not text.strip():
+                    vec = [0.0] * dim
+                    embeddings.append(
+                        EmbeddingVector(
+                            vector=vec,
+                            text=text,
+                            model=spec.model,
+                            dimensions=len(vec),
+                            index=i,
+                        )
+                    )
+                    continue
 
                 rng = self._rng_for(spec.model, text)
                 vec = self._make_vector(dim, rng)

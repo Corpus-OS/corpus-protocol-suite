@@ -81,8 +81,14 @@ except Exception:  # noqa: BLE001
 # ---------------------------------------------------------------------------
 
 try:
-    from llama_index.core.embeddings import BaseEmbedding, DEFAULT_EMBED_BATCH_SIZE
+    from llama_index.core.embeddings import BaseEmbedding
     from llama_index.core.callbacks import CallbackManager
+
+    # DEFAULT_EMBED_BATCH_SIZE was removed in newer versions of LlamaIndex
+    try:
+        from llama_index.core.embeddings import DEFAULT_EMBED_BATCH_SIZE
+    except ImportError:
+        DEFAULT_EMBED_BATCH_SIZE = 512  # Default value for newer versions
 
     LLAMAINDEX_AVAILABLE = True
 except ImportError:  # pragma: no cover - only used when LlamaIndex isn't installed
@@ -301,6 +307,9 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
     - Concrete `EmbeddingProtocolV1` adapter implementations.
     """
 
+    # Configure pydantic to allow extra fields (for newer LlamaIndex versions using pydantic v2)
+    model_config = {"extra": "allow", "arbitrary_types_allowed": True}
+
     def __init__(
         self,
         corpus_adapter: EmbeddingProtocolV1,
@@ -328,6 +337,16 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         if embed_batch_size < 1:
             raise ValueError("embed_batch_size must be positive")
 
+        # Initialize BaseEmbedding with LlamaIndex expected parameters FIRST
+        # This sets up pydantic's __pydantic_extra__ dict for extra fields
+        super().__init__(
+            model_name=model_name,
+            embed_batch_size=embed_batch_size,
+            callback_manager=callback_manager,
+            **kwargs,
+        )
+
+        # Now set our custom attributes after pydantic initialization
         self.corpus_adapter = corpus_adapter
         self._model_name = model_name
         self.batch_config = batch_config
@@ -345,14 +364,6 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
                 "`get_embedding_dimension()` on the corpus_adapter or pass "
                 "`embedding_dimension=...` to CorpusLlamaIndexEmbeddings.",
             )
-
-        # Initialize BaseEmbedding with LlamaIndex expected parameters
-        super().__init__(
-            model_name=self._model_name,
-            embed_batch_size=self._embed_batch_size,
-            callback_manager=callback_manager,
-            **kwargs,
-        )
 
         logger.info(
             "CorpusLlamaIndexEmbeddings initialized with model_name=%s, "
@@ -563,6 +574,10 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
             - adapter.get_embedding_dimension(), or
             - embedding_dimension override passed at init.
         """
+        # Explicit override takes precedence
+        if self._embedding_dimension_override is not None:
+            return int(self._embedding_dimension_override)
+        
         if hasattr(self.corpus_adapter, "get_embedding_dimension"):
             try:
                 return int(self.corpus_adapter.get_embedding_dimension())
@@ -570,12 +585,7 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
                 logger.debug(
                     "Failed to get embedding dimension from adapter: %s", e
                 )
-                if self._embedding_dimension_override is not None:
-                    return int(self._embedding_dimension_override)
                 raise
-
-        if self._embedding_dimension_override is not None:
-            return int(self._embedding_dimension_override)
 
         # Should be unreachable due to __init__ check, but keep a hard failure
         raise RuntimeError(

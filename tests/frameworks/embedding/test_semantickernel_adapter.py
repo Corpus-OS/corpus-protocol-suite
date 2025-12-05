@@ -259,6 +259,9 @@ def test_error_context_includes_semantickernel_context(
     class FailingAdapter:
         def embed(self, *args: Any, **kwargs: Any) -> Any:
             raise RuntimeError("test error from SK adapter")
+        
+        async def embed_batch(self, *args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("test error from SK adapter")
 
     embeddings = CorpusSemanticKernelEmbeddings(
         corpus_adapter=FailingAdapter(),

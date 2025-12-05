@@ -196,6 +196,9 @@ def test_error_context_includes_autogen_context(
     class FailingAdapter:
         def embed(self, *args: Any, **kwargs: Any) -> Any:
             raise RuntimeError("test error from autogen adapter")
+        
+        async def embed_batch(self, *args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("test error from autogen adapter")
 
     embeddings = CorpusAutoGenEmbeddings(corpus_adapter=FailingAdapter())
 
@@ -448,6 +451,14 @@ async def test_context_manager_closes_underlying_adapter() -> None:
 
         def embed(self, texts: Sequence[str], **_: Any) -> list[list[float]]:
             return [[0.0] * 2 for _ in texts]
+        
+        async def embed_batch(self, spec: Any, **_: Any) -> Any:
+            from corpus_sdk.embedding.embedding_base import BatchEmbedResult, EmbeddingVector
+            return BatchEmbedResult(
+                embeddings=[EmbeddingVector(vector=[0.0] * 2, text=t, model="test", dimensions=2) for t in spec.texts],
+                model="test",
+                total_texts=len(spec.texts)
+            )
 
         def close(self) -> None:
             self.closed = True

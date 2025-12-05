@@ -345,7 +345,9 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         truncation, casing, encoding, etc.
     """
 
-    corpus_adapter: EmbeddingProtocolV1
+    # Use Any for corpus_adapter to allow duck-typed Protocol implementations
+    # The validator will check for the required 'embed' method
+    corpus_adapter: Any
     model: Optional[str] = None
     framework_version: Optional[str] = None
     batch_config: Optional[BatchConfig] = None
@@ -357,9 +359,9 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
     # Private attribute for caching the translator instance
     _translator_cache: Optional[EmbeddingTranslator] = PrivateAttr(default=None)
 
-    @field_validator("corpus_adapter")
+    @field_validator("corpus_adapter", mode="before")
     @classmethod
-    def validate_corpus_adapter(cls, v: EmbeddingProtocolV1) -> EmbeddingProtocolV1:
+    def validate_corpus_adapter(cls, v: Any) -> Any:
         """
         Validate that corpus_adapter implements the required embedding protocol.
 
@@ -501,7 +503,8 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
             framework_ctx["model"] = effective_model
 
         # Add LangChain-specific context for observability
-        if config:
+        # Only access config if it's a Mapping to avoid AttributeError on invalid types
+        if config and isinstance(config, Mapping):
             framework_ctx.update(
                 {
                     "tags": config.get("tags"),
@@ -639,7 +642,7 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         logger.debug(
             "Async embedding %d documents for LangChain run: %s",
             len(texts),
-            config.get("run_id", "unknown") if config else "unknown",
+            config.get("run_id", "unknown") if (config and isinstance(config, Mapping)) else "unknown",
         )
 
         translated = await self._translator.arun_embed(
@@ -680,7 +683,7 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
 
         logger.debug(
             "Async embedding query for LangChain run: %s",
-            config.get("run_id", "unknown") if config else "unknown",
+            config.get("run_id", "unknown") if (config and isinstance(config, Mapping)) else "unknown",
         )
 
         translated = await self._translator.arun_embed(
@@ -721,7 +724,7 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         logger.debug(
             "Sync embedding %d documents for LangChain run: %s",
             len(texts),
-            config.get("run_name", "unknown") if config else "unknown",
+            config.get("run_name", "unknown") if (config and isinstance(config, Mapping)) else "unknown",
         )
 
         translated = self._translator.embed(
@@ -755,7 +758,7 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
 
         logger.debug(
             "Sync embedding query for LangChain run: %s",
-            config.get("run_name", "unknown") if config else "unknown",
+            config.get("run_name", "unknown") if (config and isinstance(config, Mapping)) else "unknown",
         )
 
         translated = self._translator.embed(
@@ -764,6 +767,124 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
             framework_ctx=framework_ctx,
         )
         return self._coerce_embedding_vector(translated)
+
+    # ------------------------------------------------------------------ #
+    # Health / capabilities passthrough
+    # ------------------------------------------------------------------ #
+
+    def capabilities(self) -> Mapping[str, Any]:
+        """
+        Best-effort capabilities passthrough to the underlying adapter (sync).
+        """
+        import asyncio
+        import dataclasses
+        import inspect
+        
+        if hasattr(self.corpus_adapter, "capabilities"):
+            caps_method = self.corpus_adapter.capabilities
+            # Check if it's a coroutine function (async method)
+            if inspect.iscoroutinefunction(caps_method):
+                # Run the async method in a new event loop
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        return {}
+                except RuntimeError:
+                    pass
+                result = asyncio.run(caps_method())
+                # Convert dataclass to dict if needed
+                if dataclasses.is_dataclass(result):
+                    return dataclasses.asdict(result)  # type: ignore[return-value]
+                return result  # type: ignore[no-any-return]
+            else:
+                result = caps_method()
+                # Convert dataclass to dict if needed
+                if dataclasses.is_dataclass(result):
+                    return dataclasses.asdict(result)  # type: ignore[return-value]
+                return result  # type: ignore[no-any-return]
+        return {}
+
+    async def acapabilities(self) -> Mapping[str, Any]:
+        """
+        Best-effort capabilities passthrough to the underlying adapter (async).
+        """
+        import asyncio
+        import dataclasses
+        import inspect
+        
+        if hasattr(self.corpus_adapter, "acapabilities"):
+            result = await self.corpus_adapter.acapabilities()
+            if dataclasses.is_dataclass(result):
+                return dataclasses.asdict(result)  # type: ignore[return-value]
+            return result  # type: ignore[no-any-return]
+        if hasattr(self.corpus_adapter, "capabilities"):
+            caps_method = self.corpus_adapter.capabilities
+            # Check if it's async (coroutine function)
+            if inspect.iscoroutinefunction(caps_method):
+                result = await caps_method()
+            else:
+                result = await asyncio.to_thread(caps_method)
+            if dataclasses.is_dataclass(result):
+                return dataclasses.asdict(result)  # type: ignore[return-value]
+            return result  # type: ignore[no-any-return]
+        return {}
+
+    def health(self) -> Mapping[str, Any]:
+        """
+        Best-effort health passthrough to the underlying adapter (sync).
+        """
+        import asyncio
+        import dataclasses
+        import inspect
+        
+        if hasattr(self.corpus_adapter, "health"):
+            health_method = self.corpus_adapter.health
+            # Check if it's a coroutine function (async method)
+            if inspect.iscoroutinefunction(health_method):
+                # Run the async method in a new event loop
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        return {}
+                except RuntimeError:
+                    pass
+                result = asyncio.run(health_method())
+                # Convert dataclass to dict if needed
+                if dataclasses.is_dataclass(result):
+                    return dataclasses.asdict(result)  # type: ignore[return-value]
+                return result  # type: ignore[no-any-return]
+            else:
+                result = health_method()
+                # Convert dataclass to dict if needed
+                if dataclasses.is_dataclass(result):
+                    return dataclasses.asdict(result)  # type: ignore[return-value]
+                return result  # type: ignore[no-any-return]
+        return {}
+
+    async def ahealth(self) -> Mapping[str, Any]:
+        """
+        Best-effort health passthrough to the underlying adapter (async).
+        """
+        import asyncio
+        import dataclasses
+        import inspect
+        
+        if hasattr(self.corpus_adapter, "ahealth"):
+            result = await self.corpus_adapter.ahealth()
+            if dataclasses.is_dataclass(result):
+                return dataclasses.asdict(result)  # type: ignore[return-value]
+            return result  # type: ignore[no-any-return]
+        if hasattr(self.corpus_adapter, "health"):
+            health_method = self.corpus_adapter.health
+            # Check if it's async (coroutine function)
+            if inspect.iscoroutinefunction(health_method):
+                result = await health_method()
+            else:
+                result = await asyncio.to_thread(health_method)
+            if dataclasses.is_dataclass(result):
+                return dataclasses.asdict(result)  # type: ignore[return-value]
+            return result  # type: ignore[no-any-return]
+        return {}
 
 
 # ------------------------------------------------------------------ #

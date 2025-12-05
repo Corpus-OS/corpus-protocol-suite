@@ -198,6 +198,9 @@ def test_error_context_includes_crewai_context(
     class FailingAdapter:
         def embed(self, *args: Any, **kwargs: Any) -> Any:
             raise RuntimeError("test error from crewai adapter")
+        
+        async def embed_batch(self, *args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("test error from crewai adapter")
 
     embeddings = CorpusCrewAIEmbeddings(corpus_adapter=FailingAdapter())
 

@@ -59,6 +59,7 @@ testpaths = ["tests"]
 addopts = "-v --strict-markers --strict-config"
 markers = [
     "skip_if_not_supported: skip tests if feature is not supported by the adapter",
+    "asyncio: mark test as an asyncio test",
 ]
 
 # --- Formatting/Linting/Typing (recommended, optional) ---

@@ -377,7 +377,31 @@ class CorpusCrewAIEmbeddings:
         Sync wrapper around underlying adapter capabilities, if available.
         """
         if hasattr(self.corpus_adapter, "capabilities"):
-            return self.corpus_adapter.capabilities()  # type: ignore[no-any-return]
+            caps_method = self.corpus_adapter.capabilities
+            # Check if it's a coroutine function (async method)
+            import inspect
+            if inspect.iscoroutinefunction(caps_method):
+                # Run the async method in a new event loop
+                import asyncio
+                import dataclasses
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        return {}
+                except RuntimeError:
+                    pass
+                result = asyncio.run(caps_method())
+                # Convert dataclass to dict if needed
+                if dataclasses.is_dataclass(result):
+                    return dataclasses.asdict(result)  # type: ignore[return-value]
+                return result  # type: ignore[no-any-return]
+            else:
+                result = caps_method()
+                # Convert dataclass to dict if needed
+                import dataclasses
+                if dataclasses.is_dataclass(result):
+                    return dataclasses.asdict(result)  # type: ignore[return-value]
+                return result  # type: ignore[no-any-return]
         raise NotImplementedError(
             "Underlying embedding adapter does not implement capabilities()",
         )
@@ -387,11 +411,24 @@ class CorpusCrewAIEmbeddings:
         """
         Async wrapper around underlying adapter capabilities, if available.
         """
+        import dataclasses
+        import inspect
         if hasattr(self.corpus_adapter, "acapabilities"):
-            return await self.corpus_adapter.acapabilities()  # type: ignore[no-any-return]
+            result = await self.corpus_adapter.acapabilities()
+            if dataclasses.is_dataclass(result):
+                return dataclasses.asdict(result)  # type: ignore[return-value]
+            return result  # type: ignore[no-any-return]
         if hasattr(self.corpus_adapter, "capabilities"):
-            # Fallback to sync in async context.
-            return self.corpus_adapter.capabilities()  # type: ignore[no-any-return]
+            caps_method = self.corpus_adapter.capabilities
+            # Check if it's async (coroutine function)
+            if inspect.iscoroutinefunction(caps_method):
+                result = await caps_method()
+            else:
+                import asyncio
+                result = await asyncio.to_thread(caps_method)
+            if dataclasses.is_dataclass(result):
+                return dataclasses.asdict(result)  # type: ignore[return-value]
+            return result  # type: ignore[no-any-return]
         raise NotImplementedError(
             "Underlying embedding adapter does not implement capabilities()/acapabilities()",
         )
@@ -402,7 +439,31 @@ class CorpusCrewAIEmbeddings:
         Sync wrapper around underlying adapter health, if available.
         """
         if hasattr(self.corpus_adapter, "health"):
-            return self.corpus_adapter.health()  # type: ignore[no-any-return]
+            health_method = self.corpus_adapter.health
+            # Check if it's a coroutine function (async method)
+            import inspect
+            if inspect.iscoroutinefunction(health_method):
+                # Run the async method in a new event loop
+                import asyncio
+                import dataclasses
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        return {}
+                except RuntimeError:
+                    pass
+                result = asyncio.run(health_method())
+                # Convert dataclass to dict if needed
+                if dataclasses.is_dataclass(result):
+                    return dataclasses.asdict(result)  # type: ignore[return-value]
+                return result  # type: ignore[no-any-return]
+            else:
+                result = health_method()
+                # Convert dataclass to dict if needed
+                import dataclasses
+                if dataclasses.is_dataclass(result):
+                    return dataclasses.asdict(result)  # type: ignore[return-value]
+                return result  # type: ignore[no-any-return]
         raise NotImplementedError(
             "Underlying embedding adapter does not implement health()",
         )
@@ -412,11 +473,24 @@ class CorpusCrewAIEmbeddings:
         """
         Async wrapper around underlying adapter health, if available.
         """
+        import dataclasses
+        import inspect
         if hasattr(self.corpus_adapter, "ahealth"):
-            return await self.corpus_adapter.ahealth()  # type: ignore[no-any-return]
+            result = await self.corpus_adapter.ahealth()
+            if dataclasses.is_dataclass(result):
+                return dataclasses.asdict(result)  # type: ignore[return-value]
+            return result  # type: ignore[no-any-return]
         if hasattr(self.corpus_adapter, "health"):
-            # Fallback to sync in async context.
-            return self.corpus_adapter.health()  # type: ignore[no-any-return]
+            health_method = self.corpus_adapter.health
+            # Check if it's async (coroutine function)
+            if inspect.iscoroutinefunction(health_method):
+                result = await health_method()
+            else:
+                import asyncio
+                result = await asyncio.to_thread(health_method)
+            if dataclasses.is_dataclass(result):
+                return dataclasses.asdict(result)  # type: ignore[return-value]
+            return result  # type: ignore[no-any-return]
         raise NotImplementedError(
             "Underlying embedding adapter does not implement health()/ahealth()",
         )
@@ -539,7 +613,7 @@ class CorpusCrewAIEmbeddings:
             framework_ctx["model"] = effective_model
 
         # Add rich CrewAI-specific context for observability and optimization
-        if crewai_context:
+        if crewai_context and isinstance(crewai_context, Mapping):
             framework_ctx.update(
                 {
                     "agent_role": crewai_context.get("agent_role"),
@@ -649,8 +723,8 @@ class CorpusCrewAIEmbeddings:
         logger.debug(
             "Embedding %d documents for CrewAI agent: %s, task: %s",
             len(texts_list),
-            crewai_context.get("agent_role", "unknown") if crewai_context else "unknown",
-            crewai_context.get("task_id", "unknown") if crewai_context else "unknown",
+            crewai_context.get("agent_role", "unknown") if (crewai_context and isinstance(crewai_context, Mapping)) else "unknown",
+            crewai_context.get("task_id", "unknown") if (crewai_context and isinstance(crewai_context, Mapping)) else "unknown",
         )
 
         translated = self._translator.embed(
@@ -682,7 +756,7 @@ class CorpusCrewAIEmbeddings:
 
         logger.debug(
             "Embedding query for CrewAI agent: %s",
-            crewai_context.get("agent_role", "unknown") if crewai_context else "unknown",
+            crewai_context.get("agent_role", "unknown") if (crewai_context and isinstance(crewai_context, Mapping)) else "unknown",
         )
 
         translated = self._translator.embed(
@@ -728,7 +802,7 @@ class CorpusCrewAIEmbeddings:
         logger.debug(
             "Async embedding %d documents for CrewAI task: %s",
             len(texts_list),
-            crewai_context.get("task_id", "unknown") if crewai_context else "unknown",
+            crewai_context.get("task_id", "unknown") if (crewai_context and isinstance(crewai_context, Mapping)) else "unknown",
         )
 
         translated = await self._translator.arun_embed(

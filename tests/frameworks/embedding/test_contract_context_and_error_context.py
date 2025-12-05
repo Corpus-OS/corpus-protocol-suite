@@ -75,6 +75,9 @@ def failing_corpus_adapter() -> Any:
     class FailingEmbeddingAdapter:
         def embed(self, *args: Any, **kwargs: Any) -> Any:
             raise RuntimeError("intentional failure from failing adapter")
+        
+        async def embed_batch(self, *args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("intentional failure from failing adapter")
 
     return FailingEmbeddingAdapter()
 

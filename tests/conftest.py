@@ -1082,6 +1082,30 @@ def adapter():
         ) from exc
 
 
+@pytest.fixture(autouse=True)
+def reset_async_bridge_circuit_breaker():
+    """
+    Reset AsyncBridge circuit breaker before each test.
+    
+    This prevents cascading test failures caused by the circuit breaker
+    remaining open from previous test failures. The circuit breaker is
+    a class-level singleton in AsyncBridge, so it persists across tests.
+    """
+    from corpus_sdk.core.async_bridge import AsyncBridge
+    
+    # Reset the circuit breaker state before each test
+    with AsyncBridge._circuit_breaker._lock:
+        AsyncBridge._circuit_breaker.failures = 0
+        AsyncBridge._circuit_breaker.last_failure_time = None
+    
+    yield
+    
+    # Optionally reset after test as well for cleanup
+    with AsyncBridge._circuit_breaker._lock:
+        AsyncBridge._circuit_breaker.failures = 0
+        AsyncBridge._circuit_breaker.last_failure_time = None
+
+
 # ---------------------------------------------------------------------------
 # Performance-optimized test categorization
 # ---------------------------------------------------------------------------

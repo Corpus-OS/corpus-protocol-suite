@@ -23,6 +23,7 @@ Resilience (retries, caching, rate limiting, etc.) is expected to be provided by
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from functools import cached_property, wraps
 from typing import (
@@ -509,7 +510,7 @@ class CorpusAutoGenEmbeddings:
         if effective_model:
             base["model"] = effective_model
 
-        if autogen_context:
+        if autogen_context and isinstance(autogen_context, Mapping):
             if "agent_name" in autogen_context:
                 base["agent_name"] = autogen_context["agent_name"]
             if "conversation_id" in autogen_context:
@@ -582,7 +583,32 @@ class CorpusAutoGenEmbeddings:
         Best-effort capabilities passthrough to the underlying adapter (sync).
         """
         if hasattr(self.corpus_adapter, "capabilities"):
-            return self.corpus_adapter.capabilities()  # type: ignore[no-any-return]
+            caps_method = self.corpus_adapter.capabilities
+            # Check if it's a coroutine function (async method)
+            if inspect.iscoroutinefunction(caps_method):
+                # Run the async method in a new event loop
+                import asyncio
+                import dataclasses
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        # If there's already a running loop, we can't use run()
+                        # This shouldn't happen in sync context, so return empty
+                        return {}
+                except RuntimeError:
+                    pass
+                result = asyncio.run(caps_method())
+                # Convert dataclass to dict if needed
+                if dataclasses.is_dataclass(result):
+                    return dataclasses.asdict(result)  # type: ignore[return-value]
+                return result  # type: ignore[no-any-return]
+            else:
+                result = caps_method()
+                # Convert dataclass to dict if needed
+                import dataclasses
+                if dataclasses.is_dataclass(result):
+                    return dataclasses.asdict(result)  # type: ignore[return-value]
+                return result  # type: ignore[no-any-return]
         return {}
 
     @with_async_embedding_error_context("capabilities_async")
@@ -590,10 +616,22 @@ class CorpusAutoGenEmbeddings:
         """
         Best-effort capabilities passthrough to the underlying adapter (async).
         """
+        import dataclasses
         if hasattr(self.corpus_adapter, "acapabilities"):
-            return await self.corpus_adapter.acapabilities()  # type: ignore[no-any-return]
+            result = await self.corpus_adapter.acapabilities()
+            if dataclasses.is_dataclass(result):
+                return dataclasses.asdict(result)  # type: ignore[return-value]
+            return result  # type: ignore[no-any-return]
         if hasattr(self.corpus_adapter, "capabilities"):
-            return await asyncio.to_thread(self.corpus_adapter.capabilities)  # type: ignore[arg-type]
+            caps_method = self.corpus_adapter.capabilities
+            # Check if it's async (coroutine function)
+            if inspect.iscoroutinefunction(caps_method):
+                result = await caps_method()
+            else:
+                result = await asyncio.to_thread(caps_method)
+            if dataclasses.is_dataclass(result):
+                return dataclasses.asdict(result)  # type: ignore[return-value]
+            return result  # type: ignore[no-any-return]
         return {}
 
     @with_embedding_error_context("health")
@@ -602,7 +640,32 @@ class CorpusAutoGenEmbeddings:
         Best-effort health passthrough to the underlying adapter (sync).
         """
         if hasattr(self.corpus_adapter, "health"):
-            return self.corpus_adapter.health()  # type: ignore[no-any-return]
+            health_method = self.corpus_adapter.health
+            # Check if it's a coroutine function (async method)
+            if inspect.iscoroutinefunction(health_method):
+                # Run the async method in a new event loop
+                import asyncio
+                import dataclasses
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        # If there's already a running loop, we can't use run()
+                        # This shouldn't happen in sync context, so return empty
+                        return {}
+                except RuntimeError:
+                    pass
+                result = asyncio.run(health_method())
+                # Convert dataclass to dict if needed
+                if dataclasses.is_dataclass(result):
+                    return dataclasses.asdict(result)  # type: ignore[return-value]
+                return result  # type: ignore[no-any-return]
+            else:
+                result = health_method()
+                # Convert dataclass to dict if needed
+                import dataclasses
+                if dataclasses.is_dataclass(result):
+                    return dataclasses.asdict(result)  # type: ignore[return-value]
+                return result  # type: ignore[no-any-return]
         return {}
 
     @with_async_embedding_error_context("health_async")
@@ -610,10 +673,22 @@ class CorpusAutoGenEmbeddings:
         """
         Best-effort health passthrough to the underlying adapter (async).
         """
+        import dataclasses
         if hasattr(self.corpus_adapter, "ahealth"):
-            return await self.corpus_adapter.ahealth()  # type: ignore[no-any-return]
+            result = await self.corpus_adapter.ahealth()
+            if dataclasses.is_dataclass(result):
+                return dataclasses.asdict(result)  # type: ignore[return-value]
+            return result  # type: ignore[no-any-return]
         if hasattr(self.corpus_adapter, "health"):
-            return await asyncio.to_thread(self.corpus_adapter.health)  # type: ignore[arg-type]
+            health_method = self.corpus_adapter.health
+            # Check if it's async (coroutine function)
+            if inspect.iscoroutinefunction(health_method):
+                result = await health_method()
+            else:
+                result = await asyncio.to_thread(health_method)
+            if dataclasses.is_dataclass(result):
+                return dataclasses.asdict(result)  # type: ignore[return-value]
+            return result  # type: ignore[no-any-return]
         return {}
 
     # ------------------------------------------------------------------ #

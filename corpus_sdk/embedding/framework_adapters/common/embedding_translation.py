@@ -220,7 +220,7 @@ class TextNormalizationConfig:
     """
 
     normalize_whitespace: bool = True
-    remove_empty: bool = True
+    remove_empty: bool = False  # Framework adapters should handle empty strings gracefully
     max_length: Optional[int] = None
     truncate_strategy: str = "end"
     encoding: str = "utf-8"
@@ -636,11 +636,12 @@ class DefaultEmbeddingFrameworkTranslator:
                 code="BAD_BATCH",
             )
 
-        if not texts:
-            raise BadRequest(
-                "texts must contain at least one item",
-                code="BAD_BATCH_EMPTY",
-            )
+        # Allow empty batches - they should return empty results, not error
+        # if not texts:
+        #     raise BadRequest(
+        #         "texts must contain at least one item",
+        #         code="BAD_BATCH_EMPTY",
+        #     )
 
         return [str(t) for t in texts]
 
@@ -653,16 +654,20 @@ class DefaultEmbeddingFrameworkTranslator:
     ) -> BatchEmbedSpec:
         model = self.preferred_model(op_ctx=op_ctx, framework_ctx=framework_ctx)
         
-        # Ensure model is not None when passed to BatchEmbedSpec
-        fallback_model = model or ""
+        # Use empty string as fallback - adapter will use its default model
+        # Empty string is a valid sentinel for "use default model"
+        fallback_model = model if model is not None else ""
 
         texts = self._extract_text_list(raw_batch)
         normalized = self._text_normalizer.normalize_batch(texts)
-        if not normalized:
-            raise BadRequest(
-                "All texts were filtered out during normalization",
-                code="BAD_BATCH_ALL_EMPTY",
-            )
+        
+        # Allow empty batches after normalization filtering
+        # Don't raise error if all texts filtered out - just return empty
+        # if not normalized:
+        #     raise BadRequest(
+        #         "All texts were filtered out during normalization",
+        #         code="BAD_BATCH_ALL_EMPTY",
+        #     )
 
         truncate = True
         normalize_vec = False
@@ -1298,6 +1303,7 @@ def create_embedding_translator(
     translator: Optional[EmbeddingFrameworkTranslator] = None,
     batch_config: Optional[BatchConfig] = None,
     text_normalization_config: Optional[TextNormalizationConfig] = None,
+    framework_version: Optional[str] = None,
 ) -> EmbeddingTranslator:
     """
     Convenience helper to construct an EmbeddingTranslator for a given framework.
@@ -1307,6 +1313,14 @@ def create_embedding_translator(
         - Else, if a factory is registered for `framework`, it is used.
         - Else, DefaultEmbeddingFrameworkTranslator is used with optional
           text normalization.
+    
+    Args:
+        adapter: The embedding adapter implementing EmbeddingProtocolV1.
+        framework: Framework identifier (e.g., "crewai", "langchain").
+        translator: Optional pre-configured translator instance.
+        batch_config: Optional batch configuration.
+        text_normalization_config: Optional text normalization configuration.
+        framework_version: Optional framework version string (stored but not currently used).
     """
     if translator is None:
         factory = get_embedding_translator_factory(framework)

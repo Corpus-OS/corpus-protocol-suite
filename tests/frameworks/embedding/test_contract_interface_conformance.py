@@ -316,13 +316,87 @@ def test_embedding_dimension_when_required(
     module = importlib.import_module(framework_descriptor.adapter_module)
     adapter_cls = getattr(module, framework_descriptor.adapter_class)
 
-    # Should fail without embedding_dimension
-    with pytest.raises((TypeError, ValueError)):
-        adapter_cls(corpus_adapter=adapter)
+    # Create a minimal adapter WITHOUT get_embedding_dimension() to test enforcement
+    from corpus_sdk.embedding.embedding_base import BatchEmbedResult, EmbeddingVector
+    
+    class MinimalAdapter:
+        def embed(self, *args: Any, **kwargs: Any) -> list[list[float]]:
+            # Return a batch-like result
+            batch_spec = args[0] if args else kwargs.get('batch_spec', None)
+            if batch_spec and hasattr(batch_spec, 'texts'):
+                return [[0.0] * 8] * len(batch_spec.texts)
+            return [[0.0] * 8]
+        
+        async def embed_batch(self, *args: Any, **kwargs: Any) -> BatchEmbedResult:
+            # Return a BatchEmbedResult with proper EmbeddingVector objects
+            batch_spec = args[0] if args else kwargs.get('batch_spec', None)
+            if batch_spec and hasattr(batch_spec, 'texts'):
+                embeddings = [
+                    EmbeddingVector(
+                        vector=[0.0] * 8,
+                        text=text,
+                        model="minimal-test-model",
+                        dimensions=8,
+                        index=i
+                    )
+                    for i, text in enumerate(batch_spec.texts)
+                ]
+                return BatchEmbedResult(
+                    embeddings=embeddings,
+                    model="minimal-test-model",
+                    total_texts=len(batch_spec.texts)
+                )
+            return BatchEmbedResult(
+                embeddings=[EmbeddingVector(vector=[0.0] * 8, text="", model="minimal-test-model", dimensions=8)],
+                model="minimal-test-model",
+                total_texts=1
+            )
+        
+        async def aembed(self, *args: Any, **kwargs: Any) -> list[list[float]]:
+            # Return a batch-like result
+            batch_spec = args[0] if args else kwargs.get('batch_spec', None)
+            if batch_spec and hasattr(batch_spec, 'texts'):
+                return [[0.0] * 8] * len(batch_spec.texts)
+            return [[0.0] * 8]
+        
+        async def aembed_batch(self, *args: Any, **kwargs: Any) -> BatchEmbedResult:
+            # Return a BatchEmbedResult with proper EmbeddingVector objects
+            batch_spec = args[0] if args else kwargs.get('batch_spec', None)
+            if batch_spec and hasattr(batch_spec, 'texts'):
+                embeddings = [
+                    EmbeddingVector(
+                        vector=[0.0] * 8,
+                        text=text,
+                        model="minimal-test-model",
+                        dimensions=8,
+                        index=i
+                    )
+                    for i, text in enumerate(batch_spec.texts)
+                ]
+                return BatchEmbedResult(
+                    embeddings=embeddings,
+                    model="minimal-test-model",
+                    total_texts=len(batch_spec.texts)
+                )
+            return BatchEmbedResult(
+                embeddings=[EmbeddingVector(vector=[0.0] * 8, text="", model="minimal-test-model", dimensions=8)],
+                model="minimal-test-model",
+                total_texts=1
+            )
 
-    # Should succeed with it
-    instance = adapter_cls(corpus_adapter=adapter, embedding_dimension=8)
+    minimal_adapter = MinimalAdapter()
+
+    # Should fail without embedding_dimension when adapter lacks get_embedding_dimension()
+    with pytest.raises((TypeError, ValueError)):
+        adapter_cls(corpus_adapter=minimal_adapter)
+
+    # Should succeed with embedding_dimension
+    instance = adapter_cls(corpus_adapter=minimal_adapter, embedding_dimension=8)
     assert instance is not None
+    
+    # Should also succeed with the regular adapter that HAS get_embedding_dimension()
+    instance2 = adapter_cls(corpus_adapter=adapter)
+    assert instance2 is not None
     
     # Verify methods work
     batch_fn = _get_method(instance, framework_descriptor.batch_method)

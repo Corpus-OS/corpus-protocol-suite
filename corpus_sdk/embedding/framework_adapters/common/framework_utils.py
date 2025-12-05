@@ -498,14 +498,15 @@ def coerce_embedding_matrix(
 
         matrix.append(vector)
 
-    if not matrix:
-        raise ValueError(
-            f"[{error_codes.empty_result}] "
-            f"{framework_label}: translator returned no valid embedding rows"
-        )
+    # Allow empty matrices for empty batch inputs
+    # if not matrix:
+    #     raise ValueError(
+    #         f"[{error_codes.empty_result}] "
+    #         f"{framework_label}: translator returned no valid embedding rows"
+    #     )
 
     # Validate dimension consistency and values
-    if validate_dimensions:
+    if validate_dimensions and matrix:  # Only validate if matrix is not empty
         _validate_dimension_consistency(
             matrix,
             framework=framework_label,

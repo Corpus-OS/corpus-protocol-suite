@@ -1751,7 +1751,8 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
 
         See EmbeddingProtocolV1.embed for full documentation.
         """
-        self._require_non_empty("text", spec.text)
+        # Allow empty strings - they should be handled gracefully by adapters
+        # self._require_non_empty("text", spec.text)
         self._require_non_empty("model", spec.model)
 
         # Handle streaming case separately (already handled in _embed_core)
@@ -1805,7 +1806,8 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
 
         eff_texts: List[str] = []
         for text in spec.texts:
-            self._require_non_empty("text", text)
+            # Allow empty strings - they should be handled gracefully by adapters
+            # self._require_non_empty("text", text)
             if caps.max_text_length:
                 new_text, _ = self._trunc.apply(
                     text,

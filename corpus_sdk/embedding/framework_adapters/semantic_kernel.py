@@ -231,7 +231,7 @@ def _extract_dynamic_context(
         texts_seq = args[0]
         dynamic_ctx["texts_count"] = len(texts_seq)
         empty_count = sum(
-            1 for text in texts_seq if not isinstance(text, str) or not text.strip(),
+            (1 for text in texts_seq if not isinstance(text, str) or not text.strip())
         )
         if empty_count > 0:
             dynamic_ctx["empty_texts_count"] = empty_count
@@ -293,6 +293,9 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
     - Concrete `EmbeddingProtocolV1` adapter implementations.
     """
 
+    # Configure pydantic to allow extra fields (for newer Semantic Kernel versions using pydantic v2)
+    model_config = {"extra": "allow", "arbitrary_types_allowed": True, "validate_assignment": True}
+
     def __init__(
         self,
         corpus_adapter: EmbeddingProtocolV1,
@@ -318,7 +321,9 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
         if sk_config is not None and not isinstance(sk_config, dict):
             raise TypeError("sk_config must be a dictionary")
 
-        super().__init__()  # EmbeddingGeneratorBase init (no-op for dummy fallback)
+        # Initialize EmbeddingGeneratorBase with required ai_model_id
+        # Use model_id if provided, otherwise default to "corpus-embedding-protocol"
+        super().__init__(ai_model_id=model_id or "corpus-embedding-protocol")
 
         self.corpus_adapter = corpus_adapter
         self.model_id = model_id
@@ -537,6 +542,10 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
         - adapter.get_embedding_dimension(), or
         - explicit embedding_dimension override passed at init.
         """
+        # Explicit override takes precedence
+        if self._embedding_dimension_override is not None:
+            return int(self._embedding_dimension_override)
+        
         if hasattr(self.corpus_adapter, "get_embedding_dimension"):
             try:
                 return int(self.corpus_adapter.get_embedding_dimension())
@@ -544,12 +553,7 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
                 logger.debug(
                     "Failed to get embedding dimension from adapter: %s", e,
                 )
-                if self._embedding_dimension_override is not None:
-                    return int(self._embedding_dimension_override)
                 raise
-
-        if self._embedding_dimension_override is not None:
-            return int(self._embedding_dimension_override)
 
         # Should be unreachable due to __init__ guard, but keep a hard failure
         raise RuntimeError(
@@ -781,7 +785,8 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
         """
         Sync embedding generation for multiple texts.
         """
-        context_dict: SemanticKernelContext = dict(sk_context or {})  # type: ignore[assignment]
+        # Tolerate invalid context types - use empty dict if not a Mapping
+        context_dict: SemanticKernelContext = dict(sk_context) if isinstance(sk_context, Mapping) else {}  # type: ignore[assignment]
         return self._embed_text_batch(
             texts,
             context_dict,
@@ -801,7 +806,8 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
         """
         Async embedding generation for multiple texts.
         """
-        context_dict: SemanticKernelContext = dict(sk_context or {})  # type: ignore[assignment]
+        # Tolerate invalid context types - use empty dict if not a Mapping
+        context_dict: SemanticKernelContext = dict(sk_context) if isinstance(sk_context, Mapping) else {}  # type: ignore[assignment]
         return await self._aembed_text_batch(
             texts,
             context_dict,
@@ -824,7 +830,7 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
         if not text or not text.strip():
             return self._handle_empty_text(text)
 
-        context_dict: SemanticKernelContext = dict(sk_context or {})  # type: ignore[assignment]
+        context_dict: SemanticKernelContext = dict(sk_context) if isinstance(sk_context, Mapping) else {}  # type: ignore[assignment]
         return self._embed_single_text(
             text,
             context_dict,
@@ -847,7 +853,7 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
         if not text or not text.strip():
             return self._handle_empty_text(text)
 
-        context_dict: SemanticKernelContext = dict(sk_context or {})  # type: ignore[assignment]
+        context_dict: SemanticKernelContext = dict(sk_context) if isinstance(sk_context, Mapping) else {}  # type: ignore[assignment]
         return await self._aembed_single_text(
             text,
             context_dict,
