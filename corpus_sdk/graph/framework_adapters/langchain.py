@@ -46,6 +46,7 @@ from functools import cached_property
 from typing import (
     Any,
     AsyncIterator,
+    Callable,
     Dict,
     Iterator,
     List,
@@ -53,7 +54,6 @@ from typing import (
     Optional,
     Protocol,
     TypeVar,
-    Callable,
 )
 
 from corpus_sdk.core.context_translation import (
@@ -62,16 +62,17 @@ from corpus_sdk.core.context_translation import (
 from corpus_sdk.core.error_context import attach_context
 from corpus_sdk.graph.framework_adapters.common.graph_translation import (
     DefaultGraphFrameworkTranslator,
+    GraphFrameworkTranslator,
     GraphTranslator,
     create_graph_translator,
 )
 from corpus_sdk.graph.framework_adapters.common.framework_utils import (
     create_graph_error_context_decorator,
     graph_capabilities_to_dict,
-    validate_graph_result_type,
-    validate_graph_query,
-    validate_upsert_nodes_spec,
     validate_batch_operations,
+    validate_graph_query,
+    validate_graph_result_type,
+    validate_upsert_nodes_spec,
 )
 from corpus_sdk.graph.graph_base import (
     BadRequest,
@@ -95,16 +96,13 @@ from corpus_sdk.graph.graph_base import (
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Optional LangChain Tool import (for CorpusLangChainGraphTool)
+# Optional LangChain Tool import (for CorpusGraphTool)
 # ---------------------------------------------------------------------------
 
 try:  # pragma: no cover - optional dependency
     from langchain.tools import BaseTool
-
-    LANGCHAIN_TOOL_AVAILABLE = True
 except ImportError:  # pragma: no cover - environments without LangChain
     BaseTool = object  # type: ignore[assignment]
-    LANGCHAIN_TOOL_AVAILABLE = False
 
 # Type variables for decorators
 T = TypeVar("T")
@@ -657,16 +655,57 @@ class CorpusLangChainGraphClient:
 
         return raw
 
-    def _framework_ctx_for_namespace(
+    def _framework_ctx(
         self,
-        namespace: Optional[str],
+        *,
+        operation: str,
+        namespace: Optional[str] = None,
     ) -> Mapping[str, Any]:
         """
-        Build a minimal framework_ctx mapping that lets the common translator
-        derive a preferred namespace when needed.
+        Build a framework_ctx mapping for GraphTranslator with basic
+        observability hints and the effective namespace.
         """
+        ctx: Dict[str, Any] = {
+            "framework": "langchain",
+            "operation": operation,
+        }
+
+        if self._framework_version is not None:
+            ctx["framework_version"] = self._framework_version
+
         effective_namespace = namespace or self._default_namespace
-        return {"namespace": effective_namespace} if effective_namespace is not None else {}
+        if effective_namespace is not None:
+            ctx["namespace"] = effective_namespace
+
+        return ctx
+
+    def _validate_upsert_edges_spec(self, spec: UpsertEdgesSpec) -> None:
+        """
+        LangChain-local validation for edge upsert specs.
+
+        Mirrors the AutoGen / CrewAI adapters:
+        - edges must not be None
+        - edges must be iterable and non-empty
+        - each edge must have an ID
+        """
+        if spec.edges is None:
+            raise BadRequest("UpsertEdgesSpec.edges must not be None")
+
+        try:
+            edges_iter = list(spec.edges)
+        except TypeError as exc:
+            raise BadRequest(
+                "UpsertEdgesSpec.edges must be an iterable of edges",
+            ) from exc
+
+        if not edges_iter:
+            raise BadRequest("UpsertEdgesSpec must contain at least one edge")
+
+        for edge in edges_iter:
+            if not getattr(edge, "id", None):
+                raise BadRequest("All edges must have an ID")
+
+        spec.edges = edges_iter  # type: ignore[assignment]
 
     # ------------------------------------------------------------------ #
     # Capabilities / schema / health
@@ -708,7 +747,7 @@ class CorpusLangChainGraphClient:
         ctx = self._build_ctx(config=config, extra_context=extra_context)
         schema = self._translator.get_schema(
             op_ctx=ctx,
-            framework_ctx={},
+            framework_ctx=self._framework_ctx(operation="get_schema"),
         )
         return validate_graph_result_type(
             schema,
@@ -732,7 +771,7 @@ class CorpusLangChainGraphClient:
         ctx = self._build_ctx(config=config, extra_context=extra_context)
         schema = await self._translator.arun_get_schema(
             op_ctx=ctx,
-            framework_ctx={},
+            framework_ctx=self._framework_ctx(operation="get_schema"),
         )
         return validate_graph_result_type(
             schema,
@@ -756,7 +795,7 @@ class CorpusLangChainGraphClient:
         ctx = self._build_ctx(config=config, extra_context=extra_context)
         health_result = self._translator.health(
             op_ctx=ctx,
-            framework_ctx={},
+            framework_ctx=self._framework_ctx(operation="health"),
         )
         return validate_graph_result_type(
             health_result,
@@ -780,7 +819,7 @@ class CorpusLangChainGraphClient:
         ctx = self._build_ctx(config=config, extra_context=extra_context)
         health_result = await self._translator.arun_health(
             op_ctx=ctx,
-            framework_ctx={},
+            framework_ctx=self._framework_ctx(operation="health"),
         )
         return validate_graph_result_type(
             health_result,
@@ -821,7 +860,10 @@ class CorpusLangChainGraphClient:
             timeout_ms=timeout_ms,
             stream=False,
         )
-        framework_ctx = self._framework_ctx_for_namespace(namespace)
+        framework_ctx = self._framework_ctx(
+            operation="query",
+            namespace=namespace,
+        )
 
         result = self._translator.query(
             raw_query,
@@ -864,7 +906,10 @@ class CorpusLangChainGraphClient:
             timeout_ms=timeout_ms,
             stream=False,
         )
-        framework_ctx = self._framework_ctx_for_namespace(namespace)
+        framework_ctx = self._framework_ctx(
+            operation="query",
+            namespace=namespace,
+        )
 
         result = await self._translator.arun_query(
             raw_query,
@@ -913,7 +958,10 @@ class CorpusLangChainGraphClient:
             timeout_ms=timeout_ms,
             stream=True,
         )
-        framework_ctx = self._framework_ctx_for_namespace(namespace)
+        framework_ctx = self._framework_ctx(
+            operation="stream_query",
+            namespace=namespace,
+        )
 
         for chunk in self._translator.query_stream(
             raw_query,
@@ -953,7 +1001,10 @@ class CorpusLangChainGraphClient:
             timeout_ms=timeout_ms,
             stream=True,
         )
-        framework_ctx = self._framework_ctx_for_namespace(namespace)
+        framework_ctx = self._framework_ctx(
+            operation="stream_query",
+            namespace=namespace,
+        )
 
         async for chunk in self._translator.arun_query_stream(
             raw_query,
@@ -989,8 +1040,9 @@ class CorpusLangChainGraphClient:
         validate_upsert_nodes_spec(spec)
 
         ctx = self._build_ctx(config=config, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(
-            getattr(spec, "namespace", None),
+        framework_ctx = self._framework_ctx(
+            operation="upsert_nodes",
+            namespace=getattr(spec, "namespace", None),
         )
 
         result = self._translator.upsert_nodes(
@@ -1019,8 +1071,9 @@ class CorpusLangChainGraphClient:
         validate_upsert_nodes_spec(spec)
 
         ctx = self._build_ctx(config=config, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(
-            getattr(spec, "namespace", None),
+        framework_ctx = self._framework_ctx(
+            operation="upsert_nodes",
+            namespace=getattr(spec, "namespace", None),
         )
 
         result = await self._translator.arun_upsert_nodes(
@@ -1046,9 +1099,12 @@ class CorpusLangChainGraphClient:
         """
         Sync wrapper for upserting edges.
         """
+        self._validate_upsert_edges_spec(spec)
+
         ctx = self._build_ctx(config=config, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(
-            getattr(spec, "namespace", None),
+        framework_ctx = self._framework_ctx(
+            operation="upsert_edges",
+            namespace=getattr(spec, "namespace", None),
         )
 
         result = self._translator.upsert_edges(
@@ -1074,9 +1130,12 @@ class CorpusLangChainGraphClient:
         """
         Async wrapper for upserting edges.
         """
+        self._validate_upsert_edges_spec(spec)
+
         ctx = self._build_ctx(config=config, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(
-            getattr(spec, "namespace", None),
+        framework_ctx = self._framework_ctx(
+            operation="upsert_edges",
+            namespace=getattr(spec, "namespace", None),
         )
 
         result = await self._translator.arun_upsert_edges(
@@ -1110,14 +1169,21 @@ class CorpusLangChainGraphClient:
         expression for the GraphTranslator.
         """
         ctx = self._build_ctx(config=config, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(
-            getattr(spec, "namespace", None),
+        framework_ctx = self._framework_ctx(
+            operation="delete_nodes",
+            namespace=getattr(spec, "namespace", None),
         )
 
         if spec.filter is not None:
             raw_filter_or_ids: Any = spec.filter
         else:
-            raw_filter_or_ids = list(spec.ids or [])
+            ids = list(spec.ids or [])
+            if not ids:
+                raise BadRequest(
+                    "DeleteNodesSpec must specify either filter or non-empty ids",
+                    code=ErrorCodes.BAD_ADAPTER_RESULT,
+                )
+            raw_filter_or_ids = ids
 
         result = self._translator.delete_nodes(
             raw_filter_or_ids,
@@ -1143,14 +1209,21 @@ class CorpusLangChainGraphClient:
         Async wrapper for deleting nodes.
         """
         ctx = self._build_ctx(config=config, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(
-            getattr(spec, "namespace", None),
+        framework_ctx = self._framework_ctx(
+            operation="delete_nodes",
+            namespace=getattr(spec, "namespace", None),
         )
 
         if spec.filter is not None:
             raw_filter_or_ids: Any = spec.filter
         else:
-            raw_filter_or_ids = list(spec.ids or [])
+            ids = list(spec.ids or [])
+            if not ids:
+                raise BadRequest(
+                    "DeleteNodesSpec must specify either filter or non-empty ids",
+                    code=ErrorCodes.BAD_ADAPTER_RESULT,
+                )
+            raw_filter_or_ids = ids
 
         result = await self._translator.arun_delete_nodes(
             raw_filter_or_ids,
@@ -1176,14 +1249,21 @@ class CorpusLangChainGraphClient:
         Sync wrapper for deleting edges.
         """
         ctx = self._build_ctx(config=config, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(
-            getattr(spec, "namespace", None),
+        framework_ctx = self._framework_ctx(
+            operation="delete_edges",
+            namespace=getattr(spec, "namespace", None),
         )
 
         if spec.filter is not None:
             raw_filter_or_ids: Any = spec.filter
         else:
-            raw_filter_or_ids = list(spec.ids or [])
+            ids = list(spec.ids or [])
+            if not ids:
+                raise BadRequest(
+                    "DeleteEdgesSpec must specify either filter or non-empty ids",
+                    code=ErrorCodes.BAD_ADAPTER_RESULT,
+                )
+            raw_filter_or_ids = ids
 
         result = self._translator.delete_edges(
             raw_filter_or_ids,
@@ -1209,14 +1289,21 @@ class CorpusLangChainGraphClient:
         Async wrapper for deleting edges.
         """
         ctx = self._build_ctx(config=config, extra_context=extra_context)
-        framework_ctx = self._framework_ctx_for_namespace(
-            getattr(spec, "namespace", None),
+        framework_ctx = self._framework_ctx(
+            operation="delete_edges",
+            namespace=getattr(spec, "namespace", None),
         )
 
         if spec.filter is not None:
             raw_filter_or_ids: Any = spec.filter
         else:
-            raw_filter_or_ids = list(spec.ids or [])
+            ids = list(spec.ids or [])
+            if not ids:
+                raise BadRequest(
+                    "DeleteEdgesSpec must specify either filter or non-empty ids",
+                    code=ErrorCodes.BAD_ADAPTER_RESULT,
+                )
+            raw_filter_or_ids = ids
 
         result = await self._translator.arun_delete_edges(
             raw_filter_or_ids,
@@ -1257,7 +1344,10 @@ class CorpusLangChainGraphClient:
             "filter": spec.filter,
         }
 
-        framework_ctx = self._framework_ctx_for_namespace(spec.namespace)
+        framework_ctx = self._framework_ctx(
+            operation="bulk_vertices",
+            namespace=spec.namespace,
+        )
 
         result = self._translator.bulk_vertices(
             raw_request,
@@ -1291,7 +1381,10 @@ class CorpusLangChainGraphClient:
             "filter": spec.filter,
         }
 
-        framework_ctx = self._framework_ctx_for_namespace(spec.namespace)
+        framework_ctx = self._framework_ctx(
+            operation="bulk_vertices",
+            namespace=spec.namespace,
+        )
 
         result = await self._translator.arun_bulk_vertices(
             raw_request,
@@ -1334,7 +1427,7 @@ class CorpusLangChainGraphClient:
         result = self._translator.batch(
             raw_batch_ops,
             op_ctx=ctx,
-            framework_ctx={},
+            framework_ctx=self._framework_ctx(operation="batch"),
         )
         return validate_graph_result_type(
             result,
@@ -1365,7 +1458,7 @@ class CorpusLangChainGraphClient:
         result = await self._translator.arun_batch(
             raw_batch_ops,
             op_ctx=ctx,
-            framework_ctx={},
+            framework_ctx=self._framework_ctx(operation="batch"),
         )
         return validate_graph_result_type(
             result,
@@ -1376,14 +1469,8 @@ class CorpusLangChainGraphClient:
 
 
 # ---------------------------------------------------------------------------
-# Optional LangChain Tool wrapper (old/simple design)
+# Optional LangChain Tool wrapper
 # ---------------------------------------------------------------------------
-
-# Optional additional imports (put these near the top of the file, guarded if needed)
-try:
-    from langchain.tools import BaseTool
-except ImportError:  # pragma: no cover - only used when LangChain is installed
-    BaseTool = object  # type: ignore[misc]
 
 
 class CorpusGraphTool(BaseTool):
@@ -1509,7 +1596,10 @@ class CorpusGraphTool(BaseTool):
         try:
             import json
 
-            return json.dumps(result.to_dict() if hasattr(result, "to_dict") else result, default=str)
+            return json.dumps(
+                result.to_dict() if hasattr(result, "to_dict") else result,
+                default=str,
+            )
         except Exception:  # noqa: BLE001
             return str(result)
 
@@ -1547,7 +1637,10 @@ class CorpusGraphTool(BaseTool):
         try:
             import json
 
-            return json.dumps(result.to_dict() if hasattr(result, "to_dict") else result, default=str)
+            return json.dumps(
+                result.to_dict() if hasattr(result, "to_dict") else result,
+                default=str,
+            )
         except Exception:  # noqa: BLE001
             return str(result)
 
@@ -1593,6 +1686,8 @@ def create_corpus_graph_tool(
         name=name,
         description=description,
     )
+
+
 __all__ = [
     "LangChainGraphClientProtocol",
     "CorpusLangChainGraphClient",
@@ -1602,6 +1697,6 @@ __all__ = [
     "with_async_graph_error_context",
     "with_error_context",
     "with_async_error_context",
-    "CorpusLangChainGraphTool",
+    "CorpusGraphTool",
+    "create_corpus_graph_tool",
 ]
-
