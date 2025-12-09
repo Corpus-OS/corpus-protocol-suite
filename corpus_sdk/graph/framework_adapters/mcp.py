@@ -1,69 +1,62 @@
-# corpus_sdk/mcp/graph_service.py
+# corpus_sdk/graph/framework_adapters/mcp.py
 # SPDX-License-Identifier: Apache-2.0
 
 """
 MCP adapter for Corpus Graph protocol.
 
 This module exposes a Corpus `GraphProtocolV1` implementation as an
-MCP-aware graph client, with:
+MCP (Model Context Protocol)–friendly graph client, with:
 
-- Async query + streaming query APIs for MCP servers and workflows
-- Proper integration with Corpus `GraphProtocolV1` via `GraphTranslator`
+- Async query APIs
+- Async streaming query APIs
+- Full read/write coverage:
+    * Query / streaming query
+    * Upsert nodes / edges
+    * Delete nodes / edges
+    * Bulk vertices
+    * Batch operations
+- Proper integration with the Corpus GraphProtocolV1 stack via GraphTranslator
 - OperationContext propagation derived from MCP context (`from_mcp`)
-- Shared error-context decorators for rich observability
-- Capabilities / schema / health APIs aligned with other graph adapters
+- Error-context enrichment for observability and debugging
+- Centralized orchestration and streaming via GraphTranslator
 
 Design philosophy
 -----------------
-- Protocol-first:
-    * All graph operations flow through `GraphTranslator` and the
-      underlying `GraphProtocolV1` adapter.
-    * This layer is intentionally thin and focuses on:
-        - Translating MCP context → `OperationContext`
-        - Building raw query shapes for `GraphTranslator`
-        - Mapping core protocol results into MCP-friendly response types.
-
-- MCP-specific but minimal:
-    * Defines light MCP-facing request/response dataclasses
-      (`GraphQueryRequest`, `GraphQueryResult`, etc.).
-    * Does **not** implement its own rate limiting, caching, circuit
-      breaking, or retry logic. Those belong in:
-        - The underlying graph adapter (e.g., `BaseGraphAdapter`), or
-        - Higher-level MCP orchestration layers.
+- Protocol-first: MCP is a thin skin over the Corpus graph adapter.
+- All heavy lifting (deadlines, rate limits, caching, retries, etc.) lives in
+  the underlying `BaseGraphAdapter` / `GraphProtocolV1` implementation.
+- This layer focuses on:
+    * Translating MCP context → `OperationContext`
+    * Building raw query / mutation shapes for `GraphTranslator`
+    * Delegating all async and streaming orchestration to `GraphTranslator`
+    * Attaching rich, MCP-flavored error context
 
 Responsibilities
 ----------------
-- Translate MCP context dictionaries into `OperationContext` using
-  `from_mcp`, with aligned error codes and `BadRequest` behavior.
-- Construct raw query mappings for `GraphTranslator`, including:
-    * text, params, dialect, timeout_ms, stream
-- Provide MCP-oriented query and streaming APIs that wrap core
-  `QueryResult` / `QueryChunk` without reshaping them, beyond
-  converting to simple lists of dicts where appropriate.
-- Expose:
-    * `capabilities` / `acapabilities`
-    * `get_schema` / `aget_schema`
-    * `health_check` (async)
+- Provide an MCP-oriented client for graph operations that:
+    * Uses the shared `GraphTranslator` abstraction
+    * Preserves protocol-level types (`QueryResult`, `QueryChunk`, etc.)
+    * Exposes async-only APIs consistent with MCP’s async execution model
+- Keep all graph operations going through `GraphTranslator` so that
+  streaming and error-context logic are centralized
+- Surface a clean, minimal API (`MCPGraphClientProtocol`) that can be
+  wrapped by higher-level MCP “services” or servers
 
 Non-responsibilities
 --------------------
-- Backend-specific graph behavior (lives in the `GraphProtocolV1`
-  adapter and its implementation).
-- Service-level resilience (rate limits, timeouts beyond adapter-
-  handled ones, global caching, circuit breaking, retries).
-- Transaction orchestration; this module deliberately does **not**
-  expose transaction APIs to keep the MCP adapter focused and symmetric
-  with the protocol-level graph interface.
+- Service-level behaviors (rate limiting, circuit breaking, caching,
+  retries, request quotas, etc.) – these belong in a separate service
+  layer that wraps this client, not inside the adapter.
+- MCP server wiring (tool registration, MCPServer lifecycle) – that
+  should live in a separate module (e.g., `graph_server.py`).
+- Backend-specific graph behavior – lives in graph adapters that
+  implement `GraphProtocolV1`.
+- MMR/diversification details – handled inside `GraphTranslator`.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import time
-import uuid
-from dataclasses import dataclass
-from enum import Enum
 from functools import cached_property
 from typing import (
     Any,
@@ -77,7 +70,7 @@ from typing import (
     TypeVar,
 )
 
-from corpus_sdk.core.context_translation import from_mcp
+from corpus_sdk.core.context_translation import from_mcp as core_ctx_from_mcp
 from corpus_sdk.core.error_context import attach_context
 from corpus_sdk.graph.framework_adapters.common.graph_translation import (
     DefaultGraphFrameworkTranslator,
@@ -88,88 +81,48 @@ from corpus_sdk.graph.framework_adapters.common.graph_translation import (
 from corpus_sdk.graph.framework_adapters.common.framework_utils import (
     create_graph_error_context_decorator,
     graph_capabilities_to_dict,
+    validate_batch_operations,
     validate_graph_query,
     validate_graph_result_type,
+    validate_upsert_nodes_spec,
 )
 from corpus_sdk.graph.graph_base import (
     BadRequest,
+    BatchOperation,
+    BatchResult,
+    BulkVerticesResult,
+    BulkVerticesSpec,
+    DeleteEdgesSpec,
+    DeleteNodesSpec,
+    DeleteResult,
     GraphProtocolV1,
     GraphSchema,
     OperationContext,
     QueryChunk,
     QueryResult,
-    BulkVerticesResult,
-    BatchResult,
+    UpsertEdgesSpec,
+    UpsertNodesSpec,
+    UpsertResult,
 )
 
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
-_FRAMEWORK_NAME = "mcp"
-
 
 # --------------------------------------------------------------------------- #
-# MCP-facing enums and request/response types
-# --------------------------------------------------------------------------- #
-
-
-class GraphStatus(Enum):
-    """High-level status for MCP graph responses."""
-    SUCCESS = "success"
-    FAILURE = "failure"
-    DEGRADED = "degraded"
-    RATE_LIMITED = "rate_limited"  # reserved for higher layers
-    TIMEOUT = "timeout"            # reserved for higher layers
-    CACHE_HIT = "cache_hit"        # reserved for higher layers
-
-
-class QueryType(Enum):
-    """Logical query type; typically maps to a dialect."""
-    CYPHER = "cypher"
-    GREMLIN = "gremlin"
-    SPARQL = "sparql"
-    TRAVERSAL = "traversal"
-    ANALYTICAL = "analytical"
-    PATHFINDING = "pathfinding"
-    COMMUNITY_DETECTION = "community_detection"
-
-
-@dataclass
-class GraphQueryRequest:
-    """MCP-facing graph query request wrapper."""
-    query: str
-    parameters: Optional[Dict[str, Any]] = None
-    query_type: QueryType = QueryType.CYPHER
-    timeout: float = 30.0  # seconds
-    max_results: Optional[int] = None
-    enable_explain: bool = False  # reserved for MCP-specific extensions
-    mcp_context: Optional[Dict[str, Any]] = None
-    request_id: Optional[str] = None
-
-
-@dataclass
-class GraphQueryResult:
-    """MCP-facing graph query result wrapper."""
-    results: List[Dict[str, Any]]
-    execution_time: float
-    request_id: str
-    query_plan: Optional[Dict[str, Any]] = None
-    nodes_processed: Optional[int] = None
-    relationships_processed: Optional[int] = None
-    status: GraphStatus = GraphStatus.SUCCESS
-    error_message: Optional[str] = None
-
-
-# --------------------------------------------------------------------------- #
-# Error codes + decorators (aligned with other adapters)
+# Error codes (aligned with other framework adapters)
 # --------------------------------------------------------------------------- #
 
 
 class ErrorCodes:
-    """Error code constants for the MCP graph adapter."""
+    """
+    Framework-local error code namespace for the MCP graph adapter.
 
-    # Context / translator errors
+    These codes are used for adapter/translator-level issues and complement
+    any higher-level MCP service error taxonomy.
+    """
+
     BAD_OPERATION_CONTEXT = "BAD_OPERATION_CONTEXT"
     BAD_TRANSLATED_SCHEMA = "BAD_TRANSLATED_SCHEMA"
     BAD_HEALTH_RESULT = "BAD_HEALTH_RESULT"
@@ -182,19 +135,9 @@ class ErrorCodes:
     BAD_ADAPTER_RESULT = "BAD_ADAPTER_RESULT"
 
 
-def with_graph_error_context(
-    operation: str,
-    **static_context: Any,
-) -> Callable[[Callable[..., T]], Callable[..., T]]:
-    """
-    Decorator for sync methods with rich dynamic context extraction.
-
-    Included primarily for parity; the MCP graph client is async-first.
-    """
-    return create_graph_error_context_decorator(
-        framework=_FRAMEWORK_NAME,
-        is_async=False,
-    )(operation=operation, **static_context)
+# --------------------------------------------------------------------------- #
+# Error-context decorators (async-only, framework-tagged)
+# --------------------------------------------------------------------------- #
 
 
 def with_async_graph_error_context(
@@ -203,20 +146,145 @@ def with_async_graph_error_context(
 ) -> Callable[[Callable[..., T]], Callable[..., T]]:
     """
     Decorator for async methods with rich dynamic context extraction.
+
+    Thin wrapper over the shared `create_graph_error_context_decorator`
+    for the MCP framework.
     """
     return create_graph_error_context_decorator(
-        framework=_FRAMEWORK_NAME,
+        framework="mcp",
         is_async=True,
     )(operation=operation, **static_context)
 
 
-# Backwards-compatible aliases (mirroring other adapters)
-with_error_context = with_graph_error_context
+# Backwards-compatible async alias (matches other adapters’ naming)
 with_async_error_context = with_async_graph_error_context
 
 
 # --------------------------------------------------------------------------- #
-# MCP-specific framework translator (pass-through on results)
+# Public protocol (what MCP wrappers should type against)
+# --------------------------------------------------------------------------- #
+
+
+class MCPGraphClientProtocol(Protocol):
+    """
+    Protocol describing the MCP-aware graph client interface.
+
+    This allows MCP-facing layers to type against the graph client without
+    depending on the concrete `CorpusMCPGraphClient` implementation.
+    """
+
+    # Capabilities / schema / health -------------------------------------
+
+    async def acapabilities(self) -> Mapping[str, Any]:
+        ...
+
+    async def aget_schema(
+        self,
+        *,
+        mcp_context: Optional[Mapping[str, Any]] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> GraphSchema:
+        ...
+
+    async def ahealth(
+        self,
+        *,
+        mcp_context: Optional[Mapping[str, Any]] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> Mapping[str, Any]:
+        ...
+
+    # Query / streaming ---------------------------------------------------
+
+    async def aquery(
+        self,
+        query: str,
+        *,
+        params: Optional[Mapping[str, Any]] = None,
+        dialect: Optional[str] = None,
+        namespace: Optional[str] = None,
+        timeout_ms: Optional[int] = None,
+        mcp_context: Optional[Mapping[str, Any]] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> QueryResult:
+        ...
+
+    async def astream_query(
+        self,
+        query: str,
+        *,
+        params: Optional[Mapping[str, Any]] = None,
+        dialect: Optional[str] = None,
+        namespace: Optional[str] = None,
+        timeout_ms: Optional[int] = None,
+        mcp_context: Optional[Mapping[str, Any]] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> AsyncIterator[QueryChunk]:
+        ...
+
+    # Upsert --------------------------------------------------------------
+
+    async def aupsert_nodes(
+        self,
+        spec: UpsertNodesSpec,
+        *,
+        mcp_context: Optional[Mapping[str, Any]] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> UpsertResult:
+        ...
+
+    async def aupsert_edges(
+        self,
+        spec: UpsertEdgesSpec,
+        *,
+        mcp_context: Optional[Mapping[str, Any]] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> UpsertResult:
+        ...
+
+    # Delete --------------------------------------------------------------
+
+    async def adelete_nodes(
+        self,
+        spec: DeleteNodesSpec,
+        *,
+        mcp_context: Optional[Mapping[str, Any]] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> DeleteResult:
+        ...
+
+    async def adelete_edges(
+        self,
+        spec: DeleteEdgesSpec,
+        *,
+        mcp_context: Optional[Mapping[str, Any]] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> DeleteResult:
+        ...
+
+    # Bulk / batch --------------------------------------------------------
+
+    async def abulk_vertices(
+        self,
+        spec: BulkVerticesSpec,
+        *,
+        mcp_context: Optional[Mapping[str, Any]] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> BulkVerticesResult:
+        ...
+
+    async def abatch(
+        self,
+        ops: List[BatchOperation],
+        *,
+        mcp_context: Optional[Mapping[str, Any]] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> BatchResult:
+        ...
+
+
+# --------------------------------------------------------------------------- #
+# MCP-specific GraphFrameworkTranslator (no result reshaping)
 # --------------------------------------------------------------------------- #
 
 
@@ -281,82 +349,37 @@ class MCPGraphFrameworkTranslator(DefaultGraphFrameworkTranslator):
 
 
 # --------------------------------------------------------------------------- #
-# Protocol for an MCP-aware graph client
-# --------------------------------------------------------------------------- #
-
-
-class MCPGraphClientProtocol(Protocol):
-    """
-    Protocol describing the MCP-aware graph client interface.
-
-    Async-first and thin, suitable for wiring into MCP servers.
-    """
-
-    async def execute_query(
-        self,
-        request: GraphQueryRequest,
-    ) -> GraphQueryResult:
-        ...
-
-    async def stream_query(
-        self,
-        request: GraphQueryRequest,
-    ) -> AsyncIterator[QueryChunk]:
-        ...
-
-    def capabilities(self) -> Mapping[str, Any]:
-        ...
-
-    async def acapabilities(self) -> Mapping[str, Any]:
-        ...
-
-    def get_schema(
-        self,
-        *,
-        mcp_context: Optional[Dict[str, Any]] = None,
-    ) -> GraphSchema:
-        ...
-
-    async def aget_schema(
-        self,
-        *,
-        mcp_context: Optional[Dict[str, Any]] = None,
-    ) -> GraphSchema:
-        ...
-
-    async def health_check(
-        self,
-        *,
-        mcp_context: Optional[Dict[str, Any]] = None,
-    ) -> Mapping[str, Any]:
-        ...
-
-
-# --------------------------------------------------------------------------- #
-# Main MCP graph client
+# Core MCP-oriented graph client (async-only)
 # --------------------------------------------------------------------------- #
 
 
 class CorpusMCPGraphClient:
     """
-    MCP-oriented client wrapper around a Corpus `GraphProtocolV1`.
+    MCP-oriented graph client wrapper around a Corpus `GraphProtocolV1`.
 
     This is a thin integration layer that:
 
-    - Translates MCP context dictionaries into a Corpus `OperationContext`
-      using `from_mcp`.
+    - Translates MCP context into a Corpus `OperationContext` using `from_mcp`.
     - Uses `GraphTranslator` (with an MCP-specific framework translator) to:
-        * Build raw graph query shapes
+        * Build Graph*Spec objects from simple inputs
         * Execute async graph operations
-        * Orchestrate streaming with proper error-context handling
-    - Attaches rich error context (`attach_context` via decorators) with
+        * Orchestrate streaming with proper cancellation and error handling
+    - Delegates all async orchestration and streaming glue to GraphTranslator.
+    - Attaches rich error context (`attach_context`) on this layer with
       MCP-specific hints when failures occur.
+
+    Higher-level MCP “services” (rate limiting, circuit breaking, caching,
+    metrics, etc.) are expected to wrap this client rather than be baked
+    into it.
     """
 
     def __init__(
         self,
         *,
         graph_adapter: GraphProtocolV1,
+        default_dialect: Optional[str] = None,
+        default_namespace: Optional[str] = None,
+        default_timeout_ms: Optional[int] = None,
         framework_version: Optional[str] = None,
         framework_translator: Optional[GraphFrameworkTranslator] = None,
     ) -> None:
@@ -367,30 +390,29 @@ class CorpusMCPGraphClient:
         ----------
         graph_adapter:
             Underlying `GraphProtocolV1` implementation.
+        default_dialect:
+            Optional default query dialect to use when none is provided per call.
+        default_namespace:
+            Optional default namespace to use when none is provided per call.
+        default_timeout_ms:
+            Optional default per-query timeout in milliseconds. Used when
+            `timeout_ms` is not explicitly passed to query methods.
         framework_version:
             Optional framework version string for observability.
         framework_translator:
-            Optional `GraphFrameworkTranslator` implementation. If not
-            provided, `MCPGraphFrameworkTranslator` is used by default.
+            Optional `GraphFrameworkTranslator` implementation. If not provided,
+            `MCPGraphFrameworkTranslator` is used by default.
         """
         self._graph: GraphProtocolV1 = graph_adapter
+        self._default_dialect: Optional[str] = default_dialect
+        self._default_namespace: Optional[str] = default_namespace
+        self._default_timeout_ms: Optional[int] = default_timeout_ms
         self._framework_version: Optional[str] = framework_version
-        self._framework_translator: Optional[GraphFrameworkTranslator] = (
-            framework_translator
-        )
+        self._framework_translator: Optional[GraphFrameworkTranslator] = framework_translator
 
     # ------------------------------------------------------------------ #
-    # Resource management (context managers)
+    # Resource Management (Async Context Managers)
     # ------------------------------------------------------------------ #
-
-    def __enter__(self) -> CorpusMCPGraphClient:
-        """Support sync context manager protocol."""
-        return self
-
-    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        """Clean up resources when exiting context."""
-        if hasattr(self._graph, "close"):
-            self._graph.close()
 
     async def __aenter__(self) -> CorpusMCPGraphClient:
         """Support async context manager protocol."""
@@ -417,7 +439,7 @@ class CorpusMCPGraphClient:
         )
         return create_graph_translator(
             adapter=self._graph,
-            framework=_FRAMEWORK_NAME,
+            framework="mcp",
             translator=framework_translator,
         )
 
@@ -428,7 +450,7 @@ class CorpusMCPGraphClient:
     def _build_ctx(
         self,
         *,
-        mcp_context: Optional[Dict[str, Any]] = None,
+        mcp_context: Optional[Mapping[str, Any]] = None,
         extra_context: Optional[Mapping[str, Any]] = None,
     ) -> Optional[OperationContext]:
         """
@@ -436,10 +458,10 @@ class CorpusMCPGraphClient:
 
         Expected inputs
         ----------------
-        - mcp_context: MCP context dict (optional)
+        - mcp_context: MCP context mapping (optional)
         - extra_context: Optional mapping merged into attrs (best effort)
 
-        If all are empty/None, returns None and lets downstream helpers
+        If both are None/empty, returns None and lets downstream helpers
         construct an "empty" OperationContext as needed.
         """
         extra: Dict[str, Any] = dict(extra_context or {})
@@ -448,17 +470,18 @@ class CorpusMCPGraphClient:
             return None
 
         try:
-            ctx = from_mcp(
-                mcp_context or {},
+            ctx = core_ctx_from_mcp(
+                dict(mcp_context or {}),
                 framework_version=self._framework_version,
                 **extra,
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             attach_context(
                 exc,
-                framework=_FRAMEWORK_NAME,
+                framework="mcp",
                 operation="context_translation",
             )
+            # Surface a consistent BadRequest with symbolic error code.
             raise BadRequest(
                 "Failed to build OperationContext from MCP inputs",
                 code=ErrorCodes.BAD_OPERATION_CONTEXT,
@@ -477,142 +500,119 @@ class CorpusMCPGraphClient:
         query: str,
         *,
         params: Optional[Mapping[str, Any]],
-        query_type: QueryType,
-        timeout: float,
+        dialect: Optional[str],
+        namespace: Optional[str],
+        timeout_ms: Optional[int],
         stream: bool,
     ) -> Mapping[str, Any]:
         """
-        Build a raw query mapping suitable for `GraphTranslator`.
+        Build a raw query mapping suitable for GraphTranslator.
 
         Expected fields:
             - text (str)
-            - dialect (str; derived from `QueryType`)
+            - dialect (optional)
             - params (optional mapping)
+            - namespace (optional)
             - timeout_ms (optional int)
             - stream (bool)
         """
-        dialect = query_type.value
+        effective_dialect = dialect or self._default_dialect
+        effective_namespace = namespace or self._default_namespace
+        effective_timeout = timeout_ms or self._default_timeout_ms
 
         raw: Dict[str, Any] = {
             "text": query,
             "params": dict(params or {}),
             "stream": bool(stream),
-            "dialect": dialect,
-            "timeout_ms": int(timeout * 1000),
         }
+        if effective_dialect is not None:
+            raw["dialect"] = effective_dialect
+        if effective_namespace is not None:
+            raw["namespace"] = effective_namespace
+        if effective_timeout is not None:
+            raw["timeout_ms"] = int(effective_timeout)
         return raw
 
     def _framework_ctx(
         self,
         *,
         operation: str,
+        namespace: Optional[str] = None,
         request_id: Optional[str] = None,
     ) -> Mapping[str, Any]:
         """
         Build a framework_ctx mapping that lets the common translator derive
-        framework metadata for observability.
+        a preferred namespace and capture framework metadata for observability.
         """
         ctx: Dict[str, Any] = {
-            "framework": _FRAMEWORK_NAME,
+            "framework": "mcp",
             "operation": operation,
         }
 
         if self._framework_version is not None:
             ctx["framework_version"] = self._framework_version
 
+        effective_namespace = namespace or self._default_namespace
+        if effective_namespace is not None:
+            ctx["namespace"] = effective_namespace
+
         if request_id is not None:
             ctx["request_id"] = request_id
 
         return ctx
 
-    def _process_query_results(
-        self,
-        result: Any,
-        max_results: Optional[int],
-    ) -> List[Dict[str, Any]]:
+    def _validate_upsert_edges_spec(self, spec: UpsertEdgesSpec) -> None:
         """
-        Process and limit query results into a list of dicts for MCP.
-
-        Tries to be forgiving about core result shapes:
-        - If `result` has `.rows`, use that.
-        - If `result` is iterable, normalize each row.
+        Basic structural validation for UpsertEdgesSpec.edges to provide
+        clearer errors before reaching the adapter / translator.
         """
-        # Common pattern: Graph adapters often expose `rows` on QueryResult.
-        rows = getattr(result, "rows", result)
+        if spec.edges is None:
+            raise BadRequest("UpsertEdgesSpec.edges must not be None")
 
-        if rows is None:
-            return []
+        try:
+            edges_list = list(spec.edges)
+        except TypeError as exc:
+            raise BadRequest(
+                "UpsertEdgesSpec.edges must be an iterable of edges",
+            ) from exc
 
-        processed: List[Dict[str, Any]] = []
+        if not edges_list:
+            raise BadRequest("UpsertEdgesSpec must contain at least one edge")
 
-        for row in rows:
-            if isinstance(row, dict):
-                processed.append(row)
-            elif hasattr(row, "_asdict"):  # NamedTuple-style
-                processed.append(row._asdict())
-            elif hasattr(row, "__dict__"):
-                processed.append(dict(row.__dict__))
-            else:
-                processed.append({"result": row})
-
-        if max_results is not None and len(processed) > max_results:
-            processed = processed[:max_results]
-
-        return processed
+        # Normalize to list to avoid one-shot iterables.
+        spec.edges = edges_list  # type: ignore[assignment]
 
     # ------------------------------------------------------------------ #
-    # Capabilities / schema / health
+    # Capabilities / schema / health (async-only)
     # ------------------------------------------------------------------ #
-
-    @with_graph_error_context("capabilities_sync")
-    def capabilities(self) -> Mapping[str, Any]:
-        """
-        Sync wrapper around capabilities, delegating to GraphTranslator.
-        """
-        caps = self._translator.capabilities()
-        return graph_capabilities_to_dict(caps)
 
     @with_async_graph_error_context("capabilities_async")
     async def acapabilities(self) -> Mapping[str, Any]:
         """
-        Async capabilities accessor, via GraphTranslator.
+        Async capabilities accessor.
+
+        We delegate to GraphTranslator for consistency, then normalize to a
+        simple dict for MCP-facing consumption.
         """
         caps = await self._translator.arun_capabilities()
         return graph_capabilities_to_dict(caps)
-
-    @with_graph_error_context("get_schema_sync")
-    def get_schema(
-        self,
-        *,
-        mcp_context: Optional[Dict[str, Any]] = None,
-    ) -> GraphSchema:
-        """
-        Sync schema introspection, via GraphTranslator.
-        """
-        op_ctx = self._build_ctx(mcp_context=mcp_context)
-        schema = self._translator.get_schema(
-            op_ctx=op_ctx,
-            framework_ctx=self._framework_ctx(operation="get_schema"),
-        )
-        return validate_graph_result_type(
-            schema,
-            expected_type=GraphSchema,
-            operation="GraphTranslator.get_schema",
-            error_code=ErrorCodes.BAD_TRANSLATED_SCHEMA,
-        )
 
     @with_async_graph_error_context("get_schema_async")
     async def aget_schema(
         self,
         *,
-        mcp_context: Optional[Dict[str, Any]] = None,
+        mcp_context: Optional[Mapping[str, Any]] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
     ) -> GraphSchema:
         """
         Async schema introspection, via GraphTranslator.
         """
-        op_ctx = self._build_ctx(mcp_context=mcp_context)
+        ctx = self._build_ctx(
+            mcp_context=mcp_context,
+            extra_context=extra_context,
+        )
         schema = await self._translator.arun_get_schema(
-            op_ctx=op_ctx,
+            op_ctx=ctx,
             framework_ctx=self._framework_ctx(operation="get_schema"),
         )
         return validate_graph_result_type(
@@ -623,147 +623,124 @@ class CorpusMCPGraphClient:
         )
 
     @with_async_graph_error_context("health_async")
-    async def health_check(
+    async def ahealth(
         self,
         *,
-        mcp_context: Optional[Dict[str, Any]] = None,
+        mcp_context: Optional[Mapping[str, Any]] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
     ) -> Mapping[str, Any]:
         """
-        Async health check wrapper, delegating to GraphTranslator.
-
-        Returns the underlying adapter's health mapping, wrapped with
-        MCP framework context via the error decorator.
+        Async health check wrapper, delegating orchestration to GraphTranslator.
         """
-        op_ctx = self._build_ctx(mcp_context=mcp_context)
-        health = await self._translator.arun_health(
-            op_ctx=op_ctx,
+        ctx = self._build_ctx(
+            mcp_context=mcp_context,
+            extra_context=extra_context,
+        )
+        health_result = await self._translator.arun_health(
+            op_ctx=ctx,
             framework_ctx=self._framework_ctx(operation="health"),
         )
         return validate_graph_result_type(
-            health,
+            health_result,
             expected_type=Mapping,
             operation="GraphTranslator.arun_health",
             error_code=ErrorCodes.BAD_HEALTH_RESULT,
         )
 
     # ------------------------------------------------------------------ #
-    # Query (async) – core MCP API
+    # Query (async-only)
     # ------------------------------------------------------------------ #
 
-    @with_async_graph_error_context("execute_query")
-    async def execute_query(
+    @with_async_graph_error_context("query_async")
+    async def aquery(
         self,
-        request: GraphQueryRequest,
-    ) -> GraphQueryResult:
+        query: str,
+        *,
+        params: Optional[Mapping[str, Any]] = None,
+        dialect: Optional[str] = None,
+        namespace: Optional[str] = None,
+        timeout_ms: Optional[int] = None,
+        mcp_context: Optional[Mapping[str, Any]] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> QueryResult:
         """
-        Execute a non-streaming graph query (async) for MCP.
+        Execute a non-streaming graph query (async).
 
-        Returns an MCP-facing `GraphQueryResult` that wraps the underlying
-        `QueryResult` from the GraphProtocol adapter.
+        Returns the underlying `QueryResult`.
         """
-        request_id = request.request_id or f"graph_{uuid.uuid4().hex[:8]}"
-        start_time = time.time()
+        validate_graph_query(query)
 
-        validate_graph_query(request.query)
-
-        # Build contexts for translator
-        op_ctx = self._build_ctx(
-            mcp_context=request.mcp_context,
-            extra_context={"request_id": request_id},
+        ctx = self._build_ctx(
+            mcp_context=mcp_context,
+            extra_context=extra_context,
         )
         raw_query = self._build_raw_query(
-            query=request.query,
-            params=request.parameters,
-            query_type=request.query_type,
-            timeout=request.timeout,
+            query=query,
+            params=params,
+            dialect=dialect,
+            namespace=namespace,
+            timeout_ms=timeout_ms,
             stream=False,
         )
         framework_ctx = self._framework_ctx(
             operation="query",
-            request_id=request_id,
+            namespace=namespace,
         )
 
         result = await self._translator.arun_query(
             raw_query,
-            op_ctx=op_ctx,
+            op_ctx=ctx,
             framework_ctx=framework_ctx,
             mmr_config=None,
         )
-        query_result = validate_graph_result_type(
+        return validate_graph_result_type(
             result,
             expected_type=QueryResult,
             operation="GraphTranslator.arun_query",
             error_code=ErrorCodes.BAD_TRANSLATED_RESULT,
         )
 
-        processed = self._process_query_results(
-            query_result,
-            request.max_results,
-        )
-        execution_time = time.time() - start_time
-
-        # Optional: query plan (MCP nuance) – only if adapter exposes it.
-        query_plan: Optional[Dict[str, Any]] = None
-        if request.enable_explain and hasattr(self._graph, "explain_query"):
-            try:
-                # Best-effort, adapter-specific; not part of GraphTranslator.
-                query_plan = await self._graph.explain_query(  # type: ignore[attr-defined]
-                    raw_query,
-                    op_ctx=op_ctx,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Failed to generate query plan for request %s: %s", request_id, exc)
-
-        return GraphQueryResult(
-            results=processed,
-            execution_time=execution_time,
-            request_id=request_id,
-            query_plan=query_plan,
-            nodes_processed=getattr(query_result, "nodes_processed", None),
-            relationships_processed=getattr(
-                query_result,
-                "relationships_processed",
-                None,
-            ),
-            status=GraphStatus.SUCCESS,
-            error_message=None,
-        )
-
     # ------------------------------------------------------------------ #
-    # Streaming query (async) – core MCP API
+    # Streaming query (async-only)
     # ------------------------------------------------------------------ #
 
     @with_async_graph_error_context("stream_query_async")
-    async def stream_query(
+    async def astream_query(
         self,
-        request: GraphQueryRequest,
+        query: str,
+        *,
+        params: Optional[Mapping[str, Any]] = None,
+        dialect: Optional[str] = None,
+        namespace: Optional[str] = None,
+        timeout_ms: Optional[int] = None,
+        mcp_context: Optional[Mapping[str, Any]] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
     ) -> AsyncIterator[QueryChunk]:
         """
         Execute a streaming graph query (async), yielding `QueryChunk` items.
-
-        Delegates streaming orchestration to `GraphTranslator`.
         """
-        validate_graph_query(request.query)
+        validate_graph_query(query)
 
-        op_ctx = self._build_ctx(
-            mcp_context=request.mcp_context,
-            extra_context={"request_id": request.request_id},
+        ctx = self._build_ctx(
+            mcp_context=mcp_context,
+            extra_context=extra_context,
         )
         raw_query = self._build_raw_query(
-            query=request.query,
-            params=request.parameters,
-            query_type=request.query_type,
-            timeout=request.timeout,
+            query=query,
+            params=params,
+            dialect=dialect,
+            namespace=namespace,
+            timeout_ms=timeout_ms,
             stream=True,
         )
         framework_ctx = self._framework_ctx(
             operation="stream_query",
-            request_id=request.request_id,
+            namespace=namespace,
         )
 
         async for chunk in self._translator.arun_query_stream(
             raw_query,
-            op_ctx=op_ctx,
+            op_ctx=ctx,
             framework_ctx=framework_ctx,
         ):
             yield validate_graph_result_type(
@@ -773,18 +750,278 @@ class CorpusMCPGraphClient:
                 error_code=ErrorCodes.BAD_TRANSLATED_CHUNK,
             )
 
+    # ------------------------------------------------------------------ #
+    # Upsert nodes / edges (async-only)
+    # ------------------------------------------------------------------ #
+
+    @with_async_graph_error_context("upsert_nodes_async")
+    async def aupsert_nodes(
+        self,
+        spec: UpsertNodesSpec,
+        *,
+        mcp_context: Optional[Mapping[str, Any]] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> UpsertResult:
+        """
+        Async wrapper for upserting nodes via GraphTranslator.
+        """
+        validate_upsert_nodes_spec(spec)
+
+        ctx = self._build_ctx(
+            mcp_context=mcp_context,
+            extra_context=extra_context,
+        )
+        framework_ctx = self._framework_ctx(
+            operation="upsert_nodes",
+            namespace=getattr(spec, "namespace", None),
+        )
+
+        result = await self._translator.arun_upsert_nodes(
+            spec.nodes,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+        return validate_graph_result_type(
+            result,
+            expected_type=UpsertResult,
+            operation="GraphTranslator.arun_upsert_nodes",
+            error_code=ErrorCodes.BAD_UPSERT_RESULT,
+        )
+
+    @with_async_graph_error_context("upsert_edges_async")
+    async def aupsert_edges(
+        self,
+        spec: UpsertEdgesSpec,
+        *,
+        mcp_context: Optional[Mapping[str, Any]] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> UpsertResult:
+        """
+        Async wrapper for upserting edges via GraphTranslator.
+        """
+        self._validate_upsert_edges_spec(spec)
+
+        ctx = self._build_ctx(
+            mcp_context=mcp_context,
+            extra_context=extra_context,
+        )
+        framework_ctx = self._framework_ctx(
+            operation="upsert_edges",
+            namespace=getattr(spec, "namespace", None),
+        )
+
+        result = await self._translator.arun_upsert_edges(
+            spec.edges,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+        return validate_graph_result_type(
+            result,
+            expected_type=UpsertResult,
+            operation="GraphTranslator.arun_upsert_edges",
+            error_code=ErrorCodes.BAD_UPSERT_RESULT,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Delete nodes / edges (async-only)
+    # ------------------------------------------------------------------ #
+
+    @with_async_graph_error_context("delete_nodes_async")
+    async def adelete_nodes(
+        self,
+        spec: DeleteNodesSpec,
+        *,
+        mcp_context: Optional[Mapping[str, Any]] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> DeleteResult:
+        """
+        Async wrapper for deleting nodes via GraphTranslator.
+        """
+        ctx = self._build_ctx(
+            mcp_context=mcp_context,
+            extra_context=extra_context,
+        )
+        framework_ctx = self._framework_ctx(
+            operation="delete_nodes",
+            namespace=getattr(spec, "namespace", None),
+        )
+
+        if spec.filter is not None:
+            raw_filter_or_ids: Any = spec.filter
+        else:
+            raw_filter_or_ids = list(spec.ids or [])
+
+        result = await self._translator.arun_delete_nodes(
+            raw_filter_or_ids,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+        return validate_graph_result_type(
+            result,
+            expected_type=DeleteResult,
+            operation="GraphTranslator.arun_delete_nodes",
+            error_code=ErrorCodes.BAD_DELETE_RESULT,
+        )
+
+    @with_async_graph_error_context("delete_edges_async")
+    async def adelete_edges(
+        self,
+        spec: DeleteEdgesSpec,
+        *,
+        mcp_context: Optional[Mapping[str, Any]] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> DeleteResult:
+        """
+        Async wrapper for deleting edges via GraphTranslator.
+        """
+        ctx = self._build_ctx(
+            mcp_context=mcp_context,
+            extra_context=extra_context,
+        )
+        framework_ctx = self._framework_ctx(
+            operation="delete_edges",
+            namespace=getattr(spec, "namespace", None),
+        )
+
+        if spec.filter is not None:
+            raw_filter_or_ids: Any = spec.filter
+        else:
+            raw_filter_or_ids = list(spec.ids or [])
+
+        result = await self._translator.arun_delete_edges(
+            raw_filter_or_ids,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+        return validate_graph_result_type(
+            result,
+            expected_type=DeleteResult,
+            operation="GraphTranslator.arun_delete_edges",
+            error_code=ErrorCodes.BAD_DELETE_RESULT,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Bulk vertices (async-only)
+    # ------------------------------------------------------------------ #
+
+    @with_async_graph_error_context("bulk_vertices_async")
+    async def abulk_vertices(
+        self,
+        spec: BulkVerticesSpec,
+        *,
+        mcp_context: Optional[Mapping[str, Any]] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> BulkVerticesResult:
+        """
+        Async wrapper for bulk_vertices via GraphTranslator.
+        """
+        ctx = self._build_ctx(
+            mcp_context=mcp_context,
+            extra_context=extra_context,
+        )
+
+        raw_request: Mapping[str, Any] = {
+            "namespace": spec.namespace,
+            "limit": spec.limit,
+            "cursor": spec.cursor,
+            "filter": spec.filter,
+        }
+
+        framework_ctx = self._framework_ctx(
+            operation="bulk_vertices",
+            namespace=spec.namespace,
+        )
+
+        result = await self._translator.arun_bulk_vertices(
+            raw_request,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+        return validate_graph_result_type(
+            result,
+            expected_type=BulkVerticesResult,
+            operation="GraphTranslator.arun_bulk_vertices",
+            error_code=ErrorCodes.BAD_BULK_VERTICES_RESULT,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Batch (async-only)
+    # ------------------------------------------------------------------ #
+
+    @with_async_graph_error_context("batch_async")
+    async def abatch(
+        self,
+        ops: List[BatchOperation],
+        *,
+        mcp_context: Optional[Mapping[str, Any]] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> BatchResult:
+        """
+        Async wrapper for batch operations via GraphTranslator.
+
+        Translates `BatchOperation` dataclasses into the raw mapping shape
+        expected by GraphTranslator and returns the underlying `BatchResult`.
+        """
+        validate_batch_operations(self._graph, ops)
+
+        ctx = self._build_ctx(
+            mcp_context=mcp_context,
+            extra_context=extra_context,
+        )
+        raw_batch_ops: List[Mapping[str, Any]] = [
+            {"op": op.op, "args": dict(op.args or {})} for op in ops
+        ]
+        framework_ctx = self._framework_ctx(operation="batch")
+
+        result = await self._translator.arun_batch(
+            raw_batch_ops,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+        return validate_graph_result_type(
+            result,
+            expected_type=BatchResult,
+            operation="GraphTranslator.arun_batch",
+            error_code=ErrorCodes.BAD_BATCH_RESULT,
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Factory
+# --------------------------------------------------------------------------- #
+
+
+def create_mcp_graph_client(
+    graph_adapter: GraphProtocolV1,
+    **kwargs: Any,
+) -> CorpusMCPGraphClient:
+    """
+    Convenience factory for constructing an MCP-oriented graph client.
+
+    Example
+    -------
+    ```python
+    from corpus_sdk.graph.framework_adapters.mcp import create_mcp_graph_client
+
+    client = create_mcp_graph_client(
+        graph_adapter=my_graph_adapter,
+        default_namespace="tenant_123",
+        framework_version="mcp-graph-0.1.0",
+    )
+    ```
+    """
+    return CorpusMCPGraphClient(
+        graph_adapter=graph_adapter,
+        **kwargs,
+    )
+
 
 __all__ = [
-    "CorpusMCPGraphClient",
     "MCPGraphClientProtocol",
+    "CorpusMCPGraphClient",
     "MCPGraphFrameworkTranslator",
-    "GraphQueryRequest",
-    "GraphQueryResult",
-    "QueryType",
-    "GraphStatus",
+    "create_mcp_graph_client",
     "ErrorCodes",
-    "with_graph_error_context",
     "with_async_graph_error_context",
-    "with_error_context",
     "with_async_error_context",
 ]
