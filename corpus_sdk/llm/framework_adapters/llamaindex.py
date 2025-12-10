@@ -1,47 +1,62 @@
+# corpus_sdk/llm/framework_adapters/llamaindex.py
+# SPDX-License-Identifier: Apache-2.0
+
 """
-LlamaIndex adapter for the Corpus LLM protocol.
+LlamaIndex adapter for Corpus LLM protocol.
 
-This module provides a production-grade implementation of the LlamaIndex `LLM`
-interface backed by a Corpus `LLMProtocolV1` through the shared `LLMTranslator`
-layer.
+This module exposes a Corpus `LLMProtocolV1` implementation as a LlamaIndex
+`LLM`, fully wired through the shared `LLMTranslator` layer with:
 
-Purpose
--------
-The adapter enables LlamaIndex runtimes—sync or async, streaming or non-streaming—
-to call Corpus models without needing to understand Corpus message formats,
-sampling parameters, or protocol details. All model interaction, message shaping,
-tool behavior, JSON repair, safety filtering, and post-processing are delegated
-to `LLMTranslator`, ensuring cross-framework consistency.
+- Async + sync chat APIs (`achat` / `chat`)
+- Async + sync streaming chat (`astream_chat` / `stream_chat`)
+- Centralized token counting via `LLMTranslator.count_tokens_for_messages`
+- OperationContext propagation from LlamaIndex callbacks / config
+- Rich, configurable error context aligned with other LLM framework adapters
 
-Key Responsibilities
+Key responsibilities
 --------------------
-- Convert LlamaIndex `ChatMessage` and config objects into Corpus `OperationContext`
-  via the centralized context translation layer.
-- Build sampling + routing parameters (`model`, `temperature`, `stop_sequences`, etc.)
-  in a single, predictable place.
-- Invoke `LLMTranslator` for:
-      • async/sync completion  
-      • async/sync true incremental streaming  
-      • token counting with robust fallbacks
-- Convert translator-level results and chunks into LlamaIndex `ChatResponse` objects.
-- Attach rich, structured error context (optional, configurable) for observability
-  without affecting hot-path performance.
+- Accept LlamaIndex `ChatMessage` sequences and pass them through the
+  framework-agnostic `LLMTranslator` (no direct protocol calls in this file).
+- Build `OperationContext` from LlamaIndex callback state via
+  `context_from_llamaindex(...)`.
+- Derive sampling parameters (model, temperature, max_tokens, stop, etc.)
+  from LlamaIndex kwargs in a single, well-defined place.
+- Delegate all completion / streaming orchestration to `LLMTranslator`
+  for both sync and async flows.
+- Convert translator-level results and stream chunks into LlamaIndex
+  `ChatResponse` / streaming `ChatResponse` generators.
+- Attach structured, LlamaIndex-flavored error context using the shared
+  error-context utilities, with lazy message metrics computed only on error.
 
-Design Principles
+Design principles
 -----------------
-- **Protocol-first**: No LlamaIndex-specific logic ever touches the Corpus protocol.
-- **Translator-centric**: Message normalization, tools, post-processing, and safety
-  are handled entirely inside `LLMTranslator`.
-- **Non-intrusive**: No retries, timeouts, or circuit-breaking are implemented here.
-  Callers may compose their own control-plane policies.
-- **Lazy error metrics**: Per-message metrics and additional context are collected
-  only when an exception occurs, minimizing hot-path overhead.
-- **Optional dependency safe**: Importing the module never requires LlamaIndex to
-  be installed; usage requires it.
+- Protocol-first:
+    `LLMProtocolV1` is the source of truth; this adapter is a thin,
+    LlamaIndex-oriented skin over the shared `LLMTranslator` stack.
 
-This adapter is the recommended way to use Corpus LLMs inside LlamaIndex pipelines
-and RAG systems, providing consistent semantics with other framework adapters such
-as LangChain, AutoGen, and CrewAI.
+- Translator-centric:
+    Message normalization, provider-specific quirks, safety, JSON repair,
+    and token usage shaping all live in `LLMTranslator` and its registered
+    `LLMFrameworkTranslator` for `framework="llamaindex"`.
+
+- Low-friction integration:
+    The class behaves like a normal LlamaIndex `LLM`, exposing metadata
+    (`LLMMetadata`) with context window and num_output hints so RAG components
+    can reason about chunk sizes and planning.
+
+- Observability without hot-path cost:
+    Error context includes model, sampling params, request identifiers,
+    and (optionally) message metrics, but those metrics are only computed
+    when an exception actually occurs.
+
+Non-responsibilities
+--------------------
+- Provider-level retries, circuit breaking, or caching – these should live
+  in the underlying `LLMProtocolV1` adapter or a higher-level service layer.
+- Business logic, routing, or tool wiring – those belong in application code
+  or separate orchestration modules, not in this adapter.
+- Direct manipulation of LlamaIndex graphs, indexes, or query engines – this
+  file is purely about LLM behavior behind the `LLM` interface.
 """
 
 from __future__ import annotations
@@ -64,16 +79,20 @@ from typing import (
 from corpus_sdk.core.context_translation import (
     from_llamaindex as context_from_llamaindex,
 )
+from corpus_sdk.core.error_context import attach_context
 from corpus_sdk.llm.llm_base import (
     BadRequest,
     LLMProtocolV1,
     OperationContext,
 )
-from corpus_sdk.llm.framework_adapters.common.error_context import attach_context
 from corpus_sdk.llm.framework_adapters.common.llm_translation import (
     LLMTranslator,
     create_llm_translator,
     get_llm_translator_factory,
+)
+from corpus_sdk.llm.framework_adapters.common.framework_utils import (
+    CoercionErrorCodes,
+    coerce_token_usage,
 )
 
 logger = logging.getLogger(__name__)
@@ -145,6 +164,17 @@ class LlamaIndexLLMProtocol(Protocol):
 
 
 # ---------------------------------------------------------------------------
+# Error-code bundle (aligned with other LLM adapters)
+# ---------------------------------------------------------------------------
+
+ERROR_CODES = CoercionErrorCodes(
+    invalid_result="LLAMAINDEX_LLM_INVALID_RESULT",
+    empty_result="LLAMAINDEX_LLM_EMPTY_RESULT",
+    conversion_error="LLAMAINDEX_LLM_CONVERSION_ERROR",
+    framework_label="llamaindex",
+)
+
+# ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
@@ -187,13 +217,47 @@ def _usage_to_dict(usage: Any) -> Dict[str, Optional[int]]:
     """
     Normalize usage objects into a simple dict.
 
-    Supports either:
-    - objects with .prompt_tokens / .completion_tokens / .total_tokens
-    - mappings with those keys
+    Primary path:
+    - Use shared `coerce_token_usage` from framework_utils for consistency
+      across framework adapters.
+
+    Fallback:
+    - Objects with .prompt_tokens / .completion_tokens / .total_tokens
+    - Mappings with those keys
     """
     if usage is None:
         return {}
 
+    # Preferred: shared coercion utility (aligned with other adapters)
+    try:
+        # `coerce_token_usage` expects either a result with `.usage` or a
+        # mapping containing a `usage` field; wrap if needed.
+        payload: Any
+        if isinstance(usage, Mapping):
+            payload = {"usage": usage}
+        else:
+            payload = usage
+
+        token_usage = coerce_token_usage(
+            payload,
+            framework="llamaindex",
+            error_codes=ERROR_CODES,
+            logger=logger,
+        )
+        result = {
+            "prompt_tokens": token_usage.prompt_tokens,
+            "completion_tokens": token_usage.completion_tokens,
+            "total_tokens": token_usage.total_tokens,
+        }
+        # Strip Nones just in case
+        return {k: v for k, v in result.items() if v is not None}
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "LlamaIndex: failed to coerce token usage via framework_utils: %s",
+            exc,
+        )
+
+    # Fallback: manual mapping/attribute extraction
     if isinstance(usage, Mapping):
         prompt_tokens = usage.get("prompt_tokens")
         completion_tokens = usage.get("completion_tokens")
@@ -203,13 +267,13 @@ def _usage_to_dict(usage: Any) -> Dict[str, Optional[int]]:
         completion_tokens = getattr(usage, "completion_tokens", None)
         total_tokens = getattr(usage, "total_tokens", None)
 
-    result: Dict[str, Optional[int]] = {
+    result_fallback: Dict[str, Optional[int]] = {
         "prompt_tokens": int(prompt_tokens) if isinstance(prompt_tokens, int) else None,
         "completion_tokens": int(completion_tokens) if isinstance(completion_tokens, int) else None,
         "total_tokens": int(total_tokens) if isinstance(total_tokens, int) else None,
     }
     # Strip all-None payloads
-    return {k: v for k, v in result.items() if v is not None}
+    return {k: v for k, v in result_fallback.items() if v is not None}
 
 
 def _build_chat_response(
@@ -563,6 +627,7 @@ class CorpusLlamaIndexLLM(LLM):
             "request_id": ctx.request_id,
             "tenant": ctx.tenant,
             "stream": stream,
+            "error_codes": ERROR_CODES,
         }
 
         if self._config.include_message_metrics_on_error:
@@ -696,7 +761,7 @@ class CorpusLlamaIndexLLM(LLM):
         logger.debug(
             "Built sampling params for LlamaIndex: model=%s, temperature=%.2f, max_tokens=%s",
             clean.get("model", self.model),
-            clean.get("temperature", self.temperature),
+            float(clean.get("temperature", self.temperature)),
             clean.get("max_tokens", self.max_tokens),
         )
 
