@@ -671,7 +671,3 @@ __all__ = [
     "ERROR_CODES",
 ]
 
-This keeps MCP aligned with the other adapters:
-	•	Shared error codes via CoercionErrorCodes.
-	•	Explicit OperationContext usage.
-	•	Token counting flows through LLMTranslator first, with a clean heuristic fallback.
