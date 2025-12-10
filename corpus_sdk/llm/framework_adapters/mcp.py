@@ -1,13 +1,3 @@
-You’re right, MCP should not have cache/rate limiting/etc. The version you pasted is the right shape; it just needs token counting via LLMTranslator with a robust fallback, like the other adapters.
-
-Here’s the full updated corpus_sdk/mcp/llm_service.py with:
-	•	Intro doc tweaked to mention token counting via LLMTranslator with heuristic fallback.
-	•	New method count_tokens_for_prompt(...) that:
-	•	Calls self._translator.count_tokens_for_messages(...) with a single user message.
-	•	Handles both int and mapping results (tokens / total_tokens / count).
-	•	Falls back to _estimate_tokens(prompt) on any error or weird result.
-	•	No other behavior changed. No cache, no rate limiting, nothing extra.
-
 # corpus_sdk/mcp/llm_service.py
 # SPDX-License-Identifier: Apache-2.0
 
