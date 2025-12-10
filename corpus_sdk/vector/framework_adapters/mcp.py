@@ -1,145 +1,189 @@
-# corpus_sdk/vector/mcp_vector_service.py
+# corpus_sdk/vector/framework_adapters/mcp_vector_service.py
 # SPDX-License-Identifier: Apache-2.0
 
 """
-MCP Vector Translation Service
+MCP-facing vector service for Corpus Vector protocol.
 
-This module provides the MCP-facing vector service implementation for
-Corpus VectorProtocolV1. It mirrors the structure, design, and
-responsibilities of MCPLLMTranslationService and MCPGraphTranslationService:
+This is a *thin* integration layer between:
 
-- Async-only API surface (no sync methods)
-- No batching, no caching, no retries, no circuit breakers
-- Thin translation layer around VectorTranslator + VectorProtocolV1
-- Uses OperationContext consistently for tracing
-- Uses shared error utils for consistent diagnostics
-- Does not add algorithms (MMR, normalization, ranking, etc.)
-- Accepts raw embeddings + metadata (MCP-native shape)
-- Exposes minimal high-level operations required by MCP:
-    * capabilities()
-    * similarity_search()
-    * stream_similarity_search()
-    * add_texts()
-    * add_documents()
-    * delete()
+- MCP tools implemented in the MCP server (typically JS), and
+- Corpus `VectorProtocolV1` adapters via `VectorTranslator`.
 
-Design Philosophy
------------------
-- MCP services must be predictable, minimal, and fully aligned.
-- All complexity lives inside the underlying adapter or VectorTranslator.
-- This file NEVER reinvents protocol logic, token logic, batching, or shaping.
-- Errors are wrapped identically to other MCP services via attach_context().
+Design
+------
+
+- Mirrors the patterns used by other MCP services (LLM, Graph, etc.).
+- Async-only API for MCP server to call.
+- Does *not* implement:
+    * MMR
+    * Embeddings
+    * Business logic
+    * Metadata envelopes
+    * Length / shape validation
+
+All heavy lifting is delegated to:
+
+- The underlying `VectorProtocolV1` adapter
+- The shared `VectorTranslator` (batching, limits, error handling, etc.)
+
+This layer focuses on:
+
+- Building `OperationContext` via `context_translation.from_mcp`
+- Normalizing framework context for vector operations
+- Adding rich error context via `attach_context` + `VectorCoercionErrorCodes`
+- Keeping the request/response payloads as generic `dict`/`Any` so
+  the translator defines the contract.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Iterable, AsyncIterator, Mapping
+import logging
+from functools import cached_property
+from typing import Any, Dict, Mapping, Optional
 
+from corpus_sdk.core.context_translation import (
+    from_mcp as ctx_from_mcp,
+    from_dict as ctx_from_dict,
+)
+from corpus_sdk.core.error_context import attach_context
 from corpus_sdk.vector.vector_base import (
     VectorProtocolV1,
-    VectorCapabilities,
-    QueryResult,
-    QueryChunk,
     OperationContext,
-    BadRequest,
-    NotSupported,
 )
-from corpus_sdk.core.context_translation import from_dict as ctx_from_dict
-from corpus_sdk.core.error_context import attach_context
 from corpus_sdk.vector.framework_adapters.common.vector_translation import (
-    VectorTranslator,
     DefaultVectorFrameworkTranslator,
+    VectorTranslator,
 )
-
-# Shared framework utils for consistency across MCP services
 from corpus_sdk.vector.framework_adapters.common.framework_utils import (
     VectorCoercionErrorCodes,
     VectorResourceLimits,
     VectorValidationFlags,
+    TopKWarningConfig,
     normalize_vector_context,
     attach_vector_context_to_framework_ctx,
+    warn_if_extreme_k,
 )
 
-import logging
 logger = logging.getLogger(__name__)
 
+_FRAMEWORK_NAME = "mcp"
 
-VECTOR_ERROR_CODES = VectorCoercionErrorCodes(framework_label="mcp")
+VECTOR_ERROR_CODES = VectorCoercionErrorCodes(framework_label=_FRAMEWORK_NAME)
 VECTOR_LIMITS = VectorResourceLimits()
 VECTOR_FLAGS = VectorValidationFlags()
+TOPK_WARNING_CONFIG = TopKWarningConfig(framework_label=_FRAMEWORK_NAME)
 
 
-class MCPVectorTranslationService:
+class MCPVectorService:
     """
-    MCP-facing vector service for Corpus.
+    Thin MCP vector service over a Corpus `VectorProtocolV1`.
 
-    This class strictly mirrors the architecture of MCPLLMTranslationService
-    and MCPGraphTranslationService:
+    The MCP server should:
+    - Instantiate this once per adapter.
+    - Expose its methods as MCP tools (e.g. `vector.query`, `vector.upsert`, `vector.delete`).
 
-    - Translate MCP request → raw vector spec dict → VectorTranslator call
-    - Wrap errors using attach_context()
-    - Use OperationContext consistently
-    - Return raw dicts suitable for JSON serialization
-    - NO sync methods
-    - NO MMR
-    - NO batching logic
-    - NO custom transformations of embeddings or metadata
+    This class intentionally does *not* reshape inputs/outputs; it expects
+    the MCP layer to pass through "raw" vector protocol-style dicts and
+    lets `VectorTranslator` define the concrete schema.
     """
 
     def __init__(
         self,
         *,
-        adapter: VectorProtocolV1,
-        namespace: Optional[str] = None,
-        default_top_k: int = 4,
+        corpus_adapter: VectorProtocolV1,
+        namespace: Optional[str] = "default",
     ) -> None:
-        self._adapter = adapter
-        self._namespace = namespace
-        self._default_top_k = int(default_top_k)
-        self._caps: Optional[VectorCapabilities] = None
+        self.corpus_adapter = corpus_adapter
+        self.namespace = namespace
+        self._caps = None  # lazily fetched capabilities
 
-        # Translator identical pattern to MCPLLM + MCPGraph
-        self._translator = VectorTranslator(
-            adapter=self._adapter,
-            framework="mcp",
-            translator=DefaultVectorFrameworkTranslator(),
+    # ------------------------------------------------------------------ #
+    # Translator wiring
+    # ------------------------------------------------------------------ #
+
+    @cached_property
+    def _translator(self) -> VectorTranslator:
+        framework_translator = DefaultVectorFrameworkTranslator()
+        return VectorTranslator(
+            adapter=self.corpus_adapter,
+            framework=_FRAMEWORK_NAME,
+            translator=framework_translator,
         )
 
-    # ----------------------------
-    # Internal helpers
-    # ----------------------------
+    # ------------------------------------------------------------------ #
+    # Context / framework_ctx helpers
+    # ------------------------------------------------------------------ #
 
-    def _resolve_namespace(self, ns: Optional[str]) -> Optional[str]:
-        return ns if ns is not None else self._namespace
+    def _effective_namespace(self, overridden: Optional[str], raw_request: Dict[str, Any]) -> Optional[str]:
+        """
+        Resolve namespace precedence:
 
-    def _resolve_op_ctx(self, ctx: Optional[Any]) -> Optional[OperationContext]:
-        if ctx is None:
-            return None
+        1. Explicit `namespace` argument
+        2. `raw_request["namespace"]`
+        3. Default `self.namespace`
+        """
+        if overridden is not None:
+            return overridden
+        if "namespace" in raw_request:
+            ns = raw_request.get("namespace")
+            return str(ns) if ns is not None else None
+        return self.namespace
+
+    def _build_ctx(
+        self,
+        *,
+        ctx: Optional[OperationContext] = None,
+        mcp_context: Optional[Mapping[str, Any]] = None,
+        context_dict: Optional[Mapping[str, Any]] = None,
+    ) -> Optional[OperationContext]:
+        """
+        Build OperationContext with precedence:
+
+        1. Explicit `ctx` (already OperationContext)
+        2. `mcp_context` via ctx_from_mcp
+        3. `context_dict` via ctx_from_dict
+        """
         if isinstance(ctx, OperationContext):
             return ctx
-        try:
-            translated = ctx_from_dict(ctx)
-            if isinstance(translated, OperationContext):
-                return translated
-        except Exception as exc:
-            attach_context(
-                exc,
-                framework="mcp",
-                operation="context_translation",
-            )
-            raise
+
+        if mcp_context is not None:
+            try:
+                maybe = ctx_from_mcp(mcp_context)
+                if isinstance(maybe, OperationContext):
+                    return maybe
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("ctx_from_mcp failed: %s", exc)
+
+        if isinstance(context_dict, Mapping):
+            try:
+                maybe = ctx_from_dict(context_dict)
+                if isinstance(maybe, OperationContext):
+                    return maybe
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("ctx_from_dict failed: %s", exc)
+
         return None
 
-    def _framework_ctx(self, namespace: Optional[str]) -> Dict[str, Any]:
-        raw = {}
-        if namespace:
-            raw["namespace"] = namespace
+    def _framework_ctx_for_namespace(
+        self,
+        namespace: Optional[str],
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Build a framework_ctx enriched with normalized vector context.
+        """
+        raw_ctx: Dict[str, Any] = {}
+        if namespace is not None:
+            raw_ctx["namespace"] = namespace
+        if extra_context:
+            raw_ctx.update(extra_context)
 
         vector_ctx = normalize_vector_context(
-            raw,
-            framework="mcp",
+            raw_ctx,
+            framework=_FRAMEWORK_NAME,
             logger=logger,
         )
+
         framework_ctx: Dict[str, Any] = {}
         attach_vector_context_to_framework_ctx(
             framework_ctx,
@@ -149,267 +193,195 @@ class MCPVectorTranslationService:
         )
         return framework_ctx
 
-    async def _get_caps(self) -> VectorCapabilities:
-        if self._caps is None:
-            try:
-                self._caps = await self._translator.arun_capabilities()
-            except Exception as exc:
-                attach_context(exc, framework="mcp", operation="capabilities")
-                raise
-        return self._caps
+    # ------------------------------------------------------------------ #
+    # Capabilities (thin wrapper)
+    # ------------------------------------------------------------------ #
 
-    def _validate_query_result(self, result: Any, *, op: str) -> QueryResult:
-        if not isinstance(result, QueryResult):
-            raise BadRequest(
-                f"{op} returned invalid result type: {type(result).__name__}",
-                code="BAD_QUERY_RESULT",
-            )
-        return result
-
-    def _validate_stream_chunk(self, chunk: Any, *, op: str) -> QueryChunk:
-        if not isinstance(chunk, QueryChunk):
-            raise BadRequest(
-                f"{op} yielded invalid chunk type: {type(chunk).__name__}",
-                code="BAD_STREAM_CHUNK",
-            )
-        return chunk
-
-    # ----------------------------
-    # Public API (async-only)
-    # ----------------------------
-
-    async def capabilities(self) -> VectorCapabilities:
-        """Return vector store capabilities."""
-        return await self._get_caps()
-
-    async def add_texts(
-        self,
-        texts: Iterable[str],
-        *,
-        embeddings: Optional[List[List[float]]] = None,
-        metadatas: Optional[List[Mapping[str, Any]]] = None,
-        namespace: Optional[str] = None,
-        ctx: Optional[Any] = None,
-    ) -> List[str]:
+    async def aget_capabilities(self) -> Any:
         """
-        Add raw text + embedding rows to the vector store.
-        MCP-native shape → list of:
-        {
-            "id": "string",
-            "vector": [...],
-            "metadata": {},
-            "namespace": ...
-        }
+        Pass-through capabilities call.
 
-        This method does:
-        - Validate lengths
-        - Shape raw dicts
-        - Let VectorTranslator handle the protocol call
+        Returns whatever the translator/adapter returns (shape is adapter-defined).
         """
-
-        texts_list = list(texts)
-        n = len(texts_list)
-        if n == 0:
-            return []
-
-        if embeddings is None or len(embeddings) != n:
-            raise BadRequest(
-                "embeddings must be provided and match text count",
-                code="BAD_EMBEDDINGS",
-            )
-
-        meta_list: List[Mapping[str, Any]] = []
-        if metadatas is None:
-            meta_list = [{} for _ in range(n)]
-        else:
-            if len(metadatas) != n:
-                raise BadRequest(
-                    "metadatas length mismatch",
-                    code="BAD_METADATA",
-                )
-            meta_list = list(metadatas)
-
-        ns = self._resolve_namespace(namespace)
-        op_ctx = self._resolve_op_ctx(ctx)
-
-        # Build raw vector rows directly for translator
-        vectors = []
-        for text, emb, meta in zip(texts_list, embeddings, meta_list):
-            vectors.append(
-                {
-                    "id": meta.get("id") or meta.get("doc_id") or None,
-                    "vector": [float(x) for x in emb],
-                    "metadata": dict(meta),
-                    "namespace": ns,
-                    "text": text,
-                }
-            )
-
-        raw_request = {
-            "namespace": ns,
-            "vectors": vectors,
-        }
-
         try:
-            await self._translator.arun_upsert(
-                raw_request,
-                op_ctx=op_ctx,
-                framework_ctx=self._framework_ctx(ns),
+            return await self._translator.arun_capabilities()
+        except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework=_FRAMEWORK_NAME,
+                operation="vector_aget_capabilities",
+                error_codes=VECTOR_ERROR_CODES,
             )
-        except Exception as exc:
-            attach_context(exc, framework="mcp", operation="add_texts")
             raise
 
-        # IDs may come from metadata or may be assigned by backend
-        ids = [str(meta.get("id") or meta.get("doc_id") or "") for meta in meta_list]
-        return ids
+    # ------------------------------------------------------------------ #
+    # Thin async ops: upsert / query / delete
+    # ------------------------------------------------------------------ #
 
-    async def add_documents(
+    async def aupsert(
         self,
-        documents: Iterable[Mapping[str, Any]],
+        request: Dict[str, Any],
         *,
-        embeddings: Optional[List[List[float]]] = None,
         namespace: Optional[str] = None,
-        ctx: Optional[Any] = None,
-    ) -> List[str]:
+        ctx: Optional[OperationContext] = None,
+        mcp_context: Optional[Mapping[str, Any]] = None,
+        context_dict: Optional[Mapping[str, Any]] = None,
+    ) -> Any:
         """
-        Add general documents.
-        Document shape:
+        Thin async upsert wrapper.
+
+        `request` should already be shaped as the vector upsert request
+        the translator expects (e.g. with `vectors`, `namespace`, etc.).
+        """
+        raw_request = dict(request or {})
+        ns = self._effective_namespace(namespace, raw_request)
+        if ns is not None:
+            raw_request.setdefault("namespace", ns)
+
+        op_ctx = self._build_ctx(
+            ctx=ctx,
+            mcp_context=mcp_context,
+            context_dict=context_dict,
+        )
+        framework_ctx = self._framework_ctx_for_namespace(ns)
+
+        try:
+            result = await self._translator.arun_upsert(
+                raw_request,
+                op_ctx=op_ctx,
+                framework_ctx=framework_ctx,
+            )
+            return result
+        except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework=_FRAMEWORK_NAME,
+                operation="vector_aupsert",
+                error_codes=VECTOR_ERROR_CODES,
+                namespace=ns,
+            )
+            raise
+
+    async def aquery(
+        self,
+        request: Dict[str, Any],
+        *,
+        namespace: Optional[str] = None,
+        ctx: Optional[OperationContext] = None,
+        mcp_context: Optional[Mapping[str, Any]] = None,
+        context_dict: Optional[Mapping[str, Any]] = None,
+    ) -> Any:
+        """
+        Thin async query wrapper.
+
+        `request` should be a dict shaped for the translator's query:
             {
-                "text": "...",
-                "metadata": {...}
+                "vector": [...],
+                "top_k": int,
+                "namespace": Optional[str],
+                "filters": Optional[dict],
+                "include_metadata": bool,
+                "include_vectors": bool,
+                ...
+            }
+
+        This method:
+        - Resolves namespace
+        - Normalizes vector context
+        - Adds error context
+        - Delegates everything else to the translator
+        """
+        raw_request = dict(request or {})
+        ns = self._effective_namespace(namespace, raw_request)
+        if ns is not None:
+            raw_request.setdefault("namespace", ns)
+
+        # Optional: warn for extreme top_k, following other adapters
+        top_k = raw_request.get("top_k")
+        if isinstance(top_k, int):
+            warn_if_extreme_k(
+                top_k,
+                framework=_FRAMEWORK_NAME,
+                op_name="vector_aquery",
+                warning_config=TOPK_WARNING_CONFIG,
+                logger=logger,
+            )
+
+        op_ctx = self._build_ctx(
+            ctx=ctx,
+            mcp_context=mcp_context,
+            context_dict=context_dict,
+        )
+        framework_ctx = self._framework_ctx_for_namespace(ns)
+
+        try:
+            result = await self._translator.arun_query(
+                raw_request,
+                op_ctx=op_ctx,
+                framework_ctx=framework_ctx,
+            )
+            return result
+        except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework=_FRAMEWORK_NAME,
+                operation="vector_aquery",
+                error_codes=VECTOR_ERROR_CODES,
+                namespace=ns,
+                top_k=top_k,
+            )
+            raise
+
+    async def adelete(
+        self,
+        request: Dict[str, Any],
+        *,
+        namespace: Optional[str] = None,
+        ctx: Optional[OperationContext] = None,
+        mcp_context: Optional[Mapping[str, Any]] = None,
+        context_dict: Optional[Mapping[str, Any]] = None,
+    ) -> Any:
+        """
+        Thin async delete wrapper.
+
+        `request` should be shaped for the translator's delete:
+            {
+                "ids": Optional[list[str]],
+                "namespace": Optional[str],
+                "filter": Optional[dict],
+                ...
             }
         """
-        docs = list(documents)
-        texts = [str(d.get("text") or "") for d in docs]
-        metas = [dict(d.get("metadata") or {}) for d in docs]
-        return await self.add_texts(
-            texts,
-            embeddings=embeddings,
-            metadatas=metas,
-            namespace=namespace,
+        raw_request = dict(request or {})
+        ns = self._effective_namespace(namespace, raw_request)
+        if ns is not None:
+            raw_request.setdefault("namespace", ns)
+
+        op_ctx = self._build_ctx(
             ctx=ctx,
+            mcp_context=mcp_context,
+            context_dict=context_dict,
         )
-
-    async def similarity_search(
-        self,
-        *,
-        vector: List[float],
-        k: Optional[int] = None,
-        namespace: Optional[str] = None,
-        filter: Optional[Mapping[str, Any]] = None,
-        ctx: Optional[Any] = None,
-    ) -> List[Dict[str, Any]]:
-        """Return search results as raw dicts matching MCP expectations."""
-        ns = self._resolve_namespace(namespace)
-        op_ctx = self._resolve_op_ctx(ctx)
-        top_k = int(k or self._default_top_k)
-
-        raw_request = {
-            "vector": [float(x) for x in vector],
-            "top_k": top_k,
-            "namespace": ns,
-            "filters": dict(filter) if filter else None,
-            "include_metadata": True,
-            "include_vectors": False,
-        }
+        framework_ctx = self._framework_ctx_for_namespace(ns)
 
         try:
-            result_any = await self._translator.arun_query(
+            result = await self._translator.arun_delete(
                 raw_request,
                 op_ctx=op_ctx,
-                framework_ctx=self._framework_ctx(ns),
+                framework_ctx=framework_ctx,
             )
-        except Exception as exc:
-            attach_context(exc, framework="mcp", operation="similarity_search")
+            return result
+        except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework=_FRAMEWORK_NAME,
+                operation="vector_adelete",
+                error_codes=VECTOR_ERROR_CODES,
+                namespace=ns,
+            )
             raise
 
-        result = self._validate_query_result(result_any, op="similarity_search")
-        matches = list(result.matches or [])
-        payload = []
 
-        for m in matches:
-            vector_obj = m.vector
-            meta = dict(vector_obj.metadata or {})
-            payload.append(
-                {
-                    "id": str(vector_obj.id),
-                    "score": float(m.score),
-                    "metadata": meta,
-                    "text": meta.get("text", ""),
-                }
-            )
-        return payload
-
-    async def stream_similarity_search(
-        self,
-        *,
-        vector: List[float],
-        k: Optional[int] = None,
-        namespace: Optional[str] = None,
-        filter: Optional[Mapping[str, Any]] = None,
-        ctx: Optional[Any] = None,
-    ) -> AsyncIterator[Dict[str, Any]]:
-        """Streaming version of similarity_search."""
-        ns = self._resolve_namespace(namespace)
-        op_ctx = self._resolve_op_ctx(ctx)
-        top_k = int(k or self._default_top_k)
-
-        raw_request = {
-            "vector": [float(x) for x in vector],
-            "top_k": top_k,
-            "namespace": ns,
-            "filters": dict(filter) if filter else None,
-            "include_metadata": True,
-            "include_vectors": False,
-        }
-
-        try:
-            async for chunk in self._translator.arun_query_stream(
-                raw_request,
-                op_ctx=op_ctx,
-                framework_ctx=self._framework_ctx(ns),
-            ):
-                chunk_qc = self._validate_stream_chunk(chunk, op="stream_similarity_search")
-
-                for m in chunk_qc.matches or []:
-                    vector_obj = m.vector
-                    meta = dict(vector_obj.metadata or {})
-                    yield {
-                        "id": str(vector_obj.id),
-                        "score": float(m.score),
-                        "metadata": meta,
-                        "text": meta.get("text", ""),
-                    }
-
-        except Exception as exc:
-            attach_context(exc, framework="mcp", operation="stream_similarity_search")
-            raise
-
-    async def delete(
-        self,
-        *,
-        ids: Optional[List[str]] = None,
-        namespace: Optional[str] = None,
-        filter: Optional[Mapping[str, Any]] = None,
-        ctx: Optional[Any] = None,
-    ) -> None:
-        """Delete vectors by IDs or filter."""
-        ns = self._resolve_namespace(namespace)
-        op_ctx = self._resolve_op_ctx(ctx)
-
-        raw_request = {
-            "namespace": ns,
-            "ids": ids,
-            "filter": dict(filter) if filter else None,
-        }
-
-        try:
-            await self._translator.arun_delete(
-                raw_request,
-                op_ctx=op_ctx,
-                framework_ctx=self._framework_ctx(ns),
-            )
-        except Exception as exc:
-            attach_context(exc, framework="mcp", operation="delete")
-            raise
+__all__ = [
+    "MCPVectorService",
+]
