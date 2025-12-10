@@ -1,3 +1,13 @@
+You’re right, MCP should not have cache/rate limiting/etc. The version you pasted is the right shape; it just needs token counting via LLMTranslator with a robust fallback, like the other adapters.
+
+Here’s the full updated corpus_sdk/mcp/llm_service.py with:
+	•	Intro doc tweaked to mention token counting via LLMTranslator with heuristic fallback.
+	•	New method count_tokens_for_prompt(...) that:
+	•	Calls self._translator.count_tokens_for_messages(...) with a single user message.
+	•	Handles both int and mapping results (tokens / total_tokens / count).
+	•	Falls back to _estimate_tokens(prompt) on any error or weird result.
+	•	No other behavior changed. No cache, no rate limiting, nothing extra.
+
 # corpus_sdk/mcp/llm_service.py
 # SPDX-License-Identifier: Apache-2.0
 
@@ -10,7 +20,8 @@ layer as an MCP-oriented LLM service with:
 - Context-aware MCP → OperationContext translation via `from_mcp`
 - Async non-streaming + streaming completion APIs
 - Framework-agnostic translation via `LLMTranslator` (no direct message translation)
-- Lightweight token estimation for basic accounting / heuristics
+- Token counting via `LLMTranslator` with a robust heuristic fallback
+- Lightweight token estimation helper for quick local heuristics
 - Rich error context attachment for observability via `CoercionErrorCodes`
 
 Design goals
@@ -25,13 +36,14 @@ Design goals
    Keep this module focused on:
    - Building `OperationContext` from raw MCP metadata via `from_mcp`
    - Assembling sampling parameters + a small `framework_ctx`
-   - Delegating to `LLMTranslator` for completion + streaming
+   - Delegating to `LLMTranslator` for completion + streaming + token counting
 
 3. Alignment with other adapters:
-   Mirror the structure of the LangChain / CrewAI / Semantic Kernel adapters:
+   Mirror the structure of the LangChain / LlamaIndex / Semantic Kernel adapters:
    - Validated config dataclass
    - `LLMProtocolV1` adapter validation
    - Shared error-code bundle via `CoercionErrorCodes`
+   - Token counting via `LLMTranslator` with robust fallback
    - Simple token estimation helper for callers that need it
 """
 
@@ -147,7 +159,9 @@ class MCPLLMTranslationService:
     - Provides:
         * `acomplete`   – async, non-streaming completion
         * `astream`     – async streaming completion
-        * `estimate_tokens` – simple char-based token heuristic
+        * `count_tokens_for_prompt` – token counting via `LLMTranslator`
+          with robust fallback
+        * `estimate_tokens_for_prompt` – simple char-based heuristic
 
     The MCP-specific behavior (how MCP messages are shaped, how tools are
     wired, etc.) is handled in the registered `"mcp"` `LLMFrameworkTranslator`,
@@ -367,15 +381,13 @@ class MCPLLMTranslationService:
         }
 
         # Forward a small, sanitized MCP context slice if present.
-        # Callers can decide how much to put into mcp_context; we avoid
-        # copying large or sensitive blobs by default.
         if mcp_context:
             framework_ctx["mcp_context_keys"] = list(mcp_context.keys())
 
         return framework_ctx
 
     # ------------------------------------------------------------------ #
-    # Token estimation
+    # Token estimation + counting
     # ------------------------------------------------------------------ #
 
     def _estimate_tokens(self, text: str) -> int:
@@ -389,11 +401,89 @@ class MCPLLMTranslationService:
         """
         if not text:
             return 0
-        # Could be swapped to a shared utility later if desired.
         return max(1, len(text) // 4)
 
-    # Public helper for callers that want a quick estimate.
+    # Public helper for callers that want a quick heuristic estimate.
     def estimate_tokens_for_prompt(self, prompt: str) -> int:
+        return self._estimate_tokens(prompt)
+
+    def count_tokens_for_prompt(
+        self,
+        prompt: str,
+        *,
+        model: Optional[str] = None,
+        mcp_context: Optional[Mapping[str, Any]] = None,
+        request_id: Optional[str] = None,
+    ) -> int:
+        """
+        Count tokens for a single prompt using LLMTranslator when possible.
+
+        Preferred path:
+        - Use `LLMTranslator.count_tokens_for_messages` so token counting
+          matches provider-specific formatting and behavior.
+
+        Fallback:
+        - If translator/adapter counting fails or returns an unexpected shape,
+          fall back to the local `_estimate_tokens` heuristic.
+        """
+        if not prompt or not prompt.strip():
+            return 0
+
+        # Build a minimal MCP OperationContext for counting.
+        mcp_ctx: Mapping[str, Any] = mcp_context or {}
+        try:
+            ctx = self._build_operation_context(mcp_ctx)
+        except Exception:
+            # If context building itself fails, just use the heuristic.
+            logger.debug("MCP token count: failed to build OperationContext; using heuristic")
+            return self._estimate_tokens(prompt)
+
+        params = self._build_sampling_params(
+            model=model,
+            temperature=None,
+            max_tokens=None,
+        )
+        model_for_ctx = str(params.get("model", self.model))
+        framework_ctx = self._build_framework_ctx(
+            operation="count_tokens",
+            stream=False,
+            model=model_for_ctx,
+            request_id=request_id or ctx.request_id,
+            mcp_context=mcp_ctx,
+        )
+
+        # Single user message for counting.
+        messages = [{"role": "user", "content": prompt}]
+
+        try:
+            tokens_any = self._translator.count_tokens_for_messages(
+                raw_messages=messages,
+                model=model_for_ctx,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+
+            # Direct int result
+            if isinstance(tokens_any, int):
+                return tokens_any
+
+            # Mapping-style result from translator
+            if isinstance(tokens_any, Mapping):
+                for key in ("tokens", "total_tokens", "count"):
+                    value = tokens_any.get(key)
+                    if isinstance(value, int):
+                        return value
+
+            logger.debug(
+                "MCP token count: unexpected result shape %r; falling back to heuristic",
+                type(tokens_any),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "MCP token count via translator failed; falling back to heuristic: %s",
+                exc,
+            )
+
         return self._estimate_tokens(prompt)
 
     # ------------------------------------------------------------------ #
@@ -580,3 +670,8 @@ __all__ = [
     "MCPLLMTranslationService",
     "ERROR_CODES",
 ]
+
+This keeps MCP aligned with the other adapters:
+	•	Shared error codes via CoercionErrorCodes.
+	•	Explicit OperationContext usage.
+	•	Token counting flows through LLMTranslator first, with a clean heuristic fallback.
