@@ -1,57 +1,61 @@
-Corpus SDK Framework Adapter Quick Start
+# Corpus SDK Framework Adapter Quick Start
 
-Goal: Make Corpus Protocol–speaking services usable from 6 popular frameworks (Autogen, CrewAI, LangChain, LlamaIndex, Semantic Kernel, MCP) across all 4 domains (LLM, Embedding, Vector, Graph) – with thin, honest translation layers, not fantasy SDKs.
+**Goal:** Make Corpus Protocol-speaking services usable from 6 popular frameworks (Autogen, CrewAI, LangChain, LlamaIndex, Semantic Kernel, MCP) across all 4 domains (LLM, Embedding, Vector, Graph) - with thin, honest translation layers, not fantasy SDKs.
 
-⸻
+---
 
-Table of Contents
-	•		0.	Mental Model (What You’re Actually Building)
-	•		1.	Prerequisites & Shared Wire Client
-	•		2.	Autogen Integration
-	•	2.1 LLM (Chat Completion)
-	•	2.2 Embedding-backed “Memory”
-	•	2.3 Vector Search Tool
-	•	2.4 Graph Query Tool
-	•	2.5 Wiring Agents
-	•		3.	CrewAI Integration
-	•	3.1 CrewAI LLM Backend
-	•	3.2 CrewAI Embedding & Vector-backed Tools
-	•	3.3 CrewAI Graph Tool
-	•		4.	LangChain Integration
-	•	4.1 Chat Model (LLM)
-	•	4.2 Embeddings
-	•	4.3 VectorStore
-	•	4.4 Graph Tooling
-	•		5.	LlamaIndex Integration
-	•	5.1 LLM
-	•	5.2 Embedding Model
-	•	5.3 Vector Index / Storage
-	•	5.4 Graph-backed Query Engine
-	•		6.	Semantic Kernel Integration
-	•	6.1 Text Embedding Service
-	•	6.2 Chat Completion Service
-	•	6.3 Vector / Graph Connectors
-	•		7.	MCP Integration
-	•	7.1 MCP Server Backed by Corpus Protocols
-	•	7.2 Using Corpus from MCP-aware Frameworks
-	•		8.	Contexts, Deadlines, Tenants & Error Mapping
-	•		9.	Framework Conformance & Smoke Tests
-	•		10.	Integration Launch Checklist (TL;dr)
+## Table of Contents
 
-⸻
+0. **[Mental Model](#0-mental-model-what-youre-actually-building)** (What You're Actually Building)
+1. **[Prerequisites & Shared Wire Client](#1-prerequisites--shared-wire-client)**
+2. **[Autogen Integration](#2-autogen-integration)**
+   - 2.1 LLM (Chat Completion)
+   - 2.2 Embedding-backed "Memory"
+   - 2.3 Vector Search Tool
+   - 2.4 Graph Query Tool
+   - 2.5 Wiring Agents
+3. **[CrewAI Integration](#3-crewai-integration)**
+   - 3.1 CrewAI LLM Backend
+   - 3.2 CrewAI Embedding & Vector-backed Tools
+   - 3.3 CrewAI Graph Tool
+4. **[LangChain Integration](#4-langchain-integration)**
+   - 4.1 Chat Model (LLM)
+   - 4.2 Embeddings
+   - 4.3 VectorStore
+   - 4.4 Graph Tooling
+5. **[LlamaIndex Integration](#5-llamaindex-integration)**
+   - 5.1 LLM
+   - 5.2 Embedding Model
+   - 5.3 Vector Index / Storage
+   - 5.4 Graph-backed Query Engine
+6. **[Semantic Kernel Integration](#6-semantic-kernel-integration)**
+   - 6.1 Text Embedding Service
+   - 6.2 Chat Completion Service
+   - 6.3 Vector / Graph Connectors
+7. **[MCP Integration](#7-mcp-integration)**
+   - 7.1 MCP Server Backed by Corpus Protocols
+   - 7.2 Using Corpus from MCP-aware Frameworks
+8. **[Contexts, Deadlines, Tenants & Error Mapping](#8-contexts-deadlines-tenants--error-mapping)**
+9. **[Framework Conformance & Smoke Tests](#9-framework-conformance--smoke-tests)**
+10. **[Integration Launch Checklist (TL;DR)](#10-integration-launch-checklist-tldr)**
 
-0. Mental Model (What You’re Actually Building)
+---
+
+## 0. Mental Model (What You're Actually Building)
 
 You already have server-side adapters:
 
+```
 [BaseLLMAdapter / BaseEmbeddingAdapter / ...]
           ↓
 [WireLLMHandler / WireEmbeddingHandler / ...]
           ↓
       HTTP endpoints (speak Corpus Protocol)
+```
 
-This document is about the client-side:
+This document is about the **client-side**:
 
+```
 [Framework-native API]  (Autogen, CrewAI, LangChain, etc.)
         ↓
 [Framework adapter]     ← very thin, framework-specific glue
@@ -59,29 +63,29 @@ This document is about the client-side:
 [CorpusClient]          ← sends/receives Corpus envelopes over HTTP
         ↓
 [Your HTTP services]    ← built with Base*Adapter + Wire*Handler
+```
 
-Design rules for framework adapters:
-	1.	Thin – 50–200 LOC per adapter. No business logic.
-	2.	Honest – no fake SDK modules; everything in this doc is code YOU define.
-	3.	Protocol-correct – envelopes must match SCHEMA.md.
-	4.	Framework-native – return the types each framework expects (or very close).
+**Design rules for framework adapters:**
+1. **Thin** – 50–200 LOC per adapter. No business logic.
+2. **Honest** – no fake SDK modules; everything in this doc is code YOU define.
+3. **Protocol-correct** – envelopes must match SCHEMA.md.
+4. **Framework-native** – return the types each framework expects (or very close).
 
-⸻
+---
 
-1. Prerequisites & Shared Wire Client
+## 1. Prerequisites & Shared Wire Client
 
-You need a tiny, shared CorpusClient that understands your envelopes and endpoints.
+You need a tiny, shared `CorpusClient` that understands your envelopes and endpoints.
 
-Assumption:
-You’ve deployed four HTTP endpoints (names are up to you), each expecting/returning Corpus envelopes:
-	•	llm_url – handles op: "llm.complete" etc.
-	•	embedding_url – handles op: "embedding.embed" / embedding.embed_batch
-	•	vector_url – handles op: "vector.query", vector.upsert, …
-	•	graph_url – handles op: "graph.query" / graph.stream.query"
+**Assumption:** You've deployed four HTTP endpoints (names are up to you), each expecting/returning Corpus envelopes:
+- `llm_url` – handles `op: "llm.complete"` etc.
+- `embedding_url` – handles `op: "embedding.embed"` / `embedding.embed_batch`
+- `vector_url` – handles `op: "vector.query"`, `vector.upsert`, …
+- `graph_url` – handles `op: "graph.query"` / `graph.stream.query"`
 
-Create:
+**Create:** `corpus_sdk/framework_client/client.py`
 
-# corpus_sdk/framework_client/client.py
+```python
 from __future__ import annotations
 import time
 import uuid
@@ -260,23 +264,24 @@ class CorpusClient:
             args["params"] = params
         args.update(extra_args)
         return await self._post(self.graph_url, "graph.query", args)
+```
 
-This client is the only place that knows about op, ctx, and exact args.
-Every framework adapter below only deals in messages, texts, vectors, etc. and just calls CorpusClient.
+This client is the only place that knows about `op`, `ctx`, and exact args. Every framework adapter below only deals in messages, texts, vectors, etc. and just calls `CorpusClient`.
 
-⸻
+---
 
-2. Autogen Integration
+## 2. Autogen Integration
 
-Key idea:
-	•	Wrap CorpusClient.llm_complete in an object Autogen can call as an LLM.
-	•	Use CorpusClient.embed / embed_batch for “memory”.
-	•	Use CorpusClient.vector_query and graph_query behind tools.
+**Key idea:**
+- Wrap `CorpusClient.llm_complete` in an object Autogen can call as an LLM.
+- Use `CorpusClient.embed` / `embed_batch` for "memory".
+- Use `CorpusClient.vector_query` and `graph_query` behind tools.
 
-2.1 LLM (Chat Completion)
+### 2.1 LLM (Chat Completion)
 
-File: corpus_sdk/llm/framework_adapters/autogen.py
+**File:** `corpus_sdk/llm/framework_adapters/autogen.py`
 
+```python
 from __future__ import annotations
 from typing import Any, Dict, List, Optional
 import asyncio
@@ -340,9 +345,11 @@ class CorpusAutogenLLMClient:
         **kwargs: Any,
     ) -> Dict[str, Any]:
         return asyncio.run(self.create_chat_completion(messages, **kwargs))
+```
 
-Usage in Autogen (pseudo):
+**Usage in Autogen (pseudo):**
 
+```python
 from autogen import ConversableAgent
 
 from corpus_sdk.framework_client.client import CorpusClient
@@ -373,15 +380,17 @@ agent = ConversableAgent(
         ]
     },
 )
+```
 
-⸻
+---
 
-2.2 Embedding-backed “Memory”
+### 2.2 Embedding-backed "Memory"
 
-Use CorpusClient.embed and vector_query to back Autogen’s retrieval agents.
+Use `CorpusClient.embed` and `vector_query` to back Autogen's retrieval agents.
 
-File: corpus_sdk/embedding/framework_adapters/autogen.py
+**File:** `corpus_sdk/embedding/framework_adapters/autogen.py`
 
+```python
 from __future__ import annotations
 from typing import Any, Dict, List
 import asyncio
@@ -456,15 +465,17 @@ class CorpusMemoryStore:
 
     def similarity_search_sync(self, query: str, k: int = 4) -> List[Dict[str, Any]]:
         return asyncio.run(self.similarity_search(query, k=k))
+```
 
-⸻
+---
 
-2.3 Vector Search Tool
+### 2.3 Vector Search Tool
 
-Turn similarity_search_sync into a callable tool.
+Turn `similarity_search_sync` into a callable tool.
 
-File: corpus_sdk/vector/framework_adapters/autogen.py
+**File:** `corpus_sdk/vector/framework_adapters/autogen.py`
 
+```python
 from __future__ import annotations
 from typing import List
 
@@ -488,13 +499,15 @@ class CorpusVectorSearchTool:
             score = m.get("score")
             chunks.append(f"[score={score:.3f}] {text}")
         return "\n\n".join(chunks)
+```
 
-⸻
+---
 
-2.4 Graph Query Tool
+### 2.4 Graph Query Tool
 
-File: corpus_sdk/graph/framework_adapters/autogen.py
+**File:** `corpus_sdk/graph/framework_adapters/autogen.py`
 
+```python
 from __future__ import annotations
 import asyncio
 from typing import Any, Dict
@@ -515,21 +528,23 @@ class CorpusGraphQueryTool:
         if not rows:
             return "No results."
         return "\n".join(str(r) for r in rows[:20])
+```
 
-⸻
+---
 
-2.5 Wiring Agents
+### 2.5 Wiring Agents
 
 Tie all the above together:
 
-File: corpus_sdk/autogen_system.py
+**File:** `corpus_sdk/autogen_system.py`
 
+```python
 from __future__ import annotations
 
 from corpus_sdk.framework_client.client import CorpusClient
 from corpus_sdk.llm.framework_adapters.autogen import CorpusAutogenLLMClient
 from corpus_sdk.embedding.framework_adapters.autogen import CorpusMemoryStore
-from corpus_sdk.vector.framework_adapters.autogen import CorpusVectorSearchTool
+from corpus_sdk.vector/framework_adapters.autogen import CorpusVectorSearchTool
 from corpus_sdk.graph.framework_adapters.autogen import CorpusGraphQueryTool
 
 
@@ -563,17 +578,19 @@ def build_autogen_stack():
         "vector_tool": vector_tool,
         "graph_tool": graph_tool,
     }
+```
 
-⸻
+---
 
-3. CrewAI Integration
+## 3. CrewAI Integration
 
-CrewAI typically wants an LLM object plus BaseTool implementations. Same pattern: wrap CorpusClient.
+CrewAI typically wants an LLM object plus `BaseTool` implementations. Same pattern: wrap `CorpusClient`.
 
-3.1 CrewAI LLM Backend
+### 3.1 CrewAI LLM Backend
 
-File: corpus_sdk/llm/framework_adapters/crewai.py
+**File:** `corpus_sdk/llm/framework_adapters/crewai.py`
 
+```python
 from __future__ import annotations
 import asyncio
 from typing import Any
@@ -610,13 +627,15 @@ class CorpusCrewAILLM:
 
     def __call__(self, prompt: str, **kwargs: Any) -> str:
         return asyncio.run(self.acomplete(prompt, **kwargs))
+```
 
-⸻
+---
 
-3.2 CrewAI Embedding & Vector-backed Tools
+### 3.2 CrewAI Embedding & Vector-backed Tools
 
-File: corpus_sdk/vector/framework_adapters/crewai.py
+**File:** `corpus_sdk/vector/framework_adapters/crewai.py`
 
+```python
 from __future__ import annotations
 import asyncio
 from typing import Any, Dict, List
@@ -663,13 +682,15 @@ class CorpusCrewAIVectorSearchTool:
             score = m.get("score")
             parts.append(f"[score={score:.3f}] {text}")
         return "\n\n".join(parts)
+```
 
-⸻
+---
 
-3.3 CrewAI Graph Tool
+### 3.3 CrewAI Graph Tool
 
-File: corpus_sdk/graph/framework_adapters/crewai.py
+**File:** `corpus_sdk/graph/framework_adapters/crewai.py`
 
+```python
 from __future__ import annotations
 import asyncio
 from typing import Any
@@ -690,17 +711,19 @@ class CorpusCrewAIGraphTool:
         if not rows:
             return "No results from graph."
         return "\n".join(str(r) for r in rows[:20])
+```
 
-⸻
+---
 
-4. LangChain Integration
+## 4. LangChain Integration
 
 LangChain is stricter about base class methods, but same pattern.
 
-4.1 Chat Model (LLM)
+### 4.1 Chat Model (LLM)
 
-File: corpus_sdk/llm/framework_adapters/langchain.py
+**File:** `corpus_sdk/llm/framework_adapters/langchain.py`
 
+```python
 from __future__ import annotations
 import asyncio
 from typing import Any, Dict, List, Optional
@@ -788,13 +811,15 @@ class CorpusLangChainChat(BaseChatModel):
                 "usage": result.get("usage", {}),
             },
         )
+```
 
-⸻
+---
 
-4.2 Embeddings
+### 4.2 Embeddings
 
-File: corpus_sdk/embedding/framework_adapters/langchain.py
+**File:** `corpus_sdk/embedding/framework_adapters/langchain.py`
 
+```python
 from __future__ import annotations
 import asyncio
 from typing import List
@@ -831,13 +856,15 @@ class CorpusLangChainEmbeddings(Embeddings):
 
     def embed_query(self, text: str) -> List[float]:
         return asyncio.run(self._aembed_query(text))
+```
 
-⸻
+---
 
-4.3 VectorStore
+### 4.3 VectorStore
 
-File: corpus_sdk/vector/framework_adapters/langchain.py
+**File:** `corpus_sdk/vector/framework_adapters/langchain.py`
 
+```python
 from __future__ import annotations
 import asyncio
 from typing import Any, Dict, Iterable, List, Optional
@@ -929,13 +956,15 @@ class CorpusLangChainVectorStore(VectorStore):
 
     def similarity_search(self, query: str, k: int = 4, **kwargs: Any) -> List[Document]:
         return asyncio.run(self._asimilarity_search(query, k=k, **kwargs))
+```
 
-⸻
+---
 
-4.4 Graph Tooling
+### 4.4 Graph Tooling
 
-File: corpus_sdk/graph/framework_adapters/langchain.py
+**File:** `corpus_sdk/graph/framework_adapters/langchain.py`
 
+```python
 from __future__ import annotations
 import asyncio
 from typing import Any
@@ -969,17 +998,19 @@ class CorpusLangChainGraphTool(BaseTool):
         if not rows:
             return "No graph results."
         return "\n".join(str(r) for r in rows[:20])
+```
 
-⸻
+---
 
-5. LlamaIndex Integration
+## 5. LlamaIndex Integration
 
-Same pattern: wrap CorpusClient in LlamaIndex base classes.
+Same pattern: wrap `CorpusClient` in LlamaIndex base classes.
 
-5.1 LLM
+### 5.1 LLM
 
-File: corpus_sdk/llm/framework_adapters/llamaindex.py
+**File:** `corpus_sdk/llm/framework_adapters/llamaindex.py`
 
+```python
 from __future__ import annotations
 import asyncio
 from typing import Any
@@ -1032,13 +1063,15 @@ class CorpusLlamaIndexLLM(CustomLLM):
 
     def complete(self, prompt: str, **kwargs: Any) -> CompletionResponse:
         return asyncio.run(self.acomplete(prompt, **kwargs))
+```
 
-⸻
+---
 
-5.2 Embedding Model
+### 5.2 Embedding Model
 
-File: corpus_sdk/embedding/framework_adapters/llamaindex.py
+**File:** `corpus_sdk/embedding/framework_adapters/llamaindex.py`
 
+```python
 from __future__ import annotations
 from typing import List
 import asyncio
@@ -1065,13 +1098,15 @@ class CorpusLlamaIndexEmbedding(BaseEmbedding):
     async def _aget_text_embeddings(self, texts: List[str]) -> List[List[float]]:
         res = await self._corpus.embed_batch(model=self.model, texts=texts)
         return [e["vector"] for e in res["embeddings"]]
+```
 
-⸻
+---
 
-5.3 Vector Index / Storage
+### 5.3 Vector Index / Storage
 
-File: corpus_sdk/vector/framework_adapters/llamaindex.py
+**File:** `corpus_sdk/vector/framework_adapters/llamaindex.py`
 
+```python
 from __future__ import annotations
 from typing import Any, Dict, List, Optional
 import asyncio
@@ -1155,13 +1190,15 @@ class CorpusLlamaIndexVectorStore(VectorStore):
 
     def query(self, query: VectorStoreQuery) -> VectorStoreQueryResult:
         return asyncio.run(self._aquery(query))
+```
 
-⸻
+---
 
-5.4 Graph-backed Query Engine
+### 5.4 Graph-backed Query Engine
 
-File: corpus_sdk/graph/framework_adapters/llamaindex.py
+**File:** `corpus_sdk/graph/framework_adapters/llamaindex.py`
 
+```python
 from __future__ import annotations
 import asyncio
 from typing import Any
@@ -1188,17 +1225,19 @@ class CorpusGraphQueryEngine(CustomQueryEngine):
 
     def query(self, query_str: str) -> Response:
         return asyncio.run(self._aquery(query_str))
+```
 
-⸻
+---
 
-6. Semantic Kernel Integration
+## 6. Semantic Kernel Integration
 
 Semantic Kernel wants connector classes that implement their base interfaces.
 
-6.1 Text Embedding Service
+### 6.1 Text Embedding Service
 
-File: corpus_sdk/embedding/framework_adapters/semantic_kernel.py
+**File:** `corpus_sdk/embedding/framework_adapters/semantic_kernel.py`
 
+```python
 from __future__ import annotations
 from typing import List
 import asyncio
@@ -1226,13 +1265,15 @@ class CorpusSKEmbedding(TextEmbeddingBase):
 
     def generate_embeddings(self, texts: List[str]) -> List[List[float]]:
         return asyncio.run(self._generate_embeddings_async(texts))
+```
 
-⸻
+---
 
-6.2 Chat Completion Service
+### 6.2 Chat Completion Service
 
-File: corpus_sdk/llm/framework_adapters/semantic_kernel.py
+**File:** `corpus_sdk/llm/framework_adapters/semantic_kernel.py`
 
+```python
 from __future__ import annotations
 import asyncio
 from typing import Any, List
@@ -1280,15 +1321,17 @@ class CorpusSKChat(ChatCompletionClientBase):
         **kwargs: Any,
     ) -> str:
         return asyncio.run(self._acomplete_chat(chat_history, **kwargs))
+```
 
-⸻
+---
 
-6.3 Vector / Graph Connectors
+### 6.3 Vector / Graph Connectors
 
-For memory / vector stores, SK typically uses MemoryStoreBase.
+For memory / vector stores, SK typically uses `MemoryStoreBase`.
 
-File: corpus_sdk/vector/framework_adapters/semantic_kernel.py
+**File:** `corpus_sdk/vector/framework_adapters/semantic_kernel.py`
 
+```python
 from __future__ import annotations
 from typing import List, Tuple
 import asyncio
@@ -1341,17 +1384,19 @@ class CorpusSKMemoryStore(MemoryStoreBase):
         min_relevance_score: float = 0.0,
     ) -> List[Tuple[MemoryRecord, float]]:
         return asyncio.run(self._aget_nearest_matches(embedding, limit))
+```
 
-⸻
+---
 
-7. MCP Integration
+## 7. MCP Integration
 
-Corpus becomes the backend of an MCP server. Tools call CorpusClient.
+Corpus becomes the backend of an MCP server. Tools call `CorpusClient`.
 
-7.1 MCP Server Backed by Corpus Protocols
+### 7.1 MCP Server Backed by Corpus Protocols
 
-File: mcp_server.py
+**File:** `mcp_server.py`
 
+```python
 from __future__ import annotations
 import asyncio
 from typing import Any, Dict
@@ -1456,31 +1501,33 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+```
 
-⸻
+---
 
-7.2 Using Corpus from MCP-aware Frameworks
+### 7.2 Using Corpus from MCP-aware Frameworks
 
 Once this server is wired, any MCP-aware client (Claude Desktop, Cursor, etc.) can use:
-	•	corpus_complete → your LLM
-	•	corpus_vector_search → embedding + vector
-	•	corpus_graph_query → graph
+- `corpus_complete` → your LLM
+- `corpus_vector_search` → embedding + vector
+- `corpus_graph_query` → graph
 
-Config is client-specific (e.g., JSON config telling it to run python mcp_server.py), but the underlying logic is the same: MCP tools call CorpusClient.
+Config is client-specific (e.g., JSON config telling it to run `python mcp_server.py`), but the underlying logic is the same: MCP tools call `CorpusClient`.
 
-⸻
+---
 
-8. Contexts, Deadlines, Tenants & Error Mapping
+## 8. Contexts, Deadlines, Tenants & Error Mapping
 
 Your server side enforces deadlines, tenants, error taxonomy. On the framework side:
-	•	Always send ctx.deadline_ms reasonably (CorpusClient already does).
-	•	Always send ctx.tenant (set once in CorpusClient).
-	•	Convert framework-specific error types to/from CorpusError as needed.
+- Always send `ctx.deadline_ms` reasonably (`CorpusClient` already does).
+- Always send `ctx.tenant` (set once in `CorpusClient`).
+- Convert framework-specific error types to/from `CorpusError` as needed.
 
-Example thin error wrapper for LangChain:
+**Example thin error wrapper for LangChain:**
 
-File: corpus_sdk/framework_client/errors.py
+**File:** `corpus_sdk/framework_client/errors.py`
 
+```python
 from __future__ import annotations
 
 from corpus_sdk.framework_client.client import CorpusError
@@ -1501,9 +1548,11 @@ def map_corpus_error_to_framework(err: CorpusError) -> Exception:
     if "UNAVAILABLE" in msg:
         return FrameworkUnavailableError(msg)
     return err
+```
 
-Usage inside CorpusLangChainChat._agenerate:
+**Usage inside `CorpusLangChainChat._agenerate`:**
 
+```python
 from corpus_sdk.framework_client.errors import map_corpus_error_to_framework
 from corpus_sdk.framework_client.client import CorpusError
 
@@ -1512,17 +1561,19 @@ try:
     result = await self._corpus.llm_complete(**corpus_args)
 except CorpusError as e:
     raise map_corpus_error_to_framework(e) from e
+```
 
-⸻
+---
 
-9. Framework Conformance & Smoke Tests
+## 9. Framework Conformance & Smoke Tests
 
-You don’t need a giant test matrix – just targeted smoke tests per framework.
+You don't need a giant test matrix – just targeted smoke tests per framework.
 
-Example (LangChain):
+**Example (LangChain):**
 
-File: tests/test_langchain_llm.py
+**File:** `tests/test_langchain_llm.py`
 
+```python
 from __future__ import annotations
 import pytest
 
@@ -1546,52 +1597,59 @@ async def test_langchain_chat_generates():
     llm = CorpusLangChainChat(corpus, model_name="test-model")
     result = await llm._agenerate([])
     assert result.generations[0].message.content == "hello from corpus"
+```
 
 Do similarly small tests for:
-	•	Autogen: create_chat_completion returns expected dict shape.
-	•	CrewAI: calling the tool / LLM returns a string.
-	•	LlamaIndex: complete() returns CompletionResponse.
-	•	Semantic Kernel: embedding/chat connectors run end-to-end.
-	•	MCP: tool handlers return { "type": "text", "text": ... }.
+- **Autogen:** `create_chat_completion` returns expected dict shape.
+- **CrewAI:** calling the tool / LLM returns a string.
+- **LlamaIndex:** `complete()` returns `CompletionResponse`.
+- **Semantic Kernel:** embedding/chat connectors run end-to-end.
+- **MCP:** tool handlers return `{ "type": "text", "text": ... }`.
 
-⸻
+---
 
-10. Integration Launch Checklist (TL;DR)
+## 10. Integration Launch Checklist (TL;DR)
 
-By framework × domain:
-	•	Autogen
-	•	LLM wrapper (corpus_sdk/llm/framework_adapters/autogen.py)
-	•	Embedding+Vector “memory” (corpus_sdk/embedding/framework_adapters/autogen.py)
-	•	Vector tool (corpus_sdk/vector/framework_adapters/autogen.py)
-	•	Graph tool (corpus_sdk/graph/framework_adapters/autogen.py)
-	•	CrewAI
-	•	LLM backend (corpus_sdk/llm/framework_adapters/crewai.py)
-	•	Vector tool (corpus_sdk/vector/framework_adapters/crewai.py)
-	•	Graph tool (corpus_sdk/graph/framework_adapters/crewai.py)
-	•	LangChain
-	•	ChatModel (corpus_sdk/llm/framework_adapters/langchain.py)
-	•	Embeddings (corpus_sdk/embedding/framework_adapters/langchain.py)
-	•	VectorStore (corpus_sdk/vector/framework_adapters/langchain.py)
-	•	Graph tool (corpus_sdk/graph/framework_adapters/langchain.py)
-	•	LlamaIndex
-	•	LLM (corpus_sdk/llm/framework_adapters/llamaindex.py)
-	•	Embedding model (corpus_sdk/embedding/framework_adapters/llamaindex.py)
-	•	VectorStore (corpus_sdk/vector/framework_adapters/llamaindex.py)
-	•	Graph QueryEngine (corpus_sdk/graph/framework_adapters/llamaindex.py)
-	•	Semantic Kernel
-	•	TextEmbeddingBase (corpus_sdk/embedding/framework_adapters/semantic_kernel.py)
-	•	ChatCompletionClientBase (corpus_sdk/llm/framework_adapters/semantic_kernel.py)
-	•	MemoryStoreBase (corpus_sdk/vector/framework_adapters/semantic_kernel.py)
-	•	MCP
-	•	MCP server exposing:
-	•	corpus_complete
-	•	corpus_vector_search
-	•	corpus_graph_query
+**By framework × domain:**
 
-Cross-cutting:
-	•	Shared CorpusClient is the single source of truth for envelopes.
-	•	No framework adapter knows about op/ctx/args details; they just call CorpusClient.
-	•	Every adapter returns framework-native types (or a very thin wrapper).
-	•	Timeouts & tenants are consistently set in CorpusClient._make_ctx.
-	•	Schema-level invariants (e.g., total_tokens = prompt + completion) are enforced server-side, not in framework glue.
-	•	Smoke tests exist for each framework integration.
+**Autogen**
+- LLM wrapper (`corpus_sdk/llm/framework_adapters/autogen.py`)
+- Embedding+Vector "memory" (`corpus_sdk/embedding/framework_adapters/autogen.py`)
+- Vector tool (`corpus_sdk/vector/framework_adapters/autogen.py`)
+- Graph tool (`corpus_sdk/graph/framework_adapters/autogen.py`)
+
+**CrewAI**
+- LLM backend (`corpus_sdk/llm/framework_adapters/crewai.py`)
+- Vector tool (`corpus_sdk/vector/framework_adapters/crewai.py`)
+- Graph tool (`corpus_sdk/graph/framework_adapters/crewai.py`)
+
+**LangChain**
+- ChatModel (`corpus_sdk/llm/framework_adapters/langchain.py`)
+- Embeddings (`corpus_sdk/embedding/framework_adapters/langchain.py`)
+- VectorStore (`corpus_sdk/vector/framework_adapters/langchain.py`)
+- Graph tool (`corpus_sdk/graph/framework_adapters/langchain.py`)
+
+**LlamaIndex**
+- LLM (`corpus_sdk/llm/framework_adapters/llamaindex.py`)
+- Embedding model (`corpus_sdk/embedding/framework_adapters/llamaindex.py`)
+- VectorStore (`corpus_sdk/vector/framework_adapters/llamaindex.py`)
+- Graph QueryEngine (`corpus_sdk/graph/framework_adapters/llamaindex.py`)
+
+**Semantic Kernel**
+- TextEmbeddingBase (`corpus_sdk/embedding/framework_adapters/semantic_kernel.py`)
+- ChatCompletionClientBase (`corpus_sdk/llm/framework_adapters/semantic_kernel.py`)
+- MemoryStoreBase (`corpus_sdk/vector/framework_adapters/semantic_kernel.py`)
+
+**MCP**
+- MCP server exposing:
+  - `corpus_complete`
+  - `corpus_vector_search`
+  - `corpus_graph_query`
+
+**Cross-cutting:**
+- Shared `CorpusClient` is the single source of truth for envelopes.
+- No framework adapter knows about `op`/`ctx`/`args` details; they just call `CorpusClient`.
+- Every adapter returns framework-native types (or a very thin wrapper).
+- Timeouts & tenants are consistently set in `CorpusClient._make_ctx`.
+- Schema-level invariants (e.g., `total_tokens = prompt + completion`) are enforced server-side, not in framework glue.
+- Smoke tests exist for each framework integration.
