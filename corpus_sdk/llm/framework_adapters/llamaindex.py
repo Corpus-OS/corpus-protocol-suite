@@ -1,17 +1,47 @@
-# corpus_sdk/llm/framework_adapters/llamaindex.py
-# SPDX-License-Identifier: Apache-2.0
-
 """
-LlamaIndex adapter for Corpus LLM protocol.
+LlamaIndex adapter for the Corpus LLM protocol.
 
-This module exposes a Corpus `LLMProtocolV1` as a LlamaIndex `LLM`
-implementation, with:
+This module provides a production-grade implementation of the LlamaIndex `LLM`
+interface backed by a Corpus `LLMProtocolV1` through the shared `LLMTranslator`
+layer.
 
-- Async + sync chat generation
-- Async + sync streaming chat (true incremental streaming)
-- Context propagation via `OperationContext`
-- Protocol-first design: all calls go through the LLMTranslator layer
-- Rich, configurable error context for observability
+Purpose
+-------
+The adapter enables LlamaIndex runtimes—sync or async, streaming or non-streaming—
+to call Corpus models without needing to understand Corpus message formats,
+sampling parameters, or protocol details. All model interaction, message shaping,
+tool behavior, JSON repair, safety filtering, and post-processing are delegated
+to `LLMTranslator`, ensuring cross-framework consistency.
+
+Key Responsibilities
+--------------------
+- Convert LlamaIndex `ChatMessage` and config objects into Corpus `OperationContext`
+  via the centralized context translation layer.
+- Build sampling + routing parameters (`model`, `temperature`, `stop_sequences`, etc.)
+  in a single, predictable place.
+- Invoke `LLMTranslator` for:
+      • async/sync completion  
+      • async/sync true incremental streaming  
+      • token counting with robust fallbacks
+- Convert translator-level results and chunks into LlamaIndex `ChatResponse` objects.
+- Attach rich, structured error context (optional, configurable) for observability
+  without affecting hot-path performance.
+
+Design Principles
+-----------------
+- **Protocol-first**: No LlamaIndex-specific logic ever touches the Corpus protocol.
+- **Translator-centric**: Message normalization, tools, post-processing, and safety
+  are handled entirely inside `LLMTranslator`.
+- **Non-intrusive**: No retries, timeouts, or circuit-breaking are implemented here.
+  Callers may compose their own control-plane policies.
+- **Lazy error metrics**: Per-message metrics and additional context are collected
+  only when an exception occurs, minimizing hot-path overhead.
+- **Optional dependency safe**: Importing the module never requires LlamaIndex to
+  be installed; usage requires it.
+
+This adapter is the recommended way to use Corpus LLMs inside LlamaIndex pipelines
+and RAG systems, providing consistent semantics with other framework adapters such
+as LangChain, AutoGen, and CrewAI.
 """
 
 from __future__ import annotations
