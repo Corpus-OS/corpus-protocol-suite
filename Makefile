@@ -40,7 +40,11 @@
 	test-wire \
 	test-wire-fast \
 	clean \
-	help
+	help \
+	validate-test-dirs
+
+# Use bash because this Makefile relies on bash-isms (e.g., `read -p`).
+SHELL := /bin/bash
 
 # Configuration
 PYTEST := pytest
@@ -72,8 +76,25 @@ PYTEST_PARALLEL := $(if $(filter-out 1,$(PYTEST_JOBS)),-n $(PYTEST_JOBS),)
 COV_REPORT_TERM := --cov-report=term
 COV_THRESHOLD := --cov-fail-under=$(COV_FAIL_UNDER)
 
-# Validate per-protocol test directories exist (hard failure)
-$(foreach dir,$(TEST_DIRS),$(if $(wildcard $(dir)),,$(error Test directory $(dir) not found)))
+# --------------------------------------------------------------------------- #
+# Directory Validation
+# --------------------------------------------------------------------------- #
+# IMPORTANT: Do NOT fail at parse-time. This allows `make help`, `make clean`, etc.
+# Validation is enforced only for targets that actually need core protocol test dirs.
+validate-test-dirs:
+	@missing=0; \
+	for d in $(TEST_DIRS); do \
+		if [ ! -d "$$d" ]; then \
+			echo "❌ Test directory $$d not found"; \
+			missing=1; \
+		fi; \
+	done; \
+	if [ "$$missing" -ne 0 ]; then \
+		echo ""; \
+		echo "💡 If you're running from a partial checkout, ensure core protocol tests exist:"; \
+		echo "   Expected: $(TEST_DIRS)"; \
+		exit 1; \
+	fi
 
 # Soft-guard: warn (do not fail) if schema/golden/wire/framework dirs are missing
 $(if $(wildcard $(SCHEMA_TEST_DIR)),,$(warning ⚠️  Schema test directory '$(SCHEMA_TEST_DIR)' not found))
@@ -84,13 +105,48 @@ $(if $(wildcard $(VECTOR_FRAMEWORKS_DIR)),,$(warning ⚠️  Vector framework te
 $(if $(wildcard $(EMBEDDING_FRAMEWORKS_DIR)),,$(warning ⚠️  Embedding framework test directory '$(EMBEDDING_FRAMEWORKS_DIR)' not found))
 $(if $(wildcard $(GRAPH_FRAMEWORKS_DIR)),,$(warning ⚠️  Graph framework test directory '$(GRAPH_FRAMEWORKS_DIR)' not found))
 
+# --------------------------------------------------------------------------- #
 # Dependency check
+# --------------------------------------------------------------------------- #
+# Keep the simple UX, but validate the things we actually rely on:
+# - pytest
+# - corpus_sdk
+# - pytest-cov (for coverage flags used in most suites)
+# - pytest-xdist (only required when parallelism is enabled)
 check-deps:
 	@echo "🔍 Checking test dependencies..."
-	@python -c "import pytest, corpus_sdk" 2>/dev/null || \
-		(echo "❌ Error: Test dependencies not installed."; \
-		 echo "   Please run: pip install .[test]"; exit 1)
-	@echo "✅ Dependencies OK"
+	@python - <<'PY'
+import sys, importlib
+
+def must(mod):
+    try:
+        importlib.import_module(mod)
+        return True
+    except Exception:
+        return False
+
+missing = []
+for m in ("pytest", "corpus_sdk", "pytest_cov"):
+    if not must(m):
+        missing.append(m)
+
+# xdist is only required if -n is used (PYTEST_JOBS != 1)
+# We can't reliably read Make variables inside Python without env, so just check and warn here.
+# The Makefile will still fail later if -n is used without xdist; this warning makes it obvious.
+xdist_ok = must("xdist") or must("pytest_xdist")
+
+if missing:
+    print("❌ Error: Test dependencies not installed.")
+    print("   Missing:", ", ".join(missing))
+    print("   Please run: pip install .[test]")
+    sys.exit(1)
+
+if not xdist_ok:
+    print("⚠️  Note: pytest-xdist not detected. Parallel runs (-n) may fail.")
+    print("   Install with: pip install .[test]  (or pip install pytest-xdist)")
+
+print("✅ Dependencies OK")
+PY
 
 # Optional: show key tool versions (useful in CI logs)
 check-versions:
@@ -99,14 +155,14 @@ check-versions:
 	@python - <<'PY'
 import importlib
 def ver(mod):
-    try:
-        m = importlib.import_module(mod)
-        v = getattr(m, '__version__', 'unknown')
-    except Exception as e:
-        v = f'not installed ({e})'
-    print(f'{mod} {v}')
+	try:
+		m = importlib.import_module(mod)
+		v = getattr(m, '__version__', 'unknown')
+	except Exception as e:
+		v = f'not installed ({e})'
+	print(f'{mod} {v}')
 for m in ('pytest','jsonschema','rfc3339_validator'):
-    ver(m)
+	ver(m)
 PY
 
 # --------------------------------------------------------------------------- #
@@ -125,9 +181,11 @@ validate-env:
 	@echo "✅ Environment validation complete"
 
 # Interactive test environment setup
+# Fix: prior `command -v read` check is unreliable because `read` is a shell builtin.
+# Use a TTY check instead; if non-interactive, print manual instructions.
 setup-test-env:
 	@echo "🎯 Setting up test environment..."
-	@if command -v read > /dev/null 2>&1; then \
+	@if [ -t 0 ]; then \
 		read -p "Test endpoint [http://localhost:8080]: " endpoint; \
 		endpoint=$${endpoint:-http://localhost:8080}; \
 		read -p "API key [test-key]: " key; \
@@ -137,7 +195,7 @@ setup-test-env:
 		echo "✅ Test environment saved to .testenv"; \
 		echo "   Load with: export $$(cat .testenv | xargs)"; \
 	else \
-		echo "❌ 'read' command not available - manual setup required"; \
+		echo "❌ Non-interactive shell detected - manual setup required"; \
 		echo "   Create .testenv with:"; \
 		echo "   CORPUS_ENDPOINT=http://your-endpoint"; \
 		echo "   CORPUS_API_KEY=your-api-key"; \
@@ -156,7 +214,7 @@ safety-check: validate-env
 # + top-level orchestration/CLI tests
 # NOTE: Framework adapter suites are opt-in via their own targets.
 # --------------------------------------------------------------------------- #
-test-conformance test-all-conformance: check-deps safety-check
+test-conformance test-all-conformance: check-deps safety-check validate-test-dirs
 	@echo "🚀 Running ALL protocol conformance suites..."
 	@echo "   Protocols: $(PROTOCOLS)"
 	@echo "   Extra test files: $(EXTRA_TEST_FILES)"
@@ -180,7 +238,7 @@ test-conformance test-all-conformance: check-deps safety-check
 # --------------------------------------------------------------------------- #
 
 # Single target to handle all protocol conformance tests
-test-%-conformance: check-deps
+test-%-conformance: check-deps validate-test-dirs
 	@echo "🚀 Running $(shell echo $* | tr 'a-z' 'A-Z') Protocol V1 conformance tests..."
 	@echo "   Parallel jobs: $(PYTEST_JOBS)"
 	@echo "   Coverage threshold: $(COV_FAIL_UNDER)%"
@@ -296,7 +354,7 @@ test-wire-fast: check-deps
 # --------------------------------------------------------------------------- #
 
 # Quick health check (smoke test)
-quick-check: check-deps
+quick-check: check-deps validate-test-dirs
 	@echo "🔍 Quick health check..."
 	$(PYTEST) tests/ -k "test_golden_validates or test_schema_meta" -v --no-cov -x
 
@@ -316,153 +374,10 @@ test-root-conformance: check-deps
 # Reports & CI Integration
 # --------------------------------------------------------------------------- #
 
-# Generate conformance report (with error handling and duration aggregation if JUnit XML is present)
+# Generate conformance report (Delegated to python module)
 conformance-report: test-conformance
 	@echo "📊 Generating detailed conformance report..."
-	@python - <<'PY'
-try:
-    import json, datetime, os, glob
-    from xml.etree import ElementTree
-    
-    # All possible test suites (keep in sync with Python run_conformance + CLI)
-    ALL_TEST_SUITES = {
-        "schema": "Schema Conformance",
-        "golden": "Golden Wire Validation",
-        "wire": "Wire Envelope Conformance",
-        "llm": "LLM Protocol V1.0",
-        "vector": "Vector Protocol V1.0",
-        "graph": "Graph Protocol V1.0",
-        "embedding": "Embedding Protocol V1.0",
-        "llm_frameworks": "LLM Framework Adapters V1.0",
-        "vector_frameworks": "Vector Framework Adapters V1.0",
-        "embedding_frameworks": "Embedding Framework Adapters V1.0",
-        "graph_frameworks": "Graph Framework Adapters V1.0",
-        "cli": "CLI Tests",
-        "root_conformance": "Conformance Runner Tests",
-        "conformance": "Full Conformance Suite"
-    }
-    
-    # Aggregate results from JUnit XML files
-    total_tests = 0
-    total_failures = 0
-    total_errors = 0
-    total_time = 0.0
-    
-    # Deduplicate XML files to avoid double-counting (e.g. conformance_results.xml)
-    xml_files = sorted(set(glob.glob("*_results.xml") + ["conformance_results.xml"]))
-    suites_ran = []
-    protocols_ran = []
-    
-    # Protocol detection mapping (for protocols field in report)
-    protocol_map = {
-        "llm": "LLM",
-        "vector": "Vector", 
-        "graph": "Graph",
-        "embedding": "Embedding",
-        "llm_frameworks": "LLM Framework Adapters",
-        "vector_frameworks": "Vector Framework Adapters",
-        "embedding_frameworks": "Embedding Framework Adapters",
-        "graph_frameworks": "Graph Framework Adapters",
-    }
-    
-    for xml_file in xml_files:
-        if os.path.exists(xml_file):
-            try:
-                tree = ElementTree.parse(xml_file)
-                root = tree.getroot()
-                total_tests += int(root.get("tests", 0))
-                total_failures += int(root.get("failures", 0))
-                total_errors += int(root.get("errors", 0))
-                try:
-                    total_time += float(root.get("time", 0))
-                except (TypeError, ValueError):
-                    pass
-                
-                # Determine which suite this is
-                if xml_file == "conformance_results.xml":
-                    if "conformance" not in suites_ran:
-                        suites_ran.append("conformance")
-                elif xml_file.endswith("_results.xml"):
-                    suite_name = xml_file.replace("_results.xml", "")
-                    if suite_name in ALL_TEST_SUITES:
-                        if suite_name not in suites_ran:
-                            suites_ran.append(suite_name)
-                        
-                        # Check if it's a protocol suite
-                        if suite_name in protocol_map and suite_name not in protocols_ran:
-                            protocols_ran.append(suite_name)
-                
-            except Exception as e:
-                print(f"⚠️  Could not parse {xml_file}: {e}")
-    
-    status = "PASS" if total_failures == 0 and total_errors == 0 else "FAIL"
-    
-    # If no protocols detected from XML, use core defaults
-    if not protocols_ran and total_tests > 0:
-        protocols_ran = ["llm", "vector", "graph", "embedding"]
-    
-    # Filter test_suites to only include those that actually ran
-    test_suites_order = [
-        "schema",
-        "golden",
-        "wire",
-        "llm",
-        "vector",
-        "graph",
-        "embedding",
-        "llm_frameworks",
-        "vector_frameworks",
-        "embedding_frameworks",
-        "graph_frameworks",
-        "cli",
-        "root_conformance",
-    ]
-    test_suites_ran = [
-        suite for suite in test_suites_order
-        if suite in suites_ran or suite in protocols_ran
-    ]
-    
-    # Fallback: if we have tests but no suites detected, include core protocols
-    if total_tests > 0 and not test_suites_ran:
-        test_suites_ran = [
-            "schema",
-            "golden",
-            "wire",
-            "llm",
-            "vector",
-            "graph",
-            "embedding",
-        ]
-    
-    results = {
-        "protocols": protocols_ran,
-        "status": status,
-        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
-        "summary": {
-            "total_tests": total_tests,
-            "failures": total_failures,
-            "errors": total_errors,
-            "duration_seconds": round(total_time, 3)
-        },
-        "coverage_threshold": $(COV_FAIL_UNDER),
-        "test_suites": test_suites_ran,
-        "environment": os.getenv("CORPUS_TEST_ENV", "default")
-    }
-    
-    with open("conformance_report.json", "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2)
-    
-    print("✅ Conformance report: conformance_report.json")
-    print(f"📈 Summary: {total_tests} tests, {total_failures} failures, {total_errors} errors")
-    print(f"⏱️  Duration: {round(total_time, 3)}s")
-    print(f"🎯 Status: {status}")
-    if test_suites_ran:
-        print(f"📋 Test suites ran: {', '.join(test_suites_ran)}")
-    
-except Exception as e:
-    print(f"❌ Failed to generate report: {e}")
-    raise SystemExit(1)
-PY
+	@python -m tests.run_conformance conformance-report
 
 # Upload results to conformance service
 upload-results:
@@ -483,7 +398,7 @@ upload-results:
 # --------------------------------------------------------------------------- #
 
 # Full CI pipeline (wire tests first for fast feedback, then full conformance)
-test-ci: check-deps validate-env
+test-ci: check-deps validate-env validate-test-dirs
 	@echo "🏗️  Running CI-optimized conformance suite..."
 	@echo "   Step 1: Wire envelope conformance (fast feedback)"
 	$(PYTEST) $(WIRE_TEST_DIR)/test_wire_conformance.py \
@@ -497,7 +412,7 @@ test-ci: check-deps validate-env
 	@echo "✅ CI conformance suite complete"
 
 # Fast CI pipeline (for PR validation) - includes wire tests
-test-ci-fast: check-deps
+test-ci-fast: check-deps validate-test-dirs
 	@echo "⚡ Running fast CI validation (includes wire tests)..."
 	@make test-wire-fast
 	@make test-fast
@@ -522,7 +437,7 @@ test-docker:
 # --------------------------------------------------------------------------- #
 
 # Fast all tests (protocol suites + wire tests + extra test files)
-test-fast: check-deps
+test-fast: check-deps validate-test-dirs
 	@echo "⚡ Running fast tests (no coverage, skipping slow tests)..."
 	$(PYTEST) \
 		$(TEST_DIRS) \
@@ -534,7 +449,7 @@ test-fast: check-deps
 		--no-cov
 
 # Fast per-protocol tests (explicit wire test still available via test-wire-fast)
-test-fast-%: check-deps
+test-fast-%: check-deps validate-test-dirs
 	@echo "⚡ Running fast $(shell echo $* | tr 'a-z' 'A-Z') tests (no coverage, skipping slow)..."
 	$(PYTEST) tests/$* $(PYTEST_ARGS) $(PYTEST_PARALLEL) -m "not slow" --no-cov
 
@@ -560,7 +475,7 @@ test-fast-graph-frameworks: check-deps
 # --------------------------------------------------------------------------- #
 
 # Verify command (alias for test-conformance with better messaging)
-verify: check-deps safety-check
+verify: check-deps safety-check validate-test-dirs
 	@echo "🔍 Running Corpus Protocol Conformance Suite..."
 	@echo "   Protocols: $(PROTOCOLS)"
 	@echo "   Extra test files: $(EXTRA_TEST_FILES)"
@@ -621,7 +536,7 @@ help:
 	@echo "  test-fast-graph-frameworks        Fast Graph Framework Adapters tests (no coverage, skip slow)"
 	@echo ""
 	@echo "Schema & Golden Conformance:"
-	@echo "  test-schema                       Run schema meta-lint (Draft 2020-12, \$id/\$ref checks)"
+	@echo "  test-schema                       Run schema meta-lint (Draft 2020-12, \$$id/\$$ref checks)"
 	@echo "  test-golden                       Validate golden wire messages (envelopes/streams/invariants)"
 	@echo "  verify-schema                     Run schema meta-lint + golden validation"
 	@echo "  test-schema-fast                  Fast schema meta-lint (no coverage, skip slow)"
