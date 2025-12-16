@@ -1,7 +1,7 @@
 # corpus_sdk/llm/llm_base.py
 # SPDX-License-Identifier: Apache-2.0
 
-ARCHITECTURAL NOTE: SINGLE-FILE MODULE STRATEGY
+# ARCHITECTURAL NOTE: SINGLE-FILE MODULE STRATEGY
 -----------------------------------------------
 This module is intentionally designed as a self-contained, zero-dependency artifact.
 It combines Type Definitions, Protocol Interfaces, and Base Implementations into
