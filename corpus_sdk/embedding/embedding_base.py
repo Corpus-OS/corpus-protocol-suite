@@ -824,7 +824,7 @@ class EmbeddingCapabilities:
         supports_streaming: Whether streaming embeddings are supported
         supports_batch_embedding: Whether batch embedding operations are supported
         supports_caching: Whether embedding caching is supported
-        idempotent_operations: Whether operations are idempotent with idempotency_key
+        idempotent_writes: Whether operations are idempotent with idempotency_key
         supports_multi_tenant: Whether multi-tenant isolation is supported
         normalizes_at_source: Whether adapter normalizes vectors at source when requested
         truncation_mode: "base" or "adapter" to signal where truncation is applied
@@ -843,7 +843,7 @@ class EmbeddingCapabilities:
     supports_streaming: bool = False
     supports_batch_embedding: bool = True
     supports_caching: bool = False
-    idempotent_operations: bool = False
+    idempotent_writes: bool = False
     supports_multi_tenant: bool = False
     normalizes_at_source: bool = False
     truncation_mode: str = "base"
