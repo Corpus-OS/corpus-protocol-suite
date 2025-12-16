@@ -830,6 +830,7 @@ class EmbeddingCapabilities:
         truncation_mode: "base" or "adapter" to signal where truncation is applied
         supports_deadline: Whether adapter cooperates with deadline cancellation
     """
+    protocol: str
     server: str
     version: str
     supported_models: Tuple[str, ...]
