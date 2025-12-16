@@ -414,7 +414,7 @@ interface GraphCapabilities {
   supports_bulk_vertices: boolean;
   supports_batch: boolean;
   supports_schema: boolean;
-  idempotent_writes: boolean;
+  idempotent_operations: boolean;
   supports_deadline: boolean;
   supports_namespaces: boolean;
   supports_property_filters: boolean;
@@ -573,7 +573,7 @@ interface IndexInfo {
     "supports_bulk_vertices": true,
     "supports_batch": true,
     "supports_schema": true,
-    "idempotent_writes": true,
+    "idempotent_operations": true,
     "supports_deadline": true,
     "supports_namespaces": true,
     "supports_property_filters": true,
@@ -1201,7 +1201,7 @@ interface LLMCapabilities {
   supports_parallel_tool_calls: boolean;
   supports_deadline: boolean;
   supports_count_tokens: boolean;
-  idempotent_writes: boolean;
+  idempotent_operations: boolean;
   supports_multi_tenant: boolean;
   max_tokens_per_minute?: number; // Optional: rate limiting info
   max_requests_per_minute?: number; // Optional: request rate limits
@@ -1334,7 +1334,7 @@ interface LLMChunk {
     "supports_parallel_tool_calls": true,
     "supports_deadline": true,
     "supports_count_tokens": true,
-    "idempotent_writes": true,
+    "idempotent_operations": true,
     "supports_multi_tenant": true,
     "max_tokens_per_minute": 100000,
     "max_requests_per_minute": 1000,
@@ -1637,7 +1637,7 @@ interface VectorCapabilities {
   max_batch_size?: number;
   supports_index_management: boolean;
   supports_deadline: boolean;
-  idempotent_writes: boolean;
+  idempotent_operations: boolean;
   supports_multi_tenant: boolean;
   max_top_k?: number;
   max_filter_terms?: number;
@@ -1800,7 +1800,7 @@ interface NamespaceResult {
     "max_batch_size": 100,
     "supports_index_management": true,
     "supports_deadline": true,
-    "idempotent_writes": true,
+    "idempotent_operations": true,
     "supports_multi_tenant": true,
     "max_top_k": 10000,
     "max_filter_terms": 10,
@@ -2230,7 +2230,7 @@ interface EmbeddingCapabilities {
   supports_multi_tenant: boolean;
   supports_deadline: boolean;
   normalizes_at_source: boolean;
-  idempotent_writes: boolean;     // Standardized naming
+  idempotent_operations: boolean;     // Standardized naming
   truncation_mode: string;        // "base" or "adapter"
   max_batch_tokens?: number;      // Optional: token-based batch limits
   supports_multilingual?: boolean; // Optional: multilingual support
@@ -2340,7 +2340,7 @@ interface EmbedBatchResult {
     "supports_multi_tenant": true,
     "supports_deadline": true,
     "normalizes_at_source": true,
-    "idempotent_writes": true,
+    "idempotent_operations": true,
     "truncation_mode": "base",
     "max_batch_tokens": 8000000,
     "supports_multilingual": true,
@@ -3042,10 +3042,10 @@ adapter = BaseLLMAdapter(mode="standalone")
 - **Embedding Types:** EmbedSpec, EmbedBatchSpec, EmbedResult, EmbeddingVector, EmbedBatchResult, EmbeddingHealthStatus
 
 ### 30.3 Capabilities Index
-- **Graph Capabilities:** protocol, server, version, supported_query_dialects, supports_stream_query, supports_bulk_vertices, supports_batch, supports_schema, idempotent_writes, supports_deadline, supports_namespaces, supports_property_filters, supports_multi_tenant, max_batch_ops, max_query_complexity, max_nodes_per_transaction, supports_analytics_queries
-- **LLM Capabilities:** protocol, server, version, model_family, supported_models, max_context_length, supports_streaming, supports_roles, supports_system_message, supports_json_output, supports_parallel_tool_calls, supports_deadline, supports_count_tokens, idempotent_writes, supports_multi_tenant, max_tokens_per_minute, max_requests_per_minute, supports_function_calling, supports_vision, supports_logprobs
-- **Vector Capabilities:** protocol, server, version, max_dimensions, supported_metrics, supports_namespaces, supports_metadata_filtering, supports_batch_operations, max_batch_size, supports_index_management, supports_deadline, idempotent_writes, supports_multi_tenant, max_top_k, max_filter_terms, supports_hybrid_search, supports_sparse_vectors, max_namespaces, supports_vector_compression
-- **Embedding Capabilities:** protocol, server, version, supported_models, max_batch_size, max_text_length, max_dimensions, supports_normalization, supports_truncation, supports_token_counting, supports_multi_tenant, supports_deadline, normalizes_at_source, idempotent_writes, truncation_mode, max_batch_tokens, supports_multilingual, supports_custom_dimensions
+- **Graph Capabilities:** protocol, server, version, supported_query_dialects, supports_stream_query, supports_bulk_vertices, supports_batch, supports_schema, idempotent_operations, supports_deadline, supports_namespaces, supports_property_filters, supports_multi_tenant, max_batch_ops, max_query_complexity, max_nodes_per_transaction, supports_analytics_queries
+- **LLM Capabilities:** protocol, server, version, model_family, supported_models, max_context_length, supports_streaming, supports_roles, supports_system_message, supports_json_output, supports_parallel_tool_calls, supports_deadline, supports_count_tokens, idempotent_operations, supports_multi_tenant, max_tokens_per_minute, max_requests_per_minute, supports_function_calling, supports_vision, supports_logprobs
+- **Vector Capabilities:** protocol, server, version, max_dimensions, supported_metrics, supports_namespaces, supports_metadata_filtering, supports_batch_operations, max_batch_size, supports_index_management, supports_deadline, idempotent_operations, supports_multi_tenant, max_top_k, max_filter_terms, supports_hybrid_search, supports_sparse_vectors, max_namespaces, supports_vector_compression
+- **Embedding Capabilities:** protocol, server, version, supported_models, max_batch_size, max_text_length, max_dimensions, supports_normalization, supports_truncation, supports_token_counting, supports_multi_tenant, supports_deadline, normalizes_at_source, idempotent_operations, truncation_mode, max_batch_tokens, supports_multilingual, supports_custom_dimensions
 
 ### 30.4 Error Codes Index
 - BAD_REQUEST, AUTH_ERROR, RESOURCE_EXHAUSTED, TRANSIENT_NETWORK, UNAVAILABLE, NOT_SUPPORTED, DEADLINE_EXCEEDED, MODEL_OVERLOADED, TEXT_TOO_LONG, DIMENSION_MISMATCH, QUERY_PARSE_ERROR
