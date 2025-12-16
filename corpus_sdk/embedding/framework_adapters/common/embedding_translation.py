@@ -105,33 +105,59 @@ R = TypeVar("R")
 # Helpers: OperationContext normalization
 # =============================================================================
 
-
 def _ensure_operation_context(
     ctx: Optional[Union[OperationContext, Mapping[str, Any]]],
 ) -> OperationContext:
     """Normalize various context shapes into an embedding OperationContext."""
+    # 1) No context → build from empty dict
     if ctx is None:
         core_ctx = ctx_from_dict({})
-    elif isinstance(ctx, OperationContext):
-        return ctx
-    elif isinstance(ctx, Mapping):
-        core_ctx = ctx_from_dict(ctx)
-    else:
-        raise BadRequest(
-            f"Unsupported context type: {type(ctx).__name__}",
-            code="BAD_OPERATION_CONTEXT",
+        return OperationContext(
+            request_id=getattr(core_ctx, "request_id", None),
+            idempotency_key=getattr(core_ctx, "idempotency_key", None),
+            deadline_ms=getattr(core_ctx, "deadline_ms", None),
+            traceparent=getattr(core_ctx, "traceparent", None),
+            tenant=getattr(core_ctx, "tenant", None),
+            metrics=getattr(core_ctx, "metrics", None),
+            attrs=getattr(core_ctx, "attrs", None) or {},
         )
 
-    return OperationContext(
-        request_id=getattr(core_ctx, "request_id", None),
-        idempotency_key=getattr(core_ctx, "idempotency_key", None),
-        deadline_ms=getattr(core_ctx, "deadline_ms", None),
-        traceparent=getattr(core_ctx, "traceparent", None),
-        tenant=getattr(core_ctx, "tenant", None),
-        metrics=getattr(core_ctx, "metrics", None),
-        attrs=getattr(core_ctx, "attrs", None) or {},
-    )
+    # 2) Already our embedding OperationContext → just use it
+    if isinstance(ctx, OperationContext):
+        return ctx
 
+    # 3) Mapping → go through core context translation
+    if isinstance(ctx, Mapping):
+        core_ctx = ctx_from_dict(ctx)
+        return OperationContext(
+            request_id=getattr(core_ctx, "request_id", None),
+            idempotency_key=getattr(core_ctx, "idempotency_key", None),
+            deadline_ms=getattr(core_ctx, "deadline_ms", None),
+            traceparent=getattr(core_ctx, "traceparent", None),
+            tenant=getattr(core_ctx, "tenant", None),
+            metrics=getattr(core_ctx, "metrics", None),
+            attrs=getattr(core_ctx, "attrs", None) or {},
+        )
+
+    # 4) Duck-typed context: something that *looks* like an OperationContext
+    #    (this covers cases where another layer has already wrapped it, but
+    #     isinstance(..., OperationContext) doesn't match for whatever reason).
+    if hasattr(ctx, "request_id") or hasattr(ctx, "attrs"):
+        return OperationContext(
+            request_id=getattr(ctx, "request_id", None),
+            idempotency_key=getattr(ctx, "idempotency_key", None),
+            deadline_ms=getattr(ctx, "deadline_ms", None),
+            traceparent=getattr(ctx, "traceparent", None),
+            tenant=getattr(ctx, "tenant", None),
+            metrics=getattr(ctx, "metrics", None),
+            attrs=getattr(ctx, "attrs", None) or {},
+        )
+
+    # 5) Everything else → still a hard error
+    raise BadRequest(
+        f"Unsupported context type: {type(ctx).__name__}",
+        code="BAD_OPERATION_CONTEXT",
+    )
 
 # =============================================================================
 # Batching configuration
