@@ -1139,7 +1139,7 @@ class EmbeddingCapabilities:
     supports_truncation: bool = True
     supports_token_counting: bool = True
     supports_deadline: bool = True
-    idempotent_operations: bool = True  # Wire key: idempotent_writes
+    idempotent_writes: bool = True  # Wire key: idempotent_writes
     supports_multi_tenant: bool = True
 ```
 
@@ -1211,7 +1211,7 @@ Implementations MUST declare:
 * Optional: `max_batch_size`, `max_text_length`, `max_dimensions`.
 * Boolean flags as defined in `EmbeddingCapabilities`.
 
-**Note:** The wire-level key is `idempotent_writes` as defined in PROTOCOLS.md; `idempotent_operations` is the corresponding SDK field name.
+**Note:** The wire-level key is `idempotent_writes` as defined in PROTOCOLS.md; `idempotent_writes` is the corresponding SDK field name.
 
 ### 10.6. Semantics
 
