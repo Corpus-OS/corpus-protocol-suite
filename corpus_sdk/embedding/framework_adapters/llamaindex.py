@@ -24,6 +24,8 @@ by the underlying adapter, typically a BaseEmbeddingAdapter subclass.
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from functools import cached_property, wraps
 from typing import (
     Any,
@@ -130,6 +132,7 @@ class ErrorCodes:
 
     # LlamaIndex-specific context errors
     LLAMAINDEX_CONTEXT_INVALID = "LLAMAINDEX_CONTEXT_INVALID"
+    LLAMAINDEX_CONFIG_INVALID = "LLAMAINDEX_CONFIG_INVALID"
 
 
 # Coercion configuration for the common embedding utils
@@ -148,6 +151,206 @@ class LlamaIndexContext(TypedDict, total=False):
     callback_manager: Optional[Any]
     trace_id: Optional[str]
     workflow: Optional[str]
+
+
+class LlamaIndexAdapterConfig(TypedDict, total=False):
+    """
+    Adapter-level configuration for the LlamaIndex embedding adapter.
+
+    This is *not* the per-call LlamaIndex BaseEmbedding kwargs; it configures
+    adapter behavior for context propagation and strictness.
+
+    Fields
+    ------
+    enable_operation_context_propagation:
+        If True, include the OperationContext instance in framework_ctx as
+        `_operation_context` for downstream inspection. Defaults to True.
+
+    strict_text_types:
+        If True, reject non-string items in batch embedding calls rather than
+        silently treating them as empty. Defaults to True for hardening parity
+        with the other framework adapters.
+
+    max_node_ids_in_context:
+        Maximum number of node_ids to include in framework_ctx and error context
+        to prevent log bloat. Defaults to 100.
+    """
+
+    enable_operation_context_propagation: bool
+    strict_text_types: bool
+    max_node_ids_in_context: int
+
+
+# ---------------------------------------------------------------------------
+# Safety / robustness utilities (input validation + safe snapshots)
+# ---------------------------------------------------------------------------
+
+
+def _validate_texts_are_strings(texts: Sequence[Any], *, op_name: str) -> None:
+    """
+    Fail fast if a caller provides non-string items.
+
+    We intentionally do not coerce arbitrary objects to str here, because that can
+    silently embed repr() outputs and lead to confusing retrieval behavior.
+    """
+    for i, t in enumerate(texts):
+        if not isinstance(t, str):
+            raise TypeError(
+                f"{op_name} expects Sequence[str]; item {i} is {type(t).__name__}",
+            )
+
+
+def _safe_snapshot(value: Any, *, max_items: int = 200, max_str: int = 5_000) -> Any:
+    """
+    Best-effort conversion into a JSON-ish, safe-to-log snapshot.
+
+    - Limits container size to reduce log bloat
+    - Truncates long strings
+    - Falls back to repr() for unknown objects
+    """
+    try:
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        if isinstance(value, str):
+            return value if len(value) <= max_str else value[:max_str] + "…"
+        if isinstance(value, Mapping):
+            out: Dict[str, Any] = {}
+            for idx, (k, v) in enumerate(value.items()):
+                if idx >= max_items:
+                    out["…"] = f"truncated after {max_items} items"
+                    break
+                out[str(k)] = _safe_snapshot(v, max_items=max_items, max_str=max_str)
+            return out
+        if isinstance(value, (list, tuple)):
+            out_list: List[Any] = []
+            for idx, v in enumerate(value):
+                if idx >= max_items:
+                    out_list.append(f"… truncated after {max_items} items")
+                    break
+                out_list.append(_safe_snapshot(v, max_items=max_items, max_str=max_str))
+            return out_list
+        return repr(value)
+    except Exception:  # noqa: BLE001
+        return {"repr": repr(value)}
+
+
+def _looks_like_operation_context(obj: Any) -> bool:
+    """
+    OperationContext may be a concrete type or a Protocol/alias depending on the SDK.
+
+    Prefer isinstance when it works; fall back to a lightweight structural
+    heuristic to avoid false negatives.
+    """
+    if obj is None:
+        return False
+    try:
+        if isinstance(obj, OperationContext):
+            return True
+    except TypeError:
+        # OperationContext may be a Protocol/typing alias at runtime
+        pass
+
+    return any(
+        hasattr(obj, attr)
+        for attr in (
+            "trace_id",
+            "request_id",
+            "user_id",
+            "tags",
+            "metadata",
+            "to_dict",
+        )
+    )
+
+
+def _infer_dim_from_matrix(mat: List[List[float]]) -> Optional[int]:
+    """Best-effort embedding dimension inference from a 2D embedding matrix."""
+    if not mat:
+        return None
+    first = mat[0]
+    if not isinstance(first, list):
+        return None
+    return len(first)
+
+
+def _filter_llamaindex_context_from_kwargs(kwargs: Mapping[str, Any]) -> LlamaIndexContext:
+    """
+    Extract only known LlamaIndex context keys from BaseEmbedding kwargs.
+
+    LlamaIndex passes a variety of kwargs depending on execution path; we keep
+    this adapter resilient by filtering to known keys for framework_ctx and for
+    context translation.
+    """
+    ctx: LlamaIndexContext = {}
+    for key in ("node_ids", "index_id", "callback_manager", "trace_id", "workflow"):
+        if key in kwargs:
+            ctx[key] = kwargs[key]  # type: ignore[literal-required]
+    return ctx
+
+
+# ---------------------------------------------------------------------------
+# Error-context decorators with dynamic context extraction
+# ---------------------------------------------------------------------------
+
+
+def _extract_dynamic_context(
+    instance: Any,
+    args: Tuple[Any, ...],
+    kwargs: Dict[str, Any],
+    operation: str,
+) -> Dict[str, Any]:
+    """
+    Extract rich dynamic context from method call for enhanced observability.
+
+    Provides per-call metrics:
+    - text_len for single-text operations
+    - texts_count / empty_texts_count for batch operations
+    - node_ids (bounded), node_count, index_id, callback_manager presence
+    - trace_id, workflow
+    - model/model_name from the embedding instance
+    - embedding_dim_hint when available
+    """
+    dynamic_ctx: Dict[str, Any] = {
+        "model": getattr(instance, "model_name", "unknown"),
+        "model_name": getattr(instance, "model_name", "unknown"),
+        "framework_version": _FRAMEWORK_VERSION,
+    }
+
+    dim_hint = getattr(instance, "_embedding_dim_hint", None)
+    if isinstance(dim_hint, int):
+        dynamic_ctx["embedding_dim"] = dim_hint
+
+    # Text-based metrics
+    if operation in ("query", "text") and args and isinstance(args[0], str):
+        dynamic_ctx["text_len"] = len(args[0])
+    elif operation == "texts" and args and isinstance(args[0], Sequence):
+        texts_seq = args[0]
+        dynamic_ctx["texts_count"] = len(texts_seq)
+        empty_count = sum(
+            1 for text in texts_seq if not isinstance(text, str) or not text.strip()
+        )
+        if empty_count:
+            dynamic_ctx["empty_texts_count"] = empty_count
+
+    ctx = _filter_llamaindex_context_from_kwargs(kwargs)
+    if ctx.get("node_ids") is not None:
+        node_ids = ctx.get("node_ids") or []
+        max_nodes = getattr(instance, "_max_node_ids_in_context", 100)
+        bounded = node_ids[:max_nodes]
+        dynamic_ctx["node_ids"] = bounded
+        dynamic_ctx["node_count"] = len(node_ids)
+        if len(node_ids) > len(bounded):
+            dynamic_ctx["node_ids_truncated"] = True
+
+    # Loop extraction for parity with other adapters
+    for key in ("index_id", "trace_id", "workflow"):
+        if key in ctx:
+            dynamic_ctx[key] = ctx[key]  # type: ignore[literal-required]
+
+    if "callback_manager" in ctx:
+        dynamic_ctx["has_callback_manager"] = bool(ctx.get("callback_manager"))
+
+    return dynamic_ctx
 
 
 def _create_error_context_decorator(
@@ -175,7 +378,12 @@ def _create_error_context_decorator(
                         kwargs,
                         operation,
                     )
-                    full_context = {**static_context, **dynamic_context}
+                    # Explicit framework_version inclusion for consistency + future-proofing.
+                    full_context = {
+                        **static_context,
+                        **dynamic_context,
+                        "framework_version": _FRAMEWORK_VERSION,
+                    }
                     try:
                         return await func(self, *args, **kwargs)
                     except Exception as exc:  # noqa: BLE001
@@ -188,82 +396,36 @@ def _create_error_context_decorator(
                         raise
 
                 return async_wrapper
-            else:
 
-                @wraps(func)
-                def sync_wrapper(self: Any, *args: Any, **kwargs: Any) -> T:
-                    dynamic_context = _extract_dynamic_context(
-                        self,
-                        args,
-                        kwargs,
-                        operation,
+            @wraps(func)
+            def sync_wrapper(self: Any, *args: Any, **kwargs: Any) -> T:
+                dynamic_context = _extract_dynamic_context(
+                    self,
+                    args,
+                    kwargs,
+                    operation,
+                )
+                full_context = {
+                    **static_context,
+                    **dynamic_context,
+                    "framework_version": _FRAMEWORK_VERSION,
+                }
+                try:
+                    return func(self, *args, **kwargs)
+                except Exception as exc:  # noqa: BLE001
+                    attach_context(
+                        exc,
+                        framework=_FRAMEWORK_NAME,
+                        operation=f"embedding_{operation}",
+                        **full_context,
                     )
-                    full_context = {**static_context, **dynamic_context}
-                    try:
-                        return func(self, *args, **kwargs)
-                    except Exception as exc:  # noqa: BLE001
-                        attach_context(
-                            exc,
-                            framework=_FRAMEWORK_NAME,
-                            operation=f"embedding_{operation}",
-                            **full_context,
-                        )
-                        raise
+                    raise
 
-                return sync_wrapper
+            return sync_wrapper
 
         return decorator
 
     return decorator_factory
-
-
-def _extract_dynamic_context(
-    instance: Any,
-    args: Tuple[Any, ...],
-    kwargs: Dict[str, Any],
-    operation: str,
-) -> Dict[str, Any]:
-    """
-    Extract rich dynamic context from method call for enhanced observability.
-
-    Provides per-call metrics:
-    - text_len for single-text operations
-    - texts_count / empty_texts_count for batch operations
-    - node_ids, node_count, index_id, callback_manager presence
-    - trace_id, workflow
-    - model_name from the embedding instance
-    """
-    dynamic_ctx: Dict[str, Any] = {
-        "model_name": getattr(instance, "model_name", "unknown"),
-        "framework_version": _FRAMEWORK_VERSION,
-    }
-
-    # Extract text-based metrics
-    if operation in ["query", "text"] and args and isinstance(args[0], str):
-        dynamic_ctx["text_len"] = len(args[0])
-    elif operation == "texts" and args and isinstance(args[0], Sequence):
-        texts_seq = args[0]
-        dynamic_ctx["texts_count"] = len(texts_seq)
-        empty_count = sum(
-            1 for text in texts_seq if not isinstance(text, str) or not text.strip()
-        )
-        if empty_count > 0:
-            dynamic_ctx["empty_texts_count"] = empty_count
-
-    # Extract LlamaIndex-specific context from kwargs
-    if "node_ids" in kwargs:
-        dynamic_ctx["node_ids"] = kwargs["node_ids"]
-        dynamic_ctx["node_count"] = len(kwargs["node_ids"]) if kwargs["node_ids"] else 0
-    if "index_id" in kwargs:
-        dynamic_ctx["index_id"] = kwargs["index_id"]
-    if "callback_manager" in kwargs:
-        dynamic_ctx["has_callback_manager"] = bool(kwargs["callback_manager"])
-    if "trace_id" in kwargs:
-        dynamic_ctx["trace_id"] = kwargs["trace_id"]
-    if "workflow" in kwargs:
-        dynamic_ctx["workflow"] = kwargs["workflow"]
-
-    return dynamic_ctx
 
 
 # Convenience decorators with rich context extraction
@@ -272,6 +434,8 @@ def with_embedding_error_context(
     **static_context: Any,
 ) -> Callable[[Callable[..., T]], Callable[..., T]]:
     """Decorator for sync methods with rich dynamic context extraction."""
+    static_context.setdefault("error_codes", EMBEDDING_COERCION_ERROR_CODES)
+    static_context.setdefault("framework_version", _FRAMEWORK_VERSION)
     return _create_error_context_decorator(operation, is_async=False)(**static_context)
 
 
@@ -280,6 +444,8 @@ def with_async_embedding_error_context(
     **static_context: Any,
 ) -> Callable[[Callable[..., T]], Callable[..., T]]:
     """Decorator for async methods with rich dynamic context extraction."""
+    static_context.setdefault("error_codes", EMBEDDING_COERCION_ERROR_CODES)
+    static_context.setdefault("framework_version", _FRAMEWORK_VERSION)
     return _create_error_context_decorator(operation, is_async=True)(**static_context)
 
 
@@ -310,11 +476,21 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         callback_manager: Optional[CallbackManager] = None,
         embed_batch_size: int = DEFAULT_EMBED_BATCH_SIZE,
         *,
+        llamaindex_config: Optional[LlamaIndexAdapterConfig] = None,
         embedding_dimension: Optional[int] = None,
         **kwargs: Any,
     ):
         """
         Initialize Corpus LlamaIndex Embeddings.
+
+        Parameters
+        ----------
+        llamaindex_config:
+            Adapter-level configuration (separate from per-call kwargs). Mirrors the
+            `*_config` pattern used across the framework adapters.
+        embedding_dimension:
+            Optional explicit embedding dimension override. Required if the adapter
+            does not implement `get_embedding_dimension()`.
         """
         # Behavioral validation (duck-typed) instead of strict isinstance
         if not hasattr(corpus_adapter, "embed") or not callable(
@@ -328,12 +504,39 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         if embed_batch_size < 1:
             raise ValueError("embed_batch_size must be positive")
 
+        # Validate + normalize llamaindex_config
+        if llamaindex_config is None:
+            llamaindex_config = {}
+        if not isinstance(llamaindex_config, Mapping):
+            raise ValueError(
+                f"[{ErrorCodes.LLAMAINDEX_CONFIG_INVALID}] "
+                f"llamaindex_config must be a Mapping, got {type(llamaindex_config).__name__}",
+            )
+        normalized_config: LlamaIndexAdapterConfig = dict(llamaindex_config)  # type: ignore[assignment]
+        normalized_config.setdefault("enable_operation_context_propagation", True)
+        normalized_config.setdefault("strict_text_types", True)
+        normalized_config.setdefault("max_node_ids_in_context", 100)
+
+        normalized_config["enable_operation_context_propagation"] = bool(
+            normalized_config["enable_operation_context_propagation"]
+        )
+        normalized_config["strict_text_types"] = bool(normalized_config["strict_text_types"])
+        normalized_config["max_node_ids_in_context"] = int(normalized_config["max_node_ids_in_context"])
+
         self.corpus_adapter = corpus_adapter
         self._model_name = model_name
         self.batch_config = batch_config
         self.text_normalization_config = text_normalization_config
         self._embed_batch_size = embed_batch_size
         self._embedding_dimension_override = embedding_dimension
+        self.llamaindex_config: LlamaIndexAdapterConfig = normalized_config
+
+        # Thread-safety for translator lazy init (multi-threaded ingestion / concurrent calls).
+        self._translator_lock = threading.Lock()
+
+        # Keep these private for fast access in extractors
+        self._max_node_ids_in_context: int = normalized_config["max_node_ids_in_context"]
+        self._embedding_dim_hint: Optional[int] = None
 
         # Enforce known embedding dimension to avoid incorrect fallbacks
         if (
@@ -356,11 +559,13 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
 
         logger.info(
             "CorpusLlamaIndexEmbeddings initialized with model_name=%s, "
-            "embed_batch_size=%d, framework_version=%s, embedding_dimension=%s",
+            "embed_batch_size=%d, framework_version=%s, embedding_dimension=%s, "
+            "llamaindex_config=%s",
             self._model_name,
             self._embed_batch_size,
             _FRAMEWORK_VERSION or "unknown",
             self._embedding_dimension_override,
+            self.llamaindex_config,
         )
 
     # ------------------------------------------------------------------ #
@@ -376,19 +581,27 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
     def _translator(self) -> EmbeddingTranslator:
         """
         Lazily construct and cache the `EmbeddingTranslator`.
+
+        Thread-safe lazy initialization via a lock + double-check pattern to avoid
+        duplicate initialization under concurrent access.
         """
-        translator = create_embedding_translator(
-            adapter=self.corpus_adapter,
-            framework=_FRAMEWORK_NAME,
-            translator=None,  # use registry/default generic translator
-            batch_config=self.batch_config,
-            text_normalization_config=self.text_normalization_config,
-        )
-        logger.debug(
-            "EmbeddingTranslator initialized for LlamaIndex with model_name=%s",
-            self.model_name,
-        )
-        return translator
+        with self._translator_lock:
+            existing = self.__dict__.get("_translator")
+            if isinstance(existing, EmbeddingTranslator):
+                return existing
+
+            translator = create_embedding_translator(
+                adapter=self.corpus_adapter,
+                framework=_FRAMEWORK_NAME,
+                translator=None,  # use registry/default generic translator
+                batch_config=self.batch_config,
+                text_normalization_config=self.text_normalization_config,
+            )
+            logger.debug(
+                "EmbeddingTranslator initialized for LlamaIndex with model_name=%s",
+                self.model_name,
+            )
+            return translator
 
     def _build_contexts(
         self,
@@ -408,10 +621,20 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         core_ctx: Optional[OperationContext] = None
         framework_ctx: Dict[str, Any] = {
             "framework": _FRAMEWORK_NAME,
+            # Canonical model + LlamaIndex-native model_name for observability parity
+            "model": self.model_name,
             "model_name": self.model_name,
+            # Include error_codes in framework_ctx for downstream consistency
+            "error_codes": EMBEDDING_COERCION_ERROR_CODES,
+            # Canonical adapter config key for parity with other adapters
+            "llamaindex_config": dict(self.llamaindex_config),
         }
         if _FRAMEWORK_VERSION is not None:
             framework_ctx["framework_version"] = _FRAMEWORK_VERSION
+
+        # Surface best-effort dim hint for parity with other adapters
+        dim_hint = self._embedding_dim_hint or self.embedding_dimension
+        framework_ctx["embedding_dim_hint"] = dim_hint
 
         # Validate input type for llamaindex_context
         if llamaindex_context is not None:
@@ -428,24 +651,40 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         # Convert LlamaIndex context to core OperationContext with defensive handling
         if llamaindex_context is not None:
             try:
-                core_ctx_candidate = context_from_llamaindex(llamaindex_context)
-                if isinstance(core_ctx_candidate, OperationContext):
-                    core_ctx = core_ctx_candidate
+                # Best-effort propagation of framework version into translation (if supported)
+                try:
+                    core_ctx_candidate = context_from_llamaindex(
+                        llamaindex_context,
+                        framework_version=_FRAMEWORK_VERSION,
+                    )
+                except TypeError:
+                    core_ctx_candidate = context_from_llamaindex(llamaindex_context)
 
-                    # Enrich OperationContext attrs with framework metadata
+                if _looks_like_operation_context(core_ctx_candidate):
+                    core_ctx = core_ctx_candidate  # type: ignore[assignment]
+
+                    # Enrich OperationContext attrs with framework metadata (best-effort).
                     attrs = dict(getattr(core_ctx, "attrs", {}) or {})
                     attrs.setdefault("framework", _FRAMEWORK_NAME)
                     if _FRAMEWORK_VERSION is not None:
                         attrs.setdefault("framework_version", _FRAMEWORK_VERSION)
 
-                    core_ctx = OperationContext(
-                        request_id=core_ctx.request_id,
-                        idempotency_key=core_ctx.idempotency_key,
-                        deadline_ms=core_ctx.deadline_ms,
-                        traceparent=core_ctx.traceparent,
-                        tenant=core_ctx.tenant,
-                        attrs=attrs,
-                    )
+                    # Preserve existing field values if OperationContext is immutable.
+                    try:
+                        core_ctx = OperationContext(
+                            request_id=getattr(core_ctx, "request_id", None),
+                            idempotency_key=getattr(core_ctx, "idempotency_key", None),
+                            deadline_ms=getattr(core_ctx, "deadline_ms", None),
+                            traceparent=getattr(core_ctx, "traceparent", None),
+                            tenant=getattr(core_ctx, "tenant", None),
+                            attrs=attrs,
+                        )
+                    except Exception:
+                        # If OperationContext can't be reconstructed, keep the candidate.
+                        try:
+                            setattr(core_ctx, "attrs", attrs)  # type: ignore[attr-defined]
+                        except Exception:
+                            pass
 
                     logger.debug(
                         "Successfully created OperationContext from LlamaIndex context "
@@ -465,42 +704,46 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
                     "Proceeding with degraded context.",
                     e,
                 )
-                try:
-                    snapshot = dict(llamaindex_context)
-                except Exception:  # noqa: BLE001
-                    snapshot = {"repr": repr(llamaindex_context)}
+                # Never allow context attachment to break embeddings.
                 try:
                     attach_context(
                         e,
                         framework=_FRAMEWORK_NAME,
                         operation="context_build",
-                        context_snapshot=snapshot,
+                        context_snapshot=_safe_snapshot(llamaindex_context),
                         framework_version=_FRAMEWORK_VERSION,
+                        error_codes=EMBEDDING_COERCION_ERROR_CODES,
+                        llamaindex_config=_safe_snapshot(self.llamaindex_config),
                     )
                 except Exception:
-                    # Never mask upstream exceptions when attaching context
                     pass
 
-        # Add LlamaIndex-specific context for nodes and retrieval
+        # Add LlamaIndex-specific context for nodes and retrieval (bounded)
         if llamaindex_context:
-            if "node_ids" in llamaindex_context:
-                framework_ctx["node_ids"] = llamaindex_context["node_ids"]
-            if "index_id" in llamaindex_context:
-                framework_ctx["index_id"] = llamaindex_context["index_id"]
+            node_ids = llamaindex_context.get("node_ids")
+            if node_ids is not None:
+                bounded = (node_ids or [])[: self._max_node_ids_in_context]
+                framework_ctx["node_ids"] = bounded
+                framework_ctx["node_count"] = len(node_ids or [])
+                if len(node_ids or []) > len(bounded):
+                    framework_ctx["node_ids_truncated"] = True
+
+            for key in ("index_id", "trace_id", "workflow"):
+                if key in llamaindex_context:
+                    framework_ctx[key] = llamaindex_context.get(key)
+
             if "callback_manager" in llamaindex_context:
-                framework_ctx["callback_manager"] = llamaindex_context[
-                    "callback_manager"
-                ]
-            if "trace_id" in llamaindex_context:
-                framework_ctx["trace_id"] = llamaindex_context["trace_id"]
-            if "workflow" in llamaindex_context:
-                framework_ctx["workflow"] = llamaindex_context["workflow"]
+                framework_ctx["has_callback_manager"] = bool(
+                    llamaindex_context.get("callback_manager")
+                )
 
         # Include any extra call-specific hints while preserving structure
         framework_ctx.update({k: v for k, v in kwargs.items() if not k.startswith("_")})
 
-        # Stash OperationContext for downstream inspection
-        if core_ctx is not None:
+        # Stash OperationContext for downstream inspection (configurable)
+        if core_ctx is not None and self.llamaindex_config.get(
+            "enable_operation_context_propagation", True
+        ):
             framework_ctx["_operation_context"] = core_ctx
 
         return core_ctx, framework_ctx
@@ -512,7 +755,13 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         """Validate LlamaIndex context structure and log warnings for anomalies."""
         if not any(
             key in context
-            for key in ("node_ids", "index_id", "callback_manager", "trace_id", "workflow")
+            for key in (
+                "node_ids",
+                "index_id",
+                "callback_manager",
+                "trace_id",
+                "workflow",
+            )
         ):
             logger.debug(
                 "LlamaIndex context missing common fields (node_ids, index_id, etc.) - "
@@ -567,9 +816,7 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
             try:
                 return int(self.corpus_adapter.get_embedding_dimension())
             except Exception as e:  # noqa: BLE001
-                logger.debug(
-                    "Failed to get embedding dimension from adapter: %s", e
-                )
+                logger.debug("Failed to get embedding dimension from adapter: %s", e)
                 if self._embedding_dimension_override is not None:
                     return int(self._embedding_dimension_override)
                 raise
@@ -590,8 +837,7 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         """
         dim = self.embedding_dimension
         logger.warning(
-            "Empty text provided for embedding, returning zero vector "
-            "(dimension=%d)",
+            "Empty text provided for embedding, returning zero vector (dimension=%d)",
             dim,
         )
         return [0.0] * dim
@@ -625,12 +871,23 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
             len(llamaindex_context.get("node_ids", []) or []),
         )
 
+        start = time.perf_counter()
         translated = self._translator.embed(
             raw_texts=text,
             op_ctx=core_ctx,
             framework_ctx=framework_ctx,
         )
-        return self._coerce_embedding_vector(translated)
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+
+        vec = self._coerce_embedding_vector(translated)
+        self._embedding_dim_hint = len(vec)
+
+        logger.debug(
+            "LlamaIndex embed_single_text completed: dim=%d latency_ms=%.2f",
+            len(vec),
+            elapsed_ms,
+        )
+        return vec
 
     async def _aembed_single_text(
         self,
@@ -648,12 +905,23 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
             len(llamaindex_context.get("node_ids", []) or []),
         )
 
+        start = time.perf_counter()
         translated = await self._translator.arun_embed(
             raw_texts=text,
             op_ctx=core_ctx,
             framework_ctx=framework_ctx,
         )
-        return self._coerce_embedding_vector(translated)
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+
+        vec = self._coerce_embedding_vector(translated)
+        self._embedding_dim_hint = len(vec)
+
+        logger.debug(
+            "LlamaIndex aembed_single_text completed: dim=%d latency_ms=%.2f",
+            len(vec),
+            elapsed_ms,
+        )
+        return vec
 
     def _embed_text_batch(
         self,
@@ -664,13 +932,14 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         self._warn_if_extreme_batch(texts, op_name="_get_text_embeddings")
 
         texts_list = list(texts)
-        non_empty_texts = [
-            t for t in texts_list if isinstance(t, str) and t.strip()
+        if self.llamaindex_config.get("strict_text_types", True):
+            _validate_texts_are_strings(texts_list, op_name="_get_text_embeddings")
+
+        non_empty_texts = [t for t in texts_list if isinstance(t, str) and t.strip()]
+        empty_indices_list = [
+            i for i, t in enumerate(texts_list) if not isinstance(t, str) or not t.strip()
         ]
-        empty_indices = [
-            i for i, t in enumerate(texts_list)
-            if not isinstance(t, str) or not t.strip()
-        ]
+        empty_indices = set(empty_indices_list)
 
         if not non_empty_texts:
             dim = self.embedding_dimension
@@ -687,27 +956,46 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
             len(llamaindex_context.get("node_ids", []) or []),
         )
 
+        start = time.perf_counter()
         translated = self._translator.embed(
             raw_texts=non_empty_texts,
             op_ctx=core_ctx,
             framework_ctx=framework_ctx,
         )
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+
         embeddings = self._coerce_embedding_matrix(translated)
 
+        dim = _infer_dim_from_matrix(embeddings)
+        if dim is not None:
+            self._embedding_dim_hint = dim
+
         if empty_indices:
-            dim = (
-                len(embeddings[0]) if embeddings else self.embedding_dimension
-            )
+            inferred_dim = dim if dim is not None else self.embedding_dimension
             result_embeddings: List[List[float]] = []
             non_empty_idx = 0
             for i in range(len(texts_list)):
                 if i in empty_indices:
-                    result_embeddings.append([0.0] * dim)
+                    result_embeddings.append([0.0] * inferred_dim)
                 else:
                     result_embeddings.append(embeddings[non_empty_idx])
                     non_empty_idx += 1
+
+            logger.debug(
+                "LlamaIndex embed_text_batch completed: total=%d non_empty=%d dim=%s latency_ms=%.2f",
+                len(texts_list),
+                len(non_empty_texts),
+                inferred_dim,
+                elapsed_ms,
+            )
             return result_embeddings
 
+        logger.debug(
+            "LlamaIndex embed_text_batch completed: total=%d dim=%s latency_ms=%.2f",
+            len(texts_list),
+            dim,
+            elapsed_ms,
+        )
         return embeddings
 
     async def _aembed_text_batch(
@@ -719,13 +1007,14 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         self._warn_if_extreme_batch(texts, op_name="_aget_text_embeddings")
 
         texts_list = list(texts)
-        non_empty_texts = [
-            t for t in texts_list if isinstance(t, str) and t.strip()
+        if self.llamaindex_config.get("strict_text_types", True):
+            _validate_texts_are_strings(texts_list, op_name="_aget_text_embeddings")
+
+        non_empty_texts = [t for t in texts_list if isinstance(t, str) and t.strip()]
+        empty_indices_list = [
+            i for i, t in enumerate(texts_list) if not isinstance(t, str) or not t.strip()
         ]
-        empty_indices = [
-            i for i, t in enumerate(texts_list)
-            if not isinstance(t, str) or not t.strip()
-        ]
+        empty_indices = set(empty_indices_list)
 
         if not non_empty_texts:
             dim = self.embedding_dimension
@@ -742,27 +1031,46 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
             len(llamaindex_context.get("node_ids", []) or []),
         )
 
+        start = time.perf_counter()
         translated = await self._translator.arun_embed(
             raw_texts=non_empty_texts,
             op_ctx=core_ctx,
             framework_ctx=framework_ctx,
         )
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+
         embeddings = self._coerce_embedding_matrix(translated)
 
+        dim = _infer_dim_from_matrix(embeddings)
+        if dim is not None:
+            self._embedding_dim_hint = dim
+
         if empty_indices:
-            dim = (
-                len(embeddings[0]) if embeddings else self.embedding_dimension
-            )
+            inferred_dim = dim if dim is not None else self.embedding_dimension
             result_embeddings: List[List[float]] = []
             non_empty_idx = 0
             for i in range(len(texts_list)):
                 if i in empty_indices:
-                    result_embeddings.append([0.0] * dim)
+                    result_embeddings.append([0.0] * inferred_dim)
                 else:
                     result_embeddings.append(embeddings[non_empty_idx])
                     non_empty_idx += 1
+
+            logger.debug(
+                "LlamaIndex aembed_text_batch completed: total=%d non_empty=%d dim=%s latency_ms=%.2f",
+                len(texts_list),
+                len(non_empty_texts),
+                inferred_dim,
+                elapsed_ms,
+            )
             return result_embeddings
 
+        logger.debug(
+            "LlamaIndex aembed_text_batch completed: total=%d dim=%s latency_ms=%.2f",
+            len(texts_list),
+            dim,
+            elapsed_ms,
+        )
         return embeddings
 
     # ------------------------------------------------------------------ #
@@ -777,7 +1085,7 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         if not query or not query.strip():
             return self._handle_empty_text(query)
 
-        context: LlamaIndexContext = kwargs  # type: ignore[assignment]
+        context = _filter_llamaindex_context_from_kwargs(kwargs)
         return self._embed_single_text(query, context)
 
     @with_async_embedding_error_context("query")
@@ -788,7 +1096,7 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         if not query or not query.strip():
             return self._handle_empty_text(query)
 
-        context: LlamaIndexContext = kwargs  # type: ignore[assignment]
+        context = _filter_llamaindex_context_from_kwargs(kwargs)
         return await self._aembed_single_text(query, context)
 
     @with_embedding_error_context("text")
@@ -799,7 +1107,7 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         if not text or not text.strip():
             return self._handle_empty_text(text)
 
-        context: LlamaIndexContext = kwargs  # type: ignore[assignment]
+        context = _filter_llamaindex_context_from_kwargs(kwargs)
         return self._embed_single_text(text, context)
 
     @with_async_embedding_error_context("text")
@@ -810,7 +1118,7 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         if not text or not text.strip():
             return self._handle_empty_text(text)
 
-        context: LlamaIndexContext = kwargs  # type: ignore[assignment]
+        context = _filter_llamaindex_context_from_kwargs(kwargs)
         return await self._aembed_single_text(text, context)
 
     @with_embedding_error_context("texts")
@@ -822,7 +1130,7 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         """
         Batch text embedding implementation for LlamaIndex nodes.
         """
-        context: LlamaIndexContext = kwargs  # type: ignore[assignment]
+        context = _filter_llamaindex_context_from_kwargs(kwargs)
         return self._embed_text_batch(texts, context)
 
     @with_async_embedding_error_context("texts")
@@ -834,7 +1142,7 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         """
         Async batch text embedding implementation for LlamaIndex nodes.
         """
-        context: LlamaIndexContext = kwargs  # type: ignore[assignment]
+        context = _filter_llamaindex_context_from_kwargs(kwargs)
         return await self._aembed_text_batch(texts, context)
 
 
@@ -846,6 +1154,7 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
 def configure_llamaindex_embeddings(
     corpus_adapter: EmbeddingProtocolV1,
     model_name: str = "corpus-embedding-protocol",
+    llamaindex_config: Optional[LlamaIndexAdapterConfig] = None,
     **kwargs: Any,
 ) -> CorpusLlamaIndexEmbeddings:
     """
@@ -862,6 +1171,7 @@ def configure_llamaindex_embeddings(
     embeddings = CorpusLlamaIndexEmbeddings(
         corpus_adapter=corpus_adapter,
         model_name=model_name,
+        llamaindex_config=llamaindex_config,
         **kwargs,
     )
 
@@ -901,6 +1211,7 @@ def configure_llamaindex_embeddings(
 def register_with_llamaindex(
     corpus_adapter: EmbeddingProtocolV1,
     model_name: str = "corpus-embedding-protocol",
+    llamaindex_config: Optional[LlamaIndexAdapterConfig] = None,
     **kwargs: Any,
 ) -> CorpusLlamaIndexEmbeddings:
     """
@@ -913,6 +1224,7 @@ def register_with_llamaindex(
     return configure_llamaindex_embeddings(
         corpus_adapter=corpus_adapter,
         model_name=model_name,
+        llamaindex_config=llamaindex_config,
         **kwargs,
     )
 
@@ -920,6 +1232,7 @@ def register_with_llamaindex(
 __all__ = [
     "CorpusLlamaIndexEmbeddings",
     "LlamaIndexContext",
+    "LlamaIndexAdapterConfig",
     "configure_llamaindex_embeddings",
     "register_with_llamaindex",
     "ErrorCodes",
