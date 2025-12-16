@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from typing import Any, Dict
+from collections.abc import Mapping, Sequence
+from typing import Any, Dict, List, Optional
 
 import asyncio
 import inspect
@@ -18,6 +18,107 @@ from corpus_sdk.embedding.framework_adapters.autogen import (
     create_retriever,
     register_embeddings,
 )
+
+from corpus_sdk.embedding.embedding_base import (
+    BatchEmbedResult,
+    BatchEmbedSpec,
+    EmbedResult,
+    EmbedSpec,
+    EmbeddingCapabilities,
+    EmbeddingProtocolV1,
+    EmbeddingStats,
+    EmbeddingVector,
+)
+
+
+# ---------------------------------------------------------------------------
+# Test adapter fixture (Protocol V1-shaped)
+# ---------------------------------------------------------------------------
+
+
+class StubV1Adapter:
+    """
+    Minimal EmbeddingProtocolV1-shaped adapter used for conformance tests.
+
+    NOTE: We intentionally return typed results (EmbedResult / BatchEmbedResult)
+    because the AutoGen adapter routes through EmbeddingTranslator, which expects
+    protocol-level results, not raw matrices.
+    """
+
+    def __init__(self) -> None:
+        self.closed = False
+        self.aclosed = False
+
+    async def capabilities(self) -> EmbeddingCapabilities:
+        return EmbeddingCapabilities(
+            server="stub",
+            version="0",
+            supported_models=(
+                "auto-model",
+                "sync-model",
+                "text-embedding-3-large",
+                "text-embedding-3-small",
+            ),
+        )
+
+    async def embed(self, spec: EmbedSpec, *, ctx: Any = None) -> EmbedResult:
+        vec = [0.0, 1.0]
+        ev = EmbeddingVector(
+            vector=vec,
+            text=spec.text,
+            model=spec.model,
+            dimensions=len(vec),
+            index=None,
+            metadata=None,
+        )
+        return EmbedResult(
+            embedding=ev,
+            model=spec.model,
+            text=spec.text,
+            tokens_used=None,
+            truncated=False,
+        )
+
+    async def embed_batch(self, spec: BatchEmbedSpec, *, ctx: Any = None) -> BatchEmbedResult:
+        evs = [
+            EmbeddingVector(
+                vector=[0.0, 1.0],
+                text=t,
+                model=spec.model,
+                dimensions=2,
+                index=i,
+                metadata=None,
+            )
+            for i, t in enumerate(spec.texts)
+        ]
+        return BatchEmbedResult(
+            embeddings=evs,
+            model=spec.model,
+            total_texts=len(spec.texts),
+            total_tokens=None,
+            failed_texts=[],
+        )
+
+    async def count_tokens(self, text: str, model: str, *, ctx: Any = None) -> int:
+        return len(text)
+
+    async def health(self, *, ctx: Any = None) -> Dict[str, Any]:
+        return {"ok": True, "server": "stub", "version": "0", "models": {}}
+
+    async def get_stats(self, *, ctx: Any = None) -> EmbeddingStats:
+        return EmbeddingStats()
+
+    # Lifecycle hooks (used by context manager tests)
+    def close(self) -> None:
+        self.closed = True
+
+    async def aclose(self) -> None:
+        self.aclosed = True
+
+
+@pytest.fixture
+def adapter() -> EmbeddingProtocolV1:
+    return StubV1Adapter()
 
 
 # ---------------------------------------------------------------------------
@@ -43,9 +144,8 @@ def _assert_embedding_vector_shape(result: Any) -> None:
         assert isinstance(val, (int, float)), f"Embedding value is not numeric: {val!r}"
 
 
-def _make_embeddings(adapter: Any, **kwargs: Any) -> CorpusAutoGenEmbeddings:
-    """Construct a CorpusAutoGenEmbeddings instance from the generic adapter."""
-    return CorpusAutoGenEmbeddings(corpus_adapter=adapter, **kwargs)
+def _make_embeddings(adapter_obj: Any, **kwargs: Any) -> CorpusAutoGenEmbeddings:
+    return CorpusAutoGenEmbeddings(corpus_adapter=adapter_obj, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -55,8 +155,7 @@ def _make_embeddings(adapter: Any, **kwargs: Any) -> CorpusAutoGenEmbeddings:
 
 def test_constructor_rejects_adapter_without_embed() -> None:
     """
-    CorpusAutoGenEmbeddings should enforce that corpus_adapter exposes
-    an `embed` method; otherwise __init__ should raise TypeError.
+    CorpusAutoGenEmbeddings enforces that corpus_adapter exposes a callable `embed`.
     """
 
     class BadAdapter:
@@ -65,16 +164,17 @@ def test_constructor_rejects_adapter_without_embed() -> None:
             pass
 
     with pytest.raises(TypeError) as exc_info:
-        CorpusAutoGenEmbeddings(corpus_adapter=BadAdapter())
+        CorpusAutoGenEmbeddings(corpus_adapter=BadAdapter())  # type: ignore[arg-type]
 
     msg = str(exc_info.value)
     assert "must implement an EmbeddingProtocolV1-compatible interface" in msg
+    assert "'embed' method" in msg
 
 
 def test_register_embeddings_returns_instance(adapter: Any) -> None:
     """
-    register_embeddings should return a CorpusAutoGenEmbeddings instance wired
-    to the given corpus adapter and model/framework_version.
+    register_embeddings returns a CorpusAutoGenEmbeddings instance wired to the given
+    corpus adapter and model/framework_version.
     """
     emb = register_embeddings(
         corpus_adapter=adapter,
@@ -85,8 +185,92 @@ def test_register_embeddings_returns_instance(adapter: Any) -> None:
     assert isinstance(emb, CorpusAutoGenEmbeddings)
     assert emb.corpus_adapter is adapter
     assert emb.model == "auto-model"
-    # framework_version is stored on _framework_version attribute
     assert getattr(emb, "_framework_version") == "autogen-fw-1.0"
+
+
+# ---------------------------------------------------------------------------
+# Translator boundary (conformance seam)
+# ---------------------------------------------------------------------------
+
+
+def test_translator_created_with_expected_args(monkeypatch: pytest.MonkeyPatch, adapter: Any) -> None:
+    """
+    Pin the create_embedding_translator call signature/arguments to avoid
+    subtle version-skew regressions.
+    """
+    captured: Dict[str, Any] = {}
+
+    class DummyTranslator:
+        def embed(self, raw_texts: Any, op_ctx: Any, framework_ctx: Any) -> Any:
+            # Return a simple numeric matrix/vector depending on input shape.
+            if isinstance(raw_texts, list):
+                return [[0.0, 1.0] for _ in raw_texts]
+            return [0.0, 1.0]
+
+        async def arun_embed(self, raw_texts: Any, op_ctx: Any, framework_ctx: Any) -> Any:
+            return self.embed(raw_texts, op_ctx, framework_ctx)
+
+    def fake_create_embedding_translator(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return DummyTranslator()
+
+    monkeypatch.setattr(autogen_adapter_module, "create_embedding_translator", fake_create_embedding_translator)
+
+    embeddings = CorpusAutoGenEmbeddings(
+        corpus_adapter=adapter,
+        model="m",
+        batch_config=None,
+        text_normalization_config=None,
+        framework_version="fv",
+    )
+    _ = embeddings.embed_documents(["x"])
+
+    assert captured["adapter"] is adapter
+    assert captured["framework"] == "autogen"
+    assert captured["translator"] is None
+    assert "batch_config" in captured
+    assert "text_normalization_config" in captured
+
+
+def test_framework_ctx_contains_autogen_metadata(monkeypatch: pytest.MonkeyPatch, adapter: Any) -> None:
+    """
+    Ensure framework_ctx contains key observability & AutoGen routing metadata.
+    """
+    seen: Dict[str, Any] = {}
+
+    class DummyTranslator:
+        def embed(self, raw_texts: Any, op_ctx: Any, framework_ctx: Any) -> Any:
+            seen["raw_texts"] = raw_texts
+            seen["op_ctx"] = op_ctx
+            seen["framework_ctx"] = framework_ctx
+            return [[0.0, 1.0] for _ in raw_texts]
+
+        async def arun_embed(self, raw_texts: Any, op_ctx: Any, framework_ctx: Any) -> Any:
+            return self.embed(raw_texts, op_ctx, framework_ctx)
+
+    monkeypatch.setattr(autogen_adapter_module, "create_embedding_translator", lambda **_: DummyTranslator())
+
+    embeddings = CorpusAutoGenEmbeddings(corpus_adapter=adapter, model="m", framework_version="fv")
+
+    _ = embeddings.embed_documents(
+        ["a", "b"],
+        autogen_context={
+            "conversation_id": "c1",
+            "agent_name": "agent1",
+            "workflow_type": "chain",
+            "retriever_name": "retr1",
+        },
+    )
+
+    fc = seen["framework_ctx"]
+    assert fc["framework"] == "autogen"
+    assert fc["model"] == "m"
+    assert fc["framework_version"] == "fv"
+    assert fc["conversation_id"] == "c1"
+    assert fc["agent_name"] == "agent1"
+    assert fc["workflow_type"] == "chain"
+    assert fc["retriever_name"] == "retr1"
+    assert "_operation_context" in fc  # best-effort: may be None, but key is set when built
 
 
 # ---------------------------------------------------------------------------
@@ -113,13 +297,10 @@ def test_autogen_interface_compatibility(adapter: Any) -> None:
             EmbeddingFunction,
         )
     except ImportError:
-        # AutoGen not installed - nothing more to assert.
         pytest.skip("AutoGen is not installed; cannot assert EmbeddingFunction compatibility")
 
-    # We can't reliably assert isinstance(...) if EmbeddingFunction is a Protocol,
-    # but we can assert that our implementation is structurally compatible:
+    # Structural compatibility checks (EmbeddingFunction may be a Protocol)
     assert hasattr(embeddings, "__call__")
-    # And that calling __call__ with texts works as EmbeddingFunction expects.
     result = embeddings(["if-this-fails-we-are-not-compatible"])
     _assert_embedding_matrix_shape(result, expected_rows=1)
 
@@ -135,27 +316,18 @@ def test_autogen_context_passed_to_context_translation(
 ) -> None:
     """
     Verify that autogen_context is passed through to context_from_autogen
-    when embedding.
+    with framework_version.
     """
     captured: Dict[str, Any] = {}
 
     def fake_from_autogen(ctx: Dict[str, Any], framework_version: Any = None) -> None:
         captured["ctx"] = ctx
         captured["framework_version"] = framework_version
-        # Returning None is allowed; adapter will just skip OperationContext.
         return None
 
-    # Patch the imported symbol inside the module under test
-    monkeypatch.setattr(
-        autogen_adapter_module,
-        "context_from_autogen",
-        fake_from_autogen,
-    )
+    monkeypatch.setattr(autogen_adapter_module, "context_from_autogen", fake_from_autogen)
 
-    embeddings = _make_embeddings(
-        adapter,
-        framework_version="autogen-test-version",
-    )
+    embeddings = _make_embeddings(adapter, framework_version="autogen-test-version")
 
     auto_ctx = {
         "conversation_id": "conv-123",
@@ -164,53 +336,148 @@ def test_autogen_context_passed_to_context_translation(
         "retriever_name": "retriever-y",
     }
 
-    result = embeddings.embed_documents(
-        ["foo", "bar"],
-        autogen_context=auto_ctx,
-    )
+    result = embeddings.embed_documents(["foo", "bar"], autogen_context=auto_ctx)
     _assert_embedding_matrix_shape(result, expected_rows=2)
 
-    assert captured.get("ctx") is not None
     assert captured["ctx"] == auto_ctx
     assert captured["framework_version"] == "autogen-test-version"
 
 
-def test_error_context_includes_autogen_context(
-    monkeypatch: pytest.MonkeyPatch,
+def test_invalid_autogen_context_type_is_ignored(monkeypatch: pytest.MonkeyPatch, adapter: Any) -> None:
+    """
+    autogen_context is best-effort. If the type is wrong (not a Mapping),
+    embeddings should still work.
+    """
+    class DummyTranslator:
+        def embed(self, raw_texts: Any, op_ctx: Any, framework_ctx: Any) -> Any:
+            # Always return a valid numeric matrix.
+            return [[0.0, 1.0] for _ in raw_texts]
+
+        async def arun_embed(self, raw_texts: Any, op_ctx: Any, framework_ctx: Any) -> Any:
+            return self.embed(raw_texts, op_ctx, framework_ctx)
+
+    monkeypatch.setattr(autogen_adapter_module, "create_embedding_translator", lambda **_: DummyTranslator())
+
+    embeddings = _make_embeddings(adapter)
+    out = embeddings.embed_documents(["x"], autogen_context="not-a-mapping")  # type: ignore[arg-type]
+    _assert_embedding_matrix_shape(out, expected_rows=1)
+
+
+def test_context_translation_failure_attaches_context_but_does_not_break(
+    monkeypatch: pytest.MonkeyPatch, adapter: Any
 ) -> None:
     """
-    When an error occurs during AutoGen embedding, error context should include
-    AutoGen-specific metadata via attach_context().
+    If context_from_autogen raises, embeddings proceed without OperationContext,
+    and attach_context is invoked with operation="context_build".
+    """
+    calls = {"attached": False}
+
+    def boom(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("ctx boom")
+
+    def fake_attach_context(exc: BaseException, **ctx: Any) -> None:
+        if ctx.get("operation") == "context_build":
+            calls["attached"] = True
+
+    class DummyTranslator:
+        def embed(self, raw_texts: Any, op_ctx: Any, framework_ctx: Any) -> Any:
+            return [[0.0, 1.0] for _ in raw_texts]
+
+        async def arun_embed(self, raw_texts: Any, op_ctx: Any, framework_ctx: Any) -> Any:
+            return self.embed(raw_texts, op_ctx, framework_ctx)
+
+    monkeypatch.setattr(autogen_adapter_module, "context_from_autogen", boom)
+    monkeypatch.setattr(autogen_adapter_module, "attach_context", fake_attach_context)
+    monkeypatch.setattr(autogen_adapter_module, "create_embedding_translator", lambda **_: DummyTranslator())
+
+    embeddings = _make_embeddings(adapter, framework_version="fv")
+    out = embeddings.embed_documents(["x"], autogen_context={"conversation_id": "c"})
+    _assert_embedding_matrix_shape(out, expected_rows=1)
+    assert calls["attached"] is True
+
+
+# ---------------------------------------------------------------------------
+# Input validation conformance
+# ---------------------------------------------------------------------------
+
+
+def test_embed_documents_rejects_non_strings(adapter: Any) -> None:
+    embeddings = _make_embeddings(adapter)
+    with pytest.raises(TypeError, match=r"expects Sequence\[str\]"):
+        embeddings.embed_documents(["ok", 123])  # type: ignore[list-item]
+
+
+@pytest.mark.asyncio
+async def test_aembed_documents_rejects_non_strings(adapter: Any) -> None:
+    embeddings = _make_embeddings(adapter)
+    with pytest.raises(TypeError, match=r"expects Sequence\[str\]"):
+        await embeddings.aembed_documents(["ok", object()])  # type: ignore[list-item]
+
+
+# ---------------------------------------------------------------------------
+# Error context attachment conformance
+# ---------------------------------------------------------------------------
+
+
+def test_error_context_includes_autogen_context(monkeypatch: pytest.MonkeyPatch, adapter: Any) -> None:
+    """
+    When an error occurs, attach_context should be invoked with AutoGen-specific
+    metadata and standard fields.
     """
     captured_context: Dict[str, Any] = {}
 
     def fake_attach_context(exc: BaseException, **ctx: Any) -> None:
         captured_context.update(ctx)
 
-    monkeypatch.setattr(
-        autogen_adapter_module,
-        "attach_context",
-        fake_attach_context,
-    )
+    class RaisingTranslator:
+        def embed(self, raw_texts: Any, op_ctx: Any, framework_ctx: Any) -> Any:
+            raise RuntimeError("boom")
 
-    class FailingAdapter:
-        def embed(self, *args: Any, **kwargs: Any) -> Any:
-            raise RuntimeError("test error from autogen adapter")
+    monkeypatch.setattr(autogen_adapter_module, "attach_context", fake_attach_context)
+    monkeypatch.setattr(autogen_adapter_module, "create_embedding_translator", lambda **_: RaisingTranslator())
 
-    embeddings = CorpusAutoGenEmbeddings(corpus_adapter=FailingAdapter())
-
+    embeddings = _make_embeddings(adapter, model="m", framework_version="fv")
     auto_ctx = {"conversation_id": "conv-ctx", "agent_name": "tester"}
 
-    with pytest.raises(RuntimeError, match="test error from autogen adapter"):
+    with pytest.raises(RuntimeError, match="boom"):
         embeddings.embed_documents(["text"], autogen_context=auto_ctx)
 
-    # Verify some context was attached
     assert captured_context, "attach_context was not called"
-    assert "framework" in captured_context
     assert captured_context.get("framework") == "autogen"
-    # AutoGen-specific fields should be present
+    assert captured_context.get("operation") == "embedding_documents"
     assert captured_context.get("conversation_id") == "conv-ctx"
     assert captured_context.get("agent_name") == "tester"
+    assert captured_context.get("model") == "m"
+    assert captured_context.get("framework_version") == "fv"
+    assert "error_codes" in captured_context
+
+
+@pytest.mark.asyncio
+async def test_async_error_context_includes_autogen_context(monkeypatch: pytest.MonkeyPatch, adapter: Any) -> None:
+    captured_context: Dict[str, Any] = {}
+
+    def fake_attach_context(exc: BaseException, **ctx: Any) -> None:
+        captured_context.update(ctx)
+
+    class RaisingTranslator:
+        async def arun_embed(self, raw_texts: Any, op_ctx: Any, framework_ctx: Any) -> Any:
+            raise RuntimeError("boom-async")
+
+    monkeypatch.setattr(autogen_adapter_module, "attach_context", fake_attach_context)
+    monkeypatch.setattr(autogen_adapter_module, "create_embedding_translator", lambda **_: RaisingTranslator())
+
+    embeddings = _make_embeddings(adapter, model="m", framework_version="fv")
+    auto_ctx = {"conversation_id": "conv-ctx", "agent_name": "tester"}
+
+    with pytest.raises(RuntimeError, match="boom-async"):
+        await embeddings.aembed_documents(["text"], autogen_context=auto_ctx)
+
+    assert captured_context.get("framework") == "autogen"
+    assert captured_context.get("operation") == "embedding_documents"
+    assert captured_context.get("conversation_id") == "conv-ctx"
+    assert captured_context.get("agent_name") == "tester"
+    assert captured_context.get("model") == "m"
+    assert captured_context.get("framework_version") == "fv"
 
 
 # ---------------------------------------------------------------------------
@@ -219,10 +486,6 @@ def test_error_context_includes_autogen_context(
 
 
 def test_sync_embed_documents_and_query_basic(adapter: Any) -> None:
-    """
-    Basic smoke test for sync embed_documents / embed_query behavior:
-    they should accept text input and return numeric shapes.
-    """
     embeddings = _make_embeddings(adapter, model="sync-model")
 
     texts = ["alpha", "beta", "gamma"]
@@ -236,32 +499,18 @@ def test_sync_embed_documents_and_query_basic(adapter: Any) -> None:
 
 
 def test_call_aliases_embed_documents(adapter: Any) -> None:
-    """
-    __call__ should behave like embed_documents for AutoGen's EmbeddingFunction
-    protocol: passing a sequence of texts and returning a matrix.
-    """
     embeddings = _make_embeddings(adapter)
 
     texts = ["call-one", "call-two"]
-    result = embeddings(texts)  # uses __call__
+    result = embeddings(texts)  # __call__
     _assert_embedding_matrix_shape(result, expected_rows=len(texts))
 
 
 def test_sync_embed_documents_with_autogen_context(adapter: Any) -> None:
-    """
-    embed_documents should accept autogen_context kwarg and not raise TypeError.
-    """
     embeddings = _make_embeddings(adapter)
 
-    ctx = {
-        "conversation_id": "conv-ctx",
-        "agent_name": "tester",
-    }
-
-    result = embeddings.embed_documents(
-        ["ctx-one", "ctx-two"],
-        autogen_context=ctx,
-    )
+    ctx = {"conversation_id": "conv-ctx", "agent_name": "tester"}
+    result = embeddings.embed_documents(["ctx-one", "ctx-two"], autogen_context=ctx)
     _assert_embedding_matrix_shape(result, expected_rows=2)
 
 
@@ -272,15 +521,7 @@ def test_sync_embed_documents_with_autogen_context(adapter: Any) -> None:
 
 @pytest.mark.asyncio
 async def test_async_embed_documents_and_query_basic(adapter: Any) -> None:
-    """
-    Async aembed_documents / aembed_query should exist and produce shapes
-    compatible with the sync API.
-    """
     embeddings = _make_embeddings(adapter)
-
-    # Ensure async methods exist and are coroutine functions
-    assert hasattr(embeddings, "aembed_documents")
-    assert hasattr(embeddings, "aembed_query")
 
     assert inspect.iscoroutinefunction(embeddings.aembed_documents)
     assert inspect.iscoroutinefunction(embeddings.aembed_query)
@@ -297,10 +538,6 @@ async def test_async_embed_documents_and_query_basic(adapter: Any) -> None:
 
 @pytest.mark.asyncio
 async def test_async_and_sync_same_dimension(adapter: Any) -> None:
-    """
-    Check that sync and async embeddings for the same input produce vectors
-    of the same dimensionality (not necessarily identical values).
-    """
     embeddings = _make_embeddings(adapter)
 
     texts = ["dim-a", "dim-b"]
@@ -312,31 +549,26 @@ async def test_async_and_sync_same_dimension(adapter: Any) -> None:
     sync_q = embeddings.embed_query(query)
     async_q = await embeddings.aembed_query(query)
 
-    # Row counts
     assert len(sync_vecs) == len(async_vecs) == len(texts)
-
-    # Dimensions (if any rows present)
     if sync_vecs and async_vecs:
         assert len(sync_vecs[0]) == len(async_vecs[0])
-
-    # Query dims
     assert len(sync_q) == len(async_q)
 
 
 # ---------------------------------------------------------------------------
-# Capabilities / health passthrough (best-effort)
+# Capabilities / health passthrough (best-effort, legacy sync adapters)
 # ---------------------------------------------------------------------------
 
 
 def test_capabilities_and_health_passthrough_when_underlying_provides() -> None:
     """
-    When the underlying adapter implements capabilities/acapabilities and
-    health/ahealth, CorpusAutoGenEmbeddings should surface them.
+    This is intentionally for legacy adapters that expose sync capabilities/health
+    (CorpusAutoGenEmbeddings.capabilities()/health() are sync passthrough).
     """
 
     class FullAdapter:
-        def embed(self, texts: Sequence[str], **_: Any) -> list[list[float]]:
-            return [[0.0, 1.0] for _ in texts]
+        def embed(self, *args: Any, **kwargs: Any) -> Any:
+            return None
 
         def capabilities(self) -> Dict[str, Any]:
             return {"ok": True}
@@ -350,37 +582,26 @@ def test_capabilities_and_health_passthrough_when_underlying_provides() -> None:
         async def ahealth(self) -> Dict[str, Any]:
             return {"status_async": "healthy"}
 
-    embeddings = CorpusAutoGenEmbeddings(corpus_adapter=FullAdapter())
+    embeddings = CorpusAutoGenEmbeddings(corpus_adapter=FullAdapter())  # type: ignore[arg-type]
 
-    # Sync passthrough
     caps = embeddings.capabilities()
-    assert isinstance(caps, dict)
     assert caps.get("ok") is True
 
     health = embeddings.health()
-    assert isinstance(health, dict)
     assert health.get("status") == "healthy"
 
-    # Async passthrough via event loop
     acaps = asyncio.run(embeddings.acapabilities())
-    assert isinstance(acaps, dict)
     assert acaps.get("ok_async") is True
 
     ahealth = asyncio.run(embeddings.ahealth())
-    assert isinstance(ahealth, dict)
     assert ahealth.get("status_async") == "healthy"
 
 
 @pytest.mark.asyncio
 async def test_async_capabilities_and_health_fallback_to_sync() -> None:
-    """
-    acapabilities/ahealth should fall back to sync capabilities()/health()
-    when only sync methods are implemented on the underlying adapter.
-    """
-
     class CapHealthAdapter:
-        def embed(self, texts: Sequence[str], **_: Any) -> list[list[float]]:
-            return [[0.0, 1.0] for _ in texts]
+        def embed(self, *args: Any, **kwargs: Any) -> Any:
+            return None
 
         def capabilities(self) -> Dict[str, Any]:
             return {"via_sync_caps": True}
@@ -388,44 +609,29 @@ async def test_async_capabilities_and_health_fallback_to_sync() -> None:
         def health(self) -> Dict[str, Any]:
             return {"via_sync_health": True}
 
-    embeddings = CorpusAutoGenEmbeddings(corpus_adapter=CapHealthAdapter())
+    embeddings = CorpusAutoGenEmbeddings(corpus_adapter=CapHealthAdapter())  # type: ignore[arg-type]
 
     acaps = await embeddings.acapabilities()
-    assert isinstance(acaps, dict)
     assert acaps.get("via_sync_caps") is True
 
     ahealth = await embeddings.ahealth()
-    assert isinstance(ahealth, dict)
     assert ahealth.get("via_sync_health") is True
 
 
 def test_capabilities_and_health_return_empty_when_missing() -> None:
-    """
-    If the underlying adapter has no capabilities()/health(), the AutoGen
-    adapter should return an empty dict rather than raising.
-    """
-
     class NoCapHealthAdapter:
-        def embed(self, texts: Sequence[str], **_: Any) -> list[list[float]]:
-            return [[0.0] * 3 for _ in texts]
+        def embed(self, *args: Any, **kwargs: Any) -> Any:
+            return None
 
-    embeddings = CorpusAutoGenEmbeddings(corpus_adapter=NoCapHealthAdapter())
+    embeddings = CorpusAutoGenEmbeddings(corpus_adapter=NoCapHealthAdapter())  # type: ignore[arg-type]
 
-    caps = embeddings.capabilities()
-    assert isinstance(caps, dict)
-    assert caps == {}
+    assert embeddings.capabilities() == {}
+    assert embeddings.health() == {}
 
-    health = embeddings.health()
-    assert isinstance(health, dict)
-    assert health == {}
-
-    # Async variants should also return empty mapping
     acaps = asyncio.run(embeddings.acapabilities())
-    assert isinstance(acaps, dict)
     assert acaps == {}
 
     ahealth = asyncio.run(embeddings.ahealth())
-    assert isinstance(ahealth, dict)
     assert ahealth == {}
 
 
@@ -436,40 +642,21 @@ def test_capabilities_and_health_return_empty_when_missing() -> None:
 
 @pytest.mark.asyncio
 async def test_context_manager_closes_underlying_adapter() -> None:
-    """
-    __enter__/__exit__ and __aenter__/__aexit__ should call close/aclose on
-    the underlying adapter when those methods exist.
-    """
+    adapter_obj = StubV1Adapter()
+    embeddings = CorpusAutoGenEmbeddings(corpus_adapter=adapter_obj)
 
-    class ClosingAdapter:
-        def __init__(self) -> None:
-            self.closed = False
-            self.aclosed = False
-
-        def embed(self, texts: Sequence[str], **_: Any) -> list[list[float]]:
-            return [[0.0] * 2 for _ in texts]
-
-        def close(self) -> None:
-            self.closed = True
-
-        async def aclose(self) -> None:
-            self.aclosed = True
-
-    adapter = ClosingAdapter()
-
-    # Sync context manager
-    with CorpusAutoGenEmbeddings(corpus_adapter=adapter) as emb:
+    with embeddings as emb:
         _ = emb.embed_documents(["x"])  # smoke
 
-    assert adapter.closed is True
+    assert adapter_obj.closed is True
 
-    # Async context manager
-    adapter2 = ClosingAdapter()
-    emb2 = CorpusAutoGenEmbeddings(corpus_adapter=adapter2)
-    async with emb2:
-        _ = await emb2.aembed_documents(["y"])
+    adapter_obj2 = StubV1Adapter()
+    embeddings2 = CorpusAutoGenEmbeddings(corpus_adapter=adapter_obj2)
 
-    assert adapter2.aclosed is True
+    async with embeddings2:
+        _ = await embeddings2.aembed_documents(["y"])
+
+    assert adapter_obj2.aclosed is True
 
 
 # ---------------------------------------------------------------------------
@@ -481,10 +668,6 @@ def test_create_retriever_raises_runtime_error_when_autogen_not_installed(
     monkeypatch: pytest.MonkeyPatch,
     adapter: Any,
 ) -> None:
-    """
-    When AutoGen is not installed (or import fails), create_retriever should
-    raise RuntimeError with a helpful message.
-    """
     import builtins as _builtins
 
     orig_import = _builtins.__import__
@@ -497,36 +680,19 @@ def test_create_retriever_raises_runtime_error_when_autogen_not_installed(
     monkeypatch.setattr(_builtins, "__import__", fake_import)
 
     with pytest.raises(RuntimeError) as exc_info:
-        create_retriever(
-            corpus_adapter=adapter,
-            vector_store=object(),
-            model="m",
-        )
+        create_retriever(corpus_adapter=adapter, vector_store=object(), model="m")
 
-    msg = str(exc_info.value)
-    assert "AutoGen is not installed" in msg
+    assert "AutoGen is not installed" in str(exc_info.value)
 
 
-def test_create_retriever_configures_vector_store_embedding_function(
-    monkeypatch: pytest.MonkeyPatch,
-    adapter: Any,
-) -> None:
-    """
-    When AutoGen is "available", create_retriever should:
-
-    - Construct a CorpusAutoGenEmbeddings instance.
-    - Attach it to vector_store.embedding_function when present.
-    - Return a VectorStoreRetriever wrapping the same vector_store.
-    """
-    # Stub AutoGen's VectorStoreRetriever via sys.modules
+def test_create_retriever_prefers_setter_method(monkeypatch: pytest.MonkeyPatch, adapter: Any) -> None:
     retrieve_utils_mod = types.ModuleType("autogen.retrieve_utils")
 
     class DummyVectorStoreRetriever:
-        def __init__(self, vectorstore: Any) -> None:
+        def __init__(self, vectorstore: Any, **_: Any) -> None:
             self.vectorstore = vectorstore
 
     setattr(retrieve_utils_mod, "VectorStoreRetriever", DummyVectorStoreRetriever)
-
     autogen_pkg = types.ModuleType("autogen")
 
     monkeypatch.setitem(sys.modules, "autogen", autogen_pkg)
@@ -534,7 +700,48 @@ def test_create_retriever_configures_vector_store_embedding_function(
 
     class DummyVectorStore:
         def __init__(self) -> None:
+            self.set_called_with: Any = None
+            self.embedding_function: Any = "should-not-win"
+
+        def set_embedding_function(self, fn: Any) -> None:
+            self.set_called_with = fn
+
+        # Add one common method to avoid warning-only validation logs
+        def similarity_search(self, *args: Any, **kwargs: Any) -> Any:
+            return []
+
+    vs = DummyVectorStore()
+
+    retriever = create_retriever(corpus_adapter=adapter, vector_store=vs, model="text-embedding-3-large")
+
+    assert isinstance(retriever, DummyVectorStoreRetriever)
+    assert retriever.vectorstore is vs
+    assert vs.set_called_with is not None
+    assert isinstance(vs.set_called_with, CorpusAutoGenEmbeddings)
+
+
+def test_create_retriever_configures_vector_store_embedding_function(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: Any,
+) -> None:
+    retrieve_utils_mod = types.ModuleType("autogen.retrieve_utils")
+
+    class DummyVectorStoreRetriever:
+        def __init__(self, vectorstore: Any, **_: Any) -> None:
+            self.vectorstore = vectorstore
+
+    setattr(retrieve_utils_mod, "VectorStoreRetriever", DummyVectorStoreRetriever)
+
+    autogen_pkg = types.ModuleType("autogen")
+    monkeypatch.setitem(sys.modules, "autogen", autogen_pkg)
+    monkeypatch.setitem(sys.modules, "autogen.retrieve_utils", retrieve_utils_mod)
+
+    class DummyVectorStore:
+        def __init__(self) -> None:
             self.embedding_function: Any | None = None
+
+        def query(self, *args: Any, **kwargs: Any) -> Any:
+            return []
 
     vs = DummyVectorStore()
 
@@ -545,28 +752,23 @@ def test_create_retriever_configures_vector_store_embedding_function(
         framework_version="auto-fw-2",
     )
 
-    # Retriever should be our dummy type and hold original vector store
     assert isinstance(retriever, DummyVectorStoreRetriever)
     assert retriever.vectorstore is vs
 
-    # embedding_function should be CorpusAutoGenEmbeddings
     assert isinstance(vs.embedding_function, CorpusAutoGenEmbeddings)
     assert vs.embedding_function.corpus_adapter is adapter
     assert vs.embedding_function.model == "text-embedding-3-large"
+    assert getattr(vs.embedding_function, "_framework_version") == "auto-fw-2"
 
 
 def test_create_retriever_configures_private_embedding_function_when_only_private_present(
     monkeypatch: pytest.MonkeyPatch,
     adapter: Any,
 ) -> None:
-    """
-    If vector_store does not expose `embedding_function` but does expose
-    `_embedding_function`, create_retriever should set that attribute.
-    """
     retrieve_utils_mod = types.ModuleType("autogen.retrieve_utils")
 
     class DummyVectorStoreRetriever:
-        def __init__(self, vectorstore: Any) -> None:
+        def __init__(self, vectorstore: Any, **_: Any) -> None:
             self.vectorstore = vectorstore
 
     setattr(retrieve_utils_mod, "VectorStoreRetriever", DummyVectorStoreRetriever)
@@ -579,13 +781,12 @@ def test_create_retriever_configures_private_embedding_function_when_only_privat
         def __init__(self) -> None:
             self._embedding_function: Any | None = None
 
+        def similarity_search(self, *args: Any, **kwargs: Any) -> Any:
+            return []
+
     vs = DummyVectorStore()
 
-    retriever = create_retriever(
-        corpus_adapter=adapter,
-        vector_store=vs,
-        model="text-embedding-3-small",
-    )
+    retriever = create_retriever(corpus_adapter=adapter, vector_store=vs, model="text-embedding-3-small")
 
     assert isinstance(retriever, DummyVectorStoreRetriever)
     assert retriever.vectorstore is vs
