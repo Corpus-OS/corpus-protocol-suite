@@ -830,10 +830,10 @@ class EmbeddingCapabilities:
         truncation_mode: "base" or "adapter" to signal where truncation is applied
         supports_deadline: Whether adapter cooperates with deadline cancellation
     """
-    protocol: str = EMBEDDING_PROTOCOL_ID
     server: str
     version: str
     supported_models: Tuple[str, ...]
+    protocol: str = EMBEDDING_PROTOCOL_ID
     max_batch_size: Optional[int] = None
     max_text_length: Optional[int] = None
     max_dimensions: Optional[int] = None
