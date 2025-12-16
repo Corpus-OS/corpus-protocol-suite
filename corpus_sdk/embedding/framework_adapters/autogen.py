@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
+import time
 from functools import cached_property, wraps
 from typing import (
     Any,
@@ -63,6 +65,9 @@ from corpus_sdk.embedding.framework_adapters.common.framework_utils import (
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+# Warn-once guard for private vector-store mutations.
+_WARNED_PRIVATE_EMBEDDING_ATTR = False
 
 
 # --------------------------------------------------------------------------- #
@@ -130,6 +135,89 @@ class AutoGenRetriever(Protocol):
 
 
 # --------------------------------------------------------------------------- #
+# Small utilities (validation / safe snapshots)
+# --------------------------------------------------------------------------- #
+
+
+def _validate_texts_are_strings(texts: Sequence[Any], *, op_name: str) -> None:
+    """
+    Fail fast if a caller provides non-string items.
+
+    We intentionally do not coerce arbitrary objects to str here, because
+    that can silently embed repr() outputs and lead to confusing retrieval.
+    """
+    for i, t in enumerate(texts):
+        if not isinstance(t, str):
+            raise TypeError(
+                f"{op_name} expects Sequence[str]; item {i} is {type(t).__name__}",
+            )
+
+
+def _safe_snapshot(value: Any, *, max_items: int = 200, max_str: int = 5_000) -> Any:
+    """
+    Best-effort conversion into a JSON-ish, safe-to-log snapshot.
+
+    - Limits container size to reduce log bloat
+    - Truncates long strings
+    - Falls back to repr() for unknown objects
+    """
+    try:
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        if isinstance(value, str):
+            return value if len(value) <= max_str else value[:max_str] + "…"
+        if isinstance(value, Mapping):
+            out: Dict[str, Any] = {}
+            for idx, (k, v) in enumerate(value.items()):
+                if idx >= max_items:
+                    out["…"] = f"truncated after {max_items} items"
+                    break
+                out[str(k)] = _safe_snapshot(v, max_items=max_items, max_str=max_str)
+            return out
+        if isinstance(value, (list, tuple)):
+            out_list: List[Any] = []
+            for idx, v in enumerate(value):
+                if idx >= max_items:
+                    out_list.append(f"… truncated after {max_items} items")
+                    break
+                out_list.append(_safe_snapshot(v, max_items=max_items, max_str=max_str))
+            return out_list
+        return repr(value)
+    except Exception:  # noqa: BLE001
+        return {"repr": repr(value)}
+
+
+def _looks_like_operation_context(obj: Any) -> bool:
+    """
+    OperationContext can be a concrete type OR a Protocol/alias depending on the SDK.
+
+    We prefer an isinstance check when it works, but fall back to a lightweight
+    structural heuristic to avoid false negatives.
+    """
+    if obj is None:
+        return False
+    try:
+        if isinstance(obj, OperationContext):
+            return True
+    except TypeError:
+        # OperationContext might be a Protocol / typing alias.
+        pass
+
+    # Heuristic: common context-ish fields/methods found in typical contexts.
+    return any(
+        hasattr(obj, attr)
+        for attr in (
+            "trace_id",
+            "request_id",
+            "user_id",
+            "tags",
+            "metadata",
+            "to_dict",
+        )
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Error-context decorators with dynamic context extraction
 # --------------------------------------------------------------------------- #
 
@@ -148,11 +236,18 @@ def _extract_dynamic_context(
     - text_len for single-text operations
     - texts_count / empty_texts_count for batch operations
     - key AutoGen routing fields (conversation_id, agent_name, workflow_type, retriever_name)
+
+    Also includes best-effort dimension hints once known.
     """
     dynamic_ctx: Dict[str, Any] = {
         "model": getattr(instance, "model", "unknown"),
         "framework_version": getattr(instance, "_framework_version", None),
     }
+
+    # Optional hint: populated after first successful embed
+    dim_hint = getattr(instance, "_embedding_dim_hint", None)
+    if isinstance(dim_hint, int):
+        dynamic_ctx["embedding_dim"] = dim_hint
 
     # Text / batch metrics
     if operation in ("query",) and args and isinstance(args[0], str):
@@ -363,6 +458,14 @@ class CorpusAutoGenEmbeddings:
         self.autogen_config: Dict[str, Any] = autogen_config or {}
         self._framework_version: Optional[str] = framework_version
 
+        # Improvement: guard lazy translator initialization under concurrency.
+        # We intentionally keep construction lazy, but ensure only one instance
+        # is created even when multiple threads race on first access.
+        self._translator_lock = threading.Lock()
+
+        # Observability improvement: best-effort dim hint set after first embed.
+        self._embedding_dim_hint: Optional[int] = None
+
         logger.info(
             "CorpusAutoGenEmbeddings initialized with model=%s, autogen_config=%r, framework_version=%r",
             self.model or "default",
@@ -403,20 +506,28 @@ class CorpusAutoGenEmbeddings:
         """
         Lazily construct and cache the `EmbeddingTranslator`.
 
-        Uses `cached_property` for thread safety and performance.
+        We use `cached_property` for ergonomic caching and add an explicit lock
+        to avoid duplicate initialization under concurrent first access.
         """
-        translator = create_embedding_translator(
-            adapter=self.corpus_adapter,
-            framework="autogen",
-            translator=None,  # use registry/default generic translator
-            batch_config=self.batch_config,
-            text_normalization_config=self.text_normalization_config,
-        )
-        logger.debug(
-            "EmbeddingTranslator initialized for AutoGen with model=%s",
-            self.model or "default",
-        )
-        return translator
+        with self._translator_lock:
+            # If another thread finished initialization while we were waiting,
+            # return the cached value immediately.
+            existing = self.__dict__.get("_translator")
+            if isinstance(existing, EmbeddingTranslator):
+                return existing
+
+            translator = create_embedding_translator(
+                adapter=self.corpus_adapter,
+                framework="autogen",
+                translator=None,  # use registry/default generic translator
+                batch_config=self.batch_config,
+                text_normalization_config=self.text_normalization_config,
+            )
+            logger.debug(
+                "EmbeddingTranslator initialized for AutoGen with model=%s",
+                self.model or "default",
+            )
+            return translator
 
     # ---- context helpers ------------------------------------------------- #
 
@@ -454,31 +565,29 @@ class CorpusAutoGenEmbeddings:
                 "Proceeding without OperationContext.",
                 exc,
             )
-            try:
-                snapshot = dict(autogen_context)
-            except TypeError:
-                snapshot = {"repr": str(autogen_context)}
             attach_context(
                 exc,
                 framework="autogen",
                 operation="context_build",
-                autogen_context_snapshot=snapshot,
+                autogen_context_snapshot=_safe_snapshot(autogen_context),
                 autogen_config=self.autogen_config,
                 framework_version=self._framework_version,
                 error_codes=EMBEDDING_COERCION_ERROR_CODES,
             )
             return None
 
-        if isinstance(core_candidate, OperationContext):
+        # Improvement: avoid brittle isinstance-only checks in case OperationContext
+        # is a Protocol/typing alias; accept "OperationContext-like" values.
+        if _looks_like_operation_context(core_candidate):
             logger.debug(
                 "Successfully created OperationContext from AutoGen context "
                 "with conversation_id=%s",
                 autogen_context.get("conversation_id", "unknown"),
             )
-            return core_candidate
+            return core_candidate  # type: ignore[return-value]
 
         logger.warning(
-            "context_from_autogen returned non-OperationContext type: %s. "
+            "context_from_autogen returned non-OperationContext-like type: %s. "
             "Ignoring OperationContext.",
             type(core_candidate).__name__,
         )
@@ -526,6 +635,10 @@ class CorpusAutoGenEmbeddings:
         if core_ctx is not None:
             base["_operation_context"] = core_ctx
 
+        # Observability improvement: include best-effort embedding dimension hint.
+        if isinstance(self._embedding_dim_hint, int):
+            base["embedding_dim_hint"] = self._embedding_dim_hint
+
         return base
 
     def _build_contexts(
@@ -571,6 +684,15 @@ class CorpusAutoGenEmbeddings:
             error_codes=EMBEDDING_COERCION_ERROR_CODES,
             logger=logger,
         )
+
+    @staticmethod
+    def _infer_dim_from_matrix(mat: List[List[float]]) -> Optional[int]:
+        if not mat:
+            return None
+        first = mat[0]
+        if not isinstance(first, list):
+            return None
+        return len(first)
 
     # ------------------------------------------------------------------ #
     # Health / capabilities passthrough
@@ -664,6 +786,8 @@ class CorpusAutoGenEmbeddings:
         for document embedding and agent memory.
         """
         texts_list = list(texts)
+        _validate_texts_are_strings(texts_list, op_name="embed_documents")
+
         warn_if_extreme_batch(
             framework="autogen",
             texts=texts_list,
@@ -684,12 +808,29 @@ class CorpusAutoGenEmbeddings:
             framework_ctx.get("conversation_id", "unknown"),
         )
 
+        start = time.perf_counter()
         translated = self._translator.embed(
             raw_texts=texts_list,
             op_ctx=core_ctx,
             framework_ctx=framework_ctx,
         )
-        return self._coerce_embedding_matrix(translated)
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+
+        mat = self._coerce_embedding_matrix(translated)
+
+        # Observability improvement: remember dim once known.
+        dim = self._infer_dim_from_matrix(mat)
+        if dim is not None:
+            self._embedding_dim_hint = dim
+
+        logger.debug(
+            "Sync embedding completed: docs=%d dim=%s latency_ms=%.2f conversation=%s",
+            len(mat),
+            dim,
+            elapsed_ms,
+            framework_ctx.get("conversation_id", "unknown"),
+        )
+        return mat
 
     @with_embedding_error_context("query")
     def embed_query(
@@ -706,6 +847,9 @@ class CorpusAutoGenEmbeddings:
         Used by AutoGen for query understanding and retrieval in
         multi-agent conversations.
         """
+        if not isinstance(text, str):
+            raise TypeError(f"embed_query expects str; got {type(text).__name__}")
+
         core_ctx, framework_ctx = self._build_contexts(
             autogen_context=autogen_context,
             model=model,
@@ -717,12 +861,26 @@ class CorpusAutoGenEmbeddings:
             framework_ctx.get("conversation_id", "unknown"),
         )
 
+        start = time.perf_counter()
         translated = self._translator.embed(
             raw_texts=text,
             op_ctx=core_ctx,
             framework_ctx=framework_ctx,
         )
-        return self._coerce_embedding_vector(translated)
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+
+        vec = self._coerce_embedding_vector(translated)
+
+        if self._embedding_dim_hint is None:
+            self._embedding_dim_hint = len(vec)
+
+        logger.debug(
+            "Sync embedding query completed: dim=%d latency_ms=%.2f conversation=%s",
+            len(vec),
+            elapsed_ms,
+            framework_ctx.get("conversation_id", "unknown"),
+        )
+        return vec
 
     # ------------------------------------------------------------------ #
     # Async API for AutoGen Async Workflows
@@ -744,6 +902,8 @@ class CorpusAutoGenEmbeddings:
         event-driven agent systems.
         """
         texts_list = list(texts)
+        _validate_texts_are_strings(texts_list, op_name="aembed_documents")
+
         warn_if_extreme_batch(
             framework="autogen",
             texts=texts_list,
@@ -764,12 +924,28 @@ class CorpusAutoGenEmbeddings:
             framework_ctx.get("conversation_id", "unknown"),
         )
 
+        start = time.perf_counter()
         translated = await self._translator.arun_embed(
             raw_texts=texts_list,
             op_ctx=core_ctx,
             framework_ctx=framework_ctx,
         )
-        return self._coerce_embedding_matrix(translated)
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+
+        mat = self._coerce_embedding_matrix(translated)
+
+        dim = self._infer_dim_from_matrix(mat)
+        if dim is not None:
+            self._embedding_dim_hint = dim
+
+        logger.debug(
+            "Async embedding completed: docs=%d dim=%s latency_ms=%.2f conversation=%s",
+            len(mat),
+            dim,
+            elapsed_ms,
+            framework_ctx.get("conversation_id", "unknown"),
+        )
+        return mat
 
     @with_async_embedding_error_context("query")
     async def aembed_query(
@@ -786,6 +962,9 @@ class CorpusAutoGenEmbeddings:
         Used in AutoGen's asynchronous agent workflows and
         flow-based conversation systems.
         """
+        if not isinstance(text, str):
+            raise TypeError(f"aembed_query expects str; got {type(text).__name__}")
+
         core_ctx, framework_ctx = self._build_contexts(
             autogen_context=autogen_context,
             model=model,
@@ -797,12 +976,26 @@ class CorpusAutoGenEmbeddings:
             framework_ctx.get("conversation_id", "unknown"),
         )
 
+        start = time.perf_counter()
         translated = await self._translator.arun_embed(
             raw_texts=text,
             op_ctx=core_ctx,
             framework_ctx=framework_ctx,
         )
-        return self._coerce_embedding_vector(translated)
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+
+        vec = self._coerce_embedding_vector(translated)
+
+        if self._embedding_dim_hint is None:
+            self._embedding_dim_hint = len(vec)
+
+        logger.debug(
+            "Async embedding query completed: dim=%d latency_ms=%.2f conversation=%s",
+            len(vec),
+            elapsed_ms,
+            framework_ctx.get("conversation_id", "unknown"),
+        )
+        return vec
 
 
 # --------------------------------------------------------------------------- #
@@ -833,6 +1026,50 @@ def _validate_vector_store_for_autogen(vector_store: Any) -> None:
         )
 
 
+def _set_vector_store_embedding_function(vector_store: Any, embedding_function: Any) -> None:
+    """
+    Configure the vector store with our embedding function.
+
+    Improvement: prefer the best available public API, then fall back.
+
+    Order:
+      1) public setter method if present
+      2) public attribute `embedding_function`
+      3) private attribute `_embedding_function` (warn once)
+    """
+    global _WARNED_PRIVATE_EMBEDDING_ATTR  # noqa: PLW0603
+
+    # 1) Public setter patterns (varies by vector store implementation)
+    for setter_name in ("set_embedding_function", "set_embedding_fn"):
+        setter = getattr(vector_store, setter_name, None)
+        if callable(setter):
+            setter(embedding_function)
+            return
+
+    # 2) Public attribute
+    if hasattr(vector_store, "embedding_function"):
+        setattr(vector_store, "embedding_function", embedding_function)
+        return
+
+    # 3) Private attribute (pragmatic fallback)
+    if hasattr(vector_store, "_embedding_function"):
+        if not _WARNED_PRIVATE_EMBEDDING_ATTR:
+            _WARNED_PRIVATE_EMBEDDING_ATTR = True
+            logger.warning(
+                "Setting private attribute '_embedding_function' on vector_store %r. "
+                "If the vector store library changes its internals, this may break.",
+                type(vector_store).__name__,
+            )
+        setattr(vector_store, "_embedding_function", embedding_function)
+        return
+
+    logger.warning(
+        "Vector store %r does not expose an embedding setter or known embedding attribute. "
+        "You may need to configure the embedding function manually.",
+        type(vector_store).__name__,
+    )
+
+
 def create_retriever(
     corpus_adapter: EmbeddingProtocolV1,
     vector_store: Any,
@@ -842,6 +1079,7 @@ def create_retriever(
     text_normalization_config: Optional[TextNormalizationConfig] = None,
     autogen_config: Optional[Dict[str, Any]] = None,
     framework_version: Optional[str] = None,
+    **retriever_kwargs: Any,
 ) -> AutoGenRetriever:
     """
     Create an AutoGen VectorStoreRetriever with Corpus embeddings.
@@ -866,6 +1104,8 @@ def create_retriever(
         Optional AutoGen-specific configuration for agent/workflow integration.
     framework_version:
         Optional framework version string for observability alignment.
+    retriever_kwargs:
+        Additional keyword arguments forwarded to AutoGen's VectorStoreRetriever.
 
     Example usage:
     ```python
@@ -903,27 +1143,9 @@ def create_retriever(
         framework_version=framework_version,
     )
 
-    # Configure the vector store with our embedding function.
-    # Prefer public attribute; fall back to private `_embedding_function`
-    # for libraries that don't expose a clean setter.
-    if hasattr(vector_store, "embedding_function"):
-        setattr(vector_store, "embedding_function", embedding_function)
-    elif hasattr(vector_store, "_embedding_function"):
-        logger.debug(
-            "Setting private attribute '_embedding_function' on vector_store %r. "
-            "If the vector store library changes its internals, this may break.",
-            type(vector_store).__name__,
-        )
-        setattr(vector_store, "_embedding_function", embedding_function)
-    else:
-        logger.warning(
-            "Vector store %r does not expose an 'embedding_function' or "
-            "'_embedding_function' attribute. You may need to configure the "
-            "embedding function manually.",
-            type(vector_store).__name__,
-        )
+    _set_vector_store_embedding_function(vector_store, embedding_function)
 
-    retriever = VectorStoreRetriever(vectorstore=vector_store)
+    retriever = VectorStoreRetriever(vectorstore=vector_store, **retriever_kwargs)
 
     logger.info("AutoGen retriever created with Corpus embeddings")
 
