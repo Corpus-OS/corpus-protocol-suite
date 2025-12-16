@@ -23,7 +23,10 @@ by the underlying adapter, typically a BaseEmbeddingAdapter subclass.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import threading
+import time
 from functools import cached_property, wraps
 from typing import (
     Any,
@@ -90,6 +93,7 @@ EMBEDDING_COERCION_ERROR_CODES: CoercionErrorCodes = CoercionErrorCodes(
     invalid_result=ErrorCodes.INVALID_EMBEDDING_RESULT,
     empty_result=ErrorCodes.EMPTY_EMBEDDING_RESULT,
     conversion_error=ErrorCodes.EMBEDDING_CONVERSION_ERROR,
+    framework_label=_FRAMEWORK_NAME,  # Consistent with AutoGen adapter labeling
 )
 
 
@@ -135,6 +139,98 @@ class CrewAIEmbedder(Protocol):
 
 
 # --------------------------------------------------------------------------- #
+# Safety / robustness utilities (input validation + safe snapshots)
+# --------------------------------------------------------------------------- #
+
+
+def _validate_texts_are_strings(texts: Sequence[Any], *, op_name: str) -> None:
+    """
+    Fail fast if a caller provides non-string items.
+
+    We intentionally do not coerce arbitrary objects to str here, because that can
+    silently embed repr() outputs and lead to confusing retrieval behavior.
+    """
+    for i, t in enumerate(texts):
+        if not isinstance(t, str):
+            raise TypeError(
+                f"{op_name} expects Sequence[str]; item {i} is {type(t).__name__}",
+            )
+
+
+def _safe_snapshot(value: Any, *, max_items: int = 200, max_str: int = 5_000) -> Any:
+    """
+    Best-effort conversion into a JSON-ish, safe-to-log snapshot.
+
+    - Limits container size to reduce log bloat
+    - Truncates long strings
+    - Falls back to repr() for unknown objects
+    """
+    try:
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        if isinstance(value, str):
+            return value if len(value) <= max_str else value[:max_str] + "…"
+        if isinstance(value, Mapping):
+            out: Dict[str, Any] = {}
+            for idx, (k, v) in enumerate(value.items()):
+                if idx >= max_items:
+                    out["…"] = f"truncated after {max_items} items"
+                    break
+                out[str(k)] = _safe_snapshot(v, max_items=max_items, max_str=max_str)
+            return out
+        if isinstance(value, (list, tuple)):
+            out_list: List[Any] = []
+            for idx, v in enumerate(value):
+                if idx >= max_items:
+                    out_list.append(f"… truncated after {max_items} items")
+                    break
+                out_list.append(_safe_snapshot(v, max_items=max_items, max_str=max_str))
+            return out_list
+        return repr(value)
+    except Exception:  # noqa: BLE001
+        return {"repr": repr(value)}
+
+
+def _looks_like_operation_context(obj: Any) -> bool:
+    """
+    OperationContext may be a concrete type or a Protocol/alias depending on the SDK.
+
+    Prefer isinstance when it works; fall back to a lightweight structural
+    heuristic to avoid false negatives.
+    """
+    if obj is None:
+        return False
+    try:
+        if isinstance(obj, OperationContext):
+            return True
+    except TypeError:
+        # OperationContext may be a Protocol/typing alias at runtime
+        pass
+
+    return any(
+        hasattr(obj, attr)
+        for attr in (
+            "trace_id",
+            "request_id",
+            "user_id",
+            "tags",
+            "metadata",
+            "to_dict",
+        )
+    )
+
+
+def _infer_dim_from_matrix(mat: List[List[float]]) -> Optional[int]:
+    """Best-effort embedding dimension inference from a 2D embedding matrix."""
+    if not mat:
+        return None
+    first = mat[0]
+    if not isinstance(first, list):
+        return None
+    return len(first)
+
+
+# --------------------------------------------------------------------------- #
 # Error-context decorators with dynamic context extraction
 # --------------------------------------------------------------------------- #
 
@@ -158,6 +254,11 @@ def _extract_dynamic_context(
         "model": getattr(instance, "model", "unknown"),
     }
 
+    # Optional best-effort dimension hint (populated after first successful embed)
+    dim_hint = getattr(instance, "_embedding_dim_hint", None)
+    if isinstance(dim_hint, int):
+        dynamic_ctx["embedding_dim"] = dim_hint
+
     # Text / batch metrics
     if operation == "query" and args and isinstance(args[0], str):
         dynamic_ctx["text_len"] = len(args[0])
@@ -171,21 +272,12 @@ def _extract_dynamic_context(
         if empty_count:
             dynamic_ctx["empty_texts_count"] = empty_count
 
-    # CrewAI-specific context (if passed via keyword)
+    # CrewAI-specific context (if passed via keyword) — loop style for parity with AutoGen
     crewai_context = kwargs.get("crewai_context") or {}
     if isinstance(crewai_context, Mapping):
-        if "agent_role" in crewai_context:
-            dynamic_ctx["agent_role"] = crewai_context["agent_role"]
-        if "task_id" in crewai_context:
-            dynamic_ctx["task_id"] = crewai_context["task_id"]
-        if "workflow" in crewai_context:
-            dynamic_ctx["workflow"] = crewai_context["workflow"]
-        if "crew_id" in crewai_context:
-            dynamic_ctx["crew_id"] = crewai_context["crew_id"]
-        if "agent_id" in crewai_context:
-            dynamic_ctx["agent_id"] = crewai_context["agent_id"]
-        if "process_id" in crewai_context:
-            dynamic_ctx["process_id"] = crewai_context["process_id"]
+        for key in ("agent_role", "task_id", "workflow", "crew_id", "agent_id", "process_id"):
+            if key in crewai_context:
+                dynamic_ctx[key] = crewai_context[key]
 
     return dynamic_ctx
 
@@ -232,33 +324,33 @@ def _create_error_context_decorator(
                         raise
 
                 return async_wrapper
-            else:
-                @wraps(func)
-                def sync_wrapper(self: Any, *args: Any, **kwargs: Any) -> T:
-                    dynamic_context = _extract_dynamic_context(
-                        self,
-                        args,
-                        kwargs,
-                        operation,
-                    )
-                    full_context = {
-                        **static_context,
-                        **dynamic_context,
-                        "error_codes": EMBEDDING_COERCION_ERROR_CODES,
-                        "framework_version": getattr(self, "_framework_version", None),
-                    }
-                    try:
-                        return func(self, *args, **kwargs)
-                    except Exception as exc:  # noqa: BLE001
-                        attach_context(
-                            exc,
-                            framework=_FRAMEWORK_NAME,
-                            operation=f"embedding_{operation}",
-                            **full_context,
-                        )
-                        raise
 
-                return sync_wrapper
+            @wraps(func)
+            def sync_wrapper(self: Any, *args: Any, **kwargs: Any) -> T:
+                dynamic_context = _extract_dynamic_context(
+                    self,
+                    args,
+                    kwargs,
+                    operation,
+                )
+                full_context = {
+                    **static_context,
+                    **dynamic_context,
+                    "error_codes": EMBEDDING_COERCION_ERROR_CODES,
+                    "framework_version": getattr(self, "_framework_version", None),
+                }
+                try:
+                    return func(self, *args, **kwargs)
+                except Exception as exc:  # noqa: BLE001
+                    attach_context(
+                        exc,
+                        framework=_FRAMEWORK_NAME,
+                        operation=f"embedding_{operation}",
+                        **full_context,
+                    )
+                    raise
+
+            return sync_wrapper
 
         return decorator
 
@@ -336,6 +428,12 @@ class CorpusCrewAIEmbeddings:
         self.crewai_config = self._validate_crewai_config(crewai_config or {})
         self._framework_version: Optional[str] = framework_version
 
+        # Best-effort embedding dimension hint for observability and downstream context.
+        self._embedding_dim_hint: Optional[int] = None
+
+        # Thread-safe initialization of the cached translator under concurrent access.
+        self._translator_lock = threading.Lock()
+
         logger.info(
             "CorpusCrewAIEmbeddings initialized with model: %s, config: %s, framework_version=%s",
             model or "default",
@@ -378,9 +476,8 @@ class CorpusCrewAIEmbeddings:
         """
         if hasattr(self.corpus_adapter, "capabilities"):
             return self.corpus_adapter.capabilities()  # type: ignore[no-any-return]
-        raise NotImplementedError(
-            "Underlying embedding adapter does not implement capabilities()",
-        )
+        # Consistent with other adapters: best-effort, non-fatal.
+        return {}
 
     @with_async_embedding_error_context("capabilities")
     async def acapabilities(self) -> Mapping[str, Any]:
@@ -390,11 +487,9 @@ class CorpusCrewAIEmbeddings:
         if hasattr(self.corpus_adapter, "acapabilities"):
             return await self.corpus_adapter.acapabilities()  # type: ignore[no-any-return]
         if hasattr(self.corpus_adapter, "capabilities"):
-            # Fallback to sync in async context.
-            return self.corpus_adapter.capabilities()  # type: ignore[no-any-return]
-        raise NotImplementedError(
-            "Underlying embedding adapter does not implement capabilities()/acapabilities()",
-        )
+            # Fallback to sync in async context (offloaded to avoid blocking).
+            return await asyncio.to_thread(self.corpus_adapter.capabilities)  # type: ignore[arg-type]
+        return {}
 
     @with_embedding_error_context("health")
     def health(self) -> Mapping[str, Any]:
@@ -403,9 +498,8 @@ class CorpusCrewAIEmbeddings:
         """
         if hasattr(self.corpus_adapter, "health"):
             return self.corpus_adapter.health()  # type: ignore[no-any-return]
-        raise NotImplementedError(
-            "Underlying embedding adapter does not implement health()",
-        )
+        # Consistent with other adapters: best-effort, non-fatal.
+        return {}
 
     @with_async_embedding_error_context("health")
     async def ahealth(self) -> Mapping[str, Any]:
@@ -415,11 +509,9 @@ class CorpusCrewAIEmbeddings:
         if hasattr(self.corpus_adapter, "ahealth"):
             return await self.corpus_adapter.ahealth()  # type: ignore[no-any-return]
         if hasattr(self.corpus_adapter, "health"):
-            # Fallback to sync in async context.
-            return self.corpus_adapter.health()  # type: ignore[no-any-return]
-        raise NotImplementedError(
-            "Underlying embedding adapter does not implement health()/ahealth()",
-        )
+            # Fallback to sync in async context (offloaded to avoid blocking).
+            return await asyncio.to_thread(self.corpus_adapter.health)  # type: ignore[arg-type]
+        return {}
 
     # ------------------------------------------------------------------ #
     # Internal helpers
@@ -451,19 +543,22 @@ class CorpusCrewAIEmbeddings:
         Uses `cached_property` for thread safety and optimal performance
         in multi-agent CrewAI environments.
         """
-        translator = create_embedding_translator(
-            adapter=self.corpus_adapter,
-            framework=_FRAMEWORK_NAME,
-            translator=None,
-            batch_config=self.batch_config,
-            text_normalization_config=self.text_normalization_config,
-            framework_version=self._framework_version,
-        )
-        logger.debug(
-            "EmbeddingTranslator initialized for CrewAI with model: %s",
-            self.model or "default",
-        )
-        return translator
+        # cached_property caches the instance value; the lock prevents duplicate
+        # construction under concurrent first access.
+        with self._translator_lock:
+            translator = create_embedding_translator(
+                adapter=self.corpus_adapter,
+                framework=_FRAMEWORK_NAME,
+                translator=None,
+                batch_config=self.batch_config,
+                text_normalization_config=self.text_normalization_config,
+                framework_version=self._framework_version,
+            )
+            logger.debug(
+                "EmbeddingTranslator initialized for CrewAI with model: %s",
+                self.model or "default",
+            )
+            return translator
 
     def _build_contexts(
         self,
@@ -484,10 +579,15 @@ class CorpusCrewAIEmbeddings:
         core_ctx: Optional[OperationContext] = None
         framework_ctx: Dict[str, Any] = {
             "framework": _FRAMEWORK_NAME,
-            "config": self.crewai_config,
+            "crewai_config": self.crewai_config,  # single canonical key
+            "error_codes": EMBEDDING_COERCION_ERROR_CODES,  # consistency across adapters
         }
         if self._framework_version is not None:
             framework_ctx["framework_version"] = self._framework_version
+
+        # Expose best-effort dim hint for observability parity with other adapters.
+        if isinstance(self._embedding_dim_hint, int):
+            framework_ctx["embedding_dim_hint"] = self._embedding_dim_hint
 
         # Convert CrewAI context to core OperationContext with comprehensive error handling
         if crewai_context is not None:
@@ -498,8 +598,8 @@ class CorpusCrewAIEmbeddings:
                     crewai_context,
                     framework_version=self._framework_version,
                 )
-                if isinstance(core_ctx_candidate, OperationContext):
-                    core_ctx = core_ctx_candidate
+                if _looks_like_operation_context(core_ctx_candidate):
+                    core_ctx = core_ctx_candidate  # type: ignore[assignment]
                     logger.debug(
                         "Successfully created OperationContext from CrewAI context "
                         "for agent: %s, task: %s",
@@ -520,17 +620,14 @@ class CorpusCrewAIEmbeddings:
                     "Using empty context.",
                     e,
                 )
-                try:
-                    snapshot = dict(crewai_context)
-                except Exception:  # noqa: BLE001
-                    snapshot = {"repr": repr(crewai_context)}
                 attach_context(
                     e,
                     framework=_FRAMEWORK_NAME,
                     operation="context_build",
-                    crewai_context_snapshot=snapshot,
-                    config=self.crewai_config,
+                    crewai_context_snapshot=_safe_snapshot(crewai_context),
+                    crewai_config=self.crewai_config,
                     framework_version=self._framework_version,
+                    error_codes=EMBEDDING_COERCION_ERROR_CODES,
                 )
 
         # Framework-level context for CrewAI-specific optimizations
@@ -631,9 +728,12 @@ class CorpusCrewAIEmbeddings:
 
         Used by CrewAI agents during RAG operations and knowledge processing.
         """
+        texts_list = list(texts)
+        _validate_texts_are_strings(texts_list, op_name="embed_documents")
+
         warn_if_extreme_batch(
             framework=_FRAMEWORK_NAME,
-            texts=texts,
+            texts=texts_list,
             op_name="embed_documents",
             batch_config=self.batch_config,
             logger=logger,
@@ -645,7 +745,6 @@ class CorpusCrewAIEmbeddings:
             **kwargs,
         )
 
-        texts_list = list(texts)
         logger.debug(
             "Embedding %d documents for CrewAI agent: %s, task: %s",
             len(texts_list),
@@ -653,12 +752,28 @@ class CorpusCrewAIEmbeddings:
             crewai_context.get("task_id", "unknown") if crewai_context else "unknown",
         )
 
+        start = time.perf_counter()
         translated = self._translator.embed(
             raw_texts=texts_list,
             op_ctx=core_ctx,
             framework_ctx=framework_ctx,
         )
-        return self._coerce_embedding_matrix(translated)
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+
+        mat = self._coerce_embedding_matrix(translated)
+
+        # Cache best-effort dimension hint for observability and downstream framework_ctx.
+        dim = _infer_dim_from_matrix(mat)
+        if dim is not None:
+            self._embedding_dim_hint = dim
+
+        logger.debug(
+            "CrewAI embed_documents completed: docs=%d dim=%s latency_ms=%.2f",
+            len(mat),
+            dim,
+            elapsed_ms,
+        )
+        return mat
 
     @with_embedding_error_context("query")
     def embed_query(
@@ -674,6 +789,9 @@ class CorpusCrewAIEmbeddings:
 
         Used by CrewAI for query understanding and retrieval in agent workflows.
         """
+        if not isinstance(text, str):
+            raise TypeError(f"embed_query expects str; got {type(text).__name__}")
+
         core_ctx, framework_ctx = self._build_contexts(
             crewai_context=crewai_context,
             model=model,
@@ -685,12 +803,25 @@ class CorpusCrewAIEmbeddings:
             crewai_context.get("agent_role", "unknown") if crewai_context else "unknown",
         )
 
+        start = time.perf_counter()
         translated = self._translator.embed(
             raw_texts=text,
             op_ctx=core_ctx,
             framework_ctx=framework_ctx,
         )
-        return self._coerce_embedding_vector(translated)
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+
+        vec = self._coerce_embedding_vector(translated)
+
+        # Cache best-effort dimension hint for observability and downstream framework_ctx.
+        self._embedding_dim_hint = len(vec)
+
+        logger.debug(
+            "CrewAI embed_query completed: dim=%d latency_ms=%.2f",
+            len(vec),
+            elapsed_ms,
+        )
+        return vec
 
     # ------------------------------------------------------------------ #
     # Async API for CrewAI Flows
@@ -710,9 +841,12 @@ class CorpusCrewAIEmbeddings:
 
         Designed for async CrewAI workflows and parallel agent execution.
         """
+        texts_list = list(texts)
+        _validate_texts_are_strings(texts_list, op_name="aembed_documents")
+
         warn_if_extreme_batch(
             framework=_FRAMEWORK_NAME,
-            texts=texts,
+            texts=texts_list,
             op_name="aembed_documents",
             batch_config=self.batch_config,
             logger=logger,
@@ -724,19 +858,34 @@ class CorpusCrewAIEmbeddings:
             **kwargs,
         )
 
-        texts_list = list(texts)
         logger.debug(
             "Async embedding %d documents for CrewAI task: %s",
             len(texts_list),
             crewai_context.get("task_id", "unknown") if crewai_context else "unknown",
         )
 
+        start = time.perf_counter()
         translated = await self._translator.arun_embed(
             raw_texts=texts_list,
             op_ctx=core_ctx,
             framework_ctx=framework_ctx,
         )
-        return self._coerce_embedding_matrix(translated)
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+
+        mat = self._coerce_embedding_matrix(translated)
+
+        # Cache best-effort dimension hint for observability and downstream framework_ctx.
+        dim = _infer_dim_from_matrix(mat)
+        if dim is not None:
+            self._embedding_dim_hint = dim
+
+        logger.debug(
+            "CrewAI aembed_documents completed: docs=%d dim=%s latency_ms=%.2f",
+            len(mat),
+            dim,
+            elapsed_ms,
+        )
+        return mat
 
     @with_async_embedding_error_context("query")
     async def aembed_query(
@@ -752,18 +901,34 @@ class CorpusCrewAIEmbeddings:
 
         Optimized for async CrewAI agent interactions and real-time workflows.
         """
+        if not isinstance(text, str):
+            raise TypeError(f"aembed_query expects str; got {type(text).__name__}")
+
         core_ctx, framework_ctx = self._build_contexts(
             crewai_context=crewai_context,
             model=model,
             **kwargs,
         )
 
+        start = time.perf_counter()
         translated = await self._translator.arun_embed(
             raw_texts=text,
             op_ctx=core_ctx,
             framework_ctx=framework_ctx,
         )
-        return self._coerce_embedding_vector(translated)
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+
+        vec = self._coerce_embedding_vector(translated)
+
+        # Cache best-effort dimension hint for observability and downstream framework_ctx.
+        self._embedding_dim_hint = len(vec)
+
+        logger.debug(
+            "CrewAI aembed_query completed: dim=%d latency_ms=%.2f",
+            len(vec),
+            elapsed_ms,
+        )
+        return vec
 
 
 # ------------------------------------------------------------------ #
@@ -842,6 +1007,14 @@ def register_with_crewai(
                 "You may need to attach the embedder manually.",
                 type(crew).__name__,
                 exc,
+            )
+            attach_context(
+                exc,
+                framework=_FRAMEWORK_NAME,
+                operation="register_with_crewai",
+                crew_snapshot=_safe_snapshot({"type": type(crew).__name__, "name": getattr(crew, "name", None)}),
+                error_codes=EMBEDDING_COERCION_ERROR_CODES,
+                framework_version=framework_version,
             )
             agents = []
 
