@@ -793,7 +793,7 @@ class LLMCapabilities:
     supports_parallel_tool_calls: bool = False
     supports_tool_choice: bool = False  
     max_tool_calls_per_turn: Optional[int] = None  
-    idempotent_operations: bool = False
+    idempotent_writes: bool = False
     supports_multi_tenant: bool = False
     supports_system_message: bool = True
     supports_deadline: bool = True
@@ -1224,7 +1224,7 @@ class BaseLLMAdapter(LLMProtocolV1):
             "supports_json_output": caps.supports_json_output,
             "supports_tools": caps.supports_tools,
             "supports_parallel_tool_calls": caps.supports_parallel_tool_calls,
-            "idempotent_operations": caps.idempotent_operations,
+            "idempotent_writes": caps.idempotent_writes,
             "supports_multi_tenant": caps.supports_multi_tenant,
             "supports_system_message": caps.supports_system_message,
             "supports_deadline": caps.supports_deadline,
