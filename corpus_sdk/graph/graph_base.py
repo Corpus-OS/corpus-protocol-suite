@@ -1,17 +1,6 @@
 # corpus_sdk/graph/graph_base.py
 # SPDX-License-Identifier: Apache-2.0
 
-ARCHITECTURAL NOTE: SINGLE-FILE MODULE STRATEGY
------------------------------------------------
-This module is intentionally designed as a self-contained, zero-dependency artifact.
-It combines Type Definitions, Protocol Interfaces, and Base Implementations into
-one file to maximize portability and ease of adoption.
-
-- DO NOT split this file into separate 'types.py', 'interfaces.py', or 'impl.py'.
-- DO NOT introduce external dependencies beyond the Python standard library.
-- Users should be able to copy-paste this single file into their project and
-  have a working, production-grade Corpus adapter base immediately.
-
 """
 Adapter SDK — Graph Protocol V1.0
 
