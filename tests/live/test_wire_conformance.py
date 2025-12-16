@@ -377,7 +377,7 @@ class TestEnvelopeEdgeCases:
 
     def test_missing_op_rejected(self, adapter: Any) -> None:
         """Envelope without 'op' should be rejected."""
-        from wire_validators import validate_envelope_shape
+        from tests.live.wire_validators import validate_envelope_shape
 
         envelope = {"ctx": {"request_id": "test"}, "args": {}}
 
@@ -386,7 +386,7 @@ class TestEnvelopeEdgeCases:
 
     def test_missing_ctx_rejected(self, adapter: Any) -> None:
         """Envelope without 'ctx' should be rejected."""
-        from wire_validators import validate_envelope_shape
+        from tests.live.wire_validators import validate_envelope_shape
 
         envelope = {"op": "llm.complete", "args": {}}
 
@@ -395,7 +395,7 @@ class TestEnvelopeEdgeCases:
 
     def test_missing_args_rejected(self, adapter: Any) -> None:
         """Envelope without 'args' should be rejected."""
-        from wire_validators import validate_envelope_shape
+        from tests.live.wire_validators import validate_envelope_shape
 
         envelope = {"op": "llm.complete", "ctx": {"request_id": "test"}}
 
@@ -404,14 +404,14 @@ class TestEnvelopeEdgeCases:
 
     def test_non_dict_envelope_rejected(self, adapter: Any) -> None:
         """Non-dict envelope should be rejected."""
-        from wire_validators import validate_envelope_shape
+        from tests.live.wire_validators import validate_envelope_shape
 
         with pytest.raises(EnvelopeTypeError, match="must be dict"):
             validate_envelope_shape(["not", "a", "dict"], case_id="test_non_dict")
 
     def test_empty_request_id_rejected(self, adapter: Any) -> None:
         """Empty request_id should be rejected."""
-        from wire_validators import validate_ctx_field
+        from tests.live.wire_validators import validate_ctx_field
 
         envelope = {"ctx": {"request_id": ""}}
 
@@ -420,14 +420,14 @@ class TestEnvelopeEdgeCases:
 
     def test_max_request_id_accepted(self, adapter: Any) -> None:
         """Maximum length request_id should be accepted."""
-        from wire_validators import validate_ctx_field, MAX_REQUEST_ID_LENGTH
+        from tests.live.wire_validators import validate_ctx_field, MAX_REQUEST_ID_LENGTH
 
         envelope = {"ctx": {"request_id": "x" * MAX_REQUEST_ID_LENGTH}}
         validate_ctx_field(envelope, case_id="test_max_request_id")
 
     def test_oversized_request_id_rejected(self, adapter: Any) -> None:
         """Request_id exceeding max length should be rejected."""
-        from wire_validators import validate_ctx_field, MAX_REQUEST_ID_LENGTH
+        from tests.live.wire_validators import validate_ctx_field, MAX_REQUEST_ID_LENGTH
 
         envelope = {"ctx": {"request_id": "x" * (MAX_REQUEST_ID_LENGTH + 1)}}
 
@@ -436,7 +436,7 @@ class TestEnvelopeEdgeCases:
 
     def test_deadline_ms_zero_rejected(self, adapter: Any) -> None:
         """Zero deadline_ms should be rejected."""
-        from wire_validators import validate_ctx_field
+        from tests.live.wire_validators import validate_ctx_field
 
         envelope = {"ctx": {"request_id": "test", "deadline_ms": 0}}
 
@@ -445,7 +445,7 @@ class TestEnvelopeEdgeCases:
 
     def test_negative_deadline_rejected(self, adapter: Any) -> None:
         """Negative deadline_ms should be rejected."""
-        from wire_validators import validate_ctx_field
+        from tests.live.wire_validators import validate_ctx_field
 
         envelope = {"ctx": {"request_id": "test", "deadline_ms": -100}}
 
@@ -454,7 +454,7 @@ class TestEnvelopeEdgeCases:
 
     def test_invalid_priority_rejected(self, adapter: Any) -> None:
         """Invalid priority value should be rejected."""
-        from wire_validators import validate_ctx_field
+        from tests.live.wire_validators import validate_ctx_field
 
         envelope = {"ctx": {"request_id": "test", "priority": "super_urgent"}}
 
@@ -463,7 +463,7 @@ class TestEnvelopeEdgeCases:
 
     def test_valid_priorities_accepted(self, adapter: Any) -> None:
         """All valid priority values should be accepted."""
-        from wire_validators import validate_ctx_field
+        from tests.live.wire_validators import validate_ctx_field
 
         for priority in ["low", "normal", "high", "critical"]:
             envelope = {"ctx": {"request_id": "test", "priority": priority}}
@@ -475,7 +475,7 @@ class TestSerializationEdgeCases:
 
     def test_non_serializable_rejected(self, adapter: Any) -> None:
         """Non-JSON-serializable values should be rejected."""
-        from wire_validators import json_roundtrip
+        from tests.live.wire_validators import json_roundtrip
 
         envelope = {
             "op": "llm.complete",
@@ -488,7 +488,7 @@ class TestSerializationEdgeCases:
 
     def test_unicode_preserved(self, adapter: Any) -> None:
         """Unicode should be preserved through round-trip."""
-        from wire_validators import json_roundtrip
+        from tests.live.wire_validators import json_roundtrip
 
         unicode_text = "Hello 世界 🌍 مرحبا שלום"
         envelope = {
@@ -502,7 +502,7 @@ class TestSerializationEdgeCases:
 
     def test_float_precision_preserved(self, adapter: Any) -> None:
         """Float precision should be preserved through round-trip."""
-        from wire_validators import json_roundtrip
+        from tests.live.wire_validators import json_roundtrip
 
         value = 0.123456789012345
         envelope = {
@@ -516,7 +516,7 @@ class TestSerializationEdgeCases:
 
     def test_deeply_nested_structure(self, adapter: Any) -> None:
         """Deeply nested structures should serialize correctly."""
-        from wire_validators import json_roundtrip
+        from tests.live.wire_validators import json_roundtrip
 
         nested = {"level": 0}
         current = nested
@@ -539,21 +539,21 @@ class TestArgsValidationEdgeCases:
 
     def test_llm_complete_missing_prompt_and_messages(self, adapter: Any) -> None:
         """llm.complete without prompt or messages should be rejected."""
-        from wire_validators import validate_llm_complete_args
+        from tests.live.wire_validators import validate_llm_complete_args
 
         with pytest.raises(ArgsValidationError, match="requires 'prompt' or 'messages'"):
             validate_llm_complete_args({}, case_id="test")
 
     def test_llm_chat_empty_messages_rejected(self, adapter: Any) -> None:
         """llm.chat with empty messages should be rejected."""
-        from wire_validators import validate_llm_chat_args
+        from tests.live.wire_validators import validate_llm_chat_args
 
         with pytest.raises(ArgsValidationError, match="must not be empty"):
             validate_llm_chat_args({"messages": []}, case_id="test")
 
     def test_llm_chat_invalid_role_rejected(self, adapter: Any) -> None:
         """llm.chat with invalid role should be rejected."""
-        from wire_validators import validate_llm_chat_args
+        from tests.live.wire_validators import validate_llm_chat_args
 
         args = {"messages": [{"role": "invalid", "content": "test"}]}
 
@@ -562,28 +562,28 @@ class TestArgsValidationEdgeCases:
 
     def test_vector_query_missing_vector_and_text(self, adapter: Any) -> None:
         """vector.query without vector or text should be rejected."""
-        from wire_validators import validate_vector_query_args
+        from tests.live.wire_validators import validate_vector_query_args
 
         with pytest.raises(ArgsValidationError, match="requires 'vector' or 'text'"):
             validate_vector_query_args({}, case_id="test")
 
     def test_vector_empty_dimensions_rejected(self, adapter: Any) -> None:
         """Empty vector should be rejected."""
-        from wire_validators import validate_vector_query_args
+        from tests.live.wire_validators import validate_vector_query_args
 
         with pytest.raises(ArgsValidationError, match="dimensions"):
             validate_vector_query_args({"vector": []}, case_id="test")
 
     def test_vector_non_numeric_rejected(self, adapter: Any) -> None:
         """Non-numeric values in vector should be rejected."""
-        from wire_validators import validate_vector_query_args
+        from tests.live.wire_validators import validate_vector_query_args
 
         with pytest.raises(ArgsValidationError, match="numbers"):
             validate_vector_query_args({"vector": [1.0, "bad", 3.0]}, case_id="test")
 
     def test_vector_upsert_dimension_mismatch(self, adapter: Any) -> None:
         """Vectors with inconsistent dimensions should be rejected."""
-        from wire_validators import validate_vector_upsert_args
+        from tests.live.wire_validators import validate_vector_upsert_args
 
         args = {
             "vectors": [
@@ -597,14 +597,14 @@ class TestArgsValidationEdgeCases:
 
     def test_embedding_missing_text_and_texts(self, adapter: Any) -> None:
         """embedding.embed without text or texts should be rejected."""
-        from wire_validators import validate_embedding_embed_args
+        from tests.live.wire_validators import validate_embedding_embed_args
 
         with pytest.raises(ArgsValidationError, match="requires 'text' or 'texts'"):
             validate_embedding_embed_args({}, case_id="test")
 
     def test_graph_query_invalid_language(self, adapter: Any) -> None:
         """graph.query with invalid language should be rejected."""
-        from wire_validators import validate_graph_query_args
+        from tests.live.wire_validators import validate_graph_query_args
 
         args = {"query": "MATCH (n) RETURN n", "language": "sql"}
 
@@ -613,7 +613,7 @@ class TestArgsValidationEdgeCases:
 
     def test_graph_mutate_invalid_type(self, adapter: Any) -> None:
         """graph.mutate with invalid mutation type should be rejected."""
-        from wire_validators import validate_graph_mutate_args
+        from tests.live.wire_validators import validate_graph_mutate_args
 
         args = {"mutations": [{"type": "invalid_mutation"}]}
 
