@@ -11,10 +11,13 @@ protocol operations. Each case specifies:
   - Optional operation-specific argument validators
   - Metadata for filtering and reporting (tags, descriptions)
 
-Separated from test execution to allow:
-  - Reuse across different test harnesses
-  - External configuration via YAML/JSON
-  - Tooling (coverage reports, OpenAPI generation, etc.)
+IMPORTANT ALIGNMENT NOTE
+------------------------
+This registry is aligned to the production WireAdapter we just created:
+- One builder method per *protocol operation* (no variant-specific builders).
+- Variants (tools/json/filter/batch/etc.) remain separate CASES, but they reuse
+  the same base operation builder method. The test harness must supply
+  variant args payloads based on case.id / tags / args_validator.
 """
 
 from __future__ import annotations
@@ -29,7 +32,8 @@ logger = logging.getLogger(__name__)
 
 # Optional YAML support
 try:
-    import yaml
+    import yaml  # type: ignore
+
     YAML_AVAILABLE = True
 except ImportError:
     YAML_AVAILABLE = False
@@ -55,22 +59,22 @@ DEFAULT_SCHEMA_BASE_URL = "https://corpusos.com/schemas"
 @dataclass(frozen=True)
 class CasesConfig:
     """Configuration for case registry loading."""
-    
+
     schema_base_url: str = DEFAULT_SCHEMA_BASE_URL
     config_paths: tuple = (
         "config/wire_test_cases.yaml",
         "config/wire_test_cases.yml",
         "config/wire_test_cases.json",
     )
-    
+
     @classmethod
     def from_env(cls) -> "CasesConfig":
         """Create configuration from environment variables."""
         base_url = os.environ.get("CORPUS_SCHEMA_BASE_URL", DEFAULT_SCHEMA_BASE_URL)
-        
+
         env_config = os.environ.get("CORPUS_TEST_CASES_CONFIG")
         paths = (env_config,) if env_config else cls.config_paths
-        
+
         return cls(schema_base_url=base_url, config_paths=paths)
 
 
@@ -82,7 +86,7 @@ class CasesConfig:
 class WireRequestCase:
     """
     Immutable test case for wire-level request validation.
-    
+
     Attributes:
         id: Stable identifier for pytest parameterization and reporting.
         component: Protocol component - one of: llm, vector, embedding, graph.
@@ -94,7 +98,7 @@ class WireRequestCase:
         description: Human-readable description for documentation/reports.
         tags: Set of tags for selective test execution and filtering.
     """
-    
+
     id: str
     component: str
     op: str
@@ -104,50 +108,53 @@ class WireRequestCase:
     args_validator: Optional[str] = None
     description: str = ""
     tags: FrozenSet[str] = field(default_factory=frozenset)
-    
+
     def __post_init__(self) -> None:
         """Validate case invariants on construction."""
         if not self.id:
             raise ValueError("Case 'id' must be non-empty")
-        
+
         if self.component not in VALID_COMPONENTS:
             raise ValueError(
                 f"Invalid component '{self.component}', "
                 f"must be one of {sorted(VALID_COMPONENTS)}"
             )
-        
+
         if not self.op.startswith(f"{self.component}."):
             raise ValueError(
                 f"Operation '{self.op}' must start with component prefix '{self.component}.'"
             )
-        
+
         if not self.build_method:
             raise ValueError("Case 'build_method' must be non-empty")
-    
+
+        if not self.schema_id:
+            raise ValueError("Case 'schema_id' must be non-empty")
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "WireRequestCase":
         """
         Create WireRequestCase from dictionary.
-        
+
         Supports loading from external YAML/JSON configuration.
         """
-        required = {"id", "component", "op", "build_method"}
+        required = {"id", "component", "op", "build_method", "schema_id"}
         missing = required - set(data.keys())
         if missing:
             raise ValueError(f"Missing required fields: {missing}")
-        
+
         return cls(
             id=data["id"],
             component=data["component"],
             op=data["op"],
             build_method=data["build_method"],
-            schema_id=data.get("schema_id", ""),
+            schema_id=data["schema_id"],
             schema_versions=tuple(data.get("schema_versions", (SCHEMA_VERSION_SEGMENT,))),
             args_validator=data.get("args_validator"),
             description=data.get("description", ""),
             tags=frozenset(data.get("tags", [])),
         )
-    
+
     def to_dict(self) -> Dict[str, Any]:
         """Serialize case to dictionary."""
         return {
@@ -161,7 +168,7 @@ class WireRequestCase:
             "description": self.description,
             "tags": sorted(self.tags),
         }
-    
+
     def matches_filter(
         self,
         component: Optional[str] = None,
@@ -187,7 +194,7 @@ def _load_yaml_file(path: str) -> Optional[Dict[str, Any]]:
     if not YAML_AVAILABLE:
         logger.warning(f"YAML not available, cannot load {path}")
         return None
-    
+
     try:
         with open(path, "r", encoding="utf-8") as f:
             return yaml.safe_load(f)
@@ -209,34 +216,28 @@ def _load_json_file(path: str) -> Optional[Dict[str, Any]]:
 def load_external_config(paths: Optional[tuple] = None) -> Optional[Dict[str, Any]]:
     """
     Load test case configuration from external files.
-    
+
     Searches paths in order, returns first successful load.
     Supports both YAML and JSON formats.
-    
-    Args:
-        paths: Tuple of file paths to search. If None, uses default paths.
-    
-    Returns:
-        Loaded configuration dict, or None if no config found.
     """
     config = CasesConfig.from_env()
     search_paths = paths or config.config_paths
-    
+
     for path in search_paths:
         if not path or not os.path.exists(path):
             continue
-        
+
         if path.endswith((".yaml", ".yml")):
             loaded = _load_yaml_file(path)
         elif path.endswith(".json"):
             loaded = _load_json_file(path)
         else:
             continue
-        
+
         if loaded:
             logger.info(f"Loaded test case configuration from {path}")
             return loaded
-    
+
     return None
 
 
@@ -247,16 +248,14 @@ def load_external_config(paths: Optional[tuple] = None) -> Optional[Dict[str, An
 def _build_default_cases(base_url: str) -> List[WireRequestCase]:
     """
     Build the default registry of wire request test cases.
-    
-    This is the canonical set of protocol operations that should be tested
-    for wire-level conformance. Matches the Operation Registry in the
-    Corpus Protocol Specification v1.0.
+
+    This set is aligned to PROTOCOLS.md v1.0 operations AND to WireAdapter:
+    - One build method per operation (variants reuse the base build method).
     """
     v = SCHEMA_VERSION_SEGMENT
 
     return [
         # ========================== LLM ========================== #
-        # §11.1 capabilities
         WireRequestCase(
             id="llm_capabilities",
             component="llm",
@@ -266,7 +265,6 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             description="Discover supported LLM features and models",
             tags=frozenset({"llm", "discovery", "capabilities"}),
         ),
-        # §11.2 complete
         WireRequestCase(
             id="llm_complete",
             component="llm",
@@ -277,27 +275,28 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             description="Generate LLM completion for given messages",
             tags=frozenset({"core", "llm", "completion"}),
         ),
+        # Variant: tools (same builder; different args fixture)
         WireRequestCase(
             id="llm_complete_with_tools",
             component="llm",
             op="llm.complete",
-            build_method="build_llm_complete_with_tools_envelope",
+            build_method="build_llm_complete_envelope",
             schema_id=f"{base_url}/llm/{v}/llm.envelope.request.json",
             args_validator="validate_llm_complete_args",
             description="LLM completion with tool/function calling",
             tags=frozenset({"core", "llm", "completion", "tools"}),
         ),
+        # Variant: JSON mode (same builder; different args fixture)
         WireRequestCase(
             id="llm_complete_json_mode",
             component="llm",
             op="llm.complete",
-            build_method="build_llm_complete_json_mode_envelope",
+            build_method="build_llm_complete_envelope",
             schema_id=f"{base_url}/llm/{v}/llm.envelope.request.json",
             args_validator="validate_llm_complete_args",
             description="LLM completion with JSON output mode",
             tags=frozenset({"llm", "completion", "json_mode"}),
         ),
-        # §11.3 stream
         WireRequestCase(
             id="llm_stream",
             component="llm",
@@ -308,17 +307,17 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             description="Stream LLM completion incrementally",
             tags=frozenset({"core", "llm", "streaming"}),
         ),
+        # Variant: streaming + tools (same builder; different args fixture)
         WireRequestCase(
             id="llm_stream_with_tools",
             component="llm",
             op="llm.stream",
-            build_method="build_llm_stream_with_tools_envelope",
+            build_method="build_llm_stream_envelope",
             schema_id=f"{base_url}/llm/{v}/llm.envelope.request.json",
             args_validator="validate_llm_stream_args",
             description="Stream LLM completion with tool calling",
             tags=frozenset({"llm", "streaming", "tools"}),
         ),
-        # §11.4 count_tokens
         WireRequestCase(
             id="llm_count_tokens",
             component="llm",
@@ -329,7 +328,6 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             description="Count tokens in text for a specific model",
             tags=frozenset({"llm", "tokens"}),
         ),
-        # §11.5 health
         WireRequestCase(
             id="llm_health",
             component="llm",
@@ -341,7 +339,6 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
         ),
 
         # ======================== VECTOR ========================= #
-        # §15.1 capabilities
         WireRequestCase(
             id="vector_capabilities",
             component="vector",
@@ -351,7 +348,6 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             description="Discover vector database capabilities and limits",
             tags=frozenset({"vector", "discovery", "capabilities"}),
         ),
-        # §15.2 query
         WireRequestCase(
             id="vector_query",
             component="vector",
@@ -362,27 +358,17 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             description="Vector similarity search query",
             tags=frozenset({"core", "vector", "query"}),
         ),
+        # Variant: filter (same builder; different args fixture)
         WireRequestCase(
             id="vector_query_with_filter",
             component="vector",
             op="vector.query",
-            build_method="build_vector_query_with_filter_envelope",
+            build_method="build_vector_query_envelope",
             schema_id=f"{base_url}/vector/{v}/vector.envelope.request.json",
             args_validator="validate_vector_query_args",
             description="Vector query with metadata filtering",
             tags=frozenset({"core", "vector", "query", "filter"}),
         ),
-        WireRequestCase(
-            id="vector_query_by_text",
-            component="vector",
-            op="vector.query",
-            build_method="build_vector_query_by_text_envelope",
-            schema_id=f"{base_url}/vector/{v}/vector.envelope.request.json",
-            args_validator="validate_vector_query_args",
-            description="Vector query using text (auto-embedded)",
-            tags=frozenset({"vector", "query", "text"}),
-        ),
-        # §15.3 upsert
         WireRequestCase(
             id="vector_upsert",
             component="vector",
@@ -397,7 +383,7 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             id="vector_upsert_batch",
             component="vector",
             op="vector.upsert",
-            build_method="build_vector_upsert_batch_envelope",
+            build_method="build_vector_upsert_envelope",
             schema_id=f"{base_url}/vector/{v}/vector.envelope.request.json",
             args_validator="validate_vector_upsert_args",
             description="Batch vector upsert",
@@ -407,13 +393,12 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             id="vector_upsert_with_metadata",
             component="vector",
             op="vector.upsert",
-            build_method="build_vector_upsert_with_metadata_envelope",
+            build_method="build_vector_upsert_envelope",
             schema_id=f"{base_url}/vector/{v}/vector.envelope.request.json",
             args_validator="validate_vector_upsert_args",
             description="Vector upsert with metadata",
             tags=frozenset({"vector", "write", "upsert", "metadata"}),
         ),
-        # §15.4 delete
         WireRequestCase(
             id="vector_delete",
             component="vector",
@@ -428,23 +413,12 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             id="vector_delete_by_filter",
             component="vector",
             op="vector.delete",
-            build_method="build_vector_delete_by_filter_envelope",
+            build_method="build_vector_delete_envelope",
             schema_id=f"{base_url}/vector/{v}/vector.envelope.request.json",
             args_validator="validate_vector_delete_args",
             description="Delete vectors by metadata filter",
             tags=frozenset({"vector", "write", "delete", "filter"}),
         ),
-        WireRequestCase(
-            id="vector_delete_all",
-            component="vector",
-            op="vector.delete",
-            build_method="build_vector_delete_all_envelope",
-            schema_id=f"{base_url}/vector/{v}/vector.envelope.request.json",
-            args_validator="validate_vector_delete_args",
-            description="Delete all vectors in namespace",
-            tags=frozenset({"vector", "write", "delete"}),
-        ),
-        # §15.5 create_namespace
         WireRequestCase(
             id="vector_create_namespace",
             component="vector",
@@ -455,7 +429,6 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             description="Create a new vector namespace",
             tags=frozenset({"vector", "namespace", "write"}),
         ),
-        # §15.6 delete_namespace
         WireRequestCase(
             id="vector_delete_namespace",
             component="vector",
@@ -466,7 +439,6 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             description="Delete a vector namespace",
             tags=frozenset({"vector", "namespace", "write", "delete"}),
         ),
-        # §15.7 health
         WireRequestCase(
             id="vector_health",
             component="vector",
@@ -478,7 +450,6 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
         ),
 
         # ======================= EMBEDDING ======================= #
-        # §19.1 capabilities
         WireRequestCase(
             id="embedding_capabilities",
             component="embedding",
@@ -488,7 +459,6 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             description="Discover embedding model capabilities",
             tags=frozenset({"embedding", "discovery", "capabilities"}),
         ),
-        # §19.2 embed
         WireRequestCase(
             id="embedding_embed",
             component="embedding",
@@ -503,7 +473,7 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             id="embedding_embed_with_model",
             component="embedding",
             op="embedding.embed",
-            build_method="build_embedding_embed_with_model_envelope",
+            build_method="build_embedding_embed_envelope",
             schema_id=f"{base_url}/embedding/{v}/embedding.envelope.request.json",
             args_validator="validate_embedding_embed_args",
             description="Generate embedding with explicit model selection",
@@ -513,7 +483,7 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             id="embedding_embed_truncate",
             component="embedding",
             op="embedding.embed",
-            build_method="build_embedding_embed_truncate_envelope",
+            build_method="build_embedding_embed_envelope",
             schema_id=f"{base_url}/embedding/{v}/embedding.envelope.request.json",
             args_validator="validate_embedding_embed_args",
             description="Generate embedding with truncation enabled",
@@ -523,13 +493,12 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             id="embedding_embed_normalized",
             component="embedding",
             op="embedding.embed",
-            build_method="build_embedding_embed_normalized_envelope",
+            build_method="build_embedding_embed_envelope",
             schema_id=f"{base_url}/embedding/{v}/embedding.envelope.request.json",
             args_validator="validate_embedding_embed_args",
             description="Generate normalized embedding",
             tags=frozenset({"embedding", "embed", "normalize"}),
         ),
-        # §19.3 embed_batch
         WireRequestCase(
             id="embedding_embed_batch",
             component="embedding",
@@ -544,13 +513,12 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             id="embedding_embed_batch_large",
             component="embedding",
             op="embedding.embed_batch",
-            build_method="build_embedding_embed_batch_large_envelope",
+            build_method="build_embedding_embed_batch_envelope",
             schema_id=f"{base_url}/embedding/{v}/embedding.envelope.request.json",
             args_validator="validate_embedding_embed_batch_args",
             description="Large batch embedding request",
             tags=frozenset({"embedding", "batch", "large"}),
         ),
-        # §19.4 count_tokens
         WireRequestCase(
             id="embedding_count_tokens",
             component="embedding",
@@ -561,7 +529,6 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             description="Count tokens for embedding model",
             tags=frozenset({"embedding", "tokens"}),
         ),
-        # §19.5 health
         WireRequestCase(
             id="embedding_health",
             component="embedding",
@@ -573,7 +540,6 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
         ),
 
         # ========================= GRAPH ========================= #
-        # §7.1 capabilities
         WireRequestCase(
             id="graph_capabilities",
             component="graph",
@@ -583,7 +549,6 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             description="Discover graph database capabilities",
             tags=frozenset({"graph", "discovery", "capabilities"}),
         ),
-        # §7.2 upsert_nodes
         WireRequestCase(
             id="graph_upsert_nodes",
             component="graph",
@@ -598,13 +563,12 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             id="graph_upsert_nodes_batch",
             component="graph",
             op="graph.upsert_nodes",
-            build_method="build_graph_upsert_nodes_batch_envelope",
+            build_method="build_graph_upsert_nodes_envelope",
             schema_id=f"{base_url}/graph/{v}/graph.envelope.request.json",
             args_validator="validate_graph_upsert_nodes_args",
             description="Batch upsert graph nodes",
             tags=frozenset({"graph", "write", "nodes", "batch"}),
         ),
-        # §7.3 upsert_edges
         WireRequestCase(
             id="graph_upsert_edges",
             component="graph",
@@ -619,13 +583,12 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             id="graph_upsert_edges_batch",
             component="graph",
             op="graph.upsert_edges",
-            build_method="build_graph_upsert_edges_batch_envelope",
+            build_method="build_graph_upsert_edges_envelope",
             schema_id=f"{base_url}/graph/{v}/graph.envelope.request.json",
             args_validator="validate_graph_upsert_edges_args",
             description="Batch upsert graph edges",
             tags=frozenset({"graph", "write", "edges", "batch"}),
         ),
-        # §7.4 delete_nodes
         WireRequestCase(
             id="graph_delete_nodes",
             component="graph",
@@ -640,13 +603,12 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             id="graph_delete_nodes_by_label",
             component="graph",
             op="graph.delete_nodes",
-            build_method="build_graph_delete_nodes_by_label_envelope",
+            build_method="build_graph_delete_nodes_envelope",
             schema_id=f"{base_url}/graph/{v}/graph.envelope.request.json",
             args_validator="validate_graph_delete_nodes_args",
-            description="Delete graph nodes by label",
+            description="Delete graph nodes by label (variant args)",
             tags=frozenset({"graph", "write", "delete", "nodes", "label"}),
         ),
-        # §7.5 delete_edges
         WireRequestCase(
             id="graph_delete_edges",
             component="graph",
@@ -661,54 +623,52 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             id="graph_delete_edges_by_type",
             component="graph",
             op="graph.delete_edges",
-            build_method="build_graph_delete_edges_by_type_envelope",
+            build_method="build_graph_delete_edges_envelope",
             schema_id=f"{base_url}/graph/{v}/graph.envelope.request.json",
             args_validator="validate_graph_delete_edges_args",
-            description="Delete graph edges by type",
+            description="Delete graph edges by type (variant args)",
             tags=frozenset({"graph", "write", "delete", "edges", "type"}),
         ),
-        # §7.6 query
         WireRequestCase(
             id="graph_query_gremlin",
             component="graph",
             op="graph.query",
-            build_method="build_graph_query_gremlin_envelope",
+            build_method="build_graph_query_envelope",
             schema_id=f"{base_url}/graph/{v}/graph.envelope.request.json",
             args_validator="validate_graph_query_args",
-            description="Execute Gremlin graph query",
+            description="Execute Gremlin graph query (variant args)",
             tags=frozenset({"core", "graph", "query", "gremlin"}),
         ),
         WireRequestCase(
             id="graph_query_cypher",
             component="graph",
             op="graph.query",
-            build_method="build_graph_query_cypher_envelope",
+            build_method="build_graph_query_envelope",
             schema_id=f"{base_url}/graph/{v}/graph.envelope.request.json",
             args_validator="validate_graph_query_args",
-            description="Execute Cypher graph query",
+            description="Execute Cypher graph query (variant args)",
             tags=frozenset({"graph", "query", "cypher"}),
         ),
         WireRequestCase(
             id="graph_query_sparql",
             component="graph",
             op="graph.query",
-            build_method="build_graph_query_sparql_envelope",
+            build_method="build_graph_query_envelope",
             schema_id=f"{base_url}/graph/{v}/graph.envelope.request.json",
             args_validator="validate_graph_query_args",
-            description="Execute SPARQL RDF query",
+            description="Execute SPARQL query (variant args; may be NOT_SUPPORTED by provider)",
             tags=frozenset({"graph", "query", "sparql"}),
         ),
         WireRequestCase(
             id="graph_query_with_params",
             component="graph",
             op="graph.query",
-            build_method="build_graph_query_with_params_envelope",
+            build_method="build_graph_query_envelope",
             schema_id=f"{base_url}/graph/{v}/graph.envelope.request.json",
             args_validator="validate_graph_query_args",
             description="Graph query with parameterized bindings",
             tags=frozenset({"graph", "query", "parameters"}),
         ),
-        # §7.7 stream_query
         WireRequestCase(
             id="graph_stream_query",
             component="graph",
@@ -723,13 +683,12 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             id="graph_stream_query_gremlin",
             component="graph",
             op="graph.stream_query",
-            build_method="build_graph_stream_query_gremlin_envelope",
+            build_method="build_graph_stream_query_envelope",
             schema_id=f"{base_url}/graph/{v}/graph.envelope.request.json",
             args_validator="validate_graph_query_args",
-            description="Stream Gremlin query results",
+            description="Stream Gremlin query results (variant args)",
             tags=frozenset({"graph", "query", "streaming", "gremlin"}),
         ),
-        # §7.8 bulk_vertices
         WireRequestCase(
             id="graph_bulk_vertices",
             component="graph",
@@ -737,10 +696,21 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             build_method="build_graph_bulk_vertices_envelope",
             schema_id=f"{base_url}/graph/{v}/graph.envelope.request.json",
             args_validator="validate_graph_bulk_vertices_args",
-            description="Scan or page through graph nodes in bulk",
+            description="Bulk operations on vertices (import/export)",
             tags=frozenset({"graph", "write", "bulk", "nodes"}),
         ),
-        # §7.9 get_schema
+        # ADDED: graph.batch (exists in PROTOCOLS.md and WireAdapter)
+        WireRequestCase(
+            id="graph_batch",
+            component="graph",
+            op="graph.batch",
+            build_method="build_graph_batch_envelope",
+            schema_id=f"{base_url}/graph/{v}/graph.envelope.request.json",
+            # args_validator optional; define later if you want strict args checks
+            args_validator=None,
+            description="Execute multiple graph operations in a batch",
+            tags=frozenset({"graph", "batch", "write"}),
+        ),
         WireRequestCase(
             id="graph_get_schema",
             component="graph",
@@ -750,7 +720,6 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             description="Retrieve graph schema (node labels, edge types, properties)",
             tags=frozenset({"graph", "schema", "discovery"}),
         ),
-        # §7.10 health
         WireRequestCase(
             id="graph_health",
             component="graph",
@@ -770,97 +739,74 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
 class WireRequestCaseRegistry:
     """
     Registry of wire request test cases with indexing and filtering.
-    
+
     Provides efficient lookup by ID, operation, component, and tags.
     Supports loading from external configuration or using defaults.
     """
-    
+
     def __init__(self, cases: Optional[List[WireRequestCase]] = None):
-        """
-        Initialize registry with cases.
-        
-        Args:
-            cases: List of cases. If None, loads from config or uses defaults.
-        """
         if cases is not None:
             self._cases = list(cases)
         else:
             self._cases = self._load_cases()
-        
+
         self._build_indices()
-    
+
     def _load_cases(self) -> List[WireRequestCase]:
-        """Load cases from external config or use defaults."""
         config = CasesConfig.from_env()
         external = load_external_config()
-        
+
         if external and "wire_request_cases" in external:
             logger.info("Loading wire request cases from external configuration")
-            return [
-                WireRequestCase.from_dict(case)
-                for case in external["wire_request_cases"]
-            ]
-        
+            return [WireRequestCase.from_dict(case) for case in external["wire_request_cases"]]
+
         return _build_default_cases(config.schema_base_url)
-    
+
     def _build_indices(self) -> None:
-        """Build lookup indices for efficient access."""
         self._by_id: Dict[str, WireRequestCase] = {}
         self._by_op: Dict[str, List[WireRequestCase]] = {}
         self._by_component: Dict[str, List[WireRequestCase]] = {}
         self._by_tag: Dict[str, List[WireRequestCase]] = {}
-        
+
         for case in self._cases:
-            # Index by ID (unique)
             if case.id in self._by_id:
                 raise ValueError(f"Duplicate case ID: {case.id}")
             self._by_id[case.id] = case
-            
-            # Index by operation
+
             self._by_op.setdefault(case.op, []).append(case)
-            
-            # Index by component
             self._by_component.setdefault(case.component, []).append(case)
-            
-            # Index by tags
+
             for tag in case.tags:
                 self._by_tag.setdefault(tag, []).append(case)
-    
+
     @property
     def cases(self) -> List[WireRequestCase]:
-        """Get all cases (immutable copy)."""
         return list(self._cases)
-    
+
     def __len__(self) -> int:
         return len(self._cases)
-    
+
     def __iter__(self):
         return iter(self._cases)
-    
+
     def __getitem__(self, case_id: str) -> WireRequestCase:
-        """Get case by ID."""
         return self._by_id[case_id]
-    
+
     def __contains__(self, case_id: str) -> bool:
-        """Check if case ID exists."""
         return case_id in self._by_id
-    
+
     def get(self, case_id: str) -> Optional[WireRequestCase]:
-        """Get case by ID, or None if not found."""
         return self._by_id.get(case_id)
-    
+
     def get_by_op(self, op: str) -> List[WireRequestCase]:
-        """Get all cases for an operation."""
         return list(self._by_op.get(op, []))
-    
+
     def get_by_component(self, component: str) -> List[WireRequestCase]:
-        """Get all cases for a component."""
         return list(self._by_component.get(component, []))
-    
+
     def get_by_tag(self, tag: str) -> List[WireRequestCase]:
-        """Get all cases with a specific tag."""
         return list(self._by_tag.get(tag, []))
-    
+
     def filter(
         self,
         component: Optional[str] = None,
@@ -869,87 +815,54 @@ class WireRequestCaseRegistry:
         tags_all: Optional[List[str]] = None,
         tags_any: Optional[List[str]] = None,
     ) -> List[WireRequestCase]:
-        """
-        Filter cases by multiple criteria.
-        
-        Args:
-            component: Filter by component name.
-            tag: Filter by single tag (shorthand for tags_any with one tag).
-            op_prefix: Filter by operation prefix.
-            tags_all: Case must have ALL of these tags.
-            tags_any: Case must have at least ONE of these tags.
-        
-        Returns:
-            List of matching cases.
-        """
         result = []
-        
+
         for case in self._cases:
-            # Component filter
             if component and case.component != component:
                 continue
-            
-            # Operation prefix filter
+
             if op_prefix and not case.op.startswith(op_prefix):
                 continue
-            
-            # Single tag filter (legacy/shorthand)
+
             if tag and tag not in case.tags:
                 continue
-            
-            # All tags filter
+
             if tags_all and not all(t in case.tags for t in tags_all):
                 continue
-            
-            # Any tags filter
+
             if tags_any and not any(t in case.tags for t in tags_any):
                 continue
-            
+
             result.append(case)
-        
+
         return result
-    
+
     @property
     def components(self) -> List[str]:
-        """Get list of all components with cases."""
         return sorted(self._by_component.keys())
-    
+
     @property
     def operations(self) -> List[str]:
-        """Get list of all operations with cases."""
         return sorted(self._by_op.keys())
-    
+
     @property
     def tags(self) -> List[str]:
-        """Get list of all tags used in cases."""
         return sorted(self._by_tag.keys())
-    
+
     def get_coverage_summary(self) -> Dict[str, Any]:
-        """
-        Generate coverage summary for reporting.
-        
-        Returns:
-            Dictionary with coverage statistics.
-        """
         return {
             "total_cases": len(self._cases),
-            "cases_by_component": {
-                comp: len(cases) for comp, cases in self._by_component.items()
-            },
-            "cases_by_tag": {
-                tag: len(cases) for tag, cases in self._by_tag.items()
-            },
+            "cases_by_component": {comp: len(cases) for comp, cases in self._by_component.items()},
+            "cases_by_tag": {tag: len(cases) for tag, cases in self._by_tag.items()},
             "operations_covered": len(self._by_op),
             "components_covered": self.components,
             "all_tags": self.tags,
         }
-    
+
     def to_list(self) -> List[Dict[str, Any]]:
-        """Serialize all cases to list of dicts."""
         return [case.to_dict() for case in self._cases]
-    
+
     def to_json(self, indent: int = 2) -> str:
-        """Serialize registry to JSON string."""
         return json.dumps({"wire_request_cases": self.to_list()}, indent=indent)
 
 
@@ -957,17 +870,10 @@ class WireRequestCaseRegistry:
 # Module-Level Registry Instance
 # ---------------------------------------------------------------------------
 
-# Default registry instance, loaded at import time
 _default_registry: Optional[WireRequestCaseRegistry] = None
 
 
 def get_registry() -> WireRequestCaseRegistry:
-    """
-    Get the default wire request case registry.
-    
-    Lazy-loads on first access to avoid import-time side effects
-    in environments that don't need the full registry.
-    """
     global _default_registry
     if _default_registry is None:
         _default_registry = WireRequestCaseRegistry()
@@ -975,12 +881,10 @@ def get_registry() -> WireRequestCaseRegistry:
 
 
 def get_cases() -> List[WireRequestCase]:
-    """Get all wire request cases from the default registry."""
     return get_registry().cases
 
 
 def get_case(case_id: str) -> Optional[WireRequestCase]:
-    """Get a specific case by ID from the default registry."""
     return get_registry().get(case_id)
 
 
@@ -988,27 +892,19 @@ def get_case(case_id: str) -> Optional[WireRequestCase]:
 # Convenience Exports for pytest
 # ---------------------------------------------------------------------------
 
-# These are commonly used in test parameterization
-WIRE_REQUEST_CASES: List[WireRequestCase] = []  # Populated lazily
-
-
-def _ensure_cases_loaded() -> None:
-    """Ensure WIRE_REQUEST_CASES is populated."""
-    global WIRE_REQUEST_CASES
-    if not WIRE_REQUEST_CASES:
-        WIRE_REQUEST_CASES.extend(get_cases())
+# Make this non-empty for typical pytest imports/parameterization.
+WIRE_REQUEST_CASES: List[WireRequestCase] = get_cases()
 
 
 def get_pytest_params() -> List[WireRequestCase]:
     """
     Get cases formatted for pytest.mark.parametrize.
-    
+
     Usage:
         @pytest.mark.parametrize("case", get_pytest_params(), ids=lambda c: c.id)
         def test_wire_request(case, adapter):
             ...
     """
-    _ensure_cases_loaded()
     return WIRE_REQUEST_CASES
 
 
@@ -1016,11 +912,7 @@ def get_pytest_params() -> List[WireRequestCase]:
 # CLI Support
 # ---------------------------------------------------------------------------
 
-def print_cases_table(
-    cases: List[WireRequestCase],
-    verbose: bool = False,
-) -> None:
-    """Print cases in a formatted table."""
+def print_cases_table(cases: List[WireRequestCase], verbose: bool = False) -> None:
     if verbose:
         for case in cases:
             print(f"\n{case.id}")
@@ -1032,7 +924,6 @@ def print_cases_table(
             print(f"  Tags:         {', '.join(sorted(case.tags)) or 'none'}")
             print(f"  Description:  {case.description or 'none'}")
     else:
-        # Compact table format
         print(f"{'ID':<40} {'Component':<12} {'Tags'}")
         print("-" * 80)
         for case in cases:
@@ -1043,86 +934,49 @@ def print_cases_table(
 
 
 def main() -> None:
-    """CLI entry point for case registry inspection."""
     import argparse
-    
-    parser = argparse.ArgumentParser(
-        description="CORPUS Protocol Wire Request Case Registry",
-    )
-    parser.add_argument(
-        "--list", "-l",
-        action="store_true",
-        help="List all test cases",
-    )
-    parser.add_argument(
-        "--verbose", "-v",
-        action="store_true",
-        help="Verbose output",
-    )
-    parser.add_argument(
-        "--component", "-c",
-        type=str,
-        help="Filter by component",
-    )
-    parser.add_argument(
-        "--tag", "-t",
-        type=str,
-        help="Filter by tag",
-    )
-    parser.add_argument(
-        "--coverage",
-        action="store_true",
-        help="Print coverage summary",
-    )
-    parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Output as JSON",
-    )
-    parser.add_argument(
-        "--output", "-o",
-        type=str,
-        help="Write output to file",
-    )
-    
+
+    parser = argparse.ArgumentParser(description="CORPUS Protocol Wire Request Case Registry")
+    parser.add_argument("--list", "-l", action="store_true", help="List all test cases")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
+    parser.add_argument("--component", "-c", type=str, help="Filter by component")
+    parser.add_argument("--tag", "-t", type=str, help="Filter by tag")
+    parser.add_argument("--coverage", action="store_true", help="Print coverage summary")
+    parser.add_argument("--json", action="store_true", help="Output as JSON")
+    parser.add_argument("--output", "-o", type=str, help="Write output to file")
+
     args = parser.parse_args()
     registry = get_registry()
-    
+
     if args.coverage:
         summary = registry.get_coverage_summary()
-        if args.json:
-            output = json.dumps(summary, indent=2)
-        else:
-            output = f"""Wire Request Case Coverage Summary
-===================================
-Total cases:        {summary['total_cases']}
-Operations covered: {summary['operations_covered']}
-Components covered: {', '.join(summary['components_covered'])}
+        output = json.dumps(summary, indent=2) if args.json else (
+            "Wire Request Case Coverage Summary\n"
+            "===================================\n"
+            f"Total cases:        {summary['total_cases']}\n"
+            f"Operations covered: {summary['operations_covered']}\n"
+            f"Components covered: {', '.join(summary['components_covered'])}\n\n"
+            "Cases by component:\n"
+            + "\n".join(f"  {k}: {v}" for k, v in summary["cases_by_component"].items())
+            + "\n\nCases by tag:\n"
+            + "\n".join(f"  {k}: {v}" for k, v in sorted(summary["cases_by_tag"].items()))
+            + "\n"
+        )
 
-Cases by component:
-{chr(10).join(f"  {k}: {v}" for k, v in summary['cases_by_component'].items())}
-
-Cases by tag:
-{chr(10).join(f"  {k}: {v}" for k, v in sorted(summary['cases_by_tag'].items()))}
-"""
         if args.output:
-            with open(args.output, "w") as f:
+            with open(args.output, "w", encoding="utf-8") as f:
                 f.write(output)
             print(f"Coverage summary written to {args.output}")
         else:
             print(output)
         return
-    
-    # Filter cases
-    cases = registry.filter(
-        component=args.component,
-        tag=args.tag,
-    )
-    
+
+    cases = registry.filter(component=args.component, tag=args.tag)
+
     if args.json:
         output = json.dumps([c.to_dict() for c in cases], indent=2)
         if args.output:
-            with open(args.output, "w") as f:
+            with open(args.output, "w", encoding="utf-8") as f:
                 f.write(output)
             print(f"Cases written to {args.output}")
         else:
