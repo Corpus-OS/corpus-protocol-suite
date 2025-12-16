@@ -32,10 +32,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import threading
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from functools import wraps, cached_property
+from functools import wraps
 from typing import (
     Any,
     AsyncIterator,
@@ -48,6 +49,8 @@ from typing import (
     TypedDict,
     Tuple,
     TypeVar,
+    Mapping,
+    Sequence,
 )
 
 from corpus_sdk.core.context_translation import from_mcp
@@ -79,6 +82,19 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 _FRAMEWORK_NAME = "mcp"
+
+# Best-effort MCP framework/service version for observability parity.
+# This is optional and safe to be None.
+try:  # pragma: no cover
+    from importlib.metadata import version as _pkg_version  # py3.8+
+
+    _FRAMEWORK_VERSION: Optional[str]
+    try:
+        _FRAMEWORK_VERSION = _pkg_version("mcp_embedding_server")
+    except Exception:  # noqa: BLE001
+        _FRAMEWORK_VERSION = None
+except Exception:  # noqa: BLE001
+    _FRAMEWORK_VERSION = None
 
 
 # --------------------------------------------------------------------------- #
@@ -183,23 +199,25 @@ def _extract_dynamic_context(
 
     Captures:
     - model identifier from the embedding instance
+    - framework_version if present
     - text_len for single-text operations
     - texts_count / empty_texts_count for batch operations
-    - key MCP routing fields (session_id, tool_name, server_id, client_id, trace_id)
+    - key MCP routing fields (session_id, tool_name, server_id, client_id, trace_id, request_id)
     """
     dynamic_ctx: Dict[str, Any] = {
         "model": getattr(instance, "model", "unknown"),
         "framework": _FRAMEWORK_NAME,
+        "framework_version": getattr(instance, "_framework_version", None),
     }
 
     # Text / batch metrics (args here do NOT include self)
     if operation == "query" and args and isinstance(args[0], str):
         dynamic_ctx["text_len"] = len(args[0])
-    elif operation == "documents" and args and isinstance(args[0], list):
-        texts_list = args[0]
-        dynamic_ctx["texts_count"] = len(texts_list)
+    elif operation == "documents" and args and isinstance(args[0], Sequence) and not isinstance(args[0], str):
+        texts_seq = args[0]
+        dynamic_ctx["texts_count"] = len(texts_seq)
         empty_count = sum(
-            1 for text in texts_list
+            1 for text in texts_seq
             if not isinstance(text, str) or not text.strip()
         )
         if empty_count:
@@ -207,12 +225,10 @@ def _extract_dynamic_context(
 
     # MCP-specific context (if passed through kwargs)
     mcp_context = kwargs.get("mcp_context") or {}
-    if isinstance(mcp_context, Dict):
-        dynamic_ctx["session_id"] = mcp_context.get("session_id")
-        dynamic_ctx["tool_name"] = mcp_context.get("tool_name")
-        dynamic_ctx["server_id"] = mcp_context.get("server_id")
-        dynamic_ctx["client_id"] = mcp_context.get("client_id")
-        dynamic_ctx["trace_id"] = mcp_context.get("trace_id")
+    if isinstance(mcp_context, Mapping):
+        for key in ("session_id", "tool_name", "server_id", "client_id", "trace_id", "request_id"):
+            if key in mcp_context:
+                dynamic_ctx[key] = mcp_context.get(key)
 
     return dynamic_ctx
 
@@ -238,6 +254,7 @@ def _create_error_context_decorator(
                 )
                 full_context: Dict[str, Any] = {
                     "framework": _FRAMEWORK_NAME,
+                    "framework_version": getattr(self, "_framework_version", None),
                     "error_codes": EMBEDDING_COERCION_ERROR_CODES,
                     **static_context,
                     **dynamic_context,
@@ -339,12 +356,19 @@ class CorpusMCPEmbeddings:
         self.text_normalization_config = text_normalization_config
         self.mcp_config = self._validate_mcp_config(mcp_config or {})
 
+        # Optional framework/service version for parity with other adapters.
+        self._framework_version: Optional[str] = _FRAMEWORK_VERSION
+
         # Service state
         self._active_requests: int = 0
         self._active_requests_lock = asyncio.Lock()
         self._request_semaphore = asyncio.Semaphore(
             self.mcp_config["max_concurrent_requests"],
         )
+
+        # Translator cache + lock (thread-safe lazy init; parity with other adapters).
+        self._translator_lock = threading.Lock()
+        self._translator_instance: Optional[EmbeddingTranslator] = None
 
         # Simple protocol metrics (for health/introspection)
         self._protocol_success_count: int = 0
@@ -360,19 +384,25 @@ class CorpusMCPEmbeddings:
         self._protocol_batch_total_latency: float = 0.0
 
         logger.info(
-            "CorpusMCPEmbeddings initialized with model=%s, max_concurrent=%d",
+            "CorpusMCPEmbeddings initialized with model=%s, max_concurrent=%d, framework_version=%s",
             model or "default",
             self.mcp_config["max_concurrent_requests"],
+            self._framework_version or "unknown",
         )
 
     # ------------------------------------------------------------------ #
     # Translator (framework-agnostic orchestrator)
     # ------------------------------------------------------------------ #
 
-    @cached_property
+    @property
     def _translator(self) -> EmbeddingTranslator:
         """
         Lazily construct the `EmbeddingTranslator` for MCP.
+
+        Thread-safe lazy initialization for parity with other framework adapters:
+        - Prevents double initialization in multi-threaded server deployments.
+        - Keeps the MCP service async-first while remaining safe under import-time
+          or executor/threaded access patterns.
 
         This orchestrator:
         - Normalizes OperationContext
@@ -380,18 +410,28 @@ class CorpusMCPEmbeddings:
         - Calls the underlying EmbeddingProtocolV1 adapter
         - Translates results to framework-level shapes (dicts)
         """
-        translator = create_embedding_translator(
-            adapter=self.corpus_adapter,
-            framework=_FRAMEWORK_NAME,
-            translator=None,
-            batch_config=self.batch_config,
-            text_normalization_config=self.text_normalization_config,
-        )
-        logger.debug(
-            "EmbeddingTranslator initialized for MCP with model=%s",
-            self.model or "default",
-        )
-        return translator
+        existing = self._translator_instance
+        if isinstance(existing, EmbeddingTranslator):
+            return existing
+
+        with self._translator_lock:
+            existing = self._translator_instance
+            if isinstance(existing, EmbeddingTranslator):
+                return existing
+
+            translator = create_embedding_translator(
+                adapter=self.corpus_adapter,
+                framework=_FRAMEWORK_NAME,
+                translator=None,
+                batch_config=self.batch_config,
+                text_normalization_config=self.text_normalization_config,
+            )
+            self._translator_instance = translator
+            logger.debug(
+                "EmbeddingTranslator initialized for MCP with model=%s",
+                self.model or "default",
+            )
+            return translator
 
     # ------------------------------------------------------------------ #
     # Configuration validation
@@ -432,7 +472,7 @@ class CorpusMCPEmbeddings:
 
     @asynccontextmanager
     async def _track_active_request(self) -> AsyncIterator[None]:
-        """Context manager for thread-safe active request tracking."""
+        """Context manager for asyncio-safe active request tracking."""
         async with self._active_requests_lock:
             self._active_requests += 1
         try:
@@ -465,7 +505,9 @@ class CorpusMCPEmbeddings:
         core_ctx: Optional[OperationContext] = None
         framework_ctx: Dict[str, Any] = {
             "framework": _FRAMEWORK_NAME,
-            "mcp_config": self.mcp_config,
+            "framework_version": self._framework_version,
+            "mcp_config": self.mcp_config,  # canonical config key (parity with other adapters)
+            "error_codes": EMBEDDING_COERCION_ERROR_CODES,  # parity: also present in framework_ctx
         }
 
         if enhanced_mcp_context:
@@ -475,6 +517,8 @@ class CorpusMCPEmbeddings:
                     # Enrich OperationContext with framework metadata
                     attrs = dict(getattr(core_ctx_candidate, "attrs", {}) or {})
                     attrs.setdefault("framework", _FRAMEWORK_NAME)
+                    if self._framework_version is not None:
+                        attrs.setdefault("framework_version", self._framework_version)
 
                     core_ctx = OperationContext(
                         request_id=core_ctx_candidate.request_id,
@@ -516,6 +560,8 @@ class CorpusMCPEmbeddings:
                         operation="context_build",
                         mcp_context_snapshot=snapshot,
                         mcp_config=self.mcp_config,
+                        framework_version=self._framework_version,
+                        error_codes=EMBEDDING_COERCION_ERROR_CODES,
                     )
                 except Exception:  # noqa: BLE001
                     # Never mask upstream exceptions when attaching context
@@ -528,17 +574,13 @@ class CorpusMCPEmbeddings:
             framework_ctx["model"] = effective_model
 
         if enhanced_mcp_context:
-            framework_ctx.update(
-                {
-                    "session_id": enhanced_mcp_context.get("session_id"),
-                    "tool_name": enhanced_mcp_context.get("tool_name"),
-                    "server_id": enhanced_mcp_context.get("server_id"),
-                    "client_id": enhanced_mcp_context.get("client_id"),
-                    "trace_id": enhanced_mcp_context.get("trace_id"),
-                    "request_id": enhanced_mcp_context.get("request_id", request_id),
-                    **kwargs,
-                },
-            )
+            # Preserve MCP routing fields as top-level framework_ctx keys (fast access downstream).
+            for key in ("session_id", "tool_name", "server_id", "client_id", "trace_id", "request_id"):
+                if key in enhanced_mcp_context:
+                    framework_ctx[key] = enhanced_mcp_context.get(key)
+
+            # Include any extra call-specific hints (excluding internal keys).
+            framework_ctx.update({k: v for k, v in kwargs.items() if not k.startswith("_")})
 
             if (
                 self.mcp_config["tool_aware_batching"]
@@ -578,7 +620,10 @@ class CorpusMCPEmbeddings:
             traceparent=None,
             tenant=None,
             metrics=None,
-            attrs={"framework": _FRAMEWORK_NAME},
+            attrs={
+                "framework": _FRAMEWORK_NAME,
+                "framework_version": self._framework_version,
+            },
         )
 
     # ------------------------------------------------------------------ #
@@ -676,8 +721,12 @@ class CorpusMCPEmbeddings:
             logger=logger,
         )
 
-    def _validate_embedding_request(self, texts: List[str], request_id: str) -> None:
-        """Comprehensive request validation (MCP layer)."""
+    def _validate_embedding_request(self, texts: List[Any], request_id: str) -> List[str]:
+        """
+        Comprehensive request validation (MCP layer).
+
+        Returns a validated `List[str]` to make downstream logic simpler and safer.
+        """
         if not texts:
             raise MCPEmbeddingServiceError(
                 "No texts provided",
@@ -692,14 +741,8 @@ class CorpusMCPEmbeddings:
                 request_id,
             )
 
-        total_chars = sum(len(text) for text in texts)
-        if total_chars > 1_000_000:
-            raise MCPEmbeddingServiceError(
-                f"Total text size {total_chars} characters exceeds limit",
-                ErrorCodes.TEXT_SIZE_EXCEEDED,
-                request_id,
-            )
-
+        # Validate type first (avoid surprising behavior in size accounting).
+        validated_texts: List[str] = []
         for i, text in enumerate(texts):
             if not isinstance(text, str):
                 raise MCPEmbeddingServiceError(
@@ -707,6 +750,118 @@ class CorpusMCPEmbeddings:
                     ErrorCodes.INVALID_TEXT_TYPE,
                     request_id,
                 )
+            validated_texts.append(text)
+
+        total_chars = sum(len(text) for text in validated_texts)
+        if total_chars > 1_000_000:
+            raise MCPEmbeddingServiceError(
+                f"Total text size {total_chars} characters exceeds limit",
+                ErrorCodes.TEXT_SIZE_EXCEEDED,
+                request_id,
+            )
+
+        return validated_texts
+
+    async def _run_translation(
+        self,
+        *,
+        raw_texts: Any,
+        translation_ctx: OperationContext,
+        framework_ctx: Dict[str, Any],
+        request_id: str,
+        op_kind: str,
+        count_metrics: bool = True,
+    ) -> Any:
+        """
+        Execute the translator call under MCP concurrency limits + active request tracking.
+
+        Parameters
+        ----------
+        raw_texts:
+            Either a single string or a list of strings.
+        translation_ctx:
+            Non-None OperationContext to pass to the translator.
+        framework_ctx:
+            MCP framework context dict.
+        request_id:
+            MCP service request identifier (for error mapping).
+        op_kind:
+            One of {"query", "documents"}; used for per-op metrics.
+        count_metrics:
+            If False, the call will not affect service metrics counters.
+            Useful for health checks that should not skew production telemetry.
+        """
+        async with self._track_active_request():
+            async with self._request_semaphore:
+                try:
+                    protocol_start = time.perf_counter()
+                    translated = await self._translator.arun_embed(
+                        raw_texts=raw_texts,
+                        op_ctx=translation_ctx,
+                        framework_ctx=framework_ctx,
+                    )
+                except EmbeddingAdapterError as exc:
+                    if count_metrics:
+                        self._protocol_error_count += 1
+                        if op_kind == "query":
+                            self._protocol_embed_error_count += 1
+                        else:
+                            self._protocol_batch_error_count += 1
+                    raise self._map_adapter_error_to_service_error(exc, request_id)
+                except asyncio.TimeoutError as exc:
+                    if count_metrics:
+                        self._protocol_error_count += 1
+                        if op_kind == "query":
+                            self._protocol_embed_error_count += 1
+                        else:
+                            self._protocol_batch_error_count += 1
+                    raise MCPEmbeddingServiceError(
+                        "Embedding request timed out",
+                        ErrorCodes.REQUEST_TIMEOUT,
+                        request_id,
+                    ) from exc
+                except Exception as exc:  # noqa: BLE001
+                    if count_metrics:
+                        self._protocol_error_count += 1
+                        if op_kind == "query":
+                            self._protocol_embed_error_count += 1
+                        else:
+                            self._protocol_batch_error_count += 1
+                    raise self._map_adapter_error_to_service_error(exc, request_id)
+
+                latency = time.perf_counter() - protocol_start
+                if count_metrics:
+                    self._protocol_success_count += 1
+                    self._protocol_total_latency += latency
+                    if op_kind == "query":
+                        self._protocol_embed_success_count += 1
+                        self._protocol_embed_total_latency += latency
+                    else:
+                        self._protocol_batch_success_count += 1
+                        self._protocol_batch_total_latency += latency
+
+                return translated
+
+    # ------------------------------------------------------------------ #
+    # Optional adapter passthroughs (parity with other adapters)
+    # ------------------------------------------------------------------ #
+
+    async def acapabilities(self) -> Dict[str, Any]:
+        """Best-effort capabilities passthrough to the underlying adapter."""
+        if hasattr(self.corpus_adapter, "acapabilities"):
+            return await self.corpus_adapter.acapabilities()  # type: ignore[no-any-return]
+        if hasattr(self.corpus_adapter, "capabilities"):
+            # Safe sync fallback in async context (small + bounded).
+            return await asyncio.to_thread(self.corpus_adapter.capabilities)  # type: ignore[arg-type]
+        return {}
+
+    async def ahealth(self) -> Dict[str, Any]:
+        """Best-effort health passthrough to the underlying adapter."""
+        if hasattr(self.corpus_adapter, "ahealth"):
+            return await self.corpus_adapter.ahealth()  # type: ignore[no-any-return]
+        if hasattr(self.corpus_adapter, "health"):
+            return await asyncio.to_thread(self.corpus_adapter.health)  # type: ignore[arg-type]
+        return {}
 
     # ------------------------------------------------------------------ #
     # Core Embedding API (MCP Compatible)
@@ -728,13 +883,15 @@ class CorpusMCPEmbeddings:
         the underlying EmbeddingProtocolV1 adapter for execution.
         """
         request_id = f"embed_docs_{uuid.uuid4().hex[:8]}"
-        start_time = time.time()
+        start_time = time.perf_counter()
 
-        self._validate_embedding_request(texts, request_id)
+        validated_texts = self._validate_embedding_request(texts, request_id)
 
+        # This warning is still useful for adapter-level batching behavior
+        # (even though MCP enforces max 1000 at the service boundary).
         warn_if_extreme_batch(
             framework=_FRAMEWORK_NAME,
-            texts=texts,
+            texts=validated_texts,
             op_name="embed_documents",
             batch_config=self.batch_config,
             logger=logger,
@@ -752,53 +909,29 @@ class CorpusMCPEmbeddings:
 
         logger.debug(
             "Embedding %d documents for MCP tool=%s, session=%s, request=%s",
-            len(texts),
+            len(validated_texts),
             mcp_context.get("tool_name", "unknown") if mcp_context else "unknown",
             mcp_context.get("session_id", "unknown") if mcp_context else "unknown",
             request_id,
         )
 
-        async with self._track_active_request():
-            async with self._request_semaphore:
-                try:
-                    protocol_start = time.time()
-                    translated = await self._translator.arun_embed(
-                        raw_texts=texts,
-                        op_ctx=translation_ctx,
-                        framework_ctx=framework_ctx,
-                    )
-                except EmbeddingAdapterError as exc:
-                    self._protocol_error_count += 1
-                    self._protocol_batch_error_count += 1
-                    raise self._map_adapter_error_to_service_error(exc, request_id)
-                except asyncio.TimeoutError as exc:
-                    # In case underlying stack bubbles raw TimeoutError
-                    self._protocol_error_count += 1
-                    self._protocol_batch_error_count += 1
-                    raise MCPEmbeddingServiceError(
-                        "Embedding request timed out",
-                        ErrorCodes.REQUEST_TIMEOUT,
-                        request_id,
-                    ) from exc
-                except Exception as exc:  # noqa: BLE001
-                    self._protocol_error_count += 1
-                    self._protocol_batch_error_count += 1
-                    raise self._map_adapter_error_to_service_error(exc, request_id)
+        translated = await self._run_translation(
+            raw_texts=validated_texts,
+            translation_ctx=translation_ctx,
+            framework_ctx=framework_ctx,
+            request_id=request_id,
+            op_kind="documents",
+            count_metrics=True,
+        )
 
-                latency = time.time() - protocol_start
-                self._protocol_success_count += 1
-                self._protocol_total_latency += latency
-                self._protocol_batch_success_count += 1
-                self._protocol_batch_total_latency += latency
+        processing_time = time.perf_counter() - start_time
+        logger.debug(
+            "Embedding completed in %.3fs for request %s",
+            processing_time,
+            request_id,
+        )
 
-                processing_time = time.time() - start_time
-                logger.debug(
-                    "Embedding completed in %.3fs for request %s",
-                    processing_time,
-                    request_id,
-                )
-
-                return self._coerce_embedding_matrix(translated)
+        return self._coerce_embedding_matrix(translated)
 
     @with_embedding_error_context("query")
     async def embed_query(
@@ -816,8 +949,9 @@ class CorpusMCPEmbeddings:
         """
         request_id = f"embed_query_{uuid.uuid4().hex[:8]}"
 
-        # Reuse batch validator with length 1 for consistent limits
-        self._validate_embedding_request([text], request_id)
+        # Reuse batch validator with length 1 for consistent limits.
+        validated_texts = self._validate_embedding_request([text], request_id)
+        validated_text = validated_texts[0]
 
         core_ctx, framework_ctx = self._build_contexts(
             mcp_context=mcp_context,
@@ -834,39 +968,16 @@ class CorpusMCPEmbeddings:
             request_id,
         )
 
-        async with self._track_active_request():
-            async with self._request_semaphore:
-                try:
-                    protocol_start = time.time()
-                    translated = await self._translator.arun_embed(
-                        raw_texts=text,
-                        op_ctx=translation_ctx,
-                        framework_ctx=framework_ctx,
-                    )
-                except EmbeddingAdapterError as exc:
-                    self._protocol_error_count += 1
-                    self._protocol_embed_error_count += 1
-                    raise self._map_adapter_error_to_service_error(exc, request_id)
-                except asyncio.TimeoutError as exc:
-                    self._protocol_error_count += 1
-                    self._protocol_embed_error_count += 1
-                    raise MCPEmbeddingServiceError(
-                        "Query embedding request timed out",
-                        ErrorCodes.REQUEST_TIMEOUT,
-                        request_id,
-                    ) from exc
-                except Exception as exc:  # noqa: BLE001
-                    self._protocol_error_count += 1
-                    self._protocol_embed_error_count += 1
-                    raise self._map_adapter_error_to_service_error(exc, request_id)
+        translated = await self._run_translation(
+            raw_texts=validated_text,
+            translation_ctx=translation_ctx,
+            framework_ctx=framework_ctx,
+            request_id=request_id,
+            op_kind="query",
+            count_metrics=True,
+        )
 
-                latency = time.time() - protocol_start
-                self._protocol_success_count += 1
-                self._protocol_total_latency += latency
-                self._protocol_embed_success_count += 1
-                self._protocol_embed_total_latency += latency
-
-                return self._coerce_embedding_vector(translated)
+        return self._coerce_embedding_vector(translated)
 
     # ------------------------------------------------------------------ #
     # Health check / introspection
@@ -914,17 +1025,35 @@ class CorpusMCPEmbeddings:
             "protocol_batch_error_count": self._protocol_batch_error_count,
             "avg_protocol_batch_latency_ms": avg_batch_latency_ms,
             "max_concurrent_requests": self.mcp_config["max_concurrent_requests"],
+            "framework_version": self._framework_version,
         }
 
         # Smoke test with actual embedding to surface adapter-level health
+        # without skewing core service metrics.
         try:
-            test_embedding = await self.embed_query(
-                "health_check",
-                mcp_context={
-                    "tool_name": "health_check",
-                    "session_id": "health_check",
-                },
+            request_id = "health_check"
+            mcp_context: MCPContext = {
+                "tool_name": "health_check",
+                "session_id": "health_check",
+                "request_id": request_id,
+            }
+            core_ctx, framework_ctx = self._build_contexts(
+                mcp_context=mcp_context,
+                request_id=request_id,
+                health_check=True,  # observability hint
             )
+            translation_ctx = self._get_translation_op_ctx(core_ctx, request_id)
+
+            translated = await self._run_translation(
+                raw_texts="health_check",
+                translation_ctx=translation_ctx,
+                framework_ctx=framework_ctx,
+                request_id=request_id,
+                op_kind="query",
+                count_metrics=False,  # avoid skewing production telemetry
+            )
+            test_embedding = self._coerce_embedding_vector(translated)
+
             health_status["service_test"] = "passed"
             health_status["embedding_dimension"] = len(test_embedding)
         except Exception as exc:  # noqa: BLE001
