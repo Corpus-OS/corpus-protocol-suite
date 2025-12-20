@@ -331,6 +331,7 @@ def test_config_to_operation_context_when_translator_returns_operation_context(
     Parity: when context_from_langchain returns an OperationContext, the
     adapter should treat it as such and pass it through core_ctx.
     """
+
     def fake_from_langchain(
         config: Dict[str, Any],
         framework_version: str | None = None,
@@ -417,6 +418,177 @@ def test_invalid_config_type_is_ignored(adapter: Any) -> None:
     # Deliberately pass a non-mapping config; this should not raise
     result = embeddings.embed_documents(["x"], config="not-a-mapping")  # type: ignore[arg-type]
     _assert_embedding_matrix_shape(result, expected_rows=1)
+
+
+# ---------------------------------------------------------------------------
+# Adapter-level config / OperationContext propagation parity
+# ---------------------------------------------------------------------------
+
+
+def test_langchain_adapter_config_defaults_and_bool_coercion(adapter: Any) -> None:
+    """
+    langchain_config should be normalized with defaults and booleans coerced.
+
+    Parity: Mirrors CrewAI config tests but for LangChain-specific config.
+    """
+    embeddings = CorpusLangChainEmbeddings(
+        corpus_adapter=adapter,
+        langchain_config={
+            "fallback_to_simple_context": 1,  # truthy -> bool
+            # let enable_operation_context_propagation default
+        },
+    )
+
+    cfg = embeddings.langchain_config
+
+    # Defaults filled in
+    assert "fallback_to_simple_context" in cfg
+    assert "enable_operation_context_propagation" in cfg
+
+    # Bool coercion
+    assert isinstance(cfg["fallback_to_simple_context"], bool)
+    assert isinstance(cfg["enable_operation_context_propagation"], bool)
+
+    # Specific values
+    assert cfg["fallback_to_simple_context"] is True
+    assert cfg["enable_operation_context_propagation"] is True
+
+
+def test_langchain_adapter_config_rejects_non_mapping(adapter: Any) -> None:
+    """
+    langchain_config must be a Mapping; non-mapping values should raise
+    a clear error mentioning LANGCHAIN_CONFIG_INVALID.
+    """
+    with pytest.raises(ValidationError) as exc_info:
+        CorpusLangChainEmbeddings(
+            corpus_adapter=adapter,
+            langchain_config="not-a-mapping",  # type: ignore[arg-type]
+        )
+
+    msg = str(exc_info.value)
+    assert "LANGCHAIN_CONFIG_INVALID" in msg or "langchain_config must be a Mapping" in msg
+
+
+def test_fallback_to_simple_context_true_uses_default_operation_context(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: Any,
+) -> None:
+    """
+    When context_from_langchain returns a non-OperationContext and
+    fallback_to_simple_context is True, we should use a default OperationContext().
+    """
+
+    class WeirdCtx:
+        pass
+
+    def fake_from_langchain(
+        config: Dict[str, Any],
+        framework_version: str | None = None,
+    ) -> Any:
+        return WeirdCtx()
+
+    monkeypatch.setattr(langchain_adapter_module, "context_from_langchain", fake_from_langchain)
+
+    embeddings = CorpusLangChainEmbeddings(
+        corpus_adapter=adapter,
+        langchain_config={"fallback_to_simple_context": True},
+    )
+
+    config = {"run_id": "run-fallback-true"}
+
+    core_ctx, framework_ctx = embeddings._build_contexts(config=config)
+
+    assert isinstance(core_ctx, OperationContext)
+    assert framework_ctx["framework"] == "langchain"
+
+
+def test_fallback_to_simple_context_false_leaves_core_ctx_none(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: Any,
+) -> None:
+    """
+    When context_from_langchain returns a non-OperationContext and
+    fallback_to_simple_context is False, core_ctx should remain None.
+    """
+
+    class WeirdCtx:
+        pass
+
+    def fake_from_langchain(
+        config: Dict[str, Any],
+        framework_version: str | None = None,
+    ) -> Any:
+        return WeirdCtx()
+
+    monkeypatch.setattr(langchain_adapter_module, "context_from_langchain", fake_from_langchain)
+
+    embeddings = CorpusLangChainEmbeddings(
+        corpus_adapter=adapter,
+        langchain_config={"fallback_to_simple_context": False},
+    )
+
+    config = {"run_id": "run-fallback-false"}
+
+    core_ctx, framework_ctx = embeddings._build_contexts(config=config)
+
+    assert core_ctx is None
+    assert framework_ctx["framework"] == "langchain"
+
+
+def test_enable_operation_context_propagation_flag_controls_operation_context(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: Any,
+) -> None:
+    """
+    enable_operation_context_propagation controls whether _operation_context
+    is included in framework_ctx.
+    """
+
+    def fake_from_langchain(
+        config: Dict[str, Any],
+        framework_version: str | None = None,
+    ) -> OperationContext:
+        return OperationContext(request_id="r2")
+
+    monkeypatch.setattr(langchain_adapter_module, "context_from_langchain", fake_from_langchain)
+
+    config = {"run_id": "run-opctx"}
+
+    # Default / True case
+    emb_default = CorpusLangChainEmbeddings(
+        corpus_adapter=adapter,
+        langchain_config={"enable_operation_context_propagation": True},
+    )
+    core_ctx, framework_ctx = emb_default._build_contexts(config=config)
+    assert isinstance(core_ctx, OperationContext)
+    assert framework_ctx.get("_operation_context") is core_ctx
+
+    # Disabled case
+    emb_disabled = CorpusLangChainEmbeddings(
+        corpus_adapter=adapter,
+        langchain_config={"enable_operation_context_propagation": False},
+    )
+    core_ctx2, framework_ctx2 = emb_disabled._build_contexts(config=config)
+    assert isinstance(core_ctx2, OperationContext)
+    assert "_operation_context" not in framework_ctx2
+
+
+def test_build_contexts_includes_framework_metadata(adapter: Any) -> None:
+    """
+    _build_contexts should include framework name, error_codes, and
+    langchain_config in framework_ctx.
+    """
+    embeddings = CorpusLangChainEmbeddings(
+        corpus_adapter=adapter,
+        model="meta-model",
+        langchain_config={"fallback_to_simple_context": True},
+    )
+
+    core_ctx, framework_ctx = embeddings._build_contexts(config={"run_id": "meta-run"})
+
+    assert framework_ctx["framework"] == "langchain"
+    assert "error_codes" in framework_ctx
+    assert "langchain_config" in framework_ctx
 
 
 # ---------------------------------------------------------------------------
