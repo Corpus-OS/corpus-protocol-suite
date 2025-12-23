@@ -776,6 +776,40 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
             logger=logger,
         )
 
+# ------------------------------------------------------------------ #
+    # Capapabilties and health API
+# ------------------------------------------------------------------ #
+
+    def capabilities(self) -> Mapping[str, Any]:
+        """Best-effort capabilities passthrough."""
+        if hasattr(self.corpus_adapter, "capabilities"):
+            return self.corpus_adapter.capabilities()  # type: ignore[no-any-return]
+        return {}
+
+    async def acapabilities(self) -> Mapping[str, Any]:
+        """Best-effort async capabilities passthrough."""
+        if hasattr(self.corpus_adapter, "acapabilities"):
+            return await self.corpus_adapter.acapabilities()  # type: ignore[no-any-return]
+        if hasattr(self.corpus_adapter, "capabilities"):
+            import asyncio
+            return await asyncio.to_thread(self.corpus_adapter.capabilities)
+        return {}
+    
+    def health(self) -> Mapping[str, Any]:
+        """Best-effort health passthrough."""
+        if hasattr(self.corpus_adapter, "health"):
+            return self.corpus_adapter.health()  # type: ignore[no-any-return]
+        return {}
+    
+    async def ahealth(self) -> Mapping[str, Any]:
+        """Best-effort async health passthrough."""
+        if hasattr(self.corpus_adapter, "ahealth"):
+            return await self.corpus_adapter.ahealth()  # type: ignore[no-any-return]
+        if hasattr(self.corpus_adapter, "health"):
+            import asyncio
+            return await asyncio.to_thread(self.corpus_adapter.health)
+        return {}
+
     # ------------------------------------------------------------------ #
     # Async API
     # ------------------------------------------------------------------ #
