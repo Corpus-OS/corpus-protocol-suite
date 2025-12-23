@@ -23,6 +23,7 @@ by the underlying adapter, typically a BaseEmbeddingAdapter subclass.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 import time
