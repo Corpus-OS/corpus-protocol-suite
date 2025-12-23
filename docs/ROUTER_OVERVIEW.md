@@ -1,7 +1,5 @@
 # Corpus Router: The Intelligent Control Plane for AI Infrastructure
 
----
-
 ## Executive Summary
 
 Corpus Router is the **intelligent control plane** that reduces AI infrastructure costs by 30-60% while eliminating vendor and framework lock-in. It's not another framework or gateway—it's a **protocol-native routing layer** that understands AI semantics across all providers and domains.
