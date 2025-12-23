@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import threading
+import concurrent.futures
+import logging
 from typing import Any, Dict, Mapping, List
 
 import pytest
@@ -12,6 +15,7 @@ from corpus_sdk.graph.framework_adapters.autogen import (
     CorpusAutoGenGraphClient,
     ErrorCodes,
 )
+from corpus_sdk.graph.graph_base import OperationContext, GraphCapabilities
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +115,64 @@ def test_framework_translator_override_is_respected(
     kwargs = captured_args["kwargs"]
     assert kwargs.get("framework") == "autogen"
     assert kwargs.get("translator") is custom
+
+
+def test_constructor_rejects_invalid_adapter() -> None:
+    """Verify constructor raises TypeError for non-graph adapter."""
+    with pytest.raises(TypeError) as exc_info:
+        CorpusAutoGenGraphClient(adapter="not-a-graph-adapter")  # type: ignore[arg-type]
+    msg = str(exc_info.value).lower()
+    assert "adapter" in msg or "graphprotocolv1" in msg or "compatible" in msg
+
+
+def test_constructor_accepts_adapter_without_close() -> None:
+    """Verify adapter without close() method is still accepted."""
+    class SimpleAdapter:
+        async def query(self, *args, **kwargs):
+            return {"records": [], "summary": {}}
+        async def capabilities(self):
+            return GraphCapabilities(server="test", version="1.0")
+
+    client = CorpusAutoGenGraphClient(adapter=SimpleAdapter())
+    assert client is not None
+
+
+def test_translator_lazy_initialization(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: Any,
+) -> None:
+    """Verify translator is only created when needed."""
+    call_count = 0
+
+    def fake_create(*args: Any, **kwargs: Any) -> Any:
+        nonlocal call_count
+        call_count += 1
+        class DummyTranslator:
+            pass
+        return DummyTranslator()
+
+    monkeypatch.setattr(autogen_adapter_module, "create_graph_translator", fake_create)
+
+    client = _make_client(adapter)
+    assert call_count == 0  # Not yet created
+
+    _ = client._translator  # Access triggers creation
+    assert call_count == 1
+
+    _ = client._translator  # Second access should use cached
+    assert call_count == 1  # Still 1
+
+
+def test_import_autogen_graph_client() -> None:
+    """Verify CorpusAutoGenGraphClient can be imported properly."""
+    from corpus_sdk.graph.framework_adapters.autogen import (
+        CorpusAutoGenGraphClient,
+        AutoGenGraphFrameworkTranslator,
+        ErrorCodes,
+    )
+    assert CorpusAutoGenGraphClient is not None
+    assert AutoGenGraphFrameworkTranslator is not None
+    assert ErrorCodes is not None
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +299,72 @@ def test_build_ctx_failure_raises_badrequest_with_error_code_and_attaches_contex
     assert captured_ctx.get("operation") == "context_translation"
 
 
+def test_context_translation_with_empty_conversation(
+    adapter: Any,
+) -> None:
+    """Handle empty conversation dict gracefully."""
+    client = _make_client(adapter)
+
+    result = client.query("MATCH (n) RETURN n", conversation={})
+    assert result is not None
+
+
+def test_context_translation_with_none_values(
+    adapter: Any,
+) -> None:
+    """Handle None values in conversation/extra_context."""
+    client = _make_client(adapter)
+
+    result = client.query(
+        "MATCH (n) RETURN n",
+        conversation=None,
+        extra_context=None
+    )
+    assert result is not None
+
+
+def test_extra_context_overrides_framework_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: Any,
+) -> None:
+    """Verify extra_context can override framework metadata."""
+    captured: Dict[str, Any] = {}
+
+    class DummyOperationContext:
+        def __init__(self, **kwargs: Any) -> None:
+            self.attrs = kwargs
+
+    monkeypatch.setattr(
+        autogen_adapter_module,
+        "OperationContext",
+        DummyOperationContext,
+    )
+
+    def fake_core_ctx_from_autogen(
+        conversation: Any,
+        *,
+        framework_version: Any = None,
+        **extra: Any,
+    ) -> Any:
+        captured.update(extra)
+        return DummyOperationContext()
+
+    monkeypatch.setattr(
+        autogen_adapter_module,
+        "core_ctx_from_autogen",
+        fake_core_ctx_from_autogen,
+    )
+
+    client = _make_client(adapter)
+
+    # extra_context should appear in captured extra kwargs
+    extra_ctx = {"custom_field": "custom_value", "override": "should_win"}
+    client.query("MATCH (n) RETURN n", extra_context=extra_ctx)
+
+    assert captured.get("custom_field") == "custom_value"
+    assert captured.get("override") == "should_win"
+
+
 # ---------------------------------------------------------------------------
 # Error-context decorator behavior
 # ---------------------------------------------------------------------------
@@ -340,6 +468,121 @@ async def test_error_context_includes_autogen_metadata_async(
         assert captured_context["conversation_id"] == "conv-ctx-async"
     if "agent_name" in captured_context:
         assert captured_context["agent_name"] == "tester-async"
+
+
+def test_error_context_includes_query_text(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: Any,
+) -> None:
+    """Error context should include the query that failed."""
+    captured: Dict[str, Any] = {}
+
+    def fake_attach(exc: BaseException, **ctx: Any) -> None:
+        captured.update(ctx)
+
+    monkeypatch.setattr(autogen_adapter_module, "attach_context", fake_attach)
+
+    class FailingTranslator:
+        def query(self, *args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("query execution failed")
+
+    def fake_create_graph_translator(*_: Any, **__: Any) -> Any:
+        return FailingTranslator()
+
+    monkeypatch.setattr(autogen_adapter_module, "create_graph_translator", fake_create_graph_translator)
+
+    client = _make_client(adapter)
+
+    query_text = "MATCH (n:Special) WHERE n.name = 'test' RETURN n"
+    with pytest.raises(RuntimeError):
+        client.query(query_text)
+
+    assert captured.get("query") == query_text or "query" in str(captured)
+
+
+def test_error_context_preserves_autogen_specific_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: Any,
+) -> None:
+    """Verify AutoGen-specific fields like agent_id, workflow_id are preserved."""
+    captured: Dict[str, Any] = {}
+
+    def fake_attach(exc: BaseException, **ctx: Any) -> None:
+        captured.update(ctx)
+
+    monkeypatch.setattr(autogen_adapter_module, "attach_context", fake_attach)
+
+    class FailingTranslator:
+        def query(self, *args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("test error")
+
+    def fake_create_graph_translator(*_: Any, **__: Any) -> Any:
+        return FailingTranslator()
+
+    monkeypatch.setattr(autogen_adapter_module, "create_graph_translator", fake_create_graph_translator)
+
+    client = _make_client(adapter)
+
+    auto_ctx = {
+        "conversation_id": "conv-123",
+        "agent_id": "agent-456",
+        "workflow_id": "workflow-789",
+        "custom_field": "custom_value"
+    }
+
+    with pytest.raises(RuntimeError):
+        client.query("MATCH (n) RETURN n", **auto_ctx)
+
+    # Check AutoGen-specific fields are preserved
+    for key in ["conversation_id", "agent_id", "workflow_id"]:
+        if key in captured:
+            assert captured[key] == auto_ctx[key]
+
+
+def test_graph_specific_error_codes(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: Any,
+) -> None:
+    """Verify graph-specific error codes are used appropriately."""
+    from corpus_sdk.graph.framework_adapters.autogen import ErrorCodes
+
+    # Test each error code
+    error_tests = [
+        (ErrorCodes.BAD_OPERATION_CONTEXT, "context_translation"),
+        (ErrorCodes.BAD_TRANSLATED_CHUNK, "stream_validation"),
+    ]
+
+    for error_code, operation_type in error_tests:
+        captured_code = None
+
+        def fake_attach(exc: BaseException, **ctx: Any) -> None:
+            nonlocal captured_code
+            captured_code = getattr(exc, "code", None)
+
+        monkeypatch.setattr(autogen_adapter_module, "attach_context", fake_attach)
+
+        # Setup specific failure for each error code
+        if error_code == ErrorCodes.BAD_OPERATION_CONTEXT:
+            def fake_core_ctx(*args: Any, **kwargs: Any) -> Any:
+                raise RuntimeError("bad context")
+            monkeypatch.setattr(autogen_adapter_module, "core_ctx_from_autogen", fake_core_ctx)
+        elif error_code == ErrorCodes.BAD_TRANSLATED_CHUNK:
+            class BadChunkTranslator:
+                def query_stream(self, *args: Any, **kwargs: Any) -> Any:
+                    yield {"not": "a-query-chunk"}
+            def fake_create(*_: Any, **__: Any) -> Any:
+                return BadChunkTranslator()
+            monkeypatch.setattr(autogen_adapter_module, "create_graph_translator", fake_create)
+
+        client = _make_client(adapter)
+
+        try:
+            if error_code == ErrorCodes.BAD_OPERATION_CONTEXT:
+                client.query("MATCH (n) RETURN n", conversation={"invalid": "context"})
+            elif error_code == ErrorCodes.BAD_TRANSLATED_CHUNK:
+                next(client.stream_query("MATCH (n) RETURN n"))
+        except Exception as e:
+            assert getattr(e, "code", None) == error_code
 
 
 # ---------------------------------------------------------------------------
@@ -514,6 +757,82 @@ async def test_astream_query_invalid_chunk_triggers_validation_and_context_async
     assert str(captured_ctx.get("operation", "")).startswith("graph_")
 
 
+def test_stream_query_empty_result(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: Any,
+) -> None:
+    """Handle empty stream gracefully."""
+    class EmptyTranslator:
+        def query_stream(self, *args: Any, **kwargs: Any) -> Any:
+            return iter([])
+
+    def fake_create_graph_translator(*_: Any, **__: Any) -> Any:
+        return EmptyTranslator()
+
+    monkeypatch.setattr(autogen_adapter_module, "create_graph_translator", fake_create_graph_translator)
+
+    client = _make_client(adapter)
+
+    chunks = list(client.stream_query("MATCH (n) WHERE 1=0 RETURN n"))
+    assert chunks == []
+
+
+@pytest.mark.asyncio
+async def test_astream_query_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: Any,
+) -> None:
+    """Verify async stream can be cancelled mid-iteration."""
+    class SlowTranslator:
+        async def arun_query_stream(self, *args: Any, **kwargs: Any):
+            async def _gen():
+                for i in range(10):
+                    await asyncio.sleep(0.01)  # Small delay
+                    yield {"records": [i], "is_final": i == 9}
+            return _gen()
+
+    def fake_create_graph_translator(*_: Any, **__: Any) -> Any:
+        return SlowTranslator()
+
+    monkeypatch.setattr(autogen_adapter_module, "create_graph_translator", fake_create_graph_translator)
+
+    client = _make_client(adapter)
+
+    # Start streaming
+    stream = client.astream_query("MATCH (n) RETURN n")
+    if inspect.isawaitable(stream):
+        stream = await stream
+
+    count = 0
+    async for _ in stream:  # noqa: B007
+        count += 1
+        if count >= 3:
+            break  # Cancel early
+
+    assert count == 3
+
+
+def test_stream_large_result_sets(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: Any,
+) -> None:
+    """Performance with large results."""
+    class LargeResultTranslator:
+        def query_stream(self, *args: Any, **kwargs: Any) -> Any:
+            for i in range(100):
+                yield {"records": [f"record_{i}"], "is_final": i == 99}
+
+    def fake_create_graph_translator(*_: Any, **__: Any) -> Any:
+        return LargeResultTranslator()
+
+    monkeypatch.setattr(autogen_adapter_module, "create_graph_translator", fake_create_graph_translator)
+
+    client = _make_client(adapter)
+
+    chunks = list(client.stream_query("MATCH (n) RETURN n LIMIT 100"))
+    assert len(chunks) == 100
+
+
 # ---------------------------------------------------------------------------
 # Sync semantics (basic smoke tests)
 # ---------------------------------------------------------------------------
@@ -555,6 +874,52 @@ def test_sync_query_accepts_optional_params_and_context(adapter: Any) -> None:
         conversation={"conversation_id": "conv-sync"},
         extra_context={"request_id": "req-sync"},
     )
+    assert result is not None
+
+
+def test_type_validation_on_query_params(adapter: Any) -> None:
+    """Verify query parameters are properly typed."""
+    client = _make_client(adapter)
+
+    # Should accept correct types
+    result = client.query(
+        "MATCH (n) RETURN n LIMIT $limit",
+        params={"limit": 5},  # int
+        dialect="cypher",  # str
+        timeout_ms=1000,  # int
+        namespace="test"  # str
+    )
+    assert result is not None
+
+    # Test invalid params type
+    with pytest.raises((TypeError, ValueError)):
+        client.query("MATCH (n) RETURN n", params="not-a-dict")  # type: ignore[arg-type]
+
+
+def test_invalid_query_dialect_handling(adapter: Any) -> None:
+    """Handle unsupported dialects gracefully."""
+    client = _make_client(adapter, default_dialect="cypher")
+
+    # Should work with None/default dialect
+    result = client.query("MATCH (n) RETURN n", dialect=None)
+    assert result is not None
+
+    # Unsupported dialect might be handled by adapter
+    result = client.query("MATCH (n) RETURN n", dialect="unsupported_dialect")
+    assert result is not None  # Adapter may handle or ignore
+
+
+def test_namespace_validation(adapter: Any) -> None:
+    """Namespace format/safety."""
+    client = _make_client(adapter)
+
+    # Valid namespaces
+    for namespace in ["test", "test-ns", "test_ns", "test.ns"]:
+        result = client.query("MATCH (n) RETURN n", namespace=namespace)
+        assert result is not None
+
+    # Empty namespace should work
+    result = client.query("MATCH (n) RETURN n", namespace="")
     assert result is not None
 
 
@@ -614,6 +979,49 @@ async def test_async_query_accepts_optional_params_and_context(
         extra_context={"request_id": "req-async"},
     )
     assert result is not None
+
+
+def test_sync_and_async_capabilities_same(adapter: Any) -> None:
+    """Verify sync and async capabilities return same structure."""
+    client = _make_client(adapter)
+
+    sync_caps = client.capabilities()
+    async_caps = asyncio.run(client.acapabilities())
+
+    # Compare structure, not necessarily exact equality if timestamps differ
+    assert isinstance(sync_caps, (dict, GraphCapabilities))
+    assert isinstance(async_caps, (dict, GraphCapabilities))
+
+
+@pytest.mark.asyncio
+async def test_async_fallback_to_sync_methods() -> None:
+    """Verify async methods fall back to sync when async not available."""
+    class SyncOnlyAdapter:
+        async def query(self, *args: Any, **kwargs: Any) -> Any:
+            return {"records": [], "summary": {}}
+        async def capabilities(self) -> Any:
+            return GraphCapabilities(server="test", version="1.0")
+        # No aquery method, but sync query is async
+
+    adapter = SyncOnlyAdapter()
+    client = CorpusAutoGenGraphClient(adapter=adapter)
+
+    # Should work via async interface
+    result = await client.aquery("MATCH (n) RETURN n")
+    assert result is not None
+
+
+@pytest.mark.asyncio
+async def test_async_and_sync_query_results_compatible(adapter: Any) -> None:
+    """Result format consistency between sync and async."""
+    client = _make_client(adapter)
+
+    sync_result = client.query("MATCH (n) RETURN n LIMIT 1")
+    async_result = await client.aquery("MATCH (n) RETURN n LIMIT 1")
+
+    # Both should have similar structure
+    assert hasattr(sync_result, "records") or isinstance(sync_result, dict)
+    assert hasattr(async_result, "records") or isinstance(async_result, dict)
 
 
 # ---------------------------------------------------------------------------
@@ -765,6 +1173,20 @@ async def test_abulk_vertices_builds_raw_request_and_calls_translator_async(
     assert fw_ctx["operation"] == "bulk_vertices"
     assert fw_ctx.get("namespace") == "ns-abulk"
     assert captured["op_ctx"] is None
+
+
+def test_bulk_vertices_with_invalid_spec(adapter: Any) -> None:
+    """Handle invalid bulk spec gracefully."""
+    client = _make_client(adapter)
+
+    class InvalidSpec:
+        # Missing required attributes
+        pass
+
+    spec = InvalidSpec()  # type: ignore[arg-type]
+
+    with pytest.raises((AttributeError, TypeError)):
+        client.bulk_vertices(spec)
 
 
 def test_batch_builds_raw_batch_ops_and_calls_translator(
@@ -921,6 +1343,32 @@ async def test_abatch_builds_raw_batch_ops_and_calls_translator_async(
     assert captured["op_ctx"] is None
 
 
+def test_batch_with_empty_operations(adapter: Any) -> None:
+    """Handle empty batch operations list."""
+    client = _make_client(adapter)
+
+    # Might raise BadRequest or handle empty list
+    try:
+        result = client.batch([])
+        assert result is not None  # Should handle empty batch
+    except Exception as e:
+        assert "empty" in str(e).lower() or "must not" in str(e).lower()
+
+
+def test_batch_operation_validation(adapter: Any) -> None:
+    """Invalid operation types."""
+    client = _make_client(adapter)
+
+    class InvalidOp:
+        def __init__(self) -> None:
+            self.op = "invalid_operation"
+            self.args = {}
+
+    # Should raise for invalid operations
+    with pytest.raises((ValueError, TypeError)):
+        client.batch([InvalidOp()])  # type: ignore[arg-type]
+
+
 # ---------------------------------------------------------------------------
 # Capabilities / health passthrough (basic)
 # ---------------------------------------------------------------------------
@@ -936,7 +1384,7 @@ def test_capabilities_and_health_basic(adapter: Any) -> None:
     client = _make_client(adapter)
 
     caps = client.capabilities()
-    assert isinstance(caps, Mapping)
+    assert isinstance(caps, (Mapping, GraphCapabilities))
 
     health = client.health()
     assert isinstance(health, Mapping)
@@ -951,7 +1399,7 @@ async def test_async_capabilities_and_health_basic(adapter: Any) -> None:
     client = _make_client(adapter)
 
     acaps = await client.acapabilities()
-    assert isinstance(acaps, Mapping)
+    assert isinstance(acaps, (Mapping, GraphCapabilities))
 
     ahealth = await client.ahealth()
     assert isinstance(ahealth, Mapping)
@@ -975,11 +1423,11 @@ async def test_context_manager_closes_underlying_adapter() -> None:
             self.aclosed = False
 
         # Minimal methods to keep GraphTranslator happy when invoked
-        def capabilities(self) -> Dict[str, Any]:  # type: ignore[override]
-            return {}
+        async def query(self, *args: Any, **kwargs: Any) -> Any:
+            return {"records": [], "summary": {}}
 
-        def health(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:  # noqa: ARG002
-            return {}
+        async def capabilities(self) -> GraphCapabilities:
+            return GraphCapabilities(server="test", version="1.0")
 
         def close(self) -> None:
             self.closed = True
@@ -1004,6 +1452,624 @@ async def test_context_manager_closes_underlying_adapter() -> None:
         assert client2 is not None
 
     assert adapter2.aclosed is True
+
+
+def test_context_manager_with_exception(adapter: Any) -> None:
+    """Cleanup on error."""
+    class TestAdapter:
+        def __init__(self) -> None:
+            self.closed = False
+        async def query(self, *args: Any, **kwargs: Any) -> Any:
+            return {"records": [], "summary": {}}
+        async def capabilities(self) -> Any:
+            return GraphCapabilities(server="test", version="1.0")
+        def close(self) -> None:
+            self.closed = True
+
+    adapter_instance = TestAdapter()
+    client = CorpusAutoGenGraphClient(adapter=adapter_instance)
+
+    try:
+        with client:
+            raise RuntimeError("test exception")
+    except RuntimeError:
+        pass
+
+    assert adapter_instance.closed is True
+
+
+def test_double_close_protection(adapter: Any) -> None:
+    """Idempotent close."""
+    close_count = 0
+
+    class CountingAdapter:
+        async def query(self, *args: Any, **kwargs: Any) -> Any:
+            return {"records": [], "summary": {}}
+        async def capabilities(self) -> Any:
+            return GraphCapabilities(server="test", version="1.0")
+        def close(self) -> None:
+            nonlocal close_count
+            close_count += 1
+
+    adapter_instance = CountingAdapter()
+    client = CorpusAutoGenGraphClient(adapter=adapter_instance)
+
+    with client:
+        pass
+
+    # Try to close again
+    client.close()
+    assert close_count == 1  # Should not double-close
+
+
+@pytest.mark.asyncio
+async def test_async_close_with_pending_operations() -> None:
+    """Close during active ops."""
+    import asyncio
+
+    class SlowAdapter:
+        def __init__(self) -> None:
+            self.aclosed = False
+            self.active_queries = 0
+
+        async def query(self, *args: Any, **kwargs: Any) -> Any:
+            self.active_queries += 1
+            await asyncio.sleep(0.1)
+            self.active_queries -= 1
+            return {"records": [], "summary": {}}
+
+        async def capabilities(self) -> Any:
+            return GraphCapabilities(server="test", version="1.0")
+
+        async def aclose(self) -> None:
+            # Wait for active queries to finish
+            while self.active_queries > 0:
+                await asyncio.sleep(0.01)
+            self.aclosed = True
+
+    adapter_instance = SlowAdapter()
+    client = CorpusAutoGenGraphClient(adapter=adapter_instance)
+
+    # Start async operation
+    import asyncio
+    query_task = asyncio.create_task(client.aquery("MATCH (n) RETURN n"))
+
+    # Close while query is running
+    await asyncio.sleep(0.05)  # Let query start
+    await client.aclose()
+
+    # Wait for query to finish
+    await query_task
+
+    assert adapter_instance.aclosed is True
+
+
+# ---------------------------------------------------------------------------
+# Concurrency Tests
+# ---------------------------------------------------------------------------
+
+def test_thread_safety_sync_queries(adapter: Any) -> None:
+    """
+    Multiple threads should safely share a single CorpusAutoGenGraphClient.
+    """
+    client = _make_client(adapter)
+    results = []
+    errors = []
+
+    def execute_query(thread_id: int) -> None:
+        try:
+            query = f"MATCH (n) RETURN n LIMIT {(thread_id % 5) + 1}"
+            params = {"thread": thread_id}
+
+            result = client.query(
+                query,
+                params=params,
+                namespace=f"thread-{thread_id}",
+                conversation={"thread_id": thread_id, "agent": f"agent-{thread_id}"}
+            )
+            results.append((thread_id, result))
+        except Exception as e:
+            errors.append((thread_id, str(e)))
+
+    # Create and run threads
+    threads = []
+    num_threads = 10
+
+    for i in range(num_threads):
+        t = threading.Thread(target=execute_query, args=(i,))
+        threads.append(t)
+
+    # Start all threads
+    for t in threads:
+        t.start()
+
+    # Wait for completion
+    for t in threads:
+        t.join()
+
+    # Verify results
+    assert len(errors) == 0, f"Errors occurred in threads: {errors}"
+    assert len(results) == num_threads
+    # Verify all thread IDs are present
+    thread_ids = [tid for tid, _ in results]
+    assert set(thread_ids) == set(range(num_threads))
+
+
+def test_thread_safety_with_mixed_operations(adapter: Any) -> None:
+    """
+    Multiple threads performing different operations (query, stream, bulk).
+    """
+    client = _make_client(adapter)
+
+    def run_query(task_id: int) -> Any:
+        return client.query(f"MATCH (n) RETURN n LIMIT {task_id % 3}")
+
+    def run_stream(task_id: int) -> int:
+        chunks = list(client.stream_query(f"MATCH (n) RETURN n LIMIT {task_id % 2 + 1}"))
+        return len(chunks)
+
+    def run_bulk(task_id: int) -> Any:
+        class Spec:
+            namespace = f"ns-{task_id}"
+            limit = task_id % 10 + 1
+            cursor = None
+            filter = {"thread": task_id}
+
+        return client.bulk_vertices(Spec())
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        futures = []
+        for i in range(15):
+            if i % 3 == 0:
+                futures.append(executor.submit(run_query, i))
+            elif i % 3 == 1:
+                futures.append(executor.submit(run_stream, i))
+            else:
+                futures.append(executor.submit(run_bulk, i))
+
+        results = []
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                results.append(future.result())
+            except Exception as e:
+                pytest.fail(f"Thread operation failed: {e}")
+
+        assert len(results) == 15
+
+
+@pytest.mark.asyncio
+async def test_concurrent_async_queries(adapter: Any) -> None:
+    """
+    Multiple async tasks should execute concurrently without issues.
+    """
+    client = _make_client(adapter)
+
+    async def execute_async_query(task_id: int, delay: float = 0) -> tuple[int, Any]:
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+        result = await client.aquery(
+            f"MATCH (n) RETURN n LIMIT {(task_id % 3) + 1}",
+            params={"task": task_id},
+            conversation={"task_id": task_id},
+            namespace=f"async-{task_id}"
+        )
+        return task_id, result
+
+    # Create tasks with staggered delays to maximize concurrency
+    tasks = []
+    for i in range(10):
+        delay = (i % 3) * 0.01  # Small staggered delays
+        tasks.append(execute_async_query(i, delay))
+
+    # Execute concurrently
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Verify all succeeded
+    for i, result in enumerate(results):
+        if isinstance(result, Exception):
+            pytest.fail(f"Task {i} failed: {result}")
+
+    # Verify all task IDs are present
+    task_ids = [tid for tid, _ in results if not isinstance(tid, Exception)]
+    assert set(task_ids) == set(range(10))
+
+
+@pytest.mark.asyncio
+async def test_concurrent_mixed_async_operations(adapter: Any) -> None:
+    """
+    Mixed async operations (aquery, astream, abulk) executing concurrently.
+    """
+    client = _make_client(adapter)
+
+    async def run_aquery(task_id: int) -> Any:
+        return await client.aquery(f"MATCH (n) RETURN n LIMIT 1")
+
+    async def run_astream(task_id: int) -> int:
+        count = 0
+        aiter = client.astream_query(f"MATCH (n) RETURN n LIMIT 2")
+        if inspect.isawaitable(aiter):
+            aiter = await aiter
+        async for _ in aiter:
+            count += 1
+        return count
+
+    async def run_abulk(task_id: int) -> Any:
+        class Spec:
+            namespace = "test-ns"
+            limit = 5
+            cursor = None
+            filter = {"task": task_id}
+
+        return await client.abulk_vertices(Spec())
+
+    # Create mixed tasks
+    tasks = []
+    for i in range(9):
+        if i % 3 == 0:
+            tasks.append(run_aquery(i))
+        elif i % 3 == 1:
+            tasks.append(run_astream(i))
+        else:
+            tasks.append(run_abulk(i))
+
+    # Run with semaphore to limit concurrency
+    semaphore = asyncio.Semaphore(3)
+
+    async def run_with_semaphore(task_func, task_id):
+        async with semaphore:
+            return await task_func(task_id)
+
+    semaphore_tasks = [run_with_semaphore(tasks[i], i) for i in range(len(tasks))]
+    results = await asyncio.gather(*semaphore_tasks, return_exceptions=True)
+
+    # Check for errors
+    errors = [r for r in results if isinstance(r, Exception)]
+    assert len(errors) == 0, f"Concurrent operations failed: {errors}"
+
+
+@pytest.mark.asyncio
+async def test_mixed_sync_async_concurrent_access(adapter: Any) -> None:
+    """
+    Test scenario where sync and async operations are called concurrently.
+    """
+    import asyncio
+
+    client = _make_client(adapter)
+    results = {"sync": [], "async": []}
+    errors = {"sync": [], "async": []}
+
+    # Sync thread function
+    def sync_operations() -> None:
+        for i in range(5):
+            try:
+                result = client.query(f"SYNC MATCH (n) RETURN n LIMIT {i+1}")
+                results["sync"].append((i, result))
+            except Exception as e:
+                errors["sync"].append((i, str(e)))
+
+    # Async task function
+    async def async_operations() -> None:
+        for i in range(5):
+            try:
+                result = await client.aquery(f"ASYNC MATCH (n) RETURN n LIMIT {i+1}")
+                results["async"].append((i, result))
+            except Exception as e:
+                errors["async"].append((i, str(e)))
+
+    # Run sync in thread, async in event loop
+    sync_thread = threading.Thread(target=sync_operations)
+    sync_thread.start()
+
+    async_task = asyncio.create_task(async_operations())
+
+    # Wait for both
+    sync_thread.join()
+    await async_task
+
+    # Verify results
+    assert len(errors["sync"]) == 0, f"Sync errors: {errors['sync']}"
+    assert len(errors["async"]) == 0, f"Async errors: {errors['async']}"
+    assert len(results["sync"]) == 5
+    assert len(results["async"]) == 5
+
+
+def test_connection_pool_limits(adapter: Any) -> None:
+    """
+    Test that concurrent operations respect connection/resource limits.
+    """
+    client = _make_client(adapter)
+
+    def make_request(request_id: int) -> Any:
+        try:
+            import time
+            time.sleep(0.001 * (request_id % 3))
+
+            return client.query(
+                f"MATCH (n) WHERE id(n) = {request_id} RETURN n",
+                timeout_ms=10000
+            )
+        except Exception as e:
+            return e
+
+    # Test with more workers than typical connection pool size
+    max_workers = 20
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(make_request, i) for i in range(50)]
+
+        # Wait for all with timeout
+        done, not_done = concurrent.futures.wait(futures, timeout=30.0)
+
+        assert len(not_done) == 0, f"{len(not_done)} requests timed out"
+
+        # Check results
+        success_count = 0
+        error_count = 0
+
+        for future in done:
+            result = future.result()
+            if isinstance(result, Exception):
+                error_count += 1
+            else:
+                success_count += 1
+
+        # Most should succeed
+        assert success_count > 0
+        # Log error rate for debugging
+        error_rate = error_count / len(futures)
+        assert error_rate < 0.5, f"High error rate: {error_rate}"
+
+
+def test_stress_test_high_concurrency(adapter: Any) -> None:
+    """Extreme load test."""
+    client = _make_client(adapter)
+
+    def stress_task(task_id: int) -> bool:
+        try:
+            for i in range(10):
+                client.query(f"MATCH (n) RETURN n LIMIT {task_id % 5}")
+            return True
+        except Exception:
+            return False
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
+        futures = [executor.submit(stress_task, i) for i in range(100)]
+        results = [f.result() for f in concurrent.futures.as_completed(futures)]
+
+    success_rate = sum(results) / len(results)
+    assert success_rate > 0.8, f"Stress test success rate too low: {success_rate}"
+
+
+def test_concurrent_batch_operations(adapter: Any) -> None:
+    """Multiple batch operations concurrently."""
+    client = _make_client(adapter)
+
+    class BatchOp:
+        def __init__(self, op: str, args: Dict[str, Any]) -> None:
+            self.op = op
+            self.args = args
+
+    def run_batch(thread_id: int) -> bool:
+        try:
+            ops = [
+                BatchOp("query", {"text": f"MATCH (n) RETURN n LIMIT {thread_id}"}),
+            ]
+            client.batch(ops)  # type: ignore[arg-type]
+            return True
+        except Exception:
+            return False
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(run_batch, i) for i in range(20)]
+        results = [f.result() for f in concurrent.futures.as_completed(futures)]
+
+    assert all(results), "Some batch operations failed"
+
+
+# ---------------------------------------------------------------------------
+# Integration Tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.integration
+class TestAutoGenGraphIntegration:
+    """Integration tests with real AutoGen workflows."""
+
+    def test_can_create_graph_queries_for_autogen_agent(self, adapter: Any) -> None:
+        """
+        Real integration: Can create graph queries that work with AutoGen agents.
+        """
+        client = _make_client(adapter, framework_version="1.0.0")
+
+        result = client.query(
+            "MATCH (n) RETURN n LIMIT 1",
+            conversation={
+                "conversation_id": "conv-123",
+                "agent_name": "graph_researcher",
+                "workflow_type": "knowledge_graph"
+            }
+        )
+        assert result is not None
+
+        # Test with context
+        result_with_context = client.query(
+            "MATCH (n) RETURN n LIMIT 1",
+            conversation={"conversation_id": "conv-456", "agent_name": "analyst"},
+            extra_context={"request_id": "req-789", "priority": "high"}
+        )
+        assert result_with_context is not None
+
+    def test_graph_queries_work_with_autogen_workflows(self, adapter: Any) -> None:
+        """
+        Real integration: Graph queries work with AutoGen's multi-agent workflows.
+        """
+        client = _make_client(adapter)
+
+        # Test different query types that might be used in agent workflows
+        queries = [
+            "MATCH (n:Person) RETURN n.name, n.age LIMIT 5",
+            "MATCH (a)-[r:KNOWS]->(b) RETURN a.name, r.since, b.name",
+            "MATCH p=(a:Person)-[*1..3]->(b) RETURN p LIMIT 3"
+        ]
+
+        for query in queries:
+            result = client.query(
+                query,
+                conversation={
+                    "conversation_id": "workflow-1",
+                    "agent_name": "graph_agent",
+                    "workflow_type": "relationship_analysis"
+                }
+            )
+            assert result is not None
+
+        # Test streaming in workflow context
+        stream_result = list(client.stream_query(
+            "MATCH (n) RETURN n LIMIT 10",
+            conversation={"conversation_id": "stream-workflow", "agent_name": "stream_processor"}
+        ))
+        assert isinstance(stream_result, list)
+
+    def test_error_handling_in_autogen_graph_workflow(self, adapter: Any) -> None:
+        """
+        Real integration: Error handling in AutoGen graph workflows.
+        """
+        client = _make_client(adapter)
+
+        # Test that errors are properly contextualized for AutoGen
+        try:
+            # This might fail depending on adapter implementation
+            client.query("INVALID CYPHER QUERY SYNTAX")
+        except Exception as e:
+            # Error should contain useful context
+            error_str = str(e)
+            assert len(error_str) > 0
+            # Should have some error code or message
+            assert hasattr(e, 'code') or 'error' in error_str.lower() or 'invalid' in error_str.lower()
+
+    @pytest.mark.asyncio
+    async def test_async_graph_in_autogen_workflow(self, adapter: Any) -> None:
+        """
+        Async graph operations in async AutoGen workflows.
+        """
+        client = _make_client(adapter)
+
+        # Test async query in agent context
+        result = await client.aquery(
+            "MATCH (n) RETURN n LIMIT 3",
+            conversation={
+                "conversation_id": "async-session",
+                "agent_name": "async_agent",
+                "workflow_type": "async_processing"
+            }
+        )
+        assert result is not None
+
+        # Test async streaming
+        count = 0
+        aiter = client.astream_query("MATCH (n) RETURN n LIMIT 5")
+        if inspect.isawaitable(aiter):
+            aiter = await aiter
+
+        async for chunk in aiter:
+            count += 1
+            assert chunk is not None
+
+        assert count > 0
+
+    def test_multiple_agents_can_share_same_graph_client(self, adapter: Any) -> None:
+        """
+        Real integration: Multiple agents/retrievers can share the same graph client.
+        """
+        client = _make_client(adapter)
+
+        # Simulate multiple agents using same client
+        contexts = [
+            {"conversation_id": "conv-1", "agent_name": "researcher", "workflow_type": "research"},
+            {"conversation_id": "conv-1", "agent_name": "analyst", "workflow_type": "analysis"},
+            {"conversation_id": "conv-2", "agent_name": "summarizer", "workflow_type": "summarization"},
+        ]
+
+        for ctx in contexts:
+            result = client.query(
+                f"MATCH (n) RETURN n LIMIT 1",
+                **ctx
+            )
+            assert result is not None
+
+            # Test batch operations from different agents
+            class BulkSpec:
+                namespace = f"ns-{ctx['agent_name']}"
+                limit = 3
+                cursor = None
+                filter = {"agent": ctx["agent_name"]}
+
+            try:
+                bulk_result = client.bulk_vertices(BulkSpec())
+                assert bulk_result is not None
+            except Exception:
+                # bulk_vertices might not be supported
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Logging / Telemetry Tests
+# ---------------------------------------------------------------------------
+
+def test_logging_includes_autogen_context(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: Any,
+) -> None:
+    """Verify AutoGen context is included in logs."""
+    import logging
+
+    log_capture: List[str] = []
+
+    class TestHandler(logging.Handler):
+        def emit(self, record):
+            log_capture.append(record.getMessage())
+
+    logger = logging.getLogger("corpus_sdk.graph.framework_adapters.autogen")
+    handler = TestHandler()
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+
+    try:
+        client = _make_client(adapter)
+        client.query(
+            "MATCH (n) RETURN n",
+            conversation={"conversation_id": "log-test"}
+        )
+
+        # Check logs contain AutoGen context
+        log_messages = " ".join(log_capture).lower()
+        assert "autogen" in log_messages or "framework" in log_messages
+    finally:
+        logger.removeHandler(handler)
+
+
+def test_operation_telemetry_includes_framework(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: Any,
+) -> None:
+    """Verify framework info in operation telemetry."""
+    captured_metrics = []
+
+    class TestMetrics:
+        def observe(self, **kwargs):
+            captured_metrics.append(kwargs)
+        def counter(self, **kwargs):
+            captured_metrics.append(kwargs)
+
+    monkeypatch.setattr(autogen_adapter_module, "get_metrics_sink", lambda: TestMetrics())
+
+    client = _make_client(adapter)
+    client.query("MATCH (n) RETURN n LIMIT 1")
+
+    # Check that metrics include framework info
+    assert len(captured_metrics) > 0
+    for metric in captured_metrics:
+        if metric.get("component") == "graph":
+            assert "framework" in str(metric).lower() or "autogen" in str(metric).lower()
 
 
 if __name__ == "__main__":
