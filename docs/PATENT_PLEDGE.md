@@ -3,7 +3,7 @@
 To encourage broad adoption and innovation around the Corpus Protocol Suite, **Interoperable Intelligence Inc.** makes the following defensive patent pledge:
 
 ### Patent Non-Assertion Pledge
-**We pledge not to assert our patents against you for implementing the Corpus Protocol specifications**, except in defensive counterclaims.
+**We pledge not to assert our patent claims against you for implementing the Corpus Protocol specifications**, except in defensive counterclaims.
 
 More specifically:
 
@@ -17,22 +17,22 @@ More specifically:
    This pledge applies only to patent claims that are **necessarily infringed by conformant implementation** of the Corpus Protocol specifications as published in `docs/spec/`.
    
    **Covered (Essential Claims):**
-   - Patents covering protocol message formats, routing mechanisms, interface definitions, and other elements required for compliant implementation
+   - Patent claims covering protocol message formats, routing mechanisms, interface definitions, and other elements required for compliant implementation
    - Patent claims where there is no technically feasible alternative to implement the specification without infringement
    
    **Not Covered (Non-Essential Claims):**
-   - Patents on optional features, optimizations, or extensions beyond the specifications
-   - Patents on technologies that use or integrate with Corpus Protocol but are not required for protocol compliance
-   - Patents on products, services, algorithms, or implementations independent of protocol conformance
-   - Patents unrelated to protocol implementation or interoperability
+   - Patent claims on optional features, optimizations, or extensions beyond the specifications
+   - Patent claims on technologies that use or integrate with Corpus Protocol but are not required for protocol compliance
+   - Patent claims on products, services, algorithms, or implementations independent of protocol conformance
+   - Patent claims unrelated to protocol implementation or interoperability
    - Implementation choices where technically feasible alternatives exist
    
-   **Clarifying Example:** If you build a Corpus-compatible API gateway (covered under this pledge) and also develop a proprietary ensemble optimization algorithm (not covered), this pledge protects your gateway's protocol implementation but does not prevent patent enforcement on the separate optimization technology.
+   **Clarifying Example:** If you build a Corpus-compatible API gateway (covered under this pledge) and also develop a proprietary ensemble optimization algorithm (not covered), this pledge protects your gateway's protocol implementation but does not prevent enforcement of patent claims on the separate optimization technology.
 
 2. **Defensive Suspension**
    This pledge is suspended with respect to any entity that:
-   - Asserts any patent against Interoperable Intelligence Inc. or its affiliates
-   - Asserts any patent **related to protocol implementation, interoperability, or AI infrastructure** against any user, distributor, or implementer of the Corpus Protocol
+   - Asserts any patent claim against Interoperable Intelligence Inc. or its affiliates
+   - Asserts any patent claim **related to protocol implementation, interoperability, or AI infrastructure** against any user, distributor, or implementer of the Corpus Protocol
    - Challenges the validity of any Interoperable Intelligence Inc. patent in a proceeding
 
 3. **Scope & Limitations**
@@ -58,9 +58,9 @@ More specifically:
 4. **Definitions**
    - **"Implementing"** means creating software that adheres to the protocol specifications
    - **"Essential Patent Claims"** means patent claims that are necessarily infringed by any conformant implementation of the Corpus Protocol specifications, where no technically feasible alternative exists
-   - **"Defensive counterclaim"** means asserting patents only as a counterclaim in response to being sued first, specifically for patents covering the Corpus Protocol specifications or related to its implementation
+   - **"Defensive counterclaim"** means asserting patent claims only as a counterclaim in response to being sued first, specifically for patent claims covering the Corpus Protocol specifications or related to its implementation
    - **"Corpus Protocol specifications"** means the officially designated and versioned documents published by Interoperable Intelligence Inc. in `docs/spec/` and their authorized successors
-   - **"Related to protocol implementation"** means patents covering protocol interfaces, interoperability patterns, or AI infrastructure directly relevant to Corpus Protocol implementation
+   - **"Related to protocol implementation"** means patent claims covering protocol interfaces, interoperability patterns, or AI infrastructure directly relevant to Corpus Protocol implementation
    - **"Conformant implementation"** means implementation that complies with the mandatory requirements specified in `docs/spec/` without requiring use of optional features or extensions
 
 ### Certification Without Trademark Conflict
@@ -101,13 +101,13 @@ This pledge applies only to Essential Patent Claims as defined above. All other 
 >
 > ✅ **Protected:** You implement Corpus Protocol routing and add your own proprietary features on top (the protocol implementation is protected).
 >
-> ⚠️ **Not Protected - Separate Analysis:** You implement Corpus Protocol (protected) and separately build an ensemble optimization algorithm that infringes our patents (not protected - separate technology).
+> ⚠️ **Not Protected - Separate Analysis:** You implement Corpus Protocol (protected) and separately build an ensemble optimization algorithm that infringes our patent claims (not protected - separate technology).
 >
-> ⚠️ **Not Protected - Optional Extension:** You implement an optional extension to Corpus Protocol that wasn't in `docs/spec/` and it infringes our patents (extensions beyond specification not covered).
+> ⚠️ **Not Protected - Optional Extension:** You implement an optional extension to Corpus Protocol that wasn't in `docs/spec/` and it infringes our patent claims (extensions beyond specification not covered).
 >
 > ⚠️ **Not Protected (pledge suspended):** You sue Interoperable Intelligence Inc. for patent infringement.
 >
-> ⚠️ **Not Protected (pledge suspended):** You sue another Corpus implementer claiming their protocol adapter infringes your patents.
+> ⚠️ **Not Protected (pledge suspended):** You sue another Corpus implementer claiming their protocol adapter infringes your patent claims.
 >
 > ⚠️ **Not Protected:** You use "Corpus" trademarks without permission (trademark law applies separately).
 >
@@ -118,7 +118,7 @@ For clarification or to request a signed non-assertion covenant, contact:
 - Email: `legal@interoperable.ai` or `legal@corpus.io`
 - Web: `https://corpus.io/patents`
 
-For questions about whether specific patents or implementations are covered by this pledge, contact our legal team with details of your use case.
+For questions about whether specific patent claims or implementations are covered by this pledge, contact our legal team with details of your use case.
 
 ---
 
@@ -126,4 +126,5 @@ For questions about whether specific patents or implementations are covered by t
 **Effective Date:** December 23, 2025  
 **Last Updated:** December 23, 2025
 
-© 2026 Interoperable Intelligence Inc. This pledge may be referenced and linked freely.
+© 2025 Interoperable Intelligence Inc. This pledge may be referenced and linked freely.
+```
