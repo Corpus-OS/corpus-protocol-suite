@@ -85,6 +85,10 @@ def _assert_embedding_vector_shape(result: Any) -> None:
 
 def _make_embeddings(adapter: Any, **kwargs: Any) -> CorpusLangChainEmbeddings:
     """Construct a CorpusLangChainEmbeddings instance from the adapter."""
+    # If no model is specified, auto-select the first supported model
+    if "model" not in kwargs:
+        if hasattr(adapter, "supported_models") and adapter.supported_models:
+            kwargs["model"] = adapter.supported_models[0]
     return CorpusLangChainEmbeddings(corpus_adapter=adapter, **kwargs)
 
 
@@ -261,7 +265,7 @@ def test_runnable_config_passed_to_context_translation(
 
     embeddings = CorpusLangChainEmbeddings(
         corpus_adapter=adapter,
-        model="cfg-model",
+        model="mock-embed-512",
         framework_version="lc-test-version",
     )
 
@@ -307,7 +311,7 @@ def test_runnable_config_passed_to_context_translation_for_embed_query(
 
     embeddings = CorpusLangChainEmbeddings(
         corpus_adapter=adapter,
-        model="cfg-model-query",
+        model="mock-embed-512",
         framework_version="lc-test-version-query",
     )
 
@@ -385,7 +389,7 @@ def test_context_from_langchain_failure_still_embeds(
 
     embeddings = CorpusLangChainEmbeddings(
         corpus_adapter=adapter,
-        model="ctx-fail-model",
+        model="mock-embed-512",
         framework_version="lc-ctx-fail",
     )
 
@@ -412,7 +416,7 @@ def test_invalid_config_type_is_ignored(adapter: Any) -> None:
     """
     embeddings = CorpusLangChainEmbeddings(
         corpus_adapter=adapter,
-        model="invalid-config-model",
+        model="mock-embed-512",
     )
 
     # Deliberately pass a non-mapping config; this should not raise
@@ -678,6 +682,11 @@ def test_error_context_includes_langchain_metadata(
             raise RuntimeError(
                 "test error from langchain adapter: Check model configuration and API keys",
             )
+        
+        async def embed_batch(self, *args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError(
+                "test error from langchain adapter: Check model configuration and API keys",
+            )
 
     embeddings = CorpusLangChainEmbeddings(
         corpus_adapter=FailingAdapter(),
@@ -759,14 +768,14 @@ async def test_async_error_context_includes_langchain_metadata(
     }
 
     # Patch the translator so the async path fails deterministically.
-    with monkeypatch.context() as m:
-        m.setattr(embeddings, "_translator", FailingTranslator())
+    # Use object.__setattr__ to bypass Pydantic's PrivateAttr protection
+    object.__setattr__(embeddings, "_translator_cache", FailingTranslator())
 
-        with pytest.raises(
-            RuntimeError,
-            match="async test error from langchain translator",
-        ) as exc_info:
-            await embeddings.aembed_documents(["x", "y"], config=config)
+    with pytest.raises(
+        RuntimeError,
+        match="async test error from langchain translator",
+    ) as exc_info:
+        await embeddings.aembed_documents(["x", "y"], config=config)
 
     error_str = str(exc_info.value)
     assert "Verify API key" in error_str or "access permissions" in error_str
@@ -810,30 +819,30 @@ def test_embed_documents_error_context_includes_langchain_fields(
         model="test-model",
     )
 
-    with monkeypatch.context() as m:
-        m.setattr(embeddings, "_translator", FailingTranslator())
+    # Use object.__setattr__ to bypass Pydantic's PrivateAttr protection
+    object.__setattr__(embeddings, "_translator_cache", FailingTranslator())
 
-        config = {
-            "run_id": "run-123",
-            "run_name": "test-run",
-            "tags": ["tag-a"],
-            "metadata": {"pipeline": "test"},
-        }
+    config = {
+        "run_id": "run-123",
+        "run_name": "test-run",
+        "tags": ["tag-a"],
+        "metadata": {"pipeline": "test"},
+    }
 
-        with pytest.raises(RuntimeError) as exc_info:
-            embeddings.embed_documents(["text"], config=config)
+    with pytest.raises(RuntimeError) as exc_info:
+        embeddings.embed_documents(["text"], config=config)
 
-        error_str = str(exc_info.value)
-        assert "translator failed" in error_str
-        assert "Check model configuration" in error_str or "API limits" in error_str
+    error_str = str(exc_info.value)
+    assert "translator failed" in error_str
+    assert "Check model configuration" in error_str or "API limits" in error_str
 
-        ctx = captured
-        assert ctx["framework"] == "langchain"
-        assert ctx["operation"] == "embedding_documents"
-        assert ctx["model"] == "test-model"
-        # RunnableConfig fields should be surfaced where possible
-        assert ctx.get("run_id") == "run-123"
-        assert ctx.get("run_name") == "test-run"
+    ctx = captured
+    assert ctx["framework"] == "langchain"
+    assert ctx["operation"] == "embedding_documents"
+    assert ctx["model"] == "test-model"
+    # RunnableConfig fields should be surfaced where possible
+    assert ctx.get("run_id") == "run-123"
+    assert ctx.get("run_name") == "test-run"
 
 
 @pytest.mark.asyncio
@@ -865,23 +874,23 @@ async def test_aembed_query_error_context_includes_langchain_fields(
         model="async-test-model",
     )
 
-    with monkeypatch.context() as m:
-        m.setattr(embeddings, "_translator", FailingTranslator())
+    # Use object.__setattr__ to bypass Pydantic's PrivateAttr protection
+    object.__setattr__(embeddings, "_translator_cache", FailingTranslator())
 
-        config = {"run_id": "run-async-1", "run_name": "async-run"}
+    config = {"run_id": "run-async-1", "run_name": "async-run"}
 
-        with pytest.raises(RuntimeError) as exc_info:
-            await embeddings.aembed_query("hello", config=config)
+    with pytest.raises(RuntimeError) as exc_info:
+        await embeddings.aembed_query("hello", config=config)
 
-        error_str = str(exc_info.value)
-        assert "translator failed" in error_str
-        assert "Verify API key" in error_str or "access permissions" in error_str
+    error_str = str(exc_info.value)
+    assert "translator failed" in error_str
+    assert "Verify API key" in error_str or "access permissions" in error_str
 
-        ctx = captured
-        assert ctx["framework"] == "langchain"
-        assert ctx["operation"] == "embedding_query"
-        assert ctx.get("run_id") == "run-async-1"
-        assert ctx.get("model") == "async-test-model"
+    ctx = captured
+    assert ctx["framework"] == "langchain"
+    assert ctx["operation"] == "embedding_query"
+    assert ctx.get("run_id") == "run-async-1"
+    assert ctx.get("model") == "async-test-model"
 
 
 # ---------------------------------------------------------------------------
@@ -896,7 +905,7 @@ def test_sync_embed_documents_and_query_basic(adapter: Any) -> None:
     """
     embeddings = configure_langchain_embeddings(
         corpus_adapter=adapter,
-        model="sync-model",
+        model="mock-embed-512",
     )
 
     texts = ["alpha", "beta", "gamma"]
@@ -916,7 +925,7 @@ def test_empty_texts_embed_documents_returns_empty_matrix(adapter: Any) -> None:
     """
     embeddings = configure_langchain_embeddings(
         corpus_adapter=adapter,
-        model="empty-list-model",
+        model="mock-embed-512",
     )
 
     result = embeddings.embed_documents([])
@@ -931,7 +940,7 @@ def test_empty_string_embed_query_has_consistent_dimension(adapter: Any) -> None
     """
     embeddings = configure_langchain_embeddings(
         corpus_adapter=adapter,
-        model="empty-string-model",
+        model="mock-embed-512",
     )
 
     empty_vec = embeddings.embed_query("")
@@ -953,7 +962,7 @@ async def test_async_embed_documents_and_query_basic(adapter: Any) -> None:
     """
     embeddings = configure_langchain_embeddings(
         corpus_adapter=adapter,
-        model="async-model",
+        model="mock-embed-512",
     )
 
     # Ensure we actually have async methods and they are coroutine functions
@@ -980,7 +989,7 @@ async def test_async_and_sync_same_dimension(adapter: Any) -> None:
     """
     embeddings = configure_langchain_embeddings(
         corpus_adapter=adapter,
-        model="dim-model",
+        model="mock-embed-512",
     )
 
     texts = ["same-dim-1", "same-dim-2"]
@@ -1011,7 +1020,7 @@ def test_large_batch_sync_shape(adapter: Any) -> None:
     """
     embeddings = configure_langchain_embeddings(
         corpus_adapter=adapter,
-        model="large-batch-model",
+        model="mock-embed-512",
     )
 
     texts = [f"text-{i}" for i in range(50)]
@@ -1153,6 +1162,24 @@ async def test_context_manager_closes_underlying_adapter() -> None:
 
         def embed(self, texts: Sequence[str], **_: Any) -> list[list[float]]:
             return [[0.0] * 2 for _ in texts]
+        
+        async def embed_batch(self, spec: Any, **_: Any) -> Any:
+            from corpus_sdk.embedding.embedding_base import BatchEmbedResult, EmbeddingVector
+            embeddings = [
+                EmbeddingVector(
+                    vector=[0.0] * 2,
+                    text=text,
+                    model=spec.model,
+                    dimensions=2,
+                    index=i,
+                )
+                for i, text in enumerate(spec.texts)
+            ]
+            return BatchEmbedResult(
+                embeddings=embeddings,
+                model=spec.model,
+                total_texts=len(spec.texts),
+            )
 
         def close(self) -> None:
             self.closed = True
@@ -1163,14 +1190,14 @@ async def test_context_manager_closes_underlying_adapter() -> None:
     adapter = ClosingAdapter()
 
     # Sync context manager
-    with CorpusLangChainEmbeddings(corpus_adapter=adapter, model="ctx-model") as emb:
+    with CorpusLangChainEmbeddings(corpus_adapter=adapter, model="mock-embed-512") as emb:
         _ = emb.embed_documents(["x"])  # smoke
 
     assert adapter.closed is True
 
     # Async context manager
     adapter2 = ClosingAdapter()
-    emb2 = CorpusLangChainEmbeddings(corpus_adapter=adapter2, model="ctx-model-2")
+    emb2 = CorpusLangChainEmbeddings(corpus_adapter=adapter2, model="mock-embed-512")
 
     async with emb2:
         _ = await emb2.aembed_documents(["y"])
@@ -1190,7 +1217,7 @@ def test_shared_embedder_thread_safety(adapter: Any) -> None:
     """
     embedder = configure_langchain_embeddings(
         corpus_adapter=adapter,
-        model="concurrent-model",
+        model="mock-embed-512",
     )
 
     def embed_query(text: str) -> Any:
@@ -1216,7 +1243,7 @@ async def test_concurrent_async_embedding(adapter: Any) -> None:
     """
     embedder = configure_langchain_embeddings(
         corpus_adapter=adapter,
-        model="async-concurrent-model",
+        model="mock-embed-512",
     )
 
     async def embed_async(text: str) -> Any:
@@ -1273,7 +1300,7 @@ class TestLangChainIntegration:
 
         embedder = configure_langchain_embeddings(
             corpus_adapter=adapter,
-            model="integration-model",
+            model="mock-embed-512",
         )
 
         assert isinstance(embedder, Embeddings)
@@ -1301,7 +1328,7 @@ class TestLangChainIntegration:
 
         embedder = configure_langchain_embeddings(
             corpus_adapter=adapter,
-            model="chain-model",
+            model="mock-embed-512",
         )
 
         chain = RunnableLambda(lambda s: embedder.embed_query(s))
@@ -1318,14 +1345,21 @@ class TestLangChainIntegration:
         """
 
         class FailingAdapter:
-            def embed(self, texts: Sequence[str], **_: Any) -> list[list[float]]:
+            async def embed(self, spec: Any, ctx: Any = None) -> Any:
+                raise RuntimeError(
+                    "API limit reached: Please upgrade your plan or wait before retrying",
+                )
+
+            async def embed_batch(
+                self, spec: Any, ctx: Any = None
+            ) -> Any:
                 raise RuntimeError(
                     "API limit reached: Please upgrade your plan or wait before retrying",
                 )
 
         failing_embedder = CorpusLangChainEmbeddings(
             corpus_adapter=FailingAdapter(),
-            model="failing-model",
+            model="mock-embed-512",
         )
 
         with pytest.raises(RuntimeError) as exc_info:

@@ -59,6 +59,8 @@ testpaths = ["tests"]
 addopts = "-v --strict-markers --strict-config"
 markers = [
     "skip_if_not_supported: skip tests if feature is not supported by the adapter",
+    "integration: marks tests as integration tests (deselect with '-m \"not integration\"')",
+    "concurrency: marks tests that test concurrent behavior",
 ]
 
 # --- Formatting/Linting/Typing (recommended, optional) ---

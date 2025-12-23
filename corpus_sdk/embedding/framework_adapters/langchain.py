@@ -48,8 +48,8 @@ from typing import (
     Tuple,
     TypeVar,
     Callable,
-    TypedDict,
 )
+from typing_extensions import TypedDict
 
 from pydantic import BaseModel, ConfigDict, PrivateAttr, field_validator
 
@@ -482,7 +482,7 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         This is separate from per-call LangChain RunnableConfig-like `config`.
     """
 
-    corpus_adapter: EmbeddingProtocolV1
+    corpus_adapter: Any  # Runtime-validated for EmbeddingProtocolV1 behavior
     model: Optional[str] = None
     framework_version: Optional[str] = None
     batch_config: Optional[BatchConfig] = None
@@ -503,7 +503,7 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
 
     @field_validator("corpus_adapter")
     @classmethod
-    def validate_corpus_adapter(cls, v: EmbeddingProtocolV1) -> EmbeddingProtocolV1:
+    def validate_corpus_adapter(cls, v: Any) -> Any:
         """
         Validate that corpus_adapter implements the required embedding protocol.
 
@@ -688,7 +688,7 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
             framework_ctx["model"] = effective_model
 
         # Add LangChain-specific context for observability
-        if config:
+        if config and isinstance(config, Mapping):
             framework_ctx.update(
                 {
                     "tags": config.get("tags"),
@@ -848,6 +848,11 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
             Additional framework-specific parameters.
         """
         texts_list = list(texts)
+        
+        # Early return for empty input - LangChain convention
+        if not texts_list:
+            return []
+        
         _validate_texts_are_strings(texts_list, op_name="aembed_documents")
         self._warn_if_extreme_batch(texts_list, op_name="aembed_documents")
 
@@ -860,7 +865,7 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         logger.debug(
             "Async embedding %d documents for LangChain run: %s",
             len(texts_list),
-            config.get("run_id", "unknown") if config else "unknown",
+            config.get("run_id", "unknown") if (config and isinstance(config, Mapping)) else "unknown",
         )
 
         start = time.perf_counter()
@@ -911,6 +916,22 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         """
         if not isinstance(text, str):
             raise TypeError(f"aembed_query expects str; got {type(text).__name__}")
+        
+        # Special case: empty string - return zero vector matching adapter dimensions
+        if text == "":
+            # Get a sample embedding to determine dimensions
+            try:
+                sample = await self._translator.arun_embed(
+                    raw_texts=" ",  # Use single space as minimal valid input
+                    op_ctx=None,
+                    framework_ctx={},
+                )
+                vec = self._coerce_embedding_vector(sample)
+                # Return zero vector with same dimensions
+                return [0.0] * len(vec) if vec else []
+            except Exception:
+                # If that fails, return empty list
+                return []
 
         core_ctx, framework_ctx = self._build_contexts(
             config=config,
@@ -920,7 +941,7 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
 
         logger.debug(
             "Async embedding query for LangChain run: %s",
-            config.get("run_id", "unknown") if config else "unknown",
+            config.get("run_id", "unknown") if (config and isinstance(config, Mapping)) else "unknown",
         )
 
         start = time.perf_counter()
@@ -964,6 +985,11 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         encoded in the OperationContext.
         """
         texts_list = list(texts)
+        
+        # Early return for empty input - LangChain convention
+        if not texts_list:
+            return []
+        
         _validate_texts_are_strings(texts_list, op_name="embed_documents")
         self._warn_if_extreme_batch(texts_list, op_name="embed_documents")
 
@@ -976,7 +1002,7 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         logger.debug(
             "Sync embedding %d documents for LangChain run: %s",
             len(texts_list),
-            config.get("run_name", "unknown") if config else "unknown",
+            config.get("run_name", "unknown") if (config and isinstance(config, Mapping)) else "unknown",
         )
 
         start = time.perf_counter()
@@ -1020,6 +1046,22 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         """
         if not isinstance(text, str):
             raise TypeError(f"embed_query expects str; got {type(text).__name__}")
+        
+        # Special case: empty string - return zero vector matching adapter dimensions
+        if text == "":
+            # Get a sample embedding to determine dimensions
+            try:
+                sample = self._translator.embed(
+                    raw_texts=" ",  # Use single space as minimal valid input
+                    op_ctx=None,
+                    framework_ctx={},
+                )
+                vec = self._coerce_embedding_vector(sample)
+                # Return zero vector with same dimensions
+                return [0.0] * len(vec) if vec else []
+            except Exception:
+                # If that fails, return empty list
+                return []
 
         core_ctx, framework_ctx = self._build_contexts(
             config=config,
@@ -1029,7 +1071,7 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
 
         logger.debug(
             "Sync embedding query for LangChain run: %s",
-            config.get("run_name", "unknown") if config else "unknown",
+            config.get("run_name", "unknown") if (config and isinstance(config, Mapping)) else "unknown",
         )
 
         start = time.perf_counter()
