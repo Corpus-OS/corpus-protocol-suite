@@ -431,9 +431,10 @@ class CorpusAutoGenEmbeddings:
         if not hasattr(corpus_adapter, "embed") or not callable(
             getattr(corpus_adapter, "embed", None),
         ):
+            adapter_type = type(corpus_adapter).__name__ if corpus_adapter is not None else "None"
             raise TypeError(
-                "corpus_adapter must implement an EmbeddingProtocolV1-compatible "
-                "interface with an 'embed' method",
+                f"corpus_adapter must implement an EmbeddingProtocolV1-compatible "
+                f"interface with an 'embed' method, got {adapter_type}",
             )
 
         # Light config validation: fail fast on clearly wrong types.
@@ -704,7 +705,13 @@ class CorpusAutoGenEmbeddings:
         Best-effort capabilities passthrough to the underlying adapter (sync).
         """
         if hasattr(self.corpus_adapter, "capabilities"):
-            return self.corpus_adapter.capabilities()  # type: ignore[no-any-return]
+            caps_method = self.corpus_adapter.capabilities
+            # Check if capabilities is a coroutine function (async method)
+            if asyncio.iscoroutinefunction(caps_method):
+                # If it's async, we need to run it in an event loop
+                return AsyncBridge.run_async(caps_method())  # type: ignore[no-any-return]
+            else:
+                return caps_method()  # type: ignore[no-any-return]
         return {}
 
     @with_async_embedding_error_context("capabilities_async")
@@ -715,7 +722,12 @@ class CorpusAutoGenEmbeddings:
         if hasattr(self.corpus_adapter, "acapabilities"):
             return await self.corpus_adapter.acapabilities()  # type: ignore[no-any-return]
         if hasattr(self.corpus_adapter, "capabilities"):
-            return await asyncio.to_thread(self.corpus_adapter.capabilities)  # type: ignore[arg-type]
+            caps_method = self.corpus_adapter.capabilities
+            # Check if capabilities is a coroutine function (async method)
+            if asyncio.iscoroutinefunction(caps_method):
+                return await caps_method()  # type: ignore[no-any-return]
+            else:
+                return await asyncio.to_thread(caps_method)  # type: ignore[arg-type]
         return {}
 
     @with_embedding_error_context("health")
@@ -724,7 +736,13 @@ class CorpusAutoGenEmbeddings:
         Best-effort health passthrough to the underlying adapter (sync).
         """
         if hasattr(self.corpus_adapter, "health"):
-            return self.corpus_adapter.health()  # type: ignore[no-any-return]
+            health_method = self.corpus_adapter.health
+            # Check if health is a coroutine function (async method)
+            if asyncio.iscoroutinefunction(health_method):
+                # If it's async, we need to run it in an event loop
+                return AsyncBridge.run_async(health_method())  # type: ignore[no-any-return]
+            else:
+                return health_method()  # type: ignore[no-any-return]
         return {}
 
     @with_async_embedding_error_context("health_async")
@@ -735,7 +753,14 @@ class CorpusAutoGenEmbeddings:
         if hasattr(self.corpus_adapter, "ahealth"):
             return await self.corpus_adapter.ahealth()  # type: ignore[no-any-return]
         if hasattr(self.corpus_adapter, "health"):
-            return await asyncio.to_thread(self.corpus_adapter.health)  # type: ignore[arg-type]
+            health_method = self.corpus_adapter.health
+            # Check if health is a coroutine function (async method)
+            if asyncio.iscoroutinefunction(health_method):
+                # If it's async, we can directly await it
+                return await health_method()  # type: ignore[no-any-return]
+            else:
+                # If it's sync, run it in a thread pool
+                return await asyncio.to_thread(health_method)  # type: ignore[arg-type]
         return {}
 
     # ------------------------------------------------------------------ #

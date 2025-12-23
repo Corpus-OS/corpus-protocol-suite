@@ -160,7 +160,7 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
             supports_normalization=True,
             supports_truncation=True,
             supports_token_counting=True,
-            idempotent_operations=False,
+            idempotent_writes=False,
             supports_multi_tenant=True,
             normalizes_at_source=self.normalizes_at_source,
             truncation_mode="base",
