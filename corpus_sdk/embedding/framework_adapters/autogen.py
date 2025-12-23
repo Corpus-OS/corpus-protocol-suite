@@ -18,18 +18,18 @@ Design notes / philosophy
 -------------------------
 - **Protocol-first**: we require only an `embed` method (duck-typed) instead of
   strict inheritance from a specific adapter base class.
-- **Resilient to framework evolution**: LlamaIndex’s internals and signatures
+- **Resilient to framework evolution**: AutoGen’s internals and signatures
   change; we filter/normalize context defensively and keep our adapter surface stable.
 - **Observability-first**: all embedding operations attach rich error context:
   framework identity, model info, batch sizes, node IDs, trace/workflow IDs, etc.
 - **Fail-safe context translation**: context translation must never break embeddings.
   If translation fails, we proceed without `OperationContext` and attach diagnostic context.
-- **Strict by default** (configurable): non-string inputs in batch operations are rejected
-  unless `strict_text_types=False`, in which case they are treated as empty and receive
-  zero-vector embeddings to preserve row alignment.
+- **Strict by default**: non-string inputs in batch operations are rejected to avoid
+  embedding `repr()` output by accident. If you need softer behavior, wrap this
+  class and preprocess inputs before calling it.
 
 Resilience (retries, caching, rate limiting, etc.) is expected to be provided
-by the underlying adapter, typically a BaseEmbeddingAdapter subclass.
+by the underlying adapter, typically a `BaseEmbeddingAdapter` subclass.
 """
 
 from __future__ import annotations
@@ -445,7 +445,7 @@ class CorpusAutoGenEmbeddings:
         ):
             adapter_type = type(corpus_adapter).__name__ if corpus_adapter is not None else "None"
             raise TypeError(
-                f"corpus_adapter must implement an EmbeddingProtocolV1-compatible "
+                "corpus_adapter must implement an EmbeddingProtocolV1-compatible "
                 f"interface with an 'embed' method, got {adapter_type}",
             )
 
@@ -471,12 +471,10 @@ class CorpusAutoGenEmbeddings:
         self.autogen_config: Dict[str, Any] = autogen_config or {}
         self._framework_version: Optional[str] = framework_version
 
-        # Improvement: guard lazy translator initialization under concurrency.
-        # We intentionally keep construction lazy, but ensure only one instance
-        # is created even when multiple threads race on first access.
+        # Guard lazy translator initialization under concurrency.
         self._translator_lock = threading.Lock()
 
-        # Observability improvement: best-effort dim hint set after first embed.
+        # Observability: best-effort dim hint set after first embed.
         self._embedding_dim_hint: Optional[int] = None
 
         logger.info(
@@ -589,7 +587,7 @@ class CorpusAutoGenEmbeddings:
             )
             return None
 
-        # Improvement: avoid brittle isinstance-only checks in case OperationContext
+        # Avoid brittle isinstance-only checks in case OperationContext
         # is a Protocol/typing alias; accept "OperationContext-like" values.
         if _looks_like_operation_context(core_candidate):
             logger.debug(
@@ -648,7 +646,7 @@ class CorpusAutoGenEmbeddings:
         if core_ctx is not None:
             base["_operation_context"] = core_ctx
 
-        # Observability improvement: include best-effort embedding dimension hint.
+        # Observability: include best-effort embedding dimension hint.
         if isinstance(self._embedding_dim_hint, int):
             base["embedding_dim_hint"] = self._embedding_dim_hint
 
@@ -715,64 +713,79 @@ class CorpusAutoGenEmbeddings:
     def capabilities(self) -> Mapping[str, Any]:
         """
         Best-effort capabilities passthrough to the underlying adapter (sync).
+
+        If the underlying adapter only exposes async capabilities, callers
+        should prefer `acapabilities()`; this method will simply return `{}`.
         """
         if hasattr(self.corpus_adapter, "capabilities"):
             caps_method = self.corpus_adapter.capabilities
-            # Check if capabilities is a coroutine function (async method)
+            # Only support sync here; async forms should go through acapabilities.
             if asyncio.iscoroutinefunction(caps_method):
-                # If it's async, we need to run it in an event loop
-                return AsyncBridge.run_async(caps_method())  # type: ignore[no-any-return]
-            else:
-                return caps_method()  # type: ignore[no-any-return]
+                logger.warning(
+                    "Underlying embedding adapter exposes async 'capabilities'; "
+                    "use 'acapabilities()' instead of sync 'capabilities()'.",
+                )
+                return {}
+            return caps_method()  # type: ignore[no-any-return]
         return {}
 
     @with_async_embedding_error_context("capabilities_async")
     async def acapabilities(self) -> Mapping[str, Any]:
         """
         Best-effort capabilities passthrough to the underlying adapter (async).
+
+        Preference order:
+        1) `acapabilities` on the adapter
+        2) `capabilities` on the adapter (awaited if async, or run in a thread if sync)
+        3) `{}` if neither is present
         """
         if hasattr(self.corpus_adapter, "acapabilities"):
             return await self.corpus_adapter.acapabilities()  # type: ignore[no-any-return]
         if hasattr(self.corpus_adapter, "capabilities"):
             caps_method = self.corpus_adapter.capabilities
-            # Check if capabilities is a coroutine function (async method)
             if asyncio.iscoroutinefunction(caps_method):
                 return await caps_method()  # type: ignore[no-any-return]
-            else:
-                return await asyncio.to_thread(caps_method)  # type: ignore[arg-type]
+            # Sync fallback: run in thread pool
+            return await asyncio.to_thread(caps_method)  # type: ignore[arg-type]
         return {}
 
     @with_embedding_error_context("health")
     def health(self) -> Mapping[str, Any]:
         """
         Best-effort health passthrough to the underlying adapter (sync).
+
+        If the underlying adapter only exposes async health, callers
+        should prefer `ahealth()`; this method will simply return `{}`.
         """
         if hasattr(self.corpus_adapter, "health"):
             health_method = self.corpus_adapter.health
-            # Check if health is a coroutine function (async method)
+            # Only support sync here; async forms should go through ahealth.
             if asyncio.iscoroutinefunction(health_method):
-                # If it's async, we need to run it in an event loop
-                return AsyncBridge.run_async(health_method())  # type: ignore[no-any-return]
-            else:
-                return health_method()  # type: ignore[no-any-return]
+                logger.warning(
+                    "Underlying embedding adapter exposes async 'health'; "
+                    "use 'ahealth()' instead of sync 'health()'.",
+                )
+                return {}
+            return health_method()  # type: ignore[no-any-return]
         return {}
 
     @with_async_embedding_error_context("health_async")
     async def ahealth(self) -> Mapping[str, Any]:
         """
         Best-effort health passthrough to the underlying adapter (async).
+
+        Preference order:
+        1) `ahealth` on the adapter
+        2) `health` on the adapter (awaited if async, or run in a thread if sync)
+        3) `{}` if neither is present
         """
         if hasattr(self.corpus_adapter, "ahealth"):
             return await self.corpus_adapter.ahealth()  # type: ignore[no-any-return]
         if hasattr(self.corpus_adapter, "health"):
             health_method = self.corpus_adapter.health
-            # Check if health is a coroutine function (async method)
             if asyncio.iscoroutinefunction(health_method):
-                # If it's async, we can directly await it
                 return await health_method()  # type: ignore[no-any-return]
-            else:
-                # If it's sync, run it in a thread pool
-                return await asyncio.to_thread(health_method)  # type: ignore[arg-type]
+            return await asyncio.to_thread(health_method)  # type: ignore[arg-type]
         return {}
 
     # ------------------------------------------------------------------ #
@@ -855,7 +868,7 @@ class CorpusAutoGenEmbeddings:
 
         mat = self._coerce_embedding_matrix(translated)
 
-        # Observability improvement: remember dim once known.
+        # Observability: remember dim once known.
         dim = self._infer_dim_from_matrix(mat)
         if dim is not None:
             self._embedding_dim_hint = dim
