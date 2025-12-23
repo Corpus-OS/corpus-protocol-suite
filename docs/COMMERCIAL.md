@@ -18,7 +18,7 @@ Separately from the Apache 2.0 License, **Interoperable Intelligence Inc.** (the
 
 **You're automatically covered by:**
 - **Apache 2.0 License** - Full code usage rights (see LICENSE file)
-- **Defensive Patent Pledge** - Non-assertion of essential protocol patents (see PATENT_PLEDGE.md)
+- **Defensive Patent Pledge** - Non-assertion of essential patent claims (see PATENT_PLEDGE.md)
 
 **Cost:** Free
 
@@ -31,8 +31,8 @@ Separately from the Apache 2.0 License, **Interoperable Intelligence Inc.** (the
 | Feature | Free (Apache 2.0 + Pledge) | Commercial License |
 |---------|---------------------------|-------------------|
 | Implement protocol | ✅ Included | ✅ Included |
-| Essential patent protection | ✅ Included | ✅ Included |
-| Non-essential patent licenses | ❌ Not included | ✅ Available |
+| Essential patent claim protection | ✅ Included | ✅ Included |
+| Non-essential patent claim licenses | ❌ Not included | ✅ Available |
 | Trademark usage rights | ❌ Not included | ✅ Available |
 | "Corpus Certified" designation | ❌ Not included | ✅ Available |
 | Enterprise support & SLA | ❌ Not included | ✅ Available |
@@ -47,13 +47,13 @@ The Commercial License is an optional, independent agreement that can grant righ
 
 ### 1. Additional Patent Rights
 
-**Beyond our Defensive Patent Pledge**, which covers essential protocol patents, a Commercial License can provide:
+**Beyond our Defensive Patent Pledge**, which covers essential patent claims, a Commercial License can provide:
 
-- Rights to practice certain Interoperable Intelligence Inc. **non-essential patents** - including proprietary optimization algorithms, advanced routing strategies, and optional features not required for protocol compliance, that are not necessarily limited to "the Work" as defined in the Apache License
+- Rights to practice certain Interoperable Intelligence Inc. **non-essential patent claims** - including claims covering proprietary optimization algorithms, advanced routing strategies, and optional features not required for protocol compliance, that are not necessarily limited to "the Work" as defined in the Apache License
 - Broader patent grants beyond protocol implementation
 - Patent indemnification may be available subject to separate negotiation and terms
 
-**Example:** License to use our proprietary ensemble optimization algorithms in your commercial products.
+**Example:** License to non-essential patent claims covering our proprietary ensemble optimization algorithms in your commercial products.
 
 ### 2. Expanded Commercialization Rights
 
@@ -122,7 +122,7 @@ The Commercial License is **purely additive** and does not restrict any rights g
 
 ## Relationship to Defensive Patent Pledge
 
-Interoperable Intelligence Inc. has published a **Defensive Patent Pledge** (see PATENT_PLEDGE.md) that provides non-assertion of essential protocol patents to all implementers.
+Interoperable Intelligence Inc. has published a **Defensive Patent Pledge** (see PATENT_PLEDGE.md) that provides non-assertion of essential patent claims to all implementers.
 
 **The Commercial License may provide additional rights beyond the Pledge, subject to specific negotiated terms.**
 
@@ -149,7 +149,7 @@ Interoperable Intelligence Inc. has published a **Defensive Patent Pledge** (see
 
 ⭐ You want official “Corpus Certified” branding
 ⭐ You need to use Corpus trademarks in marketing
-⭐ You want to license non-essential patents (advanced features)
+⭐ You want to license non-essential patent claims (advanced features)
 ⭐ You require enterprise SLA and 24/7 support
 ⭐ You need patent indemnification for procurement
 ⭐ You want priority feature development
@@ -184,7 +184,7 @@ Commercial License pricing typically varies based on:
 **What you need:**
 - Implement Corpus Protocol ✅ (Apache 2.0)
 - Deploy commercially ✅ (Apache 2.0)
-- Protocol patent protection ✅ (Defensive Pledge)
+- Essential patent claim protection ✅ (Defensive Pledge)
 
 **What you DON'T need:**
 - Trademark rights (you'll brand as "YourProduct powered by open protocols")
@@ -216,7 +216,7 @@ Commercial License pricing typically varies based on:
 
 **What you need:**
 - Implement Corpus Protocol ✅ (Apache 2.0)
-- Protocol patent protection ✅ (Defensive Pledge)
+- Essential patent claim protection ✅ (Defensive Pledge)
 - Optional: Co-branding rights ⭐ (Commercial License)
 - Optional: Joint go-to-market support ⭐ (Commercial License)
 
@@ -235,8 +235,8 @@ Commercial License pricing typically varies based on:
 ### Q: What's the difference between the Defensive Patent Pledge and a Commercial License?
 
 **A:** 
-- **Defensive Patent Pledge (Free):** Non-assertion of essential protocol patents - we promise not to sue you for implementing the protocol specifications
-- **Commercial License (Paid):** May provide additional rights including non-essential patent licenses, trademark usage, certification, enterprise support, and potentially patent indemnification, subject to specific negotiated terms
+- **Defensive Patent Pledge (Free):** Non-assertion of essential patent claims - we promise not to sue you for implementing the protocol specifications
+- **Commercial License (Paid):** May provide additional rights including licenses to non-essential patent claims, trademark usage, certification, enterprise support, and potentially patent indemnification, subject to specific negotiated terms
 
 ---
 
@@ -260,7 +260,7 @@ Without authorization, you cannot claim:
 
 ### Q: Does buying a Commercial License give me rights to the source code beyond Apache 2.0?
 
-**A:** No. The source code rights remain Apache 2.0 regardless of Commercial License status. The Commercial License provides *additional* rights (such as patents, trademarks, support, SLA) but doesn't change the code license.
+**A:** No. The source code rights remain Apache 2.0 regardless of Commercial License status. The Commercial License provides *additional* rights (such as patent claim licenses, trademarks, support, SLA) but doesn't change the code license.
 
 ---
 
