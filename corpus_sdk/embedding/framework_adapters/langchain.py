@@ -14,8 +14,19 @@ This module exposes Corpus `EmbeddingProtocolV1` implementations as
 - Rich error context attachment for observability
 - Model selection via framework_ctx / OperationContext attrs
 
-The design mirrors the Corpus LangChain LLM adapter: this is a *thin*,
-framework-specific skin over the protocol-first Corpus embedding stack.
+Design notes / philosophy
+-------------------------
+- **Protocol-first**: we require only an `embed` method (duck-typed) instead of
+  strict inheritance from a specific adapter base class.
+- **Resilient to framework evolution**: LlamaIndex’s internals and signatures
+  change; we filter/normalize context defensively and keep our adapter surface stable.
+- **Observability-first**: all embedding operations attach rich error context:
+  framework identity, model info, batch sizes, node IDs, trace/workflow IDs, etc.
+- **Fail-safe context translation**: context translation must never break embeddings.
+  If translation fails, we proceed without `OperationContext` and attach diagnostic context.
+- **Strict by default** (configurable): non-string inputs in batch operations are rejected
+  unless `strict_text_types=False`, in which case they are treated as empty and receive
+  zero-vector embeddings to preserve row alignment.
 
 Resilience (retries, caching, rate limiting, etc.) is expected to be provided
 by the underlying adapter, typically a BaseEmbeddingAdapter subclass.
