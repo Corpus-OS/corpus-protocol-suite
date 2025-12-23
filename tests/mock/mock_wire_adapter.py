@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import uuid
 from dataclasses import asdict, is_dataclass
 from typing import Any, Dict, Mapping, Optional, Union
 
@@ -78,8 +79,15 @@ def _normalize_ctx(ctx: Any) -> Dict[str, Any]:
 
     We do not force presence of optional fields; we simply pass through known fields if present.
     Unknown fields are preserved (attrs/extensions are allowed by spec).
+    
+    Auto-generates a request_id if not provided (required by wire protocol).
     """
     d = _to_mapping(ctx)
+    
+    # Auto-generate request_id if missing (required by protocol)
+    if "request_id" not in d or d["request_id"] is None:
+        d["request_id"] = f"req_{uuid.uuid4().hex[:16]}"
+    
     # Ensure nested attrs is a mapping if present
     if "attrs" in d and d["attrs"] is not None and not isinstance(d["attrs"], Mapping):
         raise TypeError("ctx.attrs must be a mapping when provided")
@@ -266,142 +274,252 @@ class WireAdapter:
     def build_graph_capabilities_envelope(
         self, ctx: Any = None, args: Any = None
     ) -> Dict[str, Any]:
-        return self.build_request_envelope("graph.capabilities", ctx, args)
+        return self.build_request_envelope("graph.capabilities", ctx, args or {})
 
     def build_graph_upsert_nodes_envelope(
         self, ctx: Any = None, args: Any = None
     ) -> Dict[str, Any]:
-        return self.build_request_envelope("graph.upsert_nodes", ctx, args)
+        # upsert_nodes requires nodes array
+        default_args = {
+            "nodes": [
+                {
+                    "id": "node1",
+                    "label": "Person",
+                    "props": {"name": "Alice", "age": 30}
+                }
+            ]
+        }
+        return self.build_request_envelope("graph.upsert_nodes", ctx, args or default_args)
 
     def build_graph_upsert_edges_envelope(
         self, ctx: Any = None, args: Any = None
     ) -> Dict[str, Any]:
-        return self.build_request_envelope("graph.upsert_edges", ctx, args)
+        # create_edge requires label, from_id, to_id, props (single edge)
+        default_args = {
+            "label": "KNOWS",
+            "from_id": "node1",
+            "to_id": "node2",
+            "props": {"since": 2020}
+        }
+        return self.build_request_envelope("graph.create_edge", ctx, args or default_args)
 
     def build_graph_delete_nodes_envelope(
         self, ctx: Any = None, args: Any = None
     ) -> Dict[str, Any]:
-        return self.build_request_envelope("graph.delete_nodes", ctx, args)
+        # delete_nodes requires ids or label (adding namespace to disambiguate from delete_edge)
+        default_args = {
+            "ids": ["node1"],
+            "namespace": "default"
+        }
+        return self.build_request_envelope("graph.delete_nodes", ctx, args or default_args)
 
     def build_graph_delete_edges_envelope(
         self, ctx: Any = None, args: Any = None
     ) -> Dict[str, Any]:
-        return self.build_request_envelope("graph.delete_edges", ctx, args)
+        # delete_edge requires ids or type (using type to disambiguate from delete_nodes)
+        default_args = {
+            "type": "KNOWS"
+        }
+        return self.build_request_envelope("graph.delete_edge", ctx, args or default_args)
 
     def build_graph_query_envelope(
         self, ctx: Any = None, args: Any = None
     ) -> Dict[str, Any]:
-        return self.build_request_envelope("graph.query", ctx, args)
+        # query requires dialect and text
+        default_args = {
+            "dialect": "cypher",
+            "text": "MATCH (n) RETURN n LIMIT 10",
+            "page_size": 10
+        }
+        return self.build_request_envelope("graph.query", ctx, args or default_args)
 
     def build_graph_stream_query_envelope(
         self, ctx: Any = None, args: Any = None
     ) -> Dict[str, Any]:
-        return self.build_request_envelope("graph.stream_query", ctx, args)
+        # stream_query requires dialect and text
+        default_args = {
+            "dialect": "cypher",
+            "text": "MATCH (n) RETURN n",
+            "page_size": 10
+        }
+        return self.build_request_envelope("graph.stream_query", ctx, args or default_args)
 
     def build_graph_bulk_vertices_envelope(
         self, ctx: Any = None, args: Any = None
     ) -> Dict[str, Any]:
-        return self.build_request_envelope("graph.bulk_vertices", ctx, args)
+        # bulk_vertices requires ids or label
+        default_args = {
+            "ids": ["node1", "node2"]
+        }
+        return self.build_request_envelope("graph.bulk_vertices", ctx, args or default_args)
 
     def build_graph_batch_envelope(
         self, ctx: Any = None, args: Any = None
     ) -> Dict[str, Any]:
-        return self.build_request_envelope("graph.batch", ctx, args)
+        # batch requires ops array with proper op types
+        default_args = {
+            "ops": [
+                {
+                    "op": "create_vertex",
+                    "label": "Person",
+                    "props": {"name": "Alice"}
+                }
+            ]
+        }
+        return self.build_request_envelope("graph.batch", ctx, args or default_args)
 
     def build_graph_get_schema_envelope(
         self, ctx: Any = None, args: Any = None
     ) -> Dict[str, Any]:
-        return self.build_request_envelope("graph.get_schema", ctx, args)
+        return self.build_request_envelope("graph.get_schema", ctx, args or {})
 
     def build_graph_health_envelope(
         self, ctx: Any = None, args: Any = None
     ) -> Dict[str, Any]:
-        return self.build_request_envelope("graph.health", ctx, args)
+        return self.build_request_envelope("graph.health", ctx, args or {})
 
     # LLM (5)
     def build_llm_capabilities_envelope(
         self, ctx: Any = None, args: Any = None
     ) -> Dict[str, Any]:
-        return self.build_request_envelope("llm.capabilities", ctx, args)
+        # capabilities operations typically have empty args
+        return self.build_request_envelope("llm.capabilities", ctx, args or {})
 
     def build_llm_complete_envelope(
         self, ctx: Any = None, args: Any = None
     ) -> Dict[str, Any]:
-        return self.build_request_envelope("llm.complete", ctx, args)
+        # Provide minimal valid args for llm.complete
+        default_args = {
+            "messages": [{"role": "user", "content": "Hello"}],
+            "model": "gpt-3.5-turbo",
+        }
+        return self.build_request_envelope("llm.complete", ctx, args or default_args)
 
     def build_llm_stream_envelope(
         self, ctx: Any = None, args: Any = None
     ) -> Dict[str, Any]:
-        return self.build_request_envelope("llm.stream", ctx, args)
+        # Same as complete but for streaming
+        default_args = {
+            "messages": [{"role": "user", "content": "Hello"}],
+            "model": "gpt-3.5-turbo",
+            "stream": True,
+        }
+        return self.build_request_envelope("llm.stream", ctx, args or default_args)
 
     def build_llm_count_tokens_envelope(
         self, ctx: Any = None, args: Any = None
     ) -> Dict[str, Any]:
-        return self.build_request_envelope("llm.count_tokens", ctx, args)
+        # count_tokens requires text or messages
+        default_args = {
+            "text": "Hello world",
+            "model": "gpt-3.5-turbo",
+        }
+        return self.build_request_envelope("llm.count_tokens", ctx, args or default_args)
 
     def build_llm_health_envelope(
         self, ctx: Any = None, args: Any = None
     ) -> Dict[str, Any]:
-        return self.build_request_envelope("llm.health", ctx, args)
+        # health operations typically have empty args
+        return self.build_request_envelope("llm.health", ctx, args or {})
 
     # Vector (7)
     def build_vector_capabilities_envelope(
         self, ctx: Any = None, args: Any = None
     ) -> Dict[str, Any]:
-        return self.build_request_envelope("vector.capabilities", ctx, args)
+        return self.build_request_envelope("vector.capabilities", ctx, args or {})
 
     def build_vector_query_envelope(
         self, ctx: Any = None, args: Any = None
     ) -> Dict[str, Any]:
-        return self.build_request_envelope("vector.query", ctx, args)
+        # query requires vector or text
+        default_args = {
+            "vector": [0.1, 0.2, 0.3],
+            "k": 5,
+            "namespace": "default",
+        }
+        return self.build_request_envelope("vector.query", ctx, args or default_args)
 
     def build_vector_upsert_envelope(
         self, ctx: Any = None, args: Any = None
     ) -> Dict[str, Any]:
-        return self.build_request_envelope("vector.upsert", ctx, args)
+        # upsert requires vectors
+        default_args = {
+            "vectors": [
+                {"id": "vec1", "values": [0.1, 0.2, 0.3]},
+            ],
+            "namespace": "default",
+        }
+        return self.build_request_envelope("vector.upsert", ctx, args or default_args)
 
     def build_vector_delete_envelope(
         self, ctx: Any = None, args: Any = None
     ) -> Dict[str, Any]:
-        return self.build_request_envelope("vector.delete", ctx, args)
+        # delete requires ids, filter, or delete_all
+        default_args = {
+            "ids": ["vec1"],
+            "namespace": "default",
+        }
+        return self.build_request_envelope("vector.delete", ctx, args or default_args)
 
     def build_vector_create_namespace_envelope(
         self, ctx: Any = None, args: Any = None
     ) -> Dict[str, Any]:
-        return self.build_request_envelope("vector.create_namespace", ctx, args)
+        default_args = {
+            "namespace": "test_namespace",
+            "dimension": 3,
+        }
+        return self.build_request_envelope("vector.namespace_create", ctx, args or default_args)
 
     def build_vector_delete_namespace_envelope(
         self, ctx: Any = None, args: Any = None
     ) -> Dict[str, Any]:
-        return self.build_request_envelope("vector.delete_namespace", ctx, args)
+        default_args = {
+            "namespace": "test_namespace",
+        }
+        return self.build_request_envelope("vector.namespace_delete", ctx, args or default_args)
 
     def build_vector_health_envelope(
         self, ctx: Any = None, args: Any = None
     ) -> Dict[str, Any]:
-        return self.build_request_envelope("vector.health", ctx, args)
+        return self.build_request_envelope("vector.health", ctx, args or {})
 
     # Embedding (5)
     def build_embedding_capabilities_envelope(
         self, ctx: Any = None, args: Any = None
     ) -> Dict[str, Any]:
-        return self.build_request_envelope("embedding.capabilities", ctx, args)
+        return self.build_request_envelope("embedding.capabilities", ctx, args or {})
 
     def build_embedding_embed_envelope(
         self, ctx: Any = None, args: Any = None
     ) -> Dict[str, Any]:
-        return self.build_request_envelope("embedding.embed", ctx, args)
+        # embed requires text or texts
+        default_args = {
+            "text": "Hello, world!",
+            "model": "text-embedding-ada-002",
+        }
+        return self.build_request_envelope("embedding.embed", ctx, args or default_args)
 
     def build_embedding_embed_batch_envelope(
         self, ctx: Any = None, args: Any = None
     ) -> Dict[str, Any]:
-        return self.build_request_envelope("embedding.embed_batch", ctx, args)
+        # embed_batch requires texts array
+        default_args = {
+            "texts": ["Hello", "World"],
+            "model": "text-embedding-ada-002",
+        }
+        return self.build_request_envelope("embedding.embed_batch", ctx, args or default_args)
 
     def build_embedding_count_tokens_envelope(
         self, ctx: Any = None, args: Any = None
     ) -> Dict[str, Any]:
-        return self.build_request_envelope("embedding.count_tokens", ctx, args)
+        # count_tokens requires text
+        default_args = {
+            "text": "Hello, world!",
+            "model": "text-embedding-ada-002",
+        }
+        return self.build_request_envelope("embedding.count_tokens", ctx, args or default_args)
 
     def build_embedding_health_envelope(
         self, ctx: Any = None, args: Any = None
     ) -> Dict[str, Any]:
-        return self.build_request_envelope("embedding.health", ctx, args)
+        return self.build_request_envelope("embedding.health", ctx, args or {})
