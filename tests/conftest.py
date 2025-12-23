@@ -34,6 +34,19 @@ Environment Variables:
     CORPUS_PLAIN_OUTPUT  Disable emoji output for CI environments
 """
 
+# SQLite workaround for ChromaDB/CrewAI compatibility
+# ChromaDB requires SQLite >= 3.35.0, but system may have older version
+# Use pysqlite3-binary which includes a newer SQLite version
+import sys
+try:
+    import pysqlite3
+    # Override sqlite3 module with pysqlite3 before any imports
+    sys.modules['sqlite3'] = sys.modules['pysqlite3']
+except ImportError:
+    # If pysqlite3 not available, use system sqlite3
+    # (some tests may skip due to version requirements)
+    pass
+
 import os
 import time
 import math

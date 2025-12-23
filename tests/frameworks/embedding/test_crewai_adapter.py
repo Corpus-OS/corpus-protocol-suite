@@ -79,6 +79,9 @@ def _make_embeddings(adapter: Any, **kwargs: Any) -> CorpusCrewAIEmbeddings:
     """
     Construct a CorpusCrewAIEmbeddings instance from the generic adapter.
     """
+    # Default to first supported model if no model specified
+    if 'model' not in kwargs and hasattr(adapter, 'supported_models'):
+        kwargs['model'] = adapter.supported_models[0]
     return CorpusCrewAIEmbeddings(corpus_adapter=adapter, **kwargs)
 
 
@@ -269,8 +272,11 @@ def test_error_context_includes_crewai_context(
     class FailingAdapter:
         async def embed(self, *args: Any, **kwargs: Any) -> Any:
             raise RuntimeError("test error from crewai adapter: Check model configuration and API keys")
+        
+        async def embed_batch(self, *args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("test error from crewai adapter: Check model configuration and API keys")
 
-    embeddings = CorpusCrewAIEmbeddings(corpus_adapter=FailingAdapter())
+    embeddings = CorpusCrewAIEmbeddings(corpus_adapter=FailingAdapter(), model="test-model")
 
     crew_ctx = {"agent_role": "tester", "task_id": "task-123"}
 
@@ -453,7 +459,7 @@ def test_sync_embed_documents_and_query_basic(adapter) -> None:
     
     Framework Compatibility: Sync API stable across all CrewAI versions.
     """
-    embeddings = _make_embeddings(adapter, model="sync-model")
+    embeddings = _make_embeddings(adapter, model="mock-embed-512")
 
     texts = ["alpha", "beta", "gamma"]
     query = "delta"
@@ -594,41 +600,56 @@ async def test_aembed_query_rejects_non_string(adapter):
 def test_crewai_interface_compatibility(adapter) -> None:
     """
     Verify that CorpusCrewAIEmbeddings implements the expected CrewAI
-    Embeddings interface when CrewAI is available.
+    Embeddings interface.
     
-    Framework Compatibility: Duck-typing compatibility with CrewAI 0.28.0+.
+    Framework Compatibility: Duck-typing compatibility with CrewAI 0.28.0+, 1.7.2+.
     Note: We test protocol compliance, not inheritance, for better
-    forward compatibility.
+    forward compatibility. CrewAI 1.7.2 uses duck typing without a public base class.
     """
     embeddings = _make_embeddings(adapter)
 
-    # Core methods should always exist
-    assert hasattr(embeddings, "embed_documents")
-    assert hasattr(embeddings, "embed_query")
-    assert hasattr(embeddings, "aembed_documents")
-    assert hasattr(embeddings, "aembed_query")
-
-    # Try to import CrewAI's Embeddings base class if available
+    # Core synchronous methods required by CrewAI
+    assert hasattr(embeddings, "embed_documents"), "Missing embed_documents method"
+    assert hasattr(embeddings, "embed_query"), "Missing embed_query method"
+    assert callable(embeddings.embed_documents), "embed_documents not callable"
+    assert callable(embeddings.embed_query), "embed_query not callable"
+    
+    # Core async methods (optional but recommended)
+    assert hasattr(embeddings, "aembed_documents"), "Missing aembed_documents method"
+    assert hasattr(embeddings, "aembed_query"), "Missing aembed_query method"
+    assert callable(embeddings.aembed_documents), "aembed_documents not callable"
+    assert callable(embeddings.aembed_query), "aembed_query not callable"
+    
+    # Verify methods work with correct signatures
+    # embed_documents should accept a list of strings
+    result_docs = embeddings.embed_documents(["test1", "test2"])
+    assert isinstance(result_docs, list), "embed_documents should return a list"
+    assert len(result_docs) == 2, "embed_documents should return one embedding per input"
+    assert all(isinstance(emb, list) for emb in result_docs), "Each embedding should be a list"
+    
+    # embed_query should accept a single string
+    result_query = embeddings.embed_query("test query")
+    assert isinstance(result_query, list), "embed_query should return a list"
+    assert all(isinstance(x, (int, float)) for x in result_query), "Query embedding should contain numbers"
+    
+    # Optional: Try to import CrewAI to verify integration (won't fail if not available)
     try:
-        from crewai.embeddings import Embeddings  # type: ignore[import]
-        
-        # IMPORTANT: We use duck typing, not inheritance
-        # Check that we can be used where Embeddings is expected
-        # This is a weaker but more flexible check
-        embedder = embeddings
-        
-        # Verify we have all required methods with correct signatures
-        required_methods = ['embed_documents', 'embed_query', 
-                           'aembed_documents', 'aembed_query']
-        for method in required_methods:
-            assert hasattr(embedder, method), f"Missing required method: {method}"
-            assert callable(getattr(embedder, method)), f"Method not callable: {method}"
-            
-        # Note: We don't assert isinstance() because we use protocol pattern
-        # for better forward compatibility
-        
+        import crewai
+        # If CrewAI is available, verify we can actually assign to an agent
+        # This is the real compatibility test for 1.7.2+
+        agent = crewai.Agent(
+            role="test",
+            goal="test",
+            backstory="test",
+            allow_delegation=False,
+            verbose=False
+        )
+        # Assignment should work without errors
+        agent.embedder = embeddings
+        assert agent.embedder is embeddings, "Embedder assignment failed"
     except ImportError:
-        pytest.skip("CrewAI is not installed; cannot assert interface compatibility")
+        # CrewAI not installed, but that's okay - we verified the interface
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -807,8 +828,16 @@ class TestCrewAIIntegration:
     These tests verify that our adapter actually works in CrewAI workflows.
     They're skipped if CrewAI is not installed.
     
-    Framework Compatibility: Tested with CrewAI 0.28.0-0.51.0.
+    Framework Compatibility: Tested with CrewAI 0.28.0-0.51.0, 1.7.2+.
+    
+    Note: CrewAI 1.7.2 requires an LLM to be configured, so we set a fake
+    API key in the environment for these tests.
     """
+    
+    @pytest.fixture(autouse=True)
+    def setup_crewai_env(self, monkeypatch):
+        """Set up environment for CrewAI tests (fake API key to avoid errors)."""
+        monkeypatch.setenv("OPENAI_API_KEY", "fake-key-for-testing")
     
     @pytest.fixture
     def crewai_available(self):
@@ -828,7 +857,7 @@ class TestCrewAIIntegration:
         """
         import crewai
         
-        embedder = create_embedder(adapter, model="test-model")
+        embedder = create_embedder(adapter, model="mock-embed-512")
         
         # Create a minimal agent that would use embedder
         # This tests the actual interface compatibility
@@ -836,6 +865,7 @@ class TestCrewAIIntegration:
             role="researcher",
             goal="Research topics",
             backstory="A curious researcher",
+            
             allow_delegation=False,
             verbose=False
         )
@@ -865,17 +895,18 @@ class TestCrewAIIntegration:
         """
         import crewai
         
-        embedder = create_embedder(adapter, model="test-model")
+        embedder = create_embedder(adapter, model="mock-embed-512")
         
-        # Create agent with embedder
+        # Create agent first, then assign embedder (CrewAI 1.x pattern)
         agent = crewai.Agent(
             role="researcher",
             goal="Research topics",
             backstory="A curious researcher",
-            embedder=embedder,  # Assign at creation
+            
             allow_delegation=False,
             verbose=False
         )
+        agent.embedder = embedder
         
         # Create a knowledge source (this would trigger embeddings in real use)
         # Note: Actual RAG would require setting up a vector store
@@ -896,26 +927,28 @@ class TestCrewAIIntegration:
         import crewai
         from crewai import Task
         
-        embedder = create_embedder(adapter, model="shared-model")
+        embedder = create_embedder(adapter, model="mock-embed-512")
         
-        # Create multiple agents sharing the same embedder
+        # Create multiple agents, then assign embedder (CrewAI 1.x pattern)
         researcher = crewai.Agent(
             role="researcher",
             goal="Research information",
             backstory="Expert researcher",
-            embedder=embedder,
+            
             allow_delegation=False,
             verbose=False
         )
+        researcher.embedder = embedder
         
         analyst = crewai.Agent(
             role="analyst",
             goal="Analyze research",
             backstory="Data analyst",
-            embedder=embedder,  # Same embedder
+            
             allow_delegation=False,
             verbose=False
         )
+        analyst.embedder = embedder
         
         # Create tasks
         research_task = Task(
@@ -962,20 +995,25 @@ class TestCrewAIIntegration:
             async def embed(self, texts: List[str], ctx=None) -> List[List[float]]:
                 raise RuntimeError("Rate limit exceeded: Please wait before retrying")
             
+            async def embed_batch(self, *args, **kwargs):
+                raise RuntimeError("Rate limit exceeded: Please wait before retrying")
+            
             def capabilities(self) -> Dict[str, Any]:
-                return {"supported_models": ["test-model"]}
+                return {"supported_models": ["mock-embed-512"]}
         
         adapter = FailingTestAdapter()
-        embedder = create_embedder(adapter, model="failing-model")
+        embedder = create_embedder(adapter, model="mock-embed-512")
         
+        # Create agent, then assign embedder (CrewAI 1.x pattern)
         agent = crewai.Agent(
             role="researcher",
             goal="Research topics",
             backstory="A curious researcher",
-            embedder=embedder,
+            
             allow_delegation=False,
             verbose=False
         )
+        agent.embedder = embedder
         
         # Test that errors from embedder propagate with context
         with pytest.raises(Exception) as exc_info:
@@ -997,16 +1035,18 @@ class TestCrewAIIntegration:
         """
         import crewai
         
-        embedder = create_embedder(adapter, model="async-model")
+        embedder = create_embedder(adapter, model="mock-embed-512")
         
+        # Create agent, then assign embedder (CrewAI 1.x pattern)
         agent = crewai.Agent(
             role="researcher",
             goal="Research topics",
             backstory="A curious researcher",
-            embedder=embedder,
+            
             allow_delegation=False,
             verbose=False
         )
+        agent.embedder = embedder
         
         # Test async embedding
         embeddings = await agent.embedder.aembed_query("async query")
@@ -1030,7 +1070,7 @@ class TestConcurrency:
         """
         import concurrent.futures
         
-        embedder = create_embedder(adapter, model="concurrent-model")
+        embedder = create_embedder(adapter, model="mock-embed-512")
         
         def embed_query(text: str):
             return embedder.embed_query(text)
@@ -1053,7 +1093,7 @@ class TestConcurrency:
         """
         Async embedding supports concurrent operations.
         """
-        embedder = create_embedder(adapter, model="async-concurrent-model")
+        embedder = create_embedder(adapter, model="mock-embed-512")
         
         async def embed_async(text: str):
             return await embedder.aembed_query(text)

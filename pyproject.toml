@@ -20,8 +20,9 @@ test = [
   "langchain-core>=0.1.0",
   "llama-index-core>=0.10.0",
   "semantic-kernel>=0.9.0",
-  "pyautogen>=0.2.0",
+  "pyautogen>=0.10.0",
   "crewai>=0.1.0",
+  "pysqlite3-binary>=0.5.0",
 ]
 
 # Per-framework extras
@@ -35,10 +36,11 @@ semantic-kernel = [
   "semantic-kernel>=0.9.0",
 ]
 autogen = [
-  "pyautogen>=0.2.0",
+  "pyautogen>=0.10.0",
 ]
 crewai = [
   "crewai>=0.1.0",
+  "pysqlite3-binary>=0.5.0",
 ]
 
 # Convenience "everything" extra for all framework integrations
@@ -46,8 +48,9 @@ frameworks = [
   "langchain-core>=0.1.0",
   "llama-index-core>=0.10.0",
   "semantic-kernel>=0.9.0",
-  "pyautogen>=0.2.0",
+  "pyautogen>=0.10.0",
   "crewai>=0.1.0",
+  "pysqlite3-binary>=0.5.0",
 ]
 
 [project.scripts]
@@ -59,6 +62,9 @@ testpaths = ["tests"]
 addopts = "-v --strict-markers --strict-config"
 markers = [
     "skip_if_not_supported: skip tests if feature is not supported by the adapter",
+    "concurrency: marks tests as concurrency/thread-safety tests",
+    "integration: marks tests as integration tests with real frameworks",
+    "asyncio: mark test as an asyncio test",
 ]
 
 # --- Formatting/Linting/Typing (recommended, optional) ---
