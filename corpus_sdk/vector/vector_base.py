@@ -161,7 +161,7 @@ from typing import (
     runtime_checkable,
 )
 
-VECTOR_PROTOCOL_VERSION = "1.0.1"
+VECTOR_PROTOCOL_VERSION = "1.0.0"
 VECTOR_PROTOCOL_ID = "vector/v1.0"
 LOG = logging.getLogger(__name__)
 
