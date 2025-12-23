@@ -22,6 +22,7 @@ test = [
   "semantic-kernel>=0.9.0",
   "pyautogen>=0.10.0",
   "crewai>=0.1.0",
+  "pysqlite3-binary>=0.5.0",
 ]
 
 # Per-framework extras
@@ -39,6 +40,7 @@ autogen = [
 ]
 crewai = [
   "crewai>=0.1.0",
+  "pysqlite3-binary>=0.5.0",
 ]
 
 # Convenience "everything" extra for all framework integrations
@@ -48,6 +50,7 @@ frameworks = [
   "semantic-kernel>=0.9.0",
   "pyautogen>=0.10.0",
   "crewai>=0.1.0",
+  "pysqlite3-binary>=0.5.0",
 ]
 
 [project.scripts]
