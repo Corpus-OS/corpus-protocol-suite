@@ -591,9 +591,10 @@ class CorpusCrewAIEmbeddings:
 
         # Convert CrewAI context to core OperationContext with comprehensive error handling
         if crewai_context is not None:
-            try:
-                self._validate_crewai_context_structure(crewai_context)
+            # NOTE: Input validation errors are not best-effort: wrong-type context should fail fast.
+            self._validate_crewai_context_structure(crewai_context)
 
+            try:
                 core_ctx_candidate = context_from_crewai(
                     crewai_context,
                     framework_version=self._framework_version,
