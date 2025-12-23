@@ -36,7 +36,7 @@ Separately from the Apache 2.0 License, **Interoperable Intelligence Inc.** (the
 | Trademark usage rights | ❌ Not included | ✅ Available |
 | "Corpus Certified" designation | ❌ Not included | ✅ Available |
 | Enterprise support & SLA | ❌ Not included | ✅ Available |
-| Patent indemnification | ❌ Not included | ✅ Available |
+| Patent indemnification | ❌ Not included | ✅ May be available |
 | Priority feature requests | ❌ Not included | ✅ Available |
 
 ---
@@ -51,7 +51,7 @@ The Commercial License is an optional, independent agreement that can grant righ
 
 - Rights to practice certain Interoperable Intelligence Inc. **non-essential patents** - including proprietary optimization algorithms, advanced routing strategies, and optional features not required for protocol compliance, that are not necessarily limited to "the Work" as defined in the Apache License
 - Broader patent grants beyond protocol implementation
-- Patent indemnification - legal defense and coverage if third parties assert patent claims against your implementation
+- Patent indemnification may be available subject to separate negotiation and terms
 
 **Example:** License to use our proprietary ensemble optimization algorithms in your commercial products.
 
@@ -124,18 +124,7 @@ The Commercial License is **purely additive** and does not restrict any rights g
 
 Interoperable Intelligence Inc. has published a **Defensive Patent Pledge** (see PATENT_PLEDGE.md) that provides non-assertion of essential protocol patents to all implementers.
 
-**The Commercial License provides ADDITIONAL rights beyond the Pledge:**
-
-| Coverage | Defensive Patent Pledge (Free) | Commercial License (Paid) |
-|----------|-------------------------------|--------------------------|
-| Essential protocol patents | ✅ Non-assertion | ✅ Non-assertion |
-| Non-essential patents | ❌ Not covered | ✅ License available |
-| Patent indemnification | ❌ Not provided | ✅ Available |
-| Trademark rights | ❌ Explicitly excluded | ✅ Available |
-
-**Key distinction:**
-- **Patent Pledge:** "We won't sue you for implementing the protocol"
-- **Commercial License:** "We grant you additional patent rights + we'll defend you if others sue"
+**The Commercial License may provide additional rights beyond the Pledge, subject to specific negotiated terms.**
 
 ---
 
@@ -215,7 +204,7 @@ Commercial License pricing typically varies based on:
 - Official "Corpus Certified" designation ⭐ (Commercial License)
 - Use Corpus logo in marketing ⭐ (Commercial License)
 - Enterprise SLA for your customers ⭐ (Commercial License)
-- Patent indemnification for procurement ⭐ (Commercial License)
+- Patent indemnification for procurement ⭐ (May be available via Commercial License)
 
 **Conclusion:** Commercial License highly valuable for enterprise credibility.
 
@@ -243,13 +232,11 @@ Commercial License pricing typically varies based on:
 
 ---
 
-### Q: What's the difference between "patent pledge" and "patent license"?
+### Q: What's the difference between the Defensive Patent Pledge and a Commercial License?
 
 **A:** 
-- **Patent Pledge (Free):** "We promise not to sue you" for essential protocol patents
-- **Patent License (Commercial):** "We grant you explicit rights to use" non-essential patents + "we'll defend you if others sue"
-
-The pledge is passive (non-assertion), the license is active (grant + indemnification).
+- **Defensive Patent Pledge (Free):** Non-assertion of essential protocol patents - we promise not to sue you for implementing the protocol specifications
+- **Commercial License (Paid):** May provide additional rights including non-essential patent licenses, trademark usage, certification, enterprise support, and potentially patent indemnification, subject to specific negotiated terms
 
 ---
 
@@ -273,7 +260,7 @@ Without authorization, you cannot claim:
 
 ### Q: Does buying a Commercial License give me rights to the source code beyond Apache 2.0?
 
-**A:** No. The source code rights remain Apache 2.0 regardless of Commercial License status. The Commercial License provides *additional* rights (patents, trademarks, support, SLA) but doesn't change the code license.
+**A:** No. The source code rights remain Apache 2.0 regardless of Commercial License status. The Commercial License provides *additional* rights (such as patents, trademarks, support, SLA) but doesn't change the code license.
 
 ---
 
@@ -289,7 +276,7 @@ Without authorization, you cannot claim:
 ---
 
 **Document Version:** 1.0  
-**Last Updated:** December 23, 2024
+**Last Updated:** December 23, 2025
 
-© 2024 Interoperable Intelligence Inc.
+© 2025 Interoperable Intelligence Inc.
 ```
