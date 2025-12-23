@@ -714,6 +714,11 @@ async def test_async_error_context_includes_langchain_metadata(
     """
     Async embedding errors should also attach LangChain-specific metadata
     via attach_context(), mirroring the sync error-context behavior.
+
+    NOTE: The Corpus embedding stack is protocol-first: the underlying adapter is
+    only required to implement `embed()`. Async behavior may be provided by the
+    translator (e.g., offloading sync embed to a thread), so this test MUST NOT
+    assert that an adapter-level `aembed()` is invoked.
     """
     captured_context: Dict[str, Any] = {}
 
@@ -726,17 +731,25 @@ async def test_async_error_context_includes_langchain_metadata(
         fake_attach_context,
     )
 
-    class FailingAsyncAdapter:
-        def embed(self, *args: Any, **kwargs: Any) -> Any:
-            raise RuntimeError("sync embed should not be called in this test")
-
-        async def aembed(self, *args: Any, **kwargs: Any) -> Any:
+    class FailingTranslator:
+        async def arun_embed(
+            self,
+            raw_texts: Any,
+            op_ctx: Any = None,
+            framework_ctx: Any = None,
+        ) -> Any:
             raise RuntimeError(
-                "async test error from langchain adapter: Verify API key and model access permissions",
+                "async test error from langchain translator: Verify API key and model access permissions",
             )
 
+    class MinimalAdapter:
+        # Must satisfy Pydantic validation (has `embed`), but it won't be used
+        # because we patch the translator below.
+        def embed(self, texts: Sequence[str], **_: Any) -> list[list[float]]:
+            return [[0.0, 1.0] for _ in texts]
+
     embeddings = CorpusLangChainEmbeddings(
-        corpus_adapter=FailingAsyncAdapter(),
+        corpus_adapter=MinimalAdapter(),
         model="err-async-model",
     )
 
@@ -745,8 +758,15 @@ async def test_async_error_context_includes_langchain_metadata(
         "run_name": "error-test-async",
     }
 
-    with pytest.raises(RuntimeError, match="async test error from langchain adapter") as exc_info:
-        await embeddings.aembed_documents(["x", "y"], config=config)
+    # Patch the translator so the async path fails deterministically.
+    with monkeypatch.context() as m:
+        m.setattr(embeddings, "_translator", FailingTranslator())
+
+        with pytest.raises(
+            RuntimeError,
+            match="async test error from langchain translator",
+        ) as exc_info:
+            await embeddings.aembed_documents(["x", "y"], config=config)
 
     error_str = str(exc_info.value)
     assert "Verify API key" in error_str or "access permissions" in error_str
@@ -754,8 +774,9 @@ async def test_async_error_context_includes_langchain_metadata(
     assert captured_context, "attach_context was not called"
     assert captured_context.get("framework") == "langchain"
     assert captured_context.get("operation") == "embedding_documents"
-    if "run_id" in captured_context:
-        assert captured_context["run_id"] == "run-ctx-async"
+    # Best-effort propagation of RunnableConfig metadata
+    assert captured_context.get("run_id") == "run-ctx-async"
+    assert captured_context.get("run_name") == "error-test-async"
 
 
 def test_embed_documents_error_context_includes_langchain_fields(
