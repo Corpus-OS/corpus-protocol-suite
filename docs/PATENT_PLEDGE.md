@@ -1,4 +1,4 @@
-## 🛡️ Defensive Patent Pledge
+##  Defensive Patent Pledge
 
 To encourage broad adoption and innovation around the Corpus Protocol Suite, **Interoperable Intelligence Inc.** makes the following defensive patent pledge:
 
