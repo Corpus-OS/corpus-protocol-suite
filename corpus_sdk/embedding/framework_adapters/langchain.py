@@ -26,14 +26,13 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections.abc import Mapping, Sequence
 from functools import wraps
 from typing import (
     Any,
     Dict,
     List,
-    Mapping,
     Optional,
-    Sequence,
     Tuple,
     TypeVar,
     Callable,
@@ -776,9 +775,9 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
             logger=logger,
         )
 
-# ------------------------------------------------------------------ #
-    # Capapabilties and health API
-# ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------ #
+    # Capabilities and health API - FIXED with correct return types
+    # ------------------------------------------------------------------ #
 
     def capabilities(self) -> Mapping[str, Any]:
         """Best-effort capabilities passthrough."""
@@ -791,7 +790,6 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         if hasattr(self.corpus_adapter, "acapabilities"):
             return await self.corpus_adapter.acapabilities()  # type: ignore[no-any-return]
         if hasattr(self.corpus_adapter, "capabilities"):
-            import asyncio
             return await asyncio.to_thread(self.corpus_adapter.capabilities)
         return {}
     
@@ -806,7 +804,6 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         if hasattr(self.corpus_adapter, "ahealth"):
             return await self.corpus_adapter.ahealth()  # type: ignore[no-any-return]
         if hasattr(self.corpus_adapter, "health"):
-            import asyncio
             return await asyncio.to_thread(self.corpus_adapter.health)
         return {}
 
