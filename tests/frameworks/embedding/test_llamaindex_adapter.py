@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Sequence, Mapping
 from typing import Any, Dict
 
 import inspect
 import pytest
+from unittest.mock import Mock, patch
+import concurrent.futures
+import asyncio
 
 import corpus_sdk.embedding.framework_adapters.llamaindex as llamaindex_adapter_module
 from corpus_sdk.embedding.framework_adapters.llamaindex import (
@@ -14,7 +17,10 @@ from corpus_sdk.embedding.framework_adapters.llamaindex import (
     LLAMAINDEX_AVAILABLE,
     configure_llamaindex_embeddings,
     register_with_llamaindex,
+    ErrorCodes,
+    LlamaIndexAdapterConfig,
 )
+from corpus_sdk.embedding.embedding_base import OperationContext
 
 
 # ---------------------------------------------------------------------------
@@ -52,17 +58,18 @@ def _assert_embedding_vector_shape(result: Any) -> None:
         ), f"Embedding value is not numeric: {val!r}"
 
 
-def _make_embeddings(adapter: Any) -> CorpusLlamaIndexEmbeddings:
+def _make_embeddings(adapter: Any, **kwargs: Any) -> CorpusLlamaIndexEmbeddings:
     """
     Construct a CorpusLlamaIndexEmbeddings instance from the generic adapter.
 
     If the adapter doesn't implement get_embedding_dimension, we provide
     embedding_dimension explicitly to satisfy the constructor's contract.
     """
-    kwargs: dict[str, Any] = {"corpus_adapter": adapter}
+    base_kwargs: dict[str, Any] = {"corpus_adapter": adapter}
     if not hasattr(adapter, "get_embedding_dimension"):
-        kwargs["embedding_dimension"] = 8
-    return CorpusLlamaIndexEmbeddings(**kwargs)
+        base_kwargs["embedding_dimension"] = 8
+    base_kwargs.update(kwargs)
+    return CorpusLlamaIndexEmbeddings(**base_kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -386,3 +393,761 @@ async def test_async_and_sync_same_dimension(adapter: Any) -> None:
         async_dim = len(async_mat[0])
         assert sync_dim == async_dim
 
+
+# ---------------------------------------------------------------------------
+# NEW TESTS: Error Context & Error Message Quality
+# ---------------------------------------------------------------------------
+
+def test_error_context_includes_llamaindex_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    When an error occurs, error context should include LlamaIndex-specific metadata
+    via attach_context().
+    """
+    captured_context: Dict[str, Any] = {}
+
+    def fake_attach_context(exc: BaseException, **ctx: Any) -> None:
+        captured_context.update(ctx)
+
+    monkeypatch.setattr(
+        llamaindex_adapter_module,
+        "attach_context",
+        fake_attach_context,
+    )
+
+    class FailingAdapter:
+        def embed(self, *args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("test error from llamaindex adapter: Check model configuration and API keys")
+
+    embeddings = CorpusLlamaIndexEmbeddings(
+        corpus_adapter=FailingAdapter(),
+        embedding_dimension=8,
+        model_name="err-model",
+    )
+
+    llama_ctx = {
+        "node_ids": ["n1", "n2", "n3"],
+        "index_id": "idx-123",
+        "trace_id": "trace-xyz",
+    }
+
+    with pytest.raises(RuntimeError, match="test error from llamaindex adapter") as exc_info:
+        embeddings._get_text_embedding("test text", **llama_ctx)
+    
+    # Verify error contains actionable information
+    error_str = str(exc_info.value)
+    assert "Check model configuration" in error_str or "API keys" in error_str
+    
+    # Verify some context was attached
+    assert captured_context, "attach_context was not called"
+    
+    # Framework tagging should be present
+    assert "framework" in captured_context
+    assert captured_context.get("framework") == "llamaindex"
+    
+    # LlamaIndex-specific fields should be present in the context
+    assert "node_ids" in captured_context
+    assert captured_context.get("index_id") == "idx-123"
+    assert captured_context.get("trace_id") == "trace-xyz"
+    
+    # Verify context contains debugging breadcrumbs
+    assert "operation" in captured_context
+    assert captured_context["operation"] == "embedding_text"
+    
+    # Verify error codes are attached for proper categorization
+    assert "error_codes" in captured_context
+    assert captured_context["error_codes"] == llamaindex_adapter_module.EMBEDDING_COERCION_ERROR_CODES
+
+
+def test_embedding_error_context_includes_node_ids(monkeypatch: pytest.MonkeyPatch, adapter: Any) -> None:
+    """
+    Error context should include node_ids (truncated to max limit).
+    """
+    captured: Dict[str, Any] = {}
+
+    def fake_attach_context(exc: BaseException, **ctx: Any) -> None:
+        captured.update(ctx)
+
+    monkeypatch.setattr(llamaindex_adapter_module, "attach_context", fake_attach_context)
+
+    class FailingTranslator:
+        def embed(self, raw_texts: Any, op_ctx: Any = None, framework_ctx: Any = None) -> Any:
+            raise RuntimeError("translator failed: Check model configuration")
+
+    embeddings = CorpusLlamaIndexEmbeddings(
+        corpus_adapter=adapter,
+        embedding_dimension=8,
+        model_name="test-model",
+        llamaindex_config={"max_node_ids_in_context": 2},  # Limit to 2 nodes
+    )
+
+    with monkeypatch.context() as m:
+        m.setattr(embeddings, "_translator", FailingTranslator())
+        
+        # Create many node_ids to test truncation
+        llama_ctx = {
+            "node_ids": [f"node-{i}" for i in range(10)],  # 10 nodes
+            "index_id": "idx-123",
+        }
+
+        with pytest.raises(RuntimeError) as exc_info:
+            embeddings._get_text_embedding("test text", **llama_ctx)
+        
+        error_str = str(exc_info.value)
+        assert "translator failed" in error_str
+        assert "Check model configuration" in error_str
+
+        ctx = captured
+        assert ctx["framework"] == "llamaindex"
+        assert ctx["operation"] == "embedding_text"
+        # Should include truncated node_ids
+        assert "node_ids" in ctx
+        assert len(ctx["node_ids"]) == 2  # Truncated to max limit
+        assert ctx["node_ids"] == ["node-0", "node-1"]
+        assert ctx["node_count"] == 10  # Total count should still be accurate
+        assert ctx.get("node_ids_truncated") is True
+
+
+def test_invalid_llamaindex_context_type_is_ignored(monkeypatch: pytest.MonkeyPatch, adapter: Any) -> None:
+    """
+    Non-mapping llamaindex_context should be ignored gracefully.
+    """
+    class DummyTranslator:
+        def embed(self, raw_texts: Any, op_ctx: Any = None, framework_ctx: Any = None) -> Any:
+            if isinstance(raw_texts, list):
+                return [[0.0, 1.0] for _ in raw_texts]
+            return [0.0, 1.0]
+
+        async def arun_embed(self, raw_texts: Any, op_ctx: Any = None, framework_ctx: Any = None) -> Any:
+            return self.embed(raw_texts, op_ctx, framework_ctx)
+
+    monkeypatch.setattr(llamaindex_adapter_module, "create_embedding_translator", lambda **_: DummyTranslator())
+
+    embeddings = _make_embeddings(adapter)
+
+    # Non-mapping context should not break embeddings
+    result = embeddings._get_text_embedding("x", **{"not-a-mapping": True})  # type: ignore[arg-type]
+    _assert_embedding_vector_shape(result)
+
+
+def test_context_from_llamaindex_failure_attaches_context(monkeypatch: pytest.MonkeyPatch, adapter: Any) -> None:
+    """
+    If context_from_llamaindex raises, attach_context should be called.
+    """
+    calls = {"attached": False}
+
+    def boom(ctx: Dict[str, Any]) -> Any:
+        raise RuntimeError("ctx boom")
+
+    def fake_attach_context(exc: BaseException, **ctx: Any) -> None:
+        if ctx.get("operation") == "context_build":
+            calls["attached"] = True
+
+    monkeypatch.setattr(llamaindex_adapter_module, "context_from_llamaindex", boom)
+    monkeypatch.setattr(llamaindex_adapter_module, "attach_context", fake_attach_context)
+
+    embeddings = _make_embeddings(adapter)
+
+    llama_ctx = {"node_ids": ["n1"], "index_id": "idx-123"}
+    result = embeddings._get_text_embedding("x", **llama_ctx)
+    _assert_embedding_vector_shape(result)
+    assert calls["attached"] is True
+
+
+def test_embed_documents_error_context_includes_llamaindex_fields(monkeypatch: pytest.MonkeyPatch, adapter: Any) -> None:
+    """
+    Sync errors should include LlamaIndex context fields.
+    """
+    captured: Dict[str, Any] = {}
+
+    def fake_attach_context(exc: BaseException, **ctx: Any) -> None:
+        captured.update(ctx)
+
+    class FailingTranslator:
+        def embed(self, raw_texts: Any, op_ctx: Any = None, framework_ctx: Any = None) -> Any:
+            raise RuntimeError("translator failed: Check model configuration and API limits")
+
+    monkeypatch.setattr(llamaindex_adapter_module, "attach_context", fake_attach_context)
+
+    embeddings = CorpusLlamaIndexEmbeddings(
+        corpus_adapter=adapter,
+        embedding_dimension=8,
+        model_name="test-model",
+    )
+
+    with monkeypatch.context() as m:
+        m.setattr(embeddings, "_translator", FailingTranslator())
+        
+        llama_ctx = {
+            "node_ids": ["doc-node-1", "doc-node-2"],
+            "index_id": "doc-index",
+            "workflow": "document-indexing",
+            "callback_manager": Mock(),
+        }
+
+        with pytest.raises(RuntimeError) as exc_info:
+            embeddings._get_text_embeddings(["doc1", "doc2"], **llama_ctx)
+        
+        error_str = str(exc_info.value)
+        assert "translator failed" in error_str
+        assert "Check model configuration" in error_str
+
+        ctx = captured
+        assert ctx["framework"] == "llamaindex"
+        assert ctx["operation"] == "embedding_texts"
+        assert ctx["model_name"] == "test-model"
+        assert ctx["node_ids"] == ["doc-node-1", "doc-node-2"]
+        assert ctx["index_id"] == "doc-index"
+        assert ctx["workflow"] == "document-indexing"
+        assert ctx.get("has_callback_manager") is True
+
+
+@pytest.mark.asyncio
+async def test_async_error_context_includes_llamaindex_fields(monkeypatch: pytest.MonkeyPatch, adapter: Any) -> None:
+    """
+    Async errors should include LlamaIndex context fields.
+    """
+    captured: Dict[str, Any] = {}
+
+    def fake_attach_context(exc: BaseException, **ctx: Any) -> None:
+        captured.update(ctx)
+
+    class FailingTranslator:
+        async def arun_embed(self, raw_texts: Any, op_ctx: Any = None, framework_ctx: Any = None) -> Any:
+            raise RuntimeError("async translator failed: Verify API key and model access permissions")
+
+    monkeypatch.setattr(llamaindex_adapter_module, "attach_context", fake_attach_context)
+
+    embeddings = CorpusLlamaIndexEmbeddings(
+        corpus_adapter=adapter,
+        embedding_dimension=8,
+        model_name="async-test-model",
+    )
+
+    with monkeypatch.context() as m:
+        m.setattr(embeddings, "_translator", FailingTranslator())
+        
+        llama_ctx = {"node_ids": ["async-node-1"], "trace_id": "async-trace"}
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await embeddings._aget_text_embeddings(["async-doc1", "async-doc2"], **llama_ctx)
+        
+        error_str = str(exc_info.value)
+        assert "async translator failed" in error_str
+        assert "Verify API key" in error_str
+
+        ctx = captured
+        assert ctx["framework"] == "llamaindex"
+        assert ctx["operation"] == "embedding_texts"
+        assert ctx.get("node_ids") == ["async-node-1"]
+        assert ctx.get("trace_id") == "async-trace"
+        assert ctx.get("model_name") == "async-test-model"
+
+
+def test_error_message_quality_for_invalid_inputs(adapter: Any) -> None:
+    """
+    Error messages should be actionable (not cryptic Python errors).
+    """
+    embeddings = _make_embeddings(adapter)
+
+    # Test non-string query
+    with pytest.raises(TypeError) as exc:
+        embeddings._get_query_embedding(123)  # type: ignore[arg-type]
+    
+    error_msg = str(exc.value)
+    assert "embedding_query" in error_msg or "embedding" in error_msg
+    # Error should indicate what went wrong
+    assert "str" in error_msg or "string" in error_msg
+
+
+# ---------------------------------------------------------------------------
+# NEW TESTS: Input Validation
+# ---------------------------------------------------------------------------
+
+def test_get_text_embeddings_rejects_non_string_items(adapter: Any) -> None:
+    """
+    _get_text_embeddings should reject non-string items when strict_text_types=True.
+    """
+    # Create embeddings with strict_text_types=True (default)
+    embeddings = CorpusLlamaIndexEmbeddings(
+        corpus_adapter=adapter,
+        embedding_dimension=8,
+        model_name="strict-model",
+        llamaindex_config={"strict_text_types": True},
+    )
+
+    with pytest.raises(TypeError) as exc:
+        embeddings._get_text_embeddings(["ok", 123, "ok2"])  # type: ignore[list-item]
+    
+    error_msg = str(exc.value)
+    assert "_get_text_embeddings expects Sequence[str]" in error_msg
+    assert "item 1 is int" in error_msg
+
+
+@pytest.mark.asyncio
+async def test_async_get_text_embeddings_rejects_non_string_items(adapter: Any) -> None:
+    """
+    _aget_text_embeddings should reject non-string items when strict_text_types=True.
+    """
+    embeddings = CorpusLlamaIndexEmbeddings(
+        corpus_adapter=adapter,
+        embedding_dimension=8,
+        model_name="async-strict-model",
+        llamaindex_config={"strict_text_types": True},
+    )
+
+    with pytest.raises(TypeError) as exc:
+        await embeddings._aget_text_embeddings(["ok", object(), "ok2"])  # type: ignore[list-item]
+    
+    error_msg = str(exc.value)
+    assert "_aget_text_embeddings expects Sequence[str]" in error_msg
+    assert "item 1 is object" in error_msg
+
+
+def test_llamaindex_config_rejects_non_mapping() -> None:
+    """
+    llamaindex_config must be a Mapping; non-mapping values should raise.
+    """
+    class MockAdapter:
+        def embed(self, *args: Any, **kwargs: Any) -> list[list[float]]:
+            return [[0.0] * 8]
+
+    with pytest.raises(ValueError) as exc_info:
+        CorpusLlamaIndexEmbeddings(
+            corpus_adapter=MockAdapter(),
+            embedding_dimension=8,
+            llamaindex_config="not-a-mapping",  # type: ignore[arg-type]
+        )
+
+    msg = str(exc_info.value)
+    assert "LLAMAINDEX_CONFIG_INVALID" in msg
+    assert "llamaindex_config must be a Mapping" in msg
+
+
+def test_embed_batch_size_validation() -> None:
+    """
+    embed_batch_size must be positive.
+    """
+    class MockAdapter:
+        def embed(self, *args: Any, **kwargs: Any) -> list[list[float]]:
+            return [[0.0] * 8]
+
+    # Zero batch size should fail
+    with pytest.raises(ValueError) as exc_info:
+        CorpusLlamaIndexEmbeddings(
+            corpus_adapter=MockAdapter(),
+            embedding_dimension=8,
+            embed_batch_size=0,
+        )
+    assert "embed_batch_size must be positive" in str(exc_info.value)
+
+    # Negative batch size should fail
+    with pytest.raises(ValueError) as exc_info:
+        CorpusLlamaIndexEmbeddings(
+            corpus_adapter=MockAdapter(),
+            embedding_dimension=8,
+            embed_batch_size=-1,
+        )
+    assert "embed_batch_size must be positive" in str(exc_info.value)
+
+    # Positive batch size should work
+    embeddings = CorpusLlamaIndexEmbeddings(
+        corpus_adapter=MockAdapter(),
+        embedding_dimension=8,
+        embed_batch_size=100,
+    )
+    assert embeddings._embed_batch_size == 100
+
+
+# ---------------------------------------------------------------------------
+# NEW TESTS: Config/Context Validation
+# ---------------------------------------------------------------------------
+
+def test_llamaindex_config_defaults_and_bool_coercion(adapter: Any) -> None:
+    """
+    llamaindex_config should be normalized with defaults and booleans coerced.
+    """
+    embeddings = CorpusLlamaIndexEmbeddings(
+        corpus_adapter=adapter,
+        embedding_dimension=8,
+        llamaindex_config={
+            "enable_operation_context_propagation": 1,  # truthy -> bool
+            "strict_text_types": 0,  # falsy -> bool
+            # leave max_node_ids_in_context unset
+        },
+    )
+
+    cfg = embeddings.llamaindex_config
+    # Defaults filled in
+    assert "enable_operation_context_propagation" in cfg
+    assert "strict_text_types" in cfg
+    assert "max_node_ids_in_context" in cfg
+
+    # Bool coercion
+    assert isinstance(cfg["enable_operation_context_propagation"], bool)
+    assert isinstance(cfg["strict_text_types"], bool)
+    assert isinstance(cfg["max_node_ids_in_context"], int)
+
+    # Specific values
+    assert cfg["enable_operation_context_propagation"] is True
+    assert cfg["strict_text_types"] is False
+    assert cfg["max_node_ids_in_context"] == 100  # default
+
+
+def test_enable_operation_context_propagation_flag(monkeypatch: pytest.MonkeyPatch, adapter: Any) -> None:
+    """
+    enable_operation_context_propagation controls _operation_context inclusion.
+    """
+    def fake_from_llamaindex(ctx: Dict[str, Any]) -> OperationContext:
+        return OperationContext(request_id="r1")
+
+    monkeypatch.setattr(llamaindex_adapter_module, "context_from_llamaindex", fake_from_llamaindex)
+
+    llama_ctx = {"node_ids": ["n1"]}
+
+    # Default/True case
+    emb_default = CorpusLlamaIndexEmbeddings(
+        corpus_adapter=adapter,
+        embedding_dimension=8,
+        llamaindex_config={"enable_operation_context_propagation": True},
+    )
+    core_ctx, framework_ctx = emb_default._build_contexts(llamaindex_context=llama_ctx)
+    assert isinstance(core_ctx, OperationContext)
+    assert framework_ctx.get("_operation_context") is core_ctx
+
+    # Disabled case
+    emb_disabled = CorpusLlamaIndexEmbeddings(
+        corpus_adapter=adapter,
+        embedding_dimension=8,
+        llamaindex_config={"enable_operation_context_propagation": False},
+    )
+    core_ctx2, framework_ctx2 = emb_disabled._build_contexts(llamaindex_context=llama_ctx)
+    assert isinstance(core_ctx2, OperationContext)
+    assert "_operation_context" not in framework_ctx2
+
+
+def test_strict_text_types_flag_behavior(adapter: Any) -> None:
+    """
+    strict_text_types flag should control validation strictness.
+    """
+    # With strict_text_types=True (default), should reject
+    emb_strict = CorpusLlamaIndexEmbeddings(
+        corpus_adapter=adapter,
+        embedding_dimension=8,
+        llamaindex_config={"strict_text_types": True},
+    )
+
+    with pytest.raises(TypeError):
+        emb_strict._get_text_embeddings(["ok", 123])  # type: ignore[list-item]
+
+    # With strict_text_types=False, should handle gracefully
+    emb_lenient = CorpusLlamaIndexEmbeddings(
+        corpus_adapter=adapter,
+        embedding_dimension=8,
+        llamaindex_config={"strict_text_types": False},
+    )
+
+    # Should not raise, should handle non-string as empty
+    result = emb_lenient._get_text_embeddings(["ok", 123, "ok2"])  # type: ignore[list-item]
+    _assert_embedding_matrix_shape(result, expected_rows=3)
+    # All rows should have the same dimension
+    assert all(len(row) == 8 for row in result)
+
+
+# ---------------------------------------------------------------------------
+# NEW TESTS: Capabilities/Health Passthrough
+# ---------------------------------------------------------------------------
+
+def test_capabilities_passthrough_when_underlying_provides() -> None:
+    """
+    Should surface capabilities from underlying adapter.
+    """
+    class CapabilitiesAdapter:
+        def embed(self, texts: Sequence[str], **_: Any) -> list[list[float]]:
+            return [[0.0] * 8 for _ in texts]
+
+        def capabilities(self) -> Dict[str, Any]:
+            return {"supported_models": ["model-a", "model-b"], "max_tokens": 8192}
+
+    adapter = CapabilitiesAdapter()
+    embeddings = CorpusLlamaIndexEmbeddings(
+        corpus_adapter=adapter,
+        embedding_dimension=8,
+        model_name="cap-model",
+    )
+
+    caps = embeddings.capabilities()
+    assert isinstance(caps, dict)
+    assert caps.get("supported_models") == ["model-a", "model-b"]
+    assert caps.get("max_tokens") == 8192
+
+
+def test_health_passthrough_when_underlying_provides() -> None:
+    """
+    Should surface health from underlying adapter.
+    """
+    class HealthAdapter:
+        def embed(self, texts: Sequence[str], **_: Any) -> list[list[float]]:
+            return [[0.0] * 8 for _ in texts]
+
+        def health(self) -> Dict[str, Any]:
+            return {"status": "healthy", "uptime_seconds": 3600}
+
+    adapter = HealthAdapter()
+    embeddings = CorpusLlamaIndexEmbeddings(
+        corpus_adapter=adapter,
+        embedding_dimension=8,
+        model_name="health-model",
+    )
+
+    health = embeddings.health()
+    assert isinstance(health, dict)
+    assert health.get("status") == "healthy"
+    assert health.get("uptime_seconds") == 3600
+
+
+def test_capabilities_empty_when_missing() -> None:
+    """
+    Should return empty dict when adapter has no capabilities.
+    """
+    class NoCapAdapter:
+        def embed(self, texts: Sequence[str], **_: Any) -> list[list[float]]:
+            return [[0.0] * 8 for _ in texts]
+
+    embeddings = CorpusLlamaIndexEmbeddings(
+        corpus_adapter=NoCapAdapter(),
+        embedding_dimension=8,
+        model_name="no-cap-model",
+    )
+
+    caps = embeddings.capabilities()
+    assert isinstance(caps, dict)
+    assert caps == {}
+
+
+def test_health_empty_when_missing() -> None:
+    """
+    Should return empty dict when adapter has no health.
+    """
+    class NoHealthAdapter:
+        def embed(self, texts: Sequence[str], **_: Any) -> list[list[float]]:
+            return [[0.0] * 8 for _ in texts]
+
+    embeddings = CorpusLlamaIndexEmbeddings(
+        corpus_adapter=NoHealthAdapter(),
+        embedding_dimension=8,
+        model_name="no-health-model",
+    )
+
+    health = embeddings.health()
+    assert isinstance(health, dict)
+    assert health == {}
+
+
+# ---------------------------------------------------------------------------
+# NEW TESTS: Resource Management
+# ---------------------------------------------------------------------------
+
+def test_context_manager_closes_underlying_adapter() -> None:
+    """
+    __enter__/__exit__ should call close on underlying adapter.
+    """
+    class ClosingAdapter:
+        def __init__(self) -> None:
+            self.closed = False
+            self.aclosed = False
+
+        def embed(self, texts: Sequence[str], **_: Any) -> list[list[float]]:
+            return [[0.0] * 8 for _ in texts]
+
+        def close(self) -> None:
+            self.closed = True
+
+        async def aclose(self) -> None:
+            self.aclosed = True
+
+    adapter = ClosingAdapter()
+    embeddings = CorpusLlamaIndexEmbeddings(
+        corpus_adapter=adapter,
+        embedding_dimension=8,
+        model_name="ctx-model",
+    )
+
+    with embeddings as emb:
+        _ = emb._get_text_embedding("x")  # smoke test
+
+    assert adapter.closed is True
+
+
+@pytest.mark.asyncio
+async def test_async_context_manager_closes_underlying_adapter() -> None:
+    """
+    __aenter__/__aexit__ should call aclose on underlying adapter.
+    """
+    class ClosingAdapter:
+        def __init__(self) -> None:
+            self.closed = False
+            self.aclosed = False
+
+        def embed(self, texts: Sequence[str], **_: Any) -> list[list[float]]:
+            return [[0.0] * 8 for _ in texts]
+
+        def close(self) -> None:
+            self.closed = True
+
+        async def aclose(self) -> None:
+            self.aclosed = True
+
+    adapter = ClosingAdapter()
+    embeddings = CorpusLlamaIndexEmbeddings(
+        corpus_adapter=adapter,
+        embedding_dimension=8,
+        model_name="async-ctx-model",
+    )
+
+    async with embeddings:
+        _ = await embeddings._aget_text_embedding("y")
+
+    assert adapter.aclosed is True
+
+
+# ---------------------------------------------------------------------------
+# NEW TESTS: Concurrency
+# ---------------------------------------------------------------------------
+
+@pytest.mark.concurrency
+def test_shared_embedder_thread_safety(adapter: Any) -> None:
+    """
+    Shared embedder should be thread-safe for concurrent access.
+    """
+    embedder = configure_llamaindex_embeddings(
+        corpus_adapter=adapter,
+        model_name="concurrent-model",
+        embedding_dimension=8,
+    )
+
+    def embed_query(text: str) -> Any:
+        return embedder._get_query_embedding(text)
+
+    texts = [f"query {i}" for i in range(10)]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        futures = [executor.submit(embed_query, text) for text in texts]
+        results = [f.result() for f in concurrent.futures.as_completed(futures)]
+
+    assert len(results) == len(texts)
+    for result in results:
+        assert isinstance(result, list)
+        assert all(isinstance(x, float) for x in result)
+
+
+@pytest.mark.asyncio
+@pytest.mark.concurrency
+async def test_concurrent_async_embedding(adapter: Any) -> None:
+    """
+    Async embedding should support concurrent operations.
+    """
+    embedder = configure_llamaindex_embeddings(
+        corpus_adapter=adapter,
+        model_name="async-concurrent-model",
+        embedding_dimension=8,
+    )
+
+    async def embed_async(text: str) -> Any:
+        return await embedder._aget_query_embedding(text)
+
+    texts = [f"async query {i}" for i in range(5)]
+    tasks = [embed_async(text) for text in texts]
+    results = await asyncio.gather(*tasks)
+
+    assert len(results) == len(texts)
+    for result in results:
+        assert isinstance(result, list)
+        assert all(isinstance(x, float) for x in result)
+
+
+# ---------------------------------------------------------------------------
+# NEW TESTS: Integration
+# ---------------------------------------------------------------------------
+
+@pytest.mark.integration
+class TestLlamaIndexIntegration:
+    """
+    Integration tests with real LlamaIndex objects.
+    """
+    
+    @pytest.fixture
+    def llamaindex_available(self) -> bool:
+        try:
+            import llama_index
+            return True
+        except ImportError:
+            pytest.skip("LlamaIndex not installed - skipping integration tests")
+    
+    def test_can_use_with_llamaindex_settings(self, llamaindex_available: bool, adapter: Any) -> None:
+        """
+        Should work with LlamaIndex Settings.embed_model.
+        """
+        if not LLAMAINDEX_AVAILABLE:
+            pytest.skip("LLAMAINDEX_AVAILABLE is False - skipping Settings integration")
+
+        embedder = configure_llamaindex_embeddings(
+            corpus_adapter=adapter,
+            model_name="integration-model",
+            embedding_dimension=8,
+        )
+
+        # Test basic embedding functionality
+        docs = ["LlamaIndex is a framework.", "Embeddings convert text to vectors."]
+        doc_vecs = embedder._get_text_embeddings(docs)
+        _assert_embedding_matrix_shape(doc_vecs, expected_rows=len(docs))
+
+        query_vec = embedder._get_query_embedding("What is LlamaIndex?")
+        _assert_embedding_vector_shape(query_vec)
+    
+    def test_embeddings_work_in_llamaindex_pipelines(self, llamaindex_available: bool, adapter: Any) -> None:
+        """
+        Should work in LlamaIndex document processing pipelines.
+        """
+        if not LLAMAINDEX_AVAILABLE:
+            pytest.skip("LLAMAINDEX_AVAILABLE is False - skipping pipeline integration")
+
+        embedder = configure_llamaindex_embeddings(
+            corpus_adapter=adapter,
+            model_name="pipeline-model",
+            embedding_dimension=8,
+        )
+
+        # Simulate LlamaIndex pipeline context
+        llama_ctx = {
+            "node_ids": ["doc-node-1", "doc-node-2"],
+            "index_id": "pipeline-index",
+            "workflow": "document-ingestion",
+        }
+
+        # Test with LlamaIndex context
+        embeddings = embedder._get_text_embeddings(["doc1", "doc2"], **llama_ctx)
+        _assert_embedding_matrix_shape(embeddings, expected_rows=2)
+    
+    def test_error_handling_in_llamaindex_workflow(self, llamaindex_available: bool) -> None:
+        """
+        Error handling in LlamaIndex context should be actionable.
+        """
+        class FailingAdapter:
+            def embed(self, texts: Sequence[str], **_: Any) -> list[list[float]]:
+                raise RuntimeError("Rate limit exceeded: Please wait 60 seconds before retrying")
+            
+            def get_embedding_dimension(self) -> int:
+                return 8
+
+        adapter = FailingAdapter()
+        failing_embedder = CorpusLlamaIndexEmbeddings(
+            corpus_adapter=adapter,
+            model_name="failing-model",
+        )
+
+        with pytest.raises(RuntimeError) as exc_info:
+            failing_embedder._get_text_embeddings(["test document"])
+
+        error_str = str(exc_info.value)
+        assert "rate limit" in error_str.lower() or "exceeded" in error_str.lower()
+        assert "wait 60 seconds" in error_str.lower() or "retry" in error_str.lower()
