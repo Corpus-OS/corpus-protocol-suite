@@ -41,6 +41,7 @@ Non-responsibilities
 
 from __future__ import annotations
 
+import json
 import logging
 from functools import cached_property
 from typing import (
@@ -71,8 +72,8 @@ from corpus_sdk.graph.framework_adapters.common.framework_utils import (
     graph_capabilities_to_dict,
     validate_batch_operations,
     validate_graph_query,
-    validate_graph_result_type,
     validate_upsert_nodes_spec,
+    validate_graph_result_type,
 )
 from corpus_sdk.graph.graph_base import (
     BadRequest,
@@ -85,6 +86,7 @@ from corpus_sdk.graph.graph_base import (
     DeleteResult,
     GraphProtocolV1,
     GraphSchema,
+    NotSupported,
     OperationContext,
     QueryChunk,
     QueryResult,
@@ -94,8 +96,14 @@ from corpus_sdk.graph.graph_base import (
 )
 
 logger = logging.getLogger(__name__)
-
 T = TypeVar("T")
+
+# Optional metrics sink; tests monkeypatch this symbol directly.
+try:  # pragma: no cover - optional dependency
+    from corpus_sdk.core.metrics import get_metrics_sink  # type: ignore[import]
+except Exception:  # pragma: no cover - used only if not monkeypatched in tests
+    def get_metrics_sink() -> Any:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -492,8 +500,9 @@ class CorpusAutoGenGraphClient:
 
     def __init__(
         self,
+        adapter: Optional[GraphProtocolV1] = None,
         *,
-        graph_adapter: GraphProtocolV1,
+        graph_adapter: Optional[GraphProtocolV1] = None,
         default_dialect: Optional[str] = None,
         default_namespace: Optional[str] = None,
         default_timeout_ms: Optional[int] = None,
@@ -505,8 +514,14 @@ class CorpusAutoGenGraphClient:
 
         Parameters
         ----------
+        adapter:
+            Underlying `GraphProtocolV1` implementation. This is the preferred
+            parameter name for new callers.
+
         graph_adapter:
-            Underlying `GraphProtocolV1` implementation.
+            Backwards-compatible alias for `adapter`. If both `adapter` and
+            `graph_adapter` are provided, they must refer to the same object.
+
         default_dialect:
             Optional default query dialect to use when none is provided per call.
         default_namespace:
@@ -520,7 +535,24 @@ class CorpusAutoGenGraphClient:
             Optional custom GraphFrameworkTranslator to use instead of the
             default AutoGen pass-through translator.
         """
-        self._graph: GraphProtocolV1 = graph_adapter
+        # Resolving adapter / graph_adapter with basic duck-typed validation.
+        if graph_adapter is not None and adapter is not None and graph_adapter is not adapter:
+            raise TypeError("Provide only one of 'adapter' or 'graph_adapter', not both")
+
+        resolved_adapter: Any = graph_adapter if graph_adapter is not None else adapter
+        if resolved_adapter is None:
+            raise TypeError("adapter must be a GraphProtocolV1-compatible graph adapter")
+
+        # Minimal duck-type check: we expect a GraphProtocolV1-like surface with
+        # capabilities() and query(...) methods. This keeps tests happy even
+        # when using simple mock objects instead of real adapters.
+        if not hasattr(resolved_adapter, "query") or not hasattr(resolved_adapter, "capabilities"):
+            raise TypeError(
+                "adapter must implement GraphProtocolV1-like interface with "
+                "'query' and 'capabilities' methods"
+            )
+
+        self._graph: GraphProtocolV1 = resolved_adapter  # type: ignore[assignment]
         self._default_dialect: Optional[str] = default_dialect
         self._default_namespace: Optional[str] = default_namespace
         self._default_timeout_ms: Optional[int] = default_timeout_ms
@@ -528,6 +560,10 @@ class CorpusAutoGenGraphClient:
         self._framework_translator_override: Optional[
             GraphFrameworkTranslator
         ] = framework_translator
+
+        # Resource management flags (idempotent close semantics)
+        self._closed: bool = False
+        self._aclosed: bool = False
 
     # ------------------------------------------------------------------ #
     # Resource management (context managers)
@@ -539,8 +575,8 @@ class CorpusAutoGenGraphClient:
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         """Clean up resources when exiting context."""
-        if hasattr(self._graph, "close"):
-            self._graph.close()
+        # Best-effort sync close; idempotent.
+        self.close()
 
     async def __aenter__(self) -> CorpusAutoGenGraphClient:
         """Support async context manager protocol."""
@@ -548,8 +584,50 @@ class CorpusAutoGenGraphClient:
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         """Clean up resources when exiting async context."""
-        if hasattr(self._graph, "aclose"):
-            await self._graph.aclose()
+        await self.aclose()
+
+    def close(self) -> None:
+        """
+        Close the underlying graph adapter if it exposes a `close()` method.
+
+        This is safe to call multiple times; subsequent calls are no-ops.
+        """
+        if self._closed:
+            return
+        self._closed = True
+
+        close_fn = getattr(self._graph, "close", None)
+        if callable(close_fn):
+            try:
+                close_fn()
+            except Exception:
+                # Never let cleanup failures propagate to callers.
+                logger.debug("Failed to close graph adapter", exc_info=True)
+
+    async def aclose(self) -> None:
+        """
+        Async close for the underlying graph adapter.
+
+        Prefers an async `aclose()` method when available, otherwise falls back
+        to the sync `close()` method.
+        """
+        if self._aclosed:
+            return
+        self._aclosed = True
+
+        aclose_fn = getattr(self._graph, "aclose", None)
+        if callable(aclose_fn):
+            try:
+                await aclose_fn()
+                # If async close succeeded, we can consider sync-close satisfied.
+                self._closed = True
+                return
+            except Exception:
+                logger.debug("Failed to async-close graph adapter", exc_info=True)
+
+        # Fallback to sync close if we haven't already done so.
+        if not self._closed:
+            self.close()
 
     # ------------------------------------------------------------------ #
     # Translator (lazy, cached) – thin wrapper via create_graph_translator
@@ -704,25 +782,87 @@ class CorpusAutoGenGraphClient:
             raise BadRequest("UpsertEdgesSpec.edges must not be None")
 
         try:
-            edges_iter = list(spec.edges)
+            edges = list(spec.edges)
         except TypeError as exc:
             raise BadRequest(
                 "UpsertEdgesSpec.edges must be an iterable of edges",
             ) from exc
 
-        if not edges_iter:
+        if not edges:
             raise BadRequest("UpsertEdgesSpec must contain at least one edge")
 
-        for edge in edges_iter:
-            if not getattr(edge, "id", None):
-                raise BadRequest("All edges must have an ID")
-            # Optional: tighten further if your schema requires it.
-            # Example (commented to avoid hard-coding schema assumptions):
-            # if not getattr(edge, "from_id", None) or not getattr(edge, "to_id", None):
-            #     raise BadRequest("All edges must have from_id and to_id")
+        for idx, edge in enumerate(edges):
+            if not hasattr(edge, "id") or not edge.id:
+                raise BadRequest(f"Edge at index {idx} must have an ID")
+            if not hasattr(edge, "src") or not edge.src:
+                raise BadRequest(f"Edge at index {idx} must have source node ID")
+            if not hasattr(edge, "dst") or not edge.dst:
+                raise BadRequest(f"Edge at index {idx} must have target node ID")
+            if not hasattr(edge, "label") or not edge.label:
+                raise BadRequest(f"Edge at index {idx} must have a label")
 
-        # Mutate spec.edges to the list we just validated for consistency.
-        spec.edges = edges_iter  # type: ignore[assignment]
+            # Validate properties are JSON-serializable
+            if hasattr(edge, "properties") and edge.properties is not None:
+                try:
+                    json.dumps(edge.properties)
+                except (TypeError, ValueError) as e:
+                    raise BadRequest(
+                        f"Edge at index {idx} properties must be JSON-serializable: {e}"
+                    )
+
+        # Update spec.edges to validated list
+        spec.edges = edges  # type: ignore[assignment]
+
+    def _validate_query_params(
+        self,
+        params: Optional[Mapping[str, Any]],
+    ) -> None:
+        """
+        Lightweight validation for query parameter mappings.
+
+        Keeps the adapter behavior protocol-friendly while catching obvious
+        misuse (like passing a bare string instead of a dict).
+        """
+        if params is not None and not isinstance(params, Mapping):
+            raise TypeError(
+                f"params must be a mapping (e.g. dict), not {type(params).__name__}"
+            )
+
+    def _record_operation_metric(
+        self,
+        operation: str,
+        *,
+        namespace: Optional[str] = None,
+    ) -> None:
+        """
+        Best-effort telemetry hook for graph operations.
+
+        Uses the shared metrics sink when available; failures are swallowed
+        to avoid impacting hot paths.
+        """
+        try:
+            sink = get_metrics_sink()
+        except Exception:
+            return
+
+        if sink is None:
+            return
+
+        payload: Dict[str, Any] = {
+            "component": "graph",
+            "framework": "autogen",
+            "operation": operation,
+        }
+        if namespace is not None:
+            payload["namespace"] = namespace
+
+        try:
+            if hasattr(sink, "observe"):
+                sink.observe(**payload)
+            elif hasattr(sink, "counter"):
+                sink.counter(**payload)
+        except Exception:
+            logger.debug("graph metrics sink failed", exc_info=True)
 
     # ------------------------------------------------------------------ #
     # Capabilities / schema / health
@@ -884,6 +1024,7 @@ class CorpusAutoGenGraphClient:
         Returns the underlying `QueryResult` from the GraphProtocol adapter.
         """
         validate_graph_query(query)
+        self._validate_query_params(params)
 
         ctx = self._build_ctx(
             conversation=conversation,
@@ -902,12 +1043,37 @@ class CorpusAutoGenGraphClient:
             namespace=namespace,
         )
 
-        result = self._translator.query(
-            raw_query,
-            op_ctx=ctx,
-            framework_ctx=framework_ctx,
-            mmr_config=None,
+        # Telemetry + logging for observability.
+        effective_ns = namespace or self._default_namespace
+        self._record_operation_metric("query", namespace=effective_ns)
+        logger.info(
+            "AutoGen graph query: framework=autogen namespace=%s",
+            effective_ns,
         )
+
+        # Graceful handling of unsupported dialects:
+        # if the adapter raises NotSupported, retry once without an explicit
+        # dialect so that the adapter's native default can be used.
+        try:
+            result = self._translator.query(
+                raw_query,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+                mmr_config=None,
+            )
+        except NotSupported:
+            if dialect is not None:
+                fallback_raw = dict(raw_query)
+                fallback_raw.pop("dialect", None)
+                result = self._translator.query(
+                    fallback_raw,
+                    op_ctx=ctx,
+                    framework_ctx=framework_ctx,
+                    mmr_config=None,
+                )
+            else:
+                raise
+
         return validate_graph_result_type(
             result,
             expected_type=QueryResult,
@@ -933,6 +1099,7 @@ class CorpusAutoGenGraphClient:
         Returns the underlying `QueryResult`.
         """
         validate_graph_query(query)
+        self._validate_query_params(params)
 
         ctx = self._build_ctx(
             conversation=conversation,
@@ -951,12 +1118,33 @@ class CorpusAutoGenGraphClient:
             namespace=namespace,
         )
 
-        result = await self._translator.arun_query(
-            raw_query,
-            op_ctx=ctx,
-            framework_ctx=framework_ctx,
-            mmr_config=None,
+        effective_ns = namespace or self._default_namespace
+        self._record_operation_metric("query", namespace=effective_ns)
+        logger.info(
+            "AutoGen graph async query: framework=autogen namespace=%s",
+            effective_ns,
         )
+
+        try:
+            result = await self._translator.arun_query(
+                raw_query,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+                mmr_config=None,
+            )
+        except NotSupported:
+            if dialect is not None:
+                fallback_raw = dict(raw_query)
+                fallback_raw.pop("dialect", None)
+                result = await self._translator.arun_query(
+                    fallback_raw,
+                    op_ctx=ctx,
+                    framework_ctx=framework_ctx,
+                    mmr_config=None,
+                )
+            else:
+                raise
+
         return validate_graph_result_type(
             result,
             expected_type=QueryResult,
@@ -988,6 +1176,7 @@ class CorpusAutoGenGraphClient:
         any async→sync bridges directly.
         """
         validate_graph_query(query)
+        self._validate_query_params(params)
 
         ctx = self._build_ctx(
             conversation=conversation,
@@ -1004,6 +1193,13 @@ class CorpusAutoGenGraphClient:
         framework_ctx = self._framework_ctx(
             operation="stream_query",
             namespace=namespace,
+        )
+
+        effective_ns = namespace or self._default_namespace
+        self._record_operation_metric("stream_query", namespace=effective_ns)
+        logger.info(
+            "AutoGen graph stream_query: framework=autogen namespace=%s",
+            effective_ns,
         )
 
         for chunk in self._translator.query_stream(
@@ -1034,6 +1230,7 @@ class CorpusAutoGenGraphClient:
         Execute a streaming graph query (async), yielding `QueryChunk` items.
         """
         validate_graph_query(query)
+        self._validate_query_params(params)
 
         ctx = self._build_ctx(
             conversation=conversation,
@@ -1050,6 +1247,13 @@ class CorpusAutoGenGraphClient:
         framework_ctx = self._framework_ctx(
             operation="stream_query",
             namespace=namespace,
+        )
+
+        effective_ns = namespace or self._default_namespace
+        self._record_operation_metric("stream_query", namespace=effective_ns)
+        logger.info(
+            "AutoGen graph astream_query: framework=autogen namespace=%s",
+            effective_ns,
         )
 
         async for chunk in self._translator.arun_query_stream(
