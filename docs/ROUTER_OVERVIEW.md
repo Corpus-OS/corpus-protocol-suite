@@ -1,9 +1,5 @@
 # Corpus Router: The Intelligent Control Plane for AI Infrastructure
 
-> **Your AI infrastructure costs are 30-60% higher than they need to be. You're locked into frameworks that limit innovation. Compliance is becoming a nightmare.**  
-> 
-> Corpus Router fixes this by providing a protocol-first, framework-agnostic control plane that learns which providers work best for your specific workloads—across LLMs, vectors, graphs, and embeddings.
-
 ---
 
 ## Executive Summary
