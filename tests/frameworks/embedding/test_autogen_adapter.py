@@ -874,27 +874,28 @@ def test_capabilities_and_health_return_empty_when_missing() -> None:
 def test_context_manager_closes_underlying_adapter(monkeypatch: pytest.MonkeyPatch, adapter) -> None:
     """
     Context manager should close underlying adapter (sync version).
-
-        async def embed(self, *args: Any, **kwargs: Any) -> Any:
-            return [[0.1, 0.2, 0.3]]
+    """
+    closed = {"v": False}
+    async def embed(self, *args: Any, **kwargs: Any) -> Any:
+        return [[0.1, 0.2, 0.3]]
         
-        async def embed_batch(self, *args: Any, **kwargs: Any) -> Any:
-            from corpus_sdk.embedding.embedding_base import BatchEmbedResult, EmbeddingVector
-            embeddings = [
-                EmbeddingVector(
+    async def embed_batch(self, *args: Any, **kwargs: Any) -> Any:
+        from corpus_sdk.embedding.embedding_base import BatchEmbedResult, EmbeddingVector
+        embeddings = [
+            EmbeddingVector(
                     vector=[0.1, 0.2, 0.3],
                     text="x",
                     model="mock-embed-512",
                     dimensions=3,
                     index=0
-                )
-            ]
-            return BatchEmbedResult(
+            )
+        ]
+        return BatchEmbedResult(
                 embeddings=embeddings, 
                 model="mock-embed-512", 
                 total_texts=1
-            )
-
+        )
+    
     def close() -> None:
         closed["v"] = True
 
@@ -912,13 +913,14 @@ def test_context_manager_closes_underlying_adapter(monkeypatch: pytest.MonkeyPat
 async def test_async_context_manager_closes_underlying_adapter(monkeypatch: pytest.MonkeyPatch, adapter) -> None:
     """
     Async context manager should close underlying adapter (async version).
-
-        async def embed(self, *args: Any, **kwargs: Any) -> Any:
-            return [[0.1, 0.2, 0.3]]
+    """
+    aclosed = {"v": False}
+    async def embed(self, *args: Any, **kwargs: Any) -> Any:
+        return [[0.1, 0.2, 0.3]]
         
-        async def embed_batch(self, *args: Any, **kwargs: Any) -> Any:
-            from corpus_sdk.embedding.embedding_base import BatchEmbedResult, EmbeddingVector
-            embeddings = [
+    async def embed_batch(self, *args: Any, **kwargs: Any) -> Any:
+        from corpus_sdk.embedding.embedding_base import BatchEmbedResult, EmbeddingVector
+        embeddings = [
                 EmbeddingVector(
                     vector=[0.1, 0.2, 0.3],
                     text="y",
@@ -926,12 +928,12 @@ async def test_async_context_manager_closes_underlying_adapter(monkeypatch: pyte
                     dimensions=3,
                     index=0
                 )
-            ]
-            return BatchEmbedResult(
+        ]
+        return BatchEmbedResult(
                 embeddings=embeddings, 
                 model="mock-embed-512", 
                 total_texts=1
-            )
+        )
 
     async def aclose() -> None:
         aclosed["v"] = True
