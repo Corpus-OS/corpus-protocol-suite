@@ -781,11 +781,12 @@ class LLMCapabilities:
         - Input validation (e.g., context window)
         - Detecting support for streaming / JSON modes / tools / deadlines
     """
-    protocol: str = LLM_PROTOCOL_ID
+    
     server: str
     version: str
     model_family: str
     max_context_length: int
+    protocol: str = LLM_PROTOCOL_ID
     supports_streaming: bool = True
     supports_roles: bool = True
     supports_json_output: bool = False
