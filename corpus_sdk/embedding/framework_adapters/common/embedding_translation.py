@@ -79,6 +79,8 @@ from typing import (
     Union,
 )
 
+import asyncio
+
 from corpus_sdk.embedding.embedding_base import (
     EmbeddingProtocolV1,
     OperationContext,
@@ -1199,6 +1201,173 @@ class EmbeddingTranslator:
 
         return await self._run_operation(
             op_name="batch_embed",
+            op_ctx=op_ctx,
+            sync=False,
+            logic=_logic,
+        )
+
+    # --------------------------------------------------------------------- #
+    # Capabilities / Health
+    # --------------------------------------------------------------------- #
+
+    def capabilities(
+        self,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,  # noqa: ARG002
+    ) -> Mapping[str, Any]:
+        """
+        Synchronous capabilities API.
+
+        Uses the same _run_operation / AsyncBridge machinery as other
+        non-streaming operations so async↔sync bridging stays centralized.
+        """
+
+        async def _logic(ctx: OperationContext) -> Mapping[str, Any]:
+            caps = getattr(self._adapter, "capabilities", None)
+            acaps = getattr(self._adapter, "acapabilities", None)
+
+            if callable(acaps):
+                result = await acaps()  # type: ignore[no-any-return]
+            elif callable(caps):
+                if asyncio.iscoroutinefunction(caps):
+                    result = await caps()  # type: ignore[no-any-return]
+                else:
+                    # sync function; this runs in AsyncBridge's loop thread context
+                    result = caps()  # type: ignore[no-any-return]
+            else:
+                return {}
+
+            if not isinstance(result, Mapping):
+                raise BadRequest(
+                    f"adapter.capabilities returned unsupported type: "
+                    f"{type(result).__name__}",
+                    code="BAD_ADAPTER_RESULT",
+                )
+            return dict(result)
+
+        return self._run_operation(
+            op_name="capabilities",
+            op_ctx=op_ctx,
+            sync=True,
+            logic=_logic,
+        )
+
+    async def arun_capabilities(
+        self,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,  # noqa: ARG002
+    ) -> Mapping[str, Any]:
+        """
+        Async capabilities API.
+
+        Ensures sync adapter methods are run in a worker thread so we don't
+        block the caller's event loop.
+        """
+
+        async def _logic(ctx: OperationContext) -> Mapping[str, Any]:
+            caps = getattr(self._adapter, "capabilities", None)
+            acaps = getattr(self._adapter, "acapabilities", None)
+
+            if callable(acaps):
+                result = await acaps()  # type: ignore[no-any-return]
+            elif callable(caps):
+                if asyncio.iscoroutinefunction(caps):
+                    result = await caps()  # type: ignore[no-any-return]
+                else:
+                    result = await asyncio.to_thread(caps)  # type: ignore[arg-type]
+            else:
+                return {}
+
+            if not isinstance(result, Mapping):
+                raise BadRequest(
+                    f"adapter.capabilities returned unsupported type: "
+                    f"{type(result).__name__}",
+                    code="BAD_ADAPTER_RESULT",
+                )
+            return dict(result)
+
+        return await self._run_operation(
+            op_name="capabilities",
+            op_ctx=op_ctx,
+            sync=False,
+            logic=_logic,
+        )
+
+    def health(
+        self,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,  # noqa: ARG002
+    ) -> Mapping[str, Any]:
+        """
+        Synchronous health API.
+        """
+
+        async def _logic(ctx: OperationContext) -> Mapping[str, Any]:
+            health = getattr(self._adapter, "health", None)
+            ahealth = getattr(self._adapter, "ahealth", None)
+
+            if callable(ahealth):
+                result = await ahealth()  # type: ignore[no-any-return]
+            elif callable(health):
+                if asyncio.iscoroutinefunction(health):
+                    result = await health()  # type: ignore[no-any-return]
+                else:
+                    result = health()  # type: ignore[no-any-return]
+            else:
+                return {}
+
+            if not isinstance(result, Mapping):
+                raise BadRequest(
+                    f"adapter.health returned unsupported type: "
+                    f"{type(result).__name__}",
+                    code="BAD_ADAPTER_RESULT",
+                )
+            return dict(result)
+
+        return self._run_operation(
+            op_name="health",
+            op_ctx=op_ctx,
+            sync=True,
+            logic=_logic,
+        )
+
+    async def arun_health(
+        self,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,  # noqa: ARG002
+    ) -> Mapping[str, Any]:
+        """
+        Async health API.
+        """
+
+        async def _logic(ctx: OperationContext) -> Mapping[str, Any]:
+            health = getattr(self._adapter, "health", None)
+            ahealth = getattr(self._adapter, "ahealth", None)
+
+            if callable(ahealth):
+                result = await ahealth()  # type: ignore[no-any-return]
+            elif callable(health):
+                if asyncio.iscoroutinefunction(health):
+                    result = await health()  # type: ignore[no-any-return]
+                else:
+                    result = await asyncio.to_thread(health)  # type: ignore[arg-type]
+            else:
+                return {}
+
+            if not isinstance(result, Mapping):
+                raise BadRequest(
+                    f"adapter.health returned unsupported type: "
+                    f"{type(result).__name__}",
+                    code="BAD_ADAPTER_RESULT",
+                )
+            return dict(result)
+
+        return await self._run_operation(
+            op_name="health",
             op_ctx=op_ctx,
             sync=False,
             logic=_logic,
