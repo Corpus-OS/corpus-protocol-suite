@@ -115,48 +115,60 @@ class BridgeMetrics:
 
 
 class CircuitBreaker:
-    """Simple circuit breaker pattern for fault tolerance."""
-    
+    """Simple circuit breaker pattern for fault tolerance.
+
+    Notes
+    -----
+    - Uses time.monotonic() for failure timing to avoid wall-clock skew issues.
+    - last_failure_time is stored as a monotonic timestamp.
+    """
+
     def __init__(
-        self, 
+        self,
         failure_threshold: int = DEFAULT_CIRCUIT_BREAKER_THRESHOLD,
-        recovery_timeout: float = DEFAULT_CIRCUIT_BREAKER_TIMEOUT
+        recovery_timeout: float = DEFAULT_CIRCUIT_BREAKER_TIMEOUT,
     ):
         self.failure_threshold = failure_threshold
         self.recovery_timeout = recovery_timeout
         self.failures = 0
+        # Monotonic timestamp of last failure (or None if fully healthy)
         self.last_failure_time: Optional[float] = None
         self._lock = threading.Lock()
-    
+
     def should_try(self) -> bool:
         """Check if requests should be allowed through."""
+        now = time.monotonic()
         with self._lock:
             if self.failures < self.failure_threshold:
                 return True
-            if self.last_failure_time and (time.time() - self.last_failure_time) > self.recovery_timeout:
+            if self.last_failure_time and (now - self.last_failure_time) > self.recovery_timeout:
                 # Reset after recovery timeout
                 self.failures = 0
+                self.last_failure_time = None
                 return True
             return False
-    
+
     def record_failure(self) -> None:
         """Record a failure and potentially trip the circuit breaker."""
         with self._lock:
             self.failures += 1
-            self.last_failure_time = time.time()
-    
+            self.last_failure_time = time.monotonic()
+
     def record_success(self) -> None:
         """Record a success and reset failure count."""
         with self._lock:
             self.failures = 0
-    
+            self.last_failure_time = None
+
     @property
     def is_open(self) -> bool:
         """Check if circuit breaker is currently open."""
+        now = time.monotonic()
         with self._lock:
-            return self.failures >= self.failure_threshold and (
-                self.last_failure_time is None or 
-                (time.time() - self.last_failure_time) <= self.recovery_timeout
+            return (
+                self.failures >= self.failure_threshold
+                and self.last_failure_time is not None
+                and (now - self.last_failure_time) <= self.recovery_timeout
             )
 
 
@@ -229,7 +241,7 @@ class AsyncBridge:
     _max_workers: int = DEFAULT_MAX_WORKERS
     _max_pending_tasks: int = DEFAULT_MAX_PENDING_TASKS
     _pending_futures: Set[Future] = set()
-    
+
     # Monitoring and fault tolerance
     _metrics = BridgeMetrics()
     _metrics_lock = threading.Lock()
@@ -241,11 +253,11 @@ class AsyncBridge:
 
     @classmethod
     def configure(
-        cls, 
+        cls,
         max_workers: Optional[int] = None,
         max_pending_tasks: Optional[int] = None,
         circuit_breaker_threshold: Optional[int] = None,
-        circuit_breaker_timeout: Optional[float] = None
+        circuit_breaker_timeout: Optional[float] = None,
     ) -> None:
         """
         Configure the async bridge runtime parameters.
@@ -267,29 +279,30 @@ class AsyncBridge:
                 if max_workers <= 0:
                     raise ValueError("max_workers must be a positive integer")
                 cls._max_workers = max_workers
-                
+
             if max_pending_tasks is not None:
                 if max_pending_tasks <= 0:
                     raise ValueError("max_pending_tasks must be a positive integer")
                 cls._max_pending_tasks = max_pending_tasks
-            
+
             if circuit_breaker_threshold is not None or circuit_breaker_timeout is not None:
                 if circuit_breaker_threshold is not None and circuit_breaker_threshold <= 0:
                     raise ValueError("circuit_breaker_threshold must be positive")
                 if circuit_breaker_timeout is not None and circuit_breaker_timeout <= 0:
                     raise ValueError("circuit_breaker_timeout must be positive")
-                    
+
                 # Create new circuit breaker with updated settings
                 cls._circuit_breaker = CircuitBreaker(
                     failure_threshold=circuit_breaker_threshold or DEFAULT_CIRCUIT_BREAKER_THRESHOLD,
-                    recovery_timeout=circuit_breaker_timeout or DEFAULT_CIRCUIT_BREAKER_TIMEOUT
+                    recovery_timeout=circuit_breaker_timeout or DEFAULT_CIRCUIT_BREAKER_TIMEOUT,
                 )
-            
+
             if cls._executor is not None:
-                logger.debug(
-                    "AsyncBridge.configure: executor already created; "
-                    "new settings will apply only to future executors."
-                )
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "AsyncBridge.configure: executor already created; "
+                        "new settings will apply only to future executors."
+                    )
 
     # ------------------------------------------------------------------ #
     # Internal helpers
@@ -307,10 +320,11 @@ class AsyncBridge:
                 max_workers=cls._max_workers,
                 thread_name_prefix="corpus_async_",
             )
-            logger.debug(
-                "AsyncBridge: created ThreadPoolExecutor(max_workers=%d)",
-                cls._max_workers,
-            )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "AsyncBridge: created ThreadPoolExecutor(max_workers=%d)",
+                    cls._max_workers,
+                )
         return cls._executor
 
     @staticmethod
@@ -335,13 +349,13 @@ class AsyncBridge:
 
     @staticmethod
     def _run_in_context(
-        coro: Coroutine[Any, Any, T], 
+        coro: Coroutine[Any, Any, T],
         timeout: Optional[float],
-        context: contextvars.Context
+        context: contextvars.Context,
     ) -> T:
         """
         Run coroutine in a specific contextvars context.
-        
+
         This wrapper ensures exceptions from asyncio.run are properly handled
         and don't crash the worker thread.
         """
@@ -367,11 +381,12 @@ class AsyncBridge:
         cls,
         exc: Exception,
         timeout: Optional[float],
-        threaded_execution: bool
+        threaded_execution: bool,
     ) -> None:
         """Safely attach context to exceptions for better debugging."""
         try:
             from corpus_sdk.core.error_context import attach_context
+
             attach_context(
                 exc,
                 origin="async_bridge",
@@ -381,7 +396,8 @@ class AsyncBridge:
                 circuit_breaker_open=cls._circuit_breaker.is_open,
             )
         except Exception as attach_error:
-            logger.debug("Failed to attach error context: %s", attach_error)
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("Failed to attach error context: %s", attach_error)
 
     @classmethod
     def _update_metrics(
@@ -391,7 +407,7 @@ class AsyncBridge:
         timed_out: bool = False,
         errored: bool = False,
         resource_error: bool = False,
-        circuit_trip: bool = False
+        circuit_trip: bool = False,
     ) -> None:
         """Update performance and health metrics."""
         with cls._metrics_lock:
@@ -406,7 +422,7 @@ class AsyncBridge:
                 cls._metrics.resource_errors += 1
             if circuit_trip:
                 cls._metrics.circuit_breaker_trips += 1
-            
+
             # Update duration statistics using Welford's method for numerical stability
             new_avg = cls._metrics.avg_duration + (duration - cls._metrics.avg_duration) / cls._metrics.calls_total
             cls._metrics.avg_duration = new_avg
@@ -469,7 +485,7 @@ class AsyncBridge:
                 duration=perf_counter() - start_time,
                 threaded=False,
                 errored=True,
-                circuit_trip=True
+                circuit_trip=True,
             )
             raise exc
 
@@ -484,9 +500,10 @@ class AsyncBridge:
             # Case 1: Running loop - use a background thread to avoid nested loops.
             if loop_running:
                 threaded_execution = True
-                logger.debug(
-                    "AsyncBridge.run_async: running loop detected; using executor with contextvars"
-                )
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "AsyncBridge.run_async: running loop detected; using executor with contextvars"
+                    )
 
                 # Check resource limits before proceeding
                 cls._check_resource_limits()
@@ -496,17 +513,25 @@ class AsyncBridge:
                 ctx = contextvars.copy_context()
 
                 # CRITICAL FIX #1: All operations under lock to prevent race condition
-                # between future creation, tracking, and callback registration
+                # between future creation, tracking, and callback registration.
                 with cls._lock:
                     executor = cls._get_or_create_executor()
-                    future = executor.submit(cls._run_in_context, coro, effective_timeout, ctx)
+                    try:
+                        future = executor.submit(cls._run_in_context, coro, effective_timeout, ctx)
+                    except RuntimeError as e:
+                        # Executor may have been shut down or is unavailable.
+                        resource_exc = AsyncBridgeResourceError(
+                            "AsyncBridge executor is unavailable or shut down"
+                        )
+                        cls._attach_error_context(resource_exc, effective_timeout, True)
+                        raise resource_exc from e
+
                     cls._pending_futures.add(future)
-                    
-                    # Callback registration while holding lock ensures no race
+
                     def cleanup_future(f: Future) -> None:
                         with cls._lock:
                             cls._pending_futures.discard(f)
-                    
+
                     future.add_done_callback(cleanup_future)
 
                 # Let exceptions from the coroutine surface naturally.
@@ -520,7 +545,8 @@ class AsyncBridge:
                     raise
 
             # Case 2: No running loop - use asyncio.run directly.
-            logger.debug("AsyncBridge.run_async: no running loop; using asyncio.run")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("AsyncBridge.run_async: no running loop; using asyncio.run")
             try:
                 result = asyncio.run(cls._with_timeout(coro, effective_timeout))
                 cls._circuit_breaker.record_success()
@@ -541,7 +567,7 @@ class AsyncBridge:
                 duration=duration,
                 threaded=threaded_execution,
                 timed_out=True,
-                errored=True
+                errored=True,
             )
             raise
         except AsyncBridgeResourceError:
@@ -551,7 +577,7 @@ class AsyncBridge:
                 duration=duration,
                 threaded=threaded_execution,
                 resource_error=True,
-                errored=True
+                errored=True,
             )
             raise
         except Exception:
@@ -560,7 +586,7 @@ class AsyncBridge:
             cls._update_metrics(
                 duration=duration,
                 threaded=threaded_execution,
-                errored=True
+                errored=True,
             )
             raise
         else:
@@ -568,7 +594,7 @@ class AsyncBridge:
             duration = perf_counter() - start_time
             cls._update_metrics(
                 duration=duration,
-                threaded=threaded_execution
+                threaded=threaded_execution,
             )
 
     @classmethod
@@ -628,14 +654,14 @@ class AsyncBridge:
                 "pending_tasks": len(cls._pending_futures),
                 "executor_created": cls._executor is not None,
             }
-        
+
         metrics = cls.get_metrics()
         circuit_breaker = {
             "is_open": cls._circuit_breaker.is_open,
             "failures": cls._circuit_breaker.failures,
             "failure_threshold": cls._circuit_breaker.failure_threshold,
         }
-        
+
         return {
             "executor": executor_info,
             "circuit_breaker": circuit_breaker,
@@ -665,33 +691,34 @@ class AsyncBridge:
         It is safe to call multiple times.
         """
         with cls._lock:
-            # CRITICAL FIX #2: Make shutdown idempotent and exception-safe
-            # Clear executor reference first, before shutdown() which might raise
+            # CRITICAL FIX #2: Make shutdown idempotent and exception-safe.
+            # Clear executor reference first, before shutdown() which might raise.
             executor = cls._executor
             cls._executor = None
-            
+
             if executor is None:
                 # Already shut down or never created
                 return
-            
+
             try:
                 if cancel_futures:
                     # Cancel pending futures
                     for future in cls._pending_futures.copy():
                         future.cancel()
                     cls._pending_futures.clear()
-                
+
                 executor.shutdown(wait=wait)
-                logger.debug(
-                    "AsyncBridge: executor shutdown (wait=%s, cancel_futures=%s)",
-                    wait,
-                    cancel_futures,
-                )
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "AsyncBridge: executor shutdown (wait=%s, cancel_futures=%s)",
+                        wait,
+                        cancel_futures,
+                    )
             except Exception as e:
                 logger.error(
                     "AsyncBridge: error during executor shutdown: %s",
                     e,
-                    exc_info=True
+                    exc_info=True,
                 )
                 # Don't re-raise - we've already cleared the executor reference
                 # Subsequent shutdown calls will be no-ops
@@ -730,7 +757,7 @@ def sync_wrapper(
 __all__ = [
     "AsyncBridge",
     "AsyncBridgeTimeoutError",
-    "AsyncBridgeResourceError", 
+    "AsyncBridgeResourceError",
     "AsyncBridgeCircuitOpenError",
     "BridgeMetrics",
     "DEFAULT_MAX_WORKERS",
