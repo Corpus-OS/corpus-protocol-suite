@@ -14,7 +14,7 @@ import concurrent.futures
 import corpus_sdk.embedding.framework_adapters.autogen as autogen_adapter_module
 from corpus_sdk.embedding.framework_adapters.autogen import (
     CorpusAutoGenEmbeddings,
-    create_retriever,
+    create_vector_memory,
     register_embeddings,
 )
 from corpus_sdk.embedding.embedding_base import OperationContext, EmbeddingCapabilities
@@ -876,26 +876,7 @@ def test_context_manager_closes_underlying_adapter(monkeypatch: pytest.MonkeyPat
     Context manager should close underlying adapter (sync version).
     """
     closed = {"v": False}
-    async def embed(self, *args: Any, **kwargs: Any) -> Any:
-        return [[0.1, 0.2, 0.3]]
-        
-    async def embed_batch(self, *args: Any, **kwargs: Any) -> Any:
-        from corpus_sdk.embedding.embedding_base import BatchEmbedResult, EmbeddingVector
-        embeddings = [
-            EmbeddingVector(
-                    vector=[0.1, 0.2, 0.3],
-                    text="x",
-                    model="mock-embed-512",
-                    dimensions=3,
-                    index=0
-            )
-        ]
-        return BatchEmbedResult(
-                embeddings=embeddings, 
-                model="mock-embed-512", 
-                total_texts=1
-        )
-    
+
     def close() -> None:
         closed["v"] = True
 
@@ -915,25 +896,6 @@ async def test_async_context_manager_closes_underlying_adapter(monkeypatch: pyte
     Async context manager should close underlying adapter (async version).
     """
     aclosed = {"v": False}
-    async def embed(self, *args: Any, **kwargs: Any) -> Any:
-        return [[0.1, 0.2, 0.3]]
-        
-    async def embed_batch(self, *args: Any, **kwargs: Any) -> Any:
-        from corpus_sdk.embedding.embedding_base import BatchEmbedResult, EmbeddingVector
-        embeddings = [
-                EmbeddingVector(
-                    vector=[0.1, 0.2, 0.3],
-                    text="y",
-                    model="mock-embed-512",
-                    dimensions=3,
-                    index=0
-                )
-        ]
-        return BatchEmbedResult(
-                embeddings=embeddings, 
-                model="mock-embed-512", 
-                total_texts=1
-        )
 
     async def aclose() -> None:
         aclosed["v"] = True
@@ -1169,138 +1131,160 @@ class TestAutoGenIntegration:
 
 
 # ---------------------------------------------------------------------------
-# create_retriever Integration Tests
+# create_vector_memory Integration Tests
 # ---------------------------------------------------------------------------
 
-def test_create_retriever_raises_runtime_error_when_autogen_not_installed(
+def test_create_vector_memory_raises_runtime_error_when_autogen_not_installed(
     monkeypatch: pytest.MonkeyPatch,
     adapter,
 ) -> None:
-    """Clear error when AutoGen not installed."""
+    """Clear error when AutoGen Chroma dependencies are not installed."""
     import builtins as _builtins
 
     orig_import = _builtins.__import__
 
     def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
-        if name.startswith("autogen"):
-            raise ImportError("AutoGen not installed: pip install pyautogen")
+        if name.startswith("autogen_ext.memory.chromadb"):
+            raise ImportError("autogen-ext[chromadb] not installed")
         return orig_import(name, globals, locals, fromlist, level)
 
     monkeypatch.setattr(_builtins, "__import__", fake_import)
 
     with pytest.raises(RuntimeError) as exc_info:
-        create_retriever(corpus_adapter=adapter, vector_store=object(), model="mock-embed-512")
+        create_vector_memory(corpus_adapter=adapter, collection_name="test-collection")
 
-    assert "AutoGen is not installed" in str(exc_info.value)
-    assert "pip install pyautogen" in str(exc_info.value)
-
-
-def test_create_retriever_prefers_setter_method(monkeypatch: pytest.MonkeyPatch, adapter) -> None:
-    """create_retriever should prefer public setter methods."""
-    retrieve_utils_mod = types.ModuleType("autogen.retrieve_utils")
-
-    class DummyVectorStoreRetriever:
-        def __init__(self, vectorstore: Any, **_: Any) -> None:
-            self.vectorstore = vectorstore
-
-    setattr(retrieve_utils_mod, "VectorStoreRetriever", DummyVectorStoreRetriever)
-    autogen_pkg = types.ModuleType("autogen")
-
-    monkeypatch.setitem(sys.modules, "autogen", autogen_pkg)
-    monkeypatch.setitem(sys.modules, "autogen.retrieve_utils", retrieve_utils_mod)
-
-    class DummyVectorStore:
-        def __init__(self) -> None:
-            self.set_called_with: Any = None
-            self.embedding_function: Any = "should-not-win"
-
-        def set_embedding_function(self, fn: Any) -> None:
-            self.set_called_with = fn
-
-        def similarity_search(self, *args: Any, **kwargs: Any) -> Any:
-            return []
-
-    vs = DummyVectorStore()
-
-    retriever = create_retriever(corpus_adapter=adapter, vector_store=vs, model="mock-embed-512")
-
-    assert isinstance(retriever, DummyVectorStoreRetriever)
-    assert retriever.vectorstore is vs
-    assert vs.set_called_with is not None
-    assert isinstance(vs.set_called_with, CorpusAutoGenEmbeddings)
+    msg = str(exc_info.value)
+    assert "AutoGen Chroma memory dependencies are not installed" in msg
+    assert "autogen-ext[chromadb]" in msg
 
 
-def test_create_retriever_configures_vector_store_embedding_function(
+def test_create_vector_memory_configures_chroma_with_custom_embedding_function(
     monkeypatch: pytest.MonkeyPatch,
     adapter,
 ) -> None:
-    """create_retriever should configure vector store embedding function."""
-    retrieve_utils_mod = types.ModuleType("autogen.retrieve_utils")
+    """create_vector_memory wires up Chroma config and embedding function correctly."""
+    chroma_mod = types.ModuleType("autogen_ext.memory.chromadb")
 
-    class DummyVectorStoreRetriever:
-        def __init__(self, vectorstore: Any, **_: Any) -> None:
-            self.vectorstore = vectorstore
+    class DummyEmbeddingFunctionConfig:
+        def __init__(self, function: Any, params: Dict[str, Any]) -> None:
+            self.function = function
+            self.params = params
 
-    setattr(retrieve_utils_mod, "VectorStoreRetriever", DummyVectorStoreRetriever)
+    class DummyConfig:
+        def __init__(
+            self,
+            collection_name: str,
+            persistence_path: Optional[str] = None,
+            embedding_function_config: Optional[DummyEmbeddingFunctionConfig] = None,
+            k: int = 3,
+            score_threshold: Optional[float] = None,
+        ) -> None:
+            self.collection_name = collection_name
+            self.persistence_path = persistence_path
+            self.embedding_function_config = embedding_function_config
+            self.k = k
+            self.score_threshold = score_threshold
 
-    autogen_pkg = types.ModuleType("autogen")
-    monkeypatch.setitem(sys.modules, "autogen", autogen_pkg)
-    monkeypatch.setitem(sys.modules, "autogen.retrieve_utils", retrieve_utils_mod)
+    class DummyMemory:
+        def __init__(self, config: DummyConfig) -> None:
+            self.config = config
 
-    class DummyVectorStore:
-        def __init__(self) -> None:
-            self.embedding_function: Any | None = None
+    chroma_mod.CustomEmbeddingFunctionConfig = DummyEmbeddingFunctionConfig
+    chroma_mod.PersistentChromaDBVectorMemoryConfig = DummyConfig
+    chroma_mod.ChromaDBVectorMemory = DummyMemory
 
-        def query(self, *args: Any, **kwargs: Any) -> Any:
-            return []
+    # Make the dotted package path resolvable
+    monkeypatch.setitem(sys.modules, "autogen_ext", types.ModuleType("autogen_ext"))
+    monkeypatch.setitem(sys.modules, "autogen_ext.memory", types.ModuleType("autogen_ext.memory"))
+    monkeypatch.setitem(sys.modules, "autogen_ext.memory.chromadb", chroma_mod)
 
-    vs = DummyVectorStore()
-
-    retriever = create_retriever(
+    memory = create_vector_memory(
         corpus_adapter=adapter,
-        vector_store=vs,
+        collection_name="corpus_autogen_memory",
+        persistence_path="/tmp/chroma",
         model="mock-embed-512",
-        framework_version="auto-fw-2",
+        batch_config=None,
+        text_normalization_config=None,
+        autogen_config={"foo": "bar"},
+        framework_version="fw-1.0",
+        k=5,
+        score_threshold=0.42,
     )
 
-    assert isinstance(retriever, DummyVectorStoreRetriever)
-    assert retriever.vectorstore is vs
+    assert isinstance(memory, DummyMemory)
+    cfg = memory.config
+    assert cfg.collection_name == "corpus_autogen_memory"
+    assert cfg.persistence_path == "/tmp/chroma"
+    assert cfg.k == 5
+    assert cfg.score_threshold == 0.42
 
-    assert isinstance(vs.embedding_function, CorpusAutoGenEmbeddings)
-    assert vs.embedding_function.corpus_adapter is adapter
-    assert vs.embedding_function.model == "mock-embed-512"
+    emb_cfg = cfg.embedding_function_config
+    assert isinstance(emb_cfg, DummyEmbeddingFunctionConfig)
+
+    # Exercise embedding function factory
+    embedding_fn = emb_cfg.function(**emb_cfg.params)
+    assert isinstance(embedding_fn, CorpusAutoGenEmbeddings)
+    assert embedding_fn.corpus_adapter is adapter
+    assert embedding_fn.model == "mock-embed-512"
+    assert embedding_fn.autogen_config == {"foo": "bar"}
+    assert embedding_fn._framework_version == "fw-1.0"
 
 
-def test_create_retriever_configures_private_embedding_function_when_only_private_present(
+def test_create_vector_memory_uses_defaults_when_optional_args_omitted(
     monkeypatch: pytest.MonkeyPatch,
     adapter,
 ) -> None:
-    """create_retriever should work with private embedding function attribute."""
-    retrieve_utils_mod = types.ModuleType("autogen.retrieve_utils")
+    """create_vector_memory applies sensible defaults when args are omitted."""
+    chroma_mod = types.ModuleType("autogen_ext.memory.chromadb")
 
-    class DummyVectorStoreRetriever:
-        def __init__(self, vectorstore: Any, **_: Any) -> None:
-            self.vectorstore = vectorstore
+    class DummyEmbeddingFunctionConfig:
+        def __init__(self, function: Any, params: Dict[str, Any]) -> None:
+            self.function = function
+            self.params = params
 
-    setattr(retrieve_utils_mod, "VectorStoreRetriever", DummyVectorStoreRetriever)
-    autogen_pkg = types.ModuleType("autogen")
+    class DummyConfig:
+        def __init__(
+            self,
+            collection_name: str,
+            persistence_path: Optional[str] = None,
+            embedding_function_config: Optional[DummyEmbeddingFunctionConfig] = None,
+            k: int = 3,
+            score_threshold: Optional[float] = None,
+        ) -> None:
+            self.collection_name = collection_name
+            self.persistence_path = persistence_path
+            self.embedding_function_config = embedding_function_config
+            self.k = k
+            self.score_threshold = score_threshold
 
-    monkeypatch.setitem(sys.modules, "autogen", autogen_pkg)
-    monkeypatch.setitem(sys.modules, "autogen.retrieve_utils", retrieve_utils_mod)
+    class DummyMemory:
+        def __init__(self, config: DummyConfig) -> None:
+            self.config = config
 
-    class DummyVectorStore:
-        def __init__(self) -> None:
-            self._embedding_function: Any | None = None
+    chroma_mod.CustomEmbeddingFunctionConfig = DummyEmbeddingFunctionConfig
+    chroma_mod.PersistentChromaDBVectorMemoryConfig = DummyConfig
+    chroma_mod.ChromaDBVectorMemory = DummyMemory
 
-        def similarity_search(self, *args: Any, **kwargs: Any) -> Any:
-            return []
+    monkeypatch.setitem(sys.modules, "autogen_ext", types.ModuleType("autogen_ext"))
+    monkeypatch.setitem(sys.modules, "autogen_ext.memory", types.ModuleType("autogen_ext.memory"))
+    monkeypatch.setitem(sys.modules, "autogen_ext.memory.chromadb", chroma_mod)
 
-    vs = DummyVectorStore()
+    memory = create_vector_memory(corpus_adapter=adapter)
 
-    retriever = create_retriever(corpus_adapter=adapter, vector_store=vs, model="mock-embed-512")
+    assert isinstance(memory, DummyMemory)
+    cfg = memory.config
+    # Defaults from create_vector_memory signature
+    assert cfg.collection_name == "corpus_autogen_memory"
+    assert cfg.persistence_path is None
+    assert cfg.k == 3
+    assert cfg.score_threshold is None
 
-    assert isinstance(retriever, DummyVectorStoreRetriever)
-    assert retriever.vectorstore is vs
+    emb_cfg = cfg.embedding_function_config
+    assert isinstance(emb_cfg, DummyEmbeddingFunctionConfig)
 
-    assert isinstance(vs._embedding_function, CorpusAutoGenEmbeddings)
-    assert vs._embedding_function.corpus_adapter is adapter
+    embedding_fn = emb_cfg.function(**emb_cfg.params)
+    assert isinstance(embedding_fn, CorpusAutoGenEmbeddings)
+    assert embedding_fn.corpus_adapter is adapter
+    # Defaults: model, batch_config, text_normalization_config, autogen_config, framework_version
+    assert embedding_fn.model is None
+    assert embedding_fn.autogen_config == {}  # we passed autogen_config=None
