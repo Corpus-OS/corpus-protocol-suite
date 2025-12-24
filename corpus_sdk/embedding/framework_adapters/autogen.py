@@ -4,32 +4,55 @@
 """
 AutoGen adapter for Corpus Embedding protocol.
 
-This module exposes Corpus `EmbeddingProtocolV1` implementations for
-use with Microsoft AutoGen multi-agent conversations, with:
+This module exposes Corpus `EmbeddingProtocolV1` implementations for use with the
+modern Microsoft AutoGen ecosystem (AgentChat/Core/Ext), with:
 
-- Full compatibility with AutoGen's `EmbeddingFunction` protocol
-- Support for AutoGen's group chat and agent memory systems
-- Context normalization using existing `context_translation.from_autogen`
+- A callable embedding function compatible with Chroma-style `embedding_function`
+- Integration helper for AutoGen's Chroma-backed memory (`autogen_ext.memory.chromadb`)
+- Support for async + sync embedding APIs
+- Context normalization using `context_translation.from_autogen`
 - Framework-agnostic orchestration via `EmbeddingTranslator`
-- Async → sync bridging handled in the common embedding layer
 - Rich error context attachment for observability
 
 Design notes / philosophy
 -------------------------
 - **Protocol-first**: we require only an `embed` method (duck-typed) instead of
   strict inheritance from a specific adapter base class.
-- **Resilient to framework evolution**: AutoGen’s internals and signatures
-  change; we filter/normalize context defensively and keep our adapter surface stable.
-- **Observability-first**: all embedding operations attach rich error context:
+- **Resilient to framework evolution**: framework internals and signatures change;
+  we filter/normalize context defensively and keep our adapter surface stable.
+- **Observability-first**: embedding operations attach rich error context:
   framework identity, model info, batch sizes, node IDs, trace/workflow IDs, etc.
 - **Fail-safe context translation**: context translation must never break embeddings.
   If translation fails, we proceed without `OperationContext` and attach diagnostic context.
 - **Strict by default**: non-string inputs in batch operations are rejected to avoid
   embedding `repr()` output by accident. If you need softer behavior, wrap this
   class and preprocess inputs before calling it.
+- **Async/sync bridge discipline**: sync APIs refuse to run inside an active event
+  loop and instruct callers to use async variants instead, avoiding deadlocks and
+  subtle hangs.
 
-Resilience (retries, caching, rate limiting, etc.) is expected to be provided
-by the underlying adapter, typically a `BaseEmbeddingAdapter` subclass.
+Compatibility notes
+-------------------
+- This module keeps AutoGen as an **optional dependency** by performing AutoGen imports
+  lazily inside integration helpers (e.g., `create_vector_memory`). Importing this module
+  does not require AutoGen to be installed.
+- Modern Microsoft AutoGen packages typically require **Python 3.10+**. If you run tests
+  or integration against AutoGen, ensure your environment matches that requirement.
+- This adapter is intentionally framework-light: it provides a stable embedding callable
+  and a modern AutoGen memory wiring helper, without binding to unstable retriever internals.
+
+Where the embedding logic actually lives
+----------------------------------------
+All embedding orchestration, batching, normalization, retries/caching expectations, etc.
+are handled by the shared embedding layer and the concrete Corpus adapter:
+
+- `corpus_sdk.embedding.framework_adapters.common.embedding_translation`
+- Concrete `EmbeddingProtocolV1` adapter implementations
+
+This module mainly:
+- Translates AutoGen-style context into `OperationContext` (best effort)
+- Packages rich observability context around calls
+- Provides a callable embedding function and optional AutoGen memory wiring
 """
 
 from __future__ import annotations
@@ -43,27 +66,23 @@ from typing import (
     Any,
     Callable,
     Dict,
+    List,
     Mapping,
     Optional,
     Protocol,
     Sequence,
     Tuple,
     TypeVar,
-    List,
     TypedDict,
 )
 
-from corpus_sdk.core.context_translation import (
-    from_autogen as context_from_autogen,
-)
+from corpus_sdk.core.async_bridge import AsyncBridge
+from corpus_sdk.core.context_translation import from_autogen as context_from_autogen
 from corpus_sdk.core.error_context import attach_context
-from corpus_sdk.embedding.embedding_base import (
-    EmbeddingProtocolV1,
-    OperationContext,
-)
+from corpus_sdk.embedding.embedding_base import EmbeddingProtocolV1, OperationContext
 from corpus_sdk.embedding.framework_adapters.common.embedding_translation import (
-    EmbeddingTranslator,
     BatchConfig,
+    EmbeddingTranslator,
     TextNormalizationConfig,
     create_embedding_translator,
 )
@@ -78,10 +97,6 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
-# Warn-once guard for private vector-store mutations.
-_WARNED_PRIVATE_EMBEDDING_ATTR = False
-
-
 # --------------------------------------------------------------------------- #
 # Error codes + context types
 # --------------------------------------------------------------------------- #
@@ -91,8 +106,7 @@ class ErrorCodes:
     """
     Error code constants for AutoGen embedding adapter.
 
-    This is a simple namespace for framework-specific codes. The shared
-    coercion helpers use `EMBEDDING_COERCION_ERROR_CODES`, which is a
+    Shared coercion helpers consume `EMBEDDING_COERCION_ERROR_CODES`, which is a
     `CoercionErrorCodes` instance derived from these values.
     """
 
@@ -104,8 +118,10 @@ class ErrorCodes:
     # AutoGen-specific context errors
     AUTOGEN_CONTEXT_INVALID = "AUTOGEN_CONTEXT_INVALID"
 
+    # Sync/async bridge errors
+    SYNC_WRAPPER_CALLED_IN_EVENT_LOOP = "SYNC_WRAPPER_CALLED_IN_EVENT_LOOP"
 
-# Coercion configuration for the common embedding utils
+
 EMBEDDING_COERCION_ERROR_CODES: CoercionErrorCodes = CoercionErrorCodes(
     invalid_result=ErrorCodes.INVALID_EMBEDDING_RESULT,
     empty_result=ErrorCodes.EMPTY_EMBEDDING_RESULT,
@@ -115,7 +131,11 @@ EMBEDDING_COERCION_ERROR_CODES: CoercionErrorCodes = CoercionErrorCodes(
 
 
 class AutoGenContext(TypedDict, total=False):
-    """Structured type for AutoGen execution context."""
+    """
+    Structured type for AutoGen execution context.
+
+    This is intentionally small and permissive; callers may include additional keys.
+    """
     agent_name: Optional[str]
     conversation_id: Optional[str]
     workflow_type: Optional[str]
@@ -124,30 +144,21 @@ class AutoGenContext(TypedDict, total=False):
     user_id: Optional[str]
 
 
-# --------------------------------------------------------------------------- #
-# AutoGen retriever protocol
-# --------------------------------------------------------------------------- #
-
-
-class AutoGenRetriever(Protocol):
+class AutoGenMemory(Protocol):
     """
-    Protocol representing AutoGen VectorStoreRetriever interface.
+    Loose protocol representing a modern AutoGen memory component.
 
-    Shorter name for cleaner usage throughout the module.
+    This is intentionally minimal; it exists to provide a usable return type for
+    `create_vector_memory()` without binding tightly to AutoGen implementation details.
     """
 
-    @property
-    def vectorstore(self) -> Any:
-        """Underlying vector store used for retrieval."""
-        ...
-
-    def retrieve(self, query: str, **kwargs: Any) -> Any:
-        """Retrieve documents for the given query."""
-        ...
+    async def add(self, *args: Any, **kwargs: Any) -> Any: ...
+    async def query(self, *args: Any, **kwargs: Any) -> Any: ...
+    async def close(self, *args: Any, **kwargs: Any) -> Any: ...
 
 
 # --------------------------------------------------------------------------- #
-# Small utilities (validation / safe snapshots)
+# Small utilities (validation / safe snapshots / loop guards)
 # --------------------------------------------------------------------------- #
 
 
@@ -155,14 +166,12 @@ def _validate_texts_are_strings(texts: Sequence[Any], *, op_name: str) -> None:
     """
     Fail fast if a caller provides non-string items.
 
-    We intentionally do not coerce arbitrary objects to str here, because
-    that can silently embed repr() outputs and lead to confusing retrieval.
+    We intentionally do not coerce arbitrary objects to str here, because that can silently
+    embed repr() outputs and lead to confusing retrieval behavior.
     """
     for i, t in enumerate(texts):
         if not isinstance(t, str):
-            raise TypeError(
-                f"{op_name} expects Sequence[str]; item {i} is {type(t).__name__}",
-            )
+            raise TypeError(f"{op_name} expects Sequence[str]; item {i} is {type(t).__name__}")
 
 
 def _safe_snapshot(value: Any, *, max_items: int = 200, max_str: int = 5_000) -> Any:
@@ -199,12 +208,91 @@ def _safe_snapshot(value: Any, *, max_items: int = 200, max_str: int = 5_000) ->
         return {"repr": repr(value)}
 
 
+def _ensure_not_in_event_loop(sync_api_name: str) -> None:
+    """
+    Guard: sync wrappers must not be called from within a running event loop.
+
+    This prevents deadlocks / hangs from calling blocking sync bridges in async contexts.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    raise RuntimeError(
+        f"{sync_api_name} was called from inside an active asyncio event loop. "
+        f"Use the async variant instead (e.g. 'await a{sync_api_name}()'). "
+        f"[{ErrorCodes.SYNC_WRAPPER_CALLED_IN_EVENT_LOOP}]"
+    )
+
+
+def _run_coro_sync(coro: Any, *, api_name: str, timeout_s: Optional[float] = None) -> Any:
+    """
+    Run a coroutine from sync code using the SDK's AsyncBridge.
+
+    NOTE: We intentionally *do not* attempt to nest into an already-running event loop
+    from here; callers must use async variants in those contexts.
+    """
+    _ensure_not_in_event_loop(api_name)
+    return AsyncBridge.run_async(coro, timeout=timeout_s)
+
+
+async def _maybe_close_async(adapter: Any) -> None:
+    """
+    Best-effort async resource cleanup.
+
+    Preference:
+      1) aclose() if present
+      2) close() if present (await if coroutinefunction, else run in thread)
+    """
+    aclose = getattr(adapter, "aclose", None)
+    if callable(aclose):
+        await aclose()
+        return
+
+    close = getattr(adapter, "close", None)
+    if not callable(close):
+        return
+
+    if asyncio.iscoroutinefunction(close):
+        await close()
+    else:
+        await asyncio.to_thread(close)
+
+
+def _maybe_close_sync(adapter: Any) -> None:
+    """
+    Best-effort sync resource cleanup.
+
+    Preference:
+      1) aclose() if present (run via sync bridge)
+      2) close() if present (run coroutine via bridge if async)
+    """
+    aclose = getattr(adapter, "aclose", None)
+    if callable(aclose):
+        try:
+            _run_coro_sync(aclose(), api_name="close")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Error while closing adapter via aclose(): %s", exc)
+        return
+
+    close = getattr(adapter, "close", None)
+    if not callable(close):
+        return
+
+    try:
+        if asyncio.iscoroutinefunction(close):
+            _run_coro_sync(close(), api_name="close")
+        else:
+            close()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Error while closing adapter via close(): %s", exc)
+
+
 def _looks_like_operation_context(obj: Any) -> bool:
     """
     OperationContext can be a concrete type OR a Protocol/alias depending on the SDK.
 
-    We prefer an isinstance check when it works, but fall back to a lightweight
-    structural heuristic to avoid false negatives.
+    Prefer an isinstance check when it works; otherwise use a lightweight structural heuristic.
     """
     if obj is None:
         return False
@@ -215,17 +303,9 @@ def _looks_like_operation_context(obj: Any) -> bool:
         # OperationContext might be a Protocol / typing alias.
         pass
 
-    # Heuristic: common context-ish fields/methods found in typical contexts.
     return any(
         hasattr(obj, attr)
-        for attr in (
-            "trace_id",
-            "request_id",
-            "user_id",
-            "tags",
-            "metadata",
-            "to_dict",
-        )
+        for attr in ("request_id", "traceparent", "tenant", "attrs", "to_dict")
     )
 
 
@@ -241,50 +321,44 @@ def _extract_dynamic_context(
     operation: str,
 ) -> Dict[str, Any]:
     """
-    Extract dynamic context from an embedding call for enhanced observability.
+    Extract per-call dynamic context for observability.
 
     Captures:
-    - model identifier from the embedding instance
-    - text_len for single-text operations
-    - texts_count / empty_texts_count for batch operations
-    - key AutoGen routing fields (conversation_id, agent_name, workflow_type, retriever_name)
-
-    Also includes best-effort dimension hints once known.
+    - model identifier
+    - text_len for single-text ops
+    - texts_count / empty_texts_count for batch ops
+    - key routing fields from autogen_context (conversation_id, agent_name, workflow_type, retriever_name)
+    - embedding_dim hint once known
     """
     dynamic_ctx: Dict[str, Any] = {
         "model": getattr(instance, "model", "unknown"),
         "framework_version": getattr(instance, "_framework_version", None),
     }
 
-    # Optional hint: populated after first successful embed
     dim_hint = getattr(instance, "_embedding_dim_hint", None)
     if isinstance(dim_hint, int):
         dynamic_ctx["embedding_dim"] = dim_hint
 
-    # Text / batch metrics
     if operation in ("query",) and args and isinstance(args[0], str):
         dynamic_ctx["text_len"] = len(args[0])
-    elif operation in ("documents", "function_call") and args and isinstance(args[0], Sequence):
-        texts_seq = args[0]
-        dynamic_ctx["texts_count"] = len(texts_seq)
-        empty_count = sum(
-            1 for text in texts_seq
-            if not isinstance(text, str) or not text.strip()
-        )
-        if empty_count:
-            dynamic_ctx["empty_texts_count"] = empty_count
+    elif operation in ("documents", "function_call") and args:
+        maybe_texts = args[0]
+        # IMPORTANT: strings are Sequences, but not "batch texts"
+        if isinstance(maybe_texts, Sequence) and not isinstance(maybe_texts, (str, bytes)):
+            dynamic_ctx["texts_count"] = len(maybe_texts)
+            empty_count = sum(
+                1
+                for text in maybe_texts
+                if not isinstance(text, str) or not text.strip()
+            )
+            if empty_count:
+                dynamic_ctx["empty_texts_count"] = empty_count
 
-    # AutoGen-specific context (if passed through kwargs)
     autogen_context = kwargs.get("autogen_context") or {}
     if isinstance(autogen_context, Mapping):
-        if "conversation_id" in autogen_context:
-            dynamic_ctx["conversation_id"] = autogen_context["conversation_id"]
-        if "agent_name" in autogen_context:
-            dynamic_ctx["agent_name"] = autogen_context["agent_name"]
-        if "workflow_type" in autogen_context:
-            dynamic_ctx["workflow_type"] = autogen_context["workflow_type"]
-        if "retriever_name" in autogen_context:
-            dynamic_ctx["retriever_name"] = autogen_context["retriever_name"]
+        for key in ("conversation_id", "agent_name", "workflow_type", "retriever_name"):
+            if key in autogen_context:
+                dynamic_ctx[key] = autogen_context[key]
 
     return dynamic_ctx
 
@@ -296,24 +370,16 @@ def _create_error_context_decorator(
     """
     Factory for creating error context decorators with rich per-call metrics.
 
-    Mirrors the pattern used in other framework adapters (e.g., LLM, vector)
-    to keep behavior consistent.
+    Mirrors the pattern used in other framework adapters to keep behavior consistent.
     """
 
-    def decorator_factory(
-        **static_context: Any,
-    ) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    def decorator_factory(**static_context: Any) -> Callable[[Callable[..., T]], Callable[..., T]]:
         def decorator(func: Callable[..., T]) -> Callable[..., T]:
             if is_async:
 
                 @wraps(func)
                 async def async_wrapper(self: Any, *args: Any, **kwargs: Any) -> T:
-                    dynamic_context = _extract_dynamic_context(
-                        self,
-                        args,
-                        kwargs,
-                        operation,
-                    )
+                    dynamic_context = _extract_dynamic_context(self, args, kwargs, operation)
                     full_context: Dict[str, Any] = {
                         "error_codes": EMBEDDING_COERCION_ERROR_CODES,
                         **static_context,
@@ -330,104 +396,61 @@ def _create_error_context_decorator(
                         )
                         raise
 
-                return async_wrapper
-            else:
+                return async_wrapper  # type: ignore[return-value]
 
-                @wraps(func)
-                def sync_wrapper(self: Any, *args: Any, **kwargs: Any) -> T:
-                    dynamic_context = _extract_dynamic_context(
-                        self,
-                        args,
-                        kwargs,
-                        operation,
+            @wraps(func)
+            def sync_wrapper(self: Any, *args: Any, **kwargs: Any) -> T:
+                dynamic_context = _extract_dynamic_context(self, args, kwargs, operation)
+                full_context: Dict[str, Any] = {
+                    "error_codes": EMBEDDING_COERCION_ERROR_CODES,
+                    **static_context,
+                    **dynamic_context,
+                }
+                try:
+                    return func(self, *args, **kwargs)
+                except Exception as exc:  # noqa: BLE001
+                    attach_context(
+                        exc,
+                        framework="autogen",
+                        operation=f"embedding_{operation}",
+                        **full_context,
                     )
-                    full_context: Dict[str, Any] = {
-                        "error_codes": EMBEDDING_COERCION_ERROR_CODES,
-                        **static_context,
-                        **dynamic_context,
-                    }
-                    try:
-                        return func(self, *args, **kwargs)
-                    except Exception as exc:  # noqa: BLE001
-                        attach_context(
-                            exc,
-                            framework="autogen",
-                            operation=f"embedding_{operation}",
-                            **full_context,
-                        )
-                        raise
+                    raise
 
-                return sync_wrapper
+            return sync_wrapper  # type: ignore[return-value]
 
         return decorator
 
     return decorator_factory
 
 
-def with_embedding_error_context(
-    operation: str,
-    **static_context: Any,
-) -> Callable[[Callable[..., T]], Callable[..., T]]:
+def with_embedding_error_context(operation: str, **static_context: Any) -> Callable[[Callable[..., T]], Callable[..., T]]:
     """Decorator for sync methods with rich dynamic context extraction."""
     return _create_error_context_decorator(operation, is_async=False)(**static_context)
 
 
-def with_async_embedding_error_context(
-    operation: str,
-    **static_context: Any,
-) -> Callable[[Callable[..., T]], Callable[..., T]]:
+def with_async_embedding_error_context(operation: str, **static_context: Any) -> Callable[[Callable[..., T]], Callable[..., T]]:
     """Decorator for async methods with rich dynamic context extraction."""
     return _create_error_context_decorator(operation, is_async=True)(**static_context)
 
 
 # --------------------------------------------------------------------------- #
-# Core AutoGen EmbeddingFunction implementation
+# Core embedding function implementation
 # --------------------------------------------------------------------------- #
 
 
 class CorpusAutoGenEmbeddings:
     """
-    AutoGen embedding function backed by a Corpus `EmbeddingProtocolV1` adapter.
+    AutoGen-compatible embedding function backed by a Corpus `EmbeddingProtocolV1` adapter.
 
-    AutoGen-Specific Responsibilities
-    ---------------------------------
-    - Implement AutoGen's `EmbeddingFunction` protocol for vector stores
-    - Support AutoGen agent memory and retrieval-augmented generation
-    - Integrate with AutoGen's group chat and multi-agent workflows
-    - Provide embeddings for agent context and document retrieval
-    - Work with AutoGen's `VectorStoreRetriever` and custom retrievers
+    This class is designed to be:
+    - Callable for vector-store embedding_function protocols (`__call__`)
+    - Explicit for query/document embedding (`embed_query`, `embed_documents`)
+    - Async-capable (`aembed_query`, `aembed_documents`)
 
-    Non-responsibilities
-    --------------------
-    - Agent orchestration and conversation management (handled by AutoGen)
-    - Retrieval logic and similarity search (handled by AutoGen retrievers)
-    - Multi-agent communication patterns (handled by AutoGen group chats)
-
-    All embedding logic lives in:
-    - `corpus_sdk.embedding.framework_adapters.common.embedding_translation`
-    - Concrete `EmbeddingProtocolV1` adapter implementations.
-
-    Attributes
-    ----------
-    corpus_adapter:
-        Underlying Corpus embedding adapter implementing `EmbeddingProtocolV1`.
-
-    model:
-        Optional model identifier used in AutoGen contexts.
-
-    batch_config:
-        Optional `BatchConfig` to control batching behavior.
-
-    text_normalization_config:
-        Optional `TextNormalizationConfig` to control whitespace cleanup,
-        truncation, casing, encoding, etc.
-
-    autogen_config:
-        Optional AutoGen-specific configuration for agent context
-        and workflow integration.
-
-    framework_version:
-        Optional framework version string for observability alignment.
+    It is intentionally **framework-light**: it does not depend on AutoGen types at import time.
+    AutoGen integration is achieved via `create_vector_memory()` which wires this callable into
+    AutoGen's ChromaDB-backed memory.
     """
 
     def __init__(
@@ -440,25 +463,17 @@ class CorpusAutoGenEmbeddings:
         framework_version: Optional[str] = None,
     ) -> None:
         # Behavioral validation (duck-typed) instead of strict isinstance
-        if not hasattr(corpus_adapter, "embed") or not callable(
-            getattr(corpus_adapter, "embed", None),
-        ):
+        if not hasattr(corpus_adapter, "embed") or not callable(getattr(corpus_adapter, "embed", None)):
             adapter_type = type(corpus_adapter).__name__ if corpus_adapter is not None else "None"
             raise TypeError(
-                "corpus_adapter must implement an EmbeddingProtocolV1-compatible "
-                f"interface with an 'embed' method, got {adapter_type}",
+                "corpus_adapter must implement an EmbeddingProtocolV1-compatible interface "
+                f"with an 'embed' method, got {adapter_type}",
             )
 
         # Light config validation: fail fast on clearly wrong types.
         if batch_config is not None and not isinstance(batch_config, BatchConfig):
-            raise TypeError(
-                f"batch_config must be a BatchConfig instance, "
-                f"got {type(batch_config).__name__}",
-            )
-        if (
-            text_normalization_config is not None
-            and not isinstance(text_normalization_config, TextNormalizationConfig)
-        ):
+            raise TypeError(f"batch_config must be a BatchConfig instance, got {type(batch_config).__name__}")
+        if text_normalization_config is not None and not isinstance(text_normalization_config, TextNormalizationConfig):
             raise TypeError(
                 "text_normalization_config must be a TextNormalizationConfig instance, "
                 f"got {type(text_normalization_config).__name__}",
@@ -471,10 +486,11 @@ class CorpusAutoGenEmbeddings:
         self.autogen_config: Dict[str, Any] = autogen_config or {}
         self._framework_version: Optional[str] = framework_version
 
-        # Guard lazy translator initialization under concurrency.
-        self._translator_lock = threading.Lock()
+        # Guard lazy translator initialization + dim hint update under concurrency.
+        self._lock = threading.Lock()
 
-        # Observability: best-effort dim hint set after first embed.
+        # Observability: best-effort dim hint set after first embed (best-effort, first-write-wins).
+        # This is for observability only and never used for correctness.
         self._embedding_dim_hint: Optional[int] = None
 
         logger.info(
@@ -492,21 +508,18 @@ class CorpusAutoGenEmbeddings:
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        if hasattr(self.corpus_adapter, "close"):
-            try:
-                self.corpus_adapter.close()  # type: ignore[call-arg]
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Error while closing embedding adapter in __exit__: %s", exc)
+        # Cleanup is delegated to _maybe_close_sync, which already does best-effort
+        # handling and logging. No extra try/except needed here.
+        _maybe_close_sync(self.corpus_adapter)
 
     async def __aenter__(self) -> "CorpusAutoGenEmbeddings":
         return self
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        if hasattr(self.corpus_adapter, "aclose"):
-            try:
-                await self.corpus_adapter.aclose()  # type: ignore[call-arg]
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Error while closing embedding adapter in __aexit__: %s", exc)
+        try:
+            await _maybe_close_async(self.corpus_adapter)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Error while closing embedding adapter in __aexit__: %s", exc)
 
     # ------------------------------------------------------------------ #
     # Internal helpers
@@ -520,9 +533,7 @@ class CorpusAutoGenEmbeddings:
         We use `cached_property` for ergonomic caching and add an explicit lock
         to avoid duplicate initialization under concurrent first access.
         """
-        with self._translator_lock:
-            # If another thread finished initialization while we were waiting,
-            # return the cached value immediately.
+        with self._lock:
             existing = self.__dict__.get("_translator")
             if isinstance(existing, EmbeddingTranslator):
                 return existing
@@ -534,24 +545,30 @@ class CorpusAutoGenEmbeddings:
                 batch_config=self.batch_config,
                 text_normalization_config=self.text_normalization_config,
             )
-            logger.debug(
-                "EmbeddingTranslator initialized for AutoGen with model=%s",
-                self.model or "default",
-            )
+            logger.debug("EmbeddingTranslator initialized for AutoGen with model=%s", self.model or "default")
             return translator
 
-    # ---- context helpers ------------------------------------------------- #
+    def _update_dim_hint(self, dim: Optional[int]) -> None:
+        """
+        Thread-safe, best-effort dim hint update.
 
-    def _build_core_context(
-        self,
-        autogen_context: Optional[Mapping[str, Any]],
-    ) -> Optional[OperationContext]:
+        This is used only for observability/metrics; it is never used to drive
+        correctness or adapter behavior. First non-None write wins.
+        """
+        if dim is None:
+            return
+        if self._embedding_dim_hint is not None:
+            return
+        with self._lock:
+            if self._embedding_dim_hint is None:
+                self._embedding_dim_hint = dim
+
+    def _build_core_context(self, autogen_context: Optional[Mapping[str, Any]]) -> Optional[OperationContext]:
         """
         Build an OperationContext from an AutoGen-style context mapping.
 
-        Context translation is *best-effort*: failures are logged and
-        attached to the exception, but embedding operations must still
-        succeed without an OperationContext.
+        Context translation is best-effort: failures are logged and attached to the exception,
+        but embedding operations must still succeed without an OperationContext.
         """
         if autogen_context is None:
             return None
@@ -570,10 +587,8 @@ class CorpusAutoGenEmbeddings:
                 framework_version=self._framework_version,
             )
         except Exception as exc:  # noqa: BLE001
-            # Context translation is best-effort and must never break embeddings.
             logger.warning(
-                "Failed to create OperationContext from autogen_context: %s. "
-                "Proceeding without OperationContext.",
+                "Failed to create OperationContext from autogen_context: %s. Proceeding without OperationContext.",
                 exc,
             )
             attach_context(
@@ -587,19 +602,11 @@ class CorpusAutoGenEmbeddings:
             )
             return None
 
-        # Avoid brittle isinstance-only checks in case OperationContext
-        # is a Protocol/typing alias; accept "OperationContext-like" values.
         if _looks_like_operation_context(core_candidate):
-            logger.debug(
-                "Successfully created OperationContext from AutoGen context "
-                "with conversation_id=%s",
-                autogen_context.get("conversation_id", "unknown"),
-            )
             return core_candidate  # type: ignore[return-value]
 
         logger.warning(
-            "context_from_autogen returned non-OperationContext-like type: %s. "
-            "Ignoring OperationContext.",
+            "context_from_autogen returned non-OperationContext-like type: %s. Ignoring OperationContext.",
             type(core_candidate).__name__,
         )
         return None
@@ -615,38 +622,29 @@ class CorpusAutoGenEmbeddings:
         """
         Build the framework-specific context mapping for the translator.
 
-        This carries observability hints and AutoGen-specific routing fields,
-        separate from the protocol-level OperationContext.
+        This carries observability hints and AutoGen routing fields, separate from
+        the protocol-level OperationContext.
         """
         effective_model = model or self.model
-
         base: Dict[str, Any] = {
             "framework": "autogen",
             "autogen_config": dict(self.autogen_config),
         }
+
         if self._framework_version is not None:
             base["framework_version"] = self._framework_version
         if effective_model:
             base["model"] = effective_model
 
         if autogen_context:
-            if "agent_name" in autogen_context:
-                base["agent_name"] = autogen_context["agent_name"]
-            if "conversation_id" in autogen_context:
-                base["conversation_id"] = autogen_context["conversation_id"]
-            if "workflow_type" in autogen_context:
-                base["workflow_type"] = autogen_context["workflow_type"]
-            if "retriever_name" in autogen_context:
-                base["retriever_name"] = autogen_context["retriever_name"]
+            for key in ("agent_name", "conversation_id", "workflow_type", "retriever_name"):
+                if key in autogen_context:
+                    base[key] = autogen_context[key]
 
-        # Include any extra call-specific hints.
         base.update(kwargs)
 
-        # Also expose the OperationContext itself for downstream inspection.
         if core_ctx is not None:
             base["_operation_context"] = core_ctx
-
-        # Observability: include best-effort embedding dimension hint.
         if isinstance(self._embedding_dim_hint, int):
             base["embedding_dim_hint"] = self._embedding_dim_hint
 
@@ -659,12 +657,6 @@ class CorpusAutoGenEmbeddings:
         model: Optional[str] = None,
         **kwargs: Any,
     ) -> Tuple[Optional[OperationContext], Dict[str, Any]]:
-        """
-        Build both OperationContext and framework_ctx for an embedding call.
-
-        This is a thin wrapper around `_build_core_context` and
-        `_build_framework_context` to keep call sites terse.
-        """
         core_ctx = self._build_core_context(autogen_context)
         framework_ctx = self._build_framework_context(
             autogen_context=autogen_context,
@@ -675,9 +667,7 @@ class CorpusAutoGenEmbeddings:
         return core_ctx, framework_ctx
 
     def _coerce_embedding_matrix(self, result: Any) -> List[List[float]]:
-        """
-        Thin wrapper around shared coercion utility for matrix outputs.
-        """
+        """Thin wrapper around shared coercion utility for matrix outputs."""
         return coerce_embedding_matrix(
             result=result,
             framework="autogen",
@@ -686,9 +676,7 @@ class CorpusAutoGenEmbeddings:
         )
 
     def _coerce_embedding_vector(self, result: Any) -> List[float]:
-        """
-        Thin wrapper around shared coercion utility for single-vector outputs.
-        """
+        """Thin wrapper around shared coercion utility for single-vector outputs."""
         return coerce_embedding_vector(
             result=result,
             framework="autogen",
@@ -706,90 +694,89 @@ class CorpusAutoGenEmbeddings:
         return len(first)
 
     # ------------------------------------------------------------------ #
-    # Health / capabilities passthrough
+    # Capabilities / health passthrough (NO BLANK RETURNS)
     # ------------------------------------------------------------------ #
 
     @with_embedding_error_context("capabilities")
     def capabilities(self) -> Mapping[str, Any]:
         """
-        Best-effort capabilities passthrough to the underlying adapter (sync).
+        Sync capabilities passthrough.
 
-        If the underlying adapter only exposes async capabilities, callers
-        should prefer `acapabilities()`; this method will simply return `{}`.
+        - If adapter `capabilities` is async, run it via AsyncBridge (and guard loops).
+        - If adapter method doesn't exist, return {} to indicate "not supported".
         """
-        if hasattr(self.corpus_adapter, "capabilities"):
-            caps_method = self.corpus_adapter.capabilities
-            # Only support sync here; async forms should go through acapabilities.
-            if asyncio.iscoroutinefunction(caps_method):
-                logger.warning(
-                    "Underlying embedding adapter exposes async 'capabilities'; "
-                    "use 'acapabilities()' instead of sync 'capabilities()'.",
-                )
-                return {}
-            return caps_method()  # type: ignore[no-any-return]
-        return {}
+        caps = getattr(self.corpus_adapter, "capabilities", None)
+        if not callable(caps):
+            return {}
+
+        if asyncio.iscoroutinefunction(caps):
+            return _run_coro_sync(caps(), api_name="capabilities")  # type: ignore[no-any-return]
+        return caps()  # type: ignore[no-any-return]
 
     @with_async_embedding_error_context("capabilities_async")
     async def acapabilities(self) -> Mapping[str, Any]:
         """
-        Best-effort capabilities passthrough to the underlying adapter (async).
+        Async capabilities passthrough.
 
         Preference order:
         1) `acapabilities` on the adapter
-        2) `capabilities` on the adapter (awaited if async, or run in a thread if sync)
+        2) `capabilities` on the adapter (await if async, or run in a thread if sync)
         3) `{}` if neither is present
         """
-        if hasattr(self.corpus_adapter, "acapabilities"):
-            return await self.corpus_adapter.acapabilities()  # type: ignore[no-any-return]
-        if hasattr(self.corpus_adapter, "capabilities"):
-            caps_method = self.corpus_adapter.capabilities
-            if asyncio.iscoroutinefunction(caps_method):
-                return await caps_method()  # type: ignore[no-any-return]
-            # Sync fallback: run in thread pool
-            return await asyncio.to_thread(caps_method)  # type: ignore[arg-type]
-        return {}
+        caps = getattr(self.corpus_adapter, "capabilities", None)
+        acaps = getattr(self.corpus_adapter, "acapabilities", None)
+
+        if callable(acaps):
+            return await acaps()  # type: ignore[no-any-return]
+
+        if not callable(caps):
+            return {}
+
+        if asyncio.iscoroutinefunction(caps):
+            return await caps()  # type: ignore[no-any-return]
+        return await asyncio.to_thread(caps)  # type: ignore[arg-type]
 
     @with_embedding_error_context("health")
     def health(self) -> Mapping[str, Any]:
         """
-        Best-effort health passthrough to the underlying adapter (sync).
+        Sync health passthrough.
 
-        If the underlying adapter only exposes async health, callers
-        should prefer `ahealth()`; this method will simply return `{}`.
+        - If adapter `health` is async, run it via AsyncBridge (and guard loops).
+        - If adapter method doesn't exist, return {} to indicate "not supported".
         """
-        if hasattr(self.corpus_adapter, "health"):
-            health_method = self.corpus_adapter.health
-            # Only support sync here; async forms should go through ahealth.
-            if asyncio.iscoroutinefunction(health_method):
-                logger.warning(
-                    "Underlying embedding adapter exposes async 'health'; "
-                    "use 'ahealth()' instead of sync 'health()'.",
-                )
-                return {}
-            return health_method()  # type: ignore[no-any-return]
-        return {}
+        health = getattr(self.corpus_adapter, "health", None)
+        if not callable(health):
+            return {}
+
+        if asyncio.iscoroutinefunction(health):
+            return _run_coro_sync(health(), api_name="health")  # type: ignore[no-any-return]
+        return health()  # type: ignore[no-any-return]
 
     @with_async_embedding_error_context("health_async")
     async def ahealth(self) -> Mapping[str, Any]:
         """
-        Best-effort health passthrough to the underlying adapter (async).
+        Async health passthrough.
 
         Preference order:
         1) `ahealth` on the adapter
-        2) `health` on the adapter (awaited if async, or run in a thread if sync)
+        2) `health` on the adapter (await if async, or run in a thread if sync)
         3) `{}` if neither is present
         """
-        if hasattr(self.corpus_adapter, "ahealth"):
-            return await self.corpus_adapter.ahealth()  # type: ignore[no-any-return]
-        if hasattr(self.corpus_adapter, "health"):
-            health_method = self.corpus_adapter.health
-            if asyncio.iscoroutinefunction(health_method):
-                return await health_method()  # type: ignore[no-any-return]
-            return await asyncio.to_thread(health_method)  # type: ignore[arg-type]
-        return {}
+        health = getattr(self.corpus_adapter, "health", None)
+        ahealth = getattr(self.corpus_adapter, "ahealth", None)
+
+        if callable(ahealth):
+            return await ahealth()  # type: ignore[no-any-return]
+
+        if not callable(health):
+            return {}
+
+        if asyncio.iscoroutinefunction(health):
+            return await health()  # type: ignore[no-any-return]
+        return await asyncio.to_thread(health)  # type: ignore[arg-type]
 
     # ------------------------------------------------------------------ #
-    # Core AutoGen EmbeddingFunction Interface
+    # EmbeddingFunction interface (sync, guarded)
     # ------------------------------------------------------------------ #
 
     @with_embedding_error_context("function_call")
@@ -802,17 +789,13 @@ class CorpusAutoGenEmbeddings:
         **kwargs: Any,
     ) -> List[List[float]]:
         """
-        Make the instance callable for AutoGen's EmbeddingFunction protocol.
+        Callable interface expected by many vector stores:
+          embedding_function(texts: Sequence[str]) -> List[List[float]]
 
-        This enables direct usage with AutoGen's VectorStoreRetriever:
-        ```python
-        retriever = VectorStoreRetriever(
-            vectorstore=Chroma(embedding_function=CorpusAutoGenEmbeddings(...)),
-            ...
-        )
-        ```
+        This is a thin wrapper over `embed_documents`, with an event-loop guard
+        to prevent misuse from async contexts.
         """
-        # AutoGen generally passes a list, but Sequence[str] keeps us flexible.
+        _ensure_not_in_event_loop("__call__")
         return self.embed_documents(
             list(texts),
             autogen_context=autogen_context,
@@ -832,9 +815,10 @@ class CorpusAutoGenEmbeddings:
         """
         Sync embedding for multiple documents.
 
-        This is the primary method used by AutoGen's retrieval systems
-        for document embedding and agent memory.
+        Used for indexing/memory writes in typical RAG pipelines.
         """
+        _ensure_not_in_event_loop("embed_documents")
+
         texts_list = list(texts)
         _validate_texts_are_strings(texts_list, op_name="embed_documents")
 
@@ -852,12 +836,6 @@ class CorpusAutoGenEmbeddings:
             **kwargs,
         )
 
-        logger.debug(
-            "Sync embedding %d documents for AutoGen conversation: %s",
-            len(texts_list),
-            framework_ctx.get("conversation_id", "unknown"),
-        )
-
         start = time.perf_counter()
         translated = self._translator.embed(
             raw_texts=texts_list,
@@ -867,16 +845,12 @@ class CorpusAutoGenEmbeddings:
         elapsed_ms = (time.perf_counter() - start) * 1000.0
 
         mat = self._coerce_embedding_matrix(translated)
-
-        # Observability: remember dim once known.
-        dim = self._infer_dim_from_matrix(mat)
-        if dim is not None:
-            self._embedding_dim_hint = dim
+        self._update_dim_hint(self._infer_dim_from_matrix(mat))
 
         logger.debug(
             "Sync embedding completed: docs=%d dim=%s latency_ms=%.2f conversation=%s",
             len(mat),
-            dim,
+            self._embedding_dim_hint,
             elapsed_ms,
             framework_ctx.get("conversation_id", "unknown"),
         )
@@ -894,9 +868,10 @@ class CorpusAutoGenEmbeddings:
         """
         Sync embedding for a single query.
 
-        Used by AutoGen for query understanding and retrieval in
-        multi-agent conversations.
+        Used for retrieval queries / similarity searches.
         """
+        _ensure_not_in_event_loop("embed_query")
+
         if not isinstance(text, str):
             raise TypeError(f"embed_query expects str; got {type(text).__name__}")
 
@@ -904,11 +879,6 @@ class CorpusAutoGenEmbeddings:
             autogen_context=autogen_context,
             model=model,
             **kwargs,
-        )
-
-        logger.debug(
-            "Sync embedding query for AutoGen conversation: %s",
-            framework_ctx.get("conversation_id", "unknown"),
         )
 
         start = time.perf_counter()
@@ -920,9 +890,7 @@ class CorpusAutoGenEmbeddings:
         elapsed_ms = (time.perf_counter() - start) * 1000.0
 
         vec = self._coerce_embedding_vector(translated)
-
-        if self._embedding_dim_hint is None:
-            self._embedding_dim_hint = len(vec)
+        self._update_dim_hint(len(vec))
 
         logger.debug(
             "Sync embedding query completed: dim=%d latency_ms=%.2f conversation=%s",
@@ -933,7 +901,7 @@ class CorpusAutoGenEmbeddings:
         return vec
 
     # ------------------------------------------------------------------ #
-    # Async API for AutoGen Async Workflows
+    # Async API
     # ------------------------------------------------------------------ #
 
     @with_async_embedding_error_context("documents")
@@ -948,8 +916,7 @@ class CorpusAutoGenEmbeddings:
         """
         Async embedding for multiple documents.
 
-        Designed for use with AutoGen's async workflows and
-        event-driven agent systems.
+        Suitable for async AutoGen flows and event-driven pipelines.
         """
         texts_list = list(texts)
         _validate_texts_are_strings(texts_list, op_name="aembed_documents")
@@ -968,12 +935,6 @@ class CorpusAutoGenEmbeddings:
             **kwargs,
         )
 
-        logger.debug(
-            "Async embedding %d documents for AutoGen conversation: %s",
-            len(texts_list),
-            framework_ctx.get("conversation_id", "unknown"),
-        )
-
         start = time.perf_counter()
         translated = await self._translator.arun_embed(
             raw_texts=texts_list,
@@ -983,15 +944,12 @@ class CorpusAutoGenEmbeddings:
         elapsed_ms = (time.perf_counter() - start) * 1000.0
 
         mat = self._coerce_embedding_matrix(translated)
-
-        dim = self._infer_dim_from_matrix(mat)
-        if dim is not None:
-            self._embedding_dim_hint = dim
+        self._update_dim_hint(self._infer_dim_from_matrix(mat))
 
         logger.debug(
             "Async embedding completed: docs=%d dim=%s latency_ms=%.2f conversation=%s",
             len(mat),
-            dim,
+            self._embedding_dim_hint,
             elapsed_ms,
             framework_ctx.get("conversation_id", "unknown"),
         )
@@ -1008,9 +966,6 @@ class CorpusAutoGenEmbeddings:
     ) -> List[float]:
         """
         Async embedding for a single query.
-
-        Used in AutoGen's asynchronous agent workflows and
-        flow-based conversation systems.
         """
         if not isinstance(text, str):
             raise TypeError(f"aembed_query expects str; got {type(text).__name__}")
@@ -1019,11 +974,6 @@ class CorpusAutoGenEmbeddings:
             autogen_context=autogen_context,
             model=model,
             **kwargs,
-        )
-
-        logger.debug(
-            "Async embedding query for AutoGen conversation: %s",
-            framework_ctx.get("conversation_id", "unknown"),
         )
 
         start = time.perf_counter()
@@ -1035,9 +985,7 @@ class CorpusAutoGenEmbeddings:
         elapsed_ms = (time.perf_counter() - start) * 1000.0
 
         vec = self._coerce_embedding_vector(translated)
-
-        if self._embedding_dim_hint is None:
-            self._embedding_dim_hint = len(vec)
+        self._update_dim_hint(len(vec))
 
         logger.debug(
             "Async embedding query completed: dim=%d latency_ms=%.2f conversation=%s",
@@ -1049,157 +997,92 @@ class CorpusAutoGenEmbeddings:
 
 
 # --------------------------------------------------------------------------- #
-# AutoGen-Specific Helper Functions
+# Modern AutoGen integration helper: ChromaDBVectorMemory
 # --------------------------------------------------------------------------- #
 
 
-def _validate_vector_store_for_autogen(vector_store: Any) -> None:
-    """
-    Best-effort validation that the provided vector_store looks like a
-    typical vector store object AutoGen expects.
-
-    We keep this intentionally loose to avoid over-constraining users:
-      - Accepts stores that expose common vector-store methods like
-        `similarity_search` or `query`.
-    """
-    if vector_store is None:
-        raise TypeError("vector_store must not be None")
-
-    has_similarity = hasattr(vector_store, "similarity_search")
-    has_query = hasattr(vector_store, "query")
-
-    if not (has_similarity or has_query):
-        logger.warning(
-            "Vector store %r does not expose common methods like 'similarity_search' "
-            "or 'query'. It may not be compatible with AutoGen's VectorStoreRetriever.",
-            type(vector_store).__name__,
-        )
-
-
-def _set_vector_store_embedding_function(vector_store: Any, embedding_function: Any) -> None:
-    """
-    Configure the vector store with our embedding function.
-
-    Improvement: prefer the best available public API, then fall back.
-
-    Order:
-      1) public setter method if present
-      2) public attribute `embedding_function`
-      3) private attribute `_embedding_function` (warn once)
-    """
-    global _WARNED_PRIVATE_EMBEDDING_ATTR  # noqa: PLW0603
-
-    # 1) Public setter patterns (varies by vector store implementation)
-    for setter_name in ("set_embedding_function", "set_embedding_fn"):
-        setter = getattr(vector_store, setter_name, None)
-        if callable(setter):
-            setter(embedding_function)
-            return
-
-    # 2) Public attribute
-    if hasattr(vector_store, "embedding_function"):
-        setattr(vector_store, "embedding_function", embedding_function)
-        return
-
-    # 3) Private attribute (pragmatic fallback)
-    if hasattr(vector_store, "_embedding_function"):
-        if not _WARNED_PRIVATE_EMBEDDING_ATTR:
-            _WARNED_PRIVATE_EMBEDDING_ATTR = True
-            logger.warning(
-                "Setting private attribute '_embedding_function' on vector_store %r. "
-                "If the vector store library changes its internals, this may break.",
-                type(vector_store).__name__,
-            )
-        setattr(vector_store, "_embedding_function", embedding_function)
-        return
-
-    logger.warning(
-        "Vector store %r does not expose an embedding setter or known embedding attribute. "
-        "You may need to configure the embedding function manually.",
-        type(vector_store).__name__,
-    )
-
-
-def create_retriever(
+def create_vector_memory(
     corpus_adapter: EmbeddingProtocolV1,
-    vector_store: Any,
     *,
+    collection_name: str = "corpus_autogen_memory",
+    persistence_path: Optional[str] = None,
     model: Optional[str] = None,
     batch_config: Optional[BatchConfig] = None,
     text_normalization_config: Optional[TextNormalizationConfig] = None,
     autogen_config: Optional[Dict[str, Any]] = None,
     framework_version: Optional[str] = None,
-    **retriever_kwargs: Any,
-) -> AutoGenRetriever:
+    k: int = 3,
+    score_threshold: Optional[float] = None,
+) -> AutoGenMemory:
     """
-    Create an AutoGen VectorStoreRetriever with Corpus embeddings.
+    Create a modern AutoGen ChromaDB vector memory configured to use Corpus embeddings.
 
-    This provides a convenient way to create AutoGen retrievers
-    with Corpus embeddings in a single function call.
+    AutoGen is an optional dependency: imports are performed lazily.
 
     Parameters
     ----------
     corpus_adapter:
         Underlying embedding adapter implementing `EmbeddingProtocolV1`.
-    vector_store:
-        Vector store instance compatible with AutoGen's VectorStoreRetriever.
-    model:
-        Optional model identifier to use for embeddings.
-    batch_config:
-        Optional batching configuration forwarded to `CorpusAutoGenEmbeddings`.
-    text_normalization_config:
-        Optional text normalization configuration forwarded to
-        `CorpusAutoGenEmbeddings`.
-    autogen_config:
-        Optional AutoGen-specific configuration for agent/workflow integration.
-    framework_version:
-        Optional framework version string for observability alignment.
-    retriever_kwargs:
-        Additional keyword arguments forwarded to AutoGen's VectorStoreRetriever.
+    collection_name:
+        Chroma collection name for the memory store.
+    persistence_path:
+        Optional path for persistent Chroma storage. If None, uses default behavior.
+    model, batch_config, text_normalization_config, autogen_config, framework_version:
+        Forwarded to `CorpusAutoGenEmbeddings` construction.
+    k:
+        Default number of nearest neighbors to retrieve.
+    score_threshold:
+        Optional similarity score threshold; depends on AutoGen/Chroma semantics.
 
-    Example usage:
-    ```python
-    from corpus_sdk.embedding.framework_adapters.autogen import create_retriever
-    from chromadb import Chroma
-
-    vectorstore = Chroma(collection_name="autogen_docs")
-
-    retriever = create_retriever(
-        corpus_adapter=my_adapter,
-        vector_store=vectorstore,
-        model="text-embedding-3-large",
-    )
-    ```
+    Returns
+    -------
+    AutoGenMemory
+        A ChromaDBVectorMemory instance (typed loosely via Protocol).
     """
     try:
-        from autogen.retrieve_utils import VectorStoreRetriever
-    except ImportError as exc:  # noqa: BLE001
-        message = (
-            "AutoGen is not installed. To use create_retriever, install the "
-            "AutoGen package, for example: 'pip install pyautogen'."
+        from autogen_ext.memory.chromadb import (  # type: ignore[import-not-found]
+            ChromaDBVectorMemory,
+            PersistentChromaDBVectorMemoryConfig,
+            CustomEmbeddingFunctionConfig,
         )
-        logger.error(message)
-        raise RuntimeError(message) from exc
+    except ImportError as exc:  # noqa: BLE001
+        raise RuntimeError(
+            "AutoGen Chroma memory dependencies are not installed. Install with:\n"
+            '  pip install -U "autogen-agentchat" "autogen-core" "autogen-ext[chromadb]"'
+        ) from exc
 
-    # Best-effort validation before mutating the vector store.
-    _validate_vector_store_for_autogen(vector_store)
+    # AutoGen uses a function+params config to build the embedding function.
+    def _embedding_fn_factory(**params: Any) -> Any:
+        return CorpusAutoGenEmbeddings(
+            corpus_adapter=params["corpus_adapter"],
+            model=params.get("model"),
+            batch_config=params.get("batch_config"),
+            text_normalization_config=params.get("text_normalization_config"),
+            autogen_config=params.get("autogen_config"),
+            framework_version=params.get("framework_version"),
+        )
 
-    embedding_function = CorpusAutoGenEmbeddings(
-        corpus_adapter=corpus_adapter,
-        model=model,
-        batch_config=batch_config,
-        text_normalization_config=text_normalization_config,
-        autogen_config=autogen_config,
-        framework_version=framework_version,
+    embedding_function_config = CustomEmbeddingFunctionConfig(
+        function=_embedding_fn_factory,
+        params={
+            "corpus_adapter": corpus_adapter,
+            "model": model,
+            "batch_config": batch_config,
+            "text_normalization_config": text_normalization_config,
+            "autogen_config": autogen_config or {},
+            "framework_version": framework_version,
+        },
     )
 
-    _set_vector_store_embedding_function(vector_store, embedding_function)
+    cfg = PersistentChromaDBVectorMemoryConfig(
+        collection_name=collection_name,
+        persistence_path=persistence_path,
+        embedding_function_config=embedding_function_config,
+        k=k,
+        score_threshold=score_threshold,
+    )
 
-    retriever = VectorStoreRetriever(vectorstore=vector_store, **retriever_kwargs)
-
-    logger.info("AutoGen retriever created with Corpus embeddings")
-
-    return retriever
+    return ChromaDBVectorMemory(config=cfg)
 
 
 def register_embeddings(
@@ -1211,10 +1094,9 @@ def register_embeddings(
     framework_version: Optional[str] = None,
 ) -> CorpusAutoGenEmbeddings:
     """
-    Register Corpus embeddings for global use in AutoGen workflows.
+    Convenience constructor for a reusable embedding function instance.
 
-    This function provides a centralized way to configure Corpus embeddings
-    for multiple AutoGen agents and retrievers.
+    Useful when you want to pass the same embedding function to multiple components.
     """
     embeddings = CorpusAutoGenEmbeddings(
         corpus_adapter=corpus_adapter,
@@ -1230,15 +1112,14 @@ def register_embeddings(
         model or "default model",
         framework_version,
     )
-
     return embeddings
 
 
 __all__ = [
     "CorpusAutoGenEmbeddings",
     "AutoGenContext",
-    "AutoGenRetriever",
-    "create_retriever",
+    "AutoGenMemory",
+    "create_vector_memory",
     "register_embeddings",
     "ErrorCodes",
     "with_embedding_error_context",
