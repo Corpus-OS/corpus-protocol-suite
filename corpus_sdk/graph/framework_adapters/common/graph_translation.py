@@ -75,7 +75,7 @@ from __future__ import annotations
 import logging
 import math
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from typing import (
     Any,
     AsyncIterator,
@@ -100,6 +100,7 @@ from corpus_sdk.graph.graph_base import (
     BulkVerticesSpec,
     DeleteEdgesSpec,
     DeleteNodesSpec,
+    GraphCapabilities,
     GraphQuerySpec,
     GraphSchema,
     GraphProtocolV1,
@@ -139,27 +140,51 @@ def _ensure_operation_context(
         - OperationContext: returned as-is
         - Mapping[str, Any]: interpreted via context_translation.from_dict,
           then adapted into a graph OperationContext.
+        - Duck-typed context: any object with request_id/attrs attributes.
     """
+    # 1) No context → build from empty dict
     if ctx is None:
         core_ctx = ctx_from_dict({})
-    elif isinstance(ctx, OperationContext):
-        return ctx
-    elif isinstance(ctx, Mapping):
-        core_ctx = ctx_from_dict(ctx)
-    else:
-        raise BadRequest(
-            f"Unsupported context type: {type(ctx).__name__}",
-            code="BAD_OPERATION_CONTEXT",
+        return OperationContext(
+            request_id=getattr(core_ctx, "request_id", None),
+            idempotency_key=getattr(core_ctx, "idempotency_key", None),
+            deadline_ms=getattr(core_ctx, "deadline_ms", None),
+            traceparent=getattr(core_ctx, "traceparent", None),
+            tenant=getattr(core_ctx, "tenant", None),
+            attrs=getattr(core_ctx, "attrs", None) or {},
         )
 
-    # Reconstruct as graph OperationContext with validation
-    return OperationContext(
-        request_id=getattr(core_ctx, "request_id", None),
-        idempotency_key=getattr(core_ctx, "idempotency_key", None),
-        deadline_ms=getattr(core_ctx, "deadline_ms", None),
-        traceparent=getattr(core_ctx, "traceparent", None),
-        tenant=getattr(core_ctx, "tenant", None),
-        attrs=getattr(core_ctx, "attrs", None) or {},
+    # 2) Already our graph OperationContext → just use it
+    if isinstance(ctx, OperationContext):
+        return ctx
+
+    # 3) Mapping → go through core context translation
+    if isinstance(ctx, Mapping):
+        core_ctx = ctx_from_dict(ctx)
+        return OperationContext(
+            request_id=getattr(core_ctx, "request_id", None),
+            idempotency_key=getattr(core_ctx, "idempotency_key", None),
+            deadline_ms=getattr(core_ctx, "deadline_ms", None),
+            traceparent=getattr(core_ctx, "traceparent", None),
+            tenant=getattr(core_ctx, "tenant", None),
+            attrs=getattr(core_ctx, "attrs", None) or {},
+        )
+
+    # 4) Duck-typed context (covers cases where another layer already wrapped it)
+    if hasattr(ctx, "request_id") or hasattr(ctx, "attrs"):
+        return OperationContext(
+            request_id=getattr(ctx, "request_id", None),
+            idempotency_key=getattr(ctx, "idempotency_key", None),
+            deadline_ms=getattr(ctx, "deadline_ms", None),
+            traceparent=getattr(ctx, "traceparent", None),
+            tenant=getattr(ctx, "tenant", None),
+            attrs=getattr(ctx, "attrs", None) or {},
+        )
+
+    # 5) Everything else → hard error
+    raise BadRequest(
+        f"Unsupported context type: {type(ctx).__name__}",
+        code="BAD_OPERATION_CONTEXT",
     )
 
 
@@ -511,6 +536,26 @@ class GraphFrameworkTranslator(Protocol):
     def translate_schema(
         self,
         schema: GraphSchema,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        ...
+
+    # ---- capabilities / health ----
+
+    def translate_capabilities(
+        self,
+        capabilities: GraphCapabilities,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        ...
+
+    def translate_health(
+        self,
+        health: Mapping[str, Any],
         *,
         op_ctx: OperationContext,
         framework_ctx: Optional[Any] = None,
@@ -1003,6 +1048,28 @@ class DefaultGraphFrameworkTranslator:
     ) -> Any:
         return schema
 
+    # ---- capabilities / health ----
+
+    def translate_capabilities(
+        self,
+        capabilities: GraphCapabilities,
+        *,
+        op_ctx: OperationContext,  # noqa: ARG002
+        framework_ctx: Optional[Any] = None,  # noqa: ARG002
+    ) -> Any:
+        # Simple default: expose as plain dict
+        return asdict(capabilities)
+
+    def translate_health(
+        self,
+        health: Mapping[str, Any],
+        *,
+        op_ctx: OperationContext,  # noqa: ARG002
+        framework_ctx: Optional[Any] = None,  # noqa: ARG002
+    ) -> Any:
+        # Simple default: normalize to dict
+        return dict(health or {})
+
 
 # =============================================================================
 # Graph Translator Orchestrator
@@ -1273,6 +1340,144 @@ class GraphTranslator:
                 )
 
         return _factory
+
+    # --------------------------------------------------------------------- #
+    # Capabilities / Health APIs
+    # --------------------------------------------------------------------- #
+
+    def capabilities(
+        self,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        """
+        Synchronous capabilities API.
+
+        Wraps adapter.capabilities() with error-context and translation.
+        """
+
+        async def _logic(ctx: OperationContext) -> Any:
+            caps = await self._adapter.capabilities()
+
+            if not isinstance(caps, GraphCapabilities):
+                raise BadRequest(
+                    f"adapter.capabilities returned unsupported type: "
+                    f"{type(caps).__name__}",
+                    code="BAD_ADAPTER_RESULT",
+                )
+
+            return self._translator.translate_capabilities(
+                caps,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+
+        return self._run_operation(
+            op_name="capabilities",
+            op_ctx=op_ctx,
+            sync=True,
+            logic=_logic,
+        )
+
+    async def arun_capabilities(
+        self,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        """
+        Async capabilities API.
+        """
+
+        async def _logic(ctx: OperationContext) -> Any:
+            caps = await self._adapter.capabilities()
+
+            if not isinstance(caps, GraphCapabilities):
+                raise BadRequest(
+                    f"adapter.capabilities returned unsupported type: "
+                    f"{type(caps).__name__}",
+                    code="BAD_ADAPTER_RESULT",
+                )
+
+            return self._translator.translate_capabilities(
+                caps,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+
+        return await self._run_operation(
+            op_name="capabilities",
+            op_ctx=op_ctx,
+            sync=False,
+            logic=_logic,
+        )
+
+    def health(
+        self,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        """
+        Synchronous health API.
+
+        Wraps adapter.health(ctx=...) with error-context and translation.
+        """
+
+        async def _logic(ctx: OperationContext) -> Any:
+            res = await self._adapter.health(ctx=ctx)
+
+            if not isinstance(res, Mapping):
+                raise BadRequest(
+                    f"adapter.health returned unsupported type: {type(res).__name__}",
+                    code="BAD_ADAPTER_RESULT",
+                )
+
+            return self._translator.translate_health(
+                res,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+
+        return self._run_operation(
+            op_name="health",
+            op_ctx=op_ctx,
+            sync=True,
+            logic=_logic,
+        )
+
+    async def arun_health(
+        self,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        """
+        Async health API.
+        """
+
+        async def _logic(ctx: OperationContext) -> Any:
+            res = await self._adapter.health(ctx=ctx)
+
+            if not isinstance(res, Mapping):
+                raise BadRequest(
+                    f"adapter.health returned unsupported type: {type(res).__name__}",
+                    code="BAD_ADAPTER_RESULT",
+                )
+
+            return self._translator.translate_health(
+                res,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+
+        return await self._run_operation(
+            op_name="health",
+            op_ctx=op_ctx,
+            sync=False,
+            logic=_logic,
+        )
 
     # --------------------------------------------------------------------- #
     # Sync Query APIs
