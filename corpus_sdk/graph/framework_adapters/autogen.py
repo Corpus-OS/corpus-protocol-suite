@@ -86,10 +86,12 @@ from corpus_sdk.graph.graph_base import (
     DeleteResult,
     GraphProtocolV1,
     GraphSchema,
+    GraphTraversalSpec,
     NotSupported,
     OperationContext,
     QueryChunk,
     QueryResult,
+    TraversalResult,
     UpsertEdgesSpec,
     UpsertNodesSpec,
     UpsertResult,
@@ -130,6 +132,8 @@ class ErrorCodes:
     BAD_BULK_VERTICES_RESULT = "BAD_BULK_VERTICES_RESULT"
     BAD_BATCH_RESULT = "BAD_BATCH_RESULT"
     BAD_ADAPTER_RESULT = "BAD_ADAPTER_RESULT"
+    BAD_TRAVERSAL_RESULT = "BAD_TRAVERSAL_RESULT"
+    BAD_TRANSACTION_RESULT = "BAD_TRANSACTION_RESULT"
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +176,31 @@ def with_async_graph_error_context(
 # Backwards-compatible aliases (if callers were using old names)
 with_error_context = with_graph_error_context
 with_async_error_context = with_async_graph_error_context
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _looks_like_operation_context(obj: Any) -> bool:
+    """
+    Heuristic check; OperationContext may be a Protocol/alias in some SDK versions.
+    """
+    if obj is None:
+        return False
+
+    # If OperationContext is a real class, this will work; if it's a Protocol,
+    # this may raise TypeError in some typing modes.
+    try:
+        if isinstance(obj, OperationContext):
+            return True
+    except TypeError:
+        pass
+
+    # Fallback to structural check
+    attrs = ("request_id", "traceparent", "tenant", "attrs", "to_dict")
+    return any(hasattr(obj, attr) for attr in attrs)
 
 
 # ---------------------------------------------------------------------------
@@ -435,7 +464,7 @@ class AutoGenGraphClientProtocol(Protocol):
     ) -> DeleteResult:
         ...
 
-    # Bulk / batch
+    # Bulk / traversal / transaction / batch
 
     def bulk_vertices(
         self,
@@ -453,6 +482,42 @@ class AutoGenGraphClientProtocol(Protocol):
         conversation: Optional[Any] = None,
         extra_context: Optional[Mapping[str, Any]] = None,
     ) -> BulkVerticesResult:
+        ...
+
+    def traversal(
+        self,
+        spec: GraphTraversalSpec,
+        *,
+        conversation: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> TraversalResult:
+        ...
+
+    async def atraversal(
+        self,
+        spec: GraphTraversalSpec,
+        *,
+        conversation: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> TraversalResult:
+        ...
+
+    def transaction(
+        self,
+        ops: List[BatchOperation],
+        *,
+        conversation: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> BatchResult:
+        ...
+
+    async def atransaction(
+        self,
+        ops: List[BatchOperation],
+        *,
+        conversation: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> BatchResult:
         ...
 
     def batch(
@@ -666,13 +731,9 @@ class CorpusAutoGenGraphClient:
         """
         Build an OperationContext from AutoGen-style inputs.
 
-        Expected inputs
-        ----------------
-        - conversation: AutoGen conversation object (optional)
-        - extra_context: Optional mapping merged into attrs (best effort)
-
-        If both are None/empty, returns None and lets downstream helpers
-        construct an "empty" OperationContext as needed.
+        Context translation is *best-effort*: failures are logged and attached
+        for observability, but graph operations must still be able to proceed
+        without an OperationContext.
         """
         extra: Dict[str, Any] = dict(extra_context or {})
 
@@ -680,30 +741,39 @@ class CorpusAutoGenGraphClient:
             return None
 
         try:
-            ctx = core_ctx_from_autogen(
+            ctx_candidate = core_ctx_from_autogen(
                 conversation,
                 framework_version=self._framework_version,
                 **extra,
             )
         except Exception as exc:
+            logger.warning(
+                "[%s] Failed to build OperationContext from AutoGen inputs; "
+                "proceeding without OperationContext. conversation_type=%s extra_keys=%s",
+                ErrorCodes.BAD_OPERATION_CONTEXT,
+                type(conversation).__name__ if conversation is not None else "None",
+                list(extra.keys()),
+            )
             attach_context(
                 exc,
                 framework="autogen",
                 operation="context_translation",
+                error_code=ErrorCodes.BAD_OPERATION_CONTEXT,
+                conversation_type=type(conversation).__name__ if conversation is not None else "None",
+                extra_context_keys=list(extra.keys()),
             )
-            # Surface a consistent BadRequest with symbolic error code.
-            raise BadRequest(
-                "Failed to build OperationContext from AutoGen inputs",
-                code=ErrorCodes.BAD_OPERATION_CONTEXT,
-            ) from exc
+            return None
 
-        if not isinstance(ctx, OperationContext):
-            raise BadRequest(
-                f"from_autogen produced unsupported context type: {type(ctx).__name__}",
-                code=ErrorCodes.BAD_OPERATION_CONTEXT,
-            )
+        if _looks_like_operation_context(ctx_candidate):
+            return ctx_candidate  # type: ignore[return-value]
 
-        return ctx
+        logger.warning(
+            "[%s] from_autogen returned non-OperationContext-like type: %s. "
+            "Ignoring OperationContext.",
+            ErrorCodes.BAD_OPERATION_CONTEXT,
+            type(ctx_candidate).__name__,
+        )
+        return None
 
     def _build_raw_query(
         self,
@@ -1719,8 +1789,174 @@ class CorpusAutoGenGraphClient:
         )
 
     # ------------------------------------------------------------------ #
-    # Batch (sync + async)
+    # Traversal (sync + async)
     # ------------------------------------------------------------------ #
+
+    @with_graph_error_context("traversal_sync")
+    def traversal(
+        self,
+        spec: GraphTraversalSpec,
+        *,
+        conversation: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> TraversalResult:
+        """
+        Sync wrapper for graph traversal.
+
+        Builds a raw traversal request and delegates to GraphTranslator.
+        """
+        ctx = self._build_ctx(
+            conversation=conversation,
+            extra_context=extra_context,
+        )
+
+        raw_request: Mapping[str, Any] = {
+            "start_nodes": list(spec.start_nodes),
+            "max_depth": spec.max_depth,
+            "direction": spec.direction,
+            "relationship_types": spec.relationship_types,
+            "node_filters": spec.node_filters,
+            "relationship_filters": spec.relationship_filters,
+            "return_properties": spec.return_properties,
+            "namespace": spec.namespace,
+        }
+
+        framework_ctx = self._framework_ctx(
+            operation="traversal",
+            namespace=spec.namespace,
+        )
+
+        result = self._translator.traversal(
+            raw_request,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+        return validate_graph_result_type(
+            result,
+            expected_type=TraversalResult,
+            operation="GraphTranslator.traversal",
+            error_code=ErrorCodes.BAD_TRAVERSAL_RESULT,
+        )
+
+    @with_async_graph_error_context("traversal_async")
+    async def atraversal(
+        self,
+        spec: GraphTraversalSpec,
+        *,
+        conversation: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> TraversalResult:
+        """
+        Async wrapper for graph traversal.
+        """
+        ctx = self._build_ctx(
+            conversation=conversation,
+            extra_context=extra_context,
+        )
+
+        raw_request: Mapping[str, Any] = {
+            "start_nodes": list(spec.start_nodes),
+            "max_depth": spec.max_depth,
+            "direction": spec.direction,
+            "relationship_types": spec.relationship_types,
+            "node_filters": spec.node_filters,
+            "relationship_filters": spec.relationship_filters,
+            "return_properties": spec.return_properties,
+            "namespace": spec.namespace,
+        }
+
+        framework_ctx = self._framework_ctx(
+            operation="traversal",
+            namespace=spec.namespace,
+        )
+
+        result = await self._translator.arun_traversal(
+            raw_request,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+        return validate_graph_result_type(
+            result,
+            expected_type=TraversalResult,
+            operation="GraphTranslator.arun_traversal",
+            error_code=ErrorCodes.BAD_TRAVERSAL_RESULT,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Transaction + Batch (sync + async)
+    # ------------------------------------------------------------------ #
+
+    @with_graph_error_context("transaction_sync")
+    def transaction(
+        self,
+        ops: List[BatchOperation],
+        *,
+        conversation: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> BatchResult:
+        """
+        Sync wrapper for transactional batch operations.
+
+        Translates `BatchOperation` dataclasses into the raw mapping shape
+        expected by GraphTranslator and returns the underlying `BatchResult`.
+        """
+        # Reuse batch validation; semantics are still a list of BatchOperation.
+        validate_batch_operations(self._graph, ops)
+
+        ctx = self._build_ctx(
+            conversation=conversation,
+            extra_context=extra_context,
+        )
+
+        raw_ops: List[Mapping[str, Any]] = [
+            {"op": op.op, "args": dict(op.args or {})} for op in ops
+        ]
+
+        result = self._translator.transaction(
+            raw_ops,
+            op_ctx=ctx,
+            framework_ctx=self._framework_ctx(operation="transaction"),
+        )
+        return validate_graph_result_type(
+            result,
+            expected_type=BatchResult,
+            operation="GraphTranslator.transaction",
+            error_code=ErrorCodes.BAD_TRANSACTION_RESULT,
+        )
+
+    @with_async_graph_error_context("transaction_async")
+    async def atransaction(
+        self,
+        ops: List[BatchOperation],
+        *,
+        conversation: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> BatchResult:
+        """
+        Async wrapper for transactional batch operations.
+        """
+        validate_batch_operations(self._graph, ops)
+
+        ctx = self._build_ctx(
+            conversation=conversation,
+            extra_context=extra_context,
+        )
+
+        raw_ops: List[Mapping[str, Any]] = [
+            {"op": op.op, "args": dict(op.args or {})} for op in ops
+        ]
+
+        result = await self._translator.arun_transaction(
+            raw_ops,
+            op_ctx=ctx,
+            framework_ctx=self._framework_ctx(operation="transaction"),
+        )
+        return validate_graph_result_type(
+            result,
+            expected_type=BatchResult,
+            operation="GraphTranslator.arun_transaction",
+            error_code=ErrorCodes.BAD_TRANSACTION_RESULT,
+        )
 
     @with_graph_error_context("batch_sync")
     def batch(
