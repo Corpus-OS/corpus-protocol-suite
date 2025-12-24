@@ -694,7 +694,7 @@ class CorpusAutoGenEmbeddings:
         return len(first)
 
     # ------------------------------------------------------------------ #
-    # Capabilities / health passthrough (NO BLANK RETURNS)
+    # Capabilities / health passthrough via EmbeddingTranslator
     # ------------------------------------------------------------------ #
 
     @with_embedding_error_context("capabilities")
@@ -702,78 +702,39 @@ class CorpusAutoGenEmbeddings:
         """
         Sync capabilities passthrough.
 
-        - If adapter `capabilities` is async, run it via AsyncBridge (and guard loops).
-        - If adapter method doesn't exist, return {} to indicate "not supported".
+        Delegates to EmbeddingTranslator.capabilities(), which handles
+        async/sync adapter methods via its own AsyncBridge usage.
         """
-        caps = getattr(self.corpus_adapter, "capabilities", None)
-        if not callable(caps):
-            return {}
-
-        if asyncio.iscoroutinefunction(caps):
-            return _run_coro_sync(caps(), api_name="capabilities")  # type: ignore[no-any-return]
-        return caps()  # type: ignore[no-any-return]
+        # We intentionally do **not** manually touch corpus_adapter.capabilities here:
+        # the translator centralizes all bridging / error context for embedding layer.
+        return self._translator.capabilities()
 
     @with_async_embedding_error_context("capabilities_async")
     async def acapabilities(self) -> Mapping[str, Any]:
         """
         Async capabilities passthrough.
 
-        Preference order:
-        1) `acapabilities` on the adapter
-        2) `capabilities` on the adapter (await if async, or run in a thread if sync)
-        3) `{}` if neither is present
+        Delegates to EmbeddingTranslator.arun_capabilities().
         """
-        caps = getattr(self.corpus_adapter, "capabilities", None)
-        acaps = getattr(self.corpus_adapter, "acapabilities", None)
-
-        if callable(acaps):
-            return await acaps()  # type: ignore[no-any-return]
-
-        if not callable(caps):
-            return {}
-
-        if asyncio.iscoroutinefunction(caps):
-            return await caps()  # type: ignore[no-any-return]
-        return await asyncio.to_thread(caps)  # type: ignore[arg-type]
+        return await self._translator.arun_capabilities()
 
     @with_embedding_error_context("health")
     def health(self) -> Mapping[str, Any]:
         """
         Sync health passthrough.
 
-        - If adapter `health` is async, run it via AsyncBridge (and guard loops).
-        - If adapter method doesn't exist, return {} to indicate "not supported".
+        Delegates to EmbeddingTranslator.health().
         """
-        health = getattr(self.corpus_adapter, "health", None)
-        if not callable(health):
-            return {}
-
-        if asyncio.iscoroutinefunction(health):
-            return _run_coro_sync(health(), api_name="health")  # type: ignore[no-any-return]
-        return health()  # type: ignore[no-any-return]
+        return self._translator.health()
 
     @with_async_embedding_error_context("health_async")
     async def ahealth(self) -> Mapping[str, Any]:
         """
         Async health passthrough.
 
-        Preference order:
-        1) `ahealth` on the adapter
-        2) `health` on the adapter (await if async, or run in a thread if sync)
-        3) `{}` if neither is present
+        Delegates to EmbeddingTranslator.arun_health().
         """
-        health = getattr(self.corpus_adapter, "health", None)
-        ahealth = getattr(self.corpus_adapter, "ahealth", None)
-
-        if callable(ahealth):
-            return await ahealth()  # type: ignore[no-any-return]
-
-        if not callable(health):
-            return {}
-
-        if asyncio.iscoroutinefunction(health):
-            return await health()  # type: ignore[no-any-return]
-        return await asyncio.to_thread(health)  # type: ignore[arg-type]
+        return await self._translator.arun_health()
 
     # ------------------------------------------------------------------ #
     # EmbeddingFunction interface (sync, guarded)
