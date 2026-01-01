@@ -1,6 +1,6 @@
 # CORPUS Protocol Suite - Migration Reference Guide
 
-**Version:** 1.0 • **Protocol Compatibility:** v1.0 • **Last Updated:** January 2025
+**Version:** 1.0 • **Protocol Compatibility:** v1.0 • **Last Updated:** January 2026
 
 ---
 
