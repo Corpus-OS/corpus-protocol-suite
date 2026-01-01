@@ -20,7 +20,7 @@ This pledge is **intentionally limited to protocol-level essentials** and is **n
 This pledge applies only to your activities that are **both**:
 
 1. **Protocol-conformant**, and  
-2. Limited to **Core Corpus Protocol interfaces** as defined in `docs/spec/core/` (or their officially designated successors).
+2. Limited to **Core Corpus Protocol interfaces** as defined in `docs/spec/` (or their officially designated successors).
 
 Covered activities include:
 
