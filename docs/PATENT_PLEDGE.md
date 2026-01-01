@@ -24,7 +24,7 @@ This pledge applies only to your activities that are **both**:
 
 Covered activities include:
 
-- Implementing the **Corpus Core Wire Protocols** as described in `docs/spec/core/`
+- Implementing the **Corpus Core Wire Protocols** as described in `docs/spec/`
 - Building **adapters, clients, servers, or tools** that:
   - Accept and emit Corpus Protocol messages as defined in the Core specifications; and
   - Do not incorporate non-covered patented features (see §1.3 and §1.4)
