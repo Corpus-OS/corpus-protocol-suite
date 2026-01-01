@@ -1,4 +1,4 @@
-## Defensive Patent Pledge (Protocol-Level Essentials)
+## Defensive Patent Pledge 
 
 > **Document Version:** 1.3  
 > **Effective Date:** December 23, 2025  
