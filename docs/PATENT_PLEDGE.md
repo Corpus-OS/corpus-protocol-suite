@@ -5,7 +5,7 @@
 > **Last Updated:** January 1, 2026  
 > **Company:** Interoperable Intelligence Inc.
 
-To encourage broad adoption and innovation around the Corpus Protocol Suite, **Interoperable Intelligence Inc.** makes the following **narrow, protocol-focused defensive patent pledge**.
+To encourage broad adoption and innovation around the Corpus Protocol Suite, **Interoperable Intelligence Inc.** makes the following **protocol-focused defensive patent pledge**.
 
 This pledge is **intentionally limited to protocol-level essentials** and is **not a waiver** of rights in our routing, orchestration, conformance, cost-normalization, or optimization patents.
 
