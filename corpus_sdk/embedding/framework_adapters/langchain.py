@@ -18,15 +18,16 @@ Design notes / philosophy
 -------------------------
 - **Protocol-first**: we require only an `embed` method (duck-typed) instead of
   strict inheritance from a specific adapter base class.
-- **Resilient to framework evolution**: LlamaIndex’s internals and signatures
-  change; we filter/normalize context defensively and keep our adapter surface stable.
+- **Resilient to framework evolution**: LangChain’s RunnableConfig and invocation
+  APIs evolve; we normalize/validate context defensively and keep our adapter
+  surface stable.
 - **Observability-first**: all embedding operations attach rich error context:
   framework identity, model info, batch sizes, node IDs, trace/workflow IDs, etc.
 - **Fail-safe context translation**: context translation must never break embeddings.
-  If translation fails, we proceed without `OperationContext` and attach diagnostic context.
-- **Strict by default** (configurable): non-string inputs in batch operations are rejected
-  unless `strict_text_types=False`, in which case they are treated as empty and receive
-  zero-vector embeddings to preserve row alignment.
+  If translation fails, we proceed without `OperationContext` (optionally falling
+  back to a simple one) and attach diagnostic context.
+- **Strict by default**: non-string inputs in batch operations are rejected with
+  `TypeError` instead of being coerced, to avoid silently embedding repr() outputs.
 
 Resilience (retries, caching, rate limiting, etc.) is expected to be provided
 by the underlying adapter, typically a BaseEmbeddingAdapter subclass.
@@ -313,7 +314,6 @@ def _extract_dynamic_context(
     # LangChain-specific config (if passed via keyword)
     config = kwargs.get("config") or {}
     if isinstance(config, Mapping):
-        # Loop style to reduce verbosity and keep parity with other adapters.
         for key in ("run_id", "run_name", "tags"):
             if key in config:
                 dynamic_ctx[key] = config[key]
@@ -653,7 +653,9 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
                     logger.debug(
                         "Successfully created OperationContext from LangChain config "
                         "with run_id: %s",
-                        config.get("run_id", "unknown"),
+                        config.get("run_id", "unknown")
+                        if isinstance(config, Mapping)
+                        else "unknown",
                     )
                 else:
                     logger.warning(
@@ -688,7 +690,7 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
             framework_ctx["model"] = effective_model
 
         # Add LangChain-specific context for observability
-        if config:
+        if isinstance(config, Mapping):
             framework_ctx.update(
                 {
                     "tags": config.get("tags"),
@@ -788,35 +790,101 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         )
 
     # ------------------------------------------------------------------ #
-    # Capabilities and health API - FIXED with correct return types
+    # Capabilities and health API - with error context
     # ------------------------------------------------------------------ #
 
     def capabilities(self) -> Mapping[str, Any]:
-        """Best-effort capabilities passthrough."""
-        if hasattr(self.corpus_adapter, "capabilities"):
-            return self.corpus_adapter.capabilities()  # type: ignore[no-any-return]
+        """Best-effort capabilities passthrough with error context."""
+        adapter = self.corpus_adapter
+        caps_fn = getattr(adapter, "capabilities", None)
+        if callable(caps_fn):
+            try:
+                return caps_fn()  # type: ignore[no-any-return]
+            except Exception as exc:  # noqa: BLE001
+                attach_context(
+                    exc,
+                    framework=_FRAMEWORK_NAME,
+                    operation="embedding_capabilities",
+                    error_codes=EMBEDDING_COERCION_ERROR_CODES,
+                )
+                raise
         return {}
 
     async def acapabilities(self) -> Mapping[str, Any]:
-        """Best-effort async capabilities passthrough."""
-        if hasattr(self.corpus_adapter, "acapabilities"):
-            return await self.corpus_adapter.acapabilities()  # type: ignore[no-any-return]
-        if hasattr(self.corpus_adapter, "capabilities"):
-            return await asyncio.to_thread(self.corpus_adapter.capabilities)
+        """Best-effort async capabilities passthrough with error context."""
+        adapter = self.corpus_adapter
+        acaps_fn = getattr(adapter, "acapabilities", None)
+        if callable(acaps_fn):
+            try:
+                return await acaps_fn()  # type: ignore[no-any-return]
+            except Exception as exc:  # noqa: BLE001
+                attach_context(
+                    exc,
+                    framework=_FRAMEWORK_NAME,
+                    operation="embedding_capabilities_async",
+                    error_codes=EMBEDDING_COERCION_ERROR_CODES,
+                )
+                raise
+
+        caps_fn = getattr(adapter, "capabilities", None)
+        if callable(caps_fn):
+            try:
+                return await asyncio.to_thread(caps_fn)  # type: ignore[arg-type]
+            except Exception as exc:  # noqa: BLE001
+                attach_context(
+                    exc,
+                    framework=_FRAMEWORK_NAME,
+                    operation="embedding_capabilities_async",
+                    error_codes=EMBEDDING_COERCION_ERROR_CODES,
+                )
+                raise
         return {}
-    
+
     def health(self) -> Mapping[str, Any]:
-        """Best-effort health passthrough."""
-        if hasattr(self.corpus_adapter, "health"):
-            return self.corpus_adapter.health()  # type: ignore[no-any-return]
+        """Best-effort health passthrough with error context."""
+        adapter = self.corpus_adapter
+        health_fn = getattr(adapter, "health", None)
+        if callable(health_fn):
+            try:
+                return health_fn()  # type: ignore[no-any-return]
+            except Exception as exc:  # noqa: BLE001
+                attach_context(
+                    exc,
+                    framework=_FRAMEWORK_NAME,
+                    operation="embedding_health",
+                    error_codes=EMBEDDING_COERCION_ERROR_CODES,
+                )
+                raise
         return {}
-    
+
     async def ahealth(self) -> Mapping[str, Any]:
-        """Best-effort async health passthrough."""
-        if hasattr(self.corpus_adapter, "ahealth"):
-            return await self.corpus_adapter.ahealth()  # type: ignore[no-any-return]
-        if hasattr(self.corpus_adapter, "health"):
-            return await asyncio.to_thread(self.corpus_adapter.health)
+        """Best-effort async health passthrough with error context."""
+        adapter = self.corpus_adapter
+        ahealth_fn = getattr(adapter, "ahealth", None)
+        if callable(ahealth_fn):
+            try:
+                return await ahealth_fn()  # type: ignore[no-any-return]
+            except Exception as exc:  # noqa: BLE001
+                attach_context(
+                    exc,
+                    framework=_FRAMEWORK_NAME,
+                    operation="embedding_health_async",
+                    error_codes=EMBEDDING_COERCION_ERROR_CODES,
+                )
+                raise
+
+        health_fn = getattr(adapter, "health", None)
+        if callable(health_fn):
+            try:
+                return await asyncio.to_thread(health_fn)  # type: ignore[arg-type]
+            except Exception as exc:  # noqa: BLE001
+                attach_context(
+                    exc,
+                    framework=_FRAMEWORK_NAME,
+                    operation="embedding_health_async",
+                    error_codes=EMBEDDING_COERCION_ERROR_CODES,
+                )
+                raise
         return {}
 
     # ------------------------------------------------------------------ #
@@ -860,7 +928,7 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         logger.debug(
             "Async embedding %d documents for LangChain run: %s",
             len(texts_list),
-            config.get("run_id", "unknown") if config else "unknown",
+            config.get("run_id", "unknown") if isinstance(config, Mapping) else "unknown",
         )
 
         start = time.perf_counter()
@@ -920,7 +988,7 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
 
         logger.debug(
             "Async embedding query for LangChain run: %s",
-            config.get("run_id", "unknown") if config else "unknown",
+            config.get("run_id", "unknown") if isinstance(config, Mapping) else "unknown",
         )
 
         start = time.perf_counter()
@@ -976,7 +1044,7 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         logger.debug(
             "Sync embedding %d documents for LangChain run: %s",
             len(texts_list),
-            config.get("run_name", "unknown") if config else "unknown",
+            config.get("run_name", "unknown") if isinstance(config, Mapping) else "unknown",
         )
 
         start = time.perf_counter()
@@ -1029,7 +1097,7 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
 
         logger.debug(
             "Sync embedding query for LangChain run: %s",
-            config.get("run_name", "unknown") if config else "unknown",
+            config.get("run_name", "unknown") if isinstance(config, Mapping) else "unknown",
         )
 
         start = time.perf_counter()
