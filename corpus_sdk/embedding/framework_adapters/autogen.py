@@ -76,7 +76,6 @@ from typing import (
     TypedDict,
 )
 
-from corpus_sdk.core.async_bridge import AsyncBridge
 from corpus_sdk.core.context_translation import from_autogen as context_from_autogen
 from corpus_sdk.core.error_context import attach_context
 from corpus_sdk.embedding.embedding_base import EmbeddingProtocolV1, OperationContext
@@ -225,17 +224,6 @@ def _ensure_not_in_event_loop(sync_api_name: str) -> None:
     )
 
 
-def _run_coro_sync(coro: Any, *, api_name: str, timeout_s: Optional[float] = None) -> Any:
-    """
-    Run a coroutine from sync code using the SDK's AsyncBridge.
-
-    NOTE: We intentionally *do not* attempt to nest into an already-running event loop
-    from here; callers must use async variants in those contexts.
-    """
-    _ensure_not_in_event_loop(api_name)
-    return AsyncBridge.run_async(coro, timeout=timeout_s)
-
-
 async def _maybe_close_async(adapter: Any) -> None:
     """
     Best-effort async resource cleanup.
@@ -257,35 +245,6 @@ async def _maybe_close_async(adapter: Any) -> None:
         await close()
     else:
         await asyncio.to_thread(close)
-
-
-def _maybe_close_sync(adapter: Any) -> None:
-    """
-    Best-effort sync resource cleanup.
-
-    Preference:
-      1) aclose() if present (run via sync bridge)
-      2) close() if present (run coroutine via bridge if async)
-    """
-    aclose = getattr(adapter, "aclose", None)
-    if callable(aclose):
-        try:
-            _run_coro_sync(aclose(), api_name="close")
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Error while closing adapter via aclose(): %s", exc)
-        return
-
-    close = getattr(adapter, "close", None)
-    if not callable(close):
-        return
-
-    try:
-        if asyncio.iscoroutinefunction(close):
-            _run_coro_sync(close(), api_name="close")
-        else:
-            close()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Error while closing adapter via close(): %s", exc)
 
 
 def _looks_like_operation_context(obj: Any) -> bool:
@@ -508,18 +467,34 @@ class CorpusAutoGenEmbeddings:
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        # Cleanup is delegated to _maybe_close_sync, which already does best-effort
-        # handling and logging. No extra try/except needed here.
-        _maybe_close_sync(self.corpus_adapter)
+        """
+        Sync context manager exit.
+
+        Uses the EmbeddingTranslator.close() helper, which centralizes async/sync
+        bridging via AsyncBridge. We keep the existing event-loop discipline:
+        sync cleanup is not allowed inside an active event loop.
+        """
+        try:
+            _ensure_not_in_event_loop("close")
+            # Best-effort translator-driven cleanup; errors are logged and swallowed here.
+            self._translator.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Error while closing embedding translator in __exit__: %s", exc)
 
     async def __aenter__(self) -> "CorpusAutoGenEmbeddings":
         return self
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        """
+        Async context manager exit.
+
+        Delegates resource cleanup to EmbeddingTranslator.aclose() and logs,
+        but does not propagate, any cleanup errors.
+        """
         try:
-            await _maybe_close_async(self.corpus_adapter)
+            await self._translator.aclose()
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Error while closing embedding adapter in __aexit__: %s", exc)
+            logger.warning("Error while closing embedding translator in __aexit__: %s", exc)
 
     # ------------------------------------------------------------------ #
     # Internal helpers
