@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-AutoGen adapter for Corpus Vector protocol (v1, translator-based).
+AutoGen adapter for Corpus Vector protocol (v2, translator-based).
 
 This module exposes Corpus `VectorProtocolV1` implementations as
 AutoGen-friendly vector stores and retrievers, with:
