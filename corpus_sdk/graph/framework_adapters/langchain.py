@@ -101,8 +101,11 @@ logger = logging.getLogger(__name__)
 
 try:  # pragma: no cover - optional dependency
     from langchain.tools import BaseTool
+
+    LANGCHAIN_TOOLS_AVAILABLE = True
 except ImportError:  # pragma: no cover - environments without LangChain
     BaseTool = object  # type: ignore[assignment]
+    LANGCHAIN_TOOLS_AVAILABLE = False
 
 # Type variables for decorators
 T = TypeVar("T")
@@ -529,7 +532,13 @@ class CorpusLangChainGraphClient:
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         """Clean up resources when exiting context."""
         if hasattr(self._graph, "close"):
-            self._graph.close()
+            try:
+                self._graph.close()
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "Error while closing graph adapter in __exit__: %s",
+                    e,
+                )
 
     async def __aenter__(self) -> CorpusLangChainGraphClient:
         """Support async context manager protocol."""
@@ -538,7 +547,13 @@ class CorpusLangChainGraphClient:
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         """Clean up resources when exiting async context."""
         if hasattr(self._graph, "aclose"):
-            await self._graph.aclose()
+            try:
+                await self._graph.aclose()
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "Error while closing graph adapter in __aexit__: %s",
+                    e,
+                )
 
     # ------------------------------------------------------------------ #
     # Translator (lazy, cached) – mirrors CrewAI adapter pattern
@@ -582,6 +597,10 @@ class CorpusLangChainGraphClient:
 
         If both are None/empty, returns None and lets downstream helpers
         construct an "empty" OperationContext as needed.
+
+        On translation failure, we log + attach error context and fall back
+        to `None` instead of raising, to avoid breaking graph calls purely
+        due to context issues.
         """
         extra = dict(extra_context or {})
 
@@ -594,22 +613,28 @@ class CorpusLangChainGraphClient:
                 framework_version=self._framework_version,
                 **extra,
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             attach_context(
                 exc,
                 framework="langchain",
                 operation="context_translation",
+                error_code=ErrorCodes.BAD_OPERATION_CONTEXT,
+                config_snapshot=str(config)[:1024] if config is not None else None,
             )
-            raise BadRequest(
-                "Failed to build OperationContext from LangChain inputs",
-                code=ErrorCodes.BAD_OPERATION_CONTEXT,
-            ) from exc
+            logger.warning(
+                "Failed to build OperationContext from LangChain inputs; "
+                "proceeding without OperationContext: %s",
+                exc,
+            )
+            return None
 
         if not isinstance(ctx, OperationContext):
-            raise BadRequest(
-                f"from_langchain produced unsupported context type: {type(ctx).__name__}",
-                code=ErrorCodes.BAD_OPERATION_CONTEXT,
+            logger.warning(
+                "from_langchain produced unsupported context type %s; "
+                "proceeding without OperationContext.",
+                type(ctx).__name__,
             )
+            return None
 
         return ctx
 
@@ -679,7 +704,7 @@ class CorpusLangChainGraphClient:
 
         return ctx
 
-    def _validate_upsert_edges_spec(self, spec: UpsertEdgesSpec) -> None:
+    def _validate_upsert_edges_spec(self, spec: UpsertEdgesSpec) -> List[Any]:
         """
         LangChain-local validation for edge upsert specs.
 
@@ -687,6 +712,8 @@ class CorpusLangChainGraphClient:
         - edges must not be None
         - edges must be iterable and non-empty
         - each edge must have an ID
+
+        Returns a validated list of edges without mutating the original spec.
         """
         if spec.edges is None:
             raise BadRequest("UpsertEdgesSpec.edges must not be None")
@@ -705,7 +732,7 @@ class CorpusLangChainGraphClient:
             if not getattr(edge, "id", None):
                 raise BadRequest("All edges must have an ID")
 
-        spec.edges = edges_iter  # type: ignore[assignment]
+        return edges_iter
 
     # ------------------------------------------------------------------ #
     # Capabilities / schema / health
@@ -1099,7 +1126,7 @@ class CorpusLangChainGraphClient:
         """
         Sync wrapper for upserting edges.
         """
-        self._validate_upsert_edges_spec(spec)
+        edges = self._validate_upsert_edges_spec(spec)
 
         ctx = self._build_ctx(config=config, extra_context=extra_context)
         framework_ctx = self._framework_ctx(
@@ -1108,7 +1135,7 @@ class CorpusLangChainGraphClient:
         )
 
         result = self._translator.upsert_edges(
-            spec.edges,
+            edges,
             op_ctx=ctx,
             framework_ctx=framework_ctx,
         )
@@ -1130,7 +1157,7 @@ class CorpusLangChainGraphClient:
         """
         Async wrapper for upserting edges.
         """
-        self._validate_upsert_edges_spec(spec)
+        edges = self._validate_upsert_edges_spec(spec)
 
         ctx = self._build_ctx(config=config, extra_context=extra_context)
         framework_ctx = self._framework_ctx(
@@ -1139,7 +1166,7 @@ class CorpusLangChainGraphClient:
         )
 
         result = await self._translator.arun_upsert_edges(
-            spec.edges,
+            edges,
             op_ctx=ctx,
             framework_ctx=framework_ctx,
         )
@@ -1660,6 +1687,9 @@ def create_corpus_graph_tool(
     Convenience factory to create a `CorpusLangChainGraphClient` and wrap it
     in a `CorpusGraphTool` in one go.
 
+    If LangChain tools are not installed, this will raise an ImportError
+    so that misuse is surfaced clearly.
+
     Example
     -------
         graph_adapter = MyGraphAdapter(...)
@@ -1673,6 +1703,12 @@ def create_corpus_graph_tool(
             agent_type=AgentType.OPENAI_FUNCTIONS,
         )
     """
+    if not LANGCHAIN_TOOLS_AVAILABLE:
+        raise ImportError(
+            "LangChain tools are not installed. Install `langchain` to use "
+            "create_corpus_graph_tool / CorpusGraphTool."
+        )
+
     client = CorpusLangChainGraphClient(
         graph_adapter=graph_adapter,
         default_dialect=default_dialect,
