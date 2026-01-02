@@ -61,6 +61,7 @@ Non-responsibilities
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
@@ -173,6 +174,7 @@ ERROR_CODES = CoercionErrorCodes(
     conversion_error="LLAMAINDEX_LLM_CONVERSION_ERROR",
     framework_label="llamaindex",
 )
+
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -468,6 +470,37 @@ def _analyze_messages_for_context(messages: Sequence[ChatMessage]) -> Dict[str, 
 
 
 # ---------------------------------------------------------------------------
+# Event loop guards for sync APIs
+# ---------------------------------------------------------------------------
+
+
+def _ensure_not_in_event_loop(
+    sync_api_name: str,
+    async_api_name: Optional[str] = None,
+) -> None:
+    """
+    Prevent deadlocks from calling sync APIs inside an active asyncio event loop.
+
+    This is a lightweight guard used only on sync entrypoints. If a running
+    event loop is detected, we raise a clear RuntimeError with guidance to
+    use the async variant instead.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        # No running loop: safe to call sync API.
+        return
+
+    hint = ""
+    if async_api_name:
+        hint = f" Use the async variant instead (e.g. '{async_api_name}')."
+    raise RuntimeError(
+        f"{sync_api_name} was called from inside an active asyncio event loop."
+        f"{hint} [LLAMAINDEX_LLM_SYNC_WRAPPER_CALLED_IN_EVENT_LOOP]"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main adapter
 # ---------------------------------------------------------------------------
 
@@ -481,7 +514,7 @@ class CorpusLlamaIndexLLM(LLM):
     - All LLM calls go through `LLMTranslator` (no direct message_translation
       or protocol calls in this file).
     - Message normalization, system message handling, tools, safety, and
-      post-processing are handled centrally by the translator.
+    post-processing are handled centrally by the translator.
     - This file focuses on:
         * LlamaIndex-specific context building
         * Error-context attachment
@@ -492,7 +525,7 @@ class CorpusLlamaIndexLLM(LLM):
     model: str = "default"
     temperature: float = 0.7
     max_tokens: Optional[int] = None
-    framework_version: Optional[str] = None
+    framework_version: Optional[int] = None  # type: ignore[assignment]
     config: Optional[LlamaIndexLLMConfig] = None
     # Optional explicit context window override; surfaced via metadata.
     context_window: Optional[int] = None
@@ -698,12 +731,49 @@ class CorpusLlamaIndexLLM(LLM):
 
         This keeps all LLM-level context building centralized in the core
         context translators instead of baking assumptions into this adapter.
+
+        The translation is hardened with error-context attachment so that
+        failures in context construction are observable and diagnosable.
         """
         callback_manager = kwargs.get("callback_manager")
-        return context_from_llamaindex(
-            callback_manager,
-            framework_version=self.framework_version,
-        )
+
+        try:
+            ctx = context_from_llamaindex(
+                callback_manager,
+                framework_version=self.framework_version,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Attach context-translation specific metadata so failures here are
+            # distinguishable from protocol or provider failures.
+            attach_context(
+                exc,
+                framework="llamaindex",
+                resource_type="llm",
+                operation="llm_context_translation",
+                framework_version=self.framework_version,
+                error_codes=ERROR_CODES,
+                callback_manager_type=type(callback_manager).__name__,
+            )
+            raise
+
+        if not isinstance(ctx, OperationContext):
+            type_name = type(ctx).__name__
+            exc = TypeError(
+                "context_from_llamaindex produced unsupported context type "
+                f"{type_name}"
+            )
+            attach_context(
+                exc,
+                framework="llamaindex",
+                resource_type="llm",
+                operation="llm_context_translation",
+                framework_version=self.framework_version,
+                error_codes=ERROR_CODES,
+                returned_type=type_name,
+            )
+            raise exc
+
+        return ctx
 
     def _extract_stop_sequences(self, kwargs: Mapping[str, Any]) -> Optional[List[str]]:
         """
@@ -942,6 +1012,8 @@ class CorpusLlamaIndexLLM(LLM):
 
         Uses LLMTranslator.complete under the hood (sync bridge).
         """
+        _ensure_not_in_event_loop("chat", "achat")
+
         if not messages:
             raise BadRequest(
                 "Messages list cannot be empty",
@@ -987,6 +1059,8 @@ class CorpusLlamaIndexLLM(LLM):
 
         Uses LLMTranslator.stream, which bridges async streaming into sync.
         """
+        _ensure_not_in_event_loop("stream_chat", "astream_chat")
+
         if not messages:
             raise BadRequest(
                 "Messages list cannot be empty",
@@ -1125,6 +1199,287 @@ class CorpusLlamaIndexLLM(LLM):
         """Simple fallback token estimation."""
         combined_text = self._combine_messages_for_counting(messages)
         return max(1, len(combined_text) // 4)
+
+    # ------------------------------------------------------------------ #
+    # Health / capabilities via translator with adapter fallback
+    # ------------------------------------------------------------------ #
+
+    def health(self, **kwargs: Any) -> Mapping[str, Any]:
+        """
+        Synchronous health check routed through the LLMTranslator when available.
+
+        Primary path:
+            - Call self._translator.health(**kwargs)
+
+        Fallback:
+            - Call underlying llm_adapter.health(**kwargs) if translator does
+              not expose a health endpoint.
+
+        This keeps health semantics consistent across frameworks while still
+        supporting legacy adapters.
+        """
+        # Prefer translator-level health
+        health_fn = getattr(self._translator, "health", None)
+        if callable(health_fn):
+            try:
+                return health_fn(**kwargs)
+            except Exception as exc:  # noqa: BLE001
+                if self._config.enable_error_context:
+                    attach_context(
+                        exc,
+                        framework="llamaindex",
+                        resource_type="llm",
+                        operation="health",
+                        model=self.model,
+                        error_codes=ERROR_CODES,
+                        source="translator",
+                    )
+                raise
+
+        # Fallback to underlying adapter health if available
+        adapter_health = getattr(self.llm_adapter, "health", None)
+        if not callable(adapter_health):
+            raise AttributeError(
+                "Neither LLMTranslator nor underlying llm_adapter implements 'health'"
+            )
+
+        try:
+            return adapter_health(**kwargs)  # type: ignore[call-arg]
+        except Exception as exc:  # noqa: BLE001
+            if self._config.enable_error_context:
+                attach_context(
+                    exc,
+                    framework="llamaindex",
+                    resource_type="llm",
+                    operation="health",
+                    model=self.model,
+                    error_codes=ERROR_CODES,
+                    source="adapter",
+                )
+            raise
+
+    async def ahealth(self, **kwargs: Any) -> Mapping[str, Any]:
+        """
+        Async health check routed through the LLMTranslator when available.
+
+        Resolution order:
+        1. translator.ahealth(**kwargs)
+        2. translator.health(**kwargs) via asyncio.to_thread(...)
+        3. llm_adapter.ahealth(**kwargs)
+        4. llm_adapter.health(**kwargs) via asyncio.to_thread(...)
+        """
+        # 1. translator.ahealth
+        translator_ahealth = getattr(self._translator, "ahealth", None)
+        if callable(translator_ahealth):
+            try:
+                return await translator_ahealth(**kwargs)  # type: ignore[misc]
+            except Exception as exc:  # noqa: BLE001
+                if self._config.enable_error_context:
+                    attach_context(
+                        exc,
+                        framework="llamaindex",
+                        resource_type="llm",
+                        operation="ahealth",
+                        model=self.model,
+                        error_codes=ERROR_CODES,
+                        source="translator_async",
+                    )
+                raise
+
+        # 2. translator.health via thread
+        translator_health = getattr(self._translator, "health", None)
+        if callable(translator_health):
+            try:
+                return await asyncio.to_thread(translator_health, **kwargs)
+            except Exception as exc:  # noqa: BLE001
+                if self._config.enable_error_context:
+                    attach_context(
+                        exc,
+                        framework="llamaindex",
+                        resource_type="llm",
+                        operation="ahealth",
+                        model=self.model,
+                        error_codes=ERROR_CODES,
+                        source="translator_sync_thread",
+                    )
+                raise
+
+        # 3. adapter.ahealth
+        adapter_ahealth = getattr(self.llm_adapter, "ahealth", None)
+        if callable(adapter_ahealth):
+            try:
+                return await adapter_ahealth(**kwargs)  # type: ignore[misc]
+            except Exception as exc:  # noqa: BLE001
+                if self._config.enable_error_context:
+                    attach_context(
+                        exc,
+                        framework="llamaindex",
+                        resource_type="llm",
+                        operation="ahealth",
+                        model=self.model,
+                        error_codes=ERROR_CODES,
+                        source="adapter_async",
+                    )
+                raise
+
+        # 4. adapter.health via thread
+        adapter_health = getattr(self.llm_adapter, "health", None)
+        if callable(adapter_health):
+            try:
+                return await asyncio.to_thread(adapter_health, **kwargs)
+            except Exception as exc:  # noqa: BLE001
+                if self._config.enable_error_context:
+                    attach_context(
+                        exc,
+                        framework="llamaindex",
+                        resource_type="llm",
+                        operation="ahealth",
+                        model=self.model,
+                        error_codes=ERROR_CODES,
+                        source="adapter_sync_thread",
+                    )
+                raise
+
+        raise AttributeError(
+            "No health/ahealth implementation available on LLMTranslator or llm_adapter"
+        )
+
+    def capabilities(self, **kwargs: Any) -> Mapping[str, Any]:
+        """
+        Synchronous capabilities query routed through the LLMTranslator when available.
+
+        Primary path:
+            - self._translator.capabilities(**kwargs)
+
+        Fallback:
+            - self.llm_adapter.capabilities(**kwargs) if translator does not expose it.
+        """
+        # Prefer translator-level capabilities
+        translator_capabilities = getattr(self._translator, "capabilities", None)
+        if callable(translator_capabilities):
+            try:
+                return translator_capabilities(**kwargs)
+            except Exception as exc:  # noqa: BLE001
+                if self._config.enable_error_context:
+                    attach_context(
+                        exc,
+                        framework="llamaindex",
+                        resource_type="llm",
+                        operation="capabilities",
+                        model=self.model,
+                        error_codes=ERROR_CODES,
+                        source="translator",
+                    )
+                raise
+
+        # Fallback to underlying adapter capabilities
+        adapter_capabilities = getattr(self.llm_adapter, "capabilities", None)
+        if not callable(adapter_capabilities):
+            raise AttributeError(
+                "Neither LLMTranslator nor underlying llm_adapter implements 'capabilities'"
+            )
+
+        try:
+            return adapter_capabilities(**kwargs)  # type: ignore[call-arg]
+        except Exception as exc:  # noqa: BLE001
+            if self._config.enable_error_context:
+                attach_context(
+                    exc,
+                    framework="llamaindex",
+                    resource_type="llm",
+                    operation="capabilities",
+                    model=self.model,
+                    error_codes=ERROR_CODES,
+                    source="adapter",
+                )
+            raise
+
+    async def acapabilities(self, **kwargs: Any) -> Mapping[str, Any]:
+        """
+        Async capabilities query routed through the LLMTranslator when available.
+
+        Resolution order:
+        1. translator.acapabilities(**kwargs)
+        2. translator.capabilities(**kwargs) via asyncio.to_thread(...)
+        3. llm_adapter.acapabilities(**kwargs)
+        4. llm_adapter.capabilities(**kwargs) via asyncio.to_thread(...)
+        """
+        # 1. translator.acapabilities
+        translator_acapabilities = getattr(self._translator, "acapabilities", None)
+        if callable(translator_acapabilities):
+            try:
+                return await translator_acapabilities(**kwargs)  # type: ignore[misc]
+            except Exception as exc:  # noqa: BLE001
+                if self._config.enable_error_context:
+                    attach_context(
+                        exc,
+                        framework="llamaindex",
+                        resource_type="llm",
+                        operation="acapabilities",
+                        model=self.model,
+                        error_codes=ERROR_CODES,
+                        source="translator_async",
+                    )
+                raise
+
+        # 2. translator.capabilities via thread
+        translator_capabilities = getattr(self._translator, "capabilities", None)
+        if callable(translator_capabilities):
+            try:
+                return await asyncio.to_thread(translator_capabilities, **kwargs)
+            except Exception as exc:  # noqa: BLE001
+                if self._config.enable_error_context:
+                    attach_context(
+                        exc,
+                        framework="llamaindex",
+                        resource_type="llm",
+                        operation="acapabilities",
+                        model=self.model,
+                        error_codes=ERROR_CODES,
+                        source="translator_sync_thread",
+                    )
+                raise
+
+        # 3. adapter.acapabilities
+        adapter_acapabilities = getattr(self.llm_adapter, "acapabilities", None)
+        if callable(adapter_acapabilities):
+            try:
+                return await adapter_acapabilities(**kwargs)  # type: ignore[misc]
+            except Exception as exc:  # noqa: BLE001
+                if self._config.enable_error_context:
+                    attach_context(
+                        exc,
+                        framework="llamaindex",
+                        resource_type="llm",
+                        operation="acapabilities",
+                        model=self.model,
+                        error_codes=ERROR_CODES,
+                        source="adapter_async",
+                    )
+                raise
+
+        # 4. adapter.capabilities via thread
+        adapter_capabilities = getattr(self.llm_adapter, "capabilities", None)
+        if callable(adapter_capabilities):
+            try:
+                return await asyncio.to_thread(adapter_capabilities, **kwargs)
+            except Exception as exc:  # noqa: BLE001
+                if self._config.enable_error_context:
+                    attach_context(
+                        exc,
+                        framework="llamaindex",
+                        resource_type="llm",
+                        operation="acapabilities",
+                        model=self.model,
+                        error_codes=ERROR_CODES,
+                        source="adapter_sync_thread",
+                    )
+                raise
+
+        raise AttributeError(
+            "No capabilities/acapabilities implementation available on "
+            "LLMTranslator or llm_adapter"
+        )
 
 
 __all__ = [
