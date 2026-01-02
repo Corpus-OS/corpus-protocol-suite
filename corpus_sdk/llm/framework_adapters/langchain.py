@@ -540,7 +540,7 @@ class CorpusLangChainLLM(BaseChatModel):
         * Builds sampling params + lightweight `framework_ctx`
         * Wires LangChain callbacks
         * Uses translator for generation, streaming, and token counting
-        * Optionally exposes health / capabilities passthroughs
+        * Exposes health / capabilities via the translator
     """
 
     # Pydantic v2-style config
@@ -584,7 +584,7 @@ class CorpusLangChainLLM(BaseChatModel):
                 "`langchain_core`."
             )
 
-        # Keep a direct reference to the underlying adapter for health/capabilities.
+        # Keep a direct reference to the underlying adapter for lifecycle / debugging.
         self._llm_adapter = llm_adapter
 
         # Resolve configuration precedence: explicit config > individual params.
@@ -844,100 +844,90 @@ class CorpusLangChainLLM(BaseChatModel):
         return ChatGenerationChunk(message=ai_chunk)
 
     # ------------------------------------------------------------------ #
-    # Optional health / capabilities passthroughs (translator-first)
+    # Health / capabilities via translator-only
     # ------------------------------------------------------------------ #
 
     @with_llm_error_context("capabilities")
     def capabilities(self) -> Mapping[str, Any]:
         """
-        Expose capabilities, preferring translator semantics.
+        Expose capabilities, via the LLMTranslator.
 
-        Resolution order:
-        1. self._translator.capabilities()
-        2. self._llm_adapter.capabilities()
+        Translator is the single source of truth; the underlying adapter is
+        not called directly to avoid divergent behavior.
         """
-        translator_cap = getattr(self._translator, "capabilities", None)
-        if callable(translator_cap):
-            return translator_cap()
+        result = self._translator.capabilities()
 
-        return self._llm_adapter.capabilities()
+        if not isinstance(result, Mapping):
+            raise TypeError(
+                f"{INIT_CONFIG_ERROR}: "
+                f"translator capabilities() returned unsupported type: "
+                f"{type(result).__name__}"
+            )
+        return result
 
     @with_async_llm_error_context("acapabilities")
     async def acapabilities(self) -> Mapping[str, Any]:
         """
-        Async capabilities wrapper, translator-first.
+        Async capabilities wrapper, translator-only.
 
         Resolution order:
         1. self._translator.acapabilities()
-        2. self._translator.capabilities() via executor
-        3. self._llm_adapter.acapabilities()
-        4. self._llm_adapter.capabilities() via executor
+        2. self._translator.capabilities() via asyncio.to_thread
         """
-        # 1. Translator async, if present
-        translator_acap = getattr(self._translator, "acapabilities", None)
-        if callable(translator_acap):
-            return await translator_acap()  # type: ignore[misc]
+        async_caps = getattr(self._translator, "acapabilities", None)
+        if callable(async_caps):
+            result = await async_caps()
+        else:
+            result = await asyncio.to_thread(self._translator.capabilities)
 
-        loop = asyncio.get_running_loop()
-
-        # 2. Translator sync via executor
-        translator_cap = getattr(self._translator, "capabilities", None)
-        if callable(translator_cap):
-            return await loop.run_in_executor(None, translator_cap)
-
-        # 3. Adapter async, if present
-        adapter_acap = getattr(self._llm_adapter, "acapabilities", None)
-        if callable(adapter_acap):
-            return await adapter_acap()  # type: ignore[misc]
-
-        # 4. Adapter sync via executor (required for LLMProtocolV1)
-        return await loop.run_in_executor(None, self._llm_adapter.capabilities)
+        if not isinstance(result, Mapping):
+            raise TypeError(
+                f"{INIT_CONFIG_ERROR}: "
+                f"translator capabilities() returned unsupported type: "
+                f"{type(result).__name__}"
+            )
+        return result
 
     @with_llm_error_context("health")
     def health(self) -> Mapping[str, Any]:
         """
-        Expose health, preferring translator semantics.
+        Expose health, via the LLMTranslator.
 
-        Resolution order:
-        1. self._translator.health()
-        2. self._llm_adapter.health()
+        Translator is the single source of truth; the underlying adapter is
+        not called directly to avoid divergent behavior.
         """
-        translator_health = getattr(self._translator, "health", None)
-        if callable(translator_health):
-            return translator_health()
+        result = self._translator.health()
 
-        return self._llm_adapter.health()
+        if not isinstance(result, Mapping):
+            raise TypeError(
+                f"{INIT_CONFIG_ERROR}: "
+                f"translator health() returned unsupported type: "
+                f"{type(result).__name__}"
+            )
+        return result
 
     @with_async_llm_error_context("ahealth")
     async def ahealth(self) -> Mapping[str, Any]:
         """
-        Async health wrapper, translator-first.
+        Async health wrapper, translator-only.
 
         Resolution order:
         1. self._translator.ahealth()
-        2. self._translator.health() via executor
-        3. self._llm_adapter.ahealth()
-        4. self._llm_adapter.health() via executor
+        2. self._translator.health() via asyncio.to_thread
         """
-        # 1. Translator async, if present
-        translator_ahealth = getattr(self._translator, "ahealth", None)
-        if callable(translator_ahealth):
-            return await translator_ahealth()  # type: ignore[misc]
+        async_health = getattr(self._translator, "ahealth", None)
+        if callable(async_health):
+            result = await async_health()
+        else:
+            result = await asyncio.to_thread(self._translator.health)
 
-        loop = asyncio.get_running_loop()
-
-        # 2. Translator sync via executor
-        translator_health = getattr(self._translator, "health", None)
-        if callable(translator_health):
-            return await loop.run_in_executor(None, translator_health)
-
-        # 3. Adapter async, if present
-        adapter_ahealth = getattr(self._llm_adapter, "ahealth", None)
-        if callable(adapter_ahealth):
-            return await adapter_ahealth()  # type: ignore[misc]
-
-        # 4. Adapter sync via executor (required for LLMProtocolV1)
-        return await loop.run_in_executor(None, self._llm_adapter.health)
+        if not isinstance(result, Mapping):
+            raise TypeError(
+                f"{INIT_CONFIG_ERROR}: "
+                f"translator health() returned unsupported type: "
+                f"{type(result).__name__}"
+            )
+        return result
 
     # ------------------------------------------------------------------ #
     # LangChain async API (via LLMTranslator)
