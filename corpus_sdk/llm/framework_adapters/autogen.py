@@ -41,9 +41,10 @@ Design principles
 
 from __future__ import annotations
 
+import json
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from functools import wraps
 from typing import (
     Any,
@@ -639,7 +640,7 @@ class CorpusAutoGenChatClient:
         kwargs: Dict[str, Any],
     ) -> Dict[str, Any]:
         """
-        Extract sampling / routing parameters from kwargs.
+        Extract sampling / routing parameters and tool config from kwargs.
 
         Recognized keys are removed from kwargs; unknown keys are ignored.
         """
@@ -651,6 +652,10 @@ class CorpusAutoGenChatClient:
         elif isinstance(stop_arg, (list, tuple)):
             stop_sequences = [str(s) for s in stop_arg]
 
+        # Tooling (pass straight through to LLMTranslator)
+        tools = kwargs.pop("tools", None)
+        tool_choice = kwargs.pop("tool_choice", None)
+
         params: Dict[str, Any] = {
             "model": kwargs.pop("model", self.model),
             "temperature": kwargs.pop("temperature", self.temperature),
@@ -660,6 +665,8 @@ class CorpusAutoGenChatClient:
             "presence_penalty": kwargs.pop("presence_penalty", None),
             "stop_sequences": stop_sequences,
             "system_message": kwargs.pop("system_message", None),
+            "tools": tools,
+            "tool_choice": tool_choice,
         }
 
         # Drop None values so the translator sees a clean param set.
@@ -758,6 +765,7 @@ class CorpusAutoGenChatClient:
                 "model": ...,
                 "usage": {...},
                 "finish_reason": ...,
+                "tool_calls": [ ... ],
                 ...
             }
 
@@ -767,7 +775,7 @@ class CorpusAutoGenChatClient:
         completion_id = completion_id or _new_id()
         created = created or _now_epoch_s()
 
-        # Text / model / finish_reason best-effort extraction.
+        # Text / model / finish_reason best-effort extraction, plus raw tool calls.
         if isinstance(result, Mapping):
             text = str(
                 result.get("text")
@@ -777,10 +785,56 @@ class CorpusAutoGenChatClient:
             )
             model = str(result.get("model") or "unknown")
             finish_reason = result.get("finish_reason")
+            raw_tool_calls = result.get("tool_calls") or []
         else:
             text = str(getattr(result, "text", "") or "")
             model = str(getattr(result, "model", "unknown"))
             finish_reason = getattr(result, "finish_reason", None)
+            raw_tool_calls = getattr(result, "tool_calls", []) or []
+
+        # Normalize tool calls to OpenAI ChatCompletion shape.
+        openai_tool_calls: list[Dict[str, Any]] = []
+        for tc in raw_tool_calls:
+            if isinstance(tc, Mapping):
+                tc_dict = dict(tc)
+            else:
+                try:
+                    tc_dict = asdict(tc)
+                except Exception:
+                    tc_dict = {
+                        "id": getattr(tc, "id", None),
+                        "function": getattr(tc, "function", None),
+                        "type": getattr(tc, "type", "function"),
+                    }
+
+            tc_id = tc_dict.get("id") or _new_id("call")
+            tc_type = tc_dict.get("type", "function")
+            fn = tc_dict.get("function") or {}
+
+            if isinstance(fn, Mapping):
+                fn_name = fn.get("name")
+                fn_args = fn.get("arguments")
+            else:
+                fn_name = getattr(fn, "name", None)
+                fn_args = getattr(fn, "arguments", None)
+
+            # Ensure arguments is a JSON string as OpenAI expects.
+            if not isinstance(fn_args, str):
+                try:
+                    fn_args = json.dumps(fn_args or {})
+                except Exception:
+                    fn_args = "{}"
+
+            openai_tool_calls.append(
+                {
+                    "id": tc_id,
+                    "type": tc_type,
+                    "function": {
+                        "name": fn_name or "",
+                        "arguments": fn_args,
+                    },
+                }
+            )
 
         # Usage: prefer shared coercion utility for consistency / bounds.
         usage_dict: Dict[str, int] = {
@@ -814,6 +868,17 @@ class CorpusAutoGenChatClient:
                         if isinstance(value, int):
                             usage_dict[key] = value
 
+        # If we have tool calls and no explicit finish_reason, default it.
+        if openai_tool_calls and not finish_reason:
+            finish_reason = "tool_calls"
+
+        message: Dict[str, Any] = {
+            "role": "assistant",
+            "content": text,
+        }
+        if openai_tool_calls:
+            message["tool_calls"] = openai_tool_calls
+
         return {
             "id": completion_id,
             "object": "chat.completion",
@@ -822,10 +887,7 @@ class CorpusAutoGenChatClient:
             "choices": [
                 {
                     "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": text,
-                    },
+                    "message": message,
                     "finish_reason": finish_reason,
                 }
             ],
@@ -851,6 +913,7 @@ class CorpusAutoGenChatClient:
                 "is_final": bool,
                 "model": ...,
                 "usage_so_far": {...} | None,
+                "tool_calls": [ ... ] | None,
                 ...
             }
         """
@@ -859,17 +922,68 @@ class CorpusAutoGenChatClient:
             is_final = bool(chunk.get("is_final", False))
             model = str(chunk.get("model") or model_fallback)
             usage = chunk.get("usage_so_far") or chunk.get("usage")
+            raw_tool_calls = chunk.get("tool_calls") or []
         else:
             text = str(getattr(chunk, "text", "") or getattr(chunk, "delta", "") or "")
             is_final = bool(getattr(chunk, "is_final", False))
             model = str(getattr(chunk, "model", model_fallback))
             usage = getattr(chunk, "usage_so_far", None)
+            raw_tool_calls = getattr(chunk, "tool_calls", []) or []
 
         delta: Dict[str, Any] = {}
         if is_first:
             delta["role"] = "assistant"
         if text:
             delta["content"] = text
+
+        # For simplicity and compatibility, emit full tool_calls payloads
+        # on the chunk where they appear. This is valid OpenAI shape and
+        # keeps the logic efficient and predictable.
+        if raw_tool_calls:
+            openai_tool_calls: list[Dict[str, Any]] = []
+            for tc in raw_tool_calls:
+                if isinstance(tc, Mapping):
+                    tc_dict = dict(tc)
+                else:
+                    try:
+                        tc_dict = asdict(tc)
+                    except Exception:
+                        tc_dict = {
+                            "id": getattr(tc, "id", None),
+                            "function": getattr(tc, "function", None),
+                            "type": getattr(tc, "type", "function"),
+                        }
+
+                tc_id = tc_dict.get("id") or _new_id("call")
+                tc_type = tc_dict.get("type", "function")
+                fn = tc_dict.get("function") or {}
+
+                if isinstance(fn, Mapping):
+                    fn_name = fn.get("name")
+                    fn_args = fn.get("arguments")
+                else:
+                    fn_name = getattr(fn, "name", None)
+                    fn_args = getattr(fn, "arguments", None)
+
+                if not isinstance(fn_args, str):
+                    try:
+                        fn_args = json.dumps(fn_args or {})
+                    except Exception:
+                        fn_args = "{}"
+
+                openai_tool_calls.append(
+                    {
+                        "id": tc_id,
+                        "type": tc_type,
+                        "function": {
+                            "name": fn_name or "",
+                            "arguments": fn_args,
+                        },
+                    }
+                )
+
+            if openai_tool_calls:
+                delta["tool_calls"] = openai_tool_calls
 
         choice: Dict[str, Any] = {
             "index": 0,
