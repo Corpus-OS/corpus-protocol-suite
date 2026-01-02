@@ -1201,45 +1201,28 @@ class CorpusLlamaIndexLLM(LLM):
         return max(1, len(combined_text) // 4)
 
     # ------------------------------------------------------------------ #
-    # Health / capabilities via translator with adapter fallback
+    # Health / capabilities via translator only (no adapter fallback)
     # ------------------------------------------------------------------ #
 
     def health(self, **kwargs: Any) -> Mapping[str, Any]:
         """
         Synchronous health check.
 
-        Resolution order:
+        Resolution:
         1. self._translator.health(**kwargs)
-        2. self.llm_adapter.health(**kwargs)
 
-        This keeps health semantics centralized in the translator while
-        preserving compatibility with adapters that implement health only.
+        The translator is the single source of truth. If it does not implement
+        health(), this is treated as a configuration error.
         """
         translator_health = getattr(self._translator, "health", None)
-        if callable(translator_health):
-            try:
-                return translator_health(**kwargs)
-            except Exception as exc:  # noqa: BLE001
-                if self._config.enable_error_context:
-                    attach_context(
-                        exc,
-                        framework="llamaindex",
-                        resource_type="llm",
-                        operation="health",
-                        model=self.model,
-                        error_codes=ERROR_CODES,
-                        source="translator",
-                    )
-                raise
-
-        adapter_health = getattr(self.llm_adapter, "health", None)
-        if not callable(adapter_health):
+        if not callable(translator_health):
             raise AttributeError(
-                "No health implementation available on LLMTranslator or llm_adapter"
+                "LLMTranslator for framework='llamaindex' does not implement health(). "
+                "Health semantics must be provided by the translator."
             )
 
         try:
-            return adapter_health(**kwargs)
+            return translator_health(**kwargs)
         except Exception as exc:  # noqa: BLE001
             if self._config.enable_error_context:
                 attach_context(
@@ -1249,7 +1232,7 @@ class CorpusLlamaIndexLLM(LLM):
                     operation="health",
                     model=self.model,
                     error_codes=ERROR_CODES,
-                    source="adapter",
+                    source="translator",
                 )
             raise
 
@@ -1257,11 +1240,12 @@ class CorpusLlamaIndexLLM(LLM):
         """
         Async health check.
 
-        Resolution order:
-        1. self._translator.ahealth(**kwargs)
+        Resolution:
+        1. self._translator.ahealth(**kwargs) if available
         2. self._translator.health(**kwargs) via worker thread
-        3. self.llm_adapter.ahealth(**kwargs)
-        4. self.llm_adapter.health(**kwargs) via worker thread
+
+        No fallback to the underlying llm_adapter – the translator is the
+        only supported surface.
         """
         loop = asyncio.get_running_loop()
 
@@ -1302,81 +1286,30 @@ class CorpusLlamaIndexLLM(LLM):
                     )
                 raise
 
-        adapter_ahealth = getattr(self.llm_adapter, "ahealth", None)
-        if callable(adapter_ahealth):
-            try:
-                return await adapter_ahealth(**kwargs)  # type: ignore[misc]
-            except Exception as exc:  # noqa: BLE001
-                if self._config.enable_error_context:
-                    attach_context(
-                        exc,
-                        framework="llamaindex",
-                        resource_type="llm",
-                        operation="ahealth",
-                        model=self.model,
-                        error_codes=ERROR_CODES,
-                        source="adapter_async",
-                    )
-                raise
-
-        adapter_health = getattr(self.llm_adapter, "health", None)
-        if callable(adapter_health):
-            try:
-                return await loop.run_in_executor(
-                    None,
-                    lambda: adapter_health(**kwargs),
-                )
-            except Exception as exc:  # noqa: BLE001
-                if self._config.enable_error_context:
-                    attach_context(
-                        exc,
-                        framework="llamaindex",
-                        resource_type="llm",
-                        operation="ahealth",
-                        model=self.model,
-                        error_codes=ERROR_CODES,
-                        source="adapter_sync_thread",
-                    )
-                raise
-
         raise AttributeError(
-            "No health/ahealth implementation available on LLMTranslator or llm_adapter"
+            "LLMTranslator for framework='llamaindex' does not implement "
+            "ahealth() or health(). Health semantics must be provided by the translator."
         )
 
     def capabilities(self, **kwargs: Any) -> Mapping[str, Any]:
         """
         Synchronous capabilities query.
 
-        Resolution order:
+        Resolution:
         1. self._translator.capabilities(**kwargs)
-        2. self.llm_adapter.capabilities(**kwargs)
+
+        The translator is the single source of truth. If it does not implement
+        capabilities(), this is treated as a configuration error.
         """
         translator_capabilities = getattr(self._translator, "capabilities", None)
-        if callable(translator_capabilities):
-            try:
-                return translator_capabilities(**kwargs)
-            except Exception as exc:  # noqa: BLE001
-                if self._config.enable_error_context:
-                    attach_context(
-                        exc,
-                        framework="llamaindex",
-                        resource_type="llm",
-                        operation="capabilities",
-                        model=self.model,
-                        error_codes=ERROR_CODES,
-                        source="translator",
-                    )
-                raise
-
-        adapter_capabilities = getattr(self.llm_adapter, "capabilities", None)
-        if not callable(adapter_capabilities):
+        if not callable(translator_capabilities):
             raise AttributeError(
-                "No capabilities implementation available on "
-                "LLMTranslator or llm_adapter"
+                "LLMTranslator for framework='llamaindex' does not implement "
+                "capabilities(). Capabilities semantics must be provided by the translator."
             )
 
         try:
-            return adapter_capabilities(**kwargs)
+            return translator_capabilities(**kwargs)
         except Exception as exc:  # noqa: BLE001
             if self._config.enable_error_context:
                 attach_context(
@@ -1386,7 +1319,7 @@ class CorpusLlamaIndexLLM(LLM):
                     operation="capabilities",
                     model=self.model,
                     error_codes=ERROR_CODES,
-                    source="adapter",
+                    source="translator",
                 )
             raise
 
@@ -1394,11 +1327,12 @@ class CorpusLlamaIndexLLM(LLM):
         """
         Async capabilities query.
 
-        Resolution order:
-        1. self._translator.acapabilities(**kwargs)
+        Resolution:
+        1. self._translator.acapabilities(**kwargs) if available
         2. self._translator.capabilities(**kwargs) via worker thread
-        3. self.llm_adapter.acapabilities(**kwargs)
-        4. self.llm_adapter.capabilities(**kwargs) via worker thread
+
+        No fallback to the underlying llm_adapter – the translator is the
+        only supported surface.
         """
         loop = asyncio.get_running_loop()
 
@@ -1439,46 +1373,10 @@ class CorpusLlamaIndexLLM(LLM):
                     )
                 raise
 
-        adapter_acapabilities = getattr(self.llm_adapter, "acapabilities", None)
-        if callable(adapter_acapabilities):
-            try:
-                return await adapter_acapabilities(**kwargs)  # type: ignore[misc]
-            except Exception as exc:  # noqa: BLE001
-                if self._config.enable_error_context:
-                    attach_context(
-                        exc,
-                        framework="llamaindex",
-                        resource_type="llm",
-                        operation="acapabilities",
-                        model=self.model,
-                        error_codes=ERROR_CODES,
-                        source="adapter_async",
-                    )
-                raise
-
-        adapter_capabilities = getattr(self.llm_adapter, "capabilities", None)
-        if callable(adapter_capabilities):
-            try:
-                return await loop.run_in_executor(
-                    None,
-                    lambda: adapter_capabilities(**kwargs),
-                )
-            except Exception as exc:  # noqa: BLE001
-                if self._config.enable_error_context:
-                    attach_context(
-                        exc,
-                        framework="llamaindex",
-                        resource_type="llm",
-                        operation="acapabilities",
-                        model=self.model,
-                        error_codes=ERROR_CODES,
-                        source="adapter_sync_thread",
-                    )
-                raise
-
         raise AttributeError(
-            "No capabilities/acapabilities implementation available on "
-            "LLMTranslator or llm_adapter"
+            "LLMTranslator for framework='llamaindex' does not implement "
+            "acapabilities() or capabilities(). Capabilities semantics must be "
+            "provided by the translator."
         )
 
 
