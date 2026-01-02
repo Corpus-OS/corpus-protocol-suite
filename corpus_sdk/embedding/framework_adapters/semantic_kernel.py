@@ -598,42 +598,45 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
         )
 
     # ------------------------------------------------------------------ #
-    # Capabilities / health passthrough (sync + async fallback)
+    # Capabilities / health passthrough via EmbeddingTranslator
     # ------------------------------------------------------------------ #
 
-    def capabilities(self) -> Dict[str, Any]:
-        if hasattr(self.corpus_adapter, "capabilities"):
-            try:
-                caps = self.corpus_adapter.capabilities()  # type: ignore[misc]
-                return dict(caps) if isinstance(caps, Mapping) else dict(caps or {})
-            except Exception:
-                return {}
-        return {}
+    @with_embedding_error_context("capabilities")
+    def capabilities(self) -> Mapping[str, Any]:
+        """
+        Sync capabilities passthrough.
 
-    async def acapabilities(self) -> Dict[str, Any]:
-        if hasattr(self.corpus_adapter, "acapabilities"):
-            caps = await self.corpus_adapter.acapabilities()  # type: ignore[misc]
-            return dict(caps) if isinstance(caps, Mapping) else dict(caps or {})
-        if hasattr(self.corpus_adapter, "capabilities"):
-            return await asyncio.to_thread(self.capabilities)
-        return {}
+        Delegates to EmbeddingTranslator.capabilities(), which centralizes
+        async/sync adapter behavior and error context.
+        """
+        return self._translator.capabilities()
 
-    def health(self) -> Dict[str, Any]:
-        if hasattr(self.corpus_adapter, "health"):
-            try:
-                h = self.corpus_adapter.health()  # type: ignore[misc]
-                return dict(h) if isinstance(h, Mapping) else dict(h or {})
-            except Exception:
-                return {}
-        return {}
+    @with_async_embedding_error_context("capabilities")
+    async def acapabilities(self) -> Mapping[str, Any]:
+        """
+        Async capabilities passthrough.
 
-    async def ahealth(self) -> Dict[str, Any]:
-        if hasattr(self.corpus_adapter, "ahealth"):
-            h = await self.corpus_adapter.ahealth()  # type: ignore[misc]
-            return dict(h) if isinstance(h, Mapping) else dict(h or {})
-        if hasattr(self.corpus_adapter, "health"):
-            return await asyncio.to_thread(self.health)
-        return {}
+        Delegates to EmbeddingTranslator.arun_capabilities().
+        """
+        return await self._translator.arun_capabilities()
+
+    @with_embedding_error_context("health")
+    def health(self) -> Mapping[str, Any]:
+        """
+        Sync health passthrough.
+
+        Delegates to EmbeddingTranslator.health().
+        """
+        return self._translator.health()
+
+    @with_async_embedding_error_context("health")
+    async def ahealth(self) -> Mapping[str, Any]:
+        """
+        Async health passthrough.
+
+        Delegates to EmbeddingTranslator.arun_health().
+        """
+        return await self._translator.arun_health()
 
     # ------------------------------------------------------------------ #
     # Resource management (context managers)
