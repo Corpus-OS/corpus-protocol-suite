@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-AutoGen adapter for Corpus Vector protocol (v2, translator-based).
+AutoGen adapter for Corpus Vector protocol (v1, translator-based).
 
 This module exposes Corpus `VectorProtocolV1` implementations as
 AutoGen-friendly vector stores and retrievers, with:
@@ -50,13 +50,11 @@ from typing import (
     TypeVar,
 )
 
-from adapter_sdk.vector_base import (
+from corpus_sdk.vector.vector_base import (
     VectorProtocolV1,
     OperationContext,
     BadRequest,
     NotSupported,
-    VectorAdapterError,
-    UpsertResult,
 )
 from corpus_sdk.core.context_translation import (
     from_autogen as core_ctx_from_autogen,
@@ -777,49 +775,59 @@ class CorpusAutoGenVectorStore:
         return [float(x) for x in embs[0]]
 
     # ------------------------------------------------------------------ #
-    # Partial upsert failure handling
+    # Upsert result validation (uses ErrorCodes.BAD_UPSERT_RESULT)
     # ------------------------------------------------------------------ #
 
-    def _handle_partial_upsert_failure(
+    def _validate_upsert_result(
         self,
-        result: UpsertResult,
+        result: Any,
         total_texts: int,
         namespace: Optional[str],
     ) -> None:
         """
-        Best-effort partial failure handling for upserts.
+        Best-effort validation of an upsert result.
 
-        - Logs a warning if some (but not all) records failed.
-        - Logs a debug sample of individual failures if available.
-        - Only raises if *all* records failed.
+        We look at the *translated* upsert result (typically a mapping like
+        {"ids": [...], "count": int}) and ensure that at least one record was
+        successfully written.
+
+        If it appears that all records failed, we raise a BadRequest with
+        ErrorCodes.BAD_UPSERT_RESULT.
+
+        This is intentionally soft:
+        - If the shape of the result is unexpected, we just log and do not raise.
         """
-        try:
-            upserted = int(getattr(result, "upserted_count", 0))
-            failed = int(getattr(result, "failed_count", 0))
-            failures = getattr(result, "failures", None) or []
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(
-                "UpsertResult introspection failed in AutoGen adapter: %r", exc
-            )
-            return
-
         if total_texts <= 0:
             return
+        if result is None:
+            logger.debug("Upsert result is None; skipping validation")
+            return
 
-        if failed > 0:
-            logger.warning(
-                "CorpusAutoGenVectorStore upsert partial failure: %s/%s succeeded, %s failed (namespace=%r)",
-                upserted,
-                total_texts,
-                failed,
-                namespace,
+        if not isinstance(result, Mapping):
+            logger.debug(
+                "Skipping upsert result validation for non-mapping result: %r",
+                type(result).__name__,
             )
-            for failure in list(failures)[:5]:
-                logger.debug("Upsert failure detail (sample): %r", failure)
+            return
 
-        if upserted == 0 and failed >= total_texts:
-            # Treat as hard failure: nothing made it into the index.
-            raise VectorAdapterError(
+        try:
+            if "count" in result:
+                count = int(result.get("count") or 0)
+            else:
+                ids = result.get("ids") or []
+                if isinstance(ids, (list, tuple)):
+                    count = len(ids)
+                else:
+                    count = 0
+        except Exception:
+            logger.debug(
+                "Skipping upsert result validation for unexpected shape",
+                exc_info=True,
+            )
+            return
+
+        if count <= 0:
+            raise BadRequest(
                 "All documents failed to upsert into vector index",
                 code=ErrorCodes.BAD_UPSERT_RESULT,
                 details={"namespace": namespace, "total": total_texts},
@@ -1000,15 +1008,19 @@ class CorpusAutoGenVectorStore:
                 }
             )
 
-        # We intentionally ignore the returned ID list; we return our logical IDs.
+        # We return logical IDs, but still validate the translated upsert result
+        # to detect "everything failed" scenarios.
         result = self._translator.upsert(
             raw_documents=raw_documents,
             op_ctx=ctx,
             framework_ctx=self._framework_ctx_for_namespace(ns),
         )
 
-        if isinstance(result, UpsertResult):
-            self._handle_partial_upsert_failure(result, len(texts_list), ns)
+        self._validate_upsert_result(
+            result=result,
+            total_texts=len(texts_list),
+            namespace=ns,
+        )
 
         return ids_norm
 
@@ -1067,8 +1079,11 @@ class CorpusAutoGenVectorStore:
             framework_ctx=self._framework_ctx_for_namespace(ns),
         )
 
-        if isinstance(result, UpsertResult):
-            self._handle_partial_upsert_failure(result, len(texts_list), ns)
+        self._validate_upsert_result(
+            result=result,
+            total_texts=len(texts_list),
+            namespace=ns,
+        )
 
         return ids_norm
 
