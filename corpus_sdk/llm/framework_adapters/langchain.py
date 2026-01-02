@@ -42,6 +42,7 @@ Design goals
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from functools import wraps
@@ -189,6 +190,38 @@ ERROR_CODES = CoercionErrorCodes(
 
 # Symbolic code for init/config errors (for log/search friendliness)
 INIT_CONFIG_ERROR = "LANGCHAIN_LLM_BAD_INIT_CONFIG"
+
+# Symbolic code for misuse of sync APIs inside an event loop
+SYNC_WRAPPER_CALLED_IN_EVENT_LOOP = "LANGCHAIN_LLM_SYNC_WRAPPER_CALLED_IN_EVENT_LOOP"
+
+
+# ---------------------------------------------------------------------------
+# Event-loop safety helper
+# ---------------------------------------------------------------------------
+
+
+def _ensure_not_in_event_loop(sync_api_name: str) -> None:
+    """
+    Prevent use of sync LangChain APIs from inside an active asyncio event loop.
+
+    This mirrors the behavior of other high-quality adapters: calling sync
+    generation/streaming from an async context is a common source of
+    deadlocks and subtle performance bugs.
+
+    Instead of silently allowing it, we raise a clear, actionable error.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        # No running loop: safe to use sync API.
+        return
+
+    raise RuntimeError(
+        f"{sync_api_name} was called from inside an active asyncio event loop. "
+        f"Use the async LangChain API instead (e.g. `_agenerate` / `_astream`). "
+        f"[{SYNC_WRAPPER_CALLED_IN_EVENT_LOOP}]"
+    )
+
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -507,6 +540,7 @@ class CorpusLangChainLLM(BaseChatModel):
         * Builds sampling params + lightweight `framework_ctx`
         * Wires LangChain callbacks
         * Uses translator for generation, streaming, and token counting
+        * Optionally exposes health / capabilities passthroughs
     """
 
     # Pydantic v2-style config
@@ -516,6 +550,7 @@ class CorpusLangChainLLM(BaseChatModel):
     }
 
     _translator: LLMTranslator
+    _llm_adapter: LLMProtocolV1
 
     model: str = "default"
     temperature: float = 0.7
@@ -548,6 +583,9 @@ class CorpusLangChainLLM(BaseChatModel):
                 "or ensure `langchain` is updated to a version that provides "
                 "`langchain_core`."
             )
+
+        # Keep a direct reference to the underlying adapter for health/capabilities.
+        self._llm_adapter = llm_adapter
 
         # Resolve configuration precedence: explicit config > individual params.
         if config is not None:
@@ -806,6 +844,59 @@ class CorpusLangChainLLM(BaseChatModel):
         return ChatGenerationChunk(message=ai_chunk)
 
     # ------------------------------------------------------------------ #
+    # Optional health / capabilities passthroughs
+    # ------------------------------------------------------------------ #
+
+    @with_llm_error_context("capabilities")
+    def capabilities(self) -> Mapping[str, Any]:
+        """
+        Expose underlying LLMProtocolV1 capabilities.
+
+        This is optional and does not affect LangChain behavior, but is useful
+        for open-source users who want to introspect supported models/features.
+        """
+        return self._llm_adapter.capabilities()
+
+    @with_async_llm_error_context("acapabilities")
+    async def acapabilities(self) -> Mapping[str, Any]:
+        """
+        Async wrapper for underlying capabilities.
+
+        Prefer `llm_adapter.acapabilities()` when available; otherwise, call
+        the sync method in a background thread.
+        """
+        acap = getattr(self._llm_adapter, "acapabilities", None)
+        if callable(acap):
+            return await acap()
+
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._llm_adapter.capabilities)
+
+    @with_llm_error_context("health")
+    def health(self) -> Mapping[str, Any]:
+        """
+        Expose underlying LLMProtocolV1 health status.
+
+        Returns a provider-defined mapping with health details.
+        """
+        return self._llm_adapter.health()
+
+    @with_async_llm_error_context("ahealth")
+    async def ahealth(self) -> Mapping[str, Any]:
+        """
+        Async wrapper for underlying health endpoint.
+
+        Prefer `llm_adapter.ahealth()` when available; otherwise, call the
+        sync method in a background thread.
+        """
+        ahealth = getattr(self._llm_adapter, "ahealth", None)
+        if callable(ahealth):
+            return await ahealth()
+
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._llm_adapter.health)
+
+    # ------------------------------------------------------------------ #
     # LangChain async API (via LLMTranslator)
     # ------------------------------------------------------------------ #
 
@@ -974,7 +1065,13 @@ class CorpusLangChainLLM(BaseChatModel):
     ) -> ChatResult:
         """
         Sync chat generation entrypoint used by LangChain.
+
+        This method enforces event-loop safety: it must not be called from
+        inside an active asyncio event loop. Use `_agenerate` instead in that
+        case.
         """
+        _ensure_not_in_event_loop("_generate")
+
         self._validate_messages(messages)
 
         ctx, params, framework_ctx = self._build_context_and_params(
@@ -1031,7 +1128,13 @@ class CorpusLangChainLLM(BaseChatModel):
     ) -> Iterator[ChatGenerationChunk]:
         """
         Sync streaming entrypoint used by LangChain.
+
+        This method enforces event-loop safety: it must not be called from
+        inside an active asyncio event loop. Use `_astream` instead in that
+        case.
         """
+        _ensure_not_in_event_loop("_stream")
+
         self._validate_messages(messages)
 
         ctx, params, framework_ctx = self._build_context_and_params(
@@ -1203,4 +1306,6 @@ __all__ = [
     "with_async_llm_error_context",
     "ERROR_CODES",
     "LANGCHAIN_AVAILABLE",
+    "INIT_CONFIG_ERROR",
+    "SYNC_WRAPPER_CALLED_IN_EVENT_LOOP",
 ]
