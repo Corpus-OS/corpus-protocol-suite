@@ -41,6 +41,8 @@ Non-responsibilities
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 from functools import cached_property
 from typing import (
@@ -98,7 +100,11 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 
+# --------------------------------------------------------------------------- #
 # Error code constants (flat, framework-specific)
+# --------------------------------------------------------------------------- #
+
+
 class ErrorCodes:
     BAD_OPERATION_CONTEXT = "BAD_OPERATION_CONTEXT"
     BAD_TRANSLATED_SCHEMA = "BAD_TRANSLATED_SCHEMA"
@@ -110,6 +116,32 @@ class ErrorCodes:
     BAD_BULK_VERTICES_RESULT = "BAD_BULK_VERTICES_RESULT"
     BAD_BATCH_RESULT = "BAD_BATCH_RESULT"
     BAD_ADAPTER_RESULT = "BAD_ADAPTER_RESULT"
+    SYNC_WRAPPER_CALLED_IN_EVENT_LOOP = "SYNC_WRAPPER_CALLED_IN_EVENT_LOOP"
+
+
+# --------------------------------------------------------------------------- #
+# Event-loop guard to prevent sync-over-async deadlocks
+# --------------------------------------------------------------------------- #
+
+
+def _ensure_not_in_event_loop(api_name: str) -> None:
+    """
+    Guard against calling sync wrappers from within an active asyncio event loop.
+
+    This mirrors the AutoGen / other framework adapter pattern to avoid
+    sync-over-async deadlocks in environments like Jupyter, FastAPI, etc.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        # No running loop in this thread – safe to use sync wrappers.
+        return
+
+    # An event loop is running; raise a clear error directing callers to async APIs.
+    raise RuntimeError(
+        f"{api_name}() cannot be called from within an active asyncio event loop; "
+        f"use a{api_name}() instead. [{ErrorCodes.SYNC_WRAPPER_CALLED_IN_EVENT_LOOP}]",
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -152,6 +184,31 @@ def with_async_graph_error_context(
 # Backwards-compatible aliases (for older imports)
 with_error_context = with_graph_error_context
 with_async_error_context = with_async_graph_error_context
+
+
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+
+
+def _looks_like_operation_context(obj: Any) -> bool:
+    """
+    Heuristic check; OperationContext may be a Protocol/alias in some SDK versions.
+    """
+    if obj is None:
+        return False
+
+    # If OperationContext is a real class, this will work; if it's a Protocol,
+    # this may raise TypeError in some typing modes.
+    try:
+        if isinstance(obj, OperationContext):
+            return True
+    except TypeError:
+        pass
+
+    # Fallback to structural check
+    attrs = ("request_id", "traceparent", "tenant", "attrs", "to_dict")
+    return any(hasattr(obj, attr) for attr in attrs)
 
 
 # --------------------------------------------------------------------------- #
@@ -437,6 +494,14 @@ class LlamaIndexGraphClientProtocol(Protocol):
     ) -> BatchResult:
         ...
 
+    # Resource management -------------------------------------------------
+
+    def close(self) -> None:
+        ...
+
+    async def aclose(self) -> None:
+        ...
+
 
 class CorpusLlamaIndexGraphClient:
     """
@@ -491,9 +556,11 @@ class CorpusLlamaIndexGraphClient:
         self._default_timeout_ms: Optional[int] = default_timeout_ms
         self._framework_version: Optional[str] = framework_version
         self._framework_translator: Optional[GraphFrameworkTranslator] = framework_translator
+        self._closed: bool = False
+        self._aclosed: bool = False
 
     # ------------------------------------------------------------------ #
-    # Resource Management (Context Managers)
+    # Resource Management (Context Managers + explicit close)
     # ------------------------------------------------------------------ #
 
     def __enter__(self) -> CorpusLlamaIndexGraphClient:
@@ -502,8 +569,7 @@ class CorpusLlamaIndexGraphClient:
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         """Clean up resources when exiting context."""
-        if hasattr(self._graph, "close"):
-            self._graph.close()
+        self.close()
 
     async def __aenter__(self) -> CorpusLlamaIndexGraphClient:
         """Support async context manager protocol."""
@@ -511,8 +577,50 @@ class CorpusLlamaIndexGraphClient:
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         """Clean up resources when exiting async context."""
+        await self.aclose()
+
+    def close(self) -> None:
+        """
+        Explicitly close the underlying graph adapter (sync).
+
+        This is idempotent and logs any close errors instead of raising, to
+        avoid surprising exceptions during context teardown.
+        """
+        if self._closed:
+            return
+        self._closed = True
+
+        if hasattr(self._graph, "close"):
+            try:
+                self._graph.close()
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "Error while closing graph adapter in close(): %s",
+                    e,
+                )
+
+    async def aclose(self) -> None:
+        """
+        Explicitly close the underlying graph adapter (async).
+
+        Prefers an async close method if available, falling back to sync close.
+        """
+        if self._aclosed:
+            return
+        self._aclosed = True
+
         if hasattr(self._graph, "aclose"):
-            await self._graph.aclose()
+            try:
+                await self._graph.aclose()
+                return
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "Error while closing graph adapter in aclose(): %s",
+                    e,
+                )
+
+        # Fallback to sync close if async close is unavailable or failed.
+        self.close()
 
     # ------------------------------------------------------------------ #
     # Translator (lazy, cached) – DI-aware
@@ -556,6 +664,10 @@ class CorpusLlamaIndexGraphClient:
 
         If both are None/empty, returns None and lets downstream helpers
         construct an "empty" OperationContext as needed.
+
+        Context translation is best-effort: failures are logged and attached
+        for observability, but graph operations may still proceed without an
+        OperationContext.
         """
         extra: Dict[str, Any] = dict(extra_context or {})
 
@@ -563,30 +675,72 @@ class CorpusLlamaIndexGraphClient:
             return None
 
         try:
-            ctx = core_ctx_from_llamaindex(
+            ctx_candidate = core_ctx_from_llamaindex(
                 callback_manager,
                 framework_version=self._framework_version,
                 **extra,
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             attach_context(
                 exc,
                 framework="llamaindex",
                 operation="context_translation",
+                error_code=ErrorCodes.BAD_OPERATION_CONTEXT,
+                callback_manager_type=type(callback_manager).__name__
+                if callback_manager is not None
+                else "None",
+                extra_context_keys=list(extra.keys()),
             )
-            # Surface a consistent BadRequest with symbolic error code.
-            raise BadRequest(
-                "Failed to build OperationContext from LlamaIndex inputs",
-                code=ErrorCodes.BAD_OPERATION_CONTEXT,
-            ) from exc
+            logger.warning(
+                "[%s] Failed to build OperationContext from LlamaIndex inputs; "
+                "proceeding without OperationContext: %s",
+                ErrorCodes.BAD_OPERATION_CONTEXT,
+                exc,
+            )
+            return None
 
-        if not isinstance(ctx, OperationContext):
-            raise BadRequest(
-                f"from_llamaindex produced unsupported context type: {type(ctx).__name__}",
-                code=ErrorCodes.BAD_OPERATION_CONTEXT,
+        if not _looks_like_operation_context(ctx_candidate):
+            logger.warning(
+                "[%s] from_llamaindex produced non-OperationContext-like type: %s. "
+                "Proceeding without OperationContext.",
+                ErrorCodes.BAD_OPERATION_CONTEXT,
+                type(ctx_candidate).__name__,
+            )
+            return None
+
+        # Best-effort enrichment of attrs with framework + framework_version.
+        try:
+            attrs = getattr(ctx_candidate, "attrs", None)
+            enriched_attrs: Dict[str, Any]
+            if isinstance(attrs, Mapping):
+                enriched_attrs = dict(attrs)
+            else:
+                enriched_attrs = {}
+
+            if "framework" not in enriched_attrs:
+                enriched_attrs["framework"] = "llamaindex"
+            if (
+                self._framework_version is not None
+                and "framework_version" not in enriched_attrs
+            ):
+                enriched_attrs["framework_version"] = self._framework_version
+
+            try:
+                setattr(ctx_candidate, "attrs", enriched_attrs)
+            except Exception:  # noqa: BLE001
+                # Fallback: try to mutate attrs in-place if it's a mutable mapping.
+                if isinstance(attrs, dict):
+                    attrs.setdefault("framework", "llamaindex")
+                    if self._framework_version is not None:
+                        attrs.setdefault("framework_version", self._framework_version)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "[%s] Failed to enrich OperationContext.attrs for LlamaIndex: %s",
+                ErrorCodes.BAD_OPERATION_CONTEXT,
+                exc,
             )
 
-        return ctx
+        return ctx_candidate  # type: ignore[return-value]
 
     def _build_raw_query(
         self,
@@ -658,26 +812,64 @@ class CorpusLlamaIndexGraphClient:
         """
         LlamaIndex-local validation for edge upsert specs.
 
-        (We still use shared validation helpers for node specs and batch ops.)
+        Mirrors the stricter validation used in other framework adapters:
+        - edges must not be None
+        - edges must be iterable and non-empty
+        - each edge must have id, src, dst, label
+        - properties (if present) must be JSON-serializable
         """
         if spec.edges is None:
-            raise BadRequest("UpsertEdgesSpec.edges must not be None")
+            raise BadRequest(
+                "UpsertEdgesSpec.edges must not be None",
+                code=ErrorCodes.BAD_ADAPTER_RESULT,
+            )
 
         try:
             edges_iter = list(spec.edges)
         except TypeError as exc:
             raise BadRequest(
                 "UpsertEdgesSpec.edges must be an iterable of edges",
+                code=ErrorCodes.BAD_ADAPTER_RESULT,
             ) from exc
 
         if not edges_iter:
-            raise BadRequest("UpsertEdgesSpec must contain at least one edge")
+            raise BadRequest(
+                "UpsertEdgesSpec must contain at least one edge",
+                code=ErrorCodes.BAD_ADAPTER_RESULT,
+            )
 
-        for edge in edges_iter:
+        for idx, edge in enumerate(edges_iter):
             if not getattr(edge, "id", None):
-                raise BadRequest("All edges must have an ID")
+                raise BadRequest(
+                    f"Edge at index {idx} must have an ID",
+                    code=ErrorCodes.BAD_ADAPTER_RESULT,
+                )
+            if not getattr(edge, "src", None):
+                raise BadRequest(
+                    f"Edge at index {idx} must have source node ID",
+                    code=ErrorCodes.BAD_ADAPTER_RESULT,
+                )
+            if not getattr(edge, "dst", None):
+                raise BadRequest(
+                    f"Edge at index {idx} must have target node ID",
+                    code=ErrorCodes.BAD_ADAPTER_RESULT,
+                )
+            if not getattr(edge, "label", None):
+                raise BadRequest(
+                    f"Edge at index {idx} must have a label",
+                    code=ErrorCodes.BAD_ADAPTER_RESULT,
+                )
+            properties = getattr(edge, "properties", None)
+            if properties is not None:
+                try:
+                    json.dumps(properties)
+                except (TypeError, ValueError) as e:
+                    raise BadRequest(
+                        f"Edge at index {idx} properties must be JSON-serializable: {e}",
+                        code=ErrorCodes.BAD_ADAPTER_RESULT,
+                    )
 
-        # Mutate spec.edges to the list we just validated for consistency.
+        # Mutate spec.edges to the validated list for consistency.
         spec.edges = edges_iter  # type: ignore[assignment]
 
     # ------------------------------------------------------------------ #
@@ -690,6 +882,7 @@ class CorpusLlamaIndexGraphClient:
         Sync wrapper around capabilities, delegating async→sync bridging
         to GraphTranslator.
         """
+        _ensure_not_in_event_loop("capabilities")
         caps = self._translator.capabilities()
         return graph_capabilities_to_dict(caps)
 
@@ -717,6 +910,7 @@ class CorpusLlamaIndexGraphClient:
         Delegates to GraphTranslator so that async→sync bridging and
         error-context handling are centralized.
         """
+        _ensure_not_in_event_loop("get_schema")
         ctx = self._build_ctx(
             callback_manager=callback_manager,
             extra_context=extra_context,
@@ -771,6 +965,7 @@ class CorpusLlamaIndexGraphClient:
 
         Uses GraphTranslator for consistency with other operations.
         """
+        _ensure_not_in_event_loop("health")
         ctx = self._build_ctx(
             callback_manager=callback_manager,
             extra_context=extra_context,
@@ -834,6 +1029,7 @@ class CorpusLlamaIndexGraphClient:
 
         Returns the underlying `QueryResult` from the GraphProtocol adapter.
         """
+        _ensure_not_in_event_loop("query")
         validate_graph_query(query)
 
         ctx = self._build_ctx(
@@ -938,6 +1134,7 @@ class CorpusLlamaIndexGraphClient:
         SyncStreamBridge under the hood. This method itself does not use
         any async→sync bridges directly.
         """
+        _ensure_not_in_event_loop("stream_query")
         validate_graph_query(query)
 
         ctx = self._build_ctx(
@@ -1034,6 +1231,7 @@ class CorpusLlamaIndexGraphClient:
         and passes the desired namespace via framework_ctx so that the
         translator can build the correct UpsertNodesSpec.
         """
+        _ensure_not_in_event_loop("upsert_nodes")
         validate_upsert_nodes_spec(spec)
 
         ctx = self._build_ctx(
@@ -1102,6 +1300,7 @@ class CorpusLlamaIndexGraphClient:
         """
         Sync wrapper for upserting edges.
         """
+        _ensure_not_in_event_loop("upsert_edges")
         self._validate_upsert_edges_spec(spec)
 
         ctx = self._build_ctx(
@@ -1177,6 +1376,7 @@ class CorpusLlamaIndexGraphClient:
         Uses DeleteNodesSpec to derive either an ID list or a filter
         expression for the GraphTranslator.
         """
+        _ensure_not_in_event_loop("delete_nodes")
         ctx = self._build_ctx(
             callback_manager=callback_manager,
             extra_context=extra_context,
@@ -1189,7 +1389,13 @@ class CorpusLlamaIndexGraphClient:
         if spec.filter is not None:
             raw_filter_or_ids: Any = spec.filter
         else:
-            raw_filter_or_ids = list(spec.ids or [])
+            ids = list(spec.ids or [])
+            if not ids:
+                raise BadRequest(
+                    "DeleteNodesSpec must specify either filter or non-empty ids",
+                    code=ErrorCodes.BAD_ADAPTER_RESULT,
+                )
+            raw_filter_or_ids = ids
 
         result = self._translator.delete_nodes(
             raw_filter_or_ids,
@@ -1226,7 +1432,13 @@ class CorpusLlamaIndexGraphClient:
         if spec.filter is not None:
             raw_filter_or_ids: Any = spec.filter
         else:
-            raw_filter_or_ids = list(spec.ids or [])
+            ids = list(spec.ids or [])
+            if not ids:
+                raise BadRequest(
+                    "DeleteNodesSpec must specify either filter or non-empty ids",
+                    code=ErrorCodes.BAD_ADAPTER_RESULT,
+                )
+            raw_filter_or_ids = ids
 
         result = await self._translator.arun_delete_nodes(
             raw_filter_or_ids,
@@ -1251,7 +1463,8 @@ class CorpusLlamaIndexGraphClient:
         """
         Sync wrapper for deleting edges.
         """
-        ctx = self._build_ctx(
+        _ensure_not_in_event_loop("delete_edges")
+        ctx = self.__build_ctx(
             callback_manager=callback_manager,
             extra_context=extra_context,
         )
@@ -1263,7 +1476,13 @@ class CorpusLlamaIndexGraphClient:
         if spec.filter is not None:
             raw_filter_or_ids: Any = spec.filter
         else:
-            raw_filter_or_ids = list(spec.ids or [])
+            ids = list(spec.ids or [])
+            if not ids:
+                raise BadRequest(
+                    "DeleteEdgesSpec must specify either filter or non-empty ids",
+                    code=ErrorCodes.BAD_ADAPTER_RESULT,
+                )
+            raw_filter_or_ids = ids
 
         result = self._translator.delete_edges(
             raw_filter_or_ids,
@@ -1300,7 +1519,13 @@ class CorpusLlamaIndexGraphClient:
         if spec.filter is not None:
             raw_filter_or_ids: Any = spec.filter
         else:
-            raw_filter_or_ids = list(spec.ids or [])
+            ids = list(spec.ids or [])
+            if not ids:
+                raise BadRequest(
+                    "DeleteEdgesSpec must specify either filter or non-empty ids",
+                    code=ErrorCodes.BAD_ADAPTER_RESULT,
+                )
+            raw_filter_or_ids = ids
 
         result = await self._translator.arun_delete_edges(
             raw_filter_or_ids,
@@ -1332,6 +1557,7 @@ class CorpusLlamaIndexGraphClient:
         Converts `BulkVerticesSpec` into the raw request shape expected by
         GraphTranslator and returns the underlying `BulkVerticesResult`.
         """
+        _ensure_not_in_event_loop("bulk_vertices")
         ctx = self._build_ctx(
             callback_manager=callback_manager,
             extra_context=extra_context,
@@ -1419,6 +1645,7 @@ class CorpusLlamaIndexGraphClient:
         Translates `BatchOperation` dataclasses into the raw mapping shape
         expected by GraphTranslator and returns the underlying `BatchResult`.
         """
+        _ensure_not_in_event_loop("batch")
         validate_batch_operations(self._graph, ops)
 
         ctx = self._build_ctx(
@@ -1475,6 +1702,7 @@ class CorpusLlamaIndexGraphClient:
             operation="GraphTranslator.arun_batch",
             error_code=ErrorCodes.BAD_BATCH_RESULT,
         )
+
 
 from typing import TYPE_CHECKING
 
@@ -1712,8 +1940,8 @@ else:
 __all__ = [
     "LlamaIndexGraphClientProtocol",
     "CorpusLlamaIndexGraphClient",
-    "LlamaIndexGraphFrameworkTranslator",  # if you made it public
-    "CorpusGraphStore",                    # <-- NEW
+    "LlamaIndexGraphFrameworkTranslator",
+    "CorpusGraphStore",
     "ErrorCodes",
     "with_graph_error_context",
     "with_async_graph_error_context",
