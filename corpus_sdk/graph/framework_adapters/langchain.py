@@ -41,6 +41,7 @@ Non-responsibilities
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from functools import cached_property
 from typing import (
@@ -127,6 +128,7 @@ class ErrorCodes:
     BAD_BULK_VERTICES_RESULT = "BAD_BULK_VERTICES_RESULT"
     BAD_BATCH_RESULT = "BAD_BATCH_RESULT"
     BAD_ADAPTER_RESULT = "BAD_ADAPTER_RESULT"
+    SYNC_WRAPPER_CALLED_IN_EVENT_LOOP = "SYNC_WRAPPER_CALLED_IN_EVENT_LOOP"
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +171,54 @@ def with_async_graph_error_context(
 # Backwards-compatible aliases (for older imports)
 with_error_context = with_graph_error_context
 with_async_error_context = with_async_graph_error_context
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _looks_like_operation_context(obj: Any) -> bool:
+    """
+    Heuristic check; OperationContext may be a Protocol/alias in some SDK versions.
+
+    We try a direct isinstance check when possible, but fall back to a
+    structural check on common OperationContext attributes so that this
+    adapter is resilient to typing/aliasing changes.
+    """
+    if obj is None:
+        return False
+
+    try:
+        if isinstance(obj, OperationContext):
+            return True
+    except TypeError:
+        # OperationContext may be a Protocol in some typing modes
+        pass
+
+    attrs = ("request_id", "traceparent", "tenant", "attrs", "to_dict")
+    return any(hasattr(obj, attr) for attr in attrs)
+
+
+def _ensure_not_in_event_loop(sync_api_name: str) -> None:
+    """
+    Guard against calling sync graph APIs from within an active asyncio loop.
+
+    This prevents subtle sync-over-async deadlocks in environments like
+    Jupyter, FastAPI, or async LangChain chains. Callers are directed to
+    use the corresponding async variant instead.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        # No running event loop -> safe for sync calls.
+        return
+
+    raise RuntimeError(
+        f"{sync_api_name} was called from inside an active asyncio event loop. "
+        f"Use the async variant instead (e.g. 'a{sync_api_name}'). "
+        f"[{ErrorCodes.SYNC_WRAPPER_CALLED_IN_EVENT_LOOP}]"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -459,6 +509,14 @@ class LangChainGraphClientProtocol(Protocol):
     ) -> BatchResult:
         ...
 
+    # Resource management -------------------------------------------------
+
+    def close(self) -> None:
+        ...
+
+    async def aclose(self) -> None:
+        ...
+
 
 # ---------------------------------------------------------------------------
 # Main LangChain client
@@ -521,6 +579,10 @@ class CorpusLangChainGraphClient:
             framework_translator
         )
 
+        # Resource management flags (idempotent close semantics)
+        self._closed: bool = False
+        self._aclosed: bool = False
+
     # ------------------------------------------------------------------ #
     # Resource Management (Context Managers)
     # ------------------------------------------------------------------ #
@@ -530,30 +592,73 @@ class CorpusLangChainGraphClient:
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        """Clean up resources when exiting context."""
-        if hasattr(self._graph, "close"):
-            try:
-                self._graph.close()
-            except Exception as e:  # noqa: BLE001
-                logger.warning(
-                    "Error while closing graph adapter in __exit__: %s",
-                    e,
-                )
+        """
+        Clean up resources when exiting context.
+
+        Uses the explicit `close()` method so that resource-management
+        semantics remain centralized and idempotent.
+        """
+        self.close()
 
     async def __aenter__(self) -> CorpusLangChainGraphClient:
         """Support async context manager protocol."""
         return self
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        """Clean up resources when exiting async context."""
-        if hasattr(self._graph, "aclose"):
+        """
+        Clean up resources when exiting async context.
+
+        Uses the explicit `aclose()` method to honor async cleanup paths.
+        """
+        await self.aclose()
+
+    def close(self) -> None:
+        """
+        Close the underlying graph adapter if it exposes a `close()` method.
+
+        This is safe to call multiple times; subsequent calls are no-ops.
+        """
+        if self._closed:
+            return
+        self._closed = True
+
+        close_fn = getattr(self._graph, "close", None)
+        if callable(close_fn):
             try:
-                await self._graph.aclose()
+                close_fn()
             except Exception as e:  # noqa: BLE001
                 logger.warning(
-                    "Error while closing graph adapter in __aexit__: %s",
+                    "Error while closing graph adapter in close(): %s",
                     e,
                 )
+
+    async def aclose(self) -> None:
+        """
+        Async close for the underlying graph adapter.
+
+        Prefers an async `aclose()` method when available, otherwise falls back
+        to the sync `close()` method.
+        """
+        if self._aclosed:
+            return
+        self._aclosed = True
+
+        aclose_fn = getattr(self._graph, "aclose", None)
+        if callable(aclose_fn):
+            try:
+                await aclose_fn()
+                # If async close succeeded, we can consider sync-close satisfied.
+                self._closed = True
+                return
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "Error while async-closing graph adapter in aclose(): %s",
+                    e,
+                )
+
+        # Fallback to sync close if we haven't already done so.
+        if not self._closed:
+            self.close()
 
     # ------------------------------------------------------------------ #
     # Translator (lazy, cached) – mirrors CrewAI adapter pattern
@@ -608,7 +713,7 @@ class CorpusLangChainGraphClient:
             return None
 
         try:
-            ctx = core_ctx_from_langchain(
+            ctx_candidate = core_ctx_from_langchain(
                 config,
                 framework_version=self._framework_version,
                 **extra,
@@ -620,6 +725,8 @@ class CorpusLangChainGraphClient:
                 operation="context_translation",
                 error_code=ErrorCodes.BAD_OPERATION_CONTEXT,
                 config_snapshot=str(config)[:1024] if config is not None else None,
+                config_type=type(config).__name__ if config is not None else "None",
+                extra_context_keys=list(extra.keys()),
             )
             logger.warning(
                 "Failed to build OperationContext from LangChain inputs; "
@@ -628,15 +735,49 @@ class CorpusLangChainGraphClient:
             )
             return None
 
-        if not isinstance(ctx, OperationContext):
+        if not _looks_like_operation_context(ctx_candidate):
             logger.warning(
                 "from_langchain produced unsupported context type %s; "
                 "proceeding without OperationContext.",
-                type(ctx).__name__,
+                type(ctx_candidate).__name__,
             )
             return None
 
-        return ctx
+        # Best-effort enrichment of attrs with framework metadata while
+        # preserving the original OperationContext instance.
+        try:
+            attrs = getattr(ctx_candidate, "attrs", None)
+            if isinstance(attrs, Mapping):
+                # Copy to avoid mutating shared mappings, if any.
+                enriched_attrs: Dict[str, Any] = dict(attrs)
+            else:
+                enriched_attrs = {}
+
+            enriched_attrs.setdefault("framework", "langchain")
+            if self._framework_version is not None:
+                enriched_attrs.setdefault("framework_version", self._framework_version)
+
+            try:
+                setattr(ctx_candidate, "attrs", enriched_attrs)
+            except Exception:
+                # If attrs is not assignable, fall back to in-place update where possible.
+                try:
+                    if hasattr(attrs, "setdefault"):
+                        attrs.setdefault("framework", "langchain")
+                        if self._framework_version is not None:
+                            attrs.setdefault("framework_version", self._framework_version)
+                except Exception:
+                    logger.debug(
+                        "Failed to update OperationContext attrs in-place for LangChain",
+                        exc_info=True,
+                    )
+        except Exception:
+            logger.debug(
+                "Failed to enrich OperationContext attrs for LangChain",
+                exc_info=True,
+            )
+
+        return ctx_candidate  # type: ignore[return-value]
 
     def _build_raw_query(
         self,
@@ -734,6 +875,21 @@ class CorpusLangChainGraphClient:
 
         return edges_iter
 
+    def _validate_query_params(
+        self,
+        params: Optional[Mapping[str, Any]],
+    ) -> None:
+        """
+        Lightweight validation for query parameter mappings.
+
+        Keeps the adapter behavior protocol-friendly while catching obvious
+        misuse (like passing a bare string instead of a dict).
+        """
+        if params is not None and not isinstance(params, Mapping):
+            raise TypeError(
+                f"params must be a mapping (e.g. dict), not {type(params).__name__}"
+            )
+
     # ------------------------------------------------------------------ #
     # Capabilities / schema / health
     # ------------------------------------------------------------------ #
@@ -744,6 +900,7 @@ class CorpusLangChainGraphClient:
         Sync wrapper around capabilities, delegating async→sync bridging
         to GraphTranslator.
         """
+        _ensure_not_in_event_loop("capabilities")
         caps = self._translator.capabilities()
         return graph_capabilities_to_dict(caps)
 
@@ -771,6 +928,7 @@ class CorpusLangChainGraphClient:
         Delegates to GraphTranslator so that async→sync bridging and
         error-context handling are centralized.
         """
+        _ensure_not_in_event_loop("get_schema")
         ctx = self._build_ctx(config=config, extra_context=extra_context)
         schema = self._translator.get_schema(
             op_ctx=ctx,
@@ -819,6 +977,7 @@ class CorpusLangChainGraphClient:
 
         Uses GraphTranslator for consistency with other operations.
         """
+        _ensure_not_in_event_loop("health")
         ctx = self._build_ctx(config=config, extra_context=extra_context)
         health_result = self._translator.health(
             op_ctx=ctx,
@@ -876,7 +1035,9 @@ class CorpusLangChainGraphClient:
 
         Returns the underlying `QueryResult` from the GraphProtocol adapter.
         """
+        _ensure_not_in_event_loop("query")
         validate_graph_query(query)
+        self._validate_query_params(params)
 
         ctx = self._build_ctx(config=config, extra_context=extra_context)
         raw_query = self._build_raw_query(
@@ -923,6 +1084,7 @@ class CorpusLangChainGraphClient:
         Returns the underlying `QueryResult`.
         """
         validate_graph_query(query)
+        self._validate_query_params(params)
 
         ctx = self._build_ctx(config=config, extra_context=extra_context)
         raw_query = self._build_raw_query(
@@ -974,7 +1136,9 @@ class CorpusLangChainGraphClient:
         SyncStreamBridge under the hood. This method itself does not use
         any async→sync bridges directly.
         """
+        _ensure_not_in_event_loop("stream_query")
         validate_graph_query(query)
+        self._validate_query_params(params)
 
         ctx = self._build_ctx(config=config, extra_context=extra_context)
         raw_query = self._build_raw_query(
@@ -1018,6 +1182,7 @@ class CorpusLangChainGraphClient:
         Execute a streaming graph query (async), yielding `QueryChunk` items.
         """
         validate_graph_query(query)
+        self._validate_query_params(params)
 
         ctx = self._build_ctx(config=config, extra_context=extra_context)
         raw_query = self._build_raw_query(
@@ -1064,6 +1229,7 @@ class CorpusLangChainGraphClient:
         and passes the desired namespace via framework_ctx so that the
         translator can build the correct UpsertNodesSpec.
         """
+        _ensure_not_in_event_loop("upsert_nodes")
         validate_upsert_nodes_spec(spec)
 
         ctx = self._build_ctx(config=config, extra_context=extra_context)
@@ -1126,6 +1292,7 @@ class CorpusLangChainGraphClient:
         """
         Sync wrapper for upserting edges.
         """
+        _ensure_not_in_event_loop("upsert_edges")
         edges = self._validate_upsert_edges_spec(spec)
 
         ctx = self._build_ctx(config=config, extra_context=extra_context)
@@ -1195,6 +1362,7 @@ class CorpusLangChainGraphClient:
         Uses DeleteNodesSpec to derive either an ID list or a filter
         expression for the GraphTranslator.
         """
+        _ensure_not_in_event_loop("delete_nodes")
         ctx = self._build_ctx(config=config, extra_context=extra_context)
         framework_ctx = self._framework_ctx(
             operation="delete_nodes",
@@ -1275,6 +1443,7 @@ class CorpusLangChainGraphClient:
         """
         Sync wrapper for deleting edges.
         """
+        _ensure_not_in_event_loop("delete_edges")
         ctx = self._build_ctx(config=config, extra_context=extra_context)
         framework_ctx = self._framework_ctx(
             operation="delete_edges",
@@ -1362,6 +1531,7 @@ class CorpusLangChainGraphClient:
         Converts `BulkVerticesSpec` into the raw request shape expected by
         GraphTranslator and returns the underlying `BulkVerticesResult`.
         """
+        _ensure_not_in_event_loop("bulk_vertices")
         ctx = self._build_ctx(config=config, extra_context=extra_context)
 
         raw_request: Mapping[str, Any] = {
@@ -1443,6 +1613,7 @@ class CorpusLangChainGraphClient:
         Translates `BatchOperation` dataclasses into the raw mapping shape
         expected by GraphTranslator and returns the underlying `BatchResult`.
         """
+        _ensure_not_in_event_loop("batch")
         validate_batch_operations(self._graph, ops)
 
         ctx = self._build_ctx(config=config, extra_context=extra_context)
