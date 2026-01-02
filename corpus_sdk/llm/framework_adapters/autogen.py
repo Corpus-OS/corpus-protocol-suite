@@ -41,6 +41,7 @@ Design principles
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -201,6 +202,25 @@ def _now_epoch_s() -> int:
 
 def _new_id(prefix: str = "chatcmpl") -> str:
     return f"{prefix}-{uuid4().hex}"
+
+
+def _ensure_not_in_event_loop(sync_api_name: str) -> None:
+    """
+    Prevent the use of sync APIs from within an active asyncio event loop.
+
+    This avoids subtle deadlocks and encourages callers to use the async
+    variants (e.g., `acreate`) when already inside async code.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        # No running loop: safe to call sync API.
+        return
+
+    raise RuntimeError(
+        f"{sync_api_name} was called from within an active asyncio event loop. "
+        f"Use the async variant instead (for example, 'await a{sync_api_name}(...)')."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -499,9 +519,23 @@ class CorpusAutoGenChatClient:
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        if hasattr(self._adapter, "close"):
+        """
+        Synchronous context manager exit.
+
+        Best-effort cleanup of both the translator and the underlying adapter,
+        if they expose compatible `close()` methods.
+        """
+        translator_close = getattr(self._translator, "close", None)
+        if callable(translator_close):
             try:
-                self._adapter.close()  # type: ignore[call-arg]
+                translator_close()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Error while closing LLM translator in __exit__: %s", exc)
+
+        adapter_close = getattr(self._adapter, "close", None)
+        if callable(adapter_close):
+            try:
+                adapter_close()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Error while closing LLM adapter in __exit__: %s", exc)
 
@@ -509,11 +543,149 @@ class CorpusAutoGenChatClient:
         return self
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        if hasattr(self._adapter, "aclose"):
+        """
+        Async context manager exit.
+
+        Best-effort cleanup of both the translator and the underlying adapter,
+        preferring async `aclose()` when available and falling back to `close()`
+        via `asyncio.to_thread` when necessary.
+        """
+        translator_aclose = getattr(self._translator, "aclose", None)
+        if callable(translator_aclose):
             try:
-                await self._adapter.aclose()  # type: ignore[call-arg]
+                await translator_aclose()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Error while closing LLM translator in __aexit__: %s", exc)
+        else:
+            translator_close = getattr(self._translator, "close", None)
+            if callable(translator_close):
+                try:
+                    if asyncio.iscoroutinefunction(translator_close):
+                        await translator_close()
+                    else:
+                        await asyncio.to_thread(translator_close)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Error while closing LLM translator (sync close) in __aexit__: %s",
+                        exc,
+                    )
+
+        adapter_aclose = getattr(self._adapter, "aclose", None)
+        if callable(adapter_aclose):
+            try:
+                await adapter_aclose()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Error while closing LLM adapter in __aexit__: %s", exc)
+        else:
+            adapter_close = getattr(self._adapter, "close", None)
+            if callable(adapter_close):
+                try:
+                    if asyncio.iscoroutinefunction(adapter_close):
+                        await adapter_close()
+                    else:
+                        await asyncio.to_thread(adapter_close)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Error while closing LLM adapter (sync close) in __aexit__: %s",
+                        exc,
+                    )
+
+    # ------------------------------------------------------------------ #
+    # Capabilities / health
+    # ------------------------------------------------------------------ #
+
+    @with_llm_error_context("capabilities")
+    def capabilities(self) -> Mapping[str, Any]:
+        """
+        Synchronous capabilities accessor.
+
+        Delegates to the LLM translator when available, falling back to the
+        underlying adapter. Returns a Mapping suitable for observability and
+        introspection tooling.
+        """
+        translator_caps = getattr(self._translator, "capabilities", None)
+        if callable(translator_caps):
+            result = translator_caps()
+        else:
+            result = self._adapter.capabilities()
+
+        if not isinstance(result, Mapping):
+            raise TypeError(
+                f"{ErrorCodes.BAD_USAGE_RESULT}: "
+                f"capabilities() returned unsupported type: {type(result).__name__}"
+            )
+        return result
+
+    @with_async_llm_error_context("acapabilities")
+    async def acapabilities(self) -> Mapping[str, Any]:
+        """
+        Async capabilities accessor.
+
+        Prefers async translator methods when available, otherwise falls back
+        to sync methods executed in a thread.
+        """
+        async_caps = getattr(self._translator, "arun_capabilities", None)
+        if callable(async_caps):
+            result = await async_caps()
+        else:
+            translator_caps = getattr(self._translator, "capabilities", None)
+            if callable(translator_caps):
+                result = await asyncio.to_thread(translator_caps)
+            else:
+                result = await asyncio.to_thread(self._adapter.capabilities)
+
+        if not isinstance(result, Mapping):
+            raise TypeError(
+                f"{ErrorCodes.BAD_USAGE_RESULT}: "
+                f"capabilities() returned unsupported type: {type(result).__name__}"
+            )
+        return result
+
+    @with_llm_error_context("health")
+    def health(self) -> Mapping[str, Any]:
+        """
+        Synchronous health accessor.
+
+        Delegates to the LLM translator when available, falling back to the
+        underlying adapter. Returns a Mapping representing the health status.
+        """
+        translator_health = getattr(self._translator, "health", None)
+        if callable(translator_health):
+            result = translator_health()
+        else:
+            result = self._adapter.health()
+
+        if not isinstance(result, Mapping):
+            raise TypeError(
+                f"{ErrorCodes.BAD_USAGE_RESULT}: "
+                f"health() returned unsupported type: {type(result).__name__}"
+            )
+        return result
+
+    @with_async_llm_error_context("ahealth")
+    async def ahealth(self) -> Mapping[str, Any]:
+        """
+        Async health accessor.
+
+        Prefers async translator methods when available, otherwise falls back
+        to sync methods executed in a thread.
+        """
+        async_health = getattr(self._translator, "arun_health", None)
+        if callable(async_health):
+            result = await async_health()
+        else:
+            translator_health = getattr(self._translator, "health", None)
+            if callable(translator_health):
+                result = await asyncio.to_thread(translator_health)
+            else:
+                result = await asyncio.to_thread(self._adapter.health)
+
+        if not isinstance(result, Mapping):
+            raise TypeError(
+                f"{ErrorCodes.BAD_USAGE_RESULT}: "
+                f"health() returned unsupported type: {type(result).__name__}"
+            )
+        return result
 
     # ------------------------------------------------------------------ #
     # Internal helpers: validation & context
@@ -1082,8 +1254,8 @@ class CorpusAutoGenChatClient:
             chunk_iter: Optional[AsyncIterator[Any]] = None
 
             try:
-                # FIX: LLMTranslator.arun_stream returns an AsyncIterator directly,
-                # not a coroutine. We do NOT await it here.
+                # LLMTranslator.arun_stream returns an AsyncIterator directly;
+                # do not await it here.
                 chunk_iter = self._translator.arun_stream(
                     raw_messages=messages,
                     op_ctx=ctx,
@@ -1134,6 +1306,8 @@ class CorpusAutoGenChatClient:
             client.create(messages=[...], model="...", stream=False)
             for chunk in client.create(messages=[...], stream=True): ...
         """
+        _ensure_not_in_event_loop("create")
+
         if self._validate_inputs_flag:
             self._validate_messages(messages)
 
@@ -1209,6 +1383,7 @@ class CorpusAutoGenChatClient:
         messages: Sequence[Mapping[str, Any]],
         **kwargs: Any,
     ) -> Union[Dict[str, Any], Iterator[Dict[str, Any]]]:
+        _ensure_not_in_event_loop("__call__")
         return self.create(messages, **kwargs)
 
 
