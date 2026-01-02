@@ -41,6 +41,7 @@ Non-responsibilities
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from functools import cached_property
@@ -112,6 +113,7 @@ class ErrorCodes:
     BAD_BULK_VERTICES_RESULT = "BAD_BULK_VERTICES_RESULT"
     BAD_BATCH_RESULT = "BAD_BATCH_RESULT"
     BAD_ADAPTER_RESULT = "BAD_ADAPTER_RESULT"
+    SYNC_WRAPPER_CALLED_IN_EVENT_LOOP = "SYNC_WRAPPER_CALLED_IN_EVENT_LOOP"
 
 
 # --------------------------------------------------------------------------- #
@@ -179,6 +181,26 @@ def _looks_like_operation_context(obj: Any) -> bool:
     # Fallback to structural check
     attrs = ("request_id", "traceparent", "tenant", "attrs", "to_dict")
     return any(hasattr(obj, attr) for attr in attrs)
+
+
+def _ensure_not_in_event_loop(sync_api_name: str) -> None:
+    """
+    Prevent deadlocks from calling sync graph APIs in async contexts.
+
+    This mirrors the embedding adapters' safety guard and gives a clear,
+    actionable error if a sync method is used from inside a running event
+    loop (e.g., Jupyter, FastAPI, or async CrewAI agents).
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        # No running loop: safe to call sync API.
+        return
+    raise RuntimeError(
+        f"{sync_api_name} was called from inside an active asyncio event loop. "
+        f"Use the async variant instead (e.g. 'await a{sync_api_name}(...)'). "
+        f"[{ErrorCodes.SYNC_WRAPPER_CALLED_IN_EVENT_LOOP}]"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -464,6 +486,14 @@ class CrewAIGraphClientProtocol(Protocol):
     ) -> BatchResult:
         ...
 
+    # Resource lifecycle --------------------------------------------------
+
+    def close(self) -> None:
+        ...
+
+    async def aclose(self) -> None:
+        ...
+
 
 class CorpusCrewAIGraphClient:
     """
@@ -521,6 +551,10 @@ class CorpusCrewAIGraphClient:
             GraphFrameworkTranslator
         ] = framework_translator
 
+        # Resource management flags (idempotent close semantics)
+        self._closed: bool = False
+        self._aclosed: bool = False
+
     # ------------------------------------------------------------------ #
     # Resource Management (Context Managers)
     # ------------------------------------------------------------------ #
@@ -531,8 +565,7 @@ class CorpusCrewAIGraphClient:
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         """Clean up resources when exiting context."""
-        if hasattr(self._graph, "close"):
-            self._graph.close()
+        self.close()
 
     async def __aenter__(self) -> CorpusCrewAIGraphClient:
         """Support async context manager protocol."""
@@ -540,8 +573,50 @@ class CorpusCrewAIGraphClient:
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         """Clean up resources when exiting async context."""
-        if hasattr(self._graph, "aclose"):
-            await self._graph.aclose()
+        await self.aclose()
+
+    def close(self) -> None:
+        """
+        Close the underlying graph adapter if it exposes a `close()` method.
+
+        This is safe to call multiple times; subsequent calls are no-ops.
+        """
+        if self._closed:
+            return
+        self._closed = True
+
+        close_fn = getattr(self._graph, "close", None)
+        if callable(close_fn):
+            try:
+                close_fn()
+            except Exception:
+                # Never let cleanup failures propagate to callers.
+                logger.debug("Failed to close graph adapter", exc_info=True)
+
+    async def aclose(self) -> None:
+        """
+        Async close for the underlying graph adapter.
+
+        Prefers an async `aclose()` method when available, otherwise falls back
+        to the sync `close()` method.
+        """
+        if self._aclosed:
+            return
+        self._aclosed = True
+
+        aclose_fn = getattr(self._graph, "aclose", None)
+        if callable(aclose_fn):
+            try:
+                await aclose_fn()
+                # If async close succeeded, we can consider sync-close satisfied.
+                self._closed = True
+                return
+            except Exception:
+                logger.debug("Failed to async-close graph adapter", exc_info=True)
+
+        # Fallback to sync close if we haven't already done so.
+        if not self._closed:
+            self.close()
 
     # ------------------------------------------------------------------ #
     # Translator (lazy, cached) – mirrors AutoGen adapter pattern
@@ -619,7 +694,23 @@ class CorpusCrewAIGraphClient:
             return None
 
         if _looks_like_operation_context(ctx_candidate):
-            return ctx_candidate  # type: ignore[return-value]
+            # Enrich OperationContext.attrs with framework metadata so that
+            # downstream observability and GraphTranslator always see the
+            # framework identity and version without depending on upstream
+            # context translation details.
+            attrs = dict(getattr(ctx_candidate, "attrs", {}) or {})
+            attrs.setdefault("framework", "crewai")
+            if self._framework_version is not None:
+                attrs.setdefault("framework_version", self._framework_version)
+
+            return OperationContext(
+                request_id=ctx_candidate.request_id,
+                idempotency_key=getattr(ctx_candidate, "idempotency_key", None),
+                deadline_ms=getattr(ctx_candidate, "deadline_ms", None),
+                traceparent=getattr(ctx_candidate, "traceparent", None),
+                tenant=getattr(ctx_candidate, "tenant", None),
+                attrs=attrs,
+            )
 
         logger.warning(
             "[%s] from_crewai returned non-OperationContext-like type: %s. "
@@ -739,6 +830,21 @@ class CorpusCrewAIGraphClient:
         # Normalize spec.edges to the validated list
         spec.edges = edges  # type: ignore[assignment]
 
+    def _validate_query_params(
+        self,
+        params: Optional[Mapping[str, Any]],
+    ) -> None:
+        """
+        Lightweight validation for query parameter mappings.
+
+        Keeps the adapter behavior protocol-friendly while catching obvious
+        misuse (like passing a bare string instead of a dict).
+        """
+        if params is not None and not isinstance(params, Mapping):
+            raise TypeError(
+                f"params must be a mapping (e.g. dict), not {type(params).__name__}"
+            )
+
     # ------------------------------------------------------------------ #
     # Capabilities / schema / health
     # ------------------------------------------------------------------ #
@@ -749,6 +855,8 @@ class CorpusCrewAIGraphClient:
         Sync wrapper around capabilities, delegating async→sync bridging
         to GraphTranslator.
         """
+        _ensure_not_in_event_loop("capabilities")
+
         caps = self._translator.capabilities()
         return graph_capabilities_to_dict(caps)
 
@@ -776,6 +884,8 @@ class CorpusCrewAIGraphClient:
         Delegates to GraphTranslator so that async→sync bridging and
         error-context handling are centralized.
         """
+        _ensure_not_in_event_loop("get_schema")
+
         ctx = self._build_ctx(task=task, extra_context=extra_context)
         schema = self._translator.get_schema(
             op_ctx=ctx,
@@ -824,6 +934,8 @@ class CorpusCrewAIGraphClient:
 
         Uses GraphTranslator for consistency with other operations.
         """
+        _ensure_not_in_event_loop("health")
+
         ctx = self._build_ctx(task=task, extra_context=extra_context)
         health_result = self._translator.health(
             op_ctx=ctx,
@@ -883,7 +995,10 @@ class CorpusCrewAIGraphClient:
 
         Returns the underlying `QueryResult` from the GraphProtocol adapter.
         """
+        _ensure_not_in_event_loop("query")
+
         validate_graph_query(query)
+        self._validate_query_params(params)
 
         ctx = self._build_ctx(task=task, extra_context=extra_context)
         raw_query = self._build_raw_query(
@@ -930,6 +1045,7 @@ class CorpusCrewAIGraphClient:
         Returns the underlying `QueryResult`.
         """
         validate_graph_query(query)
+        self._validate_query_params(params)
 
         ctx = self._build_ctx(task=task, extra_context=extra_context)
         raw_query = self._build_raw_query(
@@ -981,7 +1097,10 @@ class CorpusCrewAIGraphClient:
         SyncStreamBridge under the hood. This method itself does not use
         any async→sync bridges directly.
         """
+        _ensure_not_in_event_loop("stream_query")
+
         validate_graph_query(query)
+        self._validate_query_params(params)
 
         ctx = self._build_ctx(task=task, extra_context=extra_context)
         raw_query = self._build_raw_query(
@@ -1025,6 +1144,7 @@ class CorpusCrewAIGraphClient:
         Execute a streaming graph query (async), yielding `QueryChunk` items.
         """
         validate_graph_query(query)
+        self._validate_query_params(params)
 
         ctx = self._build_ctx(task=task, extra_context=extra_context)
         raw_query = self._build_raw_query(
@@ -1071,6 +1191,8 @@ class CorpusCrewAIGraphClient:
         and passes the desired namespace via framework_ctx so that the
         translator can build the correct UpsertNodesSpec.
         """
+        _ensure_not_in_event_loop("upsert_nodes")
+
         validate_upsert_nodes_spec(spec)
 
         ctx = self._build_ctx(task=task, extra_context=extra_context)
@@ -1133,6 +1255,8 @@ class CorpusCrewAIGraphClient:
         """
         Sync wrapper for upserting edges.
         """
+        _ensure_not_in_event_loop("upsert_edges")
+
         self._validate_upsert_edges_spec(spec)
 
         ctx = self._build_ctx(task=task, extra_context=extra_context)
@@ -1202,6 +1326,8 @@ class CorpusCrewAIGraphClient:
         Uses DeleteNodesSpec to derive either an ID list or a filter
         expression for the GraphTranslator.
         """
+        _ensure_not_in_event_loop("delete_nodes")
+
         ctx = self._build_ctx(task=task, extra_context=extra_context)
         framework_ctx = self._framework_ctx(
             operation="delete_nodes",
@@ -1282,6 +1408,8 @@ class CorpusCrewAIGraphClient:
         """
         Sync wrapper for deleting edges.
         """
+        _ensure_not_in_event_loop("delete_edges")
+
         ctx = self._build_ctx(task=task, extra_context=extra_context)
         framework_ctx = self._framework_ctx(
             operation="delete_edges",
@@ -1369,6 +1497,8 @@ class CorpusCrewAIGraphClient:
         Converts `BulkVerticesSpec` into the raw request shape expected by
         GraphTranslator and returns the underlying `BulkVerticesResult`.
         """
+        _ensure_not_in_event_loop("bulk_vertices")
+
         ctx = self._build_ctx(task=task, extra_context=extra_context)
 
         raw_request: Mapping[str, Any] = {
@@ -1450,6 +1580,8 @@ class CorpusCrewAIGraphClient:
         Translates `BatchOperation` dataclasses into the raw mapping shape
         expected by GraphTranslator and returns the underlying `BatchResult`.
         """
+        _ensure_not_in_event_loop("batch")
+
         validate_batch_operations(self._graph, ops)
 
         ctx = self._build_ctx(task=task, extra_context=extra_context)
