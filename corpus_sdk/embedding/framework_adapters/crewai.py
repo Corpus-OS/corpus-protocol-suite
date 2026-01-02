@@ -525,7 +525,8 @@ class CorpusCrewAIEmbeddings:
         """Validate and normalize CrewAI configuration with sensible defaults."""
         validated: CrewAIConfig = config.copy()
 
-        validated.setdefault("fallback_to_simple_context", True)
+        # Align default with LangChain adapter: do NOT auto-create OperationContext
+        validated.setdefault("fallback_to_simple_context", False)
         validated.setdefault("enable_agent_context_propagation", True)
         validated.setdefault("task_aware_batching", False)
 
@@ -595,45 +596,46 @@ class CorpusCrewAIEmbeddings:
 
         # Convert CrewAI context to core OperationContext with comprehensive error handling
         if crewai_context is not None:
-            # NOTE: Input validation errors are not best-effort: wrong-type context should fail fast.
+            # Soft validation: invalid shapes are logged and ignored instead of raising.
             self._validate_crewai_context_structure(crewai_context)
 
-            try:
-                core_ctx_candidate = context_from_crewai(
-                    crewai_context,
-                    framework_version=self._framework_version,
-                )
-                if _looks_like_operation_context(core_ctx_candidate):
-                    core_ctx = core_ctx_candidate  # type: ignore[assignment]
-                    logger.debug(
-                        "Successfully created OperationContext from CrewAI context "
-                        "for agent: %s, task: %s",
-                        crewai_context.get("agent_role", "unknown"),
-                        crewai_context.get("task_id", "unknown"),
+            if isinstance(crewai_context, Mapping):
+                try:
+                    core_ctx_candidate = context_from_crewai(
+                        crewai_context,
+                        framework_version=self._framework_version,
                     )
-                else:
+                    if _looks_like_operation_context(core_ctx_candidate):
+                        core_ctx = core_ctx_candidate  # type: ignore[assignment]
+                        logger.debug(
+                            "Successfully created OperationContext from CrewAI context "
+                            "for agent: %s, task: %s",
+                            crewai_context.get("agent_role", "unknown"),
+                            crewai_context.get("task_id", "unknown"),
+                        )
+                    else:
+                        logger.warning(
+                            "context_from_crewai returned non-OperationContext type: %s. "
+                            "Using empty context.",
+                            type(core_ctx_candidate).__name__,
+                        )
+                        if self.crewai_config["fallback_to_simple_context"]:
+                            core_ctx = OperationContext()
+                except Exception as e:  # noqa: BLE001
                     logger.warning(
-                        "context_from_crewai returned non-OperationContext type: %s. "
+                        "Failed to create OperationContext from crewai_context: %s. "
                         "Using empty context.",
-                        type(core_ctx_candidate).__name__,
+                        e,
                     )
-                    if self.crewai_config["fallback_to_simple_context"]:
-                        core_ctx = OperationContext()
-            except Exception as e:  # noqa: BLE001
-                logger.warning(
-                    "Failed to create OperationContext from crewai_context: %s. "
-                    "Using empty context.",
-                    e,
-                )
-                attach_context(
-                    e,
-                    framework=_FRAMEWORK_NAME,
-                    operation="context_build",
-                    crewai_context_snapshot=_safe_snapshot(crewai_context),
-                    crewai_config=self.crewai_config,
-                    framework_version=self._framework_version,
-                    error_codes=EMBEDDING_COERCION_ERROR_CODES,
-                )
+                    attach_context(
+                        e,
+                        framework=_FRAMEWORK_NAME,
+                        operation="context_build",
+                        crewai_context_snapshot=_safe_snapshot(crewai_context),
+                        crewai_config=self.crewai_config,
+                        framework_version=self._framework_version,
+                        error_codes=EMBEDDING_COERCION_ERROR_CODES,
+                    )
 
         # Framework-level context for CrewAI-specific optimizations
         effective_model = model or self.model
@@ -641,7 +643,7 @@ class CorpusCrewAIEmbeddings:
             framework_ctx["model"] = effective_model
 
         # Add rich CrewAI-specific context for observability and optimization
-        if crewai_context:
+        if isinstance(crewai_context, Mapping) and crewai_context:
             framework_ctx.update(
                 {
                     "agent_role": crewai_context.get("agent_role"),
@@ -674,12 +676,19 @@ class CorpusCrewAIEmbeddings:
         return core_ctx, framework_ctx
 
     def _validate_crewai_context_structure(self, context: Mapping[str, Any]) -> None:
-        """Validate CrewAI context structure and log warnings for anomalies."""
+        """
+        Validate CrewAI context structure and log warnings for anomalies.
+
+        This is intentionally soft: invalid context shapes are logged and
+        ignored rather than raising, to match other framework adapters.
+        """
         if not isinstance(context, Mapping):
-            raise ValueError(
-                f"[{ErrorCodes.CREWAI_CONTEXT_INVALID}] "
-                f"CrewAI context must be a mapping, got {type(context).__name__}",
+            logger.warning(
+                "[%s] CrewAI context must be a mapping, got %s; ignoring context",
+                ErrorCodes.CREWAI_CONTEXT_INVALID,
+                type(context).__name__,
             )
+            return
 
         if not context.get("agent_role") and not context.get("task_id"):
             logger.debug(
@@ -753,8 +762,12 @@ class CorpusCrewAIEmbeddings:
         logger.debug(
             "Embedding %d documents for CrewAI agent: %s, task: %s",
             len(texts_list),
-            crewai_context.get("agent_role", "unknown") if crewai_context else "unknown",
-            crewai_context.get("task_id", "unknown") if crewai_context else "unknown",
+            crewai_context.get("agent_role", "unknown")
+            if isinstance(crewai_context, Mapping)
+            else "unknown",
+            crewai_context.get("task_id", "unknown")
+            if isinstance(crewai_context, Mapping)
+            else "unknown",
         )
 
         start = time.perf_counter()
@@ -805,7 +818,9 @@ class CorpusCrewAIEmbeddings:
 
         logger.debug(
             "Embedding query for CrewAI agent: %s",
-            crewai_context.get("agent_role", "unknown") if crewai_context else "unknown",
+            crewai_context.get("agent_role", "unknown")
+            if isinstance(crewai_context, Mapping)
+            else "unknown",
         )
 
         start = time.perf_counter()
@@ -866,7 +881,9 @@ class CorpusCrewAIEmbeddings:
         logger.debug(
             "Async embedding %d documents for CrewAI task: %s",
             len(texts_list),
-            crewai_context.get("task_id", "unknown") if crewai_context else "unknown",
+            crewai_context.get("task_id", "unknown")
+            if isinstance(crewai_context, Mapping)
+            else "unknown",
         )
 
         start = time.perf_counter()
