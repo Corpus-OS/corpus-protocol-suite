@@ -477,86 +477,45 @@ class CorpusCrewAIEmbeddings:
                 logger.warning("Error while closing embedding adapter in __aexit__: %s", exc)
 
     # ------------------------------------------------------------------ #
-    # Health / capabilities passthrough
+    # Health / capabilities passthrough via EmbeddingTranslator
     # ------------------------------------------------------------------ #
 
     @with_embedding_error_context("capabilities")
     def capabilities(self) -> Mapping[str, Any]:
         """
-        Sync wrapper around underlying adapter capabilities, if available.
+        Sync capabilities passthrough.
+
+        Delegates to EmbeddingTranslator.capabilities(), which centralizes
+        async/sync adapter methods and error context.
         """
-        if hasattr(self.corpus_adapter, "capabilities"):
-            result = self.corpus_adapter.capabilities()
-            # If the adapter's capabilities() is async, we need to run it in an event loop
-            if asyncio.iscoroutine(result):
-                try:
-                    loop = asyncio.get_event_loop()
-                    if loop.is_running():
-                        # If loop is already running, we can't use run_until_complete
-                        # Return empty dict or raise an error
-                        logger.warning("Cannot call async capabilities() from sync context while event loop is running")
-                        return {}
-                    result = loop.run_until_complete(result)
-                except RuntimeError:
-                    # No event loop, create one
-                    result = asyncio.run(result)
-            
-            # Convert EmbeddingCapabilities dataclass to dict if needed
-            if hasattr(result, '__dataclass_fields__'):
-                from dataclasses import asdict
-                return asdict(result)  # type: ignore[return-value]
-            return result  # type: ignore[no-any-return]
-        # Consistent with other adapters: best-effort, non-fatal.
-        return {}
+        return self._translator.capabilities()
 
     @with_async_embedding_error_context("capabilities")
     async def acapabilities(self) -> Mapping[str, Any]:
         """
-        Async wrapper around underlying adapter capabilities, if available.
+        Async capabilities passthrough.
+
+        Delegates to EmbeddingTranslator.arun_capabilities().
         """
-        result = None
-        if hasattr(self.corpus_adapter, "acapabilities"):
-            result = await self.corpus_adapter.acapabilities()
-        elif hasattr(self.corpus_adapter, "capabilities"):
-            # Fallback to capabilities - check if it's async or sync
-            caps_method = self.corpus_adapter.capabilities
-            if asyncio.iscoroutinefunction(caps_method):
-                # It's async, call and await directly
-                result = await caps_method()
-            else:
-                # It's sync, offload to thread to avoid blocking
-                result = await asyncio.to_thread(caps_method)
-        
-        if result is None:
-            return {}
-        
-        # Convert EmbeddingCapabilities dataclass to dict if needed
-        if hasattr(result, '__dataclass_fields__'):
-            from dataclasses import asdict
-            return asdict(result)  # type: ignore[return-value]
-        return result  # type: ignore[no-any-return]
+        return await self._translator.arun_capabilities()
 
     @with_embedding_error_context("health")
     def health(self) -> Mapping[str, Any]:
         """
-        Sync wrapper around underlying adapter health, if available.
+        Sync health passthrough.
+
+        Delegates to EmbeddingTranslator.health().
         """
-        if hasattr(self.corpus_adapter, "health"):
-            return self.corpus_adapter.health()  # type: ignore[no-any-return]
-        # Consistent with other adapters: best-effort, non-fatal.
-        return {}
+        return self._translator.health()
 
     @with_async_embedding_error_context("health")
     async def ahealth(self) -> Mapping[str, Any]:
         """
-        Async wrapper around underlying adapter health, if available.
+        Async health passthrough.
+
+        Delegates to EmbeddingTranslator.arun_health().
         """
-        if hasattr(self.corpus_adapter, "ahealth"):
-            return await self.corpus_adapter.ahealth()  # type: ignore[no-any-return]
-        if hasattr(self.corpus_adapter, "health"):
-            # Fallback to sync in async context (offloaded to avoid blocking).
-            return await asyncio.to_thread(self.corpus_adapter.health)  # type: ignore[arg-type]
-        return {}
+        return await self._translator.arun_health()
 
     # ------------------------------------------------------------------ #
     # Internal helpers
