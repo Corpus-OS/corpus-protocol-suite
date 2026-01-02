@@ -44,6 +44,7 @@ Design goals
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from functools import wraps
@@ -104,6 +105,7 @@ class ErrorCodes:
 
     BAD_OPERATION_CONTEXT = "CREWAI_LLM_BAD_OPERATION_CONTEXT"
     BAD_INIT_CONFIG = "CREWAI_LLM_BAD_INIT_CONFIG"
+    SYNC_WRAPPER_CALLED_IN_EVENT_LOOP = "CREWAI_LLM_SYNC_WRAPPER_CALLED_IN_EVENT_LOOP"
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +170,32 @@ def _ensure_crewai_installed() -> None:
             "CrewAI is required to use CorpusCrewAILLM. "
             "Install with: pip install 'crewai>=0.51.0'"
         ) from _CREWAI_IMPORT_ERROR
+
+
+# ---------------------------------------------------------------------------
+# Sync event-loop guard (prevents sync-in-async deadlocks)
+# ---------------------------------------------------------------------------
+
+
+def _ensure_not_in_event_loop(sync_api_name: str) -> None:
+    """
+    Prevent calling blocking sync APIs from within an active asyncio event loop.
+
+    This avoids subtle deadlocks when users accidentally call sync methods
+    (e.g. `complete` or `stream`) from async code instead of using the
+    corresponding async variants (`acomplete`, `astream`).
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        # No running loop, safe to proceed.
+        return
+
+    raise RuntimeError(
+        f"{sync_api_name} was called from inside an active asyncio event loop. "
+        f"Use the async variant instead (e.g. 'a{sync_api_name}'). "
+        f"[{ErrorCodes.SYNC_WRAPPER_CALLED_IN_EVENT_LOOP}]"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -460,12 +488,16 @@ def _extract_stop_sequences(kwargs: Mapping[str, Any]) -> Optional[list[str]]:
     return [str(stop)]
 
 
-def _build_operation_context_from_kwargs(kwargs: Mapping[str, Any]) -> OperationContext:
+def _build_operation_context_from_kwargs(
+    kwargs: Mapping[str, Any],
+) -> Optional[OperationContext]:
     """
-    Build OperationContext from generic kwargs using ContextTranslator.
+    Build an OperationContext from generic kwargs using ContextTranslator.
 
     Defensive behavior:
     - If `ctx` is already an OperationContext, return it.
+    - If there is no context information at all, return None and let
+      downstream layers construct a default OperationContext if desired.
     - Else, call `ContextTranslator.from_crewai(...)`.
     - If that call fails, attach rich context and re-raise.
     - If it returns a non-OperationContext, attach context and raise TypeError.
@@ -496,6 +528,10 @@ def _build_operation_context_from_kwargs(kwargs: Mapping[str, Any]) -> Operation
     context_kwargs: Dict[str, Any] = {
         k: v for k, v in kwargs.items() if k in allowed_keys
     }
+
+    # If there is no contextual information at all, allow a None op_ctx.
+    if task is None and not context_kwargs:
+        return None
 
     try:
         ctx = ContextTranslator.from_crewai(
@@ -852,10 +888,13 @@ class CorpusCrewAILLM:
         operation: str,
         stream: bool,
         kwargs: Mapping[str, Any],
-    ) -> Tuple[OperationContext, Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    ) -> Tuple[Optional[OperationContext], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
         """
-        Build (OperationContext, sampling params, framework_ctx, resolved_kwargs)
+        Build (OperationContext | None, sampling params, framework_ctx, resolved_kwargs)
         in a single place, mirroring other framework adapters.
+
+        When no CrewAI context is provided at all, the OperationContext may be
+        None and downstream layers are responsible for constructing a default.
         """
         resolved_kwargs = self._apply_instance_defaults(kwargs)
         request_id = resolved_kwargs.get("request_id")
@@ -1028,6 +1067,8 @@ class CorpusCrewAILLM:
         Any
             Framework-level completion as produced by the CrewAI LLMFrameworkTranslator.
         """
+        _ensure_not_in_event_loop("complete")
+
         if getattr(self, "_validate_inputs_flag", True):
             self._validate_messages(messages)
 
@@ -1084,6 +1125,8 @@ class CorpusCrewAILLM:
             Streaming chunks as produced by the CrewAI LLMFrameworkTranslator
             (typically text tokens for CrewAI).
         """
+        _ensure_not_in_event_loop("stream")
+
         if getattr(self, "_validate_inputs_flag", True):
             self._validate_messages(messages)
 
@@ -1122,6 +1165,92 @@ class CorpusCrewAILLM:
                         "Failed to close sync stream iterator in CrewAI adapter: %s",
                         exc,
                     )
+
+    # ---------------------------------------------------------------------
+    # Health and capabilities passthroughs
+    # ---------------------------------------------------------------------
+
+    @with_llm_error_context("health")
+    def health(self, **kwargs: Any) -> Mapping[str, Any]:
+        """
+        Sync health check passthrough.
+
+        Delegates to the underlying LLM adapter's `health()` method.
+        Guarded against use from inside an event loop to prevent sync blocking
+        in async code.
+        """
+        _ensure_not_in_event_loop("health")
+
+        health_fn = getattr(self._llm_adapter, "health", None)
+        if not callable(health_fn):
+            raise RuntimeError(
+                "Underlying LLM adapter does not implement health(). "
+                "This violates the LLMProtocolV1 requirements."
+            )
+        return health_fn(**kwargs)
+
+    @with_async_llm_error_context("ahealth")
+    async def ahealth(self, **kwargs: Any) -> Mapping[str, Any]:
+        """
+        Async health check passthrough.
+
+        Prefer an async `ahealth()` method on the underlying adapter when
+        available, otherwise run the sync `health()` method in a worker
+        thread via `asyncio.to_thread` to avoid blocking the event loop.
+        """
+        ahealth_fn = getattr(self._llm_adapter, "ahealth", None)
+        if callable(ahealth_fn):
+            return await ahealth_fn(**kwargs)
+
+        health_fn = getattr(self._llm_adapter, "health", None)
+        if callable(health_fn):
+            return await asyncio.to_thread(health_fn, **kwargs)
+
+        raise RuntimeError(
+            "Underlying LLM adapter does not implement health(). "
+            "This violates the LLMProtocolV1 requirements."
+        )
+
+    @with_llm_error_context("capabilities")
+    def capabilities(self, **kwargs: Any) -> Mapping[str, Any]:
+        """
+        Sync capabilities passthrough.
+
+        Delegates to the underlying LLM adapter's `capabilities()` method.
+        Guarded against use from inside an event loop to prevent sync blocking
+        in async code.
+        """
+        _ensure_not_in_event_loop("capabilities")
+
+        caps_fn = getattr(self._llm_adapter, "capabilities", None)
+        if not callable(caps_fn):
+            raise RuntimeError(
+                "Underlying LLM adapter does not implement capabilities(). "
+                "This violates the LLMProtocolV1 requirements."
+            )
+        return caps_fn(**kwargs)
+
+    @with_async_llm_error_context("acapabilities")
+    async def acapabilities(self, **kwargs: Any) -> Mapping[str, Any]:
+        """
+        Async capabilities passthrough.
+
+        Prefer an async `acapabilities()` method on the underlying adapter when
+        available, otherwise run the sync `capabilities()` method in a worker
+        thread via `asyncio.to_thread` to avoid blocking the event loop.
+        """
+        acaps_fn = getattr(self._llm_adapter, "acapabilities", None)
+        if callable(acaps_fn):
+            return await acaps_fn(**kwargs)
+
+        caps_fn = getattr(self._llm_adapter, "capabilities", None)
+        if callable(caps_fn):
+            return await asyncio.to_thread(caps_fn, **kwargs)
+
+        raise RuntimeError(
+            "Underlying LLM adapter does not implement capabilities(). "
+            "This violates the LLMProtocolV1 requirements."
+        )
 
 
 __all__ = [
