@@ -525,7 +525,7 @@ class CorpusLlamaIndexLLM(LLM):
     model: str = "default"
     temperature: float = 0.7
     max_tokens: Optional[int] = None
-    framework_version: Optional[int] = None  # type: ignore[assignment]
+    framework_version: Optional[str] = None
     config: Optional[LlamaIndexLLMConfig] = None
     # Optional explicit context window override; surfaced via metadata.
     context_window: Optional[int] = None
@@ -1206,23 +1206,19 @@ class CorpusLlamaIndexLLM(LLM):
 
     def health(self, **kwargs: Any) -> Mapping[str, Any]:
         """
-        Synchronous health check routed through the LLMTranslator when available.
+        Synchronous health check.
 
-        Primary path:
-            - Call self._translator.health(**kwargs)
+        Resolution order:
+        1. self._translator.health(**kwargs)
+        2. self.llm_adapter.health(**kwargs)
 
-        Fallback:
-            - Call underlying llm_adapter.health(**kwargs) if translator does
-              not expose a health endpoint.
-
-        This keeps health semantics consistent across frameworks while still
-        supporting legacy adapters.
+        This keeps health semantics centralized in the translator while
+        preserving compatibility with adapters that implement health only.
         """
-        # Prefer translator-level health
-        health_fn = getattr(self._translator, "health", None)
-        if callable(health_fn):
+        translator_health = getattr(self._translator, "health", None)
+        if callable(translator_health):
             try:
-                return health_fn(**kwargs)
+                return translator_health(**kwargs)
             except Exception as exc:  # noqa: BLE001
                 if self._config.enable_error_context:
                     attach_context(
@@ -1236,15 +1232,14 @@ class CorpusLlamaIndexLLM(LLM):
                     )
                 raise
 
-        # Fallback to underlying adapter health if available
         adapter_health = getattr(self.llm_adapter, "health", None)
         if not callable(adapter_health):
             raise AttributeError(
-                "Neither LLMTranslator nor underlying llm_adapter implements 'health'"
+                "No health implementation available on LLMTranslator or llm_adapter"
             )
 
         try:
-            return adapter_health(**kwargs)  # type: ignore[call-arg]
+            return adapter_health(**kwargs)
         except Exception as exc:  # noqa: BLE001
             if self._config.enable_error_context:
                 attach_context(
@@ -1260,15 +1255,16 @@ class CorpusLlamaIndexLLM(LLM):
 
     async def ahealth(self, **kwargs: Any) -> Mapping[str, Any]:
         """
-        Async health check routed through the LLMTranslator when available.
+        Async health check.
 
         Resolution order:
-        1. translator.ahealth(**kwargs)
-        2. translator.health(**kwargs) via asyncio.to_thread(...)
-        3. llm_adapter.ahealth(**kwargs)
-        4. llm_adapter.health(**kwargs) via asyncio.to_thread(...)
+        1. self._translator.ahealth(**kwargs)
+        2. self._translator.health(**kwargs) via worker thread
+        3. self.llm_adapter.ahealth(**kwargs)
+        4. self.llm_adapter.health(**kwargs) via worker thread
         """
-        # 1. translator.ahealth
+        loop = asyncio.get_running_loop()
+
         translator_ahealth = getattr(self._translator, "ahealth", None)
         if callable(translator_ahealth):
             try:
@@ -1286,11 +1282,13 @@ class CorpusLlamaIndexLLM(LLM):
                     )
                 raise
 
-        # 2. translator.health via thread
         translator_health = getattr(self._translator, "health", None)
         if callable(translator_health):
             try:
-                return await asyncio.to_thread(translator_health, **kwargs)
+                return await loop.run_in_executor(
+                    None,
+                    lambda: translator_health(**kwargs),
+                )
             except Exception as exc:  # noqa: BLE001
                 if self._config.enable_error_context:
                     attach_context(
@@ -1304,7 +1302,6 @@ class CorpusLlamaIndexLLM(LLM):
                     )
                 raise
 
-        # 3. adapter.ahealth
         adapter_ahealth = getattr(self.llm_adapter, "ahealth", None)
         if callable(adapter_ahealth):
             try:
@@ -1322,11 +1319,13 @@ class CorpusLlamaIndexLLM(LLM):
                     )
                 raise
 
-        # 4. adapter.health via thread
         adapter_health = getattr(self.llm_adapter, "health", None)
         if callable(adapter_health):
             try:
-                return await asyncio.to_thread(adapter_health, **kwargs)
+                return await loop.run_in_executor(
+                    None,
+                    lambda: adapter_health(**kwargs),
+                )
             except Exception as exc:  # noqa: BLE001
                 if self._config.enable_error_context:
                     attach_context(
@@ -1346,15 +1345,12 @@ class CorpusLlamaIndexLLM(LLM):
 
     def capabilities(self, **kwargs: Any) -> Mapping[str, Any]:
         """
-        Synchronous capabilities query routed through the LLMTranslator when available.
+        Synchronous capabilities query.
 
-        Primary path:
-            - self._translator.capabilities(**kwargs)
-
-        Fallback:
-            - self.llm_adapter.capabilities(**kwargs) if translator does not expose it.
+        Resolution order:
+        1. self._translator.capabilities(**kwargs)
+        2. self.llm_adapter.capabilities(**kwargs)
         """
-        # Prefer translator-level capabilities
         translator_capabilities = getattr(self._translator, "capabilities", None)
         if callable(translator_capabilities):
             try:
@@ -1372,15 +1368,15 @@ class CorpusLlamaIndexLLM(LLM):
                     )
                 raise
 
-        # Fallback to underlying adapter capabilities
         adapter_capabilities = getattr(self.llm_adapter, "capabilities", None)
         if not callable(adapter_capabilities):
             raise AttributeError(
-                "Neither LLMTranslator nor underlying llm_adapter implements 'capabilities'"
+                "No capabilities implementation available on "
+                "LLMTranslator or llm_adapter"
             )
 
         try:
-            return adapter_capabilities(**kwargs)  # type: ignore[call-arg]
+            return adapter_capabilities(**kwargs)
         except Exception as exc:  # noqa: BLE001
             if self._config.enable_error_context:
                 attach_context(
@@ -1396,15 +1392,16 @@ class CorpusLlamaIndexLLM(LLM):
 
     async def acapabilities(self, **kwargs: Any) -> Mapping[str, Any]:
         """
-        Async capabilities query routed through the LLMTranslator when available.
+        Async capabilities query.
 
         Resolution order:
-        1. translator.acapabilities(**kwargs)
-        2. translator.capabilities(**kwargs) via asyncio.to_thread(...)
-        3. llm_adapter.acapabilities(**kwargs)
-        4. llm_adapter.capabilities(**kwargs) via asyncio.to_thread(...)
+        1. self._translator.acapabilities(**kwargs)
+        2. self._translator.capabilities(**kwargs) via worker thread
+        3. self.llm_adapter.acapabilities(**kwargs)
+        4. self.llm_adapter.capabilities(**kwargs) via worker thread
         """
-        # 1. translator.acapabilities
+        loop = asyncio.get_running_loop()
+
         translator_acapabilities = getattr(self._translator, "acapabilities", None)
         if callable(translator_acapabilities):
             try:
@@ -1422,11 +1419,13 @@ class CorpusLlamaIndexLLM(LLM):
                     )
                 raise
 
-        # 2. translator.capabilities via thread
         translator_capabilities = getattr(self._translator, "capabilities", None)
         if callable(translator_capabilities):
             try:
-                return await asyncio.to_thread(translator_capabilities, **kwargs)
+                return await loop.run_in_executor(
+                    None,
+                    lambda: translator_capabilities(**kwargs),
+                )
             except Exception as exc:  # noqa: BLE001
                 if self._config.enable_error_context:
                     attach_context(
@@ -1440,7 +1439,6 @@ class CorpusLlamaIndexLLM(LLM):
                     )
                 raise
 
-        # 3. adapter.acapabilities
         adapter_acapabilities = getattr(self.llm_adapter, "acapabilities", None)
         if callable(adapter_acapabilities):
             try:
@@ -1458,11 +1456,13 @@ class CorpusLlamaIndexLLM(LLM):
                     )
                 raise
 
-        # 4. adapter.capabilities via thread
         adapter_capabilities = getattr(self.llm_adapter, "capabilities", None)
         if callable(adapter_capabilities):
             try:
-                return await asyncio.to_thread(adapter_capabilities, **kwargs)
+                return await loop.run_in_executor(
+                    None,
+                    lambda: adapter_capabilities(**kwargs),
+                )
             except Exception as exc:  # noqa: BLE001
                 if self._config.enable_error_context:
                     attach_context(
