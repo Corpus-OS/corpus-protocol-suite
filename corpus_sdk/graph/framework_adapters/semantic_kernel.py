@@ -40,6 +40,8 @@ Non-responsibilities
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 from functools import cached_property
 from typing import (
@@ -108,6 +110,7 @@ class ErrorCodes:
     BAD_BULK_VERTICES_RESULT = "BAD_BULK_VERTICES_RESULT"
     BAD_BATCH_RESULT = "BAD_BATCH_RESULT"
     BAD_ADAPTER_RESULT = "BAD_ADAPTER_RESULT"
+    SYNC_WRAPPER_CALLED_IN_EVENT_LOOP = "SYNC_WRAPPER_CALLED_IN_EVENT_LOOP"
 
 
 # --------------------------------------------------------------------------- #
@@ -150,6 +153,51 @@ def with_async_graph_error_context(
 # Backwards-compatible aliases (for older imports)
 with_error_context = with_graph_error_context
 with_async_error_context = with_async_graph_error_context
+
+
+def _looks_like_operation_context(obj: Any) -> bool:
+    """
+    Heuristic check; OperationContext may be a Protocol/alias in some SDK versions.
+
+    We first try a nominal isinstance check, then fall back to a structural
+    check on common attributes used by OperationContext.
+    """
+    if obj is None:
+        return False
+
+    try:
+        if isinstance(obj, OperationContext):
+            return True
+    except TypeError:
+        # OperationContext may be a typing.Protocol in some modes.
+        pass
+
+    attrs = ("request_id", "traceparent", "tenant", "attrs", "to_dict")
+    return any(hasattr(obj, attr) for attr in attrs)
+
+
+def _ensure_not_in_event_loop(api_name: str) -> None:
+    """
+    Guard to prevent sync methods from being called inside a running event loop.
+
+    This mirrors the behavior of other framework adapters (e.g., AutoGen /
+    LangChain / LlamaIndex) to avoid sync-over-async deadlocks in environments
+    like Jupyter, FastAPI, or SK-hosted loops.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # No running event loop in this thread – safe for sync calls.
+        return
+
+    if loop.is_running():
+        # We raise a RuntimeError with a stable, symbolic error code to make it
+        # easy to detect and handle in higher-level orchestration.
+        raise RuntimeError(
+            f"{ErrorCodes.SYNC_WRAPPER_CALLED_IN_EVENT_LOOP}: "
+            f"Semantic Kernel sync graph API '{api_name}' cannot be called "
+            "from an active event loop. Use the corresponding async method instead."
+        )
 
 
 class SemanticKernelGraphClientProtocol(Protocol):
@@ -388,6 +436,14 @@ class SemanticKernelGraphClientProtocol(Protocol):
     ) -> BatchResult:
         ...
 
+    # Resource management -------------------------------------------------
+
+    def close(self) -> None:
+        ...
+
+    async def aclose(self) -> None:
+        ...
+
 
 class SemanticKernelGraphFrameworkTranslator(DefaultGraphFrameworkTranslator):
     """
@@ -505,28 +561,96 @@ class CorpusSemanticKernelGraphClient:
         self._framework_translator: Optional[DefaultGraphFrameworkTranslator] = (
             framework_translator
         )
+        # Idempotent close flags for explicit close() / aclose() and context managers.
+        self._closed: bool = False
+        self._aclosed: bool = False
 
     # ------------------------------------------------------------------ #
     # Resource Management (Context Managers)
     # ------------------------------------------------------------------ #
 
-    def __enter__(self) -> CorpusSemanticKernelGraphClient:
+    def __enter__(self) -> "CorpusSemanticKernelGraphClient":
         """Support context manager protocol for resource cleanup."""
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        """Clean up resources when exiting context."""
-        if hasattr(self._graph, "close"):
-            self._graph.close()
+        """
+        Clean up resources when exiting context.
 
-    async def __aenter__(self) -> CorpusSemanticKernelGraphClient:
+        Delegates to the explicit close() method so that cleanup behavior
+        is centralized and idempotent.
+        """
+        try:
+            self.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Error while closing graph client in __exit__: %s",
+                exc,
+            )
+
+    async def __aenter__(self) -> "CorpusSemanticKernelGraphClient":
         """Support async context manager protocol."""
         return self
 
-    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        """Clean up resources when exiting async context."""
+    async def __aexit__(
+        self,
+        exc_type: Any,
+        exc_val: Any,
+        exc_tb: Any,
+    ) -> None:
+        """
+        Clean up resources when exiting async context.
+
+        Delegates to the explicit aclose() method so that cleanup behavior
+        is centralized and idempotent.
+        """
+        try:
+            await self.aclose()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Error while closing graph client in __aexit__: %s",
+                exc,
+            )
+
+    def close(self) -> None:
+        """
+        Explicitly close underlying resources (sync).
+
+        This method is idempotent and safe to call multiple times. It will
+        call `close()` on the underlying graph adapter when available.
+        """
+        if self._closed:
+            return
+        self._closed = True
+
+        if hasattr(self._graph, "close"):
+            try:
+                self._graph.close()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Error while closing graph adapter in close(): %s",
+                    exc,
+                )
+
+    async def aclose(self) -> None:
+        """
+        Explicitly close underlying resources (async).
+
+        This method is idempotent and safe to call multiple times. It will
+        call `aclose()` on the underlying graph adapter when available.
+        """
+        if self._aclosed:
+            return
+        self._aclosed = True
+
         if hasattr(self._graph, "aclose"):
-            await self._graph.aclose()
+            try:
+                await self._graph.aclose()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Error while closing graph adapter in aclose(): %s",
+                    exc,
+                )
 
     # ------------------------------------------------------------------ #
     # Translator (lazy, cached)
@@ -570,6 +694,10 @@ class CorpusSemanticKernelGraphClient:
 
         If all are empty/None, returns None and lets downstream helpers
         construct an "empty" OperationContext as needed.
+
+        Context translation is best-effort: failures are logged and attached
+        for observability, but graph operations proceed without an
+        OperationContext when necessary.
         """
         extra: Dict[str, Any] = dict(extra_context or {})
 
@@ -577,27 +705,57 @@ class CorpusSemanticKernelGraphClient:
             return None
 
         try:
-            ctx = core_ctx_from_semantic_kernel(
+            ctx_candidate = core_ctx_from_semantic_kernel(
                 context,
                 settings=settings,
                 framework_version=self._framework_version,
                 **extra,
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
+            # Attach rich error context but do not fail the graph call purely
+            # because context translation misbehaved.
             attach_context(
                 exc,
                 framework="semantic_kernel",
                 operation="context_translation",
+                error_code=ErrorCodes.BAD_OPERATION_CONTEXT,
+                context_type=type(context).__name__ if context is not None else "None",
+                settings_type=type(settings).__name__ if settings is not None else "None",
+                extra_context_keys=list(extra.keys()),
             )
-            raise BadRequest(
-                "Failed to build OperationContext from Semantic Kernel inputs",
-                code=ErrorCodes.BAD_OPERATION_CONTEXT,
-            ) from exc
+            logger.warning(
+                "[%s] Failed to build OperationContext from Semantic Kernel inputs; "
+                "proceeding without OperationContext. context_type=%s settings_type=%s extra_keys=%s",
+                ErrorCodes.BAD_OPERATION_CONTEXT,
+                type(context).__name__ if context is not None else "None",
+                type(settings).__name__ if settings is not None else "None",
+                list(extra.keys()),
+            )
+            return None
 
-        if not isinstance(ctx, OperationContext):
-            raise BadRequest(
-                f"from_semantic_kernel produced unsupported context type: {type(ctx).__name__}",
-                code=ErrorCodes.BAD_OPERATION_CONTEXT,
+        if not _looks_like_operation_context(ctx_candidate):
+            logger.warning(
+                "[%s] from_semantic_kernel produced unsupported context type %s; "
+                "proceeding without OperationContext.",
+                ErrorCodes.BAD_OPERATION_CONTEXT,
+                type(ctx_candidate).__name__,
+            )
+            return None
+
+        ctx: OperationContext = ctx_candidate  # type: ignore[assignment]
+
+        # Best-effort enrichment of OperationContext.attrs with framework metadata.
+        attrs = getattr(ctx, "attrs", None)
+        try:
+            if isinstance(attrs, dict):
+                if "framework" not in attrs:
+                    attrs["framework"] = "semantic_kernel"
+                if self._framework_version is not None and "framework_version" not in attrs:
+                    attrs["framework_version"] = self._framework_version
+        except Exception:  # noqa: BLE001
+            # Attrs may be immutable or otherwise protected; this is non-fatal.
+            logger.debug(
+                "Failed to enrich OperationContext.attrs for Semantic Kernel framework.",
             )
 
         return ctx
@@ -668,21 +826,66 @@ class CorpusSemanticKernelGraphClient:
         """
         Basic structural validation for UpsertEdgesSpec.edges to provide
         clearer errors before reaching the adapter / translator.
+
+        This mirrors the stricter checks in other framework adapters:
+        - edges must not be None
+        - edges must be iterable and non-empty
+        - each edge must have id, src, dst, label
+        - properties (if present) must be JSON-serializable
         """
         if spec.edges is None:
-            raise BadRequest("UpsertEdgesSpec.edges must not be None")
+            raise BadRequest(
+                "UpsertEdgesSpec.edges must not be None",
+                code=ErrorCodes.BAD_ADAPTER_RESULT,
+            )
 
         try:
             edges_list = list(spec.edges)
         except TypeError as exc:
             raise BadRequest(
                 "UpsertEdgesSpec.edges must be an iterable of edges",
+                code=ErrorCodes.BAD_ADAPTER_RESULT,
             ) from exc
 
         if not edges_list:
-            raise BadRequest("UpsertEdgesSpec must contain at least one edge")
+            raise BadRequest(
+                "UpsertEdgesSpec must contain at least one edge",
+                code=ErrorCodes.BAD_ADAPTER_RESULT,
+            )
 
-        # Normalize to list to avoid one-shot iterables.
+        for idx, edge in enumerate(edges_list):
+            if not getattr(edge, "id", None):
+                raise BadRequest(
+                    f"Edge at index {idx} must have an ID",
+                    code=ErrorCodes.BAD_ADAPTER_RESULT,
+                )
+            if not getattr(edge, "src", None):
+                raise BadRequest(
+                    f"Edge at index {idx} must have source node ID",
+                    code=ErrorCodes.BAD_ADAPTER_RESULT,
+                )
+            if not getattr(edge, "dst", None):
+                raise BadRequest(
+                    f"Edge at index {idx} must have target node ID",
+                    code=ErrorCodes.BAD_ADAPTER_RESULT,
+                )
+            if not getattr(edge, "label", None):
+                raise BadRequest(
+                    f"Edge at index {idx} must have a label",
+                    code=ErrorCodes.BAD_ADAPTER_RESULT,
+                )
+
+            props = getattr(edge, "properties", None)
+            if props is not None:
+                try:
+                    json.dumps(props)
+                except (TypeError, ValueError) as exc:
+                    raise BadRequest(
+                        f"Edge at index {idx} properties must be JSON-serializable: {exc}",
+                        code=ErrorCodes.BAD_ADAPTER_RESULT,
+                    ) from exc
+
+        # Normalize to list to avoid one-shot iterables after validation.
         spec.edges = edges_list  # type: ignore[assignment]
 
     # ------------------------------------------------------------------ #
@@ -695,6 +898,7 @@ class CorpusSemanticKernelGraphClient:
         Sync wrapper around capabilities, delegating async→sync bridging
         to GraphTranslator.
         """
+        _ensure_not_in_event_loop("capabilities")
         caps = self._translator.capabilities()
         # Normalize to a simple dict for SK consumption via shared helper.
         return graph_capabilities_to_dict(caps)
@@ -721,6 +925,7 @@ class CorpusSemanticKernelGraphClient:
         """
         Sync schema introspection, via GraphTranslator.
         """
+        _ensure_not_in_event_loop("get_schema")
         ctx = self._build_ctx(
             context=context,
             settings=settings,
@@ -728,7 +933,7 @@ class CorpusSemanticKernelGraphClient:
         )
         schema = self._translator.get_schema(
             op_ctx=ctx,
-            framework_ctx={},
+            framework_ctx=self._framework_ctx(operation="get_schema"),
         )
         return validate_graph_result_type(
             schema,
@@ -755,7 +960,7 @@ class CorpusSemanticKernelGraphClient:
         )
         schema = await self._translator.arun_get_schema(
             op_ctx=ctx,
-            framework_ctx={},
+            framework_ctx=self._framework_ctx(operation="get_schema"),
         )
         return validate_graph_result_type(
             schema,
@@ -777,6 +982,7 @@ class CorpusSemanticKernelGraphClient:
 
         Delegates async→sync bridging to GraphTranslator.
         """
+        _ensure_not_in_event_loop("health")
         ctx = self._build_ctx(
             context=context,
             settings=settings,
@@ -784,7 +990,7 @@ class CorpusSemanticKernelGraphClient:
         )
         health_result = self._translator.health(
             op_ctx=ctx,
-            framework_ctx={},
+            framework_ctx=self._framework_ctx(operation="health"),
         )
         return validate_graph_result_type(
             health_result,
@@ -811,7 +1017,7 @@ class CorpusSemanticKernelGraphClient:
         )
         health_result = await self._translator.arun_health(
             op_ctx=ctx,
-            framework_ctx={},
+            framework_ctx=self._framework_ctx(operation="health"),
         )
         return validate_graph_result_type(
             health_result,
@@ -842,6 +1048,7 @@ class CorpusSemanticKernelGraphClient:
 
         Returns the underlying `QueryResult`.
         """
+        _ensure_not_in_event_loop("query")
         validate_graph_query(query)
 
         ctx = self._build_ctx(
@@ -949,6 +1156,7 @@ class CorpusSemanticKernelGraphClient:
         Delegates streaming orchestration to GraphTranslator, which uses
         SyncStreamBridge under the hood.
         """
+        _ensure_not_in_event_loop("stream_query")
         validate_graph_query(query)
 
         ctx = self._build_ctx(
@@ -1045,6 +1253,7 @@ class CorpusSemanticKernelGraphClient:
         """
         Sync wrapper for upserting nodes via GraphTranslator.
         """
+        _ensure_not_in_event_loop("upsert_nodes")
         validate_upsert_nodes_spec(spec)
 
         ctx = self._build_ctx(
@@ -1117,6 +1326,7 @@ class CorpusSemanticKernelGraphClient:
         """
         Sync wrapper for upserting edges via GraphTranslator.
         """
+        _ensure_not_in_event_loop("upsert_edges")
         self._validate_upsert_edges_spec(spec)
 
         ctx = self._build_ctx(
@@ -1193,6 +1403,7 @@ class CorpusSemanticKernelGraphClient:
         """
         Sync wrapper for deleting nodes via GraphTranslator.
         """
+        _ensure_not_in_event_loop("delete_nodes")
         ctx = self._build_ctx(
             context=context,
             settings=settings,
@@ -1206,7 +1417,13 @@ class CorpusSemanticKernelGraphClient:
         if spec.filter is not None:
             raw_filter_or_ids: Any = spec.filter
         else:
-            raw_filter_or_ids = list(spec.ids or [])
+            ids = list(spec.ids or [])
+            if not ids:
+                raise BadRequest(
+                    "DeleteNodesSpec must specify either filter or non-empty ids",
+                    code=ErrorCodes.BAD_ADAPTER_RESULT,
+                )
+            raw_filter_or_ids = ids
 
         result = self._translator.delete_nodes(
             raw_filter_or_ids,
@@ -1245,7 +1462,13 @@ class CorpusSemanticKernelGraphClient:
         if spec.filter is not None:
             raw_filter_or_ids: Any = spec.filter
         else:
-            raw_filter_or_ids = list(spec.ids or [])
+            ids = list(spec.ids or [])
+            if not ids:
+                raise BadRequest(
+                    "DeleteNodesSpec must specify either filter or non-empty ids",
+                    code=ErrorCodes.BAD_ADAPTER_RESULT,
+                )
+            raw_filter_or_ids = ids
 
         result = await self._translator.arun_delete_nodes(
             raw_filter_or_ids,
@@ -1271,6 +1494,7 @@ class CorpusSemanticKernelGraphClient:
         """
         Sync wrapper for deleting edges via GraphTranslator.
         """
+        _ensure_not_in_event_loop("delete_edges")
         ctx = self._build_ctx(
             context=context,
             settings=settings,
@@ -1284,7 +1508,13 @@ class CorpusSemanticKernelGraphClient:
         if spec.filter is not None:
             raw_filter_or_ids: Any = spec.filter
         else:
-            raw_filter_or_ids = list(spec.ids or [])
+            ids = list(spec.ids or [])
+            if not ids:
+                raise BadRequest(
+                    "DeleteEdgesSpec must specify either filter or non-empty ids",
+                    code=ErrorCodes.BAD_ADAPTER_RESULT,
+                )
+            raw_filter_or_ids = ids
 
         result = self._translator.delete_edges(
             raw_filter_or_ids,
@@ -1323,7 +1553,13 @@ class CorpusSemanticKernelGraphClient:
         if spec.filter is not None:
             raw_filter_or_ids: Any = spec.filter
         else:
-            raw_filter_or_ids = list(spec.ids or [])
+            ids = list(spec.ids or [])
+            if not ids:
+                raise BadRequest(
+                    "DeleteEdgesSpec must specify either filter or non-empty ids",
+                    code=ErrorCodes.BAD_ADAPTER_RESULT,
+                )
+            raw_filter_or_ids = ids
 
         result = await self._translator.arun_delete_edges(
             raw_filter_or_ids,
@@ -1353,6 +1589,7 @@ class CorpusSemanticKernelGraphClient:
         """
         Sync wrapper for bulk_vertices via GraphTranslator.
         """
+        _ensure_not_in_event_loop("bulk_vertices")
         ctx = self._build_ctx(
             context=context,
             settings=settings,
@@ -1437,6 +1674,7 @@ class CorpusSemanticKernelGraphClient:
         """
         Sync wrapper for batch operations via GraphTranslator.
         """
+        _ensure_not_in_event_loop("batch")
         validate_batch_operations(self._graph, ops)
 
         ctx = self._build_ctx(
