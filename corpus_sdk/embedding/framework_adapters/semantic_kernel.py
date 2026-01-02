@@ -19,6 +19,26 @@ while maintaining the protocol-first Corpus embedding stack.
 
 Resilience (retries, caching, rate limiting, etc.) is expected to be provided
 by the underlying adapter, typically a BaseEmbeddingAdapter subclass.
+
+Design notes / philosophy
+-------------------------
+- **Protocol-first**: only a duck-typed `embed` method is required on the
+  `corpus_adapter`, rather than strict subclassing of a specific base class.
+- **Resilient to framework evolution**: Semantic Kernel APIs and signatures
+  evolve; this adapter defensively normalizes context and avoids depending on
+  unstable internals.
+- **Observability-first**: every embedding operation attaches rich error context
+  (framework identity, model info, batch metrics, SK routing fields, context
+  snapshots) via `attach_context`.
+- **Fail-safe context translation**: context translation via
+  `context_from_semantic_kernel` must never break embeddings; failures are
+  logged with snapshots and embeddings proceed without a core context.
+- **Strict by default** (configurable): non-string inputs in batch operations
+  are rejected unless `strict_text_types=False`, in which case they are treated
+  as empty and receive zero-vector embeddings while preserving row alignment.
+- **Async-safe sync usage**: sync APIs enforce guard rails to prevent calling
+  them from inside an active asyncio event loop; callers are guided to their
+  async counterparts with explicit error codes.
 """
 
 from __future__ import annotations
@@ -108,6 +128,9 @@ class ErrorCodes:
     SEMANTIC_KERNEL_CONTEXT_INVALID = "SEMANTIC_KERNEL_CONTEXT_INVALID"
     SEMANTIC_KERNEL_CONFIG_INVALID = "SEMANTIC_KERNEL_CONFIG_INVALID"
 
+    # Sync wrapper misuse (parity with other adapters)
+    SYNC_WRAPPER_CALLED_IN_EVENT_LOOP = "SYNC_WRAPPER_CALLED_IN_EVENT_LOOP"
+
 
 # Coercion configuration for the common embedding utils
 EMBEDDING_COERCION_ERROR_CODES: CoercionErrorCodes = CoercionErrorCodes(
@@ -158,7 +181,7 @@ class SemanticKernelAdapterConfig(TypedDict, total=False):
 
 
 # ---------------------------------------------------------------------------
-# Helpers (validation, snapshots)
+# Helpers (validation, snapshots, event-loop guards, async closing)
 # ---------------------------------------------------------------------------
 
 
@@ -220,6 +243,59 @@ def _normalize_sk_config(sk_config: Mapping[str, Any]) -> SemanticKernelAdapterC
     return cfg
 
 
+def _ensure_not_in_event_loop(
+    sync_api_name: str,
+    *,
+    async_alternative: Optional[str] = None,
+) -> None:
+    """
+    Prevent deadlocks from calling sync APIs in async contexts.
+
+    In async code, callers must use the async variants (e.g. generate_embedding_async).
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        # No running event loop: safe to call sync method.
+        return
+
+    if async_alternative:
+        suggestion = f"Use the async variant instead (e.g. 'await {async_alternative}(...)'). "
+    else:
+        suggestion = "Use the corresponding async variant instead. "
+    raise RuntimeError(
+        f"{sync_api_name} was called from inside an active asyncio event loop. "
+        f"{suggestion}"
+        f"[{ErrorCodes.SYNC_WRAPPER_CALLED_IN_EVENT_LOOP}]"
+    )
+
+
+async def _maybe_close_async(obj: Any) -> None:
+    """
+    Best-effort async resource cleanup with prioritization.
+
+    - Prefer an async `aclose()` method if present.
+    - Fall back to a coroutine `close()` if defined.
+    - Fall back to a sync `close()` executed in a worker thread.
+    """
+    if obj is None:
+        return
+
+    aclose = getattr(obj, "aclose", None)
+    if callable(aclose):
+        await aclose()
+        return
+
+    close = getattr(obj, "close", None)
+    if not callable(close):
+        return
+
+    if asyncio.iscoroutinefunction(close):
+        await close()
+    else:
+        await asyncio.to_thread(close)
+
+
 # ---------------------------------------------------------------------------
 # Error-context decorators with dynamic context extraction
 # ---------------------------------------------------------------------------
@@ -238,6 +314,7 @@ def _extract_dynamic_context(
     Captures:
     - model_id / model
     - framework_version
+    - embedding_dim hint (when available)
     - text_len / texts_count / empty_texts_count
     - Semantic Kernel routing fields from sk_context
     - snapshot of sk_context (for nested/complex cases)
@@ -248,23 +325,30 @@ def _extract_dynamic_context(
         "framework_version": _FRAMEWORK_VERSION,
     }
 
+    dim_hint = getattr(instance, "_embedding_dim_hint", None)
+    if isinstance(dim_hint, int):
+        ctx["embedding_dim"] = dim_hint
+
     # Metrics
     if operation == "embedding_query":
         if args and isinstance(args[0], str):
             ctx["text_len"] = len(args[0])
     elif operation == "embedding_documents":
-        if args and isinstance(args[0], Sequence):
-            texts_seq = args[0]
-            try:
-                ctx["texts_count"] = len(texts_seq)  # type: ignore[arg-type]
-                empty_count = 0
-                for t in texts_seq:  # type: ignore[assignment]
-                    if not isinstance(t, str) or not t.strip():
-                        empty_count += 1
-                if empty_count:
-                    ctx["empty_texts_count"] = empty_count
-            except Exception:
-                pass
+        if args:
+            maybe_texts = args[0]
+            # Strings are Sequences; avoid counting characters as documents.
+            if isinstance(maybe_texts, Sequence) and not isinstance(maybe_texts, (str, bytes)):
+                texts_seq = maybe_texts
+                try:
+                    ctx["texts_count"] = len(texts_seq)  # type: ignore[arg-type]
+                    empty_count = 0
+                    for t in texts_seq:  # type: ignore[assignment]
+                        if not isinstance(t, str) or not t.strip():
+                            empty_count += 1
+                    if empty_count:
+                        ctx["empty_texts_count"] = empty_count
+                except Exception:
+                    pass
 
     sk_context = kwargs.get("sk_context")
     if isinstance(sk_context, Mapping) and sk_context:
@@ -421,6 +505,9 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
         self._translator_lock = threading.Lock()
         self._translator_instance: Optional[EmbeddingTranslator] = None
 
+        # Best-effort embedding dimension hint (populated after first successful embed)
+        self._embedding_dim_hint: Optional[int] = None
+
         # Enforce known embedding dimension to avoid incorrect fallbacks
         if (
             not hasattr(self.corpus_adapter, "get_embedding_dimension")
@@ -455,6 +542,10 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
                 text_normalization_config=self.text_normalization_config,
             )
             self._translator_instance = translator
+            logger.debug(
+                "EmbeddingTranslator initialized for Semantic Kernel with model_id=%s",
+                self.model_id or "default",
+            )
             return translator
 
     @property
@@ -482,6 +573,22 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
             "Embedding dimension is unknown. Adapter does not expose "
             "`get_embedding_dimension()` and no `embedding_dimension` override was provided."
         )
+
+    def _update_dim_hint(self, dim: Optional[int]) -> None:
+        """
+        Thread-safe, best-effort dimension hint update.
+
+        Uses first-write-wins semantics under the existing translator lock to
+        avoid races in concurrent first-embed scenarios.
+        """
+        if dim is None:
+            return
+        if self._embedding_dim_hint is not None:
+            return
+
+        with self._translator_lock:
+            if self._embedding_dim_hint is None:
+                self._embedding_dim_hint = dim
 
     # ------------------------------------------------------------------ #
     # Context building (SK context → OperationContext + framework_ctx)
@@ -512,6 +619,14 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
         }
         if _FRAMEWORK_VERSION is not None:
             framework_ctx["framework_version"] = _FRAMEWORK_VERSION
+
+        # Provide a best-effort dimension hint for downstream logging and tooling.
+        try:
+            dim_hint = self._embedding_dim_hint or self.embedding_dimension
+        except Exception:
+            # If embedding_dimension resolution fails, we still want embeddings to work.
+            dim_hint = self._embedding_dim_hint
+        framework_ctx["embedding_dim_hint"] = dim_hint
 
         ctx_map: Optional[Mapping[str, Any]] = None
         if sk_context is None:
@@ -552,7 +667,10 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
                         framework=_FRAMEWORK_NAME,
                         operation="context_build",
                         error_codes=EMBEDDING_COERCION_ERROR_CODES,
-                        sk_context_snapshot=_safe_snapshot(ctx_map, max_items=self.sk_config["max_items_in_context"]),
+                        sk_context_snapshot=_safe_snapshot(
+                            ctx_map,
+                            max_items=self.sk_config["max_items_in_context"],
+                        ),
                         framework_version=_FRAMEWORK_VERSION,
                     )
                 except Exception:
@@ -609,6 +727,7 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
         Delegates to EmbeddingTranslator.capabilities(), which centralizes
         async/sync adapter behavior and error context.
         """
+        _ensure_not_in_event_loop("capabilities", async_alternative="acapabilities")
         return self._translator.capabilities()
 
     @with_async_embedding_error_context("capabilities")
@@ -627,6 +746,7 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
 
         Delegates to EmbeddingTranslator.health().
         """
+        _ensure_not_in_event_loop("health", async_alternative="ahealth")
         return self._translator.health()
 
     @with_async_embedding_error_context("health")
@@ -639,35 +759,76 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
         return await self._translator.arun_health()
 
     # ------------------------------------------------------------------ #
-    # Resource management (context managers)
+    # Resource management (context managers + explicit close)
     # ------------------------------------------------------------------ #
+
+    def close(self) -> None:
+        """
+        Close underlying resources if they expose a close() method.
+
+        This includes:
+        - The underlying corpus_adapter
+        - The EmbeddingTranslator if it was constructed and exposes close()
+        """
+        translator = self._translator_instance
+        if isinstance(translator, EmbeddingTranslator):
+            close_translator = getattr(translator, "close", None)
+            if callable(close_translator):
+                try:
+                    close_translator()
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        "Error while closing embedding translator in close(): %s",
+                        e,
+                    )
+
+        fn = getattr(self.corpus_adapter, "close", None)
+        if callable(fn):
+            try:
+                fn()
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "Error while closing embedding adapter in close(): %s",
+                    e,
+                )
+
+    async def aclose(self) -> None:
+        """
+        Async-close underlying resources if they expose async closers.
+
+        Prefers:
+        - translator.aclose() / translator.close()
+        - corpus_adapter.aclose() / corpus_adapter.close()
+        """
+        translator = self._translator_instance
+        if isinstance(translator, EmbeddingTranslator):
+            try:
+                await _maybe_close_async(translator)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "Error while closing embedding translator in aclose(): %s",
+                    e,
+                )
+
+        try:
+            await _maybe_close_async(self.corpus_adapter)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "Error while closing embedding adapter in aclose(): %s",
+                e,
+            )
 
     def __enter__(self) -> "CorpusSemanticKernelEmbeddings":
         return self
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
-        if hasattr(self.corpus_adapter, "close") and callable(getattr(self.corpus_adapter, "close")):
-            try:
-                self.corpus_adapter.close()  # type: ignore[misc]
-            except Exception:
-                pass
+        self.close()
 
     async def __aenter__(self) -> "CorpusSemanticKernelEmbeddings":
         return self
 
     async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
-        if hasattr(self.corpus_adapter, "aclose") and callable(getattr(self.corpus_adapter, "aclose")):
-            try:
-                await self.corpus_adapter.aclose()  # type: ignore[misc]
-                return
-            except Exception:
-                pass
-        # fallback: try sync close in a thread
-        if hasattr(self.corpus_adapter, "close") and callable(getattr(self.corpus_adapter, "close")):
-            try:
-                await asyncio.to_thread(self.corpus_adapter.close)  # type: ignore[arg-type]
-            except Exception:
-                pass
+        await self.aclose()
 
     # ------------------------------------------------------------------ #
     # Unified embedding helpers (single + batch)
@@ -687,7 +848,9 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
             op_ctx=core_ctx,
             framework_ctx=framework_ctx,
         )
-        return self._coerce_embedding_vector(translated)
+        vec = self._coerce_embedding_vector(translated)
+        self._update_dim_hint(len(vec))
+        return vec
 
     async def _aembed_single_text(self, text: str, *, sk_context: Any = None) -> List[float]:
         core_ctx, framework_ctx = self._build_contexts(sk_context=sk_context)
@@ -702,7 +865,9 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
             op_ctx=core_ctx,
             framework_ctx=framework_ctx,
         )
-        return self._coerce_embedding_vector(translated)
+        vec = self._coerce_embedding_vector(translated)
+        self._update_dim_hint(len(vec))
+        return vec
 
     def _embed_text_batch(self, texts: Sequence[Any], *, sk_context: Any = None, op_name: str) -> List[List[float]]:
         texts_list = list(texts)
@@ -722,7 +887,10 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
             else:
                 empty_indices.append(i)
 
-        self._warn_if_extreme_batch([t if isinstance(t, str) else "" for t in texts_list], op_name=op_name)
+        self._warn_if_extreme_batch(
+            [t if isinstance(t, str) else "" for t in texts_list],
+            op_name=op_name,
+        )
 
         if not normalized:
             dim = self.embedding_dimension
@@ -742,15 +910,18 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
         )
         mat = self._coerce_embedding_matrix(translated)
 
+        dim = len(mat[0]) if mat else None
+        self._update_dim_hint(dim)
+
         # Re-insert zero rows for empty inputs
         if empty_indices:
-            dim = len(mat[0]) if mat else self.embedding_dimension
+            inferred_dim = dim if dim is not None else self.embedding_dimension
             out: List[List[float]] = []
             j = 0
             empty_set = set(empty_indices)
             for i in range(len(texts_list)):
                 if i in empty_set:
-                    out.append([0.0] * dim)
+                    out.append([0.0] * inferred_dim)
                 else:
                     out.append(mat[j])
                     j += 1
@@ -775,7 +946,10 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
             else:
                 empty_indices.append(i)
 
-        self._warn_if_extreme_batch([t if isinstance(t, str) else "" for t in texts_list], op_name=op_name)
+        self._warn_if_extreme_batch(
+            [t if isinstance(t, str) else "" for t in texts_list],
+            op_name=op_name,
+        )
 
         if not normalized:
             dim = self.embedding_dimension
@@ -795,14 +969,17 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
         )
         mat = self._coerce_embedding_matrix(translated)
 
+        dim = len(mat[0]) if mat else None
+        self._update_dim_hint(dim)
+
         if empty_indices:
-            dim = len(mat[0]) if mat else self.embedding_dimension
+            inferred_dim = dim if dim is not None else self.embedding_dimension
             out: List[List[float]] = []
             j = 0
             empty_set = set(empty_indices)
             for i in range(len(texts_list)):
                 if i in empty_set:
-                    out.append([0.0] * dim)
+                    out.append([0.0] * inferred_dim)
                 else:
                     out.append(mat[j])
                     j += 1
@@ -822,8 +999,16 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
         sk_context: Any = None,
         **__: Any,
     ) -> List[List[float]]:
+        _ensure_not_in_event_loop(
+            "generate_embeddings",
+            async_alternative="generate_embeddings_async",
+        )
         # Tests expect type errors mentioning generate_embeddings specifically.
-        return self._embed_text_batch(texts, sk_context=sk_context, op_name="generate_embeddings")
+        return self._embed_text_batch(
+            texts,
+            sk_context=sk_context,
+            op_name="generate_embeddings",
+        )
 
     @with_embedding_error_context("embedding_query")
     def generate_embedding(
@@ -833,6 +1018,11 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
         sk_context: Any = None,
         **__: Any,
     ) -> List[float]:
+        _ensure_not_in_event_loop(
+            "generate_embedding",
+            async_alternative="generate_embedding_async",
+        )
+
         if self.sk_config["strict_text_types"]:
             _validate_text_is_string(text, op_name="generate_embedding")
 
@@ -853,7 +1043,11 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
         sk_context: Any = None,
         **__: Any,
     ) -> List[List[float]]:
-        return await self._aembed_text_batch(texts, sk_context=sk_context, op_name="generate_embeddings_async")
+        return await self._aembed_text_batch(
+            texts,
+            sk_context=sk_context,
+            op_name="generate_embeddings_async",
+        )
 
     @with_async_embedding_error_context("embedding_query")
     async def generate_embedding_async(
@@ -880,6 +1074,10 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
 
     @with_embedding_error_context("embedding_documents")
     def embed_documents(self, texts: Sequence[Any], *, sk_context: Any = None, **kwargs: Any) -> List[List[float]]:
+        _ensure_not_in_event_loop(
+            "embed_documents",
+            async_alternative="aembed_documents",
+        )
         # Tests look for "embed_documents expects Sequence[str]" errors.
         if self.sk_config["strict_text_types"]:
             _validate_texts_are_strings(list(texts), op_name="embed_documents")
@@ -887,6 +1085,10 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
 
     @with_embedding_error_context("embedding_query")
     def embed_query(self, text: Any, *, sk_context: Any = None, **kwargs: Any) -> List[float]:
+        _ensure_not_in_event_loop(
+            "embed_query",
+            async_alternative="aembed_query",
+        )
         if self.sk_config["strict_text_types"]:
             _validate_text_is_string(text, op_name="embed_query")
         return self.generate_embedding(text, sk_context=sk_context, **kwargs)
