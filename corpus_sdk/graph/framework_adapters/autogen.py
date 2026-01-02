@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import json
 import logging
+import asyncio
 from functools import cached_property
 from typing import (
     Any,
@@ -194,6 +195,26 @@ def _looks_like_operation_context(obj: Any) -> bool:
     # Fallback to structural check
     attrs = ("request_id", "traceparent", "tenant", "attrs", "to_dict")
     return any(hasattr(obj, attr) for attr in attrs)
+
+
+def _ensure_not_in_event_loop(sync_api_name: str) -> None:
+    """
+    Prevent accidentally calling sync APIs from inside an active asyncio event loop.
+
+    This mirrors the safety behavior used in the AutoGen embedding adapter to
+    avoid subtle deadlocks and confusing behavior. Call this at the top of
+    sync methods that also have async counterparts (query/aquery, etc.).
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        # No running loop → safe to call sync API.
+        return
+
+    raise RuntimeError(
+        f"{sync_api_name} was called from inside an active asyncio event loop. "
+        f"Use the async variant instead (e.g. 'a{sync_api_name}')."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -727,6 +748,12 @@ class CorpusAutoGenGraphClient:
         Context translation is *best-effort*: failures are logged and attached
         for observability, but graph operations must still be able to proceed
         without an OperationContext.
+
+        When a valid OperationContext is produced, its attrs are enriched with
+        framework metadata so downstream layers can reliably identify the
+        source of the call:
+            - framework="autogen"
+            - framework_version=<self._framework_version> (if set)
         """
         extra: Dict[str, Any] = dict(extra_context or {})
 
@@ -757,16 +784,31 @@ class CorpusAutoGenGraphClient:
             )
             return None
 
-        if _looks_like_operation_context(ctx_candidate):
-            return ctx_candidate  # type: ignore[return-value]
+        if not _looks_like_operation_context(ctx_candidate):
+            logger.warning(
+                "[%s] from_autogen returned non-OperationContext-like type: %s. "
+                "Ignoring OperationContext.",
+                ErrorCodes.BAD_OPERATION_CONTEXT,
+                type(ctx_candidate).__name__,
+            )
+            return None
 
-        logger.warning(
-            "[%s] from_autogen returned non-OperationContext-like type: %s. "
-            "Ignoring OperationContext.",
-            ErrorCodes.BAD_OPERATION_CONTEXT,
-            type(ctx_candidate).__name__,
-        )
-        return None
+        # Enrich attrs with framework metadata in-place (best-effort)
+        try:
+            attrs = getattr(ctx_candidate, "attrs", None) or {}
+            if not isinstance(attrs, dict):
+                attrs = dict(attrs)
+            attrs.setdefault("framework", "autogen")
+            if self._framework_version is not None:
+                attrs.setdefault("framework_version", self._framework_version)
+            setattr(ctx_candidate, "attrs", attrs)
+        except Exception:
+            logger.debug(
+                "Failed to enrich OperationContext attrs for AutoGen context",
+                exc_info=True,
+            )
+
+        return ctx_candidate  # type: ignore[return-value]
 
     def _build_raw_query(
         self,
@@ -903,6 +945,8 @@ class CorpusAutoGenGraphClient:
         Uses GraphTranslator for consistency with other operations and
         normalizes to an AutoGen-friendly dict.
         """
+        _ensure_not_in_event_loop("capabilities")
+
         caps = self._translator.capabilities()
         return graph_capabilities_to_dict(caps)
 
@@ -929,6 +973,8 @@ class CorpusAutoGenGraphClient:
         Delegates to GraphTranslator so that async→sync bridging and
         error-context handling are centralized.
         """
+        _ensure_not_in_event_loop("get_schema")
+
         ctx = self._build_ctx(
             conversation=conversation,
             extra_context=extra_context,
@@ -983,6 +1029,8 @@ class CorpusAutoGenGraphClient:
 
         Uses GraphTranslator for consistency with other operations.
         """
+        _ensure_not_in_event_loop("health")
+
         ctx = self._build_ctx(
             conversation=conversation,
             extra_context=extra_context,
@@ -1050,6 +1098,8 @@ class CorpusAutoGenGraphClient:
 
         Returns the underlying `QueryResult` from the GraphProtocol adapter.
         """
+        _ensure_not_in_event_loop("query")
+
         validate_graph_query(query)
         self._validate_query_params(params)
 
@@ -1199,6 +1249,8 @@ class CorpusAutoGenGraphClient:
         SyncStreamBridge under the hood. This method itself does not use
         any async→sync bridges directly.
         """
+        _ensure_not_in_event_loop("stream_query")
+
         validate_graph_query(query)
         self._validate_query_params(params)
 
@@ -1309,6 +1361,8 @@ class CorpusAutoGenGraphClient:
         and passes the desired namespace via framework_ctx so that the
         translator can build the correct UpsertNodesSpec.
         """
+        _ensure_not_in_event_loop("upsert_nodes")
+
         validate_upsert_nodes_spec(spec)
 
         ctx = self._build_ctx(
@@ -1377,6 +1431,8 @@ class CorpusAutoGenGraphClient:
         """
         Sync wrapper for upserting edges.
         """
+        _ensure_not_in_event_loop("upsert_edges")
+
         self._validate_upsert_edges_spec(spec)
 
         ctx = self._build_ctx(
@@ -1452,6 +1508,8 @@ class CorpusAutoGenGraphClient:
         Uses DeleteNodesSpec to derive either an ID list or a filter
         expression for the GraphTranslator.
         """
+        _ensure_not_in_event_loop("delete_nodes")
+
         ctx = self._build_ctx(
             conversation=conversation,
             extra_context=extra_context,
@@ -1558,6 +1616,8 @@ class CorpusAutoGenGraphClient:
         """
         Sync wrapper for deleting edges.
         """
+        _ensure_not_in_event_loop("delete_edges")
+
         ctx = self._build_ctx(
             conversation=conversation,
             extra_context=extra_context,
@@ -1671,6 +1731,8 @@ class CorpusAutoGenGraphClient:
         Converts `BulkVerticesSpec` into the raw request shape expected by
         GraphTranslator and returns the underlying `BulkVerticesResult`.
         """
+        _ensure_not_in_event_loop("bulk_vertices")
+
         ctx = self._build_ctx(
             conversation=conversation,
             extra_context=extra_context,
@@ -1757,6 +1819,8 @@ class CorpusAutoGenGraphClient:
 
         Builds a raw traversal request and delegates to GraphTranslator.
         """
+        _ensure_not_in_event_loop("traversal")
+
         ctx = self._build_ctx(
             conversation=conversation,
             extra_context=extra_context,
@@ -1852,6 +1916,8 @@ class CorpusAutoGenGraphClient:
         Translates `BatchOperation` dataclasses into the raw mapping shape
         expected by GraphTranslator and returns the underlying `BatchResult`.
         """
+        _ensure_not_in_event_loop("transaction")
+
         # Reuse batch validation; semantics are still a list of BatchOperation.
         validate_batch_operations(self._graph, ops)
 
@@ -1924,6 +1990,8 @@ class CorpusAutoGenGraphClient:
         Translates `BatchOperation` dataclasses into the raw mapping shape
         expected by GraphTranslator and returns the underlying `BatchResult`.
         """
+        _ensure_not_in_event_loop("batch")
+
         validate_batch_operations(self._graph, ops)
 
         ctx = self._build_ctx(
