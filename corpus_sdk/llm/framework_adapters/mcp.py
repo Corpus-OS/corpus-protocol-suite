@@ -39,15 +39,19 @@ Design goals
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import (
     Any,
     AsyncIterator,
+    Callable,
     Dict,
     Mapping,
     Optional,
     Sequence,
+    Tuple,
+    TypeVar,
 )
 
 from corpus_sdk.core.context_translation import from_mcp
@@ -72,6 +76,8 @@ logger = logging.getLogger(__name__)
 
 _FRAMEWORK_NAME = "mcp"
 
+T = TypeVar("T")
+
 
 # ---------------------------------------------------------------------------
 # Error-code bundle (CoercionErrorCodes alignment)
@@ -83,6 +89,161 @@ ERROR_CODES = CoercionErrorCodes(
     conversion_error="MCP_LLM_CONVERSION_ERROR",
     framework_label=_FRAMEWORK_NAME,
 )
+
+
+# ---------------------------------------------------------------------------
+# Error context helpers (decorator-based, lazy)
+# ---------------------------------------------------------------------------
+
+
+def _extract_dynamic_context(
+    instance: Any,
+    args: Tuple[Any, ...],
+    kwargs: Dict[str, Any],
+    operation: str,
+) -> Dict[str, Any]:
+    """
+    Extract dynamic context for error enrichment.
+
+    This is called only on the error path to avoid overhead on the happy path.
+    For MCP, the primary inputs of interest are:
+
+    - prompt length (when applicable)
+    - resolved model (if present as a kwarg)
+    - request_id (if provided)
+    """
+    dynamic_ctx: Dict[str, Any] = {
+        "framework_name": _FRAMEWORK_NAME,
+        "model": getattr(instance, "model", "unknown"),
+        "temperature": getattr(instance, "temperature", 0.7),
+        "operation": operation,
+    }
+
+    # Prompt-based metrics (acomplete / astream / count_tokens_for_prompt)
+    try:
+        prompt: Optional[str] = None
+
+        if args:
+            # For our public APIs, the first positional after self is always prompt.
+            candidate = args[0]
+            if isinstance(candidate, str):
+                prompt = candidate
+
+        if prompt is None and "prompt" in kwargs and isinstance(kwargs["prompt"], str):
+            prompt = kwargs["prompt"]
+
+        if prompt is not None:
+            prompt_str = str(prompt)
+            dynamic_ctx["prompt_chars"] = len(prompt_str)
+    except Exception as prompt_exc:  # pragma: no cover - metrics must never be fatal
+        logger.debug(
+            "MCP error-context: failed to compute prompt metrics: %s",
+            prompt_exc,
+        )
+
+    # Surface request_id and explicit model override when present.
+    try:
+        if "request_id" in kwargs:
+            dynamic_ctx["request_id"] = kwargs["request_id"]
+        if "model" in kwargs and kwargs["model"] is not None:
+            dynamic_ctx["requested_model"] = kwargs["model"]
+    except Exception as req_exc:  # pragma: no cover
+        logger.debug(
+            "MCP error-context: failed to extract request_id/model: %s",
+            req_exc,
+        )
+
+    return dynamic_ctx
+
+
+def _create_error_context_decorator(
+    operation: str,
+    is_async: bool = False,
+) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    """
+    Factory for creating error-context decorators with lazy dynamic context.
+
+    Successful calls are unaffected; on exception, metrics and identifiers
+    are computed and attached via `attach_context` with a consistent
+    LLM-oriented operation label.
+    """
+
+    def decorator_factory(
+        **static_context: Any,
+    ) -> Callable[[Callable[..., T]], Callable[..., T]]:
+        def decorator(func: Callable[..., T]) -> Callable[..., T]:
+            if is_async:
+
+                async def async_wrapper(self: Any, *args: Any, **kwargs: Any) -> T:
+                    try:
+                        return await func(self, *args, **kwargs)
+                    except Exception as exc:  # noqa: BLE001
+                        dynamic_ctx = _extract_dynamic_context(
+                            self,
+                            args,
+                            kwargs,
+                            operation,
+                        )
+                        full_ctx: Dict[str, Any] = {
+                            "error_codes": ERROR_CODES,
+                        }
+                        full_ctx.update(static_context)
+                        full_ctx.update(dynamic_ctx)
+                        attach_context(
+                            exc,
+                            framework=_FRAMEWORK_NAME,
+                            operation=f"llm_{operation}",
+                            **full_ctx,
+                        )
+                        raise
+
+                return async_wrapper  # type: ignore[return-value]
+            else:
+
+                def sync_wrapper(self: Any, *args: Any, **kwargs: Any) -> T:
+                    try:
+                        return func(self, *args, **kwargs)
+                    except Exception as exc:  # noqa: BLE001
+                        dynamic_ctx = _extract_dynamic_context(
+                            self,
+                            args,
+                            kwargs,
+                            operation,
+                        )
+                        full_ctx: Dict[str, Any] = {
+                            "error_codes": ERROR_CODES,
+                        }
+                        full_ctx.update(static_context)
+                        full_ctx.update(dynamic_ctx)
+                        attach_context(
+                            exc,
+                            framework=_FRAMEWORK_NAME,
+                            operation=f"llm_{operation}",
+                            **full_ctx,
+                        )
+                        raise
+
+                return sync_wrapper  # type: ignore[return-value]
+
+        return decorator
+
+    return decorator_factory
+
+
+def with_llm_error_context(
+    operation: str,
+    **static_context: Any,
+) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    """Decorator for sync MCP LLM methods with rich dynamic context extraction."""
+    return _create_error_context_decorator(operation, is_async=False)(**static_context)
+
+
+def with_async_llm_error_context(
+    operation: str,
+    **static_context: Any,
+) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    """Decorator for async MCP LLM methods with rich dynamic context extraction."""
+    return _create_error_context_decorator(operation, is_async=True)(**static_context)
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +313,8 @@ class MCPLLMTranslationService:
         * `count_tokens_for_prompt` – token counting via `LLMTranslator`
           with robust fallback
         * `estimate_tokens_for_prompt` – simple char-based heuristic
+        * `health` / `ahealth` – translator-only health
+        * `capabilities` / `acapabilities` – translator-only capabilities
 
     The MCP-specific behavior (how MCP messages are shaped, how tools are
     wired, etc.) is handled in the registered `"mcp"` `LLMFrameworkTranslator`,
@@ -397,6 +560,7 @@ class MCPLLMTranslationService:
     def estimate_tokens_for_prompt(self, prompt: str) -> int:
         return self._estimate_tokens(prompt)
 
+    @with_llm_error_context("count_tokens_for_prompt")
     def count_tokens_for_prompt(
         self,
         prompt: str,
@@ -413,20 +577,20 @@ class MCPLLMTranslationService:
           matches provider-specific formatting and behavior.
 
         Fallback:
-        - If translator/adapter counting fails or returns an unexpected shape,
+        - If translator counting fails or returns an unexpected shape,
           fall back to the local `_estimate_tokens` heuristic.
+
+        Note:
+        - OperationContext construction is treated as required for this path.
+          If MCP context translation fails, the error is surfaced rather than
+          silently falling back, keeping this strictly translator-first.
         """
         if not prompt or not prompt.strip():
             return 0
 
         # Build a minimal MCP OperationContext for counting.
         mcp_ctx: Mapping[str, Any] = mcp_context or {}
-        try:
-            ctx = self._build_operation_context(mcp_ctx)
-        except Exception:
-            # If context building itself fails, just use the heuristic.
-            logger.debug("MCP token count: failed to build OperationContext; using heuristic")
-            return self._estimate_tokens(prompt)
+        ctx = self._build_operation_context(mcp_ctx)
 
         params = self._build_sampling_params(
             model=model,
@@ -480,6 +644,7 @@ class MCPLLMTranslationService:
     # MCP async completion API (non-streaming)
     # ------------------------------------------------------------------ #
 
+    @with_async_llm_error_context("acomplete")
     async def acomplete(
         self,
         prompt: str,
@@ -541,44 +706,28 @@ class MCPLLMTranslationService:
         # Build a simple chat-style message list: single user message.
         messages = [{"role": "user", "content": prompt}]
 
-        try:
-            result = await self._translator.arun_complete(
-                raw_messages=messages,
-                model=params.get("model"),
-                max_tokens=params.get("max_tokens"),
-                temperature=params.get("temperature"),
-                top_p=None,
-                frequency_penalty=None,
-                presence_penalty=None,
-                stop_sequences=None,
-                tools=tools,
-                tool_choice=tool_choice,
-                system_message=system_message,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-            return result
-        except Exception as exc:  # noqa: BLE001
-            # Attach rich error context but never mask the original exception.
-            try:
-                attach_context(
-                    exc,
-                    framework=_FRAMEWORK_NAME,
-                    operation="llm_acomplete",
-                    error_codes=ERROR_CODES,
-                    model=model_for_ctx,
-                    request_id=request_id or ctx.request_id,
-                    prompt_chars=len(prompt),
-                    stream=False,
-                )
-            except Exception:  # noqa: BLE001
-                pass
-            raise
+        result = await self._translator.arun_complete(
+            raw_messages=messages,
+            model=params.get("model"),
+            max_tokens=params.get("max_tokens"),
+            temperature=params.get("temperature"),
+            top_p=None,
+            frequency_penalty=None,
+            presence_penalty=None,
+            stop_sequences=None,
+            tools=tools,
+            tool_choice=tool_choice,
+            system_message=system_message,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+        return result
 
     # ------------------------------------------------------------------ #
     # MCP async streaming API
     # ------------------------------------------------------------------ #
 
+    @with_async_llm_error_context("astream")
     async def astream(
         self,
         prompt: str,
@@ -619,45 +768,128 @@ class MCPLLMTranslationService:
 
         messages = [{"role": "user", "content": prompt}]
 
-        try:
-            agen = await self._translator.arun_stream(
-                raw_messages=messages,
-                model=params.get("model"),
-                max_tokens=params.get("max_tokens"),
-                temperature=params.get("temperature"),
-                top_p=None,
-                frequency_penalty=None,
-                presence_penalty=None,
-                stop_sequences=None,
-                tools=tools,
-                tool_choice=tool_choice,
-                system_message=system_message,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
+        agen = await self._translator.arun_stream(
+            raw_messages=messages,
+            model=params.get("model"),
+            max_tokens=params.get("max_tokens"),
+            temperature=params.get("temperature"),
+            top_p=None,
+            frequency_penalty=None,
+            presence_penalty=None,
+            stop_sequences=None,
+            tools=tools,
+            tool_choice=tool_choice,
+            system_message=system_message,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+
+        async for chunk in agen:
+            yield chunk
+
+    # ------------------------------------------------------------------ #
+    # Health / capabilities via translator only (no adapter fallback)
+    # ------------------------------------------------------------------ #
+
+    @with_llm_error_context("health")
+    def health(self, **kwargs: Any) -> Mapping[str, Any]:
+        """
+        Synchronous health check.
+
+        Translator-only:
+        - `self._translator.health(**kwargs)` MUST be implemented for
+          framework="mcp".
+        - No fallback to llm_adapter.health to avoid legacy/adapter coupling.
+        """
+        translator_health = getattr(self._translator, "health", None)
+        if not callable(translator_health):
+            raise AttributeError(
+                "LLMTranslator for framework='mcp' must implement "
+                "health(); no adapter fallback is allowed."
+            )
+        return translator_health(**kwargs)
+
+    @with_async_llm_error_context("ahealth")
+    async def ahealth(self, **kwargs: Any) -> Mapping[str, Any]:
+        """
+        Async health check.
+
+        Translator-only resolution:
+        1. self._translator.ahealth(**kwargs)
+        2. self._translator.health(**kwargs) via worker thread
+
+        If neither is implemented, this is treated as a configuration error.
+        """
+        loop = asyncio.get_running_loop()
+
+        translator_ahealth = getattr(self._translator, "ahealth", None)
+        if callable(translator_ahealth):
+            return await translator_ahealth(**kwargs)  # type: ignore[misc]
+
+        translator_health = getattr(self._translator, "health", None)
+        if callable(translator_health):
+            return await loop.run_in_executor(
+                None,
+                lambda: translator_health(**kwargs),
             )
 
-            async for chunk in agen:
-                yield chunk
-        except Exception as exc:  # noqa: BLE001
-            try:
-                attach_context(
-                    exc,
-                    framework=_FRAMEWORK_NAME,
-                    operation="llm_astream",
-                    error_codes=ERROR_CODES,
-                    model=model_for_ctx,
-                    request_id=request_id or ctx.request_id,
-                    prompt_chars=len(prompt),
-                    stream=True,
-                )
-            except Exception:  # noqa: BLE001
-                pass
-            raise
+        raise AttributeError(
+            "LLMTranslator for framework='mcp' must implement "
+            "ahealth() or health(); no adapter fallback is allowed."
+        )
+
+    @with_llm_error_context("capabilities")
+    def capabilities(self, **kwargs: Any) -> Mapping[str, Any]:
+        """
+        Synchronous capabilities query.
+
+        Translator-only:
+        - `self._translator.capabilities(**kwargs)` MUST be implemented.
+        - No fallback to llm_adapter.capabilities to keep a strict
+          translator-first contract.
+        """
+        translator_capabilities = getattr(self._translator, "capabilities", None)
+        if not callable(translator_capabilities):
+            raise AttributeError(
+                "LLMTranslator for framework='mcp' must implement "
+                "capabilities(); no adapter fallback is allowed."
+            )
+        return translator_capabilities(**kwargs)
+
+    @with_async_llm_error_context("acapabilities")
+    async def acapabilities(self, **kwargs: Any) -> Mapping[str, Any]:
+        """
+        Async capabilities query.
+
+        Translator-only resolution:
+        1. self._translator.acapabilities(**kwargs)
+        2. self._translator.capabilities(**kwargs) via worker thread
+
+        If neither is implemented, this is treated as a configuration error.
+        """
+        loop = asyncio.get_running_loop()
+
+        translator_acapabilities = getattr(self._translator, "acapabilities", None)
+        if callable(translator_acapabilities):
+            return await translator_acapabilities(**kwargs)  # type: ignore[misc]
+
+        translator_capabilities = getattr(self._translator, "capabilities", None)
+        if callable(translator_capabilities):
+            return await loop.run_in_executor(
+                None,
+                lambda: translator_capabilities(**kwargs),
+            )
+
+        raise AttributeError(
+            "LLMTranslator for framework='mcp' must implement "
+            "acapabilities() or capabilities(); no adapter fallback is allowed."
+        )
 
 
 __all__ = [
     "MCPLLMServiceConfig",
     "MCPLLMTranslationService",
+    "with_llm_error_context",
+    "with_async_llm_error_context",
     "ERROR_CODES",
 ]
-
