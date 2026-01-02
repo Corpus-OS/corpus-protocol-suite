@@ -25,8 +25,7 @@ Design notes / philosophy
 - **Fail-safe context translation**: context translation must never break embeddings.
   If translation fails, we proceed without `OperationContext` and attach diagnostic context.
 - **Strict by default** (configurable): non-string inputs in batch operations are rejected
-  unless `strict_text_types=False`, in which case they are treated as empty and receive
-  zero-vector embeddings to preserve row alignment.
+  to avoid silently embedding repr() outputs and confusing retrieval behavior.
 
 Resilience (retries, caching, rate limiting, etc.) is expected to be provided
 by the underlying adapter, typically a BaseEmbeddingAdapter subclass.
@@ -98,13 +97,16 @@ class ErrorCodes:
     # CrewAI-specific context errors
     CREWAI_CONTEXT_INVALID = "CREWAI_CONTEXT_INVALID"
 
+    # Sync wrapper misuse errors
+    SYNC_WRAPPER_CALLED_IN_EVENT_LOOP = "SYNC_WRAPPER_CALLED_IN_EVENT_LOOP"
+
 
 # Coercion configuration for the common embedding utils
 EMBEDDING_COERCION_ERROR_CODES: CoercionErrorCodes = CoercionErrorCodes(
     invalid_result=ErrorCodes.INVALID_EMBEDDING_RESULT,
     empty_result=ErrorCodes.EMPTY_EMBEDDING_RESULT,
     conversion_error=ErrorCodes.EMBEDDING_CONVERSION_ERROR,
-    framework_label=_FRAMEWORK_NAME,  # Consistent with AutoGen adapter labeling
+    framework_label=_FRAMEWORK_NAME,  # Consistent labeling across adapters
 )
 
 
@@ -241,6 +243,53 @@ def _infer_dim_from_matrix(mat: List[List[float]]) -> Optional[int]:
     return len(first)
 
 
+def _ensure_not_in_event_loop(sync_api_name: str) -> None:
+    """
+    Prevent deadlocks from calling sync APIs in async contexts.
+
+    This guard enforces a clear contract:
+    - In async code, use `a...` async variants.
+    - In sync code, use sync methods directly.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        # No running event loop: safe to call sync method.
+        return
+
+    raise RuntimeError(
+        f"{sync_api_name} was called from inside an active asyncio event loop. "
+        f"Use the async variant instead (e.g. 'await a{sync_api_name}()'). "
+        f"[{ErrorCodes.SYNC_WRAPPER_CALLED_IN_EVENT_LOOP}]"
+    )
+
+
+async def _maybe_close_async(obj: Any) -> None:
+    """
+    Best-effort async resource cleanup with prioritization.
+
+    - Prefer an async `aclose()` method if present.
+    - Fall back to a coroutine `close()` if the object defines one.
+    - Fall back to a sync `close()` executed in a worker thread.
+    """
+    if obj is None:
+        return
+
+    aclose = getattr(obj, "aclose", None)
+    if callable(aclose):
+        await aclose()
+        return
+
+    close = getattr(obj, "close", None)
+    if not callable(close):
+        return
+
+    if asyncio.iscoroutinefunction(close):
+        await close()
+    else:
+        await asyncio.to_thread(close)
+
+
 # --------------------------------------------------------------------------- #
 # Error-context decorators with dynamic context extraction
 # --------------------------------------------------------------------------- #
@@ -273,17 +322,21 @@ def _extract_dynamic_context(
     # Text / batch metrics
     if operation == "query" and args and isinstance(args[0], str):
         dynamic_ctx["text_len"] = len(args[0])
-    elif operation == "documents" and args and isinstance(args[0], Sequence):
-        texts_seq = args[0]
-        dynamic_ctx["texts_count"] = len(texts_seq)
-        empty_count = sum(
-            1 for text in texts_seq
-            if not isinstance(text, str) or not text.strip()
-        )
-        if empty_count:
-            dynamic_ctx["empty_texts_count"] = empty_count
+    elif operation == "documents" and args:
+        # Strings are Sequences but should NOT be treated as batches.
+        maybe_texts = args[0]
+        if isinstance(maybe_texts, Sequence) and not isinstance(maybe_texts, (str, bytes)):
+            texts_seq = maybe_texts
+            dynamic_ctx["texts_count"] = len(texts_seq)
+            empty_count = sum(
+                1
+                for text in texts_seq
+                if not isinstance(text, str) or not text.strip()
+            )
+            if empty_count:
+                dynamic_ctx["empty_texts_count"] = empty_count
 
-    # CrewAI-specific context (if passed via keyword) — loop style for parity with AutoGen
+    # CrewAI-specific context (if passed via keyword) — loop style for parity with other adapters
     crewai_context = kwargs.get("crewai_context") or {}
     if isinstance(crewai_context, Mapping):
         for key in ("agent_role", "task_id", "workflow", "crew_id", "agent_id", "process_id"):
@@ -460,21 +513,64 @@ class CorpusCrewAIEmbeddings:
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        """
+        Best-effort synchronous cleanup.
+
+        We only invoke synchronous `close()` methods here to avoid creating or
+        interfering with event loops in sync contexts.
+        """
+        # Close translator if it was ever constructed.
+        translator = self.__dict__.get("_translator")
+        if isinstance(translator, EmbeddingTranslator):
+            close = getattr(translator, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Error while closing embedding translator in __exit__: %s",
+                        exc,
+                    )
+
+        # Preserve original behavior: attempt to close the underlying adapter.
         if hasattr(self.corpus_adapter, "close"):
             try:
                 self.corpus_adapter.close()  # type: ignore[call-arg]
             except Exception as exc:  # noqa: BLE001
-                logger.warning("Error while closing embedding adapter in __exit__: %s", exc)
+                logger.warning(
+                    "Error while closing embedding adapter in __exit__: %s",
+                    exc,
+                )
 
     async def __aenter__(self) -> "CorpusCrewAIEmbeddings":
         return self
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        if hasattr(self.corpus_adapter, "aclose"):
+        """
+        Best-effort async cleanup.
+
+        This path can safely await async closers or offload sync closers without
+        blocking the event loop.
+        """
+        # Close translator if it was ever constructed.
+        translator = self.__dict__.get("_translator")
+        if isinstance(translator, EmbeddingTranslator):
             try:
-                await self.corpus_adapter.aclose()  # type: ignore[call-arg]
+                await _maybe_close_async(translator)
             except Exception as exc:  # noqa: BLE001
-                logger.warning("Error while closing embedding adapter in __aexit__: %s", exc)
+                logger.warning(
+                    "Error while closing embedding translator in __aexit__: %s",
+                    exc,
+                )
+
+        # Preserve and extend original behavior: close the underlying adapter as well.
+        try:
+            await _maybe_close_async(self.corpus_adapter)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Error while closing embedding adapter in __aexit__: %s",
+                exc,
+            )
 
     # ------------------------------------------------------------------ #
     # Health / capabilities passthrough via EmbeddingTranslator
@@ -488,6 +584,7 @@ class CorpusCrewAIEmbeddings:
         Delegates to EmbeddingTranslator.capabilities(), which centralizes
         async/sync adapter methods and error context.
         """
+        _ensure_not_in_event_loop("capabilities")
         return self._translator.capabilities()
 
     @with_async_embedding_error_context("capabilities")
@@ -506,6 +603,7 @@ class CorpusCrewAIEmbeddings:
 
         Delegates to EmbeddingTranslator.health().
         """
+        _ensure_not_in_event_loop("health")
         return self._translator.health()
 
     @with_async_embedding_error_context("health")
@@ -525,7 +623,7 @@ class CorpusCrewAIEmbeddings:
         """Validate and normalize CrewAI configuration with sensible defaults."""
         validated: CrewAIConfig = config.copy()
 
-        # Align default with LangChain adapter: do NOT auto-create OperationContext
+        # Align default with other adapters: do NOT auto-create OperationContext
         validated.setdefault("fallback_to_simple_context", False)
         validated.setdefault("enable_agent_context_propagation", True)
         validated.setdefault("task_aware_batching", False)
@@ -546,11 +644,14 @@ class CorpusCrewAIEmbeddings:
         Lazily construct and cache the `EmbeddingTranslator`.
 
         Uses `cached_property` for thread safety and optimal performance
-        in multi-agent CrewAI environments.
+        in multi-agent CrewAI environments, with a lock to avoid duplicate
+        construction under concurrent first access.
         """
-        # cached_property caches the instance value; the lock prevents duplicate
-        # construction under concurrent first access.
         with self._translator_lock:
+            existing = self.__dict__.get("_translator")
+            if isinstance(existing, EmbeddingTranslator):
+                return existing
+
             translator = create_embedding_translator(
                 adapter=self.corpus_adapter,
                 framework=_FRAMEWORK_NAME,
@@ -565,28 +666,112 @@ class CorpusCrewAIEmbeddings:
             )
             return translator
 
-    def _build_contexts(
+    def _update_dim_hint(self, dim: Optional[int]) -> None:
+        """
+        Thread-safe, best-effort dimension hint update.
+
+        First-write-wins semantics are used so that concurrent calls do not
+        cause the hint to oscillate; the first successful embedding defines
+        the observed dimension.
+        """
+        if dim is None:
+            return
+        if self._embedding_dim_hint is not None:
+            return
+
+        with self._translator_lock:
+            if self._embedding_dim_hint is None:
+                self._embedding_dim_hint = dim
+
+    def _build_core_context(
         self,
         *,
         crewai_context: Optional[CrewAIContext] = None,
-        model: Optional[str] = None,
-        **kwargs: Any,
-    ) -> Tuple[Optional[OperationContext], Dict[str, Any]]:
+    ) -> Optional[OperationContext]:
         """
-        Build contexts for CrewAI execution environment with comprehensive validation.
+        Build a core OperationContext from CrewAI context with comprehensive error handling.
 
-        Returns
-        -------
-        Tuple of:
-        - core_ctx: core OperationContext or None if no/invalid context
-        - framework_ctx: CrewAI-specific context for translator
+        This function focuses purely on translating framework-specific context into the
+        core OperationContext structure used by the embedding layer.
         """
         core_ctx: Optional[OperationContext] = None
+
+        if crewai_context is None:
+            return None
+
+        # Soft validation: invalid shapes are logged and ignored instead of raising.
+        self._validate_crewai_context_structure(crewai_context)
+
+        if not isinstance(crewai_context, Mapping):
+            return None
+
+        try:
+            core_ctx_candidate = context_from_crewai(
+                crewai_context,
+                framework_version=self._framework_version,
+            )
+            if _looks_like_operation_context(core_ctx_candidate):
+                core_ctx = core_ctx_candidate  # type: ignore[assignment]
+                logger.debug(
+                    "Successfully created OperationContext from CrewAI context "
+                    "for agent: %s, task: %s",
+                    crewai_context.get("agent_role", "unknown"),
+                    crewai_context.get("task_id", "unknown"),
+                )
+            else:
+                logger.warning(
+                    "context_from_crewai returned non-OperationContext type: %s. "
+                    "Using empty context.",
+                    type(core_ctx_candidate).__name__,
+                )
+                if self.crewai_config["fallback_to_simple_context"]:
+                    core_ctx = OperationContext()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "Failed to create OperationContext from crewai_context: %s. "
+                "Using empty context.",
+                e,
+            )
+            attach_context(
+                e,
+                framework=_FRAMEWORK_NAME,
+                operation="context_build",
+                crewai_context_snapshot=_safe_snapshot(crewai_context),
+                crewai_config=self.crewai_config,
+                framework_version=self._framework_version,
+                error_codes=EMBEDDING_COERCION_ERROR_CODES,
+            )
+
+            if self.crewai_config["fallback_to_simple_context"]:
+                core_ctx = OperationContext()
+
+        return core_ctx
+
+    def _build_framework_context(
+        self,
+        *,
+        core_ctx: Optional[OperationContext],
+        crewai_context: Optional[CrewAIContext] = None,
+        model: Optional[str] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """
+        Build framework-specific context for the CrewAI execution environment.
+
+        This includes:
+        - Framework identity and version
+        - CrewAI configuration flags
+        - Best-effort dimension hint
+        - Model selection
+        - CrewAI routing fields and task-aware batching hints
+        - Any extra non-private call-specific hints
+        """
         framework_ctx: Dict[str, Any] = {
             "framework": _FRAMEWORK_NAME,
-            "crewai_config": self.crewai_config,  # single canonical key
-            "error_codes": EMBEDDING_COERCION_ERROR_CODES,  # consistency across adapters
+            "crewai_config": self.crewai_config,
+            "error_codes": EMBEDDING_COERCION_ERROR_CODES,
         }
+
         if self._framework_version is not None:
             framework_ctx["framework_version"] = self._framework_version
 
@@ -594,55 +779,12 @@ class CorpusCrewAIEmbeddings:
         if isinstance(self._embedding_dim_hint, int):
             framework_ctx["embedding_dim_hint"] = self._embedding_dim_hint
 
-        # Convert CrewAI context to core OperationContext with comprehensive error handling
-        if crewai_context is not None:
-            # Soft validation: invalid shapes are logged and ignored instead of raising.
-            self._validate_crewai_context_structure(crewai_context)
-
-            if isinstance(crewai_context, Mapping):
-                try:
-                    core_ctx_candidate = context_from_crewai(
-                        crewai_context,
-                        framework_version=self._framework_version,
-                    )
-                    if _looks_like_operation_context(core_ctx_candidate):
-                        core_ctx = core_ctx_candidate  # type: ignore[assignment]
-                        logger.debug(
-                            "Successfully created OperationContext from CrewAI context "
-                            "for agent: %s, task: %s",
-                            crewai_context.get("agent_role", "unknown"),
-                            crewai_context.get("task_id", "unknown"),
-                        )
-                    else:
-                        logger.warning(
-                            "context_from_crewai returned non-OperationContext type: %s. "
-                            "Using empty context.",
-                            type(core_ctx_candidate).__name__,
-                        )
-                        if self.crewai_config["fallback_to_simple_context"]:
-                            core_ctx = OperationContext()
-                except Exception as e:  # noqa: BLE001
-                    logger.warning(
-                        "Failed to create OperationContext from crewai_context: %s. "
-                        "Using empty context.",
-                        e,
-                    )
-                    attach_context(
-                        e,
-                        framework=_FRAMEWORK_NAME,
-                        operation="context_build",
-                        crewai_context_snapshot=_safe_snapshot(crewai_context),
-                        crewai_config=self.crewai_config,
-                        framework_version=self._framework_version,
-                        error_codes=EMBEDDING_COERCION_ERROR_CODES,
-                    )
-
-        # Framework-level context for CrewAI-specific optimizations
+        # Model selection: explicit argument wins over adapter-level default.
         effective_model = model or self.model
         if effective_model:
             framework_ctx["model"] = effective_model
 
-        # Add rich CrewAI-specific context for observability and optimization
+        # Add rich CrewAI-specific context for observability and optimization.
         if isinstance(crewai_context, Mapping) and crewai_context:
             framework_ctx.update(
                 {
@@ -663,16 +805,42 @@ class CorpusCrewAIEmbeddings:
                     f"task_aware_{crewai_context['task_id']}"
                 )
 
-        # Include any extra call-specific hints while preserving structure
+        # Include any extra call-specific hints while preserving structure.
+        # Private/internal kwargs (starting with "_") are not propagated.
         framework_ctx.update({k: v for k, v in kwargs.items() if not k.startswith("_")})
 
-        # Stash OperationContext for downstream inspection when enabled
+        # Stash OperationContext for downstream inspection when enabled.
         if (
             core_ctx is not None
             and self.crewai_config["enable_agent_context_propagation"]
         ):
             framework_ctx["_operation_context"] = core_ctx
 
+        return framework_ctx
+
+    def _build_contexts(
+        self,
+        *,
+        crewai_context: Optional[CrewAIContext] = None,
+        model: Optional[str] = None,
+        **kwargs: Any,
+    ) -> Tuple[Optional[OperationContext], Dict[str, Any]]:
+        """
+        Build contexts for CrewAI execution environment with comprehensive validation.
+
+        Returns
+        -------
+        Tuple of:
+        - core_ctx: core OperationContext or None if no/invalid context
+        - framework_ctx: CrewAI-specific context for translator
+        """
+        core_ctx = self._build_core_context(crewai_context=crewai_context)
+        framework_ctx = self._build_framework_context(
+            core_ctx=core_ctx,
+            crewai_context=crewai_context,
+            model=model,
+            **kwargs,
+        )
         return core_ctx, framework_ctx
 
     def _validate_crewai_context_structure(self, context: Mapping[str, Any]) -> None:
@@ -742,6 +910,8 @@ class CorpusCrewAIEmbeddings:
 
         Used by CrewAI agents during RAG operations and knowledge processing.
         """
+        _ensure_not_in_event_loop("embed_documents")
+
         texts_list = list(texts)
         _validate_texts_are_strings(texts_list, op_name="embed_documents")
 
@@ -782,8 +952,7 @@ class CorpusCrewAIEmbeddings:
 
         # Cache best-effort dimension hint for observability and downstream framework_ctx.
         dim = _infer_dim_from_matrix(mat)
-        if dim is not None:
-            self._embedding_dim_hint = dim
+        self._update_dim_hint(dim)
 
         logger.debug(
             "CrewAI embed_documents completed: docs=%d dim=%s latency_ms=%.2f",
@@ -807,6 +976,8 @@ class CorpusCrewAIEmbeddings:
 
         Used by CrewAI for query understanding and retrieval in agent workflows.
         """
+        _ensure_not_in_event_loop("embed_query")
+
         if not isinstance(text, str):
             raise TypeError(f"embed_query expects str; got {type(text).__name__}")
 
@@ -834,7 +1005,7 @@ class CorpusCrewAIEmbeddings:
         vec = self._coerce_embedding_vector(translated)
 
         # Cache best-effort dimension hint for observability and downstream framework_ctx.
-        self._embedding_dim_hint = len(vec)
+        self._update_dim_hint(len(vec))
 
         logger.debug(
             "CrewAI embed_query completed: dim=%d latency_ms=%.2f",
@@ -842,6 +1013,29 @@ class CorpusCrewAIEmbeddings:
             elapsed_ms,
         )
         return vec
+
+    @with_embedding_error_context("function_call")
+    def __call__(
+        self,
+        texts: Sequence[str],
+        *,
+        crewai_context: Optional[CrewAIContext] = None,
+        model: Optional[str] = None,
+        **kwargs: Any,
+    ) -> List[List[float]]:
+        """
+        Callable interface for vector-store style protocols.
+
+        This allows the adapter to be passed directly as an `embedding_function`
+        where a simple callable is expected.
+        """
+        _ensure_not_in_event_loop("__call__")
+        return self.embed_documents(
+            texts,
+            crewai_context=crewai_context,
+            model=model,
+            **kwargs,
+        )
 
     # ------------------------------------------------------------------ #
     # Async API for CrewAI Flows
@@ -898,8 +1092,7 @@ class CorpusCrewAIEmbeddings:
 
         # Cache best-effort dimension hint for observability and downstream framework_ctx.
         dim = _infer_dim_from_matrix(mat)
-        if dim is not None:
-            self._embedding_dim_hint = dim
+        self._update_dim_hint(dim)
 
         logger.debug(
             "CrewAI aembed_documents completed: docs=%d dim=%s latency_ms=%.2f",
@@ -943,7 +1136,7 @@ class CorpusCrewAIEmbeddings:
         vec = self._coerce_embedding_vector(translated)
 
         # Cache best-effort dimension hint for observability and downstream framework_ctx.
-        self._embedding_dim_hint = len(vec)
+        self._update_dim_hint(len(vec))
 
         logger.debug(
             "CrewAI aembed_query completed: dim=%d latency_ms=%.2f",
@@ -1034,7 +1227,9 @@ def register_with_crewai(
                 exc,
                 framework=_FRAMEWORK_NAME,
                 operation="register_with_crewai",
-                crew_snapshot=_safe_snapshot({"type": type(crew).__name__, "name": getattr(crew, "name", None)}),
+                crew_snapshot=_safe_snapshot(
+                    {"type": type(crew).__name__, "name": getattr(crew, "name", None)},
+                ),
                 error_codes=EMBEDDING_COERCION_ERROR_CODES,
                 framework_version=framework_version,
             )
