@@ -1046,44 +1046,45 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         return embeddings
 
     # ------------------------------------------------------------------ #
-    # Capabilities / health passthrough (optional on underlying adapter)
+    # Capabilities / health passthrough (via EmbeddingTranslator)
     # ------------------------------------------------------------------ #
 
-    def capabilities(self) -> Dict[str, Any]:
+    @with_embedding_error_context("capabilities")
+    def capabilities(self) -> Mapping[str, Any]:
         """
-        Return underlying adapter capabilities if implemented, else empty dict.
+        Sync capabilities passthrough.
 
-        Notes:
-        - This is intentionally a thin passthrough; shape is adapter-defined.
-        - We avoid raising if missing to keep integrations low-friction.
+        Delegates to EmbeddingTranslator.capabilities(), which centralizes
+        async/sync adapter methods and error context behavior across frameworks.
         """
-        fn = getattr(self.corpus_adapter, "capabilities", None)
-        if callable(fn):
-            try:
-                out = fn()
-                return out if isinstance(out, dict) else {}
-            except Exception as e:  # noqa: BLE001
-                logger.debug("capabilities() passthrough failed: %s", e)
-                return {}
-        return {}
+        return self._translator.capabilities()
 
-    def health(self) -> Dict[str, Any]:
+    @with_async_embedding_error_context("capabilities")
+    async def acapabilities(self) -> Mapping[str, Any]:
         """
-        Return underlying adapter health if implemented, else empty dict.
+        Async capabilities passthrough.
 
-        Notes:
-        - This is intentionally a thin passthrough; shape is adapter-defined.
-        - We avoid raising if missing to keep integrations low-friction.
+        Delegates to EmbeddingTranslator.arun_capabilities().
         """
-        fn = getattr(self.corpus_adapter, "health", None)
-        if callable(fn):
-            try:
-                out = fn()
-                return out if isinstance(out, dict) else {}
-            except Exception as e:  # noqa: BLE001
-                logger.debug("health() passthrough failed: %s", e)
-                return {}
-        return {}
+        return await self._translator.arun_capabilities()
+
+    @with_embedding_error_context("health")
+    def health(self) -> Mapping[str, Any]:
+        """
+        Sync health passthrough.
+
+        Delegates to EmbeddingTranslator.health().
+        """
+        return self._translator.health()
+
+    @with_async_embedding_error_context("health")
+    async def ahealth(self) -> Mapping[str, Any]:
+        """
+        Async health passthrough.
+
+        Delegates to EmbeddingTranslator.arun_health().
+        """
+        return await self._translator.arun_health()
 
     # ------------------------------------------------------------------ #
     # Resource management (context managers)
