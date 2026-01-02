@@ -51,7 +51,21 @@ from typing import (
 )
 
 from pydantic import BaseModel, Field
-from crewai.tools import BaseTool
+
+# --------------------------------------------------------------------------- #
+# Optional CrewAI import (soft dependency)
+# --------------------------------------------------------------------------- #
+
+try:  # pragma: no cover - optional dependency
+    from crewai.tools import BaseTool
+
+    CREWAI_AVAILABLE = True
+except ImportError:  # pragma: no cover - environments without CrewAI
+    CREWAI_AVAILABLE = False
+
+    class BaseTool(BaseModel):  # type: ignore[no-redef]
+        """Minimal stub BaseTool; real usage requires `crewai`."""
+        pass
 
 from corpus_sdk.vector.vector_base import (
     VectorProtocolV1,
@@ -137,6 +151,7 @@ def with_error_context(
                     exc,
                     framework="crewai",
                     operation=operation,
+                    error_codes=VECTOR_ERROR_CODES,
                     **enhanced_context,
                 )
                 raise
@@ -165,6 +180,7 @@ def with_async_error_context(
                     exc,
                     framework="crewai",
                     operation=operation,
+                    error_codes=VECTOR_ERROR_CODES,
                     **enhanced_context,
                 )
                 raise
@@ -331,6 +347,20 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
     # Optional static OperationContext for advanced scenarios
     static_operation_context: Optional[OperationContext] = None
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        """
+        Initialize the tool.
+
+        We keep imports soft but fail loudly if someone tries to use the
+        tool without CrewAI installed.
+        """
+        if not CREWAI_AVAILABLE:
+            raise RuntimeError(
+                "CorpusCrewAIVectorSearchTool requires `crewai` to be installed. "
+                "Install it with `pip install crewai`."
+            )
+        super().__init__(*args, **kwargs)
+
     # ------------------------------------------------------------------ #
     # Translator setup
     # ------------------------------------------------------------------ #
@@ -400,7 +430,12 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
             self._caps = caps
             return caps
         except Exception as exc:  # noqa: BLE001
-            attach_context(exc, framework="crewai", operation="capabilities")
+            attach_context(
+                exc,
+                framework="crewai",
+                operation="capabilities",
+                error_codes=VECTOR_ERROR_CODES,
+            )
             raise
 
     def _effective_namespace(self, namespace: Optional[str]) -> Optional[str]:
@@ -571,6 +606,7 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
                 framework="crewai",
                 operation="embedding_function",
                 query_preview=query[:128],
+                error_codes=VECTOR_ERROR_CODES,
             )
             raise BadRequest(
                 f"embedding_function failed for query: {exc}",
@@ -612,6 +648,7 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
                     framework="crewai",
                     operation="embed_query_async",
                     query_preview=query[:128],
+                    error_codes=VECTOR_ERROR_CODES,
                 )
                 raise BadRequest(
                     f"async_embedding_function failed for query: {exc}",
@@ -633,6 +670,7 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
                     framework="crewai",
                     operation="embed_query_async",
                     query_preview=query[:128],
+                    error_codes=VECTOR_ERROR_CODES,
                 )
                 raise BadRequest(
                     f"embedding_function failed for query: {exc}",
