@@ -1082,7 +1082,9 @@ class CorpusAutoGenChatClient:
             chunk_iter: Optional[AsyncIterator[Any]] = None
 
             try:
-                chunk_iter = await self._translator.arun_stream(
+                # FIX: LLMTranslator.arun_stream returns an AsyncIterator directly,
+                # not a coroutine. We do NOT await it here.
+                chunk_iter = self._translator.arun_stream(
                     raw_messages=messages,
                     op_ctx=ctx,
                     framework_ctx=framework_ctx,
