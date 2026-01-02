@@ -41,6 +41,7 @@ Non-responsibilities
 
 from __future__ import annotations
 
+import json
 import logging
 from functools import cached_property
 from typing import (
@@ -153,6 +154,31 @@ def with_async_graph_error_context(
 # Backwards-compatible aliases (for older imports)
 with_error_context = with_graph_error_context
 with_async_error_context = with_async_graph_error_context
+
+
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+
+
+def _looks_like_operation_context(obj: Any) -> bool:
+    """
+    Heuristic check; OperationContext may be a Protocol/alias in some SDK versions.
+    """
+    if obj is None:
+        return False
+
+    # If OperationContext is a real class, this will work; if it's a Protocol,
+    # this may raise TypeError in some typing modes.
+    try:
+        if isinstance(obj, OperationContext):
+            return True
+    except TypeError:
+        pass
+
+    # Fallback to structural check
+    attrs = ("request_id", "traceparent", "tenant", "attrs", "to_dict")
+    return any(hasattr(obj, attr) for attr in attrs)
 
 
 # --------------------------------------------------------------------------- #
@@ -558,6 +584,10 @@ class CorpusCrewAIGraphClient:
 
         If both are None/empty, returns None and lets downstream helpers
         construct an "empty" OperationContext as needed.
+
+        Context translation is best-effort: failures are logged and
+        attached for observability, but graph operations may still
+        proceed without an OperationContext.
         """
         extra = dict(extra_context or {})
 
@@ -565,29 +595,39 @@ class CorpusCrewAIGraphClient:
             return None
 
         try:
-            ctx = core_ctx_from_crewai(
+            ctx_candidate = core_ctx_from_crewai(
                 task,
                 framework_version=self._framework_version,
                 **extra,
             )
         except Exception as exc:
+            logger.warning(
+                "[%s] Failed to build OperationContext from CrewAI inputs; "
+                "proceeding without OperationContext. task_type=%s extra_keys=%s",
+                ErrorCodes.BAD_OPERATION_CONTEXT,
+                type(task).__name__ if task is not None else "None",
+                list(extra.keys()),
+            )
             attach_context(
                 exc,
                 framework="crewai",
                 operation="context_translation",
+                error_code=ErrorCodes.BAD_OPERATION_CONTEXT,
+                task_type=type(task).__name__ if task is not None else "None",
+                extra_context_keys=list(extra.keys()),
             )
-            raise BadRequest(
-                "Failed to build OperationContext from CrewAI inputs",
-                code=ErrorCodes.BAD_OPERATION_CONTEXT,
-            ) from exc
+            return None
 
-        if not isinstance(ctx, OperationContext):
-            raise BadRequest(
-                f"from_crewai produced unsupported context type: {type(ctx).__name__}",
-                code=ErrorCodes.BAD_OPERATION_CONTEXT,
-            )
+        if _looks_like_operation_context(ctx_candidate):
+            return ctx_candidate  # type: ignore[return-value]
 
-        return ctx
+        logger.warning(
+            "[%s] from_crewai returned non-OperationContext-like type: %s. "
+            "Ignoring OperationContext.",
+            ErrorCodes.BAD_OPERATION_CONTEXT,
+            type(ctx_candidate).__name__,
+        )
+        return None
 
     def _build_raw_query(
         self,
@@ -662,27 +702,42 @@ class CorpusCrewAIGraphClient:
         Similar to the AutoGen adapter:
         - edges must not be None
         - edges must be iterable and non-empty
-        - each edge must have an ID
+        - each edge must have required structural fields
+        - properties (if present) must be JSON-serializable
         """
         if spec.edges is None:
             raise BadRequest("UpsertEdgesSpec.edges must not be None")
 
         try:
-            edges_iter = list(spec.edges)
+            edges = list(spec.edges)
         except TypeError as exc:
             raise BadRequest(
                 "UpsertEdgesSpec.edges must be an iterable of edges",
             ) from exc
 
-        if not edges_iter:
+        if not edges:
             raise BadRequest("UpsertEdgesSpec must contain at least one edge")
 
-        for edge in edges_iter:
-            if not getattr(edge, "id", None):
-                raise BadRequest("All edges must have an ID")
+        for idx, edge in enumerate(edges):
+            if not hasattr(edge, "id") or not edge.id:
+                raise BadRequest(f"Edge at index {idx} must have an ID")
+            if not hasattr(edge, "src") or not edge.src:
+                raise BadRequest(f"Edge at index {idx} must have source node ID")
+            if not hasattr(edge, "dst") or not edge.dst:
+                raise BadRequest(f"Edge at index {idx} must have target node ID")
+            if not hasattr(edge, "label") or not edge.label:
+                raise BadRequest(f"Edge at index {idx} must have a label")
+
+            if hasattr(edge, "properties") and edge.properties is not None:
+                try:
+                    json.dumps(edge.properties)
+                except (TypeError, ValueError) as e:
+                    raise BadRequest(
+                        f"Edge at index {idx} properties must be JSON-serializable: {e}"
+                    )
 
         # Normalize spec.edges to the validated list
-        spec.edges = edges_iter  # type: ignore[assignment]
+        spec.edges = edges  # type: ignore[assignment]
 
     # ------------------------------------------------------------------ #
     # Capabilities / schema / health
