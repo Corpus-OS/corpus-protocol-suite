@@ -790,102 +790,82 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         )
 
     # ------------------------------------------------------------------ #
-    # Capabilities and health API - with error context
+    # Capabilities and health API - via EmbeddingTranslator
     # ------------------------------------------------------------------ #
 
+    @with_embedding_error_context("capabilities")
     def capabilities(self) -> Mapping[str, Any]:
-        """Best-effort capabilities passthrough with error context."""
-        adapter = self.corpus_adapter
-        caps_fn = getattr(adapter, "capabilities", None)
-        if callable(caps_fn):
-            try:
-                return caps_fn()  # type: ignore[no-any-return]
-            except Exception as exc:  # noqa: BLE001
-                attach_context(
-                    exc,
-                    framework=_FRAMEWORK_NAME,
-                    operation="embedding_capabilities",
-                    error_codes=EMBEDDING_COERCION_ERROR_CODES,
-                )
-                raise
-        return {}
+        """
+        Best-effort synchronous capabilities passthrough.
 
+        Delegates to EmbeddingTranslator.capabilities(), which centralizes
+        async/sync bridging and error-context wiring for the embedding layer.
+        """
+        try:
+            return self._translator.capabilities()
+        except Exception as exc:  # noqa: BLE001
+            # The decorator already attaches context; this is a small extra breadcrumb
+            attach_context(
+                exc,
+                framework=_FRAMEWORK_NAME,
+                operation="embedding_capabilities",
+                error_codes=EMBEDDING_COERCION_ERROR_CODES,
+            )
+            raise
+
+    @with_async_embedding_error_context("capabilities_async")
     async def acapabilities(self) -> Mapping[str, Any]:
-        """Best-effort async capabilities passthrough with error context."""
-        adapter = self.corpus_adapter
-        acaps_fn = getattr(adapter, "acapabilities", None)
-        if callable(acaps_fn):
-            try:
-                return await acaps_fn()  # type: ignore[no-any-return]
-            except Exception as exc:  # noqa: BLE001
-                attach_context(
-                    exc,
-                    framework=_FRAMEWORK_NAME,
-                    operation="embedding_capabilities_async",
-                    error_codes=EMBEDDING_COERCION_ERROR_CODES,
-                )
-                raise
+        """
+        Best-effort asynchronous capabilities passthrough.
 
-        caps_fn = getattr(adapter, "capabilities", None)
-        if callable(caps_fn):
-            try:
-                return await asyncio.to_thread(caps_fn)  # type: ignore[arg-type]
-            except Exception as exc:  # noqa: BLE001
-                attach_context(
-                    exc,
-                    framework=_FRAMEWORK_NAME,
-                    operation="embedding_capabilities_async",
-                    error_codes=EMBEDDING_COERCION_ERROR_CODES,
-                )
-                raise
-        return {}
+        Delegates to EmbeddingTranslator.arun_capabilities().
+        """
+        try:
+            return await self._translator.arun_capabilities()
+        except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework=_FRAMEWORK_NAME,
+                operation="embedding_capabilities_async",
+                error_codes=EMBEDDING_COERCION_ERROR_CODES,
+            )
+            raise
 
+    @with_embedding_error_context("health")
     def health(self) -> Mapping[str, Any]:
-        """Best-effort health passthrough with error context."""
-        adapter = self.corpus_adapter
-        health_fn = getattr(adapter, "health", None)
-        if callable(health_fn):
-            try:
-                return health_fn()  # type: ignore[no-any-return]
-            except Exception as exc:  # noqa: BLE001
-                attach_context(
-                    exc,
-                    framework=_FRAMEWORK_NAME,
-                    operation="embedding_health",
-                    error_codes=EMBEDDING_COERCION_ERROR_CODES,
-                )
-                raise
-        return {}
+        """
+        Best-effort synchronous health passthrough.
 
+        Delegates to EmbeddingTranslator.health().
+        """
+        try:
+            return self._translator.health()
+        except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework=_FRAMEWORK_NAME,
+                operation="embedding_health",
+                error_codes=EMBEDDING_COERCION_ERROR_CODES,
+            )
+            raise
+
+    @with_async_embedding_error_context("health_async")
     async def ahealth(self) -> Mapping[str, Any]:
-        """Best-effort async health passthrough with error context."""
-        adapter = self.corpus_adapter
-        ahealth_fn = getattr(adapter, "ahealth", None)
-        if callable(ahealth_fn):
-            try:
-                return await ahealth_fn()  # type: ignore[no-any-return]
-            except Exception as exc:  # noqa: BLE001
-                attach_context(
-                    exc,
-                    framework=_FRAMEWORK_NAME,
-                    operation="embedding_health_async",
-                    error_codes=EMBEDDING_COERCION_ERROR_CODES,
-                )
-                raise
+        """
+        Best-effort asynchronous health passthrough.
 
-        health_fn = getattr(adapter, "health", None)
-        if callable(health_fn):
-            try:
-                return await asyncio.to_thread(health_fn)  # type: ignore[arg-type]
-            except Exception as exc:  # noqa: BLE001
-                attach_context(
-                    exc,
-                    framework=_FRAMEWORK_NAME,
-                    operation="embedding_health_async",
-                    error_codes=EMBEDDING_COERCION_ERROR_CODES,
-                )
-                raise
-        return {}
+        Delegates to EmbeddingTranslator.arun_health().
+        """
+        try:
+            return await self._translator.arun_health()
+        except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework=_FRAMEWORK_NAME,
+                operation="embedding_health_async",
+                error_codes=EMBEDDING_COERCION_ERROR_CODES,
+            )
+            raise
 
     # ------------------------------------------------------------------ #
     # Async API
