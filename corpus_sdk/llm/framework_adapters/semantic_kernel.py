@@ -45,6 +45,7 @@ Design goals
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from functools import wraps
@@ -66,7 +67,7 @@ from typing import (
 from corpus_sdk.core.context_translation import (
     from_semantic_kernel as context_from_semantic_kernel,
 )
-from corpus_sdk.llm.framework_adapters.common.error_context import attach_context
+from corpus_sdk.core.error_context import attach_context
 from corpus_sdk.llm.llm_base import (
     LLMProtocolV1,
     OperationContext,
@@ -1016,6 +1017,104 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
         if not combined:
             return 0
         return max(1, len(combined) // 4)
+
+    # ------------------------------------------------------------------ #
+    # Health / capabilities via translator only (no adapter fallback)
+    # ------------------------------------------------------------------ #
+
+    @with_llm_error_context("health")
+    def health(self, **kwargs: Any) -> Mapping[str, Any]:
+        """
+        Synchronous health check.
+
+        Translator-only:
+        - `self._translator.health(**kwargs)` MUST be implemented for
+          framework="semantic_kernel".
+        - No fallback to llm_adapter.health to avoid legacy/adapter coupling.
+        """
+        translator_health = getattr(self._translator, "health", None)
+        if not callable(translator_health):
+            raise AttributeError(
+                "LLMTranslator for framework='semantic_kernel' must implement "
+                "health(); no adapter fallback is allowed."
+            )
+        return translator_health(**kwargs)
+
+    @with_async_llm_error_context("ahealth")
+    async def ahealth(self, **kwargs: Any) -> Mapping[str, Any]:
+        """
+        Async health check.
+
+        Translator-only resolution:
+        1. self._translator.ahealth(**kwargs)
+        2. self._translator.health(**kwargs) via worker thread
+
+        If neither is implemented, this is treated as a configuration error.
+        """
+        loop = asyncio.get_running_loop()
+
+        translator_ahealth = getattr(self._translator, "ahealth", None)
+        if callable(translator_ahealth):
+            return await translator_ahealth(**kwargs)  # type: ignore[misc]
+
+        translator_health = getattr(self._translator, "health", None)
+        if callable(translator_health):
+            return await loop.run_in_executor(
+                None,
+                lambda: translator_health(**kwargs),
+            )
+
+        raise AttributeError(
+            "LLMTranslator for framework='semantic_kernel' must implement "
+            "ahealth() or health(); no adapter fallback is allowed."
+        )
+
+    @with_llm_error_context("capabilities")
+    def capabilities(self, **kwargs: Any) -> Mapping[str, Any]:
+        """
+        Synchronous capabilities query.
+
+        Translator-only:
+        - `self._translator.capabilities(**kwargs)` MUST be implemented.
+        - No fallback to llm_adapter.capabilities to keep a strict
+          translator-first contract.
+        """
+        translator_capabilities = getattr(self._translator, "capabilities", None)
+        if not callable(translator_capabilities):
+            raise AttributeError(
+                "LLMTranslator for framework='semantic_kernel' must implement "
+                "capabilities(); no adapter fallback is allowed."
+            )
+        return translator_capabilities(**kwargs)
+
+    @with_async_llm_error_context("acapabilities")
+    async def acapabilities(self, **kwargs: Any) -> Mapping[str, Any]:
+        """
+        Async capabilities query.
+
+        Translator-only resolution:
+        1. self._translator.acapabilities(**kwargs)
+        2. self._translator.capabilities(**kwargs) via worker thread
+
+        If neither is implemented, this is treated as a configuration error.
+        """
+        loop = asyncio.get_running_loop()
+
+        translator_acapabilities = getattr(self._translator, "acapabilities", None)
+        if callable(translator_acapabilities):
+            return await translator_acapabilities(**kwargs)  # type: ignore[misc]
+
+        translator_capabilities = getattr(self._translator, "capabilities", None)
+        if callable(translator_capabilities):
+            return await loop.run_in_executor(
+                None,
+                lambda: translator_capabilities(**kwargs),
+            )
+
+        raise AttributeError(
+            "LLMTranslator for framework='semantic_kernel' must implement "
+            "acapabilities() or capabilities(); no adapter fallback is allowed."
+        )
 
 
 __all__ = [
