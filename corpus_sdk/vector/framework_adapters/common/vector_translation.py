@@ -141,6 +141,9 @@ def _ensure_operation_context(
         - OperationContext: returned as-is
         - Mapping[str, Any]: interpreted via context_translation.from_dict,
           then adapted into a vector OperationContext.
+
+    Raises:
+        BadRequest: if `ctx` is of an unsupported type.
     """
     if ctx is None:
         core_ctx = ctx_from_dict({})
@@ -267,7 +270,15 @@ class FilterTranslator:
     }
 
     def normalize(self, raw: Any) -> Optional[Mapping[str, Any]]:
-        """Normalize arbitrary filter DSL into a mapping, or None."""
+        """
+        Normalize arbitrary filter DSL into a mapping, or None.
+
+        Returns:
+            A normalized mapping, or None if the input is falsy / empty.
+
+        Raises:
+            BadRequest: if the filter shape or type is unsupported.
+        """
         if raw is None:
             return None
 
@@ -280,7 +291,10 @@ class FilterTranslator:
             return self._normalize_sequence(raw)
 
         # Anything else is unsupported.
-        LOG.warning("FilterTranslator: unsupported type %s, ignoring.", type(raw))
+        LOG.warning(
+            "FilterTranslator: unsupported filter type %s; raising BadRequest.",
+            type(raw),
+        )
         raise BadRequest(
             f"Unsupported filter type: {type(raw).__name__}",
             code="BAD_FILTER",
@@ -320,8 +334,8 @@ class FilterTranslator:
                 if mapped:
                     out[key] = {mapped: v}
                 else:
-                    # Unrecognized operator - log warning and keep as-is
-                    LOG.warning(
+                    # Unrecognized operator - log at debug and keep as-is.
+                    LOG.debug(
                         "FilterTranslator: unrecognized range operator %r for field %r; "
                         "keeping original value",
                         op,
@@ -333,6 +347,14 @@ class FilterTranslator:
         return out
 
     def _normalize_sequence(self, raw: Sequence[Any]) -> Mapping[str, Any]:
+        """
+        Normalize sequence-based filter syntax.
+
+        Supported patterns:
+            - ["age", ">", 18]         -> {"age": {"$gt": 18}}
+            - [ {...}, {...} ]         -> {"$and": [ ... ]}
+            - [ ["age", ">", 18], ...] -> {"$and": [ normalized(...) ]}
+        """
         # Tuple condition: ["age", ">", 18]
         # Explicitly check if the middle element is a known string operator
         # to safely distinguish from data lists [1, 2, 3].
@@ -965,6 +987,9 @@ class VectorTranslator:
             - Each match contains:
                 * a numeric score field (mmr_config.score_key), and
                 * a vector field (mmr_config.vector_key) with equal dimensions
+
+        If any of these structural requirements are not met, MMR is skipped and
+        the original result is returned unchanged.
         """
         if mmr_config is None or not mmr_config.enabled:
             return result
@@ -1087,7 +1112,7 @@ class VectorTranslator:
             remaining = [matches[i] for i in range(n) if i not in selected_indices]
             reordered.extend(remaining)
 
-        LOG.info(
+        LOG.debug(
             "MMR applied: %d matches -> %d selected with lambda=%.2f (invert_score=%s)",
             n,
             len(selected_indices),
@@ -1224,13 +1249,13 @@ class VectorTranslator:
                 raise self._translator.map_adapter_error(
                     e, op_ctx=ctx, framework_ctx=framework_ctx
                 ) from e
-            
+
             if not isinstance(result, QueryResult):
                 raise BadRequest(
                     f"Invalid result type: {type(result)}",
                     code="BAD_ADAPTER_RESULT",
                 )
-            
+
             result = self._apply_mmr_to_query_result(result, mmr_config)
             return self._translator.translate_query_result(
                 result,
