@@ -24,7 +24,8 @@ Design goals
 
 2. Optional dependency safe:
    Import of LangChain is guarded. Importing this module is safe even if
-   LangChain is not installed.
+   LangChain is not installed; attempting to *instantiate* the adapter without
+   LangChain will raise a clear ImportError.
 
 3. Simple & explicit interface:
    Clean API that LangChain can use directly by plugging in this client
@@ -59,13 +60,96 @@ from typing import (
     TypeVar,
 )
 
-from langchain_core.callbacks import (
-    AsyncCallbackManagerForLLMRun,
-    CallbackManagerForLLMRun,
-)
-from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, HumanMessage
-from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
+# ---------------------------------------------------------------------------
+# Optional LangChain imports (guarded)
+# ---------------------------------------------------------------------------
+
+try:  # pragma: no cover - optional dependency
+    from langchain_core.callbacks import (
+        AsyncCallbackManagerForLLMRun,
+        CallbackManagerForLLMRun,
+    )
+    from langchain_core.language_models import BaseChatModel
+    from langchain_core.messages import (
+        AIMessage,
+        AIMessageChunk,
+        BaseMessage,
+        HumanMessage,
+    )
+    from langchain_core.outputs import (
+        ChatGeneration,
+        ChatGenerationChunk,
+        ChatResult,
+    )
+
+    LANGCHAIN_AVAILABLE = True
+except ImportError:  # pragma: no cover - environments without LangChain
+    LANGCHAIN_AVAILABLE = False
+
+    # Minimal shims so the module can be imported and type hints are valid.
+    # These are never *used* at runtime because CorpusLangChainLLM.__init__
+    # raises if LangChain is not available.
+
+    class BaseChatModel:  # type: ignore[no-redef]
+        pass
+
+    class BaseMessage:  # type: ignore[no-redef]
+        def __init__(self, content: Any = "") -> None:
+            self.content = content
+            self.type = "unknown"
+
+    class AIMessage(BaseMessage):  # type: ignore[no-redef]
+        def __init__(self, content: Any = "") -> None:
+            super().__init__(content)
+            self.type = "ai"
+
+    class HumanMessage(BaseMessage):  # type: ignore[no-redef]
+        def __init__(self, content: Any = "") -> None:
+            super().__init__(content)
+            self.type = "human"
+
+    class AIMessageChunk(AIMessage):  # type: ignore[no-redef]
+        pass
+
+    class ChatGeneration:  # type: ignore[no-redef]
+        def __init__(self, message: AIMessage, generation_info: Optional[Dict[str, Any]] = None) -> None:
+            self.message = message
+            self.generation_info = generation_info or {}
+
+    class ChatGenerationChunk:  # type: ignore[no-redef]
+        def __init__(self, message: AIMessageChunk) -> None:
+            self.message = message
+
+    class ChatResult:  # type: ignore[no-redef]
+        def __init__(self, generations: List[ChatGeneration]) -> None:
+            self.generations = generations
+
+    class CallbackManagerForLLMRun:  # type: ignore[no-redef]
+        def on_llm_start(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def on_llm_end(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def on_llm_error(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def on_llm_new_token(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+    class AsyncCallbackManagerForLLMRun:  # type: ignore[no-redef]
+        async def on_llm_start(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def on_llm_end(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def on_llm_error(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def on_llm_new_token(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
 
 from corpus_sdk.core.context_translation import ContextTranslator
 from corpus_sdk.core.error_context import attach_context
@@ -312,12 +396,18 @@ def _build_operation_context_from_config(
 
     Defensive behavior:
     - If `config` is already an OperationContext, return it.
+    - If `config` is None, construct a default OperationContext.
     - Else, call `ContextTranslator.from_langchain(config, ...)`.
     - If that call fails, attach rich context and re-raise.
     - If it returns a non-OperationContext, attach context and raise TypeError.
     """
     if isinstance(config, OperationContext):
         return config
+
+    if config is None:
+        # Typical LangChain usage does not always provide a config; treat this
+        # as a normal case and create a default OperationContext.
+        return OperationContext()
 
     try:
         ctx = ContextTranslator.from_langchain(
@@ -451,6 +541,14 @@ class CorpusLangChainLLM(BaseChatModel):
         """
         Initialize the LangChain adapter.
         """
+        if not LANGCHAIN_AVAILABLE:
+            raise ImportError(
+                "CorpusLangChainLLM requires `langchain-core` (and its dependencies) "
+                "to be installed. Please install it with `pip install langchain-core` "
+                "or ensure `langchain` is updated to a version that provides "
+                "`langchain_core`."
+            )
+
         # Resolve configuration precedence: explicit config > individual params.
         if config is not None:
             self._config = config
@@ -481,7 +579,7 @@ class CorpusLangChainLLM(BaseChatModel):
             effective_safety_filter = safety_filter
             effective_json_repair = json_repair
 
-        # Validate adapter + config invariants in a single place.
+        # Validate adapter invariants in a single place.
         self._validate_init_params(llm_adapter)
 
         super().__init__(**kwargs)
@@ -514,7 +612,9 @@ class CorpusLangChainLLM(BaseChatModel):
         Validate initialization parameters and adapter capabilities.
 
         - Ensures the adapter exposes core `LLMProtocolV1` methods.
-        - Validates temperature and max_tokens constraints.
+
+        Configuration values (temperature, max_tokens) have already been
+        validated by LangChainLLMConfig.
         """
         required_methods = (
             "complete",
@@ -534,19 +634,6 @@ class CorpusLangChainLLM(BaseChatModel):
                 "llm_adapter must implement LLMProtocolV1; missing methods: "
                 + ", ".join(missing)
             )
-
-        if not isinstance(self.temperature, (int, float)) or not (
-            0.0 <= float(self.temperature) <= 2.0
-        ):
-            raise ValueError(
-                f"{INIT_CONFIG_ERROR}: temperature must be between 0.0 and 2.0"
-            )
-
-        if self.max_tokens is not None:
-            if not isinstance(self.max_tokens, int) or self.max_tokens < 1:
-                raise ValueError(
-                    f"{INIT_CONFIG_ERROR}: max_tokens must be a positive integer"
-                )
 
     # ------------------------------------------------------------------ #
     # LangChain-required properties
@@ -1115,4 +1202,5 @@ __all__ = [
     "with_llm_error_context",
     "with_async_llm_error_context",
     "ERROR_CODES",
+    "LANGCHAIN_AVAILABLE",
 ]
