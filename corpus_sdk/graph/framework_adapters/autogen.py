@@ -100,13 +100,6 @@ from corpus_sdk.graph.graph_base import (
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
-# Optional metrics sink; tests monkeypatch this symbol directly.
-try:  # pragma: no cover - optional dependency
-    from corpus_sdk.core.metrics import get_metrics_sink  # type: ignore[import]
-except Exception:  # pragma: no cover - used only if not monkeypatched in tests
-    def get_metrics_sink() -> Any:
-        return None
-
 
 # ---------------------------------------------------------------------------
 # Error code constants (standalone, NOT subclassing shared coercion enums)
@@ -898,42 +891,6 @@ class CorpusAutoGenGraphClient:
                 f"params must be a mapping (e.g. dict), not {type(params).__name__}"
             )
 
-    def _record_operation_metric(
-        self,
-        operation: str,
-        *,
-        namespace: Optional[str] = None,
-    ) -> None:
-        """
-        Best-effort telemetry hook for graph operations.
-
-        Uses the shared metrics sink when available; failures are swallowed
-        to avoid impacting hot paths.
-        """
-        try:
-            sink = get_metrics_sink()
-        except Exception:
-            return
-
-        if sink is None:
-            return
-
-        payload: Dict[str, Any] = {
-            "component": "graph",
-            "framework": "autogen",
-            "operation": operation,
-        }
-        if namespace is not None:
-            payload["namespace"] = namespace
-
-        try:
-            if hasattr(sink, "observe"):
-                sink.observe(**payload)
-            elif hasattr(sink, "counter"):
-                sink.counter(**payload)
-        except Exception:
-            logger.debug("graph metrics sink failed", exc_info=True)
-
     # ------------------------------------------------------------------ #
     # Capabilities / schema / health
     # ------------------------------------------------------------------ #
@@ -1113,9 +1070,7 @@ class CorpusAutoGenGraphClient:
             namespace=namespace,
         )
 
-        # Telemetry + logging for observability.
         effective_ns = namespace or self._default_namespace
-        self._record_operation_metric("query", namespace=effective_ns)
         logger.info(
             "AutoGen graph query: framework=autogen namespace=%s",
             effective_ns,
@@ -1189,7 +1144,6 @@ class CorpusAutoGenGraphClient:
         )
 
         effective_ns = namespace or self._default_namespace
-        self._record_operation_metric("query", namespace=effective_ns)
         logger.info(
             "AutoGen graph async query: framework=autogen namespace=%s",
             effective_ns,
@@ -1266,7 +1220,6 @@ class CorpusAutoGenGraphClient:
         )
 
         effective_ns = namespace or self._default_namespace
-        self._record_operation_metric("stream_query", namespace=effective_ns)
         logger.info(
             "AutoGen graph stream_query: framework=autogen namespace=%s",
             effective_ns,
@@ -1320,7 +1273,6 @@ class CorpusAutoGenGraphClient:
         )
 
         effective_ns = namespace or self._default_namespace
-        self._record_operation_metric("stream_query", namespace=effective_ns)
         logger.info(
             "AutoGen graph astream_query: framework=autogen namespace=%s",
             effective_ns,
