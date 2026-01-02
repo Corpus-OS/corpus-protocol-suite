@@ -844,56 +844,99 @@ class CorpusLangChainLLM(BaseChatModel):
         return ChatGenerationChunk(message=ai_chunk)
 
     # ------------------------------------------------------------------ #
-    # Optional health / capabilities passthroughs
+    # Optional health / capabilities passthroughs (translator-first)
     # ------------------------------------------------------------------ #
 
     @with_llm_error_context("capabilities")
     def capabilities(self) -> Mapping[str, Any]:
         """
-        Expose underlying LLMProtocolV1 capabilities.
+        Expose capabilities, preferring translator semantics.
 
-        This is optional and does not affect LangChain behavior, but is useful
-        for open-source users who want to introspect supported models/features.
+        Resolution order:
+        1. self._translator.capabilities()
+        2. self._llm_adapter.capabilities()
         """
+        translator_cap = getattr(self._translator, "capabilities", None)
+        if callable(translator_cap):
+            return translator_cap()
+
         return self._llm_adapter.capabilities()
 
     @with_async_llm_error_context("acapabilities")
     async def acapabilities(self) -> Mapping[str, Any]:
         """
-        Async wrapper for underlying capabilities.
+        Async capabilities wrapper, translator-first.
 
-        Prefer `llm_adapter.acapabilities()` when available; otherwise, call
-        the sync method in a background thread.
+        Resolution order:
+        1. self._translator.acapabilities()
+        2. self._translator.capabilities() via executor
+        3. self._llm_adapter.acapabilities()
+        4. self._llm_adapter.capabilities() via executor
         """
-        acap = getattr(self._llm_adapter, "acapabilities", None)
-        if callable(acap):
-            return await acap()
+        # 1. Translator async, if present
+        translator_acap = getattr(self._translator, "acapabilities", None)
+        if callable(translator_acap):
+            return await translator_acap()  # type: ignore[misc]
 
         loop = asyncio.get_running_loop()
+
+        # 2. Translator sync via executor
+        translator_cap = getattr(self._translator, "capabilities", None)
+        if callable(translator_cap):
+            return await loop.run_in_executor(None, translator_cap)
+
+        # 3. Adapter async, if present
+        adapter_acap = getattr(self._llm_adapter, "acapabilities", None)
+        if callable(adapter_acap):
+            return await adapter_acap()  # type: ignore[misc]
+
+        # 4. Adapter sync via executor (required for LLMProtocolV1)
         return await loop.run_in_executor(None, self._llm_adapter.capabilities)
 
     @with_llm_error_context("health")
     def health(self) -> Mapping[str, Any]:
         """
-        Expose underlying LLMProtocolV1 health status.
+        Expose health, preferring translator semantics.
 
-        Returns a provider-defined mapping with health details.
+        Resolution order:
+        1. self._translator.health()
+        2. self._llm_adapter.health()
         """
+        translator_health = getattr(self._translator, "health", None)
+        if callable(translator_health):
+            return translator_health()
+
         return self._llm_adapter.health()
 
     @with_async_llm_error_context("ahealth")
     async def ahealth(self) -> Mapping[str, Any]:
         """
-        Async wrapper for underlying health endpoint.
+        Async health wrapper, translator-first.
 
-        Prefer `llm_adapter.ahealth()` when available; otherwise, call the
-        sync method in a background thread.
+        Resolution order:
+        1. self._translator.ahealth()
+        2. self._translator.health() via executor
+        3. self._llm_adapter.ahealth()
+        4. self._llm_adapter.health() via executor
         """
-        ahealth = getattr(self._llm_adapter, "ahealth", None)
-        if callable(ahealth):
-            return await ahealth()
+        # 1. Translator async, if present
+        translator_ahealth = getattr(self._translator, "ahealth", None)
+        if callable(translator_ahealth):
+            return await translator_ahealth()  # type: ignore[misc]
 
         loop = asyncio.get_running_loop()
+
+        # 2. Translator sync via executor
+        translator_health = getattr(self._translator, "health", None)
+        if callable(translator_health):
+            return await loop.run_in_executor(None, translator_health)
+
+        # 3. Adapter async, if present
+        adapter_ahealth = getattr(self._llm_adapter, "ahealth", None)
+        if callable(adapter_ahealth):
+            return await adapter_ahealth()  # type: ignore[misc]
+
+        # 4. Adapter sync via executor (required for LLMProtocolV1)
         return await loop.run_in_executor(None, self._llm_adapter.health)
 
     # ------------------------------------------------------------------ #
