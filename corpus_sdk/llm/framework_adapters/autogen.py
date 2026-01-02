@@ -595,22 +595,15 @@ class CorpusAutoGenChatClient:
     # ------------------------------------------------------------------ #
 
     @with_llm_error_context("capabilities")
-    def capabilities(self, **kwargs: Any) -> Mapping[str, Any]:
+    def capabilities(self) -> Mapping[str, Any]:
         """
         Synchronous capabilities accessor.
 
-        Delegates exclusively to the LLM translator. The translator is the
-        single source of truth for capability reporting; the underlying adapter
-        is not used here to avoid divergent behavior and technical debt.
+        Delegates exclusively to the LLM translator. Returns a Mapping
+        suitable for observability and introspection tooling.
         """
-        translator_caps = getattr(self._translator, "capabilities", None)
-        if not callable(translator_caps):
-            raise TypeError(
-                f"{ErrorCodes.BAD_USAGE_RESULT}: "
-                "LLMTranslator does not implement capabilities()"
-            )
+        result = self._translator.capabilities()
 
-        result = translator_caps(**kwargs)
         if not isinstance(result, Mapping):
             raise TypeError(
                 f"{ErrorCodes.BAD_USAGE_RESULT}: "
@@ -619,28 +612,20 @@ class CorpusAutoGenChatClient:
         return result
 
     @with_async_llm_error_context("acapabilities")
-    async def acapabilities(self, **kwargs: Any) -> Mapping[str, Any]:
+    async def acapabilities(self) -> Mapping[str, Any]:
         """
         Async capabilities accessor.
 
-        Delegates exclusively to the LLM translator:
-
-        - Prefer an async `acapabilities(**kwargs)` on the translator.
-        - Otherwise, run the sync `capabilities(**kwargs)` in a worker thread.
-
-        The underlying adapter is intentionally not used here.
+        Prefers async translator methods when available, otherwise falls back
+        to sync translator methods executed in a thread. The underlying
+        adapter is not called directly to keep capabilities centralized
+        in the translator layer.
         """
         async_caps = getattr(self._translator, "acapabilities", None)
         if callable(async_caps):
-            result = await async_caps(**kwargs)
+            result = await async_caps()
         else:
-            caps_fn = getattr(self._translator, "capabilities", None)
-            if not callable(caps_fn):
-                raise TypeError(
-                    f"{ErrorCodes.BAD_USAGE_RESULT}: "
-                    "LLMTranslator does not implement capabilities() or acapabilities()"
-                )
-            result = await asyncio.to_thread(caps_fn, **kwargs)
+            result = await asyncio.to_thread(self._translator.capabilities)
 
         if not isinstance(result, Mapping):
             raise TypeError(
@@ -650,22 +635,15 @@ class CorpusAutoGenChatClient:
         return result
 
     @with_llm_error_context("health")
-    def health(self, **kwargs: Any) -> Mapping[str, Any]:
+    def health(self) -> Mapping[str, Any]:
         """
         Synchronous health accessor.
 
-        Delegates exclusively to the LLM translator. Health reporting is
-        centralized in the translator so that all framework adapters see
-        consistent semantics.
+        Delegates exclusively to the LLM translator. Returns a Mapping
+        representing the health status.
         """
-        translator_health = getattr(self._translator, "health", None)
-        if not callable(translator_health):
-            raise TypeError(
-                f"{ErrorCodes.BAD_USAGE_RESULT}: "
-                "LLMTranslator does not implement health()"
-            )
+        result = self._translator.health()
 
-        result = translator_health(**kwargs)
         if not isinstance(result, Mapping):
             raise TypeError(
                 f"{ErrorCodes.BAD_USAGE_RESULT}: "
@@ -674,28 +652,20 @@ class CorpusAutoGenChatClient:
         return result
 
     @with_async_llm_error_context("ahealth")
-    async def ahealth(self, **kwargs: Any) -> Mapping[str, Any]:
+    async def ahealth(self) -> Mapping[str, Any]:
         """
         Async health accessor.
 
-        Delegates exclusively to the LLM translator:
-
-        - Prefer an async `ahealth(**kwargs)` on the translator.
-        - Otherwise, run the sync `health(**kwargs)` in a worker thread.
-
-        The underlying adapter is intentionally not used here.
+        Prefers async translator methods when available, otherwise falls back
+        to sync translator methods executed in a thread. The underlying
+        adapter is not called directly to keep health centralized in the
+        translator layer.
         """
         async_health = getattr(self._translator, "ahealth", None)
         if callable(async_health):
-            result = await async_health(**kwargs)
+            result = await async_health()
         else:
-            translator_health = getattr(self._translator, "health", None)
-            if not callable(translator_health):
-                raise TypeError(
-                    f"{ErrorCodes.BAD_USAGE_RESULT}: "
-                    "LLMTranslator does not implement health() or ahealth()"
-                )
-            result = await asyncio.to_thread(translator_health, **kwargs)
+            result = await asyncio.to_thread(self._translator.health)
 
         if not isinstance(result, Mapping):
             raise TypeError(
