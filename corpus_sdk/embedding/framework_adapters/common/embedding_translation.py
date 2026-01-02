@@ -1374,6 +1374,85 @@ class EmbeddingTranslator:
         )
 
     # --------------------------------------------------------------------- #
+    # Resource Management / Cleanup
+    # --------------------------------------------------------------------- #
+
+    async def aclose(
+        self,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,  # noqa: ARG002
+    ) -> None:
+        """
+        Async resource cleanup helper.
+
+        Best-effort closing of the underlying adapter. Preference order:
+            1) adapter.aclose() if present
+            2) adapter.close() if present (awaited if async, else run in a worker thread)
+
+        Errors are wrapped with standard embedding error context via _run_operation.
+        """
+
+        async def _logic(ctx: OperationContext) -> None:  # noqa: ARG001
+            adapter = self._adapter
+            aclose = getattr(adapter, "aclose", None)
+            if callable(aclose):
+                await aclose()
+                return
+
+            close = getattr(adapter, "close", None)
+            if not callable(close):
+                return
+
+            if asyncio.iscoroutinefunction(close):
+                await close()
+            else:
+                await asyncio.to_thread(close)
+
+        await self._run_operation(
+            op_name="close",
+            op_ctx=op_ctx,
+            sync=False,
+            logic=_logic,
+        )
+
+    def close(
+        self,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,  # noqa: ARG002
+    ) -> None:
+        """
+        Synchronous resource cleanup helper.
+
+        Delegates adapter closing to the shared AsyncBridge in `_run_operation`,
+        ensuring consistent timeout handling and error-context attachment.
+        """
+
+        async def _logic(ctx: OperationContext) -> None:  # noqa: ARG001
+            adapter = self._adapter
+            aclose = getattr(adapter, "aclose", None)
+            if callable(aclose):
+                await aclose()
+                return
+
+            close = getattr(adapter, "close", None)
+            if not callable(close):
+                return
+
+            if asyncio.iscoroutinefunction(close):
+                await close()
+            else:
+                await asyncio.to_thread(close)
+
+        self._run_operation(
+            op_name="close",
+            op_ctx=op_ctx,
+            sync=True,
+            logic=_logic,
+        )
+
+    # --------------------------------------------------------------------- #
     # Stats / Inspection
     # --------------------------------------------------------------------- #
 
