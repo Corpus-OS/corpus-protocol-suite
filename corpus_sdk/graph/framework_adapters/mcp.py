@@ -463,6 +463,10 @@ class CorpusMCPGraphClient:
 
         If both are None/empty, returns None and lets downstream helpers
         construct an "empty" OperationContext as needed.
+
+        On translation failure, we attach error context and log a warning,
+        but *do not* raise; we degrade gracefully to `None` so graph calls
+        can still proceed without an OperationContext.
         """
         extra: Dict[str, Any] = dict(extra_context or {})
 
@@ -475,23 +479,28 @@ class CorpusMCPGraphClient:
                 framework_version=self._framework_version,
                 **extra,
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             attach_context(
                 exc,
                 framework="mcp",
                 operation="context_translation",
+                error_code=ErrorCodes.BAD_OPERATION_CONTEXT,
+                context_snapshot=str(mcp_context)[:1024] if mcp_context is not None else None,
             )
-            # Surface a consistent BadRequest with symbolic error code.
-            raise BadRequest(
-                "Failed to build OperationContext from MCP inputs",
-                code=ErrorCodes.BAD_OPERATION_CONTEXT,
-            ) from exc
+            logger.warning(
+                "Failed to build OperationContext from MCP inputs; "
+                "proceeding without OperationContext: %s",
+                exc,
+            )
+            return None
 
         if not isinstance(ctx, OperationContext):
-            raise BadRequest(
-                f"from_mcp produced unsupported context type: {type(ctx).__name__}",
-                code=ErrorCodes.BAD_OPERATION_CONTEXT,
+            logger.warning(
+                "from_mcp produced unsupported context type %s; "
+                "proceeding without OperationContext.",
+                type(ctx).__name__,
             )
+            return None
 
         return ctx
 
@@ -582,6 +591,23 @@ class CorpusMCPGraphClient:
         # Normalize to list to avoid one-shot iterables.
         spec.edges = edges_list  # type: ignore[assignment]
 
+    def _extract_request_id(
+        self,
+        mcp_context: Optional[Mapping[str, Any]],
+    ) -> Optional[str]:
+        """
+        Extract a best-effort request_id from the MCP context for tracing.
+
+        We keep this intentionally loose (stringify if present) and ignore
+        type mismatches rather than failing the call.
+        """
+        if mcp_context is None:
+            return None
+        value = mcp_context.get("request_id")
+        if value is None:
+            return None
+        return str(value)
+
     # ------------------------------------------------------------------ #
     # Capabilities / schema / health (async-only)
     # ------------------------------------------------------------------ #
@@ -611,9 +637,13 @@ class CorpusMCPGraphClient:
             mcp_context=mcp_context,
             extra_context=extra_context,
         )
+        framework_ctx = self._framework_ctx(
+            operation="get_schema",
+            request_id=self._extract_request_id(mcp_context),
+        )
         schema = await self._translator.arun_get_schema(
             op_ctx=ctx,
-            framework_ctx=self._framework_ctx(operation="get_schema"),
+            framework_ctx=framework_ctx,
         )
         return validate_graph_result_type(
             schema,
@@ -636,9 +666,13 @@ class CorpusMCPGraphClient:
             mcp_context=mcp_context,
             extra_context=extra_context,
         )
+        framework_ctx = self._framework_ctx(
+            operation="health",
+            request_id=self._extract_request_id(mcp_context),
+        )
         health_result = await self._translator.arun_health(
             op_ctx=ctx,
-            framework_ctx=self._framework_ctx(operation="health"),
+            framework_ctx=framework_ctx,
         )
         return validate_graph_result_type(
             health_result,
@@ -685,6 +719,7 @@ class CorpusMCPGraphClient:
         framework_ctx = self._framework_ctx(
             operation="query",
             namespace=namespace,
+            request_id=self._extract_request_id(mcp_context),
         )
 
         result = await self._translator.arun_query(
@@ -736,6 +771,7 @@ class CorpusMCPGraphClient:
         framework_ctx = self._framework_ctx(
             operation="stream_query",
             namespace=namespace,
+            request_id=self._extract_request_id(mcp_context),
         )
 
         async for chunk in self._translator.arun_query_stream(
@@ -774,6 +810,7 @@ class CorpusMCPGraphClient:
         framework_ctx = self._framework_ctx(
             operation="upsert_nodes",
             namespace=getattr(spec, "namespace", None),
+            request_id=self._extract_request_id(mcp_context),
         )
 
         result = await self._translator.arun_upsert_nodes(
@@ -808,6 +845,7 @@ class CorpusMCPGraphClient:
         framework_ctx = self._framework_ctx(
             operation="upsert_edges",
             namespace=getattr(spec, "namespace", None),
+            request_id=self._extract_request_id(mcp_context),
         )
 
         result = await self._translator.arun_upsert_edges(
@@ -844,12 +882,19 @@ class CorpusMCPGraphClient:
         framework_ctx = self._framework_ctx(
             operation="delete_nodes",
             namespace=getattr(spec, "namespace", None),
+            request_id=self._extract_request_id(mcp_context),
         )
 
         if spec.filter is not None:
             raw_filter_or_ids: Any = spec.filter
         else:
-            raw_filter_or_ids = list(spec.ids or [])
+            ids = list(spec.ids or [])
+            if not ids:
+                raise BadRequest(
+                    "DeleteNodesSpec must specify either filter or non-empty ids",
+                    code=ErrorCodes.BAD_ADAPTER_RESULT,
+                )
+            raw_filter_or_ids = ids
 
         result = await self._translator.arun_delete_nodes(
             raw_filter_or_ids,
@@ -881,12 +926,19 @@ class CorpusMCPGraphClient:
         framework_ctx = self._framework_ctx(
             operation="delete_edges",
             namespace=getattr(spec, "namespace", None),
+            request_id=self._extract_request_id(mcp_context),
         )
 
         if spec.filter is not None:
             raw_filter_or_ids: Any = spec.filter
         else:
-            raw_filter_or_ids = list(spec.ids or [])
+            ids = list(spec.ids or [])
+            if not ids:
+                raise BadRequest(
+                    "DeleteEdgesSpec must specify either filter or non-empty ids",
+                    code=ErrorCodes.BAD_ADAPTER_RESULT,
+                )
+            raw_filter_or_ids = ids
 
         result = await self._translator.arun_delete_edges(
             raw_filter_or_ids,
@@ -930,6 +982,7 @@ class CorpusMCPGraphClient:
         framework_ctx = self._framework_ctx(
             operation="bulk_vertices",
             namespace=spec.namespace,
+            request_id=self._extract_request_id(mcp_context),
         )
 
         result = await self._translator.arun_bulk_vertices(
@@ -971,7 +1024,10 @@ class CorpusMCPGraphClient:
         raw_batch_ops: List[Mapping[str, Any]] = [
             {"op": op.op, "args": dict(op.args or {})} for op in ops
         ]
-        framework_ctx = self._framework_ctx(operation="batch")
+        framework_ctx = self._framework_ctx(
+            operation="batch",
+            request_id=self._extract_request_id(mcp_context),
+        )
 
         result = await self._translator.arun_batch(
             raw_batch_ops,
