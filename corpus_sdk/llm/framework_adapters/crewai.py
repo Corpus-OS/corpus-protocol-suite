@@ -1167,44 +1167,68 @@ class CorpusCrewAILLM:
                     )
 
     # ---------------------------------------------------------------------
-    # Health and capabilities passthroughs
+    # Health and capabilities passthroughs (translator-first)
     # ---------------------------------------------------------------------
 
     @with_llm_error_context("health")
     def health(self, **kwargs: Any) -> Mapping[str, Any]:
         """
-        Sync health check passthrough.
+        Sync health check.
 
-        Delegates to the underlying LLM adapter's `health()` method.
+        Resolution order:
+        1. self._translator.health(**kwargs)
+        2. self._llm_adapter.health(**kwargs)
+
         Guarded against use from inside an event loop to prevent sync blocking
         in async code.
         """
         _ensure_not_in_event_loop("health")
 
+        translator_health = getattr(self._translator, "health", None)
+        if callable(translator_health):
+            return translator_health(**kwargs)
+
         health_fn = getattr(self._llm_adapter, "health", None)
-        if not callable(health_fn):
-            raise RuntimeError(
-                "Underlying LLM adapter does not implement health(). "
-                "This violates the LLMProtocolV1 requirements."
-            )
-        return health_fn(**kwargs)
+        if callable(health_fn):
+            return health_fn(**kwargs)
+
+        raise RuntimeError(
+            "Underlying LLM adapter does not implement health(). "
+            "This violates the LLMProtocolV1 requirements."
+        )
 
     @with_async_llm_error_context("ahealth")
     async def ahealth(self, **kwargs: Any) -> Mapping[str, Any]:
         """
-        Async health check passthrough.
+        Async health check.
 
-        Prefer an async `ahealth()` method on the underlying adapter when
-        available, otherwise run the sync `health()` method in a worker
-        thread via `asyncio.to_thread` to avoid blocking the event loop.
+        Resolution order:
+        1. self._translator.ahealth(**kwargs)
+        2. self._translator.health(**kwargs) via executor
+        3. self._llm_adapter.ahealth(**kwargs)
+        4. self._llm_adapter.health(**kwargs) via executor
         """
+        # 1. Translator async, if present
+        translator_ahealth = getattr(self._translator, "ahealth", None)
+        if callable(translator_ahealth):
+            return await translator_ahealth(**kwargs)  # type: ignore[misc]
+
+        loop = asyncio.get_running_loop()
+
+        # 2. Translator sync via executor
+        translator_health = getattr(self._translator, "health", None)
+        if callable(translator_health):
+            return await loop.run_in_executor(None, lambda: translator_health(**kwargs))
+
+        # 3. Adapter async, if present
         ahealth_fn = getattr(self._llm_adapter, "ahealth", None)
         if callable(ahealth_fn):
-            return await ahealth_fn(**kwargs)
+            return await ahealth_fn(**kwargs)  # type: ignore[misc]
 
+        # 4. Adapter sync via executor
         health_fn = getattr(self._llm_adapter, "health", None)
         if callable(health_fn):
-            return await asyncio.to_thread(health_fn, **kwargs)
+            return await loop.run_in_executor(None, lambda: health_fn(**kwargs))
 
         raise RuntimeError(
             "Underlying LLM adapter does not implement health(). "
@@ -1214,38 +1238,62 @@ class CorpusCrewAILLM:
     @with_llm_error_context("capabilities")
     def capabilities(self, **kwargs: Any) -> Mapping[str, Any]:
         """
-        Sync capabilities passthrough.
+        Sync capabilities query.
 
-        Delegates to the underlying LLM adapter's `capabilities()` method.
+        Resolution order:
+        1. self._translator.capabilities(**kwargs)
+        2. self._llm_adapter.capabilities(**kwargs)
+
         Guarded against use from inside an event loop to prevent sync blocking
         in async code.
         """
         _ensure_not_in_event_loop("capabilities")
 
+        translator_caps = getattr(self._translator, "capabilities", None)
+        if callable(translator_caps):
+            return translator_caps(**kwargs)
+
         caps_fn = getattr(self._llm_adapter, "capabilities", None)
-        if not callable(caps_fn):
-            raise RuntimeError(
-                "Underlying LLM adapter does not implement capabilities(). "
-                "This violates the LLMProtocolV1 requirements."
-            )
-        return caps_fn(**kwargs)
+        if callable(caps_fn):
+            return caps_fn(**kwargs)
+
+        raise RuntimeError(
+            "Underlying LLM adapter does not implement capabilities(). "
+            "This violates the LLMProtocolV1 requirements."
+        )
 
     @with_async_llm_error_context("acapabilities")
     async def acapabilities(self, **kwargs: Any) -> Mapping[str, Any]:
         """
-        Async capabilities passthrough.
+        Async capabilities query.
 
-        Prefer an async `acapabilities()` method on the underlying adapter when
-        available, otherwise run the sync `capabilities()` method in a worker
-        thread via `asyncio.to_thread` to avoid blocking the event loop.
+        Resolution order:
+        1. self._translator.acapabilities(**kwargs)
+        2. self._translator.capabilities(**kwargs) via executor
+        3. self._llm_adapter.acapabilities(**kwargs)
+        4. self._llm_adapter.capabilities(**kwargs) via executor
         """
+        # 1. Translator async, if present
+        translator_acaps = getattr(self._translator, "acapabilities", None)
+        if callable(translator_acaps):
+            return await translator_acaps(**kwargs)  # type: ignore[misc]
+
+        loop = asyncio.get_running_loop()
+
+        # 2. Translator sync via executor
+        translator_caps = getattr(self._translator, "capabilities", None)
+        if callable(translator_caps):
+            return await loop.run_in_executor(None, lambda: translator_caps(**kwargs))
+
+        # 3. Adapter async, if present
         acaps_fn = getattr(self._llm_adapter, "acapabilities", None)
         if callable(acaps_fn):
-            return await acaps_fn(**kwargs)
+            return await acaps_fn(**kwargs)  # type: ignore[misc]
 
+        # 4. Adapter sync via executor
         caps_fn = getattr(self._llm_adapter, "capabilities", None)
         if callable(caps_fn):
-            return await asyncio.to_thread(caps_fn, **kwargs)
+            return await loop.run_in_executor(None, lambda: caps_fn(**kwargs))
 
         raise RuntimeError(
             "Underlying LLM adapter does not implement capabilities(). "
