@@ -33,6 +33,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from functools import cached_property, wraps
+from threading import RLock
 from typing import (
     Any,
     AsyncIterator,
@@ -96,6 +97,9 @@ class ErrorCodes:
     BAD_METADATA = "BAD_METADATA"
     BAD_IDS = "BAD_IDS"
     NO_EMBEDDING_FUNCTION = "NO_EMBEDDING_FUNCTION"
+    BAD_TEXTS = "BAD_TEXTS"
+    UNKNOWN_VECTOR_DIMENSION = "UNKNOWN_VECTOR_DIMENSION"
+    VECTOR_DIM_MISMATCH = "VECTOR_DIM_MISMATCH"
 
 
 # Bundle of error codes for vector coercion utilities
@@ -106,7 +110,7 @@ VECTOR_COERCION_ERROR_CODES: VectorCoercionErrorCodes = VectorCoercionErrorCodes
     conversion_error="VECTOR_CONVERSION_ERROR",
     score_out_of_range="VECTOR_SCORE_OUT_OF_RANGE",
     vector_dimension_exceeded="VECTOR_DIMENSION_EXCEEDED",
-    vector_norm_invalid="VECTOR_NORM_INVALID",
+    vector_norm_invalid="VECTOR_VECTOR_NORM_INVALID",
     framework_label="autogen",
 )
 
@@ -152,16 +156,272 @@ def _warn_if_extreme_k(k: int, op_name: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Error decorators
+# Event-loop guard
 # --------------------------------------------------------------------------- #
+
+
+def _ensure_not_in_event_loop(sync_api_name: str) -> None:
+    """
+    Prevent deadlocks from calling sync APIs in active event loops.
+
+    This is a defensive guard for environments where users might
+    accidentally call sync vector APIs from async frameworks.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        # No running loop -> safe to use sync API.
+        return
+    raise RuntimeError(
+        f"{sync_api_name} was called from inside an active asyncio event loop. "
+        f"Use the async variant instead (e.g. 'a{sync_api_name}')."
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Error decorators with operation-specific context builders
+# --------------------------------------------------------------------------- #
+
+
+def _build_add_context(args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build additional error-context fields for add_* style operations.
+
+    Extracts:
+    - texts_count
+    - vectors_count (alias of texts_count for vector ops)
+    - total_content_chars (sum of source text lengths, best-effort)
+    - metadatas_count
+    - ids_count
+    - has_embeddings
+    """
+    extra: Dict[str, Any] = {}
+    try:
+        texts = None
+        if len(args) >= 2:
+            texts = args[1]
+        else:
+            texts = kwargs.get("texts") or kwargs.get("documents")
+
+        texts_list: Optional[List[Any]] = None
+        if texts is not None:
+            try:
+                texts_list = list(texts)
+                extra["texts_count"] = len(texts_list)
+                extra["vectors_count"] = len(texts_list)
+                # Best-effort sum of text lengths if they are strings.
+                total_chars = 0
+                for t in texts_list:
+                    if isinstance(t, str):
+                        total_chars += len(t)
+                    else:
+                        total_chars += len(str(t))
+                extra["total_content_chars"] = total_chars
+            except Exception:
+                # Last-resort: treat as a single payload
+                extra["texts_count"] = 1
+                extra["vectors_count"] = 1
+
+        metadatas = kwargs.get("metadatas")
+        if isinstance(metadatas, list):
+            extra["metadatas_count"] = len(metadatas)
+
+        ids = kwargs.get("ids")
+        if isinstance(ids, list):
+            extra["ids_count"] = len(ids)
+
+        if "embeddings" in kwargs and kwargs["embeddings"] is not None:
+            extra["has_embeddings"] = True
+    except Exception:
+        # Metrics must never break error-context attachment
+        pass
+    return extra
+
+
+def _build_search_context(args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build additional error-context fields for search/query/MMR operations.
+
+    Extracts:
+    - query_chars (when a text query is present)
+    - total_content_chars (alias of query_chars for vector search operations)
+    - k
+    - fetch_k
+    - lambda_mult
+    """
+    extra: Dict[str, Any] = {}
+    try:
+        query = None
+        if len(args) >= 2:
+            query = args[1]
+        else:
+            query = kwargs.get("query")
+
+        if isinstance(query, str):
+            qc = len(query)
+            extra["query_chars"] = qc
+            extra["total_content_chars"] = qc
+
+        k = kwargs.get("k")
+        if isinstance(k, int):
+            extra["k"] = k
+
+        fetch_k = kwargs.get("fetch_k")
+        if isinstance(fetch_k, int):
+            extra["fetch_k"] = fetch_k
+
+        lambda_mult = kwargs.get("lambda_mult")
+        if isinstance(lambda_mult, (int, float)):
+            extra["lambda_mult"] = float(lambda_mult)
+    except Exception:
+        pass
+    return extra
+
+
+def _build_delete_context(args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build additional error-context fields for delete operations.
+
+    Extracts:
+    - ids_count
+    - has_filter
+    """
+    extra: Dict[str, Any] = {}
+    try:
+        ids = kwargs.get("ids")
+        if isinstance(ids, list):
+            extra["ids_count"] = len(ids)
+
+        if "filter" in kwargs:
+            extra["has_filter"] = kwargs["filter"] is not None
+    except Exception:
+        pass
+    return extra
+
+
+def _build_vectorize_context(args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build additional error-context fields for vectorize operations (__call__/acall).
+
+    Extracts:
+    - vectors_count
+    - total_content_chars
+    - has_empty_items
+    """
+    extra: Dict[str, Any] = {}
+    try:
+        payload = None
+        if len(args) >= 2:
+            payload = args[1]
+        else:
+            payload = kwargs.get("texts")
+
+        if isinstance(payload, str):
+            extra["vectors_count"] = 1
+            extra["total_content_chars"] = len(payload)
+            extra["has_empty_items"] = (not payload.strip())
+            return extra
+
+        batch = list(payload or [])
+        extra["vectors_count"] = len(batch)
+        total_chars = 0
+        has_empty = False
+        for t in batch:
+            s = t if isinstance(t, str) else str(t)
+            total_chars += len(s)
+            if not s.strip():
+                has_empty = True
+        extra["total_content_chars"] = total_chars
+        extra["has_empty_items"] = has_empty
+    except Exception:
+        pass
+    return extra
+
+
+_OPERATION_CONTEXT_BUILDERS: Dict[
+    str, Callable[[Tuple[Any, ...], Dict[str, Any]], Dict[str, Any]]
+] = {
+    # Add operations
+    "add_texts_sync": _build_add_context,
+    "add_texts_async": _build_add_context,
+    "add_documents_sync": _build_add_context,
+    "add_documents_async": _build_add_context,
+    "from_texts_sync": _build_add_context,
+    "from_documents_sync": _build_add_context,
+    # Search/query/MMR operations
+    "similarity_search_sync": _build_search_context,
+    "similarity_search_async": _build_search_context,
+    "similarity_search_with_score_sync": _build_search_context,
+    "similarity_search_with_score_async": _build_search_context,
+    "similarity_search_stream_sync": _build_search_context,
+    "similarity_search_stream_async": _build_search_context,
+    "mmr_search_sync": _build_search_context,
+    "mmr_search_async": _build_search_context,
+    "query_sync": _build_search_context,
+    "query_async": _build_search_context,
+    # Vectorize operations
+    "call_sync": _build_vectorize_context,
+    "call_async": _build_vectorize_context,
+    # Delete operations
+    "delete_sync": _build_delete_context,
+    "delete_async": _build_delete_context,
+}
+
+
+def _build_dynamic_error_context(
+    operation: str,
+    args: Tuple[Any, ...],
+    kwargs: Dict[str, Any],
+    base_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Build a rich dynamic error context for vector operations.
+
+    This function is shared by both sync and async decorators so the
+    behavior is identical across both paths.
+    """
+    extra: Dict[str, Any] = dict(base_context)
+    try:
+        # Generic parameters available for most operations
+        if "k" in kwargs and "k" not in extra:
+            extra["k"] = kwargs["k"]
+        if "namespace" in kwargs:
+            extra["namespace"] = kwargs["namespace"]
+        if "filter" in kwargs and "has_filter" not in extra:
+            extra["has_filter"] = kwargs["filter"] is not None
+
+        # Self-introspection: default namespace & framework_version & dim hint
+        if args:
+            self_obj = args[0]
+            default_ns = getattr(self_obj, "namespace", None)
+            if default_ns is not None:
+                extra.setdefault("default_namespace", default_ns)
+            fv = getattr(self_obj, "_framework_version", None)
+            if fv is not None:
+                extra.setdefault("framework_version", fv)
+            dh = getattr(self_obj, "_vector_dim_hint", None)
+            if isinstance(dh, int):
+                extra.setdefault("vector_dimension_hint", dh)
+
+        # Operation-specific builder hook (best-effort)
+        builder = _OPERATION_CONTEXT_BUILDERS.get(operation)
+        if builder is not None:
+            op_specific = builder(args, kwargs)
+            if op_specific:
+                extra.update(op_specific)
+    except Exception:
+        # Error-context enrichment must never be fatal
+        pass
+
+    return extra
 
 
 def with_error_context(operation: str, **context_kwargs: Any):
     """
     Decorator to automatically attach error context to sync exceptions.
 
-    Adds some lightweight dynamic metadata (e.g., k, namespace, default_namespace,
-    framework_version) for better observability.
+    Keeps the wrapper itself small and delegates dynamic context building
+    to `_build_dynamic_error_context` plus operation-specific builders.
     """
 
     def decorator(fn: T) -> T:
@@ -170,27 +430,12 @@ def with_error_context(operation: str, **context_kwargs: Any):
             try:
                 return fn(*args, **kwargs)
             except Exception as exc:
-                extra = dict(context_kwargs)
-                # Best-effort dynamic context extraction
-                try:
-                    if "k" in kwargs:
-                        extra["k"] = kwargs["k"]
-                    if "namespace" in kwargs:
-                        extra["namespace"] = kwargs["namespace"]
-                    if "filter" in kwargs:
-                        extra["has_filter"] = kwargs["filter"] is not None
-
-                    if args:
-                        self_obj = args[0]
-                        default_ns = getattr(self_obj, "namespace", None)
-                        if default_ns is not None:
-                            extra.setdefault("default_namespace", default_ns)
-                        fv = getattr(self_obj, "_framework_version", None)
-                        if fv is not None:
-                            extra.setdefault("framework_version", fv)
-                except Exception:  # pragma: no cover - defensive only
-                    pass
-
+                extra = _build_dynamic_error_context(
+                    operation,
+                    args,
+                    kwargs,
+                    base_context=dict(context_kwargs),
+                )
                 attach_context(
                     exc,
                     framework="autogen",
@@ -209,8 +454,8 @@ def with_async_error_context(operation: str, **context_kwargs: Any):
     """
     Decorator to automatically attach error context to async exceptions.
 
-    Adds some lightweight dynamic metadata (e.g., k, namespace, default_namespace,
-    framework_version) for better observability.
+    Keeps the wrapper itself small and delegates dynamic context building
+    to `_build_dynamic_error_context` plus operation-specific builders.
     """
 
     def decorator(fn: T) -> T:
@@ -219,27 +464,12 @@ def with_async_error_context(operation: str, **context_kwargs: Any):
             try:
                 return await fn(*args, **kwargs)
             except Exception as exc:
-                extra = dict(context_kwargs)
-                # Best-effort dynamic context extraction
-                try:
-                    if "k" in kwargs:
-                        extra["k"] = kwargs["k"]
-                    if "namespace" in kwargs:
-                        extra["namespace"] = kwargs["namespace"]
-                    if "filter" in kwargs:
-                        extra["has_filter"] = kwargs["filter"] is not None
-
-                    if args:
-                        self_obj = args[0]
-                        default_ns = getattr(self_obj, "namespace", None)
-                        if default_ns is not None:
-                            extra.setdefault("default_namespace", default_ns)
-                        fv = getattr(self_obj, "_framework_version", None)
-                        if fv is not None:
-                            extra.setdefault("framework_version", fv)
-                except Exception:  # pragma: no cover - defensive only
-                    pass
-
+                extra = _build_dynamic_error_context(
+                    operation,
+                    args,
+                    kwargs,
+                    base_context=dict(context_kwargs),
+                )
                 attach_context(
                     exc,
                     framework="autogen",
@@ -336,6 +566,11 @@ class CorpusAutoGenVectorStore:
 
         Signature:
             async_embedding_function(texts: List[str]) -> Awaitable[List[List[float]]]
+
+    own_adapter:
+        If True, this store owns the lifecycle of corpus_adapter and will attempt
+        to close it during close()/aclose(). Defaults to False for backwards
+        compatibility and to preserve caller-managed lifecycles.
     """
 
     def __init__(
@@ -353,6 +588,7 @@ class CorpusAutoGenVectorStore:
             Callable[[List[str]], Awaitable[Embeddings]]
         ] = None,
         framework_version: Optional[str] = None,
+        own_adapter: bool = False,
     ) -> None:
         self.corpus_adapter: VectorProtocolV1 = corpus_adapter
         self.namespace = namespace
@@ -370,6 +606,13 @@ class CorpusAutoGenVectorStore:
 
         # Observability / context
         self._framework_version: Optional[str] = framework_version
+
+        # Vector dimension hint (best-effort, thread-safe first-write-wins)
+        self._vector_dim_hint: Optional[int] = None
+        self._dim_lock: RLock = RLock()
+
+        # Lifecycle ownership for underlying adapter (opt-in)
+        self._own_adapter: bool = bool(own_adapter)
 
     # ------------------------------------------------------------------ #
     # Translator (lazy, cached)
@@ -391,24 +634,23 @@ class CorpusAutoGenVectorStore:
         )
 
     # ------------------------------------------------------------------ #
-    # Context & namespace helpers
+    # Standardized context building (core + framework + orchestrator)
     # ------------------------------------------------------------------ #
 
-    def _build_ctx(
+    def _build_core_context(
         self,
         *,
-        conversation: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
+        conversation: Optional[Any],
+        extra_context: Optional[Mapping[str, Any]],
     ) -> Optional[OperationContext]:
         """
         Build an OperationContext from an AutoGen-style conversation plus
         optional extra context.
 
-        If both are None/empty, returns None (translator will construct an
-        "empty" OperationContext as needed).
+        - Returns None only when there is no input context at all.
+        - Raises (with attached context) on translation failures.
         """
         extra: Dict[str, Any] = dict(extra_context or {})
-
         if conversation is None and not extra:
             return None
 
@@ -429,18 +671,153 @@ class CorpusAutoGenVectorStore:
             raise
 
         if not isinstance(ctx, OperationContext):
-            raise BadRequest(
+            err = BadRequest(
                 f"from_autogen produced unsupported context type: {type(ctx).__name__}",
                 code=ErrorCodes.BAD_OPERATION_CONTEXT,
             )
+            attach_context(
+                err,
+                framework="autogen",
+                operation="vector_context_translation",
+                framework_version=self._framework_version,
+                error_codes=VECTOR_COERCION_ERROR_CODES,
+                produced_type=type(ctx).__name__,
+            )
+            raise err
 
         return ctx
+
+    def _build_framework_context(
+        self,
+        core_ctx: Optional[OperationContext],
+        *,
+        operation: str,
+        namespace: Optional[str],
+    ) -> Mapping[str, Any]:
+        """
+        Build framework_ctx metadata for the vector translator.
+
+        This remains stable and framework-only:
+        - namespace (effective)
+        - framework_version (if present)
+        - operation name (for observability/debugging)
+        """
+        ns = self._effective_namespace(namespace)
+        ctx: Dict[str, Any] = {"operation": str(operation)}
+        if ns is not None:
+            ctx["namespace"] = ns
+        if self._framework_version is not None:
+            ctx["framework_version"] = self._framework_version
+        return ctx
+
+    def _build_contexts(
+        self,
+        *,
+        operation: str,
+        conversation: Optional[Any],
+        extra_context: Optional[Mapping[str, Any]],
+        namespace: Optional[str],
+    ) -> Tuple[Optional[OperationContext], Mapping[str, Any]]:
+        """
+        Orchestrate both core OperationContext and framework_ctx building.
+
+        This is the single entrypoint used by all public APIs so behavior is
+        consistent everywhere.
+        """
+        core = self._build_core_context(conversation=conversation, extra_context=extra_context)
+        fw = self._build_framework_context(core, operation=operation, namespace=namespace)
+        return core, fw
+
+    # Backwards-compatible alias for existing internal callers (kept intentionally).
+    def _build_ctx(
+        self,
+        *,
+        conversation: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> Optional[OperationContext]:
+        """
+        Backwards-compatible wrapper around _build_core_context.
+
+        (Kept to avoid changing internal call patterns elsewhere; public
+        methods use _build_contexts for standardized behavior.)
+        """
+        return self._build_core_context(conversation=conversation, extra_context=extra_context)
+
+    # ------------------------------------------------------------------ #
+    # Namespace helper
+    # ------------------------------------------------------------------ #
 
     def _effective_namespace(self, namespace: Optional[str]) -> Optional[str]:
         """
         Resolve namespace using explicit override or store default.
         """
         return namespace if namespace is not None else self.namespace
+
+    # ------------------------------------------------------------------ #
+    # Dimension hint helpers
+    # ------------------------------------------------------------------ #
+
+    def _update_dim_hint(self, embedding_dim: Optional[int]) -> None:
+        """
+        Thread-safe, best-effort update of the vector dimension hint.
+
+        The first successful write wins; subsequent calls are no-ops.
+        """
+        if embedding_dim is None or embedding_dim <= 0:
+            return
+        if self._vector_dim_hint is not None:
+            return
+        with self._dim_lock:
+            if self._vector_dim_hint is None:
+                self._vector_dim_hint = int(embedding_dim)
+
+    def _maybe_check_dim(self, vec: Sequence[float], *, where: str) -> None:
+        """
+        Validate vector dimensionality against the current hint (if set).
+
+        This is a lightweight consistency check that prevents shape drift
+        (e.g., mixed-embedding models) from silently producing inconsistent
+        results.
+        """
+        hint = self._vector_dim_hint
+        if hint is None:
+            return
+        if len(vec) != hint:
+            err = BadRequest(
+                f"vector dimension mismatch in {where}: got {len(vec)}, expected {hint}",
+                code=ErrorCodes.VECTOR_DIM_MISMATCH,
+                details={"got": len(vec), "expected": hint, "where": where},
+            )
+            attach_context(
+                err,
+                framework="autogen",
+                operation=f"vector_{where}",
+                error_codes=VECTOR_COERCION_ERROR_CODES,
+                vector_dimension_hint=hint,
+            )
+            raise err
+
+    def _zero_vector(self) -> List[float]:
+        """
+        Construct a deterministic zero vector based on known vector dimension.
+
+        Raises if vector dimension is unknown.
+        """
+        dim = self._vector_dim_hint
+        if dim is None or dim <= 0:
+            err = BadRequest(
+                "vector dimension is unknown; cannot produce deterministic zero vectors",
+                code=ErrorCodes.UNKNOWN_VECTOR_DIMENSION,
+            )
+            attach_context(
+                err,
+                framework="autogen",
+                operation="vector_zero_vector",
+                error_codes=VECTOR_COERCION_ERROR_CODES,
+                vector_dimension_hint=dim,
+            )
+            raise err
+        return [0.0] * int(dim)
 
     # ------------------------------------------------------------------ #
     # Normalization helpers
@@ -503,6 +880,55 @@ class CorpusAutoGenVectorStore:
             )
         return [str(i) for i in ids]
 
+    # ------------------------------------------------------------------ #
+    # Embedding helpers (sync + async)
+    # ------------------------------------------------------------------ #
+
+    def _validate_embedding_batch_shape(self, embeddings: Embeddings, *, where: str) -> None:
+        """
+        Validate embedding batch shapes for internal consistency and against
+        any established dimension hint.
+
+        - Ensures all vectors have the same length (if possible).
+        - Enforces current hint, if set.
+        - Updates hint (first-write-wins) based on the first vector.
+        """
+        try:
+            if not embeddings:
+                return
+            first = embeddings[0]
+            if first is None:
+                return
+            dim0 = len(first)
+            if dim0 > 0:
+                self._update_dim_hint(dim0)
+            # Enforce against hint if present
+            if self._vector_dim_hint is not None:
+                self._maybe_check_dim(first, where=where)
+            # Ensure uniformity across batch (best-effort)
+            for idx, v in enumerate(embeddings):
+                if v is None:
+                    continue
+                if len(v) != dim0:
+                    err = BadRequest(
+                        f"embedding batch contains inconsistent vector sizes: "
+                        f"index 0 has {dim0}, index {idx} has {len(v)}",
+                        code=ErrorCodes.VECTOR_DIM_MISMATCH,
+                        details={"first_dim": dim0, "mismatch_dim": len(v), "index": idx},
+                    )
+                    attach_context(
+                        err,
+                        framework="autogen",
+                        operation=f"vector_{where}",
+                        error_codes=VECTOR_COERCION_ERROR_CODES,
+                        vector_dimension_hint=self._vector_dim_hint,
+                    )
+                    raise err
+        except Exception:
+            # If validation itself fails unexpectedly, we allow the original flow
+            # to proceed. Any downstream coercion/translator checks will still run.
+            raise
+
     def _ensure_embeddings(
         self,
         texts: List[str],
@@ -512,8 +938,8 @@ class CorpusAutoGenVectorStore:
         Ensure embeddings are available for a batch of texts (sync).
 
         Behavior:
-        - If embeddings are provided, verify length.
-        - Else, if `embedding_function` is set, compute embeddings.
+        - If embeddings are provided, verify length and validate shapes.
+        - Else, if `embedding_function` is set, compute embeddings and validate shapes.
         - Else, raise NotSupported.
         """
         if embeddings is not None:
@@ -523,6 +949,7 @@ class CorpusAutoGenVectorStore:
                     code=ErrorCodes.BAD_EMBEDDINGS,
                     details={"texts": len(texts), "embeddings": len(embeddings)},
                 )
+            self._validate_embedding_batch_shape(embeddings, where="embed_documents")
             return embeddings
 
         if self.embedding_function is None:
@@ -553,6 +980,8 @@ class CorpusAutoGenVectorStore:
                 f"embedding_function returned {len(computed)} embeddings for {len(texts)} texts",
                 code=ErrorCodes.BAD_EMBEDDINGS,
             )
+
+        self._validate_embedding_batch_shape(computed, where="embed_documents")
         return computed
 
     async def _ensure_embeddings_async(
@@ -564,9 +993,9 @@ class CorpusAutoGenVectorStore:
         Async-safe version of _ensure_embeddings.
 
         Behavior:
-        - If embeddings are provided, verify length.
-        - Else, if async_embedding_function is set, await it.
-        - Else, if embedding_function is set, run it in a worker thread.
+        - If embeddings are provided, verify length and validate shapes.
+        - Else, if async_embedding_function is set, await it and validate shapes.
+        - Else, if embedding_function is set, run it in a worker thread and validate shapes.
         - Else, raise NotSupported.
         """
         if embeddings is not None:
@@ -576,6 +1005,7 @@ class CorpusAutoGenVectorStore:
                     code=ErrorCodes.BAD_EMBEDDINGS,
                     details={"texts": len(texts), "embeddings": len(embeddings)},
                 )
+            self._validate_embedding_batch_shape(embeddings, where="embed_documents_async")
             return embeddings
 
         if self.async_embedding_function is not None:
@@ -622,6 +1052,8 @@ class CorpusAutoGenVectorStore:
                 f"embedding function returned {len(computed)} embeddings for {len(texts)} texts",
                 code=ErrorCodes.BAD_EMBEDDINGS,
             )
+
+        self._validate_embedding_batch_shape(computed, where="embed_documents_async")
         return computed
 
     def _embed_query(
@@ -634,12 +1066,52 @@ class CorpusAutoGenVectorStore:
         Ensure a single query embedding is available (sync).
 
         Behavior:
-        - If `embedding` is provided, use it.
+        - If `embedding` is provided, use it (and validate dimension vs hint).
+        - Else, if query is empty/whitespace:
+            * return deterministic zero vector if dimension is known
+            * otherwise raise (existing behavior preserved when dim unknown)
         - Else, if `embedding_function` is set, compute embedding for [query].
         - Else, raise NotSupported.
         """
         if embedding is not None:
-            return [float(x) for x in embedding]
+            vec = [float(x) for x in embedding]
+            if not vec:
+                err = BadRequest(
+                    "provided query embedding cannot be empty",
+                    code=ErrorCodes.BAD_EMBEDDINGS,
+                )
+                attach_context(
+                    err,
+                    framework="autogen",
+                    operation="vector_embed_query",
+                    query=query,
+                    framework_version=self._framework_version,
+                    error_codes=VECTOR_COERCION_ERROR_CODES,
+                    vector_dimension_hint=self._vector_dim_hint,
+                )
+                raise err
+            self._update_dim_hint(len(vec))
+            self._maybe_check_dim(vec, where="embed_query")
+            return vec
+
+        if not query or not str(query).strip():
+            # Deterministic empty-input handling: return zeros if dimension is known.
+            if self._vector_dim_hint is not None:
+                return self._zero_vector()
+
+            err = BadRequest(
+                "query cannot be empty when no embedding is supplied",
+                code=ErrorCodes.BAD_TEXTS,
+            )
+            attach_context(
+                err,
+                framework="autogen",
+                operation="vector_embed_query",
+                query=query,
+                framework_version=self._framework_version,
+                error_codes=VECTOR_COERCION_ERROR_CODES,
+            )
+            raise err
 
         if self.embedding_function is None:
             exc = NotSupported(
@@ -688,7 +1160,25 @@ class CorpusAutoGenVectorStore:
             )
             raise err
 
-        return [float(x) for x in embs[0]]
+        vec = [float(x) for x in embs[0]]
+        if not vec:
+            err = BadRequest(
+                "embedding_function returned an empty vector for query",
+                code=ErrorCodes.BAD_EMBEDDINGS,
+            )
+            attach_context(
+                err,
+                framework="autogen",
+                operation="vector_embed_query",
+                query=query,
+                framework_version=self._framework_version,
+                error_codes=VECTOR_COERCION_ERROR_CODES,
+            )
+            raise err
+
+        self._update_dim_hint(len(vec))
+        self._maybe_check_dim(vec, where="embed_query")
+        return vec
 
     async def _embed_query_async(
         self,
@@ -700,13 +1190,53 @@ class CorpusAutoGenVectorStore:
         Async-safe query embedding helper.
 
         Behavior:
-        - If `embedding` is provided, use it.
+        - If `embedding` is provided, use it (and validate dimension vs hint).
+        - Else, if query is empty/whitespace:
+            * return deterministic zero vector if dimension is known
+            * otherwise raise (existing behavior preserved when dim unknown)
         - Else, if `async_embedding_function` is set, await it.
         - Else, if `embedding_function` is set, run it in a worker thread.
         - Else, raise NotSupported.
         """
         if embedding is not None:
-            return [float(x) for x in embedding]
+            vec = [float(x) for x in embedding]
+            if not vec:
+                err = BadRequest(
+                    "provided query embedding cannot be empty",
+                    code=ErrorCodes.BAD_EMBEDDINGS,
+                )
+                attach_context(
+                    err,
+                    framework="autogen",
+                    operation="vector_embed_query_async",
+                    query=query,
+                    framework_version=self._framework_version,
+                    error_codes=VECTOR_COERCION_ERROR_CODES,
+                    vector_dimension_hint=self._vector_dim_hint,
+                )
+                raise err
+            self._update_dim_hint(len(vec))
+            self._maybe_check_dim(vec, where="embed_query_async")
+            return vec
+
+        if not query or not str(query).strip():
+            # Deterministic empty-input handling: return zeros if dimension is known.
+            if self._vector_dim_hint is not None:
+                return self._zero_vector()
+
+            err = BadRequest(
+                "query cannot be empty when no embedding is supplied",
+                code=ErrorCodes.BAD_TEXTS,
+            )
+            attach_context(
+                err,
+                framework="autogen",
+                operation="vector_embed_query_async",
+                query=query,
+                framework_version=self._framework_version,
+                error_codes=VECTOR_COERCION_ERROR_CODES,
+            )
+            raise err
 
         if self.async_embedding_function is not None:
             try:
@@ -772,7 +1302,25 @@ class CorpusAutoGenVectorStore:
             )
             raise err
 
-        return [float(x) for x in embs[0]]
+        vec = [float(x) for x in embs[0]]
+        if not vec:
+            err = BadRequest(
+                "embedding function returned an empty vector for query",
+                code=ErrorCodes.BAD_EMBEDDINGS,
+            )
+            attach_context(
+                err,
+                framework="autogen",
+                operation="vector_embed_query_async",
+                query=query,
+                framework_version=self._framework_version,
+                error_codes=VECTOR_COERCION_ERROR_CODES,
+            )
+            raise err
+
+        self._update_dim_hint(len(vec))
+        self._maybe_check_dim(vec, where="embed_query_async")
+        return vec
 
     # ------------------------------------------------------------------ #
     # Upsert result validation (uses ErrorCodes.BAD_UPSERT_RESULT)
@@ -888,7 +1436,7 @@ class CorpusAutoGenVectorStore:
         return results
 
     # ------------------------------------------------------------------ #
-    # Internal query helper (sync + async)
+    # Internal query helpers
     # ------------------------------------------------------------------ #
 
     def _build_raw_query(
@@ -913,9 +1461,13 @@ class CorpusAutoGenVectorStore:
             include_vectors: bool
         """
         ns = self._effective_namespace(namespace)
+        vec = [float(x) for x in embedding]
+        self._update_dim_hint(len(vec) if vec else None)
+        if vec:
+            self._maybe_check_dim(vec, where="build_raw_query")
 
         raw: Dict[str, Any] = {
-            "vector": [float(x) for x in embedding],
+            "vector": vec,
             "top_k": int(k),
             "filters": dict(filter) if filter is not None else None,
             "namespace": ns,
@@ -924,6 +1476,8 @@ class CorpusAutoGenVectorStore:
         }
         return raw
 
+    # Backwards-compatible helper retained; public calls now use _build_contexts
+    # (kept to avoid removing anything, and to preserve internal utility).
     def _framework_ctx_for_namespace(self, namespace: Optional[str]) -> Mapping[str, Any]:
         """
         Minimal framework_ctx that hints preferred namespace to the translator.
@@ -951,6 +1505,148 @@ class CorpusAutoGenVectorStore:
         return _coerce_hits_safe(chunk)
 
     # ------------------------------------------------------------------ #
+    # Callable interface: vector function (__call__ / acall)
+    # ------------------------------------------------------------------ #
+
+    @with_error_context("call_sync")
+    def __call__(self, texts: Any) -> Any:
+        """
+        Callable embedding function for integrations that expect a vector_function.
+
+        Input:
+        - str -> returns List[float]
+        - Sequence[str] -> returns List[List[float]]
+
+        Empty-input handling:
+        - Empty batch -> returns [] (existing style)
+        - Empty/whitespace items -> deterministic zero vectors *if* dimension is known.
+          If dimension is unknown and all items are empty, raises with attached context.
+        """
+        _ensure_not_in_event_loop("__call__")
+
+        single = False
+        if isinstance(texts, str):
+            single = True
+            batch = [texts]
+        else:
+            batch = list(texts or [])
+
+        if not batch:
+            return [] if not single else []
+
+        empties: List[int] = []
+        nonempty: List[str] = []
+        for i, t in enumerate(batch):
+            s = t if isinstance(t, str) else str(t)
+            if not s.strip():
+                empties.append(i)
+            else:
+                nonempty.append(s)
+
+        computed_vectors: List[List[float]] = []
+        if nonempty:
+            computed = self._ensure_embeddings(nonempty, embeddings=None)
+            computed_vectors = [[float(x) for x in v] for v in computed]
+            if computed_vectors and computed_vectors[0]:
+                self._update_dim_hint(len(computed_vectors[0]))
+
+        # If we have empty items and still do not know dimension, we cannot
+        # deterministically produce zero vectors.
+        if empties and self._vector_dim_hint is None:
+            err = BadRequest(
+                "cannot vectorize empty/whitespace items because vector dimension is unknown",
+                code=ErrorCodes.UNKNOWN_VECTOR_DIMENSION,
+                details={"empty_items": len(empties), "total_items": len(batch)},
+            )
+            attach_context(
+                err,
+                framework="autogen",
+                operation="vector_call_sync",
+                error_codes=VECTOR_COERCION_ERROR_CODES,
+                vectors_count=len(batch),
+                total_content_chars=sum(len((t if isinstance(t, str) else str(t))) for t in batch),
+                vector_dimension_hint=self._vector_dim_hint,
+            )
+            raise err
+
+        # Reconstruct output aligned to original indices.
+        out: List[List[float]] = []
+        it = iter(computed_vectors)
+        empty_set = set(empties)
+        for i, _ in enumerate(batch):
+            if i in empty_set:
+                out.append(self._zero_vector())
+            else:
+                v = next(it)
+                self._maybe_check_dim(v, where="__call__")
+                out.append(v)
+
+        return out[0] if single else out
+
+    @with_async_error_context("call_async")
+    async def acall(self, texts: Any) -> Any:
+        """
+        Async callable embedding function.
+
+        Mirrors __call__ behavior but uses async embedding computation when available.
+        """
+        single = False
+        if isinstance(texts, str):
+            single = True
+            batch = [texts]
+        else:
+            batch = list(texts or [])
+
+        if not batch:
+            return [] if not single else []
+
+        empties: List[int] = []
+        nonempty: List[str] = []
+        for i, t in enumerate(batch):
+            s = t if isinstance(t, str) else str(t)
+            if not s.strip():
+                empties.append(i)
+            else:
+                nonempty.append(s)
+
+        computed_vectors: List[List[float]] = []
+        if nonempty:
+            computed = await self._ensure_embeddings_async(nonempty, embeddings=None)
+            computed_vectors = [[float(x) for x in v] for v in computed]
+            if computed_vectors and computed_vectors[0]:
+                self._update_dim_hint(len(computed_vectors[0]))
+
+        if empties and self._vector_dim_hint is None:
+            err = BadRequest(
+                "cannot vectorize empty/whitespace items because vector dimension is unknown",
+                code=ErrorCodes.UNKNOWN_VECTOR_DIMENSION,
+                details={"empty_items": len(empties), "total_items": len(batch)},
+            )
+            attach_context(
+                err,
+                framework="autogen",
+                operation="vector_call_async",
+                error_codes=VECTOR_COERCION_ERROR_CODES,
+                vectors_count=len(batch),
+                total_content_chars=sum(len((t if isinstance(t, str) else str(t))) for t in batch),
+                vector_dimension_hint=self._vector_dim_hint,
+            )
+            raise err
+
+        out: List[List[float]] = []
+        it = iter(computed_vectors)
+        empty_set = set(empties)
+        for i, _ in enumerate(batch):
+            if i in empty_set:
+                out.append(self._zero_vector())
+            else:
+                v = next(it)
+                self._maybe_check_dim(v, where="acall")
+                out.append(v)
+
+        return out[0] if single else out
+
+    # ------------------------------------------------------------------ #
     # Public add APIs (sync + async)
     # ------------------------------------------------------------------ #
 
@@ -974,11 +1670,27 @@ class CorpusAutoGenVectorStore:
           are supplied.
         - Delegates upsert orchestration to VectorTranslator.
         """
-        texts_list = list(texts)
+        _ensure_not_in_event_loop("add_texts")
+
+        texts_list = [str(t) for t in texts]
         if not texts_list:
             return []
 
-        ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
+        # Enforce non-empty texts for writes
+        for idx, t in enumerate(texts_list):
+            if not t.strip():
+                raise BadRequest(
+                    f"text at index {idx} is empty or whitespace-only",
+                    code=ErrorCodes.BAD_TEXTS,
+                    details={"index": idx},
+                )
+
+        op_ctx, fw_ctx = self._build_contexts(
+            operation="add_texts",
+            conversation=conversation,
+            extra_context=extra_context,
+            namespace=namespace,
+        )
         metadatas_norm = self._normalize_metadatas(len(texts_list), metadatas)
         ids_norm = self._normalize_ids(len(texts_list), ids)
         emb = self._ensure_embeddings(texts_list, embeddings)
@@ -987,6 +1699,10 @@ class CorpusAutoGenVectorStore:
 
         raw_documents: List[Mapping[str, Any]] = []
         for text, vec, meta, vid in zip(texts_list, emb, metadatas_norm, ids_norm):
+            vec_f = [float(x) for x in vec]
+            if vec_f:
+                self._update_dim_hint(len(vec_f))
+                self._maybe_check_dim(vec_f, where="add_texts")
             if self.metadata_field:
                 envelope: Dict[str, Any] = {}
                 if meta:
@@ -1002,7 +1718,7 @@ class CorpusAutoGenVectorStore:
             raw_documents.append(
                 {
                     "id": vid,
-                    "vector": [float(x) for x in vec],
+                    "vector": vec_f,
                     "metadata": metadata_payload,
                     "namespace": ns,
                 }
@@ -1012,8 +1728,8 @@ class CorpusAutoGenVectorStore:
         # to detect "everything failed" scenarios.
         result = self._translator.upsert(
             raw_documents=raw_documents,
-            op_ctx=ctx,
-            framework_ctx=self._framework_ctx_for_namespace(ns),
+            op_ctx=op_ctx,
+            framework_ctx=fw_ctx,
         )
 
         self._validate_upsert_result(
@@ -1039,11 +1755,25 @@ class CorpusAutoGenVectorStore:
         """
         Add texts to the vector store (async).
         """
-        texts_list = list(texts)
+        texts_list = [str(t) for t in texts]
         if not texts_list:
             return []
 
-        ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
+        # Enforce non-empty texts for writes
+        for idx, t in enumerate(texts_list):
+            if not t.strip():
+                raise BadRequest(
+                    f"text at index {idx} is empty or whitespace-only",
+                    code=ErrorCodes.BAD_TEXTS,
+                    details={"index": idx},
+                )
+
+        op_ctx, fw_ctx = self._build_contexts(
+            operation="aadd_texts",
+            conversation=conversation,
+            extra_context=extra_context,
+            namespace=namespace,
+        )
         metadatas_norm = self._normalize_metadatas(len(texts_list), metadatas)
         ids_norm = self._normalize_ids(len(texts_list), ids)
         emb = await self._ensure_embeddings_async(texts_list, embeddings)
@@ -1052,6 +1782,10 @@ class CorpusAutoGenVectorStore:
 
         raw_documents: List[Mapping[str, Any]] = []
         for text, vec, meta, vid in zip(texts_list, emb, metadatas_norm, ids_norm):
+            vec_f = [float(x) for x in vec]
+            if vec_f:
+                self._update_dim_hint(len(vec_f))
+                self._maybe_check_dim(vec_f, where="aadd_texts")
             if self.metadata_field:
                 envelope: Dict[str, Any] = {}
                 if meta:
@@ -1067,7 +1801,7 @@ class CorpusAutoGenVectorStore:
             raw_documents.append(
                 {
                     "id": vid,
-                    "vector": [float(x) for x in vec],
+                    "vector": vec_f,
                     "metadata": metadata_payload,
                     "namespace": ns,
                 }
@@ -1075,8 +1809,8 @@ class CorpusAutoGenVectorStore:
 
         result = await self._translator.arun_upsert(
             raw_documents=raw_documents,
-            op_ctx=ctx,
-            framework_ctx=self._framework_ctx_for_namespace(ns),
+            op_ctx=op_ctx,
+            framework_ctx=fw_ctx,
         )
 
         self._validate_upsert_result(
@@ -1100,11 +1834,13 @@ class CorpusAutoGenVectorStore:
         """
         Add AutoGenDocuments to the vector store (sync).
         """
+        _ensure_not_in_event_loop("add_documents")
+
         docs_list = list(documents)
         if not docs_list:
             return []
 
-        texts = [d.page_content for d in docs_list]
+        texts = [str(d.page_content) for d in docs_list]
         metadatas = [dict(d.metadata or {}) for d in docs_list]
         return self.add_texts(
             texts,
@@ -1133,7 +1869,7 @@ class CorpusAutoGenVectorStore:
         if not docs_list:
             return []
 
-        texts = [d.page_content for d in docs_list]
+        texts = [str(d.page_content) for d in docs_list]
         metadatas = [dict(d.metadata or {}) for d in docs_list]
         return await self.aadd_texts(
             texts,
@@ -1164,7 +1900,14 @@ class CorpusAutoGenVectorStore:
         """
         Perform similarity search and return AutoGenDocuments (sync).
         """
-        ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
+        _ensure_not_in_event_loop("similarity_search")
+
+        op_ctx, fw_ctx = self._build_contexts(
+            operation="similarity_search",
+            conversation=conversation,
+            extra_context=extra_context,
+            namespace=namespace,
+        )
         query_emb = self._embed_query(query, embedding=embedding)
 
         top_k = k or self.default_top_k
@@ -1180,8 +1923,8 @@ class CorpusAutoGenVectorStore:
 
         result = self._translator.query(
             raw_query,
-            op_ctx=ctx,
-            framework_ctx=self._framework_ctx_for_namespace(namespace),
+            op_ctx=op_ctx,
+            framework_ctx=fw_ctx,
             mmr_config=None,
         )
         matches = self._extract_matches_from_result(result)
@@ -1203,7 +1946,14 @@ class CorpusAutoGenVectorStore:
         """
         Similarity search returning (AutoGenDocument, score) tuples (sync).
         """
-        ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
+        _ensure_not_in_event_loop("similarity_search_with_score")
+
+        op_ctx, fw_ctx = self._build_contexts(
+            operation="similarity_search_with_score",
+            conversation=conversation,
+            extra_context=extra_context,
+            namespace=namespace,
+        )
         query_emb = self._embed_query(query, embedding=embedding)
 
         top_k = k or self.default_top_k
@@ -1219,8 +1969,8 @@ class CorpusAutoGenVectorStore:
 
         result = self._translator.query(
             raw_query,
-            op_ctx=ctx,
-            framework_ctx=self._framework_ctx_for_namespace(namespace),
+            op_ctx=op_ctx,
+            framework_ctx=fw_ctx,
             mmr_config=None,
         )
         matches = self._extract_matches_from_result(result)
@@ -1241,7 +1991,12 @@ class CorpusAutoGenVectorStore:
         """
         Perform similarity search and return AutoGenDocuments (async).
         """
-        ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
+        op_ctx, fw_ctx = self._build_contexts(
+            operation="asimilarity_search",
+            conversation=conversation,
+            extra_context=extra_context,
+            namespace=namespace,
+        )
         query_emb = await self._embed_query_async(query, embedding=embedding)
 
         top_k = k or self.default_top_k
@@ -1257,8 +2012,8 @@ class CorpusAutoGenVectorStore:
 
         result = await self._translator.arun_query(
             raw_query,
-            op_ctx=ctx,
-            framework_ctx=self._framework_ctx_for_namespace(namespace),
+            op_ctx=op_ctx,
+            framework_ctx=fw_ctx,
             mmr_config=None,
         )
         matches = self._extract_matches_from_result(result)
@@ -1280,7 +2035,12 @@ class CorpusAutoGenVectorStore:
         """
         Similarity search returning (AutoGenDocument, score) tuples (async).
         """
-        ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
+        op_ctx, fw_ctx = self._build_contexts(
+            operation="asimilarity_search_with_score",
+            conversation=conversation,
+            extra_context=extra_context,
+            namespace=namespace,
+        )
         query_emb = await self._embed_query_async(query, embedding=embedding)
 
         top_k = k or self.default_top_k
@@ -1296,8 +2056,8 @@ class CorpusAutoGenVectorStore:
 
         result = await self._translator.arun_query(
             raw_query,
-            op_ctx=ctx,
-            framework_ctx=self._framework_ctx_for_namespace(namespace),
+            op_ctx=op_ctx,
+            framework_ctx=fw_ctx,
             mmr_config=None,
         )
         matches = self._extract_matches_from_result(result)
@@ -1326,7 +2086,14 @@ class CorpusAutoGenVectorStore:
         which uses SyncStreamBridge internally; this adapter does not directly
         instantiate any async↔sync bridges.
         """
-        ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
+        _ensure_not_in_event_loop("similarity_search_stream")
+
+        op_ctx, fw_ctx = self._build_contexts(
+            operation="similarity_search_stream",
+            conversation=conversation,
+            extra_context=extra_context,
+            namespace=namespace,
+        )
         query_emb = self._embed_query(query, embedding=embedding)
 
         top_k = k or self.default_top_k
@@ -1342,8 +2109,8 @@ class CorpusAutoGenVectorStore:
 
         for chunk in self._translator.query_stream(
             raw_query,
-            op_ctx=ctx,
-            framework_ctx=self._framework_ctx_for_namespace(namespace),
+            op_ctx=op_ctx,
+            framework_ctx=fw_ctx,
         ):
             matches = self._extract_matches_from_chunk(chunk)
             for doc, _ in self._from_matches(matches):
@@ -1366,7 +2133,12 @@ class CorpusAutoGenVectorStore:
 
         Delegates streaming orchestration to `VectorTranslator.arun_query_stream`.
         """
-        ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
+        op_ctx, fw_ctx = self._build_contexts(
+            operation="asimilarity_search_stream",
+            conversation=conversation,
+            extra_context=extra_context,
+            namespace=namespace,
+        )
         query_emb = await self._embed_query_async(query, embedding=embedding)
 
         top_k = k or self.default_top_k
@@ -1382,8 +2154,8 @@ class CorpusAutoGenVectorStore:
 
         async for chunk in self._translator.arun_query_stream(
             raw_query,
-            op_ctx=ctx,
-            framework_ctx=self._framework_ctx_for_namespace(namespace),
+            op_ctx=op_ctx,
+            framework_ctx=fw_ctx,
         ):
             matches = self._extract_matches_from_chunk(chunk)
             for doc, _ in self._from_matches(matches):
@@ -1411,7 +2183,14 @@ class CorpusAutoGenVectorStore:
         Returns raw match records from the translator, instead of
         AutoGenDocument objects.
         """
-        ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
+        _ensure_not_in_event_loop("query")
+
+        op_ctx, fw_ctx = self._build_contexts(
+            operation="query",
+            conversation=conversation,
+            extra_context=extra_context,
+            namespace=namespace,
+        )
         top_k = k or self.default_top_k
         _warn_if_extreme_k(top_k, op_name="query")
 
@@ -1425,8 +2204,8 @@ class CorpusAutoGenVectorStore:
 
         result = self._translator.query(
             raw_query,
-            op_ctx=ctx,
-            framework_ctx=self._framework_ctx_for_namespace(namespace),
+            op_ctx=op_ctx,
+            framework_ctx=fw_ctx,
             mmr_config=None,
         )
         return self._extract_matches_from_result(result)
@@ -1449,7 +2228,12 @@ class CorpusAutoGenVectorStore:
         Returns raw match records from the translator, instead of
         AutoGenDocument objects.
         """
-        ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
+        op_ctx, fw_ctx = self._build_contexts(
+            operation="aquery",
+            conversation=conversation,
+            extra_context=extra_context,
+            namespace=namespace,
+        )
         top_k = k or self.default_top_k
         _warn_if_extreme_k(top_k, op_name="aquery")
 
@@ -1463,8 +2247,8 @@ class CorpusAutoGenVectorStore:
 
         result = await self._translator.arun_query(
             raw_query,
-            op_ctx=ctx,
-            framework_ctx=self._framework_ctx_for_namespace(namespace),
+            op_ctx=op_ctx,
+            framework_ctx=fw_ctx,
             mmr_config=None,
         )
         return self._extract_matches_from_result(result)
@@ -1493,7 +2277,14 @@ class CorpusAutoGenVectorStore:
         This runs a similarity search with a larger `fetch_k` and delegates
         MMR re-ranking to VectorTranslator via MMRConfig.
         """
-        ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
+        _ensure_not_in_event_loop("max_marginal_relevance_search")
+
+        op_ctx, fw_ctx = self._build_contexts(
+            operation="max_marginal_relevance_search",
+            conversation=conversation,
+            extra_context=extra_context,
+            namespace=namespace,
+        )
         query_emb = self._embed_query(query, embedding=embedding)
 
         base_k = k or self.default_top_k
@@ -1522,8 +2313,8 @@ class CorpusAutoGenVectorStore:
 
         result = self._translator.query(
             raw_query,
-            op_ctx=ctx,
-            framework_ctx=self._framework_ctx_for_namespace(namespace),
+            op_ctx=op_ctx,
+            framework_ctx=fw_ctx,
             mmr_config=mmr_config,
         )
         matches = self._extract_matches_from_result(result)
@@ -1547,7 +2338,12 @@ class CorpusAutoGenVectorStore:
         """
         Perform Maximal Marginal Relevance (MMR) search (async).
         """
-        ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
+        op_ctx, fw_ctx = self._build_contexts(
+            operation="amax_marginal_relevance_search",
+            conversation=conversation,
+            extra_context=extra_context,
+            namespace=namespace,
+        )
         query_emb = await self._embed_query_async(query, embedding=embedding)
 
         base_k = k or self.default_top_k
@@ -1575,8 +2371,8 @@ class CorpusAutoGenVectorStore:
 
         result = await self._translator.arun_query(
             raw_query,
-            op_ctx=ctx,
-            framework_ctx=self._framework_ctx_for_namespace(namespace),
+            op_ctx=op_ctx,
+            framework_ctx=fw_ctx,
             mmr_config=mmr_config,
         )
         matches = self._extract_matches_from_result(result)
@@ -1602,7 +2398,14 @@ class CorpusAutoGenVectorStore:
 
         If both ids and filter are provided, filter takes precedence.
         """
-        ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
+        _ensure_not_in_event_loop("delete")
+
+        op_ctx, fw_ctx = self._build_contexts(
+            operation="delete",
+            conversation=conversation,
+            extra_context=extra_context,
+            namespace=namespace,
+        )
         ns = self._effective_namespace(namespace)
 
         if filter is not None:
@@ -1617,8 +2420,8 @@ class CorpusAutoGenVectorStore:
 
         self._translator.delete(
             raw_filter_or_ids,
-            op_ctx=ctx,
-            framework_ctx=self._framework_ctx_for_namespace(ns),
+            op_ctx=op_ctx,
+            framework_ctx=fw_ctx,
         )
 
     @with_async_error_context("delete_async")
@@ -1636,7 +2439,12 @@ class CorpusAutoGenVectorStore:
 
         If both ids and filter are provided, filter takes precedence.
         """
-        ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
+        op_ctx, fw_ctx = self._build_contexts(
+            operation="adelete",
+            conversation=conversation,
+            extra_context=extra_context,
+            namespace=namespace,
+        )
         ns = self._effective_namespace(namespace)
 
         if filter is not None:
@@ -1651,85 +2459,254 @@ class CorpusAutoGenVectorStore:
 
         await self._translator.arun_delete(
             raw_filter_or_ids,
-            op_ctx=ctx,
-            framework_ctx=self._framework_ctx_for_namespace(ns),
+            op_ctx=op_ctx,
+            framework_ctx=fw_ctx,
         )
 
     # ------------------------------------------------------------------ #
-    # Health / capabilities (thin pass-through)
+    # Health / capabilities via translator only (no adapter fallback)
     # ------------------------------------------------------------------ #
 
     @with_error_context("capabilities_sync")
-    def capabilities(self) -> Mapping[str, Any]:
+    def capabilities(self, **kwargs: Any) -> Mapping[str, Any]:
         """
-        Thin pass-through to the underlying adapter's capabilities().
+        Synchronous capabilities query.
 
-        If no capabilities method is exposed, raises NotSupported.
+        Translator-only:
+        - `self._translator.capabilities(**kwargs)` MUST be implemented.
+        - No fallback to corpus_adapter.capabilities to keep a strict
+          translator-first contract.
         """
-        adapter = self.corpus_adapter
-        caps = getattr(adapter, "capabilities", None)
-        if callable(caps):
-            return caps()  # type: ignore[misc]
-        raise NotSupported(
-            "Underlying vector adapter does not expose capabilities()",
-        )
+        _ensure_not_in_event_loop("capabilities")
+
+        translator_capabilities = getattr(self._translator, "capabilities", None)
+        if not callable(translator_capabilities):
+            raise NotSupported(
+                "VectorTranslator for framework='autogen' must implement "
+                "capabilities(); no adapter fallback is allowed.",
+            )
+        return translator_capabilities(**kwargs)  # type: ignore[misc]
 
     @with_async_error_context("capabilities_async")
-    async def acapabilities(self) -> Mapping[str, Any]:
+    async def acapabilities(self, **kwargs: Any) -> Mapping[str, Any]:
         """
-        Async capabilities accessor.
+        Async capabilities query.
 
-        Prefers an async capabilities method; otherwise uses a thread pool
-        around the sync method, if available.
+        Translator-only resolution:
+        1. self._translator.acapabilities(**kwargs)
+        2. self._translator.capabilities(**kwargs) via worker thread
+
+        If neither is implemented, this is treated as a configuration error.
         """
-        adapter = self.corpus_adapter
-        acaps = getattr(adapter, "acapabilities", None)
-        if callable(acaps):
-            return await acaps()  # type: ignore[misc]
+        translator_acapabilities = getattr(self._translator, "acapabilities", None)
+        if callable(translator_acapabilities):
+            return await translator_acapabilities(**kwargs)  # type: ignore[misc]
 
-        caps = getattr(adapter, "capabilities", None)
-        if callable(caps):
-            return await asyncio.to_thread(caps)  # type: ignore[arg-type]
+        translator_capabilities = getattr(self._translator, "capabilities", None)
+        if callable(translator_capabilities):
+            return await asyncio.to_thread(translator_capabilities, **kwargs)
 
         raise NotSupported(
-            "Underlying vector adapter does not expose capabilities()/acapabilities()",
+            "VectorTranslator for framework='autogen' must implement "
+            "acapabilities() or capabilities(); no adapter fallback is allowed.",
         )
 
     @with_error_context("health_sync")
-    def health(self) -> Mapping[str, Any]:
+    def health(self, **kwargs: Any) -> Mapping[str, Any]:
         """
-        Thin pass-through to the underlying adapter's health().
+        Synchronous health check.
 
-        If no health method is exposed, raises NotSupported.
+        Translator-only:
+        - `self._translator.health(**kwargs)` MUST be implemented.
+        - No fallback to corpus_adapter.health to avoid legacy/adapter coupling.
         """
-        adapter = self.corpus_adapter
-        health_fn = getattr(adapter, "health", None)
-        if callable(health_fn):
-            return health_fn()  # type: ignore[misc]
-        raise NotSupported(
-            "Underlying vector adapter does not expose health()",
-        )
+        _ensure_not_in_event_loop("health")
+
+        translator_health = getattr(self._translator, "health", None)
+        if not callable(translator_health):
+            raise NotSupported(
+                "VectorTranslator for framework='autogen' must implement "
+                "health(); no adapter fallback is allowed.",
+            )
+        return translator_health(**kwargs)  # type: ignore[misc]
 
     @with_async_error_context("health_async")
-    async def ahealth(self) -> Mapping[str, Any]:
+    async def ahealth(self, **kwargs: Any) -> Mapping[str, Any]:
         """
-        Async health accessor.
+        Async health check.
 
-        Prefers an async health method; otherwise uses a thread pool
-        around the sync method, if available.
+        Translator-only resolution:
+        1. self._translator.ahealth(**kwargs)
+        2. self._translator.health(**kwargs) via worker thread
+
+        If neither is implemented, this is treated as a configuration error.
         """
-        adapter = self.corpus_adapter
-        ahealth_fn = getattr(adapter, "ahealth", None)
-        if callable(ahealth_fn):
-            return await ahealth_fn()  # type: ignore[misc]
+        translator_ahealth = getattr(self._translator, "ahealth", None)
+        if callable(translator_ahealth):
+            return await translator_ahealth(**kwargs)  # type: ignore[misc]
 
-        health_fn = getattr(adapter, "health", None)
-        if callable(health_fn):
-            return await asyncio.to_thread(health_fn)  # type: ignore[arg-type]
+        translator_health = getattr(self._translator, "health", None)
+        if callable(translator_health):
+            return await asyncio.to_thread(translator_health, **kwargs)
 
         raise NotSupported(
-            "Underlying vector adapter does not expose health()/ahealth()",
+            "VectorTranslator for framework='autogen' must implement "
+            "ahealth() or health(); no adapter fallback is allowed.",
         )
+
+    # ------------------------------------------------------------------ #
+    # Resource cleanup (close / aclose / context managers)
+    # ------------------------------------------------------------------ #
+
+    def close(self) -> None:
+        """
+        Best-effort synchronous cleanup of translator/adapter resources.
+
+        This method never raises; it only logs warnings on failure.
+
+        Ownership semantics:
+        - Always attempts to close the VectorTranslator if it supports close().
+        - If own_adapter=True, also attempts to close the underlying corpus_adapter.
+        """
+        try:
+            translator_close = getattr(self._translator, "close", None)
+        except Exception:
+            translator_close = None
+
+        if callable(translator_close):
+            try:
+                translator_close()
+            except Exception:
+                logger.warning(
+                    "Error while closing VectorTranslator synchronously",
+                    exc_info=True,
+                )
+
+        if self._own_adapter:
+            try:
+                adapter_close = getattr(self.corpus_adapter, "close", None)
+            except Exception:
+                adapter_close = None
+            if callable(adapter_close):
+                try:
+                    adapter_close()
+                except Exception:
+                    logger.warning(
+                        "Error while closing corpus_adapter synchronously",
+                        exc_info=True,
+                    )
+
+    async def aclose(self) -> None:
+        """
+        Best-effort asynchronous cleanup of translator/adapter resources.
+
+        This method never raises; it only logs warnings on failure.
+
+        Ownership semantics:
+        - Prefers translator.aclose() if available; falls back to translator.close().
+        - If own_adapter=True, also closes/acloses the underlying corpus_adapter
+          using the same preference order.
+        """
+        # Close translator
+        try:
+            translator_aclose = getattr(self._translator, "aclose", None)
+        except Exception:
+            translator_aclose = None
+
+        if callable(translator_aclose):
+            try:
+                await translator_aclose()
+            except Exception:
+                logger.warning(
+                    "Error while closing VectorTranslator asynchronously",
+                    exc_info=True,
+                )
+        else:
+            try:
+                translator_close = getattr(self._translator, "close", None)
+            except Exception:
+                translator_close = None
+            if callable(translator_close):
+                try:
+                    if asyncio.iscoroutinefunction(translator_close):
+                        await translator_close()
+                    else:
+                        await asyncio.to_thread(translator_close)
+                except Exception:
+                    logger.warning(
+                        "Error while closing VectorTranslator from async context",
+                        exc_info=True,
+                    )
+
+        # Close underlying adapter if owned
+        if self._own_adapter:
+            try:
+                adapter_aclose = getattr(self.corpus_adapter, "aclose", None)
+            except Exception:
+                adapter_aclose = None
+
+            if callable(adapter_aclose):
+                try:
+                    await adapter_aclose()
+                    return
+                except Exception:
+                    logger.warning(
+                        "Error while closing corpus_adapter asynchronously",
+                        exc_info=True,
+                    )
+            else:
+                try:
+                    adapter_close = getattr(self.corpus_adapter, "close", None)
+                except Exception:
+                    adapter_close = None
+                if callable(adapter_close):
+                    try:
+                        if asyncio.iscoroutinefunction(adapter_close):
+                            await adapter_close()
+                        else:
+                            await asyncio.to_thread(adapter_close)
+                    except Exception:
+                        logger.warning(
+                            "Error while closing corpus_adapter from async context",
+                            exc_info=True,
+                        )
+
+    def __enter__(self) -> "CorpusAutoGenVectorStore":
+        """
+        Synchronous context manager entry; returns self.
+        """
+        _ensure_not_in_event_loop("__enter__")
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        """
+        Synchronous context manager exit; best-effort close().
+        """
+        try:
+            self.close()
+        except Exception:
+            logger.warning(
+                "Error while closing CorpusAutoGenVectorStore in __exit__",
+                exc_info=True,
+            )
+
+    async def __aenter__(self) -> "CorpusAutoGenVectorStore":
+        """
+        Async context manager entry; returns self.
+        """
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        """
+        Async context manager exit; best-effort aclose().
+        """
+        try:
+            await self.aclose()
+        except Exception:
+            logger.warning(
+                "Error while closing CorpusAutoGenVectorStore in __aexit__",
+                exc_info=True,
+            )
 
     # ------------------------------------------------------------------ #
     # Convenience constructors
@@ -1749,6 +2726,8 @@ class CorpusAutoGenVectorStore:
         """
         Create a store from texts, then add them immediately (sync).
         """
+        _ensure_not_in_event_loop("from_texts")
+
         store = cls(corpus_adapter=corpus_adapter, **kwargs)
         store.add_texts(texts, metadatas=metadatas, ids=ids)
         return store
@@ -1765,6 +2744,8 @@ class CorpusAutoGenVectorStore:
         """
         Create a store from AutoGenDocuments, then add them immediately (sync).
         """
+        _ensure_not_in_event_loop("from_documents")
+
         store = cls(corpus_adapter=corpus_adapter, **kwargs)
         store.add_documents(documents)
         return store
@@ -1823,6 +2804,8 @@ class CorpusAutoGenRetrieverTool:
         Returns a list of plain dicts with `page_content` and `metadata`
         fields, which are easy for AutoGen agents to consume.
         """
+        _ensure_not_in_event_loop("CorpusAutoGenRetrieverTool.__call__")
+
         effective_kwargs: Dict[str, Any] = dict(self.search_kwargs)
         effective_kwargs.update(kwargs)
 
