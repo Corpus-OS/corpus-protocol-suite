@@ -175,13 +175,14 @@ Metadata = Dict[str, Any]
 # --------------------------------------------------------------------------- #
 
 VECTOR_ERROR_CODES = VectorCoercionErrorCodes(
-    invalid_vector_result="INVALID_VECTOR_RESULT",
-    invalid_hit_result="INVALID_VECTOR_HIT_RESULT",
-    empty_result="EMPTY_VECTOR_RESULT",
-    conversion_error="VECTOR_CONVERSION_ERROR",
-    score_out_of_range="VECTOR_SCORE_OUT_OF_RANGE",
-    vector_dimension_exceeded="VECTOR_DIMENSION_EXCEEDED",
-    vector_norm_invalid="VECTOR_NORM_INVALID",
+    # Vector-flavored codes (framework scoped)
+    invalid_vector_result="LANGCHAIN_VECTOR_INVALID_VECTOR_RESULT",
+    invalid_hit_result="LANGCHAIN_VECTOR_INVALID_HIT_RESULT",
+    empty_result="LANGCHAIN_VECTOR_EMPTY_RESULT",
+    conversion_error="LANGCHAIN_VECTOR_CONVERSION_ERROR",
+    score_out_of_range="LANGCHAIN_VECTOR_SCORE_OUT_OF_RANGE",
+    vector_dimension_exceeded="LANGCHAIN_VECTOR_DIMENSION_EXCEEDED",
+    vector_norm_invalid="LANGCHAIN_VECTOR_NORM_INVALID",
     framework_label="langchain",
 )
 VECTOR_LIMITS = VectorResourceLimits()
@@ -221,15 +222,28 @@ def _ensure_not_in_event_loop(sync_api_name: str) -> None:
     Prevent calling sync APIs from inside an active asyncio loop.
 
     This is a hard guard to avoid deadlocks or unexpected re-entrancy.
+
+    Enhanced behavior:
+    - The raised error is context-attached for observability consistency.
     """
     try:
         asyncio.get_running_loop()
     except RuntimeError:
         return
-    raise RuntimeError(
+
+    err = RuntimeError(
         f"{sync_api_name} was called from inside an active asyncio event loop. "
         f"Use the async variant instead."
     )
+    attach_context(
+        err,
+        framework="langchain",
+        operation=sync_api_name,
+        error_codes=VECTOR_ERROR_CODES,
+        event_loop_active=True,
+        sync_api_name=sync_api_name,
+    )
+    raise err
 
 
 # --------------------------------------------------------------------------- #
@@ -452,12 +466,23 @@ class CorpusLangChainVectorStore(VectorStore):
 
         We fail fast with a clear error if LangChain is not installed, but keep
         imports soft and module-import safe.
+
+        Enhanced behavior:
+        - The raised error is context-attached for consistency with all framework-facing failures.
         """
         if not LANGCHAIN_AVAILABLE:
-            raise RuntimeError(
+            err = RuntimeError(
                 "CorpusLangChainVectorStore requires `langchain-core` to be installed. "
                 "Install it with `pip install langchain-core`."
             )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="init_vector_store",
+                error_codes=VECTOR_ERROR_CODES,
+                langchain_available=False,
+            )
+            raise err
         super().__init__(*args, **kwargs)
 
     # ------------------------------------------------------------------ #
@@ -575,7 +600,7 @@ class CorpusLangChainVectorStore(VectorStore):
         """
         Build an OperationContext from a LangChain config-like object.
 
-        Updated behavior (strict):
+        Strict behavior:
         - config is None: return OperationContext() (normal).
         - config is OperationContext: return it.
         - config is Mapping: ctx_from_dict must succeed and return OperationContext.
@@ -641,7 +666,7 @@ class CorpusLangChainVectorStore(VectorStore):
         """
         Backward-compatible context builder retained for API stability.
 
-        This method now delegates to the strict core context builder.
+        This method delegates to the strict core context builder.
         """
         config = kwargs.get("config")
         return self._build_core_context(config)
@@ -683,6 +708,61 @@ class CorpusLangChainVectorStore(VectorStore):
             flags=VECTOR_FLAGS,
         )
         return framework_ctx
+
+    def _build_framework_context(
+        self,
+        core_ctx: OperationContext,
+        *,
+        operation: str,
+        namespace: Optional[str],
+        filter: Optional[Mapping[str, Any]] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Build framework_ctx metadata for the VectorTranslator.
+
+        Requirements:
+        - Depends only on stable, public pieces.
+        - Must never raise; on failure, fall back to minimal metadata.
+        - Carries vector_context (namespace, etc.) plus stable operation metadata.
+        """
+        try:
+            ns = self._effective_namespace(namespace)
+            ctx = self._framework_ctx_for_namespace(ns, extra_context=extra_context)
+            # Stable framework-level metadata (non-breaking, best-effort).
+            ctx.setdefault("vector_operation", operation)
+            ctx.setdefault("has_filter", bool(filter))
+            # core_ctx is passed separately as op_ctx; translator already consumes it.
+            _ = core_ctx  # keep explicit reference for clarity; no behavior change
+            return ctx
+        except Exception:
+            return {"vector_operation": operation, "has_filter": bool(filter)}
+
+    def _build_contexts(
+        self,
+        *,
+        operation: str,
+        namespace: Optional[str],
+        filter: Optional[Mapping[str, Any]] = None,
+        extra_framework_context: Optional[Mapping[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Tuple[OperationContext, Dict[str, Any]]:
+        """
+        Orchestrate both context layers for all public APIs:
+        - _build_core_context(...) -> OperationContext
+        - _build_framework_context(...) -> framework_ctx dict for the translator
+
+        This provides a single consistent entry point for context handling.
+        """
+        core_ctx = self._build_core_context(kwargs.get("config"))
+        fw_ctx = self._build_framework_context(
+            core_ctx,
+            operation=operation,
+            namespace=namespace,
+            filter=filter,
+            extra_context=extra_framework_context,
+        )
+        return core_ctx, fw_ctx
 
     # ------------------------------------------------------------------ #
     # Dimension hint + deterministic zero vectors
@@ -1272,6 +1352,9 @@ class CorpusLangChainVectorStore(VectorStore):
     ) -> None:
         """
         Handle partial failures in batch upsert operations gracefully.
+
+        Enhanced behavior:
+        - If all texts failed, raise a context-attached error (consistent with other failures).
         """
         if result.failed_count and result.failed_count > 0:
             successful = result.upserted_count or 0
@@ -1294,7 +1377,7 @@ class CorpusLangChainVectorStore(VectorStore):
                     )
 
         if (result.upserted_count or 0) == 0 and total_texts > 0:
-            raise VectorAdapterError(
+            err = VectorAdapterError(
                 f"All {total_texts} texts failed to upsert",
                 code="BATCH_UPSERT_FAILED",
                 details={
@@ -1303,6 +1386,15 @@ class CorpusLangChainVectorStore(VectorStore):
                     "failures": result.failures or [],
                 },
             )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="batch_upsert",
+                error_codes=VECTOR_ERROR_CODES,
+                vectors_count=total_texts,
+                namespace=namespace,
+            )
+            raise err
 
     # ------------------------------------------------------------------ #
     # Embedding helpers (KEEP original names; add empty-query hardening)
@@ -1591,7 +1683,12 @@ class CorpusLangChainVectorStore(VectorStore):
 
         embeddings: Optional[Embeddings] = kwargs.get("embeddings")
         namespace: Optional[str] = kwargs.get("namespace")
-        ctx = self._build_ctx(**kwargs)
+
+        ctx, framework_ctx = self._build_contexts(
+            operation="add_texts_sync",
+            namespace=namespace,
+            **kwargs,
+        )
 
         metadatas_norm = self._normalize_metadatas(len(texts_list), metadatas)
         ids_norm = self._normalize_ids(len(texts_list), ids)
@@ -1605,10 +1702,12 @@ class CorpusLangChainVectorStore(VectorStore):
             namespace=namespace,
         )
 
-        raw_request, framework_ctx = self._build_upsert_request(
+        raw_request, framework_ctx2 = self._build_upsert_request(
             vectors,
             namespace=namespace,
         )
+        # Merge orchestrated framework ctx with request-specific vector_context (request wins).
+        framework_ctx.update(framework_ctx2)
 
         result = self._translator.upsert(
             raw_request,
@@ -1642,7 +1741,12 @@ class CorpusLangChainVectorStore(VectorStore):
 
         embeddings: Optional[Embeddings] = kwargs.get("embeddings")
         namespace: Optional[str] = kwargs.get("namespace")
-        ctx = self._build_ctx(**kwargs)
+
+        ctx, framework_ctx = self._build_contexts(
+            operation="add_texts_async",
+            namespace=namespace,
+            **kwargs,
+        )
 
         metadatas_norm = self._normalize_metadatas(len(texts_list), metadatas)
         ids_norm = self._normalize_ids(len(texts_list), ids)
@@ -1656,10 +1760,11 @@ class CorpusLangChainVectorStore(VectorStore):
             namespace=namespace,
         )
 
-        raw_request, framework_ctx = self._build_upsert_request(
+        raw_request, framework_ctx2 = self._build_upsert_request(
             vectors,
             namespace=namespace,
         )
+        framework_ctx.update(framework_ctx2)
 
         result = await self._translator.arun_upsert(
             raw_request,
@@ -1716,7 +1821,13 @@ class CorpusLangChainVectorStore(VectorStore):
 
         embedding: Optional[Sequence[float]] = kwargs.get("embedding")
         namespace: Optional[str] = kwargs.get("namespace")
-        ctx = self._build_ctx(**kwargs)
+
+        ctx, framework_ctx = self._build_contexts(
+            operation="similarity_search_sync",
+            namespace=namespace,
+            filter=filter,
+            **kwargs,
+        )
 
         query_emb = self._embed_query(query, embedding=embedding)
         top_k = k or self.default_top_k
@@ -1757,13 +1868,14 @@ class CorpusLangChainVectorStore(VectorStore):
             logger=logger,
         )
 
-        raw_query, framework_ctx = self._build_query_request(
+        raw_query, framework_ctx2 = self._build_query_request(
             query_emb,
             k=top_k,
             namespace=namespace,
             filter=filter,
             include_vectors=False,
         )
+        framework_ctx.update(framework_ctx2)
 
         result_any = self._translator.query(
             raw_query,
@@ -1803,7 +1915,13 @@ class CorpusLangChainVectorStore(VectorStore):
 
         embedding: Optional[Sequence[float]] = kwargs.get("embedding")
         namespace: Optional[str] = kwargs.get("namespace")
-        ctx = self._build_ctx(**kwargs)
+
+        ctx, framework_ctx = self._build_contexts(
+            operation="similarity_search_stream_sync",
+            namespace=namespace,
+            filter=filter,
+            **kwargs,
+        )
 
         query_emb = self._embed_query(query, embedding=embedding)
         top_k = k or self.default_top_k
@@ -1844,13 +1962,14 @@ class CorpusLangChainVectorStore(VectorStore):
             logger=logger,
         )
 
-        raw_query, framework_ctx = self._build_query_request(
+        raw_query, framework_ctx2 = self._build_query_request(
             query_emb,
             k=top_k,
             namespace=namespace,
             filter=filter,
             include_vectors=False,
         )
+        framework_ctx.update(framework_ctx2)
 
         for chunk in self._translator.query_stream(
             raw_query,
@@ -1891,7 +2010,13 @@ class CorpusLangChainVectorStore(VectorStore):
         """
         embedding: Optional[Sequence[float]] = kwargs.get("embedding")
         namespace: Optional[str] = kwargs.get("namespace")
-        ctx = self._build_ctx(**kwargs)
+
+        ctx, framework_ctx = self._build_contexts(
+            operation="similarity_search_async",
+            namespace=namespace,
+            filter=filter,
+            **kwargs,
+        )
 
         query_emb = await self._embed_query_async(query, embedding=embedding)
         top_k = k or self.default_top_k
@@ -1932,13 +2057,14 @@ class CorpusLangChainVectorStore(VectorStore):
             logger=logger,
         )
 
-        raw_query, framework_ctx = self._build_query_request(
+        raw_query, framework_ctx2 = self._build_query_request(
             query_emb,
             k=top_k,
             namespace=namespace,
             filter=filter,
             include_vectors=False,
         )
+        framework_ctx.update(framework_ctx2)
 
         result_any = await self._translator.arun_query(
             raw_query,
@@ -1978,7 +2104,13 @@ class CorpusLangChainVectorStore(VectorStore):
 
         embedding: Optional[Sequence[float]] = kwargs.get("embedding")
         namespace: Optional[str] = kwargs.get("namespace")
-        ctx = self._build_ctx(**kwargs)
+
+        ctx, framework_ctx = self._build_contexts(
+            operation="similarity_search_with_score_sync",
+            namespace=namespace,
+            filter=filter,
+            **kwargs,
+        )
 
         query_emb = self._embed_query(query, embedding=embedding)
         top_k = k or self.default_top_k
@@ -2019,13 +2151,14 @@ class CorpusLangChainVectorStore(VectorStore):
             logger=logger,
         )
 
-        raw_query, framework_ctx = self._build_query_request(
+        raw_query, framework_ctx2 = self._build_query_request(
             query_emb,
             k=top_k,
             namespace=namespace,
             filter=filter,
             include_vectors=False,
         )
+        framework_ctx.update(framework_ctx2)
 
         result_any = self._translator.query(
             raw_query,
@@ -2062,7 +2195,13 @@ class CorpusLangChainVectorStore(VectorStore):
         """
         embedding: Optional[Sequence[float]] = kwargs.get("embedding")
         namespace: Optional[str] = kwargs.get("namespace")
-        ctx = self._build_ctx(**kwargs)
+
+        ctx, framework_ctx = self._build_contexts(
+            operation="similarity_search_with_score_async",
+            namespace=namespace,
+            filter=filter,
+            **kwargs,
+        )
 
         query_emb = await self._embed_query_async(query, embedding=embedding)
         top_k = k or self.default_top_k
@@ -2103,13 +2242,14 @@ class CorpusLangChainVectorStore(VectorStore):
             logger=logger,
         )
 
-        raw_query, framework_ctx = self._build_query_request(
+        raw_query, framework_ctx2 = self._build_query_request(
             query_emb,
             k=top_k,
             namespace=namespace,
             filter=filter,
             include_vectors=False,
         )
+        framework_ctx.update(framework_ctx2)
 
         result_any = await self._translator.arun_query(
             raw_query,
@@ -2134,7 +2274,7 @@ class CorpusLangChainVectorStore(VectorStore):
         return self._from_corpus_matches(matches)
 
     # ------------------------------------------------------------------ #
-    # MMR search (improved + configurable similarity)  [kept as in your file]
+    # MMR search (improved + configurable similarity)
     # ------------------------------------------------------------------ #
 
     @staticmethod
@@ -2363,17 +2503,24 @@ class CorpusLangChainVectorStore(VectorStore):
 
         embedding: Optional[Sequence[float]] = kwargs.get("embedding")
         namespace: Optional[str] = kwargs.get("namespace")
-        ctx = self._build_ctx(**kwargs)
+
+        ctx, framework_ctx = self._build_contexts(
+            operation="mmr_search_sync",
+            namespace=namespace,
+            filter=filter,
+            **kwargs,
+        )
 
         query_emb = self._embed_query(query, embedding=embedding)
 
-        raw_query, framework_ctx = self._build_query_request(
+        raw_query, framework_ctx2 = self._build_query_request(
             query_emb,
             k=fetch_k,
             namespace=namespace,
             filter=filter,
             include_vectors=True,
         )
+        framework_ctx.update(framework_ctx2)
 
         result_any = self._translator.query(
             raw_query,
@@ -2499,17 +2646,24 @@ class CorpusLangChainVectorStore(VectorStore):
 
         embedding: Optional[Sequence[float]] = kwargs.get("embedding")
         namespace: Optional[str] = kwargs.get("namespace")
-        ctx = self._build_ctx(**kwargs)
+
+        ctx, framework_ctx = self._build_contexts(
+            operation="mmr_search_async",
+            namespace=namespace,
+            filter=filter,
+            **kwargs,
+        )
 
         query_emb = await self._embed_query_async(query, embedding=embedding)
 
-        raw_query, framework_ctx = self._build_query_request(
+        raw_query, framework_ctx2 = self._build_query_request(
             query_emb,
             k=fetch_k,
             namespace=namespace,
             filter=filter,
             include_vectors=True,
         )
+        framework_ctx.update(framework_ctx2)
 
         result_any = await self._translator.arun_query(
             raw_query,
@@ -2562,13 +2716,20 @@ class CorpusLangChainVectorStore(VectorStore):
         _ensure_not_in_event_loop("delete")
 
         namespace: Optional[str] = kwargs.get("namespace")
-        ctx = self._build_ctx(**kwargs)
 
-        raw_request, framework_ctx = self._build_delete_request(
+        ctx, framework_ctx = self._build_contexts(
+            operation="delete_sync",
+            namespace=namespace,
+            filter=filter,
+            **kwargs,
+        )
+
+        raw_request, framework_ctx2 = self._build_delete_request(
             ids=ids,
             namespace=namespace,
             filter=filter,
         )
+        framework_ctx.update(framework_ctx2)
 
         self._translator.delete(
             raw_request,
@@ -2588,13 +2749,20 @@ class CorpusLangChainVectorStore(VectorStore):
         Delete vectors by IDs or metadata filter (async).
         """
         namespace: Optional[str] = kwargs.get("namespace")
-        ctx = self._build_ctx(**kwargs)
 
-        raw_request, framework_ctx = self._build_delete_request(
+        ctx, framework_ctx = self._build_contexts(
+            operation="delete_async",
+            namespace=namespace,
+            filter=filter,
+            **kwargs,
+        )
+
+        raw_request, framework_ctx2 = self._build_delete_request(
             ids=ids,
             namespace=namespace,
             filter=filter,
         )
+        framework_ctx.update(framework_ctx2)
 
         await self._translator.arun_delete(
             raw_request,
@@ -2603,12 +2771,16 @@ class CorpusLangChainVectorStore(VectorStore):
         )
 
     # ------------------------------------------------------------------ #
-    # Resource cleanup (additive, best-effort)
+    # Resource cleanup (full ownership: translator + underlying adapter)
     # ------------------------------------------------------------------ #
 
     def close(self) -> None:
         """
-        Best-effort cleanup of translator resources. Never raises.
+        Best-effort cleanup of translator and underlying adapter resources. Never raises.
+
+        Cleanup order:
+        1) Translator (framework orchestration layer)
+        2) Underlying adapter/backend (DB/HTTP client, etc.), if it exposes close()
         """
         try:
             close_fn = getattr(self._translator, "close", None)
@@ -2620,10 +2792,25 @@ class CorpusLangChainVectorStore(VectorStore):
             except Exception:
                 logger.warning("Error while closing VectorTranslator", exc_info=True)
 
+        try:
+            adapter_close = getattr(self.corpus_adapter, "close", None)
+        except Exception:
+            adapter_close = None
+        if callable(adapter_close):
+            try:
+                adapter_close()
+            except Exception:
+                logger.warning("Error while closing corpus_adapter", exc_info=True)
+
     async def aclose(self) -> None:
         """
-        Best-effort async cleanup of translator resources. Never raises.
+        Best-effort async cleanup of translator and underlying adapter resources. Never raises.
+
+        Cleanup order:
+        1) Translator (prefer aclose(), then close() via thread)
+        2) Underlying adapter/backend (prefer aclose(), then close() via thread)
         """
+        # --- Translator ---
         try:
             aclose_fn = getattr(self._translator, "aclose", None)
         except Exception:
@@ -2631,20 +2818,40 @@ class CorpusLangChainVectorStore(VectorStore):
         if callable(aclose_fn):
             try:
                 await aclose_fn()
-                return
             except Exception:
                 logger.warning("Error while closing VectorTranslator asynchronously", exc_info=True)
-
-        # Fallback to sync close in a thread.
-        try:
-            close_fn = getattr(self._translator, "close", None)
-        except Exception:
-            close_fn = None
-        if callable(close_fn):
+        else:
             try:
-                await asyncio.to_thread(close_fn)
+                close_fn = getattr(self._translator, "close", None)
             except Exception:
-                logger.warning("Error while closing VectorTranslator (threaded)", exc_info=True)
+                close_fn = None
+            if callable(close_fn):
+                try:
+                    await asyncio.to_thread(close_fn)
+                except Exception:
+                    logger.warning("Error while closing VectorTranslator (threaded)", exc_info=True)
+
+        # --- Underlying adapter/backend ---
+        try:
+            adapter_aclose = getattr(self.corpus_adapter, "aclose", None)
+        except Exception:
+            adapter_aclose = None
+        if callable(adapter_aclose):
+            try:
+                await adapter_aclose()
+                return
+            except Exception:
+                logger.warning("Error while closing corpus_adapter asynchronously", exc_info=True)
+
+        try:
+            adapter_close = getattr(self.corpus_adapter, "close", None)
+        except Exception:
+            adapter_close = None
+        if callable(adapter_close):
+            try:
+                await asyncio.to_thread(adapter_close)
+            except Exception:
+                logger.warning("Error while closing corpus_adapter (threaded)", exc_info=True)
 
     def __enter__(self) -> "CorpusLangChainVectorStore":
         _ensure_not_in_event_loop("__enter__")
@@ -2710,12 +2917,23 @@ class CorpusLangChainRetriever(BaseRetriever):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         """
         Initialize the retriever.
+
+        Enhanced behavior:
+        - The raised error is context-attached for consistency with all framework-facing failures.
         """
         if not LANGCHAIN_AVAILABLE:
-            raise RuntimeError(
+            err = RuntimeError(
                 "CorpusLangChainRetriever requires `langchain-core` to be installed. "
                 "Install it with `pip install langchain-core`."
             )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="init_retriever",
+                error_codes=VECTOR_ERROR_CODES,
+                langchain_available=False,
+            )
+            raise err
         super().__init__(*args, **kwargs)
 
     @with_error_context("retriever_sync")
