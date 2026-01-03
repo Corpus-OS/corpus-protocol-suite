@@ -35,9 +35,11 @@ import asyncio
 import logging
 import math
 from functools import cached_property, wraps
+from threading import RLock
 from typing import (
     Any,
     Awaitable,
+    Callable,
     Dict,
     Iterator,
     List,
@@ -47,10 +49,9 @@ from typing import (
     Tuple,
     Type,
     Union,
-    Callable,
 )
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 
 # --------------------------------------------------------------------------- #
 # Optional CrewAI import (soft dependency)
@@ -106,14 +107,47 @@ Metadata = Dict[str, Any]
 # Vector framework-utils configuration for CrewAI adapter
 # --------------------------------------------------------------------------- #
 
-VECTOR_ERROR_CODES = VectorCoercionErrorCodes(
+# Vector coercion error codes (vector-flavored, framework-labeled).
+# These are passed into attach_context for consistent observability.
+VECTOR_ERROR_CODES: VectorCoercionErrorCodes = VectorCoercionErrorCodes(
+    invalid_vector_result="CREWAI_VECTOR_INVALID_RESULT",
+    invalid_hit_result="CREWAI_VECTOR_INVALID_HIT_RESULT",
+    empty_result="CREWAI_VECTOR_EMPTY_RESULT",
+    conversion_error="CREWAI_VECTOR_CONVERSION_ERROR",
+    score_out_of_range="CREWAI_VECTOR_SCORE_OUT_OF_RANGE",
+    vector_dimension_exceeded="CREWAI_VECTOR_DIMENSION_EXCEEDED",
+    vector_norm_invalid="CREWAI_VECTOR_NORM_INVALID",
     framework_label="crewai",
 )
+
 VECTOR_LIMITS = VectorResourceLimits()
 VECTOR_FLAGS = VectorValidationFlags()
 TOPK_WARNING_CONFIG = TopKWarningConfig(
     framework_label="crewai",
 )
+
+
+# --------------------------------------------------------------------------- #
+# Event-loop guard (sync entrypoints)
+# --------------------------------------------------------------------------- #
+
+
+def _ensure_not_in_event_loop(sync_api_name: str) -> None:
+    """
+    Prevent deadlocks from calling sync APIs in active event loops.
+
+    This is a defensive guard for environments where users might accidentally
+    call sync tool/vector APIs from async frameworks.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        # No running loop -> safe to use sync API.
+        return
+    raise RuntimeError(
+        f"{sync_api_name} was called from inside an active asyncio event loop. "
+        f"Use the async variant instead."
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -130,6 +164,97 @@ class ErrorCodes:
     EMBEDDING_ERROR = "EMBEDDING_ERROR"
     BAD_TOP_K = "BAD_TOP_K"
     FILTER_NOT_SUPPORTED = "FILTER_NOT_SUPPORTED"
+    BAD_QUERY_TEXT = "BAD_QUERY_TEXT"
+    BAD_VECTOR_DIMENSION = "BAD_VECTOR_DIMENSION"
+    CAPABILITIES_NOT_AVAILABLE = "CAPABILITIES_NOT_AVAILABLE"
+
+
+def _build_dynamic_error_context(
+    operation: str,
+    args: Tuple[Any, ...],
+    kwargs: Dict[str, Any],
+    base_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Build an enriched, vector-flavored error context for tool/vector operations.
+
+    Best-effort only: this must never raise.
+    """
+    extra: Dict[str, Any] = dict(base_context)
+    try:
+        extra.setdefault("operation", operation)
+
+        # Self-introspection: defaults & basic metadata
+        if args:
+            self_obj = args[0]
+            default_ns = getattr(self_obj, "namespace", None)
+            if default_ns is not None:
+                extra.setdefault("default_namespace", default_ns)
+            score_threshold = getattr(self_obj, "score_threshold", None)
+            if score_threshold is not None:
+                extra.setdefault("score_threshold", score_threshold)
+            default_top_k = getattr(self_obj, "default_top_k", None)
+            if default_top_k is not None:
+                extra.setdefault("default_top_k", default_top_k)
+            dim_hint = getattr(self_obj, "_vector_dim_hint", None)
+            if dim_hint is not None:
+                extra.setdefault("vector_dim_hint", dim_hint)
+
+        # Common query parameters
+        query = kwargs.get("query")
+        if isinstance(query, str):
+            extra.setdefault("query_chars", len(query))
+
+        k = kwargs.get("k")
+        if isinstance(k, int):
+            extra.setdefault("k", k)
+
+        fetch_k = kwargs.get("fetch_k")
+        if isinstance(fetch_k, int):
+            extra.setdefault("fetch_k", fetch_k)
+
+        namespace = kwargs.get("namespace")
+        if namespace is not None:
+            extra.setdefault("namespace", namespace)
+
+        if "filter" in kwargs:
+            extra.setdefault("has_filter", kwargs.get("filter") is not None)
+
+        if "return_scores" in kwargs:
+            extra.setdefault("return_scores", bool(kwargs.get("return_scores")))
+
+        # Embedding / vectorization inputs
+        if "embedding" in kwargs and kwargs.get("embedding") is not None:
+            emb = kwargs.get("embedding")
+            if isinstance(emb, Sequence):
+                extra.setdefault("embedding_dim", len(emb))
+
+        texts = kwargs.get("texts")
+        if texts is not None:
+            try:
+                texts_list = list(texts)  # may raise for non-iterables
+                extra.setdefault("vectors_count", len(texts_list))
+                total_chars = 0
+                for t in texts_list:
+                    if isinstance(t, str):
+                        total_chars += len(t)
+                    else:
+                        total_chars += len(str(t))
+                extra.setdefault("total_content_chars", total_chars)
+            except Exception:
+                extra.setdefault("vectors_count", 1)
+
+        # If this wrapper was invoked via CrewAI tool `_run/_arun`,
+        # the kwargs often represent the input schema fields.
+        # Attach the most common ones.
+        if "use_mmr" in kwargs:
+            extra.setdefault("use_mmr", kwargs.get("use_mmr"))
+        if "mmr_lambda" in kwargs:
+            extra.setdefault("mmr_lambda", kwargs.get("mmr_lambda"))
+    except Exception:
+        # Error-context enrichment must never be fatal.
+        pass
+    return extra
 
 
 def with_error_context(
@@ -146,7 +271,12 @@ def with_error_context(
             try:
                 return func(*args, **kwargs)
             except Exception as exc:
-                enhanced_context = dict(context_kwargs)
+                enhanced_context = _build_dynamic_error_context(
+                    operation=operation,
+                    args=args,
+                    kwargs=kwargs,
+                    base_context=dict(context_kwargs),
+                )
                 attach_context(
                     exc,
                     framework="crewai",
@@ -175,7 +305,12 @@ def with_async_error_context(
             try:
                 return await func(*args, **kwargs)
             except Exception as exc:
-                enhanced_context = dict(context_kwargs)
+                enhanced_context = _build_dynamic_error_context(
+                    operation=operation,
+                    args=args,
+                    kwargs=kwargs,
+                    base_context=dict(context_kwargs),
+                )
                 attach_context(
                     exc,
                     framework="crewai",
@@ -341,11 +476,16 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
     use_mmr_by_default: bool = False
     mmr_lambda: float = 0.5
 
-    # Cached capabilities (used by async flows)
-    _caps: Optional[VectorCapabilities] = None
-
     # Optional static OperationContext for advanced scenarios
     static_operation_context: Optional[OperationContext] = None
+
+    # Ownership model for cleanup: by default, the caller owns the adapter.
+    own_adapter: bool = False
+
+    # Internal / cached state (private attrs; not part of tool schema)
+    _caps: Optional[VectorCapabilities] = PrivateAttr(default=None)
+    _vector_dim_hint: Optional[int] = PrivateAttr(default=None)
+    _dim_lock: RLock = PrivateAttr(default_factory=RLock)
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         """
@@ -412,107 +552,92 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
         )
 
     # ------------------------------------------------------------------ #
-    # Internal helpers: capabilities / context / validation
+    # Context building (separated core + framework contexts)
     # ------------------------------------------------------------------ #
 
-    async def _get_caps_async(self) -> VectorCapabilities:
+    def _build_core_context(self, call_context: Optional[Any]) -> Optional[OperationContext]:
         """
-        Async capability fetch with caching.
+        Build an OperationContext from an incoming CrewAI context payload.
 
-        Uses the underlying adapter's capabilities() API and attaches
-        rich error context on failure. Only used by async flows to
-        preserve the original hardening.
-        """
-        if self._caps is not None:
-            return self._caps
-        try:
-            caps = await self.corpus_adapter.capabilities()
-            self._caps = caps
-            return caps
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="crewai",
-                operation="capabilities",
-                error_codes=VECTOR_ERROR_CODES,
-            )
-            raise
-
-    def _effective_namespace(self, namespace: Optional[str]) -> Optional[str]:
-        """
-        Resolve namespace using explicit override or tool default.
-        """
-        return namespace if namespace is not None else self.namespace
-
-    def _resolve_operation_context(
-        self,
-        call_context: Optional[Any],
-    ) -> Optional[OperationContext]:
-        """
-        Build or reuse an OperationContext for this call.
-
-        Resolution order:
-        1. If `call_context` is already an OperationContext, use it.
-        2. If `call_context` is a Mapping, use context_translation.from_dict.
-        3. Otherwise, attempt context_translation.from_crewai (for Task-like objects).
-        4. Fallback to `static_operation_context` if present.
-        5. Else, return None.
+        Contract:
+        - If translation is attempted and fails, we raise with attached context.
+        - We do not silently fall back to "no context" on translation failures.
+        - If call_context is None, we may return the configured static_operation_context.
         """
         if isinstance(call_context, OperationContext):
             return call_context
 
-        if call_context is not None:
-            # Try dict-based translation first
+        if call_context is None:
+            return self.static_operation_context if isinstance(self.static_operation_context, OperationContext) else None
+
+        # Prefer explicit mapping translation when a dict-like is supplied.
+        if isinstance(call_context, Mapping):
             try:
-                if isinstance(call_context, Mapping):
-                    ctx = ctx_from_dict(call_context)
-                    if not isinstance(ctx, OperationContext):
-                        raise BadRequest(
-                            f"from_dict produced unsupported context type: {type(ctx).__name__}",
-                            code=ErrorCodes.BAD_OPERATION_CONTEXT,
-                        )
-                    return ctx
+                ctx = ctx_from_dict(call_context)
             except Exception as exc:  # noqa: BLE001
-                logger.debug(
-                    "CorpusCrewAIVectorSearchTool: from_dict context translation failed: %s",
+                attach_context(
                     exc,
+                    framework="crewai",
+                    operation="context_translation_from_dict",
+                    error_codes=VECTOR_ERROR_CODES,
                 )
-
-            # Fall back to CrewAI-specific translation
-            try:
-                ctx = ctx_from_crewai(call_context)
-                if not isinstance(ctx, OperationContext):
-                    raise BadRequest(
-                        f"from_crewai produced unsupported context type: {type(ctx).__name__}",
-                        code=ErrorCodes.BAD_OPERATION_CONTEXT,
-                    )
-                return ctx
-            except Exception as exc:  # noqa: BLE001
-                logger.debug(
-                    "CorpusCrewAIVectorSearchTool: from_crewai context translation failed: %s",
-                    exc,
+                raise
+            if not isinstance(ctx, OperationContext):
+                err = BadRequest(
+                    f"from_dict produced unsupported context type: {type(ctx).__name__}",
+                    code=ErrorCodes.BAD_OPERATION_CONTEXT,
                 )
+                attach_context(
+                    err,
+                    framework="crewai",
+                    operation="context_translation_from_dict",
+                    error_codes=VECTOR_ERROR_CODES,
+                )
+                raise err
+            return ctx
 
-        # Static context configured on the tool instance
-        if isinstance(self.static_operation_context, OperationContext):
-            return self.static_operation_context
+        # Otherwise attempt CrewAI-specific translation for Task-like objects.
+        try:
+            ctx = ctx_from_crewai(call_context)
+        except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework="crewai",
+                operation="context_translation_from_crewai",
+                error_codes=VECTOR_ERROR_CODES,
+            )
+            raise
 
-        return None
+        if not isinstance(ctx, OperationContext):
+            err = BadRequest(
+                f"from_crewai produced unsupported context type: {type(ctx).__name__}",
+                code=ErrorCodes.BAD_OPERATION_CONTEXT,
+            )
+            attach_context(
+                err,
+                framework="crewai",
+                operation="context_translation_from_crewai",
+                error_codes=VECTOR_ERROR_CODES,
+            )
+            raise err
 
-    def _framework_ctx_for_namespace(
+        return ctx
+
+    def _effective_namespace(self, namespace: Optional[str]) -> Optional[str]:
+        """Resolve namespace using explicit override or tool default."""
+        return namespace if namespace is not None else self.namespace
+
+    def _build_framework_context(
         self,
+        *,
         namespace: Optional[str],
         extra_context: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
-        Build a normalized framework_ctx mapping that is consistent with the
-        shared vector framework utilities.
+        Build a normalized framework_ctx mapping consistent with shared vector utilities.
 
-        This ensures:
-        - vector context keys (namespace, index_name, tenant_id, etc.) are
-          normalized via `normalize_vector_context`
-        - the resulting values are attached into a generic framework_ctx dict
-          via `attach_vector_context_to_framework_ctx`
+        This ensures vector context keys (namespace, index_name, tenant_id, etc.) are
+        normalized and attached into a generic framework_ctx dict.
         """
         ns = self._effective_namespace(namespace)
 
@@ -537,15 +662,152 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
         )
         return framework_ctx
 
+    def _build_contexts(
+        self,
+        *,
+        call_context: Optional[Any],
+        namespace: Optional[str],
+        extra_framework_ctx: Optional[Mapping[str, Any]] = None,
+    ) -> Tuple[Optional[OperationContext], Dict[str, Any]]:
+        """
+        Orchestrate core + framework context building for all public operations.
+        """
+        op_ctx = self._build_core_context(call_context)
+        fw_ctx = self._build_framework_context(
+            namespace=namespace,
+            extra_context=extra_framework_ctx,
+        )
+        return op_ctx, fw_ctx
+
+    # ------------------------------------------------------------------ #
+    # Capabilities ownership (translator-first; no adapter fallback)
+    # ------------------------------------------------------------------ #
+
+    async def _get_caps_async(self) -> VectorCapabilities:
+        """
+        Async capability fetch with caching (translator-owned).
+
+        Contract:
+        - Capabilities must be provided by the VectorTranslator (preferred),
+          not directly by the underlying adapter.
+        - If translator does not implement capabilities, raise NotSupported.
+        """
+        if self._caps is not None:
+            return self._caps
+
+        # Translator-owned capability resolution:
+        # 1) acapabilities()
+        # 2) capabilities() via worker thread
+        translator_acapabilities = getattr(self._translator, "acapabilities", None)
+        if callable(translator_acapabilities):
+            try:
+                caps = await translator_acapabilities()
+                self._caps = caps
+                return caps
+            except Exception as exc:  # noqa: BLE001
+                attach_context(
+                    exc,
+                    framework="crewai",
+                    operation="translator_acapabilities",
+                    error_codes=VECTOR_ERROR_CODES,
+                )
+                raise
+
+        translator_capabilities = getattr(self._translator, "capabilities", None)
+        if callable(translator_capabilities):
+            try:
+                caps = await asyncio.to_thread(translator_capabilities)
+                self._caps = caps
+                return caps
+            except Exception as exc:  # noqa: BLE001
+                attach_context(
+                    exc,
+                    framework="crewai",
+                    operation="translator_capabilities",
+                    error_codes=VECTOR_ERROR_CODES,
+                )
+                raise
+
+        err = NotSupported(
+            "VectorTranslator for framework='crewai' must implement "
+            "acapabilities() or capabilities(); no adapter fallback is allowed.",
+            code=ErrorCodes.CAPABILITIES_NOT_AVAILABLE,
+        )
+        attach_context(
+            err,
+            framework="crewai",
+            operation="capabilities",
+            error_codes=VECTOR_ERROR_CODES,
+        )
+        raise err
+
+    # ------------------------------------------------------------------ #
+    # Dimension hint helpers (thread-safe first-write-wins)
+    # ------------------------------------------------------------------ #
+
+    def _update_dim_hint(self, dim: Optional[int]) -> None:
+        """
+        Thread-safe, best-effort update of the vector dimension hint.
+
+        First successful write wins; subsequent calls are no-ops.
+        """
+        if dim is None:
+            return
+        try:
+            d = int(dim)
+        except Exception:
+            return
+        if d <= 0:
+            return
+        if self._vector_dim_hint is not None:
+            return
+        with self._dim_lock:
+            if self._vector_dim_hint is None:
+                self._vector_dim_hint = d
+
+    def _zero_vector(self) -> List[float]:
+        """
+        Deterministic zero vector based on known dimension hint.
+        """
+        dim = self._vector_dim_hint
+        if dim is None or dim <= 0:
+            raise BadRequest(
+                "vector dimension is unknown; cannot create deterministic zero vector",
+                code=ErrorCodes.BAD_VECTOR_DIMENSION,
+            )
+        return [0.0] * int(dim)
+
+    def _validate_embedding_dimension(self, vec: Sequence[float]) -> None:
+        """
+        Validate embedding dimension against the dimension hint (when known).
+
+        If the hint is not set yet, this method updates it.
+        """
+        dim = len(vec)
+        if dim <= 0:
+            return
+        hint = self._vector_dim_hint
+        if hint is None:
+            self._update_dim_hint(dim)
+            return
+        if int(hint) != int(dim):
+            raise BadRequest(
+                f"embedding dimension {dim} does not match expected {hint}",
+                code=ErrorCodes.BAD_VECTOR_DIMENSION,
+                details={"expected": int(hint), "actual": int(dim)},
+            )
+
+    # ------------------------------------------------------------------ #
+    # Result validation
+    # ------------------------------------------------------------------ #
+
     @staticmethod
     def _validate_query_result(
         result: Any,
         *,
         operation: str,
     ) -> QueryResult:
-        """
-        Validate that the translator returned a QueryResult.
-        """
+        """Validate that the translator returned a QueryResult."""
         if not isinstance(result, QueryResult):
             raise BadRequest(
                 f"{operation} returned unsupported type: {type(result).__name__}",
@@ -559,9 +821,7 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
         *,
         operation: str,
     ) -> QueryChunk:
-        """
-        Validate that the translator returned a QueryChunk for streaming.
-        """
+        """Validate that the translator returned a QueryChunk for streaming."""
         if not isinstance(chunk, QueryChunk):
             raise BadRequest(
                 f"{operation} yielded unsupported chunk type: {type(chunk).__name__}",
@@ -570,8 +830,225 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
         return chunk
 
     # ------------------------------------------------------------------ #
-    # Embedding + match translation helpers
+    # Embedding + vectorization helpers
     # ------------------------------------------------------------------ #
+
+    def vectorize_query(
+        self,
+        query: str,
+        *,
+        embedding: Optional[Sequence[float]] = None,
+    ) -> List[float]:
+        """
+        Vectorize a single query (sync).
+
+        - Guards against event-loop usage.
+        - Empty query returns deterministic zero vector when dimension is known.
+        """
+        _ensure_not_in_event_loop("vectorize_query")
+
+        return self._embed_query(query, embedding=embedding)
+
+    async def avectorize_query(
+        self,
+        query: str,
+        *,
+        embedding: Optional[Sequence[float]] = None,
+    ) -> List[float]:
+        """
+        Vectorize a single query (async).
+
+        Empty query returns deterministic zero vector when dimension is known.
+        """
+        return await self._embed_query_async(query, embedding=embedding)
+
+    def vectorize_documents(
+        self,
+        texts: Sequence[str],
+        *,
+        embeddings: Optional[Embeddings] = None,
+    ) -> List[List[float]]:
+        """
+        Vectorize a batch of documents (sync).
+
+        - Guards against event-loop usage.
+        - Empty texts return deterministic zero vectors when dimension is known.
+        """
+        _ensure_not_in_event_loop("vectorize_documents")
+
+        texts_list = [str(t) for t in texts]
+        if not texts_list:
+            return []
+
+        # If embeddings are supplied, validate and coerce.
+        if embeddings is not None:
+            if len(embeddings) != len(texts_list):
+                raise BadRequest(
+                    f"embeddings length {len(embeddings)} does not match texts length {len(texts_list)}",
+                    code=ErrorCodes.BAD_EMBEDDINGS,
+                )
+            out: List[List[float]] = []
+            for i, e in enumerate(embeddings):
+                vec = [float(x) for x in (e or [])]
+                if not vec:
+                    # Deterministic shape for empty vectors if dim known.
+                    vec = self._zero_vector()
+                self._validate_embedding_dimension(vec)
+                out.append(vec)
+            return out
+
+        # Use embedding function if configured.
+        if self.embedding_function is None:
+            raise NotSupported(
+                "No embedding_function configured; caller must supply embeddings",
+                code=ErrorCodes.NO_EMBEDDING_FUNCTION,
+                details={"texts": len(texts_list)},
+            )
+
+        # Pre-handle empties for deterministic output.
+        # We embed only non-empty texts to avoid inconsistent provider behavior on "".
+        empty_mask: List[bool] = [not str(t).strip() for t in texts_list]
+        if all(empty_mask):
+            # All empty -> require known dim for stable shape.
+            z = self._zero_vector()
+            return [list(z) for _ in texts_list]
+
+        non_empty_texts: List[str] = [t for t, is_empty in zip(texts_list, empty_mask) if not is_empty]
+        try:
+            computed = self.embedding_function(non_empty_texts)
+        except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework="crewai",
+                operation="vectorize_documents_embedding_function",
+                error_codes=VECTOR_ERROR_CODES,
+                vectors_count=len(texts_list),
+                total_content_chars=sum(len(t) for t in texts_list),
+            )
+            raise BadRequest(
+                f"embedding_function failed for documents: {exc}",
+                code=ErrorCodes.EMBEDDING_ERROR,
+            )
+
+        if len(computed) != len(non_empty_texts):
+            raise BadRequest(
+                f"embedding_function returned {len(computed)} embeddings for {len(non_empty_texts)} texts",
+                code=ErrorCodes.BAD_EMBEDDINGS,
+            )
+
+        out_vectors: List[List[float]] = []
+        idx_non_empty = 0
+        for is_empty in empty_mask:
+            if is_empty:
+                vec = self._zero_vector()
+            else:
+                vec = [float(x) for x in computed[idx_non_empty]]
+                idx_non_empty += 1
+                if not vec:
+                    vec = self._zero_vector()
+            self._validate_embedding_dimension(vec)
+            out_vectors.append(vec)
+
+        return out_vectors
+
+    async def avectorize_documents(
+        self,
+        texts: Sequence[str],
+        *,
+        embeddings: Optional[Embeddings] = None,
+    ) -> List[List[float]]:
+        """
+        Vectorize a batch of documents (async).
+
+        Empty texts return deterministic zero vectors when dimension is known.
+        """
+        texts_list = [str(t) for t in texts]
+        if not texts_list:
+            return []
+
+        if embeddings is not None:
+            if len(embeddings) != len(texts_list):
+                raise BadRequest(
+                    f"embeddings length {len(embeddings)} does not match texts length {len(texts_list)}",
+                    code=ErrorCodes.BAD_EMBEDDINGS,
+                )
+            out: List[List[float]] = []
+            for e in embeddings:
+                vec = [float(x) for x in (e or [])]
+                if not vec:
+                    vec = self._zero_vector()
+                self._validate_embedding_dimension(vec)
+                out.append(vec)
+            return out
+
+        # Pre-handle empties deterministically.
+        empty_mask: List[bool] = [not str(t).strip() for t in texts_list]
+        if all(empty_mask):
+            z = self._zero_vector()
+            return [list(z) for _ in texts_list]
+
+        non_empty_texts: List[str] = [t for t, is_empty in zip(texts_list, empty_mask) if not is_empty]
+
+        # Prefer async embedding function when provided.
+        if self.async_embedding_function is not None:
+            try:
+                computed = await self.async_embedding_function(non_empty_texts)
+            except Exception as exc:  # noqa: BLE001
+                attach_context(
+                    exc,
+                    framework="crewai",
+                    operation="avectorize_documents_async_embedding_function",
+                    error_codes=VECTOR_ERROR_CODES,
+                    vectors_count=len(texts_list),
+                    total_content_chars=sum(len(t) for t in texts_list),
+                )
+                raise BadRequest(
+                    f"async_embedding_function failed for documents: {exc}",
+                    code=ErrorCodes.EMBEDDING_ERROR,
+                )
+        else:
+            if self.embedding_function is None:
+                raise NotSupported(
+                    "No embedding_function/async_embedding_function configured; caller must supply embeddings",
+                    code=ErrorCodes.NO_EMBEDDING_FUNCTION,
+                    details={"texts": len(texts_list)},
+                )
+            try:
+                computed = await asyncio.to_thread(self.embedding_function, non_empty_texts)
+            except Exception as exc:  # noqa: BLE001
+                attach_context(
+                    exc,
+                    framework="crewai",
+                    operation="avectorize_documents_embedding_function",
+                    error_codes=VECTOR_ERROR_CODES,
+                    vectors_count=len(texts_list),
+                    total_content_chars=sum(len(t) for t in texts_list),
+                )
+                raise BadRequest(
+                    f"embedding_function failed for documents: {exc}",
+                    code=ErrorCodes.EMBEDDING_ERROR,
+                )
+
+        if len(computed) != len(non_empty_texts):
+            raise BadRequest(
+                f"embedding function returned {len(computed)} embeddings for {len(non_empty_texts)} texts",
+                code=ErrorCodes.BAD_EMBEDDINGS,
+            )
+
+        out_vectors: List[List[float]] = []
+        idx_non_empty = 0
+        for is_empty in empty_mask:
+            if is_empty:
+                vec = self._zero_vector()
+            else:
+                vec = [float(x) for x in computed[idx_non_empty]]
+                idx_non_empty += 1
+                if not vec:
+                    vec = self._zero_vector()
+            self._validate_embedding_dimension(vec)
+            out_vectors.append(vec)
+
+        return out_vectors
 
     def _embed_query(
         self,
@@ -583,12 +1060,39 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
         Ensure a single query embedding is available (sync path).
 
         Behavior:
-        - If `embedding` is provided, coerce to float list.
+        - If `embedding` is provided, coerce to float list and validate dimension.
+        - If query is empty/whitespace:
+            - return deterministic zero vector if dimension hint is known
+            - otherwise raise BAD_QUERY_TEXT (avoids inconsistent provider behavior)
         - Else, if `embedding_function` is set, compute embedding for [query].
         - Else, raise NotSupported.
         """
         if embedding is not None:
-            return [float(x) for x in embedding]
+            vec = [float(x) for x in embedding]
+            if not vec:
+                vec = self._zero_vector()
+            self._validate_embedding_dimension(vec)
+            return vec
+
+        if not str(query).strip():
+            # Deterministic behavior for empty queries
+            try:
+                vec = self._zero_vector()
+            except Exception as exc:
+                err = BadRequest(
+                    "query cannot be empty when vector dimension is unknown",
+                    code=ErrorCodes.BAD_QUERY_TEXT,
+                    details={"query_preview": str(query)[:64]},
+                )
+                attach_context(
+                    err,
+                    framework="crewai",
+                    operation="vectorize_query_empty",
+                    error_codes=VECTOR_ERROR_CODES,
+                )
+                raise err from exc
+            self._validate_embedding_dimension(vec)
+            return vec
 
         if self.embedding_function is None:
             raise NotSupported(
@@ -600,7 +1104,6 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
         try:
             embs = self.embedding_function([query])
         except Exception as exc:  # noqa: BLE001
-            # Attach context to the underlying embedding error for observability
             attach_context(
                 exc,
                 framework="crewai",
@@ -619,7 +1122,11 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
                 code=ErrorCodes.BAD_EMBEDDINGS,
             )
 
-        return [float(x) for x in embs[0]]
+        vec = [float(x) for x in embs[0]]
+        if not vec:
+            vec = self._zero_vector()
+        self._validate_embedding_dimension(vec)
+        return vec
 
     async def _embed_query_async(
         self,
@@ -631,13 +1138,39 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
         Async-safe query embedding helper.
 
         Behavior:
-        - If `embedding` is provided, use it.
+        - If `embedding` is provided, coerce to float list and validate dimension.
+        - If query is empty/whitespace:
+            - return deterministic zero vector if dimension hint is known
+            - otherwise raise BAD_QUERY_TEXT
         - Else, if `async_embedding_function` is set, await it.
         - Else, if `embedding_function` is set, run it in a worker thread.
         - Else, raise NotSupported.
         """
         if embedding is not None:
-            return [float(x) for x in embedding]
+            vec = [float(x) for x in embedding]
+            if not vec:
+                vec = self._zero_vector()
+            self._validate_embedding_dimension(vec)
+            return vec
+
+        if not str(query).strip():
+            try:
+                vec = self._zero_vector()
+            except Exception as exc:
+                err = BadRequest(
+                    "query cannot be empty when vector dimension is unknown",
+                    code=ErrorCodes.BAD_QUERY_TEXT,
+                    details={"query_preview": str(query)[:64]},
+                )
+                attach_context(
+                    err,
+                    framework="crewai",
+                    operation="avectorize_query_empty",
+                    error_codes=VECTOR_ERROR_CODES,
+                )
+                raise err from exc
+            self._validate_embedding_dimension(vec)
+            return vec
 
         if self.async_embedding_function is not None:
             try:
@@ -683,13 +1216,19 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
                 code=ErrorCodes.BAD_EMBEDDINGS,
             )
 
-        return [float(x) for x in embs[0]]
+        vec = [float(x) for x in embs[0]]
+        if not vec:
+            vec = self._zero_vector()
+        self._validate_embedding_dimension(vec)
+        return vec
+
+    # ------------------------------------------------------------------ #
+    # Match translation helpers
+    # ------------------------------------------------------------------ #
 
     @staticmethod
     def _get_match_score(match: Any) -> float:
-        """
-        Robustly extract a numeric score from a match object or mapping.
-        """
+        """Robustly extract a numeric score from a match object or mapping."""
         if isinstance(match, Mapping):
             value = match.get("score", 0.0)
         else:
@@ -700,46 +1239,49 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
             return 0.0
 
     @staticmethod
-    def _get_match_vector(match: Any) -> List[float]:
+    def _extract_match_vector_raw(match: Any) -> Any:
         """
-        Robustly extract an embedding vector from a match.
+        Extract a raw vector payload from a match, without coercion.
 
         Supports:
         - Mapping with 'embedding' key
         - Objects with `vector.vector` attribute (VectorMatch-style)
         """
-        vec_raw: Any = None
-
         if isinstance(match, Mapping) and "embedding" in match:
-            vec_raw = match.get("embedding")
-        elif hasattr(match, "vector") and getattr(match, "vector") is not None:
+            return match.get("embedding")
+
+        if hasattr(match, "vector") and getattr(match, "vector") is not None:
             vec_obj = getattr(match, "vector")
             if hasattr(vec_obj, "vector"):
-                vec_raw = getattr(vec_obj, "vector")
+                return getattr(vec_obj, "vector")
 
+        return None
+
+    def _get_match_vector(self, match: Any) -> List[float]:
+        """
+        Robustly extract an embedding vector from a match and update dimension hint.
+        """
+        vec_raw = self._extract_match_vector_raw(match)
         if vec_raw is None:
             return []
 
         try:
-            return [float(x) for x in vec_raw]
+            vec = [float(x) for x in vec_raw]
         except (TypeError, ValueError):
             return []
 
-    def _filter_matches_by_score(
-        self,
-        matches: Sequence[Any],
-    ) -> List[Any]:
-        """
-        Apply optional client-side score threshold to matches.
-        """
+        if vec:
+            # Best-effort: update dimension hint from returned vectors.
+            self._update_dim_hint(len(vec))
+        return vec
+
+    def _filter_matches_by_score(self, matches: Sequence[Any]) -> List[Any]:
+        """Apply optional client-side score threshold to matches."""
         if self.score_threshold is None:
             return list(matches)
 
         threshold = float(self.score_threshold)
-        return [
-            m for m in matches
-            if self._get_match_score(m) >= threshold
-        ]
+        return [m for m in matches if self._get_match_score(m) >= threshold]
 
     def _match_to_payload(
         self,
@@ -885,11 +1427,8 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
             )
             return indices[:k]
 
-        # Use original scores from database as relevance measure
         original_scores = [self._get_match_score(m) for m in candidate_matches]
-        candidate_vecs: List[List[float]] = [
-            self._get_match_vector(m) for m in candidate_matches
-        ]
+        candidate_vecs: List[List[float]] = [self._get_match_vector(m) for m in candidate_matches]
 
         # Normalize original scores to 0-1 range for consistency
         max_orig_score = max(original_scores) if original_scores else 1.0
@@ -898,7 +1437,6 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
         else:
             normalized_scores = [score / max_orig_score for score in original_scores]
 
-        # Precompute all pairwise similarities with caching
         similarity_cache: Dict[Tuple[int, int], float] = {}
 
         def get_similarity(i: int, j: int) -> float:
@@ -931,16 +1469,13 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
             best_score = -float("inf")
 
             for idx in candidates:
-                # Relevance term using original database score
                 relevance = normalized_scores[idx]
 
-                # Diversity term: max similarity to already selected items
                 max_similarity = 0.0
                 for sel_idx in selected:
                     similarity = get_similarity(idx, sel_idx)
                     max_similarity = max(max_similarity, similarity)
 
-                # MMR score balancing relevance and diversity
                 mmr_score = lambda_mult * relevance - (1.0 - lambda_mult) * max_similarity
 
                 if mmr_score > best_score:
@@ -970,13 +1505,15 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
         Simple top-k search without MMR (async).
         """
         top_k = int(args.k or self.default_top_k)
+        if top_k <= 0:
+            return []
+
         if caps.max_top_k is not None and top_k > caps.max_top_k:
             raise BadRequest(
                 f"top_k {top_k} exceeds maximum of {caps.max_top_k}",
                 code=ErrorCodes.BAD_TOP_K,
             )
 
-        # Soft warning for extreme top_k
         warn_if_extreme_k(
             top_k,
             framework="crewai",
@@ -986,7 +1523,10 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
         )
 
         ns = args.namespace
-        ctx = self._resolve_operation_context(args.context)
+        op_ctx, fw_ctx = self._build_contexts(
+            call_context=args.context,
+            namespace=ns,
+        )
 
         if args.filter and not caps.supports_metadata_filtering:
             raise NotSupported(
@@ -995,10 +1535,7 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
                 details={"namespace": self._effective_namespace(ns)},
             )
 
-        query_emb = await self._embed_query_async(
-            args.query,
-            embedding=args.embedding,
-        )
+        query_emb = await self._embed_query_async(args.query, embedding=args.embedding)
         raw_query = self._build_raw_query(
             embedding=query_emb,
             k=top_k,
@@ -1009,14 +1546,11 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
 
         result = await self._translator.arun_query(
             raw_query,
-            op_ctx=ctx,
-            framework_ctx=self._framework_ctx_for_namespace(ns),
+            op_ctx=op_ctx,
+            framework_ctx=fw_ctx,
             mmr_config=None,
         )
-        result_qr = self._validate_query_result(
-            result,
-            operation="VectorTranslator.arun_query",
-        )
+        result_qr = self._validate_query_result(result, operation="VectorTranslator.arun_query")
 
         matches_all = list(result_qr.matches or [])
         matches = self._filter_matches_by_score(matches_all)
@@ -1038,7 +1572,6 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
         if top_k <= 0:
             return []
 
-        # Soft warning for extreme user-visible k
         warn_if_extreme_k(
             top_k,
             framework="crewai",
@@ -1048,7 +1581,10 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
         )
 
         ns = args.namespace
-        ctx = self._resolve_operation_context(args.context)
+        op_ctx, fw_ctx = self._build_contexts(
+            call_context=args.context,
+            namespace=ns,
+        )
 
         if args.filter and not caps.supports_metadata_filtering:
             raise NotSupported(
@@ -1057,14 +1593,9 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
                 details={"namespace": self._effective_namespace(ns)},
             )
 
-        lambda_mult = (
-            float(args.mmr_lambda)
-            if args.mmr_lambda is not None
-            else float(self.mmr_lambda)
-        )
+        lambda_mult = float(args.mmr_lambda) if args.mmr_lambda is not None else float(self.mmr_lambda)
         lambda_mult = max(0.0, min(1.0, lambda_mult))
 
-        # Fetch more candidates than we will return
         fetch_k = args.fetch_k or max(top_k * 4, top_k + 5)
         if caps.max_top_k is not None and fetch_k > caps.max_top_k:
             raise BadRequest(
@@ -1072,7 +1603,6 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
                 code=ErrorCodes.BAD_TOP_K,
             )
 
-        # Soft warning for internal fetch_k as well
         warn_if_extreme_k(
             fetch_k,
             framework="crewai",
@@ -1081,10 +1611,7 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
             logger=logger,
         )
 
-        query_emb = await self._embed_query_async(
-            args.query,
-            embedding=args.embedding,
-        )
+        query_emb = await self._embed_query_async(args.query, embedding=args.embedding)
         raw_query = self._build_raw_query(
             embedding=query_emb,
             k=int(fetch_k),
@@ -1095,18 +1622,14 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
 
         result = await self._translator.arun_query(
             raw_query,
-            op_ctx=ctx,
-            framework_ctx=self._framework_ctx_for_namespace(ns),
+            op_ctx=op_ctx,
+            framework_ctx=fw_ctx,
             mmr_config=None,  # manual MMR applied here
         )
-        result_qr = self._validate_query_result(
-            result,
-            operation="VectorTranslator.arun_query",
-        )
+        result_qr = self._validate_query_result(result, operation="VectorTranslator.arun_query")
 
         matches_all = list(result_qr.matches or [])
         matches_all = self._filter_matches_by_score(matches_all)
-
         if not matches_all:
             return []
 
@@ -1117,27 +1640,14 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
         )
 
         return_scores = bool(args.return_scores)
-        return [
-            self._match_to_payload(matches_all[i], return_scores=return_scores)
-            for i in indices
-        ]
+        return [self._match_to_payload(matches_all[i], return_scores=return_scores) for i in indices]
 
     @with_async_error_context("vector_search_dispatch_async")
-    async def _asearch(
-        self,
-        args: CorpusVectorSearchInput,
-    ) -> List[Dict[str, Any]]:
-        """
-        Unified async search entry point, dispatching to simple or MMR-based search.
-        """
+    async def _asearch(self, args: CorpusVectorSearchInput) -> List[Dict[str, Any]]:
+        """Unified async search entry point, dispatching to simple or MMR-based search."""
         caps = await self._get_caps_async()
 
-        use_mmr = (
-            bool(args.use_mmr)
-            if args.use_mmr is not None
-            else bool(self.use_mmr_by_default)
-        )
-
+        use_mmr = bool(args.use_mmr) if args.use_mmr is not None else bool(self.use_mmr_by_default)
         if use_mmr:
             return await self._asearch_with_mmr(args, caps=caps)
         return await self._asearch_simple(args, caps=caps)
@@ -1147,20 +1657,18 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
     # ------------------------------------------------------------------ #
 
     @with_error_context("vector_search_sync")
-    def _search_simple_sync(
-        self,
-        args: CorpusVectorSearchInput,
-    ) -> List[Dict[str, Any]]:
+    def _search_simple_sync(self, args: CorpusVectorSearchInput) -> List[Dict[str, Any]]:
         """
         Simple top-k search without MMR (sync).
 
         Uses VectorTranslator.query directly (no direct AsyncBridge usage).
         """
+        _ensure_not_in_event_loop("CorpusCrewAIVectorSearchTool._search_simple_sync")
+
         top_k = int(args.k or self.default_top_k)
         if top_k <= 0:
             return []
 
-        # Soft warning for extreme k in sync path as well
         warn_if_extreme_k(
             top_k,
             framework="crewai",
@@ -1170,7 +1678,10 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
         )
 
         ns = args.namespace
-        ctx = self._resolve_operation_context(args.context)
+        op_ctx, fw_ctx = self._build_contexts(
+            call_context=args.context,
+            namespace=ns,
+        )
 
         query_emb = self._embed_query(args.query, embedding=args.embedding)
         raw_query = self._build_raw_query(
@@ -1183,14 +1694,11 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
 
         result = self._translator.query(
             raw_query,
-            op_ctx=ctx,
-            framework_ctx=self._framework_ctx_for_namespace(ns),
+            op_ctx=op_ctx,
+            framework_ctx=fw_ctx,
             mmr_config=None,
         )
-        result_qr = self._validate_query_result(
-            result,
-            operation="VectorTranslator.query",
-        )
+        result_qr = self._validate_query_result(result, operation="VectorTranslator.query")
 
         matches_all = list(result_qr.matches or [])
         matches = self._filter_matches_by_score(matches_all)
@@ -1199,18 +1707,16 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
         return [self._match_to_payload(m, return_scores=return_scores) for m in matches]
 
     @with_error_context("vector_search_mmr_sync")
-    def _search_with_mmr_sync(
-        self,
-        args: CorpusVectorSearchInput,
-    ) -> List[Dict[str, Any]]:
+    def _search_with_mmr_sync(self, args: CorpusVectorSearchInput) -> List[Dict[str, Any]]:
         """
         MMR-based search that fetches candidates and then re-ranks them (sync).
         """
+        _ensure_not_in_event_loop("CorpusCrewAIVectorSearchTool._search_with_mmr_sync")
+
         top_k = int(args.k or self.default_top_k)
         if top_k <= 0:
             return []
 
-        # Soft warning for user-visible k
         warn_if_extreme_k(
             top_k,
             framework="crewai",
@@ -1220,18 +1726,16 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
         )
 
         ns = args.namespace
-        ctx = self._resolve_operation_context(args.context)
-
-        lambda_mult = (
-            float(args.mmr_lambda)
-            if args.mmr_lambda is not None
-            else float(self.mmr_lambda)
+        op_ctx, fw_ctx = self._build_contexts(
+            call_context=args.context,
+            namespace=ns,
         )
+
+        lambda_mult = float(args.mmr_lambda) if args.mmr_lambda is not None else float(self.mmr_lambda)
         lambda_mult = max(0.0, min(1.0, lambda_mult))
 
         fetch_k = args.fetch_k or max(top_k * 4, top_k + 5)
 
-        # Soft warning for internal fetch_k as well
         warn_if_extreme_k(
             fetch_k,
             framework="crewai",
@@ -1251,18 +1755,14 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
 
         result = self._translator.query(
             raw_query,
-            op_ctx=ctx,
-            framework_ctx=self._framework_ctx_for_namespace(ns),
+            op_ctx=op_ctx,
+            framework_ctx=fw_ctx,
             mmr_config=None,  # manual MMR applied here
         )
-        result_qr = self._validate_query_result(
-            result,
-            operation="VectorTranslator.query",
-        )
+        result_qr = self._validate_query_result(result, operation="VectorTranslator.query")
 
         matches_all = list(result_qr.matches or [])
         matches_all = self._filter_matches_by_score(matches_all)
-
         if not matches_all:
             return []
 
@@ -1273,10 +1773,7 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
         )
 
         return_scores = bool(args.return_scores)
-        return [
-            self._match_to_payload(matches_all[i], return_scores=return_scores)
-            for i in indices
-        ]
+        return [self._match_to_payload(matches_all[i], return_scores=return_scores) for i in indices]
 
     # ------------------------------------------------------------------ #
     # CrewAI Tool API: sync + async
@@ -1290,14 +1787,11 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
         Internally delegates to the sync search implementation which uses
         VectorTranslator for all vector operations.
         """
+        _ensure_not_in_event_loop("CorpusCrewAIVectorSearchTool._run")
+
         args = self.args_schema(**kwargs)  # type: ignore[arg-type]
 
-        use_mmr = (
-            bool(args.use_mmr)
-            if args.use_mmr is not None
-            else bool(self.use_mmr_by_default)
-        )
-
+        use_mmr = bool(args.use_mmr) if args.use_mmr is not None else bool(self.use_mmr_by_default)
         if use_mmr:
             return self._search_with_mmr_sync(args)
         return self._search_simple_sync(args)
@@ -1312,6 +1806,46 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
         """
         args = self.args_schema(**kwargs)  # type: ignore[arg-type]
         return await self._asearch(args)
+
+    # ------------------------------------------------------------------ #
+    # Optional callable interface (preserves tool semantics)
+    # ------------------------------------------------------------------ #
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        """
+        Dual-purpose callable interface that preserves CrewAI tool semantics.
+
+        - If called like a CrewAI tool (query/k/namespace/filter/use_mmr/...),
+          delegates to `_run`.
+        - If called with explicit `texts=[...]` or `text="..."`, performs vectorization.
+
+        This avoids breaking common `tool("query")` usage while still providing
+        a vector-function interface for advanced integrations.
+        """
+        _ensure_not_in_event_loop("CorpusCrewAIVectorSearchTool.__call__")
+
+        # Vectorization mode (explicit keywords only).
+        if "texts" in kwargs:
+            texts = kwargs.get("texts") or []
+            embeddings = kwargs.get("embeddings")
+            return self.vectorize_documents(texts, embeddings=embeddings)
+        if "text" in kwargs:
+            text = kwargs.get("text") or ""
+            embedding = kwargs.get("embedding")
+            return self.vectorize_query(str(text), embedding=embedding)
+
+        # Tool mode:
+        if args and not kwargs:
+            # Common convenience: tool("query") -> _run(query="query")
+            if len(args) == 1 and isinstance(args[0], str):
+                return self._run(query=args[0])
+            # Otherwise fall back to schema parsing through kwargs-only.
+            raise TypeError(
+                "Tool call expects keyword arguments (or a single positional query string). "
+                "Vectorization expects keywords: texts=[...], text='...'."
+            )
+
+        return self._run(**kwargs)
 
     # ------------------------------------------------------------------ #
     # Advanced: streaming search using VectorTranslator.query_stream
@@ -1330,14 +1864,14 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
           MMR is not applied to streaming results (matching the protocol
           design that MMR requires the full result set).
         """
+        _ensure_not_in_event_loop("CorpusCrewAIVectorSearchTool.stream_search")
+
         args = self.args_schema(**kwargs)  # type: ignore[arg-type]
 
         top_k = int(args.k or self.default_top_k)
         if top_k <= 0:
-            # Empty iterator
             return iter(())
 
-        # Soft warning for streaming top_k
         warn_if_extreme_k(
             top_k,
             framework="crewai",
@@ -1347,13 +1881,14 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
         )
 
         ns = args.namespace
-        ctx = self._resolve_operation_context(args.context)
+        op_ctx, fw_ctx = self._build_contexts(
+            call_context=args.context,
+            namespace=ns,
+        )
         return_scores = bool(args.return_scores)
 
-        # Embed query
         query_emb = self._embed_query(args.query, embedding=args.embedding)
 
-        # Build raw query for streaming; we still send top_k to the backend
         raw_query = self._build_raw_query(
             embedding=query_emb,
             k=top_k,
@@ -1362,19 +1897,13 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
             include_vectors=False,
         )
 
-        # Note: We deliberately do not apply MMR here to align with the
-        # shared VectorTranslator design, which does not apply MMR to
-        # streaming results.
         yielded = 0
         for chunk in self._translator.query_stream(
             raw_query,
-            op_ctx=ctx,
-            framework_ctx=self._framework_ctx_for_namespace(ns),
+            op_ctx=op_ctx,
+            framework_ctx=fw_ctx,
         ):
-            chunk_qc = self._validate_stream_chunk(
-                chunk,
-                operation="VectorTranslator.query_stream",
-            )
+            chunk_qc = self._validate_stream_chunk(chunk, operation="VectorTranslator.query_stream")
 
             raw_matches = list(chunk_qc.matches or [])
             filtered_matches = self._filter_matches_by_score(raw_matches)
@@ -1382,11 +1911,126 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
             for match in filtered_matches:
                 if yielded >= top_k:
                     return
-                yield self._match_to_payload(
-                    match,
-                    return_scores=return_scores,
-                )
+                yield self._match_to_payload(match, return_scores=return_scores)
                 yielded += 1
+
+    # ------------------------------------------------------------------ #
+    # Resource cleanup (close / aclose / context managers)
+    # ------------------------------------------------------------------ #
+
+    def close(self) -> None:
+        """
+        Best-effort synchronous cleanup of translator resources.
+
+        This method never raises; it only logs warnings on failure.
+        By default we do not close the underlying adapter (caller-owned),
+        unless `own_adapter=True`.
+        """
+        try:
+            translator_close = getattr(self._translator, "close", None)
+        except Exception:
+            translator_close = None
+
+        if callable(translator_close):
+            try:
+                translator_close()
+            except Exception:
+                logger.warning("Error while closing VectorTranslator synchronously", exc_info=True)
+
+        if self.own_adapter:
+            try:
+                adapter_close = getattr(self.corpus_adapter, "close", None)
+            except Exception:
+                adapter_close = None
+
+            if callable(adapter_close):
+                try:
+                    adapter_close()
+                except Exception:
+                    logger.warning("Error while closing corpus_adapter synchronously", exc_info=True)
+
+    async def aclose(self) -> None:
+        """
+        Best-effort asynchronous cleanup of translator resources.
+
+        This method never raises; it only logs warnings on failure.
+        By default we do not close the underlying adapter (caller-owned),
+        unless `own_adapter=True`.
+        """
+        try:
+            translator_aclose = getattr(self._translator, "aclose", None)
+        except Exception:
+            translator_aclose = None
+
+        if callable(translator_aclose):
+            try:
+                await translator_aclose()
+            except Exception:
+                logger.warning("Error while closing VectorTranslator asynchronously", exc_info=True)
+        else:
+            try:
+                translator_close = getattr(self._translator, "close", None)
+            except Exception:
+                translator_close = None
+
+            if callable(translator_close):
+                try:
+                    if asyncio.iscoroutinefunction(translator_close):
+                        await translator_close()
+                    else:
+                        await asyncio.to_thread(translator_close)
+                except Exception:
+                    logger.warning("Error while closing VectorTranslator from async context", exc_info=True)
+
+        if self.own_adapter:
+            try:
+                adapter_aclose = getattr(self.corpus_adapter, "aclose", None)
+            except Exception:
+                adapter_aclose = None
+
+            if callable(adapter_aclose):
+                try:
+                    await adapter_aclose()
+                    return
+                except Exception:
+                    logger.warning("Error while closing corpus_adapter asynchronously", exc_info=True)
+
+            try:
+                adapter_close = getattr(self.corpus_adapter, "close", None)
+            except Exception:
+                adapter_close = None
+
+            if callable(adapter_close):
+                try:
+                    if asyncio.iscoroutinefunction(adapter_close):
+                        await adapter_close()
+                    else:
+                        await asyncio.to_thread(adapter_close)
+                except Exception:
+                    logger.warning("Error while closing corpus_adapter from async context", exc_info=True)
+
+    def __enter__(self) -> "CorpusCrewAIVectorSearchTool":
+        """Synchronous context manager entry; returns self."""
+        _ensure_not_in_event_loop("CorpusCrewAIVectorSearchTool.__enter__")
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        """Synchronous context manager exit; best-effort close()."""
+        try:
+            self.close()
+        except Exception:
+            logger.warning("Error while closing tool in __exit__", exc_info=True)
+
+    async def __aenter__(self) -> "CorpusCrewAIVectorSearchTool":
+        """Async context manager entry; returns self."""
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        """Async context manager exit; best-effort aclose()."""
+        try:
+            await self.aclose()
+        except Exception:
+            logger.warning("Error while closing tool in __aexit__", exc_info=True)
 
 
 __all__ = [
