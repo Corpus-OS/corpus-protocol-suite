@@ -206,6 +206,9 @@ class ErrorCodes:
     EMPTY_INPUT_DIM_UNKNOWN = "EMPTY_INPUT_DIM_UNKNOWN"
     BAD_MMR_LAMBDA = "BAD_MMR_LAMBDA"
     BAD_DELETE = "BAD_DELETE"
+    BAD_TOP_K = "BAD_TOP_K"
+    FILTER_NOT_SUPPORTED = "FILTER_NOT_SUPPORTED"
+    CAPABILITIES_NOT_AVAILABLE = "CAPABILITIES_NOT_AVAILABLE"
 
 
 # --------------------------------------------------------------------------- #
@@ -504,21 +507,65 @@ class CorpusLangChainVectorStore(VectorStore):
     async def _get_caps_async(self) -> VectorCapabilities:
         """
         Async capability fetch with caching.
+
+        Prefer translator.acapabilities(); fall back to translator.capabilities()
+        via a thread if needed.
         """
         if self._caps is not None:
             return self._caps
+
+        # Prefer async capabilities if available
         try:
-            caps = await self._translator.arun_capabilities()
-            self._caps = caps
-            return caps
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework="langchain",
-                operation="capabilities",
-                error_codes=VECTOR_ERROR_CODES,
-            )
-            raise
+            translator_acapabilities = getattr(self._translator, "acapabilities", None)
+        except Exception:
+            translator_acapabilities = None
+
+        if callable(translator_acapabilities):
+            try:
+                caps = await translator_acapabilities()
+                self._caps = caps
+                return caps
+            except Exception as exc:  # noqa: BLE001
+                attach_context(
+                    exc,
+                    framework="langchain",
+                    operation="capabilities",
+                    error_codes=VECTOR_ERROR_CODES,
+                )
+                raise
+
+        # Fallback to sync capabilities in a worker thread
+        try:
+            translator_capabilities = getattr(self._translator, "capabilities", None)
+        except Exception:
+            translator_capabilities = None
+
+        if callable(translator_capabilities):
+            try:
+                caps = await asyncio.to_thread(translator_capabilities)
+                self._caps = caps
+                return caps
+            except Exception as exc:  # noqa: BLE001
+                attach_context(
+                    exc,
+                    framework="langchain",
+                    operation="capabilities",
+                    error_codes=VECTOR_ERROR_CODES,
+                )
+                raise
+
+        err = NotSupported(
+            "VectorTranslator for framework='langchain' must implement "
+            "acapabilities() or capabilities(); none found.",
+            code=ErrorCodes.CAPABILITIES_NOT_AVAILABLE,
+        )
+        attach_context(
+            err,
+            framework="langchain",
+            operation="capabilities",
+            error_codes=VECTOR_ERROR_CODES,
+        )
+        raise err
 
     # --------------------------- #
     # Separated context building
@@ -1207,7 +1254,8 @@ class CorpusLangChainVectorStore(VectorStore):
         raw_request: Dict[str, Any] = {
             "namespace": ns,
             "ids": [str(i) for i in ids] if ids else None,
-            "filter": dict(filter) if filter else None,
+            # Translator uses "filters" consistently for metadata filters.
+            "filters": dict(filter) if filter else None,
         }
         framework_ctx = self._framework_ctx_for_namespace(ns)
         return raw_request, framework_ctx
@@ -1673,6 +1721,34 @@ class CorpusLangChainVectorStore(VectorStore):
         query_emb = self._embed_query(query, embedding=embedding)
         top_k = k or self.default_top_k
 
+        caps = self._get_caps_sync()
+        if caps.max_top_k is not None and top_k > caps.max_top_k:
+            err = BadRequest(
+                f"top_k {top_k} exceeds maximum of {caps.max_top_k}",
+                code=ErrorCodes.BAD_TOP_K,
+            )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="similarity_search_sync",
+                error_codes=VECTOR_ERROR_CODES,
+            )
+            raise err
+
+        if filter and not caps.supports_metadata_filtering:
+            err = NotSupported(
+                "metadata filtering is not supported by the underlying vector adapter",
+                code=ErrorCodes.FILTER_NOT_SUPPORTED,
+                details={"namespace": self._effective_namespace(namespace)},
+            )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="similarity_search_sync",
+                error_codes=VECTOR_ERROR_CODES,
+            )
+            raise err
+
         warn_if_extreme_k(
             top_k,
             framework="langchain",
@@ -1731,6 +1807,34 @@ class CorpusLangChainVectorStore(VectorStore):
 
         query_emb = self._embed_query(query, embedding=embedding)
         top_k = k or self.default_top_k
+
+        caps = self._get_caps_sync()
+        if caps.max_top_k is not None and top_k > caps.max_top_k:
+            err = BadRequest(
+                f"top_k {top_k} exceeds maximum of {caps.max_top_k}",
+                code=ErrorCodes.BAD_TOP_K,
+            )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="similarity_search_stream_sync",
+                error_codes=VECTOR_ERROR_CODES,
+            )
+            raise err
+
+        if filter and not caps.supports_metadata_filtering:
+            err = NotSupported(
+                "metadata filtering is not supported by the underlying vector adapter",
+                code=ErrorCodes.FILTER_NOT_SUPPORTED,
+                details={"namespace": self._effective_namespace(namespace)},
+            )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="similarity_search_stream_sync",
+                error_codes=VECTOR_ERROR_CODES,
+            )
+            raise err
 
         warn_if_extreme_k(
             top_k,
@@ -1792,6 +1896,34 @@ class CorpusLangChainVectorStore(VectorStore):
         query_emb = await self._embed_query_async(query, embedding=embedding)
         top_k = k or self.default_top_k
 
+        caps = await self._get_caps_async()
+        if caps.max_top_k is not None and top_k > caps.max_top_k:
+            err = BadRequest(
+                f"top_k {top_k} exceeds maximum of {caps.max_top_k}",
+                code=ErrorCodes.BAD_TOP_K,
+            )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="similarity_search_async",
+                error_codes=VECTOR_ERROR_CODES,
+            )
+            raise err
+
+        if filter and not caps.supports_metadata_filtering:
+            err = NotSupported(
+                "metadata filtering is not supported by the underlying vector adapter",
+                code=ErrorCodes.FILTER_NOT_SUPPORTED,
+                details={"namespace": self._effective_namespace(namespace)},
+            )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="similarity_search_async",
+                error_codes=VECTOR_ERROR_CODES,
+            )
+            raise err
+
         warn_if_extreme_k(
             top_k,
             framework="langchain",
@@ -1851,6 +1983,34 @@ class CorpusLangChainVectorStore(VectorStore):
         query_emb = self._embed_query(query, embedding=embedding)
         top_k = k or self.default_top_k
 
+        caps = self._get_caps_sync()
+        if caps.max_top_k is not None and top_k > caps.max_top_k:
+            err = BadRequest(
+                f"top_k {top_k} exceeds maximum of {caps.max_top_k}",
+                code=ErrorCodes.BAD_TOP_K,
+            )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="similarity_search_with_score_sync",
+                error_codes=VECTOR_ERROR_CODES,
+            )
+            raise err
+
+        if filter and not caps.supports_metadata_filtering:
+            err = NotSupported(
+                "metadata filtering is not supported by the underlying vector adapter",
+                code=ErrorCodes.FILTER_NOT_SUPPORTED,
+                details={"namespace": self._effective_namespace(namespace)},
+            )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="similarity_search_with_score_sync",
+                error_codes=VECTOR_ERROR_CODES,
+            )
+            raise err
+
         warn_if_extreme_k(
             top_k,
             framework="langchain",
@@ -1906,6 +2066,34 @@ class CorpusLangChainVectorStore(VectorStore):
 
         query_emb = await self._embed_query_async(query, embedding=embedding)
         top_k = k or self.default_top_k
+
+        caps = await self._get_caps_async()
+        if caps.max_top_k is not None and top_k > caps.max_top_k:
+            err = BadRequest(
+                f"top_k {top_k} exceeds maximum of {caps.max_top_k}",
+                code=ErrorCodes.BAD_TOP_K,
+            )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="similarity_search_with_score_async",
+                error_codes=VECTOR_ERROR_CODES,
+            )
+            raise err
+
+        if filter and not caps.supports_metadata_filtering:
+            err = NotSupported(
+                "metadata filtering is not supported by the underlying vector adapter",
+                code=ErrorCodes.FILTER_NOT_SUPPORTED,
+                details={"namespace": self._effective_namespace(namespace)},
+            )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="similarity_search_with_score_async",
+                error_codes=VECTOR_ERROR_CODES,
+            )
+            raise err
 
         warn_if_extreme_k(
             top_k,
@@ -2113,6 +2301,35 @@ class CorpusLangChainVectorStore(VectorStore):
             )
             raise err
 
+        caps = self._get_caps_sync()
+
+        if caps.max_top_k is not None and k > caps.max_top_k:
+            err = BadRequest(
+                f"k {k} exceeds maximum of {caps.max_top_k}",
+                code=ErrorCodes.BAD_TOP_K,
+            )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="mmr_search_sync",
+                error_codes=VECTOR_ERROR_CODES,
+            )
+            raise err
+
+        if filter and not caps.supports_metadata_filtering:
+            err = NotSupported(
+                "metadata filtering is not supported by the underlying vector adapter",
+                code=ErrorCodes.FILTER_NOT_SUPPORTED,
+                details={"namespace": self._effective_namespace(kwargs.get("namespace"))},
+            )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="mmr_search_sync",
+                error_codes=VECTOR_ERROR_CODES,
+            )
+            raise err
+
         warn_if_extreme_k(
             k,
             framework="langchain",
@@ -2122,6 +2339,19 @@ class CorpusLangChainVectorStore(VectorStore):
         )
 
         fetch_k: int = kwargs.get("fetch_k") or max(k * 4, k + 5)
+
+        if caps.max_top_k is not None and fetch_k > caps.max_top_k:
+            err = BadRequest(
+                f"fetch_k {fetch_k} exceeds maximum of {caps.max_top_k}",
+                code=ErrorCodes.BAD_TOP_K,
+            )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="mmr_search_sync",
+                error_codes=VECTOR_ERROR_CODES,
+            )
+            raise err
 
         warn_if_extreme_k(
             fetch_k,
@@ -2207,6 +2437,35 @@ class CorpusLangChainVectorStore(VectorStore):
             )
             raise err
 
+        caps = await self._get_caps_async()
+
+        if caps.max_top_k is not None and k > caps.max_top_k:
+            err = BadRequest(
+                f"k {k} exceeds maximum of {caps.max_top_k}",
+                code=ErrorCodes.BAD_TOP_K,
+            )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="mmr_search_async",
+                error_codes=VECTOR_ERROR_CODES,
+            )
+            raise err
+
+        if filter and not caps.supports_metadata_filtering:
+            err = NotSupported(
+                "metadata filtering is not supported by the underlying vector adapter",
+                code=ErrorCodes.FILTER_NOT_SUPPORTED,
+                details={"namespace": self._effective_namespace(kwargs.get("namespace"))},
+            )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="mmr_search_async",
+                error_codes=VECTOR_ERROR_CODES,
+            )
+            raise err
+
         warn_if_extreme_k(
             k,
             framework="langchain",
@@ -2216,6 +2475,19 @@ class CorpusLangChainVectorStore(VectorStore):
         )
 
         fetch_k: int = kwargs.get("fetch_k") or max(k * 4, k + 5)
+
+        if caps.max_top_k is not None and fetch_k > caps.max_top_k:
+            err = BadRequest(
+                f"fetch_k {fetch_k} exceeds maximum of {caps.max_top_k}",
+                code=ErrorCodes.BAD_TOP_K,
+            )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="mmr_search_async",
+                error_codes=VECTOR_ERROR_CODES,
+            )
+            raise err
 
         warn_if_extreme_k(
             fetch_k,
