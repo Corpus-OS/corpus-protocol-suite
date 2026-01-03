@@ -56,6 +56,7 @@ from corpus_sdk.vector.vector_base import (
     OperationContext,
     BadRequest,
     NotSupported,
+    VectorCapabilities,
 )
 from corpus_sdk.core.context_translation import (
     from_autogen as core_ctx_from_autogen,
@@ -100,6 +101,9 @@ class ErrorCodes:
     BAD_TEXTS = "BAD_TEXTS"
     UNKNOWN_VECTOR_DIMENSION = "UNKNOWN_VECTOR_DIMENSION"
     VECTOR_DIM_MISMATCH = "VECTOR_DIM_MISMATCH"
+    BAD_TOP_K = "BAD_TOP_K"
+    FILTER_NOT_SUPPORTED = "FILTER_NOT_SUPPORTED"
+    CAPABILITIES_NOT_AVAILABLE = "CAPABILITIES_NOT_AVAILABLE"
 
 
 # Bundle of error codes for vector coercion utilities
@@ -611,6 +615,9 @@ class CorpusAutoGenVectorStore:
         self._vector_dim_hint: Optional[int] = None
         self._dim_lock: RLock = RLock()
 
+        # Capability cache (translator-level, shared across operations)
+        self._caps: Optional[VectorCapabilities] = None
+
         # Lifecycle ownership for underlying adapter (opt-in)
         self._own_adapter: bool = bool(own_adapter)
 
@@ -632,6 +639,72 @@ class CorpusAutoGenVectorStore:
             framework="autogen",
             translator=None,
         )
+
+    # ------------------------------------------------------------------ #
+    # Capabilities helpers (translator-first, cached, capability-aware)
+    # ------------------------------------------------------------------ #
+
+    def _get_caps_sync(self) -> VectorCapabilities:
+        """
+        Synchronously fetch and cache VectorCapabilities via the translator.
+
+        This is used internally for capability-aware validation on search
+        operations (e.g., top_k limits and metadata filter support).
+        """
+        if self._caps is not None:
+            return self._caps
+
+        translator_capabilities = getattr(self._translator, "capabilities", None)
+        if not callable(translator_capabilities):
+            raise NotSupported(
+                "VectorTranslator for framework='autogen' must implement "
+                "capabilities() to support capability-aware validation.",
+                code=ErrorCodes.CAPABILITIES_NOT_AVAILABLE,
+            )
+
+        caps = translator_capabilities()
+        if not isinstance(caps, VectorCapabilities):
+            raise BadRequest(
+                f"translator.capabilities() returned unsupported type: {type(caps).__name__}",
+                code=ErrorCodes.CAPABILITIES_NOT_AVAILABLE,
+            )
+        self._caps = caps
+        return caps
+
+    async def _get_caps_async(self) -> VectorCapabilities:
+        """
+        Async capability fetch with caching.
+
+        Resolution order:
+        1. self._translator.acapabilities()
+        2. self._translator.capabilities() via worker thread
+
+        If neither is available, this is treated as a configuration error.
+        """
+        if self._caps is not None:
+            return self._caps
+
+        translator_acapabilities = getattr(self._translator, "acapabilities", None)
+        if callable(translator_acapabilities):
+            caps = await translator_acapabilities()
+        else:
+            translator_capabilities = getattr(self._translator, "capabilities", None)
+            if not callable(translator_capabilities):
+                raise NotSupported(
+                    "VectorTranslator for framework='autogen' must implement "
+                    "acapabilities() or capabilities() to support capability-aware validation.",
+                    code=ErrorCodes.CAPABILITIES_NOT_AVAILABLE,
+                )
+            caps = await asyncio.to_thread(translator_capabilities)
+
+        if not isinstance(caps, VectorCapabilities):
+            raise BadRequest(
+                f"translator capabilities response has unsupported type: {type(caps).__name__}",
+                code=ErrorCodes.CAPABILITIES_NOT_AVAILABLE,
+            )
+
+        self._caps = caps
+        return caps
 
     # ------------------------------------------------------------------ #
     # Standardized context building (core + framework + orchestrator)
@@ -1913,6 +1986,20 @@ class CorpusAutoGenVectorStore:
         top_k = k or self.default_top_k
         _warn_if_extreme_k(top_k, op_name="similarity_search")
 
+        # Capability-aware validation (fail fast before hitting the backend).
+        caps = self._get_caps_sync()
+        if caps.max_top_k is not None and top_k > caps.max_top_k:
+            raise BadRequest(
+                f"top_k {top_k} exceeds maximum of {caps.max_top_k}",
+                code=ErrorCodes.BAD_TOP_K,
+                details={"requested_top_k": top_k, "max_top_k": caps.max_top_k},
+            )
+        if filter is not None and bool(filter) and not caps.supports_metadata_filtering:
+            raise NotSupported(
+                "metadata filtering is not supported by this vector index",
+                code=ErrorCodes.FILTER_NOT_SUPPORTED,
+            )
+
         raw_query = self._build_raw_query(
             embedding=query_emb,
             k=top_k,
@@ -1959,6 +2046,19 @@ class CorpusAutoGenVectorStore:
         top_k = k or self.default_top_k
         _warn_if_extreme_k(top_k, op_name="similarity_search_with_score")
 
+        caps = self._get_caps_sync()
+        if caps.max_top_k is not None and top_k > caps.max_top_k:
+            raise BadRequest(
+                f"top_k {top_k} exceeds maximum of {caps.max_top_k}",
+                code=ErrorCodes.BAD_TOP_K,
+                details={"requested_top_k": top_k, "max_top_k": caps.max_top_k},
+            )
+        if filter is not None and bool(filter) and not caps.supports_metadata_filtering:
+            raise NotSupported(
+                "metadata filtering is not supported by this vector index",
+                code=ErrorCodes.FILTER_NOT_SUPPORTED,
+            )
+
         raw_query = self._build_raw_query(
             embedding=query_emb,
             k=top_k,
@@ -2001,6 +2101,19 @@ class CorpusAutoGenVectorStore:
 
         top_k = k or self.default_top_k
         _warn_if_extreme_k(top_k, op_name="asimilarity_search")
+
+        caps = await self._get_caps_async()
+        if caps.max_top_k is not None and top_k > caps.max_top_k:
+            raise BadRequest(
+                f"top_k {top_k} exceeds maximum of {caps.max_top_k}",
+                code=ErrorCodes.BAD_TOP_K,
+                details={"requested_top_k": top_k, "max_top_k": caps.max_top_k},
+            )
+        if filter is not None and bool(filter) and not caps.supports_metadata_filtering:
+            raise NotSupported(
+                "metadata filtering is not supported by this vector index",
+                code=ErrorCodes.FILTER_NOT_SUPPORTED,
+            )
 
         raw_query = self._build_raw_query(
             embedding=query_emb,
@@ -2045,6 +2158,19 @@ class CorpusAutoGenVectorStore:
 
         top_k = k or self.default_top_k
         _warn_if_extreme_k(top_k, op_name="asimilarity_search_with_score")
+
+        caps = await self._get_caps_async()
+        if caps.max_top_k is not None and top_k > caps.max_top_k:
+            raise BadRequest(
+                f"top_k {top_k} exceeds maximum of {caps.max_top_k}",
+                code=ErrorCodes.BAD_TOP_K,
+                details={"requested_top_k": top_k, "max_top_k": caps.max_top_k},
+            )
+        if filter is not None and bool(filter) and not caps.supports_metadata_filtering:
+            raise NotSupported(
+                "metadata filtering is not supported by this vector index",
+                code=ErrorCodes.FILTER_NOT_SUPPORTED,
+            )
 
         raw_query = self._build_raw_query(
             embedding=query_emb,
@@ -2099,6 +2225,19 @@ class CorpusAutoGenVectorStore:
         top_k = k or self.default_top_k
         _warn_if_extreme_k(top_k, op_name="similarity_search_stream")
 
+        caps = self._get_caps_sync()
+        if caps.max_top_k is not None and top_k > caps.max_top_k:
+            raise BadRequest(
+                f"top_k {top_k} exceeds maximum of {caps.max_top_k}",
+                code=ErrorCodes.BAD_TOP_K,
+                details={"requested_top_k": top_k, "max_top_k": caps.max_top_k},
+            )
+        if filter is not None and bool(filter) and not caps.supports_metadata_filtering:
+            raise NotSupported(
+                "metadata filtering is not supported by this vector index",
+                code=ErrorCodes.FILTER_NOT_SUPPORTED,
+            )
+
         raw_query = self._build_raw_query(
             embedding=query_emb,
             k=top_k,
@@ -2143,6 +2282,19 @@ class CorpusAutoGenVectorStore:
 
         top_k = k or self.default_top_k
         _warn_if_extreme_k(top_k, op_name="asimilarity_search_stream")
+
+        caps = await self._get_caps_async()
+        if caps.max_top_k is not None and top_k > caps.max_top_k:
+            raise BadRequest(
+                f"top_k {top_k} exceeds maximum of {caps.max_top_k}",
+                code=ErrorCodes.BAD_TOP_K,
+                details={"requested_top_k": top_k, "max_top_k": caps.max_top_k},
+            )
+        if filter is not None and bool(filter) and not caps.supports_metadata_filtering:
+            raise NotSupported(
+                "metadata filtering is not supported by this vector index",
+                code=ErrorCodes.FILTER_NOT_SUPPORTED,
+            )
 
         raw_query = self._build_raw_query(
             embedding=query_emb,
@@ -2194,6 +2346,19 @@ class CorpusAutoGenVectorStore:
         top_k = k or self.default_top_k
         _warn_if_extreme_k(top_k, op_name="query")
 
+        caps = self._get_caps_sync()
+        if caps.max_top_k is not None and top_k > caps.max_top_k:
+            raise BadRequest(
+                f"top_k {top_k} exceeds maximum of {caps.max_top_k}",
+                code=ErrorCodes.BAD_TOP_K,
+                details={"requested_top_k": top_k, "max_top_k": caps.max_top_k},
+            )
+        if filter is not None and bool(filter) and not caps.supports_metadata_filtering:
+            raise NotSupported(
+                "metadata filtering is not supported by this vector index",
+                code=ErrorCodes.FILTER_NOT_SUPPORTED,
+            )
+
         raw_query = self._build_raw_query(
             embedding=embedding,
             k=top_k,
@@ -2236,6 +2401,19 @@ class CorpusAutoGenVectorStore:
         )
         top_k = k or self.default_top_k
         _warn_if_extreme_k(top_k, op_name="aquery")
+
+        caps = await self._get_caps_async()
+        if caps.max_top_k is not None and top_k > caps.max_top_k:
+            raise BadRequest(
+                f"top_k {top_k} exceeds maximum of {caps.max_top_k}",
+                code=ErrorCodes.BAD_TOP_K,
+                details={"requested_top_k": top_k, "max_top_k": caps.max_top_k},
+            )
+        if filter is not None and bool(filter) and not caps.supports_metadata_filtering:
+            raise NotSupported(
+                "metadata filtering is not supported by this vector index",
+                code=ErrorCodes.FILTER_NOT_SUPPORTED,
+            )
 
         raw_query = self._build_raw_query(
             embedding=embedding,
@@ -2292,6 +2470,25 @@ class CorpusAutoGenVectorStore:
 
         _warn_if_extreme_k(base_k, op_name="max_marginal_relevance_search_k")
         _warn_if_extreme_k(actual_fetch_k, op_name="max_marginal_relevance_search_fetch_k")
+
+        caps = self._get_caps_sync()
+        if caps.max_top_k is not None and base_k > caps.max_top_k:
+            raise BadRequest(
+                f"k {base_k} exceeds maximum of {caps.max_top_k}",
+                code=ErrorCodes.BAD_TOP_K,
+                details={"requested_k": base_k, "max_top_k": caps.max_top_k},
+            )
+        if caps.max_top_k is not None and actual_fetch_k > caps.max_top_k:
+            raise BadRequest(
+                f"fetch_k {actual_fetch_k} exceeds maximum of {caps.max_top_k}",
+                code=ErrorCodes.BAD_TOP_K,
+                details={"requested_fetch_k": actual_fetch_k, "max_top_k": caps.max_top_k},
+            )
+        if filter is not None and bool(filter) and not caps.supports_metadata_filtering:
+            raise NotSupported(
+                "metadata filtering is not supported by this vector index",
+                code=ErrorCodes.FILTER_NOT_SUPPORTED,
+            )
 
         raw_query = self._build_raw_query(
             embedding=query_emb,
@@ -2351,6 +2548,25 @@ class CorpusAutoGenVectorStore:
 
         _warn_if_extreme_k(base_k, op_name="amax_marginal_relevance_search_k")
         _warn_if_extreme_k(actual_fetch_k, op_name="amax_marginal_relevance_search_fetch_k")
+
+        caps = await self._get_caps_async()
+        if caps.max_top_k is not None and base_k > caps.max_top_k:
+            raise BadRequest(
+                f"k {base_k} exceeds maximum of {caps.max_top_k}",
+                code=ErrorCodes.BAD_TOP_K,
+                details={"requested_k": base_k, "max_top_k": caps.max_top_k},
+            )
+        if caps.max_top_k is not None and actual_fetch_k > caps.max_top_k:
+            raise BadRequest(
+                f"fetch_k {actual_fetch_k} exceeds maximum of {caps.max_top_k}",
+                code=ErrorCodes.BAD_TOP_K,
+                details={"requested_fetch_k": actual_fetch_k, "max_top_k": caps.max_top_k},
+            )
+        if filter is not None and bool(filter) and not caps.supports_metadata_filtering:
+            raise NotSupported(
+                "metadata filtering is not supported by this vector index",
+                code=ErrorCodes.FILTER_NOT_SUPPORTED,
+            )
 
         raw_query = self._build_raw_query(
             embedding=query_emb,
@@ -2484,8 +2700,13 @@ class CorpusAutoGenVectorStore:
             raise NotSupported(
                 "VectorTranslator for framework='autogen' must implement "
                 "capabilities(); no adapter fallback is allowed.",
+                code=ErrorCodes.CAPABILITIES_NOT_AVAILABLE,
             )
-        return translator_capabilities(**kwargs)  # type: ignore[misc]
+        caps = translator_capabilities(**kwargs)  # type: ignore[misc]
+        # Best-effort cache when the result is a VectorCapabilities instance.
+        if isinstance(caps, VectorCapabilities) and not kwargs:
+            self._caps = caps
+        return caps
 
     @with_async_error_context("capabilities_async")
     async def acapabilities(self, **kwargs: Any) -> Mapping[str, Any]:
@@ -2500,15 +2721,22 @@ class CorpusAutoGenVectorStore:
         """
         translator_acapabilities = getattr(self._translator, "acapabilities", None)
         if callable(translator_acapabilities):
-            return await translator_acapabilities(**kwargs)  # type: ignore[misc]
+            caps = await translator_acapabilities(**kwargs)  # type: ignore[misc]
+            if isinstance(caps, VectorCapabilities) and not kwargs:
+                self._caps = caps
+            return caps
 
         translator_capabilities = getattr(self._translator, "capabilities", None)
         if callable(translator_capabilities):
-            return await asyncio.to_thread(translator_capabilities, **kwargs)
+            caps = await asyncio.to_thread(translator_capabilities, **kwargs)
+            if isinstance(caps, VectorCapabilities) and not kwargs:
+                self._caps = caps
+            return caps
 
         raise NotSupported(
             "VectorTranslator for framework='autogen' must implement "
             "acapabilities() or capabilities(); no adapter fallback is allowed.",
+            code=ErrorCodes.CAPABILITIES_NOT_AVAILABLE,
         )
 
     @with_error_context("health_sync")
