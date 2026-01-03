@@ -66,7 +66,9 @@ except ImportError:  # pragma: no cover - environments without CrewAI
 
     class BaseTool(BaseModel):  # type: ignore[no-redef]
         """Minimal stub BaseTool; real usage requires `crewai`."""
+
         pass
+
 
 from corpus_sdk.vector.vector_base import (
     VectorProtocolV1,
@@ -846,7 +848,6 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
         - Empty query returns deterministic zero vector when dimension is known.
         """
         _ensure_not_in_event_loop("vectorize_query")
-
         return self._embed_query(query, embedding=embedding)
 
     async def avectorize_query(
@@ -1049,6 +1050,128 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
             out_vectors.append(vec)
 
         return out_vectors
+
+    # ------------------------------------------------------------------ #
+    # Compatibility: stable vector-action method names (no renames/removals)
+    # ------------------------------------------------------------------ #
+    #
+    # These are strict aliases/wrappers around the existing hardened implementations
+    # above. They exist to preserve cross-adapter consistency (e.g., shared base
+    # layers that call embed_query/embed_documents).
+    #
+    # IMPORTANT: These wrappers do not change behavior, validation, or performance;
+    # they only provide stable method names.
+    #
+
+    @with_error_context("embed_query_sync")
+    def embed_query(
+        self,
+        text: str,
+        *,
+        embedding: Optional[Sequence[float]] = None,
+    ) -> List[float]:
+        """
+        Compatibility alias for query embedding (sync).
+
+        Mirrors the common adapter surface name: embed_query(text, embedding=...).
+        """
+        return self.vectorize_query(str(text), embedding=embedding)
+
+    @with_async_error_context("embed_query_async")
+    async def aembed_query(
+        self,
+        text: str,
+        *,
+        embedding: Optional[Sequence[float]] = None,
+    ) -> List[float]:
+        """
+        Compatibility alias for query embedding (async).
+
+        Mirrors the common adapter surface name: aembed_query(text, embedding=...).
+        """
+        return await self.avectorize_query(str(text), embedding=embedding)
+
+    # Optional alternate async naming some integrations use.
+    # Kept as an alias for maximum compatibility.
+    @with_async_error_context("embed_query_async_alias")
+    async def embed_query_async(
+        self,
+        text: str,
+        *,
+        embedding: Optional[Sequence[float]] = None,
+    ) -> List[float]:
+        """
+        Compatibility alias (async) for embed_query in frameworks that prefer
+        the '*_async' naming convention.
+        """
+        return await self.avectorize_query(str(text), embedding=embedding)
+
+    @with_error_context("embed_documents_sync")
+    def embed_documents(
+        self,
+        texts: Sequence[str],
+        *,
+        embeddings: Optional[Embeddings] = None,
+    ) -> List[List[float]]:
+        """
+        Compatibility alias for document embedding (sync).
+
+        Mirrors the common adapter surface name: embed_documents(texts, embeddings=...).
+        """
+        return self.vectorize_documents(texts, embeddings=embeddings)
+
+    @with_async_error_context("embed_documents_async")
+    async def aembed_documents(
+        self,
+        texts: Sequence[str],
+        *,
+        embeddings: Optional[Embeddings] = None,
+    ) -> List[List[float]]:
+        """
+        Compatibility alias for document embedding (async).
+
+        Mirrors the common adapter surface name: aembed_documents(texts, embeddings=...).
+        """
+        return await self.avectorize_documents(texts, embeddings=embeddings)
+
+    # Optional alternate async naming some integrations use.
+    @with_async_error_context("embed_documents_async_alias")
+    async def embed_documents_async(
+        self,
+        texts: Sequence[str],
+        *,
+        embeddings: Optional[Embeddings] = None,
+    ) -> List[List[float]]:
+        """
+        Compatibility alias (async) for embed_documents in frameworks that prefer
+        the '*_async' naming convention.
+        """
+        return await self.avectorize_documents(texts, embeddings=embeddings)
+
+    # Optional "embed_texts" naming used in some codebases; kept as an alias.
+    @with_error_context("embed_texts_sync")
+    def embed_texts(
+        self,
+        texts: Sequence[str],
+        *,
+        embeddings: Optional[Embeddings] = None,
+    ) -> List[List[float]]:
+        """
+        Compatibility alias (sync) for embed_documents.
+        """
+        return self.vectorize_documents(texts, embeddings=embeddings)
+
+    @with_async_error_context("embed_texts_async")
+    async def aembed_texts(
+        self,
+        texts: Sequence[str],
+        *,
+        embeddings: Optional[Embeddings] = None,
+    ) -> List[List[float]]:
+        """
+        Compatibility alias (async) for aembed_documents.
+        """
+        return await self.avectorize_documents(texts, embeddings=embeddings)
 
     def _embed_query(
         self,
@@ -1402,14 +1525,6 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
     ) -> List[int]:
         """
         Improved MMR selector that respects original database scores and caches similarities.
-
-        Args:
-            candidate_matches: Candidate matches with original scores and vectors
-            k: Number of results to select
-            lambda_mult: MMR lambda parameter (0-1), higher values favor relevance
-
-        Returns:
-            Indices into candidate_matches for selected results
         """
         if not candidate_matches or k <= 0:
             return []
