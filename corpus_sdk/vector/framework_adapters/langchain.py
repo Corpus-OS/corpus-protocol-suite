@@ -77,6 +77,7 @@ import logging
 import math
 import uuid
 from functools import cached_property, wraps
+from threading import RLock
 from typing import (
     Any,
     Awaitable,
@@ -135,7 +136,7 @@ from corpus_sdk.vector.vector_base import (
     QueryResult,
     QueryChunk,
     UpsertResult,
-    DeleteResult,
+    DeleteResult,  # kept for API parity (even if unused directly here)
     OperationContext,
     VectorCapabilities,
     # Errors
@@ -191,8 +192,141 @@ TOPK_WARNING_CONFIG = TopKWarningConfig(
 
 
 # --------------------------------------------------------------------------- #
+# Local adapter error codes (framework-facing)
+# --------------------------------------------------------------------------- #
+
+
+class ErrorCodes:
+    BAD_OPERATION_CONTEXT = "BAD_OPERATION_CONTEXT"
+    BAD_TRANSLATED_RESULT = "BAD_TRANSLATED_RESULT"
+    BAD_TRANSLATED_CHUNK = "BAD_TRANSLATED_CHUNK"
+    BAD_EMBEDDINGS = "BAD_EMBEDDINGS"
+    NO_EMBEDDING_FUNCTION = "NO_EMBEDDING_FUNCTION"
+    EMBEDDING_ERROR = "EMBEDDING_ERROR"
+    EMPTY_INPUT_DIM_UNKNOWN = "EMPTY_INPUT_DIM_UNKNOWN"
+    BAD_MMR_LAMBDA = "BAD_MMR_LAMBDA"
+    BAD_DELETE = "BAD_DELETE"
+
+
+# --------------------------------------------------------------------------- #
+# Sync-in-async guard (prevents deadlocks in notebook / server environments)
+# --------------------------------------------------------------------------- #
+
+
+def _ensure_not_in_event_loop(sync_api_name: str) -> None:
+    """
+    Prevent calling sync APIs from inside an active asyncio loop.
+
+    This is a hard guard to avoid deadlocks or unexpected re-entrancy.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    raise RuntimeError(
+        f"{sync_api_name} was called from inside an active asyncio event loop. "
+        f"Use the async variant instead."
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Error-context decorators (parallel to other framework adapters)
 # --------------------------------------------------------------------------- #
+
+
+def _safe_len(obj: Any) -> Optional[int]:
+    try:
+        return len(obj)  # type: ignore[arg-type]
+    except Exception:
+        return None
+
+
+def _sum_text_chars(texts: Sequence[str]) -> int:
+    total = 0
+    for t in texts:
+        try:
+            total += len(t)
+        except Exception:
+            pass
+    return total
+
+
+def _build_dynamic_error_context(
+    operation: str,
+    args: Tuple[Any, ...],
+    kwargs: Dict[str, Any],
+    base_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Add best-effort dynamic context for richer observability without changing behavior.
+
+    Note: This must never raise.
+    """
+    extra: Dict[str, Any] = dict(base_context)
+
+    try:
+        # Add namespace hints where possible.
+        if args:
+            self_obj = args[0]
+            default_ns = getattr(self_obj, "namespace", None)
+            if default_ns is not None:
+                extra.setdefault("default_namespace", default_ns)
+            dim_hint = getattr(self_obj, "_vector_dim_hint", None)
+            if dim_hint is not None:
+                extra.setdefault("vector_dimension_hint", dim_hint)
+
+        if "namespace" in kwargs:
+            extra.setdefault("namespace", kwargs.get("namespace"))
+        if "filter" in kwargs:
+            extra.setdefault("has_filter", kwargs.get("filter") is not None)
+
+        # Op-specific hints.
+        if operation in {"add_texts_sync", "add_texts_async"}:
+            texts_obj = args[1] if len(args) >= 2 else None
+            if texts_obj is not None:
+                try:
+                    texts_list = [str(t) for t in list(texts_obj)]
+                    extra.setdefault("texts_count", len(texts_list))
+                    extra.setdefault("vectors_count", len(texts_list))
+                    extra.setdefault("total_content_chars", _sum_text_chars(texts_list))
+                except Exception:
+                    pass
+            ids_obj = kwargs.get("ids")
+            if isinstance(ids_obj, list):
+                extra.setdefault("ids_count", len(ids_obj))
+            if kwargs.get("embeddings") is not None:
+                extra.setdefault("has_embeddings", True)
+
+        if operation in {
+            "similarity_search_sync",
+            "similarity_search_async",
+            "similarity_search_stream_sync",
+            "similarity_search_with_score_sync",
+            "similarity_search_with_score_async",
+            "mmr_search_sync",
+            "mmr_search_async",
+        }:
+            query_obj = args[1] if len(args) >= 2 else None
+            if isinstance(query_obj, str):
+                extra.setdefault("query_chars", len(query_obj))
+            k = kwargs.get("k")
+            if isinstance(k, int):
+                extra.setdefault("k", k)
+            fetch_k = kwargs.get("fetch_k")
+            if isinstance(fetch_k, int):
+                extra.setdefault("fetch_k", fetch_k)
+            if kwargs.get("embedding") is not None:
+                extra.setdefault("has_embedding", True)
+
+        if operation in {"delete_sync", "delete_async"}:
+            ids_obj = kwargs.get("ids")
+            if isinstance(ids_obj, list):
+                extra.setdefault("ids_count", len(ids_obj))
+            extra.setdefault("has_filter", kwargs.get("filter") is not None)
+    except Exception:
+        pass
+
+    return extra
 
 
 def with_error_context(
@@ -209,12 +343,18 @@ def with_error_context(
             try:
                 return func(*args, **kwargs)
             except Exception as exc:
+                extra = _build_dynamic_error_context(
+                    operation=operation,
+                    args=args,
+                    kwargs=kwargs,
+                    base_context=dict(context_kwargs),
+                )
                 attach_context(
                     exc,
                     framework="langchain",
-                    operation=operation,
+                    operation=operation,  # keep original operation string
                     error_codes=VECTOR_ERROR_CODES,
-                    **context_kwargs,
+                    **extra,
                 )
                 raise
 
@@ -237,12 +377,18 @@ def with_async_error_context(
             try:
                 return await func(*args, **kwargs)
             except Exception as exc:
+                extra = _build_dynamic_error_context(
+                    operation=operation,
+                    args=args,
+                    kwargs=kwargs,
+                    base_context=dict(context_kwargs),
+                )
                 attach_context(
                     exc,
                     framework="langchain",
-                    operation=operation,
+                    operation=operation,  # keep original operation string
                     error_codes=VECTOR_ERROR_CODES,
-                    **context_kwargs,
+                    **extra,
                 )
                 raise
 
@@ -289,6 +435,10 @@ class CorpusLangChainVectorStore(VectorStore):
 
     # Cached capabilities
     _caps: Optional[VectorCapabilities] = None
+
+    # Dimension hint (best-effort, thread-safe first-write-wins)
+    _vector_dim_hint: Optional[int] = None
+    _dim_lock: RLock = RLock()
 
     # Pydantic v2-style config
     model_config = {"arbitrary_types_allowed": True}
@@ -370,34 +520,30 @@ class CorpusLangChainVectorStore(VectorStore):
             )
             raise
 
-    def _build_ctx(self, **kwargs: Any) -> OperationContext:
-        """
-        Build an OperationContext from a LangChain config-like dict in kwargs.
+    # --------------------------- #
+    # Separated context building
+    # --------------------------- #
 
-        Behavior:
-        - If no config is provided: return a default OperationContext().
-        - If config is already an OperationContext: return it.
-        - Otherwise:
-            * Try dict-based translation via ctx_from_dict.
-            * Fall back to LangChain-aware translation via ctx_from_langchain.
-            * If all translations fail, fall back to a default OperationContext().
+    def _build_core_context(self, config: Any) -> OperationContext:
         """
-        config = kwargs.get("config")
+        Build an OperationContext from a LangChain config-like object.
 
-        # No config is completely normal in LangChain.
+        Updated behavior (strict):
+        - config is None: return OperationContext() (normal).
+        - config is OperationContext: return it.
+        - config is Mapping: ctx_from_dict must succeed and return OperationContext.
+        - otherwise: ctx_from_langchain must succeed and return OperationContext.
+        - If translation is attempted and fails or returns wrong type: raise with attach_context.
+        """
         if config is None:
             return OperationContext()
 
-        # Caller may pass OperationContext directly.
         if isinstance(config, OperationContext):
             return config
 
-        # Try dict-based translation first.
         if isinstance(config, Mapping):
             try:
                 ctx = ctx_from_dict(config)
-                if isinstance(ctx, OperationContext):
-                    return ctx
             except Exception as exc:  # noqa: BLE001
                 attach_context(
                     exc,
@@ -405,12 +551,23 @@ class CorpusLangChainVectorStore(VectorStore):
                     operation="vector_context_from_dict",
                     error_codes=VECTOR_ERROR_CODES,
                 )
+                raise
+            if not isinstance(ctx, OperationContext):
+                err = BadRequest(
+                    f"from_dict produced unsupported context type: {type(ctx).__name__}",
+                    code=ErrorCodes.BAD_OPERATION_CONTEXT,
+                )
+                attach_context(
+                    err,
+                    framework="langchain",
+                    operation="vector_context_from_dict",
+                    error_codes=VECTOR_ERROR_CODES,
+                )
+                raise err
+            return ctx
 
-        # Fallback: LangChain-specific context translation.
         try:
             ctx = ctx_from_langchain(config)
-            if isinstance(ctx, OperationContext):
-                return ctx
         except Exception as exc:  # noqa: BLE001
             attach_context(
                 exc,
@@ -418,9 +575,29 @@ class CorpusLangChainVectorStore(VectorStore):
                 operation="vector_context_from_langchain",
                 error_codes=VECTOR_ERROR_CODES,
             )
+            raise
+        if not isinstance(ctx, OperationContext):
+            err = BadRequest(
+                f"from_langchain produced unsupported context type: {type(ctx).__name__}",
+                code=ErrorCodes.BAD_OPERATION_CONTEXT,
+            )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="vector_context_from_langchain",
+                error_codes=VECTOR_ERROR_CODES,
+            )
+            raise err
+        return ctx
 
-        # Final fallback: soft behavior, but we do NOT silently drop context.
-        return OperationContext()
+    def _build_ctx(self, **kwargs: Any) -> OperationContext:
+        """
+        Backward-compatible context builder retained for API stability.
+
+        This method now delegates to the strict core context builder.
+        """
+        config = kwargs.get("config")
+        return self._build_core_context(config)
 
     def _effective_namespace(self, namespace: Optional[str]) -> Optional[str]:
         """
@@ -461,6 +638,28 @@ class CorpusLangChainVectorStore(VectorStore):
         return framework_ctx
 
     # ------------------------------------------------------------------ #
+    # Dimension hint + deterministic zero vectors
+    # ------------------------------------------------------------------ #
+
+    def _update_dim_hint(self, dim: Optional[int]) -> None:
+        """
+        Update vector dimension hint (thread-safe, first write wins).
+        """
+        if dim is None or dim <= 0:
+            return
+        if self._vector_dim_hint is not None:
+            return
+        with self._dim_lock:
+            if self._vector_dim_hint is None:
+                self._vector_dim_hint = int(dim)
+
+    def _zero_vector(self, dim: int) -> List[float]:
+        """
+        Deterministic zero vector used for empty inputs when dimension is known.
+        """
+        return [0.0] * int(dim)
+
+    # ------------------------------------------------------------------ #
     # Translation helpers: LC Documents ↔ Corpus Vector
     # ------------------------------------------------------------------ #
 
@@ -471,12 +670,19 @@ class CorpusLangChainVectorStore(VectorStore):
     ) -> Embeddings:
         """
         Ensure embeddings are available for a batch of texts (sync path).
+
+        Updated behavior (empty-input hardening):
+        - If embeddings are provided, validate length and update dim hint best-effort.
+        - If embeddings must be computed:
+            * Compute embeddings only for non-empty texts.
+            * Fill empty/whitespace texts with deterministic zero vectors.
+            * If all texts are empty and dimension is unknown, raise.
         """
         if embeddings is not None:
             if len(embeddings) != len(texts):
                 err = BadRequest(
                     f"embeddings length {len(embeddings)} does not match texts length {len(texts)}",
-                    code="BAD_EMBEDDINGS",
+                    code=ErrorCodes.BAD_EMBEDDINGS,
                     details={"texts": len(texts), "embeddings": len(embeddings)},
                 )
                 attach_context(
@@ -488,12 +694,18 @@ class CorpusLangChainVectorStore(VectorStore):
                     error_codes=VECTOR_ERROR_CODES,
                 )
                 raise err
+            # Dim hint best-effort from first embedding
+            try:
+                if embeddings and embeddings[0] is not None:
+                    self._update_dim_hint(_safe_len(embeddings[0]))
+            except Exception:
+                pass
             return embeddings
 
         if self.embedding_function is None:
             err = NotSupported(
                 "No embedding_function configured; caller must supply embeddings",
-                code="NO_EMBEDDING_FUNCTION",
+                code=ErrorCodes.NO_EMBEDDING_FUNCTION,
                 details={"texts": len(texts)},
             )
             attach_context(
@@ -505,38 +717,104 @@ class CorpusLangChainVectorStore(VectorStore):
             )
             raise err
 
+        empty_idx: List[int] = []
+        non_empty_texts: List[str] = []
+        non_empty_idx: List[int] = []
+
+        for i, t in enumerate(texts):
+            s = str(t)
+            if not s.strip():
+                empty_idx.append(i)
+            else:
+                non_empty_texts.append(s)
+                non_empty_idx.append(i)
+
+        if not non_empty_texts:
+            dim = self._vector_dim_hint
+            if dim is None:
+                err = BadRequest(
+                    "cannot embed empty texts when vector dimension is unknown",
+                    code=ErrorCodes.EMPTY_INPUT_DIM_UNKNOWN,
+                    details={"texts": len(texts)},
+                )
+                attach_context(
+                    err,
+                    framework="langchain",
+                    operation="ensure_embeddings",
+                    texts_count=len(texts),
+                    empty_texts_count=len(texts),
+                    error_codes=VECTOR_ERROR_CODES,
+                )
+                raise err
+            return [self._zero_vector(dim) for _ in texts]
+
         try:
-            computed = self.embedding_function(texts)
+            computed_non_empty = self.embedding_function(non_empty_texts)
         except Exception as exc:  # noqa: BLE001
             err = BadRequest(
                 f"embedding_function failed: {exc}",
-                code="EMBEDDING_ERROR",
-                details={"texts": len(texts)},
+                code=ErrorCodes.EMBEDDING_ERROR,
+                details={"texts": len(texts), "non_empty_texts": len(non_empty_texts)},
             )
             attach_context(
                 err,
                 framework="langchain",
                 operation="ensure_embeddings",
                 texts_count=len(texts),
+                non_empty_texts_count=len(non_empty_texts),
+                empty_texts_count=len(empty_idx),
                 error_codes=VECTOR_ERROR_CODES,
             )
             raise err
-        if len(computed) != len(texts):
+
+        if len(computed_non_empty) != len(non_empty_texts):
             err = BadRequest(
-                f"embedding_function returned {len(computed)} embeddings for {len(texts)} texts",
-                code="BAD_EMBEDDINGS",
-                details={"texts": len(texts), "embeddings": len(computed)},
+                f"embedding_function returned {len(computed_non_empty)} embeddings for {len(non_empty_texts)} texts",
+                code=ErrorCodes.BAD_EMBEDDINGS,
+                details={"texts": len(texts), "returned": len(computed_non_empty)},
             )
             attach_context(
                 err,
                 framework="langchain",
                 operation="ensure_embeddings",
                 texts_count=len(texts),
-                embeddings_count=len(computed),
+                embeddings_count=len(computed_non_empty),
                 error_codes=VECTOR_ERROR_CODES,
             )
             raise err
-        return computed
+
+        inferred_dim: Optional[int] = None
+        try:
+            if computed_non_empty and computed_non_empty[0] is not None:
+                inferred_dim = _safe_len(computed_non_empty[0])
+        except Exception:
+            inferred_dim = None
+
+        if inferred_dim is None or inferred_dim <= 0:
+            inferred_dim = self._vector_dim_hint
+
+        if inferred_dim is None or inferred_dim <= 0:
+            err = BadRequest(
+                "embedding_function produced embeddings with unknown dimension",
+                code=ErrorCodes.BAD_EMBEDDINGS,
+            )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="ensure_embeddings",
+                texts_count=len(texts),
+                error_codes=VECTOR_ERROR_CODES,
+            )
+            raise err
+
+        self._update_dim_hint(inferred_dim)
+
+        # Assemble full embeddings aligned to original order
+        full: List[List[float]] = [self._zero_vector(inferred_dim) for _ in range(len(texts))]
+        for idx, emb in zip(non_empty_idx, computed_non_empty):
+            full[idx] = [float(x) for x in emb]
+
+        return full
 
     async def _ensure_embeddings_async(
         self,
@@ -545,12 +823,14 @@ class CorpusLangChainVectorStore(VectorStore):
     ) -> Embeddings:
         """
         Async-safe embedding helper for a batch of texts.
+
+        Updated behavior mirrors sync version (empty-input hardening).
         """
         if embeddings is not None:
             if len(embeddings) != len(texts):
                 err = BadRequest(
                     f"embeddings length {len(embeddings)} does not match texts length {len(texts)}",
-                    code="BAD_EMBEDDINGS",
+                    code=ErrorCodes.BAD_EMBEDDINGS,
                     details={"texts": len(texts), "embeddings": len(embeddings)},
                 )
                 attach_context(
@@ -562,15 +842,31 @@ class CorpusLangChainVectorStore(VectorStore):
                     error_codes=VECTOR_ERROR_CODES,
                 )
                 raise err
+            try:
+                if embeddings and embeddings[0] is not None:
+                    self._update_dim_hint(_safe_len(embeddings[0]))
+            except Exception:
+                pass
             return embeddings
 
-        if self.async_embedding_function is not None:
-            try:
-                computed = await self.async_embedding_function(texts)
-            except Exception as exc:  # noqa: BLE001
+        empty_idx: List[int] = []
+        non_empty_texts: List[str] = []
+        non_empty_idx: List[int] = []
+
+        for i, t in enumerate(texts):
+            s = str(t)
+            if not s.strip():
+                empty_idx.append(i)
+            else:
+                non_empty_texts.append(s)
+                non_empty_idx.append(i)
+
+        if not non_empty_texts:
+            dim = self._vector_dim_hint
+            if dim is None:
                 err = BadRequest(
-                    f"async_embedding_function failed: {exc}",
-                    code="EMBEDDING_ERROR",
+                    "cannot embed empty texts when vector dimension is unknown",
+                    code=ErrorCodes.EMPTY_INPUT_DIM_UNKNOWN,
                     details={"texts": len(texts)},
                 )
                 attach_context(
@@ -578,6 +874,28 @@ class CorpusLangChainVectorStore(VectorStore):
                     framework="langchain",
                     operation="ensure_embeddings_async",
                     texts_count=len(texts),
+                    empty_texts_count=len(texts),
+                    error_codes=VECTOR_ERROR_CODES,
+                )
+                raise err
+            return [self._zero_vector(dim) for _ in texts]
+
+        if self.async_embedding_function is not None:
+            try:
+                computed_non_empty = await self.async_embedding_function(non_empty_texts)
+            except Exception as exc:  # noqa: BLE001
+                err = BadRequest(
+                    f"async_embedding_function failed: {exc}",
+                    code=ErrorCodes.EMBEDDING_ERROR,
+                    details={"texts": len(texts), "non_empty_texts": len(non_empty_texts)},
+                )
+                attach_context(
+                    err,
+                    framework="langchain",
+                    operation="ensure_embeddings_async",
+                    texts_count=len(texts),
+                    non_empty_texts_count=len(non_empty_texts),
+                    empty_texts_count=len(empty_idx),
                     error_codes=VECTOR_ERROR_CODES,
                 )
                 raise err
@@ -585,7 +903,7 @@ class CorpusLangChainVectorStore(VectorStore):
             if self.embedding_function is None:
                 err = NotSupported(
                     "No embedding_function/async_embedding_function configured; caller must supply embeddings",
-                    code="NO_EMBEDDING_FUNCTION",
+                    code=ErrorCodes.NO_EMBEDDING_FUNCTION,
                     details={"texts": len(texts)},
                 )
                 attach_context(
@@ -597,38 +915,71 @@ class CorpusLangChainVectorStore(VectorStore):
                 )
                 raise err
             try:
-                computed = await asyncio.to_thread(self.embedding_function, texts)
+                computed_non_empty = await asyncio.to_thread(self.embedding_function, non_empty_texts)
             except Exception as exc:  # noqa: BLE001
                 err = BadRequest(
                     f"embedding_function failed: {exc}",
-                    code="EMBEDDING_ERROR",
-                    details={"texts": len(texts)},
+                    code=ErrorCodes.EMBEDDING_ERROR,
+                    details={"texts": len(texts), "non_empty_texts": len(non_empty_texts)},
                 )
                 attach_context(
                     err,
                     framework="langchain",
                     operation="ensure_embeddings_async",
                     texts_count=len(texts),
+                    non_empty_texts_count=len(non_empty_texts),
+                    empty_texts_count=len(empty_idx),
                     error_codes=VECTOR_ERROR_CODES,
                 )
                 raise err
 
-        if len(computed) != len(texts):
+        if len(computed_non_empty) != len(non_empty_texts):
             err = BadRequest(
-                f"embedding function returned {len(computed)} embeddings for {len(texts)} texts",
-                code="BAD_EMBEDDINGS",
-                details={"texts": len(texts), "embeddings": len(computed)},
+                f"embedding function returned {len(computed_non_empty)} embeddings for {len(non_empty_texts)} texts",
+                code=ErrorCodes.BAD_EMBEDDINGS,
+                details={"texts": len(texts), "returned": len(computed_non_empty)},
             )
             attach_context(
                 err,
                 framework="langchain",
                 operation="ensure_embeddings_async",
                 texts_count=len(texts),
-                embeddings_count=len(computed),
+                embeddings_count=len(computed_non_empty),
                 error_codes=VECTOR_ERROR_CODES,
             )
             raise err
-        return computed
+
+        inferred_dim: Optional[int] = None
+        try:
+            if computed_non_empty and computed_non_empty[0] is not None:
+                inferred_dim = _safe_len(computed_non_empty[0])
+        except Exception:
+            inferred_dim = None
+
+        if inferred_dim is None or inferred_dim <= 0:
+            inferred_dim = self._vector_dim_hint
+
+        if inferred_dim is None or inferred_dim <= 0:
+            err = BadRequest(
+                "embedding function produced embeddings with unknown dimension",
+                code=ErrorCodes.BAD_EMBEDDINGS,
+            )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="ensure_embeddings_async",
+                texts_count=len(texts),
+                error_codes=VECTOR_ERROR_CODES,
+            )
+            raise err
+
+        self._update_dim_hint(inferred_dim)
+
+        full: List[List[float]] = [self._zero_vector(inferred_dim) for _ in range(len(texts))]
+        for idx, emb in zip(non_empty_idx, computed_non_empty):
+            full[idx] = [float(x) for x in emb]
+
+        return full
 
     def _normalize_metadatas(
         self,
@@ -719,10 +1070,13 @@ class CorpusLangChainVectorStore(VectorStore):
                 metadata_payload[self.text_field] = text
                 metadata_payload[self.id_field] = vid
 
+            vec = [float(x) for x in emb]
+            self._update_dim_hint(len(vec))
+
             vectors.append(
                 Vector(
                     id=str(vid),
-                    vector=[float(x) for x in emb],
+                    vector=vec,
                     metadata=metadata_payload,
                     namespace=ns,
                     text=None,
@@ -762,7 +1116,7 @@ class CorpusLangChainVectorStore(VectorStore):
             nested_meta.pop(self.text_field, None)
             nested_meta.pop(self.id_field, None)
 
-            doc = Document(page_content=text, metadata=nested_meta)
+            doc = Document(page_content=str(text), metadata=nested_meta)
             results.append((doc, float(m.score)))
         return results
 
@@ -838,7 +1192,7 @@ class CorpusLangChainVectorStore(VectorStore):
         if not ids and not filter:
             err = BadRequest(
                 "must provide ids or filter for delete",
-                code="BAD_DELETE",
+                code=ErrorCodes.BAD_DELETE,
             )
             attach_context(
                 err,
@@ -903,6 +1257,270 @@ class CorpusLangChainVectorStore(VectorStore):
             )
 
     # ------------------------------------------------------------------ #
+    # Embedding helpers (KEEP original names; add empty-query hardening)
+    # ------------------------------------------------------------------ #
+
+    def _embed_query(
+        self,
+        query: str,
+        *,
+        embedding: Optional[Sequence[float]] = None,
+    ) -> List[float]:
+        """
+        Ensure a single query embedding is available (sync path).
+
+        Updated behavior:
+        - If embedding is provided: use it, update dimension hint.
+        - If query is empty/whitespace:
+            * If dimension hint is known -> return zero vector.
+            * Else -> raise (cannot determine dimension).
+        - Otherwise: compute embedding via embedding_function (unchanged semantics).
+        """
+        if embedding is not None:
+            vec = [float(x) for x in embedding]
+            self._update_dim_hint(len(vec))
+            return vec
+
+        q = "" if query is None else str(query)
+        if not q.strip():
+            dim = self._vector_dim_hint
+            if dim is None:
+                err = BadRequest(
+                    "query cannot be empty when vector dimension is unknown",
+                    code=ErrorCodes.EMPTY_INPUT_DIM_UNKNOWN,
+                )
+                attach_context(
+                    err,
+                    framework="langchain",
+                    operation="embed_query",
+                    error_codes=VECTOR_ERROR_CODES,
+                )
+                raise err
+            return self._zero_vector(dim)
+
+        if self.embedding_function is None:
+            err = NotSupported(
+                "No embedding_function configured; caller must supply query embedding",
+                code=ErrorCodes.NO_EMBEDDING_FUNCTION,
+            )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="embed_query",
+                error_codes=VECTOR_ERROR_CODES,
+            )
+            raise err
+
+        try:
+            embs = self.embedding_function([q])
+        except Exception as exc:  # noqa: BLE001
+            err = BadRequest(
+                f"embedding_function failed for query: {exc}",
+                code=ErrorCodes.EMBEDDING_ERROR,
+            )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="embed_query",
+                error_codes=VECTOR_ERROR_CODES,
+            )
+            raise err
+        if not embs or len(embs) != 1:
+            err = BadRequest(
+                "embedding_function must return exactly one embedding for a single query",
+                code=ErrorCodes.BAD_EMBEDDINGS,
+                details={"returned": len(embs) if embs is not None else 0},
+            )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="embed_query",
+                error_codes=VECTOR_ERROR_CODES,
+            )
+            raise err
+
+        vec = [float(x) for x in embs[0]]
+        self._update_dim_hint(len(vec))
+        return vec
+
+    async def _embed_query_async(
+        self,
+        query: str,
+        *,
+        embedding: Optional[Sequence[float]] = None,
+    ) -> List[float]:
+        """
+        Async-safe query embedding helper.
+
+        Updated behavior mirrors sync version for empty-query handling.
+        """
+        if embedding is not None:
+            vec = [float(x) for x in embedding]
+            self._update_dim_hint(len(vec))
+            return vec
+
+        q = "" if query is None else str(query)
+        if not q.strip():
+            dim = self._vector_dim_hint
+            if dim is None:
+                err = BadRequest(
+                    "query cannot be empty when vector dimension is unknown",
+                    code=ErrorCodes.EMPTY_INPUT_DIM_UNKNOWN,
+                )
+                attach_context(
+                    err,
+                    framework="langchain",
+                    operation="embed_query_async",
+                    error_codes=VECTOR_ERROR_CODES,
+                )
+                raise err
+            return self._zero_vector(dim)
+
+        if self.async_embedding_function is not None:
+            try:
+                embs = await self.async_embedding_function([q])
+            except Exception as exc:  # noqa: BLE001
+                err = BadRequest(
+                    f"async_embedding_function failed for query: {exc}",
+                    code=ErrorCodes.EMBEDDING_ERROR,
+                )
+                attach_context(
+                    err,
+                    framework="langchain",
+                    operation="embed_query_async",
+                    error_codes=VECTOR_ERROR_CODES,
+                )
+                raise err
+        else:
+            if self.embedding_function is None:
+                err = NotSupported(
+                    "No embedding_function/async_embedding_function configured; caller must supply query embedding",
+                    code=ErrorCodes.NO_EMBEDDING_FUNCTION,
+                )
+                attach_context(
+                    err,
+                    framework="langchain",
+                    operation="embed_query_async",
+                    error_codes=VECTOR_ERROR_CODES,
+                )
+                raise err
+            try:
+                embs = await asyncio.to_thread(self.embedding_function, [q])
+            except Exception as exc:  # noqa: BLE001
+                err = BadRequest(
+                    f"embedding_function failed for query: {exc}",
+                    code=ErrorCodes.EMBEDDING_ERROR,
+                )
+                attach_context(
+                    err,
+                    framework="langchain",
+                    operation="embed_query_async",
+                    error_codes=VECTOR_ERROR_CODES,
+                )
+                raise err
+
+        if not embs or len(embs) != 1:
+            err = BadRequest(
+                "embedding function must return exactly one embedding for a single query",
+                code=ErrorCodes.BAD_EMBEDDINGS,
+                details={"returned": len(embs) if embs is not None else 0},
+            )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="embed_query_async",
+                error_codes=VECTOR_ERROR_CODES,
+            )
+            raise err
+
+        vec = [float(x) for x in embs[0]]
+        self._update_dim_hint(len(vec))
+        return vec
+
+    # ------------------------------------------------------------------ #
+    # Optional: callable/vectorize helpers (ADDITIVE; do not replace originals)
+    # ------------------------------------------------------------------ #
+
+    def vectorize_documents(
+        self,
+        texts: Iterable[str],
+        *,
+        embeddings: Optional[Embeddings] = None,
+    ) -> List[List[float]]:
+        """
+        Convenience embedding API (sync). Does not change core adapter usage.
+        """
+        _ensure_not_in_event_loop("vectorize_documents")
+        texts_list = [str(t) for t in texts]
+        if not texts_list:
+            return []
+        embs = self._ensure_embeddings(texts_list, embeddings)
+        out: List[List[float]] = []
+        for e in embs:
+            vec = [float(x) for x in e]
+            self._update_dim_hint(len(vec))
+            out.append(vec)
+        return out
+
+    async def avectorize_documents(
+        self,
+        texts: Iterable[str],
+        *,
+        embeddings: Optional[Embeddings] = None,
+    ) -> List[List[float]]:
+        """
+        Convenience embedding API (async).
+        """
+        texts_list = [str(t) for t in texts]
+        if not texts_list:
+            return []
+        embs = await self._ensure_embeddings_async(texts_list, embeddings)
+        out: List[List[float]] = []
+        for e in embs:
+            vec = [float(x) for x in e]
+            self._update_dim_hint(len(vec))
+            out.append(vec)
+        return out
+
+    def vectorize_query(
+        self,
+        query: str,
+        *,
+        embedding: Optional[Sequence[float]] = None,
+    ) -> List[float]:
+        """
+        Convenience query embedding API (sync). Delegates to _embed_query.
+        """
+        _ensure_not_in_event_loop("vectorize_query")
+        return self._embed_query(query, embedding=embedding)
+
+    async def avectorize_query(
+        self,
+        query: str,
+        *,
+        embedding: Optional[Sequence[float]] = None,
+    ) -> List[float]:
+        """
+        Convenience query embedding API (async). Delegates to _embed_query_async.
+        """
+        return await self._embed_query_async(query, embedding=embedding)
+
+    def __call__(self, inputs: Any, **kwargs: Any) -> Any:
+        """
+        Callable interface (additive):
+
+        - If inputs is a string: returns query embedding.
+        - If inputs is an iterable of strings: returns embeddings for documents.
+        """
+        if isinstance(inputs, str):
+            return self.vectorize_query(inputs, embedding=kwargs.get("embedding"))
+        try:
+            seq = list(inputs)
+        except Exception:
+            seq = [inputs]
+        return self.vectorize_documents(seq, embeddings=kwargs.get("embeddings"))
+
+    # ------------------------------------------------------------------ #
     # LangChain VectorStore sync API
     # ------------------------------------------------------------------ #
 
@@ -917,6 +1535,8 @@ class CorpusLangChainVectorStore(VectorStore):
         """
         Add texts to the vector store (sync).
         """
+        _ensure_not_in_event_loop("add_texts")
+
         texts_list = list(texts)
         if not texts_list:
             return []
@@ -927,10 +1547,10 @@ class CorpusLangChainVectorStore(VectorStore):
 
         metadatas_norm = self._normalize_metadatas(len(texts_list), metadatas)
         ids_norm = self._normalize_ids(len(texts_list), ids)
-        emb = self._ensure_embeddings(texts_list, embeddings)
+        emb = self._ensure_embeddings([str(t) for t in texts_list], embeddings)
 
         vectors = self._to_corpus_vectors(
-            texts=texts_list,
+            texts=[str(t) for t in texts_list],
             embeddings=emb,
             metadatas=metadatas_norm,
             ids=ids_norm,
@@ -978,10 +1598,10 @@ class CorpusLangChainVectorStore(VectorStore):
 
         metadatas_norm = self._normalize_metadatas(len(texts_list), metadatas)
         ids_norm = self._normalize_ids(len(texts_list), ids)
-        emb = await self._ensure_embeddings_async(texts_list, embeddings)
+        emb = await self._ensure_embeddings_async([str(t) for t in texts_list], embeddings)
 
         vectors = self._to_corpus_vectors(
-            texts=texts_list,
+            texts=[str(t) for t in texts_list],
             embeddings=emb,
             metadatas=metadatas_norm,
             ids=ids_norm,
@@ -1016,6 +1636,7 @@ class CorpusLangChainVectorStore(VectorStore):
         """
         Add LangChain Documents to the vector store (sync).
         """
+        _ensure_not_in_event_loop("add_documents")
         texts = [d.page_content for d in documents]
         metadatas = [dict(d.metadata or {}) for d in documents]
         return self.add_texts(texts, metadatas=metadatas, **kwargs)
@@ -1032,130 +1653,6 @@ class CorpusLangChainVectorStore(VectorStore):
         metadatas = [dict(d.metadata or {}) for d in documents]
         return await self.aadd_texts(texts, metadatas=metadatas, **kwargs)
 
-    def _embed_query(
-        self,
-        query: str,
-        *,
-        embedding: Optional[Sequence[float]] = None,
-    ) -> List[float]:
-        """
-        Ensure a single query embedding is available (sync path).
-        """
-        if embedding is not None:
-            return [float(x) for x in embedding]
-
-        if self.embedding_function is None:
-            err = NotSupported(
-                "No embedding_function configured; caller must supply query embedding",
-                code="NO_EMBEDDING_FUNCTION",
-            )
-            attach_context(
-                err,
-                framework="langchain",
-                operation="embed_query",
-                error_codes=VECTOR_ERROR_CODES,
-            )
-            raise err
-
-        try:
-            embs = self.embedding_function([query])
-        except Exception as exc:  # noqa: BLE001
-            err = BadRequest(
-                f"embedding_function failed for query: {exc}",
-                code="EMBEDDING_ERROR",
-            )
-            attach_context(
-                err,
-                framework="langchain",
-                operation="embed_query",
-                error_codes=VECTOR_ERROR_CODES,
-            )
-            raise err
-        if not embs or len(embs) != 1:
-            err = BadRequest(
-                "embedding_function must return exactly one embedding for a single query",
-                code="BAD_EMBEDDINGS",
-                details={"returned": len(embs) if embs is not None else 0},
-            )
-            attach_context(
-                err,
-                framework="langchain",
-                operation="embed_query",
-                error_codes=VECTOR_ERROR_CODES,
-            )
-            raise err
-        return [float(x) for x in embs[0]]
-
-    async def _embed_query_async(
-        self,
-        query: str,
-        *,
-        embedding: Optional[Sequence[float]] = None,
-    ) -> List[float]:
-        """
-        Async-safe query embedding helper.
-        """
-        if embedding is not None:
-            return [float(x) for x in embedding]
-
-        if self.async_embedding_function is not None:
-            try:
-                embs = await self.async_embedding_function([query])
-            except Exception as exc:  # noqa: BLE001
-                err = BadRequest(
-                    f"async_embedding_function failed for query: {exc}",
-                    code="EMBEDDING_ERROR",
-                )
-                attach_context(
-                    err,
-                    framework="langchain",
-                    operation="embed_query_async",
-                    error_codes=VECTOR_ERROR_CODES,
-                )
-                raise err
-        else:
-            if self.embedding_function is None:
-                err = NotSupported(
-                    "No embedding_function/async_embedding_function configured; caller must supply query embedding",
-                    code="NO_EMBEDDING_FUNCTION",
-                )
-                attach_context(
-                    err,
-                    framework="langchain",
-                    operation="embed_query_async",
-                    error_codes=VECTOR_ERROR_CODES,
-                )
-                raise err
-            try:
-                embs = await asyncio.to_thread(self.embedding_function, [query])
-            except Exception as exc:  # noqa: BLE001
-                err = BadRequest(
-                    f"embedding_function failed for query: {exc}",
-                    code="EMBEDDING_ERROR",
-                )
-                attach_context(
-                    err,
-                    framework="langchain",
-                    operation="embed_query_async",
-                    error_codes=VECTOR_ERROR_CODES,
-                )
-                raise err
-
-        if not embs or len(embs) != 1:
-            err = BadRequest(
-                "embedding function must return exactly one embedding for a single query",
-                code="BAD_EMBEDDINGS",
-                details={"returned": len(embs) if embs is not None else 0},
-            )
-            attach_context(
-                err,
-                framework="langchain",
-                operation="embed_query_async",
-                error_codes=VECTOR_ERROR_CODES,
-            )
-            raise err
-        return [float(x) for x in embs[0]]
-
     @with_error_context("similarity_search_sync")
     def similarity_search(
         self,
@@ -1167,6 +1664,8 @@ class CorpusLangChainVectorStore(VectorStore):
         """
         Perform similarity search and return Documents (sync).
         """
+        _ensure_not_in_event_loop("similarity_search")
+
         embedding: Optional[Sequence[float]] = kwargs.get("embedding")
         namespace: Optional[str] = kwargs.get("namespace")
         ctx = self._build_ctx(**kwargs)
@@ -1199,7 +1698,7 @@ class CorpusLangChainVectorStore(VectorStore):
         if not isinstance(result_any, QueryResult):
             err = VectorAdapterError(
                 f"VectorTranslator.query returned unsupported type: {type(result_any).__name__}",
-                code="BAD_TRANSLATED_RESULT",
+                code=ErrorCodes.BAD_TRANSLATED_RESULT,
             )
             attach_context(
                 err,
@@ -1224,6 +1723,8 @@ class CorpusLangChainVectorStore(VectorStore):
         """
         Streaming similarity search (sync), yielding Documents one by one.
         """
+        _ensure_not_in_event_loop("similarity_search_stream")
+
         embedding: Optional[Sequence[float]] = kwargs.get("embedding")
         namespace: Optional[str] = kwargs.get("namespace")
         ctx = self._build_ctx(**kwargs)
@@ -1255,7 +1756,7 @@ class CorpusLangChainVectorStore(VectorStore):
             if not isinstance(chunk, QueryChunk):
                 err = VectorAdapterError(
                     f"VectorTranslator.query_stream yielded unsupported type: {type(chunk).__name__}",
-                    code="BAD_TRANSLATED_CHUNK",
+                    code=ErrorCodes.BAD_TRANSLATED_CHUNK,
                 )
                 attach_context(
                     err,
@@ -1316,7 +1817,7 @@ class CorpusLangChainVectorStore(VectorStore):
         if not isinstance(result_any, QueryResult):
             err = VectorAdapterError(
                 f"VectorTranslator.arun_query returned unsupported type: {type(result_any).__name__}",
-                code="BAD_TRANSLATED_RESULT",
+                code=ErrorCodes.BAD_TRANSLATED_RESULT,
             )
             attach_context(
                 err,
@@ -1341,6 +1842,8 @@ class CorpusLangChainVectorStore(VectorStore):
         """
         Similarity search returning (Document, score) tuples (sync).
         """
+        _ensure_not_in_event_loop("similarity_search_with_score")
+
         embedding: Optional[Sequence[float]] = kwargs.get("embedding")
         namespace: Optional[str] = kwargs.get("namespace")
         ctx = self._build_ctx(**kwargs)
@@ -1373,7 +1876,7 @@ class CorpusLangChainVectorStore(VectorStore):
         if not isinstance(result_any, QueryResult):
             err = VectorAdapterError(
                 f"VectorTranslator.query returned unsupported type: {type(result_any).__name__}",
-                code="BAD_TRANSLATED_RESULT",
+                code=ErrorCodes.BAD_TRANSLATED_RESULT,
             )
             attach_context(
                 err,
@@ -1429,7 +1932,7 @@ class CorpusLangChainVectorStore(VectorStore):
         if not isinstance(result_any, QueryResult):
             err = VectorAdapterError(
                 f"VectorTranslator.arun_query returned unsupported type: {type(result_any).__name__}",
-                code="BAD_TRANSLATED_RESULT",
+                code=ErrorCodes.BAD_TRANSLATED_RESULT,
             )
             attach_context(
                 err,
@@ -1443,7 +1946,7 @@ class CorpusLangChainVectorStore(VectorStore):
         return self._from_corpus_matches(matches)
 
     # ------------------------------------------------------------------ #
-    # MMR search (improved + configurable similarity)
+    # MMR search (improved + configurable similarity)  [kept as in your file]
     # ------------------------------------------------------------------ #
 
     @staticmethod
@@ -1591,13 +2094,15 @@ class CorpusLangChainVectorStore(VectorStore):
         """
         Perform Maximal Marginal Relevance (MMR) search (sync).
         """
+        _ensure_not_in_event_loop("max_marginal_relevance_search")
+
         if k <= 0:
             return []
 
         if not (0.0 <= lambda_mult <= 1.0):
             err = BadRequest(
                 f"lambda_mult must be in [0, 1], got {lambda_mult}",
-                code="BAD_MMR_LAMBDA",
+                code=ErrorCodes.BAD_MMR_LAMBDA,
             )
             attach_context(
                 err,
@@ -1649,7 +2154,7 @@ class CorpusLangChainVectorStore(VectorStore):
         if not isinstance(result_any, QueryResult):
             err = VectorAdapterError(
                 f"VectorTranslator.query returned unsupported type: {type(result_any).__name__}",
-                code="BAD_TRANSLATED_RESULT",
+                code=ErrorCodes.BAD_TRANSLATED_RESULT,
             )
             attach_context(
                 err,
@@ -1691,7 +2196,7 @@ class CorpusLangChainVectorStore(VectorStore):
         if not (0.0 <= lambda_mult <= 1.0):
             err = BadRequest(
                 f"lambda_mult must be in [0, 1], got {lambda_mult}",
-                code="BAD_MMR_LAMBDA",
+                code=ErrorCodes.BAD_MMR_LAMBDA,
             )
             attach_context(
                 err,
@@ -1743,7 +2248,7 @@ class CorpusLangChainVectorStore(VectorStore):
         if not isinstance(result_any, QueryResult):
             err = VectorAdapterError(
                 f"VectorTranslator.arun_query returned unsupported type: {type(result_any).__name__}",
-                code="BAD_TRANSLATED_RESULT",
+                code=ErrorCodes.BAD_TRANSLATED_RESULT,
             )
             attach_context(
                 err,
@@ -1782,6 +2287,8 @@ class CorpusLangChainVectorStore(VectorStore):
         """
         Delete vectors by IDs or metadata filter (sync).
         """
+        _ensure_not_in_event_loop("delete")
+
         namespace: Optional[str] = kwargs.get("namespace")
         ctx = self._build_ctx(**kwargs)
 
@@ -1824,6 +2331,63 @@ class CorpusLangChainVectorStore(VectorStore):
         )
 
     # ------------------------------------------------------------------ #
+    # Resource cleanup (additive, best-effort)
+    # ------------------------------------------------------------------ #
+
+    def close(self) -> None:
+        """
+        Best-effort cleanup of translator resources. Never raises.
+        """
+        try:
+            close_fn = getattr(self._translator, "close", None)
+        except Exception:
+            close_fn = None
+        if callable(close_fn):
+            try:
+                close_fn()
+            except Exception:
+                logger.warning("Error while closing VectorTranslator", exc_info=True)
+
+    async def aclose(self) -> None:
+        """
+        Best-effort async cleanup of translator resources. Never raises.
+        """
+        try:
+            aclose_fn = getattr(self._translator, "aclose", None)
+        except Exception:
+            aclose_fn = None
+        if callable(aclose_fn):
+            try:
+                await aclose_fn()
+                return
+            except Exception:
+                logger.warning("Error while closing VectorTranslator asynchronously", exc_info=True)
+
+        # Fallback to sync close in a thread.
+        try:
+            close_fn = getattr(self._translator, "close", None)
+        except Exception:
+            close_fn = None
+        if callable(close_fn):
+            try:
+                await asyncio.to_thread(close_fn)
+            except Exception:
+                logger.warning("Error while closing VectorTranslator (threaded)", exc_info=True)
+
+    def __enter__(self) -> "CorpusLangChainVectorStore":
+        _ensure_not_in_event_loop("__enter__")
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    async def __aenter__(self) -> "CorpusLangChainVectorStore":
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.aclose()
+
+    # ------------------------------------------------------------------ #
     # Convenience constructors
     # ------------------------------------------------------------------ #
 
@@ -1840,6 +2404,7 @@ class CorpusLangChainVectorStore(VectorStore):
         """
         Create a store from texts, then add them immediately (sync).
         """
+        _ensure_not_in_event_loop("from_texts")
         store = cls(corpus_adapter=corpus_adapter, **kwargs)
         store.add_texts(texts, metadatas=metadatas, ids=ids)
         return store
@@ -1855,6 +2420,7 @@ class CorpusLangChainVectorStore(VectorStore):
         """
         Create a store from Documents, then add them immediately (sync).
         """
+        _ensure_not_in_event_loop("from_documents")
         store = cls(corpus_adapter=corpus_adapter, **kwargs)
         store.add_documents(documents)
         return store
