@@ -110,6 +110,22 @@ Streaming Responses:
 
 The WireEmbeddingHandler in this file is the reference adapter for this contract and is
 intentionally transport-agnostic (HTTP, gRPC, WebSocket, etc.).
+
+-------------------------------------------------------------------------------
+ALIGNMENT / CHANGE LOG (as we go; do not remove)
+-------------------------------------------------------------------------------
+1) SCHEMA.md will need to be updated to align with this SDK code and the conformance
+   tests. We will enumerate required schema/test changes later (logged here).
+2) For embedding: do what this file says; schema will be updated to match.
+3) ctx and args: although some systems could omit them, we are enforcing that ctx and
+   args are REQUIRED on the wire envelope for conformance and cross-protocol consistency.
+   (They may be empty objects, but must be present.)
+4) Schema will be updated accordingly.
+5) Schema should be updated in the schema docs for embedding AND common envelope to
+   reflect required-ness and any field constraints.
+
+NOTE: We are NOT changing external conformance suite behavior here; we are making the
+open-source SDK/wire handler strict and then updating schemas to match.
 """
 
 from __future__ import annotations
@@ -121,6 +137,7 @@ import math
 import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, asdict
+from collections.abc import Mapping as ABCMapping
 from typing import (
     Any,
     Awaitable,
@@ -988,7 +1005,7 @@ class EmbeddingProtocolV1(Protocol):
     ) -> Union[EmbedResult, AsyncIterator[EmbedChunk]]:
         """
         Generate embedding for a single text.
-        
+
         Returns:
             EmbedResult for non-streaming requests, AsyncIterator[EmbedChunk] for streaming
         """
@@ -1207,7 +1224,7 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
                         x["deadline_bucket"] = "<60s"
                     else:
                         x["deadline_bucket"] = ">=60s"
-            
+
             # Record to adapter's built-in metrics
             self._metrics.observe(
                 component=self._component,
@@ -1217,7 +1234,7 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
                 code=code,
                 extra=x or None,
             )
-            
+
             # Also record to context metrics if provided
             if ctx and ctx.metrics:
                 ctx.metrics.observe(
@@ -1228,7 +1245,7 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
                     code=code,
                     extra=x or None,
                 )
-            
+
             if not ok:
                 self._metrics.counter(
                     component=self._component,
@@ -1414,19 +1431,19 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
             t0 = time.monotonic()
             chunks_yielded = 0
             stream_completed = False
-            
+
             try:
                 # Track active stream
                 self._stream_stats["active_streams"] += 1
-                
+
                 async for chunk in self._apply_deadline(stream_factory(), ctx):
                     chunks_yielded += 1
                     self._stream_stats["total_chunks"] += 1
                     yield chunk
-                
+
                 stream_completed = True
                 self._stream_stats["completed_streams"] += 1
-                
+
                 # Record successful stream completion
                 self._record(
                     f"{op}_stream",
@@ -1437,7 +1454,7 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
                     **(metric_extra or {}),
                 )
                 self._breaker.on_success()
-                
+
             except EmbeddingAdapterError as e:
                 code = e.code or type(e).__name__
                 extra = dict(metric_extra or {})
@@ -1627,14 +1644,14 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
             caps = await self._do_capabilities()
             if not caps.supports_streaming:
                 raise NotSupported("streaming embeddings not supported by this adapter")
-            
+
             # For streaming, use the streaming gate wrapper
             metric_extra: Dict[str, Any] = {}
             if self._tag_model_in_metrics:
                 model_tag = self._safe_model_tag(spec.model)
                 if model_tag:
                     metric_extra["model"] = model_tag
-            
+
             return self._with_streaming_gates(
                 op="embed",
                 ctx=ctx,
@@ -2132,11 +2149,11 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
     async def get_stats(self, *, ctx: Optional[OperationContext] = None) -> EmbeddingStats:
         """
         Get embedding operation statistics and usage information.
-        
+
         Includes streaming-specific metrics in addition to base statistics.
         """
         base_stats = await self._do_get_stats(ctx)
-        
+
         # Enhance with real-time streaming metrics
         return EmbeddingStats(
             total_requests=base_stats.total_requests,
@@ -2192,9 +2209,9 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
     ) -> AsyncIterator[EmbedChunk]:
         """
         Implement streaming text embedding with validated inputs.
-        
+
         Yield EmbedChunk objects until the stream is complete.
-        
+
         Note: Streaming implementations should consider caching the final
         aggregated result when the stream completes successfully.
         """
@@ -2237,7 +2254,7 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
     async def _do_get_stats(self, ctx: Optional[OperationContext] = None) -> EmbeddingStats:
         """
         Implement statistics collection for embedding operations.
-        
+
         Default implementation returns empty stats. Override for detailed metrics.
         """
         return EmbeddingStats()
@@ -2316,7 +2333,7 @@ def _success_to_wire(result: Any, ms: float) -> Dict[str, Any]:
 def _stream_chunk_to_wire(chunk: EmbedChunk, ms: float) -> Dict[str, Any]:
     """
     Map streaming chunk to canonical streaming envelope.
-    
+
     Note: Transport layers must handle streaming responses appropriately.
     This is a helper for chunk serialization only.
     """
@@ -2348,6 +2365,22 @@ class WireEmbeddingHandler:
     def __init__(self, adapter: EmbeddingProtocolV1):
         self._adapter = adapter
 
+    @staticmethod
+    def _require_mapping_field(envelope: Mapping[str, Any], field: str) -> Mapping[str, Any]:
+        """
+        Enforce presence of a required object field on the wire envelope.
+
+        POLICY (per alignment notes above):
+        - 'ctx' and 'args' are REQUIRED for conformance and cross-protocol consistency.
+        - Callers MAY send empty objects for either field if they have no data to provide.
+        """
+        if field not in envelope:
+            raise BadRequest(f"missing '{field}'")
+        value = envelope.get(field)
+        if not isinstance(value, ABCMapping):
+            raise BadRequest(f"'{field}' must be an object")
+        return value  # type: ignore[return-value]
+
     async def handle(self, envelope: Mapping[str, Any]) -> Dict[str, Any]:
         """
         Handle a single unary request envelope and return a response envelope.
@@ -2362,12 +2395,18 @@ class WireEmbeddingHandler:
         """
         t0 = time.monotonic()
         try:
+            if not isinstance(envelope, ABCMapping):
+                raise BadRequest("envelope must be an object")
+
             op = envelope.get("op")
             if not isinstance(op, str):
                 raise BadRequest("missing or invalid 'op'")
 
-            ctx = _ctx_from_wire(envelope.get("ctx") or {})
-            args = envelope.get("args") or {}
+            # REQUIRED fields (ctx + args must be present; may be empty objects)
+            ctx_map = self._require_mapping_field(envelope, "ctx")
+            args = self._require_mapping_field(envelope, "args")
+
+            ctx = _ctx_from_wire(ctx_map)
 
             if op == "embedding.capabilities":
                 res = await self._adapter.capabilities()
@@ -2375,12 +2414,12 @@ class WireEmbeddingHandler:
 
             if op == "embedding.embed":
                 # Check for streaming - wire handler doesn't support streaming responses
-                if args.get("stream", False):
+                if bool(args.get("stream", False)):
                     raise NotSupported(
                         "streaming embeddings not supported via wire handler - "
                         "use transport-specific streaming implementation"
                     )
-                
+
                 spec = EmbedSpec(
                     text=args.get("text", ""),
                     model=args.get("model", ""),
