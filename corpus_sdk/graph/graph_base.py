@@ -833,9 +833,9 @@ class InMemoryTTLCache:
         return val
 
     async def set(self, key: str, value: Any, ttl_s: int) -> None:
-        # Allow ttl_s == 0 to disable caching (embedding-aligned semantics).
-        ttl = max(0, int(ttl_s))
-        if ttl == 0:
+        # ttl_s==0 is treated as "do not cache" to allow deterministic opt-out.
+        ttl = int(ttl_s)
+        if ttl <= 0:
             return
         self._store[key] = (time.monotonic() + ttl, value)
 
@@ -1163,7 +1163,7 @@ class BaseGraphAdapter(GraphProtocolV1):
             self._cache = cache or NoopCache()
             self._limiter = limiter or NoopLimiter()
 
-        # Allow 0 to mean "disable caching" (embedding-aligned semantics).
+        # TTL=0 disables caching deterministically (embedding/LLM-aligned semantics).
         self._cache_query_ttl_s = max(0, int(cache_query_ttl_s))
         self._cache_caps_ttl_s = max(0, int(cache_caps_ttl_s))
         self._cache_bulk_vertices_ttl_s = max(0, int(cache_bulk_vertices_ttl_s))
@@ -1341,7 +1341,6 @@ class BaseGraphAdapter(GraphProtocolV1):
     def _validate_edge(self, edge: Edge) -> None:
         if not isinstance(edge.label, str) or not edge.label:
             raise BadRequest("edge.label must be a non-empty string")
-        # GraphID is NewType(str) at type-check time; at runtime it is a str.
         if not edge.src or not isinstance(edge.src, str):
             raise BadRequest("edge.src must be a non-empty string")
         if not edge.dst or not isinstance(edge.dst, str):
@@ -1363,14 +1362,9 @@ class BaseGraphAdapter(GraphProtocolV1):
         if namespace is None or isinstance(self._cache, NoopCache):
             return
 
-        # Cache invalidation is advisory; runtime caches may omit invalidate_pattern.
-        invalidate = getattr(self._cache, "invalidate_pattern", None)
-        if invalidate is None:
-            return
-
         try:
             pattern = f"ns={namespace}|"
-            await invalidate(pattern)
+            await self._cache.invalidate_pattern(pattern)
         except Exception:
             # Never let cache invalidation break the main operation
             LOG.debug("Cache invalidation failed for namespace %s", namespace)
@@ -1508,6 +1502,11 @@ class BaseGraphAdapter(GraphProtocolV1):
                     yield chunk
                 self._record(op, t0, True, ctx=ctx, **metric_extra)
                 self._breaker.on_success()
+            except asyncio.CancelledError as e:
+                # Consumer cancellation / disconnect: record and re-raise.
+                self._record(op, t0, False, code="CancelledError", ctx=ctx, **metric_extra)
+                self._breaker.on_error(e)
+                raise
             except GraphAdapterError as e:
                 self._record(op, t0, False, code=e.code or type(e).__name__, ctx=ctx, **metric_extra)
                 self._breaker.on_error(e)
@@ -1519,12 +1518,15 @@ class BaseGraphAdapter(GraphProtocolV1):
                 raise
             finally:
                 self._limiter.release()
-                # Ensure underlying stream resources are cleaned up
+                # Ensure underlying stream resources are cleaned up (best-effort).
                 if agen is not None:
-                    try:
-                        await agen.aclose()  # If the async generator supports it
-                    except (AttributeError, RuntimeError):
-                        pass  # Not all async generators have aclose()
+                    close_fn = getattr(agen, "aclose", None)
+                    if callable(close_fn):
+                        try:
+                            # Shield cleanup so cancellation doesn't prevent closing sockets/streams.
+                            await asyncio.shield(close_fn())
+                        except Exception:
+                            pass
 
         return _gen()
 
@@ -1596,11 +1598,7 @@ class BaseGraphAdapter(GraphProtocolV1):
                     )
 
             # Use pluggable cache interface for read-only, non-streaming queries
-            if (
-                not isinstance(self._cache, NoopCache)
-                and self._cache_query_ttl_s > 0
-                and not spec.stream
-            ):
+            if not isinstance(self._cache, NoopCache) and not spec.stream and self._cache_query_ttl_s > 0:
                 key = self._make_cache_key(op="query", spec=spec, ctx=ctx)
                 cached = await self._cache.get(key)
                 if cached:
@@ -1675,8 +1673,6 @@ class BaseGraphAdapter(GraphProtocolV1):
         for n in spec.nodes:
             if n.properties is not None:
                 self._validate_properties_map(n.properties)
-        # Note: Other node validation (labels, etc.) is delegated to the adapter
-        # to allow for soft failures and per-node error reporting
 
         async def _call() -> UpsertResult:
             if self._auto_timestamp_writes:
@@ -1731,7 +1727,6 @@ class BaseGraphAdapter(GraphProtocolV1):
         """Batch upsert edges with validation, gates, and optional timestamp management."""
         if not spec.edges:
             raise BadRequest("edges must not be empty")
-        # Validate critical fields that would break graph integrity
         for e in spec.edges:
             self._validate_edge(e)
 
@@ -2093,24 +2088,6 @@ class BaseGraphAdapter(GraphProtocolV1):
         *,
         ctx: Optional[OperationContext] = None,
     ) -> BatchResult:
-        """
-        Execute a batch of operations atomically as a transaction.
-
-        This provides ACID guarantees for the entire batch - either all
-        operations succeed or none are applied.
-
-        Args:
-            operations: List of batch operations to execute atomically
-            ctx: Operation context including deadline and tracing
-
-        Returns:
-            BatchResult with transaction-level success/failure status
-
-        Raises:
-            NotSupported: If transactions are not supported by the backend
-            BadRequest: If transaction operations are invalid
-            DeadlineExceeded: If transaction exceeds context deadline
-        """
         caps = await self.capabilities()
         if not caps.supports_transaction:
             raise NotSupported("transactions are not supported by this adapter")
@@ -2124,7 +2101,6 @@ class BaseGraphAdapter(GraphProtocolV1):
                 details={"max_batch_ops": caps.max_batch_ops},
             )
 
-        # Validate transaction operations
         for idx, op in enumerate(operations):
             if not isinstance(op.op, str) or not op.op:
                 raise BadRequest(
@@ -2140,7 +2116,6 @@ class BaseGraphAdapter(GraphProtocolV1):
         async def _call() -> BatchResult:
             result = await self._do_transaction(operations, ctx=ctx)
 
-            # Invalidate caches for successful write operations in transaction
             if result.success:
                 namespaces_to_invalidate = set()
                 for idx, op in enumerate(operations):
@@ -2149,8 +2124,6 @@ class BaseGraphAdapter(GraphProtocolV1):
                             namespace = self._extract_namespace_from_batch_op(op)
                             if namespace is not None:
                                 namespaces_to_invalidate.add(namespace)
-
-                # Invalidate each affected namespace
                 for namespace in namespaces_to_invalidate:
                     await self._invalidate_namespace_cache(namespace)
 
@@ -2169,24 +2142,6 @@ class BaseGraphAdapter(GraphProtocolV1):
         *,
         ctx: Optional[OperationContext] = None,
     ) -> TraversalResult:
-        """
-        Perform graph traversal starting from specified nodes.
-
-        Traversal explores the graph structure by following relationships
-        from starting nodes up to a specified depth.
-
-        Args:
-            spec: Traversal specification including start nodes, depth, filters
-            ctx: Operation context including deadline and tracing
-
-        Returns:
-            TraversalResult containing discovered nodes, relationships, and paths
-
-        Raises:
-            NotSupported: If traversal operations are not supported
-            BadRequest: If traversal specification is invalid
-            DeadlineExceeded: If traversal exceeds context deadline
-        """
         caps = await self.capabilities()
         if not caps.supports_traversal:
             raise NotSupported("traversal operations are not supported by this adapter")
@@ -2200,14 +2155,12 @@ class BaseGraphAdapter(GraphProtocolV1):
                 details={"max_traversal_depth": caps.max_traversal_depth},
             )
 
-        # Validate filters
         if spec.node_filters is not None:
             self._validate_properties_map(spec.node_filters)
         if spec.relationship_filters is not None:
             self._validate_properties_map(spec.relationship_filters)
 
         async def _call() -> TraversalResult:
-            # Use pluggable cache interface for read-only traversals
             if not isinstance(self._cache, NoopCache) and self._cache_query_ttl_s > 0:
                 key = self._make_cache_key(op="traversal", spec=spec, ctx=ctx)
                 cached = await self._cache.get(key)
@@ -2324,12 +2277,6 @@ class BaseGraphAdapter(GraphProtocolV1):
         *,
         ctx: Optional[OperationContext] = None,
     ) -> BatchResult:
-        """
-        Backend hook for atomic transaction execution.
-
-        Adapters should override this to provide transaction support.
-        Default implementation raises NotSupported.
-        """
         raise NotSupported("transactions are not implemented by this adapter")
 
     async def _do_traversal(
@@ -2338,12 +2285,6 @@ class BaseGraphAdapter(GraphProtocolV1):
         *,
         ctx: Optional[OperationContext] = None,
     ) -> TraversalResult:
-        """
-        Backend hook for graph traversal operations.
-
-        Adapters should override this to provide traversal support.
-        Default implementation raises NotSupported.
-        """
         raise NotSupported("traversal operations are not implemented by this adapter")
 
 
@@ -2412,6 +2353,8 @@ def _success_to_wire(result: Any, ms: float) -> Dict[str, Any]:
 def _chunk_to_wire(chunk: QueryChunk, ms: float) -> Dict[str, Any]:
     """
     Map QueryChunk to streaming envelope.
+
+    Streaming frames use code="STREAMING" to align across SDKs.
     """
     return {
         "ok": True,
@@ -2434,8 +2377,11 @@ class WireGraphHandler:
     @staticmethod
     def _require_ctx_args(envelope: Mapping[str, Any]) -> Tuple[Mapping[str, Any], Mapping[str, Any]]:
         """
-        Enforce interoperability requirements:
-        - ctx and args MUST be present and MUST be objects.
+        Enforce canonical envelope strictness:
+            - 'ctx' MUST be present and MUST be an object
+            - 'args' MUST be present and MUST be an object
+
+        This keeps the wire contract unambiguous and matches the canonical envelope semantics.
         """
         if "ctx" not in envelope:
             raise BadRequest("missing required 'ctx'")
@@ -2455,10 +2401,7 @@ class WireGraphHandler:
     @staticmethod
     def _require_mapping_list(name: str, value: Any) -> List[Mapping[str, Any]]:
         """
-        Defensive parsing helper for wire lists.
-
-        Ensures list elements are mappings so malformed input becomes BadRequest
-        (not a generic UNAVAILABLE).
+        Defensive parsing helper for wire lists (list of objects).
         """
         if value is None:
             return []
@@ -2496,8 +2439,8 @@ class WireGraphHandler:
         """
         Coerce and validate a wire node dict for typed construction.
 
-        - Ensures required fields exist and types are safe.
-        - Coerces id to GraphID for typing consistency.
+        - Ensures id exists and is a string.
+        - Coerces id to GraphID for typed consistency.
         """
         d = dict(raw)
         if "id" not in d:
@@ -2515,7 +2458,8 @@ class WireGraphHandler:
         """
         Coerce and validate a wire edge dict for typed construction.
 
-        Coerces id/src/dst to GraphID for typing consistency.
+        - Ensures id/src/dst/label exist and are correct types.
+        - Coerces id/src/dst to GraphID for typed consistency.
         """
         d = dict(raw)
         for field in ("id", "src", "dst", "label"):
@@ -2531,11 +2475,7 @@ class WireGraphHandler:
         if not isinstance(d["dst"], str) or not d["dst"]:
             raise BadRequest("edges[*].dst must be a non-empty string", details={"index": idx, "field": "edges.dst"})
         if not isinstance(d["label"], str) or not d["label"]:
-            raise BadRequest(
-                "edges[*].label must be a non-empty string",
-                details={"index": idx, "field": "edges.label"},
-            )
-
+            raise BadRequest("edges[*].label must be a non-empty string", details={"index": idx, "field": "edges.label"})
         d["id"] = GraphID(d["id"])
         d["src"] = GraphID(d["src"])
         d["dst"] = GraphID(d["dst"])
@@ -2568,7 +2508,6 @@ class WireGraphHandler:
             if not isinstance(op, str):
                 raise BadRequest("missing or invalid 'op'")
 
-            # Require ctx + args for interoperability.
             ctx_raw, args = self._require_ctx_args(envelope)
             ctx = _ctx_from_wire(ctx_raw)
 
@@ -2586,34 +2525,20 @@ class WireGraphHandler:
 
             if op == "graph.upsert_nodes":
                 nodes_raw = self._require_mapping_list("nodes", args.get("nodes"))
-                nodes: List[Node] = []
-                for i, n in enumerate(nodes_raw):
-                    try:
-                        nodes.append(Node(**self._coerce_node_dict(n, i)))
-                    except GraphAdapterError:
-                        raise
-                    except Exception as e:
-                        raise BadRequest(f"Invalid node at nodes[{i}]: {e}") from e
+                nodes = [Node(**self._coerce_node_dict(n, i)) for i, n in enumerate(nodes_raw)]
                 spec = UpsertNodesSpec(nodes=nodes, namespace=args.get("namespace"))
                 res = await self._adapter.upsert_nodes(spec, ctx=ctx)
                 return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
 
             if op == "graph.upsert_edges":
                 edges_raw = self._require_mapping_list("edges", args.get("edges"))
-                edges: List[Edge] = []
-                for i, e in enumerate(edges_raw):
-                    try:
-                        edges.append(Edge(**self._coerce_edge_dict(e, i)))
-                    except GraphAdapterError:
-                        raise
-                    except Exception as ex:
-                        raise BadRequest(f"Invalid edge at edges[{i}]: {ex}") from ex
+                edges = [Edge(**self._coerce_edge_dict(e, i)) for i, e in enumerate(edges_raw)]
                 spec = UpsertEdgesSpec(edges=edges, namespace=args.get("namespace"))
                 res = await self._adapter.upsert_edges(spec, ctx=ctx)
                 return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
 
             if op == "graph.delete_nodes":
-                ids = [GraphID(s) for s in self._require_string_list("ids", args.get("ids"))]
+                ids = [GraphID(i) for i in self._require_string_list("ids", args.get("ids"))]
                 spec = DeleteNodesSpec(
                     ids=ids,
                     namespace=args.get("namespace"),
@@ -2623,7 +2548,7 @@ class WireGraphHandler:
                 return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
 
             if op == "graph.delete_edges":
-                ids = [GraphID(s) for s in self._require_string_list("ids", args.get("ids"))]
+                ids = [GraphID(i) for i in self._require_string_list("ids", args.get("ids"))]
                 spec = DeleteEdgesSpec(
                     ids=ids,
                     namespace=args.get("namespace"),
@@ -2642,12 +2567,7 @@ class WireGraphHandler:
 
             if op == "graph.batch":
                 ops_raw = self._require_mapping_list("ops", args.get("ops"))
-                ops: List[BatchOperation] = []
-                for i, o in enumerate(ops_raw):
-                    try:
-                        ops.append(BatchOperation(**dict(o)))
-                    except Exception as e:
-                        raise BadRequest(f"Invalid batch op at ops[{i}]: {e}") from e
+                ops = [BatchOperation(**dict(o)) for o in ops_raw]
                 res = await self._adapter.batch(ops, ctx=ctx)
                 return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
 
@@ -2661,12 +2581,7 @@ class WireGraphHandler:
 
             if op == "graph.transaction":
                 ops_raw = self._require_mapping_list("operations", args.get("operations"))
-                ops: List[BatchOperation] = []
-                for i, o in enumerate(ops_raw):
-                    try:
-                        ops.append(BatchOperation(**dict(o)))
-                    except Exception as e:
-                        raise BadRequest(f"Invalid transaction op at operations[{i}]: {e}") from e
+                ops = [BatchOperation(**dict(o)) for o in ops_raw]
                 res = await self._adapter.transaction(ops, ctx=ctx)
                 return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
 
@@ -2696,19 +2611,17 @@ class WireGraphHandler:
             return
 
         try:
-            # Require ctx + args for interoperability.
             ctx_raw, args = self._require_ctx_args(envelope)
             ctx = _ctx_from_wire(ctx_raw)
+            try:
+                spec = GraphQuerySpec(**dict(args))
+            except (TypeError, ValueError) as spec_err:
+                raise BadRequest(f"Invalid query spec: {spec_err}") from spec_err
         except Exception as e:
             yield _error_to_wire(e, 0.0)
             return
 
         try:
-            try:
-                spec = GraphQuerySpec(**dict(args))
-            except (TypeError, ValueError) as spec_err:
-                raise BadRequest(f"Invalid query spec: {spec_err}") from spec_err
-
             agen = self._adapter.stream_query(spec, ctx=ctx)
             async for chunk in agen:
                 ms = (time.monotonic() - t0) * 1000.0
