@@ -1,4 +1,4 @@
-# CORPUS Protocol Conformance Test Configuration
+# CORPUS Protocol Conformance Test Configuration V1.0
 
 This `conftest.py` file provides the test configuration and fixtures for the CORPUS Protocol Conformance Framework. It integrates all components of the certification system and enables the unified testing of protocol adapters.
 
@@ -17,6 +17,59 @@ The configuration is automatically loaded when pytest runs tests in the CORPUS c
 ```bash
 pip install -r requirements.txt
 ```
+
+## Version Compatibility Matrix
+
+### Python & Dependency Requirements
+From the codebase analysis:
+
+**Python Compatibility** (`conftest.py`):
+```python
+# SQLite workaround for ChromaDB/CrewAI compatibility
+# ChromaDB requires SQLite >= 3.35.0, but system may have older version
+# Use pysqlite3-binary which includes a newer SQLite version
+import sys
+try:
+    import pysqlite3
+    # Override sqlite3 module with pysqlite3 before any imports
+    sys.modules['sqlite3'] = sys.modules['pysqlite3']
+except ImportError:
+    # If pysqlite3 not available, use system sqlite3
+    # (some tests may skip due to version requirements)
+    pass
+```
+
+**Minimum Requirements**:
+- **Python**: 3.8+ (type hints suggest Python 3.8+ compatibility)
+- **SQLite**: ≥3.35.0 (or `pysqlite3-binary` package)
+- **pytest**: 7.0+ (based on plugin API usage)
+
+**JSON Schema Requirements** (`schema_registry.py`):
+- **jsonschema**: Draft 2020-12 support required
+- **Schema $id format**: Must be valid URI (http/https/urn/tag)
+
+### Protocol Version ↔ Test Suite Mapping
+From `wire_cases.py`:
+```python
+# Protocol + schema versioning
+PROTOCOL_VERSION = "1.0"
+SCHEMA_VERSION_SEGMENT = f"v{PROTOCOL_VERSION.split('.')[0]}"  # "v1"
+
+# Note: Schemas are stored WITHOUT version subdirectory
+# e.g., /schemas/llm/llm.envelope.request.json (not /schemas/llm/v1/...)
+```
+
+**Version Mapping**:
+- **Protocol V1.0** → All test suites (`llm`, `vector`, `graph`, `embedding`, frameworks)
+- **Wire Format V1** → `tests/live/` conformance tests
+- **Schema Draft 2020-12** → `tests/schema/` validation tests
+
+### Breaking Changes History
+From protocol configurations in `conftest.py`:
+- **All protocols**: Require Draft 2020-12 JSON Schema compliance
+- **Wire envelope**: Must include `op`, `ctx.request_id`, `args` (validated in `wire_validators.py`)
+- **Context fields**: `deadline_ms` must be 1-3,600,000 ms (1 hour)
+- **Schema $id**: Must be unique across all schemas (enforced by `schema_registry.py`)
 
 ## Environment Variables
 
@@ -239,26 +292,125 @@ export CORPUS_ADAPTER=my_llm_adapter:MyLLMAdapter
 pytest tests/llm -v
 ```
 
-## Troubleshooting
+## Getting Unstuck: Common Errors & Solutions
 
-### Adapter Instantiation Failed
-```
-❌ Adapter configuration error: Failed to instantiate adapter 'my_module:MyAdapter'
-```
-**Solution**: Ensure your adapter has a no-arg constructor or set `CORPUS_ENDPOINT`.
+### 1. **Adapter Instantiation Errors**
 
-### Schema Not Found
-```
-KeyError: Schema not found: https://corpusos.com/schemas/llm/llm.envelope.request.json
-```
-**Solution**: Set `CORPUS_SCHEMAS_ROOT` to point to your schemas directory.
+**Error Message** (from `conftest.py`):
+```python
+class AdapterValidationError(RuntimeError):
+    pass
 
-### Test Categorization Issues
-Tests appearing under "Other (non-CORPUS conformance tests)"
-**Solution**: Place tests in correct directory structure or update categorization patterns in `conftest.py`.
+# Common instantiation patterns checked:
+# 1. Adapter(endpoint=...)  # CORPUS_ENDPOINT environment variable
+# 2. Adapter(base_url=...)
+# 3. Adapter(url=...)
+# 4. Adapter()  # No-arg constructor
+```
 
-### Performance Issues
-**Solution**: Use `--skip-schema` for faster iteration during development.
+**Quick Fixes**:
+```python
+# If you see: "Failed to instantiate adapter 'module:ClassName'"
+# Check your adapter constructor signature:
+class MyAdapter:
+    def __init__(self, endpoint=None):  # ✓ Accepts endpoint parameter
+        pass
+    
+    # OR implement no-arg constructor:
+    def __init__(self):  # ✓ No arguments required
+        pass
+```
+
+### 2. **Schema Validation Errors**
+
+**Common Patterns** (from `wire_validators.py`):
+```python
+# Error: "Schema validation failed"
+# Usually means envelope doesn't match JSON Schema
+
+# Check these common issues:
+# 1. Missing required fields: {"op", "ctx", "args"}
+# 2. Invalid field types: "deadline_ms" must be integer
+# 3. Out of range: "deadline_ms" must be 1-3,600,000
+```
+
+**Debug Mode**:
+```bash
+# Enable verbose schema errors
+export CORPUS_VERBOSE_FAILURES=1
+pytest tests/live -v
+
+# Skip schema validation temporarily
+export CORPUS_SKIP_SCHEMA_VALIDATION=1
+pytest tests/live -v
+```
+
+### 3. **Test Categorization Issues**
+
+**From `conftest.py` categorization logic**:
+```python
+# Tests appearing under "Other (non-CORPUS conformance tests)"?
+# Directory patterns used for categorization:
+# - tests/llm/ → "llm" protocol
+# - tests/vector/ → "vector" protocol  
+# - tests/frameworks/llm/ → "llm_frameworks"
+# - tests/live/ → "wire" protocol
+```
+
+**Solution**: Place tests in correct directory or update path in test file.
+
+### 4. **JSON Schema Loading Errors**
+
+**From `schema_registry.py` error patterns**:
+```python
+# Error: "Schema not found: https://corpusos.com/schemas/llm/..."
+# Solutions:
+# 1. Set CORPUS_SCHEMAS_ROOT environment variable
+# 2. Check schema files exist in schemas/ directory
+# 3. Verify $id matches filename pattern
+
+# Error: "Duplicate $id detected"
+# Each schema must have unique $id field
+```
+
+### 5. **Performance Issues**
+
+**Cache Statistics** (reported in terminal output):
+```
+🔧 Performance: 1423 cache hits, 87 misses (cache size: 256)
+```
+**Low hit rate?** Enable verbose mode to see categorization patterns.
+
+### 6. **Wire Validation Failures**
+
+**Common error patterns** (from `wire_validators.py`):
+```python
+# ValidationError: 'ctx.request_id' length must be 1-128
+# ValidationError: 'args.messages' must be array
+# ValidationError: Vector dimensions must be 1-65536
+```
+
+**Debug with**:
+```bash
+# See exact validation failure
+pytest tests/live/test_wire_conformance.py::test_wire_request_envelope -v
+
+# Check specific case
+pytest tests/live/test_wire_conformance.py -k "test_wire_request_envelope[llm_complete]" -v
+```
+
+### 7. **Community Resources Pattern**
+
+**From codebase organization**:
+- **Issue tracking**: Check test file headers for `# SPDX-License-Identifier: Apache-2.0`
+- **Code references**: Each protocol has spec section mapping in `conftest.py`
+- **Error guidance**: Each test category has `error_guidance` with spec references
+
+**Debug workflow**:
+1. Run with `--conformance-verbose` flag
+2. Check JSON report for protocol-level failures
+3. Review `error_guidance` in `conftest.py` for specific test category
+4. Refer to spec sections listed in terminal output
 
 ## JSON Report Output
 
