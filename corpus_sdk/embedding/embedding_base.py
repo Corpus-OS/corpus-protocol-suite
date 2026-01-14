@@ -111,21 +111,6 @@ Streaming Responses:
 The WireEmbeddingHandler in this file is the reference adapter for this contract and is
 intentionally transport-agnostic (HTTP, gRPC, WebSocket, etc.).
 
--------------------------------------------------------------------------------
-ALIGNMENT / CHANGE LOG (as we go; do not remove)
--------------------------------------------------------------------------------
-1) SCHEMA.md will need to be updated to align with this SDK code and the conformance
-   tests. We will enumerate required schema/test changes later (logged here).
-2) For embedding: do what this file says; schema will be updated to match.
-3) ctx and args: although some systems could omit them, we are enforcing that ctx and
-   args are REQUIRED on the wire envelope for conformance and cross-protocol consistency.
-   (They may be empty objects, but must be present.)
-4) Schema will be updated accordingly.
-5) Schema should be updated in the schema docs for embedding AND common envelope to
-   reflect required-ness and any field constraints.
-
-NOTE: We are NOT changing external conformance suite behavior here; we are making the
-open-source SDK/wire handler strict and then updating schemas to match.
 """
 
 from __future__ import annotations
