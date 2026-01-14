@@ -1,4 +1,4 @@
-# `conftest.py` - CORPUS Protocol Conformance Test Configuration
+# CORPUS Protocol Conformance Test Configuration
 
 This `conftest.py` file provides the test configuration and fixtures for the CORPUS Protocol Conformance Framework. It integrates all components of the certification system and enables the unified testing of protocol adapters.
 
