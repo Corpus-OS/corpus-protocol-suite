@@ -158,6 +158,18 @@ Streaming (llm.stream):
         - On error, a single error envelope is sent and terminates the stream.
 
 LLM_PROTOCOL_ID is advertised in capabilities; it is not required per request.
+
+IMPORTANT WIRE STRICTNESS NOTE (Alignment)
+------------------------------------------
+For interoperability and forward/backward compatibility, this SDK treats the
+WIRE boundary as strict:
+
+- Envelopes MUST include top-level keys: op, ctx, args
+- ctx MUST be an object (mapping)
+- args MUST be an object (mapping)
+
+This is intentionally stricter than in-process calls (ctx is optional there),
+and is aligned with the canonical envelope contract.
 """
 
 from __future__ import annotations
@@ -166,6 +178,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import secrets
 import time
 from dataclasses import dataclass, asdict, field
 from typing import (
@@ -567,6 +580,24 @@ class Cache(Protocol):
         ...
 
 
+class TTLAwareCache(Protocol):
+    """
+    Optional TTL capability surface for cache implementations.
+
+    NOTE:
+        This is deliberately separate from Cache to avoid forcing every cache
+        implementation (and type-checkers) to define supports_ttl.
+
+    BaseLLMAdapter uses getattr(cache, "supports_ttl", None) to detect this
+    capability at runtime; caches that do not expose supports_ttl are treated
+    as TTL-capable by default for backward compatibility.
+    """
+
+    @property
+    def supports_ttl(self) -> bool:
+        ...
+
+
 class RateLimiter(Protocol):
     """Simple rate limiter interface."""
 
@@ -680,6 +711,11 @@ class NoopCache:
         """Accepts ttl_s for interface compatibility but ignores it."""
         return None
 
+    # Optional capability surface (not required by Cache Protocol)
+    @property
+    def supports_ttl(self) -> bool:
+        return False
+
 
 class InMemoryTTLCache:
     """
@@ -690,6 +726,10 @@ class InMemoryTTLCache:
         - Not thread-safe; intended for single-threaded event loop usage.
         - Opportunistic pruning; callers must not rely on strong guarantees.
         - Safe default for standalone/dev mode.
+
+    NOTE:
+        ttl_s <= 0 means "do not cache" and is treated as a hard opt-out.
+        This allows BaseLLMAdapter.cache_ttl_s == 0 to disable caching end-to-end.
     """
 
     def __init__(self) -> None:
@@ -710,6 +750,10 @@ class InMemoryTTLCache:
         return val
 
     async def set(self, key: str, value: Any, ttl_s: int) -> None:
+        # Treat ttl_s <= 0 as "do not cache" (hard opt-out).
+        if int(ttl_s) <= 0:
+            return None
+
         exp = time.monotonic() + max(1, int(ttl_s))
         self._store[key] = (exp, value)
         # Basic pruning to avoid unbounded growth.
@@ -720,6 +764,11 @@ class InMemoryTTLCache:
                         del self._store[k]
             except Exception:
                 pass
+
+    # Optional capability surface (not required by Cache Protocol)
+    @property
+    def supports_ttl(self) -> bool:
+        return True
 
 
 class NoopLimiter:
@@ -781,7 +830,7 @@ class LLMCapabilities:
         - Input validation (e.g., context window)
         - Detecting support for streaming / JSON modes / tools / deadlines
     """
-    
+
     server: str
     version: str
     model_family: str
@@ -790,10 +839,10 @@ class LLMCapabilities:
     supports_streaming: bool = True
     supports_roles: bool = True
     supports_json_output: bool = False
-    supports_tools: bool = False  
+    supports_tools: bool = False
     supports_parallel_tool_calls: bool = False
-    supports_tool_choice: bool = False  
-    max_tool_calls_per_turn: Optional[int] = None  
+    supports_tool_choice: bool = False
+    max_tool_calls_per_turn: Optional[int] = None
     idempotent_writes: bool = False
     supports_multi_tenant: bool = False
     supports_system_message: bool = True
@@ -931,6 +980,7 @@ class BaseLLMAdapter(LLMProtocolV1):
                 If True, attaches model to metrics where known.
             cache_ttl_s:
                 TTL for entries in the standalone in-memory cache.
+                NOTE: cache_ttl_s == 0 disables caching end-to-end.
             stream_deadline_check_every_n_chunks:
                 For streaming, perform deadline checks every N chunks instead
                 of for every single chunk. Reduces overhead for high-volume
@@ -938,12 +988,13 @@ class BaseLLMAdapter(LLMProtocolV1):
         """
         self._metrics: MetricsSink = metrics or NoopMetrics()
         self._tag_model_in_metrics: bool = bool(tag_model_in_metrics)
-        
+
         # Configuration validation
         if int(cache_ttl_s) < 0:
             raise ValueError("cache_ttl_s must be non-negative")
-        self._cache_ttl_s: int = max(1, int(cache_ttl_s))
-        
+        # Allow 0 to mean "no caching" (end-to-end).
+        self._cache_ttl_s: int = max(0, int(cache_ttl_s))
+
         if int(stream_deadline_check_every_n_chunks) < 1:
             raise ValueError("stream_deadline_check_every_n_chunks must be >= 1")
         self._stream_deadline_check_every_n_chunks: int = max(
@@ -1140,7 +1191,9 @@ class BaseLLMAdapter(LLMProtocolV1):
         """
         Generate a unique tool call ID.
         """
-        return f"call_{hashlib.sha256(str(time.time()).encode()).hexdigest()[:16]}"
+        # Use a randomness-based ID rather than time-based hashing for better
+        # collision resistance under high concurrency.
+        return f"call_{secrets.token_hex(8)}"
 
     def _record(
         self,
@@ -1186,6 +1239,22 @@ class BaseLLMAdapter(LLMProtocolV1):
                     "deadline already exceeded",
                     details={"remaining_ms": 0},
                 )
+
+    def _cache_supports_ttl(self) -> bool:
+        """
+        Determine whether the configured cache supports TTL semantics.
+
+        - If cache exposes supports_ttl, respect it.
+        - If not exposed, assume TTL-capable for backward compatibility.
+        - Never let capability probing break the call path.
+        """
+        try:
+            v = getattr(self._cache, "supports_ttl", None)
+            if v is None:
+                return True
+            return bool(v)
+        except Exception:
+            return True
 
     def _make_complete_cache_key(
         self,
@@ -1440,11 +1509,12 @@ class BaseLLMAdapter(LLMProtocolV1):
         async def _gen() -> AsyncIterator[LLMChunk]:
             chunk_count = 0
             tokens_total = 0
+            agen: Optional[AsyncIterator[LLMChunk]] = None
             try:
                 agen = agen_factory()
                 async for chunk in agen:
                     chunk_count += 1
-                    
+
                     # Robust usage tracking: update accumulated usage if present in this chunk
                     # This handles cases where usage is only in the final chunk or sent progressively.
                     usage = getattr(chunk, "usage_so_far", None)
@@ -1482,6 +1552,13 @@ class BaseLLMAdapter(LLMProtocolV1):
                     )
                 self._breaker.on_success()
 
+            except asyncio.CancelledError as e:
+                # Ensure cancellation does not leak underlying provider streams.
+                metric_extra["chunks"] = chunk_count
+                self._record(op, t0, False, code="CancelledError", ctx=ctx, **metric_extra)
+                self._breaker.on_error(e)
+                raise
+
             except LLMAdapterError as e:
                 metric_extra["chunks"] = chunk_count
                 code = e.code or type(e).__name__
@@ -1497,6 +1574,15 @@ class BaseLLMAdapter(LLMProtocolV1):
 
             finally:
                 self._limiter.release()
+                # Streaming cleanup: best-effort close of underlying async generator.
+                if agen is not None:
+                    close_fn = getattr(agen, "aclose", None)
+                    if callable(close_fn):
+                        try:
+                            # Shield to avoid being interrupted during cleanup.
+                            await asyncio.shield(close_fn())
+                        except Exception:
+                            pass
 
         return _gen()
 
@@ -1510,21 +1596,25 @@ class BaseLLMAdapter(LLMProtocolV1):
         """
         t0 = time.monotonic()
         try:
-            cached = await self._cache.get(self._caps_cache_key)
-            if cached:
-                self._metrics.counter(
-                    component=self._component,
-                    name="cache_hits",
-                    value=1,
-                    extra={"op": "capabilities"},
-                )
-                self._record("capabilities", t0, True)
-                return cached
+            # Respect cache_ttl_s == 0 as a hard disable.
+            use_cache = (self._cache_ttl_s > 0) and self._cache_supports_ttl()
+            if use_cache:
+                cached = await self._cache.get(self._caps_cache_key)
+                if cached:
+                    self._metrics.counter(
+                        component=self._component,
+                        name="cache_hits",
+                        value=1,
+                        extra={"op": "capabilities"},
+                    )
+                    self._record("capabilities", t0, True)
+                    return cached
             caps = await self._do_capabilities()
-            try:
-                await self._cache.set(self._caps_cache_key, caps, ttl_s=self._cache_ttl_s)
-            except Exception:
-                pass
+            if use_cache:
+                try:
+                    await self._cache.set(self._caps_cache_key, caps, ttl_s=self._cache_ttl_s)
+                except Exception:
+                    pass
             self._record("capabilities", t0, True)
             return caps
         except LLMAdapterError as e:
@@ -1583,30 +1673,34 @@ class BaseLLMAdapter(LLMProtocolV1):
                 caps=caps,
             )
 
+            # Respect cache_ttl_s == 0 as a hard disable.
+            use_cache = (self._cache_ttl_s > 0) and self._cache_supports_ttl()
+
             cache_key: Optional[str] = None
-            cache_key = self._make_complete_cache_key(
-                model=model,
-                system_message=system_message,
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                frequency_penalty=frequency_penalty,
-                presence_penalty=presence_penalty,
-                stop_sequences=stop_sequences,
-                tools=tools,
-                tool_choice=tool_choice,
-                caps=caps,
-                ctx=ctx,
-            )
-            cached = await self._cache.get(cache_key)
-            if cached is not None:
-                self._metrics.counter(
-                    component=self._component,
-                    name="cache_hits",
-                    value=1,
+            if use_cache:
+                cache_key = self._make_complete_cache_key(
+                    model=model,
+                    system_message=system_message,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    frequency_penalty=frequency_penalty,
+                    presence_penalty=presence_penalty,
+                    stop_sequences=stop_sequences,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    caps=caps,
+                    ctx=ctx,
                 )
-                return cached  # type: ignore[return-value]
+                cached = await self._cache.get(cache_key)
+                if cached is not None:
+                    self._metrics.counter(
+                        component=self._component,
+                        name="cache_hits",
+                        value=1,
+                    )
+                    return cached  # type: ignore[return-value]
 
             result = await self._apply_deadline(
                 self._do_complete(
@@ -1626,7 +1720,7 @@ class BaseLLMAdapter(LLMProtocolV1):
                 ctx,
             )
 
-            if cache_key is not None:
+            if use_cache and cache_key is not None:
                 try:
                     await self._cache.set(cache_key, result, ttl_s=self._cache_ttl_s)
                 except Exception:
@@ -1705,7 +1799,7 @@ class BaseLLMAdapter(LLMProtocolV1):
 
             if not caps.supports_streaming:
                 raise NotSupported("stream is not supported by this adapter")
-            
+
             if (tools or tool_choice) and not caps.supports_tools:
                 raise NotSupported("tools are not supported by this adapter")
 
@@ -2019,7 +2113,8 @@ def _chunk_to_wire(chunk: LLMChunk, ms: float) -> Dict[str, Any]:
         }
     return {
         "ok": True,
-        "code": "OK",
+        # Cross-SDK alignment: streaming chunks use STREAMING (not OK).
+        "code": "STREAMING",
         "ms": ms,
         "chunk": payload,
     }
@@ -2051,18 +2146,42 @@ class WireLLMHandler:
     def __init__(self, adapter: LLMProtocolV1):
         self._adapter = adapter
 
-    async def handle(self, envelope: Mapping[str, Any]) -> Dict[str, Any]:
+    @staticmethod
+    def _require_mapping(obj: Any, *, field: str) -> Mapping[str, Any]:
+        if not isinstance(obj, Mapping):
+            raise BadRequest(f"{field} must be an object")
+        return obj
+
+    @staticmethod
+    def _require_key(envelope: Mapping[str, Any], key: str) -> Any:
+        if key not in envelope:
+            raise BadRequest(f"missing required '{key}'")
+        return envelope.get(key)
+
+    async def handle(self, envelope: Any) -> Dict[str, Any]:
         """
         Handle unary LLM operations via JSON envelope.
+
+        Wire strictness:
+            - envelope MUST be an object
+            - MUST include: op, ctx, args
+            - ctx MUST be an object
+            - args MUST be an object
         """
         t0 = time.monotonic()
         try:
-            op = envelope.get("op")
+            env = self._require_mapping(envelope, field="envelope")
+
+            op = env.get("op")
             if not isinstance(op, str):
                 raise BadRequest("missing or invalid 'op'")
 
-            ctx = _ctx_from_wire(envelope.get("ctx") or {})
-            args = envelope.get("args") or {}
+            ctx_raw = self._require_key(env, "ctx")
+            args_raw = self._require_key(env, "args")
+            ctx_map = self._require_mapping(ctx_raw, field="ctx")
+            args = self._require_mapping(args_raw, field="args")
+
+            ctx = _ctx_from_wire(ctx_map)
 
             if op == "llm.capabilities":
                 res = await self._adapter.capabilities()
@@ -2107,14 +2226,14 @@ class WireLLMHandler:
             ms = (time.monotonic() - t0) * 1000.0
             return _error_to_wire(e, ms)
 
-    async def handle_stream(self, envelope: Mapping[str, Any]) -> AsyncIterator[Dict[str, Any]]:
+    async def handle_stream(self, envelope: Any) -> AsyncIterator[Dict[str, Any]]:
         """
         Handle streaming llm.stream requests.
 
         Expects:
             op: "llm.stream"
-            ctx: { ... }
-            args: full streaming parameter set (parity with LLMProtocolV1.stream)
+            ctx: { ... }   (REQUIRED)
+            args: { ... }  (REQUIRED)
 
         Note:
             This method forwards chunks as they are produced by the adapter.
@@ -2123,13 +2242,27 @@ class WireLLMHandler:
             may choose to map this to a terminal stream error instead.
         """
         t0 = time.monotonic()
-        op = envelope.get("op")
+        try:
+            env = self._require_mapping(envelope, field="envelope")
+        except Exception as e:
+            yield _error_to_wire(e, 0.0)
+            return
+
+        op = env.get("op")
         if op != "llm.stream":
             yield _error_to_wire(BadRequest("op must be 'llm.stream' for streaming"), 0.0)
             return
 
-        ctx = _ctx_from_wire(envelope.get("ctx") or {})
-        args = envelope.get("args") or {}
+        try:
+            ctx_raw = self._require_key(env, "ctx")
+            args_raw = self._require_key(env, "args")
+            ctx_map = self._require_mapping(ctx_raw, field="ctx")
+            args = self._require_mapping(args_raw, field="args")
+        except Exception as e:
+            yield _error_to_wire(e, 0.0)
+            return
+
+        ctx = _ctx_from_wire(ctx_map)
 
         try:
             agen = self._adapter.stream(
@@ -2178,6 +2311,7 @@ __all__ = [
     "DeadlinePolicy",
     "CircuitBreaker",
     "Cache",
+    "TTLAwareCache",
     "RateLimiter",
     "NoopDeadline",
     "SimpleDeadline",
