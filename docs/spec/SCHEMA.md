@@ -321,7 +321,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 ```
 
 **Canonical Success Envelope (`common/envelope.success.json`):**
-```json
+```
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://corpusos.com/schemas/common/envelope.success.json",
@@ -342,12 +342,22 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
       "description": "Operation duration in milliseconds"
     },
     "result": {
-      "description": "Operation-specific result (any JSON value)"
+      "description": "Operation-specific result (any JSON value)",
+      "oneOf": [
+        { "type": "object" },
+        { "type": "array" },
+        { "type": "string" },
+        { "type": "number" },
+        { "type": "integer" },
+        { "type": "boolean" },
+        { "type": "null" }
+      ]
     }
   },
   "required": ["ok", "code", "ms", "result"],
   "additionalProperties": false
 }
+
 ```
 
 **Canonical Error Envelope (`common/envelope.error.json`):**
