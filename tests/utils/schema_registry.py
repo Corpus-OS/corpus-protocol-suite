@@ -469,7 +469,7 @@ if __name__ == "__main__":
         epilog="""
 Examples:
   %(prog)s llm.envelope.request.json sample_request.json
-  %(prog)s https://adaptersdk.org/schemas/llm/llm.envelope.request.json sample_request.json
+  %(prog)s https://corpusos.com/schemas/llm/llm.envelope.request.json sample_request.json
 
 Environment:
   CORPUS_SCHEMAS_ROOT    Override the default schemas directory
