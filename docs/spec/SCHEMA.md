@@ -297,25 +297,30 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://corpusos.com/schemas/common/envelope.request.json",
-  "title": "Protocol Request Envelope",
+  "$id": "https://corpusos.com/schemas/common/envelope.success.json",
+  "title": "Protocol Success Envelope",
   "type": "object",
   "properties": {
-    "op": {
-      "type": "string",
-      "pattern": "^[a-z]+\\.[a-z_]+$",
-      "description": "Protocol operation identifier"
+    "ok": { "type": "boolean", "const": true },
+    "code": { "type": "string", "const": "OK" },
+    "ms": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Operation duration in milliseconds"
     },
-    "ctx": {
-      "type": "object",
-      "description": "Operation context"
-    },
-    "args": {
-      "type": "object",
-      "description": "Operation-specific arguments"
+    "result": {
+      "description": "Operation-specific result (any JSON value)",
+      "anyOf": [
+        { "type": "object" },
+        { "type": "array" },
+        { "type": "string" },
+        { "type": "number" },
+        { "type": "boolean" },
+        { "type": "null" }
+      ]
     }
   },
-  "required": ["op", "ctx", "args"],
+  "required": ["ok", "code", "ms", "result"],
   "additionalProperties": false
 }
 ```
@@ -1095,9 +1100,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
             "$ref": "https://corpusos.com/schemas/vector/vector.types.query_result.json"
           }
         }
-      },
-      "required": ["result"],
-      "additionalProperties": false
+      }
     }
   ]
 }
