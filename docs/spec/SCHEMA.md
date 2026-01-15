@@ -58,7 +58,6 @@ For operation semantics, lifecycle, and behavior, PROTOCOLS.md is normative.
 - [11. Reference](#11-reference)
   - [11.1 Schema Quick Reference](#111-schema-quick-reference)
   - [11.2 Error Taxonomies by Protocol](#112-error-taxonomies-by-protocol)
-  - [11.3 Performance Benchmarks](#113-performance-benchmarks)
 - [12. Appendices](#12-appendices)
   - [12.A JSON Schema Draft 2020-12 Primer](#12a-json-schema-draft-2020-12-primer)
   - [12.B $ref Resolution Examples](#12b-ref-resolution-examples)
@@ -3956,33 +3955,6 @@ Throughput:
   Sampled: 909 req/s
   Lazy: 2500 req/s
 ```
-
-**Stream Validation Performance:**
-```
-Benchmark: Stream Validation
-----------------------------
-Stream: LLM completion (1000 tokens)
-Frames: 48
-Payload size: 24KB
-
-Validation modes:
-  Strict: 392ms (8.2ms/frame)
-  Sampled (10%): 45ms (0.9ms/frame)
-  Lazy: 19ms (0.4ms/frame)
-
-Memory usage:
-  Peak: 12.3MB
-  Steady state: 4.2MB
-```
-
-**Optimization Guidelines:**
-
-1. **Use SAMPLED mode for production** - 10% sampling provides good coverage with minimal overhead
-2. **Enable validator caching** - 10x speedup for repeated validations
-3. **Limit schema complexity** - Keep schemas under 5MB each
-4. **Use $ref for reuse** - Reduces memory and improves cache efficiency
-5. **Batch validation** - Validate multiple items together when possible
-
 ---
 
 ## 12. Appendices
