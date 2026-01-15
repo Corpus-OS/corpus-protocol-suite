@@ -148,7 +148,11 @@ SPDX-License-Identifier: Apache-2.0
 
 ### 1.1. Motivation
 
-The proliferation of AI infrastructure has created a fragmented landscape of proprietary APIs and inconsistent interfaces. Fragmentation increases integration complexity, reduces operational visibility, and creates vendor lock-in. Enterprise teams need cohesive, auditable, and performance-predictable interfaces that allow swapping providers without rewriting core application code or telemetry pipelines.
+Enterprise AI teams are rebuilding the same integration logic for every model provider they adopt. Each new vendor—OpenAI, Anthropic, Cohere, internal models—brings incompatible APIs, different observability patterns, and unique failure modes. What starts as "just swap the endpoint" becomes weeks of engineering work reconciling rate limiting, streaming protocols, and telemetry formats.
+
+The real cost isn't the initial integration—it's the operational blindness that follows. Teams can't answer basic questions like "which department is driving our token spend?" or "why did response latency spike yesterday?" without building custom instrumentation for each provider. When they need to migrate workloads or negotiate better pricing, they discover they're locked in not by contracts, but by the infrastructure debt they've accumulated around each vendor's quirks.
+
+Existing abstraction layers try to solve this by creating yet another API to learn. Corpus takes a different approach: we provide protocol standards that existing frameworks like LangChain and LlamaIndex can adopt, giving enterprises unified observability, auditable operations, and genuine provider portability—without abandoning their current tooling.
 
 ### 1.2. Scope
 
