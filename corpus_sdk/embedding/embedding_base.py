@@ -1,35 +1,52 @@
 # corpus_sdk/embedding/embedding_base.py
 # SPDX-License-Identifier: Apache-2.0
-
 """
-Adapter SDK — Embedding Protocol V1 (public contract + production-grade base)
-
 Purpose
 -------
-A stable, vendor-neutral API for text embedding generation — with structured errors,
-caching strategies, rate limiting, and production observability.
+A stable, vendor-neutral API for vector similarity search and operations — with
+structured errors, caching strategies, rate limiting, and production observability.
 
-This protocol enables seamless integration with any embedding model provider while
-maintaining production-grade security, performance monitoring, and operational rigor
-for high-scale text embedding workloads.
+This module serves as the reference implementation and SDK mapping for the
+Vector Protocol V1.0. It defines:
+
+- Typed Python contracts mirroring the protocol data shapes
+- A production-ready BaseVectorAdapter with validation, metrics, and backpressure
+- A thin WireVectorHandler that converts wire envelopes ⇄ typed API
+- First-class text storage support via DocStore integration
+- Optional batch query operations for performance optimization
+- Automatic vector normalization for cosine similarity optimization
 
 Design Philosophy
 -----------------
-- Minimal surface area: Core embedding operations only, no vendor-specific extensions
+- Minimal surface area: Core vector operations only, no vendor-specific extensions
 - Async-first: All operations are non-blocking for high-concurrency environments
 - Production hardened: Built-in caching, circuit breaking, backpressure, and metrics
-- Extensible: Capability discovery allows for model-specific features
-- Performance optimized: Built-in caching strategies for embedding generation
-- Wire-first: Code-level contracts map cleanly onto a canonical JSON envelope
+- Extensible: Capability discovery allows for database-specific vector features
+- Performance-optimized: Read-path caching for similarity queries (standalone mode)
+- Wire-first: Types and helpers exist to faithfully implement the canonical JSON contract
+- Text-aware: First-class support for source text storage and retrieval
+- Batch-friendly: Optional batch operations for efficiency where supported
 
 Deliberate Non-Goals
 --------------------
-- No text preprocessing, tokenization, or chunking strategies
-- No model training, fine-tuning, or version management
-- No vendor-specific model architectures or optimizations
-- No client-side embedding post-processing or normalization
+- No embedding model management or text-to-vector transformations
+- No vector index tuning or optimization strategies
+- No provider-specific algorithms beyond capabilities
+- No client-side result re-ranking or post-processing
 
-Those behaviors live in the text processing and model management layers.
+Those behaviors live in embedding services and upper application layers.
+
+Text Storage Strategy
+---------------------
+The protocol supports three text storage strategies:
+
+1. "metadata" (default): Store text in vector metadata (simple but expensive for large texts)
+2. "docstore": Store text in separate document store (cost-optimized for production)
+3. "none": Text storage not supported
+
+When using docstore, text is automatically stored/retrieved during upsert/query operations.
+Docstore failures during upsert cause the entire operation to fail (atomicity).
+Docstore failures during query cause text to be missing but don't fail the query (graceful degradation).
 
 Mode Strategy
 -------------
@@ -50,9 +67,24 @@ offering a safe "batteries included" option for direct use:
     Suitable for development and light production. Not a replacement for a
     full-blown distributed control plane.
 
+Auto-Normalization Feature
+--------------------------
+When enabled (auto_normalize=True), vectors are automatically normalized to unit
+length (L2 norm) during upsert and query operations. This is particularly useful
+for cosine similarity searches where normalized vectors provide more consistent
+results. The feature includes optimizations to avoid unnecessary normalization
+when vectors are already approximately unit length.
+
+Threading & Processes
+---------------------
+- In-memory components (cache, breaker, limiter) are **per-process only**.
+- They are **not thread-safe** and are intended for a single-threaded async
+  event loop. For multi-threaded or multi-process deployments, use external,
+  distributed implementations of cache / limiter / breaker instead.
+
 Versioning
 ----------
-Follow SemVer against EMBEDDING_PROTOCOL_VERSION. Minor versions are strictly additive.
+Follow SemVer against VECTOR_PROTOCOL_VERSION. Minor versions are strictly additive.
 - Patch (x.y.Z): Editorial clarifications, non-breaking fixes
 - Minor (x.Y.z): New optional parameters, capabilities, or methods
 - Major (X.y.z): Breaking changes to signatures or behavior
@@ -60,13 +92,13 @@ Follow SemVer against EMBEDDING_PROTOCOL_VERSION. Minor versions are strictly ad
 Wire Contract (Canonical Interface)
 -----------------------------------
 The canonical interoperability surface for this protocol is the JSON wire envelope.
-This module defines a code-level interface (EmbeddingProtocolV1 / BaseEmbeddingAdapter)
-plus a thin wire adapter (WireEmbeddingHandler) that maps envelopes ⇄ typed methods.
+This module defines a code-level interface (VectorProtocolV1 / BaseVectorAdapter)
+plus a thin wire adapter (WireVectorHandler) that maps envelopes ⇄ typed methods.
 
-All requests MUST use the following envelope shape (MUST include all three keys):
+All requests MUST use the following envelope shape (ctx and args are REQUIRED):
 
     {
-        "op": "embedding.<operation>",
+        "op": "vector.<operation>",
         "ctx": {
             "request_id": "...",
             "idempotency_key": "...",
@@ -99,49 +131,19 @@ Unary Responses (error):
         "ms": <float>
     }
 
-Streaming (canonical, aligned with LLM and Graph)
--------------------------------------------------
-Streaming is represented as a dedicated operation on the wire:
-
-    Request:
-        {
-            "op": "embedding.stream_embed",
-            "ctx": { ... },   # REQUIRED
-            "args": {         # REQUIRED
-                "text": "<str>",
-                "model": "<str>",
-                "truncate": <bool>,
-                "normalize": <bool>
-            }
-        }
-
-Stream Responses:
-    - Zero or more streaming chunk envelopes:
-        {
-            "ok": true,
-            "code": "STREAMING",
-            "ms": <float>,
-            "chunk": { ... }        # streaming chunk payload
-        }
-
-    - On terminal success, the last chunk SHOULD set "is_final": true.
-    - On error, a single error envelope is sent and terminates the stream.
-
-The WireEmbeddingHandler in this file is the reference adapter for this contract and is
+The WireVectorHandler in this file is the reference adapter for this contract and is
 intentionally transport-agnostic (HTTP, gRPC, WebSocket, etc.).
-
 """
 
 from __future__ import annotations
 
 import asyncio
-import time
 import hashlib
-import math
+import json
 import logging
-from contextlib import asynccontextmanager
+import math
+import time
 from dataclasses import dataclass, asdict
-from collections.abc import Mapping as ABCMapping
 from typing import (
     Any,
     Awaitable,
@@ -149,150 +151,249 @@ from typing import (
     Dict,
     List,
     Mapping,
+    NewType,
     Optional,
     Protocol,
     Tuple,
     runtime_checkable,
-    AsyncIterator,
 )
 
-EMBEDDING_PROTOCOL_VERSION = "1.0.0"
-EMBEDDING_PROTOCOL_ID = "embedding/v1.0"
+VECTOR_PROTOCOL_VERSION = "1.0.0"
+VECTOR_PROTOCOL_ID = "vector/v1.0"
 LOG = logging.getLogger(__name__)
 
 # =============================================================================
 # Core Type Definitions
 # =============================================================================
 
+VectorID = NewType("VectorID", str)
+"""Type alias for vector identifiers providing explicit type safety."""
+
 
 @dataclass(frozen=True)
-class EmbeddingVector:
+class Vector:
     """
-    A single embedding vector with metadata.
+    A vector with optional metadata, identifier, and source text.
 
     Attributes:
-        vector: The embedding vector as a list of floats
-        text: The source text that was embedded
-        model: Model used to generate the embedding
-        dimensions: Vector dimensions
-        index: Optional index in the original batch (for batch operations)
-        metadata: Optional metadata associated with this embedding
-                  (e.g., document/chunk identifiers).
+        id: Unique identifier for the vector
+        vector: The vector embedding as a list of floats
+        metadata: Optional key-value pairs for filtering and retrieval
+        namespace: Optional namespace/collection for multi-tenant isolation
+        text: Optional source text that generated this vector
     """
+    id: VectorID
     vector: List[float]
-    text: str
-    model: str
-    dimensions: int
-    index: Optional[int] = None
     metadata: Optional[Dict[str, Any]] = None
+    namespace: Optional[str] = None
+    text: Optional[str] = None
 
 
 @dataclass(frozen=True)
-class EmbeddingResult:
+class VectorMatch:
     """
-    Result from embedding generation operations.
+    A single vector match with similarity score and distance.
 
     Attributes:
-        embeddings: List of generated embedding vectors
-        model: Model used for generation
-        total_tokens: Total tokens processed (if available)
-        processing_time_ms: Time taken to generate embeddings
+        vector: The matching vector
+        score: Similarity score (higher = more similar)
+        distance: Raw distance metric value (lower = more similar)
     """
-    embeddings: List[EmbeddingVector]
-    model: str
-    total_tokens: Optional[int] = None
-    processing_time_ms: Optional[float] = None
+    vector: Vector
+    score: float
+    distance: float
 
 
-@dataclass(frozen=True)
-class EmbeddingBatch:
+@dataclass
+class QueryResult:
     """
-    Batch of texts for embedding generation.
+    Result from a vector similarity search query.
 
     Attributes:
-        texts: List of texts to embed
-        model: Target model for embedding generation
-        truncate: Whether to truncate long texts (True) or error (False)
-        normalize: Whether to normalize output vectors to unit length
+        matches: List of matching vectors with similarity scores
+        query_vector: The original query vector used for search
+        namespace: Namespace/collection where search was performed
+        total_matches: Total number of matches found (before limiting)
     """
-    texts: List[str]
-    model: str
-    truncate: bool = True
-    normalize: bool = False
+    matches: List[VectorMatch]
+    query_vector: List[float]
+    namespace: str
+    total_matches: int
 
 
 # =============================================================================
-# Streaming Types (v1.0 with fixes)
+# Document Storage (for text associated with vectors)
 # =============================================================================
 
-
 @dataclass(frozen=True)
-class EmbedChunk:
-    """
-    A streaming chunk of embedding results.
+class Document:
+    """Document with text content and metadata.
 
-    Attributes:
-        embeddings: Partial or complete embedding vectors
-        is_final: Whether this is the final chunk in the stream
-        usage: Optional usage statistics for this chunk
-        model: Model used for generation
+    Note:
+        Metadata stored here is usually a *copy* of vector metadata and may
+        diverge over time. The vector backend remains the source of truth for
+        vector-level metadata; the docstore metadata is primarily for
+        doc-centric access patterns or convenience.
     """
-    embeddings: List[EmbeddingVector]
-    is_final: bool = False
-    usage: Optional[Dict[str, Any]] = None
-    model: Optional[str] = None
+    id: str
+    text: str
+    metadata: Dict[str, Any]
 
 
-@dataclass(frozen=True)
-class EmbeddingStats:
+class DocStore(Protocol):
     """
-    Statistics and usage information for embedding operations.
+    Document storage interface for vector source text.
 
-    Attributes:
-        total_requests: Total number of embedding requests processed
-        total_texts: Total number of texts embedded
-        total_tokens: Total tokens processed
-        cache_hits: Number of cache hits
-        cache_misses: Number of cache misses
-        avg_processing_time_ms: Average processing time per request
-        error_count: Total number of errors encountered
-        stream_requests: Number of streaming requests processed
-        stream_chunks_generated: Total chunks generated across all streams
-        stream_abandoned: Number of streams abandoned before completion
+    Used when vectors have associated text that should not be stored
+    in vector database metadata (for cost/performance reasons).
     """
-    total_requests: int = 0
-    total_texts: int = 0
-    total_tokens: int = 0
-    cache_hits: int = 0
-    cache_misses: int = 0
-    avg_processing_time_ms: float = 0.0
-    error_count: int = 0
-    stream_requests: int = 0
-    stream_chunks_generated: int = 0
-    stream_abandoned: int = 0
+
+    async def get(self, doc_id: str) -> Optional[Document]:
+        """Retrieve document by ID"""
+        ...
+
+    async def put(self, doc: Document) -> None:
+        """Store document"""
+        ...
+
+    async def batch_get(self, doc_ids: List[str]) -> Dict[str, Document]:
+        """Retrieve multiple documents (default: calls get() in loop)"""
+        ...
+
+    async def batch_put(self, docs: List[Document]) -> None:
+        """Store multiple documents (default: calls put() in loop)"""
+        ...
+
+    async def delete(self, doc_id: str) -> None:
+        """Delete document"""
+        ...
+
+    async def batch_delete(self, doc_ids: List[str]) -> None:
+        """Delete multiple documents (required implementation)"""
+        ...
+
+
+class InMemoryDocStore:
+    """In-memory document store for testing and development"""
+
+    def __init__(self):
+        self._store: Dict[str, Document] = {}
+
+    async def get(self, doc_id: str) -> Optional[Document]:
+        return self._store.get(doc_id)
+
+    async def put(self, doc: Document) -> None:
+        self._store[doc.id] = doc
+
+    async def batch_get(self, doc_ids: List[str]) -> Dict[str, Document]:
+        return {doc_id: doc for doc_id in doc_ids if (doc := self._store.get(doc_id))}
+
+    async def batch_put(self, docs: List[Document]) -> None:
+        for doc in docs:
+            self._store[doc.id] = doc
+
+    async def delete(self, doc_id: str) -> None:
+        self._store.pop(doc_id, None)
+
+    async def batch_delete(self, doc_ids: List[str]) -> None:
+        """Required batch delete implementation."""
+        for doc_id in doc_ids:
+            self._store.pop(doc_id, None)
+
+
+class RedisDocStore:
+    """Redis-backed document store for production.
+
+    Note:
+        Metadata stored here mirrors vector metadata at write time but is not
+        automatically kept in sync with later vector metadata changes.
+    """
+
+    def __init__(self, redis_client, key_prefix: str = "corpus:doc:"):
+        self._redis = redis_client
+        self._prefix = key_prefix
+
+    def _key(self, doc_id: str) -> str:
+        return f"{self._prefix}{doc_id}"
+
+    async def get(self, doc_id: str) -> Optional[Document]:
+        import msgpack
+        raw = await self._redis.get(self._key(doc_id))
+        if raw is None:
+            return None
+        data = msgpack.unpackb(raw, raw=False)
+        return Document(
+            id=data["id"],
+            text=data["text"],
+            metadata=data.get("metadata", {})
+        )
+
+    async def put(self, doc: Document) -> None:
+        import msgpack
+        data = {"id": doc.id, "text": doc.text, "metadata": doc.metadata}
+        await self._redis.set(
+            self._key(doc.id),
+            msgpack.packb(data),
+            ex=86400 * 30  # 30 day TTL
+        )
+
+    async def batch_get(self, doc_ids: List[str]) -> Dict[str, Document]:
+        import msgpack
+        if not doc_ids:
+            return {}
+        keys = [self._key(doc_id) for doc_id in doc_ids]
+        values = await self._redis.mget(keys)
+        results = {}
+        for doc_id, raw in zip(doc_ids, values):
+            if raw is not None:
+                data = msgpack.unpackb(raw, raw=False)
+                results[doc_id] = Document(
+                    id=data["id"],
+                    text=data["text"],
+                    metadata=data.get("metadata", {})
+                )
+        return results
+
+    async def batch_put(self, docs: List[Document]) -> None:
+        import msgpack
+        if not docs:
+            return
+        pipe = self._redis.pipeline()
+        for doc in docs:
+            data = {"id": doc.id, "text": doc.text, "metadata": doc.metadata}
+            pipe.set(self._key(doc.id), msgpack.packb(data), ex=86400 * 30)
+        await pipe.execute()
+
+    async def delete(self, doc_id: str) -> None:
+        await self._redis.delete(self._key(doc_id))
+
+    async def batch_delete(self, doc_ids: List[str]) -> None:
+        """Required batch delete implementation."""
+        if not doc_ids:
+            return
+        keys = [self._key(doc_id) for doc_id in doc_ids]
+        await self._redis.delete(*keys)
 
 
 # =============================================================================
 # Normalized Errors (with retry hints and operational guidance)
 # =============================================================================
 
-
-class EmbeddingAdapterError(Exception):
+class VectorAdapterError(Exception):
     """
-    Base exception for all embedding adapter errors.
+    Base exception for all vector adapter errors.
 
     Provides structured error information including retry guidance, resource limits,
     and operational suggestions for callers to handle failures gracefully.
 
     Attributes:
         message: Human-readable error description
-        code: Machine-readable error code for programmatic handling
+        code: Machine-readable error code (UPPER_SNAKE_CASE where possible)
         retry_after_ms: Suggested delay before retry (None if not retryable)
-        resource_scope: Scope of resource limitation ("model", "token_limit", "rate_limit")
+        resource_scope: Scope of resource limitation ("index", "memory", "compute", etc.)
         suggested_batch_reduction: Percentage reduction suggestion for batch size
-        details: Additional context-specific error details (SIEM-safe, JSON-serializable)
+        details: Additional context-specific error details (JSON-serializable, SIEM-safe)
     """
-
     def __init__(
         self,
         message: str = "",
@@ -327,88 +428,65 @@ class EmbeddingAdapterError(Exception):
             "details": {k: self.details[k] for k in sorted(self.details)},
         }
 
-    def __str__(self) -> str:
-        base = self.message or self.__class__.__name__
-        if self.code:
-            base += f" [code={self.code}]"
-        if self.retry_after_ms is not None:
-            base += f" retry_after_ms={self.retry_after_ms}"
-        if self.resource_scope:
-            base += f" resource_scope={self.resource_scope}"
-        if self.suggested_batch_reduction is not None:
-            base += f" suggested_batch_reduction={self.suggested_batch_reduction}%"
-        if self.details:
-            base += f" details={self.details}"
-        return base
 
-
-class BadRequest(EmbeddingAdapterError):
-    """Client sent an invalid request (malformed texts, invalid parameters)."""
-
+class BadRequest(VectorAdapterError):
+    """Client sent an invalid request (malformed vectors, invalid parameters)."""
     def __init__(self, message: str, **kwargs: Any):
         kwargs.setdefault("code", "BAD_REQUEST")
         super().__init__(message, **kwargs)
 
 
-class AuthError(EmbeddingAdapterError):
+class AuthError(VectorAdapterError):
     """Authentication or authorization failed (invalid credentials, permissions)."""
-
     def __init__(self, message: str, **kwargs: Any):
         kwargs.setdefault("code", "AUTH_ERROR")
         super().__init__(message, **kwargs)
 
 
-class ResourceExhausted(EmbeddingAdapterError):
+class ResourceExhausted(VectorAdapterError):
     """Quota, rate limit, or resource constraints exceeded."""
-
     def __init__(self, message: str, **kwargs: Any):
         kwargs.setdefault("code", "RESOURCE_EXHAUSTED")
         super().__init__(message, **kwargs)
 
 
-class TextTooLong(EmbeddingAdapterError):
-    """Input text exceeds model's maximum context length."""
-
+class DimensionMismatch(VectorAdapterError):
+    """Vector dimensions do not match expected schema."""
     def __init__(self, message: str, **kwargs: Any):
-        kwargs.setdefault("code", "TEXT_TOO_LONG")
+        kwargs.setdefault("code", "DIMENSION_MISMATCH")
         super().__init__(message, **kwargs)
 
 
-class ModelNotAvailable(EmbeddingAdapterError):
-    """Requested embedding model is not available."""
-
+class IndexNotReady(VectorAdapterError):
+    """Vector index is not built or ready for queries."""
     def __init__(self, message: str, **kwargs: Any):
-        kwargs.setdefault("code", "MODEL_NOT_AVAILABLE")
+        kwargs.setdefault("code", "INDEX_NOT_READY")
         super().__init__(message, **kwargs)
 
 
-class TransientNetwork(EmbeddingAdapterError):
+class TransientNetwork(VectorAdapterError):
     """Transient network failure that may succeed on retry."""
-
     def __init__(self, message: str, **kwargs: Any):
         kwargs.setdefault("code", "TRANSIENT_NETWORK")
         super().__init__(message, **kwargs)
 
 
-class Unavailable(EmbeddingAdapterError):
+class Unavailable(VectorAdapterError):
     """Service is temporarily unavailable or overloaded."""
-
     def __init__(self, message: str, **kwargs: Any):
         kwargs.setdefault("code", "UNAVAILABLE")
         super().__init__(message, **kwargs)
 
 
-class NotSupported(EmbeddingAdapterError):
+class NotSupported(VectorAdapterError):
     """Requested operation or parameter is not supported."""
-
     def __init__(self, message: str, **kwargs: Any):
         kwargs.setdefault("code", "NOT_SUPPORTED")
         super().__init__(message, **kwargs)
 
 
-class DeadlineExceeded(EmbeddingAdapterError):
+class DeadlineExceeded(VectorAdapterError):
     """Operation exceeded ctx.deadline_ms budget."""
-
     def __init__(self, message: str, **kwargs: Any):
         kwargs.setdefault("code", "DEADLINE_EXCEEDED")
         super().__init__(message, **kwargs)
@@ -418,18 +496,13 @@ class DeadlineExceeded(EmbeddingAdapterError):
 # Context (used for deadlines, identity, SIEM-safe metrics)
 # =============================================================================
 
-
 @dataclass(frozen=True)
 class OperationContext:
     """
-    Context for embedding operations providing tracing, deadlines, and multi-tenant isolation.
+    Context for vector operations providing tracing, deadlines, and multi-tenant isolation.
 
     All context information is propagated through the call chain and used for
     observability, security, and operational control without exposing sensitive data.
-
-    NOTE:
-        This context intentionally mirrors the LLM and Graph SDK contexts:
-        - The adapter owns metrics sinks; ctx does not carry a metrics sink.
 
     Attributes:
         request_id: Unique identifier for the request chain (correlation ID)
@@ -447,15 +520,14 @@ class OperationContext:
     attrs: Optional[Mapping[str, Any]] = None
 
     def __post_init__(self) -> None:
-        """Ensure attrs is always a valid dictionary at runtime."""
+        """Ensure attrs is always a valid dictionary."""
         if self.attrs is None:
             object.__setattr__(self, "attrs", {})
 
     def remaining_ms(self) -> Optional[int]:
         """
         Return remaining milliseconds until deadline, or None if no deadline set.
-
-        Always non-negative (0 if expired).
+        Non-negative (0 if expired).
         """
         if self.deadline_ms is None:
             return None
@@ -467,15 +539,13 @@ class OperationContext:
 # Metrics Interface (SIEM-safe, low-cardinality)
 # =============================================================================
 
-
 class MetricsSink(Protocol):
     """
     Protocol for metrics collection implementations.
 
     Used for operational monitoring without exposing sensitive information.
-    All metrics must be low-cardinality and never include PII or tenant identifiers.
+    All metrics must be low-cardinality and never include PII or raw tenant identifiers.
     """
-
     def observe(
         self,
         *,
@@ -486,17 +556,7 @@ class MetricsSink(Protocol):
         code: str = "OK",
         extra: Optional[Mapping[str, Any]] = None,
     ) -> None:
-        """
-        Record operation timing and status.
-
-        Args:
-            component: Component name (e.g., "embedding")
-            op: Operation name (e.g., "embed", "embed_batch")
-            ms: Operation duration in milliseconds
-            ok: Whether operation succeeded
-            code: Status code (error class name or "OK")
-            extra: Additional low-cardinality dimensions
-        """
+        """Record operation timing and status."""
         ...
 
     def counter(
@@ -507,177 +567,113 @@ class MetricsSink(Protocol):
         value: int = 1,
         extra: Optional[Mapping[str, Any]] = None,
     ) -> None:
-        """
-        Increment a counter metric.
-
-        Args:
-            component: Component name (e.g., "embedding")
-            name: Counter name (e.g., "texts_embedded", "tokens_processed")
-            value: Increment value
-            extra: Additional low-cardinality dimensions
-        """
+        """Increment a counter metric."""
         ...
 
 
 class NoopMetrics:
     """No-operation metrics sink for testing or when metrics are disabled."""
-
-    def observe(self, **_: Any) -> None:
-        ...
-
-    def counter(self, **_: Any) -> None:
-        ...
+    def observe(self, **_: Any) -> None: ...
+    def counter(self, **_: Any) -> None: ...
 
 
 # =============================================================================
-# Pluggable policy interfaces (deadlines, truncation, normalization, CB, cache)
+# Policy & Infra Extension Points (deadline, breaker, cache, limiter)
 # =============================================================================
-
 
 class DeadlinePolicy(Protocol):
     """Strategy to apply time budgets (ctx.deadline_ms) to awaits."""
-
-    async def wrap(self, awaitable: Awaitable[Any], ctx: Optional[OperationContext]) -> Any:
-        ...
-
-
-class TruncationPolicy(Protocol):
-    """Strategy to deterministically truncate text when allowed."""
-
-    def apply(self, text: str, max_len: Optional[int], allow: bool) -> Tuple[str, bool]:
-        ...
-
-
-class NormalizationPolicy(Protocol):
-    """Strategy to normalize vectors when requested."""
-
-    def normalize(self, vec: List[float]) -> List[float]:
-        ...
+    async def wrap(self, awaitable: Awaitable[Any], ctx: Optional[OperationContext]) -> Any: ...
 
 
 class CircuitBreaker(Protocol):
     """Minimal circuit breaker interface."""
-
-    def allow(self) -> bool:
-        ...
-
-    def on_success(self) -> None:
-        ...
-
-    def on_error(self, err: Exception) -> None:
-        ...
+    def allow(self) -> bool: ...
+    def on_success(self) -> None: ...
+    def on_error(self, err: Exception) -> None: ...
 
 
 class Cache(Protocol):
     """
     Minimal async cache interface.
 
-    Implementations should define whether they support TTL-based caching via
-    the `supports_ttl` property. This lets the adapter avoid type checks on
-    specific cache implementations.
+    Implementations MAY store arbitrary Python objects. The in-memory default
+    simply holds references and does not serialize. If you plug in a distributed
+    cache (e.g., Redis), you are responsible for serializing/deserializing values
+    (JSON, msgpack, etc.) safely.
+
+    Note: cache implementations MAY optionally expose an async
+    `invalidate_namespace(namespace: str)` method. If present, BaseVectorAdapter
+    will call it for namespace-scoped invalidation instead of relying on TTL.
     """
-
-    async def get(self, key: str) -> Optional[Any]:
-        ...
-
-    async def set(self, key: str, value: Any, ttl_s: int) -> None:
-        ...
-
-    @property
-    def supports_ttl(self) -> bool:
-        """
-        Whether this cache implementation supports TTL semantics on `set`.
-
-        Used by BaseEmbeddingAdapter to decide if it can safely rely on TTL.
-        """
-        ...
+    async def get(self, key: str) -> Optional[Any]: ...
+    async def set(self, key: str, value: Any, ttl_s: int) -> None: ...
 
 
 class RateLimiter(Protocol):
     """Minimal rate limiter interface."""
-
-    async def acquire(self) -> None:
-        ...
-
-    def release(self) -> None:
-        ...
-
-
-# ---- No-op / simple policies ----
+    async def acquire(self) -> None: ...
+    def release(self) -> None: ...
 
 
 class NoopDeadline:
     """No-op deadline policy (no timing/timeout behavior)."""
-
     async def wrap(self, awaitable: Awaitable[Any], ctx: Optional[OperationContext]) -> Any:
         return await awaitable
 
 
-class EnforcingDeadline:
+class SimpleDeadline:
     """
-    Deadline policy that enforces ctx.deadline_ms using asyncio.wait_for.
+    Enforces ctx.deadline_ms using asyncio.wait_for.
 
-    If deadline is already expired, fail fast with DeadlineExceeded.
+    Maps asyncio.TimeoutError → DeadlineExceeded.
     """
-
     async def wrap(self, awaitable: Awaitable[Any], ctx: Optional[OperationContext]) -> Any:
         if ctx is None or ctx.deadline_ms is None:
             return await awaitable
-        remaining = ctx.remaining_ms()
-        if remaining is not None and remaining <= 0:
-            raise DeadlineExceeded("deadline already expired")
+        tmp = OperationContext(deadline_ms=ctx.deadline_ms)
+        rem = tmp.remaining_ms()
+        if rem is not None and rem <= 0:
+            # Align with LLM adapter semantics: explicit "deadline already exceeded"
+            raise DeadlineExceeded(
+                "deadline already exceeded",
+                details={"remaining_ms": 0, "preflight": True},
+            )
         try:
             return await asyncio.wait_for(
                 awaitable,
-                timeout=(remaining / 1000.0 if remaining is not None else None),
+                timeout=(rem / 1000.0 if rem is not None else None),
             )
-        except asyncio.TimeoutError as e:
-            raise DeadlineExceeded("operation timed out") from e
-
-
-class SimpleCharTruncation:
-    """Deterministic truncation policy based on max character length."""
-
-    def apply(self, text: str, max_len: Optional[int], allow: bool) -> Tuple[str, bool]:
-        if not max_len or len(text) <= max_len:
-            return text, False
-        if not allow:
-            raise TextTooLong(f"text exceeds maximum length of {max_len}")
-        return text[:max_len], True
-
-
-class L2Normalization:
-    """L2-normalize embedding vectors when requested."""
-
-    def normalize(self, vec: List[float]) -> List[float]:
-        norm = math.sqrt(sum(v * v for v in vec)) or 1.0
-        return [v / norm for v in vec]
+        except asyncio.TimeoutError:
+            raise DeadlineExceeded(
+                "operation timed out",
+                details={"remaining_ms": 0},
+            )
 
 
 class NoopBreaker:
+    """No-op circuit breaker that always allows operations."""
     def allow(self) -> bool:
         return True
 
     def on_success(self) -> None:
-        ...
+        pass
 
     def on_error(self, err: Exception) -> None:
-        ...
+        pass
 
 
 class SimpleCircuitBreaker:
     """
-    Extremely small circuit breaker:
-      - Opens after `failure_threshold` consecutive errors.
-      - Half-opens after `cooldown_s`.
-      - Closes on the first success while half-open.
+    Tiny counter-based breaker:
+      - Opens after `consecutive_failure_threshold` errors.
+      - Half-opens after `reset_timeout_s`; first success closes it.
 
     Intended for standalone/dev use only (not distributed).
     """
-
-    def __init__(self, failure_threshold: int = 5, cooldown_s: float = 5.0) -> None:
-        self._failure_threshold = max(1, int(failure_threshold))
-        self._cooldown_s = max(0.1, float(cooldown_s))
+    def __init__(self, consecutive_failure_threshold: int = 5, reset_timeout_s: float = 10.0) -> None:
+        self._threshold = max(1, consecutive_failure_threshold)
+        self._reset_timeout_s = max(1.0, float(reset_timeout_s))
         self._failures = 0
         self._opened_at: Optional[float] = None
         self._half_open = False
@@ -686,22 +682,24 @@ class SimpleCircuitBreaker:
         if self._opened_at is None:
             return True
         elapsed = time.monotonic() - self._opened_at
-        if elapsed >= self._cooldown_s:
-            # Half-open: allow a probe request.
+        if elapsed >= self._reset_timeout_s:
+            # half-open probe
             self._half_open = True
             return True
         return False
 
     def on_success(self) -> None:
-        # Close on successful probe; reset failures.
-        self._failures = 0
-        self._opened_at = None
-        self._half_open = False
+        if self._half_open:
+            # Close on successful probe
+            self._opened_at = None
+            self._half_open = False
+            self._failures = 0
+        else:
+            self._failures = 0
 
     def on_error(self, _err: Exception) -> None:
-        # Count consecutive failures and open when threshold exceeded.
         self._failures += 1
-        if self._failures >= self._failure_threshold:
+        if self._failures >= self._threshold:
             self._opened_at = time.monotonic()
             self._failures = 0
             self._half_open = False
@@ -709,486 +707,579 @@ class SimpleCircuitBreaker:
 
 class NoopCache:
     """No-op cache used in thin/composed mode."""
-
     async def get(self, key: str) -> Optional[Any]:
         return None
 
     async def set(self, key: str, value: Any, ttl_s: int) -> None:
-        return None
-
-    @property
-    def supports_ttl(self) -> bool:
-        return False
+        pass
 
 
 class InMemoryTTLCache:
     """
-    Tiny in-memory cache with TTL. Suitable for demos/tests only.
+    Very small, in-memory TTL cache (not for large workloads).
 
-    Not thread-safe, process-safe, or distributed. Intended only for
-    single-process, single-threaded development and test usage.
+    Characteristics:
+        - Per-process only; NOT multi-process or distributed.
+        - Not thread-safe; intended for use in a single-threaded async event loop.
+        - Stores Python objects by reference; no serialization is performed.
+          If you need cross-process or cross-host caching, use a different Cache
+          implementation with explicit serialization.
+
+    This implementation also exposes an optional `invalidate_namespace(namespace: str)`
+    method used by BaseVectorAdapter for namespace-scoped invalidation.
     """
-
-    def __init__(self, max_entries: Optional[int] = None) -> None:
+    def __init__(self) -> None:
         self._store: Dict[str, Tuple[float, Any]] = {}
-        self._max_entries = max_entries
 
     async def get(self, key: str) -> Optional[Any]:
         now = time.monotonic()
         item = self._store.get(key)
         if not item:
             return None
-        exp, val = item
-        if exp < now:
+        expires_at, value = item
+        if now >= expires_at:
             self._store.pop(key, None)
             return None
-        return val
+        return value
 
     async def set(self, key: str, value: Any, ttl_s: int) -> None:
-        ttl = max(0, int(ttl_s))
-        if ttl == 0:
-            # Treat TTL=0 as "do not cache"
+        ttl_s = max(0, int(ttl_s))
+        if ttl_s == 0:
+            # Treat TTL=0 as "do not cache" (alignment with other protocol bases).
             return
-        # Simple eviction policy: drop arbitrary item if over max_entries.
-        if self._max_entries is not None and len(self._store) >= self._max_entries:
-            try:
-                self._store.pop(next(iter(self._store)))
-            except StopIteration:
-                pass
-        self._store[key] = (time.monotonic() + ttl, value)
+        self._store[key] = (time.monotonic() + ttl_s, value)
 
-    @property
-    def supports_ttl(self) -> bool:
-        return True
+    async def invalidate_namespace(self, namespace: str) -> None:
+        """
+        Best-effort namespace invalidation based on the standard cache key
+        pattern used by BaseVectorAdapter (`ns=<namespace>:`).
+        """
+        if not namespace:
+            return
+        pattern = f"ns={namespace}:"
+        keys_to_remove = [k for k in list(self._store.keys()) if pattern in k]
+        for k in keys_to_remove:
+            self._store.pop(k, None)
 
 
 class NoopLimiter:
     """No-op limiter used in thin/composed mode."""
-
     async def acquire(self) -> None:
-        return None
+        pass
 
     def release(self) -> None:
-        return None
+        pass
 
 
-class TokenBucketLimiter:
+class SimpleTokenBucketLimiter:
     """
-    Very simple token bucket limiter.
+    Simple token-bucket limiter with second-level refill.
 
-    Args:
-        rate: tokens per second
-        burst: max bucket size
+    Characteristics:
+        - Per-process only; not distributed.
+        - Not thread-safe; intended for a single-threaded async event loop.
+        - Fail-open on internal errors to avoid deadlocks in critical paths.
 
-    Intended for standalone/dev; avoids impacting main path on internal errors.
+    Intended for standalone/dev use. For production backpressure across
+    multiple workers, use a distributed rate limiter.
+
+    Note:
+        release() is intentionally a no-op to align with LLM/Graph token bucket
+        semantics: tokens are charged on acquire() only.
     """
-
-    def __init__(self, rate: float = 50.0, burst: int = 50) -> None:
-        self._rate = max(0.1, float(rate))
-        self._burst = max(1, int(burst))
-        self._tokens = float(self._burst)
+    def __init__(self, rate_per_sec: int = 50, burst: int = 100) -> None:
+        self._capacity = max(1, int(burst))
+        self._rate = max(1, int(rate_per_sec))
+        self._tokens = self._capacity
         self._last = time.monotonic()
-        self._lock = asyncio.Lock()
+
+    def _refill(self) -> None:
+        now = time.monotonic()
+        delta = now - self._last
+        if delta <= 0:
+            return
+        add = int(delta * self._rate)
+        if add > 0:
+            self._tokens = min(self._capacity, self._tokens + add)
+            self._last = now
 
     async def acquire(self) -> None:
-        """
-        Acquire one token from the bucket, waiting if necessary.
-
-        This implementation avoids holding the lock while sleeping to prevent
-        head-of-line blocking under contention.
-        """
-        while True:
-            needed: float
-            async with self._lock:
-                now = time.monotonic()
-                elapsed = now - self._last
-                if elapsed > 0:
-                    self._tokens = min(
-                        self._burst,
-                        self._tokens + elapsed * self._rate,
-                    )
-                    self._last = now
-                if self._tokens >= 1.0:
-                    self._tokens -= 1.0
+        try:
+            while True:
+                self._refill()
+                if self._tokens > 0:
+                    self._tokens -= 1
                     return
-                needed = (1.0 - self._tokens) / self._rate
-            # Sleep outside the lock so other coroutines can make progress.
-            await asyncio.sleep(max(needed, 0.001))
+                # Back off in small steps
+                await asyncio.sleep(0.02)
+        except Exception:
+            # Fail-open on limiter errors
+            return
 
     def release(self) -> None:
-        # Classic token bucket: only charge on acquire.
-        return None
+        # No-op to align with LLM/Graph token bucket semantics (charge on acquire only).
+        return
 
 
 # =============================================================================
 # Capabilities (dynamic discovery for routing and planning)
 # =============================================================================
 
-
 @dataclass(frozen=True)
-class EmbeddingCapabilities:
+class VectorCapabilities:
     """
-    Describes the capabilities and limitations of an embedding adapter implementation.
+    Describes the capabilities and limitations of a vector adapter implementation.
 
-    Used by routing layers for intelligent model selection, request planning,
-    and feature compatibility checking across different embedding providers.
+    Used by routing layers for intelligent database selection, query planning,
+    and feature compatibility checking across different vector backends.
 
     Attributes:
-        server: Backend server identifier (e.g., "openai", "cohere", "huggingface")
+        server: Backend server identifier (e.g., "pinecone", "qdrant", "weaviate")
         version: Backend server version string
-        supported_models: Supported embedding model names
-        max_batch_size: Maximum texts per batch operation
-        max_text_length: Maximum characters per text input
+        protocol: Protocol identifier (e.g., "vector/v1.0")
         max_dimensions: Maximum vector dimensions supported
-        supports_normalization: Whether vector normalization is supported
-        supports_truncation: Whether text truncation is supported
-        supports_token_counting: Whether token counting is available
-        supports_streaming: Whether streaming embeddings are supported
-        supports_batch_embedding: Whether batch embedding operations are supported
-        supports_caching: Whether embedding caching is supported
-        idempotent_writes: Whether operations are idempotent with idempotency_key
+        supported_metrics: Supported distance metrics ("cosine", "euclidean", "dotproduct")
+        supports_namespaces: Whether namespaces/collections are supported
+        supports_metadata_filtering: Whether metadata filtering is supported
+        supports_batch_operations: Whether batch upsert/delete are supported
+        max_batch_size: Maximum vectors per batch operation
+        supports_index_management: Whether index creation/deletion is supported
+        idempotent_writes: Whether write operations are idempotent with idempotency_key
         supports_multi_tenant: Whether multi-tenant isolation is supported
-        normalizes_at_source: Whether adapter normalizes vectors at source when requested
-        truncation_mode: "base" or "adapter" to signal where truncation is applied
         supports_deadline: Whether adapter cooperates with deadline cancellation
+        max_top_k: Optional upper bound on top_k per query (None means unspecified)
+        max_filter_terms: Optional guideline for filter complexity
+        text_storage_strategy: How text is stored ("metadata", "docstore", "none")
+        max_text_length: Maximum text length supported (None means unlimited)
+        supports_batch_queries: Whether batch query operations are supported
     """
     server: str
     version: str
-    supported_models: Tuple[str, ...]
-    protocol: str = EMBEDDING_PROTOCOL_ID
+    protocol: str = VECTOR_PROTOCOL_ID
+    max_dimensions: int = 0
+    supported_metrics: Tuple[str, ...] = ("cosine", "euclidean", "dotproduct")
+    supports_namespaces: bool = True
+    supports_metadata_filtering: bool = True
+    supports_batch_operations: bool = True
     max_batch_size: Optional[int] = None
-    max_text_length: Optional[int] = None
-    max_dimensions: Optional[int] = None
-    supports_normalization: bool = False
-    supports_truncation: bool = True
-    supports_token_counting: bool = False
-    supports_streaming: bool = False
-    supports_batch_embedding: bool = True
-    supports_caching: bool = False
+    supports_index_management: bool = False
     idempotent_writes: bool = False
     supports_multi_tenant: bool = False
-    normalizes_at_source: bool = False
-    truncation_mode: str = "base"
     supports_deadline: bool = True
+    max_top_k: Optional[int] = None
+    max_filter_terms: Optional[int] = None
+    text_storage_strategy: str = "metadata"  # "metadata", "docstore", "none"
+    max_text_length: Optional[int] = None
+    supports_batch_queries: bool = False
 
 
 # =============================================================================
-# Operation Specifications
+# Query and Operation Specifications
 # =============================================================================
 
-
 @dataclass(frozen=True)
-class EmbedSpec:
+class QuerySpec:
     """
-    Specification for single text embedding generation.
+    Specification for vector similarity search queries.
 
     Attributes:
-        text: Text to convert to embedding
-        model: Target model for embedding generation
-        truncate: Whether to truncate long texts (True) or error (False)
-        normalize: Whether to normalize output vector to unit length
-        metadata: Optional metadata to associate with the resulting embedding
-                  (not sent on the wire; used locally).
-        stream: Whether to stream the embedding results
+        vector: Query vector for similarity search
+        top_k: Number of top results to return
+        namespace: Target namespace/collection for the query
+        filter: Optional metadata filters for pre-search filtering
+        include_metadata: Whether to include metadata in results
+        include_vectors: Whether to include vector data in results
     """
-    text: str
-    model: str
-    truncate: bool = True
-    normalize: bool = False
-    metadata: Optional[Dict[str, Any]] = None
-    stream: bool = False
+    vector: List[float]
+    top_k: int
+    namespace: str = "default"
+    filter: Optional[Dict[str, Any]] = None
+    include_metadata: bool = True
+    include_vectors: bool = False
 
 
 @dataclass(frozen=True)
-class BatchEmbedSpec:
+class BatchQuerySpec:
     """
-    Specification for batch text embedding generation.
+    Specification for batch vector similarity search queries.
 
     Attributes:
-        texts: List of texts to embed
-        model: Target model for embedding generation
-        truncate: Whether to truncate long texts (True) or error (False)
-        normalize: Whether to normalize output vectors to unit length
-        metadatas: Optional list of per-text metadata dicts. Length must match
-                   texts when provided. Not part of the wire contract.
+        queries: List of individual query specifications
+        namespace: Target namespace/collection for all queries
     """
-    texts: List[str]
-    model: str
-    truncate: bool = True
-    normalize: bool = False
-    metadatas: Optional[List[Dict[str, Any]]] = None
+    queries: List[QuerySpec]
+    namespace: str = "default"
+
+
+@dataclass(frozen=True)
+class UpsertSpec:
+    """
+    Specification for vector upsert operations.
+
+    Attributes:
+        vectors: List of vectors to upsert
+        namespace: Target namespace/collection for the operation
+    """
+    vectors: List[Vector]
+    namespace: str = "default"
+
+
+@dataclass(frozen=True)
+class DeleteSpec:
+    """
+    Specification for vector deletion operations.
+
+    Attributes:
+        ids: List of vector IDs to delete
+        namespace: Target namespace/collection for the operation
+        filter: Optional metadata filter for bulk deletion
+    """
+    ids: List[VectorID]
+    namespace: str = "default"
+    filter: Optional[Dict[str, Any]] = None
+
+
+@dataclass(frozen=True)
+class NamespaceSpec:
+    """
+    Specification for namespace/collection management operations.
+
+    Attributes:
+        namespace: Namespace/collection name
+        dimensions: Vector dimensions for this namespace
+        distance_metric: Distance metric to use ("cosine", "euclidean", "dotproduct")
+    """
+    namespace: str
+    dimensions: int
+    distance_metric: str = "cosine"
 
 
 # =============================================================================
 # Operation Results
 # =============================================================================
 
-
 @dataclass
-class EmbedResult:
+class UpsertResult:
     """
-    Result from single text embedding generation.
+    Result from vector upsert operations.
 
     Attributes:
-        embedding: Generated embedding vector
-        model: Model used for generation
-        text: Original input text
-        tokens_used: Number of tokens processed (if available)
-        truncated: Whether input text was truncated
+        upserted_count: Number of vectors successfully upserted
+        failed_count: Number of vectors that failed to upsert
+        failures: List of individual failure details
     """
-    embedding: EmbeddingVector
-    model: str
-    text: str
-    tokens_used: Optional[int] = None
-    truncated: bool = False
+    upserted_count: int
+    failed_count: int
+    failures: List[Dict[str, Any]]
 
 
 @dataclass
-class BatchEmbedResult:
+class DeleteResult:
     """
-    Result from batch text embedding generation.
+    Result from vector deletion operations.
 
     Attributes:
-        embeddings: List of generated embedding vectors
-        model: Model used for generation
-        total_texts: Total number of texts processed
-        total_tokens: Total tokens processed (if available)
-        failed_texts: List of per-text failure details:
-            - index: index in input batch
-            - text: original text
-            - error: error class name
-            - code: stable error code (if available)
-            - message: human-readable error
-            - metadata: optional metadata associated with this text (if provided)
-
-    Contract for provider-native implementations:
-        - Unless otherwise documented, `embeddings[i]` is assumed to correspond
-          to `texts[i]` from the input BatchEmbedSpec (i.e., same length and order).
-        - Partial success may also be expressed via `failed_texts`, but any
-          deviation from 1:1 alignment MUST be documented by the implementation.
+        deleted_count: Number of vectors successfully deleted
+        failed_count: Number of vectors that failed to delete
+        failures: List of individual failure details
     """
-    embeddings: List[EmbeddingVector]
-    model: str
-    total_texts: int
-    total_tokens: Optional[int] = None
-    failed_texts: List[Dict[str, Any]] = None
+    deleted_count: int
+    failed_count: int
+    failures: List[Dict[str, Any]]
 
-    def __post_init__(self) -> None:
-        if self.failed_texts is None:
-            self.failed_texts = []
+
+@dataclass
+class NamespaceResult:
+    """
+    Result from namespace management operations.
+
+    Attributes:
+        success: Whether the operation completed successfully
+        namespace: The namespace that was operated on
+        details: Additional operation-specific details
+    """
+    success: bool
+    namespace: str
+    details: Dict[str, Any]
 
 
 # =============================================================================
 # Stable Protocol Interface (async, versioned contract)
 # =============================================================================
 
-
 @runtime_checkable
-class EmbeddingProtocolV1(Protocol):
+class VectorProtocolV1(Protocol):
     """
-    Protocol defining the Embedding Protocol V1 interface.
+    Protocol defining the Vector Protocol V1.0 interface.
 
-    Implement this protocol to create compatible embedding adapters. All methods are async
-    and designed for high-concurrency environments. The protocol is runtime-checkable
-    for dynamic adapter validation.
+    Implement this protocol to create compatible vector adapters. All methods are async
+    and designed for high-concurrency environments. This protocol is language-level;
+    the canonical wire contract is defined by the JSON envelopes.
+
+    Note: batch_query is a V1.0 addition. Adapters that don't support batch queries
+    should raise NotSupported when this method is called.
     """
 
-    async def capabilities(self) -> EmbeddingCapabilities:
-        """
-        Get the capabilities of this embedding adapter.
+    async def capabilities(self) -> VectorCapabilities:
+        """Get the capabilities of this vector adapter."""
+        ...
 
-        Returns:
-            EmbeddingCapabilities: Description of supported features and limitations
+    async def query(
+        self,
+        spec: QuerySpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> QueryResult:
+        """Execute a vector similarity search query."""
+        ...
+
+    async def batch_query(
+        self,
+        spec: BatchQuerySpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> List[QueryResult]:
+        """
+        Execute multiple vector similarity search queries in batch.
+
+        This is a V1.0 addition. Adapters that don't support batch queries
+        should raise NotSupported.
         """
         ...
 
-    async def embed(
+    async def upsert(
         self,
-        spec: EmbedSpec,
+        spec: UpsertSpec,
         *,
         ctx: Optional[OperationContext] = None,
-    ) -> EmbedResult:
-        """
-        Generate embedding for a single text (non-streaming).
-
-        NOTE:
-            Streaming is a separate method (stream_embed) to align with LLM and Graph.
-        """
+    ) -> UpsertResult:
+        """Upsert vectors into the vector store."""
         ...
 
-    async def stream_embed(
+    async def delete(
         self,
-        spec: EmbedSpec,
+        spec: DeleteSpec,
         *,
         ctx: Optional[OperationContext] = None,
-    ) -> AsyncIterator[EmbedChunk]:
-        """
-        Stream embedding generation for a single text.
-
-        Yields:
-            EmbedChunk objects until completion.
-        """
+    ) -> DeleteResult:
+        """Delete vectors from the vector store."""
         ...
 
-    async def embed_batch(
+    async def create_namespace(
         self,
-        spec: BatchEmbedSpec,
+        spec: NamespaceSpec,
         *,
         ctx: Optional[OperationContext] = None,
-    ) -> BatchEmbedResult:
-        """Generate embeddings for multiple texts in batch."""
+    ) -> NamespaceResult:
+        """Create a new namespace/collection."""
         ...
 
-    async def count_tokens(
+    async def delete_namespace(
         self,
-        text: str,
-        model: str,
+        namespace: str,
         *,
         ctx: Optional[OperationContext] = None,
-    ) -> int:
-        """Count tokens in text for a specific model."""
+    ) -> NamespaceResult:
+        """Delete a namespace/collection."""
         ...
 
     async def health(self, *, ctx: Optional[OperationContext] = None) -> Dict[str, Any]:
-        """Check the health status of the embedding backend."""
+        """Check backend health status."""
         ...
 
-    async def get_stats(self, *, ctx: Optional[OperationContext] = None) -> EmbeddingStats:
-        """Get embedding operation statistics and usage information."""
-        ...
+
+# =============================================================================
+# Structured Configuration
+# =============================================================================
+
+@dataclass(frozen=True)
+class VectorAdapterConfig:
+    """
+    Structured configuration for BaseVectorAdapter policies.
+
+    This allows callers to configure core behavior (breaker, limiter, cache TTLs)
+    in a single place, instead of ad-hoc kwargs.
+
+    Notes:
+        - `cache_*_ttl_s` are used as defaults when explicit constructor args
+          are not provided. Use 0 to disable caching for that operation.
+        - `limiter_*` and `breaker_*` are used only when BaseVectorAdapter is
+          constructing its own SimpleTokenBucketLimiter / SimpleCircuitBreaker.
+        - `auto_normalize`: If True, vectors in upsert/query operations are
+          normalized to unit length (L2) automatically. This is particularly
+          useful for cosine similarity searches.
+    """
+    cache_query_ttl_s: int = 60
+    cache_caps_ttl_s: int = 30
+    breaker_failure_threshold: int = 5
+    breaker_reset_timeout_s: float = 10.0
+    limiter_rate_per_sec: int = 50
+    limiter_burst: int = 100
+    auto_normalize: bool = False
 
 
 # =============================================================================
 # Base Instrumented Adapter (validation, metrics, error handling)
 # =============================================================================
 
-
-class BaseEmbeddingAdapter(EmbeddingProtocolV1):
+class BaseVectorAdapter(VectorProtocolV1):
     """
-    Base class for implementing Embedding Protocol V1 adapters.
+    Base class for implementing Vector Protocol V1.0 adapters.
 
     Provides common validation, metrics instrumentation, error handling, and
-    SIEM-safe observability. Implementers override the `_do_*` methods to provide
-    backend-specific functionality while inheriting:
+    SIEM-safe observability. Implementers override the `_do_*` methods to plug in
+    backend-specific behavior while inheriting:
 
       - Normalized error taxonomy
-      - Deadline enforcement via DeadlinePolicy
+      - Simple deadline enforcement (if configured)
       - Circuit breaker integration
-      - Optional in-memory caching (standalone)
-      - Rate limiting via token bucket (standalone)
+      - Read-path caching for queries (standalone mode)
+      - Rate limiting via token bucket (standalone mode)
       - Canonical metrics emission for ops & latency
+      - Automatic text storage/retrieval via DocStore
+      - Cache invalidation on write operations
+      - Optional automatic vector normalization for cosine similarity
 
-    Mode Strategy
-    -------------
-    - "thin" (default): For composition under external control planes.
-      All infra (deadline, breaker, limiter, cache) defaults to no-op.
+    Text Storage Behavior:
+      - Upsert: Docstore failures cause the entire operation to fail (atomicity)
+      - Query: Docstore failures cause missing text but don't fail the query (graceful degradation)
 
-    - "standalone": For direct use. Turns on:
-        - EnforcingDeadline
-        - SimpleCircuitBreaker
-        - InMemoryTTLCache
-        - TokenBucketLimiter
-      Intended for development and light production.
+    Auto-Normalization Behavior:
+      - When enabled (auto_normalize=True), vectors are automatically normalized to unit length
+      - Particularly useful for cosine similarity searches
+      - Includes optimization to skip normalization if vector is already unit length
+      - Applied consistently to query, batch_query, and upsert operations
 
-    Streaming Alignment
-    -------------------
-    Streaming is a dedicated method (`stream_embed`) and a dedicated wire operation
-    (`embedding.stream_embed`), matching the LLM and Graph patterns.
+    Threading:
+        - In-memory infra (cache, breaker, limiter) is not thread-safe.
+        - Intended for single-threaded async event loops. Use external distributed
+          infra for multi-threaded or multi-process deployments.
+
+    Backpressure:
+        - The SimpleTokenBucketLimiter provides per-process QPS-style backpressure.
+        - For high-volume or large-batch workloads, callers should also respect
+          capabilities.max_batch_size and manually chunk work into smaller requests.
     """
 
-    _component = "embedding"
+    _component = "vector"
 
     def __init__(
         self,
         *,
-        mode: str = "thin",
         metrics: Optional[MetricsSink] = None,
+        mode: str = "thin",
+        # Optional explicit policy overrides (advanced)
         deadline_policy: Optional[DeadlinePolicy] = None,
-        truncation: Optional[TruncationPolicy] = None,
-        normalization: Optional[NormalizationPolicy] = None,
         breaker: Optional[CircuitBreaker] = None,
         cache: Optional[Cache] = None,
         limiter: Optional[RateLimiter] = None,
-        tag_model_in_metrics: Optional[bool] = None,
-        cache_embed_ttl_s: int = 60,
-        cache_caps_ttl_s: int = 30,
-        stream_deadline_check_every_n_chunks: int = 10,
+        docstore: Optional[DocStore] = None,
+        cache_query_ttl_s: Optional[int] = None,
+        cache_caps_ttl_s: Optional[int] = None,
+        warn_on_standalone_no_metrics: bool = True,
+        config: Optional[VectorAdapterConfig] = None,
     ) -> None:
         """
-        Initialize the embedding adapter with metrics instrumentation and optional policies.
+        Initialize the vector adapter with metrics instrumentation and optional policies.
 
         Args:
-            mode: "thin" (no-op infra; meant to be wrapped by a provider) or
-                  "standalone" (turn on basic demo policies).
-            metrics: Metrics sink for operational monitoring. Uses NoopMetrics if None.
-            deadline_policy: Optional deadline policy to enforce ctx.deadline_ms.
-            truncation: Optional truncation policy; defaults vary by mode.
-            normalization: Optional normalization policy; defaults vary by mode.
-            breaker: Optional circuit breaker; defaults vary by mode.
-            cache: Optional async cache; defaults vary by mode.
-            limiter: Optional rate limiter; defaults vary by mode.
-            tag_model_in_metrics: Whether to include 'model' as a metric tag.
-            cache_embed_ttl_s: TTL for embed() cache entries when using a TTL cache.
-                               Use 0 to disable embed caching.
-            cache_caps_ttl_s: TTL for capabilities() cache entries in standalone mode.
-                              Use 0 to disable capabilities caching.
-            stream_deadline_check_every_n_chunks:
-                For streaming, perform deadline checks every N chunks instead of every chunk.
-                Keeps overhead low under hot paths while preserving deadline semantics.
+            metrics: Metrics sink. Uses NoopMetrics if None.
+            mode: "thin" or "standalone" (see module docs).
+            deadline_policy: Optional deadline policy override.
+            breaker: Optional circuit breaker override.
+            cache: Optional cache override (read paths).
+            limiter: Optional rate limiter override.
+            docstore: Optional document store for text storage.
+            cache_query_ttl_s: TTL for query cache entries in standalone mode. Use 0 to disable.
+            cache_caps_ttl_s: TTL for capabilities cache entries in standalone mode. Use 0 to disable.
+            warn_on_standalone_no_metrics: Warn if standalone is used without metrics.
+            config: Optional VectorAdapterConfig to centralize policy configuration.
+                    Explicit constructor args take precedence over config fields.
         """
+        self._metrics: MetricsSink = metrics or NoopMetrics()
+
+        # Structured config defaults
+        cfg = config or VectorAdapterConfig()
+
+        # Effective TTLs: explicit args win, config is fallback. Allow 0 to disable.
+        self._cache_query_ttl_s = (
+            cache_query_ttl_s if cache_query_ttl_s is not None
+            else cfg.cache_query_ttl_s
+        )
+        self._cache_caps_ttl_s = (
+            cache_caps_ttl_s if cache_caps_ttl_s is not None
+            else cfg.cache_caps_ttl_s
+        )
+        self._auto_normalize = cfg.auto_normalize
+
         m = (mode or "thin").strip().lower()
         if m not in {"thin", "standalone"}:
             m = "thin"
         self._mode = m
 
-        self._metrics: MetricsSink = metrics or NoopMetrics()
-
-        # Warn if standalone without metrics sink
-        if self._mode == "standalone" and isinstance(self._metrics, NoopMetrics):
-            LOG.warning(
-                "Using standalone mode without metrics - "
-                "consider providing a MetricsSink for production use"
-            )
-
-        if int(stream_deadline_check_every_n_chunks) < 1:
-            raise ValueError("stream_deadline_check_every_n_chunks must be >= 1")
-        self._stream_deadline_check_every_n_chunks: int = max(1, int(stream_deadline_check_every_n_chunks))
-
-        # Policies/infra defaults by mode (overridable)
         if self._mode == "thin":
             self._deadline: DeadlinePolicy = deadline_policy or NoopDeadline()
-            self._trunc: TruncationPolicy = truncation or SimpleCharTruncation()
-            self._norm: NormalizationPolicy = normalization or L2Normalization()
             self._breaker: CircuitBreaker = breaker or NoopBreaker()
             self._cache: Cache = cache or NoopCache()
             self._limiter: RateLimiter = limiter or NoopLimiter()
-            self._tag_model_in_metrics: bool = (
-                bool(tag_model_in_metrics) if tag_model_in_metrics is not None else False
+        else:
+            self._deadline = deadline_policy or SimpleDeadline()
+            self._breaker = breaker or SimpleCircuitBreaker(
+                consecutive_failure_threshold=cfg.breaker_failure_threshold,
+                reset_timeout_s=cfg.breaker_reset_timeout_s,
             )
-        else:  # "standalone"
-            self._deadline: DeadlinePolicy = deadline_policy or EnforcingDeadline()
-            self._trunc: TruncationPolicy = truncation or SimpleCharTruncation()
-            self._norm: NormalizationPolicy = normalization or L2Normalization()
-            self._breaker: CircuitBreaker = breaker or SimpleCircuitBreaker()
-            self._cache: Cache = cache or InMemoryTTLCache()
-            self._limiter: RateLimiter = limiter or TokenBucketLimiter()
-            self._tag_model_in_metrics: bool = (
-                bool(tag_model_in_metrics) if tag_model_in_metrics is not None else True
+            self._cache = cache or InMemoryTTLCache()
+            self._limiter = limiter or SimpleTokenBucketLimiter(
+                rate_per_sec=cfg.limiter_rate_per_sec,
+                burst=cfg.limiter_burst,
             )
+            if warn_on_standalone_no_metrics and isinstance(self._metrics, NoopMetrics):
+                LOG.warning(
+                    "Using standalone mode without metrics — provide a MetricsSink for production use"
+                )
 
-        # Allow 0 to mean "no caching".
-        self._cache_embed_ttl_s: int = max(0, int(cache_embed_ttl_s))
-        self._cache_caps_ttl_s: int = max(0, int(cache_caps_ttl_s))
+        # Document store for text storage
+        self._docstore = docstore
 
-        # Streaming metrics tracking
-        self._stream_stats = {
-            "active_streams": 0,
-            "total_chunks": 0,
-            "abandoned_streams": 0,
-            "completed_streams": 0,
-        }
+        # Capabilities cache key is namespaced per adapter instance (module/class/id)
+        self._caps_cache_key = (
+            f"{VECTOR_PROTOCOL_VERSION}:capabilities:"
+            f"{self.__class__.__module__}.{self.__class__.__qualname__}:{id(self)}"
+        )
 
-    # --- internal helpers (validation, hashing, metrics, deadlines) ---
+    # --- async context management & cleanup hooks ----------------------------
+
+    async def __aenter__(self) -> "BaseVectorAdapter":
+        """
+        Async context manager entry.
+
+        Implementers may override `close()` to ensure resources are released when
+        used via `async with BaseVectorAdapter(...):`.
+        """
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        """
+        Async context manager exit.
+
+        Delegates to `close()`; errors during cleanup SHOULD NOT raise unless
+        they represent critical invariants.
+        """
+        await self.close()
+
+    async def close(self) -> None:
+        """
+        Clean up resources (connections, pools, clients).
+
+        Override in backend implementations that maintain external resources.
+        Default implementation is a no-op.
+
+        Note: In-memory components (cache, breaker, limiter) do not require
+        explicit cleanup as they have no external resource handles.
+        """
+        pass
+
+    # --- internal helpers (validation and instrumentation) -------------------
 
     @staticmethod
     def _require_non_empty(name: str, value: str) -> None:
@@ -1196,31 +1287,64 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         if not isinstance(value, str) or not value.strip():
             raise BadRequest(f"{name} must be a non-empty string")
 
+    def _validate_vector(self, vector: List[float], normalize: bool = False) -> List[float]:
+        """
+        Validate that a vector is properly formed and optionally normalize it.
+
+        Requirements:
+            - non-empty list
+            - all elements numeric (int/float)
+
+        Args:
+            vector: The input vector list.
+            normalize: If True, returns the L2 normalized version of the vector.
+                       Throws BadRequest if vector length is zero.
+
+        Returns:
+            The validated (and potentially normalized) vector.
+        """
+        if not isinstance(vector, list) or not vector:
+            raise BadRequest("vector must be a non-empty list of floats")
+        if not all(isinstance(x, (int, float)) for x in vector):
+            raise BadRequest("vector must contain only numeric values")
+
+        if normalize:
+            norm = math.sqrt(sum(x * x for x in vector))
+            if norm == 0:
+                raise BadRequest("cannot normalize zero-length vector")
+            # Optimization: if already close to 1.0, return as-is
+            if abs(norm - 1.0) < 1e-6:
+                return vector
+            return [x / norm for x in vector]
+
+        return vector
+
+    @staticmethod
+    def _ensure_json_serializable(value: Any, label: str) -> None:
+        """
+        Ensure a value is JSON-serializable.
+
+        Used to fail fast on invalid filter/metadata payloads that must traverse
+        wire contracts or caches. Error messages are SIEM-safe and low detail.
+        """
+        if value is None:
+            return
+        try:
+            json.dumps(value)
+        except (TypeError, ValueError) as e:
+            raise BadRequest(f"{label} must be JSON-serializable: {e}")
+
     @staticmethod
     def _tenant_hash(tenant: Optional[str]) -> Optional[str]:
         """
         Create privacy-preserving hash of tenant identifier for metrics.
 
         Raw tenant IDs MUST NOT appear directly in metrics.
+        Uses a 12-character prefix of SHA256 for low-cardinality labeling.
         """
         if not tenant:
             return None
-        return hashlib.sha256(tenant.encode("utf-8")).hexdigest()[:12]
-
-    @staticmethod
-    def _safe_model_tag(model: str) -> Optional[str]:
-        """
-        Normalize model name for metrics to avoid cardinality explosions.
-
-        - Empty/None → None
-        - Length > 100 → "unknown"
-        """
-        if not model:
-            return None
-        m = str(model)
-        if len(m) > 100:
-            return "unknown"
-        return m
+        return hashlib.sha256(tenant.encode()).hexdigest()[:12]
 
     def _record(
         self,
@@ -1256,7 +1380,6 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
                         x["deadline_bucket"] = "<60s"
                     else:
                         x["deadline_bucket"] = ">=60s"
-
             self._metrics.observe(
                 component=self._component,
                 op=op,
@@ -1265,34 +1388,22 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
                 code=code,
                 extra=x or None,
             )
-
-            if not ok:
-                self._metrics.counter(
-                    component=self._component,
-                    name="errors_total",
-                    value=1,
-                    extra={"code": code},
-                )
         except Exception:
-            # Metrics failures MUST NOT affect request path.
             pass
 
-    async def _apply_deadline(
-        self,
-        awaitable: Awaitable[Any],
-        ctx: Optional[OperationContext],
-    ) -> Any:
+    async def _apply_deadline(self, awaitable: Awaitable[Any], ctx: Optional[OperationContext]) -> Any:
         """
         Apply the configured deadline policy to an awaitable.
 
-        Any asyncio.TimeoutError not handled by the policy is normalized into DeadlineExceeded.
+        Any asyncio.TimeoutError is normalized into DeadlineExceeded.
         """
         try:
             return await self._deadline.wrap(awaitable, ctx)
         except DeadlineExceeded:
+            # Propagate adapter-specific deadline errors
             raise
-        except asyncio.TimeoutError as e:
-            raise DeadlineExceeded("operation timed out") from e
+        except asyncio.TimeoutError:
+            raise DeadlineExceeded("operation timed out", details={"remaining_ms": 0})
 
     def _fail_if_expired(self, ctx: Optional[OperationContext]) -> None:
         """
@@ -1302,59 +1413,131 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         """
         if ctx is None or ctx.deadline_ms is None:
             return
-        remaining = ctx.remaining_ms()
-        if remaining is not None and remaining <= 0:
-            raise DeadlineExceeded("deadline already expired")
+        if ctx.remaining_ms() == 0:
+            raise DeadlineExceeded(
+                "operation timed out (preflight)",
+                details={"preflight": True, "remaining_ms": 0},
+            )
+
+    # --- cache keys (read paths only) ----------------------------------------
 
     @staticmethod
-    def _format_cache_key(prefix: str, *parts: str) -> str:
+    def _hash_obj(obj: Any) -> str:
         """
-        Helper to build cache keys in a consistent way while preserving
-        existing key formats.
+        Stable hash for JSON-serializable objects.
+
+        Uses json.dumps(..., sort_keys=True) with type prefix to avoid collisions
+        for different types that serialize to identical JSON.
         """
-        return prefix + "".join(parts)
+        if isinstance(obj, (list, dict)):
+            # Stable JSON with type prefix
+            payload = json.dumps(obj, sort_keys=True, separators=(",", ":"))
+            return hashlib.sha256(f"j:{payload}".encode()).hexdigest()
+        else:
+            # Use repr for non-JSON types with prefix
+            return hashlib.sha256(f"p:{repr(obj)}".encode()).hexdigest()
 
-    @staticmethod
-    def _caps_cache_key() -> str:
-        """Cache key for capabilities() when cached."""
-        return BaseEmbeddingAdapter._format_cache_key("embedding:capabilities")
-
-    def _embed_cache_key(
+    def _query_cache_key(
         self,
-        model: str,
-        normalize: bool,
-        text: str,
+        spec: QuerySpec,
+        caps: Optional[VectorCapabilities],
         ctx: Optional[OperationContext],
     ) -> str:
         """
-        Construct a cache key for embed() that:
+        Compose a cache key for query() that avoids cross-hit pollution.
 
-          - Avoids leaking raw text (uses SHA-256 digest).
-          - Is isolated per tenant via tenant hash (or 'global' if none).
+        Includes:
+            - vector hash
+            - namespace, top_k, filter, include_* flags
+            - backend identity (server/version)
+            - tenant hash (if present)
+            - text storage strategy
+            - protocol version for cache safety
         """
-        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
-        tenant_hash = self._tenant_hash(ctx.tenant) if ctx and ctx.tenant else "global"
-        return self._format_cache_key(
-            "embedding:embed:",
-            f"tenant={tenant_hash}:",
-            f"model={model}:",
-            f"norm={int(normalize)}:",
-            f"text={digest}",
+        tenant_h = self._tenant_hash(ctx.tenant) if ctx else None
+        caps_part = f"{caps.server}:{caps.version}" if caps else "unknown"
+        text_strategy = caps.text_storage_strategy if caps else "unknown"
+        return (
+            f"{VECTOR_PROTOCOL_VERSION}:query:"
+            f"{caps_part}:"
+            f"ns={spec.namespace}:"
+            f"topk={spec.top_k}:"
+            f"im={int(bool(spec.include_metadata))}:iv={int(bool(spec.include_vectors))}:"
+            f"vec={self._hash_obj(spec.vector)}:"
+            f"flt={self._hash_obj(spec.filter)}:"
+            f"tenant={tenant_h}:"
+            f"text={text_strategy}"
         )
 
-    @asynccontextmanager
-    async def _rate_limited(self):
+    def _batch_query_cache_key(
+        self,
+        spec: BatchQuerySpec,
+        caps: Optional[VectorCapabilities],
+        ctx: Optional[OperationContext],
+    ) -> str:
         """
-        Async context manager to wrap an operation with rate limiting.
+        Compose a cache key for batch_query().
+        """
+        tenant_h = self._tenant_hash(ctx.tenant) if ctx else None
+        caps_part = f"{caps.server}:{caps.version}" if caps else "unknown"
+        text_strategy = caps.text_storage_strategy if caps else "unknown"
 
-        Ensures that acquire/release semantics remain correct even in the
-        presence of exceptions, while keeping the main call site readable.
+        # Hash all queries for the cache key
+        queries_hash = self._hash_obj([
+            {
+                "vector": q.vector,
+                "top_k": q.top_k,
+                "filter": q.filter,
+                "include_metadata": q.include_metadata,
+                "include_vectors": q.include_vectors
+            }
+            for q in spec.queries
+        ])
+
+        return (
+            f"{VECTOR_PROTOCOL_VERSION}:batch_query:"
+            f"{caps_part}:"
+            f"ns={spec.namespace}:"
+            f"queries={queries_hash}:"
+            f"tenant={tenant_h}:"
+            f"text={text_strategy}"
+        )
+
+    def _namespace_cache_pattern(self, namespace: str) -> str:
         """
-        await self._limiter.acquire()
+        Return a string pattern for cache keys belonging to a specific namespace.
+        Used for cache invalidation on write operations.
+
+        Note: This uses simple substring matching for in-memory cache.
+        For distributed caches, cache implementations can provide their own
+        `invalidate_namespace(namespace: str)` hook.
+        """
+        return f"ns={namespace}:"
+
+    async def _invalidate_namespace_cache(self, namespace: str) -> None:
+        """
+        Best-effort namespace cache invalidation.
+
+        Behavior:
+            - If the underlying cache exposes an async `invalidate_namespace(namespace)`
+              method, it is called directly.
+            - Otherwise, this is a no-op and TTL-based expiry is relied upon.
+
+        This avoids reaching into cache internals (e.g., _store) and allows
+        distributed caches to provide their own invalidation semantics.
+        """
+        if isinstance(self._cache, NoopCache):
+            return
+
         try:
-            yield
-        finally:
-            self._limiter.release()
+            invalidate = getattr(self._cache, "invalidate_namespace", None)
+            if callable(invalidate):
+                await invalidate(namespace)
+        except Exception:
+            # Never let cache invalidation break the main operation
+            LOG.debug("Cache invalidation failed for namespace %s", namespace)
+
+    # --- unified unary gate wrapper (for data-path ops) ----------------------
 
     async def _with_gates_unary(
         self,
@@ -1363,291 +1546,89 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         ctx: Optional[OperationContext],
         call: Callable[[], Awaitable[Any]],
         metric_extra: Optional[Mapping[str, Any]] = None,
-        error_extra: Optional[Mapping[str, Any]] = None,
+        on_result: Optional[Callable[[Any], Mapping[str, Any]]] = None,
     ) -> Any:
         """
-        Shared unary gate wrapper:
+        DRY wrapper for unary (non-streaming) data-path operations.
 
-          - deadline preflight
-          - circuit breaker allow
-          - rate limiter acquire/release
-          - deadline enforcement
-          - metrics
-          - breaker success/error wiring
+        Responsibilities:
+            - Preflight deadline check
+            - Circuit breaker gate
+            - Rate limiter acquire/release
+            - DeadlinePolicy enforcement
+            - Metrics emission (success/failure) with optional result-derived fields
+
+        Behavior is aligned with the explicit per-method logic:
+            - Same error types and codes
+            - Same breaker semantics
+            - Same limiter semantics
         """
-        self._fail_if_expired(ctx)
-
-        # Circuit breaker gate
-        if not self._breaker.allow():
-            raise Unavailable("circuit open")
-
-        async with self._rate_limited():
-            t0 = time.monotonic()
-            try:
-                result = await self._apply_deadline(call(), ctx)
-                self._record(
-                    op,
-                    t0,
-                    True,
-                    ctx=ctx,
-                    **(metric_extra or {}),
-                )
-                self._breaker.on_success()
-                return result
-            except EmbeddingAdapterError as e:
-                code = e.code or type(e).__name__
-                extra = dict(error_extra or {})
-                self._record(
-                    op,
-                    t0,
-                    False,
-                    code=code,
-                    ctx=ctx,
-                    **extra,
-                )
-                self._breaker.on_error(e)
-                raise
-            except Exception as e:
-                extra = dict(error_extra or {})
-                self._record(
-                    op,
-                    t0,
-                    False,
-                    code="UnhandledException",
-                    ctx=ctx,
-                    **extra,
-                )
-                self._breaker.on_error(e)
-                raise
-
-    async def _with_gates_stream(
-        self,
-        *,
-        op: str,
-        ctx: Optional[OperationContext],
-        agen_factory: Callable[[], AsyncIterator[EmbedChunk]],
-        metric_extra: Optional[Mapping[str, Any]] = None,
-    ) -> AsyncIterator[EmbedChunk]:
-        """
-        Streaming gate wrapper aligned with LLM and Graph:
-
-          - deadline preflight
-          - breaker allow/on_{success,error}
-          - rate limiter acquire/release
-          - periodic deadline checks (every N chunks)
-          - metrics on completion or error
-          - proper resource cleanup for abandoned streams
-        """
-        metric_extra = dict(metric_extra or {})
+        extras = dict(metric_extra or {})
         self._fail_if_expired(ctx)
 
         if not self._breaker.allow():
-            raise Unavailable("circuit open")
+            e = Unavailable("circuit open")
+            # Record immediately to preserve observability for hard rejections
+            self._record(op, time.monotonic(), False, code=e.code or type(e).__name__, ctx=ctx, **extras)
+            raise e
 
         await self._limiter.acquire()
         t0 = time.monotonic()
-        check_n = self._stream_deadline_check_every_n_chunks
+        try:
+            result = await self._apply_deadline(call(), ctx)
 
-        async def _gen() -> AsyncIterator[EmbedChunk]:
-            chunks = 0
-            completed = False
-            agen: Optional[AsyncIterator[EmbedChunk]] = None
+            # Allow per-op enrichment based on the result (e.g., matches, counts, cache hit)
+            if on_result is not None:
+                try:
+                    res_extras = on_result(result) or {}
+                    extras.update(res_extras)
+                except Exception:
+                    # Never let metrics enrichment break the main path
+                    pass
 
-            try:
-                self._stream_stats["active_streams"] += 1
-                agen = agen_factory()
+            self._record(op, t0, True, ctx=ctx, **extras)
+            self._breaker.on_success()
+            return result
+        except VectorAdapterError as e:
+            self._record(
+                op,
+                t0,
+                False,
+                code=e.code or type(e).__name__,
+                ctx=ctx,
+                **extras,
+            )
+            self._breaker.on_error(e)
+            raise
+        except Exception as e:
+            self._record(
+                op,
+                t0,
+                False,
+                code="UNAVAILABLE",
+                ctx=ctx,
+                **extras,
+            )
+            self._breaker.on_error(e)
+            raise
+        finally:
+            self._limiter.release()
 
-                async for chunk in agen:
-                    chunks += 1
-                    self._stream_stats["total_chunks"] += 1
+    # --- final public APIs (validation + instrumentation) --------------------
 
-                    if check_n > 0 and (chunks % check_n) == 0:
-                        self._fail_if_expired(ctx)
-
-                    yield chunk
-
-                completed = True
-                self._stream_stats["completed_streams"] += 1
-                self._record(
-                    f"{op}_stream",
-                    t0,
-                    True,
-                    ctx=ctx,
-                    chunks=chunks,
-                    **metric_extra,
-                )
-                self._breaker.on_success()
-
-            except asyncio.CancelledError as e:
-                # Consumer cancellation / disconnect / abandonment
-                self._record(
-                    f"{op}_stream",
-                    t0,
-                    False,
-                    code="CancelledError",
-                    ctx=ctx,
-                    chunks=chunks,
-                    **metric_extra,
-                )
-                if not completed and chunks > 0:
-                    self._stream_stats["abandoned_streams"] += 1
-                self._breaker.on_error(e)
-                raise
-
-            except EmbeddingAdapterError as e:
-                code = e.code or type(e).__name__
-                self._record(
-                    f"{op}_stream",
-                    t0,
-                    False,
-                    code=code,
-                    ctx=ctx,
-                    chunks=chunks,
-                    **metric_extra,
-                )
-                if not completed and chunks > 0:
-                    self._stream_stats["abandoned_streams"] += 1
-                self._breaker.on_error(e)
-                raise
-
-            except Exception as e:
-                self._record(
-                    f"{op}_stream",
-                    t0,
-                    False,
-                    code="UnhandledException",
-                    ctx=ctx,
-                    chunks=chunks,
-                    **metric_extra,
-                )
-                if not completed and chunks > 0:
-                    self._stream_stats["abandoned_streams"] += 1
-                self._breaker.on_error(e)
-                raise
-
-            finally:
-                self._stream_stats["active_streams"] -= 1
-                self._limiter.release()
-
-                if chunks > 0:
-                    try:
-                        self._metrics.counter(
-                            component=self._component,
-                            name="stream_chunks",
-                            value=chunks,
-                            extra={"op": op, "completed": completed},
-                        )
-                    except Exception:
-                        pass
-
-                # Ensure underlying stream resources are cleaned up
-                if agen is not None:
-                    close_fn = getattr(agen, "aclose", None)
-                    if callable(close_fn):
-                        try:
-                            await asyncio.shield(close_fn())
-                        except Exception:
-                            pass
-
-        return _gen()
-
-    # --- metadata helpers ----------------------------------------------------
-
-    @staticmethod
-    def _attach_single_metadata(
-        base: EmbedResult,
-        metadata: Optional[Dict[str, Any]],
-    ) -> EmbedResult:
+    async def capabilities(self) -> VectorCapabilities:
         """
-        Attach caller-supplied metadata to a single EmbedResult without
-        mutating the original (important for cache safety).
-        """
-        if metadata is None:
-            return base
+        Get the capabilities of this vector adapter (with optional caching).
 
-        emb = base.embedding
-        new_emb = EmbeddingVector(
-            vector=emb.vector,
-            text=emb.text,
-            model=emb.model,
-            dimensions=emb.dimensions,
-            metadata=metadata,
-        )
-        return EmbedResult(
-            embedding=new_emb,
-            model=base.model,
-            text=base.text,
-            tokens_used=base.tokens_used,
-            truncated=base.truncated,
-        )
-
-    @staticmethod
-    def _attach_batch_metadata_to_embeddings(
-        embeddings: List[EmbeddingVector],
-        metadatas: Optional[List[Dict[str, Any]]],
-    ) -> List[EmbeddingVector]:
-        """
-        Attach per-embedding metadata, preserving order. Does not mutate
-        the original list or vectors.
-
-        Assumes that `embeddings[i]` corresponds to the same input item
-        as `metadatas[i]`.
-        """
-        if not metadatas:
-            return embeddings
-
-        out: List[EmbeddingVector] = []
-        for idx, ev in enumerate(embeddings):
-            md = metadatas[idx] if idx < len(metadatas) else None
-            if md is None:
-                out.append(ev)
-            else:
-                out.append(
-                    EmbeddingVector(
-                        vector=ev.vector,
-                        text=ev.text,
-                        model=ev.model,
-                        dimensions=ev.dimensions,
-                        metadata=md,
-                    )
-                )
-        return out
-
-    @staticmethod
-    def _attach_batch_metadata_to_failures(
-        failures: List[Dict[str, Any]],
-        metadatas: Optional[List[Dict[str, Any]]],
-    ) -> List[Dict[str, Any]]:
-        """
-        Attach metadata to per-item failure records based on index
-        (if available). Mutates the failure dicts in-place for simplicity.
-        """
-        if not metadatas:
-            return failures
-        for f in failures:
-            idx = f.get("index")
-            if isinstance(idx, int) and 0 <= idx < len(metadatas):
-                f.setdefault("metadata", metadatas[idx])
-        return failures
-
-    # --- public APIs (use helpers + backend hooks) ---
-
-    async def capabilities(self) -> EmbeddingCapabilities:
-        """
-        Get the capabilities of this embedding adapter (with optional caching).
-
-        In standalone mode with a TTL-supporting cache, caches capabilities
-        using the configured cache_caps_ttl_s. TTL=0 disables capabilities caching.
+        Standalone mode:
+            - Results may be cached briefly to avoid hot path calls.
+            - Callers MUST treat capabilities as advisory and refresh periodically.
         """
         t0 = time.monotonic()
         try:
-            use_cache = (
-                self._mode == "standalone"
-                and getattr(self._cache, "supports_ttl", False)
-                and self._cache_caps_ttl_s > 0
-            )
-            if use_cache:
-                cached = await self._cache.get(self._caps_cache_key())
+            # Check cache if TTL is non-zero
+            if self._mode == "standalone" and self._cache_caps_ttl_s > 0:
+                cached = await self._cache.get(self._caps_cache_key)
                 if cached:
                     self._metrics.counter(
                         component=self._component,
@@ -1660,739 +1641,927 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
 
             caps = await self._apply_deadline(self._do_capabilities(), ctx=None)
 
-            if use_cache:
+            # Cache if TTL is non-zero
+            if self._mode == "standalone" and self._cache_caps_ttl_s > 0:
                 try:
-                    await self._cache.set(
-                        self._caps_cache_key(),
-                        caps,
-                        ttl_s=self._cache_caps_ttl_s,
-                    )
+                    await self._cache.set(self._caps_cache_key, caps, ttl_s=self._cache_caps_ttl_s)
                 except Exception:
-                    # Cache failures are non-fatal.
                     pass
 
             self._record("capabilities", t0, True)
             return caps
-        except EmbeddingAdapterError as e:
-            code = e.code or type(e).__name__
-            self._record("capabilities", t0, False, code=code)
+        except VectorAdapterError as e:
+            self._record("capabilities", t0, False, code=e.code or type(e).__name__)
             raise
         except Exception as e:
             self._record("capabilities", t0, False, code="UNAVAILABLE")
             raise Unavailable("capabilities fetch failed") from e
 
-    async def _embed_core(
+    async def query(
         self,
-        spec: EmbedSpec,
-        ctx: Optional[OperationContext],
-    ) -> EmbedResult:
+        spec: QuerySpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> QueryResult:
         """
-        Core implementation of embed() separated for easier testing and
-        reuse from the gated public method.
+        Execute a vector similarity search query with validation and metrics.
 
-        NOTE: Cache stores base results without caller-supplied metadata.
-        Metadata is attached per call on top of the cached base.
+        See VectorProtocolV1.query for full documentation.
+
+        Docstore Behavior:
+            - If docstore is configured and text hydration fails, the query continues
+              but vectors will have text=None (graceful degradation).
+
+        Auto-Normalization:
+            - If auto_normalize is enabled, query vectors are normalized to unit length
+            - Particularly useful for cosine similarity searches
+
+        Backpressure note:
+            - For high top_k values or very hot namespaces, consider using a
+              distributed rate limiter in addition to the built-in per-process
+              token bucket to avoid overload in large clusters.
         """
-        caps = await self._do_capabilities()
-        if spec.model not in caps.supported_models:
-            raise ModelNotAvailable(f"Model '{spec.model}' is not supported")
+        # Structural validation and optional normalization
+        spec_vector = self._validate_vector(spec.vector, normalize=self._auto_normalize)
 
-        # Deterministic truncation if needed.
-        text = spec.text
-        truncated = False
-        if caps.max_text_length:
-            text, truncated = self._trunc.apply(
-                text,
-                caps.max_text_length,
-                spec.truncate,
+        # Track if normalization occurred for metrics
+        normalization_occurred = self._auto_normalize and spec_vector is not spec.vector
+
+        self._require_non_empty("namespace", spec.namespace)
+        if not isinstance(spec.top_k, int) or spec.top_k <= 0:
+            raise BadRequest("top_k must be a positive integer")
+        if spec.filter is not None and not isinstance(spec.filter, Mapping):
+            raise BadRequest("filter must be a mapping (dict) when provided")
+        if not isinstance(spec.include_metadata, bool) or not isinstance(spec.include_vectors, bool):
+            raise BadRequest("include_metadata/include_vectors must be booleans")
+
+        # If normalization changed the vector, create new spec
+        if normalization_occurred:
+            spec = QuerySpec(
+                vector=spec_vector,
+                top_k=spec.top_k,
+                namespace=spec.namespace,
+                filter=spec.filter,
+                include_metadata=spec.include_metadata,
+                include_vectors=spec.include_vectors
             )
 
-        eff_spec = EmbedSpec(
-            text=text,
-            model=spec.model,
-            truncate=spec.truncate,
-            normalize=spec.normalize,
-            metadata=None,  # provider does not see caller metadata by default
-            stream=False,   # internal call is always non-streaming
-        )
+        # JSON-serializability validation for filters (wire/caching safety)
+        if spec.filter is not None:
+            self._ensure_json_serializable(spec.filter, "filter")
 
-        # Optional cache: isolated per tenant via _embed_cache_key.
-        base_result: Optional[EmbedResult] = None
-        cache_key: Optional[str] = None
+        async def _call() -> QueryResult:
+            caps = await self.capabilities()
 
-        use_cache = (
-            getattr(self._cache, "supports_ttl", False)
-            and self._cache_embed_ttl_s > 0
-        )
-
-        if use_cache:
-            cache_key = self._embed_cache_key(
-                eff_spec.model,
-                eff_spec.normalize,
-                eff_spec.text,
-                ctx,
-            )
-            cached = await self._cache.get(cache_key)
-            if cached:
-                self._metrics.counter(
-                    component=self._component,
-                    name="cache_hits",
-                    value=1,
-                    extra={"op": "embed"},
+            # Capability gating
+            if caps.max_dimensions and len(spec.vector) > int(caps.max_dimensions):
+                raise DimensionMismatch(
+                    f"vector dimension {len(spec.vector)} exceeds max {caps.max_dimensions}",
+                    details={"provided": len(spec.vector), "max": int(caps.max_dimensions)},
                 )
-                base_result = cached
+            if caps.max_top_k is not None and spec.top_k > caps.max_top_k:
+                raise BadRequest(
+                    f"top_k {spec.top_k} exceeds maximum of {caps.max_top_k}",
+                    details={"max_top_k": caps.max_top_k},
+                )
+            if spec.filter and not caps.supports_metadata_filtering:
+                raise NotSupported("metadata filtering is not supported by this adapter")
 
-        if base_result is None:
-            # Provider-specific embed.
-            base_result = await self._do_embed(eff_spec, ctx=ctx)
-
-            # Post-processing: normalization if requested and not handled at source.
-            if eff_spec.normalize:
-                if not caps.supports_normalization:
-                    raise NotSupported("normalization not supported for this adapter")
-                if not caps.normalizes_at_source:
-                    vec = self._norm.normalize(base_result.embedding.vector)
-                    base_result.embedding = EmbeddingVector(
-                        vector=vec,
-                        text=base_result.embedding.text,
-                        model=base_result.embedding.model,
-                        dimensions=len(vec),
-                        metadata=base_result.embedding.metadata,
+            # Read-path cache (standalone only with non-zero TTL)
+            cache_hit = False
+            if self._mode == "standalone" and self._cache_query_ttl_s > 0:
+                ck = self._query_cache_key(spec, caps, ctx)
+                cached = await self._cache.get(ck)
+                if cached:
+                    cache_hit = True
+                    self._metrics.counter(
+                        component=self._component,
+                        name="cache_hits",
+                        value=1,
+                        extra={"op": "query"},
+                    )
+                    return cached
+                else:
+                    self._metrics.counter(
+                        component=self._component,
+                        name="cache_misses",
+                        value=1,
+                        extra={"op": "query"},
                     )
 
-            # Mark truncation result flag.
-            base_result.truncated = bool(truncated)
+            # Execute backend query
+            result = await self._do_query(spec, ctx=ctx)
 
-            # Cache set (best-effort) without caller-provided metadata.
-            if use_cache and cache_key is not None:
+            # Hydrate text from docstore if configured (graceful degradation on failure)
+            if self._docstore is not None and result.matches:
                 try:
-                    await self._cache.set(
-                        cache_key,
-                        base_result,
-                        ttl_s=self._cache_embed_ttl_s,
+                    doc_ids = [str(match.vector.id) for match in result.matches]
+                    docs = await self._docstore.batch_get(doc_ids)
+
+                    # Rebuild matches with hydrated text
+                    hydrated_matches = []
+                    for match in result.matches:
+                        doc = docs.get(str(match.vector.id))
+                        if doc is not None:
+                            # Create new vector with text populated
+                            hydrated_vector = Vector(
+                                id=match.vector.id,
+                                vector=match.vector.vector,
+                                metadata=match.vector.metadata,
+                                namespace=match.vector.namespace,
+                                text=doc.text  # Hydrated from docstore
+                            )
+                            hydrated_matches.append(VectorMatch(
+                                vector=hydrated_vector,
+                                score=match.score,
+                                distance=match.distance
+                            ))
+                        else:
+                            # No text found, pass through as-is
+                            hydrated_matches.append(match)
+
+                    # Replace matches with hydrated version
+                    result = QueryResult(
+                        matches=hydrated_matches,
+                        query_vector=result.query_vector,
+                        namespace=result.namespace,
+                        total_matches=result.total_matches
                     )
+                except Exception as e:
+                    # Graceful degradation: log but don't fail the query
+                    LOG.debug(
+                        "Docstore hydration failed for query in namespace %s: %r",
+                        result.namespace,
+                        e,
+                    )
+                    self._metrics.counter(
+                        component=self._component,
+                        name="docstore_hydration_errors",
+                        value=1,
+                        extra={"op": "query"},
+                    )
+                    # Continue with original result (text will be None)
+
+            # Populate cache if eligible (non-zero TTL and not already cached)
+            if self._mode == "standalone" and self._cache_query_ttl_s > 0 and not cache_hit:
+                try:
+                    ck = self._query_cache_key(spec, caps, ctx)
+                    await self._cache.set(ck, result, ttl_s=self._cache_query_ttl_s)
                 except Exception:
                     pass
 
-        # Attach metadata for this specific call (does not affect cached value).
-        result = self._attach_single_metadata(base_result, spec.metadata)
+            return result
 
-        # Per-op counters.
-        self._metrics.counter(
-            component=self._component,
-            name="texts_embedded",
-            value=1,
-        )
-        if result.tokens_used is not None:
-            self._metrics.counter(
-                component=self._component,
-                name="tokens_processed",
-                value=int(result.tokens_used),
-            )
-
-        return result
-
-    async def embed(
-        self,
-        spec: EmbedSpec,
-        *,
-        ctx: Optional[OperationContext] = None,
-    ) -> EmbedResult:
-        """
-        Generate embedding for a single text with validation, gates, and metrics.
-
-        See EmbeddingProtocolV1.embed for full documentation.
-
-        NOTE:
-            Streaming is served by stream_embed() to align with LLM and Graph.
-            If spec.stream is True, this method raises NotSupported.
-        """
-        self._require_non_empty("text", spec.text)
-        self._require_non_empty("model", spec.model)
-
-        if spec.stream:
-            raise NotSupported("streaming embeddings must use stream_embed()")
-
-        metric_extra: Dict[str, Any] = {}
-        error_extra: Dict[str, Any] = {}
-
-        if self._tag_model_in_metrics:
-            model_tag = self._safe_model_tag(spec.model)
-            if model_tag:
-                metric_extra["model"] = model_tag
-                error_extra["model"] = model_tag
-
-        return await self._with_gates_unary(
-            op="embed",
-            ctx=ctx,
-            call=lambda: self._embed_core(spec, ctx),
-            metric_extra=metric_extra,
-            error_extra=error_extra,
-        )
-
-    async def stream_embed(
-        self,
-        spec: EmbedSpec,
-        *,
-        ctx: Optional[OperationContext] = None,
-    ) -> AsyncIterator[EmbedChunk]:
-        """
-        Stream embedding generation for a single text.
-
-        This method is the canonical streaming API, aligned with LLM.stream and Graph.stream_query.
-
-        Notes:
-            - Validates inputs (text/model).
-            - Enforces capability gating (supports_streaming).
-            - Applies deterministic truncation (if supported) before invoking backend stream.
-            - Applies normalization at base if requested and not done at source.
-            - Ensures underlying backend generator is closed on abandonment to avoid resource leaks.
-        """
-        self._require_non_empty("text", spec.text)
-        self._require_non_empty("model", spec.model)
-
-        metric_extra: Dict[str, Any] = {}
-        if self._tag_model_in_metrics:
-            model_tag = self._safe_model_tag(spec.model)
-            if model_tag:
-                metric_extra["model"] = model_tag
-
-        async def agen_factory() -> AsyncIterator[EmbedChunk]:
-            caps = await self._do_capabilities()
-            if not caps.supports_streaming:
-                raise NotSupported("streaming embeddings not supported by this adapter")
-            if spec.model not in caps.supported_models:
-                raise ModelNotAvailable(f"Model '{spec.model}' is not supported")
-
-            # Deterministic truncation if needed.
-            text = spec.text
-            if caps.max_text_length:
-                text, _ = self._trunc.apply(
-                    text,
-                    caps.max_text_length,
-                    spec.truncate,
-                )
-
-            eff_spec = EmbedSpec(
-                text=text,
-                model=spec.model,
-                truncate=spec.truncate,
-                normalize=spec.normalize,
-                metadata=None,   # provider does not see caller metadata by default
-                stream=True,
-            )
-
-            # Backend stream generator.
-            agen = self._do_stream_embed(eff_spec, ctx=ctx)
-
-            # If normalization is requested and not handled at source, normalize per chunk.
-            if eff_spec.normalize:
-                if not caps.supports_normalization:
-                    raise NotSupported("normalization not supported for this adapter")
-                if caps.normalizes_at_source:
-                    async for chunk in agen:
-                        yield chunk
-                else:
-                    async for chunk in agen:
-                        normed_vectors: List[EmbeddingVector] = []
-                        for ev in chunk.embeddings:
-                            vec = self._norm.normalize(ev.vector)
-                            normed_vectors.append(
-                                EmbeddingVector(
-                                    vector=vec,
-                                    text=ev.text,
-                                    model=ev.model,
-                                    dimensions=len(vec),
-                                    index=ev.index,
-                                    metadata=ev.metadata,
-                                )
-                            )
-                        yield EmbedChunk(
-                            embeddings=normed_vectors,
-                            is_final=chunk.is_final,
-                            usage=chunk.usage,
-                            model=chunk.model,
-                        )
-            else:
-                async for chunk in agen:
-                    yield chunk
-
-        async for chunk in await self._with_gates_stream(
-            op="embed",
-            ctx=ctx,
-            agen_factory=agen_factory,
-            metric_extra=metric_extra,
-        ):
-            yield chunk
-
-    def _validate_and_prepare_batch_spec(
-        self,
-        spec: BatchEmbedSpec,
-        caps: EmbeddingCapabilities,
-    ) -> BatchEmbedSpec:
-        """
-        Validate the incoming BatchEmbedSpec against capabilities and apply
-        deterministic truncation, returning an effective spec for execution.
-        """
-        if spec.model not in caps.supported_models:
-            raise ModelNotAvailable(f"Model '{spec.model}' is not supported")
-
-        if caps.max_batch_size and len(spec.texts) > caps.max_batch_size:
-            raise BadRequest(
-                f"Batch size {len(spec.texts)} exceeds maximum of {caps.max_batch_size}",
-                details={"max_batch_size": caps.max_batch_size},
-            )
-
-        if spec.metadatas is not None and len(spec.metadatas) != len(spec.texts):
-            raise BadRequest(
-                "metadatas length must match texts length when provided",
-                details={
-                    "texts": len(spec.texts),
-                    "metadatas": len(spec.metadatas),
-                },
-            )
-
-        eff_texts: List[str] = []
-        for text in spec.texts:
-            self._require_non_empty("text", text)
-            if caps.max_text_length:
-                new_text, _ = self._trunc.apply(
-                    text,
-                    caps.max_text_length,
-                    spec.truncate,
-                )
-                eff_texts.append(new_text)
-            else:
-                eff_texts.append(text)
-
-        return BatchEmbedSpec(
-            texts=eff_texts,
-            model=spec.model,
-            truncate=spec.truncate,
-            normalize=spec.normalize,
-            metadatas=spec.metadatas,
-        )
-
-    async def _fallback_embed_batch_per_item(
-        self,
-        eff_spec: BatchEmbedSpec,
-        caps: EmbeddingCapabilities,
-        ctx: Optional[OperationContext],
-        total_texts: int,
-    ) -> BatchEmbedResult:
-        """
-        Fallback implementation for batch embedding when provider-level
-        batching is not supported. Preserves partial success semantics.
-
-        Uses asyncio.gather() to run per-text embeddings concurrently while
-        still returning results in input order and maintaining the same
-        failure structure as the sequential implementation.
-        """
-
-        async def _embed_one(idx: int, text: str):
-            cur_metadata = (
-                eff_spec.metadatas[idx]
-                if eff_spec.metadatas is not None and idx < len(eff_spec.metadatas)
-                else None
-            )
+        def _on_result(res: QueryResult) -> Mapping[str, Any]:
+            extra: Dict[str, Any] = {
+                "namespace": spec.namespace,
+                "top_k": spec.top_k,
+            }
             try:
-                single_spec = EmbedSpec(
-                    text=text,
-                    model=eff_spec.model,
-                    truncate=eff_spec.truncate,
-                    normalize=False,  # normalization applied uniformly below
-                    metadata=None,    # provider does not see caller metadata
-                    stream=False,
-                )
-                single = await self._do_embed(single_spec, ctx=ctx)
-                ev = single.embedding
-
-                if eff_spec.normalize:
-                    if not caps.supports_normalization:
-                        raise NotSupported("normalization not supported for this adapter")
-                    if not caps.normalizes_at_source:
-                        vec = self._norm.normalize(ev.vector)
-                        ev = EmbeddingVector(
-                            vector=vec,
-                            text=ev.text,
-                            model=ev.model,
-                            dimensions=len(vec),
-                            metadata=ev.metadata,
-                        )
-
-                # Attach metadata for this item (does not affect other callers).
-                if cur_metadata is not None:
-                    ev = EmbeddingVector(
-                        vector=ev.vector,
-                        text=ev.text,
-                        model=ev.model,
-                        dimensions=ev.dimensions,
-                        metadata=cur_metadata,
-                    )
-
-                return idx, ev, None
-            except EmbeddingAdapterError as item_err:
-                info: Dict[str, Any] = {
-                    "index": idx,
-                    "text": text,
-                    "error": type(item_err).__name__,
-                    "code": item_err.code or type(item_err).__name__,
-                    "message": item_err.message,
-                }
-                if cur_metadata is not None:
-                    info["metadata"] = cur_metadata
-                return idx, None, info
-            except Exception as item_err:
-                info = {
-                    "index": idx,
-                    "text": text,
-                    "error": type(item_err).__name__,
-                    "code": "UNAVAILABLE",
-                    "message": str(item_err) or "internal error",
-                }
-                if cur_metadata is not None:
-                    info["metadata"] = cur_metadata
-                return idx, None, info
-
-        tasks = [
-            _embed_one(idx, text) for idx, text in enumerate(eff_spec.texts)
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=False)
-
-        embeddings: List[EmbeddingVector] = []
-        failed: List[Dict[str, Any]] = []
-
-        # Results are in the same order as the tasks list (input order).
-        for idx, ev, error_info in results:
-            if error_info is None:
-                embeddings.append(ev)
-            else:
-                failed.append(error_info)
-
-        return BatchEmbedResult(
-            embeddings=embeddings,
-            model=eff_spec.model,
-            total_texts=total_texts,
-            total_tokens=None,
-            failed_texts=failed,
-        )
-
-    async def _embed_batch_core(
-        self,
-        spec: BatchEmbedSpec,
-        ctx: Optional[OperationContext],
-    ) -> BatchEmbedResult:
-        """
-        Core implementation of embed_batch() separated for easier testing and
-        reuse from the gated public method.
-        """
-        caps = await self._do_capabilities()
-        eff_spec = self._validate_and_prepare_batch_spec(spec, caps)
-
-        try:
-            # Primary path: provider-specific batch implementation.
-            result = await self._do_embed_batch(eff_spec, ctx=ctx)
-        except NotSupported:
-            # Fallback path: partial-success aware per-item embedding.
-            result = await self._fallback_embed_batch_per_item(
-                eff_spec,
-                caps,
-                ctx,
-                total_texts=len(spec.texts),
-            )
-        else:
-            # Post-processing of provider-native batch results.
-            # Attach metadata to embeddings/failures if provided.
-            result.embeddings = self._attach_batch_metadata_to_embeddings(
-                result.embeddings,
-                eff_spec.metadatas,
-            )
-            result.failed_texts = self._attach_batch_metadata_to_failures(
-                result.failed_texts,
-                eff_spec.metadatas,
-            )
-
-            # Post-processing: normalization if requested and not handled at source,
-            # for providers that implement _do_embed_batch directly.
-            if eff_spec.normalize:
-                if not caps.supports_normalization:
-                    raise NotSupported("normalization not supported for this adapter")
-                if not caps.normalizes_at_source:
-                    normed: List[EmbeddingVector] = []
-                    for ev in result.embeddings:
-                        vec = self._norm.normalize(ev.vector)
-                        normed.append(
-                            EmbeddingVector(
-                                vector=vec,
-                                text=ev.text,
-                                model=ev.model,
-                                dimensions=len(vec),
-                                metadata=ev.metadata,
-                            )
-                        )
-                    result.embeddings = normed
-
-        # Per-op counters.
-        self._metrics.counter(
-            component=self._component,
-            name="texts_embedded",
-            value=len(result.embeddings),
-        )
-        if result.total_tokens is not None:
-            self._metrics.counter(
-                component=self._component,
-                name="tokens_processed",
-                value=int(result.total_tokens),
-            )
-
-        return result
-
-    async def embed_batch(
-        self,
-        spec: BatchEmbedSpec,
-        *,
-        ctx: Optional[OperationContext] = None,
-    ) -> BatchEmbedResult:
-        """
-        Generate embeddings for multiple texts with validation, gates, and metrics.
-
-        Supports:
-          - Provider-native batch behavior via _do_embed_batch.
-          - Optional partial-success fallback when batch is not supported:
-            falls back to per-item _do_embed calls and populates failed_texts.
-
-        Note:
-            metadatas are not part of the wire contract; they are a local
-            convenience for frameworks to track per-text context.
-        """
-        self._require_non_empty("model", spec.model)
-        if not spec.texts:
-            raise BadRequest("texts must not be empty")
-
-        metric_extra: Dict[str, Any] = {
-            "batch_size": len(spec.texts),
-        }
-        error_extra: Dict[str, Any] = {
-            "batch_size": len(spec.texts),
-        }
-
-        if self._tag_model_in_metrics:
-            model_tag = self._safe_model_tag(spec.model)
-            if model_tag:
-                metric_extra["model"] = model_tag
-                error_extra["model"] = model_tag
-
-        return await self._with_gates_unary(
-            op="embed_batch",
-            ctx=ctx,
-            call=lambda: self._embed_batch_core(spec, ctx),
-            metric_extra=metric_extra,
-            error_extra=error_extra,
-        )
-
-    async def _count_tokens_core(
-        self,
-        text: str,
-        model: str,
-        ctx: Optional[OperationContext],
-    ) -> int:
-        """
-        Core implementation of count_tokens() separated for easier testing.
-        """
-        caps = await self._do_capabilities()
-        if model not in caps.supported_models:
-            raise ModelNotAvailable(f"Model '{model}' is not supported")
-        if not caps.supports_token_counting:
-            raise NotSupported("count_tokens is not supported by this adapter")
-        return await self._do_count_tokens(text, model, ctx=ctx)
-
-    async def count_tokens(
-        self,
-        text: str,
-        model: str,
-        *,
-        ctx: Optional[OperationContext] = None,
-    ) -> int:
-        """
-        Count tokens in text with validation, gates, and metrics.
-        """
-        # Allow empty string; just ensure it's a string
-        if not isinstance(text, str):
-            raise BadRequest("text must be a string")
-        self._require_non_empty("model", model)
-
-        metric_extra: Dict[str, Any] = {
-            "text_length": len(text),
-        }
-        error_extra: Dict[str, Any] = {}
-
-        if self._tag_model_in_metrics:
-            model_tag = self._safe_model_tag(model)
-            if model_tag:
-                metric_extra["model"] = model_tag
-                error_extra["model"] = model_tag
+                extra["matches"] = len(res.matches)
+            except Exception:
+                pass
+            # Record normalization metrics if it occurred
+            if normalization_occurred:
+                extra["vector_normalized"] = True
+            return extra
 
         result = await self._with_gates_unary(
-            op="count_tokens",
+            op="query",
             ctx=ctx,
-            call=lambda: self._count_tokens_core(text, model, ctx),
-            metric_extra=metric_extra,
-            error_extra=error_extra,
+            call=_call,
+            on_result=_on_result,
         )
 
-        # Successful call counter (non-critical).
+        # Record normalization metric if it occurred
+        if normalization_occurred:
+            self._metrics.counter(
+                component=self._component,
+                name="vectors_normalized",
+                value=1,
+                extra={"op": "query"},
+            )
+
+        # Request counters (keep legacy name and add cross-component-friendly name)
         self._metrics.counter(
             component=self._component,
-            name="count_tokens_calls",
+            name="queries",
             value=1,
         )
-        return int(result)
+        self._metrics.counter(
+            component=self._component,
+            name="requests_total",
+            value=1,
+            extra={"op": "query"},
+        )
 
-    async def _health_core(
+        return result
+
+    async def batch_query(
         self,
-        ctx: Optional[OperationContext],
-    ) -> Dict[str, Any]:
+        spec: BatchQuerySpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> List[QueryResult]:
         """
-        Core implementation of health() separated for easier testing.
+        Execute multiple vector similarity search queries in batch.
+
+        This can be more efficient than individual queries for some backends.
+        Adapters that don't support batch queries should raise NotSupported.
+
+        Docstore Behavior:
+            - If docstore is configured and text hydration fails, the batch query continues
+              but vectors will have text=None (graceful degradation).
+
+        Auto-Normalization:
+            - If auto_normalize is enabled, all query vectors are normalized to unit length
         """
-        h = await self._do_health(ctx=ctx)
-        return {
-            "ok": bool(h.get("ok", True)),
-            "server": str(h.get("server", "")),
-            "version": str(h.get("version", "")),
-            "models": h.get("models", {}),
-        }
+        self._require_non_empty("namespace", spec.namespace)
+        if not spec.queries:
+            raise BadRequest("queries must not be empty")
+
+        # Validate each query and track normalization
+        normalized_queries = []
+        queries_changed = False
+        normalization_count = 0
+
+        for i, query in enumerate(spec.queries):
+            norm_vec = self._validate_vector(query.vector, normalize=self._auto_normalize)
+
+            # Track if this vector was normalized
+            if self._auto_normalize and norm_vec is not query.vector:
+                queries_changed = True
+                normalization_count += 1
+
+            if not isinstance(query.top_k, int) or query.top_k <= 0:
+                raise BadRequest(f"query[{i}].top_k must be a positive integer")
+            if query.filter is not None and not isinstance(query.filter, Mapping):
+                raise BadRequest(f"query[{i}].filter must be a mapping (dict) when provided")
+            if query.filter is not None:
+                self._ensure_json_serializable(query.filter, f"query[{i}].filter")
+
+            if self._auto_normalize and norm_vec is not query.vector:
+                # Create updated query spec
+                normalized_queries.append(QuerySpec(
+                    vector=norm_vec,
+                    top_k=query.top_k,
+                    namespace=query.namespace,
+                    filter=query.filter,
+                    include_metadata=query.include_metadata,
+                    include_vectors=query.include_vectors
+                ))
+            else:
+                normalized_queries.append(query)
+
+        # Update spec if normalization occurred
+        if queries_changed:
+            spec = BatchQuerySpec(queries=normalized_queries, namespace=spec.namespace)
+
+        async def _call() -> List[QueryResult]:
+            caps = await self.capabilities()
+
+            if not caps.supports_batch_queries:
+                raise NotSupported("batch queries are not supported by this adapter")
+
+            # Validate capabilities for all queries
+            for i, query in enumerate(spec.queries):
+                if caps.max_dimensions and len(query.vector) > int(caps.max_dimensions):
+                    raise DimensionMismatch(
+                        f"query[{i}] vector dimension {len(query.vector)} exceeds max {caps.max_dimensions}",
+                        details={"provided": len(query.vector), "max": int(caps.max_dimensions)},
+                    )
+                if caps.max_top_k is not None and query.top_k > caps.max_top_k:
+                    raise BadRequest(
+                        f"query[{i}] top_k {query.top_k} exceeds maximum of {caps.max_top_k}",
+                        details={"max_top_k": caps.max_top_k},
+                    )
+                if query.filter and not caps.supports_metadata_filtering:
+                    raise NotSupported(f"query[{i}] metadata filtering is not supported by this adapter")
+
+            # Read-path cache (standalone only with non-zero TTL)
+            cache_hit = False
+            if self._mode == "standalone" and self._cache_query_ttl_s > 0:
+                ck = self._batch_query_cache_key(spec, caps, ctx)
+                cached = await self._cache.get(ck)
+                if cached:
+                    cache_hit = True
+                    self._metrics.counter(
+                        component=self._component,
+                        name="cache_hits",
+                        value=1,
+                        extra={"op": "batch_query"},
+                    )
+                    return cached
+                else:
+                    self._metrics.counter(
+                        component=self._component,
+                        name="cache_misses",
+                        value=1,
+                        extra={"op": "batch_query"},
+                    )
+
+            # Execute backend batch query
+            results = await self._do_batch_query(spec, ctx=ctx)
+
+            # Hydrate text from docstore if configured (graceful degradation on failure)
+            if self._docstore is not None:
+                try:
+                    # Collect all document IDs from all results
+                    all_doc_ids = []
+                    for result in results:
+                        for match in result.matches:
+                            all_doc_ids.append(str(match.vector.id))
+
+                    if all_doc_ids:
+                        docs = await self._docstore.batch_get(all_doc_ids)
+
+                        # Rebuild all results with hydrated text
+                        hydrated_results = []
+                        for result in results:
+                            hydrated_matches = []
+                            for match in result.matches:
+                                doc = docs.get(str(match.vector.id))
+                                if doc is not None:
+                                    hydrated_vector = Vector(
+                                        id=match.vector.id,
+                                        vector=match.vector.vector,
+                                        metadata=match.vector.metadata,
+                                        namespace=match.vector.namespace,
+                                        text=doc.text
+                                    )
+                                    hydrated_matches.append(VectorMatch(
+                                        vector=hydrated_vector,
+                                        score=match.score,
+                                        distance=match.distance
+                                    ))
+                                else:
+                                    hydrated_matches.append(match)
+
+                            hydrated_results.append(QueryResult(
+                                matches=hydrated_matches,
+                                query_vector=result.query_vector,
+                                namespace=result.namespace,
+                                total_matches=result.total_matches
+                            ))
+
+                        results = hydrated_results
+                except Exception as e:
+                    # Graceful degradation: log but don't fail the batch query
+                    LOG.debug("Docstore hydration failed for batch query in namespace %s: %r", spec.namespace, e)
+                    self._metrics.counter(
+                        component=self._component,
+                        name="docstore_hydration_errors",
+                        value=1,
+                        extra={"op": "batch_query"},
+                    )
+                    # Continue with original results (text will be None)
+
+            # Populate cache if eligible
+            if self._mode == "standalone" and self._cache_query_ttl_s > 0 and not cache_hit:
+                try:
+                    ck = self._batch_query_cache_key(spec, caps, ctx)
+                    await self._cache.set(ck, results, ttl_s=self._cache_query_ttl_s)
+                except Exception:
+                    pass
+
+            return results
+
+        def _on_result(results: List[QueryResult]) -> Mapping[str, Any]:
+            total_matches = sum(len(result.matches) for result in results)
+            extra = {
+                "namespace": spec.namespace,
+                "query_count": len(spec.queries),
+                "total_matches": total_matches,
+            }
+            # Record normalization metrics if any occurred
+            if normalization_count > 0:
+                extra["vectors_normalized"] = normalization_count
+            return extra
+
+        results = await self._with_gates_unary(
+            op="batch_query",
+            ctx=ctx,
+            call=_call,
+            on_result=_on_result,
+        )
+
+        # Record normalization metrics if any occurred
+        if normalization_count > 0:
+            self._metrics.counter(
+                component=self._component,
+                name="vectors_normalized",
+                value=normalization_count,
+                extra={"op": "batch_query"},
+            )
+
+        self._metrics.counter(
+            component=self._component,
+            name="batch_queries",
+            value=1,
+        )
+        self._metrics.counter(
+            component=self._component,
+            name="queries_in_batch",
+            value=len(spec.queries),
+        )
+        self._metrics.counter(
+            component=self._component,
+            name="requests_total",
+            value=1,
+            extra={"op": "batch_query"},
+        )
+
+        return results
+
+    async def upsert(
+        self,
+        spec: UpsertSpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> UpsertResult:
+        """
+        Upsert vectors into the vector store with validation and metrics.
+
+        See VectorProtocolV1.upsert for full documentation.
+
+        Docstore Behavior:
+            - If docstore is configured and text storage fails, the entire upsert
+              operation fails (atomicity).
+
+        Auto-Normalization:
+            - If auto_normalize is enabled, all vectors are normalized to unit length
+              before storage
+
+        Guidance:
+            - For very large batches, respect capabilities.max_batch_size and
+              chunk requests accordingly to avoid memory pressure.
+        """
+        self._require_non_empty("namespace", spec.namespace)
+        if not spec.vectors:
+            raise BadRequest("vectors must not be empty")
+
+        # Validate each vector, id, and its metadata
+        # Normalize vectors if auto_normalize is enabled
+        validated_vectors = []
+        vectors_changed = False
+        normalization_count = 0
+
+        for v in spec.vectors:
+            self._require_non_empty("vector.id", str(v.id))
+            norm_vec = self._validate_vector(v.vector, normalize=self._auto_normalize)
+
+            # Track if this vector was normalized
+            if self._auto_normalize and norm_vec is not v.vector:
+                vectors_changed = True
+                normalization_count += 1
+
+            if v.metadata is not None and not isinstance(v.metadata, Mapping):
+                raise BadRequest("metadata must be a mapping (dict) when provided")
+            if v.metadata is not None:
+                self._ensure_json_serializable(v.metadata, "metadata")
+
+            if self._auto_normalize and norm_vec is not v.vector:
+                validated_vectors.append(Vector(
+                    id=v.id,
+                    vector=norm_vec,
+                    metadata=v.metadata,
+                    namespace=v.namespace,
+                    text=v.text
+                ))
+            else:
+                validated_vectors.append(v)
+
+        if vectors_changed:
+            spec = UpsertSpec(vectors=validated_vectors, namespace=spec.namespace)
+
+        async def _call() -> UpsertResult:
+            caps = await self.capabilities()
+
+            # Enforce batch operation support
+            if not caps.supports_batch_operations and len(spec.vectors) > 1:
+                raise NotSupported(
+                    "batch upsert is not supported by this adapter",
+                    details={"requested": len(spec.vectors)},
+                )
+
+            # Validate text storage capabilities
+            texts_present = any(v.text for v in spec.vectors)
+            if texts_present:
+                if caps.text_storage_strategy == "none":
+                    raise NotSupported("Text storage is not supported by this adapter")
+                if caps.max_text_length:
+                    for v in spec.vectors:
+                        if v.text and len(v.text) > caps.max_text_length:
+                            raise BadRequest(
+                                f"Text length {len(v.text)} exceeds maximum {caps.max_text_length}",
+                                details={"max_text_length": caps.max_text_length}
+                            )
+
+            if caps.max_batch_size is not None and len(spec.vectors) > caps.max_batch_size:
+                suggested = (
+                    int(100 * (len(spec.vectors) - caps.max_batch_size) / len(spec.vectors))
+                    if spec.vectors else None
+                )
+                raise BadRequest(
+                    f"batch size {len(spec.vectors)} exceeds maximum of {caps.max_batch_size}",
+                    details={"max_batch_size": caps.max_batch_size},
+                    suggested_batch_reduction=suggested,
+                )
+            if caps.max_dimensions:
+                for v in spec.vectors:
+                    if len(v.vector) > caps.max_dimensions:
+                        raise DimensionMismatch(
+                            f"vector dimension {len(v.vector)} exceeds max {caps.max_dimensions}",
+                            details={"provided": len(v.vector), "max": int(caps.max_dimensions)},
+                        )
+
+            # Handle text storage if docstore is configured (atomic operation)
+            backend_vectors = spec.vectors
+            if self._docstore is not None and texts_present:
+                # Store texts in docstore and create cleaned vectors for backend
+                texts_to_store = []
+                cleaned_vectors = []
+
+                for v in spec.vectors:
+                    if v.text is not None:
+                        # Store in docstore
+                        texts_to_store.append(Document(
+                            id=str(v.id),
+                            text=v.text,
+                            metadata=v.metadata or {}
+                        ))
+
+                        # Create cleaned vector without text
+                        cleaned_vectors.append(Vector(
+                            id=v.id,
+                            vector=v.vector,
+                            metadata=v.metadata,
+                            namespace=v.namespace,
+                            text=None  # Removed
+                        ))
+                    else:
+                        # No text, pass through as-is
+                        cleaned_vectors.append(v)
+
+                # Batch store texts (failure here fails the entire upsert)
+                if texts_to_store:
+                    await self._docstore.batch_put(texts_to_store)
+
+                backend_vectors = cleaned_vectors
+
+            # Call backend with cleaned vectors (no text in metadata/vector)
+            result = await self._do_upsert(
+                UpsertSpec(vectors=backend_vectors, namespace=spec.namespace),
+                ctx=ctx
+            )
+
+            # Invalidate cache for this namespace on successful upsert
+            if result.upserted_count > 0:
+                try:
+                    await self._invalidate_namespace_cache(spec.namespace)
+                except Exception:
+                    # Never let cache invalidation break the operation
+                    pass
+
+            return result
+
+        def _on_result(res: UpsertResult) -> Mapping[str, Any]:
+            extra = {
+                "namespace": spec.namespace,
+                "vectors_processed": len(spec.vectors),
+                "upserted_count": res.upserted_count,
+            }
+            # Record normalization metrics if any occurred
+            if normalization_count > 0:
+                extra["vectors_normalized"] = normalization_count
+            return extra
+
+        result = await self._with_gates_unary(
+            op="upsert",
+            ctx=ctx,
+            call=_call,
+            on_result=_on_result,
+        )
+
+        # Record normalization metrics if any occurred
+        if normalization_count > 0:
+            self._metrics.counter(
+                component=self._component,
+                name="vectors_normalized",
+                value=normalization_count,
+                extra={"op": "upsert"},
+            )
+
+        # Token-style counters for upserted vectors and requests
+        self._metrics.counter(
+            component=self._component,
+            name="vectors_upserted",
+            value=int(result.upserted_count),
+        )
+        self._metrics.counter(
+            component=self._component,
+            name="upsert_batches",
+            value=1,
+        )
+        self._metrics.counter(
+            component=self._component,
+            name="requests_total",
+            value=1,
+            extra={"op": "upsert"},
+        )
+
+        return result
+
+    async def delete(
+        self,
+        spec: DeleteSpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> DeleteResult:
+        """
+        Delete vectors from the vector store with validation and metrics.
+
+        See VectorProtocolV1.delete for full documentation.
+        """
+        self._require_non_empty("namespace", spec.namespace)
+        if not spec.ids and not spec.filter:
+            raise BadRequest("must provide either ids or filter for deletion")
+        if spec.filter is not None and not isinstance(spec.filter, Mapping):
+            raise BadRequest("filter must be a mapping (dict) when provided")
+        if spec.filter is not None:
+            self._ensure_json_serializable(spec.filter, "filter")
+        if spec.ids:
+            for vid in spec.ids:
+                self._require_non_empty("id", str(vid))
+
+        async def _call() -> DeleteResult:
+            caps = await self.capabilities()
+
+            # Enforce batch operation support for multi-id deletes
+            if not caps.supports_batch_operations and spec.ids and len(spec.ids) > 1:
+                raise NotSupported(
+                    "batch delete is not supported by this adapter",
+                    details={"requested": len(spec.ids)},
+                )
+
+            if caps.max_batch_size is not None and spec.ids and len(spec.ids) > caps.max_batch_size:
+                suggested = (
+                    int(100 * (len(spec.ids) - caps.max_batch_size) / len(spec.ids))
+                    if spec.ids else None
+                )
+                raise BadRequest(
+                    f"batch size {len(spec.ids)} exceeds maximum of {caps.max_batch_size}",
+                    details={"max_batch_size": caps.max_batch_size},
+                    suggested_batch_reduction=suggested,
+                )
+            if spec.filter and not caps.supports_metadata_filtering:
+                raise NotSupported("metadata filtering is not supported by this adapter")
+
+            result = await self._do_delete(spec, ctx=ctx)
+
+            # Clean up docstore entries and cache on successful delete
+            if result.deleted_count > 0:
+                # Clean up docstore entries (using efficient batch_delete)
+                if self._docstore is not None and spec.ids:
+                    try:
+                        doc_ids = [str(doc_id) for doc_id in spec.ids]
+                        await self._docstore.batch_delete(doc_ids)
+                    except Exception:
+                        # Log but don't fail the operation
+                        LOG.debug("Failed to clean up docstore entries after delete")
+
+                # Invalidate cache for this namespace
+                try:
+                    await self._invalidate_namespace_cache(spec.namespace)
+                except Exception:
+                    pass
+
+            return result
+
+        def _on_result(res: DeleteResult) -> Mapping[str, Any]:
+            targeted = len(spec.ids) if spec.ids else 0
+            return {
+                "namespace": spec.namespace,
+                "vectors_targeted": targeted,
+                "deleted_count": res.deleted_count,
+            }
+
+        result = await self._with_gates_unary(
+            op="delete",
+            ctx=ctx,
+            call=_call,
+            on_result=_on_result,
+        )
+
+        self._metrics.counter(
+            component=self._component,
+            name="vectors_deleted",
+            value=int(result.deleted_count),
+        )
+        self._metrics.counter(
+            component=self._component,
+            name="delete_batches",
+            value=1,
+        )
+        self._metrics.counter(
+            component=self._component,
+            name="requests_total",
+            value=1,
+            extra={"op": "delete"},
+        )
+
+        return result
+
+    async def create_namespace(
+        self,
+        spec: NamespaceSpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> NamespaceResult:
+        """
+        Create a new namespace/collection with validation and metrics.
+
+        See VectorProtocolV1.create_namespace for full documentation.
+        """
+        self._require_non_empty("namespace", spec.namespace)
+        if spec.dimensions <= 0:
+            raise BadRequest("dimensions must be positive")
+        if spec.distance_metric not in ("cosine", "euclidean", "dotproduct"):
+            raise BadRequest("distance_metric must be one of: cosine, euclidean, dotproduct")
+
+        async def _call() -> NamespaceResult:
+            caps = await self.capabilities()
+
+            if caps.max_dimensions and spec.dimensions > caps.max_dimensions:
+                raise BadRequest(
+                    f"dimensions {spec.dimensions} exceed maximum of {caps.max_dimensions}",
+                    details={"max_dimensions": caps.max_dimensions},
+                )
+            if spec.distance_metric not in caps.supported_metrics:
+                raise NotSupported(
+                    f"distance_metric '{spec.distance_metric}' not supported",
+                    details={"supported_metrics": caps.supported_metrics},
+                )
+
+            return await self._do_create_namespace(spec, ctx=ctx)
+
+        def _on_result(_: NamespaceResult) -> Mapping[str, Any]:
+            return {"namespace": spec.namespace}
+
+        result = await self._with_gates_unary(
+            op="create_namespace",
+            ctx=ctx,
+            call=_call,
+            on_result=_on_result,
+        )
+
+        self._metrics.counter(
+            component=self._component,
+            name="requests_total",
+            value=1,
+            extra={"op": "create_namespace"},
+        )
+
+        return result
+
+    async def delete_namespace(
+        self,
+        namespace: str,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> NamespaceResult:
+        """
+        Delete a namespace/collection with validation and metrics.
+
+        See VectorProtocolV1.delete_namespace for full documentation.
+        """
+        self._require_non_empty("namespace", namespace)
+
+        async def _call() -> NamespaceResult:
+            result = await self._do_delete_namespace(namespace, ctx=ctx)
+
+            # Invalidate all cache entries for this namespace
+            if result.success:
+                try:
+                    await self._invalidate_namespace_cache(namespace)
+                except Exception:
+                    pass
+
+            return result
+
+        def _on_result(_: NamespaceResult) -> Mapping[str, Any]:
+            return {"namespace": namespace}
+
+        result = await self._with_gates_unary(
+            op="delete_namespace",
+            ctx=ctx,
+            call=_call,
+            on_result=_on_result,
+        )
+
+        self._metrics.counter(
+            component=self._component,
+            name="requests_total",
+            value=1,
+            extra={"op": "delete_namespace"},
+        )
+
+        return result
 
     async def health(self, *, ctx: Optional[OperationContext] = None) -> Dict[str, Any]:
         """
         Check health status with metrics instrumentation.
 
-        Returns a small mapping; unknown keys from backends are informational only.
+        Returns a small mapping; adapters may include extra fields, but callers
+        must treat unknown keys as informational only.
         """
-        return await self._with_gates_unary(
-            op="health",
-            ctx=ctx,
-            call=lambda: self._health_core(ctx),
-        )
+        self._fail_if_expired(ctx)
 
-    async def get_stats(self, *, ctx: Optional[OperationContext] = None) -> EmbeddingStats:
-        """
-        Get embedding operation statistics and usage information.
+        t0 = time.monotonic()
+        try:
+            h = await self._apply_deadline(self._do_health(ctx=ctx), ctx)
+            self._record("health", t0, True, ctx=ctx)
+            return {
+                "ok": bool(h.get("ok", True)),
+                "server": str(h.get("server", "")),
+                "version": str(h.get("version", "")),
+                "namespaces": h.get("namespaces", {}),
+            }
+        except VectorAdapterError as e:
+            self._record("health", t0, False, code=e.code or type(e).__name__, ctx=ctx)
+            raise
+        except Exception as e:
+            self._record("health", t0, False, code="UNAVAILABLE", ctx=ctx)
+            raise Unavailable("health check failed") from e
 
-        Includes streaming-specific metrics in addition to base statistics.
-        """
-        base_stats = await self._do_get_stats(ctx)
+    # --- hooks to implement per backend (override these) ---------------------
 
-        # Enhance with real-time streaming metrics
-        return EmbeddingStats(
-            total_requests=base_stats.total_requests,
-            total_texts=base_stats.total_texts,
-            total_tokens=base_stats.total_tokens,
-            cache_hits=base_stats.cache_hits,
-            cache_misses=base_stats.cache_misses,
-            avg_processing_time_ms=base_stats.avg_processing_time_ms,
-            error_count=base_stats.error_count,
-            stream_requests=self._stream_stats["completed_streams"] + self._stream_stats["abandoned_streams"],
-            stream_chunks_generated=self._stream_stats["total_chunks"],
-            stream_abandoned=self._stream_stats["abandoned_streams"],
-        )
-
-    # --- async context manager (resource cleanup hook) ---
-
-    async def __aenter__(self) -> "BaseEmbeddingAdapter":
-        """Allow use as an async context manager."""
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
-        """On context exit, trigger close() for backend cleanup."""
-        await self.close()
-
-    async def close(self) -> None:
-        """
-        Clean up resources (override in backend implementations).
-
-        Default implementation is a no-op.
-        """
-        return None
-
-    # --- hooks to implement per backend (override these) ---
-
-    async def _do_capabilities(self) -> EmbeddingCapabilities:
+    async def _do_capabilities(self) -> VectorCapabilities:
         """Implement to return adapter-specific capabilities."""
         raise NotImplementedError
 
-    async def _do_embed(
+    async def _do_query(
         self,
-        spec: EmbedSpec,
+        spec: QuerySpec,
         *,
         ctx: Optional[OperationContext] = None,
-    ) -> EmbedResult:
-        """Implement single text embedding with validated inputs."""
+    ) -> QueryResult:
+        """Implement vector similarity search with validated inputs."""
         raise NotImplementedError
 
-    async def _do_stream_embed(
+    async def _do_batch_query(
         self,
-        spec: EmbedSpec,
+        spec: BatchQuerySpec,
         *,
         ctx: Optional[OperationContext] = None,
-    ) -> AsyncIterator[EmbedChunk]:
-        """
-        Implement streaming text embedding with validated inputs.
-
-        Yield EmbedChunk objects until the stream is complete.
-
-        Note: Streaming implementations should consider caching the final
-        aggregated result when the stream completes successfully.
-        """
+    ) -> List[QueryResult]:
+        """Implement batch vector similarity search with validated inputs."""
         raise NotImplementedError
 
-    async def _do_embed_batch(
+    async def _do_upsert(
         self,
-        spec: BatchEmbedSpec,
+        spec: UpsertSpec,
         *,
         ctx: Optional[OperationContext] = None,
-    ) -> BatchEmbedResult:
-        """
-        Implement batch text embedding with validated inputs.
-
-        Implementers MAY populate failed_texts for partial success semantics.
-
-        Contract:
-            - By default, `embeddings[i]` is assumed to correspond to
-              `spec.texts[i]` (1:1 alignment, same length & order).
-            - If you return a different structure (e.g., only successes),
-              you MUST document this behavior clearly for callers that rely
-              on positional alignment (such as metadata propagation).
-        """
+    ) -> UpsertResult:
+        """Implement vector upsert operations with validated inputs."""
         raise NotImplementedError
 
-    async def _do_count_tokens(
+    async def _do_delete(
         self,
-        text: str,
-        model: str,
+        spec: DeleteSpec,
         *,
         ctx: Optional[OperationContext] = None,
-    ) -> int:
-        """Implement token counting for the specified model."""
+    ) -> DeleteResult:
+        """Implement vector deletion operations with validated inputs."""
+        raise NotImplementedError
+
+    async def _do_create_namespace(
+        self,
+        spec: NamespaceSpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> NamespaceResult:
+        """Implement namespace creation with validated inputs."""
+        raise NotImplementedError
+
+    async def _do_delete_namespace(
+        self,
+        namespace: str,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> NamespaceResult:
+        """Implement namespace deletion."""
         raise NotImplementedError
 
     async def _do_health(self, *, ctx: Optional[OperationContext] = None) -> Dict[str, Any]:
-        """Implement health check for the embedding backend."""
+        """Implement health check for the vector backend."""
         raise NotImplementedError
-
-    async def _do_get_stats(self, ctx: Optional[OperationContext] = None) -> EmbeddingStats:
-        """
-        Implement statistics collection for embedding operations.
-
-        Default implementation returns empty stats. Override for detailed metrics.
-        """
-        return EmbeddingStats()
 
 
 # =============================================================================
 # Wire-Level Helpers (canonical envelopes)
 # =============================================================================
-
 
 def _ctx_from_wire(ctx_dict: Mapping[str, Any]) -> OperationContext:
     """
@@ -2414,11 +2583,11 @@ def _ctx_from_wire(ctx_dict: Mapping[str, Any]) -> OperationContext:
 
 def _error_to_wire(e: Exception, ms: float) -> Dict[str, Any]:
     """
-    Map EmbeddingAdapterError (or unexpected Exception) to canonical error envelope.
+    Map VectorAdapterError (or unexpected Exception) to canonical error envelope.
 
     Single source of truth for wire-level error normalization.
     """
-    if isinstance(e, EmbeddingAdapterError):
+    if isinstance(e, VectorAdapterError):
         payload = e.asdict()
         return {
             "ok": False,
@@ -2429,7 +2598,7 @@ def _error_to_wire(e: Exception, ms: float) -> Dict[str, Any]:
             "details": payload.get("details") or None,
             "ms": ms,
         }
-    # Fallback: treat as UNAVAILABLE/INTERNAL for unknown exceptions.
+    # Fallback: treat as UNAVAILABLE/INTERNAL
     return {
         "ok": False,
         "code": "UNAVAILABLE",
@@ -2443,95 +2612,120 @@ def _error_to_wire(e: Exception, ms: float) -> Dict[str, Any]:
 
 def _success_to_wire(result: Any, ms: float) -> Dict[str, Any]:
     """
-    Map typed result objects or primitives to canonical success envelope.
+    Map typed result objects to canonical success envelope.
 
     Uses dataclasses.asdict() where applicable, else passes through.
     """
     if hasattr(result, "__dataclass_fields__"):
-        payload = asdict(result)
+        result_payload = asdict(result)
     else:
-        payload = result
+        result_payload = result
     return {
         "ok": True,
         "code": "OK",
         "ms": ms,
-        "result": payload,
+        "result": result_payload,
     }
 
 
-def _stream_chunk_to_wire(chunk: EmbedChunk, ms: float) -> Dict[str, Any]:
+class WireVectorHandler:
     """
-    Map streaming chunk to canonical streaming envelope.
-
-    Note: Transport layers must handle streaming responses appropriately.
-    This is a helper for chunk serialization only.
-    """
-    return {
-        "ok": True,
-        "code": "STREAMING",
-        "ms": ms,
-        "chunk": asdict(chunk),
-    }
-
-
-class WireEmbeddingHandler:
-    """
-    Thin wire-level adapter that exposes an EmbeddingProtocolV1 implementation using
+    Thin wire-level adapter that exposes a VectorProtocolV1 implementation using
     the canonical JSON envelope contract:
 
-        { "op": "embedding.embed", "ctx": {...}, "args": {...} } -> { ... }
+        { "op": "vector.query", "ctx": {...}, "args": {...} } -> { ... }
 
     Transport-agnostic: can be wrapped by HTTP, gRPC, WebSockets, etc.
 
-    Note: The wire contract currently does NOT carry metadata/metadatas. Those
-    fields are local-only conveniences and must be populated by in-process callers.
-
-    Streaming:
-        - embedding.stream_embed via handle_stream(...) following the canonical
-          streaming envelope pattern (aligned with LLM and Graph).
-
     Wire strictness:
         - Envelopes MUST contain all three top-level keys: op, ctx, args.
-        - ctx and args MUST be JSON objects (mappings). Callers MAY send empty objects.
+        - ctx and args MUST be JSON objects (mappings). Callers may send empty
+          objects, but the keys must be present for protocol conformance.
     """
 
-    def __init__(self, adapter: EmbeddingProtocolV1):
+    def __init__(self, adapter: VectorProtocolV1):
         self._adapter = adapter
 
     @staticmethod
     def _require_mapping_field(envelope: Mapping[str, Any], field: str) -> Mapping[str, Any]:
         """
-        Enforce presence of a required object field on the wire envelope.
+        Enforce that envelope[field] exists and is a mapping.
 
-        POLICY:
-        - 'ctx' and 'args' are REQUIRED for conformance and cross-protocol consistency.
-        - Callers MAY send empty objects for either field if they have no data to provide.
+        This makes ctx/args strict at the wire handler boundary to match the
+        canonical envelope contract.
         """
         if field not in envelope:
-            raise BadRequest(f"missing '{field}'")
-        value = envelope.get(field)
-        if not isinstance(value, ABCMapping):
-            raise BadRequest(f"'{field}' must be an object")
-        return value  # type: ignore[return-value]
+            raise BadRequest(f"missing required '{field}'")
+        v = envelope.get(field)
+        if not isinstance(v, Mapping):
+            raise BadRequest(
+                f"'{field}' must be an object",
+                details={"field": field, "type": type(v).__name__},
+            )
+        return v
+
+    @staticmethod
+    def _require_mapping_list(name: str, value: Any) -> List[Mapping[str, Any]]:
+        """
+        Defensive parsing helper for wire lists.
+
+        Ensures list elements are mappings so malformed input becomes BadRequest
+        (not a generic UNAVAILABLE).
+        """
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise BadRequest(
+                f"{name} must be a list",
+                details={"field": name, "type": type(value).__name__},
+            )
+        out: List[Mapping[str, Any]] = []
+        for i, item in enumerate(value):
+            if not isinstance(item, Mapping):
+                raise BadRequest(
+                    f"{name}[{i}] must be an object",
+                    details={"field": f"{name}[{i}]", "type": type(item).__name__},
+                )
+            out.append(item)
+        return out
+
+    @staticmethod
+    def _require_string_list(name: str, value: Any) -> List[str]:
+        """Strictly require a list of strings for wire ID lists."""
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise BadRequest(
+                f"{name} must be a list",
+                details={"field": name, "type": type(value).__name__},
+            )
+        out: List[str] = []
+        for i, item in enumerate(value):
+            if not isinstance(item, str):
+                raise BadRequest(
+                    f"{name}[{i}] must be a string",
+                    details={"field": f"{name}[{i}]", "type": type(item).__name__},
+                )
+            out.append(item)
+        return out
 
     async def handle(self, envelope: Mapping[str, Any]) -> Dict[str, Any]:
         """
         Handle a single unary request envelope and return a response envelope.
 
         Supports:
-            - embedding.capabilities
-            - embedding.embed (non-streaming only)
-            - embedding.embed_batch
-            - embedding.count_tokens
-            - embedding.health
-            - embedding.get_stats
-
-        NOTE:
-            Streaming is handled via handle_stream for op="embedding.stream_embed".
+            - vector.capabilities
+            - vector.query
+            - vector.batch_query (V1.0+)
+            - vector.upsert
+            - vector.delete
+            - vector.create_namespace
+            - vector.delete_namespace
+            - vector.health
         """
         t0 = time.monotonic()
         try:
-            if not isinstance(envelope, ABCMapping):
+            if not isinstance(envelope, Mapping):
                 raise BadRequest("envelope must be an object")
 
             op = envelope.get("op")
@@ -2541,60 +2735,97 @@ class WireEmbeddingHandler:
             # REQUIRED fields (ctx + args must be present; may be empty objects)
             ctx_map = self._require_mapping_field(envelope, "ctx")
             args = self._require_mapping_field(envelope, "args")
-
             ctx = _ctx_from_wire(ctx_map)
 
-            if op == "embedding.capabilities":
+            if op == "vector.capabilities":
                 res = await self._adapter.capabilities()
                 return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
 
-            if op == "embedding.embed":
-                # Unary embed only; streaming has its own operation.
-                if bool(args.get("stream", False)):
-                    raise NotSupported("streaming requires op='embedding.stream_embed'")
-
-                spec = EmbedSpec(
-                    text=args.get("text", ""),
-                    model=args.get("model", ""),
-                    truncate=bool(args.get("truncate", True)),
-                    normalize=bool(args.get("normalize", False)),
-                    stream=False,
-                    metadata=None,  # metadata not in wire contract
-                )
-                res = await self._adapter.embed(spec, ctx=ctx)
+            if op == "vector.query":
+                try:
+                    spec = QuerySpec(**dict(args))
+                except TypeError as te:
+                    raise BadRequest(f"missing required field(s): {str(te)}") from te
+                res = await self._adapter.query(spec, ctx=ctx)
                 return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
 
-            if op == "embedding.embed_batch":
-                texts = args.get("texts")
-                if not isinstance(texts, list):
-                    raise BadRequest("texts must be provided as a list of strings")
-                spec = BatchEmbedSpec(
-                    texts=[str(t) for t in texts],
-                    model=args.get("model", ""),
-                    truncate=bool(args.get("truncate", True)),
-                    normalize=bool(args.get("normalize", False)),
-                    metadatas=None,  # metadatas not in wire contract
+            if op == "vector.batch_query":
+                queries_raw = self._require_mapping_list("queries", args.get("queries"))
+                if not queries_raw:
+                    raise BadRequest("queries must not be empty")
+                queries: List[QuerySpec] = []
+                for i, q in enumerate(queries_raw):
+                    try:
+                        queries.append(QuerySpec(**dict(q)))
+                    except TypeError as te:
+                        raise BadRequest(
+                            f"Invalid query spec at queries[{i}]: {te}",
+                            details={"index": i},
+                        ) from te
+                    except Exception as e:
+                        raise BadRequest(
+                            f"Invalid query spec at queries[{i}]: {e}",
+                            details={"index": i, "type": type(e).__name__},
+                        ) from e
+                spec = BatchQuerySpec(
+                    queries=queries,
+                    namespace=str(args.get("namespace", "default")),
                 )
-                res = await self._adapter.embed_batch(spec, ctx=ctx)
+                res = await self._adapter.batch_query(spec, ctx=ctx)
+                return _success_to_wire([asdict(r) for r in res], (time.monotonic() - t0) * 1000.0)
+
+            if op == "vector.upsert":
+                vectors_raw = self._require_mapping_list("vectors", args.get("vectors"))
+                vectors: List[Vector] = []
+                for i, v in enumerate(vectors_raw):
+                    try:
+                        vectors.append(Vector(**dict(v)))
+                    except TypeError as te:
+                        raise BadRequest(
+                            f"Invalid vector at vectors[{i}]: {te}",
+                            details={"index": i},
+                        ) from te
+                    except Exception as e:
+                        raise BadRequest(
+                            f"Invalid vector at vectors[{i}]: {e}",
+                            details={"index": i, "type": type(e).__name__},
+                        ) from e
+                spec = UpsertSpec(
+                    vectors=vectors,
+                    namespace=str(args.get("namespace", "default")),
+                )
+                res = await self._adapter.upsert(spec, ctx=ctx)
                 return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
 
-            if op == "embedding.count_tokens":
-                text = args.get("text")
-                model = args.get("model")
-                if not isinstance(text, str):
-                    raise BadRequest("text must be a string")
-                if not isinstance(model, str):
-                    raise BadRequest("model must be a string")
-                res = await self._adapter.count_tokens(text=text, model=model, ctx=ctx)
-                return _success_to_wire(int(res), (time.monotonic() - t0) * 1000.0)
+            if op == "vector.delete":
+                ids_raw = self._require_string_list("ids", args.get("ids"))
+                ids = [VectorID(v) for v in ids_raw]
+                spec = DeleteSpec(
+                    ids=ids,
+                    namespace=str(args.get("namespace", "default")),
+                    filter=args.get("filter"),
+                )
+                res = await self._adapter.delete(spec, ctx=ctx)
+                return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
 
-            if op == "embedding.health":
+            if op == "vector.create_namespace":
+                try:
+                    spec = NamespaceSpec(**dict(args))
+                except TypeError as te:
+                    raise BadRequest(f"Invalid namespace spec: {te}") from te
+                res = await self._adapter.create_namespace(spec, ctx=ctx)
+                return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
+
+            if op == "vector.delete_namespace":
+                namespace = args.get("namespace")
+                if not isinstance(namespace, str):
+                    raise BadRequest("namespace must be provided as a string")
+                res = await self._adapter.delete_namespace(namespace, ctx=ctx)
+                return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
+
+            if op == "vector.health":
                 res = await self._adapter.health(ctx=ctx)
                 return _success_to_wire(res, (time.monotonic() - t0) * 1000.0)
-
-            if op == "embedding.get_stats":
-                res = await self._adapter.get_stats(ctx=ctx)
-                return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
 
             raise NotSupported(f"unknown operation '{op}'")
 
@@ -2602,105 +2833,62 @@ class WireEmbeddingHandler:
             ms = (time.monotonic() - t0) * 1000.0
             return _error_to_wire(e, ms)
 
-    async def handle_stream(self, envelope: Mapping[str, Any]) -> AsyncIterator[Dict[str, Any]]:
-        """
-        Handle streaming embedding requests:
-
-            op: "embedding.stream_embed"
-
-        Expects:
-            ctx: { ... }   # REQUIRED
-            args: { ... }  # REQUIRED
-
-        Emits:
-            - streaming chunk envelopes { ok, code="STREAMING", ms, chunk }
-            - or a terminal error envelope on failure
-        """
-        t0 = time.monotonic()
-        op = envelope.get("op")
-        if op != "embedding.stream_embed":
-            yield _error_to_wire(BadRequest("op must be 'embedding.stream_embed' for streaming"), 0.0)
-            return
-
-        try:
-            ctx_map = self._require_mapping_field(envelope, "ctx")
-            args = self._require_mapping_field(envelope, "args")
-            ctx = _ctx_from_wire(ctx_map)
-        except Exception as e:
-            yield _error_to_wire(e, 0.0)
-            return
-
-        try:
-            spec = EmbedSpec(
-                text=args.get("text", ""),
-                model=args.get("model", ""),
-                truncate=bool(args.get("truncate", True)),
-                normalize=bool(args.get("normalize", False)),
-                stream=True,
-                metadata=None,  # metadata not in wire contract
-            )
-            agen = self._adapter.stream_embed(spec, ctx=ctx)
-            async for chunk in agen:
-                ms = (time.monotonic() - t0) * 1000.0
-                yield _stream_chunk_to_wire(chunk, ms)
-        except Exception as e:
-            ms = (time.monotonic() - t0) * 1000.0
-            yield _error_to_wire(e, ms)
-
 
 # =============================================================================
 # Public Exports
 # =============================================================================
 
 __all__ = [
-    "EMBEDDING_PROTOCOL_VERSION",
-    "EMBEDDING_PROTOCOL_ID",
-    "EmbeddingVector",
-    "EmbeddingResult",
-    "EmbeddingBatch",
-    "EmbedChunk",
-    "EmbeddingStats",
-    "EmbeddingAdapterError",
+    "VECTOR_PROTOCOL_VERSION",
+    "VECTOR_PROTOCOL_ID",
+    "VectorID",
+    "Vector",
+    "VectorMatch",
+    "QueryResult",
+    "VectorAdapterError",
     "BadRequest",
     "AuthError",
     "ResourceExhausted",
-    "TextTooLong",
-    "ModelNotAvailable",
+    "DimensionMismatch",
+    "IndexNotReady",
     "TransientNetwork",
     "Unavailable",
     "NotSupported",
     "DeadlineExceeded",
     "OperationContext",
-    "EmbedSpec",
-    "BatchEmbedSpec",
-    "EmbedResult",
-    "BatchEmbedResult",
-    "EmbeddingCapabilities",
-    "EmbeddingProtocolV1",
-    "BaseEmbeddingAdapter",
+    "QuerySpec",
+    "BatchQuerySpec",
+    "UpsertSpec",
+    "DeleteSpec",
+    "NamespaceSpec",
+    "UpsertResult",
+    "DeleteResult",
+    "NamespaceResult",
+    "VectorCapabilities",
+    "VectorProtocolV1",
+    "VectorAdapterConfig",
+    "BaseVectorAdapter",
+    # document storage
+    "Document",
+    "DocStore",
+    "InMemoryDocStore",
+    "RedisDocStore",
     # policy & infra extension points
     "DeadlinePolicy",
-    "TruncationPolicy",
-    "NormalizationPolicy",
     "CircuitBreaker",
     "Cache",
     "RateLimiter",
     "NoopDeadline",
-    "EnforcingDeadline",
-    "SimpleCharTruncation",
-    "L2Normalization",
+    "SimpleDeadline",
     "NoopBreaker",
     "SimpleCircuitBreaker",
     "NoopCache",
     "InMemoryTTLCache",
     "NoopLimiter",
-    "TokenBucketLimiter",
-    "MetricsSink",
-    "NoopMetrics",
+    "SimpleTokenBucketLimiter",
     # wire helpers
-    "WireEmbeddingHandler",
+    "WireVectorHandler",
     "_ctx_from_wire",
     "_error_to_wire",
     "_success_to_wire",
-    "_stream_chunk_to_wire",
 ]
