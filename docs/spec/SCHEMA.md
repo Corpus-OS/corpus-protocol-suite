@@ -547,7 +547,8 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 
 #### 4.1.1 Envelope Schemas
 
-**LLM Request Envelope (`llm.envelope.request.json`):**
+**4.1.1.1 LLM Request Envelope (`llm.envelope.request.json`)**
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -558,17 +559,15 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/common/envelope.request.json" },
     {
       "properties": {
-        "op": {
-          "type": "string",
-          "pattern": "^llm\\.[a-z_]+$"
-        }
+        "op": { "type": "string" }
       }
     }
   ]
 }
 ```
 
-**LLM Success Envelope (`llm.envelope.success.json`):**
+**4.1.1.2 LLM Success Envelope (`llm.envelope.success.json`)**
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -581,7 +580,8 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-**LLM Error Envelope (`llm.envelope.error.json`):**
+**4.1.1.3 LLM Error Envelope (`llm.envelope.error.json`)**
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -594,9 +594,12 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
+---
+
 #### 4.1.2 Operation Schemas
 
-**LLM Capabilities Request (`llm.capabilities.request.json`):**
+**4.1.2.1 LLM Capabilities Request (`llm.capabilities.request.json`)**
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -607,14 +610,11 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/llm/llm.envelope.request.json" },
     {
       "properties": {
-        "op": {
-          "type": "string",
-          "const": "llm.capabilities"
-        },
+        "op": { "type": "string", "const": "llm.capabilities" },
         "args": {
           "type": "object",
-          "additionalProperties": false,
-          "description": "Empty args object required"
+          "additionalProperties": true,
+          "description": "Args object is required on the wire; extra keys are ignored by the handler."
         }
       }
     }
@@ -622,7 +622,8 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-**LLM Capabilities Success (`llm.capabilities.success.json`):**
+**4.1.2.2 LLM Capabilities Success (`llm.capabilities.success.json`)**
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -633,16 +634,15 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/llm/llm.envelope.success.json" },
     {
       "properties": {
-        "result": {
-          "$ref": "https://corpusos.com/schemas/llm/llm.capabilities.json"
-        }
+        "result": { "$ref": "https://corpusos.com/schemas/llm/llm.capabilities.json" }
       }
     }
   ]
 }
 ```
 
-**LLM Complete Request (`llm.complete.request.json`):**
+**4.1.2.3 LLM Complete Request (`llm.complete.request.json`)**
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -653,20 +653,16 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/llm/llm.envelope.request.json" },
     {
       "properties": {
-        "op": {
-          "type": "string",
-          "const": "llm.complete"
-        },
-        "args": {
-          "$ref": "https://corpusos.com/schemas/llm/llm.types.completion_spec.json"
-        }
+        "op": { "type": "string", "const": "llm.complete" },
+        "args": { "$ref": "https://corpusos.com/schemas/llm/llm.types.completion_spec.json" }
       }
     }
   ]
 }
 ```
 
-**LLM Complete Success (`llm.complete.success.json`):**
+**4.1.2.4 LLM Complete Success (`llm.complete.success.json`)**
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -677,16 +673,15 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/llm/llm.envelope.success.json" },
     {
       "properties": {
-        "result": {
-          "$ref": "https://corpusos.com/schemas/llm/llm.types.completion.json"
-        }
+        "result": { "$ref": "https://corpusos.com/schemas/llm/llm.types.completion.json" }
       }
     }
   ]
 }
 ```
 
-**LLM Stream Request (`llm.stream.request.json`):**
+**4.1.2.5 LLM Stream Request (`llm.stream.request.json`)**
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -697,20 +692,16 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/llm/llm.envelope.request.json" },
     {
       "properties": {
-        "op": {
-          "type": "string",
-          "const": "llm.stream"
-        },
-        "args": {
-          "$ref": "https://corpusos.com/schemas/llm/llm.types.stream_spec.json"
-        }
+        "op": { "type": "string", "const": "llm.stream" },
+        "args": { "$ref": "https://corpusos.com/schemas/llm/llm.types.stream_spec.json" }
       }
     }
   ]
 }
 ```
 
-**LLM Stream Success (`llm.stream.success.json`):**
+**4.1.2.6 LLM Stream Success (`llm.stream.success.json`)**
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -721,16 +712,15 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/common/envelope.stream.success.json" },
     {
       "properties": {
-        "chunk": {
-          "$ref": "https://corpusos.com/schemas/llm/llm.types.chunk.json"
-        }
+        "chunk": { "$ref": "https://corpusos.com/schemas/llm/llm.types.chunk.json" }
       }
     }
   ]
 }
 ```
 
-**LLM Count Tokens Request (`llm.count_tokens.request.json`):**
+**4.1.2.7 LLM Count Tokens Request (`llm.count_tokens.request.json`)**
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -741,20 +731,16 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/llm/llm.envelope.request.json" },
     {
       "properties": {
-        "op": {
-          "type": "string",
-          "const": "llm.count_tokens"
-        },
-        "args": {
-          "$ref": "https://corpusos.com/schemas/llm/llm.types.count_tokens_spec.json"
-        }
+        "op": { "type": "string", "const": "llm.count_tokens" },
+        "args": { "$ref": "https://corpusos.com/schemas/llm/llm.types.count_tokens_spec.json" }
       }
     }
   ]
 }
 ```
 
-**LLM Count Tokens Success (`llm.count_tokens.success.json`):**
+**4.1.2.8 LLM Count Tokens Success (`llm.count_tokens.success.json`)**
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -765,24 +751,15 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/llm/llm.envelope.success.json" },
     {
       "properties": {
-        "result": {
-          "type": "object",
-          "properties": {
-            "total_tokens": {
-              "type": "integer",
-              "minimum": 0
-            }
-          },
-          "required": ["total_tokens"],
-          "additionalProperties": false
-        }
+        "result": { "type": "integer" }
       }
     }
   ]
 }
 ```
 
-**LLM Health Request (`llm.health.request.json`):**
+**4.1.2.9 LLM Health Request (`llm.health.request.json`)**
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -793,14 +770,11 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/llm/llm.envelope.request.json" },
     {
       "properties": {
-        "op": {
-          "type": "string",
-          "const": "llm.health"
-        },
+        "op": { "type": "string", "const": "llm.health" },
         "args": {
           "type": "object",
-          "additionalProperties": false,
-          "description": "Empty args object required"
+          "additionalProperties": true,
+          "description": "Args object is required on the wire; extra keys are ignored by the handler."
         }
       }
     }
@@ -808,7 +782,8 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-**LLM Health Success (`llm.health.success.json`):**
+**4.1.2.10 LLM Health Success (`llm.health.success.json`)**
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -823,11 +798,10 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
           "type": "object",
           "properties": {
             "ok": { "type": "boolean" },
-            "status": { "type": "string" },
             "server": { "type": "string" },
             "version": { "type": "string" }
           },
-          "required": ["ok", "status", "server", "version"],
+          "required": ["ok", "server", "version"],
           "additionalProperties": true
         }
       }
@@ -836,9 +810,12 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
+---
+
 #### 4.1.3 Type Definitions
 
-**LLM Capabilities (`llm.capabilities.json`):**
+**4.1.3.1 LLM Capabilities (`llm.capabilities.json`)**
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -849,32 +826,29 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     "server": { "type": "string" },
     "version": { "type": "string" },
     "model_family": { "type": "string" },
-    "max_context_length": { "type": "integer", "minimum": 1 },
-    "protocol": { "type": "string", "const": "llm/v1.0" },
-    "supports_streaming": { "type": "boolean", "default": true },
-    "supports_roles": { "type": "boolean", "default": true },
-    "supports_json_output": { "type": "boolean", "default": false },
-    "supports_tools": { "type": "boolean", "default": false },
-    "supports_parallel_tool_calls": { "type": "boolean", "default": false },
-    "supports_tool_choice": { "type": "boolean", "default": false },
-    "max_tool_calls_per_turn": { "type": ["integer", "null"], "minimum": 0 },
-    "idempotent_writes": { "type": "boolean", "default": false },
-    "supports_multi_tenant": { "type": "boolean", "default": false },
-    "supports_system_message": { "type": "boolean", "default": true },
-    "supports_deadline": { "type": "boolean", "default": true },
-    "supports_count_tokens": { "type": "boolean", "default": true },
-    "supported_models": {
-      "type": "array",
-      "items": { "type": "string" },
-      "default": []
-    }
+    "max_context_length": { "type": "integer" },
+    "protocol": { "type": "string" },
+    "supports_streaming": { "type": "boolean" },
+    "supports_roles": { "type": "boolean" },
+    "supports_json_output": { "type": "boolean" },
+    "supports_tools": { "type": "boolean" },
+    "supports_parallel_tool_calls": { "type": "boolean" },
+    "supports_tool_choice": { "type": "boolean" },
+    "max_tool_calls_per_turn": { "type": ["integer", "null"] },
+    "idempotent_writes": { "type": "boolean" },
+    "supports_multi_tenant": { "type": "boolean" },
+    "supports_system_message": { "type": "boolean" },
+    "supports_deadline": { "type": "boolean" },
+    "supports_count_tokens": { "type": "boolean" },
+    "supported_models": { "type": "array", "items": { "type": "string" } }
   },
   "required": ["server", "version", "model_family", "max_context_length"],
   "additionalProperties": false
 }
 ```
 
-**Completion Spec (`llm.types.completion_spec.json`):**
+**4.1.3.2 Completion Spec (`llm.types.completion_spec.json`)**
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -882,68 +856,24 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "LLM Completion Specification",
   "type": "object",
   "properties": {
-    "messages": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "properties": {
-          "role": { "type": "string", "minLength": 1 },
-          "content": { "type": "string" }
-        },
-        "required": ["role", "content"],
-        "additionalProperties": false
-      },
-      "minItems": 1,
-      "description": "List of conversation messages"
-    },
-    "model": {
-      "type": "string",
-      "minLength": 1,
-      "description": "Model identifier"
-    },
-    "temperature": {
-      "type": "number",
-      "minimum": 0.0,
-      "maximum": 2.0,
-      "description": "Sampling temperature"
-    },
-    "max_tokens": {
-      "type": "integer",
-      "minimum": 1,
-      "description": "Maximum tokens to generate"
-    },
-    "top_p": {
-      "type": "number",
-      "minimum": 0.0,
-      "exclusiveMinimum": true,
-      "maximum": 1.0,
-      "description": "Nucleus sampling parameter"
-    },
-    "stop_sequences": {
-      "type": ["array", "null"],
-      "items": { "type": "string" },
-      "description": "Stop generation sequences"
-    },
-    "tools": {
-      "type": ["array", "null"],
-      "items": { "type": "object" },
-      "description": "Available tools for the model"
-    },
-    "tool_choice": {
-      "oneOf": [
-        { "type": "string" },
-        { "type": "object" },
-        { "type": "null" }
-      ],
-      "description": "Tool selection strategy"
-    }
+    "messages": { "type": "array", "items": {} },
+    "max_tokens": {},
+    "temperature": {},
+    "top_p": {},
+    "frequency_penalty": {},
+    "presence_penalty": {},
+    "stop_sequences": {},
+    "model": {},
+    "system_message": {},
+    "tools": {},
+    "tool_choice": {}
   },
-  "required": ["messages"],
   "additionalProperties": true
 }
 ```
 
-**Stream Spec (`llm.types.stream_spec.json`):**
+**4.1.3.3 Stream Spec (`llm.types.stream_spec.json`)**
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -951,68 +881,24 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "LLM Stream Specification",
   "type": "object",
   "properties": {
-    "messages": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "properties": {
-          "role": { "type": "string", "minLength": 1 },
-          "content": { "type": "string" }
-        },
-        "required": ["role", "content"],
-        "additionalProperties": false
-      },
-      "minItems": 1,
-      "description": "List of conversation messages"
-    },
-    "model": {
-      "type": "string",
-      "minLength": 1,
-      "description": "Model identifier"
-    },
-    "temperature": {
-      "type": "number",
-      "minimum": 0.0,
-      "maximum": 2.0,
-      "description": "Sampling temperature"
-    },
-    "max_tokens": {
-      "type": "integer",
-      "minimum": 1,
-      "description": "Maximum tokens to generate"
-    },
-    "top_p": {
-      "type": "number",
-      "minimum": 0.0,
-      "exclusiveMinimum": true,
-      "maximum": 1.0,
-      "description": "Nucleus sampling parameter"
-    },
-    "stop_sequences": {
-      "type": ["array", "null"],
-      "items": { "type": "string" },
-      "description": "Stop generation sequences"
-    },
-    "tools": {
-      "type": ["array", "null"],
-      "items": { "type": "object" },
-      "description": "Available tools for the model"
-    },
-    "tool_choice": {
-      "oneOf": [
-        { "type": "string" },
-        { "type": "object" },
-        { "type": "null" }
-      ],
-      "description": "Tool selection strategy"
-    }
+    "messages": { "type": "array", "items": {} },
+    "max_tokens": {},
+    "temperature": {},
+    "top_p": {},
+    "frequency_penalty": {},
+    "presence_penalty": {},
+    "stop_sequences": {},
+    "model": {},
+    "system_message": {},
+    "tools": {},
+    "tool_choice": {}
   },
-  "required": ["messages"],
   "additionalProperties": true
 }
 ```
 
-**Count Tokens Spec (`llm.types.count_tokens_spec.json`):**
+**4.1.3.4 Count Tokens Spec (`llm.types.count_tokens_spec.json`)**
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1020,32 +906,16 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "LLM Count Tokens Specification",
   "type": "object",
   "properties": {
-    "messages": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "properties": {
-          "role": { "type": "string", "minLength": 1 },
-          "content": { "type": "string" }
-        },
-        "required": ["role", "content"],
-        "additionalProperties": false
-      },
-      "minItems": 1,
-      "description": "List of conversation messages"
-    },
-    "model": {
-      "type": "string",
-      "minLength": 1,
-      "description": "Model identifier"
-    }
+    "text": { "type": "string" },
+    "model": {}
   },
-  "required": ["messages"],
-  "additionalProperties": false
+  "required": ["text"],
+  "additionalProperties": true
 }
 ```
 
-**Message Type (`llm.types.message.json`):**
+**4.1.3.5 Message Type (`llm.types.message.json`)**
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1053,36 +923,23 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "LLM Message",
   "type": "object",
   "properties": {
-    "role": {
-      "type": "string",
-      "minLength": 1
-    },
-    "content": {
-      "type": "string"
-    },
-    "name": {
-      "type": "string",
-      "description": "Tool call function name"
-    },
-    "tool_call_id": {
-      "type": "string",
-      "description": "Associate tool calls with responses"
-    },
+    "role": { "type": "string" },
+    "content": { "type": "string" },
+    "name": { "type": "string" },
+    "tool_call_id": { "type": "string" },
     "tool_calls": {
       "type": "array",
-      "items": {
-        "$ref": "#/$defs/ToolCall"
-      }
+      "items": { "$ref": "#/$defs/ToolCall" }
     }
   },
   "required": ["role", "content"],
-  "additionalProperties": false,
+  "additionalProperties": true,
   "$defs": {
     "ToolCall": {
       "type": "object",
       "properties": {
         "id": { "type": "string" },
-        "type": { "type": "string", "description": "Tool call type" },
+        "type": { "type": "string" },
         "function": {
           "type": "object",
           "properties": {
@@ -1090,17 +947,18 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
             "arguments": { "type": "string" }
           },
           "required": ["name", "arguments"],
-          "additionalProperties": false
+          "additionalProperties": true
         }
       },
       "required": ["id", "type", "function"],
-      "additionalProperties": false
+      "additionalProperties": true
     }
   }
 }
 ```
 
-**Token Usage (`llm.types.token_usage.json`):**
+**4.1.3.6 Token Usage (`llm.types.token_usage.json`)**
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1108,26 +966,17 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "Token Usage",
   "type": "object",
   "properties": {
-    "prompt_tokens": {
-      "type": "integer",
-      "minimum": 0
-    },
-    "completion_tokens": {
-      "type": "integer",
-      "minimum": 0
-    },
-    "total_tokens": {
-      "type": "integer",
-      "minimum": 0,
-      "description": "MUST equal prompt_tokens + completion_tokens"
-    }
+    "prompt_tokens": { "type": "integer" },
+    "completion_tokens": { "type": "integer" },
+    "total_tokens": { "type": "integer" }
   },
   "required": ["prompt_tokens", "completion_tokens", "total_tokens"],
-  "additionalProperties": false
+  "additionalProperties": true
 }
 ```
 
-**Completion Result (`llm.types.completion.json`):**
+**4.1.3.7 Completion Result (`llm.types.completion.json`)**
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1135,39 +984,23 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "LLM Completion",
   "type": "object",
   "properties": {
-    "text": {
-      "type": "string",
-      "description": "Generated completion text"
-    },
-    "model": {
-      "type": "string",
-      "description": "Model identifier used"
-    },
-    "model_family": {
-      "type": "string",
-      "description": "Logical model family"
-    },
-    "usage": {
-      "$ref": "https://corpusos.com/schemas/llm/llm.types.token_usage.json"
-    },
-    "finish_reason": {
-      "type": "string",
-      "description": "Reason generation stopped"
-    },
+    "text": {},
+    "model": {},
+    "model_family": {},
+    "usage": { "$ref": "https://corpusos.com/schemas/llm/llm.types.token_usage.json" },
+    "finish_reason": {},
     "tool_calls": {
       "type": "array",
-      "items": {
-        "$ref": "https://corpusos.com/schemas/llm/llm.types.message.json#/$defs/ToolCall"
-      },
-      "default": []
+      "items": { "$ref": "https://corpusos.com/schemas/llm/llm.types.message.json#/$defs/ToolCall" }
     }
   },
   "required": ["text", "model", "model_family", "usage", "finish_reason"],
-  "additionalProperties": false
+  "additionalProperties": true
 }
 ```
 
-**Streaming Chunk (`llm.types.chunk.json`):**
+**4.1.3.8 Streaming Chunk (`llm.types.chunk.json`)**
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1175,42 +1008,23 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "LLM Streaming Chunk",
   "type": "object",
   "properties": {
-    "text": {
-      "type": "string",
-      "description": "Incremental text content"
-    },
-    "is_final": {
-      "type": "boolean",
-      "default": false,
-      "description": "True for final chunk"
-    },
-    "model": {
-      "type": ["string", "null"],
-      "description": "Optional model identifier"
-    },
-    "usage_so_far": {
-      "oneOf": [
-        { "$ref": "https://corpusos.com/schemas/llm/llm.types.token_usage.json" },
-        { "type": "null" }
-      ],
-      "description": "Token usage up to this point"
-    },
-    "tool_calls": {
-      "type": "array",
-      "items": {
-        "$ref": "https://corpusos.com/schemas/llm/llm.types.message.json#/$defs/ToolCall"
-      },
-      "default": []
-    }
+    "text": {},
+    "is_final": {},
+    "model": {},
+    "usage_so_far": {},
+    "tool_calls": {}
   },
   "required": ["text", "is_final"],
-  "additionalProperties": false
+  "additionalProperties": true
 }
 ```
 
+---
+
 #### 4.1.4 Configuration Schemas
 
-**Sampling Parameters (`llm.sampling.params.json`):**
+**4.1.4.1 Sampling Parameters (`llm.sampling.params.json`)**
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1218,41 +1032,18 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "LLM Sampling Parameters",
   "type": "object",
   "properties": {
-    "temperature": {
-      "type": "number",
-      "minimum": 0.0,
-      "maximum": 2.0,
-      "description": "Creativity/randomness control"
-    },
-    "top_p": {
-      "type": "number",
-      "minimum": 0.0,
-      "exclusiveMinimum": true,
-      "maximum": 1.0,
-      "description": "Nucleus sampling parameter"
-    },
-    "frequency_penalty": {
-      "type": "number",
-      "minimum": -2.0,
-      "maximum": 2.0,
-      "description": "Reduce repetition"
-    },
-    "presence_penalty": {
-      "type": "number",
-      "minimum": -2.0,
-      "maximum": 2.0,
-      "description": "Encourage new topics"
-    },
-    "seed": {
-      "type": "integer",
-      "description": "Deterministic output seed"
-    }
+    "temperature": {},
+    "top_p": {},
+    "frequency_penalty": {},
+    "presence_penalty": {},
+    "seed": {}
   },
-  "additionalProperties": false
+  "additionalProperties": true
 }
 ```
 
-**Response Format (`llm.response_format.json`):**
+**4.1.4.2 Response Format (`llm.response_format.json`)**
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1260,17 +1051,15 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "LLM Response Format",
   "type": "object",
   "properties": {
-    "type": {
-      "type": "string",
-      "enum": ["text", "json_object"]
-    }
+    "type": {}
   },
   "required": ["type"],
-  "additionalProperties": false
+  "additionalProperties": true
 }
 ```
 
-**Tools Schema (`llm.tools.schema.json`):**
+**4.1.4.3 Tools Schema (`llm.tools.schema.json`)**
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1278,26 +1067,11 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "LLM Tools Definition",
   "type": "object",
   "properties": {
-    "type": {
-      "type": "string",
-      "description": "Tool type"
-    },
-    "function": {
-      "type": "object",
-      "properties": {
-        "name": { "type": "string" },
-        "description": { "type": "string" },
-        "parameters": {
-          "type": "object",
-          "description": "JSON Schema object"
-        }
-      },
-      "required": ["name", "parameters"],
-      "additionalProperties": false
-    }
+    "type": {},
+    "function": {}
   },
   "required": ["type", "function"],
-  "additionalProperties": false
+  "additionalProperties": true
 }
 ```
 
