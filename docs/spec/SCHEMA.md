@@ -132,7 +132,13 @@ schemas/
 │   ├── llm.types.message.json        # Message type definition
 │   ├── llm.types.token_usage.json    # Token usage reporting
 │   ├── llm.types.tool.json           # Tool definition type
-│   └── llm.types.warning.json        # Warning type definition
+│   ├── llm.types.warning.json        # Warning type definition
+│   ├── llm.complete.request.json     # LLM Complete operation request
+│   ├── llm.complete.success.json     # LLM Complete operation success
+│   ├── llm.count_tokens.request.json # LLM Count tokens request
+│   ├── llm.count_tokens.success.json # LLM Count tokens success
+│   ├── llm.stream.request.json       # LLM Stream operation request
+│   └── llm.stream.success.json       # LLM Stream operation success
 │
 ├── vector/                           # Vector protocol schemas
 │   ├── vector.envelope.request.json
@@ -149,7 +155,11 @@ schemas/
 │   ├── vector.types.upsert_result.json
 │   ├── vector.types.delete_result.json
 │   ├── vector.types.vector.json
-│   └── vector.types.vector_match.json
+│   ├── vector.types.vector_match.json
+│   ├── vector.query.request.json     # Vector Query operation request
+│   ├── vector.query.success.json     # Vector Query operation success
+│   ├── vector.batch_query.request.json # Vector Batch Query operation request
+│   └── vector.batch_query.success.json # Vector Batch Query operation success
 │
 ├── embedding/                        # Embedding protocol schemas
 │   ├── embedding.envelope.request.json
@@ -161,7 +171,13 @@ schemas/
 │   ├── embedding.types.failure.json
 │   ├── embedding.types.result.json
 │   ├── embedding.types.vector.json
-│   └── embedding.types.warning.json
+│   ├── embedding.types.warning.json
+│   ├── embedding.embed.request.json  # Embedding Embed operation request
+│   ├── embedding.embed.success.json  # Embedding Embed operation success
+│   ├── embedding.stream_embed.request.json # Embedding Stream Embed request
+│   ├── embedding.stream_embed.success.json # Embedding Stream Embed success
+│   ├── embedding.count_tokens.request.json # Embedding Count tokens request
+│   └── embedding.count_tokens.success.json # Embedding Count tokens success
 │
 └── graph/                            # Graph protocol schemas
     ├── graph.envelope.request.json
@@ -183,13 +199,22 @@ schemas/
     ├── graph.types.query_result.json
     ├── graph.types.traversal_spec.json
     ├── graph.types.traversal_result.json
-    └── graph.types.warning.json
+    ├── graph.types.warning.json
+    ├── graph.query.request.json      # Graph Query operation request
+    ├── graph.query.success.json      # Graph Query operation success
+    ├── graph.stream_query.request.json # Graph Stream Query request
+    ├── graph.stream_query.success.json # Graph Stream Query success
+    ├── graph.transaction.request.json # Graph Transaction request
+    ├── graph.transaction.success.json # Graph Transaction success
+    ├── graph.traversal.request.json  # Graph Traversal request
+    └── graph.traversal.success.json  # Graph Traversal success
 ```
 
 **Key Directories:**
 - **common/**: Schemas used across all protocols (envelopes, context)
 - **{protocol}/**: Protocol-specific schemas following naming pattern
 - **{protocol}/types/**: Reusable type definitions within protocol
+- **{protocol}/operations/**: Operation-specific schemas (implied by file structure)
 
 ### 2.2 Schema Organization Principles
 
@@ -202,6 +227,7 @@ schemas/
 1. **Common envelopes** referenced by all protocol-specific envelopes
 2. **Type definitions** (`$defs`) for reusable structures within protocol
 3. **Cross-protocol sharing** via absolute `$id` references
+4. **Operation-specific schemas** for each protocol operation
 
 **Schema Composition:**
 ```json
@@ -229,10 +255,14 @@ schemas/
 - `{protocol}.{category}.{type}.json` for operational schemas
 - `{protocol}.types.{name}.json` for type definitions
 - `{protocol}.envelope.{type}.json` for envelope schemas
+- `{protocol}.{operation}.request.json` for operation request schemas
+- `{protocol}.{operation}.success.json` for operation success schemas
 
 **Examples:**
 ```
 llm.envelope.request.json              # LLM protocol request envelope
+llm.complete.request.json              # LLM complete operation request
+llm.complete.success.json              # LLM complete operation success
 vector.types.vector.json              # Vector type definition  
 graph.types.node.json                 # Graph node type definition
 llm.capabilities.json                 # LLM capabilities type
@@ -250,6 +280,7 @@ llm.capabilities.json                 # LLM capabilities type
 https://corpusos.com/schemas/llm/llm.envelope.request.json
 https://corpusos.com/schemas/vector/vector.types.vector.json
 https://corpusos.com/schemas/common/envelope.success.json
+https://corpusos.com/schemas/llm/llm.complete.request.json
 ```
 
 **Type Naming:**
@@ -278,12 +309,10 @@ https://corpusos.com/schemas/common/envelope.success.json
     },
     "ctx": {
       "type": "object",
-      "additionalProperties": true,
-      "description": "Operation context (forward compatible)"
+      "description": "Operation context"
     },
     "args": {
       "type": "object",
-      "additionalProperties": true,
       "description": "Operation-specific arguments"
     }
   },
@@ -314,9 +343,7 @@ https://corpusos.com/schemas/common/envelope.success.json
       "description": "Operation duration in milliseconds"
     },
     "result": {
-      "type": "object",
-      "additionalProperties": true,
-      "description": "Operation-specific result"
+      "description": "Operation-specific result (any JSON value)"
     }
   },
   "required": ["ok", "code", "ms", "result"],
@@ -391,9 +418,7 @@ https://corpusos.com/schemas/common/envelope.success.json
       "description": "Time elapsed in milliseconds"
     },
     "chunk": {
-      "type": "object",
-      "additionalProperties": true,
-      "description": "Streaming chunk payload"
+      "description": "Streaming chunk payload (any JSON value)"
     }
   },
   "required": ["ok", "code", "ms", "chunk"],
@@ -413,14 +438,11 @@ https://corpusos.com/schemas/common/envelope.success.json
   "properties": {
     "request_id": {
       "type": "string",
-      "minLength": 1,
-      "maxLength": 256,
-      "pattern": "^[A-Za-z0-9._~:-]+$"
+      "description": "Request correlation ID"
     },
     "idempotency_key": {
       "type": "string",
-      "minLength": 1,
-      "maxLength": 256
+      "description": "Idempotency guarantee key"
     },
     "deadline_ms": {
       "type": "integer",
@@ -429,20 +451,20 @@ https://corpusos.com/schemas/common/envelope.success.json
     },
     "traceparent": {
       "type": "string",
-      "pattern": "^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$"
+      "description": "W3C Trace Context header"
     },
     "tenant": {
       "type": "string",
-      "minLength": 1,
-      "maxLength": 256
+      "description": "Tenant isolation identifier"
     },
     "attrs": {
       "type": "object",
+      "default": {},
       "additionalProperties": true,
-      "description": "Opaque extension attributes (normalized to {} when omitted)"
+      "description": "Extension attributes"
     }
   },
-  "additionalProperties": false
+  "additionalProperties": true
 }
 ```
 
@@ -450,16 +472,14 @@ https://corpusos.com/schemas/common/envelope.success.json
 
 | Field | Required | Validation | Purpose |
 |-------|----------|------------|---------|
-| `request_id` | Optional | RFC 3986 unreserved chars | Request correlation |
-| `idempotency_key` | Optional | ≤256 chars | Idempotency guarantee |
+| `request_id` | Optional | Any string | Request correlation |
+| `idempotency_key` | Optional | Any string | Idempotency guarantee |
 | `deadline_ms` | Optional | Positive integer | Absolute timeout |
-| `traceparent` | Optional | W3C Trace Context | Distributed tracing |
-| `tenant` | Optional | ≤256 chars | Tenant isolation |
+| `traceparent` | Optional | Any string | Distributed tracing |
+| `tenant` | Optional | Any string | Tenant isolation |
 | `attrs` | Optional | JSON object | Extension attributes |
 
 ### 3.3 Shared Type Schemas
-
-**Note:** While you have protocol-specific type schemas, common patterns emerge:
 
 **Filter Expression Pattern:**
 ```json
@@ -543,7 +563,111 @@ https://corpusos.com/schemas/common/envelope.success.json
 }
 ```
 
-#### 4.1.2 Type Definitions
+#### 4.1.2 Operation Schemas
+
+**LLM Complete Request (`llm.complete.request.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/llm/llm.complete.request.json",
+  "title": "LLM Complete Request",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/llm/llm.envelope.request.json" },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "llm.complete"
+        }
+      }
+    }
+  ]
+}
+```
+
+**LLM Complete Success (`llm.complete.success.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/llm/llm.complete.success.json",
+  "title": "LLM Complete Success",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/llm/llm.envelope.success.json" }
+  ]
+}
+```
+
+**LLM Stream Request (`llm.stream.request.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/llm/llm.stream.request.json",
+  "title": "LLM Stream Request",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/llm/llm.envelope.request.json" },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "llm.stream"
+        }
+      }
+    }
+  ]
+}
+```
+
+**LLM Stream Success (`llm.stream.success.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/llm/llm.stream.success.json",
+  "title": "LLM Stream Success",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/common/envelope.stream.success.json" }
+  ]
+}
+```
+
+**LLM Count Tokens Request (`llm.count_tokens.request.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/llm/llm.count_tokens.request.json",
+  "title": "LLM Count Tokens Request",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/llm/llm.envelope.request.json" },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "llm.count_tokens"
+        }
+      }
+    }
+  ]
+}
+```
+
+**LLM Count Tokens Success (`llm.count_tokens.success.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/llm/llm.count_tokens.success.json",
+  "title": "LLM Count Tokens Success",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/llm/llm.envelope.success.json" }
+  ]
+}
+```
+
+#### 4.1.3 Type Definitions
 
 **LLM Capabilities (`llm.capabilities.json`):**
 ```json
@@ -618,7 +742,7 @@ https://corpusos.com/schemas/common/envelope.success.json
       "type": "object",
       "properties": {
         "id": { "type": "string" },
-        "type": { "type": "string", "const": "function" },
+        "type": { "type": "string", "description": "Tool call type" },
         "function": {
           "type": "object",
           "properties": {
@@ -725,10 +849,11 @@ https://corpusos.com/schemas/common/envelope.success.json
       "description": "Optional model identifier"
     },
     "usage_so_far": {
-      "type": ["object", "null"],
-      "properties": {
-        "$ref": "https://corpusos.com/schemas/llm/llm.types.token_usage.json"
-      }
+      "oneOf": [
+        { "$ref": "https://corpusos.com/schemas/llm/llm.types.token_usage.json" },
+        { "type": "null" }
+      ],
+      "description": "Token usage up to this point"
     },
     "tool_calls": {
       "type": "array",
@@ -743,7 +868,7 @@ https://corpusos.com/schemas/common/envelope.success.json
 }
 ```
 
-#### 4.1.3 Configuration Schemas
+#### 4.1.4 Configuration Schemas
 
 **Sampling Parameters (`llm.sampling.params.json`):**
 ```json
@@ -815,7 +940,7 @@ https://corpusos.com/schemas/common/envelope.success.json
   "properties": {
     "type": {
       "type": "string",
-      "const": "function"
+      "description": "Tool type"
     },
     "function": {
       "type": "object",
@@ -887,7 +1012,77 @@ https://corpusos.com/schemas/common/envelope.success.json
 }
 ```
 
-#### 4.2.2 Type Definitions
+#### 4.2.2 Operation Schemas
+
+**Vector Query Request (`vector.query.request.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/vector/vector.query.request.json",
+  "title": "Vector Query Request",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/vector/vector.envelope.request.json" },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "vector.query"
+        }
+      }
+    }
+  ]
+}
+```
+
+**Vector Query Success (`vector.query.success.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/vector/vector.query.success.json",
+  "title": "Vector Query Success",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/vector/vector.envelope.success.json" }
+  ]
+}
+```
+
+**Vector Batch Query Request (`vector.batch_query.request.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/vector/vector.batch_query.request.json",
+  "title": "Vector Batch Query Request",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/vector/vector.envelope.request.json" },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "vector.batch_query"
+        }
+      }
+    }
+  ]
+}
+```
+
+**Vector Batch Query Success (`vector.batch_query.success.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/vector/vector.batch_query.success.json",
+  "title": "Vector Batch Query Success",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/vector/vector.envelope.success.json" }
+  ]
+}
+```
+
+#### 4.2.3 Type Definitions
 
 **Vector Capabilities (`vector.capabilities.json`):**
 ```json
@@ -954,7 +1149,7 @@ https://corpusos.com/schemas/common/envelope.success.json
       "type": "string"
     },
     "text": {
-      "type": "string"
+      "type": ["string", "null"]
     }
   },
   "required": ["id", "vector"],
@@ -1257,7 +1452,122 @@ https://corpusos.com/schemas/common/envelope.success.json
 }
 ```
 
-#### 4.3.2 Type Definitions
+#### 4.3.2 Operation Schemas
+
+**Embedding Embed Request (`embedding.embed.request.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.embed.request.json",
+  "title": "Embedding Embed Request",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/embedding/embedding.envelope.request.json" },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "embedding.embed"
+        },
+        "args": {
+          "type": "object",
+          "properties": {
+            "stream": {
+              "type": "boolean",
+              "const": false,
+              "description": "Streaming not allowed for embed operation"
+            }
+          },
+          "additionalProperties": true
+        }
+      }
+    }
+  ]
+}
+```
+
+**Embedding Embed Success (`embedding.embed.success.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.embed.success.json",
+  "title": "Embedding Embed Success",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/embedding/embedding.envelope.success.json" }
+  ]
+}
+```
+
+**Embedding Stream Embed Request (`embedding.stream_embed.request.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.stream_embed.request.json",
+  "title": "Embedding Stream Embed Request",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/embedding/embedding.envelope.request.json" },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "embedding.stream_embed"
+        }
+      }
+    }
+  ]
+}
+```
+
+**Embedding Stream Embed Success (`embedding.stream_embed.success.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.stream_embed.success.json",
+  "title": "Embedding Stream Embed Success",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/common/envelope.stream.success.json" }
+  ]
+}
+```
+
+**Embedding Count Tokens Request (`embedding.count_tokens.request.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.count_tokens.request.json",
+  "title": "Embedding Count Tokens Request",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/embedding/embedding.envelope.request.json" },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "embedding.count_tokens"
+        }
+      }
+    }
+  ]
+}
+```
+
+**Embedding Count Tokens Success (`embedding.count_tokens.success.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.count_tokens.success.json",
+  "title": "Embedding Count Tokens Success",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/embedding/embedding.envelope.success.json" }
+  ]
+}
+```
+
+#### 4.3.3 Type Definitions
 
 **Embedding Capabilities (`embedding.capabilities.json`):**
 ```json
@@ -1279,8 +1589,8 @@ https://corpusos.com/schemas/common/envelope.success.json
     "max_text_length": { "type": ["integer", "null"], "minimum": 1 },
     "max_dimensions": { "type": ["integer", "null"], "minimum": 1 },
     "supports_normalization": { "type": "boolean", "default": false },
-    "supports_truncation": { "type": "boolean", "default": false },
-    "supports_token_counting": { "type": "boolean", "default": true },
+    "supports_truncation": { "type": "boolean", "default": true },
+    "supports_token_counting": { "type": "boolean", "default": false },
     "supports_streaming": { "type": "boolean", "default": false },
     "supports_batch_embedding": { "type": "boolean", "default": true },
     "supports_caching": { "type": "boolean", "default": false },
@@ -1530,7 +1840,145 @@ https://corpusos.com/schemas/common/envelope.success.json
 }
 ```
 
-#### 4.4.2 Type Definitions
+#### 4.4.2 Operation Schemas
+
+**Graph Query Request (`graph.query.request.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.query.request.json",
+  "title": "Graph Query Request",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.request.json" },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "graph.query"
+        }
+      }
+    }
+  ]
+}
+```
+
+**Graph Query Success (`graph.query.success.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.query.success.json",
+  "title": "Graph Query Success",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.success.json" }
+  ]
+}
+```
+
+**Graph Stream Query Request (`graph.stream_query.request.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.stream_query.request.json",
+  "title": "Graph Stream Query Request",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.request.json" },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "graph.stream_query"
+        }
+      }
+    }
+  ]
+}
+```
+
+**Graph Stream Query Success (`graph.stream_query.success.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.stream_query.success.json",
+  "title": "Graph Stream Query Success",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/common/envelope.stream.success.json" }
+  ]
+}
+```
+
+**Graph Transaction Request (`graph.transaction.request.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.transaction.request.json",
+  "title": "Graph Transaction Request",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.request.json" },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "graph.transaction"
+        }
+      }
+    }
+  ]
+}
+```
+
+**Graph Transaction Success (`graph.transaction.success.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.transaction.success.json",
+  "title": "Graph Transaction Success",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.success.json" }
+  ]
+}
+```
+
+**Graph Traversal Request (`graph.traversal.request.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.traversal.request.json",
+  "title": "Graph Traversal Request",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.request.json" },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "graph.traversal"
+        }
+      }
+    }
+  ]
+}
+```
+
+**Graph Traversal Success (`graph.traversal.success.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.traversal.success.json",
+  "title": "Graph Traversal Success",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.success.json" }
+  ]
+}
+```
+
+#### 4.4.3 Type Definitions
 
 **Graph Capabilities (`graph.capabilities.json`):**
 ```json
@@ -1543,7 +1991,7 @@ https://corpusos.com/schemas/common/envelope.success.json
     "server": { "type": "string" },
     "version": { "type": "string" },
     "protocol": { "type": "string", "const": "graph/v1.0" },
-    "supports_stream_query": { "type": "boolean", "default": false },
+    "supports_stream_query": { "type": "boolean", "default": true },
     "supported_query_dialects": {
       "type": "array",
       "items": { "type": "string" },
@@ -1714,10 +2162,7 @@ https://corpusos.com/schemas/common/envelope.success.json
   "properties": {
     "records": {
       "type": "array",
-      "items": {
-        "type": "object",
-        "additionalProperties": true
-      }
+      "description": "Query results (any JSON value)"
     },
     "summary": {
       "type": "object",
@@ -1745,10 +2190,7 @@ https://corpusos.com/schemas/common/envelope.success.json
   "properties": {
     "records": {
       "type": "array",
-      "items": {
-        "type": "object",
-        "additionalProperties": true
-      }
+      "description": "Streaming results (any JSON value)"
     },
     "is_final": {
       "type": "boolean",
@@ -1806,7 +2248,7 @@ https://corpusos.com/schemas/common/envelope.success.json
   "properties": {
     "results": {
       "type": "array",
-      "items": { "type": "object", "additionalProperties": true }
+      "description": "Batch operation results (any JSON value)"
     },
     "success": { "type": "boolean" },
     "error": { "type": ["string", "null"] },
@@ -2385,7 +2827,8 @@ tests/golden/
 │   ├── llm_types_message.json
 │   ├── llm_types_token_usage.json
 │   ├── llm_types_tool.json
-│   └── llm_types_warning.json
+│   ├── llm_types_warning.json
+│   └── llm_stream_embed_request.json
 │
 ├── vector/
 │   ├── vector_capabilities_request.json
@@ -3363,6 +3806,12 @@ https://corpusos.com/schemas/llm/llm.types.message.json
 https://corpusos.com/schemas/llm/llm.types.completion.json
 https://corpusos.com/schemas/llm/llm.types.token_usage.json
 https://corpusos.com/schemas/llm/llm.types.chunk.json
+https://corpusos.com/schemas/llm/llm.complete.request.json
+https://corpusos.com/schemas/llm/llm.complete.success.json
+https://corpusos.com/schemas/llm/llm.stream.request.json
+https://corpusos.com/schemas/llm/llm.stream.success.json
+https://corpusos.com/schemas/llm/llm.count_tokens.request.json
+https://corpusos.com/schemas/llm/llm.count_tokens.success.json
 ```
 
 **Vector Schema IDs:**
@@ -3375,20 +3824,58 @@ https://corpusos.com/schemas/vector/vector.types.vector.json
 https://corpusos.com/schemas/vector/vector.types.vector_match.json
 https://corpusos.com/schemas/vector/vector.types.query_spec.json
 https://corpusos.com/schemas/vector/vector.types.query_result.json
+https://corpusos.com/schemas/vector/vector.query.request.json
+https://corpusos.com/schemas/vector/vector.query.success.json
+https://corpusos.com/schemas/vector/vector.batch_query.request.json
+https://corpusos.com/schemas/vector/vector.batch_query.success.json
+```
+
+**Embedding Schema IDs:**
+```
+https://corpusos.com/schemas/embedding/embedding.envelope.request.json
+https://corpusos.com/schemas/embedding/embedding.envelope.success.json
+https://corpusos.com/schemas/embedding/embedding.envelope.error.json
+https://corpusos.com/schemas/embedding/embedding.capabilities.json
+https://corpusos.com/schemas/embedding/embedding.embed.request.json
+https://corpusos.com/schemas/embedding/embedding.embed.success.json
+https://corpusos.com/schemas/embedding/embedding.stream_embed.request.json
+https://corpusos.com/schemas/embedding/embedding.stream_embed.success.json
+https://corpusos.com/schemas/embedding/embedding.count_tokens.request.json
+https://corpusos.com/schemas/embedding/embedding.count_tokens.success.json
+```
+
+**Graph Schema IDs:**
+```
+https://corpusos.com/schemas/graph/graph.envelope.request.json
+https://corpusos.com/schemas/graph/graph.envelope.success.json
+https://corpusos.com/schemas/graph/graph.envelope.error.json
+https://corpusos.com/schemas/graph/graph.capabilities.json
+https://corpusos.com/schemas/graph/graph.query.request.json
+https://corpusos.com/schemas/graph/graph.query.success.json
+https://corpusos.com/schemas/graph/graph.stream_query.request.json
+https://corpusos.com/schemas/graph/graph.stream_query.success.json
+https://corpusos.com/schemas/graph/graph.transaction.request.json
+https://corpusos.com/schemas/graph/graph.transaction.success.json
+https://corpusos.com/schemas/graph/graph.traversal.request.json
+https://corpusos.com/schemas/graph/graph.traversal.success.json
 ```
 
 **Operation to Schema Mapping:**
 
 | Operation | Request Schema | Success Schema |
 |-----------|----------------|----------------|
-| `llm.complete` | `llm.envelope.request.json` | `llm.envelope.success.json` |
-| `llm.stream` | `llm.envelope.request.json` | `llm.envelope.success.json` (STREAMING) |
-| `vector.query` | `vector.envelope.request.json` | `vector.envelope.success.json` |
-| `vector.batch_query` | `vector.envelope.request.json` | `vector.envelope.success.json` |
-| `embedding.embed` | `embedding.envelope.request.json` | `embedding.envelope.success.json` |
-| `embedding.stream_embed` | `embedding.envelope.request.json` | `embedding.envelope.success.json` (STREAMING) |
-| `graph.query` | `graph.envelope.request.json` | `graph.envelope.success.json` |
-| `graph.stream_query` | `graph.envelope.request.json` | `graph.envelope.success.json` (STREAMING) |
+| `llm.complete` | `llm.complete.request.json` | `llm.complete.success.json` |
+| `llm.stream` | `llm.stream.request.json` | `llm.stream.success.json` (STREAMING) |
+| `llm.count_tokens` | `llm.count_tokens.request.json` | `llm.count_tokens.success.json` |
+| `vector.query` | `vector.query.request.json` | `vector.query.success.json` |
+| `vector.batch_query` | `vector.batch_query.request.json` | `vector.batch_query.success.json` |
+| `embedding.embed` | `embedding.embed.request.json` | `embedding.embed.success.json` |
+| `embedding.stream_embed` | `embedding.stream_embed.request.json` | `embedding.stream_embed.success.json` (STREAMING) |
+| `embedding.count_tokens` | `embedding.count_tokens.request.json` | `embedding.count_tokens.success.json` |
+| `graph.query` | `graph.query.request.json` | `graph.query.success.json` |
+| `graph.stream_query` | `graph.stream_query.request.json` | `graph.stream_query.success.json` (STREAMING) |
+| `graph.transaction` | `graph.transaction.request.json` | `graph.transaction.success.json` |
+| `graph.traversal` | `graph.traversal.request.json` | `graph.traversal.success.json` |
 
 ### 11.2 Error Taxonomies by Protocol
 
