@@ -1,4 +1,4 @@
-# SCHEMA CONFORMANCE
+# CORPUS SCHEMA CONFORMANCE
 
 ## Table of Contents
 
@@ -73,7 +73,7 @@ This document is the schema companion to:
 | Metaschema & Hygiene | 5 tests | Draft 2020-12 compliance, regex, enums, reserved properties |
 | Cross-References | 2 tests | $ref resolution, local fragment validation |
 | Definitions | 2 tests | Dangling $defs detection, size limits |
-| Envelopes & Constants | 1 test | Envelope role validation, protocol constants |
+| Envelope Structure | 1 test | Envelope required keys and core constant fields (`ok`, `code`) |
 | Examples Validation | 1 test | Embedded example validation |
 | Performance & Metrics | 3 tests | Loading performance, complexity metrics, health summary |
 
@@ -87,7 +87,7 @@ This document is the schema companion to:
 | Core Schema Validation | 65+ parametrized tests | Each golden file validates against its declared schema |
 | NDJSON Stream Validation | 6 tests | LLM, Graph, and Embedding stream protocol validation |
 | Cross-Schema Invariants | 10 tests | Token totals, vector dimensions, capabilities invariants, stats validation |
-| Schema Version & Format | 2 tests | Timestamp, ID patterns, schema_version validation |
+| Field Type Validation | 2 tests | Timestamp, ID patterns, type consistency |
 | Drift Detection | 4 tests | File existence, orphan detection, naming conventions |
 | Performance & Reliability | 3 tests | File size limits, loading performance, checksum validation |
 | Component Coverage | 1 test | Component-level test coverage validation |
@@ -152,7 +152,7 @@ make safety-check    # blocks heavy runs if CORPUS_TEST_ENV=production
 ### schemas/llm/
 - **Envelopes:** `llm.envelope.{request,success,error}.json`
 - **Capabilities:** `llm.capabilities.json`
-- **Types:** `llm.types.{message,chunk,completion,token_usage,tool,warning,logprobs}.json`
+- **Types:** `llm.types.{message,chunk,completion,token_usage,tool,warning}.json`
 - **Configuration:** `llm.sampling.params.json`, `llm.tools.schema.json`, `llm.response_format.json`
 
 ### schemas/vector/
@@ -181,7 +181,7 @@ make safety-check    # blocks heavy runs if CORPUS_TEST_ENV=production
 - **Schema:** `graph.types.graph_schema.json`
 - **Type Schemas:** `graph.types.{node,edge,entity,id,chunk,warning}.json`
 
-`*.types.*.json` files are validated indirectly via `$ref` chains from envelopes and streaming envelopes. The schema meta-lint also validates each schema file in isolation for metaschema compliance, `$id`, `$ref`, and pattern/enum hygiene.
+**Note:** Some optional type schemas may exist only if referenced by `$ref` chains from operational schemas. All files listed above must exist and validate during meta-lint.
 
 ---
 
@@ -200,11 +200,17 @@ A build is schema-conformant when all of the following hold:
 8. **No dangling `$defs`** — Exported defs are referenced, or explicitly documented as public anchors; unused `$defs` either removed or justified.
 9. **Cross-schema invariants (schema-level only)** — Enforced via goldens where JSON Schema alone is insufficient:
    - Streaming envelopes use `code: "STREAMING"` (not `"OK"`)
-   - Success envelopes use `code: "OK"` (not `PARTIAL_SUCCESS` or `ACCEPTED`)
+   - Success envelopes use `code: "OK"`
+   - Success `result` may be an object or array depending on operation
    - Error envelopes have `retry_after_ms: integer|null` and `details: object|null`
    - `deadline_ms` is integer (not number)
    - Token usage invariants: `total_tokens = prompt_tokens + completion_tokens`
    - Vector dimension consistency across matches in a query result
+   - Context (`ctx`) allows additional properties for forward compatibility
+
+**Optional extensions not required by reference adapters:**
+- `schema_version` field (may be added by implementations but not required)
+- Top-level `protocol` or `component` fields (not emitted by reference adapters)
 
 **Out of scope (behavioral):** deadlines, retries, caching, normalization semantics, metrics emission, and adapter behavior. Those are tracked in PROTOCOLS.md, METRICS.md, and ERRORS.md, and in the behavioral conformance suite.
 
@@ -223,7 +229,7 @@ A build is schema-conformant when all of the following hold:
 - ✅ **Metaschema & Hygiene** (5 tests): Draft 2020-12 compliance, regex pattern compilation, enum deduplication/sorting, reserved property checks
 - ✅ **Cross-References** (2 tests): Resolve all `$ref`s (absolute and internal anchors), validate local fragments
 - ✅ **Definitions** (2 tests): Detect dangling `$defs`, enforce size limits
-- ✅ **Envelopes & Constants** (1 test): Validate envelope role conventions, protocol/component constants
+- ✅ **Envelope Structure** (1 test): Validate envelope required keys and core constant fields (`ok`, `code`)
 - ✅ **Examples Validation** (1 test): Validate embedded examples against parent schemas
 - ✅ **Performance & Metrics** (3 tests): Schema loading performance, complexity metrics, health reporting
 
@@ -245,7 +251,7 @@ A build is schema-conformant when all of the following hold:
 - ✅ **Core Schema Validation** (65+ parametrized tests): Each golden file validates against its declared schema
 - ✅ **NDJSON Stream Validation** (6 tests): LLM, Graph, and Embedding stream protocol validation, termination rules
 - ✅ **Cross-Schema Invariants** (10 tests): Token usage math, vector dimension consistency, capabilities field validation, stats validation
-- ✅ **Schema Version & Format** (2 tests): Timestamp patterns, ID validation, field type consistency
+- ✅ **Field Type Validation** (2 tests): Integer vs number validation, ID patterns
 - ✅ **Drift Detection** (4 tests): File existence checks, orphan detection, naming conventions, request-response pairs
 - ✅ **Performance & Reliability** (3 tests): File size limits, loading performance, checksum validation
 - ✅ **Component Coverage** (1 test): Component-level test coverage validation
@@ -305,7 +311,7 @@ make safety-check    # blocks heavy runs if CORPUS_TEST_ENV=production
 - Removing enum values → Major version bump
 - Changing field types (e.g., string → integer) → Major version bump
 - Tightening constraints that invalidate previously valid payloads → Major version bump
-- Changing streaming model from frame-based to envelope-based → Major version bump
+- Changing streaming envelope shape (e.g., removing `chunk`, changing `code: "STREAMING"`, or altering termination semantics) → Major version bump
 
 ### Non-Breaking Changes
 - Adding optional fields with sane defaults
@@ -313,8 +319,13 @@ make safety-check    # blocks heavy runs if CORPUS_TEST_ENV=production
 - Adding new `$defs` that are not wired into existing envelopes
 - Widening constraints (e.g., increasing max lengths, broadening patterns while staying compatible)
 - Changing `additionalProperties` from `false` to `true` in context objects
+- Adding optional `schema_version` or `protocol`/`component` fields (forward-compatible extensions)
 
-Keep `schema_version` aligned with SemVer and maintain backward compatibility guidance in commit notes.
+### Optional Extension Fields
+Implementations may add these fields without breaking conformance:
+- `schema_version` - May be added to envelopes or results for version tracking
+- `protocol` / `component` - May be added at top level for debugging/identification
+- `provider_specific` - Vendor extensions namespace
 
 ---
 
@@ -482,15 +493,18 @@ For smoke checks in sensitive environments: `make quick-check` (pairs with `vali
 - **Invalid regex** → Fix unescaped characters; confirm each pattern compiles in your target runtime.
 - **Examples fail** → Update examples or the schema; examples must validate against their parent schema.
 - **Streaming envelope shape mismatch** → Ensure streaming uses `code: "STREAMING"` and `chunk` field (not `result`). Use golden streams to spot termination issues.
-- **Schema drift vs PROTOCOLS/ERRORS/METRICS** → If behavior changes in those docs, ensure the schemas and goldens are updated in lockstep (and meta-lint extended if necessary).
+- **Schema drift vs PROTOCOLS/ERRORS/METRICS** → If behavior changes in those docs, ensure the schemas and goldens are updated in lockstep.
 - **Type mismatch errors** → Check: `deadline_ms` must be integer, `retry_after_ms` must be integer|null, `details` must be object|null.
 - **Streaming validation fails** → Ensure terminal condition: either chunk with `is_final: true` OR error envelope, and streaming uses `code: "STREAMING"` (not `"OK"`).
+- **Missing optional fields** → Remember `schema_version`, `protocol`, `component` are optional extensions not required for conformance.
+- **Result field type mismatch** → Success `result` may be object or array depending on operation (e.g., vector.batch_query returns array).
+- **File naming consistency** → Ensure `envelope.stream.success.json` filename matches across SCHEMA.md, schemas/, and tests.
 
 ---
 
 ## Versioning & Deprecation (Schema)
 
-- SemVer is required for `schema_version` on success envelopes.
+- Reference adapters do not emit `schema_version`; it remains an optional extension for implementations.
 - **Non-breaking:** adding optional fields; additive enum members (as documented); new `$defs` not wired into existing envelopes.
 - **Breaking:** removing/renaming required fields; type changes; constraint tightening that invalidates prior valid messages; `$id` renames.
 - **Deprecation:** set `deprecated: true` and (optionally) `replacement_op` in the relevant schemas; ensure goldens reflect both old and new while deprecated paths are supported.
@@ -507,6 +521,7 @@ After meta-lint (13 tests) + golden schema suites (90+ tests) pass unmodified:
    • JSON Schema Draft 2020-12
    • LLM / Vector / Embedding / Graph
    • Streaming envelope-chunk model
+   • Reference adapter aligned
 ```
 
 **Badge suggestion** (link to your generated artifact or CI run):
@@ -522,6 +537,9 @@ After meta-lint (13 tests) + golden schema suites (90+ tests) pass unmodified:
 - Periodically regenerate a schema index (path → `$id`) to spot stale or missing entries.
 - When PROTOCOLS / ERRORS / METRICS evolve, audit schemas for drift and update both schemas and goldens together to maintain a consistent contract surface.
 - Monitor streaming envelope usage: ensure all streaming operations use `code: "STREAMING"` and proper termination semantics.
+- Remember: `schema_version`, `protocol`, `component` are optional extensions; do not require them in conformance tests.
+- Ensure naming consistency: `envelope.stream.success.json` is the canonical streaming envelope filename used consistently across SCHEMA.md, schemas/, and tests.
+- Keep repository layout accurate: optional type schemas should be listed only if they exist and are referenced by `$ref` chains.
 
 **Maintainers:** Corpus SDK Team  
 **Last Updated:** 2026-01-14  
