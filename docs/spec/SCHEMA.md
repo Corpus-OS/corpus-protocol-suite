@@ -127,15 +127,22 @@ schemas/
 │   ├── llm.tools.schema.json         # Tool/tool_call definitions
 │   ├── llm.types.chunk.json          # Streaming chunk type
 │   ├── llm.types.completion.json     # Completion result type
+│   ├── llm.types.completion_spec.json # Complete operation args
+│   ├── llm.types.stream_spec.json    # Stream operation args
+│   ├── llm.types.count_tokens_spec.json # Count tokens args
 │   ├── llm.types.logprobs.json       # Log probabilities type
 │   ├── llm.types.message.json        # Message type definition
 │   ├── llm.types.token_usage.json    # Token usage reporting
 │   ├── llm.types.tool.json           # Tool definition type
 │   ├── llm.types.warning.json        # Warning type definition
+│   ├── llm.capabilities.request.json # LLM Capabilities operation request
+│   ├── llm.capabilities.success.json # LLM Capabilities operation success
 │   ├── llm.complete.request.json     # LLM Complete operation request
 │   ├── llm.complete.success.json     # LLM Complete operation success
 │   ├── llm.count_tokens.request.json # LLM Count tokens request
 │   ├── llm.count_tokens.success.json # LLM Count tokens success
+│   ├── llm.health.request.json       # LLM Health operation request
+│   ├── llm.health.success.json       # LLM Health operation success
 │   ├── llm.stream.request.json       # LLM Stream operation request
 │   └── llm.stream.success.json       # LLM Stream operation success
 │
@@ -155,10 +162,22 @@ schemas/
 │   ├── vector.types.delete_result.json
 │   ├── vector.types.vector.json
 │   ├── vector.types.vector_match.json
+│   ├── vector.capabilities.request.json # Vector Capabilities operation request
+│   ├── vector.capabilities.success.json # Vector Capabilities operation success
 │   ├── vector.query.request.json     # Vector Query operation request
 │   ├── vector.query.success.json     # Vector Query operation success
 │   ├── vector.batch_query.request.json # Vector Batch Query operation request
-│   └── vector.batch_query.success.json # Vector Batch Query operation success
+│   ├── vector.batch_query.success.json # Vector Batch Query operation success
+│   ├── vector.upsert.request.json    # Vector Upsert operation request
+│   ├── vector.upsert.success.json    # Vector Upsert operation success
+│   ├── vector.delete.request.json    # Vector Delete operation request
+│   ├── vector.delete.success.json    # Vector Delete operation success
+│   ├── vector.create_namespace.request.json # Create namespace request
+│   ├── vector.create_namespace.success.json # Create namespace success
+│   ├── vector.delete_namespace.request.json # Delete namespace request
+│   ├── vector.delete_namespace.success.json # Delete namespace success
+│   ├── vector.health.request.json    # Vector Health operation request
+│   └── vector.health.success.json    # Vector Health operation success
 │
 ├── embedding/                        # Embedding protocol schemas
 │   ├── embedding.envelope.request.json
@@ -171,12 +190,24 @@ schemas/
 │   ├── embedding.types.result.json
 │   ├── embedding.types.vector.json
 │   ├── embedding.types.warning.json
+│   ├── embedding.types.embed_spec.json # Embed operation args
+│   ├── embedding.types.stream_embed_spec.json # Stream embed args
+│   ├── embedding.types.count_tokens_spec.json # Count tokens args
+│   ├── embedding.types.batch_result.json
+│   ├── embedding.capabilities.request.json # Embedding Capabilities request
+│   ├── embedding.capabilities.success.json # Embedding Capabilities success
 │   ├── embedding.embed.request.json  # Embedding Embed operation request
 │   ├── embedding.embed.success.json  # Embedding Embed operation success
+│   ├── embedding.embed_batch.request.json # Embedding Batch Embed request
+│   ├── embedding.embed_batch.success.json # Embedding Batch Embed success
 │   ├── embedding.stream_embed.request.json # Embedding Stream Embed request
 │   ├── embedding.stream_embed.success.json # Embedding Stream Embed success
 │   ├── embedding.count_tokens.request.json # Embedding Count tokens request
-│   └── embedding.count_tokens.success.json # Embedding Count tokens success
+│   ├── embedding.count_tokens.success.json # Embedding Count tokens success
+│   ├── embedding.health.request.json # Embedding Health request
+│   ├── embedding.health.success.json # Embedding Health success
+│   ├── embedding.get_stats.request.json # Embedding Get Stats request
+│   └── embedding.get_stats.success.json # Embedding Get Stats success
 │
 └── graph/                            # Graph protocol schemas
     ├── graph.envelope.request.json
@@ -199,10 +230,28 @@ schemas/
     ├── graph.types.traversal_spec.json
     ├── graph.types.traversal_result.json
     ├── graph.types.warning.json
+    ├── graph.capabilities.request.json # Graph Capabilities request
+    ├── graph.capabilities.success.json # Graph Capabilities success
     ├── graph.query.request.json      # Graph Query operation request
     ├── graph.query.success.json      # Graph Query operation success
     ├── graph.stream_query.request.json # Graph Stream Query request
     ├── graph.stream_query.success.json # Graph Stream Query success
+    ├── graph.upsert_nodes.request.json # Graph Upsert Nodes request
+    ├── graph.upsert_nodes.success.json # Graph Upsert Nodes success
+    ├── graph.upsert_edges.request.json # Graph Upsert Edges request
+    ├── graph.upsert_edges.success.json # Graph Upsert Edges success
+    ├── graph.delete_nodes.request.json # Graph Delete Nodes request
+    ├── graph.delete_nodes.success.json # Graph Delete Nodes success
+    ├── graph.delete_edges.request.json # Graph Delete Edges request
+    ├── graph.delete_edges.success.json # Graph Delete Edges success
+    ├── graph.bulk_vertices.request.json # Graph Bulk Vertices request
+    ├── graph.bulk_vertices.success.json # Graph Bulk Vertices success
+    ├── graph.batch.request.json      # Graph Batch request
+    ├── graph.batch.success.json      # Graph Batch success
+    ├── graph.get_schema.request.json # Graph Get Schema request
+    ├── graph.get_schema.success.json # Graph Get Schema success
+    ├── graph.health.request.json     # Graph Health request
+    ├── graph.health.success.json     # Graph Health success
     ├── graph.transaction.request.json # Graph Transaction request
     ├── graph.transaction.success.json # Graph Transaction success
     ├── graph.traversal.request.json  # Graph Traversal request
@@ -297,36 +346,31 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://corpusos.com/schemas/common/envelope.success.json",
-  "title": "Protocol Success Envelope",
+  "$id": "https://corpusos.com/schemas/common/envelope.request.json",
+  "title": "Protocol Request Envelope",
   "type": "object",
   "properties": {
-    "ok": { "type": "boolean", "const": true },
-    "code": { "type": "string", "const": "OK" },
-    "ms": {
-      "type": "number",
-      "minimum": 0,
-      "description": "Operation duration in milliseconds"
+    "op": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Operation identifier (e.g., 'llm.complete', 'vector.query')"
     },
-    "result": {
-      "description": "Operation-specific result (any JSON value)",
-      "anyOf": [
-        { "type": "object" },
-        { "type": "array" },
-        { "type": "string" },
-        { "type": "number" },
-        { "type": "boolean" },
-        { "type": "null" }
-      ]
+    "ctx": {
+      "$ref": "https://corpusos.com/schemas/common/operation_context.json",
+      "description": "Operation context including request_id, deadlines, tracing"
+    },
+    "args": {
+      "type": "object",
+      "description": "Operation-specific arguments (must be an object)"
     }
   },
-  "required": ["ok", "code", "ms", "result"],
+  "required": ["op", "ctx", "args"],
   "additionalProperties": false
 }
 ```
 
 **Canonical Success Envelope (`common/envelope.success.json`):**
-```
+```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://corpusos.com/schemas/common/envelope.success.json",
@@ -362,7 +406,6 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "required": ["ok", "code", "ms", "result"],
   "additionalProperties": false
 }
-
 ```
 
 **Canonical Error Envelope (`common/envelope.error.json`):**
@@ -579,6 +622,52 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 
 #### 4.1.2 Operation Schemas
 
+**LLM Capabilities Request (`llm.capabilities.request.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/llm/llm.capabilities.request.json",
+  "title": "LLM Capabilities Request",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/llm/llm.envelope.request.json" },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "llm.capabilities"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Empty args object required"
+        }
+      }
+    }
+  ]
+}
+```
+
+**LLM Capabilities Success (`llm.capabilities.success.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/llm/llm.capabilities.success.json",
+  "title": "LLM Capabilities Success",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/llm/llm.envelope.success.json" },
+    {
+      "properties": {
+        "result": {
+          "$ref": "https://corpusos.com/schemas/llm/llm.capabilities.json"
+        }
+      }
+    }
+  ]
+}
+```
+
 **LLM Complete Request (`llm.complete.request.json`):**
 ```json
 {
@@ -593,6 +682,9 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
         "op": {
           "type": "string",
           "const": "llm.complete"
+        },
+        "args": {
+          "$ref": "https://corpusos.com/schemas/llm/llm.types.completion_spec.json"
         }
       }
     }
@@ -608,7 +700,14 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "LLM Complete Success",
   "type": "object",
   "allOf": [
-    { "$ref": "https://corpusos.com/schemas/llm/llm.envelope.success.json" }
+    { "$ref": "https://corpusos.com/schemas/llm/llm.envelope.success.json" },
+    {
+      "properties": {
+        "result": {
+          "$ref": "https://corpusos.com/schemas/llm/llm.types.completion.json"
+        }
+      }
+    }
   ]
 }
 ```
@@ -627,6 +726,9 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
         "op": {
           "type": "string",
           "const": "llm.stream"
+        },
+        "args": {
+          "$ref": "https://corpusos.com/schemas/llm/llm.types.stream_spec.json"
         }
       }
     }
@@ -642,7 +744,14 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "LLM Stream Success",
   "type": "object",
   "allOf": [
-    { "$ref": "https://corpusos.com/schemas/common/envelope.stream.success.json" }
+    { "$ref": "https://corpusos.com/schemas/common/envelope.stream.success.json" },
+    {
+      "properties": {
+        "chunk": {
+          "$ref": "https://corpusos.com/schemas/llm/llm.types.chunk.json"
+        }
+      }
+    }
   ]
 }
 ```
@@ -661,6 +770,9 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
         "op": {
           "type": "string",
           "const": "llm.count_tokens"
+        },
+        "args": {
+          "$ref": "https://corpusos.com/schemas/llm/llm.types.count_tokens_spec.json"
         }
       }
     }
@@ -676,7 +788,76 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "LLM Count Tokens Success",
   "type": "object",
   "allOf": [
-    { "$ref": "https://corpusos.com/schemas/llm/llm.envelope.success.json" }
+    { "$ref": "https://corpusos.com/schemas/llm/llm.envelope.success.json" },
+    {
+      "properties": {
+        "result": {
+          "type": "object",
+          "properties": {
+            "total_tokens": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": ["total_tokens"],
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}
+```
+
+**LLM Health Request (`llm.health.request.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/llm/llm.health.request.json",
+  "title": "LLM Health Request",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/llm/llm.envelope.request.json" },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "llm.health"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Empty args object required"
+        }
+      }
+    }
+  ]
+}
+```
+
+**LLM Health Success (`llm.health.success.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/llm/llm.health.success.json",
+  "title": "LLM Health Success",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/llm/llm.envelope.success.json" },
+    {
+      "properties": {
+        "result": {
+          "type": "object",
+          "properties": {
+            "ok": { "type": "boolean" },
+            "status": { "type": "string" },
+            "server": { "type": "string" },
+            "version": { "type": "string" }
+          },
+          "required": ["ok", "status", "server", "version"],
+          "additionalProperties": true
+        }
+      }
+    }
   ]
 }
 ```
@@ -715,6 +896,177 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     }
   },
   "required": ["server", "version", "model_family", "max_context_length"],
+  "additionalProperties": false
+}
+```
+
+**Completion Spec (`llm.types.completion_spec.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/llm/llm.types.completion_spec.json",
+  "title": "LLM Completion Specification",
+  "type": "object",
+  "properties": {
+    "messages": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "role": { "type": "string", "minLength": 1 },
+          "content": { "type": "string" }
+        },
+        "required": ["role", "content"],
+        "additionalProperties": false
+      },
+      "minItems": 1,
+      "description": "List of conversation messages"
+    },
+    "model": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Model identifier"
+    },
+    "temperature": {
+      "type": "number",
+      "minimum": 0.0,
+      "maximum": 2.0,
+      "description": "Sampling temperature"
+    },
+    "max_tokens": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Maximum tokens to generate"
+    },
+    "top_p": {
+      "type": "number",
+      "minimum": 0.0,
+      "exclusiveMinimum": true,
+      "maximum": 1.0,
+      "description": "Nucleus sampling parameter"
+    },
+    "stop_sequences": {
+      "type": ["array", "null"],
+      "items": { "type": "string" },
+      "description": "Stop generation sequences"
+    },
+    "tools": {
+      "type": ["array", "null"],
+      "items": { "type": "object" },
+      "description": "Available tools for the model"
+    },
+    "tool_choice": {
+      "oneOf": [
+        { "type": "string" },
+        { "type": "object" },
+        { "type": "null" }
+      ],
+      "description": "Tool selection strategy"
+    }
+  },
+  "required": ["messages"],
+  "additionalProperties": true
+}
+```
+
+**Stream Spec (`llm.types.stream_spec.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/llm/llm.types.stream_spec.json",
+  "title": "LLM Stream Specification",
+  "type": "object",
+  "properties": {
+    "messages": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "role": { "type": "string", "minLength": 1 },
+          "content": { "type": "string" }
+        },
+        "required": ["role", "content"],
+        "additionalProperties": false
+      },
+      "minItems": 1,
+      "description": "List of conversation messages"
+    },
+    "model": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Model identifier"
+    },
+    "temperature": {
+      "type": "number",
+      "minimum": 0.0,
+      "maximum": 2.0,
+      "description": "Sampling temperature"
+    },
+    "max_tokens": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Maximum tokens to generate"
+    },
+    "top_p": {
+      "type": "number",
+      "minimum": 0.0,
+      "exclusiveMinimum": true,
+      "maximum": 1.0,
+      "description": "Nucleus sampling parameter"
+    },
+    "stop_sequences": {
+      "type": ["array", "null"],
+      "items": { "type": "string" },
+      "description": "Stop generation sequences"
+    },
+    "tools": {
+      "type": ["array", "null"],
+      "items": { "type": "object" },
+      "description": "Available tools for the model"
+    },
+    "tool_choice": {
+      "oneOf": [
+        { "type": "string" },
+        { "type": "object" },
+        { "type": "null" }
+      ],
+      "description": "Tool selection strategy"
+    }
+  },
+  "required": ["messages"],
+  "additionalProperties": true
+}
+```
+
+**Count Tokens Spec (`llm.types.count_tokens_spec.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/llm/llm.types.count_tokens_spec.json",
+  "title": "LLM Count Tokens Specification",
+  "type": "object",
+  "properties": {
+    "messages": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "role": { "type": "string", "minLength": 1 },
+          "content": { "type": "string" }
+        },
+        "required": ["role", "content"],
+        "additionalProperties": false
+      },
+      "minItems": 1,
+      "description": "List of conversation messages"
+    },
+    "model": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Model identifier"
+    }
+  },
+  "required": ["messages"],
   "additionalProperties": false
 }
 ```
@@ -1028,6 +1380,52 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 
 #### 4.2.2 Operation Schemas
 
+**Vector Capabilities Request (`vector.capabilities.request.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/vector/vector.capabilities.request.json",
+  "title": "Vector Capabilities Request",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/vector/vector.envelope.request.json" },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "vector.capabilities"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Empty args object required"
+        }
+      }
+    }
+  ]
+}
+```
+
+**Vector Capabilities Success (`vector.capabilities.success.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/vector/vector.capabilities.success.json",
+  "title": "Vector Capabilities Success",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/vector/vector.envelope.success.json" },
+    {
+      "properties": {
+        "result": {
+          "$ref": "https://corpusos.com/schemas/vector/vector.capabilities.json"
+        }
+      }
+    }
+  ]
+}
+```
+
 **Vector Query Request (`vector.query.request.json`):**
 ```json
 {
@@ -1042,6 +1440,9 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
         "op": {
           "type": "string",
           "const": "vector.query"
+        },
+        "args": {
+          "$ref": "https://corpusos.com/schemas/vector/vector.types.query_spec.json"
         }
       }
     }
@@ -1057,7 +1458,14 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "Vector Query Success",
   "type": "object",
   "allOf": [
-    { "$ref": "https://corpusos.com/schemas/vector/vector.envelope.success.json" }
+    { "$ref": "https://corpusos.com/schemas/vector/vector.envelope.success.json" },
+    {
+      "properties": {
+        "result": {
+          "$ref": "https://corpusos.com/schemas/vector/vector.types.query_result.json"
+        }
+      }
+    }
   ]
 }
 ```
@@ -1076,6 +1484,20 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
         "op": {
           "type": "string",
           "const": "vector.batch_query"
+        },
+        "args": {
+          "type": "object",
+          "properties": {
+            "queries": {
+              "type": "array",
+              "items": {
+                "$ref": "https://corpusos.com/schemas/vector/vector.types.query_spec.json"
+              },
+              "minItems": 1
+            }
+          },
+          "required": ["queries"],
+          "additionalProperties": false
         }
       }
     }
@@ -1104,7 +1526,276 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     }
   ]
 }
+```
 
+**Vector Upsert Request (`vector.upsert.request.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/vector/vector.upsert.request.json",
+  "title": "Vector Upsert Request",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/vector/vector.envelope.request.json" },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "vector.upsert"
+        },
+        "args": {
+          "type": "object",
+          "properties": {
+            "vectors": {
+              "type": "array",
+              "items": {
+                "$ref": "https://corpusos.com/schemas/vector/vector.types.vector.json"
+              },
+              "minItems": 1
+            },
+            "namespace": {
+              "type": "string",
+              "default": "default"
+            }
+          },
+          "required": ["vectors"],
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}
+```
+
+**Vector Upsert Success (`vector.upsert.success.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/vector/vector.upsert.success.json",
+  "title": "Vector Upsert Success",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/vector/vector.envelope.success.json" },
+    {
+      "properties": {
+        "result": {
+          "$ref": "https://corpusos.com/schemas/vector/vector.types.upsert_result.json"
+        }
+      }
+    }
+  ]
+}
+```
+
+**Vector Delete Request (`vector.delete.request.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/vector/vector.delete.request.json",
+  "title": "Vector Delete Request",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/vector/vector.envelope.request.json" },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "vector.delete"
+        },
+        "args": {
+          "type": "object",
+          "properties": {
+            "ids": {
+              "type": "array",
+              "items": { "type": "string" },
+              "minItems": 1
+            },
+            "namespace": {
+              "type": "string",
+              "default": "default"
+            },
+            "filter": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          },
+          "required": ["ids"],
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}
+```
+
+**Vector Delete Success (`vector.delete.success.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/vector/vector.delete.success.json",
+  "title": "Vector Delete Success",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/vector/vector.envelope.success.json" },
+    {
+      "properties": {
+        "result": {
+          "$ref": "https://corpusos.com/schemas/vector/vector.types.delete_result.json"
+        }
+      }
+    }
+  ]
+}
+```
+
+**Vector Create Namespace Request (`vector.create_namespace.request.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/vector/vector.create_namespace.request.json",
+  "title": "Vector Create Namespace Request",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/vector/vector.envelope.request.json" },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "vector.create_namespace"
+        },
+        "args": {
+          "$ref": "https://corpusos.com/schemas/vector/vector.types.namespace_spec.json"
+        }
+      }
+    }
+  ]
+}
+```
+
+**Vector Create Namespace Success (`vector.create_namespace.success.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/vector/vector.create_namespace.success.json",
+  "title": "Vector Create Namespace Success",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/vector/vector.envelope.success.json" },
+    {
+      "properties": {
+        "result": {
+          "$ref": "https://corpusos.com/schemas/vector/vector.types.namespace_result.json"
+        }
+      }
+    }
+  ]
+}
+```
+
+**Vector Delete Namespace Request (`vector.delete_namespace.request.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/vector/vector.delete_namespace.request.json",
+  "title": "Vector Delete Namespace Request",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/vector/vector.envelope.request.json" },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "vector.delete_namespace"
+        },
+        "args": {
+          "type": "object",
+          "properties": {
+            "namespace": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": ["namespace"],
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}
+```
+
+**Vector Delete Namespace Success (`vector.delete_namespace.success.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/vector/vector.delete_namespace.success.json",
+  "title": "Vector Delete Namespace Success",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/vector/vector.envelope.success.json" },
+    {
+      "properties": {
+        "result": {
+          "$ref": "https://corpusos.com/schemas/vector/vector.types.namespace_result.json"
+        }
+      }
+    }
+  ]
+}
+```
+
+**Vector Health Request (`vector.health.request.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/vector/vector.health.request.json",
+  "title": "Vector Health Request",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/vector/vector.envelope.request.json" },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "vector.health"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Empty args object required"
+        }
+      }
+    }
+  ]
+}
+```
+
+**Vector Health Success (`vector.health.success.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/vector/vector.health.success.json",
+  "title": "Vector Health Success",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/vector/vector.envelope.success.json" },
+    {
+      "properties": {
+        "result": {
+          "type": "object",
+          "properties": {
+            "ok": { "type": "boolean" },
+            "status": { "type": "string" },
+            "server": { "type": "string" },
+            "version": { "type": "string" }
+          },
+          "required": ["ok", "status", "server", "version"],
+          "additionalProperties": true
+        }
+      }
+    }
+  ]
+}
 ```
 
 #### 4.2.3 Type Definitions
@@ -1174,7 +1865,8 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
       "type": "string"
     },
     "text": {
-      "type": ["string", "null"]
+      "type": ["string", "null"],
+      "description": "Optional text content associated with vector"
     }
   },
   "required": ["id", "vector"],
@@ -1479,6 +2171,52 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 
 #### 4.3.2 Operation Schemas
 
+**Embedding Capabilities Request (`embedding.capabilities.request.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.capabilities.request.json",
+  "title": "Embedding Capabilities Request",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/embedding/embedding.envelope.request.json" },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "embedding.capabilities"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Empty args object required"
+        }
+      }
+    }
+  ]
+}
+```
+
+**Embedding Capabilities Success (`embedding.capabilities.success.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.capabilities.success.json",
+  "title": "Embedding Capabilities Success",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/embedding/embedding.envelope.success.json" },
+    {
+      "properties": {
+        "result": {
+          "$ref": "https://corpusos.com/schemas/embedding/embedding.capabilities.json"
+        }
+      }
+    }
+  ]
+}
+```
+
 **Embedding Embed Request (`embedding.embed.request.json`):**
 ```json
 {
@@ -1495,15 +2233,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
           "const": "embedding.embed"
         },
         "args": {
-          "type": "object",
-          "properties": {
-            "stream": {
-              "type": "boolean",
-              "const": false,
-              "description": "Streaming not allowed for embed operation"
-            }
-          },
-          "additionalProperties": true
+          "$ref": "https://corpusos.com/schemas/embedding/embedding.types.embed_spec.json"
         }
       }
     }
@@ -1519,7 +2249,79 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "Embedding Embed Success",
   "type": "object",
   "allOf": [
-    { "$ref": "https://corpusos.com/schemas/embedding/embedding.envelope.success.json" }
+    { "$ref": "https://corpusos.com/schemas/embedding/embedding.envelope.success.json" },
+    {
+      "properties": {
+        "result": {
+          "$ref": "https://corpusos.com/schemas/embedding/embedding.types.result.json"
+        }
+      }
+    }
+  ]
+}
+```
+
+**Embedding Batch Embed Request (`embedding.embed_batch.request.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.embed_batch.request.json",
+  "title": "Embedding Batch Embed Request",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/embedding/embedding.envelope.request.json" },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "embedding.embed_batch"
+        },
+        "args": {
+          "type": "object",
+          "properties": {
+            "texts": {
+              "type": "array",
+              "items": { "type": "string" },
+              "minItems": 1
+            },
+            "model": {
+              "type": "string",
+              "minLength": 1
+            },
+            "truncate": {
+              "type": "boolean",
+              "default": true
+            },
+            "normalize": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "required": ["texts", "model"],
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}
+```
+
+**Embedding Batch Embed Success (`embedding.embed_batch.success.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.embed_batch.success.json",
+  "title": "Embedding Batch Embed Success",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/embedding/embedding.envelope.success.json" },
+    {
+      "properties": {
+        "result": {
+          "$ref": "https://corpusos.com/schemas/embedding/embedding.types.batch_result.json"
+        }
+      }
+    }
   ]
 }
 ```
@@ -1538,6 +2340,9 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
         "op": {
           "type": "string",
           "const": "embedding.stream_embed"
+        },
+        "args": {
+          "$ref": "https://corpusos.com/schemas/embedding/embedding.types.stream_embed_spec.json"
         }
       }
     }
@@ -1553,7 +2358,14 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "Embedding Stream Embed Success",
   "type": "object",
   "allOf": [
-    { "$ref": "https://corpusos.com/schemas/common/envelope.stream.success.json" }
+    { "$ref": "https://corpusos.com/schemas/common/envelope.stream.success.json" },
+    {
+      "properties": {
+        "chunk": {
+          "$ref": "https://corpusos.com/schemas/embedding/embedding.types.chunk.json"
+        }
+      }
+    }
   ]
 }
 ```
@@ -1572,6 +2384,9 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
         "op": {
           "type": "string",
           "const": "embedding.count_tokens"
+        },
+        "args": {
+          "$ref": "https://corpusos.com/schemas/embedding/embedding.types.count_tokens_spec.json"
         }
       }
     }
@@ -1587,7 +2402,121 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "Embedding Count Tokens Success",
   "type": "object",
   "allOf": [
-    { "$ref": "https://corpusos.com/schemas/embedding/embedding.envelope.success.json" }
+    { "$ref": "https://corpusos.com/schemas/embedding/embedding.envelope.success.json" },
+    {
+      "properties": {
+        "result": {
+          "type": "object",
+          "properties": {
+            "total_tokens": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": ["total_tokens"],
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}
+```
+
+**Embedding Health Request (`embedding.health.request.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.health.request.json",
+  "title": "Embedding Health Request",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/embedding/embedding.envelope.request.json" },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "embedding.health"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Empty args object required"
+        }
+      }
+    }
+  ]
+}
+```
+
+**Embedding Health Success (`embedding.health.success.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.health.success.json",
+  "title": "Embedding Health Success",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/embedding/embedding.envelope.success.json" },
+    {
+      "properties": {
+        "result": {
+          "type": "object",
+          "properties": {
+            "ok": { "type": "boolean" },
+            "status": { "type": "string" },
+            "server": { "type": "string" },
+            "version": { "type": "string" }
+          },
+          "required": ["ok", "status", "server", "version"],
+          "additionalProperties": true
+        }
+      }
+    }
+  ]
+}
+```
+**Embedding Get Stats Request (`embedding.get_stats.request.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.get_stats.request.json",
+  "title": "Embedding Get Stats Request",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/embedding/embedding.envelope.request.json" },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "embedding.get_stats"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Empty args object required"
+        }
+      }
+    }
+  ]
+}
+```
+
+**Embedding Get Stats Success (`embedding.get_stats.success.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.get_stats.success.json",
+  "title": "Embedding Get Stats Success",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/embedding/embedding.envelope.success.json" },
+    {
+      "properties": {
+        "result": {
+          "$ref": "https://corpusos.com/schemas/embedding/embedding.stats.json"
+        }
+      }
+    }
   ]
 }
 ```
@@ -1608,7 +2537,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     "supported_models": {
       "type": "array",
       "items": { "type": "string" },
-      "default": []
+      "minItems": 1
     },
     "max_batch_size": { "type": ["integer", "null"], "minimum": 1 },
     "max_text_length": { "type": ["integer", "null"], "minimum": 1 },
@@ -1629,7 +2558,104 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     },
     "supports_deadline": { "type": "boolean", "default": true }
   },
-  "required": ["server", "version"],
+  "required": ["server", "version", "supported_models"],
+  "additionalProperties": false
+}
+```
+
+**Embed Spec (`embedding.types.embed_spec.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.types.embed_spec.json",
+  "title": "Embedding Embed Specification",
+  "type": "object",
+  "properties": {
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Text to embed"
+    },
+    "model": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Model identifier"
+    },
+    "truncate": {
+      "type": "boolean",
+      "default": true,
+      "description": "Truncate text if exceeds max length"
+    },
+    "normalize": {
+      "type": "boolean",
+      "default": false,
+      "description": "Normalize embedding vector"
+    },
+    "stream": {
+      "type": "boolean",
+      "const": false,
+      "description": "Streaming not allowed for embed operation"
+    }
+  },
+  "required": ["text", "model"],
+  "additionalProperties": false
+}
+```
+
+**Stream Embed Spec (`embedding.types.stream_embed_spec.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.types.stream_embed_spec.json",
+  "title": "Embedding Stream Embed Specification",
+  "type": "object",
+  "properties": {
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Text to embed"
+    },
+    "model": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Model identifier"
+    },
+    "truncate": {
+      "type": "boolean",
+      "default": true,
+      "description": "Truncate text if exceeds max length"
+    },
+    "normalize": {
+      "type": "boolean",
+      "default": false,
+      "description": "Normalize embedding vector"
+    }
+  },
+  "required": ["text", "model"],
+  "additionalProperties": false
+}
+```
+
+**Count Tokens Spec (`embedding.types.count_tokens_spec.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.types.count_tokens_spec.json",
+  "title": "Embedding Count Tokens Specification",
+  "type": "object",
+  "properties": {
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Text to count tokens for"
+    },
+    "model": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Model identifier"
+    }
+  },
+  "required": ["text", "model"],
   "additionalProperties": false
 }
 ```
@@ -1867,6 +2893,52 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 
 #### 4.4.2 Operation Schemas
 
+**Graph Capabilities Request (`graph.capabilities.request.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.capabilities.request.json",
+  "title": "Graph Capabilities Request",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.request.json" },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "graph.capabilities"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Empty args object required"
+        }
+      }
+    }
+  ]
+}
+```
+
+**Graph Capabilities Success (`graph.capabilities.success.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.capabilities.success.json",
+  "title": "Graph Capabilities Success",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.success.json" },
+    {
+      "properties": {
+        "result": {
+          "$ref": "https://corpusos.com/schemas/graph/graph.capabilities.json"
+        }
+      }
+    }
+  ]
+}
+```
+
 **Graph Query Request (`graph.query.request.json`):**
 ```json
 {
@@ -1881,6 +2953,9 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
         "op": {
           "type": "string",
           "const": "graph.query"
+        },
+        "args": {
+          "$ref": "https://corpusos.com/schemas/graph/graph.types.query_spec.json"
         }
       }
     }
@@ -1896,7 +2971,14 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "Graph Query Success",
   "type": "object",
   "allOf": [
-    { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.success.json" }
+    { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.success.json" },
+    {
+      "properties": {
+        "result": {
+          "$ref": "https://corpusos.com/schemas/graph/graph.types.query_result.json"
+        }
+      }
+    }
   ]
 }
 ```
@@ -1915,6 +2997,9 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
         "op": {
           "type": "string",
           "const": "graph.stream_query"
+        },
+        "args": {
+          "$ref": "https://corpusos.com/schemas/graph/graph.types.query_spec.json"
         }
       }
     }
@@ -1930,7 +3015,509 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "Graph Stream Query Success",
   "type": "object",
   "allOf": [
-    { "$ref": "https://corpusos.com/schemas/common/envelope.stream.success.json" }
+    { "$ref": "https://corpusos.com/schemas/common/envelope.stream.success.json" },
+    {
+      "properties": {
+        "chunk": {
+          "$ref": "https://corpusos.com/schemas/graph/graph.types.chunk.json"
+        }
+      }
+    }
+  ]
+}
+```
+
+**Graph Upsert Nodes Request (`graph.upsert_nodes.request.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.upsert_nodes.request.json",
+  "title": "Graph Upsert Nodes Request",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.request.json" },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "graph.upsert_nodes"
+        },
+        "args": {
+          "type": "object",
+          "properties": {
+            "nodes": {
+              "type": "array",
+              "items": {
+                "$ref": "https://corpusos.com/schemas/graph/graph.types.node.json"
+              },
+              "minItems": 1
+            },
+            "namespace": {
+              "type": "string"
+            }
+          },
+          "required": ["nodes"],
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}
+```
+
+**Graph Upsert Nodes Success (`graph.upsert_nodes.success.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.upsert_nodes.success.json",
+  "title": "Graph Upsert Nodes Success",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.success.json" },
+    {
+      "properties": {
+        "result": {
+          "type": "object",
+          "properties": {
+            "upserted_count": { "type": "integer", "minimum": 0 },
+            "failed_count": { "type": "integer", "minimum": 0 },
+            "failures": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "id": { "type": "string" },
+                  "error": { "type": "string" }
+                },
+                "required": ["id", "error"]
+              }
+            }
+          },
+          "required": ["upserted_count", "failed_count", "failures"],
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}
+```
+
+**Graph Upsert Edges Request (`graph.upsert_edges.request.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.upsert_edges.request.json",
+  "title": "Graph Upsert Edges Request",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.request.json" },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "graph.upsert_edges"
+        },
+        "args": {
+          "type": "object",
+          "properties": {
+            "edges": {
+              "type": "array",
+              "items": {
+                "$ref": "https://corpusos.com/schemas/graph/graph.types.edge.json"
+              },
+              "minItems": 1
+            },
+            "namespace": {
+              "type": "string"
+            }
+          },
+          "required": ["edges"],
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}
+```
+
+**Graph Upsert Edges Success (`graph.upsert_edges.success.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.upsert_edges.success.json",
+  "title": "Graph Upsert Edges Success",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.success.json" },
+    {
+      "properties": {
+        "result": {
+          "type": "object",
+          "properties": {
+            "upserted_count": { "type": "integer", "minimum": 0 },
+            "failed_count": { "type": "integer", "minimum": 0 },
+            "failures": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "id": { "type": "string" },
+                  "error": { "type": "string" }
+                },
+                "required": ["id", "error"]
+              }
+            }
+          },
+          "required": ["upserted_count", "failed_count", "failures"],
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}
+```
+
+**Graph Delete Nodes Request (`graph.delete_nodes.request.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.delete_nodes.request.json",
+  "title": "Graph Delete Nodes Request",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.request.json" },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "graph.delete_nodes"
+        },
+        "args": {
+          "type": "object",
+          "properties": {
+            "ids": {
+              "type": "array",
+              "items": { "type": "string" },
+              "minItems": 1
+            },
+            "filter": {
+              "type": "object",
+              "additionalProperties": true
+            },
+            "namespace": {
+              "type": "string"
+            }
+          },
+          "required": ["ids"],
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}
+```
+
+**Graph Delete Nodes Success (`graph.delete_nodes.success.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.delete_nodes.success.json",
+  "title": "Graph Delete Nodes Success",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.success.json" },
+    {
+      "properties": {
+        "result": {
+          "type": "object",
+          "properties": {
+            "deleted_count": { "type": "integer", "minimum": 0 },
+            "failed_count": { "type": "integer", "minimum": 0 },
+            "failures": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "id": { "type": "string" },
+                  "error": { "type": "string" }
+                },
+                "required": ["id", "error"]
+              }
+            }
+          },
+          "required": ["deleted_count", "failed_count", "failures"],
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}
+```
+
+**Graph Delete Edges Request (`graph.delete_edges.request.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.delete_edges.request.json",
+  "title": "Graph Delete Edges Request",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.request.json" },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "graph.delete_edges"
+        },
+        "args": {
+          "type": "object",
+          "properties": {
+            "ids": {
+              "type": "array",
+              "items": { "type": "string" },
+              "minItems": 1
+            },
+            "filter": {
+              "type": "object",
+              "additionalProperties": true
+            },
+            "namespace": {
+              "type": "string"
+            }
+          },
+          "required": ["ids"],
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}
+```
+
+**Graph Delete Edges Success (`graph.delete_edges.success.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.delete_edges.success.json",
+  "title": "Graph Delete Edges Success",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.success.json" },
+    {
+      "properties": {
+        "result": {
+          "type": "object",
+          "properties": {
+            "deleted_count": { "type": "integer", "minimum": 0 },
+            "failed_count": { "type": "integer", "minimum": 0 },
+            "failures": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "id": { "type": "string" },
+                  "error": { "type": "string" }
+                },
+                "required": ["id", "error"]
+              }
+            }
+          },
+          "required": ["deleted_count", "failed_count", "failures"],
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}
+```
+
+**Graph Bulk Vertices Request (`graph.bulk_vertices.request.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.bulk_vertices.request.json",
+  "title": "Graph Bulk Vertices Request",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.request.json" },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "graph.bulk_vertices"
+        },
+        "args": {
+          "$ref": "https://corpusos.com/schemas/graph/graph.types.bulk_vertices_spec.json"
+        }
+      }
+    }
+  ]
+}
+```
+
+**Graph Bulk Vertices Success (`graph.bulk_vertices.success.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.bulk_vertices.success.json",
+  "title": "Graph Bulk Vertices Success",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.success.json" },
+    {
+      "properties": {
+        "result": {
+          "$ref": "https://corpusos.com/schemas/graph/graph.types.bulk_vertices_result.json"
+        }
+      }
+    }
+  ]
+}
+```
+
+**Graph Batch Request (`graph.batch.request.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.batch.request.json",
+  "title": "Graph Batch Request",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.request.json" },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "graph.batch"
+        },
+        "args": {
+          "type": "object",
+          "properties": {
+            "ops": {
+              "type": "array",
+              "items": {
+                "$ref": "https://corpusos.com/schemas/graph/graph.types.batch_op.json"
+              },
+              "minItems": 1
+            }
+          },
+          "required": ["ops"],
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}
+```
+
+**Graph Batch Success (`graph.batch.success.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.batch.success.json",
+  "title": "Graph Batch Success",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.success.json" },
+    {
+      "properties": {
+        "result": {
+          "$ref": "https://corpusos.com/schemas/graph/graph.types.batch_result.json"
+        }
+      }
+    }
+  ]
+}
+```
+
+**Graph Get Schema Request (`graph.get_schema.request.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.get_schema.request.json",
+  "title": "Graph Get Schema Request",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.request.json" },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "graph.get_schema"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Empty args object required"
+        }
+      }
+    }
+  ]
+}
+```
+
+**Graph Get Schema Success (`graph.get_schema.success.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.get_schema.success.json",
+  "title": "Graph Get Schema Success",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.success.json" },
+    {
+      "properties": {
+        "result": {
+          "$ref": "https://corpusos.com/schemas/graph/graph.types.graph_schema.json"
+        }
+      }
+    }
+  ]
+}
+```
+
+**Graph Health Request (`graph.health.request.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.health.request.json",
+  "title": "Graph Health Request",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.request.json" },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "graph.health"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Empty args object required"
+        }
+      }
+    }
+  ]
+}
+```
+
+**Graph Health Success (`graph.health.success.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.health.success.json",
+  "title": "Graph Health Success",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.success.json" },
+    {
+      "properties": {
+        "result": {
+          "$ref": "https://corpusos.com/schemas/graph/graph.types.health_result.json"
+        }
+      }
+    }
   ]
 }
 ```
@@ -1949,6 +3536,20 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
         "op": {
           "type": "string",
           "const": "graph.transaction"
+        },
+        "args": {
+          "type": "object",
+          "properties": {
+            "operations": {
+              "type": "array",
+              "items": {
+                "$ref": "https://corpusos.com/schemas/graph/graph.types.batch_op.json"
+              },
+              "minItems": 1
+            }
+          },
+          "required": ["operations"],
+          "additionalProperties": false
         }
       }
     }
@@ -1964,7 +3565,14 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "Graph Transaction Success",
   "type": "object",
   "allOf": [
-    { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.success.json" }
+    { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.success.json" },
+    {
+      "properties": {
+        "result": {
+          "$ref": "https://corpusos.com/schemas/graph/graph.types.batch_result.json"
+        }
+      }
+    }
   ]
 }
 ```
@@ -1983,6 +3591,9 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
         "op": {
           "type": "string",
           "const": "graph.traversal"
+        },
+        "args": {
+          "$ref": "https://corpusos.com/schemas/graph/graph.types.traversal_spec.json"
         }
       }
     }
@@ -1998,7 +3609,14 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "Graph Traversal Success",
   "type": "object",
   "allOf": [
-    { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.success.json" }
+    { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.success.json" },
+    {
+      "properties": {
+        "result": {
+          "$ref": "https://corpusos.com/schemas/graph/graph.types.traversal_result.json"
+        }
+      }
+    }
   ]
 }
 ```
@@ -2347,7 +3965,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
       "additionalProperties": true
     }
   },
-  "required": ["nodes", "edges"],
+  "required": ["nodes", "edges", "metadata"],
   "additionalProperties": false
 }
 ```
@@ -2776,8 +4394,11 @@ def validate_args_for_operation(args: dict, validator: Callable, case_id: str) -
 ```python
 def validate_llm_complete_args(args: dict, case_id: str) -> None:
     """Validate llm.complete operation arguments."""
-    if "prompt" not in args and "messages" not in args:
-        raise ArgsValidationError(f"{case_id}: requires 'prompt' or 'messages'")
+    if "messages" not in args:
+        raise ArgsValidationError(f"{case_id}: requires 'messages'")
+    
+    if not isinstance(args["messages"], list) or len(args["messages"]) == 0:
+        raise ArgsValidationError(f"{case_id}: 'messages' must be non-empty list")
     
     if "temperature" in args:
         temp = args["temperature"]
@@ -2788,16 +4409,41 @@ def validate_llm_complete_args(args: dict, case_id: str) -> None:
 
 def validate_vector_query_args(args: dict, case_id: str) -> None:
     """Validate vector.query operation arguments."""
-    if "vector" not in args and "text" not in args:
-        raise ArgsValidationError(f"{case_id}: requires 'vector' or 'text'")
+    if "vector" not in args:
+        raise ArgsValidationError(f"{case_id}: requires 'vector'")
     
-    if "vector" in args:
-        vector = args["vector"]
-        if not isinstance(vector, list) or len(vector) == 0:
-            raise ArgsValidationError(f"{case_id}: vector must be non-empty list")
-        
-        if not all(isinstance(x, (int, float)) for x in vector):
-            raise ArgsValidationError(f"{case_id}: vector must contain numbers")
+    if "top_k" not in args:
+        raise ArgsValidationError(f"{case_id}: requires 'top_k'")
+    
+    vector = args["vector"]
+    if not isinstance(vector, list) or len(vector) == 0:
+        raise ArgsValidationError(f"{case_id}: vector must be non-empty list")
+    
+    if not all(isinstance(x, (int, float)) for x in vector):
+        raise ArgsValidationError(f"{case_id}: vector must contain numbers")
+
+def validate_embedding_embed_args(args: dict, case_id: str) -> None:
+    """Validate embedding.embed operation arguments."""
+    if "text" not in args:
+        raise ArgsValidationError(f"{case_id}: requires 'text'")
+    
+    if "model" not in args:
+        raise ArgsValidationError(f"{case_id}: requires 'model'")
+    
+    if "stream" in args and args["stream"] is not False:
+        raise ArgsValidationError(f"{case_id}: stream must be absent or false for embed operation")
+
+def validate_graph_upsert_nodes_args(args: dict, case_id: str) -> None:
+    """Validate graph.upsert_nodes operation arguments."""
+    if "nodes" not in args:
+        raise ArgsValidationError(f"{case_id}: requires 'nodes'")
+    
+    if not isinstance(args["nodes"], list) or len(args["nodes"]) == 0:
+        raise ArgsValidationError(f"{case_id}: 'nodes' must be non-empty list")
+    
+    for i, node in enumerate(args["nodes"]):
+        if "id" not in node:
+            raise ArgsValidationError(f"{case_id}: node at index {i} missing required 'id'")
 ```
 
 ---
@@ -2812,9 +4458,40 @@ Golden tests serve as both validation fixtures and protocol documentation:
 ```python
 # Golden test mapping
 CASES = [
-    ("llm/llm_capabilities_request.json",       "https://corpusos.com/schemas/llm/llm.envelope.request.json"),
-    ("llm/llm_capabilities_success.json",       "https://corpusos.com/schemas/llm/llm.envelope.success.json"),
-    ("vector/vector_query_request.json",    "https://corpusos.com/schemas/vector/vector.envelope.request.json"),
+    # LLM
+    ("llm/llm_capabilities_request.json",       "https://corpusos.com/schemas/llm/llm.capabilities.request.json"),
+    ("llm/llm_capabilities_success.json",       "https://corpusos.com/schemas/llm/llm.capabilities.success.json"),
+    ("llm/llm_complete_request.json",           "https://corpusos.com/schemas/llm/llm.complete.request.json"),
+    ("llm/llm_complete_success.json",           "https://corpusos.com/schemas/llm/llm.complete.success.json"),
+    ("llm/llm_health_request.json",             "https://corpusos.com/schemas/llm/llm.health.request.json"),
+    ("llm/llm_health_success.json",             "https://corpusos.com/schemas/llm/llm.health.success.json"),
+    
+    # Vector
+    ("vector/vector_capabilities_request.json", "https://corpusos.com/schemas/vector/vector.capabilities.request.json"),
+    ("vector/vector_capabilities_success.json", "https://corpusos.com/schemas/vector/vector.capabilities.success.json"),
+    ("vector/vector_query_request.json",        "https://corpusos.com/schemas/vector/vector.query.request.json"),
+    ("vector/vector_batch_query_request.json",  "https://corpusos.com/schemas/vector/vector.batch_query.request.json"),
+    ("vector/vector_upsert_request.json",       "https://corpusos.com/schemas/vector/vector.upsert.request.json"),
+    ("vector/vector_create_namespace_request.json", "https://corpusos.com/schemas/vector/vector.create_namespace.request.json"),
+    ("vector/vector_health_request.json",       "https://corpusos.com/schemas/vector/vector.health.request.json"),
+    
+    # Embedding
+    ("embedding/embedding_capabilities_request.json", "https://corpusos.com/schemas/embedding/embedding.capabilities.request.json"),
+    ("embedding/embedding_embed_request.json",        "https://corpusos.com/schemas/embedding/embedding.embed.request.json"),
+    ("embedding/embedding_embed_batch_request.json",  "https://corpusos.com/schemas/embedding/embedding.embed_batch.request.json"),
+    ("embedding/embedding_health_request.json",       "https://corpusos.com/schemas/embedding/embedding.health.request.json"),
+    ("embedding/embedding_get_stats_request.json",    "https://corpusos.com/schemas/embedding/embedding.get_stats.request.json"),
+    
+    # Graph
+    ("graph/graph_capabilities_request.json",   "https://corpusos.com/schemas/graph/graph.capabilities.request.json"),
+    ("graph/graph_query_request.json",          "https://corpusos.com/schemas/graph/graph.query.request.json"),
+    ("graph/graph_upsert_nodes_request.json",   "https://corpusos.com/schemas/graph/graph.upsert_nodes.request.json"),
+    ("graph/graph_upsert_edges_request.json",   "https://corpusos.com/schemas/graph/graph.upsert_edges.request.json"),
+    ("graph/graph_delete_nodes_request.json",   "https://corpusos.com/schemas/graph/graph.delete_nodes.request.json"),
+    ("graph/graph_bulk_vertices_request.json",  "https://corpusos.com/schemas/graph/graph.bulk_vertices.request.json"),
+    ("graph/graph_batch_request.json",          "https://corpusos.com/schemas/graph/graph.batch.request.json"),
+    ("graph/graph_get_schema_request.json",     "https://corpusos.com/schemas/graph/graph.get_schema.request.json"),
+    ("graph/graph_health_request.json",         "https://corpusos.com/schemas/graph/graph.health.request.json"),
     # ... 100+ test cases
 ]
 ```
@@ -2860,15 +4537,15 @@ tests/golden/
 │   ├── vector_capabilities_success.json
 │   ├── vector_batch_query_request.json
 │   ├── vector_batch_query_success.json
+│   ├── vector_create_namespace_request.json
+│   ├── vector_create_namespace_success.json
 │   ├── vector_delete_request.json
 │   ├── vector_delete_success.json
+│   ├── vector_delete_namespace_request.json
+│   ├── vector_delete_namespace_success.json
 │   ├── vector_error_dimension_mismatch.json
 │   ├── vector_health_request.json
 │   ├── vector_health_success.json
-│   ├── vector_namespace_create_request.json
-│   ├── vector_namespace_create_success.json
-│   ├── vector_namespace_delete_request.json
-│   ├── vector_namespace_delete_success.json
 │   ├── vector_query_request.json
 │   ├── vector_query_success.json
 │   ├── vector_types_document.json
@@ -2919,8 +4596,6 @@ tests/golden/
     ├── graph_delete_edges_success.json
     ├── graph_delete_nodes_request.json
     ├── graph_delete_nodes_success.json
-    ├── graph_edge_create_request.json
-    ├── graph_edge_create_success.json
     ├── graph_envelope_error.json
     ├── graph_get_schema_request.json
     ├── graph_get_schema_success.json
@@ -3017,6 +4692,23 @@ def test_all_success_envelopes_follow_protocol_format():
         # Field constraints
         assert doc["ok"] is True, f"{fname}: 'ok' must be true"
         assert doc["code"] == "OK", f"{fname}: unexpected code {doc['code']!r}"
+
+def test_all_request_envelopes_follow_protocol_format():
+    """Test ALL request envelopes include core fields per §2.4."""
+    for fname, schema_id in CASES:
+        if "request.json" not in fname:
+            continue
+        
+        doc = load_golden(fname)
+        
+        # REQUIRED fields
+        assert "op" in doc, f"{fname}: missing 'op' field"
+        assert "ctx" in doc, f"{fname}: missing 'ctx' field"
+        assert "args" in doc, f"{fname}: missing 'args' field"
+        
+        # Field types
+        assert isinstance(doc["ctx"], dict), f"{fname}: 'ctx' must be object"
+        assert isinstance(doc["args"], dict), f"{fname}: 'args' must be object"
 ```
 
 **Streaming Validation:**
@@ -3222,7 +4914,6 @@ def test_no_dangling_defs_globally():
     
     assert not dangling, f"Dangling $defs: {dangling}"
 ```
-
 ### 8.2 Production Conformance Tests
 
 **Wire Conformance Test Suite:**
@@ -3274,16 +4965,47 @@ class WireRequestCase:
     args_validator: Optional[Callable] = None  # Operation-specific validation
     tags: List[str] = field(default_factory=list)  # Test markers
     
-    # Example case definition
+    # Example case definitions
+    LLM_CAPABILITIES = WireRequestCase(
+        id="llm.capabilities.basic",
+        op="llm.capabilities",
+        build_method="build_capabilities_request",
+        schema_id="https://corpusos.com/schemas/llm/llm.capabilities.request.json",
+        component="llm",
+        schema_versions=["1.0.0"],
+        tags=["core", "llm"],
+    )
+    
     LLM_COMPLETE = WireRequestCase(
         id="llm.complete.basic",
         op="llm.complete",
         build_method="build_complete_request",
-        schema_id="https://corpusos.com/schemas/llm/llm.envelope.request.json",
+        schema_id="https://corpusos.com/schemas/llm/llm.complete.request.json",
         component="llm",
         schema_versions=["1.0.0", "1.1.0"],
         args_validator=validate_llm_complete_args,
         tags=["core", "llm"],
+    )
+    
+    EMBEDDING_EMBED_BATCH = WireRequestCase(
+        id="embedding.embed_batch.basic",
+        op="embedding.embed_batch",
+        build_method="build_embed_batch_request",
+        schema_id="https://corpusos.com/schemas/embedding/embedding.embed_batch.request.json",
+        component="embedding",
+        schema_versions=["1.0.0"],
+        tags=["core", "embedding"],
+    )
+    
+    GRAPH_UPSERT_NODES = WireRequestCase(
+        id="graph.upsert_nodes.basic",
+        op="graph.upsert_nodes",
+        build_method="build_upsert_nodes_request",
+        schema_id="https://corpusos.com/schemas/graph/graph.upsert_nodes.request.json",
+        component="graph",
+        schema_versions=["1.0.0"],
+        args_validator=validate_graph_upsert_nodes_args,
+        tags=["core", "graph"],
     )
 ```
 
@@ -3299,9 +5021,37 @@ class TestEnvelopeEdgeCases:
         with pytest.raises(EnvelopeShapeError, match="missing required keys"):
             validate_envelope_shape(envelope, case_id="test_missing_op")
     
+    def test_missing_ctx_rejected(self, adapter: Any):
+        """Envelope without 'ctx' should be rejected."""
+        envelope = {"op": "llm.complete", "args": {}}
+        
+        with pytest.raises(EnvelopeShapeError, match="missing required keys"):
+            validate_envelope_shape(envelope, case_id="test_missing_ctx")
+    
+    def test_missing_args_rejected(self, adapter: Any):
+        """Envelope without 'args' should be rejected."""
+        envelope = {"op": "llm.complete", "ctx": {"request_id": "test"}}
+        
+        with pytest.raises(EnvelopeShapeError, match="missing required keys"):
+            validate_envelope_shape(envelope, case_id="test_missing_args")
+    
+    def test_ctx_not_object_rejected(self, adapter: Any):
+        """Envelope with non-object 'ctx' should be rejected."""
+        envelope = {"op": "llm.complete", "ctx": "invalid", "args": {}}
+        
+        with pytest.raises(CtxValidationError, match="ctx must be object"):
+            validate_envelope_shape(envelope, case_id="test_ctx_not_object")
+    
+    def test_args_not_object_rejected(self, adapter: Any):
+        """Envelope with non-object 'args' should be rejected."""
+        envelope = {"op": "llm.complete", "ctx": {"request_id": "test"}, "args": "invalid"}
+        
+        with pytest.raises(ArgsValidationError, match="args must be object"):
+            validate_envelope_shape(envelope, case_id="test_args_not_object")
+    
     def test_negative_deadline_rejected(self, adapter: Any):
         """Negative deadline_ms should be rejected."""
-        envelope = {"ctx": {"request_id": "test", "deadline_ms": -100}}
+        envelope = {"op": "llm.complete", "ctx": {"request_id": "test", "deadline_ms": -100}, "args": {}}
         
         with pytest.raises(CtxValidationError, match="deadline_ms"):
             validate_ctx_field(envelope, case_id="test_deadline_negative")
@@ -3316,6 +5066,17 @@ class TestEnvelopeEdgeCases:
         
         with pytest.raises(SerializationError):
             json_roundtrip(envelope, case_id="test_non_serializable")
+    
+    def test_embedding_stream_flag_validation(self, adapter: Any):
+        """Embedding embed operation should reject stream=true."""
+        envelope = {
+            "op": "embedding.embed",
+            "ctx": {"request_id": "test"},
+            "args": {"text": "test", "model": "test-model", "stream": True}
+        }
+        
+        with pytest.raises(ArgsValidationError, match="stream must be absent or false"):
+            validate_embedding_embed_args(envelope["args"], case_id="test_stream_flag")
 ```
 
 **Metrics Collection:**
@@ -3332,14 +5093,30 @@ class ValidationMetrics:
         self.validation_times.append((case_id, duration))
         self.successes[case_id] = self.successes.get(case_id, 0) + 1
     
+    def record_failure(self, case_id: str, error_type: str) -> None:
+        """Record validation failure."""
+        if case_id not in self.failures:
+            self.failures[case_id] = {}
+        self.failures[case_id][error_type] = self.failures[case_id].get(error_type, 0) + 1
+    
     def get_summary(self) -> Dict[str, Any]:
         """Get metrics summary for reporting."""
         return {
             "total_runs": len(self.validation_times),
             "total_successes": sum(self.successes.values()),
             "total_failures": sum(sum(errs.values()) for errs in self.failures.values()),
-            "avg_duration_ms": (sum(t[1] for t in self.validation_times) / len(self.validation_times) * 1000)
+            "avg_duration_ms": (sum(t[1] for t in self.validation_times) / len(self.validation_times) * 1000) if self.validation_times else 0,
+            "p95_duration_ms": self._calculate_percentile(95),
+            "p99_duration_ms": self._calculate_percentile(99)
         }
+    
+    def _calculate_percentile(self, percentile: int) -> float:
+        """Calculate duration percentile."""
+        if not self.validation_times:
+            return 0.0
+        sorted_times = sorted(t[1] for t in self.validation_times)
+        idx = int(len(sorted_times) * percentile / 100)
+        return sorted_times[idx] * 1000  # Convert to milliseconds
 ```
 
 ### 8.3 Performance Considerations
@@ -3431,6 +5208,38 @@ def test_validator_cache_effectiveness():
     assert v1 is v2, "Different validator instances returned from cache"
 ```
 
+**Validation Performance Benchmarks:**
+```python
+def test_validation_performance_benchmarks():
+    """Test validation performance meets benchmarks."""
+    registry = SchemaRegistry()
+    
+    # Test LLM envelope validation
+    llm_envelope = {
+        "op": "llm.complete",
+        "ctx": {"request_id": "test-123"},
+        "args": {"messages": [{"role": "user", "content": "test"}]}
+    }
+    
+    validator = registry.get_validator("https://corpusos.com/schemas/llm/llm.complete.request.json")
+    
+    # Warm up
+    for _ in range(10):
+        validator.validate(llm_envelope)
+    
+    # Benchmark
+    iterations = 1000
+    start = time.time()
+    for _ in range(iterations):
+        validator.validate(llm_envelope)
+    duration = time.time() - start
+    
+    avg_time_ms = (duration / iterations) * 1000
+    
+    # Should validate in less than 10ms on average
+    assert avg_time_ms < 10, f"Validation too slow: {avg_time_ms:.2f}ms per validation"
+```
+
 ---
 
 ## 9. Integration and Tooling
@@ -3450,6 +5259,12 @@ CORPUS_SCHEMAS_ROOT=/custom/path python -m tests.utils.schema_registry --list
 
 # Show schema statistics
 python -m tests.utils.schema_registry --stats
+
+# Validate multiple files
+python -m tests.utils.schema_registry llm.envelope.request.json file1.json file2.json file3.json
+
+# Output validation results as JSON
+python -m tests.utils.schema_registry --output json llm.envelope.request.json sample.json
 ```
 
 **Stream Validation CLI:**
@@ -3468,6 +5283,14 @@ with open("stream.ndjson", "r") as f:
 print(f"Valid: {report.is_valid}")
 print(f"Frames: {report.total_frames}")
 print(f"Errors: {len(report.validation_errors)}")
+
+# Validate from stdin
+import sys
+report = validate_ndjson_stream(
+    sys.stdin.read(),
+    envelope_schema_id="https://corpusos.com/schemas/common/envelope.stream.success.json",
+    component="embedding"
+)
 ```
 
 **Conformance Test Runner:**
@@ -3477,6 +5300,15 @@ pytest tests/live/test_wire_conformance.py -v
 
 # Run only LLM tests
 pytest tests/live/test_wire_conformance.py -v -m "llm"
+
+# Run only Embedding tests
+pytest tests/live/test_wire_conformance.py -v -m "embedding"
+
+# Run only Graph tests
+pytest tests/live/test_wire_conformance.py -v -m "graph"
+
+# Run only Vector tests
+pytest tests/live/test_wire_conformance.py -v -m "vector"
 
 # Run core operations only
 pytest tests/live/test_wire_conformance.py -v -m "core"
@@ -3489,6 +5321,12 @@ pytest tests/live/test_wire_conformance.py -v --adapter=openai
 
 # Generate coverage report
 pytest tests/live/test_wire_conformance.py -v --tb=no -q | generate_coverage_report.py
+
+# Run with detailed error output
+pytest tests/live/test_wire_conformance.py -vv --tb=long
+
+# Run parallel tests for faster execution
+pytest tests/live/test_wire_conformance.py -v -n auto
 ```
 
 **Golden Test Maintenance:**
@@ -3505,6 +5343,15 @@ pytest tests/schema/test_schema_lint.py -v
 
 # Generate missing golden fixtures
 python tools/generate_golden.py --component llm --operation complete
+python tools/generate_golden.py --component embedding --operation embed_batch
+python tools/generate_golden.py --component graph --operation upsert_nodes
+python tools/generate_golden.py --component vector --operation batch_query
+
+# Validate specific golden file
+python tools/validate_golden.py tests/golden/llm/llm_complete_request.json
+
+# Update golden fixtures from live adapters
+python tools/update_golden.py --adapter openai --operation llm.complete
 ```
 
 ### 9.2 Development Workflow
@@ -3536,6 +5383,30 @@ python tools/generate_golden.py --component llm --operation complete
 }
 ```
 
+**Operation Schema Template:**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/{protocol}/{protocol}.{operation}.request.json",
+  "title": "{Protocol} {Operation} Request",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/{protocol}/{protocol}.envelope.request.json" },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "{protocol}.{operation}"
+        },
+        "args": {
+          "$ref": "https://corpusos.com/schemas/{protocol}/{protocol}.types.{operation}_spec.json"
+        }
+      }
+    }
+  ]
+}
+```
+
 **Breaking Change Process:**
 1. **Create new schema version** - e.g., `llm.envelope.request.v2.json`
 2. **Maintain backward compatibility** - Support both versions temporarily
@@ -3543,6 +5414,37 @@ python tools/generate_golden.py --component llm --operation complete
 4. **Update adapter implementations** - Support new version
 5. **Deprecate old version** - Mark as deprecated in documentation
 6. **Schedule removal** - Remove after grace period (e.g., 6 months)
+
+**Migration Tooling:**
+```python
+class SchemaMigrator:
+    """Tool for migrating between schema versions."""
+    
+    @staticmethod
+    def migrate_llm_envelope_v1_to_v2(v1_envelope: dict) -> dict:
+        """Migrate LLM envelope from v1.0 to v2.0."""
+        v2_envelope = v1_envelope.copy()
+        
+        # Example migration: rename field
+        if "prompt" in v2_envelope.get("args", {}):
+            v2_envelope["args"]["messages"] = [
+                {"role": "user", "content": v2_envelope["args"]["prompt"]}
+            ]
+            del v2_envelope["args"]["prompt"]
+        
+        return v2_envelope
+    
+    @staticmethod
+    def migrate_embedding_args_v1_to_v2(v1_args: dict) -> dict:
+        """Migrate embedding args from v1.0 to v2.0."""
+        v2_args = v1_args.copy()
+        
+        # Add new required fields with defaults
+        if "normalize" not in v2_args:
+            v2_args["normalize"] = False
+        
+        return v2_args
+```
 
 **Debugging Workflow:**
 ```python
@@ -3552,9 +5454,11 @@ from tests.utils.schema_registry import get_validator
 validator = get_validator("https://corpusos.com/schemas/llm/llm.envelope.request.json")
 errors = list(validator.iter_errors(invalid_request))
 for error in errors:
-    print(f"Path: {error.path}")
+    print(f"Path: {'.'.join(str(p) for p in error.path)}")
     print(f"Message: {error.message}")
     print(f"Schema: {error.schema}")
+    print(f"Instance: {error.instance}")
+    print("---")
 
 # Debug stream validation
 from tests.utils.stream_validator import StreamValidationEngine
@@ -3565,6 +5469,21 @@ if not report.is_valid:
     for error in report.validation_errors:
         print(f"Frame {error.frame_number}: {error.error_type}")
         print(f"  {error.message}")
+        print(f"  Frame content: {error.frame_content[:100]}...")
+
+# Debug envelope validation
+try:
+    validate_wire_envelope(
+        envelope=test_envelope,
+        expected_op="llm.complete",
+        schema_id="https://corpusos.com/schemas/llm/llm.complete.request.json",
+        component="llm",
+        case_id="debug_test"
+    )
+except Exception as e:
+    print(f"Validation failed: {e}")
+    import traceback
+    traceback.print_exc()
 ```
 
 ### 9.3 CI/CD Integration
@@ -3579,6 +5498,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest jsonschema
       - name: Run schema lint tests
         run: pytest tests/schema/test_schema_lint.py -v
   
@@ -3587,6 +5514,14 @@ jobs:
     needs: schema-lint
     steps:
       - uses: actions/checkout@v3
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest jsonschema
       - name: Run golden tests
         run: pytest tests/schema/test_golden_schema.py -v
   
@@ -3595,22 +5530,55 @@ jobs:
     needs: golden-tests
     strategy:
       matrix:
-        adapter: [openai, anthropic, pinecone, neo4j]
+        adapter: [openai, anthropic, pinecone, neo4j, cohere, voyageai]
     steps:
       - uses: actions/checkout@v3
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest jsonschema
       - name: Run ${{ matrix.adapter }} conformance tests
         run: |
           pytest tests/live/test_wire_conformance.py -v \
             --adapter=${{ matrix.adapter }} \
             --junitxml=results-${{ matrix.adapter }}.xml
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PINECONE_API_KEY: ${{ secrets.PINECONE_API_KEY }}
+          NEO4J_URI: ${{ secrets.NEO4J_URI }}
+          NEO4J_PASSWORD: ${{ secrets.NEO4J_PASSWORD }}
+      - name: Upload test results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: test-results-${{ matrix.adapter }}
+          path: results-${{ matrix.adapter }}.xml
   
   performance-checks:
     runs-on: ubuntu-latest
     needs: conformance-tests
     steps:
       - uses: actions/checkout@v3
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest jsonschema
       - name: Run performance benchmarks
         run: python benchmarks/schema_performance.py
+      - name: Upload performance results
+        uses: actions/upload-artifact@v3
+        with:
+          name: performance-results
+          path: benchmarks/results/
 ```
 
 **Pre-commit Hooks:**
@@ -3624,12 +5592,20 @@ repos:
         entry: pytest tests/schema/test_schema_lint.py -v
         language: system
         files: ^schemas/.*\.json$
+        pass_filenames: false
         
       - id: golden-validation
         name: Golden Validation
         entry: pytest tests/schema/test_golden_schema.py -v
         language: system
         files: ^tests/golden/.*\.json$
+        pass_filenames: false
+        
+      - id: json-format
+        name: JSON Format Check
+        entry: python tools/format_json.py
+        language: system
+        files: \.json$
 ```
 
 **Code Coverage Requirements:**
@@ -3640,6 +5616,12 @@ COVERAGE_THRESHOLDS = {
     "golden_fixtures": 95,    # 95% of golden fixtures validated
     "conformance_cases": 90,  # 90% of conformance test cases
     "edge_cases": 85,         # 85% of edge case tests
+    "protocol_operations": {
+        "llm": 100,           # All LLM operations covered
+        "embedding": 100,     # All Embedding operations covered
+        "vector": 100,        # All Vector operations covered
+        "graph": 100,         # All Graph operations covered
+    }
 }
 
 def check_coverage():
@@ -3647,9 +5629,15 @@ def check_coverage():
     metrics = generate_coverage_report()
     
     for category, threshold in COVERAGE_THRESHOLDS.items():
-        coverage = metrics.get(category, {}).get("coverage", 0)
-        assert coverage >= threshold, \
-            f"{category} coverage {coverage}% < {threshold}% threshold"
+        if isinstance(threshold, dict):
+            for subcategory, subthreshold in threshold.items():
+                coverage = metrics.get(category, {}).get(subcategory, {}).get("coverage", 0)
+                assert coverage >= subthreshold, \
+                    f"{category}.{subcategory} coverage {coverage}% < {subthreshold}% threshold"
+        else:
+            coverage = metrics.get(category, {}).get("coverage", 0)
+            assert coverage >= threshold, \
+                f"{category} coverage {coverage}% < {threshold}% threshold"
 ```
 
 **Release Gate Criteria:**
@@ -3658,6 +5646,50 @@ def check_coverage():
 3. **Conformance tests**: ≥95% pass rate per adapter
 4. **Performance**: Schema loading < 2 seconds
 5. **Coverage**: Meets all threshold requirements
+6. **Breaking changes**: Documented and approved
+7. **Migration path**: Provided for any breaking changes
+
+**Automated Release Process:**
+```bash
+#!/bin/bash
+# release.sh - Automated release script
+
+set -e
+
+echo "Running pre-release checks..."
+
+# 1. Schema lint
+echo "Step 1/7: Running schema lint..."
+pytest tests/schema/test_schema_lint.py -v
+
+# 2. Golden tests
+echo "Step 2/7: Running golden tests..."
+pytest tests/schema/test_golden_schema.py -v
+
+# 3. Conformance tests
+echo "Step 3/7: Running conformance tests..."
+pytest tests/live/test_wire_conformance.py -v
+
+# 4. Performance benchmarks
+echo "Step 4/7: Running performance benchmarks..."
+python benchmarks/schema_performance.py
+
+# 5. Coverage check
+echo "Step 5/7: Checking coverage..."
+python tools/check_coverage.py
+
+# 6. Generate changelog
+echo "Step 6/7: Generating changelog..."
+python tools/generate_changelog.py
+
+# 7. Tag release
+echo "Step 7/7: Tagging release..."
+VERSION=$(python tools/get_version.py)
+git tag -a "v${VERSION}" -m "Release v${VERSION}"
+git push origin "v${VERSION}"
+
+echo "Release v${VERSION} complete!"
+```
 
 ---
 
@@ -3677,6 +5709,8 @@ def check_coverage():
 | New optional field | Unchanged | Minor bump (1.0.0 → 1.1.0) | Yes |
 | Required field change | Minor bump (v1.0 → v1.1) | Major bump (1.0.0 → 2.0.0) | No |
 | Wire format change | Major bump (v1.0 → v2.0) | Major bump (1.0.0 → 2.0.0) | No |
+| New operation | Unchanged | Minor bump (1.0.0 → 1.1.0) | Yes |
+| Deprecate operation | Minor bump (v1.0 → v1.1) | Major bump (1.0.0 → 2.0.0) | No |
 
 **Version Tolerance Validation:**
 ```python
@@ -3705,27 +5739,49 @@ def validate_with_version_tolerance(
     )
 ```
 
+**Schema Version Declaration:**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/llm/llm.envelope.request.json",
+  "title": "LLM Protocol Request Envelope",
+  "version": "1.0.0",
+  "type": "object",
+  "properties": {
+    "schemaVersion": {
+      "type": "string",
+      "const": "1.0.0",
+      "description": "Schema version for this envelope"
+    }
+  }
+}
+```
+
 ### 10.2 Breaking Change Process
 
 **Phase 1: Announcement (4 weeks before change)**
 - Add deprecation warnings to schemas
 - Update documentation with migration guide
 - Notify adapter maintainers
+- Create migration tooling
 
 **Phase 2: Dual Support (8 weeks)**
 - New schema version available
 - Both old and new versions accepted
 - Adapters can migrate at their own pace
+- Deprecation warnings in validation output
 
 **Phase 3: Deprecation (4 weeks)**
 - Old version marked as deprecated
 - Warnings in validation output
 - Strong recommendation to migrate
+- Migration tooling fully tested
 
 **Phase 4: Removal**
 - Old version removed from validation
 - Adapters must use new version
 - Breaking change complete
+- Update release notes
 
 **Migration Tooling:**
 ```python
@@ -3745,6 +5801,72 @@ class SchemaMigrator:
             del v2_envelope["args"]["prompt"]
         
         return v2_envelope
+    
+    @staticmethod
+    def migrate_vector_namespace_v1_to_v2(v1_args: dict) -> dict:
+        """Migrate vector namespace args from v1.0 to v2.0."""
+        v2_args = v1_args.copy()
+        
+        # Add distance_metric with default
+        if "distance_metric" not in v2_args:
+            v2_args["distance_metric"] = "cosine"
+        
+        return v2_args
+    
+    @staticmethod
+    def validate_and_migrate(
+        envelope: dict,
+        from_version: str,
+        to_version: str,
+        protocol: str
+    ) -> dict:
+        """Validate old version and migrate to new version."""
+        # Validate against old schema
+        old_schema_id = f"https://corpusos.com/schemas/{protocol}/{protocol}.envelope.request.v{from_version}.json"
+        assert_valid(old_schema_id, envelope)
+        
+        # Migrate
+        migrator_method = f"migrate_{protocol}_envelope_v{from_version}_to_v{to_version}"
+        migrator = getattr(SchemaMigrator, migrator_method)
+        migrated = migrator(envelope)
+        
+        # Validate against new schema
+        new_schema_id = f"https://corpusos.com/schemas/{protocol}/{protocol}.envelope.request.v{to_version}.json"
+        assert_valid(new_schema_id, migrated)
+        
+        return migrated
+```
+
+**Deprecation Warning System:**
+```python
+class DeprecationWarning:
+    """Track and report schema deprecation warnings."""
+    
+    def __init__(self, schema_id: str, deprecated_version: str, removal_version: str):
+        self.schema_id = schema_id
+        self.deprecated_version = deprecated_version
+        self.removal_version = removal_version
+        self.warning_count = 0
+    
+    def warn(self, context: str) -> None:
+        """Issue deprecation warning."""
+        self.warning_count += 1
+        warnings.warn(
+            f"Schema {self.schema_id} version {self.deprecated_version} is deprecated. "
+            f"It will be removed in version {self.removal_version}. "
+            f"Context: {context}",
+            DeprecationWarning,
+            stacklevel=2
+        )
+    
+    def get_stats(self) -> dict:
+        """Get deprecation statistics."""
+        return {
+            "schema_id": self.schema_id,
+            "deprecated_version": self.deprecated_version,
+            "removal_version": self.removal_version,
+            "warning_count": self.warning_count
+        }
 ```
 
 ### 10.3 Extension Patterns
@@ -3757,7 +5879,12 @@ class SchemaMigrator:
     "provider_specific": {
       "type": "object",
       "description": "Vendor-specific extensions",
-      "additionalProperties": true
+      "additionalProperties": true,
+      "patternProperties": {
+        "^x-[a-z0-9-]+$": {
+          "description": "Vendor extension fields must start with 'x-'"
+        }
+      }
     }
   },
   "additionalProperties": false
@@ -3776,6 +5903,10 @@ class SchemaMigrator:
         "feature_flag": {
           "type": "boolean",
           "description": "Enable experimental feature"
+        },
+        "beta_endpoint": {
+          "type": "string",
+          "description": "Beta feature endpoint"
         }
       },
       "additionalProperties": true
@@ -3799,11 +5930,57 @@ class CustomFormatValidator:
         """Validate ISO 8601 timestamp with milliseconds."""
         pattern = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$"
         return bool(re.match(pattern, timestamp))
+    
+    @classmethod
+    def validate_namespace_name(cls, namespace: str) -> bool:
+        """Validate namespace naming conventions."""
+        # Must be alphanumeric with hyphens, 1-63 characters
+        pattern = r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+        return bool(re.match(pattern, namespace))
 
 # Register custom validators
 jsonschema.Draft202012Validator.format_checker.checks(
     "vector-dimensions", raises=ValueError
 )(CustomFormatValidator.validate_vector_dimensions)
+
+jsonschema.Draft202012Validator.format_checker.checks(
+    "timestamp-iso8601-ms", raises=ValueError
+)(CustomFormatValidator.validate_timestamp_format)
+
+jsonschema.Draft202012Validator.format_checker.checks(
+    "namespace-name", raises=ValueError
+)(CustomFormatValidator.validate_namespace_name)
+```
+
+**Extension Points:**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/extensions/custom_metadata.json",
+  "title": "Custom Metadata Extension",
+  "type": "object",
+  "properties": {
+    "custom_metadata": {
+      "type": "object",
+      "properties": {
+        "tags": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "priority": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10
+        },
+        "annotations": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
 ```
 
 ---
@@ -3827,8 +6004,13 @@ https://corpusos.com/schemas/llm/llm.envelope.request.json
 https://corpusos.com/schemas/llm/llm.envelope.success.json
 https://corpusos.com/schemas/llm/llm.envelope.error.json
 https://corpusos.com/schemas/llm/llm.capabilities.json
+https://corpusos.com/schemas/llm/llm.capabilities.request.json
+https://corpusos.com/schemas/llm/llm.capabilities.success.json
 https://corpusos.com/schemas/llm/llm.types.message.json
 https://corpusos.com/schemas/llm/llm.types.completion.json
+https://corpusos.com/schemas/llm/llm.types.completion_spec.json
+https://corpusos.com/schemas/llm/llm.types.stream_spec.json
+https://corpusos.com/schemas/llm/llm.types.count_tokens_spec.json
 https://corpusos.com/schemas/llm/llm.types.token_usage.json
 https://corpusos.com/schemas/llm/llm.types.chunk.json
 https://corpusos.com/schemas/llm/llm.complete.request.json
@@ -3837,6 +6019,8 @@ https://corpusos.com/schemas/llm/llm.stream.request.json
 https://corpusos.com/schemas/llm/llm.stream.success.json
 https://corpusos.com/schemas/llm/llm.count_tokens.request.json
 https://corpusos.com/schemas/llm/llm.count_tokens.success.json
+https://corpusos.com/schemas/llm/llm.health.request.json
+https://corpusos.com/schemas/llm/llm.health.success.json
 ```
 
 **Vector Schema IDs:**
@@ -3845,14 +6029,28 @@ https://corpusos.com/schemas/vector/vector.envelope.request.json
 https://corpusos.com/schemas/vector/vector.envelope.success.json
 https://corpusos.com/schemas/vector/vector.envelope.error.json
 https://corpusos.com/schemas/vector/vector.capabilities.json
+https://corpusos.com/schemas/vector/vector.capabilities.request.json
+https://corpusos.com/schemas/vector/vector.capabilities.success.json
 https://corpusos.com/schemas/vector/vector.types.vector.json
 https://corpusos.com/schemas/vector/vector.types.vector_match.json
 https://corpusos.com/schemas/vector/vector.types.query_spec.json
 https://corpusos.com/schemas/vector/vector.types.query_result.json
+https://corpusos.com/schemas/vector/vector.types.namespace_spec.json
+https://corpusos.com/schemas/vector/vector.types.namespace_result.json
 https://corpusos.com/schemas/vector/vector.query.request.json
 https://corpusos.com/schemas/vector/vector.query.success.json
 https://corpusos.com/schemas/vector/vector.batch_query.request.json
 https://corpusos.com/schemas/vector/vector.batch_query.success.json
+https://corpusos.com/schemas/vector/vector.upsert.request.json
+https://corpusos.com/schemas/vector/vector.upsert.success.json
+https://corpusos.com/schemas/vector/vector.delete.request.json
+https://corpusos.com/schemas/vector/vector.delete.success.json
+https://corpusos.com/schemas/vector/vector.create_namespace.request.json
+https://corpusos.com/schemas/vector/vector.create_namespace.success.json
+https://corpusos.com/schemas/vector/vector.delete_namespace.request.json
+https://corpusos.com/schemas/vector/vector.delete_namespace.success.json
+https://corpusos.com/schemas/vector/vector.health.request.json
+https://corpusos.com/schemas/vector/vector.health.success.json
 ```
 
 **Embedding Schema IDs:**
@@ -3861,12 +6059,23 @@ https://corpusos.com/schemas/embedding/embedding.envelope.request.json
 https://corpusos.com/schemas/embedding/embedding.envelope.success.json
 https://corpusos.com/schemas/embedding/embedding.envelope.error.json
 https://corpusos.com/schemas/embedding/embedding.capabilities.json
+https://corpusos.com/schemas/embedding/embedding.capabilities.request.json
+https://corpusos.com/schemas/embedding/embedding.capabilities.success.json
+https://corpusos.com/schemas/embedding/embedding.types.embed_spec.json
+https://corpusos.com/schemas/embedding/embedding.types.stream_embed_spec.json
+https://corpusos.com/schemas/embedding/embedding.types.count_tokens_spec.json
 https://corpusos.com/schemas/embedding/embedding.embed.request.json
 https://corpusos.com/schemas/embedding/embedding.embed.success.json
+https://corpusos.com/schemas/embedding/embedding.embed_batch.request.json
+https://corpusos.com/schemas/embedding/embedding.embed_batch.success.json
 https://corpusos.com/schemas/embedding/embedding.stream_embed.request.json
 https://corpusos.com/schemas/embedding/embedding.stream_embed.success.json
 https://corpusos.com/schemas/embedding/embedding.count_tokens.request.json
 https://corpusos.com/schemas/embedding/embedding.count_tokens.success.json
+https://corpusos.com/schemas/embedding/embedding.health.request.json
+https://corpusos.com/schemas/embedding/embedding.health.success.json
+https://corpusos.com/schemas/embedding/embedding.get_stats.request.json
+https://corpusos.com/schemas/embedding/embedding.get_stats.success.json
 ```
 
 **Graph Schema IDs:**
@@ -3875,10 +6084,28 @@ https://corpusos.com/schemas/graph/graph.envelope.request.json
 https://corpusos.com/schemas/graph/graph.envelope.success.json
 https://corpusos.com/schemas/graph/graph.envelope.error.json
 https://corpusos.com/schemas/graph/graph.capabilities.json
+https://corpusos.com/schemas/graph/graph.capabilities.request.json
+https://corpusos.com/schemas/graph/graph.capabilities.success.json
 https://corpusos.com/schemas/graph/graph.query.request.json
 https://corpusos.com/schemas/graph/graph.query.success.json
 https://corpusos.com/schemas/graph/graph.stream_query.request.json
 https://corpusos.com/schemas/graph/graph.stream_query.success.json
+https://corpusos.com/schemas/graph/graph.upsert_nodes.request.json
+https://corpusos.com/schemas/graph/graph.upsert_nodes.success.json
+https://corpusos.com/schemas/graph/graph.upsert_edges.request.json
+https://corpusos.com/schemas/graph/graph.upsert_edges.success.json
+https://corpusos.com/schemas/graph/graph.delete_nodes.request.json
+https://corpusos.com/schemas/graph/graph.delete_nodes.success.json
+https://corpusos.com/schemas/graph/graph.delete_edges.request.json
+https://corpusos.com/schemas/graph/graph.delete_edges.success.json
+https://corpusos.com/schemas/graph/graph.bulk_vertices.request.json
+https://corpusos.com/schemas/graph/graph.bulk_vertices.success.json
+https://corpusos.com/schemas/graph/graph.batch.request.json
+https://corpusos.com/schemas/graph/graph.batch.success.json
+https://corpusos.com/schemas/graph/graph.get_schema.request.json
+https://corpusos.com/schemas/graph/graph.get_schema.success.json
+https://corpusos.com/schemas/graph/graph.health.request.json
+https://corpusos.com/schemas/graph/graph.health.success.json
 https://corpusos.com/schemas/graph/graph.transaction.request.json
 https://corpusos.com/schemas/graph/graph.transaction.success.json
 https://corpusos.com/schemas/graph/graph.traversal.request.json
@@ -3889,16 +6116,37 @@ https://corpusos.com/schemas/graph/graph.traversal.success.json
 
 | Operation | Request Schema | Success Schema |
 |-----------|----------------|----------------|
+| `llm.capabilities` | `llm.capabilities.request.json` | `llm.capabilities.success.json` |
 | `llm.complete` | `llm.complete.request.json` | `llm.complete.success.json` |
 | `llm.stream` | `llm.stream.request.json` | `llm.stream.success.json` (STREAMING) |
 | `llm.count_tokens` | `llm.count_tokens.request.json` | `llm.count_tokens.success.json` |
+| `llm.health` | `llm.health.request.json` | `llm.health.success.json` |
+| `vector.capabilities` | `vector.capabilities.request.json` | `vector.capabilities.success.json` |
 | `vector.query` | `vector.query.request.json` | `vector.query.success.json` |
 | `vector.batch_query` | `vector.batch_query.request.json` | `vector.batch_query.success.json` |
+| `vector.upsert` | `vector.upsert.request.json` | `vector.upsert.success.json` |
+| `vector.delete` | `vector.delete.request.json` | `vector.delete.success.json` |
+| `vector.create_namespace` | `vector.create_namespace.request.json` | `vector.create_namespace.success.json` |
+| `vector.delete_namespace` | `vector.delete_namespace.request.json` | `vector.delete_namespace.success.json` |
+| `vector.health` | `vector.health.request.json` | `vector.health.success.json` |
+| `embedding.capabilities` | `embedding.capabilities.request.json` | `embedding.capabilities.success.json` |
 | `embedding.embed` | `embedding.embed.request.json` | `embedding.embed.success.json` |
+| `embedding.embed_batch` | `embedding.embed_batch.request.json` | `embedding.embed_batch.success.json` |
 | `embedding.stream_embed` | `embedding.stream_embed.request.json` | `embedding.stream_embed.success.json` (STREAMING) |
 | `embedding.count_tokens` | `embedding.count_tokens.request.json` | `embedding.count_tokens.success.json` |
+| `embedding.health` | `embedding.health.request.json` | `embedding.health.success.json` |
+| `embedding.get_stats` | `embedding.get_stats.request.json` | `embedding.get_stats.success.json` |
+| `graph.capabilities` | `graph.capabilities.request.json` | `graph.capabilities.success.json` |
 | `graph.query` | `graph.query.request.json` | `graph.query.success.json` |
 | `graph.stream_query` | `graph.stream_query.request.json` | `graph.stream_query.success.json` (STREAMING) |
+| `graph.upsert_nodes` | `graph.upsert_nodes.request.json` | `graph.upsert_nodes.success.json` |
+| `graph.upsert_edges` | `graph.upsert_edges.request.json` | `graph.upsert_edges.success.json` |
+| `graph.delete_nodes` | `graph.delete_nodes.request.json` | `graph.delete_nodes.success.json` |
+| `graph.delete_edges` | `graph.delete_edges.request.json` | `graph.delete_edges.success.json` |
+| `graph.bulk_vertices` | `graph.bulk_vertices.request.json` | `graph.bulk_vertices.success.json` |
+| `graph.batch` | `graph.batch.request.json` | `graph.batch.success.json` |
+| `graph.get_schema` | `graph.get_schema.request.json` | `graph.get_schema.success.json` |
+| `graph.health` | `graph.health.request.json` | `graph.health.success.json` |
 | `graph.transaction` | `graph.transaction.request.json` | `graph.transaction.success.json` |
 | `graph.traversal` | `graph.traversal.request.json` | `graph.traversal.success.json` |
 
@@ -3931,6 +6179,8 @@ https://corpusos.com/schemas/graph/graph.traversal.success.json
 - `RESOURCE_EXHAUSTED` - Rate limit or quota exceeded
 - `DIMENSION_MISMATCH` - Vector dimension mismatch
 - `INDEX_NOT_READY` - Vector index not ready
+- `NAMESPACE_NOT_FOUND` - Specified namespace does not exist
+- `NAMESPACE_ALREADY_EXISTS` - Namespace creation conflict
 - `TRANSIENT_NETWORK` - Temporary network issue
 - `UNAVAILABLE` - Service unavailable
 - `NOT_SUPPORTED` - Requested feature not supported
@@ -3940,6 +6190,10 @@ https://corpusos.com/schemas/graph/graph.traversal.success.json
 - `BAD_REQUEST` - Invalid request parameters
 - `AUTH_ERROR` - Authentication or authorization failure
 - `RESOURCE_EXHAUSTED` - Rate limit or quota exceeded
+- `QUERY_SYNTAX_ERROR` - Invalid query syntax
+- `NODE_NOT_FOUND` - Specified node does not exist
+- `EDGE_NOT_FOUND` - Specified edge does not exist
+- `CONSTRAINT_VIOLATION` - Graph constraint violated
 - `TRANSIENT_NETWORK` - Temporary network issue
 - `UNAVAILABLE` - Service unavailable
 - `NOT_SUPPORTED` - Requested feature not supported
@@ -4107,6 +6361,16 @@ def test_schema_covers_edge_cases():
    - Verify no content after terminal frame
    - Ensure streaming envelopes use `code: "STREAMING"`
 
+6. **Request envelope validation fails**
+   - Verify `op`, `ctx`, and `args` are present
+   - Ensure `ctx` and `args` are objects (not strings or arrays)
+   - Check `op` matches expected operation name
+
+7. **Args validation fails**
+   - Verify required fields are present (e.g., `text` and `model` for embedding.embed)
+   - Check field types match schema (e.g., `messages` must be array for llm.complete)
+   - Ensure constraints are met (e.g., `stream` must be false for embedding.embed)
+
 **Debugging Commands:**
 ```bash
 # Debug schema loading
@@ -4120,7 +6384,13 @@ print('Schemas loaded successfully')
 python -m tests.utils.schema_registry llm.envelope.request.json problematic_request.json --verbose
 
 # Profile validation performance
-python -m cProfile -s cumtime tests/utils.schema_registry llm.envelope.request.json sample.json
+python -m cProfile -s cumtime tests/utils/schema_registry.py llm.envelope.request.json sample.json
+
+# Check schema for common issues
+python tools/lint_schema.py schemas/llm/llm.complete.request.json
+
+# Validate all golden fixtures
+pytest tests/schema/test_golden_schema.py -v --tb=short
 ```
 
 **Getting Help:**
@@ -4129,6 +6399,7 @@ python -m cProfile -s cumtime tests/utils.schema_registry llm.envelope.request.j
 3. **Enable verbose logging** - `CORPUS_LOG_LEVEL=DEBUG`
 4. **Review protocol spec** - Ensure alignment with PROTOCOLS.md
 5. **Consult error taxonomy** - See ERRORS.md for error semantics
+6. **Check base implementation** - Verify wire handler expectations match schema
 
 ---
 
