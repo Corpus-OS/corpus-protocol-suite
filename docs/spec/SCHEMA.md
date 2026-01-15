@@ -340,9 +340,10 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 
 ## 3. Core Schema Patterns
 
-### 3.1 Common Envelope Schema
+## 3.1 Common Envelope Schema
 
-**Canonical Request Envelope (`common/envelope.request.json`):**
+### Canonical Request Envelope (`common/envelope.request.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -352,24 +353,25 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "properties": {
     "op": {
       "type": "string",
-      "minLength": 1,
-      "description": "Operation identifier (e.g., 'llm.complete', 'vector.query')"
+      "description": "Operation identifier. The wire handler only enforces that this is a string; unknown ops are handled at runtime."
     },
     "ctx": {
       "$ref": "https://corpusos.com/schemas/common/operation_context.json",
-      "description": "Operation context including request_id, deadlines, tracing"
+      "description": "Operation context. REQUIRED on the wire; must be an object (mapping)."
     },
     "args": {
       "type": "object",
-      "description": "Operation-specific arguments (must be an object)"
+      "description": "Operation-specific arguments. REQUIRED on the wire; must be an object (mapping).",
+      "additionalProperties": true
     }
   },
   "required": ["op", "ctx", "args"],
-  "additionalProperties": false
+  "additionalProperties": true
 }
 ```
 
-**Canonical Success Envelope (`common/envelope.success.json`):**
+### Canonical Success Envelope (`common/envelope.success.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -377,14 +379,8 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "Protocol Success Envelope",
   "type": "object",
   "properties": {
-    "ok": {
-      "type": "boolean",
-      "const": true
-    },
-    "code": {
-      "type": "string",
-      "const": "OK"
-    },
+    "ok": { "type": "boolean", "const": true },
+    "code": { "type": "string", "const": "OK" },
     "ms": {
       "type": "number",
       "minimum": 0,
@@ -408,7 +404,8 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-**Canonical Error Envelope (`common/envelope.error.json`):**
+### Canonical Error Envelope (`common/envelope.error.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -416,10 +413,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "Protocol Error Envelope",
   "type": "object",
   "properties": {
-    "ok": {
-      "type": "boolean",
-      "const": false
-    },
+    "ok": { "type": "boolean", "const": false },
     "code": {
       "type": "string",
       "pattern": "^[A-Z_]+$",
@@ -440,7 +434,8 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     },
     "details": {
       "type": ["object", "null"],
-      "description": "Error-specific details"
+      "description": "Error-specific details",
+      "additionalProperties": true
     },
     "ms": {
       "type": "number",
@@ -448,12 +443,13 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
       "description": "Time spent before error in milliseconds"
     }
   },
-  "required": ["ok", "code", "error", "message", "ms"],
+  "required": ["ok", "code", "error", "message", "retry_after_ms", "details", "ms"],
   "additionalProperties": false
 }
 ```
 
-**Streaming Success Envelope (`common/envelope.stream.success.json`):**
+### Streaming Success Envelope (`common/envelope.stream.success.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -461,14 +457,8 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "Protocol Streaming Success Envelope",
   "type": "object",
   "properties": {
-    "ok": {
-      "type": "boolean",
-      "const": true
-    },
-    "code": {
-      "type": "string",
-      "const": "STREAMING"
-    },
+    "ok": { "type": "boolean", "const": true },
+    "code": { "type": "string", "const": "STREAMING" },
     "ms": {
       "type": "number",
       "minimum": 0,
@@ -482,10 +472,12 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "additionalProperties": false
 }
 ```
+---
 
-### 3.2 Operation Context Schema
+## 3.2 Operation Context Schema
 
-**Operation Context Type (`common/operation_context.json`):**
+### Operation Context Type (`common/operation_context.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -493,37 +485,17 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "Operation Context",
   "type": "object",
   "properties": {
-    "request_id": {
-      "type": "string",
-      "description": "Request correlation ID"
-    },
-    "idempotency_key": {
-      "type": "string",
-      "description": "Idempotency guarantee key"
-    },
-    "deadline_ms": {
-      "type": "integer",
-      "minimum": 1,
-      "description": "Absolute epoch milliseconds"
-    },
-    "traceparent": {
-      "type": "string",
-      "description": "W3C Trace Context header"
-    },
-    "tenant": {
-      "type": "string",
-      "description": "Tenant isolation identifier"
-    },
-    "attrs": {
-      "type": "object",
-      "default": {},
-      "additionalProperties": true,
-      "description": "Extension attributes"
-    }
+    "request_id": {},
+    "idempotency_key": {},
+    "deadline_ms": {},
+    "traceparent": {},
+    "tenant": {},
+    "attrs": {}
   },
   "additionalProperties": true
 }
 ```
+
 
 **Context Field Semantics:**
 
