@@ -1,9 +1,6 @@
-# adapter_sdk/vector_base.py
+# corpus_sdk/embedding/embedding_base.py
 # SPDX-License-Identifier: Apache-2.0
-
 """
-Adapter SDK — Vector Protocol V1.0
-
 Purpose
 -------
 A stable, vendor-neutral API for vector similarity search and operations — with
