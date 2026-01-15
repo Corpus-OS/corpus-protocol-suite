@@ -7,7 +7,7 @@
 > This document defines the schema architecture for the Corpus Protocol Suite. It establishes the normative JSON Schema definitions for all protocol operations, types, and wire formats while maintaining cross-protocol consistency and validation guarantees.
 
 > **Schema Precedence:** For field names, types, required/optional status, enums, and constraints, SCHEMA.md is normative.
-For operation semantics, lifecycle, and behavior, PROTOCOLS.md is normative..
+For operation semantics, lifecycle, and behavior, PROTOCOLS.md is normative.
 
 > **Schema Validation Convention:** All schemas use JSON Schema Draft 2020-12 with strict validation. Type definitions use `$defs` for reuse and `$id`-based resolution. Python, Go, etc. bindings are reference implementations.
 
@@ -32,7 +32,7 @@ For operation semantics, lifecycle, and behavior, PROTOCOLS.md is normative..
   - [4.3 Embedding Protocol Schemas](#43-embedding-protocol-schemas)
   - [4.4 Graph Protocol Schemas](#44-graph-protocol-schemas)
 - [5. Streaming Schemas](#5-streaming-schemas)
-  - [5.1 Stream Frame Schemas](#51-stream-frame-schemas)
+  - [5.1 Streaming Envelope Schema](#51-streaming-envelope-schema)
   - [5.2 NDJSON Schema](#52-ndjson-schema)
   - [5.3 Streaming Semantics](#53-streaming-semantics)
 - [6. Schema Validation Infrastructure](#6-schema-validation-infrastructure)
@@ -57,7 +57,7 @@ For operation semantics, lifecycle, and behavior, PROTOCOLS.md is normative..
   - [10.3 Extension Patterns](#103-extension-patterns)
 - [11. Reference](#11-reference)
   - [11.1 Schema Quick Reference](#111-schema-quick-reference)
-  - [11.2 Validation Error Codes](#112-validation-error-codes)
+  - [11.2 Error Taxonomies by Protocol](#112-error-taxonomies-by-protocol)
   - [11.3 Performance Benchmarks](#113-performance-benchmarks)
 - [12. Appendices](#12-appendices)
   - [12.A JSON Schema Draft 2020-12 Primer](#12a-json-schema-draft-2020-12-primer)
@@ -115,19 +115,17 @@ schemas/
 │   ├── envelope.request.json         # Canonical request envelope
 │   ├── envelope.success.json         # Canonical success envelope  
 │   ├── envelope.error.json           # Canonical error envelope
+│   ├── envelope.stream.success.json  # Streaming success envelope
 │   └── operation_context.json        # OperationContext type
 │
 ├── llm/                              # LLM protocol schemas
 │   ├── llm.envelope.request.json     # LLM-specific request envelope
 │   ├── llm.envelope.success.json     # LLM-specific success envelope
 │   ├── llm.envelope.error.json       # LLM-specific error envelope
+│   ├── llm.capabilities.json         # LLMCapabilities type
 │   ├── llm.response_format.json      # JSON/text output mode
 │   ├── llm.sampling.params.json      # Temperature/top_p etc.
 │   ├── llm.tools.schema.json         # Tool/tool_call definitions
-│   ├── llm.stream.frame.data.json    # Streaming data frame
-│   ├── llm.stream.frame.end.json     # Streaming end frame
-│   ├── llm.stream.frame.error.json   # Streaming error frame
-│   ├── llm.stream.frames.ndjson.schema.json  # NDJSON stream union
 │   ├── llm.types.chunk.json          # Streaming chunk type
 │   ├── llm.types.completion.json     # Completion result type
 │   ├── llm.types.logprobs.json       # Log probabilities type
@@ -140,10 +138,16 @@ schemas/
 │   ├── vector.envelope.request.json
 │   ├── vector.envelope.success.json
 │   ├── vector.envelope.error.json
+│   ├── vector.capabilities.json
+│   ├── vector.types.document.json
 │   ├── vector.types.failure_item.json
 │   ├── vector.types.filter.json
-│   ├── vector.types.partial_success_result.json
+│   ├── vector.types.namespace_result.json
+│   ├── vector.types.namespace_spec.json
 │   ├── vector.types.query_result.json
+│   ├── vector.types.query_spec.json
+│   ├── vector.types.upsert_result.json
+│   ├── vector.types.delete_result.json
 │   ├── vector.types.vector.json
 │   └── vector.types.vector_match.json
 │
@@ -151,7 +155,9 @@ schemas/
 │   ├── embedding.envelope.request.json
 │   ├── embedding.envelope.success.json
 │   ├── embedding.envelope.error.json
-│   ├── embedding.partial_success.result.json
+│   ├── embedding.capabilities.json
+│   ├── embedding.stats.json
+│   ├── embedding.types.chunk.json
 │   ├── embedding.types.failure.json
 │   ├── embedding.types.result.json
 │   ├── embedding.types.vector.json
@@ -161,15 +167,22 @@ schemas/
     ├── graph.envelope.request.json
     ├── graph.envelope.success.json
     ├── graph.envelope.error.json
-    ├── graph.stream.frame.data.json
-    ├── graph.stream.frame.end.json
-    ├── graph.stream.frame.error.json
-    ├── graph.stream.frames.ndjson.schema.json
+    ├── graph.capabilities.json
     ├── graph.types.batch_op.json
+    ├── graph.types.batch_result.json
+    ├── graph.types.bulk_vertices_spec.json
+    ├── graph.types.bulk_vertices_result.json
+    ├── graph.types.chunk.json
+    ├── graph.types.edge.json
     ├── graph.types.entity.json
+    ├── graph.types.graph_schema.json
+    ├── graph.types.health_result.json
     ├── graph.types.id.json
-    ├── graph.types.partial_success_result.json
-    ├── graph.types.row.json
+    ├── graph.types.node.json
+    ├── graph.types.query_spec.json
+    ├── graph.types.query_result.json
+    ├── graph.types.traversal_spec.json
+    ├── graph.types.traversal_result.json
     └── graph.types.warning.json
 ```
 
@@ -177,7 +190,6 @@ schemas/
 - **common/**: Schemas used across all protocols (envelopes, context)
 - **{protocol}/**: Protocol-specific schemas following naming pattern
 - **{protocol}/types/**: Reusable type definitions within protocol
-- **{protocol}/stream/**: Streaming-specific schemas
 
 ### 2.2 Schema Organization Principles
 
@@ -216,15 +228,14 @@ schemas/
 **File Naming Patterns:**
 - `{protocol}.{category}.{type}.json` for operational schemas
 - `{protocol}.types.{name}.json` for type definitions
-- `{protocol}.stream.frame.{type}.json` for streaming frames
-- `{protocol}.stream.frames.ndjson.schema.json` for NDJSON unions
+- `{protocol}.envelope.{type}.json` for envelope schemas
 
 **Examples:**
 ```
 llm.envelope.request.json              # LLM protocol request envelope
 vector.types.vector.json              # Vector type definition  
-graph.stream.frame.data.json          # Graph streaming data frame
-llm.stream.frames.ndjson.schema.json  # LLM NDJSON stream union
+graph.types.node.json                 # Graph node type definition
+llm.capabilities.json                 # LLM capabilities type
 ```
 
 **$id Naming Convention:**
@@ -252,7 +263,7 @@ https://corpusos.com/schemas/common/envelope.success.json
 
 ### 3.1 Common Envelope Schema
 
-**Canonical Request Envelope:**
+**Canonical Request Envelope (`common/envelope.request.json`):**
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -266,7 +277,9 @@ https://corpusos.com/schemas/common/envelope.success.json
       "description": "Protocol operation identifier"
     },
     "ctx": {
-      "$ref": "https://corpusos.com/schemas/common/operation_context.json"
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Operation context (forward compatible)"
     },
     "args": {
       "type": "object",
@@ -279,7 +292,7 @@ https://corpusos.com/schemas/common/envelope.success.json
 }
 ```
 
-**Canonical Success Envelope:**
+**Canonical Success Envelope (`common/envelope.success.json`):**
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -293,7 +306,7 @@ https://corpusos.com/schemas/common/envelope.success.json
     },
     "code": {
       "type": "string",
-      "enum": ["OK", "PARTIAL_SUCCESS", "ACCEPTED"]
+      "const": "OK"
     },
     "ms": {
       "type": "number",
@@ -311,7 +324,7 @@ https://corpusos.com/schemas/common/envelope.success.json
 }
 ```
 
-**Canonical Error Envelope:**
+**Canonical Error Envelope (`common/envelope.error.json`):**
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -337,13 +350,12 @@ https://corpusos.com/schemas/common/envelope.success.json
       "description": "Human-readable error message"
     },
     "retry_after_ms": {
-      "type": ["number", "null"],
+      "type": ["integer", "null"],
       "minimum": 0,
       "description": "Suggested retry delay in milliseconds"
     },
     "details": {
-      "type": "object",
-      "additionalProperties": true,
+      "type": ["object", "null"],
       "description": "Error-specific details"
     },
     "ms": {
@@ -357,9 +369,41 @@ https://corpusos.com/schemas/common/envelope.success.json
 }
 ```
 
+**Streaming Success Envelope (`common/envelope.stream.success.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/common/envelope.stream.success.json",
+  "title": "Protocol Streaming Success Envelope",
+  "type": "object",
+  "properties": {
+    "ok": {
+      "type": "boolean",
+      "const": true
+    },
+    "code": {
+      "type": "string",
+      "const": "STREAMING"
+    },
+    "ms": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Time elapsed in milliseconds"
+    },
+    "chunk": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Streaming chunk payload"
+    }
+  },
+  "required": ["ok", "code", "ms", "chunk"],
+  "additionalProperties": false
+}
+```
+
 ### 3.2 Operation Context Schema
 
-**Operation Context Type:**
+**Operation Context Type (`common/operation_context.json`):**
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -379,7 +423,7 @@ https://corpusos.com/schemas/common/envelope.success.json
       "maxLength": 256
     },
     "deadline_ms": {
-      "type": "number",
+      "type": "integer",
       "minimum": 1,
       "description": "Absolute epoch milliseconds"
     },
@@ -395,7 +439,7 @@ https://corpusos.com/schemas/common/envelope.success.json
     "attrs": {
       "type": "object",
       "additionalProperties": true,
-      "description": "Opaque extension attributes"
+      "description": "Opaque extension attributes (normalized to {} when omitted)"
     }
   },
   "additionalProperties": false
@@ -416,38 +460,6 @@ https://corpusos.com/schemas/common/envelope.success.json
 ### 3.3 Shared Type Schemas
 
 **Note:** While you have protocol-specific type schemas, common patterns emerge:
-
-**Partial Success Pattern (used across protocols):**
-```json
-{
-  "type": "object",
-  "properties": {
-    "processed_count": {
-      "type": "integer",
-      "minimum": 0
-    },
-    "failed_count": {
-      "type": "integer", 
-      "minimum": 0
-    },
-    "failures": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "properties": {
-          "id": { "type": "string" },
-          "index": { "type": "integer" },
-          "error": { "type": "string" },
-          "detail": { "type": "string" }
-        },
-        "additionalProperties": false
-      }
-    }
-  },
-  "required": ["processed_count", "failed_count", "failures"],
-  "additionalProperties": false
-}
-```
 
 **Filter Expression Pattern:**
 ```json
@@ -513,24 +525,61 @@ https://corpusos.com/schemas/common/envelope.success.json
   "title": "LLM Protocol Success Envelope",
   "type": "object",
   "allOf": [
-    { "$ref": "https://corpusos.com/schemas/common/envelope.success.json" },
-    {
-      "properties": {
-        "protocol": {
-          "type": "string",
-          "const": "llm/v1.0"
-        },
-        "component": {
-          "type": "string",
-          "const": "llm"
-        }
-      }
-    }
+    { "$ref": "https://corpusos.com/schemas/common/envelope.success.json" }
+  ]
+}
+```
+
+**LLM Error Envelope (`llm.envelope.error.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/llm/llm.envelope.error.json",
+  "title": "LLM Protocol Error Envelope",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/common/envelope.error.json" }
   ]
 }
 ```
 
 #### 4.1.2 Type Definitions
+
+**LLM Capabilities (`llm.capabilities.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/llm/llm.capabilities.json",
+  "title": "LLM Capabilities",
+  "type": "object",
+  "properties": {
+    "server": { "type": "string" },
+    "version": { "type": "string" },
+    "model_family": { "type": "string" },
+    "max_context_length": { "type": "integer", "minimum": 1 },
+    "protocol": { "type": "string", "const": "llm/v1.0" },
+    "supports_streaming": { "type": "boolean", "default": true },
+    "supports_roles": { "type": "boolean", "default": true },
+    "supports_json_output": { "type": "boolean", "default": false },
+    "supports_tools": { "type": "boolean", "default": false },
+    "supports_parallel_tool_calls": { "type": "boolean", "default": false },
+    "supports_tool_choice": { "type": "boolean", "default": false },
+    "max_tool_calls_per_turn": { "type": ["integer", "null"], "minimum": 0 },
+    "idempotent_writes": { "type": "boolean", "default": false },
+    "supports_multi_tenant": { "type": "boolean", "default": false },
+    "supports_system_message": { "type": "boolean", "default": true },
+    "supports_deadline": { "type": "boolean", "default": true },
+    "supports_count_tokens": { "type": "boolean", "default": true },
+    "supported_models": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": []
+    }
+  },
+  "required": ["server", "version", "model_family", "max_context_length"],
+  "additionalProperties": false
+}
+```
 
 **Message Type (`llm.types.message.json`):**
 ```json
@@ -542,7 +591,7 @@ https://corpusos.com/schemas/common/envelope.success.json
   "properties": {
     "role": {
       "type": "string",
-      "enum": ["system", "user", "assistant", "tool"]
+      "minLength": 1
     },
     "content": {
       "type": "string"
@@ -609,7 +658,7 @@ https://corpusos.com/schemas/common/envelope.success.json
       "description": "MUST equal prompt_tokens + completion_tokens"
     }
   },
-  "required": ["prompt_tokens", "total_tokens"],
+  "required": ["prompt_tokens", "completion_tokens", "total_tokens"],
   "additionalProperties": false
 }
 ```
@@ -630,15 +679,26 @@ https://corpusos.com/schemas/common/envelope.success.json
       "type": "string",
       "description": "Model identifier used"
     },
+    "model_family": {
+      "type": "string",
+      "description": "Logical model family"
+    },
     "usage": {
       "$ref": "https://corpusos.com/schemas/llm/llm.types.token_usage.json"
     },
     "finish_reason": {
       "type": "string",
       "description": "Reason generation stopped"
+    },
+    "tool_calls": {
+      "type": "array",
+      "items": {
+        "$ref": "https://corpusos.com/schemas/llm/llm.types.message.json#/$defs/ToolCall"
+      },
+      "default": []
     }
   },
-  "required": ["text", "model", "usage", "finish_reason"],
+  "required": ["text", "model", "model_family", "usage", "finish_reason"],
   "additionalProperties": false
 }
 ```
@@ -657,14 +717,25 @@ https://corpusos.com/schemas/common/envelope.success.json
     },
     "is_final": {
       "type": "boolean",
+      "default": false,
       "description": "True for final chunk"
     },
     "model": {
-      "type": "string",
+      "type": ["string", "null"],
       "description": "Optional model identifier"
     },
     "usage_so_far": {
-      "$ref": "https://corpusos.com/schemas/llm/llm.types.token_usage.json"
+      "type": ["object", "null"],
+      "properties": {
+        "$ref": "https://corpusos.com/schemas/llm/llm.types.token_usage.json"
+      }
+    },
+    "tool_calls": {
+      "type": "array",
+      "items": {
+        "$ref": "https://corpusos.com/schemas/llm/llm.types.message.json#/$defs/ToolCall"
+      },
+      "default": []
     }
   },
   "required": ["text", "is_final"],
@@ -765,64 +836,6 @@ https://corpusos.com/schemas/common/envelope.success.json
 }
 ```
 
-#### 4.1.4 Streaming Schemas
-
-**Stream Data Frame (`llm.stream.frame.data.json`):**
-```json
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://corpusos.com/schemas/llm/llm.stream.frame.data.json",
-  "title": "LLM Stream Data Frame",
-  "type": "object",
-  "properties": {
-    "event": {
-      "type": "string",
-      "const": "data"
-    },
-    "data": {
-      "$ref": "https://corpusos.com/schemas/llm/llm.types.chunk.json"
-    }
-  },
-  "required": ["event", "data"],
-  "additionalProperties": false
-}
-```
-
-**Stream End Frame (`llm.stream.frame.end.json`):**
-```json
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://corpusos.com/schemas/llm/llm.stream.frame.end.json",
-  "title": "LLM Stream End Frame",
-  "type": "object",
-  "properties": {
-    "event": {
-      "type": "string",
-      "const": "end"
-    },
-    "data": {
-      "$ref": "https://corpusos.com/schemas/llm/llm.types.completion.json"
-    }
-  },
-  "required": ["event", "data"],
-  "additionalProperties": false
-}
-```
-
-**NDJSON Stream Schema (`llm.stream.frames.ndjson.schema.json`):**
-```json
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://corpusos.com/schemas/llm/llm.stream.frames.ndjson.schema.json",
-  "title": "LLM NDJSON Stream Frames",
-  "oneOf": [
-    { "$ref": "https://corpusos.com/schemas/llm/llm.stream.frame.data.json" },
-    { "$ref": "https://corpusos.com/schemas/llm/llm.stream.frame.end.json" },
-    { "$ref": "https://corpusos.com/schemas/llm/llm.stream.frame.error.json" }
-  ]
-}
-```
-
 ### 4.2 Vector Protocol Schemas
 
 #### 4.2.1 Envelope Schemas
@@ -848,7 +861,73 @@ https://corpusos.com/schemas/common/envelope.success.json
 }
 ```
 
+**Vector Success Envelope (`vector.envelope.success.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/vector/vector.envelope.success.json",
+  "title": "Vector Protocol Success Envelope",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/common/envelope.success.json" }
+  ]
+}
+```
+
+**Vector Error Envelope (`vector.envelope.error.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/vector/vector.envelope.error.json",
+  "title": "Vector Protocol Error Envelope",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/common/envelope.error.json" }
+  ]
+}
+```
+
 #### 4.2.2 Type Definitions
+
+**Vector Capabilities (`vector.capabilities.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/vector/vector.capabilities.json",
+  "title": "Vector Capabilities",
+  "type": "object",
+  "properties": {
+    "server": { "type": "string" },
+    "version": { "type": "string" },
+    "protocol": { "type": "string", "const": "vector/v1.0" },
+    "max_dimensions": { "type": "integer", "minimum": 0 },
+    "supported_metrics": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": ["cosine", "euclidean", "dotproduct"]
+    },
+    "supports_namespaces": { "type": "boolean", "default": true },
+    "supports_metadata_filtering": { "type": "boolean", "default": true },
+    "supports_batch_operations": { "type": "boolean", "default": true },
+    "max_batch_size": { "type": ["integer", "null"], "minimum": 1 },
+    "supports_index_management": { "type": "boolean", "default": false },
+    "idempotent_writes": { "type": "boolean", "default": false },
+    "supports_multi_tenant": { "type": "boolean", "default": false },
+    "supports_deadline": { "type": "boolean", "default": true },
+    "max_top_k": { "type": ["integer", "null"], "minimum": 1 },
+    "max_filter_terms": { "type": ["integer", "null"], "minimum": 1 },
+    "text_storage_strategy": {
+      "type": "string",
+      "enum": ["metadata", "docstore", "none"],
+      "default": "metadata"
+    },
+    "max_text_length": { "type": ["integer", "null"], "minimum": 1 },
+    "supports_batch_queries": { "type": "boolean", "default": false }
+  },
+  "required": ["server", "version", "max_dimensions"],
+  "additionalProperties": false
+}
+```
 
 **Vector Type (`vector.types.vector.json`):**
 ```json
@@ -868,16 +947,37 @@ https://corpusos.com/schemas/common/envelope.success.json
       "minItems": 1
     },
     "metadata": {
-      "type": "object",
-      "additionalProperties": {
-        "type": ["string", "number", "boolean", "null", "array"]
-      }
+      "type": ["object", "null"],
+      "additionalProperties": true
     },
     "namespace": {
+      "type": "string"
+    },
+    "text": {
       "type": "string"
     }
   },
   "required": ["id", "vector"],
+  "additionalProperties": false
+}
+```
+
+**Document Type (`vector.types.document.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/vector/vector.types.document.json",
+  "title": "Document",
+  "type": "object",
+  "properties": {
+    "id": { "type": "string", "minLength": 1 },
+    "text": { "type": "string" },
+    "metadata": {
+      "type": ["object", "null"],
+      "additionalProperties": true
+    }
+  },
+  "required": ["id", "text"],
   "additionalProperties": false
 }
 ```
@@ -908,6 +1008,45 @@ https://corpusos.com/schemas/common/envelope.success.json
 }
 ```
 
+**Query Specification (`vector.types.query_spec.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/vector/vector.types.query_spec.json",
+  "title": "Vector Query Specification",
+  "type": "object",
+  "properties": {
+    "vector": {
+      "type": "array",
+      "items": { "type": "number" },
+      "minItems": 1
+    },
+    "top_k": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "namespace": {
+      "type": "string",
+      "default": "default"
+    },
+    "filter": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "include_metadata": {
+      "type": "boolean",
+      "default": true
+    },
+    "include_vectors": {
+      "type": "boolean",
+      "default": false
+    }
+  },
+  "required": ["vector", "top_k"],
+  "additionalProperties": false
+}
+```
+
 **Query Result (`vector.types.query_result.json`):**
 ```json
 {
@@ -934,7 +1073,105 @@ https://corpusos.com/schemas/common/envelope.success.json
       "minimum": 0
     }
   },
-  "required": ["matches", "namespace", "total_matches"],
+  "required": ["matches", "query_vector", "namespace", "total_matches"],
+  "additionalProperties": false
+}
+```
+
+**Namespace Specification (`vector.types.namespace_spec.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/vector/vector.types.namespace_spec.json",
+  "title": "Namespace Specification",
+  "type": "object",
+  "properties": {
+    "namespace": { "type": "string", "minLength": 1 },
+    "dimensions": { "type": "integer", "minimum": 1 },
+    "distance_metric": {
+      "type": "string",
+      "enum": ["cosine", "euclidean", "dotproduct"]
+    }
+  },
+  "required": ["namespace", "dimensions"],
+  "additionalProperties": false
+}
+```
+
+**Namespace Result (`vector.types.namespace_result.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/vector/vector.types.namespace_result.json",
+  "title": "Namespace Result",
+  "type": "object",
+  "properties": {
+    "success": { "type": "boolean" },
+    "namespace": { "type": "string" },
+    "details": { "type": "string" }
+  },
+  "required": ["success", "namespace"],
+  "additionalProperties": false
+}
+```
+
+**Upsert Result (`vector.types.upsert_result.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/vector/vector.types.upsert_result.json",
+  "title": "Vector Upsert Result",
+  "type": "object",
+  "properties": {
+    "upserted_count": { "type": "integer", "minimum": 0 },
+    "failed_count": { "type": "integer", "minimum": 0 },
+    "failures": {
+      "type": "array",
+      "items": {
+        "$ref": "https://corpusos.com/schemas/vector/vector.types.failure_item.json"
+      }
+    }
+  },
+  "required": ["upserted_count", "failed_count", "failures"],
+  "additionalProperties": false
+}
+```
+
+**Delete Result (`vector.types.delete_result.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/vector/vector.types.delete_result.json",
+  "title": "Vector Delete Result",
+  "type": "object",
+  "properties": {
+    "deleted_count": { "type": "integer", "minimum": 0 },
+    "failed_count": { "type": "integer", "minimum": 0 },
+    "failures": {
+      "type": "array",
+      "items": {
+        "$ref": "https://corpusos.com/schemas/vector/vector.types.failure_item.json"
+      }
+    }
+  },
+  "required": ["deleted_count", "failed_count", "failures"],
+  "additionalProperties": false
+}
+```
+
+**Failure Item (`vector.types.failure_item.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/vector/vector.types.failure_item.json",
+  "title": "Vector Failure Item",
+  "type": "object",
+  "properties": {
+    "id": { "type": "string" },
+    "error": { "type": "string" },
+    "detail": { "type": "string" }
+  },
+  "required": ["error", "detail"],
   "additionalProperties": false
 }
 ```
@@ -969,45 +1206,6 @@ https://corpusos.com/schemas/common/envelope.success.json
 }
 ```
 
-**Partial Success Result (`vector.types.partial_success_result.json`):**
-```json
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://corpusos.com/schemas/vector/vector.types.partial_success_result.json",
-  "title": "Vector Partial Success Result",
-  "type": "object",
-  "properties": {
-    "processed_count": { "type": "integer", "minimum": 0 },
-    "failed_count": { "type": "integer", "minimum": 0 },
-    "failures": {
-      "type": "array",
-      "items": {
-        "$ref": "https://corpusos.com/schemas/vector/vector.types.failure_item.json"
-      }
-    }
-  },
-  "required": ["processed_count", "failed_count", "failures"],
-  "additionalProperties": false
-}
-```
-
-**Failure Item (`vector.types.failure_item.json`):**
-```json
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://corpusos.com/schemas/vector/vector.types.failure_item.json",
-  "title": "Vector Failure Item",
-  "type": "object",
-  "properties": {
-    "id": { "type": "string" },
-    "error": { "type": "string" },
-    "detail": { "type": "string" }
-  },
-  "required": ["error", "detail"],
-  "additionalProperties": false
-}
-```
-
 ### 4.3 Embedding Protocol Schemas
 
 #### 4.3.1 Envelope Schemas
@@ -1033,7 +1231,97 @@ https://corpusos.com/schemas/common/envelope.success.json
 }
 ```
 
+**Embedding Success Envelope (`embedding.envelope.success.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.envelope.success.json",
+  "title": "Embedding Protocol Success Envelope",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/common/envelope.success.json" }
+  ]
+}
+```
+
+**Embedding Error Envelope (`embedding.envelope.error.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.envelope.error.json",
+  "title": "Embedding Protocol Error Envelope",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/common/envelope.error.json" }
+  ]
+}
+```
+
 #### 4.3.2 Type Definitions
+
+**Embedding Capabilities (`embedding.capabilities.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.capabilities.json",
+  "title": "Embedding Capabilities",
+  "type": "object",
+  "properties": {
+    "server": { "type": "string" },
+    "version": { "type": "string" },
+    "protocol": { "type": "string", "const": "embedding/v1.0" },
+    "supported_models": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "max_batch_size": { "type": ["integer", "null"], "minimum": 1 },
+    "max_text_length": { "type": ["integer", "null"], "minimum": 1 },
+    "max_dimensions": { "type": ["integer", "null"], "minimum": 1 },
+    "supports_normalization": { "type": "boolean", "default": false },
+    "supports_truncation": { "type": "boolean", "default": false },
+    "supports_token_counting": { "type": "boolean", "default": true },
+    "supports_streaming": { "type": "boolean", "default": false },
+    "supports_batch_embedding": { "type": "boolean", "default": true },
+    "supports_caching": { "type": "boolean", "default": false },
+    "idempotent_writes": { "type": "boolean", "default": false },
+    "supports_multi_tenant": { "type": "boolean", "default": false },
+    "normalizes_at_source": { "type": "boolean", "default": false },
+    "truncation_mode": {
+      "type": "string",
+      "enum": ["base", "adapter"],
+      "default": "base"
+    },
+    "supports_deadline": { "type": "boolean", "default": true }
+  },
+  "required": ["server", "version"],
+  "additionalProperties": false
+}
+```
+
+**Embedding Stats (`embedding.stats.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.stats.json",
+  "title": "Embedding Statistics",
+  "type": "object",
+  "properties": {
+    "total_requests": { "type": "integer", "minimum": 0 },
+    "total_texts": { "type": "integer", "minimum": 0 },
+    "total_tokens": { "type": "integer", "minimum": 0 },
+    "cache_hits": { "type": "integer", "minimum": 0 },
+    "cache_misses": { "type": "integer", "minimum": 0 },
+    "avg_processing_time_ms": { "type": "number", "minimum": 0 },
+    "error_count": { "type": "integer", "minimum": 0 },
+    "stream_requests": { "type": "integer", "minimum": 0 },
+    "stream_chunks_generated": { "type": "integer", "minimum": 0 },
+    "stream_abandoned": { "type": "integer", "minimum": 0 }
+  },
+  "required": ["total_requests", "total_texts", "total_tokens"],
+  "additionalProperties": false
+}
+```
 
 **Embedding Vector (`embedding.types.vector.json`):**
 ```json
@@ -1059,6 +1347,15 @@ https://corpusos.com/schemas/common/envelope.success.json
     "dimensions": {
       "type": "integer",
       "minimum": 1
+    },
+    "index": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "Index in original batch"
+    },
+    "metadata": {
+      "type": ["object", "null"],
+      "additionalProperties": true
     }
   },
   "required": ["vector", "text", "model", "dimensions"],
@@ -1079,20 +1376,26 @@ https://corpusos.com/schemas/common/envelope.success.json
     },
     "model": { "type": "string" },
     "text": { "type": "string" },
-    "tokens_used": { "type": "integer", "minimum": 0 },
-    "truncated": { "type": "boolean" }
+    "tokens_used": {
+      "type": ["integer", "null"],
+      "minimum": 0
+    },
+    "truncated": {
+      "type": "boolean",
+      "default": false
+    }
   },
   "required": ["embedding", "model", "text"],
   "additionalProperties": false
 }
 ```
 
-**Partial Success Result (`embedding.partial_success.result.json`):**
+**Embedding Chunk (`embedding.types.chunk.json`):**
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://corpusos.com/schemas/embedding/embedding.partial_success.result.json",
-  "title": "Embedding Partial Success Result",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.types.chunk.json",
+  "title": "Embedding Streaming Chunk",
   "type": "object",
   "properties": {
     "embeddings": {
@@ -1101,17 +1404,20 @@ https://corpusos.com/schemas/common/envelope.success.json
         "$ref": "https://corpusos.com/schemas/embedding/embedding.types.vector.json"
       }
     },
-    "model": { "type": "string" },
-    "total_texts": { "type": "integer", "minimum": 0 },
-    "total_tokens": { "type": "integer", "minimum": 0 },
-    "failed_texts": {
-      "type": "array",
-      "items": {
-        "$ref": "https://corpusos.com/schemas/embedding/embedding.types.failure.json"
-      }
+    "is_final": {
+      "type": "boolean",
+      "default": false,
+      "description": "True for final chunk"
+    },
+    "usage": {
+      "type": ["object", "null"],
+      "additionalProperties": true
+    },
+    "model": {
+      "type": ["string", "null"]
     }
   },
-  "required": ["embeddings", "model", "total_texts"],
+  "required": ["embeddings", "is_final"],
   "additionalProperties": false
 }
 ```
@@ -1131,9 +1437,44 @@ https://corpusos.com/schemas/common/envelope.success.json
     },
     "text": { "type": "string" },
     "error": { "type": "string" },
-    "message": { "type": "string" }
+    "code": { "type": "string" },
+    "message": { "type": "string" },
+    "metadata": {
+      "type": ["object", "null"],
+      "additionalProperties": true
+    }
   },
-  "required": ["index", "text", "error", "message"],
+  "required": ["index", "text", "error", "code", "message"],
+  "additionalProperties": false
+}
+```
+
+**Batch Embed Result (`embedding.types.batch_result.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.types.batch_result.json",
+  "title": "Batch Embedding Result",
+  "type": "object",
+  "properties": {
+    "embeddings": {
+      "type": "array",
+      "items": {
+        "$ref": "https://corpusos.com/schemas/embedding/embedding.types.vector.json"
+      }
+    },
+    "model": { "type": "string" },
+    "total_texts": { "type": "integer", "minimum": 0 },
+    "total_tokens": { "type": ["integer", "null"], "minimum": 0 },
+    "failed_texts": {
+      "type": "array",
+      "items": {
+        "$ref": "https://corpusos.com/schemas/embedding/embedding.types.failure.json"
+      },
+      "default": []
+    }
+  },
+  "required": ["embeddings", "model", "total_texts"],
   "additionalProperties": false
 }
 ```
@@ -1163,7 +1504,154 @@ https://corpusos.com/schemas/common/envelope.success.json
 }
 ```
 
+**Graph Success Envelope (`graph.envelope.success.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.envelope.success.json",
+  "title": "Graph Protocol Success Envelope",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/common/envelope.success.json" }
+  ]
+}
+```
+
+**Graph Error Envelope (`graph.envelope.error.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.envelope.error.json",
+  "title": "Graph Protocol Error Envelope",
+  "type": "object",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/common/envelope.error.json" }
+  ]
+}
+```
+
 #### 4.4.2 Type Definitions
+
+**Graph Capabilities (`graph.capabilities.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.capabilities.json",
+  "title": "Graph Capabilities",
+  "type": "object",
+  "properties": {
+    "server": { "type": "string" },
+    "version": { "type": "string" },
+    "protocol": { "type": "string", "const": "graph/v1.0" },
+    "supports_stream_query": { "type": "boolean", "default": false },
+    "supported_query_dialects": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "supports_namespaces": { "type": "boolean", "default": true },
+    "supports_property_filters": { "type": "boolean", "default": true },
+    "supports_bulk_vertices": { "type": "boolean", "default": false },
+    "supports_batch": { "type": "boolean", "default": false },
+    "supports_schema": { "type": "boolean", "default": false },
+    "idempotent_writes": { "type": "boolean", "default": false },
+    "supports_multi_tenant": { "type": "boolean", "default": false },
+    "supports_deadline": { "type": "boolean", "default": true },
+    "max_batch_ops": { "type": ["integer", "null"], "minimum": 1 },
+    "supports_transaction": { "type": "boolean", "default": false },
+    "supports_traversal": { "type": "boolean", "default": false },
+    "max_traversal_depth": { "type": ["integer", "null"], "minimum": 1 },
+    "supports_path_queries": { "type": "boolean", "default": false }
+  },
+  "required": ["server", "version"],
+  "additionalProperties": false
+}
+```
+
+**Node Type (`graph.types.node.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.types.node.json",
+  "title": "Graph Node",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "labels": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "properties": {
+      "type": "object",
+      "additionalProperties": true,
+      "default": {}
+    },
+    "namespace": {
+      "type": "string"
+    },
+    "created_at": {
+      "type": ["integer", "null"],
+      "minimum": 0
+    },
+    "updated_at": {
+      "type": ["integer", "null"],
+      "minimum": 0
+    }
+  },
+  "required": ["id", "properties"],
+  "additionalProperties": false
+}
+```
+
+**Edge Type (`graph.types.edge.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.types.edge.json",
+  "title": "Graph Edge",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "src": {
+      "type": "string",
+      "minLength": 1
+    },
+    "dst": {
+      "type": "string",
+      "minLength": 1
+    },
+    "label": {
+      "type": "string",
+      "minLength": 1
+    },
+    "properties": {
+      "type": "object",
+      "additionalProperties": true,
+      "default": {}
+    },
+    "namespace": {
+      "type": "string"
+    },
+    "created_at": {
+      "type": ["integer", "null"],
+      "minimum": 0
+    },
+    "updated_at": {
+      "type": ["integer", "null"],
+      "minimum": 0
+    }
+  },
+  "required": ["id", "src", "dst", "label", "properties"],
+  "additionalProperties": false
+}
+```
 
 **Entity Type (`graph.types.entity.json`):**
 ```json
@@ -1173,40 +1661,107 @@ https://corpusos.com/schemas/common/envelope.success.json
   "title": "Graph Entity",
   "type": "object",
   "oneOf": [
-    {
-      "type": "object",
-      "properties": {
-        "id": { "type": "string" },
-        "labels": {
-          "type": "array",
-          "items": { "type": "string" }
-        },
-        "properties": {
-          "type": "object",
-          "additionalProperties": true
-        },
-        "namespace": { "type": "string" }
-      },
-      "required": ["id", "labels", "properties"],
-      "additionalProperties": false
-    },
-    {
-      "type": "object",
-      "properties": {
-        "id": { "type": "string" },
-        "src": { "type": "string" },
-        "dst": { "type": "string" },
-        "label": { "type": "string" },
-        "properties": {
-          "type": "object",
-          "additionalProperties": true
-        },
-        "namespace": { "type": "string" }
-      },
-      "required": ["id", "src", "dst", "label", "properties"],
-      "additionalProperties": false
-    }
+    { "$ref": "https://corpusos.com/schemas/graph/graph.types.node.json" },
+    { "$ref": "https://corpusos.com/schemas/graph/graph.types.edge.json" }
   ]
+}
+```
+
+**Query Specification (`graph.types.query_spec.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.types.query_spec.json",
+  "title": "Graph Query Specification",
+  "type": "object",
+  "properties": {
+    "text": {
+      "type": "string",
+      "minLength": 1
+    },
+    "dialect": {
+      "type": "string"
+    },
+    "params": {
+      "type": "object",
+      "additionalProperties": true,
+      "default": {}
+    },
+    "namespace": {
+      "type": "string"
+    },
+    "timeout_ms": {
+      "type": ["integer", "null"],
+      "minimum": 1
+    },
+    "stream": {
+      "type": "boolean",
+      "default": false
+    }
+  },
+  "required": ["text"],
+  "additionalProperties": false
+}
+```
+
+**Query Result (`graph.types.query_result.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.types.query_result.json",
+  "title": "Graph Query Result",
+  "type": "object",
+  "properties": {
+    "records": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "dialect": {
+      "type": "string"
+    },
+    "namespace": {
+      "type": "string"
+    }
+  },
+  "required": ["records", "summary"],
+  "additionalProperties": false
+}
+```
+
+**Query Chunk (`graph.types.chunk.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.types.chunk.json",
+  "title": "Graph Streaming Chunk",
+  "type": "object",
+  "properties": {
+    "records": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    "is_final": {
+      "type": "boolean",
+      "default": false,
+      "description": "True for final chunk"
+    },
+    "summary": {
+      "type": ["object", "null"],
+      "additionalProperties": true
+    }
+  },
+  "required": ["records", "is_final"],
+  "additionalProperties": false
 }
 ```
 
@@ -1218,25 +1773,9 @@ https://corpusos.com/schemas/common/envelope.success.json
   "title": "Graph ID Value",
   "type": "object",
   "properties": {
-    "id": { "type": "string" }
+    "id": { "type": "string", "minLength": 1 }
   },
   "required": ["id"],
-  "additionalProperties": false
-}
-```
-
-**Row Type (`graph.types.row.json`):**
-```json
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://corpusos.com/schemas/graph/graph.types.row.json",
-  "title": "Graph Query Row",
-  "type": "object",
-  "patternProperties": {
-    "^.*$": {
-      "type": ["string", "number", "boolean", "null", "object", "array"]
-    }
-  },
   "additionalProperties": false
 }
 ```
@@ -1249,7 +1788,7 @@ https://corpusos.com/schemas/common/envelope.success.json
   "title": "Graph Batch Operation",
   "type": "object",
   "properties": {
-    "op": { "type": "string" },
+    "op": { "type": "string", "minLength": 1 },
     "args": { "type": "object", "additionalProperties": true }
   },
   "required": ["op", "args"],
@@ -1257,87 +1796,205 @@ https://corpusos.com/schemas/common/envelope.success.json
 }
 ```
 
-**Partial Success Result (`graph.types.partial_success_result.json`):**
+**Batch Result (`graph.types.batch_result.json`):**
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://corpusos.com/schemas/graph/graph.types.partial_success_result.json",
-  "title": "Graph Partial Success Result",
+  "$id": "https://corpusos.com/schemas/graph/graph.types.batch_result.json",
+  "title": "Graph Batch Result",
   "type": "object",
   "properties": {
-    "processed_count": { "type": "integer", "minimum": 0 },
-    "failed_count": { "type": "integer", "minimum": 0 },
-    "failures": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "properties": {
-          "id": { "type": "string" },
-          "index": { "type": "integer" },
-          "error": { "type": "string" },
-          "detail": { "type": "string" }
-        },
-        "additionalProperties": false
-      }
-    },
     "results": {
       "type": "array",
       "items": { "type": "object", "additionalProperties": true }
-    }
+    },
+    "success": { "type": "boolean" },
+    "error": { "type": ["string", "null"] },
+    "transaction_id": { "type": ["string", "null"] }
   },
-  "required": ["processed_count", "failed_count", "failures"],
+  "required": ["results", "success"],
   "additionalProperties": false
 }
 ```
 
-#### 4.4.3 Streaming Schemas
-
-**Stream Data Frame (`graph.stream.frame.data.json`):**
+**Bulk Vertices Specification (`graph.types.bulk_vertices_spec.json`):**
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://corpusos.com/schemas/graph/graph.stream.frame.data.json",
-  "title": "Graph Stream Data Frame",
+  "$id": "https://corpusos.com/schemas/graph/graph.types.bulk_vertices_spec.json",
+  "title": "Bulk Vertices Specification",
   "type": "object",
   "properties": {
-    "event": {
-      "type": "string",
-      "const": "data"
-    },
-    "data": {
-      "type": "object",
-      "properties": {
-        "records": {
-          "type": "array",
-          "items": {
-            "$ref": "https://corpusos.com/schemas/graph/graph.types.row.json"
-          }
-        },
-        "is_final": {
-          "type": "boolean",
-          "description": "True for final chunk"
-        }
-      },
-      "required": ["records", "is_final"],
-      "additionalProperties": false
+    "namespace": { "type": "string" },
+    "limit": { "type": "integer", "minimum": 1, "default": 100 },
+    "cursor": { "type": ["string", "null"] },
+    "filter": {
+      "type": ["object", "null"],
+      "additionalProperties": true
     }
   },
-  "required": ["event", "data"],
   "additionalProperties": false
 }
 ```
 
-**NDJSON Stream Schema (`graph.stream.frames.ndjson.schema.json`):**
+**Bulk Vertices Result (`graph.types.bulk_vertices_result.json`):**
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://corpusos.com/schemas/graph/graph.stream.frames.ndjson.schema.json",
-  "title": "Graph NDJSON Stream Frames",
-  "oneOf": [
-    { "$ref": "https://corpusos.com/schemas/graph/graph.stream.frame.data.json" },
-    { "$ref": "https://corpusos.com/schemas/graph/graph.stream.frame.end.json" },
-    { "$ref": "https://corpusos.com/schemas/graph/graph.stream.frame.error.json" }
-  ]
+  "$id": "https://corpusos.com/schemas/graph/graph.types.bulk_vertices_result.json",
+  "title": "Bulk Vertices Result",
+  "type": "object",
+  "properties": {
+    "nodes": {
+      "type": "array",
+      "items": {
+        "$ref": "https://corpusos.com/schemas/graph/graph.types.node.json"
+      }
+    },
+    "next_cursor": { "type": ["string", "null"] },
+    "has_more": { "type": "boolean" }
+  },
+  "required": ["nodes", "has_more"],
+  "additionalProperties": false
+}
+```
+
+**Graph Schema (`graph.types.graph_schema.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.types.graph_schema.json",
+  "title": "Graph Schema",
+  "type": "object",
+  "properties": {
+    "nodes": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "edges": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  },
+  "required": ["nodes", "edges"],
+  "additionalProperties": false
+}
+```
+
+**Health Result (`graph.types.health_result.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.types.health_result.json",
+  "title": "Graph Health Result",
+  "type": "object",
+  "properties": {
+    "ok": { "type": "boolean" },
+    "status": { "type": "string" },
+    "server": { "type": "string" },
+    "version": { "type": "string" },
+    "namespaces": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "read_only": { "type": "boolean", "default": false },
+    "degraded": { "type": "boolean", "default": false }
+  },
+  "required": ["ok", "status", "server", "version"],
+  "additionalProperties": false
+}
+```
+
+**Traversal Specification (`graph.types.traversal_spec.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.types.traversal_spec.json",
+  "title": "Graph Traversal Specification",
+  "type": "object",
+  "properties": {
+    "start_nodes": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "minItems": 1
+    },
+    "max_depth": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "direction": {
+      "type": "string",
+      "enum": ["OUTGOING", "INCOMING", "BOTH"]
+    },
+    "relationship_types": {
+      "type": ["array", "null"],
+      "items": { "type": "string" }
+    },
+    "node_filters": {
+      "type": ["object", "null"],
+      "additionalProperties": true
+    },
+    "relationship_filters": {
+      "type": ["object", "null"],
+      "additionalProperties": true
+    },
+    "return_properties": {
+      "type": ["array", "null"],
+      "items": { "type": "string" }
+    },
+    "namespace": {
+      "type": ["string", "null"]
+    }
+  },
+  "required": ["start_nodes", "max_depth", "direction"],
+  "additionalProperties": false
+}
+```
+
+**Traversal Result (`graph.types.traversal_result.json`):**
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.types.traversal_result.json",
+  "title": "Graph Traversal Result",
+  "type": "object",
+  "properties": {
+    "nodes": {
+      "type": "array",
+      "items": {
+        "$ref": "https://corpusos.com/schemas/graph/graph.types.node.json"
+      }
+    },
+    "relationships": {
+      "type": "array",
+      "items": {
+        "$ref": "https://corpusos.com/schemas/graph/graph.types.edge.json"
+      }
+    },
+    "paths": {
+      "type": "array",
+      "items": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "namespace": {
+      "type": ["string", "null"]
+    }
+  },
+  "required": ["nodes", "relationships", "paths", "summary"],
+  "additionalProperties": false
 }
 ```
 
@@ -1345,15 +2002,14 @@ https://corpusos.com/schemas/common/envelope.success.json
 
 ## 5. Streaming Schemas
 
-### 5.1 Stream Frame Schemas
+### 5.1 Streaming Envelope Schema
 
-**Protocol Stream Envelope Pattern:**
-All streaming operations use the protocol envelope format with a `chunk` field instead of `result`:
+**Streaming Model:** All streaming operations use the common streaming success envelope pattern:
 
 ```json
 {
   "ok": true,
-  "code": "OK",
+  "code": "STREAMING",
   "ms": 45.2,
   "chunk": {
     "text": "Hello world",
@@ -1363,158 +2019,95 @@ All streaming operations use the protocol envelope format with a `chunk` field i
 }
 ```
 
-**Stream Frame Structure:**
-Each protocol defines its own chunk format, but all follow this pattern:
+**Protocol Streaming Envelopes:**
 
+- **LLM Streaming**: `{ok:true, code:"STREAMING", ms:number, chunk:<llm.types.chunk>}`
+- **Graph Streaming**: `{ok:true, code:"STREAMING", ms:number, chunk:<graph.types.chunk>}`
+- **Embedding Streaming**: `{ok:true, code:"STREAMING", ms:number, chunk:<embedding.types.chunk>}`
+
+**Error Termination:** Streams terminate with a standard error envelope (not a special streaming error):
 ```json
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://corpusos.com/schemas/llm/llm.stream.frame.data.json",
-  "title": "LLM Stream Data Frame",
-  "type": "object",
-  "properties": {
-    "event": {
-      "type": "string",
-      "const": "data",
-      "description": "Discriminator for frame type"
-    },
-    "data": {
-      "$ref": "https://corpusos.com/schemas/llm/llm.types.chunk.json",
-      "description": "Protocol-specific chunk data"
-    }
-  },
-  "required": ["event", "data"],
-  "additionalProperties": false
+  "ok": false,
+  "code": "TRANSIENT_NETWORK",
+  "error": "TransientNetworkError",
+  "message": "Connection lost",
+  "ms": 123.4
 }
 ```
-
-**Frame Types Per Protocol:**
-
-| Protocol | Frame Types | Description |
-|----------|-------------|-------------|
-| **LLM** | `data`, `end`, `error` | Text streaming with completion metadata |
-| **Graph** | `data`, `end`, `error` | Query result streaming with records |
-| **Vector** | Not yet defined | Future streaming support |
-| **Embedding** | Not yet defined | Future batch streaming support |
 
 ### 5.2 NDJSON Schema
 
 **NDJSON Stream Validation:**
-Streams are delivered as NDJSON (Newline-Delimited JSON) where each line is a protocol envelope:
-
-```json
-{"ok": true, "code": "OK", "ms": 12.3, "chunk": {"text": "Hello", "is_final": false, "model": "gpt-4.1-mini"}}
-{"ok": true, "code": "OK", "ms": 15.7, "chunk": {"text": " world", "is_final": false, "model": "gpt-4.1-mini"}}
-{"ok": true, "code": "OK", "ms": 18.2, "chunk": {"text": "!", "is_final": true, "model": "gpt-4.1-mini", "usage_so_far": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}}}
-```
-
-**NDJSON Union Schema:**
-Each protocol defines a union schema for validating complete NDJSON streams:
+Streams are delivered as NDJSON (Newline-Delimited JSON) where each line is a protocol envelope. The union of possible NDJSON lines is:
 
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://corpusos.com/schemas/llm/llm.stream.frames.ndjson.schema.json",
-  "title": "LLM NDJSON Stream Frames",
-  "description": "Union of all possible frame types in an LLM NDJSON stream",
+  "$id": "https://corpusos.com/schemas/ndjson/stream.schema.json",
+  "title": "NDJSON Stream Union",
   "oneOf": [
-    { "$ref": "https://corpusos.com/schemas/llm/llm.stream.frame.data.json" },
-    { "$ref": "https://corpusos.com/schemas/llm/llm.stream.frame.end.json" },
-    { "$ref": "https://corpusos.com/schemas/llm/llm.stream.frame.error.json" }
+    { "$ref": "https://corpusos.com/schemas/common/envelope.stream.success.json" },
+    { "$ref": "https://corpusos.com/schemas/common/envelope.error.json" }
   ]
 }
 ```
 
-**Stream End Frame:**
-Terminal frame indicating successful stream completion:
-
+**Example NDJSON Stream:**
 ```json
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://corpusos.com/schemas/llm/llm.stream.frame.end.json",
-  "title": "LLM Stream End Frame",
-  "type": "object",
-  "properties": {
-    "event": {
-      "type": "string",
-      "const": "end"
-    },
-    "data": {
-      "$ref": "https://corpusos.com/schemas/llm/llm.types.completion.json",
-      "description": "Final completion result"
-    }
-  },
-  "required": ["event", "data"],
-  "additionalProperties": false
-}
-```
-
-**Stream Error Frame:**
-Terminal frame indicating stream failure:
-
-```json
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://corpusos.com/schemas/llm/llm.stream.frame.error.json",
-  "title": "LLM Stream Error Frame",
-  "type": "object",
-  "properties": {
-    "event": {
-      "type": "string",
-      "const": "error"
-    },
-    "data": {
-      "$ref": "https://corpusos.com/schemas/llm/llm.envelope.error.json",
-      "description": "Error envelope"
-    }
-  },
-  "required": ["event", "data"],
-  "additionalProperties": false
-}
+{"ok": true, "code": "STREAMING", "ms": 12.3, "chunk": {"text": "Hello", "is_final": false, "model": "gpt-4.1-mini"}}
+{"ok": true, "code": "STREAMING", "ms": 15.7, "chunk": {"text": " world", "is_final": false, "model": "gpt-4.1-mini"}}
+{"ok": true, "code": "STREAMING", "ms": 18.2, "chunk": {"text": "!", "is_final": true, "model": "gpt-4.1-mini", "usage_so_far": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}}}
 ```
 
 ### 5.3 Streaming Semantics
 
-**Protocol §2.7 Compliance:**
+**Protocol Compliance:**
 All streaming implementations MUST adhere to these semantics:
 
-1. **Single Terminal Event:** Exactly one terminal event (success or error) per stream
-2. **No Content After Terminal:** Stream MUST end after final event
+1. **Single Terminal Condition:** Exactly one terminal condition per stream:
+   - A chunk with `is_final: true` indicates successful completion
+   - An error envelope indicates stream failure
+2. **No Content After Terminal:** Stream MUST end after terminal condition
 3. **Chunk Integrity:** Complete tokens/records delivered in each chunk
 4. **Order Preservation:** Chunks delivered in correct sequence
+5. **Streaming Code:** All streaming success envelopes use `code: "STREAMING"`
 
 **Validation Rules for Streams:**
 
 ```python
 class StreamValidationRules:
-    """Protocol §2.7 streaming semantics validation."""
+    """Streaming semantics validation."""
     
     @staticmethod
     def validate_stream_termination(frames: List[dict]) -> None:
-        """Validate stream has exactly one terminal event."""
-        terminal_frames = [f for f in frames if f.get("chunk", {}).get("is_final") or not f.get("ok")]
+        """Validate stream has exactly one terminal condition."""
+        terminal_chunks = [f for f in frames if f.get("ok") and f["chunk"].get("is_final")]
+        error_frames = [f for f in frames if not f.get("ok")]
         
-        if len(terminal_frames) == 0:
-            raise StreamProtocolError("Stream missing terminal frame")
-        if len(terminal_frames) > 1:
-            raise StreamProtocolError(f"Multiple terminal frames: {len(terminal_frames)}")
+        terminal_count = len(terminal_chunks) + len(error_frames)
         
-        terminal_index = frames.index(terminal_frames[0])
+        if terminal_count == 0:
+            raise StreamProtocolError("Stream missing terminal condition")
+        if terminal_count > 1:
+            raise StreamProtocolError(f"Multiple terminal conditions: {terminal_count}")
+        
+        # Get terminal frame
+        if terminal_chunks:
+            terminal_frame = terminal_chunks[0]
+        else:
+            terminal_frame = error_frames[0]
+        
+        terminal_index = frames.index(terminal_frame)
         if terminal_index != len(frames) - 1:
             raise StreamProtocolError("Content after terminal frame")
     
     @staticmethod
-    def validate_envelope_consistency(frames: List[dict]) -> None:
-        """Validate all frames use protocol envelope format."""
+    def validate_streaming_code(frames: List[dict]) -> None:
+        """Validate all streaming success frames use STREAMING code."""
         for i, frame in enumerate(frames):
-            if "ok" not in frame or "code" not in frame or "ms" not in frame:
-                raise StreamProtocolError(f"Frame {i} missing protocol envelope fields")
-            
-            if frame["ok"] and "chunk" not in frame:
-                raise StreamProtocolError(f"Frame {i} missing 'chunk' field")
-            
-            if not frame["ok"] and "error" not in frame:
-                raise StreamProtocolError(f"Error frame {i} missing 'error' field")
+            if frame.get("ok") and frame.get("code") != "STREAMING":
+                raise StreamProtocolError(f"Frame {i} must use code='STREAMING' for streaming operations")
 ```
 
 **Performance Considerations:**
@@ -1560,6 +2153,9 @@ export CORPUS_SCHEMAS_ROOT=/path/to/schemas
 # CLI interface
 python -m tests.utils.schema_registry --list
 python -m tests.utils.schema_registry llm.envelope.request.json sample.json
+
+# Show schema statistics
+python -m tests.utils.schema_registry --stats
 ```
 
 **Registry Health Checks:**
@@ -1749,8 +2345,8 @@ Golden tests serve as both validation fixtures and protocol documentation:
 ```python
 # Golden test mapping
 CASES = [
-    ("llm/llm_complete_request.json",       "https://corpusos.com/schemas/llm/llm.envelope.request.json"),
-    ("llm/llm_complete_success.json",       "https://corpusos.com/schemas/llm/llm.envelope.success.json"),
+    ("llm/llm_capabilities_request.json",       "https://corpusos.com/schemas/llm/llm.envelope.request.json"),
+    ("llm/llm_capabilities_success.json",       "https://corpusos.com/schemas/llm/llm.envelope.success.json"),
     ("vector/vector_query_request.json",    "https://corpusos.com/schemas/vector/vector.envelope.request.json"),
     # ... 100+ test cases
 ]
@@ -1782,9 +2378,6 @@ tests/golden/
 │   ├── llm_stream.ndjson
 │   ├── llm_stream_chunk.json
 │   ├── llm_stream_error.ndjson
-│   ├── llm_stream_frame_data.json
-│   ├── llm_stream_frame_end.json
-│   ├── llm_stream_frame_error.json
 │   ├── llm_tools_schema.json
 │   ├── llm_types_chunk.json
 │   ├── llm_types_completion.json
@@ -1797,6 +2390,8 @@ tests/golden/
 ├── vector/
 │   ├── vector_capabilities_request.json
 │   ├── vector_capabilities_success.json
+│   ├── vector_batch_query_request.json
+│   ├── vector_batch_query_success.json
 │   ├── vector_delete_request.json
 │   ├── vector_delete_success.json
 │   ├── vector_error_dimension_mismatch.json
@@ -1806,12 +2401,14 @@ tests/golden/
 │   ├── vector_namespace_create_success.json
 │   ├── vector_namespace_delete_request.json
 │   ├── vector_namespace_delete_success.json
-│   ├── vector_partial_success_result.json
 │   ├── vector_query_request.json
 │   ├── vector_query_success.json
-│   ├── vector_types_failure_item.json
+│   ├── vector_types_document.json
 │   ├── vector_types_filter.json
+│   ├── vector_types_namespace_result.json
+│   ├── vector_types_namespace_spec.json
 │   ├── vector_types_query_result.json
+│   ├── vector_types_query_spec.json
 │   ├── vector_types_vector.json
 │   ├── vector_types_vector_match.json
 │   ├── vector_upsert_request.json
@@ -1829,51 +2426,70 @@ tests/golden/
 │   ├── embedding_embed_request.json
 │   ├── embedding_embed_success.json
 │   ├── embedding_envelope_error.json
+│   ├── embedding_get_stats_request.json
+│   ├── embedding_get_stats_success.json
 │   ├── embedding_health_request.json
 │   ├── embedding_health_success.json
-│   ├── embedding_partial_success_result.json
+│   ├── embedding_stream_embed_request.json
+│   ├── embedding_stream_embed_success.json
+│   ├── embedding_stream.ndjson
+│   ├── embedding_types_batch_result.json
+│   ├── embedding_types_chunk.json
 │   ├── embedding_types_failure.json
+│   ├── embedding_types_result.json
 │   ├── embedding_types_vector.json
 │   └── embedding_types_warning.json
 │
 └── graph/
-    ├── graph.delete_nodes.by_id.request.json
-    ├── graph.delete_nodes.by_id.success.json
-    ├── graph.upsert_nodes.single.request.json
-    ├── graph.upsert_nodes.single.success.json
-    ├── graph_batch_op_create_vertex.json
-    ├── graph_batch_op_query.json
     ├── graph_batch_request.json
     ├── graph_batch_success.json
+    ├── graph_bulk_vertices_request.json
+    ├── graph_bulk_vertices_success.json
     ├── graph_capabilities_request.json
     ├── graph_capabilities_success.json
+    ├── graph_delete_edges_request.json
+    ├── graph_delete_edges_success.json
+    ├── graph_delete_nodes_request.json
+    ├── graph_delete_nodes_success.json
     ├── graph_edge_create_request.json
     ├── graph_edge_create_success.json
-    ├── graph_entity_edge.json
-    ├── graph_entity_vertex.json
     ├── graph_envelope_error.json
+    ├── graph_get_schema_request.json
+    ├── graph_get_schema_success.json
     ├── graph_health_request.json
     ├── graph_health_success.json
-    ├── graph_id_value.json
-    ├── graph_partial_success_result.json
     ├── graph_query_request.json
     ├── graph_query_success.json
-    ├── graph_row.json
     ├── graph_stream.ndjson
-    ├── graph_stream_chunk.json
-    ├── graph_stream_error.ndjson
-    ├── graph_stream_frame_data.json
-    ├── graph_stream_frame_end.json
-    ├── graph_stream_frame_error.json
     ├── graph_stream_query_request.json
-    └── graph_warning.json
+    ├── graph_stream_query_success.json
+    ├── graph_transaction_request.json
+    ├── graph_transaction_success.json
+    ├── graph_traversal_request.json
+    ├── graph_traversal_success.json
+    ├── graph_types_batch_result.json
+    ├── graph_types_bulk_vertices_result.json
+    ├── graph_types_bulk_vertices_spec.json
+    ├── graph_types_chunk.json
+    ├── graph_types_edge.json
+    ├── graph_types_graph_schema.json
+    ├── graph_types_health_result.json
+    ├── graph_types_node.json
+    ├── graph_types_query_result.json
+    ├── graph_types_query_spec.json
+    ├── graph_types_traversal_result.json
+    ├── graph_types_traversal_spec.json
+    ├── graph_upsert_edges_request.json
+    ├── graph_upsert_edges_success.json
+    ├── graph_upsert_nodes_request.json
+    └── graph_upsert_nodes_success.json
 ```
 
 **Naming Conventions:**
 - `{protocol}_{operation}_{type}.json` - Operation test cases
 - `{protocol}_types_{name}.json` - Type definition examples
-- `{protocol}_stream.ndjson` - Complete streaming examples
-- `{protocol}_stream_{frame}.json` - Individual stream frame examples
+- `{protocol}_stream.ndjson` - Complete streaming examples (using envelope-chunk model)
+- `{protocol}_stream_{operation}_request.json` - Streaming operation requests
 
 ### 7.3 Golden Test Validation
 
@@ -1932,37 +2548,38 @@ def test_all_success_envelopes_follow_protocol_format():
         
         # Field constraints
         assert doc["ok"] is True, f"{fname}: 'ok' must be true"
-        assert doc["code"] in {"OK", "PARTIAL_SUCCESS", "ACCEPTED"}, \
-            f"{fname}: unexpected code {doc['code']!r}"
+        assert doc["code"] == "OK", f"{fname}: unexpected code {doc['code']!r}"
 ```
 
 **Streaming Validation:**
 ```python
-def test_streaming_uses_protocol_envelope():
-    """Test streaming operations use protocol envelope with chunk field per §2.4."""
+def test_streaming_uses_STREAMING_code():
+    """Test streaming success envelopes use code='STREAMING'."""
     streaming_files = [
         "llm/llm_stream_chunk.json",
         "graph/graph_stream_chunk.json",
+        "embedding/embedding_stream_chunk.json",
     ]
     
     for fname in streaming_files:
         doc = load_golden(fname)
         
-        # Must use protocol envelope format
+        # Must use streaming envelope format
         assert "ok" in doc, f"{fname}: missing 'ok' field"
         assert "code" in doc, f"{fname}: missing 'code' field"
         assert "ms" in doc, f"{fname}: missing 'ms' field"
         assert "chunk" in doc, f"{fname}: missing 'chunk' field"
         
         assert doc["ok"] is True, f"{fname}: 'ok' must be true"
-        assert doc["code"] == "OK", f"{fname}: 'code' must be 'OK'"
+        assert doc["code"] == "STREAMING", f"{fname}: 'code' must be 'STREAMING'"
 ```
 
 **NDJSON Stream Validation:**
 ```python
 @pytest.mark.parametrize("fname,schema_id,component", [
-    ("llm/llm_stream.ndjson", "https://corpusos.com/schemas/llm/llm.envelope.success.json", "llm"),
-    ("graph/graph_stream.ndjson", "https://corpusos.com/schemas/graph/graph.envelope.success.json", "graph"),
+    ("llm/llm_stream.ndjson", "https://corpusos.com/schemas/common/envelope.stream.success.json", "llm"),
+    ("graph/graph_stream.ndjson", "https://corpusos.com/schemas/common/envelope.stream.success.json", "graph"),
+    ("embedding/embedding_stream.ndjson", "https://corpusos.com/schemas/common/envelope.stream.success.json", "embedding"),
 ])
 def test_streaming_ndjson_validates_with_stream_validator(fname, schema_id, component):
     """Validate NDJSON streaming golden fixtures."""
@@ -2375,7 +2992,7 @@ from tests.utils.stream_validator import validate_ndjson_stream
 with open("stream.ndjson", "r") as f:
     report = validate_ndjson_stream(
         f.read(),
-        envelope_schema_id="https://corpusos.com/schemas/llm/llm.envelope.success.json",
+        envelope_schema_id="https://corpusos.com/schemas/common/envelope.stream.success.json",
         component="llm",
         mode="strict"
     )
@@ -2593,20 +3210,6 @@ def check_coverage():
 | Required field change | Minor bump (v1.0 → v1.1) | Major bump (1.0.0 → 2.0.0) | No |
 | Wire format change | Major bump (v1.0 → v2.0) | Major bump (1.0.0 → 2.0.0) | No |
 
-**Schema Version in Envelopes:**
-```json
-{
-  "ok": true,
-  "code": "OK",
-  "ms": 45.2,
-  "result": {
-    "schema_version": "1.0.0",
-    "protocol": "llm/v1.0",
-    // ... other result fields
-  }
-}
-```
-
 **Version Tolerance Validation:**
 ```python
 def validate_with_version_tolerance(
@@ -2672,9 +3275,6 @@ class SchemaMigrator:
                 {"role": "user", "content": v2_envelope["args"]["prompt"]}
             ]
             del v2_envelope["args"]["prompt"]
-        
-        # Update schema version
-        v2_envelope["schema_version"] = "2.0.0"
         
         return v2_envelope
 ```
@@ -2749,6 +3349,7 @@ jsonschema.Draft202012Validator.format_checker.checks(
 https://corpusos.com/schemas/common/envelope.request.json
 https://corpusos.com/schemas/common/envelope.success.json
 https://corpusos.com/schemas/common/envelope.error.json
+https://corpusos.com/schemas/common/envelope.stream.success.json
 https://corpusos.com/schemas/common/operation_context.json
 ```
 
@@ -2757,18 +3358,22 @@ https://corpusos.com/schemas/common/operation_context.json
 https://corpusos.com/schemas/llm/llm.envelope.request.json
 https://corpusos.com/schemas/llm/llm.envelope.success.json
 https://corpusos.com/schemas/llm/llm.envelope.error.json
+https://corpusos.com/schemas/llm/llm.capabilities.json
 https://corpusos.com/schemas/llm/llm.types.message.json
 https://corpusos.com/schemas/llm/llm.types.completion.json
 https://corpusos.com/schemas/llm/llm.types.token_usage.json
-https://corpusos.com/schemas/llm/llm.stream.frame.data.json
+https://corpusos.com/schemas/llm/llm.types.chunk.json
 ```
 
 **Vector Schema IDs:**
 ```
 https://corpusos.com/schemas/vector/vector.envelope.request.json
 https://corpusos.com/schemas/vector/vector.envelope.success.json
+https://corpusos.com/schemas/vector/vector.envelope.error.json
+https://corpusos.com/schemas/vector/vector.capabilities.json
 https://corpusos.com/schemas/vector/vector.types.vector.json
 https://corpusos.com/schemas/vector/vector.types.vector_match.json
+https://corpusos.com/schemas/vector/vector.types.query_spec.json
 https://corpusos.com/schemas/vector/vector.types.query_result.json
 ```
 
@@ -2777,53 +3382,56 @@ https://corpusos.com/schemas/vector/vector.types.query_result.json
 | Operation | Request Schema | Success Schema |
 |-----------|----------------|----------------|
 | `llm.complete` | `llm.envelope.request.json` | `llm.envelope.success.json` |
-| `llm.stream` | `llm.envelope.request.json` | `llm.envelope.success.json` |
+| `llm.stream` | `llm.envelope.request.json` | `llm.envelope.success.json` (STREAMING) |
 | `vector.query` | `vector.envelope.request.json` | `vector.envelope.success.json` |
-| `vector.upsert` | `vector.envelope.request.json` | `vector.envelope.success.json` |
+| `vector.batch_query` | `vector.envelope.request.json` | `vector.envelope.success.json` |
 | `embedding.embed` | `embedding.envelope.request.json` | `embedding.envelope.success.json` |
+| `embedding.stream_embed` | `embedding.envelope.request.json` | `embedding.envelope.success.json` (STREAMING) |
 | `graph.query` | `graph.envelope.request.json` | `graph.envelope.success.json` |
+| `graph.stream_query` | `graph.envelope.request.json` | `graph.envelope.success.json` (STREAMING) |
 
-### 11.2 Validation Error Codes
+### 11.2 Error Taxonomies by Protocol
 
-**JSON Schema Validation Errors:**
-```python
-VALIDATION_ERROR_CODES = {
-    "type": "Value must be of type {expected_type}",
-    "required": "Missing required field: {field}",
-    "additionalProperties": "Additional properties not allowed: {property}",
-    "pattern": "Value must match pattern: {pattern}",
-    "enum": "Value must be one of: {choices}",
-    "minimum": "Value must be at least {minimum}",
-    "maximum": "Value must be at most {maximum}",
-    "minLength": "Value must have at least {min_length} characters",
-    "maxLength": "Value must have at most {max_length} characters",
-    "format": "Value must be a valid {format}",
-}
-```
+**LLM Error Codes:**
+- `BAD_REQUEST` - Invalid request parameters
+- `AUTH_ERROR` - Authentication or authorization failure
+- `RESOURCE_EXHAUSTED` - Rate limit or quota exceeded
+- `TRANSIENT_NETWORK` - Temporary network issue
+- `UNAVAILABLE` - Service unavailable
+- `NOT_SUPPORTED` - Requested feature not supported
+- `MODEL_OVERLOADED` - Model capacity exceeded
+- `DEADLINE_EXCEEDED` - Request timeout
 
-**Protocol Validation Errors:**
-```python
-PROTOCOL_ERROR_CODES = {
-    "ENVELOPE_SHAPE": "Protocol envelope missing required fields",
-    "ENVELOPE_TYPE": "Protocol envelope must be a JSON object",
-    "CTX_VALIDATION": "Operation context validation failed",
-    "ARGS_VALIDATION": "Operation arguments validation failed",
-    "SERIALIZATION": "JSON serialization/deserialization failed",
-    "STREAM_TERMINATION": "Stream missing or has multiple terminal frames",
-    "STREAM_ENVELOPE": "Stream frame missing protocol envelope fields",
-    "VERSION_MISMATCH": "Schema version not supported",
-}
-```
+**Embedding Error Codes:**
+- `BAD_REQUEST` - Invalid request parameters
+- `AUTH_ERROR` - Authentication or authorization failure
+- `RESOURCE_EXHAUSTED` - Rate limit or quota exceeded
+- `TEXT_TOO_LONG` - Input text exceeds maximum length
+- `MODEL_NOT_AVAILABLE` - Requested model unavailable
+- `TRANSIENT_NETWORK` - Temporary network issue
+- `UNAVAILABLE` - Service unavailable
+- `NOT_SUPPORTED` - Requested feature not supported
+- `DEADLINE_EXCEEDED` - Request timeout
 
-**Error Recovery Strategies:**
+**Vector Error Codes:**
+- `BAD_REQUEST` - Invalid request parameters
+- `AUTH_ERROR` - Authentication or authorization failure
+- `RESOURCE_EXHAUSTED` - Rate limit or quota exceeded
+- `DIMENSION_MISMATCH` - Vector dimension mismatch
+- `INDEX_NOT_READY` - Vector index not ready
+- `TRANSIENT_NETWORK` - Temporary network issue
+- `UNAVAILABLE` - Service unavailable
+- `NOT_SUPPORTED` - Requested feature not supported
+- `DEADLINE_EXCEEDED` - Request timeout
 
-| Error Type | Automatic Retry | Manual Intervention Required |
-|------------|----------------|------------------------------|
-| `TRANSIENT_NETWORK` | Yes (with backoff) | No |
-| `RESOURCE_EXHAUSTED` | Yes (after retry_after_ms) | No |
-| `BAD_REQUEST` | No | Yes - fix request |
-| `SCHEMA_VALIDATION` | No | Yes - update schema or data |
-| `PROTOCOL_VIOLATION` | No | Yes - fix protocol implementation |
+**Graph Error Codes:**
+- `BAD_REQUEST` - Invalid request parameters
+- `AUTH_ERROR` - Authentication or authorization failure
+- `RESOURCE_EXHAUSTED` - Rate limit or quota exceeded
+- `TRANSIENT_NETWORK` - Temporary network issue
+- `UNAVAILABLE` - Service unavailable
+- `NOT_SUPPORTED` - Requested feature not supported
+- `DEADLINE_EXCEEDED` - Request timeout
 
 ### 11.3 Performance Benchmarks
 
@@ -3048,7 +3656,7 @@ def test_schema_covers_edge_cases():
 5. **Stream validation errors**
    - Check `is_final` flag on terminal chunk
    - Verify no content after terminal frame
-   - Ensure all frames use protocol envelope
+   - Ensure streaming envelopes use `code: "STREAMING"`
 
 **Debugging Commands:**
 ```bash
@@ -3063,7 +3671,7 @@ print('Schemas loaded successfully')
 python -m tests.utils.schema_registry llm.envelope.request.json problematic_request.json --verbose
 
 # Profile validation performance
-python -m cProfile -s cumtime tests/utils/schema_registry llm.envelope.request.json sample.json
+python -m cProfile -s cumtime tests/utils.schema_registry llm.envelope.request.json sample.json
 ```
 
 **Getting Help:**
