@@ -98,7 +98,7 @@ Canonical JSON envelope:
     Unary Success:
         {
             "ok": true,
-            "code": "OK",
+            "code": "STREAMING",
             "ms": <float>,          # elapsed milliseconds (best-effort)
             "result": { ... }
         }
@@ -139,7 +139,7 @@ Streaming (llm.stream):
         - Zero or more chunk envelopes:
             {
                 "ok": true,
-                "code": "OK",
+                "code": "STREAMING",
                 "ms": <float>,
                 "chunk": {
                     "text": "<partial>",
