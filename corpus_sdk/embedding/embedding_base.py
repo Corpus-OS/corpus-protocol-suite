@@ -130,6 +130,18 @@ Stream Responses:
 The WireEmbeddingHandler in this file is the reference adapter for this contract and is
 intentionally transport-agnostic (HTTP, gRPC, WebSocket, etc.).
 
+IMPORTANT WIRE STRICTNESS NOTE (Alignment)
+------------------------------------------
+For interoperability and forward/backward compatibility, this SDK treats the
+WIRE boundary as strict:
+
+- Envelopes MUST include top-level keys: op, ctx, args
+- ctx MUST be an object (mapping)
+- args MUST be an object (mapping)
+
+This is intentionally stricter than in-process calls (ctx is optional there),
+and is aligned with the canonical envelope contract.
+
 """
 
 from __future__ import annotations
