@@ -2042,43 +2042,13 @@ def _ctx_from_wire(ctx_dict: Mapping[str, Any]) -> OperationContext:
         attrs=ctx_dict.get("attrs") or {},
     )
 
-
-def _error_to_wire(e: Exception, ms: float) -> Dict[str, Any]:
-    """
-    Normalize exceptions into canonical error envelopes.
-
-    LLMAdapterError subclasses preserve their codes and messages; all other
-    exceptions are treated as UNAVAILABLE/internal for callers.
-    """
-    if isinstance(e, LLMAdapterError):
-        details = dict(e.details or {})
-        if e.throttle_scope is not None:
-            details.setdefault("throttle_scope", e.throttle_scope)
-        if e.suggested_token_reduction is not None:
-            details.setdefault("suggested_token_reduction", e.suggested_token_reduction)
-        return {
-            "ok": False,
-            "code": (e.code or type(e).__name__.upper()),
-            "error": type(e).__name__,
-            "message": e.message,
-            "retry_after_ms": e.retry_after_ms,
-            "details": details or None,
-            "ms": ms,
-        }
-    return {
-        "ok": False,
-        "code": "UNAVAILABLE",
-        "error": type(e).__name__,
-        "message": str(e) or "internal error",
-        "retry_after_ms": None,
-        "details": None,
-        "ms": ms,
-    }
-
-
 def _success_to_wire(result: Any, ms: float) -> Dict[str, Any]:
     """
-    Wrap successful results into canonical success envelope.
+    Wrap successful (unary) results into canonical success envelope.
+
+    Cross-SDK alignment:
+      - Unary success uses code="OK"
+      - Streaming chunks use code="STREAMING" (see _chunk_to_wire)
     """
     if hasattr(result, "__dataclass_fields__"):
         payload = asdict(result)
@@ -2095,30 +2065,72 @@ def _success_to_wire(result: Any, ms: float) -> Dict[str, Any]:
 def _chunk_to_wire(chunk: LLMChunk, ms: float) -> Dict[str, Any]:
     """
     Wrap an LLMChunk into the canonical streaming envelope shape.
+
+    Cross-SDK alignment:
+      - Streaming frames use code="STREAMING"
+      - Payload lives under "chunk"
     """
     if hasattr(chunk, "__dataclass_fields__"):
         payload = asdict(chunk)
     else:
-        # Fallback for non-dataclass implementations (unlikely in strict mode)
+        # Fallback for non-dataclass implementations (kept defensive)
         payload = {
-            "text": chunk.text,
-            "is_final": getattr(chunk, "is_final", False),
+            "text": getattr(chunk, "text", ""),
+            "is_final": bool(getattr(chunk, "is_final", False)),
             "model": getattr(chunk, "model", None),
             "usage_so_far": (
                 asdict(chunk.usage_so_far)
-                if getattr(chunk, "usage_so_far", None)
-                else None
+                if getattr(chunk, "usage_so_far", None) is not None
+                and hasattr(chunk.usage_so_far, "__dataclass_fields__")
+                else getattr(chunk, "usage_so_far", None)
             ),
-            "tool_calls": [asdict(tc) for tc in getattr(chunk, "tool_calls", [])]
+            "tool_calls": [
+                asdict(tc) if hasattr(tc, "__dataclass_fields__") else tc
+                for tc in getattr(chunk, "tool_calls", []) or []
+            ],
         }
+
     return {
         "ok": True,
-        # Cross-SDK alignment: streaming chunks use STREAMING (not OK).
         "code": "STREAMING",
         "ms": ms,
         "chunk": payload,
     }
 
+
+def _error_to_wire(e: Exception, ms: float) -> Dict[str, Any]:
+    """
+    Normalize exceptions into canonical error envelopes.
+
+    Cross-SDK alignment:
+      - Always includes retry_after_ms and details (nullable)
+      - Always includes ms
+    """
+    if isinstance(e, LLMAdapterError):
+        details = dict(e.details or {})
+        if e.throttle_scope is not None:
+            details.setdefault("throttle_scope", e.throttle_scope)
+        if e.suggested_token_reduction is not None:
+            details.setdefault("suggested_token_reduction", e.suggested_token_reduction)
+        return {
+            "ok": False,
+            "code": (e.code or type(e).__name__.upper()),
+            "error": type(e).__name__,
+            "message": e.message,
+            "retry_after_ms": e.retry_after_ms,
+            "details": details or None,
+            "ms": ms,
+        }
+
+    return {
+        "ok": False,
+        "code": "UNAVAILABLE",
+        "error": type(e).__name__,
+        "message": str(e) or "internal error",
+        "retry_after_ms": None,
+        "details": None,
+        "ms": ms,
+    }
 
 class WireLLMHandler:
     """
