@@ -1074,11 +1074,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "additionalProperties": true
 }
 ```
----
-
 ## 4.2 Vector Protocol Schemas
-
----
 
 ### 4.2.1 Envelope Schemas
 
