@@ -569,6 +569,8 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 
 ## 4. Protocol-Specific Schemas
 
+Note: Result/type schemas describe expected adapter-conformant payloads; the wire handler does not re-validate adapter return types at runtime.
+
 ### 4.1 LLM Protocol Schemas
 
 #### 4.1.1 Envelope Schemas
