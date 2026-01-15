@@ -1074,12 +1074,16 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "additionalProperties": true
 }
 ```
+---
 
-### 4.2 Vector Protocol Schemas
+## 4.2 Vector Protocol Schemas
 
-#### 4.2.1 Envelope Schemas
+---
 
-**Vector Request Envelope (`vector.envelope.request.json`):**
+### 4.2.1 Envelope Schemas
+
+#### 4.2.1.1 Vector Request Envelope (`vector/vector.envelope.request.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1092,7 +1096,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
       "properties": {
         "op": {
           "type": "string",
-          "pattern": "^vector\\.[a-z_]+$"
+          "description": "Operation identifier. The wire handler only enforces that this is a string; unknown ops are handled at runtime."
         }
       }
     }
@@ -1100,7 +1104,8 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-**Vector Success Envelope (`vector.envelope.success.json`):**
+#### 4.2.1.2 Vector Success Envelope (`vector/vector.envelope.success.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1113,7 +1118,8 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-**Vector Error Envelope (`vector.envelope.error.json`):**
+#### 4.2.1.3 Vector Error Envelope (`vector/vector.envelope.error.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1126,9 +1132,12 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-#### 4.2.2 Operation Schemas
+---
 
-**Vector Capabilities Request (`vector.capabilities.request.json`):**
+### 4.2.2 Operation Schemas
+
+#### 4.2.2.1 Vector Capabilities Request (`vector/vector.capabilities.request.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1139,14 +1148,11 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/vector/vector.envelope.request.json" },
     {
       "properties": {
-        "op": {
-          "type": "string",
-          "const": "vector.capabilities"
-        },
+        "op": { "type": "string", "const": "vector.capabilities" },
         "args": {
           "type": "object",
-          "additionalProperties": false,
-          "description": "Empty args object required"
+          "additionalProperties": true,
+          "description": "Args object is required on the wire; extra keys are ignored by the handler."
         }
       }
     }
@@ -1154,7 +1160,8 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-**Vector Capabilities Success (`vector.capabilities.success.json`):**
+#### 4.2.2.2 Vector Capabilities Success (`vector/vector.capabilities.success.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1165,16 +1172,15 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/vector/vector.envelope.success.json" },
     {
       "properties": {
-        "result": {
-          "$ref": "https://corpusos.com/schemas/vector/vector.capabilities.json"
-        }
+        "result": { "$ref": "https://corpusos.com/schemas/vector/vector.capabilities.json" }
       }
     }
   ]
 }
 ```
 
-**Vector Query Request (`vector.query.request.json`):**
+#### 4.2.2.3 Vector Query Request (`vector/vector.query.request.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1185,20 +1191,16 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/vector/vector.envelope.request.json" },
     {
       "properties": {
-        "op": {
-          "type": "string",
-          "const": "vector.query"
-        },
-        "args": {
-          "$ref": "https://corpusos.com/schemas/vector/vector.types.query_spec.json"
-        }
+        "op": { "type": "string", "const": "vector.query" },
+        "args": { "$ref": "https://corpusos.com/schemas/vector/vector.types.query_spec.json" }
       }
     }
   ]
 }
 ```
 
-**Vector Query Success (`vector.query.success.json`):**
+#### 4.2.2.4 Vector Query Success (`vector/vector.query.success.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1209,16 +1211,15 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/vector/vector.envelope.success.json" },
     {
       "properties": {
-        "result": {
-          "$ref": "https://corpusos.com/schemas/vector/vector.types.query_result.json"
-        }
+        "result": { "$ref": "https://corpusos.com/schemas/vector/vector.types.query_result.json" }
       }
     }
   ]
 }
 ```
 
-**Vector Batch Query Request (`vector.batch_query.request.json`):**
+#### 4.2.2.5 Vector Batch Query Request (`vector/vector.batch_query.request.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1229,23 +1230,24 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/vector/vector.envelope.request.json" },
     {
       "properties": {
-        "op": {
-          "type": "string",
-          "const": "vector.batch_query"
-        },
+        "op": { "type": "string", "const": "vector.batch_query" },
         "args": {
           "type": "object",
           "properties": {
             "queries": {
               "type": "array",
-              "items": {
-                "$ref": "https://corpusos.com/schemas/vector/vector.types.query_spec.json"
-              },
+              "items": { "$ref": "https://corpusos.com/schemas/vector/vector.types.query_spec.json" },
               "minItems": 1
+            },
+            "namespace": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": ".*\\S.*",
+              "default": "default"
             }
           },
           "required": ["queries"],
-          "additionalProperties": false
+          "additionalProperties": true
         }
       }
     }
@@ -1253,7 +1255,8 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-**Vector Batch Query Success (`vector.batch_query.success.json`):**
+#### 4.2.2.6 Vector Batch Query Success (`vector/vector.batch_query.success.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1266,9 +1269,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
       "properties": {
         "result": {
           "type": "array",
-          "items": {
-            "$ref": "https://corpusos.com/schemas/vector/vector.types.query_result.json"
-          }
+          "items": { "$ref": "https://corpusos.com/schemas/vector/vector.types.query_result.json" }
         }
       }
     }
@@ -1276,7 +1277,8 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-**Vector Upsert Request (`vector.upsert.request.json`):**
+#### 4.2.2.7 Vector Upsert Request (`vector/vector.upsert.request.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1287,27 +1289,24 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/vector/vector.envelope.request.json" },
     {
       "properties": {
-        "op": {
-          "type": "string",
-          "const": "vector.upsert"
-        },
+        "op": { "type": "string", "const": "vector.upsert" },
         "args": {
           "type": "object",
           "properties": {
             "vectors": {
               "type": "array",
-              "items": {
-                "$ref": "https://corpusos.com/schemas/vector/vector.types.vector.json"
-              },
+              "items": { "$ref": "https://corpusos.com/schemas/vector/vector.types.vector.json" },
               "minItems": 1
             },
             "namespace": {
               "type": "string",
+              "minLength": 1,
+              "pattern": ".*\\S.*",
               "default": "default"
             }
           },
           "required": ["vectors"],
-          "additionalProperties": false
+          "additionalProperties": true
         }
       }
     }
@@ -1315,7 +1314,8 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-**Vector Upsert Success (`vector.upsert.success.json`):**
+#### 4.2.2.8 Vector Upsert Success (`vector/vector.upsert.success.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1326,16 +1326,15 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/vector/vector.envelope.success.json" },
     {
       "properties": {
-        "result": {
-          "$ref": "https://corpusos.com/schemas/vector/vector.types.upsert_result.json"
-        }
+        "result": { "$ref": "https://corpusos.com/schemas/vector/vector.types.upsert_result.json" }
       }
     }
   ]
 }
 ```
 
-**Vector Delete Request (`vector.delete.request.json`):**
+#### 4.2.2.9 Vector Delete Request (`vector/vector.delete.request.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1346,29 +1345,33 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/vector/vector.envelope.request.json" },
     {
       "properties": {
-        "op": {
-          "type": "string",
-          "const": "vector.delete"
-        },
+        "op": { "type": "string", "const": "vector.delete" },
         "args": {
           "type": "object",
           "properties": {
             "ids": {
               "type": "array",
-              "items": { "type": "string" },
+              "items": { "type": "string", "minLength": 1, "pattern": ".*\\S.*" },
               "minItems": 1
             },
             "namespace": {
               "type": "string",
+              "minLength": 1,
+              "pattern": ".*\\S.*",
               "default": "default"
             },
             "filter": {
               "type": "object",
-              "additionalProperties": true
+              "minProperties": 1,
+              "additionalProperties": true,
+              "description": "Non-empty filter expression. An empty object is not permitted because the adapter treats it as absent."
             }
           },
-          "required": ["ids"],
-          "additionalProperties": false
+          "additionalProperties": true,
+          "anyOf": [
+            { "required": ["ids"] },
+            { "required": ["filter"] }
+          ]
         }
       }
     }
@@ -1376,7 +1379,8 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-**Vector Delete Success (`vector.delete.success.json`):**
+#### 4.2.2.10 Vector Delete Success (`vector/vector.delete.success.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1387,16 +1391,15 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/vector/vector.envelope.success.json" },
     {
       "properties": {
-        "result": {
-          "$ref": "https://corpusos.com/schemas/vector/vector.types.delete_result.json"
-        }
+        "result": { "$ref": "https://corpusos.com/schemas/vector/vector.types.delete_result.json" }
       }
     }
   ]
 }
 ```
 
-**Vector Create Namespace Request (`vector.create_namespace.request.json`):**
+#### 4.2.2.11 Vector Create Namespace Request (`vector/vector.create_namespace.request.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1407,20 +1410,16 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/vector/vector.envelope.request.json" },
     {
       "properties": {
-        "op": {
-          "type": "string",
-          "const": "vector.create_namespace"
-        },
-        "args": {
-          "$ref": "https://corpusos.com/schemas/vector/vector.types.namespace_spec.json"
-        }
+        "op": { "type": "string", "const": "vector.create_namespace" },
+        "args": { "$ref": "https://corpusos.com/schemas/vector/vector.types.namespace_spec.json" }
       }
     }
   ]
 }
 ```
 
-**Vector Create Namespace Success (`vector.create_namespace.success.json`):**
+#### 4.2.2.12 Vector Create Namespace Success (`vector/vector.create_namespace.success.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1431,16 +1430,15 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/vector/vector.envelope.success.json" },
     {
       "properties": {
-        "result": {
-          "$ref": "https://corpusos.com/schemas/vector/vector.types.namespace_result.json"
-        }
+        "result": { "$ref": "https://corpusos.com/schemas/vector/vector.types.namespace_result.json" }
       }
     }
   ]
 }
 ```
 
-**Vector Delete Namespace Request (`vector.delete_namespace.request.json`):**
+#### 4.2.2.13 Vector Delete Namespace Request (`vector/vector.delete_namespace.request.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1451,20 +1449,14 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/vector/vector.envelope.request.json" },
     {
       "properties": {
-        "op": {
-          "type": "string",
-          "const": "vector.delete_namespace"
-        },
+        "op": { "type": "string", "const": "vector.delete_namespace" },
         "args": {
           "type": "object",
           "properties": {
-            "namespace": {
-              "type": "string",
-              "minLength": 1
-            }
+            "namespace": { "type": "string", "minLength": 1, "pattern": ".*\\S.*" }
           },
           "required": ["namespace"],
-          "additionalProperties": false
+          "additionalProperties": true
         }
       }
     }
@@ -1472,7 +1464,8 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-**Vector Delete Namespace Success (`vector.delete_namespace.success.json`):**
+#### 4.2.2.14 Vector Delete Namespace Success (`vector/vector.delete_namespace.success.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1483,16 +1476,15 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/vector/vector.envelope.success.json" },
     {
       "properties": {
-        "result": {
-          "$ref": "https://corpusos.com/schemas/vector/vector.types.namespace_result.json"
-        }
+        "result": { "$ref": "https://corpusos.com/schemas/vector/vector.types.namespace_result.json" }
       }
     }
   ]
 }
 ```
 
-**Vector Health Request (`vector.health.request.json`):**
+#### 4.2.2.15 Vector Health Request (`vector/vector.health.request.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1503,14 +1495,11 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/vector/vector.envelope.request.json" },
     {
       "properties": {
-        "op": {
-          "type": "string",
-          "const": "vector.health"
-        },
+        "op": { "type": "string", "const": "vector.health" },
         "args": {
           "type": "object",
-          "additionalProperties": false,
-          "description": "Empty args object required"
+          "additionalProperties": true,
+          "description": "Args object is required on the wire; extra keys are ignored by the handler."
         }
       }
     }
@@ -1518,7 +1507,8 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-**Vector Health Success (`vector.health.success.json`):**
+#### 4.2.2.16 Vector Health Success (`vector/vector.health.success.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1529,26 +1519,19 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/vector/vector.envelope.success.json" },
     {
       "properties": {
-        "result": {
-          "type": "object",
-          "properties": {
-            "ok": { "type": "boolean" },
-            "status": { "type": "string" },
-            "server": { "type": "string" },
-            "version": { "type": "string" }
-          },
-          "required": ["ok", "status", "server", "version"],
-          "additionalProperties": true
-        }
+        "result": { "$ref": "https://corpusos.com/schemas/vector/vector.types.health_result.json" }
       }
     }
   ]
 }
 ```
 
-#### 4.2.3 Type Definitions
+---
 
-**Vector Capabilities (`vector.capabilities.json`):**
+### 4.2.3 Type Definitions
+
+#### 4.2.3.1 Vector Capabilities (`vector/vector.capabilities.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1560,35 +1543,28 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     "version": { "type": "string" },
     "protocol": { "type": "string", "const": "vector/v1.0" },
     "max_dimensions": { "type": "integer", "minimum": 0 },
-    "supported_metrics": {
-      "type": "array",
-      "items": { "type": "string" },
-      "default": ["cosine", "euclidean", "dotproduct"]
-    },
-    "supports_namespaces": { "type": "boolean", "default": true },
-    "supports_metadata_filtering": { "type": "boolean", "default": true },
-    "supports_batch_operations": { "type": "boolean", "default": true },
-    "max_batch_size": { "type": ["integer", "null"], "minimum": 1 },
-    "supports_index_management": { "type": "boolean", "default": false },
-    "idempotent_writes": { "type": "boolean", "default": false },
-    "supports_multi_tenant": { "type": "boolean", "default": false },
-    "supports_deadline": { "type": "boolean", "default": true },
-    "max_top_k": { "type": ["integer", "null"], "minimum": 1 },
-    "max_filter_terms": { "type": ["integer", "null"], "minimum": 1 },
-    "text_storage_strategy": {
-      "type": "string",
-      "enum": ["metadata", "docstore", "none"],
-      "default": "metadata"
-    },
-    "max_text_length": { "type": ["integer", "null"], "minimum": 1 },
-    "supports_batch_queries": { "type": "boolean", "default": false }
+    "supported_metrics": { "type": "array", "items": { "type": "string" } },
+    "supports_namespaces": { "type": "boolean" },
+    "supports_metadata_filtering": { "type": "boolean" },
+    "supports_batch_operations": { "type": "boolean" },
+    "max_batch_size": { "type": ["integer", "null"] },
+    "supports_index_management": { "type": "boolean" },
+    "idempotent_writes": { "type": "boolean" },
+    "supports_multi_tenant": { "type": "boolean" },
+    "supports_deadline": { "type": "boolean" },
+    "max_top_k": { "type": ["integer", "null"] },
+    "max_filter_terms": { "type": ["integer", "null"] },
+    "text_storage_strategy": { "type": "string", "enum": ["metadata", "docstore", "none"] },
+    "max_text_length": { "type": ["integer", "null"] },
+    "supports_batch_queries": { "type": "boolean" }
   },
-  "required": ["server", "version", "max_dimensions"],
-  "additionalProperties": false
+  "required": ["server", "version"],
+  "additionalProperties": true
 }
 ```
 
-**Vector Type (`vector.types.vector.json`):**
+#### 4.2.3.2 Vector Type (`vector/vector.types.vector.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1596,33 +1572,19 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "Vector",
   "type": "object",
   "properties": {
-    "id": {
-      "type": "string",
-      "minLength": 1
-    },
-    "vector": {
-      "type": "array",
-      "items": { "type": "number" },
-      "minItems": 1
-    },
-    "metadata": {
-      "type": ["object", "null"],
-      "additionalProperties": true
-    },
-    "namespace": {
-      "type": "string"
-    },
-    "text": {
-      "type": ["string", "null"],
-      "description": "Optional text content associated with vector"
-    }
+    "id": { "type": "string", "minLength": 1, "pattern": ".*\\S.*" },
+    "vector": { "type": "array", "items": { "type": "number" }, "minItems": 1 },
+    "metadata": { "type": ["object", "null"], "additionalProperties": true },
+    "namespace": { "type": "string" },
+    "text": { "type": ["string", "null"], "description": "Optional text content associated with vector" }
   },
   "required": ["id", "vector"],
   "additionalProperties": false
 }
 ```
 
-**Document Type (`vector.types.document.json`):**
+#### 4.2.3.3 Document Type (`vector/vector.types.document.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1630,19 +1592,17 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "Document",
   "type": "object",
   "properties": {
-    "id": { "type": "string", "minLength": 1 },
+    "id": { "type": "string", "minLength": 1, "pattern": ".*\\S.*" },
     "text": { "type": "string" },
-    "metadata": {
-      "type": ["object", "null"],
-      "additionalProperties": true
-    }
+    "metadata": { "type": "object", "additionalProperties": true }
   },
-  "required": ["id", "text"],
+  "required": ["id", "text", "metadata"],
   "additionalProperties": false
 }
 ```
 
-**Vector Match (`vector.types.vector_match.json`):**
+#### 4.2.3.4 Vector Match (`vector/vector.types.vector_match.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1650,25 +1610,17 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "Vector Match",
   "type": "object",
   "properties": {
-    "vector": {
-      "$ref": "https://corpusos.com/schemas/vector/vector.types.vector.json"
-    },
-    "score": {
-      "type": "number",
-      "description": "Similarity score (higher = more similar)"
-    },
-    "distance": {
-      "type": "number",
-      "minimum": 0,
-      "description": "Raw distance metric (lower = more similar)"
-    }
+    "vector": { "$ref": "https://corpusos.com/schemas/vector/vector.types.vector.json" },
+    "score": { "type": "number" },
+    "distance": { "type": "number" }
   },
   "required": ["vector", "score", "distance"],
   "additionalProperties": false
 }
 ```
 
-**Query Specification (`vector.types.query_spec.json`):**
+#### 4.2.3.5 Query Specification (`vector/vector.types.query_spec.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1676,38 +1628,25 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "Vector Query Specification",
   "type": "object",
   "properties": {
-    "vector": {
-      "type": "array",
-      "items": { "type": "number" },
-      "minItems": 1
-    },
-    "top_k": {
-      "type": "integer",
-      "minimum": 1
-    },
+    "vector": { "type": "array", "items": { "type": "number" }, "minItems": 1 },
+    "top_k": { "type": "integer", "minimum": 1 },
     "namespace": {
       "type": "string",
+      "minLength": 1,
+      "pattern": ".*\\S.*",
       "default": "default"
     },
-    "filter": {
-      "type": "object",
-      "additionalProperties": true
-    },
-    "include_metadata": {
-      "type": "boolean",
-      "default": true
-    },
-    "include_vectors": {
-      "type": "boolean",
-      "default": false
-    }
+    "filter": { "type": ["object", "null"], "additionalProperties": true },
+    "include_metadata": { "type": "boolean", "default": true },
+    "include_vectors": { "type": "boolean", "default": false }
   },
   "required": ["vector", "top_k"],
   "additionalProperties": false
 }
 ```
 
-**Query Result (`vector.types.query_result.json`):**
+#### 4.2.3.6 Query Result (`vector/vector.types.query_result.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1715,30 +1654,18 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "Vector Query Result",
   "type": "object",
   "properties": {
-    "matches": {
-      "type": "array",
-      "items": {
-        "$ref": "https://corpusos.com/schemas/vector/vector.types.vector_match.json"
-      }
-    },
-    "query_vector": {
-      "type": "array",
-      "items": { "type": "number" }
-    },
-    "namespace": {
-      "type": "string"
-    },
-    "total_matches": {
-      "type": "integer",
-      "minimum": 0
-    }
+    "matches": { "type": "array", "items": { "$ref": "https://corpusos.com/schemas/vector/vector.types.vector_match.json" } },
+    "query_vector": { "type": "array", "items": { "type": "number" }, "minItems": 1 },
+    "namespace": { "type": "string", "minLength": 1, "pattern": ".*\\S.*" },
+    "total_matches": { "type": "integer", "minimum": 0 }
   },
   "required": ["matches", "query_vector", "namespace", "total_matches"],
   "additionalProperties": false
 }
 ```
 
-**Namespace Specification (`vector.types.namespace_spec.json`):**
+#### 4.2.3.7 Namespace Specification (`vector/vector.types.namespace_spec.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1746,11 +1673,12 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "Namespace Specification",
   "type": "object",
   "properties": {
-    "namespace": { "type": "string", "minLength": 1 },
+    "namespace": { "type": "string", "minLength": 1, "pattern": ".*\\S.*" },
     "dimensions": { "type": "integer", "minimum": 1 },
     "distance_metric": {
       "type": "string",
-      "enum": ["cosine", "euclidean", "dotproduct"]
+      "enum": ["cosine", "euclidean", "dotproduct"],
+      "default": "cosine"
     }
   },
   "required": ["namespace", "dimensions"],
@@ -1758,7 +1686,8 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-**Namespace Result (`vector.types.namespace_result.json`):**
+#### 4.2.3.8 Namespace Result (`vector/vector.types.namespace_result.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1767,15 +1696,16 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "type": "object",
   "properties": {
     "success": { "type": "boolean" },
-    "namespace": { "type": "string" },
-    "details": { "type": "string" }
+    "namespace": { "type": "string", "minLength": 1, "pattern": ".*\\S.*" },
+    "details": { "type": "object", "additionalProperties": true }
   },
-  "required": ["success", "namespace"],
+  "required": ["success", "namespace", "details"],
   "additionalProperties": false
 }
 ```
 
-**Upsert Result (`vector.types.upsert_result.json`):**
+#### 4.2.3.9 Upsert Result (`vector/vector.types.upsert_result.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1785,19 +1715,15 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "properties": {
     "upserted_count": { "type": "integer", "minimum": 0 },
     "failed_count": { "type": "integer", "minimum": 0 },
-    "failures": {
-      "type": "array",
-      "items": {
-        "$ref": "https://corpusos.com/schemas/vector/vector.types.failure_item.json"
-      }
-    }
+    "failures": { "type": "array", "items": {} }
   },
   "required": ["upserted_count", "failed_count", "failures"],
   "additionalProperties": false
 }
 ```
 
-**Delete Result (`vector.types.delete_result.json`):**
+#### 4.2.3.10 Delete Result (`vector/vector.types.delete_result.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1807,19 +1733,15 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "properties": {
     "deleted_count": { "type": "integer", "minimum": 0 },
     "failed_count": { "type": "integer", "minimum": 0 },
-    "failures": {
-      "type": "array",
-      "items": {
-        "$ref": "https://corpusos.com/schemas/vector/vector.types.failure_item.json"
-      }
-    }
+    "failures": { "type": "array", "items": {} }
   },
   "required": ["deleted_count", "failed_count", "failures"],
   "additionalProperties": false
 }
 ```
 
-**Failure Item (`vector.types.failure_item.json`):**
+#### 4.2.3.11 Failure Item (`vector/vector.types.failure_item.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1827,44 +1749,46 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "Vector Failure Item",
   "type": "object",
   "properties": {
-    "id": { "type": "string" },
-    "error": { "type": "string" },
-    "detail": { "type": "string" }
+    "id": {},
+    "error": {},
+    "detail": {}
   },
-  "required": ["error", "detail"],
-  "additionalProperties": false
+  "additionalProperties": true
 }
 ```
 
-**Filter Type (`vector.types.filter.json`):**
+#### 4.2.3.12 Health Result (`vector/vector.types.health_result.json`)
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/vector/vector.types.health_result.json",
+  "title": "Vector Health Result",
+  "type": "object",
+  "properties": {
+    "ok": { "type": "boolean" },
+    "server": { "type": "string" },
+    "version": { "type": "string" },
+    "namespaces": { "type": "object", "additionalProperties": true }
+  },
+  "required": ["ok", "server", "version", "namespaces"],
+  "additionalProperties": true
+}
+```
+
+#### 4.2.3.13 Filter Type (`vector/vector.types.filter.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://corpusos.com/schemas/vector/vector.types.filter.json",
   "title": "Vector Filter Expression",
   "type": "object",
-  "patternProperties": {
-    "^[a-zA-Z_][a-zA-Z0-9_]*$": {
-      "oneOf": [
-        { "type": ["string", "number", "boolean", "null"] },
-        { "type": "array", "items": { "type": ["string", "number"] } },
-        {
-          "type": "object",
-          "properties": {
-            "gt": { "type": "number" },
-            "gte": { "type": "number" },
-            "lt": { "type": "number" },
-            "lte": { "type": "number" },
-            "in": { "type": "array", "items": { "type": ["string", "number"] } }
-          },
-          "additionalProperties": false
-        }
-      ]
-    }
-  },
-  "additionalProperties": false
+  "additionalProperties": true
 }
 ```
+---
+
 ## 4.3 Embedding Protocol Schemas
 
 ### 4.3.1 Envelope Schemas
