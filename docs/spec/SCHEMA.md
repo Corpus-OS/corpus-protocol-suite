@@ -1086,9 +1086,22 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "Vector Batch Query Success",
   "type": "object",
   "allOf": [
-    { "$ref": "https://corpusos.com/schemas/vector/vector.envelope.success.json" }
+    { "$ref": "https://corpusos.com/schemas/vector/vector.envelope.success.json" },
+    {
+      "properties": {
+        "result": {
+          "type": "array",
+          "items": {
+            "$ref": "https://corpusos.com/schemas/vector/vector.types.query_result.json"
+          }
+        }
+      },
+      "required": ["result"],
+      "additionalProperties": false
+    }
   ]
 }
+
 ```
 
 #### 4.2.3 Type Definitions
