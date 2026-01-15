@@ -47,7 +47,7 @@ All intelligence (model selection, cost optimization, retry logic) belongs
 in higher-level routing layers or the commercial Corpus Router.
 """
 
-from typing import Any, Dict, Optional, AsyncIterator, Union
+from typing import Any, Dict, Optional, AsyncIterator, Union, overload
 import logging
 
 from corpus_sdk.llm.llm_base import WireLLMHandler, LLMProtocolV1
@@ -195,6 +195,12 @@ class ReferenceRouter:
         """
         return self._available_protocols.copy()
     
+    @overload
+    async def route(self, envelope: Dict[str, Any]) -> Dict[str, Any]: ...
+    
+    @overload
+    async def route(self, envelope: Dict[str, Any]) -> AsyncIterator[Dict[str, Any]]: ...
+    
     async def route(
         self,
         envelope: Dict[str, Any]
@@ -211,10 +217,13 @@ class ReferenceRouter:
             - Operations starting with "vector." → Vector protocol
             - Operations starting with "graph." → Graph protocol
         
-        Streaming Operations:
+        Streaming Operations (return AsyncIterator):
             - llm.stream → LLM streaming completion
             - embedding.stream_embed → Embedding streaming
             - graph.stream_query → Graph streaming query
+        
+        Unary Operations (return Dict):
+            - All other operations
         
         Args:
             envelope: Canonical envelope with required keys: op, ctx, args
