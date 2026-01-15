@@ -12,7 +12,7 @@ structured errors, caching strategies, rate limiting, and production observabili
 This module serves as the reference implementation and SDK mapping for the
 Vector Protocol V1.0. It defines:
 
-- Typed Python contracts mirroring the protocol data shapes  
+- Typed Python contracts mirroring the protocol data shapes
 - A production-ready BaseVectorAdapter with validation, metrics, and backpressure
 - A thin WireVectorHandler that converts wire envelopes ⇄ typed API
 - First-class text storage support via DocStore integration
@@ -33,7 +33,7 @@ Design Philosophy
 Deliberate Non-Goals
 --------------------
 - No embedding model management or text-to-vector transformations
-- No vector index tuning or optimization strategies  
+- No vector index tuning or optimization strategies
 - No provider-specific algorithms beyond capabilities
 - No client-side result re-ranking or post-processing
 
@@ -98,13 +98,13 @@ The canonical interoperability surface for this protocol is the JSON wire envelo
 This module defines a code-level interface (VectorProtocolV1 / BaseVectorAdapter)
 plus a thin wire adapter (WireVectorHandler) that maps envelopes ⇄ typed methods.
 
-All requests MUST use the following envelope shape:
+All requests MUST use the following envelope shape (ctx and args are REQUIRED):
 
     {
-        "op": "vector.<operation>", 
+        "op": "vector.<operation>",
         "ctx": {
             "request_id": "...",
-            "idempotency_key": "...", 
+            "idempotency_key": "...",
             "deadline_ms": 1234567890,
             "traceparent": "...",
             "tenant": "...",
@@ -117,7 +117,7 @@ Unary Responses (success):
 
     {
         "ok": true,
-        "code": "OK", 
+        "code": "OK",
         "ms": <float>,          # elapsed milliseconds (best-effort)
         "result": { ... }       # operation-specific payload
     }
@@ -166,7 +166,7 @@ VECTOR_PROTOCOL_ID = "vector/v1.0"
 LOG = logging.getLogger(__name__)
 
 # =============================================================================
-# Core Type Definitions  
+# Core Type Definitions
 # =============================================================================
 
 VectorID = NewType("VectorID", str)
@@ -246,31 +246,31 @@ class Document:
 class DocStore(Protocol):
     """
     Document storage interface for vector source text.
-    
+
     Used when vectors have associated text that should not be stored
     in vector database metadata (for cost/performance reasons).
     """
-    
+
     async def get(self, doc_id: str) -> Optional[Document]:
         """Retrieve document by ID"""
         ...
-    
+
     async def put(self, doc: Document) -> None:
         """Store document"""
         ...
-    
+
     async def batch_get(self, doc_ids: List[str]) -> Dict[str, Document]:
         """Retrieve multiple documents (default: calls get() in loop)"""
         ...
-    
+
     async def batch_put(self, docs: List[Document]) -> None:
         """Store multiple documents (default: calls put() in loop)"""
         ...
-    
+
     async def delete(self, doc_id: str) -> None:
         """Delete document"""
         ...
-        
+
     async def batch_delete(self, doc_ids: List[str]) -> None:
         """Delete multiple documents (required implementation)"""
         ...
@@ -278,23 +278,23 @@ class DocStore(Protocol):
 
 class InMemoryDocStore:
     """In-memory document store for testing and development"""
-    
+
     def __init__(self):
         self._store: Dict[str, Document] = {}
-    
+
     async def get(self, doc_id: str) -> Optional[Document]:
         return self._store.get(doc_id)
-    
+
     async def put(self, doc: Document) -> None:
         self._store[doc.id] = doc
-    
+
     async def batch_get(self, doc_ids: List[str]) -> Dict[str, Document]:
         return {doc_id: doc for doc_id in doc_ids if (doc := self._store.get(doc_id))}
-    
+
     async def batch_put(self, docs: List[Document]) -> None:
         for doc in docs:
             self._store[doc.id] = doc
-    
+
     async def delete(self, doc_id: str) -> None:
         self._store.pop(doc_id, None)
 
@@ -306,19 +306,19 @@ class InMemoryDocStore:
 
 class RedisDocStore:
     """Redis-backed document store for production.
-    
+
     Note:
         Metadata stored here mirrors vector metadata at write time but is not
         automatically kept in sync with later vector metadata changes.
     """
-    
+
     def __init__(self, redis_client, key_prefix: str = "corpus:doc:"):
         self._redis = redis_client
         self._prefix = key_prefix
-    
+
     def _key(self, doc_id: str) -> str:
         return f"{self._prefix}{doc_id}"
-    
+
     async def get(self, doc_id: str) -> Optional[Document]:
         import msgpack
         raw = await self._redis.get(self._key(doc_id))
@@ -330,7 +330,7 @@ class RedisDocStore:
             text=data["text"],
             metadata=data.get("metadata", {})
         )
-    
+
     async def put(self, doc: Document) -> None:
         import msgpack
         data = {"id": doc.id, "text": doc.text, "metadata": doc.metadata}
@@ -339,7 +339,7 @@ class RedisDocStore:
             msgpack.packb(data),
             ex=86400 * 30  # 30 day TTL
         )
-    
+
     async def batch_get(self, doc_ids: List[str]) -> Dict[str, Document]:
         import msgpack
         if not doc_ids:
@@ -356,7 +356,7 @@ class RedisDocStore:
                     metadata=data.get("metadata", {})
                 )
         return results
-    
+
     async def batch_put(self, docs: List[Document]) -> None:
         import msgpack
         if not docs:
@@ -366,7 +366,7 @@ class RedisDocStore:
             data = {"id": doc.id, "text": doc.text, "metadata": doc.metadata}
             pipe.set(self._key(doc.id), msgpack.packb(data), ex=86400 * 30)
         await pipe.execute()
-    
+
     async def delete(self, doc_id: str) -> None:
         await self._redis.delete(self._key(doc_id))
 
@@ -656,13 +656,13 @@ class SimpleDeadline:
 
 class NoopBreaker:
     """No-op circuit breaker that always allows operations."""
-    def allow(self) -> bool: 
+    def allow(self) -> bool:
         return True
-    
-    def on_success(self) -> None: 
+
+    def on_success(self) -> None:
         pass
-    
-    def on_error(self, err: Exception) -> None: 
+
+    def on_error(self, err: Exception) -> None:
         pass
 
 
@@ -710,10 +710,10 @@ class SimpleCircuitBreaker:
 
 class NoopCache:
     """No-op cache used in thin/composed mode."""
-    async def get(self, key: str) -> Optional[Any]: 
+    async def get(self, key: str) -> Optional[Any]:
         return None
-    
-    async def set(self, key: str, value: Any, ttl_s: int) -> None: 
+
+    async def set(self, key: str, value: Any, ttl_s: int) -> None:
         pass
 
 
@@ -747,6 +747,9 @@ class InMemoryTTLCache:
 
     async def set(self, key: str, value: Any, ttl_s: int) -> None:
         ttl_s = max(0, int(ttl_s))
+        if ttl_s == 0:
+            # Treat TTL=0 as "do not cache" (alignment with other protocol bases).
+            return
         self._store[key] = (time.monotonic() + ttl_s, value)
 
     async def invalidate_namespace(self, namespace: str) -> None:
@@ -764,10 +767,10 @@ class InMemoryTTLCache:
 
 class NoopLimiter:
     """No-op limiter used in thin/composed mode."""
-    async def acquire(self) -> None: 
+    async def acquire(self) -> None:
         pass
-    
-    def release(self) -> None: 
+
+    def release(self) -> None:
         pass
 
 
@@ -782,6 +785,10 @@ class SimpleTokenBucketLimiter:
 
     Intended for standalone/dev use. For production backpressure across
     multiple workers, use a distributed rate limiter.
+
+    Note:
+        release() is intentionally a no-op to align with LLM/Graph token bucket
+        semantics: tokens are charged on acquire() only.
     """
     def __init__(self, rate_per_sec: int = 50, burst: int = 100) -> None:
         self._capacity = max(1, int(burst))
@@ -813,13 +820,8 @@ class SimpleTokenBucketLimiter:
             return
 
     def release(self) -> None:
-        try:
-            self._refill()
-            if self._tokens < self._capacity:
-                self._tokens += 1
-        except Exception:
-            # Fail-open
-            return
+        # No-op to align with LLM/Graph token bucket semantics (charge on acquire only).
+        return
 
 
 # =============================================================================
@@ -1042,7 +1044,7 @@ class VectorProtocolV1(Protocol):
     ) -> List[QueryResult]:
         """
         Execute multiple vector similarity search queries in batch.
-        
+
         This is a V1.0 addition. Adapters that don't support batch queries
         should raise NotSupported.
         """
@@ -1106,7 +1108,7 @@ class VectorAdapterConfig:
           are not provided. Use 0 to disable caching for that operation.
         - `limiter_*` and `breaker_*` are used only when BaseVectorAdapter is
           constructing its own SimpleTokenBucketLimiter / SimpleCircuitBreaker.
-        - `auto_normalize`: If True, vectors in upsert/query operations are 
+        - `auto_normalize`: If True, vectors in upsert/query operations are
           normalized to unit length (L2) automatically. This is particularly
           useful for cosine similarity searches.
     """
@@ -1204,11 +1206,11 @@ class BaseVectorAdapter(VectorProtocolV1):
 
         # Effective TTLs: explicit args win, config is fallback. Allow 0 to disable.
         self._cache_query_ttl_s = (
-            cache_query_ttl_s if cache_query_ttl_s is not None 
+            cache_query_ttl_s if cache_query_ttl_s is not None
             else cfg.cache_query_ttl_s
         )
         self._cache_caps_ttl_s = (
-            cache_caps_ttl_s if cache_caps_ttl_s is not None 
+            cache_caps_ttl_s if cache_caps_ttl_s is not None
             else cfg.cache_caps_ttl_s
         )
         self._auto_normalize = cfg.auto_normalize
@@ -1274,7 +1276,7 @@ class BaseVectorAdapter(VectorProtocolV1):
 
         Override in backend implementations that maintain external resources.
         Default implementation is a no-op.
-        
+
         Note: In-memory components (cache, breaker, limiter) do not require
         explicit cleanup as they have no external resource handles.
         """
@@ -1295,12 +1297,12 @@ class BaseVectorAdapter(VectorProtocolV1):
         Requirements:
             - non-empty list
             - all elements numeric (int/float)
-        
+
         Args:
             vector: The input vector list.
             normalize: If True, returns the L2 normalized version of the vector.
                        Throws BadRequest if vector length is zero.
-        
+
         Returns:
             The validated (and potentially normalized) vector.
         """
@@ -1317,7 +1319,7 @@ class BaseVectorAdapter(VectorProtocolV1):
             if abs(norm - 1.0) < 1e-6:
                 return vector
             return [x / norm for x in vector]
-        
+
         return vector
 
     @staticmethod
@@ -1482,7 +1484,7 @@ class BaseVectorAdapter(VectorProtocolV1):
         tenant_h = self._tenant_hash(ctx.tenant) if ctx else None
         caps_part = f"{caps.server}:{caps.version}" if caps else "unknown"
         text_strategy = caps.text_storage_strategy if caps else "unknown"
-        
+
         # Hash all queries for the cache key
         queries_hash = self._hash_obj([
             {
@@ -1494,7 +1496,7 @@ class BaseVectorAdapter(VectorProtocolV1):
             }
             for q in spec.queries
         ])
-        
+
         return (
             f"{VECTOR_PROTOCOL_VERSION}:batch_query:"
             f"{caps_part}:"
@@ -1508,7 +1510,7 @@ class BaseVectorAdapter(VectorProtocolV1):
         """
         Return a string pattern for cache keys belonging to a specific namespace.
         Used for cache invalidation on write operations.
-        
+
         Note: This uses simple substring matching for in-memory cache.
         For distributed caches, cache implementations can provide their own
         `invalidate_namespace(namespace: str)` hook.
@@ -1684,10 +1686,10 @@ class BaseVectorAdapter(VectorProtocolV1):
         """
         # Structural validation and optional normalization
         spec_vector = self._validate_vector(spec.vector, normalize=self._auto_normalize)
-        
+
         # Track if normalization occurred for metrics
         normalization_occurred = self._auto_normalize and spec_vector is not spec.vector
-        
+
         self._require_non_empty("namespace", spec.namespace)
         if not isinstance(spec.top_k, int) or spec.top_k <= 0:
             raise BadRequest("top_k must be a positive integer")
@@ -1698,14 +1700,14 @@ class BaseVectorAdapter(VectorProtocolV1):
 
         # If normalization changed the vector, create new spec
         if normalization_occurred:
-             spec = QuerySpec(
-                 vector=spec_vector,
-                 top_k=spec.top_k,
-                 namespace=spec.namespace,
-                 filter=spec.filter,
-                 include_metadata=spec.include_metadata,
-                 include_vectors=spec.include_vectors
-             )
+            spec = QuerySpec(
+                vector=spec_vector,
+                top_k=spec.top_k,
+                namespace=spec.namespace,
+                filter=spec.filter,
+                include_metadata=spec.include_metadata,
+                include_vectors=spec.include_vectors
+            )
 
         # JSON-serializability validation for filters (wire/caching safety)
         if spec.filter is not None:
@@ -1758,7 +1760,7 @@ class BaseVectorAdapter(VectorProtocolV1):
                 try:
                     doc_ids = [str(match.vector.id) for match in result.matches]
                     docs = await self._docstore.batch_get(doc_ids)
-                    
+
                     # Rebuild matches with hydrated text
                     hydrated_matches = []
                     for match in result.matches:
@@ -1780,7 +1782,7 @@ class BaseVectorAdapter(VectorProtocolV1):
                         else:
                             # No text found, pass through as-is
                             hydrated_matches.append(match)
-                    
+
                     # Replace matches with hydrated version
                     result = QueryResult(
                         matches=hydrated_matches,
@@ -1880,27 +1882,27 @@ class BaseVectorAdapter(VectorProtocolV1):
         self._require_non_empty("namespace", spec.namespace)
         if not spec.queries:
             raise BadRequest("queries must not be empty")
-        
+
         # Validate each query and track normalization
         normalized_queries = []
         queries_changed = False
         normalization_count = 0
-        
+
         for i, query in enumerate(spec.queries):
             norm_vec = self._validate_vector(query.vector, normalize=self._auto_normalize)
-            
+
             # Track if this vector was normalized
             if self._auto_normalize and norm_vec is not query.vector:
                 queries_changed = True
                 normalization_count += 1
-            
+
             if not isinstance(query.top_k, int) or query.top_k <= 0:
                 raise BadRequest(f"query[{i}].top_k must be a positive integer")
             if query.filter is not None and not isinstance(query.filter, Mapping):
                 raise BadRequest(f"query[{i}].filter must be a mapping (dict) when provided")
             if query.filter is not None:
                 self._ensure_json_serializable(query.filter, f"query[{i}].filter")
-            
+
             if self._auto_normalize and norm_vec is not query.vector:
                 # Create updated query spec
                 normalized_queries.append(QuerySpec(
@@ -1972,10 +1974,10 @@ class BaseVectorAdapter(VectorProtocolV1):
                     for result in results:
                         for match in result.matches:
                             all_doc_ids.append(str(match.vector.id))
-                    
+
                     if all_doc_ids:
                         docs = await self._docstore.batch_get(all_doc_ids)
-                        
+
                         # Rebuild all results with hydrated text
                         hydrated_results = []
                         for result in results:
@@ -1997,14 +1999,14 @@ class BaseVectorAdapter(VectorProtocolV1):
                                     ))
                                 else:
                                     hydrated_matches.append(match)
-                            
+
                             hydrated_results.append(QueryResult(
                                 matches=hydrated_matches,
                                 query_vector=result.query_vector,
                                 namespace=result.namespace,
                                 total_matches=result.total_matches
                             ))
-                        
+
                         results = hydrated_results
                 except Exception as e:
                     # Graceful degradation: log but don't fail the batch query
@@ -2106,21 +2108,21 @@ class BaseVectorAdapter(VectorProtocolV1):
         validated_vectors = []
         vectors_changed = False
         normalization_count = 0
-        
+
         for v in spec.vectors:
             self._require_non_empty("vector.id", str(v.id))
             norm_vec = self._validate_vector(v.vector, normalize=self._auto_normalize)
-            
+
             # Track if this vector was normalized
             if self._auto_normalize and norm_vec is not v.vector:
                 vectors_changed = True
                 normalization_count += 1
-            
+
             if v.metadata is not None and not isinstance(v.metadata, Mapping):
                 raise BadRequest("metadata must be a mapping (dict) when provided")
             if v.metadata is not None:
                 self._ensure_json_serializable(v.metadata, "metadata")
-            
+
             if self._auto_normalize and norm_vec is not v.vector:
                 validated_vectors.append(Vector(
                     id=v.id,
@@ -2182,7 +2184,7 @@ class BaseVectorAdapter(VectorProtocolV1):
                 # Store texts in docstore and create cleaned vectors for backend
                 texts_to_store = []
                 cleaned_vectors = []
-                
+
                 for v in spec.vectors:
                     if v.text is not None:
                         # Store in docstore
@@ -2191,7 +2193,7 @@ class BaseVectorAdapter(VectorProtocolV1):
                             text=v.text,
                             metadata=v.metadata or {}
                         ))
-                        
+
                         # Create cleaned vector without text
                         cleaned_vectors.append(Vector(
                             id=v.id,
@@ -2203,11 +2205,11 @@ class BaseVectorAdapter(VectorProtocolV1):
                     else:
                         # No text, pass through as-is
                         cleaned_vectors.append(v)
-                
+
                 # Batch store texts (failure here fails the entire upsert)
                 if texts_to_store:
                     await self._docstore.batch_put(texts_to_store)
-                
+
                 backend_vectors = cleaned_vectors
 
             # Call backend with cleaned vectors (no text in metadata/vector)
@@ -2330,7 +2332,7 @@ class BaseVectorAdapter(VectorProtocolV1):
                     except Exception:
                         # Log but don't fail the operation
                         LOG.debug("Failed to clean up docstore entries after delete")
-                
+
                 # Invalidate cache for this namespace
                 try:
                     await self._invalidate_namespace_cache(spec.namespace)
@@ -2637,10 +2639,78 @@ class WireVectorHandler:
         { "op": "vector.query", "ctx": {...}, "args": {...} } -> { ... }
 
     Transport-agnostic: can be wrapped by HTTP, gRPC, WebSockets, etc.
+
+    Wire strictness:
+        - Envelopes MUST contain all three top-level keys: op, ctx, args.
+        - ctx and args MUST be JSON objects (mappings). Callers may send empty
+          objects, but the keys must be present for protocol conformance.
     """
 
     def __init__(self, adapter: VectorProtocolV1):
         self._adapter = adapter
+
+    @staticmethod
+    def _require_mapping_field(envelope: Mapping[str, Any], field: str) -> Mapping[str, Any]:
+        """
+        Enforce that envelope[field] exists and is a mapping.
+
+        This makes ctx/args strict at the wire handler boundary to match the
+        canonical envelope contract.
+        """
+        if field not in envelope:
+            raise BadRequest(f"missing required '{field}'")
+        v = envelope.get(field)
+        if not isinstance(v, Mapping):
+            raise BadRequest(
+                f"'{field}' must be an object",
+                details={"field": field, "type": type(v).__name__},
+            )
+        return v
+
+    @staticmethod
+    def _require_mapping_list(name: str, value: Any) -> List[Mapping[str, Any]]:
+        """
+        Defensive parsing helper for wire lists.
+
+        Ensures list elements are mappings so malformed input becomes BadRequest
+        (not a generic UNAVAILABLE).
+        """
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise BadRequest(
+                f"{name} must be a list",
+                details={"field": name, "type": type(value).__name__},
+            )
+        out: List[Mapping[str, Any]] = []
+        for i, item in enumerate(value):
+            if not isinstance(item, Mapping):
+                raise BadRequest(
+                    f"{name}[{i}] must be an object",
+                    details={"field": f"{name}[{i}]", "type": type(item).__name__},
+                )
+            out.append(item)
+        return out
+
+    @staticmethod
+    def _require_string_list(name: str, value: Any) -> List[str]:
+        """Strictly require a list of strings for wire ID lists."""
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise BadRequest(
+                f"{name} must be a list",
+                details={"field": name, "type": type(value).__name__},
+            )
+        out: List[str] = []
+        for i, item in enumerate(value):
+            if not isinstance(item, str):
+                raise BadRequest(
+                    f"{name}[{i}] must be a string",
+                    details={"field": f"{name}[{i}]", "type": type(item).__name__},
+                )
+            out.append(item)
+        return out
 
     async def handle(self, envelope: Mapping[str, Any]) -> Dict[str, Any]:
         """
@@ -2658,12 +2728,17 @@ class WireVectorHandler:
         """
         t0 = time.monotonic()
         try:
+            if not isinstance(envelope, Mapping):
+                raise BadRequest("envelope must be an object")
+
             op = envelope.get("op")
             if not isinstance(op, str):
                 raise BadRequest("missing or invalid 'op'")
 
-            ctx = _ctx_from_wire(envelope.get("ctx") or {})
-            args = envelope.get("args") or {}
+            # REQUIRED fields (ctx + args must be present; may be empty objects)
+            ctx_map = self._require_mapping_field(envelope, "ctx")
+            args = self._require_mapping_field(envelope, "args")
+            ctx = _ctx_from_wire(ctx_map)
 
             if op == "vector.capabilities":
                 res = await self._adapter.capabilities()
@@ -2671,42 +2746,76 @@ class WireVectorHandler:
 
             if op == "vector.query":
                 try:
-                    spec = QuerySpec(**args)
+                    spec = QuerySpec(**dict(args))
                 except TypeError as te:
-                    raise BadRequest(f"missing required field(s): {str(te)}")
+                    raise BadRequest(f"missing required field(s): {str(te)}") from te
                 res = await self._adapter.query(spec, ctx=ctx)
                 return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
 
             if op == "vector.batch_query":
-                queries = [QuerySpec(**q) for q in args.get("queries", [])]
+                queries_raw = self._require_mapping_list("queries", args.get("queries"))
+                if not queries_raw:
+                    raise BadRequest("queries must not be empty")
+                queries: List[QuerySpec] = []
+                for i, q in enumerate(queries_raw):
+                    try:
+                        queries.append(QuerySpec(**dict(q)))
+                    except TypeError as te:
+                        raise BadRequest(
+                            f"Invalid query spec at queries[{i}]: {te}",
+                            details={"index": i},
+                        ) from te
+                    except Exception as e:
+                        raise BadRequest(
+                            f"Invalid query spec at queries[{i}]: {e}",
+                            details={"index": i, "type": type(e).__name__},
+                        ) from e
                 spec = BatchQuerySpec(
                     queries=queries,
-                    namespace=args.get("namespace", "default"),
+                    namespace=str(args.get("namespace", "default")),
                 )
                 res = await self._adapter.batch_query(spec, ctx=ctx)
                 return _success_to_wire([asdict(r) for r in res], (time.monotonic() - t0) * 1000.0)
 
             if op == "vector.upsert":
-                vectors = [Vector(**v) for v in args.get("vectors", [])]
+                vectors_raw = self._require_mapping_list("vectors", args.get("vectors"))
+                vectors: List[Vector] = []
+                for i, v in enumerate(vectors_raw):
+                    try:
+                        vectors.append(Vector(**dict(v)))
+                    except TypeError as te:
+                        raise BadRequest(
+                            f"Invalid vector at vectors[{i}]: {te}",
+                            details={"index": i},
+                        ) from te
+                    except Exception as e:
+                        raise BadRequest(
+                            f"Invalid vector at vectors[{i}]: {e}",
+                            details={"index": i, "type": type(e).__name__},
+                        ) from e
                 spec = UpsertSpec(
                     vectors=vectors,
-                    namespace=args.get("namespace", "default"),
+                    namespace=str(args.get("namespace", "default")),
                 )
                 res = await self._adapter.upsert(spec, ctx=ctx)
                 return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
 
             if op == "vector.delete":
-                ids = [VectorID(v) for v in args.get("ids", [])]
+                ids_raw = self._require_string_list("ids", args.get("ids"))
+                ids = [VectorID(v) for v in ids_raw]
                 spec = DeleteSpec(
                     ids=ids,
-                    namespace=args.get("namespace", "default"),
+                    namespace=str(args.get("namespace", "default")),
                     filter=args.get("filter"),
                 )
                 res = await self._adapter.delete(spec, ctx=ctx)
                 return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
 
             if op == "vector.create_namespace":
-                spec = NamespaceSpec(**args)
+                try:
+                    spec = NamespaceSpec(**dict(args))
+                except TypeError as te:
+                    raise BadRequest(f"Invalid namespace spec: {te}") from te
                 res = await self._adapter.create_namespace(spec, ctx=ctx)
                 return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
 
@@ -2765,7 +2874,7 @@ __all__ = [
     # document storage
     "Document",
     "DocStore",
-    "InMemoryDocStore", 
+    "InMemoryDocStore",
     "RedisDocStore",
     # policy & infra extension points
     "DeadlinePolicy",
