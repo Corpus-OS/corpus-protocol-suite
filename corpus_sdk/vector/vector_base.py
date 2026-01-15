@@ -1,4 +1,4 @@
-# corpus_sdk/embedding/embedding_base.py
+# corpus_sdk/vector/vector_base.py
 # SPDX-License-Identifier: Apache-2.0
 """
 Purpose
