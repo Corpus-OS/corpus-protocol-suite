@@ -104,6 +104,19 @@ Streaming queries (graph.stream_query) follow the same pattern as llm.stream:
 
     - Request: single envelope with op="graph.stream_query"
     - Response: stream of { ok, code, ms, chunk: { ... } } or terminal error envelope.
+
+IMPORTANT WIRE STRICTNESS NOTE (Alignment)
+------------------------------------------
+For interoperability and forward/backward compatibility, this SDK treats the
+WIRE boundary as strict:
+
+- Envelopes MUST include top-level keys: op, ctx, args
+- ctx MUST be an object (mapping)
+- args MUST be an object (mapping)
+
+This is intentionally stricter than in-process calls (ctx is optional there),
+and is aligned with the canonical envelope contract.
+
 """
 
 from __future__ import annotations
