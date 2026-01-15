@@ -1,4 +1,4 @@
-# CORPUS PROTOCOLS
+# CORPUS PROTOCOL GUIDE
 
 **Table of Contents**
 - [0. Document Metadata](#0-document-metadata)
@@ -47,6 +47,8 @@
 
 > **Document Precedence:** When PROTOCOLS.md and SPECIFICATION.md disagree on **wire format or field names**, PROTOCOLS.md is authoritative. SPECIFICATION.md is descriptive and may contain language-specific reference bindings.
 
+> **Normative Source:** SCHEMA.md and the SDK base classes/wire handlers are the normative source of truth; PROTOCOLS.md must reflect them. Schema validation ensures wire format compliance, while this document defines operational semantics.
+
 > **Type Definition Convention:** Type definitions use a TypeScript-like pseudo-notation as a language-neutral IDL for JSON structures. They are normative for the wire format. Python, Go, etc. bindings are reference implementations.
 
 ## 0. Document Metadata
@@ -63,6 +65,7 @@
 - **Embedding Protocol:** `"embedding/v1.0"`
 
 ### 0.3 Relationship to Companion Documents
+- **SCHEMA.md:** Normative JSON Schema definitions for all wire formats. Schema validation ensures compliance.
 - **SPECIFICATION.md:** Defines high-level architecture, design philosophy, and normative requirements referenced throughout this document
 - **METRICS.md:** Defines observability requirements referenced in §21
 - **ERRORS.md:** Defines error taxonomy referenced in §22
@@ -149,6 +152,11 @@ interface OperationContext {
 
 ### 2.4 Wire-Level Envelope Standardization
 
+**Wire Format Requirements:**
+- **Required keys:** All request envelopes MUST include `op`, `ctx`, and `args` keys
+- **Forward compatibility:** Unknown fields in `ctx` or `args` MUST be ignored
+- **Empty objects:** `ctx` and `args` may be empty objects `{}` but MUST exist
+
 **Canonical Request Envelope:**
 ```json
 {
@@ -165,7 +173,7 @@ interface OperationContext {
 }
 ```
 
-**Success Response Envelope:**
+**Success Response Envelope (Unary Operations):**
 ```json
 {
   "ok": true,
@@ -188,11 +196,11 @@ interface OperationContext {
 }
 ```
 
-**Streaming Frame Envelope (Adapter-level):**
+**Streaming Frame Envelope:**
 ```json
 {
   "ok": true,
-  "code": "OK", 
+  "code": "STREAMING", 
   "ms": 45.2,
   "chunk": { ... }
 }
@@ -213,6 +221,7 @@ interface OperationContext {
 - **No content after terminal:** Stream MUST end after final event
 - **Heartbeats:** Optional keep-alive messages allowed but not required
 - **Backpressure:** Clients control consumption rate; adapters MUST implement bounded buffering and flow control
+- **Streaming code:** All streaming success frames MUST use `code: "STREAMING"`
 
 ### 2.8 Thread Safety & In-Memory Infrastructure
 - **Adapter instances are not thread-safe** by default
@@ -273,6 +282,8 @@ All adapters MUST use protocol-specific base errors:
 - Report capabilities truthfully including `protocol` field
 - Enforce SIEM-safe requirements for all telemetry
 - Use canonical wire envelopes for all responses
+- Include `op`, `ctx`, and `args` keys in all request envelopes
+- Use `code: "STREAMING"` for all streaming success frames
 
 **All adapters MUST NOT:**
 - Log raw prompts, vectors, embeddings, or tenant IDs
@@ -414,12 +425,16 @@ interface GraphCapabilities {
   supports_bulk_vertices: boolean;
   supports_batch: boolean;
   supports_schema: boolean;
+  supports_transaction: boolean;
+  supports_traversal: boolean;
+  supports_path_queries: boolean;
   idempotent_writes: boolean;
   supports_deadline: boolean;
   supports_namespaces: boolean;
   supports_property_filters: boolean;
   supports_multi_tenant: boolean;
   max_batch_ops?: number;
+  max_traversal_depth?: number;   // Maximum traversal depth supported
   max_query_complexity?: number;  // Optional: maximum query complexity score
   max_nodes_per_transaction?: number; // Optional: transaction size limits
   supports_analytics_queries?: boolean; // Optional: analytical query support
@@ -446,6 +461,8 @@ interface Node {
   labels: string[];               // Multiple labels supported
   properties: Metadata;
   namespace?: string;             // Optional namespace isolation
+  created_at?: number;            // Optional: epoch milliseconds
+  updated_at?: number;            // Optional: epoch milliseconds
 }
 ```
 
@@ -458,6 +475,8 @@ interface Edge {
   label: string;
   properties: Metadata;
   namespace?: string;             // Optional namespace isolation
+  created_at?: number;            // Optional: epoch milliseconds
+  updated_at?: number;            // Optional: epoch milliseconds
 }
 ```
 
@@ -499,17 +518,68 @@ interface QueryChunk {
     has_more: boolean;
     dialect_used: string;
   };
+}
 ```
+
 ### 6.6 BulkVerticesSpec
 ```typescript
 interface BulkVerticesSpec {
-  operation: 'export' | 'import';
-  format: string;          // e.g., "json"
   namespace?: string;
-  nodes?: Node[];          // Required when operation === "import"
+  limit?: number;                 // Default: 100
+  cursor?: string;                // Opaque pagination token
+  filter?: FilterExpression;      // Property filter conditions
 }
 ```
-### 6.7 GraphSchema
+
+### 6.7 BulkVerticesResult
+```typescript
+interface BulkVerticesResult {
+  nodes: Node[];
+  next_cursor?: string;           // Optional cursor for next page
+  has_more: boolean;              // True if more nodes available
+}
+```
+
+### 6.8 GraphBatchResult
+```typescript
+interface GraphBatchResult {
+  results: any[];                 // Operation-specific results
+  success: boolean;               // Overall batch success
+  error?: string;                 // Error message if batch failed
+  transaction_id?: string;        // Optional transaction identifier
+}
+```
+
+### 6.9 GraphTraversalSpec
+```typescript
+interface GraphTraversalSpec {
+  start_nodes: string[];          // Starting node IDs
+  max_depth: number;              // Maximum traversal depth
+  direction: "OUTGOING" | "INCOMING" | "BOTH";
+  relationship_types?: string[];  // Filter by edge types
+  node_filters?: FilterExpression; // Filter nodes during traversal
+  relationship_filters?: FilterExpression; // Filter edges during traversal
+  return_properties?: string[];   // Properties to return
+  namespace?: string;             // Namespace context
+}
+```
+
+### 6.10 TraversalResult
+```typescript
+interface TraversalResult {
+  nodes: Node[];                  // Nodes discovered during traversal
+  relationships: Edge[];          // Edges traversed
+  paths: any[][];                 // Path representations (provider-specific)
+  summary: {                      // Traversal summary
+    nodes_visited: number;
+    relationships_traversed: number;
+    max_depth_reached: number;
+  };
+  namespace?: string;             // Namespace context
+}
+```
+
+### 6.11 GraphSchema
 ```typescript
 interface GraphSchema {
   node_labels: string[];
@@ -573,12 +643,16 @@ interface IndexInfo {
     "supports_bulk_vertices": true,
     "supports_batch": true,
     "supports_schema": true,
+    "supports_transaction": true,
+    "supports_traversal": true,
+    "supports_path_queries": true,
     "idempotent_writes": true,
     "supports_deadline": true,
     "supports_namespaces": true,
     "supports_property_filters": true,
     "supports_multi_tenant": true,
     "max_batch_ops": 1000,
+    "max_traversal_depth": 10,
     "max_query_complexity": 10000,
     "max_nodes_per_transaction": 50000,
     "supports_analytics_queries": true
@@ -631,7 +705,7 @@ interface UpsertNodesSpec {
 }
 ```
 
-**Output:** `BatchResult<Node>`
+**Output:** `{ upserted_count: number, failed_count: number, failures: Array<{id: string, error: string, detail: string}> }`
 
 **Response Body:**
 ```json
@@ -640,22 +714,9 @@ interface UpsertNodesSpec {
   "code": "OK",
   "ms": 45.7,
   "result": {
-    "processed_count": 1,
+    "upserted_count": 1,
     "failed_count": 0,
-    "failures": [],
-    "results": [
-      {
-        "id": "user-alice-123",
-        "labels": ["User", "Premium"],
-        "properties": {
-          "name": "Alice Smith",
-          "email": "alice@example.com",
-          "age": 30,
-          "department": "Engineering"
-        },
-        "namespace": "production"
-      }
-    ]
+    "failures": []
   }
 }
 ```
@@ -705,7 +766,7 @@ interface UpsertEdgesSpec {
 }
 ```
 
-**Output:** `BatchResult<Edge>`
+**Output:** `{ upserted_count: number, failed_count: number, failures: Array<{id: string, error: string, detail: string}> }`
 
 **Response Body:**
 ```json
@@ -714,22 +775,9 @@ interface UpsertEdgesSpec {
   "code": "OK",
   "ms": 32.1,
   "result": {
-    "processed_count": 1,
+    "upserted_count": 1,
     "failed_count": 0,
-    "failures": [],
-    "results": [
-      {
-        "id": "works-with-001",
-        "src": "user-alice-123",
-        "dst": "user-bob-456",
-        "label": "WORKS_WITH",
-        "properties": {
-          "since": "2024-06-01",
-          "project": "Phoenix"
-        },
-        "namespace": "production"
-      }
-    ]
+    "failures": []
   }
 }
 ```
@@ -767,7 +815,7 @@ interface DeleteNodesSpec {
 }
 ```
 
-**Output:** `{ deleted_count: number }`
+**Output:** `{ deleted_count: number, failed_count: number, failures: Array<{id: string, error: string, detail: string}> }`
 
 **Response Body:**
 ```json
@@ -776,7 +824,9 @@ interface DeleteNodesSpec {
   "code": "OK",
   "ms": 18.3,
   "result": {
-    "deleted_count": 1
+    "deleted_count": 1,
+    "failed_count": 0,
+    "failures": []
   }
 }
 ```
@@ -814,7 +864,7 @@ interface DeleteEdgesSpec {
 }
 ```
 
-**Output:** `{ deleted_count: number }`
+**Output:** `{ deleted_count: number, failed_count: number, failures: Array<{id: string, error: string, detail: string}> }`
 
 **Response Body:**
 ```json
@@ -823,7 +873,9 @@ interface DeleteEdgesSpec {
   "code": "OK",
   "ms": 15.7,
   "result": {
-    "deleted_count": 1
+    "deleted_count": 1,
+    "failed_count": 0,
+    "failures": []
   }
 }
 ```
@@ -907,13 +959,13 @@ interface DeleteEdgesSpec {
 
 **Stream Response Frames:**
 ```json
-{"ok": true, "code": "OK", "ms": 12.3, "chunk": {"records": [{"u.id": "user-alice-123", "u.name": "Alice Smith", "u.department": "Engineering"}], "is_final": false}}
-{"ok": true, "code": "OK", "ms": 15.7, "chunk": {"records": [{"u.id": "user-bob-456", "u.name": "Bob Johnson", "u.department": "Sales"}], "is_final": false}}
-{"ok": true, "code": "OK", "ms": 18.2, "chunk": {"summary": {"query_time_ms": 125.4, "results_count": 2, "dialect_used": "cypher", "has_more": false}, "is_final": true}}
+{"ok": true, "code": "STREAMING", "ms": 12.3, "chunk": {"records": [{"u.id": "user-alice-123", "u.name": "Alice Smith", "u.department": "Engineering"}], "is_final": false}}
+{"ok": true, "code": "STREAMING", "ms": 15.7, "chunk": {"records": [{"u.id": "user-bob-456", "u.name": "Bob Johnson", "u.department": "Sales"}], "is_final": false}}
+{"ok": true, "code": "STREAMING", "ms": 18.2, "chunk": {"summary": {"query_time_ms": 125.4, "results_count": 2, "dialect_used": "cypher", "has_more": false}, "is_final": true}}
 ```
 
 ### 7.8 bulk_vertices
-**Purpose:** Bulk operations on vertices (import/export)
+**Purpose:** Scan/paginate vertices from a namespace
 
 **Operation:** `graph.bulk_vertices`
 
@@ -928,14 +980,14 @@ interface DeleteEdgesSpec {
     "tenant": "acme-corp"
   },
   "args": {
-    "operation": "export",
-    "format": "json",
-    "namespace": "production"
+    "namespace": "production",
+    "limit": 100,
+    "cursor": "eyJwYWdlIjozfQ=="
   }
 }
 ```
 
-**Output:** `{ nodes: Node[] }`
+**Output:** `BulkVerticesResult`
 
 **Response Body:**
 ```json
@@ -956,7 +1008,9 @@ interface DeleteEdgesSpec {
         },
         "namespace": "production"
       }
-    ]
+    ],
+    "has_more": true,
+    "next_cursor": "eyJwYWdlIjo0fQ=="
   }
 }
 ```
@@ -1002,7 +1056,7 @@ interface DeleteEdgesSpec {
 }
 ```
 
-**Output:** `BatchResult<any>`
+**Output:** `GraphBatchResult`
 
 **Response Body:**
 ```json
@@ -1011,21 +1065,155 @@ interface DeleteEdgesSpec {
   "code": "OK",
   "ms": 23.4,
   "result": {
-    "processed_count": 1,
-    "failed_count": 0,
-    "failures": [],
     "results": [
       {
-        "processed_count": 1,
+        "upserted_count": 1,
         "failed_count": 0,
         "failures": []
+      }
+    ],
+    "success": true,
+    "transaction_id": "tx-12345"
+  }
+}
+```
+
+### 7.10 transaction
+**Purpose:** Execute operations in an atomic transaction
+
+**Operation:** `graph.transaction`
+
+**Availability:** Only if `capabilities.supports_transaction` is true
+
+**Request Body:**
+```json
+{
+  "op": "graph.transaction",
+  "ctx": {
+    "request_id": "req-graph-tx-001",
+    "tenant": "acme-corp"
+  },
+  "args": {
+    "ops": [
+      {
+        "op": "upsert_nodes",
+        "args": {
+          "nodes": [
+            {
+              "id": "user-david-012",
+              "labels": ["User"],
+              "properties": {
+                "name": "David Wilson",
+                "email": "david@example.com"
+              }
+            }
+          ]
+        }
       }
     ]
   }
 }
 ```
 
-### 7.10 get_schema
+**Output:** `GraphBatchResult`
+
+**Response Body:**
+```json
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 45.2,
+  "result": {
+    "results": [
+      {
+        "upserted_count": 1,
+        "failed_count": 0,
+        "failures": []
+      }
+    ],
+    "success": true,
+    "transaction_id": "tx-67890"
+  }
+}
+```
+
+### 7.11 traversal
+**Purpose:** Traverse graph relationships from starting nodes
+
+**Operation:** `graph.traversal`
+
+**Availability:** Only if `capabilities.supports_traversal` is true
+
+**Request Body:**
+```json
+{
+  "op": "graph.traversal",
+  "ctx": {
+    "request_id": "req-graph-traversal-001",
+    "tenant": "acme-corp"
+  },
+  "args": {
+    "start_nodes": ["user-alice-123"],
+    "max_depth": 3,
+    "direction": "OUTGOING",
+    "relationship_types": ["WORKS_WITH"],
+    "return_properties": ["name", "department"],
+    "namespace": "production"
+  }
+}
+```
+
+**Output:** `TraversalResult`
+
+**Response Body:**
+```json
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 67.8,
+  "result": {
+    "nodes": [
+      {
+        "id": "user-bob-456",
+        "labels": ["User"],
+        "properties": {
+          "name": "Bob Johnson",
+          "department": "Sales"
+        },
+        "namespace": "production"
+      }
+    ],
+    "relationships": [
+      {
+        "id": "works-with-001",
+        "src": "user-alice-123",
+        "dst": "user-bob-456",
+        "label": "WORKS_WITH",
+        "properties": {
+          "since": "2024-06-01",
+          "project": "Phoenix"
+        },
+        "namespace": "production"
+      }
+    ],
+    "paths": [
+      [
+        {"type": "node", "id": "user-alice-123", "labels": ["User"]},
+        {"type": "edge", "id": "works-with-001", "label": "WORKS_WITH"},
+        {"type": "node", "id": "user-bob-456", "labels": ["User"]}
+      ]
+    ],
+    "summary": {
+      "nodes_visited": 2,
+      "relationships_traversed": 1,
+      "max_depth_reached": 1
+    },
+    "namespace": "production"
+  }
+}
+```
+
+### 7.12 get_schema
 **Purpose:** Retrieve graph schema information
 
 **Operation:** `graph.get_schema`
@@ -1074,7 +1262,7 @@ interface DeleteEdgesSpec {
 }
 ```
 
-### 7.11 health
+### 7.13 health
 **Purpose:** Check adapter and provider health status
 
 **Operation:** `graph.health`
@@ -1156,6 +1344,7 @@ interface GraphHealthStatus {
 - **Exactly-once delivery:** Each row MUST be delivered exactly once within a single stream session
 - **Order preservation:** Results MUST be delivered in query result order
 - **Terminal event:** Stream MUST always end with final chunk (`is_final: true`)
+- **Streaming code:** All streaming success frames MUST use `code: "STREAMING"`
 - **Cardinality bounds:** Streams SHOULD support at least 1M rows for well-behaved queries
 - **Transport failures:** If the transport connection fails mid-stream, the stream is considered terminated and cannot be resumed
 
@@ -1198,14 +1387,17 @@ interface LLMCapabilities {
   supports_roles: boolean;
   supports_system_message: boolean;
   supports_json_output: boolean;
+  supports_tools: boolean;
   supports_parallel_tool_calls: boolean;
+  supports_tool_choice: boolean;
   supports_deadline: boolean;
   supports_count_tokens: boolean;
   idempotent_writes: boolean;
   supports_multi_tenant: boolean;
+  max_tool_calls_per_turn?: number;
   max_tokens_per_minute?: number; // Optional: rate limiting info
   max_requests_per_minute?: number; // Optional: request rate limits
-  supports_function_calling?: boolean; // Optional: function calling support
+  supports_function_calling?: boolean; // Deprecated: use supports_tools
   supports_vision?: boolean;      // Optional: multimodal vision support
   supports_logprobs?: boolean;    // Optional: token probabilities
 }
@@ -1266,7 +1458,7 @@ interface CompletionSpec {
     type: 'text' | 'json_object';
   };
   tools?: ToolDefinition[];      // Function calling tools
-  tool_choice?: 'auto' | 'none' | {  // Tool selection strategy
+  tool_choice?: 'auto' | 'none' | 'required' | {  // Tool selection strategy
     type: 'function';
     function: { name: string };
   };
@@ -1280,6 +1472,7 @@ interface LLMCompletion {
   model: string;
   usage: TokenUsage;
   finish_reason: string;         // Reason generation stopped
+  tool_calls?: ToolCall[];       // Optional tool calls from model
 }
 ```
 
@@ -1290,6 +1483,7 @@ interface LLMChunk {
   is_final: boolean;             // True for final chunk
   model?: string;                // Optional model identifier
   usage_so_far?: TokenUsage;     // Cumulative token usage
+  tool_calls?: ToolCall[];       // Optional tool calls (may appear in chunks)
 }
 ```
 
@@ -1331,14 +1525,16 @@ interface LLMChunk {
     "supports_roles": true,
     "supports_system_message": true,
     "supports_json_output": true,
+    "supports_tools": true,
     "supports_parallel_tool_calls": true,
+    "supports_tool_choice": true,
     "supports_deadline": true,
     "supports_count_tokens": true,
     "idempotent_writes": true,
     "supports_multi_tenant": true,
+    "max_tool_calls_per_turn": 10,
     "max_tokens_per_minute": 100000,
     "max_requests_per_minute": 1000,
-    "supports_function_calling": true,
     "supports_vision": false,
     "supports_logprobs": true
   }
@@ -1443,19 +1639,18 @@ interface LLMChunk {
 
 **Stream Response Frames:**
 ```json
-{"ok": true, "code": "OK", "ms": 12.3, "chunk": {"text": "Quantum", "is_final": false, "model": "gpt-4.1-mini"}}
-{"ok": true, "code": "OK", "ms": 15.7, "chunk": {"text": " computing", "is_final": false, "model": "gpt-4.1-mini"}}
-{"ok": true, "code": "OK", "ms": 18.2, "chunk": {"text": " is", "is_final": false, "model": "gpt-4.1-mini"}}
-{"ok": true, "code": "OK", "ms": 21.4, "chunk": {"text": " a", "is_final": false, "model": "gpt-4.1-mini"}}
-{"ok": true, "code": "OK", "ms": 24.8, "chunk": {"text": " new", "is_final": false, "model": "gpt-4.1-mini"}}
-{"ok": true, "code": "OK", "ms": 28.1, "chunk": {"text": " type", "is_final": false, "model": "gpt-4.1-mini"}}
-{"ok": true, "code": "OK", "ms": 31.5, "chunk": {"text": " of", "is_final": false, "model": "gpt-4.1-mini"}}
-{"ok": true, "code": "OK", "ms": 34.9, "chunk": {"text": " computing", "is_final": false, "model": "gpt-4.1-mini"}}
-{"ok": true, "code": "OK", "ms": 38.2, "chunk": {"text": " that", "is_final": false, "model": "gpt-4.1-mini"}}
-{"ok": true, "code": "OK", "ms": 41.6, "chunk": {"text": " uses", "is_final": false, "model": "gpt-4.1-mini"}}
-{"ok": true, "code": "OK", "ms": 45.0, "chunk": {"text": " quantum", "is_final": false, "model": "gpt-4.1-mini"}}
-{"ok": true, "code": "OK", "ms": 48.3, "chunk": {"text": " bits", "is_final": false, "model": "gpt-4.1-mini"}}
-{"ok": true, "code": "OK", "ms": 51.7, "chunk": {"text": " (qubits)", "is_final": true, "model": "gpt-4.1-mini", "usage_so_far": {"prompt_tokens": 12, "completion_tokens": 18, "total_tokens": 30}}}
+{"ok": true, "code": "STREAMING", "ms": 12.3, "chunk": {"text": "Quantum", "is_final": false, "model": "gpt-4.1-mini"}}
+{"ok": true, "code": "STREAMING", "ms": 15.7, "chunk": {"text": " computing", "is_final": false, "model": "gpt-4.1-mini"}}
+{"ok": true, "code": "STREAMING", "ms": 18.2, "chunk": {"text": " is", "is_final": false, "model": "gpt-4.1-mini"}}
+{"ok": true, "code": "STREAMING", "ms": 21.4, "chunk": {"text": " a", "is_final": false, "model": "gpt-4.1-mini"}}
+{"ok": true, "code": "STREAMING", "ms": 24.8, "chunk": {"text": " new", "is_final": false, "model": "gpt-4.1-mini"}}
+{"ok": true, "code": "STREAMING", "ms": 28.1, "chunk": {"text": " type", "is_final": false, "model": "gpt-4.1-mini"}}
+{"ok": true, "code": "STREAMING", "ms": 31.5, "chunk": {"text": " of", "is_final": false, "model": "gpt-4.1-mini"}}
+{"ok": true, "code": "STREAMING", "ms": 34.9, "chunk": {"text": " computing", "is_final": false, "model": "gpt-4.1-mini"}}
+{"ok": true, "code": "STREAMING", "ms": 38.2, "chunk": {"text": " that", "is_final": false, "model": "gpt-4.1-mini"}}
+{"ok": true, "code": "STREAMING", "ms": 41.6, "chunk": {"text": " uses", "is_final": false, "model": "gpt-4.1-mini"}}
+{"ok": true, "code": "STREAMING", "ms": 45.0, "chunk": {"text": " quantum", "is_final": false, "model": "gpt-4.1-mini"}}
+{"ok": true, "code": "STREAMING", "ms": 48.3, "chunk": {"text": " bits", "is_final": true, "model": "gpt-4.1-mini", "usage_so_far": {"prompt_tokens": 12, "completion_tokens": 18, "total_tokens": 30}}}
 ```
 
 ### 11.4 count_tokens
@@ -1597,12 +1792,14 @@ interface LLMHealthStatus {
 ### 12.6 Tool Call Semantics
 - **Deterministic ordering:** Tool calls returned in consistent order
 - **Parallel execution:** When `supports_parallel_tool_calls=true`, tools may be called concurrently
+- **Tool choice options:** `tool_choice` accepts `"auto"`, `"none"`, `"required"`, or specific function specification
 - **Exhaustion behavior:** Stop generation after tool calls if no further text content
 
 ### 12.7 Streaming Guarantees
 - **Chunk integrity:** Complete tokens delivered in each chunk
 - **Order preservation:** Chunks delivered in correct sequence
 - **Final indication:** Clear termination with `is_final: true`
+- **Streaming code:** All streaming success frames MUST use `code: "STREAMING"`
 
 ### 12.8 Error Mappings
 | Provider Error | Normalized Error | Wire Code | Details |
@@ -1634,13 +1831,16 @@ interface VectorCapabilities {
   supports_namespaces: boolean;
   supports_metadata_filtering: boolean;
   supports_batch_operations: boolean;
+  supports_batch_queries: boolean;
   max_batch_size?: number;
+  max_top_k?: number;
+  max_filter_terms?: number;
   supports_index_management: boolean;
   supports_deadline: boolean;
   idempotent_writes: boolean;
   supports_multi_tenant: boolean;
-  max_top_k?: number;
-  max_filter_terms?: number;
+  text_storage_strategy: "metadata" | "docstore" | "none";
+  max_text_length?: number;
   supports_hybrid_search?: boolean; // Optional: hybrid vector+keyword search
   supports_sparse_vectors?: boolean; // Optional: sparse vector support
   max_namespaces?: number;        // Optional: namespace count limit
@@ -1653,6 +1853,11 @@ interface VectorCapabilities {
 - **euclidean:** Euclidean distance (inverted for similarity)
 - **dotproduct:** Dot product similarity
 
+### 13.3 Text Storage Strategy
+- **metadata:** Text stored in vector metadata fields
+- **docstore:** Text stored in separate document store with eventual consistency
+- **none:** Text not persisted with vectors (only ID + vector)
+
 ## 14. Vector Types
 
 ### 14.1 Vector
@@ -1662,6 +1867,7 @@ interface Vector {
   vector: number[];
   metadata?: Metadata;
   namespace?: string;
+  text?: string;                  // Original text (optional)
 }
 ```
 
@@ -1697,7 +1903,15 @@ interface VectorQueryResult {
 }
 ```
 
-### 14.5 UpsertSpec
+### 14.5 BatchQuerySpec
+```typescript
+interface BatchQuerySpec {
+  queries: VectorQuerySpec[];
+  namespace?: string;
+}
+```
+
+### 14.6 UpsertSpec
 ```typescript
 interface UpsertSpec {
   vectors: Vector[];
@@ -1705,7 +1919,7 @@ interface UpsertSpec {
 }
 ```
 
-### 14.6 UpsertResult
+### 14.7 UpsertResult
 ```typescript
 interface UpsertResult {
   upserted_count: number;
@@ -1718,7 +1932,7 @@ interface UpsertResult {
 }
 ```
 
-### 14.7 DeleteSpec
+### 14.8 DeleteSpec
 ```typescript
 interface DeleteSpec {
   ids: string[];
@@ -1727,7 +1941,7 @@ interface DeleteSpec {
 }
 ```
 
-### 14.8 DeleteResult
+### 14.9 DeleteResult
 ```typescript
 interface DeleteResult {
   deleted_count: number;
@@ -1740,7 +1954,7 @@ interface DeleteResult {
 }
 ```
 
-### 14.9 NamespaceSpec
+### 14.10 NamespaceSpec
 ```typescript
 interface NamespaceSpec {
   namespace: string;
@@ -1749,7 +1963,7 @@ interface NamespaceSpec {
 }
 ```
 
-### 14.10 NamespaceResult
+### 14.11 NamespaceResult
 ```typescript
 interface NamespaceResult {
   success: boolean;
@@ -1797,13 +2011,16 @@ interface NamespaceResult {
     "supports_namespaces": true,
     "supports_metadata_filtering": true,
     "supports_batch_operations": true,
+    "supports_batch_queries": true,
     "max_batch_size": 100,
+    "max_top_k": 10000,
+    "max_filter_terms": 10,
     "supports_index_management": true,
     "supports_deadline": true,
     "idempotent_writes": true,
     "supports_multi_tenant": true,
-    "max_top_k": 10000,
-    "max_filter_terms": 10,
+    "text_storage_strategy": "metadata",
+    "max_text_length": 10000,
     "supports_hybrid_search": true,
     "supports_sparse_vectors": false,
     "max_namespaces": 1000,
@@ -1874,7 +2091,8 @@ interface NamespaceResult {
             "language": "en",
             "rating": 4.5
           },
-          "namespace": "documents"
+          "namespace": "documents",
+          "text": "Artificial intelligence research advances..."
         },
         "score": 0.95,
         "distance": 0.05
@@ -1887,7 +2105,92 @@ interface NamespaceResult {
 }
 ```
 
-### 15.3 upsert
+### 15.3 batch_query
+**Purpose:** Execute multiple vector queries in batch
+
+**Operation:** `vector.batch_query`
+
+**Input:** `BatchQuerySpec`
+
+**Validation:**
+- `queries` MUST be non-empty list
+- Each query MUST satisfy individual query validation rules
+- If `max_batch_size` is set and `len(queries) > max_batch_size` → `BAD_REQUEST`
+
+**Request Body:**
+```json
+{
+  "op": "vector.batch_query",
+  "ctx": {
+    "request_id": "req-vector-batch-query-001",
+    "tenant": "acme-corp"
+  },
+  "args": {
+    "queries": [
+      {
+        "vector": [0.1, 0.2, 0.3, 0.4, 0.5],
+        "top_k": 3,
+        "namespace": "documents"
+      },
+      {
+        "vector": [0.6, 0.7, 0.8, 0.9, 1.0],
+        "top_k": 5,
+        "namespace": "documents"
+      }
+    ],
+    "namespace": "documents"
+  }
+}
+```
+
+**Output:** `VectorQueryResult[]`
+
+**Response Body:**
+```json
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 45.2,
+  "result": [
+    {
+      "matches": [
+        {
+          "vector": {
+            "id": "doc-123",
+            "vector": [0.12, 0.22, 0.32, 0.42, 0.52],
+            "metadata": {"title": "AI Paper"},
+            "namespace": "documents"
+          },
+          "score": 0.95,
+          "distance": 0.05
+        }
+      ],
+      "query_vector": [0.1, 0.2, 0.3, 0.4, 0.5],
+      "namespace": "documents",
+      "total_matches": 1
+    },
+    {
+      "matches": [
+        {
+          "vector": {
+            "id": "doc-456",
+            "vector": [0.62, 0.72, 0.82, 0.92, 1.02],
+            "metadata": {"title": "ML Research"},
+            "namespace": "documents"
+          },
+          "score": 0.92,
+          "distance": 0.08
+        }
+      ],
+      "query_vector": [0.6, 0.7, 0.8, 0.9, 1.0],
+      "namespace": "documents",
+      "total_matches": 1
+    }
+  ]
+}
+```
+
+### 15.4 upsert
 **Purpose:** Insert or update vectors in a namespace
 
 **Operation:** `vector.upsert`
@@ -1904,6 +2207,8 @@ interface NamespaceResult {
 **Capabilities Enforcement:**
 - If `max_batch_size` is set and `len(vectors) > max_batch_size` → `BAD_REQUEST`
 - If `max_dimensions` is set and any `len(v.vector) > max_dimensions` → `DIMENSION_MISMATCH`
+- If `text` field present and `text_storage_strategy="none"` → text is ignored
+- If `text` field present and `text_storage_strategy="docstore"` → docstore writes must succeed for upsert to succeed
 
 **Request Body:**
 ```json
@@ -1924,7 +2229,8 @@ interface NamespaceResult {
           "category": "science",
           "language": "en"
         },
-        "namespace": "documents"
+        "namespace": "documents",
+        "text": "Recent advances in neural network architectures..."
       }
     ],
     "namespace": "documents"
@@ -1948,7 +2254,7 @@ interface NamespaceResult {
 }
 ```
 
-### 15.4 delete
+### 15.5 delete
 **Purpose:** Remove vectors by ID or metadata filter
 
 **Operation:** `vector.delete`
@@ -1996,7 +2302,7 @@ interface NamespaceResult {
 }
 ```
 
-### 15.5 create_namespace
+### 15.6 create_namespace
 **Purpose:** Create a new vector namespace/collection
 
 **Operation:** `vector.create_namespace`
@@ -2050,7 +2356,7 @@ interface NamespaceResult {
 }
 ```
 
-### 15.6 delete_namespace
+### 15.7 delete_namespace
 **Purpose:** Remove a vector namespace and all its vectors
 
 **Operation:** `vector.delete_namespace`
@@ -2095,7 +2401,7 @@ interface NamespaceResult {
 }
 ```
 
-### 15.7 health
+### 15.8 health
 **Purpose:** Check vector store health and namespace status
 
 **Operation:** `vector.health`
@@ -2184,6 +2490,7 @@ interface VectorHealthStatus {
 - **Consistency:** Same metric always produces same score range
 - **Documentation:** Clear explanation of score meaning for each metric
 - **Cosine normalization:** For cosine similarity, vectors SHOULD be L2-normalized
+- **Score/distance synthesis:** If backend provides only one, synthesize the other in a stable way
 
 ### 16.4 Search Behavior
 - **Approximate vs exact:** Adapters SHOULD document search accuracy guarantees
@@ -2195,15 +2502,22 @@ interface VectorHealthStatus {
 - **Size limits:** Batch size constrained by provider capabilities
 - **Empty batch validation:** Reject empty batches with `BAD_REQUEST`
 
-### 16.6 Error Mappings
+### 16.6 Text Storage Strategy Behavior
+- **metadata:** Text stored inline with vector metadata, atomic with vector write
+- **docstore:** Text stored separately; docstore write failure causes entire upsert to fail
+- **none:** Text ignored; only ID + vector + metadata persisted
+- **Query behavior:** For `text_storage_strategy="docstore"`, hydrate text from docstore; missing text returns gracefully
+
+### 16.7 Error Mappings
 | Provider Error | Normalized Error | Wire Code | Details |
 |----------------|------------------|-----------|---------|
 | Dimension mismatch | `DimensionMismatch` | `DIMENSION_MISMATCH` | `{"provided": 1537, "expected": 1536}` |
 | Namespace not found | `NamespaceNotFound` | `NAMESPACE_NOT_FOUND` | `{"namespace": "unknown"}` |
 | Index not ready | `IndexNotReady` | `INDEX_NOT_READY` | `{"namespace": "building", "estimated_ms": 120000}` |
 | Batch size exceeded | `BadRequest` | `BAD_REQUEST` | `{"max_batch_size": 100, "provided": 150}` |
+| Filter not supported | `NotSupported` | `NOT_SUPPORTED` | `{"feature": "metadata_filtering"}` |
 
-### 16.7 Deadline Rules
+### 16.8 Deadline Rules
 - **Query timeouts:** Deadline applies to entire search operation
 - **Batch operations:** Deadline applies to entire batch processing
 - **Namespace operations:** Deadline applies to management operations
@@ -2227,10 +2541,13 @@ interface EmbeddingCapabilities {
   supports_normalization: boolean;
   supports_truncation: boolean;
   supports_token_counting: boolean;
+  supports_streaming: boolean;
+  supports_batch_embedding: boolean;
+  supports_caching: boolean;
   supports_multi_tenant: boolean;
   supports_deadline: boolean;
   normalizes_at_source: boolean;
-  idempotent_writes: boolean;     // Standardized naming
+  idempotent_writes: boolean;
   truncation_mode: string;        // "base" or "adapter"
   max_batch_tokens?: number;      // Optional: token-based batch limits
   supports_multilingual?: boolean; // Optional: multilingual support
@@ -2274,16 +2591,21 @@ interface EmbedResult {
   tokens_used?: number;
   truncated?: boolean;            // True if text was truncated
 }
+```
 
+### 18.4 EmbeddingVector
+```typescript
 interface EmbeddingVector {
   vector: number[];
   text: string;                   // Denormalized for convenience
   model: string;                  // Denormalized for convenience
   dimensions: number;
+  index?: number;                 // Optional: index in original batch
+  metadata?: Metadata;            // Optional: additional metadata
 }
 ```
 
-### 18.4 EmbedBatchResult
+### 18.5 EmbedBatchResult
 ```typescript
 interface EmbedBatchResult {
   embeddings: EmbeddingVector[];
@@ -2296,6 +2618,16 @@ interface EmbedBatchResult {
     error: string;
     message: string;
   }>;
+}
+```
+
+### 18.6 EmbedChunk
+```typescript
+interface EmbedChunk {
+  embeddings: EmbeddingVector[];
+  is_final: boolean;              // True for final chunk
+  usage?: object;                 // Optional usage information
+  model?: string;                 // Optional model identifier
 }
 ```
 
@@ -2337,6 +2669,9 @@ interface EmbedBatchResult {
     "supports_normalization": true,
     "supports_truncation": true,
     "supports_token_counting": true,
+    "supports_streaming": true,
+    "supports_batch_embedding": true,
+    "supports_caching": true,
     "supports_multi_tenant": true,
     "supports_deadline": true,
     "normalizes_at_source": true,
@@ -2350,7 +2685,7 @@ interface EmbedBatchResult {
 ```
 
 ### 19.2 embed
-**Purpose:** Generate embedding vector for a single text
+**Purpose:** Generate embedding vector for a single text (unary operation)
 
 **Operation:** `embedding.embed`
 
@@ -2406,7 +2741,7 @@ interface EmbedBatchResult {
 
 **Operation:** `embedding.embed_batch`
 
-**Input:`EmbedBatchSpec`
+**Input:** `EmbedBatchSpec`
 
 **Validation:**
 - `model` MUST be non-empty string
@@ -2447,19 +2782,22 @@ interface EmbedBatchResult {
         "vector": [0.1, 0.2, 0.3, 0.4, 0.5, 0.1, 0.2, 0.3, 0.4, 0.5],
         "text": "Machine learning is a subset of artificial intelligence.",
         "model": "text-embedding-3-large",
-        "dimensions": 3072
+        "dimensions": 3072,
+        "index": 0
       },
       {
         "vector": [0.15, 0.25, 0.35, 0.45, 0.55, 0.15, 0.25, 0.35, 0.45, 0.55],
         "text": "Deep learning uses neural networks with multiple layers.",
         "model": "text-embedding-3-large",
-        "dimensions": 3072
+        "dimensions": 3072,
+        "index": 1
       },
       {
         "vector": [0.12, 0.22, 0.32, 0.42, 0.52, 0.12, 0.22, 0.32, 0.42, 0.52],
         "text": "Natural language processing helps computers understand human language.",
         "model": "text-embedding-3-large",
-        "dimensions": 3072
+        "dimensions": 3072,
+        "index": 2
       }
     ],
     "model": "text-embedding-3-large",
@@ -2470,7 +2808,47 @@ interface EmbedBatchResult {
 }
 ```
 
-### 19.4 count_tokens
+### 19.4 stream_embed
+**Purpose:** Stream embeddings incrementally (for batch operations)
+
+**Operation:** `embedding.stream_embed`
+
+**Input:** `EmbedBatchSpec`
+
+**Validation:**
+- `model` MUST be non-empty string
+- `texts` MUST be non-empty list
+
+**Request Body:**
+```json
+{
+  "op": "embedding.stream_embed",
+  "ctx": {
+    "request_id": "req-embed-stream-001",
+    "tenant": "acme-corp"
+  },
+  "args": {
+    "texts": [
+      "Text 1 for streaming embeddings",
+      "Text 2 for streaming embeddings",
+      "Text 3 for streaming embeddings"
+    ],
+    "model": "text-embedding-3-large",
+    "truncate": true
+  }
+}
+```
+
+**Output:** `AsyncIterable<EmbedChunk>`
+
+**Stream Response Frames:**
+```json
+{"ok": true, "code": "STREAMING", "ms": 12.3, "chunk": {"embeddings": [{"vector": [0.1, 0.2], "text": "Text 1 for streaming embeddings", "model": "text-embedding-3-large", "dimensions": 3072, "index": 0}], "is_final": false}}
+{"ok": true, "code": "STREAMING", "ms": 15.7, "chunk": {"embeddings": [{"vector": [0.3, 0.4], "text": "Text 2 for streaming embeddings", "model": "text-embedding-3-large", "dimensions": 3072, "index": 1}], "is_final": false}}
+{"ok": true, "code": "STREAMING", "ms": 18.2, "chunk": {"embeddings": [{"vector": [0.5, 0.6], "text": "Text 3 for streaming embeddings", "model": "text-embedding-3-large", "dimensions": 3072, "index": 2}], "is_final": true, "usage": {"total_tokens": 24}}}
+```
+
+### 19.5 count_tokens
 **Purpose:** Count tokens in text for embedding model
 
 **Operation:** `embedding.count_tokens`
@@ -2504,7 +2882,7 @@ interface EmbedBatchResult {
 }
 ```
 
-### 19.5 health
+### 19.6 health
 **Purpose:** Check embedding provider health and model status
 
 **Operation:** `embedding.health`
@@ -2603,22 +2981,30 @@ interface EmbeddingHealthStatus {
 - **Partial success:** Continue processing despite individual failures
 - **Fallback behavior:** Automatic fallback to single embedding if batch unsupported
 
-### 20.6 Determinism
+### 20.6 Streaming Semantics
+- **Streaming operation:** `embedding.stream_embed` is separate from unary operations
+- **Incremental delivery:** Embeddings delivered as they become available
+- **Streaming code:** All streaming success frames MUST use `code: "STREAMING"`
+- **Final chunk:** Last chunk must have `is_final: true`
+
+### 20.7 Determinism
 - **Same inputs:** Identical text + model → identical embedding vector
 - **Batch consistency:** Batch embedding identical to individual embeddings
 - **Normalization:** Consistent normalization when requested
 
-### 20.7 Error Mappings
+### 20.8 Error Mappings
 | Provider Error | Normalized Error | Wire Code | Details |
 |----------------|------------------|-----------|---------|
 | Text too long | `TextTooLong` | `TEXT_TOO_LONG` | `{"max_text_length": 8192, "provided_length": 8500}` |
 | Model not available | `ModelNotAvailable` | `MODEL_NOT_AVAILABLE` | `{"requested_model": "unknown-model"}` |
 | Normalization not supported | `NotSupported` | `NOT_SUPPORTED` | `{"feature": "normalization"}` |
+| Batch size exceeded | `BadRequest` | `BAD_REQUEST` | `{"max_batch_size": 2048, "provided": 2500}` |
 
-### 20.8 Deadline Rules
+### 20.9 Deadline Rules
 - **Batch timeouts:** Deadline applies to entire batch processing
 - **Token counting:** Fast operation with minimal timeout impact
 - **Provider limits:** Respect provider-specific timeout constraints
+- **Streaming timeouts:** Deadline applies to entire streaming operation
 
 ---
 
@@ -2781,6 +3167,8 @@ All batch operations use consistent partial failure reporting:
 - [ ] Capabilities reported truthfully including protocol field
 - [ ] Wire envelopes follow standardization
 - [ ] Streaming semantics followed
+- [ ] All request envelopes include `op`, `ctx`, `args` keys
+- [ ] All streaming success frames use `code: "STREAMING"`
 
 ### 26.2 Protocol-Specific Compliance
 **Graph:**
@@ -2789,6 +3177,8 @@ All batch operations use consistent partial failure reporting:
 - [ ] Streaming cardinality bounds respected
 - [ ] Batch partial failure reporting
 - [ ] Validation rules enforced (non-empty nodes/edges, etc.)
+- [ ] Transaction and traversal operations implemented where supported
+- [ ] Bulk vertices pagination implemented
 
 **LLM:**
 - [ ] Stop sequence precedence followed
@@ -2797,6 +3187,7 @@ All batch operations use consistent partial failure reporting:
 - [ ] Stream equivalence guaranteed
 - [ ] Parameter range validation enforced
 - [ ] Context window preflight implemented
+- [ ] Tool choice options (`auto`, `none`, `required`) supported
 
 **Vector:**
 - [ ] Dimension enforcement strict
@@ -2804,6 +3195,8 @@ All batch operations use consistent partial failure reporting:
 - [ ] Metric scoring normalized
 - [ ] Batch size limits enforced
 - [ ] Namespace validation implemented
+- [ ] Text storage strategy behavior implemented
+- [ ] Batch query operation implemented
 
 **Embedding:**
 - [ ] Truncation rules followed
@@ -2811,6 +3204,8 @@ All batch operations use consistent partial failure reporting:
 - [ ] Dimension matching enforced
 - [ ] Empty input handling defined
 - [ ] Batch fallback behavior implemented
+- [ ] Streaming embedding operation implemented
+- [ ] Caching support implemented where available
 
 ## 27. Cross-Protocol Standardization Tables
 
@@ -2844,6 +3239,7 @@ All batch operations use consistent partial failure reporting:
 | Order preservation | REQUIRED | Maintains semantic order |
 | Backpressure | RECOMMENDED | Respect client consumption |
 | Heartbeats | OPTIONAL | Keep-alive messages |
+| Streaming code | REQUIRED | MUST use `code: "STREAMING"` |
 
 ### 27.4 Error Code Standardization
 | Error Code | Retryable | Protocols | Typical Cause |
@@ -2859,14 +3255,17 @@ All batch operations use consistent partial failure reporting:
 | `TEXT_TOO_LONG` | No | LLM, Embedding | Input exceeds context window |
 | `DIMENSION_MISMATCH` | No | Vector | Vector dimensions don't match |
 | `QUERY_PARSE_ERROR` | No | Graph | Invalid query syntax |
+| `INDEX_NOT_READY` | Conditional | Vector | Index building in progress |
+| `NAMESPACE_NOT_FOUND` | No | Vector | Unknown namespace |
 
 *\*Retry after suggested delay*
 
 ## 28. Glossary
 
 ### 28.1 Common Terminology
-- **Adapter:** Protocol implementation bridging Corpus APIs to providers
-- **Provider:** Underlying AI/data service (OpenAI, Pinecone, Neo4j, etc.)
+- **Adapter:** Protocol implementation bridging Corpus APIs to provider backends
+- **Provider:** Underlying service (OpenAI, Pinecone, Neo4j, etc.)
+- **MUST/SHOULD/MAY:** RFC 2119 normative language
 - **Tenant:** Logical isolation boundary for multi-tenant deployments
 - **Namespace:** Protocol-specific isolation scope (collections, graphs, etc.)
 - **OperationContext:** Request-scoped context for deadlines, tracing, etc.
@@ -2963,14 +3362,13 @@ All batch operations use consistent partial failure reporting:
     ]
   },
   "Graph Batch (all success)": {
-    "processed_count": 3,
-    "failed_count": 0,
-    "failures": [],
     "results": [
       {"deleted_count": 1},
       {"upserted_count": 2}, 
       {"processed_count": 1}
-    ]
+    ],
+    "success": true,
+    "transaction_id": "tx-12345"
   }
 }
 ```
@@ -2978,16 +3376,23 @@ All batch operations use consistent partial failure reporting:
 ### 29.4 Example Streaming Traces
 **Graph Stream Frames:**
 ```json
-{"ok": true, "code": "OK", "ms": 12.3, "chunk": {"records": [{"user": {"id": "u1", "name": "Alice"}}], "is_final": false}}
-{"ok": true, "code": "OK", "ms": 15.7, "chunk": {"records": [{"user": {"id": "u2", "name": "Bob"}}], "is_final": false}}
-{"ok": true, "code": "OK", "ms": 18.2, "chunk": {"summary": {"query_time_ms": 125.4, "results_count": 2, "has_more": false}, "is_final": true}}
+{"ok": true, "code": "STREAMING", "ms": 12.3, "chunk": {"records": [{"user": {"id": "u1", "name": "Alice"}}], "is_final": false}}
+{"ok": true, "code": "STREAMING", "ms": 15.7, "chunk": {"records": [{"user": {"id": "u2", "name": "Bob"}}], "is_final": false}}
+{"ok": true, "code": "STREAMING", "ms": 18.2, "chunk": {"summary": {"query_time_ms": 125.4, "results_count": 2, "has_more": false}, "is_final": true}}
 ```
 
 **LLM Stream Frames:**
 ```json
-{"ok": true, "code": "OK", "ms": 12.3, "chunk": {"text": "Hello", "is_final": false, "model": "gpt-4.1-mini"}}
-{"ok": true, "code": "OK", "ms": 15.7, "chunk": {"text": " world", "is_final": false, "model": "gpt-4.1-mini"}}
-{"ok": true, "code": "OK", "ms": 18.2, "chunk": {"text": "!", "is_final": true, "model": "gpt-4.1-mini", "usage_so_far": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}}}
+{"ok": true, "code": "STREAMING", "ms": 12.3, "chunk": {"text": "Hello", "is_final": false, "model": "gpt-4.1-mini"}}
+{"ok": true, "code": "STREAMING", "ms": 15.7, "chunk": {"text": " world", "is_final": false, "model": "gpt-4.1-mini"}}
+{"ok": true, "code": "STREAMING", "ms": 18.2, "chunk": {"text": "!", "is_final": true, "model": "gpt-4.1-mini", "usage_so_far": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}}}
+```
+
+**Embedding Stream Frames:**
+```json
+{"ok": true, "code": "STREAMING", "ms": 12.3, "chunk": {"embeddings": [{"vector": [0.1, 0.2], "text": "Text 1", "model": "text-embedding-3-large", "dimensions": 3072, "index": 0}], "is_final": false}}
+{"ok": true, "code": "STREAMING", "ms": 15.7, "chunk": {"embeddings": [{"vector": [0.3, 0.4], "text": "Text 2", "model": "text-embedding-3-large", "dimensions": 3072, "index": 1}], "is_final": false}}
+{"ok": true, "code": "STREAMING", "ms": 18.2, "chunk": {"embeddings": [{"vector": [0.5, 0.6], "text": "Text 3", "model": "text-embedding-3-large", "dimensions": 3072, "index": 2}], "is_final": true, "usage": {"total_tokens": 24}}}
 ```
 
 ### 29.5 Context Deadline Examples
@@ -3029,26 +3434,26 @@ adapter = BaseLLMAdapter(mode="standalone")
 ## 30. Index
 
 ### 30.1 Operations Index
-- **Graph Operations:** capabilities, upsert_nodes, upsert_edges, delete_nodes, delete_edges, query, stream_query, bulk_vertices, batch, get_schema, health
+- **Graph Operations:** capabilities, upsert_nodes, upsert_edges, delete_nodes, delete_edges, query, stream_query, bulk_vertices, batch, transaction, traversal, get_schema, health
 - **LLM Operations:** capabilities, complete, stream, count_tokens, health  
-- **Vector Operations:** capabilities, query, upsert, delete, create_namespace, delete_namespace, health
-- **Embedding Operations:** capabilities, embed, embed_batch, count_tokens, health
+- **Vector Operations:** capabilities, query, batch_query, upsert, delete, create_namespace, delete_namespace, health
+- **Embedding Operations:** capabilities, embed, embed_batch, stream_embed, count_tokens, health
 
 ### 30.2 Types Index
 - **Common Types:** OperationContext, Metadata, FilterExpression, BatchResult, TokenUsage, CountTokensSpec
-- **Graph Types:** Node, Edge, GraphQuerySpec, GraphQueryResult, QueryChunk, GraphSchema, ConstraintInfo, IndexInfo, GraphHealthStatus
+- **Graph Types:** Node, Edge, GraphQuerySpec, GraphQueryResult, QueryChunk, BulkVerticesSpec, BulkVerticesResult, GraphBatchResult, GraphTraversalSpec, TraversalResult, GraphSchema, ConstraintInfo, IndexInfo, GraphHealthStatus
 - **LLM Types:** Message, ToolCall, ToolDefinition, CompletionSpec, LLMCompletion, LLMChunk, LLMHealthStatus
-- **Vector Types:** Vector, VectorMatch, VectorQuerySpec, VectorQueryResult, UpsertSpec, UpsertResult, DeleteSpec, DeleteResult, NamespaceSpec, NamespaceResult, VectorHealthStatus
-- **Embedding Types:** EmbedSpec, EmbedBatchSpec, EmbedResult, EmbeddingVector, EmbedBatchResult, EmbeddingHealthStatus
+- **Vector Types:** Vector, VectorMatch, VectorQuerySpec, VectorQueryResult, BatchQuerySpec, UpsertSpec, UpsertResult, DeleteSpec, DeleteResult, NamespaceSpec, NamespaceResult, VectorHealthStatus
+- **Embedding Types:** EmbedSpec, EmbedBatchSpec, EmbedResult, EmbeddingVector, EmbedBatchResult, EmbedChunk, EmbeddingHealthStatus
 
 ### 30.3 Capabilities Index
-- **Graph Capabilities:** protocol, server, version, supported_query_dialects, supports_stream_query, supports_bulk_vertices, supports_batch, supports_schema, idempotent_writes, supports_deadline, supports_namespaces, supports_property_filters, supports_multi_tenant, max_batch_ops, max_query_complexity, max_nodes_per_transaction, supports_analytics_queries
-- **LLM Capabilities:** protocol, server, version, model_family, supported_models, max_context_length, supports_streaming, supports_roles, supports_system_message, supports_json_output, supports_parallel_tool_calls, supports_deadline, supports_count_tokens, idempotent_writes, supports_multi_tenant, max_tokens_per_minute, max_requests_per_minute, supports_function_calling, supports_vision, supports_logprobs
-- **Vector Capabilities:** protocol, server, version, max_dimensions, supported_metrics, supports_namespaces, supports_metadata_filtering, supports_batch_operations, max_batch_size, supports_index_management, supports_deadline, idempotent_writes, supports_multi_tenant, max_top_k, max_filter_terms, supports_hybrid_search, supports_sparse_vectors, max_namespaces, supports_vector_compression
-- **Embedding Capabilities:** protocol, server, version, supported_models, max_batch_size, max_text_length, max_dimensions, supports_normalization, supports_truncation, supports_token_counting, supports_multi_tenant, supports_deadline, normalizes_at_source, idempotent_writes, truncation_mode, max_batch_tokens, supports_multilingual, supports_custom_dimensions
+- **Graph Capabilities:** protocol, server, version, supported_query_dialects, supports_stream_query, supports_bulk_vertices, supports_batch, supports_schema, supports_transaction, supports_traversal, supports_path_queries, idempotent_writes, supports_deadline, supports_namespaces, supports_property_filters, supports_multi_tenant, max_batch_ops, max_traversal_depth, max_query_complexity, max_nodes_per_transaction, supports_analytics_queries
+- **LLM Capabilities:** protocol, server, version, model_family, supported_models, max_context_length, supports_streaming, supports_roles, supports_system_message, supports_json_output, supports_tools, supports_parallel_tool_calls, supports_tool_choice, supports_deadline, supports_count_tokens, idempotent_writes, supports_multi_tenant, max_tool_calls_per_turn, max_tokens_per_minute, max_requests_per_minute, supports_function_calling, supports_vision, supports_logprobs
+- **Vector Capabilities:** protocol, server, version, max_dimensions, supported_metrics, supports_namespaces, supports_metadata_filtering, supports_batch_operations, supports_batch_queries, max_batch_size, max_top_k, max_filter_terms, supports_index_management, supports_deadline, idempotent_writes, supports_multi_tenant, text_storage_strategy, max_text_length, supports_hybrid_search, supports_sparse_vectors, max_namespaces, supports_vector_compression
+- **Embedding Capabilities:** protocol, server, version, supported_models, max_batch_size, max_text_length, max_dimensions, supports_normalization, supports_truncation, supports_token_counting, supports_streaming, supports_batch_embedding, supports_caching, supports_multi_tenant, supports_deadline, normalizes_at_source, idempotent_writes, truncation_mode, max_batch_tokens, supports_multilingual, supports_custom_dimensions
 
 ### 30.4 Error Codes Index
-- BAD_REQUEST, AUTH_ERROR, RESOURCE_EXHAUSTED, TRANSIENT_NETWORK, UNAVAILABLE, NOT_SUPPORTED, DEADLINE_EXCEEDED, MODEL_OVERLOADED, TEXT_TOO_LONG, DIMENSION_MISMATCH, QUERY_PARSE_ERROR
+- BAD_REQUEST, AUTH_ERROR, RESOURCE_EXHAUSTED, TRANSIENT_NETWORK, UNAVAILABLE, NOT_SUPPORTED, DEADLINE_EXCEEDED, MODEL_OVERLOADED, TEXT_TOO_LONG, DIMENSION_MISMATCH, QUERY_PARSE_ERROR, INDEX_NOT_READY, NAMESPACE_NOT_FOUND
 
 ### 30.5 Cross-Protocol Concepts
 - Tenant Isolation, Deadline Propagation, Streaming Semantics, Batch Operations, Partial Failures, Health Checking, Capability Discovery, Error Normalization, Observability, Security Requirements
@@ -3056,4 +3461,3 @@ adapter = BaseLLMAdapter(mode="standalone")
 ---
 
 *End of PROTOCOLS.md (protocols_version 1.0)*
-```
