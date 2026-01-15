@@ -27,9 +27,6 @@ production use at scale. It lacks:
 - Query planning and optimization
 - Cross-protocol orchestration
 
-For production-grade routing with these features, see:
-    https://www.corpusos.com/products/router
-
 This reference implementation is provided to:
 1. Demonstrate protocol interoperability
 2. Enable rapid prototyping and development
