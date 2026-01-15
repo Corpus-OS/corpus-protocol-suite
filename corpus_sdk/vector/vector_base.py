@@ -307,17 +307,41 @@ class RedisDocStore:
     Note:
         Metadata stored here mirrors vector metadata at write time but is not
         automatically kept in sync with later vector metadata changes.
+
+    Optional dependencies:
+        - Requires a Redis client compatible with the methods used here (get, set, mget, delete,
+          and optionally pipeline()).
+        - Requires `msgpack` at runtime. Imports are intentionally lazy (inside methods) so import-time
+          remains dependency-light, but missing optional deps raise a friendly NotSupported error.
     """
 
     def __init__(self, redis_client, key_prefix: str = "corpus:doc:"):
         self._redis = redis_client
         self._prefix = key_prefix
 
+    @staticmethod
+    def _msgpack():
+        """
+        Lazily import msgpack and raise a friendly, typed error if unavailable.
+
+        This keeps the OSS "single file" base importable without optional deps
+        while producing a clear runtime error when RedisDocStore is used without msgpack.
+        """
+        try:
+            import msgpack  # type: ignore
+            return msgpack
+        except Exception as e:
+            raise NotSupported(
+                "RedisDocStore requires optional dependency 'msgpack'. "
+                "Install with `pip install msgpack` (or msgpack-python), "
+                "or use InMemoryDocStore / a custom DocStore implementation."
+            ) from e
+
     def _key(self, doc_id: str) -> str:
         return f"{self._prefix}{doc_id}"
 
     async def get(self, doc_id: str) -> Optional[Document]:
-        import msgpack
+        msgpack = self._msgpack()
         raw = await self._redis.get(self._key(doc_id))
         if raw is None:
             return None
@@ -329,7 +353,7 @@ class RedisDocStore:
         )
 
     async def put(self, doc: Document) -> None:
-        import msgpack
+        msgpack = self._msgpack()
         data = {"id": doc.id, "text": doc.text, "metadata": doc.metadata}
         await self._redis.set(
             self._key(doc.id),
@@ -338,7 +362,7 @@ class RedisDocStore:
         )
 
     async def batch_get(self, doc_ids: List[str]) -> Dict[str, Document]:
-        import msgpack
+        msgpack = self._msgpack()
         if not doc_ids:
             return {}
         keys = [self._key(doc_id) for doc_id in doc_ids]
@@ -355,10 +379,13 @@ class RedisDocStore:
         return results
 
     async def batch_put(self, docs: List[Document]) -> None:
-        import msgpack
+        msgpack = self._msgpack()
         if not docs:
             return
-        pipe = self._redis.pipeline()
+        pipe_fn = getattr(self._redis, "pipeline", None)
+        if not callable(pipe_fn):
+            raise NotSupported("redis_client does not support pipeline(); cannot batch_put")
+        pipe = pipe_fn()
         for doc in docs:
             data = {"id": doc.id, "text": doc.text, "metadata": doc.metadata}
             pipe.set(self._key(doc.id), msgpack.packb(data), ex=86400 * 30)
@@ -1601,6 +1628,7 @@ class BaseVectorAdapter(VectorProtocolV1):
             self._breaker.on_error(e)
             raise
         except Exception as e:
+            # Cross-SDK alignment: standardize unknown exception metrics code.
             self._record(
                 op,
                 t0,
