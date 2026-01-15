@@ -50,10 +50,10 @@ in higher-level routing layers or the commercial Corpus Router.
 from typing import Any, Dict, Optional, AsyncIterator, Union
 import logging
 
-from corpus_sdk.llm import WireLLMHandler, LLMProtocolV1
-from corpus_sdk.embedding import WireEmbeddingHandler, EmbeddingProtocolV1
-from corpus_sdk.vector import WireVectorHandler, VectorProtocolV1
-from corpus_sdk.graph import WireGraphHandler, GraphProtocolV1
+from corpus_sdk.llm.llm_base import WireLLMHandler, LLMProtocolV1
+from corpus_sdk.embedding.embedding_base import WireEmbeddingHandler, EmbeddingProtocolV1
+from corpus_sdk.vector.vector_base import WireVectorHandler, VectorProtocolV1
+from corpus_sdk.graph.graph_base import WireGraphHandler, GraphProtocolV1
 
 LOG = logging.getLogger(__name__)
 
