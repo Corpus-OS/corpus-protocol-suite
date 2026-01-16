@@ -1783,9 +1783,10 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "additionalProperties": true
 }
 ```
----
 
 ## 4.3 Embedding Protocol Schemas
+
+---
 
 ### 4.3.1 Envelope Schemas
 
@@ -1797,23 +1798,17 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "$id": "https://corpusos.com/schemas/embedding/embedding.envelope.request.json",
   "title": "Embedding Protocol Request Envelope",
   "type": "object",
-  "properties": {
-    "op": {
-      "type": "string",
-      "description": "Operation identifier. Unknown operations are handled at runtime."
-    },
-    "ctx": {
-      "$ref": "https://corpusos.com/schemas/embedding/embedding.operation_context.json",
-      "description": "REQUIRED on the wire; must be an object (mapping)."
-    },
-    "args": {
-      "type": "object",
-      "description": "REQUIRED on the wire; must be an object (mapping).",
-      "additionalProperties": true
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/common/envelope.request.json" },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "description": "Operation identifier. The wire handler only enforces that this is a string; unknown ops are handled at runtime."
+        }
+      }
     }
-  },
-  "required": ["op", "ctx", "args"],
-  "additionalProperties": true
+  ]
 }
 ```
 
@@ -1825,25 +1820,9 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "$id": "https://corpusos.com/schemas/embedding/embedding.envelope.success.json",
   "title": "Embedding Protocol Success Envelope",
   "type": "object",
-  "properties": {
-    "ok": { "type": "boolean", "const": true },
-    "code": { "type": "string", "const": "OK" },
-    "ms": { "type": "number" },
-    "result": {
-      "description": "Operation-specific result payload (any JSON value).",
-      "oneOf": [
-        { "type": "object" },
-        { "type": "array" },
-        { "type": "string" },
-        { "type": "number" },
-        { "type": "integer" },
-        { "type": "boolean" },
-        { "type": "null" }
-      ]
-    }
-  },
-  "required": ["ok", "code", "ms", "result"],
-  "additionalProperties": false
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/common/envelope.success.json" }
+  ]
 }
 ```
 
@@ -1855,17 +1834,9 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "$id": "https://corpusos.com/schemas/embedding/embedding.envelope.error.json",
   "title": "Embedding Protocol Error Envelope",
   "type": "object",
-  "properties": {
-    "ok": { "type": "boolean", "const": false },
-    "code": { "type": "string" },
-    "error": { "type": "string" },
-    "message": { "type": "string" },
-    "retry_after_ms": { "type": ["integer", "null"] },
-    "details": { "type": ["object", "null"], "additionalProperties": true },
-    "ms": { "type": "number" }
-  },
-  "required": ["ok", "code", "error", "message", "retry_after_ms", "details", "ms"],
-  "additionalProperties": false
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/common/envelope.error.json" }
+  ]
 }
 ```
 
@@ -1877,36 +1848,13 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "$id": "https://corpusos.com/schemas/embedding/embedding.envelope.stream.success.json",
   "title": "Embedding Protocol Streaming Success Envelope",
   "type": "object",
-  "properties": {
-    "ok": { "type": "boolean", "const": true },
-    "code": { "type": "string", "const": "STREAMING" },
-    "ms": { "type": "number" },
-    "chunk": { "$ref": "https://corpusos.com/schemas/embedding/embedding.types.chunk.json" }
-  },
-  "required": ["ok", "code", "ms", "chunk"],
-  "additionalProperties": false
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/common/envelope.stream.success.json" }
+  ]
 }
 ```
 
-#### 4.3.1.5 Operation Context (`embedding/embedding.operation_context.json`)
-
-```json
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://corpusos.com/schemas/embedding/embedding.operation_context.json",
-  "title": "Embedding Operation Context",
-  "type": "object",
-  "properties": {
-    "request_id": {},
-    "idempotency_key": {},
-    "deadline_ms": {},
-    "traceparent": {},
-    "tenant": {},
-    "attrs": { "type": "object", "additionalProperties": true }
-  },
-  "additionalProperties": true
-}
-```
+> **Note:** Embedding no longer defines a separate `embedding.operation_context.json`. Embedding requests inherit `ctx` from `common/envelope.request.json`, which references `https://corpusos.com/schemas/common/operation_context.json`.
 
 ---
 
@@ -1926,8 +1874,12 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/embedding/embedding.envelope.request.json" },
     {
       "properties": {
-        "op": { "const": "embedding.capabilities" },
-        "args": { "type": "object", "additionalProperties": true }
+        "op": { "type": "string", "const": "embedding.capabilities" },
+        "args": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Args object is required on the wire; extra keys are ignored by the handler."
+        }
       }
     }
   ]
@@ -1969,18 +1921,8 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/embedding/embedding.envelope.request.json" },
     {
       "properties": {
-        "op": { "const": "embedding.embed" },
-        "args": {
-          "type": "object",
-          "properties": {
-            "text": {},
-            "model": {},
-            "truncate": {},
-            "normalize": {},
-            "stream": { "type": "boolean", "const": false }
-          },
-          "additionalProperties": true
-        }
+        "op": { "type": "string", "const": "embedding.embed" },
+        "args": { "$ref": "https://corpusos.com/schemas/embedding/embedding.types.embed_spec.json" }
       }
     }
   ]
@@ -2008,7 +1950,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 
 ---
 
-#### 4.3.2.3 `embedding.stream_embed` (streaming)
+#### 4.3.2.3 `embedding.stream_embed` (streaming, **batch**)
 
 **Request (`embedding/embedding.stream_embed.request.json`)**
 
@@ -2022,17 +1964,8 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/embedding/embedding.envelope.request.json" },
     {
       "properties": {
-        "op": { "const": "embedding.stream_embed" },
-        "args": {
-          "type": "object",
-          "properties": {
-            "text": {},
-            "model": {},
-            "truncate": {},
-            "normalize": {}
-          },
-          "additionalProperties": true
-        }
+        "op": { "type": "string", "const": "embedding.stream_embed" },
+        "args": { "$ref": "https://corpusos.com/schemas/embedding/embedding.types.stream_embed_spec.json" }
       }
     }
   ]
@@ -2048,7 +1981,12 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "Embedding Stream Embed Success Frame",
   "type": "object",
   "allOf": [
-    { "$ref": "https://corpusos.com/schemas/embedding/embedding.envelope.stream.success.json" }
+    { "$ref": "https://corpusos.com/schemas/common/envelope.stream.success.json" },
+    {
+      "properties": {
+        "chunk": { "$ref": "https://corpusos.com/schemas/embedding/embedding.types.chunk.json" }
+      }
+    }
   ]
 }
 ```
@@ -2069,19 +2007,20 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/embedding/embedding.envelope.request.json" },
     {
       "properties": {
-        "op": { "const": "embedding.embed_batch" },
+        "op": { "type": "string", "const": "embedding.embed_batch" },
         "args": {
           "type": "object",
           "properties": {
             "texts": {
               "type": "array",
-              "items": {}
+              "items": { "type": "string" },
+              "minItems": 1
             },
-            "model": {},
-            "truncate": {},
-            "normalize": {}
+            "model": { "type": "string", "minLength": 1, "pattern": ".*\\S.*" },
+            "truncate": { "type": ["boolean", "null"] },
+            "normalize": { "type": ["boolean", "null"] }
           },
-          "required": ["texts"],
+          "required": ["texts", "model"],
           "additionalProperties": true
         }
       }
@@ -2125,16 +2064,8 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/embedding/embedding.envelope.request.json" },
     {
       "properties": {
-        "op": { "const": "embedding.count_tokens" },
-        "args": {
-          "type": "object",
-          "properties": {
-            "text": { "type": "string" },
-            "model": { "type": "string" }
-          },
-          "required": ["text", "model"],
-          "additionalProperties": true
-        }
+        "op": { "type": "string", "const": "embedding.count_tokens" },
+        "args": { "$ref": "https://corpusos.com/schemas/embedding/embedding.types.count_tokens_spec.json" }
       }
     }
   ]
@@ -2176,8 +2107,12 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/embedding/embedding.envelope.request.json" },
     {
       "properties": {
-        "op": { "const": "embedding.health" },
-        "args": { "type": "object", "additionalProperties": true }
+        "op": { "type": "string", "const": "embedding.health" },
+        "args": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Args object is required on the wire; extra keys are ignored by the handler."
+        }
       }
     }
   ]
@@ -2229,8 +2164,12 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/embedding/embedding.envelope.request.json" },
     {
       "properties": {
-        "op": { "const": "embedding.get_stats" },
-        "args": { "type": "object", "additionalProperties": true }
+        "op": { "type": "string", "const": "embedding.get_stats" },
+        "args": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Args object is required on the wire; extra keys are ignored by the handler."
+        }
       }
     }
   ]
@@ -2260,7 +2199,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 
 ### 4.3.3 Type Definitions
 
-#### 4.3.3.1 Capabilities (`embedding/embedding.capabilities.json`)
+#### 4.3.3.1 Capabilities (`embedding/embedding.capabilities.json`) — **additionalProperties: true**
 
 ```json
 {
@@ -2292,11 +2231,70 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     "supports_deadline": { "type": "boolean" }
   },
   "required": ["server", "version", "supported_models", "protocol"],
-  "additionalProperties": false
+  "additionalProperties": true
 }
 ```
 
-#### 4.3.3.2 Stats (`embedding/embedding.stats.json`)
+#### 4.3.3.2 Embed Spec (`embedding/embedding.types.embed_spec.json`)
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.types.embed_spec.json",
+  "title": "Embedding Embed Spec",
+  "type": "object",
+  "properties": {
+    "text": { "type": "string", "minLength": 1 },
+    "model": { "type": "string", "minLength": 1, "pattern": ".*\\S.*" },
+    "truncate": { "type": ["boolean", "null"] },
+    "normalize": { "type": ["boolean", "null"] }
+  },
+  "required": ["text", "model"],
+  "additionalProperties": true
+}
+```
+
+#### 4.3.3.3 Stream Embed Spec (`embedding/embedding.types.stream_embed_spec.json`) — **batch streaming**
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.types.stream_embed_spec.json",
+  "title": "Embedding Stream Embed Spec",
+  "type": "object",
+  "properties": {
+    "texts": {
+      "type": "array",
+      "items": { "type": "string" },
+      "minItems": 1
+    },
+    "model": { "type": "string", "minLength": 1, "pattern": ".*\\S.*" },
+    "truncate": { "type": ["boolean", "null"] },
+    "normalize": { "type": ["boolean", "null"] }
+  },
+  "required": ["texts", "model"],
+  "additionalProperties": true
+}
+```
+
+#### 4.3.3.4 Count Tokens Spec (`embedding/embedding.types.count_tokens_spec.json`)
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.types.count_tokens_spec.json",
+  "title": "Embedding Count Tokens Spec",
+  "type": "object",
+  "properties": {
+    "text": { "type": "string", "minLength": 1 },
+    "model": { "type": "string", "minLength": 1, "pattern": ".*\\S.*" }
+  },
+  "required": ["text", "model"],
+  "additionalProperties": true
+}
+```
+
+#### 4.3.3.5 Stats (`embedding/embedding.stats.json`)
 
 ```json
 {
@@ -2321,7 +2319,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-#### 4.3.3.3 Embedding Vector (`embedding/embedding.types.vector.json`)
+#### 4.3.3.6 Embedding Vector (`embedding/embedding.types.vector.json`)
 
 ```json
 {
@@ -2342,7 +2340,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-#### 4.3.3.4 Unary Embed Result (`embedding/embedding.types.result.json`)
+#### 4.3.3.7 Unary Embed Result (`embedding/embedding.types.result.json`)
 
 ```json
 {
@@ -2362,7 +2360,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-#### 4.3.3.5 Streaming Chunk (`embedding/embedding.types.chunk.json`)
+#### 4.3.3.8 Streaming Chunk (`embedding/embedding.types.chunk.json`)
 
 ```json
 {
@@ -2384,7 +2382,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-#### 4.3.3.6 Failure Item (`embedding/embedding.types.failure.json`)
+#### 4.3.3.9 Failure Item (`embedding/embedding.types.failure.json`)
 
 ```json
 {
@@ -2405,7 +2403,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-#### 4.3.3.7 Batch Embed Result (`embedding/embedding.types.batch_result.json`)
+#### 4.3.3.10 Batch Embed Result (`embedding/embedding.types.batch_result.json`)
 
 ```json
 {
@@ -2430,8 +2428,6 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "additionalProperties": false
 }
 ```
-
-
 
 ### 4.4 Graph Protocol Schemas
 
