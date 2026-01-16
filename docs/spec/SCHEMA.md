@@ -1802,11 +1802,11 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-## 4.3 Embedding Protocol Schemas — Updated for 100% alignment with `embedding_base.py`
+## 4.3 Embedding Protocol Schemas 
 
-## 4.3.1 Envelope Schemas
+### 4.3.1 Envelope Schemas
 
-### 4.3.1.1 Embedding Request Envelope (`embedding/embedding.envelope.request.json`)
+#### 4.3.1.1 Embedding Request Envelope (`embedding/embedding.envelope.request.json`)
 
 ```json
 {
@@ -1825,7 +1825,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-### 4.3.1.2 Embedding Success Envelope (`embedding/embedding.envelope.success.json`)
+#### 4.3.1.2 Embedding Success Envelope (`embedding/embedding.envelope.success.json`)
 
 ```json
 {
@@ -1839,7 +1839,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-### 4.3.1.3 Embedding Error Envelope (`embedding/embedding.envelope.error.json`)
+#### 4.3.1.3 Embedding Error Envelope (`embedding/embedding.envelope.error.json`)
 
 ```json
 {
@@ -1853,7 +1853,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-### 4.3.1.4 Embedding Streaming Success Envelope (`embedding/embedding.envelope.stream.success.json`)
+#### 4.3.1.4 Embedding Streaming Success Envelope (`embedding/embedding.envelope.stream.success.json`)
 
 ```json
 {
@@ -1868,7 +1868,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 ```
 ## 4.3.2 Operation Schemas
 
-### 4.3.2.1 `embedding.capabilities`
+#### 4.3.2.1 `embedding.capabilities`
 
 **Request (`embedding/embedding.capabilities.request.json`)**
 
@@ -1913,9 +1913,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
----
-
-### 4.3.2.2 `embedding.embed` (unary only)
+#### 4.3.2.2 `embedding.embed` (unary only)
 
 **Request (`embedding/embedding.embed.request.json`)**
 
@@ -1956,9 +1954,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
----
-
-### 4.3.2.3 `embedding.stream_embed` (streaming; **single-text**, aligned to base)
+#### 4.3.2.3 `embedding.stream_embed` (streaming; **single-text**, aligned to base)
 
 **Request (`embedding/embedding.stream_embed.request.json`)**
 
@@ -1998,10 +1994,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   ]
 }
 ```
-
----
-
-### 4.3.2.4 `embedding.embed_batch`
+#### 4.3.2.4 `embedding.embed_batch`
 
 **Request (`embedding/embedding.embed_batch.request.json`)**
 
@@ -2056,9 +2049,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
----
-
-### 4.3.2.5 `embedding.count_tokens`
+#### 4.3.2.5 `embedding.count_tokens`
 
 **Request (`embedding/embedding.count_tokens.request.json`)**
 
@@ -2099,9 +2090,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
----
-
-### 4.3.2.6 `embedding.health`
+#### 4.3.2.6 `embedding.health`
 
 **Request (`embedding/embedding.health.request.json`)**
 
@@ -2156,9 +2145,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
----
-
-### 4.3.2.7 `embedding.get_stats`
+#### 4.3.2.7 `embedding.get_stats`
 
 **Request (`embedding/embedding.get_stats.request.json`)**
 
@@ -2203,11 +2190,9 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
----
-
 ## 4.3.3 Type Definitions
 
-### 4.3.3.1 Capabilities (`embedding/embedding.capabilities.json`)
+#### 4.3.3.1 Capabilities (`embedding/embedding.capabilities.json`)
 
 ```json
 {
@@ -2243,7 +2228,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-### 4.3.3.2 Embed Spec (`embedding/embedding.types.embed_spec.json`) — unary only
+#### 4.3.3.2 Embed Spec (`embedding/embedding.types.embed_spec.json`) — unary only
 
 * `text` non-empty
 * `model` non-empty
@@ -2267,7 +2252,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-### 4.3.3.3 Stream Embed Spec (`embedding/embedding.types.stream_embed_spec.json`) — **single text**
+#### 4.3.3.3 Stream Embed Spec (`embedding/embedding.types.stream_embed_spec.json`) — **single text**
 
 ```json
 {
@@ -2286,7 +2271,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-### 4.3.3.4 Count Tokens Spec (`embedding/embedding.types.count_tokens_spec.json`)
+#### 4.3.3.4 Count Tokens Spec (`embedding/embedding.types.count_tokens_spec.json`)
 
 ```json
 {
@@ -2303,7 +2288,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-### 4.3.3.5 Stats (`embedding/embedding.stats.json`)
+#### 4.3.3.5 Stats (`embedding/embedding.stats.json`)
 
 ```json
 {
@@ -2328,7 +2313,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-### 4.3.3.6 Embedding Vector (`embedding/embedding.types.vector.json`)
+#### 4.3.3.6 Embedding Vector (`embedding/embedding.types.vector.json`)
 
 ```json
 {
@@ -2349,7 +2334,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-### 4.3.3.7 Unary Embed Result (`embedding/embedding.types.result.json`)
+#### 4.3.3.7 Unary Embed Result (`embedding/embedding.types.result.json`)
 
 ```json
 {
@@ -2369,7 +2354,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-### 4.3.3.8 Streaming Chunk (`embedding/embedding.types.chunk.json`)
+#### 4.3.3.8 Streaming Chunk (`embedding/embedding.types.chunk.json`)
 
 ```json
 {
@@ -2391,7 +2376,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-### 4.3.3.9 Failure Item (`embedding/embedding.types.failure.json`)
+#### 4.3.3.9 Failure Item (`embedding/embedding.types.failure.json`)
 
 ```json
 {
@@ -2412,7 +2397,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-### 4.3.3.10 Batch Embed Result (`embedding/embedding.types.batch_result.json`)
+#### 4.3.3.10 Batch Embed Result (`embedding/embedding.types.batch_result.json`)
 
 ```json
 {
