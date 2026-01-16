@@ -1,4 +1,4 @@
-# Corpus Documents: Relationship and Normative Priority
+# Relationship and Normative Priority
 
 This repo defines the Corpus Protocol Suite across multiple documents. Some are normative
 (binding) and some are descriptive. This file defines which document is authoritative for
