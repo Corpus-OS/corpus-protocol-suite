@@ -307,102 +307,119 @@ These constraints are enforced in SCHEMA.md via `additionalProperties: false` on
 * All `v1.x` revisions are wire-compatible with `{component}/v1.0`.
 * Breaking changes require `"{component}/v2.0"`.
 
-#### 4.2.3. Streaming Frames (MUST where applicable)
+## 4.2.3. Streaming Frames (MUST where applicable)
 
-**Note:** SCHEMA.md and PROTOCOLS.md define the **adapter-level streaming envelope**:
+The canonical streaming interface is defined at the wire level using **JSON envelopes** validated by **SCHEMA.md**. For streaming operations (e.g., `llm.stream`, `graph.stream_query`, `embedding.stream_embed`), adapters MUST emit a sequence of **streaming success frames** and MAY terminate with an **error envelope**.
+
+### 4.2.3.1 Canonical Streaming Success Frame (MUST)
+
+Each streaming success frame MUST be a JSON object with the following top-level shape:
 
 ```json
 { "ok": true, "code": "STREAMING", "ms": 45.2, "chunk": { ... } }
 ```
 
-This `{ok, code, ms, chunk}` shape is the canonical wire format for streaming frames validated by JSON Schema.
+Rules:
 
-The `{event, data}` framing described in this section is an optional, higher-level event-stream overlay that routers or gateways MAY apply on top of the adapter envelope (e.g., for SSE or WebSocket clients). It is not a replacement for the base adapter envelope.
+* `ok` MUST be `true`.
+* `code` MUST be `"STREAMING"` for all streaming success frames.
+* `ms` MUST be a non-negative number representing time elapsed in milliseconds (as defined in SCHEMA.md).
+* `chunk` MUST be an operation-specific payload validated by the operation’s streaming chunk schema (e.g., `llm.types.chunk`, `graph.types.chunk`, `embedding.types.chunk`).
+* Streaming success frames are **closed objects** at the top level: adapters MUST NOT include top-level keys beyond `{ "ok", "code", "ms", "chunk" }` (enforced by SCHEMA.md).
 
-For streaming operations (`llm.stream`, `graph.stream_query`):
+### 4.2.3.2 Terminal Conditions (MUST)
 
-**Data frame:**
+Exactly one terminal condition MUST occur per stream:
 
-```json
-{
-  "event": "data",
-  "data": {}
-}
-```
+**A) Terminal Success (MUST)**
+A stream completes successfully when a streaming success frame is emitted whose `chunk.is_final` is `true`.
 
-**Terminal success frame:**
+* A well-formed success stream MUST include exactly one frame with `chunk.is_final: true`.
+* No streaming frames (success or error) may follow the terminal success frame.
 
-```json
-{
-  "event": "end",
-  "code": "OK"
-}
-```
-
-**Terminal error frame:**
+**B) Terminal Error (MUST)**
+A stream terminates with failure if an **error envelope** is emitted:
 
 ```json
 {
-  "event": "error",
+  "ok": false,
   "code": "UNAVAILABLE",
   "error": "Unavailable",
-  "message": "..."
+  "message": "...",
+  "retry_after_ms": null,
+  "details": null,
+  "ms": 123.4
 }
 ```
 
 Rules:
 
-* Exactly one terminal frame (`event: "end"` or `event: "error"`) per stream.
-* No `data` frames after the terminal frame.
-* Terminal error frames MUST use normalized `code` and `error`.
-* Unknown keys (including any extensions) MUST be ignored by clients.
+* Error frames MUST use the canonical error envelope shape (validated by SCHEMA.md).
+* Error envelopes are **closed objects** at the top level: adapters MUST NOT include top-level keys beyond those permitted by the error envelope schema.
+* No frames may follow a terminal error envelope.
 
-**Frame Size and Keepalive**
+### 4.2.3.3 Ordering and Integrity (MUST)
 
-* Each frame MUST be ≤ 1 MiB.
-* For streams idle for more than 15 seconds, servers SHOULD emit a keepalive frame:
+* Streams MUST preserve semantic ordering: chunks MUST be delivered in the order defined by the operation (e.g., token order for LLM, record order for graph).
+* Chunks MUST be self-contained JSON objects valid under the appropriate chunk schema.
+* Clients MUST NOT rely on JSON field ordering within frames.
 
-  ```json
-  {
-    "event": "data",
-    "data": {
-      "heartbeat": true
-    }
-  }
-  ```
-* Clients MUST treat `heartbeat` frames and other unknown fields as no-ops.
+### 4.2.3.4 Frame Size and Keepalive (MUST/SHOULD)
 
-#### 4.2.4. Transport Bindings for Streaming (Normative)
+* Each serialized frame MUST be ≤ 1 MiB.
+* For streams idle for more than 15 seconds, adapters SHOULD emit a keepalive **as a standard streaming success frame** whose chunk is a no-op per the relevant chunk schema and/or operation guidance.
 
-The logical frame model binds to transports:
+> Note: Keepalive messages MUST still conform to the schema-defined streaming success envelope and MUST NOT violate terminal conditions.
 
-**HTTP/1.1 + NDJSON**
+### 4.2.3.5 Optional Gateway Event Overlay (Informative)
+
+Gateways or routers MAY present an alternate client-facing event model (e.g., SSE `event:` + `data:` wrappers) for convenience. Such overlays are **not** part of the base adapter wire protocol and MUST NOT replace the canonical envelope+chunk frames emitted by adapters.
+
+If a gateway chooses to expose an event overlay, it SHOULD preserve the semantics and terminal conditions described above.
+
+## 4.2.4. Transport Bindings for Streaming (Normative)
+
+This section defines how the canonical streaming frame model (§4.2.3) is carried over common transports. The base unit across all transports is a **single JSON frame** that is either:
+
+* a streaming success envelope: `{ "ok": true, "code": "STREAMING", "ms": ..., "chunk": ... }`, or
+* an error envelope: `{ "ok": false, ... }`.
+
+Adapters MAY support one or more transports and SHOULD advertise supported transports via capabilities.
+
+### 4.2.4.1 HTTP/1.1 + NDJSON (MUST if supported)
 
 * `Content-Type: application/x-ndjson`
 * `Transfer-Encoding: chunked`
-* Each line is one JSON frame.
+* Each line MUST be one complete JSON frame (streaming success envelope or error envelope).
+* The final line MUST contain the terminal condition: either a frame with `chunk.is_final: true`, or an error envelope.
 
-**Server-Sent Events (SSE)**
+### 4.2.4.2 Server-Sent Events (SSE) (MUST if supported)
 
 * `Content-Type: text/event-stream`
-* `event: <event>`
-* `data: {json}`
+* Each SSE `data:` payload MUST be a complete JSON frame (streaming success envelope or error envelope).
+* Gateways MAY set SSE `event:` fields for client convenience, but clients MUST be able to recover the canonical JSON frame from `data:`.
 
-**WebSocket**
+### 4.2.4.3 WebSocket (MUST if supported)
 
-* Each message is a JSON frame.
+* Each WebSocket message MUST contain exactly one complete JSON frame (streaming success envelope or error envelope).
+* Terminal conditions follow §4.2.3.2.
 
-**gRPC / HTTP/2 Streaming**
+### 4.2.4.4 gRPC / HTTP/2 Streaming (MUST if supported)
 
-* Each streamed message corresponds to one logical frame.
+* Each streamed message MUST correspond to exactly one logical JSON frame (streaming success envelope or error envelope), encoded in a transport-appropriate way.
+* Terminal conditions follow §4.2.3.2.
 
-Adapters MAY support one or more transports and SHOULD advertise:
+### 4.2.4.5 Advertising Transport Support (SHOULD)
+
+Adapters SHOULD advertise supported streaming transports via capabilities:
 
 ```json
 "extensions": {
   "streaming_transports": ["ndjson", "sse", "websocket"]
 }
 ```
+
+Unknown keys in `extensions` MUST be ignored by clients.
 
 #### 4.2.5. Compatibility and Unknown Fields (MUST)
 
