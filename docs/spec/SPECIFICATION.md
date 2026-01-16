@@ -1,4 +1,4 @@
-# Corpus Protocol Suite Specification
+# CORPUS SPECIFICATION
 
 ## Abstract
 
@@ -12,7 +12,7 @@ This document is not an Internet Standards Track specification; it is published 
 
 ## Copyright Notice
 
-Copyright © 2025 Corpus Protocol Suite.
+Copyright © 2026 Interoperable Intelligence Inc.
 SPDX-License-Identifier: Apache-2.0
 
 ---
@@ -28,14 +28,15 @@ SPDX-License-Identifier: Apache-2.0
 * [3. Terminology](#3-terminology)
 * [4. Conventions and Notation](#4-conventions-and-notation)
 
-  * [4.1. Wire-First Canonical Form (Normative)](#41-wire-first-canonical-form-normative)
+  * [4.1. Relationship to SCHEMA.md and PROTOCOLS.md (Normative)](#41-relationship-to-schemamd-and-protocolsmd-normative)
+  * [4.2. Wire-First Canonical Form (Normative)](#42-wire-first-canonical-form-normative)
 
-    * [4.1.1. Envelopes and Content Types (MUST)](#411-envelopes-and-content-types-must)
-    * [4.1.2. Version Identification (MUST)](#412-version-identification-must)
-    * [4.1.3. Streaming Frames (MUST where applicable)](#413-streaming-frames-must-where-applicable)
-    * [4.1.4. Transport Bindings for Streaming (Normative)](#414-transport-bindings-for-streaming-normative)
-    * [4.1.5. Compatibility and Unknown Fields (MUST)](#415-compatibility-and-unknown-fields-must)
-    * [4.1.6. Operation Registry (Normative)](#416-operation-registry-normative)
+    * [4.2.1. Envelopes and Content Types (MUST)](#421-envelopes-and-content-types-must)
+    * [4.2.2. Version Identification (MUST)](#422-version-identification-must)
+    * [4.2.3. Streaming Frames (MUST where applicable)](#423-streaming-frames-must-where-applicable)
+    * [4.2.4. Transport Bindings for Streaming (Normative)](#424-transport-bindings-for-streaming-normative)
+    * [4.2.5. Compatibility and Unknown Fields (MUST)](#425-compatibility-and-unknown-fields-must)
+    * [4.2.6. Operation Registry (Normative)](#426-operation-registry-normative)
 * [5. Architecture Overview](#5-architecture-overview)
 
   * [5.1. Protocol Relationships](#51-protocol-relationships)
@@ -208,7 +209,9 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 
 ## 4. Conventions and Notation
 
-* JSON keys are **case-sensitive**; unknown keys **MUST** be ignored by clients and servers.
+* JSON keys are **case-sensitive**.
+* Unknown keys in **permissive objects** (e.g., `ctx`, capability objects, health results, and arguments whose schemas allow `additionalProperties: true`) **MUST** be ignored by clients and servers.
+* For **strict objects** (e.g., core response envelopes and types whose schemas use `additionalProperties: false`), behavior is governed by SCHEMA.md; unknown keys MAY cause validation to fail.
 * Durations are expressed in **milliseconds** unless otherwise specified.
 * Examples are **non-normative** unless explicitly marked **(Normative)**.
 * Field names use **lower_snake_case** unless specified.
@@ -226,11 +229,20 @@ Unless otherwise specified:
 * All durations are non-negative integers in milliseconds.
 * Implementations MUST reject NaN, +Inf, −Inf, and out-of-range numeric values with `BadRequest`.
 
-### 4.1. Wire-First Canonical Form (Normative)
+### 4.1. Relationship to SCHEMA.md and PROTOCOLS.md (Normative)
+
+This specification describes the architecture, semantics, and illustrative shapes of the Corpus Protocol Suite.
+
+- **SCHEMA.md** is the authoritative source of truth for JSON wire-format shapes and validation (including required fields and `additionalProperties` behavior).
+- **PROTOCOLS.md** describes operation-level semantics, streaming behavior, and error-handling rules consistent with SCHEMA.md.
+- When SCHEMA.md and this specification disagree on a JSON field name or type, **SCHEMA.md is authoritative** and this document MUST be updated to match.
+- When PROTOCOLS.md and this specification disagree on operation semantics, **PROTOCOLS.md is authoritative** for protocol behavior.
+
+### 4.2. Wire-First Canonical Form (Normative)
 
 The canonical interface is defined at the wire level using JSON documents and streaming frames.
 
-#### 4.1.1. Envelopes and Content Types (MUST)
+#### 4.2.1. Envelopes and Content Types (MUST)
 
 Non-streaming operations:
 
@@ -276,16 +288,34 @@ Non-streaming operations:
 * `code` MUST be a normalized code.
 * `error` MUST be a normalized error class name when `ok=false`.
 
-#### 4.1.2. Version Identification (MUST)
+**Closed Response Envelopes (Normative)**
+
+Core response envelopes are **closed objects** at the wire level:
+
+- Unary success envelopes MUST NOT contain any top-level keys other than `{ "ok", "code", "ms", "result" }`.
+- Error envelopes MUST NOT contain any top-level keys other than `{ "ok", "code", "error", "message", "retry_after_ms", "details", "ms" }`.
+- Streaming success frames use the `{ "ok", "code", "ms", "chunk" }` envelope defined in PROTOCOLS.md and MUST NOT contain any top-level keys beyond those fields.
+
+These constraints are enforced in SCHEMA.md via `additionalProperties: false` on the corresponding envelope schemas.
+
+#### 4.2.2. Version Identification (MUST)
 
 * Each protocol instance declares `"{component}/v1.0"`. Example: `"protocol": "vector/v1.0"`.
 * Clients MAY send `X-Adapter-Protocol: {component}/v1.0`.
 * All `v1.x` revisions are wire-compatible with `{component}/v1.0`.
 * Breaking changes require `"{component}/v2.0"`.
 
-#### 4.1.3. Streaming Frames (MUST where applicable)
+#### 4.2.3. Streaming Frames (MUST where applicable)
 
-**Note:** At the adapter boundary, streaming frames use the `{ok, code, ms, chunk}` envelope defined in PROTOCOLS.md. The `{event, data}` framing in this section is a higher-level event-stream overlay used by routers/gateways, not a replacement for the base adapter envelope.
+**Note:** SCHEMA.md and PROTOCOLS.md define the **adapter-level streaming envelope**:
+
+```json
+{ "ok": true, "code": "STREAMING", "ms": 45.2, "chunk": { ... } }
+```
+
+This `{ok, code, ms, chunk}` shape is the canonical wire format for streaming frames validated by JSON Schema.
+
+The `{event, data}` framing described in this section is an optional, higher-level event-stream overlay that routers or gateways MAY apply on top of the adapter envelope (e.g., for SSE or WebSocket clients). It is not a replacement for the base adapter envelope.
 
 For streaming operations (`llm.stream`, `graph.stream_query`):
 
@@ -340,7 +370,7 @@ Rules:
   ```
 * Clients MUST treat `heartbeat` frames and other unknown fields as no-ops.
 
-#### 4.1.4. Transport Bindings for Streaming (Normative)
+#### 4.2.4. Transport Bindings for Streaming (Normative)
 
 The logical frame model binds to transports:
 
@@ -372,13 +402,14 @@ Adapters MAY support one or more transports and SHOULD advertise:
 }
 ```
 
-#### 4.1.5. Compatibility and Unknown Fields (MUST)
+#### 4.2.5. Compatibility and Unknown Fields (MUST)
 
-* Unknown keys at any level MUST be ignored by clients and servers.
+* Unknown keys in **permissive objects** (e.g., `ctx`, capability objects, health results, and arguments whose schemas allow `additionalProperties: true`) MUST be ignored by clients and servers.
+* Core response envelopes (success, error, streaming) and other **strict objects** follow SCHEMA.md: their schemas may reject unknown keys via `additionalProperties: false`.
 * Clients MUST NOT rely on JSON field ordering.
 * Numeric fields MUST follow §4.1 numeric rules.
 
-#### 4.1.6. Operation Registry (Normative)
+#### 4.2.6. Operation Registry (Normative)
 
 The following values of `op` are reserved for V1.0:
 
@@ -475,6 +506,8 @@ Profiles define behavior but MUST NOT change wire contracts.
 ## 6. Common Foundation
 
 ### 6.1. Operation Context
+
+The following Python dataclass is an SDK-level representation of the operation context. The **canonical wire shape** of `ctx` is defined by SCHEMA.md; this dataclass is illustrative and may include convenience fields or defaults not present on the wire.
 
 ```python
 from dataclasses import dataclass
@@ -648,6 +681,8 @@ Requirements:
 Vendor-neutral interface for graph databases (Cypher, OpenCypher, Gremlin, GQL), covering CRUD, queries (sync/streaming), batch operations, and optional schema management.
 
 ### 7.2. Data Types
+
+The Python dataclasses in this section describe typical SDK-level representations. The **canonical JSON wire shapes** are defined in SCHEMA.md and reflected in the JSON examples in this specification. Where there is any discrepancy, SCHEMA.md is authoritative.
 
 ```python
 from dataclasses import dataclass
@@ -847,6 +882,8 @@ Standardized interface for chat-style completions, streaming, token accounting, 
 
 ### 8.2. Data Types
 
+The Python dataclasses in this section describe SDK-level representations of LLM types. The **canonical JSON wire shapes** are defined in SCHEMA.md and reflected in the JSON examples in this specification. Where there is any discrepancy, SCHEMA.md is authoritative.
+
 ```python
 from dataclasses import dataclass
 from typing import Optional
@@ -926,7 +963,7 @@ Validation:
 
 Streaming:
 
-* Uses §4.1.3 frame semantics.
+* Uses §4.2.3 frame semantics.
 * Last chunk MUST have `is_final=true`.
 * One final `observe` metric per stream.
 
@@ -979,6 +1016,8 @@ Streaming:
 Standardized vector storage and similarity search with namespaces, filters, and consistent metrics.
 
 ### 9.2. Data Types
+
+The Python dataclasses in this section are SDK-level representations of vector types. The **canonical JSON wire shapes** are defined in SCHEMA.md and reflected in the JSON examples. Where there is any discrepancy, SCHEMA.md is authoritative.
 
 ```python
 from dataclasses import dataclass
@@ -1102,6 +1141,8 @@ Vendor-neutral interface for generating embeddings (single/batch), counting toke
 
 ### 10.2. Data Types (Formal)
 
+The Python dataclasses in this section describe SDK-level representations of embedding types. The **canonical JSON wire shapes** are defined in SCHEMA.md and reflected in the JSON examples. Where there is any discrepancy, SCHEMA.md is authoritative.
+
 ```python
 from dataclasses import dataclass
 from typing import List, Optional, Mapping, Any
@@ -1215,7 +1256,7 @@ Implementations MUST declare:
 * Optional: `max_batch_size`, `max_text_length`, `max_dimensions`.
 * Boolean flags as defined in `EmbeddingCapabilities`.
 
-**Note:** The wire-level key is `idempotent_writes` as defined in PROTOCOLS.md; `idempotent_writes` is the corresponding SDK field name.
+**Note:** Both the wire-level JSON key and the SDK field share the same name: `idempotent_writes`. This field and its semantics are defined in PROTOCOLS.md and SCHEMA.md.
 
 ### 10.6. Semantics
 
@@ -1259,7 +1300,7 @@ Implementations MUST declare:
 
 ### 11.5. Pagination and Streaming
 
-* For streaming, follow §4.1.3.
+* For streaming, follow §4.2.3.
 * When pagination is supported (Graph or Vector or others):
 
   * Responses MUST include an opaque `next_page_token` when more results exist.
@@ -1960,6 +2001,8 @@ for attempt in range(5):
 ---
 
 ## Appendix C — Wire-Level Envelopes
+
+Core envelopes in this appendix follow the closed-envelope rules from §4.2.1 and SCHEMA.md: adapters MUST NOT add extra top-level fields beyond those shown for success, error, and streaming envelopes.
 
 ### Embedding Batch Request
 
