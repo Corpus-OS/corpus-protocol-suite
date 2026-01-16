@@ -2419,12 +2419,12 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "additionalProperties": false
 }
 ```
+## 4.4 Graph Protocol Schemas
 
-### 4.4 Graph Protocol Schemas
+### 4.4.1 Envelope Schemas
 
-#### 4.4.1 Envelope Schemas
+#### 4.4.1.1 Graph Request Envelope (`graph/graph.envelope.request.json`)
 
-**Graph Request Envelope (`graph.envelope.request.json`):**
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2435,17 +2435,15 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/common/envelope.request.json" },
     {
       "properties": {
-        "op": {
-          "type": "string",
-          "pattern": "^graph\\.[a-z_]+$"
-        }
+        "op": { "type": "string" }
       }
     }
   ]
 }
 ```
 
-**Graph Success Envelope (`graph.envelope.success.json`):**
+#### 4.4.1.2 Graph Success Envelope (`graph/graph.envelope.success.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2458,7 +2456,8 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-**Graph Error Envelope (`graph.envelope.error.json`):**
+#### 4.4.1.3 Graph Error Envelope (`graph/graph.envelope.error.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2471,9 +2470,12 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-#### 4.4.2 Operation Schemas
+---
 
-**Graph Capabilities Request (`graph.capabilities.request.json`):**
+### 4.4.2 Operation Schemas
+
+#### 4.4.2.1 Graph Capabilities Request (`graph/graph.capabilities.request.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2484,14 +2486,11 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.request.json" },
     {
       "properties": {
-        "op": {
-          "type": "string",
-          "const": "graph.capabilities"
-        },
+        "op": { "type": "string", "const": "graph.capabilities" },
         "args": {
           "type": "object",
-          "additionalProperties": false,
-          "description": "Empty args object required"
+          "additionalProperties": true,
+          "description": "Args object required on the wire; may be empty; extra keys are ignored by the handler."
         }
       }
     }
@@ -2499,7 +2498,8 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-**Graph Capabilities Success (`graph.capabilities.success.json`):**
+#### 4.4.2.2 Graph Capabilities Success (`graph/graph.capabilities.success.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2510,16 +2510,15 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.success.json" },
     {
       "properties": {
-        "result": {
-          "$ref": "https://corpusos.com/schemas/graph/graph.capabilities.json"
-        }
+        "result": { "$ref": "https://corpusos.com/schemas/graph/graph.capabilities.json" }
       }
     }
   ]
 }
 ```
 
-**Graph Query Request (`graph.query.request.json`):**
+#### 4.4.2.3 Graph Query Request (`graph/graph.query.request.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2530,20 +2529,16 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.request.json" },
     {
       "properties": {
-        "op": {
-          "type": "string",
-          "const": "graph.query"
-        },
-        "args": {
-          "$ref": "https://corpusos.com/schemas/graph/graph.types.query_spec.json"
-        }
+        "op": { "type": "string", "const": "graph.query" },
+        "args": { "$ref": "https://corpusos.com/schemas/graph/graph.types.query_spec.json" }
       }
     }
   ]
 }
 ```
 
-**Graph Query Success (`graph.query.success.json`):**
+#### 4.4.2.4 Graph Query Success (`graph/graph.query.success.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2554,16 +2549,15 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.success.json" },
     {
       "properties": {
-        "result": {
-          "$ref": "https://corpusos.com/schemas/graph/graph.types.query_result.json"
-        }
+        "result": { "$ref": "https://corpusos.com/schemas/graph/graph.types.query_result.json" }
       }
     }
   ]
 }
 ```
 
-**Graph Stream Query Request (`graph.stream_query.request.json`):**
+#### 4.4.2.5 Graph Stream Query Request (`graph/graph.stream_query.request.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2574,20 +2568,16 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.request.json" },
     {
       "properties": {
-        "op": {
-          "type": "string",
-          "const": "graph.stream_query"
-        },
-        "args": {
-          "$ref": "https://corpusos.com/schemas/graph/graph.types.query_spec.json"
-        }
+        "op": { "type": "string", "const": "graph.stream_query" },
+        "args": { "$ref": "https://corpusos.com/schemas/graph/graph.types.query_spec.json" }
       }
     }
   ]
 }
 ```
 
-**Graph Stream Query Success (`graph.stream_query.success.json`):**
+#### 4.4.2.6 Graph Stream Query Success (`graph/graph.stream_query.success.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2598,16 +2588,15 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/common/envelope.stream.success.json" },
     {
       "properties": {
-        "chunk": {
-          "$ref": "https://corpusos.com/schemas/graph/graph.types.chunk.json"
-        }
+        "chunk": { "$ref": "https://corpusos.com/schemas/graph/graph.types.chunk.json" }
       }
     }
   ]
 }
 ```
 
-**Graph Upsert Nodes Request (`graph.upsert_nodes.request.json`):**
+#### 4.4.2.7 Graph Upsert Nodes Request (`graph/graph.upsert_nodes.request.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2618,23 +2607,16 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.request.json" },
     {
       "properties": {
-        "op": {
-          "type": "string",
-          "const": "graph.upsert_nodes"
-        },
+        "op": { "type": "string", "const": "graph.upsert_nodes" },
         "args": {
           "type": "object",
           "properties": {
             "nodes": {
               "type": "array",
-              "items": {
-                "$ref": "https://corpusos.com/schemas/graph/graph.types.node.json"
-              },
+              "items": { "$ref": "https://corpusos.com/schemas/graph/graph.types.node.json" },
               "minItems": 1
             },
-            "namespace": {
-              "type": "string"
-            }
+            "namespace": { "type": "string" }
           },
           "required": ["nodes"],
           "additionalProperties": false
@@ -2645,7 +2627,8 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-**Graph Upsert Nodes Success (`graph.upsert_nodes.success.json`):**
+#### 4.4.2.8 Graph Upsert Nodes Success (`graph/graph.upsert_nodes.success.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2661,17 +2644,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
           "properties": {
             "upserted_count": { "type": "integer", "minimum": 0 },
             "failed_count": { "type": "integer", "minimum": 0 },
-            "failures": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "properties": {
-                  "id": { "type": "string" },
-                  "error": { "type": "string" }
-                },
-                "required": ["id", "error"]
-              }
-            }
+            "failures": { "type": "array", "items": { "type": "object", "additionalProperties": true } }
           },
           "required": ["upserted_count", "failed_count", "failures"],
           "additionalProperties": false
@@ -2682,7 +2655,8 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-**Graph Upsert Edges Request (`graph.upsert_edges.request.json`):**
+#### 4.4.2.9 Graph Upsert Edges Request (`graph/graph.upsert_edges.request.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2693,23 +2667,16 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.request.json" },
     {
       "properties": {
-        "op": {
-          "type": "string",
-          "const": "graph.upsert_edges"
-        },
+        "op": { "type": "string", "const": "graph.upsert_edges" },
         "args": {
           "type": "object",
           "properties": {
             "edges": {
               "type": "array",
-              "items": {
-                "$ref": "https://corpusos.com/schemas/graph/graph.types.edge.json"
-              },
+              "items": { "$ref": "https://corpusos.com/schemas/graph/graph.types.edge.json" },
               "minItems": 1
             },
-            "namespace": {
-              "type": "string"
-            }
+            "namespace": { "type": "string" }
           },
           "required": ["edges"],
           "additionalProperties": false
@@ -2720,7 +2687,8 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-**Graph Upsert Edges Success (`graph.upsert_edges.success.json`):**
+#### 4.4.2.10 Graph Upsert Edges Success (`graph/graph.upsert_edges.success.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2736,17 +2704,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
           "properties": {
             "upserted_count": { "type": "integer", "minimum": 0 },
             "failed_count": { "type": "integer", "minimum": 0 },
-            "failures": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "properties": {
-                  "id": { "type": "string" },
-                  "error": { "type": "string" }
-                },
-                "required": ["id", "error"]
-              }
-            }
+            "failures": { "type": "array", "items": { "type": "object", "additionalProperties": true } }
           },
           "required": ["upserted_count", "failed_count", "failures"],
           "additionalProperties": false
@@ -2757,7 +2715,8 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-**Graph Delete Nodes Request (`graph.delete_nodes.request.json`):**
+#### 4.4.2.11 Graph Delete Nodes Request (`graph/graph.delete_nodes.request.json`) — **ids OR filter**
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2768,28 +2727,27 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.request.json" },
     {
       "properties": {
-        "op": {
-          "type": "string",
-          "const": "graph.delete_nodes"
-        },
+        "op": { "type": "string", "const": "graph.delete_nodes" },
         "args": {
           "type": "object",
           "properties": {
             "ids": {
               "type": "array",
-              "items": { "type": "string" },
+              "items": { "type": "string", "minLength": 1, "pattern": ".*\\S.*" },
               "minItems": 1
             },
             "filter": {
               "type": "object",
+              "minProperties": 1,
               "additionalProperties": true
             },
-            "namespace": {
-              "type": "string"
-            }
+            "namespace": { "type": ["string", "null"] }
           },
-          "required": ["ids"],
-          "additionalProperties": false
+          "additionalProperties": false,
+          "anyOf": [
+            { "required": ["ids"] },
+            { "required": ["filter"] }
+          ]
         }
       }
     }
@@ -2797,7 +2755,8 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-**Graph Delete Nodes Success (`graph.delete_nodes.success.json`):**
+#### 4.4.2.12 Graph Delete Nodes Success (`graph/graph.delete_nodes.success.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2813,17 +2772,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
           "properties": {
             "deleted_count": { "type": "integer", "minimum": 0 },
             "failed_count": { "type": "integer", "minimum": 0 },
-            "failures": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "properties": {
-                  "id": { "type": "string" },
-                  "error": { "type": "string" }
-                },
-                "required": ["id", "error"]
-              }
-            }
+            "failures": { "type": "array", "items": { "type": "object", "additionalProperties": true } }
           },
           "required": ["deleted_count", "failed_count", "failures"],
           "additionalProperties": false
@@ -2834,7 +2783,8 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-**Graph Delete Edges Request (`graph.delete_edges.request.json`):**
+#### 4.4.2.13 Graph Delete Edges Request (`graph/graph.delete_edges.request.json`) — **ids OR filter**
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2845,28 +2795,27 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.request.json" },
     {
       "properties": {
-        "op": {
-          "type": "string",
-          "const": "graph.delete_edges"
-        },
+        "op": { "type": "string", "const": "graph.delete_edges" },
         "args": {
           "type": "object",
           "properties": {
             "ids": {
               "type": "array",
-              "items": { "type": "string" },
+              "items": { "type": "string", "minLength": 1, "pattern": ".*\\S.*" },
               "minItems": 1
             },
             "filter": {
               "type": "object",
+              "minProperties": 1,
               "additionalProperties": true
             },
-            "namespace": {
-              "type": "string"
-            }
+            "namespace": { "type": ["string", "null"] }
           },
-          "required": ["ids"],
-          "additionalProperties": false
+          "additionalProperties": false,
+          "anyOf": [
+            { "required": ["ids"] },
+            { "required": ["filter"] }
+          ]
         }
       }
     }
@@ -2874,7 +2823,8 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-**Graph Delete Edges Success (`graph.delete_edges.success.json`):**
+#### 4.4.2.14 Graph Delete Edges Success (`graph/graph.delete_edges.success.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2890,17 +2840,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
           "properties": {
             "deleted_count": { "type": "integer", "minimum": 0 },
             "failed_count": { "type": "integer", "minimum": 0 },
-            "failures": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "properties": {
-                  "id": { "type": "string" },
-                  "error": { "type": "string" }
-                },
-                "required": ["id", "error"]
-              }
-            }
+            "failures": { "type": "array", "items": { "type": "object", "additionalProperties": true } }
           },
           "required": ["deleted_count", "failed_count", "failures"],
           "additionalProperties": false
@@ -2911,7 +2851,8 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-**Graph Bulk Vertices Request (`graph.bulk_vertices.request.json`):**
+#### 4.4.2.15 Graph Bulk Vertices Request (`graph/graph.bulk_vertices.request.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2922,20 +2863,16 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.request.json" },
     {
       "properties": {
-        "op": {
-          "type": "string",
-          "const": "graph.bulk_vertices"
-        },
-        "args": {
-          "$ref": "https://corpusos.com/schemas/graph/graph.types.bulk_vertices_spec.json"
-        }
+        "op": { "type": "string", "const": "graph.bulk_vertices" },
+        "args": { "$ref": "https://corpusos.com/schemas/graph/graph.types.bulk_vertices_spec.json" }
       }
     }
   ]
 }
 ```
 
-**Graph Bulk Vertices Success (`graph.bulk_vertices.success.json`):**
+#### 4.4.2.16 Graph Bulk Vertices Success (`graph/graph.bulk_vertices.success.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2946,16 +2883,15 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.success.json" },
     {
       "properties": {
-        "result": {
-          "$ref": "https://corpusos.com/schemas/graph/graph.types.bulk_vertices_result.json"
-        }
+        "result": { "$ref": "https://corpusos.com/schemas/graph/graph.types.bulk_vertices_result.json" }
       }
     }
   ]
 }
 ```
 
-**Graph Batch Request (`graph.batch.request.json`):**
+#### 4.4.2.17 Graph Batch Request (`graph/graph.batch.request.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2966,18 +2902,13 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.request.json" },
     {
       "properties": {
-        "op": {
-          "type": "string",
-          "const": "graph.batch"
-        },
+        "op": { "type": "string", "const": "graph.batch" },
         "args": {
           "type": "object",
           "properties": {
             "ops": {
               "type": "array",
-              "items": {
-                "$ref": "https://corpusos.com/schemas/graph/graph.types.batch_op.json"
-              },
+              "items": { "$ref": "https://corpusos.com/schemas/graph/graph.types.batch_op.json" },
               "minItems": 1
             }
           },
@@ -2990,7 +2921,8 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-**Graph Batch Success (`graph.batch.success.json`):**
+#### 4.4.2.18 Graph Batch Success (`graph/graph.batch.success.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3001,16 +2933,15 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.success.json" },
     {
       "properties": {
-        "result": {
-          "$ref": "https://corpusos.com/schemas/graph/graph.types.batch_result.json"
-        }
+        "result": { "$ref": "https://corpusos.com/schemas/graph/graph.types.batch_result.json" }
       }
     }
   ]
 }
 ```
 
-**Graph Get Schema Request (`graph.get_schema.request.json`):**
+#### 4.4.2.19 Graph Get Schema Request (`graph/graph.get_schema.request.json`) — **extra args allowed**
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3021,14 +2952,11 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.request.json" },
     {
       "properties": {
-        "op": {
-          "type": "string",
-          "const": "graph.get_schema"
-        },
+        "op": { "type": "string", "const": "graph.get_schema" },
         "args": {
           "type": "object",
-          "additionalProperties": false,
-          "description": "Empty args object required"
+          "additionalProperties": true,
+          "description": "Args object required on the wire; may be empty; extra keys are ignored by the handler."
         }
       }
     }
@@ -3036,7 +2964,8 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-**Graph Get Schema Success (`graph.get_schema.success.json`):**
+#### 4.4.2.20 Graph Get Schema Success (`graph/graph.get_schema.success.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3047,16 +2976,15 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.success.json" },
     {
       "properties": {
-        "result": {
-          "$ref": "https://corpusos.com/schemas/graph/graph.types.graph_schema.json"
-        }
+        "result": { "$ref": "https://corpusos.com/schemas/graph/graph.types.graph_schema.json" }
       }
     }
   ]
 }
 ```
 
-**Graph Health Request (`graph.health.request.json`):**
+#### 4.4.2.21 Graph Health Request (`graph/graph.health.request.json`) — **extra args allowed**
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3067,14 +2995,11 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.request.json" },
     {
       "properties": {
-        "op": {
-          "type": "string",
-          "const": "graph.health"
-        },
+        "op": { "type": "string", "const": "graph.health" },
         "args": {
           "type": "object",
-          "additionalProperties": false,
-          "description": "Empty args object required"
+          "additionalProperties": true,
+          "description": "Args object required on the wire; may be empty; extra keys are ignored by the handler."
         }
       }
     }
@@ -3082,7 +3007,8 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-**Graph Health Success (`graph.health.success.json`):**
+#### 4.4.2.22 Graph Health Success (`graph/graph.health.success.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3093,16 +3019,15 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.success.json" },
     {
       "properties": {
-        "result": {
-          "$ref": "https://corpusos.com/schemas/graph/graph.types.health_result.json"
-        }
+        "result": { "$ref": "https://corpusos.com/schemas/graph/graph.types.health_result.json" }
       }
     }
   ]
 }
 ```
 
-**Graph Transaction Request (`graph.transaction.request.json`):**
+#### 4.4.2.23 Graph Transaction Request (`graph/graph.transaction.request.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3113,18 +3038,13 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.request.json" },
     {
       "properties": {
-        "op": {
-          "type": "string",
-          "const": "graph.transaction"
-        },
+        "op": { "type": "string", "const": "graph.transaction" },
         "args": {
           "type": "object",
           "properties": {
             "operations": {
               "type": "array",
-              "items": {
-                "$ref": "https://corpusos.com/schemas/graph/graph.types.batch_op.json"
-              },
+              "items": { "$ref": "https://corpusos.com/schemas/graph/graph.types.batch_op.json" },
               "minItems": 1
             }
           },
@@ -3137,7 +3057,8 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-**Graph Transaction Success (`graph.transaction.success.json`):**
+#### 4.4.2.24 Graph Transaction Success (`graph/graph.transaction.success.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3148,16 +3069,15 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.success.json" },
     {
       "properties": {
-        "result": {
-          "$ref": "https://corpusos.com/schemas/graph/graph.types.batch_result.json"
-        }
+        "result": { "$ref": "https://corpusos.com/schemas/graph/graph.types.batch_result.json" }
       }
     }
   ]
 }
 ```
 
-**Graph Traversal Request (`graph.traversal.request.json`):**
+#### 4.4.2.25 Graph Traversal Request (`graph/graph.traversal.request.json`) — **defaults allowed**
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3168,20 +3088,16 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.request.json" },
     {
       "properties": {
-        "op": {
-          "type": "string",
-          "const": "graph.traversal"
-        },
-        "args": {
-          "$ref": "https://corpusos.com/schemas/graph/graph.types.traversal_spec.json"
-        }
+        "op": { "type": "string", "const": "graph.traversal" },
+        "args": { "$ref": "https://corpusos.com/schemas/graph/graph.types.traversal_spec.json" }
       }
     }
   ]
 }
 ```
 
-**Graph Traversal Success (`graph.traversal.success.json`):**
+#### 4.4.2.26 Graph Traversal Success (`graph/graph.traversal.success.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3192,18 +3108,19 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     { "$ref": "https://corpusos.com/schemas/graph/graph.envelope.success.json" },
     {
       "properties": {
-        "result": {
-          "$ref": "https://corpusos.com/schemas/graph/graph.types.traversal_result.json"
-        }
+        "result": { "$ref": "https://corpusos.com/schemas/graph/graph.types.traversal_result.json" }
       }
     }
   ]
 }
 ```
 
-#### 4.4.3 Type Definitions
+---
 
-**Graph Capabilities (`graph.capabilities.json`):**
+### 4.4.3 Type Definitions
+
+#### 4.4.3.1 Graph Capabilities (`graph/graph.capabilities.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3215,11 +3132,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     "version": { "type": "string" },
     "protocol": { "type": "string", "const": "graph/v1.0" },
     "supports_stream_query": { "type": "boolean", "default": true },
-    "supported_query_dialects": {
-      "type": "array",
-      "items": { "type": "string" },
-      "default": []
-    },
+    "supported_query_dialects": { "type": "array", "items": { "type": "string" }, "default": [] },
     "supports_namespaces": { "type": "boolean", "default": true },
     "supports_property_filters": { "type": "boolean", "default": true },
     "supports_bulk_vertices": { "type": "boolean", "default": false },
@@ -3239,7 +3152,8 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-**Node Type (`graph.types.node.json`):**
+#### 4.4.3.2 Node Type (`graph/graph.types.node.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3247,38 +3161,20 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "Graph Node",
   "type": "object",
   "properties": {
-    "id": {
-      "type": "string",
-      "minLength": 1
-    },
-    "labels": {
-      "type": "array",
-      "items": { "type": "string" },
-      "default": []
-    },
-    "properties": {
-      "type": "object",
-      "additionalProperties": true,
-      "default": {}
-    },
-    "namespace": {
-      "type": "string"
-    },
-    "created_at": {
-      "type": ["integer", "null"],
-      "minimum": 0
-    },
-    "updated_at": {
-      "type": ["integer", "null"],
-      "minimum": 0
-    }
+    "id": { "type": "string", "minLength": 1 },
+    "labels": { "type": "array", "items": { "type": "string" }, "default": [] },
+    "properties": { "type": "object", "additionalProperties": true, "default": {} },
+    "namespace": { "type": "string" },
+    "created_at": { "type": ["integer", "null"], "minimum": 0 },
+    "updated_at": { "type": ["integer", "null"], "minimum": 0 }
   },
   "required": ["id", "properties"],
   "additionalProperties": false
 }
 ```
 
-**Edge Type (`graph.types.edge.json`):**
+#### 4.4.3.3 Edge Type (`graph/graph.types.edge.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3286,59 +3182,22 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "Graph Edge",
   "type": "object",
   "properties": {
-    "id": {
-      "type": "string",
-      "minLength": 1
-    },
-    "src": {
-      "type": "string",
-      "minLength": 1
-    },
-    "dst": {
-      "type": "string",
-      "minLength": 1
-    },
-    "label": {
-      "type": "string",
-      "minLength": 1
-    },
-    "properties": {
-      "type": "object",
-      "additionalProperties": true,
-      "default": {}
-    },
-    "namespace": {
-      "type": "string"
-    },
-    "created_at": {
-      "type": ["integer", "null"],
-      "minimum": 0
-    },
-    "updated_at": {
-      "type": ["integer", "null"],
-      "minimum": 0
-    }
+    "id": { "type": "string", "minLength": 1 },
+    "src": { "type": "string", "minLength": 1 },
+    "dst": { "type": "string", "minLength": 1 },
+    "label": { "type": "string", "minLength": 1 },
+    "properties": { "type": "object", "additionalProperties": true, "default": {} },
+    "namespace": { "type": "string" },
+    "created_at": { "type": ["integer", "null"], "minimum": 0 },
+    "updated_at": { "type": ["integer", "null"], "minimum": 0 }
   },
   "required": ["id", "src", "dst", "label", "properties"],
   "additionalProperties": false
 }
 ```
 
-**Entity Type (`graph.types.entity.json`):**
-```json
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://corpusos.com/schemas/graph/graph.types.entity.json",
-  "title": "Graph Entity",
-  "type": "object",
-  "oneOf": [
-    { "$ref": "https://corpusos.com/schemas/graph/graph.types.node.json" },
-    { "$ref": "https://corpusos.com/schemas/graph/graph.types.edge.json" }
-  ]
-}
-```
+#### 4.4.3.4 Query Specification (`graph/graph.types.query_spec.json`)
 
-**Query Specification (`graph.types.query_spec.json`):**
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3346,36 +3205,20 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "Graph Query Specification",
   "type": "object",
   "properties": {
-    "text": {
-      "type": "string",
-      "minLength": 1
-    },
-    "dialect": {
-      "type": "string"
-    },
-    "params": {
-      "type": "object",
-      "additionalProperties": true,
-      "default": {}
-    },
-    "namespace": {
-      "type": "string"
-    },
-    "timeout_ms": {
-      "type": ["integer", "null"],
-      "minimum": 1
-    },
-    "stream": {
-      "type": "boolean",
-      "default": false
-    }
+    "text": { "type": "string", "minLength": 1 },
+    "dialect": { "type": ["string", "null"] },
+    "params": { "type": "object", "additionalProperties": true, "default": {} },
+    "namespace": { "type": ["string", "null"] },
+    "timeout_ms": { "type": ["integer", "null"], "minimum": 1 },
+    "stream": { "type": "boolean", "default": false }
   },
   "required": ["text"],
   "additionalProperties": false
 }
 ```
 
-**Query Result (`graph.types.query_result.json`):**
+#### 4.4.3.5 Query Result (`graph/graph.types.query_result.json`) — **dialect/namespace nullable**
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3383,27 +3226,18 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "Graph Query Result",
   "type": "object",
   "properties": {
-    "records": {
-      "type": "array",
-      "description": "Query results (any JSON value)"
-    },
-    "summary": {
-      "type": "object",
-      "additionalProperties": true
-    },
-    "dialect": {
-      "type": "string"
-    },
-    "namespace": {
-      "type": "string"
-    }
+    "records": { "type": "array", "description": "Query results (any JSON value)" },
+    "summary": { "type": "object", "additionalProperties": true },
+    "dialect": { "type": ["string", "null"] },
+    "namespace": { "type": ["string", "null"] }
   },
   "required": ["records", "summary"],
   "additionalProperties": false
 }
 ```
 
-**Query Chunk (`graph.types.chunk.json`):**
+#### 4.4.3.6 Query Chunk (`graph/graph.types.chunk.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3411,41 +3245,17 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "Graph Streaming Chunk",
   "type": "object",
   "properties": {
-    "records": {
-      "type": "array",
-      "description": "Streaming results (any JSON value)"
-    },
-    "is_final": {
-      "type": "boolean",
-      "default": false,
-      "description": "True for final chunk"
-    },
-    "summary": {
-      "type": ["object", "null"],
-      "additionalProperties": true
-    }
+    "records": { "type": "array", "description": "Streaming results (any JSON value)" },
+    "is_final": { "type": "boolean", "default": false, "description": "True for final chunk" },
+    "summary": { "type": ["object", "null"], "additionalProperties": true }
   },
   "required": ["records", "is_final"],
   "additionalProperties": false
 }
 ```
 
-**ID Type (`graph.types.id.json`):**
-```json
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://corpusos.com/schemas/graph/graph.types.id.json",
-  "title": "Graph ID Value",
-  "type": "object",
-  "properties": {
-    "id": { "type": "string", "minLength": 1 }
-  },
-  "required": ["id"],
-  "additionalProperties": false
-}
-```
+#### 4.4.3.7 Batch Operation (`graph/graph.types.batch_op.json`)
 
-**Batch Operation (`graph.types.batch_op.json`):**
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3461,7 +3271,8 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-**Batch Result (`graph.types.batch_result.json`):**
+#### 4.4.3.8 Batch Result (`graph/graph.types.batch_result.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3469,10 +3280,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "Graph Batch Result",
   "type": "object",
   "properties": {
-    "results": {
-      "type": "array",
-      "description": "Batch operation results (any JSON value)"
-    },
+    "results": { "type": "array", "description": "Batch operation results (any JSON value)" },
     "success": { "type": "boolean" },
     "error": { "type": ["string", "null"] },
     "transaction_id": { "type": ["string", "null"] }
@@ -3482,7 +3290,8 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-**Bulk Vertices Specification (`graph.types.bulk_vertices_spec.json`):**
+#### 4.4.3.9 Bulk Vertices Specification (`graph/graph.types.bulk_vertices_spec.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3490,19 +3299,17 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "Bulk Vertices Specification",
   "type": "object",
   "properties": {
-    "namespace": { "type": "string" },
+    "namespace": { "type": ["string", "null"] },
     "limit": { "type": "integer", "minimum": 1, "default": 100 },
     "cursor": { "type": ["string", "null"] },
-    "filter": {
-      "type": ["object", "null"],
-      "additionalProperties": true
-    }
+    "filter": { "type": ["object", "null"], "additionalProperties": true }
   },
   "additionalProperties": false
 }
 ```
 
-**Bulk Vertices Result (`graph.types.bulk_vertices_result.json`):**
+#### 4.4.3.10 Bulk Vertices Result (`graph/graph.types.bulk_vertices_result.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3510,12 +3317,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "Bulk Vertices Result",
   "type": "object",
   "properties": {
-    "nodes": {
-      "type": "array",
-      "items": {
-        "$ref": "https://corpusos.com/schemas/graph/graph.types.node.json"
-      }
-    },
+    "nodes": { "type": "array", "items": { "$ref": "https://corpusos.com/schemas/graph/graph.types.node.json" } },
     "next_cursor": { "type": ["string", "null"] },
     "has_more": { "type": "boolean" }
   },
@@ -3524,7 +3326,8 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-**Graph Schema (`graph.types.graph_schema.json`):**
+#### 4.4.3.11 Graph Schema (`graph/graph.types.graph_schema.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3532,25 +3335,17 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "Graph Schema",
   "type": "object",
   "properties": {
-    "nodes": {
-      "type": "object",
-      "additionalProperties": true
-    },
-    "edges": {
-      "type": "object",
-      "additionalProperties": true
-    },
-    "metadata": {
-      "type": "object",
-      "additionalProperties": true
-    }
+    "nodes": { "type": "object", "additionalProperties": true },
+    "edges": { "type": "object", "additionalProperties": true },
+    "metadata": { "type": "object", "additionalProperties": true }
   },
   "required": ["nodes", "edges", "metadata"],
   "additionalProperties": false
 }
 ```
 
-**Health Result (`graph.types.health_result.json`):**
+#### 4.4.3.12 Health Result (`graph/graph.types.health_result.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3562,10 +3357,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     "status": { "type": "string" },
     "server": { "type": "string" },
     "version": { "type": "string" },
-    "namespaces": {
-      "type": "object",
-      "additionalProperties": true
-    },
+    "namespaces": { "type": "object", "additionalProperties": true },
     "read_only": { "type": "boolean", "default": false },
     "degraded": { "type": "boolean", "default": false }
   },
@@ -3574,7 +3366,8 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 }
 ```
 
-**Traversal Specification (`graph.types.traversal_spec.json`):**
+#### 4.4.3.13 Traversal Specification (`graph/graph.types.traversal_spec.json`) — **defaults allowed**
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3582,45 +3375,22 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "Graph Traversal Specification",
   "type": "object",
   "properties": {
-    "start_nodes": {
-      "type": "array",
-      "items": { "type": "string", "minLength": 1 },
-      "minItems": 1
-    },
-    "max_depth": {
-      "type": "integer",
-      "minimum": 1
-    },
-    "direction": {
-      "type": "string",
-      "enum": ["OUTGOING", "INCOMING", "BOTH"]
-    },
-    "relationship_types": {
-      "type": ["array", "null"],
-      "items": { "type": "string" }
-    },
-    "node_filters": {
-      "type": ["object", "null"],
-      "additionalProperties": true
-    },
-    "relationship_filters": {
-      "type": ["object", "null"],
-      "additionalProperties": true
-    },
-    "return_properties": {
-      "type": ["array", "null"],
-      "items": { "type": "string" }
-    },
-    "namespace": {
-      "type": ["string", "null"]
-    }
+    "start_nodes": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1 },
+    "max_depth": { "type": "integer", "minimum": 1, "default": 1 },
+    "direction": { "type": "string", "enum": ["OUTGOING", "INCOMING", "BOTH"], "default": "OUTGOING" },
+    "relationship_types": { "type": ["array", "null"], "items": { "type": "string" } },
+    "node_filters": { "type": ["object", "null"], "additionalProperties": true },
+    "relationship_filters": { "type": ["object", "null"], "additionalProperties": true },
+    "return_properties": { "type": ["array", "null"], "items": { "type": "string" } },
+    "namespace": { "type": ["string", "null"] }
   },
-  "required": ["start_nodes", "max_depth", "direction"],
+  "required": ["start_nodes"],
   "additionalProperties": false
 }
 ```
 
-**Traversal Result (`graph.types.traversal_result.json`):**
+#### 4.4.3.14 Traversal Result (`graph/graph.types.traversal_result.json`)
+
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3628,43 +3398,22 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "Graph Traversal Result",
   "type": "object",
   "properties": {
-    "nodes": {
-      "type": "array",
-      "items": {
-        "$ref": "https://corpusos.com/schemas/graph/graph.types.node.json"
-      }
-    },
-    "relationships": {
-      "type": "array",
-      "items": {
-        "$ref": "https://corpusos.com/schemas/graph/graph.types.edge.json"
-      }
-    },
+    "nodes": { "type": "array", "items": { "$ref": "https://corpusos.com/schemas/graph/graph.types.node.json" } },
+    "relationships": { "type": "array", "items": { "$ref": "https://corpusos.com/schemas/graph/graph.types.edge.json" } },
     "paths": {
       "type": "array",
       "items": {
         "type": "array",
-        "items": {
-          "type": "object",
-          "additionalProperties": true
-        }
+        "items": { "type": "object", "additionalProperties": true }
       }
     },
-    "summary": {
-      "type": "object",
-      "additionalProperties": true
-    },
-    "namespace": {
-      "type": ["string", "null"]
-    }
+    "summary": { "type": "object", "additionalProperties": true },
+    "namespace": { "type": ["string", "null"] }
   },
   "required": ["nodes", "relationships", "paths", "summary"],
   "additionalProperties": false
 }
 ```
-
----
-
 ## 5. Streaming Schemas
 
 ### 5.1 Streaming Envelope Schema
