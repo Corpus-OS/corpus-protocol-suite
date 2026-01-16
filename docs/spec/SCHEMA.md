@@ -485,15 +485,16 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "title": "Operation Context",
   "type": "object",
   "properties": {
-    "request_id": {},
-    "idempotency_key": {},
-    "deadline_ms": {},
-    "traceparent": {},
-    "tenant": {},
-    "attrs": {}
+    "request_id": { "type": ["string", "null"] },
+    "idempotency_key": { "type": ["string", "null"] },
+    "deadline_ms": { "type": ["integer", "null"], "minimum": 0 },
+    "traceparent": { "type": ["string", "null"] },
+    "tenant": { "type": ["string", "null"] },
+    "attrs": { "type": ["object", "null"], "additionalProperties": true }
   },
   "additionalProperties": true
 }
+
 ```
 
 
