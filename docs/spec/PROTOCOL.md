@@ -130,12 +130,12 @@ Corpus Protocol → Adapter → Provider API
 ### 2.1 OperationContext
 ```typescript
 interface OperationContext {
-  request_id?: string;           // Unique request identifier
-  idempotency_key?: string;      // Idempotency guarantee scope
-  deadline_ms?: number;          // Absolute epoch milliseconds
-  traceparent?: string;          // W3C trace context
-  tenant?: string;               // Tenant identifier (hashed in metrics)
-  attrs?: Map<string, any>;      // Opaque extension attributes
+  request_id?: string | null;           // Unique request identifier
+  idempotency_key?: string | null;      // Idempotency guarantee scope
+  deadline_ms?: number | null;          // Absolute epoch milliseconds
+  traceparent?: string | null;          // W3C trace context
+  tenant?: string | null;               // Tenant identifier (hashed in metrics)
+  attrs?: Map<string, any>;             // Opaque extension attributes
 }
 ```
 
@@ -154,11 +154,20 @@ interface OperationContext {
 
 **Wire Format Requirements:**
 
-* **Required keys (requests):** All request envelopes MUST include `op`, `ctx`, and `args` keys.
-* **Request top-level extensibility:** Request envelopes MAY include additional top-level keys beyond `op`, `ctx`, `args` (forward-compatibility).
-* **Context extensibility:** Unknown fields in `ctx` MUST be ignored (the context object is forward-compatible).
-* **Args extensibility (schema-governed):** Unknown fields in `args` MUST be ignored **only when the operation’s args schema permits additional properties**. If an operation’s args schema is strict (i.e., `additionalProperties: false`), unknown args fields MUST be rejected as schema-invalid.
-* **Empty objects:** `ctx` and `args` MAY be empty objects `{}` but MUST exist.
+* **Required keys (requests):** All request envelopes MUST include top-level `op`, `ctx`, and `args` keys.
+* **`ctx` forward compatibility:** Unknown fields in `ctx` MUST be ignored by adapters. The `OperationContext` JSON Schema MUST allow additional fields (`additionalProperties: true`).
+* **`args` forward compatibility:**
+
+  * Per-operation `args` schemas are authoritative for what is allowed.
+  * If an operation’s `args` schema is **permissive** (`additionalProperties: true`), adapters MUST ignore unknown fields in `args` (they are allowed and treated as no-ops).
+  * If an operation’s `args` schema is **strict** (`additionalProperties: false`), unknown fields in `args` MUST cause schema validation to fail (typically returning a `BAD_REQUEST` error).
+* **Closed response envelopes:**
+
+  * **Success envelopes** for unary operations are **closed objects**: they MUST NOT contain any top-level keys other than `{ "ok", "code", "ms", "result" }`.
+  * **Error envelopes** are **closed objects**: they MUST NOT contain any top-level keys other than `{ "ok", "code", "error", "message", "retry_after_ms", "details", "ms" }`.
+  * **Streaming success frames** are **closed objects**: they MUST NOT contain any top-level keys other than `{ "ok", "code", "ms", "chunk" }`.
+  * These constraints are enforced in SCHEMA.md via `additionalProperties: false` on the corresponding envelope schemas.
+* **Empty objects:** `ctx` and `args` MAY be empty objects `{}`, but they MUST be present.
 
 **Canonical Request Envelope:**
 
@@ -179,8 +188,6 @@ interface OperationContext {
 
 **Success Response Envelope (Unary Operations):**
 
-* **Closed shape:** Success envelopes are **closed objects**. They MUST contain exactly the fields defined by the success envelope schema and MUST NOT include additional top-level keys.
-
 ```json
 {
   "ok": true,
@@ -191,9 +198,6 @@ interface OperationContext {
 ```
 
 **Error Response Envelope:**
-
-* **Closed shape:** Error envelopes are **closed objects**. They MUST contain exactly the fields defined by the error envelope schema and MUST NOT include additional top-level keys.
-* **Nullables are still REQUIRED:** `retry_after_ms` and `details` are REQUIRED fields and MAY be `null`.
 
 ```json
 {
@@ -208,8 +212,6 @@ interface OperationContext {
 ```
 
 **Streaming Frame Envelope:**
-
-* **Closed shape:** Streaming success envelopes are **closed objects**. They MUST contain exactly the fields defined by the streaming envelope schema and MUST NOT include additional top-level keys.
 
 ```json
 {
@@ -264,7 +266,7 @@ All adapters MUST use protocol-specific base errors:
 
 > **Error Code Scope:** These are base canonical codes; each protocol defines additional protocol-specific codes in its semantics section and §27.4.
 
-**Wire Error Mapping:** Error envelope `code` comes from `e.code` if set, otherwise `type(e).__name__.upper()`
+**Wire Error Mapping:** Error envelope `code` comes from `e.code` if set, otherwise the exception type name MUST be normalized to ALL_CAPS_SNAKE format (e.g., `BadRequest` → `BAD_REQUEST`, `VertexNotFound` → `VERTEX_NOT_FOUND`).
 
 > **Error Naming Convention:** 
 > - **Wire codes:** `ALL_CAPS_SNAKE` (e.g., `DIMENSION_MISMATCH`)
@@ -324,7 +326,7 @@ All adapters MUST use protocol-specific base errors:
 * **Floats:** IEEE 754 double-precision
 * **Integers:** 64-bit signed integers where applicable
 
-> **Nullability note (schema-governed):** Where schemas allow `null` for optional fields (e.g., `usage_so_far`, `namespace`, `metadata`), implementations MAY emit explicit `null`. Clients MUST treat explicit `null` as equivalent to “not present” unless an operation/type explicitly distinguishes them.
+> **Nullability note (schema-governed):** Where schemas allow `null` for optional fields (e.g., `usage_so_far`, `namespace`, `metadata`), implementations MAY emit explicit `null`. Clients MUST treat explicit `null` as equivalent to "not present" unless an operation/type explicitly distinguishes them.
 
 ### 3.2 Metadata Maps
 ```typescript
@@ -382,13 +384,25 @@ interface TokenUsage {
 
 > **Invariant:** `total_tokens` MUST equal `prompt_tokens + completion_tokens`. In streaming contexts before completion, `usage` may be omitted entirely or provided only on the final chunk depending on adapter implementation, but when present it MUST include `completion_tokens` and satisfy the total tokens invariant.
 
-### 3.8 Shared Count Tokens Specification
+### 3.8 Protocol-Specific Count Tokens Specifications
+
+**LLMCountTokensSpec:**
 ```typescript
-interface CountTokensSpec {
-  text: string;
-  model: string;
+interface LLMCountTokensSpec {
+  text: string;                   // REQUIRED
+  model?: string | null;          // OPTIONAL and nullable
 }
 ```
+
+**EmbeddingCountTokensSpec:**
+```typescript
+interface EmbeddingCountTokensSpec {
+  text: string;                   // REQUIRED
+  model: string;                  // REQUIRED (non-empty string)
+}
+```
+
+> **Note:** There is no single shared `CountTokensSpec` type across protocols. LLM and Embedding protocols define their own specifications with different `model` field requirements.
 
 ### 3.9 JSON Schema Requirements
 - **Type schemas are strict (`additionalProperties: false`) unless explicitly allowed.**
@@ -1456,7 +1470,7 @@ interface LLMCapabilities {
   max_tool_calls_per_turn?: number | null;
 }
 ```
-> **Guidance:** Adapters SHOULD populate optional capability fields truthfully when available. Schema validation requires only the fields listed as “Schema-required.”
+> **Guidance:** Adapters SHOULD populate optional capability fields truthfully when available. Schema validation requires only the fields listed as "Schema-required."
 
 ### 9.2 Model Family & Supported Models
 - **Model listing:** Accurate list of available provider models
@@ -1497,7 +1511,7 @@ interface ToolDefinition {
 ### 10.2 CompletionSpec
 ```typescript
 interface CompletionSpec {
-  model: string;
+  model?: string | null;          // RECOMMENDED but optional and nullable
   messages: Message[];
   max_tokens?: number;
   temperature?: number;          // Range: [0.0, 2.0]
@@ -1537,7 +1551,7 @@ interface LLMCompletion {
 interface LLMChunk {
   text: string;                  // Incremental text content
   is_final: boolean;             // True for final chunk
-  model?: string;                // Optional model identifier
+  model?: string | null;         // Optional model identifier (nullable)
   usage_so_far?: TokenUsage;     // Cumulative token usage (MAY be omitted in non-final chunks)
   tool_calls?: ToolCall[];       // Optional tool calls (may appear in chunks)
 }
@@ -1603,6 +1617,7 @@ interface LLMChunk {
 **Validation:**
 - `messages` MUST be non-empty list of `{role, content}` objects
 - `messages` MUST be JSON-serializable
+- `model` is RECOMMENDED but optional and nullable
 - Parameter ranges MUST satisfy:
   - `temperature ∈ [0.0, 2.0]`
   - `top_p ∈ (0.0, 1.0]`
@@ -1713,7 +1728,7 @@ interface LLMChunk {
 
 **Operation:** `llm.count_tokens`
 
-**Input:** `CountTokensSpec`
+**Input:** `LLMCountTokensSpec`
 
 **Request Body:**
 ```json
@@ -1967,9 +1982,9 @@ interface UpsertResult {
 ### 14.8 DeleteSpec
 ```typescript
 interface DeleteSpec {
-  ids: string[];
+  ids?: string[];                 // Delete by IDs (optional)
+  filter?: FilterExpression;      // Delete by metadata filter (optional)
   namespace?: string;
-  filter?: FilterExpression;      // Delete by metadata filter
 }
 ```
 
@@ -2296,7 +2311,7 @@ interface NamespaceResult {
 - If `max_batch_size` is set and `ids` non-empty and `len(ids) > max_batch_size` → `BAD_REQUEST`
 - If `filter` set but `supports_metadata_filtering` is False → `NOT_SUPPORTED`
 
-**Request Body:**
+**Request Body (by IDs):**
 ```json
 {
   "op": "vector.delete",
@@ -2306,6 +2321,24 @@ interface NamespaceResult {
   },
   "args": {
     "ids": ["doc-123"],
+    "namespace": "documents"
+  }
+}
+```
+
+**Request Body (by filter):**
+```json
+{
+  "op": "vector.delete",
+  "ctx": {
+    "request_id": "req-vector-delete-filter-001",
+    "tenant": "acme-corp"
+  },
+  "args": {
+    "filter": {
+      "category": "technology",
+      "created_at": { "lt": 1735689600000 }
+    },
     "namespace": "documents"
   }
 }
@@ -2610,7 +2643,7 @@ interface EmbedResult {
   model: string;                  // REQUIRED
   text: string;                   // Possibly truncated (REQUIRED)
   tokens_used?: number;
-  truncated?: boolean;            // True if text was truncated
+  truncated: boolean;             // REQUIRED: True if text was truncated
 }
 ```
 
@@ -2887,7 +2920,7 @@ interface EmbeddingStats {
 
 **Operation:** `embedding.count_tokens`
 
-**Input:** `CountTokensSpec`
+**Input:** `EmbeddingCountTokensSpec`
 
 **Request Body:**
 ```json
@@ -3550,7 +3583,7 @@ adapter = BaseLLMAdapter(mode="standalone")
 - **Embedding Operations:** capabilities, embed, embed_batch, stream_embed, count_tokens, get_stats, health
 
 ### 30.2 Types Index
-- **Common Types:** OperationContext, Metadata, FilterExpression, TokenUsage, CountTokensSpec
+- **Common Types:** OperationContext, Metadata, FilterExpression, TokenUsage, LLMCountTokensSpec, EmbeddingCountTokensSpec
 - **Graph Types:** Node, Edge, GraphQuerySpec, GraphQueryResult, QueryChunk, BulkVerticesSpec, BulkVerticesResult, GraphBatchResult, GraphTraversalSpec, TraversalResult, GraphSchema, GraphHealthStatus
 - **LLM Types:** Message, ToolCall, ToolDefinition, CompletionSpec, LLMCompletion, LLMChunk, LLMHealthStatus
 - **Vector Types:** Vector, VectorMatch, VectorQuerySpec, VectorQueryResult, BatchQuerySpec, UpsertSpec, UpsertResult, DeleteSpec, DeleteResult, NamespaceSpec, NamespaceResult, VectorHealthStatus
@@ -3560,7 +3593,7 @@ adapter = BaseLLMAdapter(mode="standalone")
 - **Graph Capabilities:** protocol (recommended), server, version, supported_query_dialects, supports_stream_query, supports_bulk_vertices, supports_batch, supports_schema, supports_transaction, supports_traversal, supports_path_queries, idempotent_writes, supports_deadline, supports_namespaces, supports_property_filters, supports_multi_tenant, max_batch_ops, max_traversal_depth
 - **LLM Capabilities:** protocol (recommended), server, version, model_family, supported_models, max_context_length, supports_streaming, supports_roles, supports_system_message, supports_json_output, supports_tools, supports_parallel_tool_calls, supports_tool_choice, supports_deadline, supports_count_tokens, idempotent_writes, supports_multi_tenant, max_tool_calls_per_turn
 - **Vector Capabilities:** protocol (recommended), server, version, max_dimensions, supported_metrics, supports_namespaces, supports_metadata_filtering, supports_batch_operations, supports_batch_queries, max_batch_size, max_top_k, max_filter_terms, supports_index_management, supports_deadline, idempotent_writes, supports_multi_tenant, text_storage_strategy, max_text_length
-- **Embedding Capabilities:** protocol (recommended), server, version, supported_models, max_batch_size, max_text_length, max_dimensions, supports_normalization, supports_truncation, supports_token_counting, supports_streaming, supports_batch_embedding, supports_caching, supports_multi_tenant, supports_deadline, normalizes_at_source, idempotent_writes, truncation_mode
+- **Embedding Capabilities:** protocol (REQUIRED), server, version, supported_models, max_batch_size, max_text_length, max_dimensions, supports_normalization, supports_truncation, supports_token_counting, supports_streaming, supports_batch_embedding, supports_caching, supports_multi_tenant, supports_deadline, normalizes_at_source, idempotent_writes, truncation_mode
 
 ### 30.4 Error Codes Index
 - BAD_REQUEST, AUTH_ERROR, RESOURCE_EXHAUSTED, TRANSIENT_NETWORK, UNAVAILABLE, NOT_SUPPORTED, DEADLINE_EXCEEDED, MODEL_OVERLOADED, TEXT_TOO_LONG, DIMENSION_MISMATCH, QUERY_PARSE_ERROR, INDEX_NOT_READY, NAMESPACE_NOT_FOUND
