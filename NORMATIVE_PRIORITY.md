@@ -42,7 +42,7 @@ Examples:
 
 ## 3) Optional Companion Documents 
 
-If these files exist, they are authoritative for their subject matter, while `SCHEMA.md`
+These files are authoritative for their subject matter, while `SCHEMA.md`
 remains authoritative for the *shape* of any related envelopes/types.
 
 - `ERRORS.md`: canonical error taxonomy / normalization meanings
