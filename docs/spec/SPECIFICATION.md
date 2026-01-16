@@ -1,5 +1,7 @@
 # CORPUS SPECIFICATION
 
+**specification_version:** `1.0.0`   
+
 ## Abstract
 
 This specification defines the Corpus Protocol Suite: a vendor-neutral set of production-grade interfaces for **graph databases**, **large language models**, **vector databases**, and **text embeddings**. The suite standardizes contracts for heterogeneous AI infrastructure with built-in observability, error handling, and operational rigor. Protocols are minimal yet expressive, async-first, and extensible via negotiated capabilities. This document includes normative contracts, wire-compatible data shapes, an error taxonomy and mapping, resilience semantics, privacy and security guidance, and compatibility/versioning rules for enterprise-scale deployments.
