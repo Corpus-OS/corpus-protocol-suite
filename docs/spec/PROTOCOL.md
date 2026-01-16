@@ -1,4 +1,6 @@
-# CORPUS PROTOCOL GUIDE V1.0
+# CORPUS PROTOCOL GUIDE 
+ 
+**protocols_version:** `1.0`  
 
 **Table of Contents**
 - [0. Document Metadata](#0-document-metadata)
