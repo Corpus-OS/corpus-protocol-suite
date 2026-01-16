@@ -109,6 +109,7 @@ The Corpus Schema Reference provides the definitive JSON Schema definitions for 
 - **Wire-level validation** - All JSON payloads validated against schemas
 - **Streaming validation** - Protocol envelope validation for streaming operations
 - **Golden tests** - Example-based validation as executable documentation
+- **Schema lint test** - Automated validation that data structures conform to defined rules and constraints
 - **Conformance tests** - Production adapter validation in CI/CD
 
 ---
