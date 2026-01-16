@@ -3428,6 +3428,8 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "code": "TRANSIENT_NETWORK",
   "error": "TransientNetworkError",
   "message": "Connection lost",
+  "retry_after_ms": null,
+  "details": null,
   "ms": 123.4
 }
 ```
