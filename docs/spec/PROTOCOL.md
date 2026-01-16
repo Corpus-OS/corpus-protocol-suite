@@ -47,9 +47,9 @@
 
 > **Document Precedence:** When PROTOCOLS.md and SPECIFICATION.md disagree on **wire format or field names**, PROTOCOLS.md is authoritative. SPECIFICATION.md is descriptive and may contain language-specific reference bindings.
 
-> **Normative Source:** SCHEMA.md and the SDK base classes/wire handlers are the normative source of truth; PROTOCOLS.md must reflect them. Schema validation ensures wire format compliance, while this document defines operational semantics.
+> **Normative Source:** SCHEMA.md is the normative source of truth for JSON wire format shapes and validation. This document (PROTOCOLS.md) defines operational semantics, behavioral requirements, and implementation guidelines. Schema validation ensures wire format compliance, while this document defines how adapters should behave.
 
-> **Type Definition Convention:** Type definitions use a TypeScript-like pseudo-notation as a language-neutral IDL for JSON structures. They are normative for the wire format. Python, Go, etc. bindings are reference implementations.
+> **Type Definition Convention:** Type definitions use a TypeScript-like pseudo-notation as descriptive IDL documentation for JSON structures. These are informational references; SCHEMA.md contains the normative JSON Schema definitions. Python, Go, etc. bindings are reference implementations.
 
 ## 0. Document Metadata
 
@@ -153,17 +153,21 @@ interface OperationContext {
 ### 2.4 Wire-Level Envelope Standardization
 
 **Wire Format Requirements:**
-- **Required keys:** All request envelopes MUST include `op`, `ctx`, and `args` keys
-- **Forward compatibility:** Unknown fields in `ctx` or `args` MUST be ignored
-- **Empty objects:** `ctx` and `args` may be empty objects `{}` but MUST exist
+
+* **Required keys (requests):** All request envelopes MUST include `op`, `ctx`, and `args` keys.
+* **Request top-level extensibility:** Request envelopes MAY include additional top-level keys beyond `op`, `ctx`, `args` (forward-compatibility).
+* **Context extensibility:** Unknown fields in `ctx` MUST be ignored (the context object is forward-compatible).
+* **Args extensibility (schema-governed):** Unknown fields in `args` MUST be ignored **only when the operation’s args schema permits additional properties**. If an operation’s args schema is strict (i.e., `additionalProperties: false`), unknown args fields MUST be rejected as schema-invalid.
+* **Empty objects:** `ctx` and `args` MAY be empty objects `{}` but MUST exist.
 
 **Canonical Request Envelope:**
+
 ```json
 {
   "op": "protocol.operation",
   "ctx": {
     "request_id": "string|null",
-    "idempotency_key": "string|null", 
+    "idempotency_key": "string|null",
     "deadline_ms": "int|null",
     "traceparent": "string|null",
     "tenant": "string|null",
@@ -174,6 +178,9 @@ interface OperationContext {
 ```
 
 **Success Response Envelope (Unary Operations):**
+
+* **Closed shape:** Success envelopes are **closed objects**. They MUST contain exactly the fields defined by the success envelope schema and MUST NOT include additional top-level keys.
+
 ```json
 {
   "ok": true,
@@ -184,6 +191,10 @@ interface OperationContext {
 ```
 
 **Error Response Envelope:**
+
+* **Closed shape:** Error envelopes are **closed objects**. They MUST contain exactly the fields defined by the error envelope schema and MUST NOT include additional top-level keys.
+* **Nullables are still REQUIRED:** `retry_after_ms` and `details` are REQUIRED fields and MAY be `null`.
+
 ```json
 {
   "ok": false,
@@ -197,10 +208,13 @@ interface OperationContext {
 ```
 
 **Streaming Frame Envelope:**
+
+* **Closed shape:** Streaming success envelopes are **closed objects**. They MUST contain exactly the fields defined by the streaming envelope schema and MUST NOT include additional top-level keys.
+
 ```json
 {
   "ok": true,
-  "code": "STREAMING", 
+  "code": "STREAMING",
   "ms": 45.2,
   "chunk": { ... }
 }
@@ -208,8 +222,8 @@ interface OperationContext {
 
 ### 2.5 Event Stream vs Base Protocol
 - **Base Adapter Protocol:** Uses `{ok, code, ms, chunk}` envelope for streaming
-- **Event Stream Layer:** `{type: "data", data: { ... }}` is an optional higher-level overlay for routers/gateways
-- **Clarification:** Event-stream shape is a v2 overlay, not part of the base adapter protocol
+- **Event Stream Layer:** `{type: "data", data: { ... }}` is an optional higher-level overlay used by routers and gateways for event-driven architectures
+- **Important:** The event-stream shape is not part of the base adapter wire protocol; it's a router/gateway abstraction that may wrap base protocol envelopes
 
 ### 2.6 Mode Strategy: Thin vs Standalone
 - **Thin mode:** For composition under external control planes. All policies are no-op: no caching, no rate limiting, no circuit breaker, no deadline enforcement.
@@ -217,11 +231,15 @@ interface OperationContext {
 - **Implementation detail:** These are recommended infra patterns, not part of the wire contract.
 
 ### 2.7 Stream Semantics
-- **Single terminal:** Exactly one terminal event (success or error)
-- **No content after terminal:** Stream MUST end after final event
-- **Heartbeats:** Optional keep-alive messages allowed but not required
-- **Backpressure:** Clients control consumption rate; adapters MUST implement bounded buffering and flow control
-- **Streaming code:** All streaming success frames MUST use `code: "STREAMING"`
+* **Single terminal:** Exactly one terminal condition per stream:
+
+  * A success stream ends with a chunk where `is_final: true`, OR
+  * An error envelope terminates the stream.
+* **No content after terminal:** A stream MUST end immediately after the terminal frame.
+* **Heartbeats:** Optional keep-alive messages are allowed only if they validate as standard streaming success envelopes and do not violate terminal rules.
+* **Backpressure:** Clients control consumption rate; adapters MUST implement bounded buffering and flow control.
+* **Streaming code:** **ALL streaming success frames MUST use `code: "STREAMING"`** (per streaming envelope schema).
+* **Output envelope strictness:** Streaming success frames MUST NOT include any extra top-level fields beyond `{ok, code, ms, chunk}`.
 
 ### 2.8 Thread Safety & In-Memory Infrastructure
 - **Adapter instances are not thread-safe** by default
@@ -259,10 +277,15 @@ All adapters MUST use protocol-specific base errors:
 - **Low cardinality:** Bounded label sets in all telemetry
 
 ### 2.12 Capability Probing
-- **Dynamic discovery:** Clients probe `capabilities()` to determine supported features
-- **Truthful reporting:** Adapters MUST accurately report actual capabilities
-- **Protocol field:** All capabilities objects MUST expose a `protocol` field with the canonical protocol ID from §0.2
-- **Caching:** Capabilities may be cached with appropriate TTL (typically 5-60 minutes)
+
+* **Dynamic discovery:** Clients probe `capabilities()` to determine supported features.
+* **Truthful reporting:** Adapters MUST accurately report actual capabilities.
+* **Protocol field (schema-governed):**
+
+  * When present, `protocol` MUST equal the canonical protocol ID (e.g., `"llm/v1.0"`, `"graph/v1.0"`, `"vector/v1.0"`).
+  * For **EmbeddingCapabilities**, `protocol` is **REQUIRED** and MUST equal `"embedding/v1.0"`.
+* **Caching:** Capabilities may be cached with appropriate TTL (typically 5–60 minutes).
+
 
 ### 2.13 Idempotency Expectations
 | Operation Type | Idempotent? | Notes |
@@ -279,11 +302,11 @@ All adapters MUST use protocol-specific base errors:
 - Emit metrics for every operation with tenant hashing
 - Propagate `deadline_ms` to provider APIs with safety buffer
 - Map provider errors to canonical error taxonomy
-- Report capabilities truthfully including `protocol` field
+- Report capabilities truthfully (protocol field is recommended but not required)
 - Enforce SIEM-safe requirements for all telemetry
 - Use canonical wire envelopes for all responses
 - Include `op`, `ctx`, and `args` keys in all request envelopes
-- Use `code: "STREAMING"` for all streaming success frames
+- **Use `code: "STREAMING"` for all streaming success frames**
 
 **All adapters MUST NOT:**
 - Log raw prompts, vectors, embeddings, or tenant IDs
@@ -295,10 +318,13 @@ All adapters MUST use protocol-specific base errors:
 ## 3. Shared Types
 
 ### 3.1 Numeric Types
-- **IDs:** `string` type, provider-specific format
-- **Vectors:** `number[]` with consistent precision
-- **Floats:** IEEE 754 double-precision
-- **Integers:** 64-bit signed integers where applicable
+
+* **IDs:** `string` type, provider-specific format
+* **Vectors:** `number[]` with consistent precision
+* **Floats:** IEEE 754 double-precision
+* **Integers:** 64-bit signed integers where applicable
+
+> **Nullability note (schema-governed):** Where schemas allow `null` for optional fields (e.g., `usage_so_far`, `namespace`, `metadata`), implementations MAY emit explicit `null`. Clients MUST treat explicit `null` as equivalent to “not present” unless an operation/type explicitly distinguishes them.
 
 ### 3.2 Metadata Maps
 ```typescript
@@ -320,6 +346,7 @@ type FilterExpression = {
   [field: string]: FilterValue | FilterOperator;
 };
 ```
+- **Implementation-defined mapping:** Filter field names are implementation-defined; adapters map them to provider-specific query syntax
 - **Range queries:** `{ field: { gt: value } }` for greater than
 - **Set membership:** `{ field: [value1, value2] }` for IN queries
 - **Equality:** `{ field: value }` for exact matching
@@ -331,19 +358,12 @@ type FilterExpression = {
 - **Expiration:** Tokens should be valid for reasonable periods (hours/days)
 
 ### 3.5 Batches & Partial Failure Envelope
-```typescript
-interface BatchResult<T> {
-  processed_count: number;
-  failed_count: number;
-  failures: Array<{
-    id?: string;           // Item identifier when available
-    index?: number;        // Batch position when no ID
-    error: string;         // Normalized error type
-    detail: string;        // Human-readable details
-  }>;
-  results?: T[];          // Successful results when applicable
-}
-```
+> **Note:** Batch result shapes vary by protocol:
+> - **Vector:** Uses `{upserted_count|deleted_count, failed_count, failures[]}` for upsert and delete operations
+> - **Embedding:** Uses `{embeddings, total_texts, total_tokens?, failed_texts[]}` for batch embedding
+> - **Graph:** Uses `GraphBatchResult` with `{results[], success, error?, transaction_id?}` for batch and transaction operations
+> 
+> There is no single cross-protocol `BatchResult<T>` type; each protocol defines its own batch result shape based on semantic needs.
 
 ### 3.6 Common Validation Rules
 - **Required fields:** Presence validated before provider calls
@@ -355,10 +375,12 @@ interface BatchResult<T> {
 ```typescript
 interface TokenUsage {
   prompt_tokens: number;
-  completion_tokens?: number;  // Optional for non-generation operations
-  total_tokens: number;        // MUST equal prompt_tokens + (completion_tokens || 0)
+  completion_tokens: number;     // REQUIRED per schema (0 allowed)
+  total_tokens: number;          // MUST equal prompt_tokens + completion_tokens
 }
 ```
+
+> **Invariant:** `total_tokens` MUST equal `prompt_tokens + completion_tokens`. In streaming contexts before completion, `usage` may be omitted entirely or provided only on the final chunk depending on adapter implementation, but when present it MUST include `completion_tokens` and satisfy the total tokens invariant.
 
 ### 3.8 Shared Count Tokens Specification
 ```typescript
@@ -369,7 +391,8 @@ interface CountTokensSpec {
 ```
 
 ### 3.9 JSON Schema Requirements
-- **Additional properties:** MUST be `false` unless explicitly allowed
+- **Type schemas are strict (`additionalProperties: false`) unless explicitly allowed.**
+- **Envelopes and some args specs are intentionally permissive (`additionalProperties: true`) for forward-compatibility.**
 - **Nullability:** Fields explicitly marked optional vs required
 - **String formats:** UUID, ISO8601, email where semantically meaningful
 - **Array bounds:** Minimum/maximum lengths specified per capability
@@ -393,7 +416,7 @@ interface CountTokensSpec {
 
 ### 4.4 Embedding Protocol
 - **Purpose:** Text-to-vector embedding generation
-- **Key operations:** Embed, batch embed, token counting
+- **Key operations:** Embed, batch embed, stream embed, token counting, statistics
 - **Primary use cases:** Text vectorization for search and ML pipelines
 
 ### 4.5 Cross-Protocol Consistency Requirements
@@ -414,30 +437,34 @@ interface CountTokensSpec {
 
 ## 5. Graph Capabilities
 
-### 5.1 Required Fields
+### 5.1 Required Fields 
+
 ```typescript
 interface GraphCapabilities {
-  protocol: string;               // "graph/v1.0"
-  server: string;                 // Adapter identifier
-  version: string;                // Protocol version
-  supported_query_dialects: string[]; // e.g., ["cypher", "gremlin"]
-  supports_stream_query: boolean;
-  supports_bulk_vertices: boolean;
-  supports_batch: boolean;
-  supports_schema: boolean;
-  supports_transaction: boolean;
-  supports_traversal: boolean;
-  supports_path_queries: boolean;
-  idempotent_writes: boolean;
-  supports_deadline: boolean;
-  supports_namespaces: boolean;
-  supports_property_filters: boolean;
-  supports_multi_tenant: boolean;
-  max_batch_ops?: number;
-  max_traversal_depth?: number;   // Maximum traversal depth supported
-  max_query_complexity?: number;  // Optional: maximum query complexity score
-  max_nodes_per_transaction?: number; // Optional: transaction size limits
-  supports_analytics_queries?: boolean; // Optional: analytical query support
+  // Schema-required:
+  server: string;                 // REQUIRED
+  version: string;                // REQUIRED
+
+  // Schema-optional (recommended when known):
+  protocol?: "graph/v1.0";        // OPTIONAL in schema (const when present)
+
+  supports_stream_query?: boolean;
+  supported_query_dialects?: string[];
+  supports_namespaces?: boolean;
+  supports_property_filters?: boolean;
+  supports_bulk_vertices?: boolean;
+  supports_batch?: boolean;
+  supports_schema?: boolean;
+  supports_transaction?: boolean;
+  supports_traversal?: boolean;
+  supports_path_queries?: boolean;
+
+  idempotent_writes?: boolean;
+  supports_multi_tenant?: boolean;
+  supports_deadline?: boolean;
+
+  max_batch_ops?: number | null;
+  max_traversal_depth?: number | null;
 }
 ```
 
@@ -457,9 +484,9 @@ interface GraphCapabilities {
 ### 6.1 Node
 ```typescript
 interface Node {
-  id: string;
-  labels: string[];               // Multiple labels supported
-  properties: Metadata;
+  id: string;                     // REQUIRED
+  labels?: string[];              // Optional, defaults to []
+  properties: Metadata;           // REQUIRED
   namespace?: string;             // Optional namespace isolation
   created_at?: number;            // Optional: epoch milliseconds
   updated_at?: number;            // Optional: epoch milliseconds
@@ -469,11 +496,11 @@ interface Node {
 ### 6.2 Edge
 ```typescript
 interface Edge {
-  id: string;
-  src: string;                    // Source node ID
-  dst: string;                    // Target node ID  
-  label: string;
-  properties: Metadata;
+  id: string;                     // REQUIRED
+  src: string;                    // Source node ID (REQUIRED)
+  dst: string;                    // Target node ID (REQUIRED)  
+  label: string;                  // REQUIRED
+  properties: Metadata;           // REQUIRED
   namespace?: string;             // Optional namespace isolation
   created_at?: number;            // Optional: epoch milliseconds
   updated_at?: number;            // Optional: epoch milliseconds
@@ -483,7 +510,7 @@ interface Edge {
 ### 6.3 GraphQuerySpec
 ```typescript
 interface GraphQuerySpec {
-  text: string;                   // Query in supported dialect
+  text: string;                   // Query in supported dialect (REQUIRED)
   params?: Metadata;              // Named parameters for query
   timeout_ms?: number;            // Query-specific timeout (overrides context deadline)
   dialect?: string;               // Preferred query dialect
@@ -496,11 +523,8 @@ interface GraphQuerySpec {
 ```typescript
 interface GraphQueryResult {
   records: Record<string, any>[]; // Query result data - each record is a map of column→value
-  summary: {                      // Execution summary (REQUIRED)
-    query_time_ms: number;
-    results_count: number;
-    has_more: boolean;
-    dialect_used: string;         // Actual dialect used
+  summary: {                      // Execution summary (REQUIRED, provider/adapter-defined)
+    [key: string]: any;           // Implementation-defined keys; may include query_time_ms, results_count, etc.
   };
   dialect?: string;               // Optional dialect used
   namespace?: string;             // Optional namespace context
@@ -512,11 +536,8 @@ interface GraphQueryResult {
 interface QueryChunk {
   records: Record<string, any>[]; // Incremental result data
   is_final: boolean;              // True for final chunk
-  summary?: {                     // Final execution summary
-    query_time_ms: number;
-    results_count: number;
-    has_more: boolean;
-    dialect_used: string;
+  summary?: {                     // Final execution summary (provider/adapter-defined)
+    [key: string]: any;
   };
 }
 ```
@@ -550,10 +571,12 @@ interface GraphBatchResult {
 }
 ```
 
+> **Note:** Graph uses `GraphBatchResult` rather than a cross-protocol batch pattern. This is a protocol-specific design documented in §27.2.
+
 ### 6.9 GraphTraversalSpec
 ```typescript
 interface GraphTraversalSpec {
-  start_nodes: string[];          // Starting node IDs
+  start_nodes: string[];          // Starting node IDs (REQUIRED)
   max_depth: number;              // Maximum traversal depth
   direction: "OUTGOING" | "INCOMING" | "BOTH";
   relationship_types?: string[];  // Filter by edge types
@@ -570,10 +593,8 @@ interface TraversalResult {
   nodes: Node[];                  // Nodes discovered during traversal
   relationships: Edge[];          // Edges traversed
   paths: any[][];                 // Path representations (provider-specific)
-  summary: {                      // Traversal summary
-    nodes_visited: number;
-    relationships_traversed: number;
-    max_depth_reached: number;
+  summary: {                      // Traversal summary (provider/adapter-defined)
+    [key: string]: any;
   };
   namespace?: string;             // Namespace context
 }
@@ -582,28 +603,9 @@ interface TraversalResult {
 ### 6.11 GraphSchema
 ```typescript
 interface GraphSchema {
-  node_labels: string[];
-  edge_types: string[];
-  property_keys: string[];
-  constraints: ConstraintInfo[];  // Provider-specific constraint information
-  indexes: IndexInfo[];           // Provider-specific index information
-}
-
-// Provider-specific extension points - shape not guaranteed across providers
-interface ConstraintInfo {
-  type: string;                   // e.g., "UNIQUE", "NOT_NULL"
-  label?: string;                 // Node/edge label
-  properties?: string[];          // Property names
-  // Additional provider-specific fields allowed
-  [key: string]: any;
-}
-
-interface IndexInfo {
-  type: string;                   // e.g., "BTREE", "FULLTEXT"
-  label?: string;                 // Node/edge label
-  properties?: string[];          // Property names
-  // Additional provider-specific fields allowed
-  [key: string]: any;
+  nodes: Record<string, any>;     // Node schema information
+  edges: Record<string, any>;     // Edge schema information
+  metadata: Record<string, any>;  // Additional metadata
 }
 ```
 
@@ -652,10 +654,7 @@ interface IndexInfo {
     "supports_property_filters": true,
     "supports_multi_tenant": true,
     "max_batch_ops": 1000,
-    "max_traversal_depth": 10,
-    "max_query_complexity": 10000,
-    "max_nodes_per_transaction": 50000,
-    "supports_analytics_queries": true
+    "max_traversal_depth": 10
   }
 }
 ```
@@ -705,7 +704,7 @@ interface UpsertNodesSpec {
 }
 ```
 
-**Output:** `{ upserted_count: number, failed_count: number, failures: Array<{id: string, error: string, detail: string}> }`
+**Output:** `{ upserted_count: number, failed_count: number, failures: Array<{id: string, error: string}> }`
 
 **Response Body:**
 ```json
@@ -766,7 +765,7 @@ interface UpsertEdgesSpec {
 }
 ```
 
-**Output:** `{ upserted_count: number, failed_count: number, failures: Array<{id: string, error: string, detail: string}> }`
+**Output:** `{ upserted_count: number, failed_count: number, failures: Array<{id: string, error: string}> }`
 
 **Response Body:**
 ```json
@@ -790,17 +789,18 @@ interface UpsertEdgesSpec {
 **Input:**
 ```typescript
 interface DeleteNodesSpec {
-  ids: string[];
+  ids?: string[];                // Delete by IDs
+  filter?: FilterExpression;     // Delete by property filter
   namespace?: string;
-  filter?: Metadata;
 }
 ```
 
 **Validation:**
-- MUST have either non-empty `ids` or `filter` (not both empty)
-- `filter`, if present, MUST be JSON-serializable
+- MUST provide at least one of `ids` or `filter`
+- If `ids` provided, MUST be non-empty list
+- If `filter` provided, MUST be JSON-serializable
 
-**Request Body:**
+**Request Body (by IDs):**
 ```json
 {
   "op": "graph.delete_nodes",
@@ -815,7 +815,25 @@ interface DeleteNodesSpec {
 }
 ```
 
-**Output:** `{ deleted_count: number, failed_count: number, failures: Array<{id: string, error: string, detail: string}> }`
+**Request Body (by filter):**
+```json
+{
+  "op": "graph.delete_nodes",
+  "ctx": {
+    "request_id": "req-graph-delete-nodes-filter-001",
+    "tenant": "acme-corp"
+  },
+  "args": {
+    "filter": {
+      "department": "Engineering",
+      "created_at": { "lt": 1735689600000 }
+    },
+    "namespace": "production"
+  }
+}
+```
+
+**Output:** `{ deleted_count: number, failed_count: number, failures: Array<{id: string, error: string}> }`
 
 **Response Body:**
 ```json
@@ -839,17 +857,18 @@ interface DeleteNodesSpec {
 **Input:**
 ```typescript
 interface DeleteEdgesSpec {
-  ids: string[];
+  ids?: string[];                // Delete by IDs
+  filter?: FilterExpression;     // Delete by property filter
   namespace?: string;
-  filter?: Metadata;
 }
 ```
 
 **Validation:**
-- MUST have either non-empty `ids` or `filter` (not both empty)
-- `filter`, if present, MUST be JSON-serializable
+- MUST provide at least one of `ids` or `filter`
+- If `ids` provided, MUST be non-empty list
+- If `filter` provided, MUST be JSON-serializable
 
-**Request Body:**
+**Request Body (by IDs):**
 ```json
 {
   "op": "graph.delete_edges",
@@ -864,7 +883,25 @@ interface DeleteEdgesSpec {
 }
 ```
 
-**Output:** `{ deleted_count: number, failed_count: number, failures: Array<{id: string, error: string, detail: string}> }`
+**Request Body (by filter):**
+```json
+{
+  "op": "graph.delete_edges",
+  "ctx": {
+    "request_id": "req-graph-delete-edges-filter-001",
+    "tenant": "acme-corp"
+  },
+  "args": {
+    "filter": {
+      "label": "WORKS_WITH",
+      "since": { "lt": "2024-12-01" }
+    },
+    "namespace": "production"
+  }
+}
+```
+
+**Output:** `{ deleted_count: number, failed_count: number, failures: Array<{id: string, error: string}> }`
 
 **Response Body:**
 ```json
@@ -961,7 +998,7 @@ interface DeleteEdgesSpec {
 ```json
 {"ok": true, "code": "STREAMING", "ms": 12.3, "chunk": {"records": [{"u.id": "user-alice-123", "u.name": "Alice Smith", "u.department": "Engineering"}], "is_final": false}}
 {"ok": true, "code": "STREAMING", "ms": 15.7, "chunk": {"records": [{"u.id": "user-bob-456", "u.name": "Bob Johnson", "u.department": "Sales"}], "is_final": false}}
-{"ok": true, "code": "STREAMING", "ms": 18.2, "chunk": {"summary": {"query_time_ms": 125.4, "results_count": 2, "dialect_used": "cypher", "has_more": false}, "is_final": true}}
+{"ok": true, "code": "STREAMING", "ms": 18.2, "chunk": {"records": [], "summary": {"query_time_ms": 125.4, "results_count": 2, "dialect_used": "cypher", "has_more": false}, "is_final": true}}
 ```
 
 ### 7.8 bulk_vertices
@@ -1022,8 +1059,19 @@ interface DeleteEdgesSpec {
 
 **Availability:** Only if `capabilities.supports_batch` is true
 
+**Input:**
+```typescript
+interface GraphBatchSpec {
+  ops: Array<{
+    op: string;                   // MUST be fully-qualified operation name (e.g., "graph.upsert_nodes")
+    args: Record<string, any>;    // Operation-specific arguments
+  }>;
+}
+```
+
 **Validation:**
 - `ops` MUST be non-empty
+- Each operation `op` MUST be a fully-qualified graph operation name
 - If `max_batch_ops` is non-null, `len(ops) <= max_batch_ops`
 
 **Request Body:**
@@ -1037,7 +1085,7 @@ interface DeleteEdgesSpec {
   "args": {
     "ops": [
       {
-        "op": "upsert_nodes",
+        "op": "graph.upsert_nodes",
         "args": {
           "nodes": [
             {
@@ -1085,6 +1133,16 @@ interface DeleteEdgesSpec {
 
 **Availability:** Only if `capabilities.supports_transaction` is true
 
+**Input:**
+```typescript
+interface GraphTransactionSpec {
+  operations: Array<{
+    op: string;                   // MUST be fully-qualified operation name (e.g., "graph.upsert_nodes")
+    args: Record<string, any>;    // Operation-specific arguments
+  }>;
+}
+```
+
 **Request Body:**
 ```json
 {
@@ -1094,9 +1152,9 @@ interface DeleteEdgesSpec {
     "tenant": "acme-corp"
   },
   "args": {
-    "ops": [
+    "operations": [
       {
-        "op": "upsert_nodes",
+        "op": "graph.upsert_nodes",
         "args": {
           "nodes": [
             {
@@ -1226,9 +1284,7 @@ interface DeleteEdgesSpec {
     "request_id": "req-graph-schema-001",
     "tenant": "acme-corp"
   },
-  "args": {
-    "namespace": "production"
-  }
+  "args": {}
 }
 ```
 
@@ -1241,23 +1297,29 @@ interface DeleteEdgesSpec {
   "code": "OK",
   "ms": 12.3,
   "result": {
-    "node_labels": ["User", "Premium"],
-    "edge_types": ["WORKS_WITH"],
-    "property_keys": ["name", "email", "age", "department", "since", "project"],
-    "constraints": [
-      {
-        "type": "UNIQUE",
-        "label": "User",
-        "properties": ["email"]
+    "nodes": {
+      "User": {
+        "properties": {
+          "name": {"type": "string"},
+          "email": {"type": "string"},
+          "age": {"type": "integer"},
+          "department": {"type": "string"}
+        },
+        "labels": ["User", "Premium"]
       }
-    ],
-    "indexes": [
-      {
-        "type": "BTREE",
-        "label": "User",
-        "properties": ["department"]
+    },
+    "edges": {
+      "WORKS_WITH": {
+        "properties": {
+          "since": {"type": "string"},
+          "project": {"type": "string"}
+        }
       }
-    ]
+    },
+    "metadata": {
+      "created_at": "2025-01-15T10:00:00Z",
+      "version": "1.0"
+    }
   }
 }
 ```
@@ -1282,24 +1344,18 @@ interface DeleteEdgesSpec {
 **Output:**
 ```typescript
 interface GraphHealthStatus {
-  ok: boolean;
-  status: "ok" | "degraded";
-  server: string;
-  version: string;
-  namespaces?: { 
-    [namespace: string]: {
-      node_count: number;
-      edge_count: number;
-      ready: boolean;
-      read_only?: boolean;
-    }
-  };
-  read_only?: boolean;
-  degraded?: boolean;
-  message?: string;  // Optional status message
-  last_check?: string; // Optional timestamp of last health check
+  ok: boolean;                    // REQUIRED per schema
+  status: string;                 // REQUIRED per schema
+  server: string;                 // REQUIRED per schema
+  version: string;                // REQUIRED per schema
+  namespaces?: Record<string, any>; // Optional namespace info
+  read_only?: boolean;            // Optional read-only flag
+  degraded?: boolean;             // Optional degraded flag
+  // Additional fields allowed per schema
 }
 ```
+
+> **Note:** Graph health responses MUST include `ok`, `status`, `server`, and `version` fields. Additional fields are allowed for forward compatibility.
 
 **Response Body:**
 ```json
@@ -1321,9 +1377,7 @@ interface GraphHealthStatus {
       }
     },
     "read_only": false,
-    "degraded": false,
-    "message": "All systems operational",
-    "last_check": "2025-01-15T10:20:00Z"
+    "degraded": false
   }
 }
 ```
@@ -1349,8 +1403,9 @@ interface GraphHealthStatus {
 - **Transport failures:** If the transport connection fails mid-stream, the stream is considered terminated and cannot be resumed
 
 ### 8.4 Batch Operation Semantics
+- **Operation qualification:** Inner operations within `graph.batch` and `graph.transaction` MUST use fully-qualified operation names (e.g., `"graph.upsert_nodes"`)
 - **Order preservation:** Operations MUST be executed in specified order
-- **Atomic batches:** When `atomic=true`, all operations MUST succeed or fail together
+- **Atomic transactions:** When `graph.transaction`, all operations MUST succeed or fail together
 - **Partial visibility:** Non-atomic batch results MAY be visible as they complete
 - **Failure isolation:** Individual operation failures MUST NOT affect others in non-atomic mode
 
@@ -1374,34 +1429,34 @@ interface GraphHealthStatus {
 
 ## 9. LLM Capabilities
 
-### 9.1 Required Fields
+### 9.1 Required Fields (Schema-Required)
+
 ```typescript
 interface LLMCapabilities {
-  protocol: string;               // "llm/v1.0"
-  server: string;
-  version: string;
-  model_family: string;           // e.g., "openai", "anthropic", "cohere"
-  supported_models: string[];
-  max_context_length: number;
-  supports_streaming: boolean;
-  supports_roles: boolean;
-  supports_system_message: boolean;
-  supports_json_output: boolean;
-  supports_tools: boolean;
-  supports_parallel_tool_calls: boolean;
-  supports_tool_choice: boolean;
-  supports_deadline: boolean;
-  supports_count_tokens: boolean;
-  idempotent_writes: boolean;
-  supports_multi_tenant: boolean;
-  max_tool_calls_per_turn?: number;
-  max_tokens_per_minute?: number; // Optional: rate limiting info
-  max_requests_per_minute?: number; // Optional: request rate limits
-  supports_function_calling?: boolean; // Deprecated: use supports_tools
-  supports_vision?: boolean;      // Optional: multimodal vision support
-  supports_logprobs?: boolean;    // Optional: token probabilities
+  // Schema-required:
+  server: string;                 // REQUIRED
+  version: string;                // REQUIRED
+  model_family: string;           // REQUIRED
+  max_context_length: number;     // REQUIRED
+
+  // Schema-optional (recommended when known):
+  protocol?: string;              // OPTIONAL
+  supported_models?: string[];    // OPTIONAL
+  supports_streaming?: boolean;
+  supports_roles?: boolean;
+  supports_system_message?: boolean;
+  supports_json_output?: boolean;
+  supports_tools?: boolean;
+  supports_parallel_tool_calls?: boolean;
+  supports_tool_choice?: boolean;
+  supports_deadline?: boolean;
+  supports_count_tokens?: boolean;
+  idempotent_writes?: boolean;
+  supports_multi_tenant?: boolean;
+  max_tool_calls_per_turn?: number | null;
 }
 ```
+> **Guidance:** Adapters SHOULD populate optional capability fields truthfully when available. Schema validation requires only the fields listed as “Schema-required.”
 
 ### 9.2 Model Family & Supported Models
 - **Model listing:** Accurate list of available provider models
@@ -1469,9 +1524,10 @@ interface CompletionSpec {
 ```typescript
 interface LLMCompletion {
   text: string;                  // Generated completion text
-  model: string;
-  usage: TokenUsage;
-  finish_reason: string;         // Reason generation stopped
+  model: string;                 // REQUIRED
+  model_family: string;          // REQUIRED per schema
+  usage: TokenUsage;             // REQUIRED, follows TokenUsage schema
+  finish_reason: string;         // Reason generation stopped (REQUIRED)
   tool_calls?: ToolCall[];       // Optional tool calls from model
 }
 ```
@@ -1482,7 +1538,7 @@ interface LLMChunk {
   text: string;                  // Incremental text content
   is_final: boolean;             // True for final chunk
   model?: string;                // Optional model identifier
-  usage_so_far?: TokenUsage;     // Cumulative token usage
+  usage_so_far?: TokenUsage;     // Cumulative token usage (MAY be omitted in non-final chunks)
   tool_calls?: ToolCall[];       // Optional tool calls (may appear in chunks)
 }
 ```
@@ -1532,11 +1588,7 @@ interface LLMChunk {
     "supports_count_tokens": true,
     "idempotent_writes": true,
     "supports_multi_tenant": true,
-    "max_tool_calls_per_turn": 10,
-    "max_tokens_per_minute": 100000,
-    "max_requests_per_minute": 1000,
-    "supports_vision": false,
-    "supports_logprobs": true
+    "max_tool_calls_per_turn": 10
   }
 }
 ```
@@ -1596,6 +1648,7 @@ interface LLMChunk {
   "result": {
     "text": "Renewable energy offers several key benefits:\n\n1. Environmental sustainability - Reduces greenhouse gas emissions and air pollution\n2. Energy security - Decreases dependence on fossil fuel imports\n3. Cost stability - Renewable sources have predictable long-term costs\n4. Job creation - Growing industry creates new employment opportunities\n5. Public health - Cleaner air leads to better health outcomes",
     "model": "gpt-4.1-mini",
+    "model_family": "openai",
     "usage": {
       "prompt_tokens": 28,
       "completion_tokens": 87,
@@ -1653,6 +1706,8 @@ interface LLMChunk {
 {"ok": true, "code": "STREAMING", "ms": 48.3, "chunk": {"text": " bits", "is_final": true, "model": "gpt-4.1-mini", "usage_so_far": {"prompt_tokens": 12, "completion_tokens": 18, "total_tokens": 30}}}
 ```
 
+> **Note:** In streaming chunks, `usage_so_far` MAY be omitted in non-final chunks; when present it MUST follow the TokenUsage schema (includes `completion_tokens` and satisfies the total tokens invariant).
+
 ### 11.4 count_tokens
 **Purpose:** Count tokens in text for a specific model
 
@@ -1707,24 +1762,14 @@ interface LLMChunk {
 **Output:**
 ```typescript
 interface LLMHealthStatus {
-  ok: boolean;
-  server: string;
-  version: string;
-  status?: "ok" | "degraded";  // Optional status indicator
-  models?: {                   // Optional model status information
-    [model: string]: {
-      available: boolean;
-      rate_limited?: boolean;
-      degraded?: boolean;
-    };
-  };
-  rate_limits?: {             // Optional rate limit information
-    tokens_per_minute?: number;
-    requests_per_minute?: number;
-  };
-  message?: string;           // Optional status message
+  ok: boolean;                    // REQUIRED per schema
+  server: string;                 // REQUIRED per schema
+  version: string;                // REQUIRED per schema
+  // Additional fields allowed per schema
 }
 ```
+
+> **Note:** LLM health responses MUST include `ok`, `server`, and `version` fields. Additional fields are allowed for forward compatibility.
 
 **Response Body:**
 ```json
@@ -1735,25 +1780,7 @@ interface LLMHealthStatus {
   "result": {
     "ok": true,
     "server": "openai-adapter",
-    "version": "1.0.0",
-    "status": "ok",
-    "models": {
-      "gpt-4.1-mini": {
-        "available": true,
-        "rate_limited": false,
-        "degraded": false
-      },
-      "gpt-4.1-max": {
-        "available": true,
-        "rate_limited": false,
-        "degraded": false
-      }
-    },
-    "rate_limits": {
-      "tokens_per_minute": 100000,
-      "requests_per_minute": 1000
-    },
-    "message": "All models operational"
+    "version": "1.0.0"
   }
 }
 ```
@@ -1800,6 +1827,7 @@ interface LLMHealthStatus {
 - **Order preservation:** Chunks delivered in correct sequence
 - **Final indication:** Clear termination with `is_final: true`
 - **Streaming code:** All streaming success frames MUST use `code: "STREAMING"`
+- **Partial token usage:** `usage_so_far` MAY be omitted in non-final chunks; when present it MUST follow TokenUsage schema
 
 ### 12.8 Error Mappings
 | Provider Error | Normalized Error | Wire Code | Details |
@@ -1820,33 +1848,37 @@ interface LLMHealthStatus {
 
 ## 13. Vector Capabilities
 
-### 13.1 Required Fields
+### 13.1 Required Fields 
+
 ```typescript
 interface VectorCapabilities {
-  protocol: string;               // "vector/v1.0"
-  server: string;
-  version: string;
-  max_dimensions: number;
-  supported_metrics: string[];    // e.g., ["cosine", "euclidean", "dotproduct"]
-  supports_namespaces: boolean;
-  supports_metadata_filtering: boolean;
-  supports_batch_operations: boolean;
-  supports_batch_queries: boolean;
-  max_batch_size?: number;
-  max_top_k?: number;
-  max_filter_terms?: number;
-  supports_index_management: boolean;
-  supports_deadline: boolean;
-  idempotent_writes: boolean;
-  supports_multi_tenant: boolean;
-  text_storage_strategy: "metadata" | "docstore" | "none";
-  max_text_length?: number;
-  supports_hybrid_search?: boolean; // Optional: hybrid vector+keyword search
-  supports_sparse_vectors?: boolean; // Optional: sparse vector support
-  max_namespaces?: number;        // Optional: namespace count limit
-  supports_vector_compression?: boolean; // Optional: vector compression
+  // Schema-required:
+  server: string;                 // REQUIRED
+  version: string;                // REQUIRED
+
+  // Schema-optional (recommended when known):
+  protocol?: "vector/v1.0";       // OPTIONAL in schema (const when present)
+  max_dimensions?: number;
+  supported_metrics?: string[];
+  supports_namespaces?: boolean;
+  supports_metadata_filtering?: boolean;
+  supports_batch_operations?: boolean;
+  supports_batch_queries?: boolean;
+  max_batch_size?: number | null;
+  max_top_k?: number | null;
+  max_filter_terms?: number | null;
+  supports_index_management?: boolean;
+  supports_deadline?: boolean;
+  idempotent_writes?: boolean;
+  supports_multi_tenant?: boolean;
+  text_storage_strategy?: "metadata" | "docstore" | "none";
+  max_text_length?: number | null;
+
+  // Additional vendor fields MAY appear (schema allows additionalProperties: true).
+  [k: string]: any;
 }
 ```
+> **Guidance:** Because the schema permits additional properties for VectorCapabilities, vendor-specific capability fields MAY be included. Clients MUST ignore unknown fields
 
 ### 13.2 Supported Metrics
 - **cosine:** Cosine similarity (1 - cosine distance)
@@ -1863,8 +1895,8 @@ interface VectorCapabilities {
 ### 14.1 Vector
 ```typescript
 interface Vector {
-  id: string;
-  vector: number[];
+  id: string;                     // REQUIRED
+  vector: number[];               // REQUIRED
   metadata?: Metadata;
   namespace?: string;
   text?: string;                  // Original text (optional)
@@ -1874,18 +1906,18 @@ interface Vector {
 ### 14.2 VectorMatch
 ```typescript
 interface VectorMatch {
-  vector: Vector;
-  score: number;                  // Similarity score (higher = more similar)
-  distance: number;               // Raw distance metric (lower = more similar) - REQUIRED
-  // If backend provides only one of score/distance, synthesize the other in a stable way
+  vector: Vector;                 // REQUIRED
+  score: number;                  // Similarity score (higher = more similar) - REQUIRED
+  distance: number;               // Raw distance metric (lower = more similar) - REQUIRED per schema
+  // If backend provides only one of score/distance, adapter MUST synthesize the other
 }
 ```
 
 ### 14.3 VectorQuerySpec
 ```typescript
 interface VectorQuerySpec {
-  vector: number[];
-  top_k: number;                  // Default: 10
+  vector: number[];               // REQUIRED
+  top_k: number;                  // Default: 10 (REQUIRED)
   namespace?: string;             // Default: "default"
   filter?: FilterExpression;      // Metadata filter conditions
   include_metadata?: boolean;     // Default: true
@@ -1896,9 +1928,9 @@ interface VectorQuerySpec {
 ### 14.4 VectorQueryResult
 ```typescript
 interface VectorQueryResult {
-  matches: VectorMatch[];
-  query_vector: number[];         // May be normalized
-  namespace: string;
+  matches: VectorMatch[];         // REQUIRED
+  query_vector: number[];         // May be normalized (REQUIRED)
+  namespace: string;              // REQUIRED
   total_matches: number;          // Total matches before top_k - REQUIRED
 }
 ```
@@ -1906,7 +1938,7 @@ interface VectorQueryResult {
 ### 14.5 BatchQuerySpec
 ```typescript
 interface BatchQuerySpec {
-  queries: VectorQuerySpec[];
+  queries: VectorQuerySpec[];     // REQUIRED
   namespace?: string;
 }
 ```
@@ -1914,7 +1946,7 @@ interface BatchQuerySpec {
 ### 14.6 UpsertSpec
 ```typescript
 interface UpsertSpec {
-  vectors: Vector[];
+  vectors: Vector[];              // REQUIRED
   namespace?: string;
 }
 ```
@@ -1922,9 +1954,9 @@ interface UpsertSpec {
 ### 14.7 UpsertResult
 ```typescript
 interface UpsertResult {
-  upserted_count: number;
-  failed_count: number;
-  failures: Array<{
+  upserted_count: number;         // REQUIRED
+  failed_count: number;           // REQUIRED
+  failures: Array<{               // REQUIRED
     id: string;
     error: string;
     detail: string;
@@ -1944,9 +1976,9 @@ interface DeleteSpec {
 ### 14.9 DeleteResult
 ```typescript
 interface DeleteResult {
-  deleted_count: number;
-  failed_count: number;
-  failures: Array<{
+  deleted_count: number;          // REQUIRED
+  failed_count: number;           // REQUIRED
+  failures: Array<{               // REQUIRED
     id: string;
     error: string;
     detail: string;
@@ -1957,8 +1989,8 @@ interface DeleteResult {
 ### 14.10 NamespaceSpec
 ```typescript
 interface NamespaceSpec {
-  namespace: string;
-  dimensions: number;
+  namespace: string;              // REQUIRED
+  dimensions: number;             // REQUIRED
   distance_metric: string;        // e.g., "cosine", "euclidean"
 }
 ```
@@ -1966,12 +1998,9 @@ interface NamespaceSpec {
 ### 14.11 NamespaceResult
 ```typescript
 interface NamespaceResult {
-  success: boolean;
-  namespace: string;
-  details: Metadata;
-  vector_count?: number;          // Optional: count of vectors in namespace
-  index_status?: string;          // Optional: index build status
-  ready?: boolean;                // Optional: namespace readiness
+  success: boolean;               // REQUIRED
+  namespace: string;              // REQUIRED
+  details: Metadata;              // Additional namespace details (vector_count, ready, index_status, etc.) - REQUIRED
 }
 ```
 
@@ -2020,11 +2049,7 @@ interface NamespaceResult {
     "idempotent_writes": true,
     "supports_multi_tenant": true,
     "text_storage_strategy": "metadata",
-    "max_text_length": 10000,
-    "supports_hybrid_search": true,
-    "supports_sparse_vectors": false,
-    "max_namespaces": 1000,
-    "supports_vector_compression": true
+    "max_text_length": 10000
   }
 }
 ```
@@ -2347,11 +2372,10 @@ interface NamespaceResult {
     "namespace": "images",
     "details": {
       "index_status": "building",
-      "estimated_completion_ms": 120000
-    },
-    "vector_count": 0,
-    "index_status": "building",
-    "ready": false
+      "estimated_completion_ms": 120000,
+      "vector_count": 0,
+      "ready": false
+    }
   }
 }
 ```
@@ -2392,11 +2416,11 @@ interface NamespaceResult {
     "success": true,
     "namespace": "old-data",
     "details": {
-      "vectors_deleted": 15000
-    },
-    "vector_count": 15000,
-    "index_status": "deleted",
-    "ready": false
+      "vectors_deleted": 15000,
+      "vector_count": 15000,
+      "index_status": "deleted",
+      "ready": false
+    }
   }
 }
 ```
@@ -2421,23 +2445,15 @@ interface NamespaceResult {
 **Output:**
 ```typescript
 interface VectorHealthStatus {
-  ok: boolean;
-  server: string;
-  version: string;
-  status?: "ok" | "degraded";  // Optional status indicator
-  namespaces: {
-    [namespace: string]: {
-      ready: boolean;
-      vector_count: number;
-      dimensions: number;
-      index_status?: string;    // Optional index status
-      read_only?: boolean;      // Optional read-only status
-    };
-  };
-  total_vector_count?: number;  // Optional total vectors across all namespaces
-  message?: string;             // Optional status message
+  ok: boolean;                    // REQUIRED per schema
+  server: string;                 // REQUIRED per schema
+  version: string;                // REQUIRED per schema
+  namespaces: Record<string, any>; // REQUIRED per schema
+  // Additional fields allowed per schema
 }
 ```
+
+> **Note:** Vector health responses MUST include `ok`, `server`, `version`, and `namespaces` fields. Additional fields are allowed for forward compatibility.
 
 **Response Body:**
 ```json
@@ -2449,25 +2465,18 @@ interface VectorHealthStatus {
     "ok": true,
     "server": "pinecone-adapter",
     "version": "1.0.0",
-    "status": "ok",
     "namespaces": {
       "documents": {
         "ready": true,
         "vector_count": 15000,
-        "dimensions": 1536,
-        "index_status": "ready",
-        "read_only": false
+        "dimensions": 1536
       },
       "images": {
         "ready": false,
         "vector_count": 0,
-        "dimensions": 512,
-        "index_status": "building",
-        "read_only": false
+        "dimensions": 512
       }
-    },
-    "total_vector_count": 15000,
-    "message": "Vector store operational"
+    }
   }
 }
 ```
@@ -2484,13 +2493,14 @@ interface VectorHealthStatus {
 - **Set membership:** `{ field: [value1, value2] }` for IN queries
 - **Range queries:** `{ field: { gt: value } }` for greater than
 - **Combination:** Multiple conditions combined with AND
+- **Field mapping:** Filter field names are implementation-defined; adapters map them to provider-specific query syntax
 
 ### 16.3 Metrics & Scoring Rules
 - **Normalization:** Scores normalized to [0, 1] range where possible
 - **Consistency:** Same metric always produces same score range
 - **Documentation:** Clear explanation of score meaning for each metric
 - **Cosine normalization:** For cosine similarity, vectors SHOULD be L2-normalized
-- **Score/distance synthesis:** If backend provides only one, synthesize the other in a stable way
+- **Score/distance synthesis:** If backend provides only one, adapter MUST synthesize the other (both score and distance are REQUIRED in VectorMatch)
 
 ### 16.4 Search Behavior
 - **Approximate vs exact:** Adapters SHOULD document search accuracy guarantees
@@ -2508,7 +2518,12 @@ interface VectorHealthStatus {
 - **none:** Text ignored; only ID + vector + metadata persisted
 - **Query behavior:** For `text_storage_strategy="docstore"`, hydrate text from docstore; missing text returns gracefully
 
-### 16.7 Error Mappings
+### 16.7 Determinism
+- **Same inputs:** Identical text + model → identical embedding vector
+- **Batch consistency:** Batch embedding identical to individual embeddings
+- **Normalization:** Consistent normalization when requested
+
+### 16.8 Error Mappings
 | Provider Error | Normalized Error | Wire Code | Details |
 |----------------|------------------|-----------|---------|
 | Dimension mismatch | `DimensionMismatch` | `DIMENSION_MISMATCH` | `{"provided": 1537, "expected": 1536}` |
@@ -2517,7 +2532,7 @@ interface VectorHealthStatus {
 | Batch size exceeded | `BadRequest` | `BAD_REQUEST` | `{"max_batch_size": 100, "provided": 150}` |
 | Filter not supported | `NotSupported` | `NOT_SUPPORTED` | `{"feature": "metadata_filtering"}` |
 
-### 16.8 Deadline Rules
+### 16.9 Deadline Rules
 - **Query timeouts:** Deadline applies to entire search operation
 - **Batch operations:** Deadline applies to entire batch processing
 - **Namespace operations:** Deadline applies to management operations
@@ -2528,33 +2543,38 @@ interface VectorHealthStatus {
 
 ## 17. Embedding Capabilities
 
-### 17.1 Required Fields
+### 17.1 Required Fields 
+
 ```typescript
 interface EmbeddingCapabilities {
-  protocol: string;               // "embedding/v1.0"
-  server: string;
-  version: string;
-  supported_models: string[];
-  max_batch_size?: number;
-  max_text_length?: number;
-  max_dimensions?: number;
-  supports_normalization: boolean;
-  supports_truncation: boolean;
-  supports_token_counting: boolean;
-  supports_streaming: boolean;
-  supports_batch_embedding: boolean;
-  supports_caching: boolean;
-  supports_multi_tenant: boolean;
-  supports_deadline: boolean;
-  normalizes_at_source: boolean;
-  idempotent_writes: boolean;
-  truncation_mode: string;        // "base" or "adapter"
-  max_batch_tokens?: number;      // Optional: token-based batch limits
-  supports_multilingual?: boolean; // Optional: multilingual support
-  supports_custom_dimensions?: boolean; // Optional: dimension customization
+  // Schema-required:
+  server: string;                 // REQUIRED
+  version: string;                // REQUIRED
+  supported_models: string[];     // REQUIRED
+  protocol: "embedding/v1.0";     // REQUIRED (const)
+
+  // Schema-optional:
+  max_batch_size?: number | null;
+  max_text_length?: number | null;
+  max_dimensions?: number | null;
+
+  supports_normalization?: boolean;
+  supports_truncation?: boolean;
+  supports_token_counting?: boolean;
+  supports_streaming?: boolean;
+  supports_batch_embedding?: boolean;
+  supports_caching?: boolean;
+
+  idempotent_writes?: boolean;
+  supports_multi_tenant?: boolean;
+  supports_deadline?: boolean;
+  normalizes_at_source?: boolean;
+  truncation_mode?: string;
+
+  // Additional vendor fields MAY appear (schema allows additionalProperties: true).
+  [k: string]: any;
 }
 ```
-
 ### 17.2 Model Support
 - **Model listing:** Available embedding models with dimensions
 - **Batch capabilities:** Maximum batch sizes per model
@@ -2565,18 +2585,19 @@ interface EmbeddingCapabilities {
 ### 18.1 EmbedSpec
 ```typescript
 interface EmbedSpec {
-  text: string;
-  model: string;
+  text: string;                   // REQUIRED
+  model: string;                  // REQUIRED
   truncate?: boolean;             // Allow automatic truncation
   normalize?: boolean;            // Return normalized vectors
+  // Note: stream field MUST be false or absent for unary embed operation
 }
 ```
 
 ### 18.2 EmbedBatchSpec
 ```typescript
 interface EmbedBatchSpec {
-  texts: string[];
-  model: string;
+  texts: string[];                // REQUIRED
+  model: string;                  // REQUIRED
   truncate?: boolean;
   normalize?: boolean;
 }
@@ -2585,9 +2606,9 @@ interface EmbedBatchSpec {
 ### 18.3 EmbedResult
 ```typescript
 interface EmbedResult {
-  embedding: EmbeddingVector;
-  model: string;
-  text: string;                   // Possibly truncated
+  embedding: EmbeddingVector;     // REQUIRED
+  model: string;                  // REQUIRED
+  text: string;                   // Possibly truncated (REQUIRED)
   tokens_used?: number;
   truncated?: boolean;            // True if text was truncated
 }
@@ -2596,10 +2617,10 @@ interface EmbedResult {
 ### 18.4 EmbeddingVector
 ```typescript
 interface EmbeddingVector {
-  vector: number[];
-  text: string;                   // Denormalized for convenience
-  model: string;                  // Denormalized for convenience
-  dimensions: number;
+  vector: number[];               // REQUIRED
+  text: string;                   // Denormalized for convenience (REQUIRED)
+  model: string;                  // Denormalized for convenience (REQUIRED)
+  dimensions: number;             // REQUIRED
   index?: number;                 // Optional: index in original batch
   metadata?: Metadata;            // Optional: additional metadata
 }
@@ -2608,14 +2629,15 @@ interface EmbeddingVector {
 ### 18.5 EmbedBatchResult
 ```typescript
 interface EmbedBatchResult {
-  embeddings: EmbeddingVector[];
-  model: string;
-  total_texts: number;
+  embeddings: EmbeddingVector[];  // REQUIRED
+  model: string;                  // REQUIRED
+  total_texts: number;            // REQUIRED
   total_tokens?: number;
-  failed_texts: Array<{
+  failed_texts: Array<{           // REQUIRED
     index: number;                // Index in original batch
     text: string;
     error: string;
+    code: string;                 // REQUIRED per schema
     message: string;
   }>;
 }
@@ -2624,10 +2646,26 @@ interface EmbedBatchResult {
 ### 18.6 EmbedChunk
 ```typescript
 interface EmbedChunk {
-  embeddings: EmbeddingVector[];
-  is_final: boolean;              // True for final chunk
+  embeddings: EmbeddingVector[];  // REQUIRED
+  is_final: boolean;              // True for final chunk (REQUIRED)
   usage?: object;                 // Optional usage information
   model?: string;                 // Optional model identifier
+}
+```
+
+### 18.7 EmbeddingStats
+```typescript
+interface EmbeddingStats {
+  total_requests: number;         // REQUIRED
+  total_texts: number;            // REQUIRED
+  total_tokens: number;           // REQUIRED
+  cache_hits?: number;
+  cache_misses?: number;
+  avg_processing_time_ms?: number;
+  error_count?: number;
+  stream_requests?: number;
+  stream_chunks_generated?: number;
+  stream_abandoned?: number;
 }
 ```
 
@@ -2676,10 +2714,7 @@ interface EmbedChunk {
     "supports_deadline": true,
     "normalizes_at_source": true,
     "idempotent_writes": true,
-    "truncation_mode": "base",
-    "max_batch_tokens": 8000000,
-    "supports_multilingual": true,
-    "supports_custom_dimensions": true
+    "truncation_mode": "base"
   }
 }
 ```
@@ -2694,6 +2729,7 @@ interface EmbedChunk {
 **Validation:**
 - `text` MUST be non-empty string
 - `model` MUST be non-empty string
+- `stream` field MUST be false or absent (streaming uses separate `embedding.stream_embed` operation)
 
 **Request Body:**
 ```json
@@ -2809,15 +2845,17 @@ interface EmbedChunk {
 ```
 
 ### 19.4 stream_embed
-**Purpose:** Stream embeddings incrementally (for batch operations)
+**Purpose:** Stream embeddings incrementally for a single text
 
 **Operation:** `embedding.stream_embed`
 
-**Input:** `EmbedBatchSpec`
+**Input:** `EmbedSpec` (single text, not batch)
 
 **Validation:**
+- `text` MUST be non-empty string
 - `model` MUST be non-empty string
-- `texts` MUST be non-empty list
+- Operation is for single text only (not batch)
+- `stream` field is not used (streaming is implied by operation)
 
 **Request Body:**
 ```json
@@ -2828,11 +2866,7 @@ interface EmbedChunk {
     "tenant": "acme-corp"
   },
   "args": {
-    "texts": [
-      "Text 1 for streaming embeddings",
-      "Text 2 for streaming embeddings",
-      "Text 3 for streaming embeddings"
-    ],
+    "text": "Text for streaming embeddings",
     "model": "text-embedding-3-large",
     "truncate": true
   }
@@ -2843,9 +2877,9 @@ interface EmbedChunk {
 
 **Stream Response Frames:**
 ```json
-{"ok": true, "code": "STREAMING", "ms": 12.3, "chunk": {"embeddings": [{"vector": [0.1, 0.2], "text": "Text 1 for streaming embeddings", "model": "text-embedding-3-large", "dimensions": 3072, "index": 0}], "is_final": false}}
-{"ok": true, "code": "STREAMING", "ms": 15.7, "chunk": {"embeddings": [{"vector": [0.3, 0.4], "text": "Text 2 for streaming embeddings", "model": "text-embedding-3-large", "dimensions": 3072, "index": 1}], "is_final": false}}
-{"ok": true, "code": "STREAMING", "ms": 18.2, "chunk": {"embeddings": [{"vector": [0.5, 0.6], "text": "Text 3 for streaming embeddings", "model": "text-embedding-3-large", "dimensions": 3072, "index": 2}], "is_final": true, "usage": {"total_tokens": 24}}}
+{"ok": true, "code": "STREAMING", "ms": 12.3, "chunk": {"embeddings": [{"vector": [0.1, 0.2], "text": "Text for streaming embeddings", "model": "text-embedding-3-large", "dimensions": 3072}], "is_final": false}}
+{"ok": true, "code": "STREAMING", "ms": 15.7, "chunk": {"embeddings": [{"vector": [0.3, 0.4], "text": "Text for streaming embeddings", "model": "text-embedding-3-large", "dimensions": 3072}], "is_final": false}}
+{"ok": true, "code": "STREAMING", "ms": 18.2, "chunk": {"embeddings": [{"vector": [0.5, 0.6], "text": "Text for streaming embeddings", "model": "text-embedding-3-large", "dimensions": 3072}], "is_final": true, "usage": {"total_tokens": 8}}}
 ```
 
 ### 19.5 count_tokens
@@ -2882,7 +2916,47 @@ interface EmbedChunk {
 }
 ```
 
-### 19.6 health
+### 19.6 get_stats
+**Purpose:** Retrieve embedding service statistics and usage metrics
+
+**Operation:** `embedding.get_stats`
+
+**Request Body:**
+```json
+{
+  "op": "embedding.get_stats",
+  "ctx": {
+    "request_id": "req-embed-stats-001",
+    "tenant": "acme-corp"
+  },
+  "args": {}
+}
+```
+
+**Output:** `EmbeddingStats`
+
+**Response Body:**
+```json
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 3.5,
+  "result": {
+    "total_requests": 1250,
+    "total_texts": 3500,
+    "total_tokens": 150000,
+    "cache_hits": 450,
+    "cache_misses": 800,
+    "avg_processing_time_ms": 45.2,
+    "error_count": 12,
+    "stream_requests": 150,
+    "stream_chunks_generated": 12500,
+    "stream_abandoned": 3
+  }
+}
+```
+
+### 19.7 health
 **Purpose:** Check embedding provider health and model status
 
 **Operation:** `embedding.health`
@@ -2902,24 +2976,15 @@ interface EmbedChunk {
 **Output:**
 ```typescript
 interface EmbeddingHealthStatus {
-  ok: boolean;
-  server: string;
-  version: string;
-  status?: "ok" | "degraded";  // Optional status indicator
-  models?: {                   // Optional model status information
-    [model: string]: {
-      available: boolean;
-      rate_limited?: boolean;
-      degraded?: boolean;
-    };
-  };
-  rate_limits?: {             // Optional rate limit information
-    tokens_per_minute?: number;
-    requests_per_minute?: number;
-  };
-  message?: string;           // Optional status message
+  ok: boolean;                    // REQUIRED per schema
+  server: string;                 // REQUIRED per schema
+  version: string;                // REQUIRED per schema
+  models: Record<string, any>;    // REQUIRED per schema
+  // Additional fields allowed per schema
 }
 ```
+
+> **Note:** Embedding health responses MUST include `ok`, `server`, `version`, and `models` fields. Additional fields are allowed for forward compatibility.
 
 **Response Body:**
 ```json
@@ -2931,24 +2996,16 @@ interface EmbeddingHealthStatus {
     "ok": true,
     "server": "openai-embedding-adapter",
     "version": "1.0.0",
-    "status": "ok",
     "models": {
       "text-embedding-3-large": {
         "available": true,
-        "rate_limited": false,
-        "degraded": false
+        "max_dimensions": 3072
       },
       "text-embedding-3-small": {
         "available": true,
-        "rate_limited": false,
-        "degraded": false
+        "max_dimensions": 1536
       }
-    },
-    "rate_limits": {
-      "tokens_per_minute": 1000000,
-      "requests_per_minute": 5000
-    },
-    "message": "All embedding models operational"
+    }
   }
 }
 ```
@@ -2982,7 +3039,7 @@ interface EmbeddingHealthStatus {
 - **Fallback behavior:** Automatic fallback to single embedding if batch unsupported
 
 ### 20.6 Streaming Semantics
-- **Streaming operation:** `embedding.stream_embed` is separate from unary operations
+- **Single text streaming:** `embedding.stream_embed` processes a single text only (not batch)
 - **Incremental delivery:** Embeddings delivered as they become available
 - **Streaming code:** All streaming success frames MUST use `code: "STREAMING"`
 - **Final chunk:** Last chunk must have `is_final: true`
@@ -2992,7 +3049,12 @@ interface EmbeddingHealthStatus {
 - **Batch consistency:** Batch embedding identical to individual embeddings
 - **Normalization:** Consistent normalization when requested
 
-### 20.8 Error Mappings
+### 20.8 Statistics Collection
+- **Operation tracking:** Adapters SHOULD maintain statistics for `get_stats` operation
+- **Cache metrics:** Cache hit/miss statistics when caching supported
+- **Stream metrics:** Streaming operation statistics including abandonment rates
+
+### 20.9 Error Mappings
 | Provider Error | Normalized Error | Wire Code | Details |
 |----------------|------------------|-----------|---------|
 | Text too long | `TextTooLong` | `TEXT_TOO_LONG` | `{"max_text_length": 8192, "provided_length": 8500}` |
@@ -3000,7 +3062,7 @@ interface EmbeddingHealthStatus {
 | Normalization not supported | `NotSupported` | `NOT_SUPPORTED` | `{"feature": "normalization"}` |
 | Batch size exceeded | `BadRequest` | `BAD_REQUEST` | `{"max_batch_size": 2048, "provided": 2500}` |
 
-### 20.9 Deadline Rules
+### 20.10 Deadline Rules
 - **Batch timeouts:** Deadline applies to entire batch processing
 - **Token counting:** Fast operation with minimal timeout impact
 - **Provider limits:** Respect provider-specific timeout constraints
@@ -3046,20 +3108,14 @@ All adapters MUST map provider errors to the canonical taxonomy defined in **ERR
 - **Vector:** `DimensionMismatch`, `IndexNotReady`, `NamespaceNotFound`
 - **Graph:** `QueryParseError`, `VertexNotFound`, `SchemaValidationError`
 
-### 22.3 Partial Failure Envelopes
-All batch operations use consistent partial failure reporting:
-```typescript
-{
-  processed_count: number;
-  failed_count: number;
-  failures: Array<{
-    id?: string;           // Item identifier when available
-    index?: number;        // Batch position when no ID
-    error: string;         // Normalized error type
-    detail: string;        // Human-readable details
-  }>;
-}
-```
+### 22.3 Batch Result Patterns
+**Vector operations** use `{upserted_count|deleted_count, failed_count, failures[]}` for upsert and delete operations.
+
+**Embedding batch operations** use `{embeddings, total_texts, total_tokens?, failed_texts[]}`.
+
+**Graph batch/transaction operations** use `GraphBatchResult` with `{results[], success, error?, transaction_id?}`.
+
+> **Note:** There is no single cross-protocol `BatchResult<T>` type; each protocol defines its own batch result shape based on semantic needs.
 
 ### 22.4 Retry Semantics
 - **Automatic retry:** `TRANSIENT_NETWORK`, `UNAVAILABLE`, `RESOURCE_EXHAUSTED`
@@ -3164,11 +3220,11 @@ All batch operations use consistent partial failure reporting:
 - [ ] Tenant hashing applied in all telemetry
 - [ ] Deadline propagation with safety buffer
 - [ ] SIEM-safe requirements enforced
-- [ ] Capabilities reported truthfully including protocol field
+- [ ] Capabilities reported truthfully (protocol field is recommended)
 - [ ] Wire envelopes follow standardization
 - [ ] Streaming semantics followed
 - [ ] All request envelopes include `op`, `ctx`, `args` keys
-- [ ] All streaming success frames use `code: "STREAMING"`
+- [ ] **All streaming success frames use `code: "STREAMING"`**
 
 ### 26.2 Protocol-Specific Compliance
 **Graph:**
@@ -3179,6 +3235,11 @@ All batch operations use consistent partial failure reporting:
 - [ ] Validation rules enforced (non-empty nodes/edges, etc.)
 - [ ] Transaction and traversal operations implemented where supported
 - [ ] Bulk vertices pagination implemented
+- [ ] Graph schema format matches `{nodes, edges, metadata}`
+- [ ] Graph delete operations accept IDs or filter (not IDs only)
+- [ ] Graph batch/transaction inner ops use fully-qualified names (e.g., `"graph.upsert_nodes"`)
+- [ ] Graph batch result uses `GraphBatchResult` shape (`results`, `success`, `error`, `transaction_id`)
+- [ ] Graph health includes required fields: `ok`, `status`, `server`, `version`
 
 **LLM:**
 - [ ] Stop sequence precedence followed
@@ -3188,6 +3249,10 @@ All batch operations use consistent partial failure reporting:
 - [ ] Parameter range validation enforced
 - [ ] Context window preflight implemented
 - [ ] Tool choice options (`auto`, `none`, `required`) supported
+- [ ] Completion results include `model_family`
+- [ ] TokenUsage follows invariant: `total_tokens = prompt_tokens + completion_tokens`
+- [ ] Streaming `usage_so_far` may be omitted in non-final chunks; when present follows TokenUsage schema
+- [ ] LLM health includes required fields: `ok`, `server`, `version`
 
 **Vector:**
 - [ ] Dimension enforcement strict
@@ -3197,6 +3262,9 @@ All batch operations use consistent partial failure reporting:
 - [ ] Namespace validation implemented
 - [ ] Text storage strategy behavior implemented
 - [ ] Batch query operation implemented
+- [ ] Namespace result places details in `details` object (not top-level)
+- [ ] VectorMatch includes both `score` and `distance` (synthesize if needed)
+- [ ] Vector health includes required fields: `ok`, `server`, `version`, `namespaces`
 
 **Embedding:**
 - [ ] Truncation rules followed
@@ -3204,8 +3272,12 @@ All batch operations use consistent partial failure reporting:
 - [ ] Dimension matching enforced
 - [ ] Empty input handling defined
 - [ ] Batch fallback behavior implemented
-- [ ] Streaming embedding operation implemented
+- [ ] Streaming embedding operation for single text only (not batch)
 - [ ] Caching support implemented where available
+- [ ] Failed batch items include required `code` field
+- [ ] Unary embed operation rejects `stream=true` (streaming uses separate `embedding.stream_embed`)
+- [ ] Statistics operation (`embedding.get_stats`) implemented
+- [ ] Embedding health includes required fields: `ok`, `server`, `version`, `models`
 
 ## 27. Cross-Protocol Standardization Tables
 
@@ -3215,21 +3287,28 @@ All batch operations use consistent partial failure reporting:
 | `ok` | REQUIRED | ✓ | ✓ | ✓ | ✓ |
 | `server` | REQUIRED | ✓ | ✓ | ✓ | ✓ |
 | `version` | REQUIRED | ✓ | ✓ | ✓ | ✓ |
-| `status` | OPTIONAL | ✓ | ✓ | ✓ | ✓ |
-| `namespaces` | PROTOCOL | ✓ | ✗ | ✓ | ✗ |
-| `models` | PROTOCOL | ✗ | ✓ | ✗ | ✓ |
-| `read_only` | OPTIONAL | ✓ | ✗ | ✗ | ✗ |
-| `degraded` | OPTIONAL | ✓ | ✗ | ✗ | ✗ |
-| `message` | OPTIONAL | ✓ | ✓ | ✓ | ✓ |
+| `status` | Protocol-specific | ✓ | OPTIONAL | OPTIONAL | OPTIONAL |
+| `namespaces` | Protocol-specific | ✓ | OPTIONAL | ✓ | OPTIONAL |
+| `models` | Protocol-specific | OPTIONAL | OPTIONAL | OPTIONAL | ✓ |
+| `read_only` | OPTIONAL | ✓ | OPTIONAL | OPTIONAL | OPTIONAL |
+| `degraded` | OPTIONAL | ✓ | OPTIONAL | OPTIONAL | OPTIONAL |
+| `message` | OPTIONAL | OPTIONAL | OPTIONAL | OPTIONAL | OPTIONAL |
+
+> **Note:** Health responses MAY include additional fields beyond those listed. All health schemas allow `additionalProperties: true` for forward compatibility. Specific required fields per schema: Graph requires `ok`, `status`, `server`, `version`; LLM requires `ok`, `server`, `version`; Vector requires `ok`, `server`, `version`, `namespaces`; Embedding requires `ok`, `server`, `version`, `models`.
 
 ### 27.2 Batch Operation Standardization
-| Field | All Protocols | Purpose |
-|-------|---------------|---------|
-| `processed_count` | REQUIRED | Successfully processed items |
-| `failed_count` | REQUIRED | Failed items count |
-| `failures[]` | REQUIRED | Detailed failure information |
-| `results[]` | OPTIONAL | Successful operation results |
-| Atomic support | PROTOCOL | Protocol-specific availability |
+| Protocol | Batch Result Shape | Notes |
+|----------|-------------------|-------|
+| **Vector** | `{upserted_count|deleted_count, failed_count, failures[]}` | Used for upsert and delete operations |
+| **Embedding** | `{embeddings, total_texts, total_tokens?, failed_texts[]}` | Used for batch embedding operations |
+| **Graph** | `GraphBatchResult` | Protocol-specific shape: `{results[], success, error?, transaction_id?}` |
+| **LLM** | N/A | No batch operations defined |
+
+**Graph Batch/Transaction Notes:**
+- Inner operations MUST use fully-qualified names (e.g., `"graph.upsert_nodes"`)
+- Does not follow other protocols' batch patterns
+- Success determined by `success` boolean field
+- Individual operation results placed in `results[]` array
 
 ### 27.3 Streaming Standardization
 | Aspect | All Protocols | Requirements |
@@ -3239,7 +3318,8 @@ All batch operations use consistent partial failure reporting:
 | Order preservation | REQUIRED | Maintains semantic order |
 | Backpressure | RECOMMENDED | Respect client consumption |
 | Heartbeats | OPTIONAL | Keep-alive messages |
-| Streaming code | REQUIRED | MUST use `code: "STREAMING"` |
+| **Streaming code** | **REQUIRED** | **MUST use `code: "STREAMING"`** |
+| **Embedding streaming** | **SINGLE-TEXT** | **embedding.stream_embed processes single text only** |
 
 ### 27.4 Error Code Standardization
 | Error Code | Retryable | Protocols | Typical Cause |
@@ -3252,7 +3332,7 @@ All batch operations use consistent partial failure reporting:
 | `NOT_SUPPORTED` | No | All | Unsupported operation or parameter |
 | `DEADLINE_EXCEEDED` | Conditional | All | Operation timeout |
 | `MODEL_OVERLOADED` | Yes | LLM | Model capacity exceeded |
-| `TEXT_TOO_LONG` | No | LLM, Embedding | Input exceeds context window |
+| `TEXT_TOO_LONG` | No | Embedding | Input exceeds context window |
 | `DIMENSION_MISMATCH` | No | Vector | Vector dimensions don't match |
 | `QUERY_PARSE_ERROR` | No | Graph | Invalid query syntax |
 | `INDEX_NOT_READY` | Conditional | Vector | Index building in progress |
@@ -3363,12 +3443,41 @@ All batch operations use consistent partial failure reporting:
   },
   "Graph Batch (all success)": {
     "results": [
-      {"deleted_count": 1},
-      {"upserted_count": 2}, 
-      {"processed_count": 1}
+      {"upserted_count": 1, "failed_count": 0, "failures": []},
+      {"deleted_count": 2, "failed_count": 0, "failures": []}
     ],
     "success": true,
     "transaction_id": "tx-12345"
+  },
+  "Embedding Batch (with failures)": {
+    "embeddings": [
+      {
+        "vector": [0.1, 0.2, 0.3],
+        "text": "Successfully processed text",
+        "model": "text-embedding-3-large",
+        "dimensions": 3072,
+        "index": 0
+      }
+    ],
+    "model": "text-embedding-3-large",
+    "total_texts": 3,
+    "total_tokens": 25,
+    "failed_texts": [
+      {
+        "index": 1,
+        "text": "Text that was too long",
+        "error": "TextTooLong",
+        "code": "TEXT_TOO_LONG",
+        "message": "Text exceeds maximum length of 8192 tokens"
+      },
+      {
+        "index": 2,
+        "text": "Empty text",
+        "error": "BadRequest",
+        "code": "BAD_REQUEST", 
+        "message": "Text cannot be empty"
+      }
+    ]
   }
 }
 ```
@@ -3378,7 +3487,7 @@ All batch operations use consistent partial failure reporting:
 ```json
 {"ok": true, "code": "STREAMING", "ms": 12.3, "chunk": {"records": [{"user": {"id": "u1", "name": "Alice"}}], "is_final": false}}
 {"ok": true, "code": "STREAMING", "ms": 15.7, "chunk": {"records": [{"user": {"id": "u2", "name": "Bob"}}], "is_final": false}}
-{"ok": true, "code": "STREAMING", "ms": 18.2, "chunk": {"summary": {"query_time_ms": 125.4, "results_count": 2, "has_more": false}, "is_final": true}}
+{"ok": true, "code": "STREAMING", "ms": 18.2, "chunk": {"records": [], "summary": {"query_time_ms": 125.4, "results_count": 2, "has_more": false}, "is_final": true}}
 ```
 
 **LLM Stream Frames:**
@@ -3390,9 +3499,9 @@ All batch operations use consistent partial failure reporting:
 
 **Embedding Stream Frames:**
 ```json
-{"ok": true, "code": "STREAMING", "ms": 12.3, "chunk": {"embeddings": [{"vector": [0.1, 0.2], "text": "Text 1", "model": "text-embedding-3-large", "dimensions": 3072, "index": 0}], "is_final": false}}
-{"ok": true, "code": "STREAMING", "ms": 15.7, "chunk": {"embeddings": [{"vector": [0.3, 0.4], "text": "Text 2", "model": "text-embedding-3-large", "dimensions": 3072, "index": 1}], "is_final": false}}
-{"ok": true, "code": "STREAMING", "ms": 18.2, "chunk": {"embeddings": [{"vector": [0.5, 0.6], "text": "Text 3", "model": "text-embedding-3-large", "dimensions": 3072, "index": 2}], "is_final": true, "usage": {"total_tokens": 24}}}
+{"ok": true, "code": "STREAMING", "ms": 12.3, "chunk": {"embeddings": [{"vector": [0.1, 0.2], "text": "Text for streaming embeddings", "model": "text-embedding-3-large", "dimensions": 3072}], "is_final": false}}
+{"ok": true, "code": "STREAMING", "ms": 15.7, "chunk": {"embeddings": [{"vector": [0.3, 0.4], "text": "Text for streaming embeddings", "model": "text-embedding-3-large", "dimensions": 3072}], "is_final": false}}
+{"ok": true, "code": "STREAMING", "ms": 18.2, "chunk": {"embeddings": [{"vector": [0.5, 0.6], "text": "Text for streaming embeddings", "model": "text-embedding-3-large", "dimensions": 3072}], "is_final": true, "usage": {"total_tokens": 8}}}
 ```
 
 ### 29.5 Context Deadline Examples
@@ -3425,7 +3534,8 @@ adapter = BaseLLMAdapter(mode="standalone")
 ```
 
 ### 29.7 JSON Schema References
-- **Strict validation:** All schemas prohibit additional properties unless specified
+- **Type schemas are strict (`additionalProperties: false`) unless explicitly allowed.**
+- **Envelopes and some args specs are intentionally permissive (`additionalProperties: true`) for forward-compatibility.**
 - **Required fields:** Clearly marked in type definitions
 - **Default values:** Specified where semantically meaningful
 - **Range validation:** Numeric bounds enforced per capabilities
@@ -3437,20 +3547,20 @@ adapter = BaseLLMAdapter(mode="standalone")
 - **Graph Operations:** capabilities, upsert_nodes, upsert_edges, delete_nodes, delete_edges, query, stream_query, bulk_vertices, batch, transaction, traversal, get_schema, health
 - **LLM Operations:** capabilities, complete, stream, count_tokens, health  
 - **Vector Operations:** capabilities, query, batch_query, upsert, delete, create_namespace, delete_namespace, health
-- **Embedding Operations:** capabilities, embed, embed_batch, stream_embed, count_tokens, health
+- **Embedding Operations:** capabilities, embed, embed_batch, stream_embed, count_tokens, get_stats, health
 
 ### 30.2 Types Index
-- **Common Types:** OperationContext, Metadata, FilterExpression, BatchResult, TokenUsage, CountTokensSpec
-- **Graph Types:** Node, Edge, GraphQuerySpec, GraphQueryResult, QueryChunk, BulkVerticesSpec, BulkVerticesResult, GraphBatchResult, GraphTraversalSpec, TraversalResult, GraphSchema, ConstraintInfo, IndexInfo, GraphHealthStatus
+- **Common Types:** OperationContext, Metadata, FilterExpression, TokenUsage, CountTokensSpec
+- **Graph Types:** Node, Edge, GraphQuerySpec, GraphQueryResult, QueryChunk, BulkVerticesSpec, BulkVerticesResult, GraphBatchResult, GraphTraversalSpec, TraversalResult, GraphSchema, GraphHealthStatus
 - **LLM Types:** Message, ToolCall, ToolDefinition, CompletionSpec, LLMCompletion, LLMChunk, LLMHealthStatus
 - **Vector Types:** Vector, VectorMatch, VectorQuerySpec, VectorQueryResult, BatchQuerySpec, UpsertSpec, UpsertResult, DeleteSpec, DeleteResult, NamespaceSpec, NamespaceResult, VectorHealthStatus
-- **Embedding Types:** EmbedSpec, EmbedBatchSpec, EmbedResult, EmbeddingVector, EmbedBatchResult, EmbedChunk, EmbeddingHealthStatus
+- **Embedding Types:** EmbedSpec, EmbedBatchSpec, EmbedResult, EmbeddingVector, EmbedBatchResult, EmbedChunk, EmbeddingStats, EmbeddingHealthStatus
 
 ### 30.3 Capabilities Index
-- **Graph Capabilities:** protocol, server, version, supported_query_dialects, supports_stream_query, supports_bulk_vertices, supports_batch, supports_schema, supports_transaction, supports_traversal, supports_path_queries, idempotent_writes, supports_deadline, supports_namespaces, supports_property_filters, supports_multi_tenant, max_batch_ops, max_traversal_depth, max_query_complexity, max_nodes_per_transaction, supports_analytics_queries
-- **LLM Capabilities:** protocol, server, version, model_family, supported_models, max_context_length, supports_streaming, supports_roles, supports_system_message, supports_json_output, supports_tools, supports_parallel_tool_calls, supports_tool_choice, supports_deadline, supports_count_tokens, idempotent_writes, supports_multi_tenant, max_tool_calls_per_turn, max_tokens_per_minute, max_requests_per_minute, supports_function_calling, supports_vision, supports_logprobs
-- **Vector Capabilities:** protocol, server, version, max_dimensions, supported_metrics, supports_namespaces, supports_metadata_filtering, supports_batch_operations, supports_batch_queries, max_batch_size, max_top_k, max_filter_terms, supports_index_management, supports_deadline, idempotent_writes, supports_multi_tenant, text_storage_strategy, max_text_length, supports_hybrid_search, supports_sparse_vectors, max_namespaces, supports_vector_compression
-- **Embedding Capabilities:** protocol, server, version, supported_models, max_batch_size, max_text_length, max_dimensions, supports_normalization, supports_truncation, supports_token_counting, supports_streaming, supports_batch_embedding, supports_caching, supports_multi_tenant, supports_deadline, normalizes_at_source, idempotent_writes, truncation_mode, max_batch_tokens, supports_multilingual, supports_custom_dimensions
+- **Graph Capabilities:** protocol (recommended), server, version, supported_query_dialects, supports_stream_query, supports_bulk_vertices, supports_batch, supports_schema, supports_transaction, supports_traversal, supports_path_queries, idempotent_writes, supports_deadline, supports_namespaces, supports_property_filters, supports_multi_tenant, max_batch_ops, max_traversal_depth
+- **LLM Capabilities:** protocol (recommended), server, version, model_family, supported_models, max_context_length, supports_streaming, supports_roles, supports_system_message, supports_json_output, supports_tools, supports_parallel_tool_calls, supports_tool_choice, supports_deadline, supports_count_tokens, idempotent_writes, supports_multi_tenant, max_tool_calls_per_turn
+- **Vector Capabilities:** protocol (recommended), server, version, max_dimensions, supported_metrics, supports_namespaces, supports_metadata_filtering, supports_batch_operations, supports_batch_queries, max_batch_size, max_top_k, max_filter_terms, supports_index_management, supports_deadline, idempotent_writes, supports_multi_tenant, text_storage_strategy, max_text_length
+- **Embedding Capabilities:** protocol (recommended), server, version, supported_models, max_batch_size, max_text_length, max_dimensions, supports_normalization, supports_truncation, supports_token_counting, supports_streaming, supports_batch_embedding, supports_caching, supports_multi_tenant, supports_deadline, normalizes_at_source, idempotent_writes, truncation_mode
 
 ### 30.4 Error Codes Index
 - BAD_REQUEST, AUTH_ERROR, RESOURCE_EXHAUSTED, TRANSIENT_NETWORK, UNAVAILABLE, NOT_SUPPORTED, DEADLINE_EXCEEDED, MODEL_OVERLOADED, TEXT_TOO_LONG, DIMENSION_MISMATCH, QUERY_PARSE_ERROR, INDEX_NOT_READY, NAMESPACE_NOT_FOUND
