@@ -1091,6 +1091,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   ]
 }
 ```
+---
 
 ## 4.2 Vector Protocol Schemas
 
@@ -1377,8 +1378,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
             "filter": {
               "type": "object",
               "minProperties": 1,
-              "additionalProperties": true,
-              "description": "Non-empty filter expression. An empty object is not permitted because the adapter treats it as absent."
+              "additionalProperties": true
             }
           },
           "additionalProperties": true,
@@ -1510,11 +1510,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     {
       "properties": {
         "op": { "type": "string", "const": "vector.health" },
-        "args": {
-          "type": "object",
-          "additionalProperties": true,
-          "description": "Args object is required on the wire; extra keys are ignored by the handler."
-        }
+        "args": { "type": "object", "additionalProperties": true }
       }
     }
   ]
@@ -1589,8 +1585,8 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     "id": { "type": "string", "minLength": 1, "pattern": ".*\\S.*" },
     "vector": { "type": "array", "items": { "type": "number" }, "minItems": 1 },
     "metadata": { "type": ["object", "null"], "additionalProperties": true },
-    "namespace": { "type": "string" },
-    "text": { "type": ["string", "null"], "description": "Optional text content associated with vector" }
+    "namespace": { "type": ["string", "null"] },
+    "text": { "type": ["string", "null"] }
   },
   "required": ["id", "vector"],
   "additionalProperties": false
