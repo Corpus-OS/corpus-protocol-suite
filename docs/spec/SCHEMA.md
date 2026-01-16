@@ -88,7 +88,7 @@ The Corpus Schema Reference provides the definitive JSON Schema definitions for 
 
 | Document | Purpose | Relationship to SCHEMA.md |
 |----------|---------|---------------------------|
-| **PROTOCOLS.md** | Defines wire format and operational semantics | **Wire format takes precedence** - SCHEMA.md implements PROTOCOLS.md requirements |
+| **PROTOCOLS.md** | Defines behavioral and operational semantics | **Wire format takes precedence** - PROTOCOL.md implements SCHEMA.md requirements |
 | **SPECIFICATION.md** | High-level architecture and design philosophy | Descriptive reference; may contain language-specific bindings |
 | **ERRORS.md** | Error taxonomy and normalization rules | Error envelope schemas must align with ERROR taxonomy |
 | **METRICS.md** | Observability requirements | Schema validation includes metrics field constraints |
