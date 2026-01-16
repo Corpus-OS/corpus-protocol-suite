@@ -544,27 +544,6 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
 
 **Note: Result/type schemas describe expected adapter-conformant payloads; the wire handler does not re-validate adapter return types at runtime.**
 
-## 3.2 Operation Context Schema
-
-### Operation Context Type (`common/operation_context.json`)
-
-```json
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://corpusos.com/schemas/common/operation_context.json",
-  "title": "Operation Context",
-  "type": "object",
-  "properties": {
-    "request_id": { "type": ["string", "null"] },
-    "idempotency_key": { "type": ["string", "null"] },
-    "deadline_ms": { "type": ["integer", "null"], "minimum": 0 },
-    "traceparent": { "type": ["string", "null"] },
-    "tenant": { "type": ["string", "null"] },
-    "attrs": { "type": ["object", "null"], "additionalProperties": true }
-  },
-  "additionalProperties": true
-}
-```
 ## 4.1 LLM Protocol Schemas
 
 ### 4.1.1 Envelope Schemas
