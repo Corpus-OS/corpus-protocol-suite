@@ -1,4 +1,4 @@
-# CORPUS PROTOCOL GUIDE
+# CORPUS PROTOCOL GUIDE V1.0
 
 **Table of Contents**
 - [0. Document Metadata](#0-document-metadata)
@@ -39,9 +39,12 @@
 - [30. Index](#30-index)
 
 ---
+## Copyright Notice
 
-**Corpus Protocol Suite — Unified Protocol for Graph, LLM, Vector, and Embedding Adapters**  
-**protocols_version:** `1.0`
+Copyright © 2026 Interoperable Intelligence Inc.
+SPDX-License-Identifier: Apache-2.0
+
+---
 
 > This document defines the unified protocol specification for all Corpus adapters. It establishes the normative behavior, types, and semantics for Graph, LLM, Vector, and Embedding protocols while maintaining cross-protocol consistency.
 
