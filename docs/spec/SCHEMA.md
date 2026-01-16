@@ -96,6 +96,10 @@ The Corpus Schema Reference provides the definitive JSON Schema definitions for 
 3. **Version tolerance** - Schema evolution with backward compatibility
 4. **Performance-aware** - Validation modes tuned for production use
 
+**Where extensibility is allowed (request envelope + ctx + args pass-through)**
+**Where it is prohibited (success/error envelopes, type defs unless stated)**
+**Why (forward-compat + vendor extensions at the boundary; strictness for outputs/contracts)**
+
 **Validation Approach:**
 - **Wire-level validation** - All JSON payloads validated against schemas
 - **Streaming validation** - Protocol envelope validation for streaming operations
