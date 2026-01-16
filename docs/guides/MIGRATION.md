@@ -1,72 +1,89 @@
 # CORPUS Protocol Suite - Migration Reference Guide
 
-**Version:** 1.0 • **Protocol Compatibility:** v1.0 • **Last Updated:** January 2026
+**Version:** 1.0  
+**Protocol Compatibility:** v1.0  
+**Last Updated:** January 2026
 
 ---
 
-## 📋 Table of Contents
+## Table of Contents
 
-### [1. 🎯 Executive Summary](#1--executive-summary)
-### [2. 📖 How to Use This Guide](#2--how-to-use-this-guide)
-### [3. 🔧 Core Migration Patterns](#3--core-migration-patterns)
-### [4. 🤖 LLM Protocol Migrations](#4--llm-protocol-migrations)
-  - [4.1 OpenAI to CORPUS](#41-openai-to-corpus)
-  - [4.2 Anthropic to CORPUS](#42-anthropic-to-corpus)
-  - [4.3 Cohere to CORPUS](#43-cohere-to-corpus)
-  - [4.4 Google AI to CORPUS](#44-google-ai-to-corpus)
-  - [4.5 Azure OpenAI to CORPUS](#45-azure-openai-to-corpus)
-### [5. 🔍 Vector Protocol Migrations](#5--vector-protocol-migrations)
-  - [5.1 Pinecone to CORPUS](#51-pinecone-to-corpus)
-  - [5.2 Qdrant to CORPUS](#52-qdrant-to-corpus)
-  - [5.3 Weaviate to CORPUS](#53-weaviate-to-corpus)
-  - [5.4 Milvus to CORPUS](#54-milvus-to-corpus)
-  - [5.5 Chroma to CORPUS](#55-chroma-to-corpus)
-### [6. 📊 Embedding Protocol Migrations](#6--embedding-protocol-migrations)
-  - [6.1 OpenAI Embeddings to CORPUS](#61-openai-embeddings-to-corpus)
-  - [6.2 Cohere Embed to CORPUS](#62-cohere-embed-to-corpus)
-  - [6.3 HuggingFace to CORPUS](#63-huggingface-to-corpus)
-  - [6.4 Google Vertex AI to CORPUS](#64-google-vertex-ai-to-corpus)
-  - [6.5 AWS Bedrock to CORPUS](#65-aws-bedrock-to-corpus)
-### [7. 🌐 Graph Protocol Migrations](#7--graph-protocol-migrations)
-  - [7.1 Neo4j to CORPUS](#71-neo4j-to-corpus)
-  - [7.2 Amazon Neptune to CORPUS](#72-amazon-neptune-to-corpus)
-  - [7.3 JanusGraph to CORPUS](#73-janusgraph-to-corpus)
-  - [7.4 TigerGraph to CORPUS](#74-tigergraph-to-corpus)
-  - [7.5 ArangoDB to CORPUS](#75-arangodb-to-corpus)
-### [8. ⚡ Error Code Mapping](#8--error-code-mapping)
-### [9. 🔗 Context Propagation](#9--context-propagation)
-### [10. ✅ Migration Validation Checklist](#10--migration-validation-checklist)
-### [11. 📚 References](#11--references)
+1. [Executive Summary](#1-executive-summary)
+2. [How to Use This Guide](#2-how-to-use-this-guide)
+3. [Core Migration Patterns](#3-core-migration-patterns)
+    - 3.1 [The CORPUS Envelope Pattern](#31-the-corpus-envelope-pattern)
+    - 3.2 [Response Transformation](#32-response-transformation)
+    - 3.3 [Streaming Pattern](#33-streaming-pattern)
+    - 3.4 [Filter Expression Standard](#34-filter-expression-standard)
+    - 3.5 [Vendor Extension Handling](#35-vendor-extension-handling)
+4. [LLM Protocol Migrations](#4-llm-protocol-migrations)
+    - 4.1 [LLM Operations Reference](#41-llm-operations-reference)
+    - 4.2 [OpenAI to CORPUS](#42-openai-to-corpus)
+    - 4.3 [Anthropic to CORPUS](#43-anthropic-to-corpus)
+    - 4.4 [Cohere to CORPUS](#44-cohere-to-corpus)
+    - 4.5 [Google AI to CORPUS](#45-google-ai-to-corpus)
+    - 4.6 [Azure OpenAI to CORPUS](#46-azure-openai-to-corpus)
+5. [Vector Protocol Migrations](#5-vector-protocol-migrations)
+    - 5.1 [Vector Operations Reference](#51-vector-operations-reference)
+    - 5.2 [Pinecone to CORPUS](#52-pinecone-to-corpus)
+    - 5.3 [Qdrant to CORPUS](#53-qdrant-to-corpus)
+    - 5.4 [Weaviate to CORPUS](#54-weaviate-to-corpus)
+    - 5.5 [Milvus to CORPUS](#55-milvus-to-corpus)
+    - 5.6 [Chroma to CORPUS](#56-chroma-to-corpus)
+6. [Embedding Protocol Migrations](#6-embedding-protocol-migrations)
+    - 6.1 [Embedding Operations Reference](#61-embedding-operations-reference)
+    - 6.2 [OpenAI Embeddings to CORPUS](#62-openai-embeddings-to-corpus)
+    - 6.3 [Cohere Embed to CORPUS](#63-cohere-embed-to-corpus)
+    - 6.4 [HuggingFace to CORPUS](#64-huggingface-to-corpus)
+    - 6.5 [Google Vertex AI to CORPUS](#65-google-vertex-ai-to-corpus)
+    - 6.6 [AWS Bedrock to CORPUS](#66-aws-bedrock-to-corpus)
+7. [Graph Protocol Migrations](#7-graph-protocol-migrations)
+    - 7.1 [Graph Operations Reference](#71-graph-operations-reference)
+    - 7.2 [Neo4j to CORPUS](#72-neo4j-to-corpus)
+    - 7.3 [Amazon Neptune to CORPUS](#73-amazon-neptune-to-corpus)
+    - 7.4 [JanusGraph to CORPUS](#74-janusgraph-to-corpus)
+    - 7.5 [TigerGraph to CORPUS](#75-tigergraph-to-corpus)
+    - 7.6 [ArangoDB to CORPUS](#76-arangodb-to-corpus)
+8. [Error Code Mapping](#8-error-code-mapping)
+9. [Context Propagation](#9-context-propagation)
+10. [Migration Validation Checklist](#10-migration-validation-checklist)
+11. [References](#11-references)
+12. [Migration Guide Implementation Notes](#12-migration-guide-implementation-notes)
 
 ---
 
-## 1. 🎯 Executive Summary
+## 1. Executive Summary
 
 ### What This Guide Provides
-This document is your **definitive reference** for migrating existing AI service APIs to the CORPUS Protocol Suite. It provides **wire-level mapping tables** showing exactly how to transform requests and responses between vendor-specific formats and the standardized CORPUS protocol.
+This document provides **mapping guidance** for migrating existing AI service APIs to the CORPUS Protocol Suite. It offers **wire-level mapping tables** showing how to transform requests and responses between vendor-specific formats and the standardized CORPUS protocol defined in SCHEMA.md and PROTOCOLS.md.
 
 ### Key Migration Benefits
-- **Unified Interface**: Replace multiple provider APIs with one consistent protocol
-- **Vendor Agnostic**: Switch between providers without code changes
-- **Production Ready**: Built-in observability, error handling, and security
-- **Future Proof**: Protocol evolves independently of provider changes
+- **Unified Interface**: Use one consistent protocol across multiple providers
+- **Vendor Flexibility**: Switch between providers with minimal code changes
+- **Production Features**: Leverage built-in observability, error handling, and security patterns
+- **Protocol Evolution**: Benefit from protocol improvements independent of provider changes
 
 ### Scope Boundaries
 | What's Included | What's Excluded |
 |----------------|-----------------|
-| Wire format translations | SDK implementation details |
-| Parameter mapping tables | Operational deployment guides |
-| Error code normalization | Business logic guidance |
-| Context propagation | Performance optimization |
-| Schema validation rules | Provider-specific features |
+| Wire format translation examples | SDK implementation details |
+| Parameter mapping guidance | Operational deployment guides |
+| Error code normalization patterns | Business logic guidance |
+| Context propagation patterns | Performance optimization |
+| Schema-compatible examples | Provider-specific features not in CORPUS |
+
+### Document Authority
+- **SCHEMA.md** is authoritative for field names, types, requiredness, and envelope closure
+- **PROTOCOLS.md** is authoritative for operation semantics and behavior
+- **This guide** provides non-normative mapping examples and migration patterns
 
 ---
 
-## 2. 📖 How to Use This Guide
+## 2. How to Use This Guide
 
 ### For Adapter Developers
 1. **Find your provider** in the relevant protocol section (LLM, Vector, etc.)
-2. **Follow the mapping tables** to transform requests/responses
+2. **Follow the mapping tables** to transform requests/responses according to CORPUS schema
 3. **Validate** using the checklist in Section 10
 4. **Test** with the provided example transformations
 
@@ -86,15 +103,15 @@ def transform_provider_to_corpus(provider_request):
 ### Document Conventions
 - **Bold terms**: CORPUS-specific concepts
 - `Inline code`: Field names and values
-- 📊 **Tables**: Wire-level mappings
-- ⚠️ **Notes**: Important migration considerations
+- **Tables**: Wire-level mappings
+- **Notes**: Important migration considerations
 
 ---
 
-## 3. 🔧 Core Migration Patterns
+## 3. Core Migration Patterns
 
 ### 3.1 The CORPUS Envelope Pattern
-**Every CORPUS request follows this structure:**
+**Every CORPUS request follows this structure (per SCHEMA.md):**
 
 ```json
 {
@@ -103,7 +120,8 @@ def transform_provider_to_corpus(provider_request):
     "request_id": "req-123",
     "deadline_ms": 1730312345000,
     "tenant": "acme-corp",
-    "traceparent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+    "traceparent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+    "attrs": {}                  // Optional vendor extensions
   },
   "args": {                      // Operation-specific parameters
     // ... varies by operation
@@ -112,7 +130,7 @@ def transform_provider_to_corpus(provider_request):
 ```
 
 ### 3.2 Response Transformation
-**Provider responses transform to CORPUS envelopes:**
+**Provider responses transform to CORPUS envelopes (closed per SCHEMA.md):**
 
 ```json
 // CORPUS Success Response
@@ -140,30 +158,145 @@ def transform_provider_to_corpus(provider_request):
 ```
 
 ### 3.3 Streaming Pattern
-**Streaming operations use chunked envelopes:**
+**Streaming operations use chunked envelopes with strict closure rules:**
 
 ```json
-// Each stream frame
+// Each streaming success frame (closed envelope)
 {
   "ok": true,
-  "code": "OK",
+  "code": "STREAMING",
   "ms": 15.7,
   "chunk": {
     "text": "Hello",
     "is_final": false
   }
 }
+
+// Final chunk
+{
+  "ok": true,
+  "code": "STREAMING",
+  "ms": 156.2,
+  "chunk": {
+    "text": " world.",
+    "is_final": true
+  }
+}
+
+// Stream terminated by error
+{
+  "ok": false,
+  "code": "RESOURCE_EXHAUSTED",
+  "error": "ResourceExhausted",
+  "message": "Rate limit exceeded",
+  "retry_after_ms": 5000,
+  "ms": 89.3
+}
 ```
+
+**Streaming Rules (per SCHEMA.md and PROTOCOLS.md):**
+- All success frames use `"code": "STREAMING"` (never `"OK"`)
+- Streams end with either a final chunk (`"is_final": true`) or an error envelope
+- No frames may appear after terminal condition
+- All streaming envelopes are closed to `{ok, code, ms, chunk}` only
+
+### 3.4 Filter Expression Standard
+**CORPUS uses a unified operator-object form for filter expressions (per PROTOCOLS.md):**
+
+```json
+// Equality filter
+{
+  "category": "books"
+}
+
+// Range filter (using operator objects)
+{
+  "price": {"gte": 20, "lt": 100}
+}
+
+// Membership filter
+{
+  "tags": {"in": ["fiction", "scifi"]}
+}
+
+// Combined filters
+{
+  "category": "books",
+  "price": {"gte": 20},
+  "tags": {"in": ["fiction", "scifi"]}
+}
+```
+
+**Important:** Do not use field__gte or field__in conventions. Always use the operator-object form shown above.
+
+### 3.5 Vendor Extension Handling
+**Request-side extensions follow these patterns:**
+
+```json
+// Using ctx.attrs for vendor-specific metadata
+{
+  "op": "llm.complete",
+  "ctx": {
+    "request_id": "req-123",
+    "attrs": {
+      "x-openai-organization": "org-123",
+      "x-azure-api-version": "2023-12-01-preview"
+    }
+  },
+  "args": {
+    "model": "gpt-4",
+    "messages": [...]
+  }
+}
+```
+
+**Key Rules (per SCHEMA.md):**
+- **Never** add top-level fields to success/error/streaming envelopes (they are closed)
+- Use `ctx.attrs` for vendor-specific request metadata
+- Only place vendor-specific keys in `args` when the operation's schema explicitly allows `additionalProperties: true`
+- Namespace extension keys with `x-<vendor>-` prefix (e.g., `x-openai-`, `x-azure-`)
+- Response envelopes must not contain vendor extensions in the success/error structure
 
 ---
 
-## 4. 🤖 LLM Protocol Migrations
+## 4. LLM Protocol Migrations
 
-### 4.1 OpenAI to CORPUS
+### 4.1 LLM Operations Reference
+CORPUS v1.0 defines these LLM operations (per PROTOCOLS.md):
 
-#### Request Mapping
-| OpenAI Field | CORPUS Field | Type | Transformation Required |
-|--------------|--------------|------|-------------------------|
+| Operation | Description | Provider Example |
+|-----------|-------------|------------------|
+| `llm.capabilities` | Get provider/model capabilities | OpenAI `/models` endpoint |
+| `llm.complete` | Standard completion (non-streaming) | OpenAI `/chat/completions` |
+| `llm.stream` | Streaming completion | OpenAI `/chat/completions` with `stream: true` |
+| `llm.count_tokens` | Count tokens in text | Anthropic token counting |
+| `llm.health` | Check LLM service health | Provider health endpoint |
+
+**Provider-Agnostic Mapping Template:**
+```json
+// General pattern for provider → CORPUS transformation
+{
+  "op": "llm.operation",
+  "ctx": {
+    "request_id": "generated-or-from-header",
+    "deadline_ms": "calculated-deadline",
+    "attrs": {
+      // Vendor-specific headers go here with x- prefix
+    }
+  },
+  "args": {
+    // Operation-specific arguments per SCHEMA.md
+  }
+}
+```
+
+### 4.2 OpenAI to CORPUS
+
+#### Request Mapping (Chat Completions API)
+**Primary Source:** [OpenAI Chat Completions API Reference](https://platform.openai.com/docs/api-reference/chat)
+
+| OpenAI Field | CORPUS Field | Type | Transformation |
+|--------------|--------------|------|----------------|
 | `model` | `args.model` | string | Direct mapping |
 | `messages` | `args.messages` | array | Same format, roles unchanged |
 | `max_tokens` | `args.max_tokens` | integer | Direct mapping |
@@ -175,7 +308,11 @@ def transform_provider_to_corpus(provider_request):
 | `tools` | `args.tools` | array | Same format |
 | `tool_choice` | `args.tool_choice` | string/object | Same format |
 | `response_format` | `args.response_format` | object | Same format |
-| `seed` | `args.seed` | integer | Direct mapping |
+| `seed` | `ctx.attrs.x-openai-seed` | integer | Namespaced in attrs |
+| `user` | `ctx.attrs.x-openai-user` | string | Namespaced in attrs |
+| `stop` | `args.stop` | string/array | Direct mapping |
+| `n` | `ctx.attrs.x-openai-n` | integer | Namespaced in attrs |
+| `logit_bias` | `ctx.attrs.x-openai-logit_bias` | object | Namespaced in attrs |
 
 **Wire Envelope Example:**
 ```json
@@ -188,7 +325,9 @@ POST /v1/chat/completions
     {"role": "user", "content": "Hello"}
   ],
   "temperature": 0.7,
-  "max_tokens": 100
+  "max_tokens": 100,
+  "seed": 42,
+  "user": "user-123"
 }
 
 // CORPUS Equivalent
@@ -197,7 +336,11 @@ POST /v1/operations
   "op": "llm.complete",
   "ctx": {
     "request_id": "req-123",
-    "deadline_ms": 1730312345000
+    "deadline_ms": 1730312345000,
+    "attrs": {
+      "x-openai-user": "user-123",
+      "x-openai-seed": 42
+    }
   },
   "args": {
     "model": "gpt-4",
@@ -211,6 +354,33 @@ POST /v1/operations
 }
 ```
 
+**Streaming Example:**
+```json
+// OpenAI streaming request
+POST /v1/chat/completions
+{
+  "model": "gpt-4",
+  "messages": [...],
+  "stream": true
+}
+
+// CORPUS streaming equivalent
+{
+  "op": "llm.stream",
+  "ctx": {
+    "request_id": "req-456",
+    "deadline_ms": 1730312345000
+  },
+  "args": {
+    "model": "gpt-4",
+    "messages": [...]
+  }
+}
+
+// CORPUS streaming chunk
+{"ok": true, "code": "STREAMING", "ms": 15.7, "chunk": {"text": "Hello", "is_final": false}}
+```
+
 #### Response Mapping
 | OpenAI Response Field | CORPUS Response Field | Transformation |
 |----------------------|----------------------|----------------|
@@ -222,14 +392,39 @@ POST /v1/operations
 | `finish_reason` | `result.finish_reason` | Direct mapping |
 | `id` | `ctx.request_id` (if provided) | Context mapping |
 | `created` | Not included | Timestamp in `ms` field |
+| `object` | Not included | Type indicator |
 
-**Streaming Differences:**
+#### Other LLM Operations
 ```json
-// OpenAI streaming chunk
-data: {"id":"chatcmpl-123","object":"chat.completion.chunk","choices":[{"delta":{"content":"Hello"}}]}
+// llm.capabilities example
+{
+  "op": "llm.capabilities",
+  "ctx": {
+    "request_id": "cap-req-123"
+  },
+  "args": {}
+}
 
-// CORPUS streaming chunk
-{"ok": true, "code": "OK", "ms": 15.7, "chunk": {"text": "Hello", "is_final": false}}
+// llm.count_tokens example (per SCHEMA.md: text required)
+{
+  "op": "llm.count_tokens",
+  "ctx": {
+    "request_id": "count-req-456"
+  },
+  "args": {
+    "model": "gpt-4",
+    "text": "Hello world"
+  }
+}
+
+// llm.health example
+{
+  "op": "llm.health",
+  "ctx": {
+    "request_id": "health-req-789"
+  },
+  "args": {}
+}
 ```
 
 #### Error Mapping
@@ -243,80 +438,25 @@ data: {"id":"chatcmpl-123","object":"chat.completion.chunk","choices":[{"delta":
 | `TimeoutError` | `DEADLINE_EXCEEDED` | Conditional | Check deadline |
 | `ContentFilterError` | `BAD_REQUEST` | No | Add `details.filtered_reason` |
 
----
+### 4.3 Anthropic to CORPUS
 
-### 4.2 Anthropic to CORPUS
+#### Request Mapping (Messages API)
+**Primary Source:** Anthropic Messages API Reference
 
-#### Request Mapping
-| Anthropic Field | CORPUS Field | Type | Transformation Required |
-|----------------|--------------|------|-------------------------|
+| Anthropic Field | CORPUS Field | Type | Transformation |
+|----------------|--------------|------|----------------|
 | `model` | `args.model` | string | Map: `claude-3-opus-20240229` → `claude-3-opus` |
 | `messages` | `args.messages` | array | Convert Anthropic format: `{role, content}` → same |
 | `max_tokens` | `args.max_tokens` | integer | Direct mapping |
 | `temperature` | `args.temperature` | float | Same range [0.0, 1.0] → [0.0, 2.0] |
 | `top_p` | `args.top_p` | float | Same range (0.0, 1.0] |
-| `top_k` | `args.top_k` | integer | Via extensions: `extensions.anthropic:top_k` |
+| `top_k` | `ctx.attrs.x-anthropic-top_k` | integer | Namespaced in attrs |
 | `stream` | `op: "llm.stream"` | boolean | Different operation |
 | `system` | `args.system_message` | string | Move from messages array |
 | `tools` | `args.tools` | array | Convert Anthropic tool format |
 | `tool_choice` | `args.tool_choice` | object | Convert format |
-
-**Message Format Conversion:**
-```python
-# Anthropic messages → CORPUS messages
-anthropic_messages = [
-    {"role": "user", "content": "Hello"},
-    {"role": "assistant", "content": "Hi there!"}
-]
-
-# CORPUS messages (same format)
-corpus_messages = [
-    {"role": "user", "content": "Hello"},
-    {"role": "assistant", "content": "Hi there!"}
-]
-
-# System message handling
-if anthropic_request.get("system"):
-    corpus_args["system_message"] = anthropic_request["system"]
-```
-
-**Wire Envelope Example:**
-```json
-// Anthropic Request
-POST /v1/messages
-{
-  "model": "claude-3-opus-20240229",
-  "max_tokens": 1024,
-  "messages": [{"role": "user", "content": "Hello"}],
-  "system": "You are a helpful assistant"
-}
-
-// CORPUS Equivalent
-POST /v1/operations
-{
-  "op": "llm.complete",
-  "ctx": {
-    "request_id": "req-456",
-    "deadline_ms": 1730312345000
-  },
-  "args": {
-    "model": "claude-3-opus",
-    "messages": [{"role": "user", "content": "Hello"}],
-    "max_tokens": 1024,
-    "system_message": "You are a helpful assistant"
-  }
-}
-```
-
-#### Response Mapping
-| Anthropic Response Field | CORPUS Response Field | Transformation |
-|-------------------------|----------------------|----------------|
-| `content[0].text` | `result.text` | Join content blocks if multiple |
-| `model` | `result.model` | Map to normalized model name |
-| `usage.input_tokens` | `result.usage.prompt_tokens` | Rename field |
-| `usage.output_tokens` | `result.usage.completion_tokens` | Rename field |
-| `stop_reason` | `result.finish_reason` | Map values: `end_turn` → `stop`, `max_tokens` → `length` |
-| `id` | `ctx.request_id` (if provided) | Context mapping |
+| `stop_sequences` | `args.stop` | array | Direct mapping |
+| `metadata` | `ctx.attrs.x-anthropic-metadata` | object | Namespaced in attrs |
 
 **Tool Call Conversion:**
 ```json
@@ -339,33 +479,35 @@ POST /v1/operations
 }
 ```
 
-#### Error Mapping
-| Anthropic Error | CORPUS Error Code | Retryable | Notes |
-|----------------|------------------|-----------|-------|
-| `rate_limit_error` | `RESOURCE_EXHAUSTED` | Yes | Add `retry_after_ms` |
-| `authentication_error` | `AUTH_ERROR` | No | Direct mapping |
-| `invalid_request_error` | `BAD_REQUEST` | No | Direct mapping |
-| `overloaded_error` | `UNAVAILABLE` | Yes | Provider overloaded |
-| `api_error` | `UNAVAILABLE` | Yes | Provider issue |
-| `timeout_error` | `DEADLINE_EXCEEDED` | Conditional | Check deadline |
+#### Response Mapping
+| Anthropic Response Field | CORPUS Response Field | Transformation |
+|-------------------------|----------------------|----------------|
+| `content[0].text` | `result.text` | Join content blocks if multiple |
+| `model` | `result.model` | Map to normalized model name |
+| `usage.input_tokens` | `result.usage.prompt_tokens` | Rename field |
+| `usage.output_tokens` | `result.usage.completion_tokens` | Rename field |
+| `stop_reason` | `result.finish_reason` | Map values: `end_turn` → `stop`, `max_tokens` → `length` |
+| `id` | `ctx.request_id` (if provided) | Context mapping |
+| `type` | Not included | Type indicator |
 
----
+### 4.4 Cohere to CORPUS
 
-### 4.3 Cohere to CORPUS
+#### Request Mapping (Chat API)
+**Needs verification against current Cohere Chat API reference**
 
-#### Request Mapping
-| Cohere Field | CORPUS Field | Type | Transformation Required |
-|--------------|--------------|------|-------------------------|
+| Cohere Field | CORPUS Field | Type | Transformation |
+|--------------|--------------|------|----------------|
 | `model` | `args.model` | string | Map: `command-r-plus` → `cohere-command-r-plus` |
 | `message` | `args.messages` | string | Convert to messages array |
 | `chat_history` | `args.messages` | array | Merge with current message |
 | `max_tokens` | `args.max_tokens` | integer | Direct mapping |
 | `temperature` | `args.temperature` | float | Same range [0.0, 1.0] → [0.0, 2.0] |
 | `p` | `args.top_p` | float | Rename field |
-| `k` | `args.top_k` | integer | Via extensions: `extensions.cohere:top_k` |
+| `k` | `ctx.attrs.x-cohere-top_k` | integer | Namespaced in attrs |
 | `stream` | `op: "llm.stream"` | boolean | Different operation |
 | `tools` | `args.tools` | array | Convert Cohere tool format |
 | `tool_results` | `args.messages` | array | Add as tool role messages |
+| `connectors` | `ctx.attrs.x-cohere-connectors` | array | Namespaced in attrs |
 
 **Message Format Conversion:**
 ```python
@@ -390,98 +532,35 @@ else:
     }]
 ```
 
-**Wire Envelope Example:**
-```json
-// Cohere Request
-POST /v1/chat
-{
-  "model": "command-r-plus",
-  "message": "What is AI?",
-  "chat_history": [
-    {"role": "USER", "message": "Hello"},
-    {"role": "CHATBOT", "message": "Hi there!"}
-  ],
-  "temperature": 0.3,
-  "max_tokens": 200
-}
-
-// CORPUS Equivalent
-POST /v1/operations
-{
-  "op": "llm.complete",
-  "ctx": {
-    "request_id": "req-789",
-    "deadline_ms": 1730312345000
-  },
-  "args": {
-    "model": "cohere-command-r-plus",
-    "messages": [
-      {"role": "user", "content": "Hello"},
-      {"role": "assistant", "content": "Hi there!"},
-      {"role": "user", "content": "What is AI?"}
-    ],
-    "temperature": 0.3,
-    "max_tokens": 200
-  }
-}
-```
-
 #### Response Mapping
 | Cohere Response Field | CORPUS Response Field | Transformation |
 |----------------------|----------------------|----------------|
 | `text` | `result.text` | Direct mapping |
-| `generation_id` | `result.model` (or context) | Store in `details` |
+| `generation_id` | `result.id` | Store in result |
 | `token_count.prompt_tokens` | `result.usage.prompt_tokens` | Direct mapping |
 | `token_count.response_tokens` | `result.usage.completion_tokens` | Direct mapping |
 | `token_count.total_tokens` | `result.usage.total_tokens` | Direct mapping |
 | `finish_reason` | `result.finish_reason` | Map values |
 | `tool_calls` | `result.tool_calls` | Convert format |
 
-**Tool Call Conversion:**
-```json
-// Cohere tool call
-{
-  "name": "get_weather",
-  "parameters": {"city": "San Francisco"}
-}
+### 4.5 Google AI to CORPUS
 
-// CORPUS tool call
-{
-  "id": "call_123",  // Generate if not provided
-  "type": "function",
-  "function": {
-    "name": "get_weather",
-    "arguments": "{\"city\": \"San Francisco\"}"
-  }
-}
-```
+#### Request Mapping (Gemini API)
+**Status: Needs verification against official Google Gemini API reference**
 
-#### Error Mapping
-| Cohere Error | CORPUS Error Code | Retryable | Notes |
-|--------------|------------------|-----------|-------|
-| `rate_limit_error` | `RESOURCE_EXHAUSTED` | Yes | Add `retry_after_ms` |
-| `authentication_error` | `AUTH_ERROR` | No | Direct mapping |
-| `invalid_request_error` | `BAD_REQUEST` | No | Direct mapping |
-| `internal_server_error` | `UNAVAILABLE` | Yes | Provider issue |
-| `service_unavailable` | `UNAVAILABLE` | Yes | Provider down |
-| `timeout_error` | `DEADLINE_EXCEEDED` | Conditional | Check deadline |
-
----
-
-### 4.4 Google AI (Gemini) to CORPUS
-
-#### Request Mapping
-| Google AI Field | CORPUS Field | Type | Transformation Required |
-|-----------------|--------------|------|-------------------------|
+| Google AI Field | CORPUS Field | Type | Transformation |
+|-----------------|--------------|------|----------------|
 | `model` | `args.model` | string | Map: `gemini-pro` → `google-gemini-pro` |
 | `contents` | `args.messages` | array | Convert parts format |
 | `generationConfig.maxOutputTokens` | `args.max_tokens` | integer | Rename and restructure |
 | `generationConfig.temperature` | `args.temperature` | float | Same range [0.0, 1.0] → [0.0, 2.0] |
 | `generationConfig.topP` | `args.top_p` | float | Same range (0.0, 1.0] |
-| `generationConfig.topK` | `args.top_k` | integer | Via extensions |
-| `safetySettings` | Not directly mapped | array | Handle via extensions |
+| `generationConfig.topK` | `ctx.attrs.x-google-top_k` | integer | Namespaced in attrs |
+| `safetySettings` | `ctx.attrs.x-google-safety_settings` | array | Namespaced in attrs |
 | `tools` | `args.tools` | array | Convert Google tool format |
 | `toolConfig` | `args.tool_choice` | object | Convert format |
+| `systemInstruction` | `args.system_message` | string | Direct mapping |
+| `stopSequences` | `args.stop` | array | Direct mapping |
 
 **Message Format Conversion:**
 ```python
@@ -502,50 +581,6 @@ for content in google_request.get("contents", []):
         })
 ```
 
-**Wire Envelope Example:**
-```json
-// Google AI Request
-POST /v1/models/gemini-pro:generateContent
-{
-  "contents": [
-    {
-      "role": "user",
-      "parts": [{"text": "Explain quantum computing"}]
-    }
-  ],
-  "generationConfig": {
-    "temperature": 0.7,
-    "maxOutputTokens": 200
-  },
-  "safetySettings": [
-    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"}
-  ]
-}
-
-// CORPUS Equivalent
-POST /v1/operations
-{
-  "op": "llm.complete",
-  "ctx": {
-    "request_id": "req-901",
-    "deadline_ms": 1730312345000
-  },
-  "args": {
-    "model": "google-gemini-pro",
-    "messages": [
-      {"role": "user", "content": "Explain quantum computing"}
-    ],
-    "temperature": 0.7,
-    "max_tokens": 200
-  },
-  "extensions": {
-    "google:safety_settings": [
-      {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"}
-    ]
-  }
-}
-```
-
 #### Response Mapping
 | Google AI Response Field | CORPUS Response Field | Transformation |
 |-------------------------|----------------------|----------------|
@@ -555,48 +590,15 @@ POST /v1/operations
 | `usageMetadata.candidatesTokenCount` | `result.usage.completion_tokens` | Direct mapping |
 | `usageMetadata.totalTokenCount` | `result.usage.total_tokens` | Direct mapping |
 | `finishReason` | `result.finish_reason` | Map values: `STOP` → `stop`, `MAX_TOKENS` → `length` |
-| `safetyRatings` | Not in result | Store in `extensions` |
+| `safetyRatings` | Not in result | Store in ctx.attrs |
 
-**Safety Handling:**
-```json
-{
-  "ok": true,
-  "code": "OK",
-  "ms": 145.2,
-  "result": {
-    "text": "Quantum computing is...",
-    "model": "google-gemini-pro",
-    "usage": {...}
-  },
-  "extensions": {
-    "google:safety_ratings": [
-      {
-        "category": "HARM_CATEGORY_HARASSMENT",
-        "probability": "LOW",
-        "blocked": false
-      }
-    ]
-  }
-}
-```
+### 4.6 Azure OpenAI to CORPUS
 
-#### Error Mapping
-| Google AI Error | CORPUS Error Code | Retryable | Notes |
-|-----------------|------------------|-----------|-------|
-| `RESOURCE_EXHAUSTED` | `RESOURCE_EXHAUSTED` | Yes | Direct mapping |
-| `PERMISSION_DENIED` | `AUTH_ERROR` | No | Direct mapping |
-| `INVALID_ARGUMENT` | `BAD_REQUEST` | No | Direct mapping |
-| `UNAVAILABLE` | `UNAVAILABLE` | Yes | Direct mapping |
-| `DEADLINE_EXCEEDED` | `DEADLINE_EXCEEDED` | Conditional | Check deadline |
-| `FAILED_PRECONDITION` | `BAD_REQUEST` | No | Check preconditions |
+#### Request Mapping (Chat Completions)
+**Primary Source:** [Azure OpenAI Chat Completions Reference](https://learn.microsoft.com/en-us/azure/ai-foundry/openai/reference?view=foundry-classic)
 
----
-
-### 4.5 Azure OpenAI to CORPUS
-
-#### Request Mapping
-| Azure OpenAI Field | CORPUS Field | Type | Transformation Required |
-|-------------------|--------------|------|-------------------------|
+| Azure OpenAI Field | CORPUS Field | Type | Transformation |
+|-------------------|--------------|------|----------------|
 | `model` | `args.model` | string | Map deployment name to model: `gpt-4-deployment` → `gpt-4` |
 | `messages` | `args.messages` | array | Same format as OpenAI |
 | `max_tokens` | `args.max_tokens` | integer | Direct mapping |
@@ -606,8 +608,9 @@ POST /v1/operations
 | `presence_penalty` | `args.presence_penalty` | float | Same range [-2.0, 2.0] |
 | `stream` | `op: "llm.stream"` | boolean | Different operation |
 | `tools` | `args.tools` | array | Same format as OpenAI |
-| `dataSources` | `extensions.azure:data_sources` | array | Azure-specific feature |
-| `enhancements` | `extensions.azure:enhancements` | object | Azure-specific feature |
+| `dataSources` | `ctx.attrs.x-azure-data_sources` | array | Namespaced in attrs |
+| `enhancements` | `ctx.attrs.x-azure-enhancements` | object | Namespaced in attrs |
+| API version in URL | `ctx.attrs.x-azure-api_version` | string | In context attrs |
 
 **Deployment to Model Mapping:**
 ```python
@@ -623,54 +626,6 @@ azure_deployment = request.get("model")  # e.g., "gpt-4-deployment"
 corpus_model = deployment_mapping.get(azure_deployment, azure_deployment)
 ```
 
-**Wire Envelope Example:**
-```json
-// Azure OpenAI Request
-POST /openai/deployments/gpt-4-deployment/chat/completions?api-version=2023-12-01-preview
-{
-  "messages": [
-    {"role": "system", "content": "You are helpful"},
-    {"role": "user", "content": "Hello"}
-  ],
-  "max_tokens": 100,
-  "temperature": 0.7,
-  "dataSources": [
-    {
-      "type": "AzureCognitiveSearch",
-      "parameters": {...}
-    }
-  ]
-}
-
-// CORPUS Equivalent
-POST /v1/operations
-{
-  "op": "llm.complete",
-  "ctx": {
-    "request_id": "req-234",
-    "deadline_ms": 1730312345000
-  },
-  "args": {
-    "model": "gpt-4",
-    "messages": [
-      {"role": "system", "content": "You are helpful"},
-      {"role": "user", "content": "Hello"}
-    ],
-    "max_tokens": 100,
-    "temperature": 0.7
-  },
-  "extensions": {
-    "azure:data_sources": [
-      {
-        "type": "AzureCognitiveSearch",
-        "parameters": {...}
-      }
-    ],
-    "azure:api_version": "2023-12-01-preview"
-  }
-}
-```
-
 #### Response Mapping
 | Azure OpenAI Response Field | CORPUS Response Field | Transformation |
 |----------------------------|----------------------|----------------|
@@ -682,78 +637,67 @@ POST /v1/operations
 | `finish_reason` | `result.finish_reason` | Direct mapping |
 | `id` | `ctx.request_id` (if provided) | Context mapping |
 
-**Azure-Specific Extensions:**
+---
+
+## 5. Vector Protocol Migrations
+
+### 5.1 Vector Operations Reference
+CORPUS v1.0 defines these vector operations (per PROTOCOLS.md):
+
+| Operation | Description | Provider Example |
+|-----------|-------------|------------------|
+| `vector.capabilities` | Get vector store capabilities | Pinecone `/describe_index_stats` |
+| `vector.query` | Single vector similarity search | Pinecone `/query` |
+| `vector.batch_query` | Multiple vector searches | Pinecone batch query |
+| `vector.upsert` | Insert/update vectors | Pinecone `/vectors/upsert` |
+| `vector.delete` | Delete vectors by ID/filter | Pinecone `/vectors/delete` |
+| `vector.create_namespace` | Create namespace/collection | Pinecone namespace creation |
+| `vector.delete_namespace` | Delete namespace/collection | Pinecone namespace deletion |
+| `vector.health` | Check vector service health | Provider health endpoint |
+
+**Provider-Agnostic Mapping Template:**
 ```json
+// General pattern for vector operations
 {
-  "ok": true,
-  "code": "OK", 
-  "ms": 167.8,
-  "result": {
-    "text": "The answer is...",
-    "model": "gpt-4",
-    "usage": {...}
-  },
-  "extensions": {
-    "azure:system_fingerprint": "fp_1234567890",
-    "azure:content_filter_results": {
-      "hate": {"filtered": false, "severity": "safe"},
-      "self_harm": {"filtered": false, "severity": "safe"}
-    }
+  "op": "vector.operation",
+  "ctx": {...},
+  "args": {
+    // Operation-specific arguments per SCHEMA.md
   }
 }
 ```
 
-#### Error Mapping
-| Azure OpenAI Error | CORPUS Error Code | Retryable | Notes |
-|-------------------|------------------|-----------|-------|
-| `429 Too Many Requests` | `RESOURCE_EXHAUSTED` | Yes | Add `retry_after_ms` |
-| `401 Unauthorized` | `AUTH_ERROR` | No | Direct mapping |
-| `403 Forbidden` | `AUTH_ERROR` | No | Permission issue |
-| `400 Bad Request` | `BAD_REQUEST` | No | Direct mapping |
-| `503 Service Unavailable` | `UNAVAILABLE` | Yes | Azure service down |
-| `504 Gateway Timeout` | `DEADLINE_EXCEEDED` | Conditional | Check deadline |
-| `429 Resource Exhausted` | `RESOURCE_EXHAUSTED` | Yes | Quota exceeded |
+### 5.2 Pinecone to CORPUS
 
----
+#### Request Mapping (Query Operation)
+**Primary Source:** Pinecone API Reference (metadata filtering guide)
 
-## 5. 🔍 Vector Protocol Migrations
-
-### 5.1 Pinecone to CORPUS
-
-#### Request Mapping
-| Pinecone Field | CORPUS Field | Type | Transformation Required |
-|----------------|--------------|------|-------------------------|
+| Pinecone Field | CORPUS Field | Type | Transformation |
+|----------------|--------------|------|----------------|
 | `vector` | `args.vector` | array[float] | Direct mapping |
-| `topK` | `args.top_k` | integer | Rename: `topK` → `top_k` |
+| `topK` | `args.top_k` | integer | Rename field |
 | `namespace` | `args.namespace` | string | Direct mapping |
 | `filter` | `args.filter` | object | Convert Pinecone filter syntax |
 | `includeMetadata` | `args.include_metadata` | boolean | Rename field |
-| `includeValues` | `args.include_vectors` | boolean | Rename: `includeValues` → `include_vectors` |
+| `includeValues` | `args.include_vectors` | boolean | Rename field |
 | `sparseVector` | `args.sparse_vector` | object | Direct mapping |
+| `id` (for query by ID) | `ctx.attrs.x-pinecone-query_by_id` | string | Namespaced in attrs |
 | `id` (for upsert) | `vectors[].id` | string | Restructure for batch |
 
-**Filter Syntax Conversion:**
-```python
-# Pinecone filter → CORPUS filter
-pinecone_filter = {
-    "category": {"$eq": "books"},
-    "price": {"$gte": 20, "$lt": 100},
-    "tags": {"$in": ["fiction", "scifi"]}
+**Filter Conversion (CORPUS Standard Form):**
+```json
+// Pinecone filter (using $ operators)
+{
+  "category": {"$eq": "books"},
+  "price": {"$gte": 20, "$lt": 100},
+  "tags": {"$in": ["fiction", "scifi"]}
 }
 
-# CORPUS filter
-corpus_filter = {
-    "category": "books",
-    "price__gte": 20,
-    "price__lt": 100,
-    "tags__in": ["fiction", "scifi"]
-}
-
-# OR using extensions for complex operators
-corpus_filter = {
-    "category": "books",
-    "price": {"gte": 20, "lt": 100},
-    "tags": ["fiction", "scifi"]
+// CORPUS filter (operator-object form per SCHEMA.md)
+{
+  "category": "books",
+  "price": {"gte": 20, "lt": 100},
+  "tags": {"in": ["fiction", "scifi"]}
 }
 ```
 
@@ -787,11 +731,111 @@ POST /v1/operations
     "namespace": "documents",
     "filter": {
       "category": "technology",
-      "year__gte": 2020
+      "year": {"gte": 2020}
     },
     "include_metadata": true,
     "include_vectors": false
   }
+}
+```
+
+#### Other Vector Operations
+```json
+// vector.capabilities example
+{
+  "op": "vector.capabilities",
+  "ctx": {
+    "request_id": "cap-req-123"
+  },
+  "args": {}
+}
+
+// vector.batch_query example
+{
+  "op": "vector.batch_query",
+  "ctx": {
+    "request_id": "batch-req-456"
+  },
+  "args": {
+    "namespace": "documents",
+    "queries": [
+      {
+        "vector": [0.1, 0.2, 0.3],
+        "top_k": 10,
+        "filter": {"category": "books"}
+      },
+      {
+        "vector": [0.4, 0.5, 0.6],
+        "top_k": 5,
+        "filter": {"category": "articles"}
+      }
+    ]
+  }
+}
+
+// vector.upsert example
+{
+  "op": "vector.upsert",
+  "ctx": {
+    "request_id": "upsert-req-789"
+  },
+  "args": {
+    "namespace": "documents",
+    "vectors": [
+      {
+        "id": "vec-1",
+        "vector": [0.1, 0.2, 0.3],
+        "metadata": {"category": "book", "author": "Author Name"},
+        "sparse_vector": {"indices": [1, 3], "values": [0.5, 0.7]}
+      }
+    ]
+  }
+}
+
+// vector.delete example
+{
+  "op": "vector.delete",
+  "ctx": {
+    "request_id": "delete-req-101"
+  },
+  "args": {
+    "namespace": "documents",
+    "filter": {"category": "obsolete"}  // Delete by filter
+    // or "ids": ["vec-1", "vec-2"] for ID-based deletion
+  }
+}
+
+// vector.create_namespace example (per SCHEMA.md)
+{
+  "op": "vector.create_namespace",
+  "ctx": {
+    "request_id": "create-req-112"
+  },
+  "args": {
+    "namespace": "new-collection",
+    "dimensions": 768,
+    "distance_metric": "cosine"
+  }
+}
+
+// vector.delete_namespace example
+{
+  "op": "vector.delete_namespace",
+  "ctx": {
+    "request_id": "delete-ns-req-113"
+  },
+  "args": {
+    "namespace": "old-collection"
+  }
+}
+
+// vector.health example
+{
+  "op": "vector.health",
+  "ctx": {
+    "request_id": "health-req-114"
+  },
+  "args": {}
 }
 ```
 
@@ -807,41 +851,6 @@ POST /v1/operations
 | `namespace` | `result.namespace` | Direct mapping |
 | `usage` | `result.usage` | Map to usage object |
 
-**Upsert/Delete Operations:**
-```json
-// Pinecone upsert
-POST /vectors/upsert
-{
-  "vectors": [
-    {
-      "id": "vec-1",
-      "values": [0.1, 0.2, 0.3],
-      "metadata": {"category": "book"},
-      "sparseValues": {"indices": [1, 3], "values": [0.5, 0.7]}
-    }
-  ],
-  "namespace": "documents"
-}
-
-// CORPUS upsert
-{
-  "op": "vector.upsert",
-  "ctx": {...},
-  "args": {
-    "vectors": [
-      {
-        "id": "vec-1",
-        "vector": [0.1, 0.2, 0.3],
-        "metadata": {"category": "book"},
-        "sparse_vector": {"indices": [1, 3], "values": [0.5, 0.7]},
-        "namespace": "documents"
-      }
-    ],
-    "namespace": "documents"
-  }
-}
-```
-
 #### Error Mapping
 | Pinecone Error | CORPUS Error Code | Retryable | Notes |
 |----------------|------------------|-----------|-------|
@@ -853,611 +862,179 @@ POST /vectors/upsert
 | `503 Service Unavailable` | `UNAVAILABLE` | Yes | Pinecone service down |
 | `504 Gateway Timeout` | `DEADLINE_EXCEEDED` | Conditional | Check deadline |
 
----
+### 5.3 Qdrant to CORPUS
 
-### 5.2 Qdrant to CORPUS
+#### Request Mapping (Search Points)
+**Primary Source:** Qdrant Search Points Documentation
 
-#### Request Mapping
-| Qdrant Field | CORPUS Field | Type | Transformation Required |
-|--------------|--------------|------|-------------------------|
+| Qdrant Field | CORPUS Field | Type | Transformation |
+|--------------|--------------|------|----------------|
 | `vector` | `args.vector` | array/dict | Qdrant supports named vectors |
-| `limit` | `args.top_k` | integer | Rename: `limit` → `top_k` |
+| `limit` | `args.top_k` | integer | Rename field |
 | `with_payload` | `args.include_metadata` | boolean/array | Rename and handle array case |
 | `with_vector` | `args.include_vectors` | boolean | Rename field |
 | `filter` | `args.filter` | object | Convert Qdrant filter syntax |
 | `score_threshold` | `args.score_threshold` | float | Direct mapping |
 | `offset` | `args.offset` | integer | Direct mapping |
-| `collection_name` | `args.namespace` | string | Rename: collection → namespace |
+| `collection_name` | `args.namespace` | string | Rename field |
+| `params` | `ctx.attrs.x-qdrant-params` | object | Namespaced in attrs |
 
-**Filter Syntax Conversion:**
-```python
-# Qdrant filter → CORPUS filter
-qdrant_filter = {
-    "must": [
-        {"key": "category", "match": {"value": "books"}},
-        {"key": "price", "range": {"gte": 20}}
-    ],
-    "should": [
-        {"key": "tags", "match": {"any": ["fiction", "scifi"]}}
-    ]
+**Filter Conversion:**
+```json
+// Qdrant filter
+{
+  "must": [
+    {"key": "category", "match": {"value": "books"}},
+    {"key": "price", "range": {"gte": 20}}
+  ]
 }
 
-# CORPUS filter (simplified)
-corpus_filter = {
-    "category": "books",
-    "price__gte": 20
-}
-# Complex filters via extensions
-corpus_filter = {
-    "category": "books",
-    "price": {"gte": 20}
+// CORPUS filter (operator-object form)
+{
+  "category": "books",
+  "price": {"gte": 20}
 }
 ```
 
-**Named Vectors Handling:**
+### 5.4 Weaviate to CORPUS
+
+#### Request Mapping (GraphQL Get)
+**Primary Source:** Weaviate GraphQL API Reference
+
+| Weaviate Field | CORPUS Field | Type | Transformation |
+|----------------|--------------|------|----------------|
+| `vector` | `args.vector` | array | Direct mapping |
+| `limit` | `args.top_k` | integer | Rename field |
+| `nearVector` | `args.vector` | object | Extract vector from object |
+| `nearText` | `args.text` | string | Text-based search |
+| `where` | `args.filter` | object | Convert GraphQL-like filter |
+| `className` | `args.namespace` | string | Rename field |
+| `_additional` | Selection | object | Map to include flags |
+| `autocut` | `ctx.attrs.x-weaviate-autocut` | integer | Namespaced in attrs |
+
+**Filter Conversion:**
 ```json
-// Qdrant with named vectors
+// Weaviate where filter
 {
-  "vector": {
-    "name": "text_embedding",
-    "vector": [0.1, 0.2, 0.3]
-  }
-}
-
-// CORPUS equivalent
-{
-  "vector": [0.1, 0.2, 0.3],
-  "extensions": {
-    "qdrant:vector_name": "text_embedding"
-  }
-}
-```
-
-**Wire Envelope Example:**
-```json
-// Qdrant Search Request
-POST /collections/documents/points/search
-{
-  "vector": [0.1, 0.2, 0.3],
-  "limit": 10,
-  "with_payload": true,
-  "with_vector": false,
-  "filter": {
-    "must": [
-      {"key": "category", "match": {"value": "technology"}}
-    ]
-  }
-}
-
-// CORPUS Equivalent
-POST /v1/operations
-{
-  "op": "vector.query",
-  "ctx": {
-    "request_id": "vec-456",
-    "deadline_ms": 1730312345000
-  },
-  "args": {
-    "vector": [0.1, 0.2, 0.3],
-    "top_k": 10,
-    "namespace": "documents",
-    "filter": {
-      "category": "technology"
-    },
-    "include_metadata": true,
-    "include_vectors": false
-  }
-}
-```
-
-#### Response Mapping
-| Qdrant Response Field | CORPUS Response Field | Transformation |
-|----------------------|----------------------|----------------|
-| `result[]` | `result.matches[]` | Array of matches |
-| `result[].id` | `matches[].vector.id` | Qdrant uses integer or UUID |
-| `result[].score` | `matches[].score` | Direct mapping |
-| `result[].version` | `matches[].vector.version` | Store in vector metadata |
-| `result[].payload` | `matches[].vector.metadata` | Rename: payload → metadata |
-| `result[].vector` | `matches[].vector.vector` | Direct mapping |
-| `time` | `result.query_time_ms` | Convert to milliseconds |
-
-**Batch Operations:**
-```json
-// Qdrant batch upsert
-POST /collections/{collection}/points
-{
-  "points": [
+  "operator": "And",
+  "operands": [
     {
-      "id": 1,
-      "vector": [0.1, 0.2, 0.3],
-      "payload": {"category": "book"}
+      "path": ["category"],
+      "operator": "Equal",
+      "valueString": "books"
+    },
+    {
+      "path": ["price"],
+      "operator": "GreaterThanEqual",
+      "valueNumber": 20
     }
   ]
 }
 
-// CORPUS upsert
+// CORPUS filter (operator-object form)
 {
-  "op": "vector.upsert",
-  "ctx": {...},
-  "args": {
-    "vectors": [
-      {
-        "id": "1",  // Convert to string
-        "vector": [0.1, 0.2, 0.3],
-        "metadata": {"category": "book"},
-        "namespace": "documents"
-      }
-    ],
-    "namespace": "documents"
-  }
+  "category": "books",
+  "price": {"gte": 20}
 }
 ```
 
-#### Error Mapping
-| Qdrant Error | CORPUS Error Code | Retryable | Notes |
-|--------------|------------------|-----------|-------|
-| `429 Too Many Requests` | `RESOURCE_EXHAUSTED` | Yes | Rate limit |
-| `400 Bad Request` | `BAD_REQUEST` | No | Invalid parameters |
-| `401 Unauthorized` | `AUTH_ERROR` | No | Authentication |
-| `404 Not Found` | `NAMESPACE_NOT_FOUND` | No | Collection doesn't exist |
-| `500 Internal Server Error` | `UNAVAILABLE` | Yes | Qdrant internal error |
-| `503 Service Unavailable` | `UNAVAILABLE` | Yes | Service down |
-
----
-
-### 5.3 Weaviate to CORPUS
+### 5.5 Milvus to CORPUS
 
 #### Request Mapping
-| Weaviate Field | CORPUS Field | Type | Transformation Required |
-|----------------|--------------|------|-------------------------|
+**Status: Needs verification against Milvus REST/SDK reference**
+
+| Milvus Field | CORPUS Field | Type | Transformation |
+|--------------|--------------|------|----------------|
 | `vector` | `args.vector` | array | Direct mapping |
-| `limit` | `args.top_k` | integer | Rename: `limit` → `top_k` |
-| `nearVector` | `args.vector` | object | Extract vector from object |
-| `nearText` | `args.text` | object | Text-based search |
-| `where` | `args.filter` | object | Convert GraphQL-like filter |
-| `additional` | Selection of fields | object | Map to include flags |
-| `className` | `args.namespace` | string | Rename: class → namespace |
-| `autocut` | `args.autocut` | integer | Direct mapping |
-
-**Filter Syntax Conversion:**
-```python
-# Weaviate where filter → CORPUS filter
-weaviate_filter = {
-    "operator": "And",
-    "operands": [
-        {
-            "path": ["category"],
-            "operator": "Equal",
-            "valueString": "books"
-        },
-        {
-            "path": ["price"],
-            "operator": "GreaterThanEqual",
-            "valueNumber": 20
-        }
-    ]
-}
-
-# CORPUS filter
-corpus_filter = {
-    "category": "books",
-    "price__gte": 20
-}
-
-# Complex operator mapping
-operator_map = {
-    "Equal": "eq",
-    "NotEqual": "neq",
-    "GreaterThan": "gt",
-    "GreaterThanEqual": "gte",
-    "LessThan": "lt",
-    "LessThanEqual": "lte",
-    "Like": "like",
-    "ContainsAny": "in"
-}
-```
-
-**NearText Handling:**
-```json
-// Weaviate nearText search
-{
-  "nearText": {
-    "concepts": ["quantum physics"],
-    "certainty": 0.8,
-    "moveAwayFrom": {
-      "concepts": ["classical physics"],
-      "force": 0.5
-    }
-  }
-}
-
-// CORPUS equivalent with extensions
-{
-  "text": "quantum physics",
-  "extensions": {
-    "weaviate:certainty": 0.8,
-    "weaviate:move_away_from": {
-      "concepts": ["classical physics"],
-      "force": 0.5
-    }
-  }
-}
-```
-
-**Wire Envelope Example:**
-```json
-// Weaviate GraphQL Query
-{
-  "query": """
-  {
-    Get {
-      Article(
-        nearVector: {
-          vector: [0.1, 0.2, 0.3]
-        }
-        limit: 10
-        where: {
-          path: ["category"]
-          operator: Equal
-          valueString: "technology"
-        }
-      ) {
-        _additional {
-          id
-          vector
-        }
-        title
-        content
-      }
-    }
-  }
-  """
-}
-
-// CORPUS Equivalent (simplified)
-POST /v1/operations
-{
-  "op": "vector.query",
-  "ctx": {...},
-  "args": {
-    "vector": [0.1, 0.2, 0.3],
-    "top_k": 10,
-    "namespace": "Article",
-    "filter": {
-      "category": "technology"
-    },
-    "include_metadata": true,
-    "include_vectors": true
-  }
-}
-```
-
-#### Response Mapping
-| Weaviate Response Field | CORPUS Response Field | Transformation |
-|------------------------|----------------------|----------------|
-| `data.Get.{Class}[]` | `result.matches[]` | Extract from nested structure |
-| `_additional.id` | `matches[].vector.id` | Direct mapping |
-| `_additional.vector` | `matches[].vector.vector` | Direct mapping |
-| `_additional.certainty` | `matches[].score` | Convert certainty to score |
-| `_additional.distance` | `matches[].distance` | Direct mapping |
-| Properties (title, etc.) | `matches[].vector.metadata` | Flatten into metadata |
-| `errors` | Error envelope | Convert to CORPUS error |
-
-**Certainty to Score Conversion:**
-```python
-# Weaviate certainty [0, 1] → CORPUS score [0, 1]
-def certainty_to_score(certainty: float) -> float:
-    return certainty  # Direct mapping for cosine similarity
-    
-# For distance metrics, need conversion
-def distance_to_score(distance: float, metric: str) -> float:
-    if metric == "cosine":
-        return 1 - distance
-    elif metric == "l2-squared":
-        return 1 / (1 + distance)  # Normalize
-    else:
-        return distance  # Use as-is
-```
-
-#### Error Mapping
-| Weaviate Error | CORPUS Error Code | Retryable | Notes |
-|----------------|------------------|-----------|-------|
-| `429 Too Many Requests` | `RESOURCE_EXHAUSTED` | Yes | Rate limit |
-| `400 Bad Request` | `BAD_REQUEST` | No | Invalid GraphQL |
-| `401 Unauthorized` | `AUTH_ERROR` | No | Authentication |
-| `404 Not Found` | `NAMESPACE_NOT_FOUND` | No | Class doesn't exist |
-| `422 Unprocessable Entity` | `DIMENSION_MISMATCH` | No | Vector dimension issue |
-| `500 Internal Server Error` | `UNAVAILABLE` | Yes | Weaviate internal error |
-| `503 Service Unavailable` | `UNAVAILABLE` | Yes | Service down |
-
----
-
-### 5.4 Milvus to CORPUS
-
-#### Request Mapping
-| Milvus Field | CORPUS Field | Type | Transformation Required |
-|--------------|--------------|------|-------------------------|
-| `vector` | `args.vector` | array | Direct mapping |
-| `limit` | `args.top_k` | integer | Rename: `limit` → `top_k` |
+| `limit` | `args.top_k` | integer | Rename field |
 | `output_fields` | Selection | array | Map to include flags |
-| `filter` | `args.filter` | string | Convert boolean expression |
+| `filter` | `args.filter` | string | Keep as string or parse |
 | `expr` | `args.filter` | string | Boolean expression |
-| `collection_name` | `args.namespace` | string | Rename: collection → namespace |
-| `anns_field` | `args.field` | string | Vector field name |
+| `collection_name` | `args.namespace` | string | Rename field |
+| `anns_field` | `ctx.attrs.x-milvus-anns_field` | string | Namespaced in attrs |
 | `metric_type` | `args.metric` | string | Distance metric |
-| `params` | `args.search_params` | object | Search parameters |
+| `params` | `ctx.attrs.x-milvus-search_params` | object | Namespaced in attrs |
 
-**Filter Expression Conversion:**
-```python
-# Milvus boolean expression → CORPUS filter
-milvius_expr = 'category == "books" and price >= 20 and tags in ["fiction", "scifi"]'
+**Note:** Milvus filter expressions as strings can be kept as-is in `args.filter` or parsed into CORPUS operator-object form if possible.
 
-# Parse and convert to CORPUS filter
-# This requires expression parsing
-corpus_filter = {
-    "category": "books",
-    "price__gte": 20,
-    "tags__in": ["fiction", "scifi"]
-}
-
-# Complex expressions remain as string
-corpus_filter = milvus_expr  # Keep as string for complex cases
-```
-
-**Search Parameters:**
-```json
-// Milvus search params
-{
-  "params": {
-    "metric_type": "IP",  # or "L2", "COSINE"
-    "params": {
-      "nprobe": 10,
-      "ef": 64
-    }
-  }
-}
-
-// CORPUS with extensions
-{
-  "metric": "inner_product",  # or "l2", "cosine"
-  "extensions": {
-    "milvus:nprobe": 10,
-    "milvus:ef": 64
-  }
-}
-```
-
-**Wire Envelope Example:**
-```json
-// Milvus Search Request
-POST /v1/vector/search
-{
-  "collection_name": "documents",
-  "vector": [0.1, 0.2, 0.3],
-  "limit": 10,
-  "output_fields": ["title", "category"],
-  "expr": "category == 'technology' and year >= 2020",
-  "search_params": {
-    "metric_type": "COSINE",
-    "params": {"nprobe": 10}
-  }
-}
-
-// CORPUS Equivalent
-POST /v1/operations
-{
-  "op": "vector.query",
-  "ctx": {...},
-  "args": {
-    "vector": [0.1, 0.2, 0.3],
-    "top_k": 10,
-    "namespace": "documents",
-    "filter": "category == 'technology' and year >= 2020",
-    "include_metadata": true,
-    "metric": "cosine"
-  },
-  "extensions": {
-    "milvus:nprobe": 10
-  }
-}
-```
-
-#### Response Mapping
-| Milvus Response Field | CORPUS Response Field | Transformation |
-|----------------------|----------------------|----------------|
-| `results[]` | `result.matches[]` | Array of matches |
-| `results[].id` | `matches[].vector.id` | Direct mapping |
-| `results[].score` | `matches[].score` | Direct mapping |
-| `results[].distance` | `matches[].distance` | Direct mapping |
-| Output fields | `matches[].vector.metadata` | Flatten into metadata |
-| `status.error_code` | Error code | Map to CORPUS error |
-| `status.reason` | Error message | Include in details |
-
-**ID Field Handling:**
-```python
-# Milvus IDs can be integers or strings
-milvus_id = result["id"]
-if isinstance(milvus_id, int):
-    corpus_id = str(milvus_id)
-else:
-    corpus_id = milvus_id
-```
-
-#### Error Mapping
-| Milvus Error | CORPUS Error Code | Retryable | Notes |
-|--------------|------------------|-----------|-------|
-| `429 Too Many Requests` | `RESOURCE_EXHAUSTED` | Yes | Rate limit |
-| `400 Bad Request` | `BAD_REQUEST` | No | Invalid parameters |
-| `401 Unauthorized` | `AUTH_ERROR` | No | Authentication |
-| `404 Not Found` | `NAMESPACE_NOT_FOUND` | No | Collection doesn't exist |
-| `500 Internal Server Error` | `UNAVAILABLE` | Yes | Milvus internal error |
-| `503 Service Unavailable` | `UNAVAILABLE` | Yes | Service down |
-| `Code 1` (Success) | `OK` | N/A | Success code |
-
----
-
-### 5.5 Chroma to CORPUS
+### 5.6 Chroma to CORPUS
 
 #### Request Mapping
-| Chroma Field | CORPUS Field | Type | Transformation Required |
-|--------------|--------------|------|-------------------------|
+**Status: Needs verification against Chroma API documentation**
+
+| Chroma Field | CORPUS Field | Type | Transformation |
+|--------------|--------------|------|----------------|
 | `query_embeddings` | `args.vector` | array | Can be batch of vectors |
-| `n_results` | `args.top_k` | integer | Rename: `n_results` → `top_k` |
-| `where` | `args.filter` | object | Direct mapping |
-| `where_document` | `args.document_filter` | object | Filter on document content |
+| `n_results` | `args.top_k` | integer | Rename field |
+| `where` | `args.filter` | object | Direct mapping (similar syntax) |
+| `where_document` | `ctx.attrs.x-chroma-document_filter` | object | Namespaced in attrs |
 | `include` | Selection | array/object | Map to include flags |
 | `collection_name` | `args.namespace` | string | Direct mapping |
 | `query_texts` | `args.text` | array | Text-based search |
 
-**Filter Syntax:**
+**Filter Conversion:**
 ```json
 // Chroma where filter
 {
   "where": {
     "category": {"$eq": "books"},
     "price": {"$gte": 20}
-  },
-  "where_document": {
-    "$contains": "quantum"
   }
 }
 
-// CORPUS equivalent
+// CORPUS filter (operator-object form)
 {
-  "filter": {
-    "category": "books",
-    "price__gte": 20
-  },
-  "extensions": {
-    "chroma:document_contains": "quantum"
-  }
+  "category": "books",
+  "price": {"gte": 20}
 }
 ```
-
-**Include Field Mapping:**
-```json
-// Chroma include
-{
-  "include": ["metadatas", "documents", "distances"]
-}
-
-// CORPUS equivalent
-{
-  "include_metadata": true,
-  "include_documents": true,
-  "include_distances": true
-}
-```
-
-**Wire Envelope Example:**
-```json
-// Chroma Query Request
-POST /api/v1/collections/documents/query
-{
-  "query_embeddings": [[0.1, 0.2, 0.3]],
-  "n_results": 10,
-  "where": {
-    "category": {"$eq": "technology"}
-  },
-  "include": ["metadatas", "distances"]
-}
-
-// CORPUS Equivalent
-POST /v1/operations
-{
-  "op": "vector.query",
-  "ctx": {...},
-  "args": {
-    "vector": [0.1, 0.2, 0.3],
-    "top_k": 10,
-    "namespace": "documents",
-    "filter": {
-      "category": "technology"
-    },
-    "include_metadata": true,
-    "include_distances": true
-  }
-}
-```
-
-#### Response Mapping
-| Chroma Response Field | CORPUS Response Field | Transformation |
-|----------------------|----------------------|----------------|
-| `ids[0]` | `matches[].vector.id` | Batch results |
-| `distances[0]` | `matches[].distance` | Direct mapping |
-| `metadatas[0]` | `matches[].vector.metadata` | Direct mapping |
-| `documents[0]` | `matches[].vector.document` | Store in metadata |
-| `embeddings[0]` | `matches[].vector.vector` | Direct mapping |
-| `uris[0]` | `matches[].vector.uri` | Store in metadata |
-
-**Batch Results Handling:**
-```python
-# Chroma returns batch results
-chroma_response = {
-    "ids": [["id1", "id2"], ["id3", "id4"]],  # Per query
-    "distances": [[0.1, 0.2], [0.3, 0.4]],
-    "metadatas": [[{"cat": "a"}, {"cat": "b"}], [{"cat": "c"}, {"cat": "d"}]]
-}
-
-# CORPUS format for first query
-corpus_matches = [
-    {
-        "vector": {
-            "id": "id1",
-            "vector": None,  # Not included in this example
-            "metadata": {"cat": "a"}
-        },
-        "distance": 0.1,
-        "score": 1 - 0.1  # Convert distance to score
-    },
-    # ... more matches
-]
-```
-
-#### Error Mapping
-| Chroma Error | CORPUS Error Code | Retryable | Notes |
-|--------------|------------------|-----------|-------|
-| `429 Too Many Requests` | `RESOURCE_EXHAUSTED` | Yes | Rate limit |
-| `400 Bad Request` | `BAD_REQUEST` | No | Invalid parameters |
-| `401 Unauthorized` | `AUTH_ERROR` | No | Authentication |
-| `404 Not Found` | `NAMESPACE_NOT_FOUND` | No | Collection doesn't exist |
-| `422 Unprocessable Entity` | `DIMENSION_MISMATCH` | No | Embedding dimension issue |
-| `500 Internal Server Error` | `UNAVAILABLE` | Yes | Chroma internal error |
-| `503 Service Unavailable` | `UNAVAILABLE` | Yes | Service down |
 
 ---
 
-## 6. 📊 Embedding Protocol Migrations
+## 6. Embedding Protocol Migrations
 
-### 6.1 OpenAI Embeddings to CORPUS
+### 6.1 Embedding Operations Reference
+CORPUS v1.0 defines these embedding operations (per PROTOCOLS.md):
 
-#### Request Mapping
-| OpenAI Field | CORPUS Field | Type | Transformation Required |
-|--------------|--------------|------|-------------------------|
+| Operation | Description | Provider Example |
+|-----------|-------------|------------------|
+| `embedding.capabilities` | Get embedding model capabilities | OpenAI `/models` endpoint |
+| `embedding.embed` | Single text embedding | OpenAI `/embeddings` |
+| `embedding.embed_batch` | Batch text embeddings | OpenAI `/embeddings` with array input |
+| `embedding.stream_embed` | Streaming embeddings | Provider-specific streaming |
+| `embedding.count_tokens` | Count tokens in text | Provider token counting |
+| `embedding.get_stats` | Get embedding statistics | Provider usage statistics |
+| `embedding.health` | Check embedding service health | Provider health endpoint |
+
+**Provider-Agnostic Mapping Template:**
+```json
+// General pattern for embedding operations
+{
+  "op": "embedding.operation",
+  "ctx": {...},
+  "args": {
+    // Operation-specific arguments per SCHEMA.md
+  }
+}
+```
+
+### 6.2 OpenAI Embeddings to CORPUS
+
+#### Request Mapping (Embeddings API)
+**Primary Source:** [OpenAI Embeddings API Reference](https://platform.openai.com/docs/api-reference/embeddings)
+
+| OpenAI Field | CORPUS Field | Type | Transformation |
+|--------------|--------------|------|----------------|
 | `model` | `args.model` | string | Map: `text-embedding-ada-002` → `ada-002` |
 | `input` (single) | `args.text` | string | Single embedding |
 | `input` (batch) | `args.texts` | array | Batch embedding |
-| `encoding_format` | `args.encoding_format` | string | Via extensions |
-| `user` | `ctx.attrs.user` | string | Move to context |
+| `encoding_format` | `ctx.attrs.x-openai-encoding_format` | string | Namespaced in attrs |
+| `user` | `ctx.attrs.x-openai-user` | string | In context attrs |
 | `dimensions` | `args.dimensions` | integer | Reduce dimensions |
-
-**Model Name Normalization:**
-```python
-# OpenAI model → CORPUS model name
-model_mapping = {
-    "text-embedding-ada-002": "ada-002",
-    "text-embedding-3-small": "text-embedding-3-small",
-    "text-embedding-3-large": "text-embedding-3-large",
-    # Add other mappings
-}
-
-openai_model = request.get("model")
-corpus_model = model_mapping.get(openai_model, openai_model)
-```
 
 **Single vs Batch Operations:**
 ```json
-// OpenAI single embedding
+// Single embedding - OpenAI
 POST /v1/embeddings
 {
   "model": "text-embedding-ada-002",
@@ -1465,34 +1042,79 @@ POST /v1/embeddings
   "encoding_format": "float"
 }
 
-// CORPUS equivalent
-POST /v1/operations
+// Single embedding - CORPUS
 {
   "op": "embedding.embed",
-  "ctx": {...},
+  "ctx": {
+    "request_id": "embed-req-123",
+    "attrs": {
+      "x-openai-encoding_format": "float"
+    }
+  },
   "args": {
     "text": "The quick brown fox",
     "model": "ada-002"
-  },
-  "extensions": {
-    "openai:encoding_format": "float"
   }
 }
 
-// OpenAI batch embedding
+// Batch embedding - OpenAI
 {
   "model": "text-embedding-ada-002",
   "input": ["Text 1", "Text 2", "Text 3"]
 }
 
-// CORPUS batch
+// Batch embedding - CORPUS
 {
   "op": "embedding.embed_batch",
-  "ctx": {...},
+  "ctx": {
+    "request_id": "batch-embed-req-456"
+  },
   "args": {
     "texts": ["Text 1", "Text 2", "Text 3"],
     "model": "ada-002"
   }
+}
+```
+
+#### Other Embedding Operations
+```json
+// embedding.capabilities example
+{
+  "op": "embedding.capabilities",
+  "ctx": {
+    "request_id": "cap-req-123"
+  },
+  "args": {}
+}
+
+// embedding.count_tokens example (per SCHEMA.md: text and model required)
+{
+  "op": "embedding.count_tokens",
+  "ctx": {
+    "request_id": "count-req-456"
+  },
+  "args": {
+    "model": "ada-002",
+    "text": "Hello world"
+  }
+}
+
+// embedding.get_stats example
+{
+  "op": "embedding.get_stats",
+  "ctx": {
+    "request_id": "stats-req-789"
+  },
+  "args": {}
+}
+
+// embedding.health example
+{
+  "op": "embedding.health",
+  "ctx": {
+    "request_id": "health-req-890"
+  },
+  "args": {}
 }
 ```
 
@@ -1506,343 +1128,44 @@ POST /v1/operations
 | `object` | Not included | Type indicator |
 | `data[].index` | `result.embeddings[].index` | Preserve order |
 
-**Batch Response Structure:**
-```json
-// OpenAI batch response
-{
-  "object": "list",
-  "data": [
-    {
-      "object": "embedding",
-      "embedding": [0.1, 0.2, 0.3],
-      "index": 0
-    },
-    {
-      "object": "embedding", 
-      "embedding": [0.4, 0.5, 0.6],
-      "index": 1
-    }
-  ],
-  "model": "text-embedding-ada-002",
-  "usage": {"prompt_tokens": 20, "total_tokens": 20}
-}
-
-// CORPUS batch response
-{
-  "ok": true,
-  "code": "OK",
-  "ms": 45.2,
-  "result": {
-    "embeddings": [
-      {
-        "vector": [0.1, 0.2, 0.3],
-        "text": "Text 1",
-        "model": "ada-002",
-        "dimensions": 1536
-      },
-      {
-        "vector": [0.4, 0.5, 0.6],
-        "text": "Text 2", 
-        "model": "ada-002",
-        "dimensions": 1536
-      }
-    ],
-    "model": "ada-002",
-    "total_texts": 2,
-    "total_tokens": 20
-  }
-}
-```
-
-#### Error Mapping
-| OpenAI Error | CORPUS Error Code | Retryable | Notes |
-|--------------|------------------|-----------|-------|
-| `RateLimitError` | `RESOURCE_EXHAUSTED` | Yes | Rate limit |
-| `AuthenticationError` | `AUTH_ERROR` | No | Authentication |
-| `BadRequestError` | `BAD_REQUEST` | No | Invalid input |
-| `APIConnectionError` | `TRANSIENT_NETWORK` | Yes | Network issues |
-| `APIError` | `UNAVAILABLE` | Yes | Provider issue |
-| `TimeoutError` | `DEADLINE_EXCEEDED` | Conditional | Check deadline |
-
----
-
-### 6.2 Cohere Embed to CORPUS
+### 6.3 Cohere Embed to CORPUS
 
 #### Request Mapping
-| Cohere Field | CORPUS Field | Type | Transformation Required |
-|--------------|--------------|------|-------------------------|
+**Status: Needs verification against Cohere Embed API reference**
+
+| Cohere Field | CORPUS Field | Type | Transformation |
+|--------------|--------------|------|----------------|
 | `model` | `args.model` | string | Map: `embed-english-v3.0` → `cohere-v3-en` |
 | `texts` | `args.texts` | array | Always batch in Cohere |
-| `input_type` | `args.input_type` | string | Via extensions |
-| `embedding_types` | `args.embedding_types` | array | Via extensions |
-| `truncate` | `args.truncate` | string | Map to boolean |
-| `compress` | `args.compress` | boolean | Via extensions |
+| `input_type` | `ctx.attrs.x-cohere-input_type` | string | Namespaced in attrs |
+| `embedding_types` | `ctx.attrs.x-cohere-embedding_types` | array | Namespaced in attrs |
+| `truncate` | `args.truncate` | boolean/string | Map to boolean or string |
+| `compress` | `ctx.attrs.x-cohere-compress` | boolean | Namespaced in attrs |
 
-**Model and Input Type Mapping:**
-```python
-# Cohere model names
-cohere_models = {
-    "embed-english-v3.0": "cohere-v3-en",
-    "embed-multilingual-v3.0": "cohere-v3-multi",
-    "embed-english-light-v3.0": "cohere-v3-en-light",
-    # Add other models
-}
-
-# Input types
-input_types = {
-    "search_document": "document",
-    "search_query": "query",
-    "classification": "classification",
-    "clustering": "clustering"
-}
-```
-
-**Wire Envelope Example:**
-```json
-// Cohere Embed Request
-POST /v1/embed
-{
-  "model": "embed-english-v3.0",
-  "texts": ["Hello world", "AI is amazing"],
-  "input_type": "search_document",
-  "embedding_types": ["float"],
-  "truncate": "END"
-}
-
-// CORPUS Equivalent
-POST /v1/operations
-{
-  "op": "embedding.embed_batch",
-  "ctx": {...},
-  "args": {
-    "texts": ["Hello world", "AI is amazing"],
-    "model": "cohere-v3-en",
-    "truncate": true
-  },
-  "extensions": {
-    "cohere:input_type": "search_document",
-    "cohere:embedding_types": ["float"],
-    "cohere:truncate_mode": "END"
-  }
-}
-```
-
-#### Response Mapping
-| Cohere Response Field | CORPUS Response Field | Transformation |
-|----------------------|----------------------|----------------|
-| `embeddings.float` | `result.embeddings[].vector` | Float embeddings |
-| `embeddings.int8` | Not directly mapped | Store in extensions |
-| `embeddings.ubinary` | Not directly mapped | Store in extensions |
-| `id` | `ctx.request_id` | Request correlation |
-| `texts` | `result.embeddings[].text` | Original texts |
-| `meta` | `result.meta` | Via extensions |
-
-**Multiple Embedding Types:**
-```json
-// Cohere response with multiple types
-{
-  "id": "embed-123",
-  "texts": ["Hello world"],
-  "embeddings": {
-    "float": [[0.1, 0.2, 0.3]],
-    "int8": [[1, 2, 3]],
-    "ubinary": [[1, 0, 1]]
-  },
-  "meta": {
-    "api_version": {"version": "1"}
-  }
-}
-
-// CORPUS response (primary type only)
-{
-  "ok": true,
-  "code": "OK",
-  "ms": 32.7,
-  "result": {
-    "embeddings": [
-      {
-        "vector": [0.1, 0.2, 0.3],
-        "text": "Hello world",
-        "model": "cohere-v3-en",
-        "dimensions": 1024
-      }
-    ],
-    "model": "cohere-v3-en",
-    "total_texts": 1
-  },
-  "extensions": {
-    "cohere:int8_embeddings": [[1, 2, 3]],
-    "cohere:ubinary_embeddings": [[1, 0, 1]],
-    "cohere:api_version": "1"
-  }
-}
-```
-
-#### Error Mapping
-| Cohere Error | CORPUS Error Code | Retryable | Notes |
-|--------------|------------------|-----------|-------|
-| `rate_limit_error` | `RESOURCE_EXHAUSTED` | Yes | Rate limit |
-| `authentication_error` | `AUTH_ERROR` | No | Authentication |
-| `invalid_request_error` | `BAD_REQUEST` | No | Invalid input |
-| `internal_server_error` | `UNAVAILABLE` | Yes | Provider issue |
-| `service_unavailable` | `UNAVAILABLE` | Yes | Service down |
-| `timeout_error` | `DEADLINE_EXCEEDED` | Conditional | Check deadline |
-
----
-
-### 6.3 HuggingFace to CORPUS
+### 6.4 HuggingFace to CORPUS
 
 #### Request Mapping
-| HuggingFace Field | CORPUS Field | Type | Transformation Required |
-|-------------------|--------------|------|-------------------------|
+**Status: Needs verification against Hugging Face Inference API docs**
+
+| HuggingFace Field | CORPUS Field | Type | Transformation |
+|-------------------|--------------|------|----------------|
 | `model` | `args.model` | string | Map: `sentence-transformers/all-MiniLM-L6-v2` → `miniLM-L6-v2` |
 | `inputs` | `args.texts` | array/string | Can be single or batch |
 | `normalize` | `args.normalize` | boolean | Direct mapping |
 | `truncate` | `args.truncate` | boolean | Direct mapping |
-| `options` | `args.options` | object | Via extensions |
-| `parameters` | `args.parameters` | object | Model parameters |
+| `options` | `ctx.attrs.x-huggingface-options` | object | Namespaced in attrs |
+| `parameters` | `ctx.attrs.x-huggingface-parameters` | object | Namespaced in attrs |
 
-**Model Name Normalization:**
-```python
-# Common HuggingFace models
-model_aliases = {
-    "sentence-transformers/all-MiniLM-L6-v2": "miniLM-L6-v2",
-    "sentence-transformers/all-mpnet-base-v2": "mpnet-base-v2",
-    "intfloat/e5-large-v2": "e5-large-v2",
-    "BAAI/bge-large-en-v1.5": "bge-large-en-v1.5",
-    # Add more as needed
-}
-
-hf_model = request.get("model")
-corpus_model = model_aliases.get(hf_model, hf_model.split("/")[-1])
-```
-
-**Wire Envelope Example:**
-```json
-// HuggingFace Inference Request
-POST /models/sentence-transformers/all-MiniLM-L6-v2
-{
-  "inputs": "The quick brown fox jumps over the lazy dog",
-  "options": {
-    "wait_for_model": true,
-    "use_cache": false
-  },
-  "parameters": {
-    "normalize": true
-  }
-}
-
-// CORPUS Equivalent
-POST /v1/operations
-{
-  "op": "embedding.embed",
-  "ctx": {...},
-  "args": {
-    "text": "The quick brown fox jumps over the lazy dog",
-    "model": "miniLM-L6-v2",
-    "normalize": true
-  },
-  "extensions": {
-    "huggingface:wait_for_model": true,
-    "huggingface:use_cache": false
-  }
-}
-```
-
-#### Response Mapping
-| HuggingFace Response | CORPUS Response Field | Transformation |
-|---------------------|----------------------|----------------|
-| Single array | `result.embedding.vector` | Single embedding |
-| Array of arrays | `result.embeddings[].vector` | Batch embeddings |
-| Inference time | `result.processing_time_ms` | Convert to ms |
-| Model info | `result.model_details` | Via extensions |
-| Error array | `result.failed_texts` | Partial failures |
-
-**Response Formats:**
-```json
-// HuggingFace single embedding
-[[0.1, 0.2, 0.3, 0.4, 0.5]]
-
-// CORPUS single embedding
-{
-  "ok": true,
-  "code": "OK",
-  "ms": 28.3,
-  "result": {
-    "embedding": {
-      "vector": [0.1, 0.2, 0.3, 0.4, 0.5],
-      "text": "The quick brown fox...",
-      "model": "miniLM-L6-v2",
-      "dimensions": 384
-    },
-    "model": "miniLM-L6-v2"
-  }
-}
-
-// HuggingFace batch embeddings
-[
-  [0.1, 0.2, 0.3],
-  [0.4, 0.5, 0.6],
-  [0.7, 0.8, 0.9]
-]
-
-// CORPUS batch embeddings
-{
-  "ok": true,
-  "code": "OK",
-  "ms": 56.7,
-  "result": {
-    "embeddings": [
-      {
-        "vector": [0.1, 0.2, 0.3],
-        "text": "Text 1",
-        "model": "miniLM-L6-v2",
-        "dimensions": 384
-      },
-      // ... more embeddings
-    ],
-    "model": "miniLM-L6-v2",
-    "total_texts": 3
-  }
-}
-```
-
-#### Error Mapping
-| HuggingFace Error | CORPUS Error Code | Retryable | Notes |
-|-------------------|------------------|-----------|-------|
-| `429 Too Many Requests` | `RESOURCE_EXHAUSTED` | Yes | Rate limit |
-| `400 Bad Request` | `BAD_REQUEST` | No | Invalid input |
-| `401 Unauthorized` | `AUTH_ERROR` | No | Authentication |
-| `503 Service Unavailable` | `UNAVAILABLE` | Yes | Model loading |
-| `504 Gateway Timeout` | `DEADLINE_EXCEEDED` | Conditional | Check deadline |
-| `422 Unprocessable Entity` | `BAD_REQUEST` | No | Input too long |
-
----
-
-### 6.4 Google Vertex AI to CORPUS
+### 6.5 Google Vertex AI to CORPUS
 
 #### Request Mapping
-| Vertex AI Field | CORPUS Field | Type | Transformation Required |
-|-----------------|--------------|------|-------------------------|
+**Status: Needs verification against Vertex AI embeddings reference**
+
+| Vertex AI Field | CORPUS Field | Type | Transformation |
+|-----------------|--------------|------|----------------|
 | `instances[]` | `args.texts` | array | Extract from instances |
-| `parameters` | `args.parameters` | object | Model parameters |
+| `parameters` | `args` fields | object | Map to CORPUS args |
 | `endpoint` | `args.model` | string | Extract model from endpoint |
-| `task_type` | `args.task_type` | string | Via extensions |
-| `title` | `args.title` | string | Via extensions |
-
-**Endpoint to Model Mapping:**
-```python
-# Vertex AI endpoint pattern
-# projects/{project}/locations/{location}/publishers/google/models/{model}
-import re
-
-def extract_model_from_endpoint(endpoint: str) -> str:
-    pattern = r"/models/([^/]+)$"
-    match = re.search(pattern, endpoint)
-    if match:
-        return f"google-{match.group(1)}"
-    return endpoint
-```
 
 **Instances Structure:**
 ```json
@@ -1871,240 +1194,71 @@ def extract_model_from_endpoint(endpoint: str) -> str:
 }
 ```
 
-#### Response Mapping
-| Vertex AI Response Field | CORPUS Response Field | Transformation |
-|-------------------------|----------------------|----------------|
-| `predictions[]` | `result.embeddings[]` | Array of predictions |
-| `predictions[].embeddings` | `embeddings[].vector` | Extract embeddings |
-| `predictions[].statistics` | `embeddings[].statistics` | Via extensions |
-| `metadata` | `result.metadata` | Via extensions |
-| `model_version_id` | `result.model_version` | Via extensions |
-
-**Response Structure:**
-```json
-// Vertex AI response
-{
-  "predictions": [
-    {
-      "embeddings": {
-        "values": [0.1, 0.2, 0.3],
-        "statistics": {
-          "token_count": 9,
-          "truncated": false
-        }
-      }
-    }
-  ],
-  "metadata": {
-    "billableCharacterCount": 27,
-    "model_version_id": "001"
-  }
-}
-
-// CORPUS response
-{
-  "ok": true,
-  "code": "OK",
-  "ms": 67.8,
-  "result": {
-    "embeddings": [
-      {
-        "vector": [0.1, 0.2, 0.3],
-        "text": "The quick brown fox",
-        "model": "google-textembedding-gecko",
-        "dimensions": 768
-      }
-    ],
-    "model": "google-textembedding-gecko",
-    "total_texts": 1,
-    "total_tokens": 9
-  },
-  "extensions": {
-    "vertex:model_version": "001",
-    "vertex:billable_character_count": 27
-  }
-}
-```
-
-#### Error Mapping
-| Vertex AI Error | CORPUS Error Code | Retryable | Notes |
-|-----------------|------------------|-----------|-------|
-| `RESOURCE_EXHAUSTED` | `RESOURCE_EXHAUSTED` | Yes | Quota exceeded |
-| `PERMISSION_DENIED` | `AUTH_ERROR` | No | Authentication |
-| `INVALID_ARGUMENT` | `BAD_REQUEST` | No | Invalid input |
-| `NOT_FOUND` | `MODEL_NOT_AVAILABLE` | No | Model not found |
-| `UNAVAILABLE` | `UNAVAILABLE` | Yes | Service down |
-| `DEADLINE_EXCEEDED` | `DEADLINE_EXCEEDED` | Conditional | Check deadline |
-
----
-
-### 6.5 AWS Bedrock to CORPUS
+### 6.6 AWS Bedrock to CORPUS
 
 #### Request Mapping
-| Bedrock Field | CORPUS Field | Type | Transformation Required |
-|---------------|--------------|------|-------------------------|
+**Primary Source:** AWS Bedrock Titan Embeddings Documentation
+
+| Bedrock Field | CORPUS Field | Type | Transformation |
+|---------------|--------------|------|----------------|
 | `modelId` | `args.model` | string | Map: `amazon.titan-embed-text-v1` → `titan-embed-text-v1` |
 | `inputText` | `args.text` | string | Single text |
 | `inputTexts` | `args.texts` | array | Batch texts |
 | `dimensions` | `args.dimensions` | integer | Output dimensions |
 | `normalize` | `args.normalize` | boolean | Direct mapping |
-| `embeddingTypes` | `args.embedding_types` | array | Via extensions |
-
-**Model ID Mapping:**
-```python
-# Bedrock model IDs
-bedrock_models = {
-    "amazon.titan-embed-text-v1": "titan-embed-text-v1",
-    "amazon.titan-embed-text-v2:0": "titan-embed-text-v2",
-    "cohere.embed-english-v3": "cohere-v3-en",
-    "cohere.embed-multilingual-v3": "cohere-v3-multi"
-}
-```
-
-**Request Body Structure:**
-```json
-// Bedrock request (Titan model)
-{
-  "inputText": "The quick brown fox",
-  "dimensions": 256,
-  "normalize": true
-}
-
-// CORPUS equivalent
-{
-  "op": "embedding.embed",
-  "ctx": {...},
-  "args": {
-    "text": "The quick brown fox",
-    "model": "titan-embed-text-v1",
-    "dimensions": 256,
-    "normalize": true
-  }
-}
-
-// Bedrock request (Cohere model)
-{
-  "texts": ["Hello", "World"],
-  "input_type": "search_document",
-  "truncate": "END"
-}
-
-// CORPUS equivalent
-{
-  "op": "embedding.embed_batch",
-  "ctx": {...},
-  "args": {
-    "texts": ["Hello", "World"],
-    "model": "cohere-v3-en",
-    "truncate": true
-  },
-  "extensions": {
-    "cohere:input_type": "search_document",
-    "cohere:truncate_mode": "END"
-  }
-}
-```
-
-#### Response Mapping
-| Bedrock Response Field | CORPUS Response Field | Transformation |
-|-----------------------|----------------------|----------------|
-| `embedding` | `result.embedding.vector` | Titan model |
-| `embeddings[]` | `result.embeddings[].vector` | Cohere model |
-| `inputTextTokenCount` | `result.total_tokens` | Token count |
-| `message` | Error message | For errors |
-| `type` | Error type | For errors |
-
-**Model-Specific Responses:**
-```json
-// Titan response
-{
-  "embedding": [0.1, 0.2, 0.3],
-  "inputTextTokenCount": 9
-}
-
-// CORPUS response for Titan
-{
-  "ok": true,
-  "code": "OK",
-  "ms": 89.1,
-  "result": {
-    "embedding": {
-      "vector": [0.1, 0.2, 0.3],
-      "text": "The quick brown fox",
-      "model": "titan-embed-text-v1",
-      "dimensions": 1536
-    },
-    "model": "titan-embed-text-v1",
-    "total_tokens": 9
-  }
-}
-
-// Cohere via Bedrock response
-{
-  "embeddings": [
-    [0.1, 0.2, 0.3],
-    [0.4, 0.5, 0.6]
-  ],
-  "id": "embed-123",
-  "texts": ["Hello", "World"]
-}
-
-// CORPUS response for Cohere via Bedrock
-{
-  "ok": true,
-  "code": "OK",
-  "ms": 45.6,
-  "result": {
-    "embeddings": [
-      {
-        "vector": [0.1, 0.2, 0.3],
-        "text": "Hello",
-        "model": "cohere-v3-en",
-        "dimensions": 1024
-      },
-      {
-        "vector": [0.4, 0.5, 0.6],
-        "text": "World",
-        "model": "cohere-v3-en",
-        "dimensions": 1024
-      }
-    ],
-    "model": "cohere-v3-en",
-    "total_texts": 2
-  }
-}
-```
-
-#### Error Mapping
-| Bedrock Error | CORPUS Error Code | Retryable | Notes |
-|---------------|------------------|-----------|-------|
-| `ThrottlingException` | `RESOURCE_EXHAUSTED` | Yes | AWS throttling |
-| `AccessDeniedException` | `AUTH_ERROR` | No | Permissions |
-| `ValidationException` | `BAD_REQUEST` | No | Invalid request |
-| `ModelNotReadyException` | `MODEL_NOT_AVAILABLE` | Yes | Model loading |
-| `ServiceQuotaExceededException` | `RESOURCE_EXHAUSTED` | No | Quota exceeded |
-| `InternalServerException` | `UNAVAILABLE` | Yes | AWS internal error |
+| `embeddingTypes` | `ctx.attrs.x-bedrock-embedding_types` | array | Namespaced in attrs |
 
 ---
 
-## 7. 🌐 Graph Protocol Migrations
+## 7. Graph Protocol Migrations
 
-*Note: Due to context limits, I'll provide the first graph migration in detail and summarize the others. Press "Continue" to get the complete Graph Protocol section.*
+### 7.1 Graph Operations Reference
+CORPUS v1.0 defines these graph operations (per PROTOCOLS.md):
 
-### 7.1 Neo4j to CORPUS
+| Operation | Description | Provider Example |
+|-----------|-------------|------------------|
+| `graph.capabilities` | Get graph database capabilities | Neo4j endpoint info |
+| `graph.query` | Execute query (Cypher/Gremlin/etc.) | Neo4j transaction endpoint |
+| `graph.stream_query` | Stream query results | Neo4j streaming endpoint |
+| `graph.upsert_nodes` | Insert/update nodes | Neo4j CREATE/MERGE |
+| `graph.upsert_edges` | Insert/update edges/relationships | Neo4j CREATE/MERGE |
+| `graph.delete_nodes` | Delete nodes | Neo4j DELETE |
+| `graph.delete_edges` | Delete edges/relationships | Neo4j DELETE |
+| `graph.bulk_vertices` | Bulk vertex operations | Neo4j LOAD CSV |
+| `graph.batch` | Batch operations | Neo4j transaction with multiple statements |
+| `graph.transaction` | Transaction management | Neo4j transaction endpoints |
+| `graph.traversal` | Graph traversal | Gremlin traversal |
+| `graph.get_schema` | Get graph schema | Neo4j `CALL db.schema.visualization()` |
+| `graph.health` | Check graph service health | Provider health endpoint |
 
-#### Request Mapping
-| Neo4j Field | CORPUS Field | Type | Transformation Required |
-|-------------|--------------|------|-------------------------|
-| `cypher` | `args.text` | string | Direct mapping |
-| `params` | `args.params` | object | Direct mapping |
-| `database` | `args.namespace` | string | Rename: database → namespace |
-| `resultDataContents` | `args.result_format` | array | Via extensions |
-| `includeStats` | `args.include_stats` | boolean | Via extensions |
-
-**Wire Envelope Example:**
+**Provider-Agnostic Mapping Template:**
 ```json
-// Neo4j Cypher Request
+// General pattern for graph operations
+{
+  "op": "graph.operation",
+  "ctx": {...},
+  "args": {
+    // Operation-specific arguments per SCHEMA.md
+  }
+}
+```
+
+### 7.2 Neo4j to CORPUS
+
+#### Request Mapping (Transactional HTTP API)
+**Status: Needs verification against Neo4j HTTP API reference**
+
+| Neo4j Field | CORPUS Field | Type | Transformation |
+|-------------|--------------|------|----------------|
+| `cypher` | `args.text` | string | Cypher query text |
+| `params` | `args.params` | object | Query parameters |
+| `database` | `args.namespace` | string | Database name |
+| `resultDataContents` | `ctx.attrs.x-neo4j-result_data_contents` | array | Namespaced in attrs |
+| `includeStats` | `args.include_stats` | boolean | Rename field |
+
+**Wire Envelope Examples:**
+```json
+// Neo4j Cypher Query
 POST /db/neo4j/tx/commit
 {
   "statements": [
@@ -2117,22 +1271,162 @@ POST /db/neo4j/tx/commit
 }
 
 // CORPUS Equivalent
-POST /v1/operations
 {
   "op": "graph.query",
   "ctx": {
     "request_id": "graph-123",
-    "deadline_ms": 1730312345000
+    "deadline_ms": 1730312345000,
+    "attrs": {
+      "x-neo4j-result_data_contents": ["row", "graph"]
+    }
   },
   "args": {
     "dialect": "cypher",
     "text": "MATCH (n:Person) WHERE n.name = $name RETURN n",
     "params": {"name": "Alice"},
-    "namespace": "neo4j"
-  },
-  "extensions": {
-    "neo4j:result_data_contents": ["row", "graph"]
+    "namespace": "neo4j",
+    "include_stats": true
   }
+}
+
+// graph.stream_query example
+{
+  "op": "graph.stream_query",
+  "ctx": {
+    "request_id": "stream-query-456"
+  },
+  "args": {
+    "dialect": "cypher",
+    "text": "MATCH (n:Person) RETURN n LIMIT 1000",
+    "namespace": "neo4j"
+  }
+}
+
+// graph.upsert_nodes example (per SCHEMA.md Node shape)
+{
+  "op": "graph.upsert_nodes",
+  "ctx": {
+    "request_id": "upsert-nodes-789"
+  },
+  "args": {
+    "dialect": "cypher",
+    "namespace": "neo4j",
+    "nodes": [
+      {
+        "id": "person-1",
+        "labels": ["Person"],
+        "properties": {
+          "name": "Alice",
+          "age": 30
+        }
+      }
+    ]
+  }
+}
+
+// graph.upsert_edges example (per SCHEMA.md Edge shape)
+{
+  "op": "graph.upsert_edges",
+  "ctx": {
+    "request_id": "upsert-edges-890"
+  },
+  "args": {
+    "dialect": "cypher",
+    "namespace": "neo4j",
+    "edges": [
+      {
+        "id": "edge-1",
+        "src": "person-1",
+        "dst": "person-2",
+        "label": "KNOWS",
+        "properties": {"since": 2020}
+      }
+    ]
+  }
+}
+
+// graph.get_schema example
+{
+  "op": "graph.get_schema",
+  "ctx": {
+    "request_id": "schema-req-901"
+  },
+  "args": {}
+}
+
+// graph.batch example (per SCHEMA.md GraphBatchSpec)
+{
+  "op": "graph.batch",
+  "ctx": {
+    "request_id": "batch-req-902"
+  },
+  "args": {
+    "namespace": "neo4j",
+    "ops": [
+      {
+        "op": "graph.query",
+        "args": {
+          "dialect": "cypher",
+          "text": "CREATE (n:Person {name: $name})",
+          "params": {"name": "Alice"}
+        }
+      },
+      {
+        "op": "graph.query",
+        "args": {
+          "dialect": "cypher",
+          "text": "CREATE (n:Person {name: $name})",
+          "params": {"name": "Bob"}
+        }
+      }
+    ]
+  }
+}
+
+// graph.transaction example (per SCHEMA.md GraphTransactionSpec)
+{
+  "op": "graph.transaction",
+  "ctx": {
+    "request_id": "tx-req-903"
+  },
+  "args": {
+    "namespace": "neo4j",
+    "operations": [
+      {
+        "op": "graph.upsert_nodes",
+        "args": {
+          "dialect": "cypher",
+          "nodes": [{
+            "id": "person-3",
+            "labels": ["Person"],
+            "properties": {"name": "Charlie"}
+          }]
+        }
+      },
+      {
+        "op": "graph.upsert_edges",
+        "args": {
+          "dialect": "cypher",
+          "edges": [{
+            "id": "edge-2",
+            "src": "person-1",
+            "dst": "person-3",
+            "label": "KNOWS",
+            "properties": {"since": 2021}
+          }]
+        }
+      }
+    ]
+  }
+}
+
+// graph.health example
+{
+  "op": "graph.health",
+  "ctx": {
+    "request_id": "health-req-904"
+  },
+  "args": {}
 }
 ```
 
@@ -2145,56 +1439,64 @@ POST /v1/operations
 | `results[].stats` | `result.summary.stats` | Query statistics |
 | `errors` | Error envelope | Convert to CORPUS error |
 
-**Transaction Support:**
-```json
-// Neo4j transaction
-{
-  "statements": [...],
-  "commit": true
-}
+### 7.3 Amazon Neptune to CORPUS
 
-// CORPUS with transaction hint
-{
-  "op": "graph.query",
-  "ctx": {...},
-  "args": {...},
-  "extensions": {
-    "neo4j:transaction": {"commit": true}
-  }
-}
-```
+#### Request Mapping (Gremlin API)
+**Primary Source:** Amazon Neptune Gremlin REST API Documentation
+
+| Neptune Field | CORPUS Field | Type | Transformation |
+|--------------|--------------|------|----------------|
+| `gremlin` | `args.text` | string | Gremlin query |
+| `sparql` | `args.text` | string | SPARQL query |
+| `opencypher` | `args.text` | string | OpenCypher query |
+| Query type | `args.dialect` | string | `gremlin|sparql|opencypher` |
+| `profile` | `ctx.attrs.x-neptune-profile` | boolean | Namespaced in attrs |
+
+### 7.4 JanusGraph to CORPUS
+
+#### Request Mapping (Gremlin Server)
+**Status: Needs verification against JanusGraph Gremlin Server reference**
+
+| JanusGraph Field | CORPUS Field | Type | Transformation |
+|------------------|--------------|------|----------------|
+| `gremlin` | `args.text` | string | Gremlin query |
+| `bindings` | `args.params` | object | Query parameters |
+| Graph name | `args.namespace` | string | Graph namespace |
+| `language` | `ctx.attrs.x-janusgraph-language` | string | Namespaced in attrs |
+| `aliases` | `ctx.attrs.x-janusgraph-aliases` | object | Namespaced in attrs |
+| `session` | `ctx.attrs.x-janusgraph-session` | string | Namespaced in attrs |
+| `timeout` | `ctx.attrs.x-janusgraph-timeout` | integer | Namespaced in attrs |
+
+### 7.5 TigerGraph to CORPUS
+
+#### Request Mapping (RESTPP API)
+**Status: Needs verification against TigerGraph RESTPP documentation**
+
+| TigerGraph Field | CORPUS Field | Type | Transformation |
+|------------------|--------------|------|----------------|
+| `query` | `args.text` | string | GSQL query |
+| Graph name | `args.namespace` | string | Graph name |
+| `params` | `args.params` | object | Query parameters |
+| Query name in URL | `ctx.attrs.x-tigergraph-query_name` | string | Namespaced in attrs |
+
+### 7.6 ArangoDB to CORPUS
+
+#### Request Mapping (AQL Cursor API)
+**Status: Needs verification against ArangoDB HTTP API cursor reference**
+
+| ArangoDB Field | CORPUS Field | Type | Transformation |
+|----------------|--------------|------|----------------|
+| `query` | `args.text` | string | AQL query |
+| `bindVars` | `args.params` | object | Query parameters |
+| Database name | `args.namespace` | string | Database name |
+| `count` | `args.include_count` | boolean | Include count in result |
+| `batchSize` | `ctx.attrs.x-arangodb-batch_size` | integer | Namespaced in attrs |
+| `ttl` | `ctx.attrs.x-arangodb-ttl` | number | Namespaced in attrs |
+| `options` | `ctx.attrs.x-arangodb-options` | object | Namespaced in attrs |
 
 ---
 
-### Quick Summary of Remaining Graph Migrations:
-
-**7.2 Amazon Neptune:**
-- **Gremlin queries**: `args.dialect = "gremlin"`
-- **SPARQL queries**: `args.dialect = "sparql"`
-- **OpenCypher**: `args.dialect = "opencypher"`
-- **Batch operations**: Neptune batch → CORPUS `graph.batch`
-
-**7.3 JanusGraph:**
-- **Gremlin focus**: Similar to Neptune
-- **Schema operations**: `graph.get_schema`
-- **Transaction management**: Via extensions
-- **Index management**: Via `extensions.janusgraph:index_ops`
-
-**7.4 TigerGraph:**
-- **GSQL queries**: `args.dialect = "gsql"`
-- **Built-in algorithms**: Via extensions
-- **Graph analytics**: `extensions.tigergraph:algorithm`
-- **REST endpoints**: Map to CORPUS operations
-
-**7.5 ArangoDB:**
-- **AQL queries**: `args.dialect = "aql"`
-- **Graph traversals**: Special AQL functions
-- **Multi-model**: Document + graph support
-- **Foxx services**: Map to custom operations
-
----
-
-## 8. ⚡ Error Code Mapping
+## 8. Error Code Mapping
 
 ### Cross-Provider Error Translation
 | Provider Error Pattern | CORPUS Error Code | HTTP Code | Retry Strategy |
@@ -2217,7 +1519,7 @@ POST /v1/operations
 
 ---
 
-## 9. 🔗 Context Propagation
+## 9. Context Propagation
 
 ### Standard Context Fields
 | Provider Context | CORPUS `ctx` Field | Example |
@@ -2227,42 +1529,37 @@ POST /v1/operations
 | Deadline header | `deadline_ms` | Absolute epoch ms |
 | `traceparent` | `traceparent` | W3C Trace Context |
 | Tenant header | `tenant` | Hashed in metrics |
-| User context | `attrs.user` | User ID or context |
+| User context | `ctx.attrs` | Namespaced vendor attrs |
 
 ### Provider-Specific Context Mapping
 **AWS**: `X-Amzn-Trace-Id` → `traceparent`
 **Google Cloud**: `X-Cloud-Trace-Context` → `traceparent`
 **Azure**: `traceparent` header (W3C standard)
-**Custom headers**: Map to `ctx.attrs`
+**Custom headers**: Map to `ctx.attrs` with `x-` prefix
 
 ---
 
-## 10. ✅ Migration Validation Checklist
+## 10. Migration Validation Checklist
 
 ### Pre-Migration Checks
 - [ ] Provider API documentation reviewed
-- [ ] CORPUS protocol specification understood
-- [ ] Schema validation infrastructure ready
+- [ ] CORPUS protocol specification (PROTOCOLS.md) understood
+- [ ] CORPUS schema (SCHEMA.md) reviewed for field requirements
 - [ ] Test environment configured
 
 ### Wire Transformation Tests
-- [ ] Request envelope transformation validated
-- [ ] Response envelope transformation validated
+- [ ] Request envelope transformation validated (exactly {op, ctx, args})
+- [ ] Response envelope transformation validated (closed envelopes)
 - [ ] Error mapping tested with all provider errors
 - [ ] Context propagation verified
-- [ ] Streaming support validated (if applicable)
+- [ ] Streaming support validated with `code: "STREAMING"`
 
 ### Schema Compliance
-- [ ] All requests validate against CORPUS schemas
-- [ ] All responses validate against CORPUS schemas
-- [ ] Golden test fixtures created and validated
-- [ ] Edge cases tested (empty arrays, null values, etc.)
-
-### Performance Validation
-- [ ] Latency within acceptable bounds
-- [ ] Memory usage monitored
-- [ ] Throughput meets requirements
-- [ ] Error recovery tested
+- [ ] All requests validate against CORPUS request schema
+- [ ] All responses validate against CORPUS response/error schemas
+- [ ] Streaming frames use closed envelope with `chunk` field only
+- [ ] Filter expressions use operator-object form (not field__gte)
+- [ ] Vendor extensions use `x-` prefix in `ctx.attrs`
 
 ### Production Readiness
 - [ ] Observability integrated (metrics, logs, traces)
@@ -2272,28 +1569,37 @@ POST /v1/operations
 
 ---
 
-## 11. 📚 References
+## 11. References
 
 ### CORPUS Documentation
-- **PROTOCOLS.md**: Wire format specification
-- **SCHEMA.md**: JSON Schema definitions
-- **SPECIFICATION.md**: Architecture and design
-- **ERRORS.md**: Error taxonomy and handling
-- **METRICS.md**: Observability requirements
+- **PROTOCOLS.md**: Wire format specification and operation semantics
+- **SCHEMA.md**: JSON Schema definitions and envelope closure rules
+- **ERRORS.md**: Error taxonomy and handling guidelines
 
 ### Provider Documentation
-- **OpenAI API Reference**: https://platform.openai.com/docs/api-reference
-- **Anthropic Messages API**: https://docs.anthropic.com/claude/reference/messages_post
+- **OpenAI API Reference**: https://platform.openai.com/docs/api-reference/chat
+- **OpenAI Embeddings API**: https://platform.openai.com/docs/api-reference/embeddings
+- **Azure OpenAI Reference**: https://learn.microsoft.com/en-us/azure/ai-foundry/openai/reference?view=foundry-classic
 - **Pinecone API**: https://docs.pinecone.io/reference/api/overview
-- **Qdrant API**: https://qdrant.tech/documentation/
-- **Neo4j HTTP API**: https://neo4j.com/docs/http-api/current/
+- **Qdrant Search Points**: Qdrant documentation
+- **Weaviate GraphQL**: Weaviate documentation
+- **Anthropic Messages API**: Anthropic documentation
 
-### Tools & Libraries
-- **JSON Schema Validator**: For schema validation
-- **OpenAPI/Swagger**: For provider API documentation
-- **Golden Test Framework**: For migration validation
-- **Protocol Buffers**: For future gRPC support
+### Standards
+- **W3C Trace Context**: https://www.w3.org/TR/trace-context/
+- **JSON Schema**: https://json-schema.org/
 
 ---
 
-*Migration Reference Guide v1.0 - Complete*
+### Testing Considerations
+When implementing migrations based on this guide:
+1. Validate against SCHEMA.md for all envelope structures
+2. Test streaming termination conditions (final chunk or error)
+3. Verify filter expressions use correct operator-object syntax
+4. Ensure vendor extensions don't leak into response envelopes
+5. Verify operation arguments match PROTOCOLS.md specifications
+6. For sections marked "Needs verification", confirm with current provider documentation
+
+---
+
+*CORPUS Protocol Suite Migration Reference Guide v1.0*
