@@ -14,6 +14,11 @@ Covers schema-only quality gates without requiring golden fixtures, and MUST CON
   - Common envelopes (common/envelope.*.json) are normative for required/additionalProperties.
   - Protocol envelopes should allOf/$ref the corresponding common envelope.
   - Do NOT require envelopes to declare protocol/component/schema_version fields (SCHEMA.md does not define them on envelopes).
+- Additional SCHEMA.md-aligned invariants for *common* envelopes:
+  - common/envelope.success.json: ok.const == true, code.const == "OK"
+  - common/envelope.error.json: ok.const == false, code.pattern == "^[A-Z_]+$"
+  - common/envelope.stream.success.json: code.const == "STREAMING"
+  - common/envelope.request.json: properties.ctx is a $ref to common/operation_context.json
 - If a schema provides "examples", each example validates against the schema
 
 This file intentionally does not validate payloads; golden tests cover that.
@@ -24,7 +29,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Dict, List, Set, Tuple, Any, Iterable
+from typing import Any, Dict, Iterable, List, Set, Tuple
 
 import pytest
 
@@ -60,7 +65,7 @@ SCHEMA_ID_BASE = "https://corpusos.com/schemas"
 ID_ALLOWED = re.compile(r"^[A-Za-z0-9._~:/#-]+$")  # permissive but disallows spaces, etc.
 PATTERN_CACHE: Dict[str, re.Pattern] = {}
 
-# Enhanced constants (guardrails; SCHEMA.md does not define these, but they are safe lint-only checks)
+# Lint-only guardrails (SCHEMA.md does not mandate these, but they are safe for hygiene checks)
 SUPPORTED_PROTOCOLS = {"llm/v1.0", "vector/v1.0", "embedding/v1.0", "graph/v1.0"}
 MAX_SCHEMA_SIZE_BYTES = 1 * 1024 * 1024  # 1MB per schema
 MAX_DEFS_COUNT = 50  # Maximum number of definitions per schema
@@ -274,6 +279,15 @@ def _allof_refs(schema: dict) -> List[str]:
         if isinstance(entry, dict) and isinstance(entry.get("$ref"), str):
             refs.append(entry["$ref"])
     return refs
+
+
+def _prop(schema: dict, name: str) -> dict | None:
+    """Convenience: return schema['properties'][name] if it's a dict."""
+    props = schema.get("properties")
+    if not isinstance(props, dict):
+        return None
+    v = props.get(name)
+    return v if isinstance(v, dict) else None
 
 
 # --------------------------------------------------------------------------------------
@@ -495,16 +509,22 @@ def test_defs_size_limits():
 
 
 # --------------------------------------------------------------------------------------
-# Test 6: Envelope role sanity (SCHEMA.md-conformant) + optional protocol const hygiene
+# Test 6: Envelope role sanity (SCHEMA.md-conformant) + common-envelope invariants
 # --------------------------------------------------------------------------------------
 
-def test_envelope_role_sanity():
+def test_envelope_role_sanity_and_common_invariants():
     """
     Test envelope schema conventions per SCHEMA.md.
 
     Key rule: common/* envelopes are normative for required/additionalProperties.
     Protocol envelopes typically inherit via allOf + $ref to common envelopes.
     This lint MUST NOT require duplicated 'required' on inheriting envelopes.
+
+    Also enforces additional SCHEMA.md-aligned invariants on common envelopes:
+      - success: ok.const==true, code.const=="OK"
+      - error: ok.const==false, code.pattern=="^[A-Z_]+$"
+      - stream success: code.const=="STREAMING"
+      - request: ctx is a $ref to common/operation_context.json
     """
     problems: List[str] = []
 
@@ -512,6 +532,7 @@ def test_envelope_role_sanity():
     common_success_id = f"{SCHEMA_ID_BASE}/common/envelope.success.json"
     common_error_id = f"{SCHEMA_ID_BASE}/common/envelope.error.json"
     common_stream_id = f"{SCHEMA_ID_BASE}/common/envelope.stream.success.json"
+    operation_ctx_id = f"{SCHEMA_ID_BASE}/common/operation_context.json"
 
     for path in _iter_schema_files():
         schema = _load_json(path)
@@ -524,7 +545,6 @@ def test_envelope_role_sanity():
             or _is_envelope_error(fname)
             or _is_common_stream_envelope(fname)
         )
-
         if not is_env:
             continue
 
@@ -538,9 +558,15 @@ def test_envelope_role_sanity():
             for k in ("op", "ctx", "args"):
                 if k not in req:
                     problems.append(f"{path}: common request envelope must require {k}")
+
             # SCHEMA.md: request envelope allows additional properties (extensibility at boundary)
             if schema.get("additionalProperties") is not True:
                 problems.append(f"{path}: common request envelope additionalProperties must be true")
+
+            # SCHEMA.md-aligned invariant: ctx should $ref operation_context.json
+            ctx = _prop(schema, "ctx")
+            if not ctx or ctx.get("$ref") != operation_ctx_id:
+                problems.append(f"{path}: properties.ctx must be $ref {operation_ctx_id}")
 
         if comp == "common" and fname == "envelope.success.json":
             req = schema.get("required") or []
@@ -550,6 +576,14 @@ def test_envelope_role_sanity():
             if schema.get("additionalProperties") is not False:
                 problems.append(f"{path}: common success envelope additionalProperties must be false")
 
+            # SCHEMA.md-aligned invariants: ok const true; code const OK
+            ok = _prop(schema, "ok")
+            if not ok or ok.get("const") is not True:
+                problems.append(f"{path}: properties.ok must have const true")
+            code = _prop(schema, "code")
+            if not code or code.get("const") != "OK":
+                problems.append(f"{path}: properties.code must have const 'OK'")
+
         if comp == "common" and fname == "envelope.error.json":
             req = schema.get("required") or []
             for k in ("ok", "code", "error", "message", "retry_after_ms", "details", "ms"):
@@ -557,6 +591,14 @@ def test_envelope_role_sanity():
                     problems.append(f"{path}: common error envelope must require {k}")
             if schema.get("additionalProperties") is not False:
                 problems.append(f"{path}: common error envelope additionalProperties must be false")
+
+            # SCHEMA.md-aligned invariants: ok const false; code pattern canonical
+            ok = _prop(schema, "ok")
+            if not ok or ok.get("const") is not False:
+                problems.append(f"{path}: properties.ok must have const false")
+            code = _prop(schema, "code")
+            if not code or code.get("pattern") != "^[A-Z_]+$":
+                problems.append(f"{path}: properties.code must have pattern '^[A-Z_]+$'")
 
         if comp == "common" and fname == "envelope.stream.success.json":
             req = schema.get("required") or []
@@ -566,21 +608,23 @@ def test_envelope_role_sanity():
             if schema.get("additionalProperties") is not False:
                 problems.append(f"{path}: common stream success envelope additionalProperties must be false")
 
+            # SCHEMA.md-aligned invariant: code const STREAMING
+            code = _prop(schema, "code")
+            if not code or code.get("const") != "STREAMING":
+                problems.append(f"{path}: properties.code must have const 'STREAMING'")
+
         # ---- Protocol envelopes should allOf/$ref corresponding common envelope ----
         if comp in {"llm", "vector", "embedding", "graph"}:
             refs = _allof_refs(schema)
 
-            if fname.endswith(".envelope.request.json"):
-                if common_request_id not in refs:
-                    problems.append(f"{path}: protocol request envelope should allOf/$ref {common_request_id}")
+            if fname.endswith(".envelope.request.json") and common_request_id not in refs:
+                problems.append(f"{path}: protocol request envelope should allOf/$ref {common_request_id}")
 
-            if fname.endswith(".envelope.success.json"):
-                if common_success_id not in refs:
-                    problems.append(f"{path}: protocol success envelope should allOf/$ref {common_success_id}")
+            if fname.endswith(".envelope.success.json") and common_success_id not in refs:
+                problems.append(f"{path}: protocol success envelope should allOf/$ref {common_success_id}")
 
-            if fname.endswith(".envelope.error.json"):
-                if common_error_id not in refs:
-                    problems.append(f"{path}: protocol error envelope should allOf/$ref {common_error_id}")
+            if fname.endswith(".envelope.error.json") and common_error_id not in refs:
+                problems.append(f"{path}: protocol error envelope should allOf/$ref {common_error_id}")
 
             # Streaming operation success schemas: allOf/$ref common stream envelope
             # (They may not be named *.envelope.*, so we detect by reference)
@@ -602,10 +646,8 @@ def test_protocol_constants_match_component_when_present():
         if comp not in {"llm", "vector", "embedding", "graph"}:
             continue
 
-        props = schema.get("properties", {})
-        proto = props.get("protocol", {})
-
-        if not isinstance(proto, dict) or "const" not in proto:
+        proto = _prop(schema, "protocol")
+        if not proto or "const" not in proto:
             continue
 
         value = proto["const"]
