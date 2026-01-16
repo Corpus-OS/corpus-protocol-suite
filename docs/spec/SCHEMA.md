@@ -92,7 +92,7 @@ The Corpus Schema Reference provides the definitive JSON Schema definitions for 
 | **SPECIFICATION.md** | High-level architecture and design philosophy | Descriptive reference; may contain language-specific bindings |
 | **ERRORS.md** | Error taxonomy and normalization rules | Error envelope schemas must align with ERROR taxonomy |
 | **METRICS.md** | Observability requirements | Schema validation includes metrics field constraints |
-| **IMPLEMENTATION.md** | Implementation guidance | Provides implementation patterns for schema validation |
+| **IMPLEMENTATION.md** | Implementation guidance | Provides implementation patterns for Corpus SDK |
 
 ### 1.3 Schema Philosophy
 
