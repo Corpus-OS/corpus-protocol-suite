@@ -410,6 +410,9 @@ interface EmbeddingCountTokensSpec {
 - **Nullability:** Fields explicitly marked optional vs required
 - **String formats:** UUID, ISO8601, email where semantically meaningful
 - **Array bounds:** Minimum/maximum lengths specified per capability
+- **Type schemas are strict (`additionalProperties: false`) unless explicitly allowed.**
+- **Certain envelopes (e.g. request envelopes, `ctx`, health and capability results) and some args specs are intentionally permissive (`additionalProperties: true`) for forward-compatibility; core response envelopes (success, error, streaming) are closed.**
+
 
 ## 4. Protocol Overview
 
