@@ -446,6 +446,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
   "required": ["ok", "code", "error", "message", "retry_after_ms", "details", "ms"],
   "additionalProperties": false
 }
+
 ```
 
 ### Streaming Success Envelope (`common/envelope.stream.success.json`)
