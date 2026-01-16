@@ -1,4 +1,4 @@
-# CORPUS Schema Reference
+# CORPUS SCHEMA GUIDE
 
 **schema_version:** `1.0.0`  
 **protocols_version:** `1.0`  
