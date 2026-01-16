@@ -12,6 +12,12 @@ For operation semantics, lifecycle, and behavior, PROTOCOLS.md is normative.
 > **Schema Validation Convention:** All schemas use JSON Schema Draft 2020-12 with strict validation. Type definitions use `$defs` for reuse and `$id`-based resolution. Python, Go, etc. bindings are reference implementations.
 
 ---
+## Copyright Notice
+
+Copyright © 2026 Interoperable Intelligence Inc.
+SPDX-License-Identifier: Apache-2.0
+
+---
 
 ## Table of Contents
 - [1. Introduction](#1-introduction)
