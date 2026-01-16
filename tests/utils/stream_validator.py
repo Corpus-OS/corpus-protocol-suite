@@ -36,7 +36,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Optional
 
-from .schema_registry import assert_valid, SchemaRegistry
+from tests.utils.schema_registry import assert_valid, SchemaRegistry
 
 
 class StreamFormat(Enum):
