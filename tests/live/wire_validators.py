@@ -5,21 +5,29 @@ Wire-level validators for CORPUS Protocol conformance testing.
 This module provides validation logic for wire-level request envelopes:
 
   - Envelope structure validation (op, ctx, args)
-  - Context field validation (request_id, deadline_ms, tenant, etc.)
+  - Context field validation (OperationContext, aligned to SCHEMA.md)
   - JSON serialization round-trip validation
-  - Schema validation with version tolerance
-  - Operation-specific argument validators
+  - Strict JSON Schema validation (Draft 2020-12) with SCHEMA.md version tolerance
+  - Operation-specific argument validators (lightweight, schema-aligned checks)
+  - Coverage gates: ensure schema request-ops are covered by tests/live/wire_cases.py
 
 Separated from test execution to allow:
-  - Reuse in production code for request validation
+  - Reuse in production code for request validation (best-effort mode)
   - Unit testing of validators in isolation
   - Clear separation between "what to validate" and "how to validate"
 
-IMPORTANT: This module is the source of truth for validation semantics.
-When the protocol spec changes (e.g., new ctx fields, updated args constraints,
-new valid roles/priorities), this module must be updated to stay in sync.
-The constants and validators defined here should match the JSON Schema
-definitions in schemas/*.
+ALIGNMENT NOTE (SCHEMA.md)
+--------------------------
+SCHEMA.md is normative for field names, types, required/optional status, enums, and constraints.
+
+Key points implemented here:
+- common/envelope.request.json: requires op, ctx, args; additionalProperties: true
+- common/operation_context.json: all fields optional and nullable; additionalProperties: true
+- Type schemas often use additionalProperties: false; therefore STRICT conformance must run schema validation.
+- Version tolerance is normative: schema_id#version/<semver> fallback is implemented when enabled.
+
+Policy constraints (max sizes, “nice-to-have” semantics) are WARN-only by default so schema-valid payloads
+do not fail conformance unless explicitly enforced.
 """
 
 from __future__ import annotations
@@ -28,6 +36,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, FrozenSet, List, Optional, Tuple
@@ -45,37 +54,36 @@ CtxDict = Dict[str, Any]
 
 
 # ---------------------------------------------------------------------------
-# Constants
+# Constants (SCHEMA.md-aligned)
 # ---------------------------------------------------------------------------
 
-# Envelope structure
+# Envelope structure: common/envelope.request.json
 REQUIRED_ENVELOPE_KEYS: FrozenSet[str] = frozenset({"op", "ctx", "args"})
-REQUIRED_CTX_KEYS: FrozenSet[str] = frozenset({"request_id"})
-OPTIONAL_CTX_KEYS: FrozenSet[str] = frozenset({
-    "deadline_ms",
-    "tenant", 
-    "trace_id",
-    "span_id",
-    "priority",
-    "idempotency_key",
-})
 
-# Validation limits
-MAX_REQUEST_ID_LENGTH = 128
-MIN_REQUEST_ID_LENGTH = 1
-MAX_DEADLINE_MS = 3_600_000  # 1 hour
-MIN_DEADLINE_MS = 1
-MAX_TENANT_LENGTH = 256
+# OperationContext keys: common/operation_context.json (all optional, nullable)
+KNOWN_CTX_KEYS: FrozenSet[str] = frozenset(
+    {
+        "request_id",
+        "idempotency_key",
+        "deadline_ms",
+        "traceparent",
+        "tenant",
+        "attrs",
+    }
+)
 
-# Vector limits
-MAX_VECTOR_DIMENSIONS = 65536
-MIN_VECTOR_DIMENSIONS = 1
-MAX_TOP_K = 10_000
-MIN_TOP_K = 1
+# Policy limits (NOT schema-required). Must not reject schema-valid payloads unless enforced.
+POLICY_MAX_REQUEST_ID_LENGTH = 128
+POLICY_MIN_REQUEST_ID_LENGTH = 1
 
-# Batch limits
-MAX_BATCH_SIZE = 1000
-MAX_TEXT_LENGTH = 1_000_000  # ~1MB
+POLICY_MAX_VECTOR_DIMENSIONS = 10_000
+POLICY_MAX_TOP_K = 10_000
+POLICY_MAX_BATCH_SIZE = 1000
+POLICY_MAX_TEXT_LENGTH = 1_000_000  # ~1MB
+
+# SCHEMA.md version tolerance fragment format: "#version/<semver>"
+_VERSION_FRAGMENT_PREFIX = "version/"
+_SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
 
 
 # ---------------------------------------------------------------------------
@@ -84,29 +92,43 @@ MAX_TEXT_LENGTH = 1_000_000  # ~1MB
 
 @dataclass(frozen=True)
 class ValidatorConfig:
-    """Configuration for validation behavior."""
-    
+    """
+    Configuration for validation behavior.
+
+    enable_json_roundtrip:
+      - True: full JSON round-trip check (wire safety)
+      - False: quick JSON-serializability check only
+
+    schema_validation_mode:
+      - "strict": schema registry missing => FAIL (conformance posture)
+      - "best_effort": schema registry missing => WARN + continue (production reuse posture)
+
+    schema_version_tolerance:
+      - "strict": validate only primary schema_id
+      - "tolerant": try primary, then #version/<semver> variants (no extra warnings)
+      - "warn": same as tolerant but logs when fallback is used
+
+    policy_enforcement:
+      - "off": no policy checks
+      - "warn": warn-only (default) so schema-valid payloads pass
+      - "enforce": raise on policy violations
+    """
+
     enable_json_roundtrip: bool = True
-    schema_version_tolerance: str = "strict"  # strict | tolerant | warn
-    schema_base_url: str = "https://corpusos.com/schemas"
-    
+    schema_validation_mode: str = "strict"          # strict | best_effort
+    schema_version_tolerance: str = "strict"        # strict | tolerant | warn
+    policy_enforcement: str = "warn"                # off | warn | enforce
+
     @classmethod
     def from_env(cls) -> "ValidatorConfig":
-        """Create configuration from environment variables."""
         return cls(
-            enable_json_roundtrip=os.environ.get(
-                "CORPUS_VALIDATION_FULL", "true"
-            ).lower() == "true",
-            schema_version_tolerance=os.environ.get(
-                "CORPUS_SCHEMA_VERSION_TOLERANCE", "strict"
-            ),
-            schema_base_url=os.environ.get(
-                "CORPUS_SCHEMA_BASE_URL", "https://corpusos.com/schemas"
-            ),
+            enable_json_roundtrip=os.environ.get("CORPUS_VALIDATION_FULL", "true").lower() == "true",
+            schema_validation_mode=os.environ.get("CORPUS_SCHEMA_VALIDATION_MODE", "strict").lower(),
+            schema_version_tolerance=os.environ.get("CORPUS_SCHEMA_VERSION_TOLERANCE", "strict").lower(),
+            policy_enforcement=os.environ.get("CORPUS_POLICY_ENFORCEMENT", "warn").lower(),
         )
 
 
-# Global config instance
 CONFIG = ValidatorConfig.from_env()
 
 
@@ -116,7 +138,7 @@ CONFIG = ValidatorConfig.from_env()
 
 class ValidationError(Exception):
     """Base exception for validation failures."""
-    
+
     def __init__(
         self,
         message: str,
@@ -127,40 +149,64 @@ class ValidationError(Exception):
         self.case_id = case_id
         self.field = field
         self.details = details or {}
-        
+
         prefix = f"{case_id}: " if case_id else ""
         field_info = f" (field: {field})" if field else ""
         super().__init__(f"{prefix}{message}{field_info}")
 
 
 class EnvelopeShapeError(ValidationError):
-    """Envelope missing required structure."""
     pass
 
 
 class EnvelopeTypeError(ValidationError):
-    """Envelope field has wrong type."""
     pass
 
 
 class CtxValidationError(ValidationError):
-    """Context field validation failed."""
     pass
 
 
 class ArgsValidationError(ValidationError):
-    """Operation-specific args validation failed."""
     pass
 
 
 class SchemaValidationError(ValidationError):
-    """JSON Schema validation failed."""
     pass
 
 
 class SerializationError(ValidationError):
-    """JSON serialization/deserialization failed."""
     pass
+
+
+# ---------------------------------------------------------------------------
+# Helpers: Policy checks (warn-only by default)
+# ---------------------------------------------------------------------------
+
+def _policy_violation(
+    message: str,
+    *,
+    case_id: Optional[str],
+    field: Optional[str],
+    details: Optional[Dict[str, Any]] = None,
+) -> None:
+    """
+    Handle a policy violation according to CONFIG.policy_enforcement.
+
+    - off: do nothing
+    - warn: log warning
+    - enforce: raise ValidationError
+    """
+    mode = CONFIG.policy_enforcement
+    if mode == "off":
+        return
+    if mode == "warn":
+        logger.warning(f"{case_id + ': ' if case_id else ''}{message}" + (f" (field: {field})" if field else ""))
+        return
+    if mode == "enforce":
+        raise ValidationError(message, case_id=case_id, field=field, details=details or {})
+    # Unknown mode -> warn (fail-safe)
+    logger.warning(f"Unknown CORPUS_POLICY_ENFORCEMENT={mode!r}; treating as warn. {message}")
 
 
 # ---------------------------------------------------------------------------
@@ -170,11 +216,11 @@ class SerializationError(ValidationError):
 class SchemaValidationCache:
     """
     Thread-safe LRU cache for schema validation results.
-    
-    Caches validation results keyed by (schema_id, envelope_hash) to avoid
-    redundant validation of identical requests.
+
+    Caches results keyed by (schema_id, envelope_hash) to avoid redundant validation.
+    Note: schema_id may include fragments (e.g., #version/1.2.3).
     """
-    
+
     def __init__(self, max_size: int = 256) -> None:
         self._cache: Dict[str, bool] = {}
         self._access_order: List[str] = []
@@ -182,51 +228,56 @@ class SchemaValidationCache:
         self._lock = threading.RLock()
         self._hits = 0
         self._misses = 0
-    
+
     @staticmethod
     def _envelope_to_key(schema_id: str, envelope: EnvelopeDict) -> str:
-        """Convert envelope to stable cache key."""
-        canonical = json.dumps(envelope, sort_keys=True, separators=(",", ":"))
-        # Use 32 hex chars (128 bits) for negligible collision risk at scale
+        canonical = json.dumps(envelope, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         envelope_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
         return f"{schema_id}:{envelope_hash}"
-    
+
     def get(self, schema_id: str, envelope: EnvelopeDict) -> Optional[bool]:
-        """Get cached validation result."""
         key = self._envelope_to_key(schema_id, envelope)
         with self._lock:
             if key in self._cache:
-                self._access_order.remove(key)
+                # Refresh LRU
+                try:
+                    self._access_order.remove(key)
+                except ValueError:
+                    # Defensive: reconstruct if order drifted
+                    self._access_order = [k for k in self._access_order if k in self._cache]
                 self._access_order.append(key)
                 self._hits += 1
                 return self._cache[key]
             self._misses += 1
             return None
-    
+
     def set(self, schema_id: str, envelope: EnvelopeDict, valid: bool) -> None:
-        """Cache validation result."""
         key = self._envelope_to_key(schema_id, envelope)
         with self._lock:
             if key in self._cache:
-                self._access_order.remove(key)
+                try:
+                    self._access_order.remove(key)
+                except ValueError:
+                    pass
             elif len(self._cache) >= self._max_size:
-                oldest = self._access_order.pop(0)
-                del self._cache[oldest]
-            
+                # Evict oldest existing key
+                while self._access_order:
+                    oldest = self._access_order.pop(0)
+                    if oldest in self._cache:
+                        del self._cache[oldest]
+                        break
             self._cache[key] = valid
             self._access_order.append(key)
-    
+
     def clear(self) -> None:
-        """Clear the cache."""
         with self._lock:
             self._cache.clear()
             self._access_order.clear()
             self._hits = 0
             self._misses = 0
-    
+
     @property
     def stats(self) -> Dict[str, Any]:
-        """Get cache statistics."""
         with self._lock:
             total = self._hits + self._misses
             return {
@@ -238,33 +289,23 @@ class SchemaValidationCache:
             }
 
 
-# Global cache instance
 _schema_cache = SchemaValidationCache()
 
 
 def get_schema_cache() -> SchemaValidationCache:
-    """Get the global schema validation cache."""
     return _schema_cache
 
 
 # ---------------------------------------------------------------------------
-# Envelope Structure Validation
+# Envelope Structure Validation (SCHEMA.md-aligned)
 # ---------------------------------------------------------------------------
 
-def validate_envelope_shape(
-    envelope: Any,
-    case_id: Optional[str] = None,
-) -> None:
+def validate_envelope_shape(envelope: Any, case_id: Optional[str] = None) -> None:
     """
-    Validate envelope has correct top-level structure.
-    
-    Args:
-        envelope: The envelope to validate.
-        case_id: Optional case ID for error messages.
-    
-    Raises:
-        EnvelopeShapeError: If envelope structure is invalid.
-        EnvelopeTypeError: If envelope is wrong type.
+    Validate envelope has correct top-level structure per common/envelope.request.json.
+
+    Requires: op, ctx, args
+    Types: envelope dict; ctx dict; args dict
     """
     if not isinstance(envelope, dict):
         raise EnvelopeTypeError(
@@ -272,7 +313,7 @@ def validate_envelope_shape(
             case_id=case_id,
             details={"actual_type": type(envelope).__name__},
         )
-    
+
     missing = REQUIRED_ENVELOPE_KEYS - set(envelope.keys())
     if missing:
         raise EnvelopeShapeError(
@@ -280,38 +321,41 @@ def validate_envelope_shape(
             case_id=case_id,
             details={"missing": sorted(missing), "present": sorted(envelope.keys())},
         )
-    
+
+    # ctx + args must be objects on the wire
+    if not isinstance(envelope.get("ctx"), dict):
+        raise EnvelopeTypeError(
+            f"'ctx' must be object, got {type(envelope.get('ctx')).__name__}",
+            case_id=case_id,
+            field="ctx",
+        )
+    if not isinstance(envelope.get("args"), dict):
+        raise EnvelopeTypeError(
+            f"'args' must be object, got {type(envelope.get('args')).__name__}",
+            case_id=case_id,
+            field="args",
+        )
+
+    # Request envelope allows additionalProperties:true (extra keys are permitted)
     extra = set(envelope.keys()) - REQUIRED_ENVELOPE_KEYS
     if extra:
-        logger.debug(f"Envelope has extra top-level keys: {sorted(extra)}")
+        logger.debug(f"Envelope has extra top-level keys (allowed): {sorted(extra)}")
 
 
-def validate_op_field(
-    envelope: EnvelopeDict,
-    expected_op: str,
-    case_id: Optional[str] = None,
-) -> None:
+def validate_op_field(envelope: EnvelopeDict, expected_op: str, case_id: Optional[str] = None) -> None:
     """
     Validate 'op' field matches expected operation.
-    
-    Args:
-        envelope: The envelope to validate.
-        expected_op: Expected operation name.
-        case_id: Optional case ID for error messages.
-    
-    Raises:
-        EnvelopeTypeError: If op is not a string.
-        ValidationError: If op doesn't match expected.
+
+    Note: common/envelope.request.json only enforces string; op-specific request schemas enforce const.
+    This equality check enforces operation conformance.
     """
     op = envelope["op"]
-    
     if not isinstance(op, str):
         raise EnvelopeTypeError(
             f"'op' must be string, got {type(op).__name__}",
             case_id=case_id,
             field="op",
         )
-    
     if op != expected_op:
         raise ValidationError(
             f"Operation mismatch: expected '{expected_op}', got '{op}'",
@@ -321,167 +365,107 @@ def validate_op_field(
         )
 
 
-def validate_ctx_field(
-    envelope: EnvelopeDict,
-    case_id: Optional[str] = None,
-) -> None:
+def validate_ctx_field(envelope: EnvelopeDict, case_id: Optional[str] = None) -> None:
     """
-    Validate 'ctx' field structure and contents.
-    
-    Args:
-        envelope: The envelope to validate.
-        case_id: Optional case ID for error messages.
-    
-    Raises:
-        EnvelopeTypeError: If ctx or fields have wrong type.
-        CtxValidationError: If ctx field values are invalid.
+    Validate 'ctx' per SCHEMA.md common/operation_context.json.
+
+    All fields are optional and nullable:
+      - request_id: string|null
+      - idempotency_key: string|null
+      - deadline_ms: integer|null, minimum 0
+      - traceparent: string|null
+      - tenant: string|null
+      - attrs: object|null (additionalProperties: true)
+
+    Unknown ctx keys are permitted (additionalProperties: true).
     """
     ctx = envelope["ctx"]
-    
     if not isinstance(ctx, dict):
         raise EnvelopeTypeError(
             f"'ctx' must be object, got {type(ctx).__name__}",
             case_id=case_id,
             field="ctx",
         )
-    
-    # Required: request_id
-    _validate_request_id(ctx, case_id)
-    
-    # Optional fields
+
+    # request_id: string|null (optional)
+    if "request_id" in ctx:
+        _validate_optional_string(ctx.get("request_id"), "ctx.request_id", case_id)
+        rid = ctx.get("request_id")
+        if isinstance(rid, str):
+            if len(rid) < POLICY_MIN_REQUEST_ID_LENGTH:
+                _policy_violation(
+                    f"'ctx.request_id' length below policy minimum {POLICY_MIN_REQUEST_ID_LENGTH} (got {len(rid)})",
+                    case_id=case_id,
+                    field="ctx.request_id",
+                    details={"length": len(rid)},
+                )
+            if len(rid) > POLICY_MAX_REQUEST_ID_LENGTH:
+                _policy_violation(
+                    f"'ctx.request_id' length exceeds policy maximum {POLICY_MAX_REQUEST_ID_LENGTH} (got {len(rid)})",
+                    case_id=case_id,
+                    field="ctx.request_id",
+                    details={"length": len(rid)},
+                )
+
+    # idempotency_key: string|null (optional)
+    if "idempotency_key" in ctx:
+        _validate_optional_string(ctx.get("idempotency_key"), "ctx.idempotency_key", case_id)
+
+    # deadline_ms: integer|null, minimum 0 (optional)
     if "deadline_ms" in ctx:
-        _validate_deadline_ms(ctx["deadline_ms"], case_id)
-    
-    if "tenant" in ctx and ctx["tenant"] is not None:
-        _validate_tenant(ctx["tenant"], case_id)
-    
-    if "trace_id" in ctx and ctx["trace_id"] is not None:
-        _validate_string_field(ctx["trace_id"], "ctx.trace_id", case_id)
-    
-    if "span_id" in ctx and ctx["span_id"] is not None:
-        _validate_string_field(ctx["span_id"], "ctx.span_id", case_id)
-    
-    if "priority" in ctx and ctx["priority"] is not None:
-        _validate_priority(ctx["priority"], case_id)
-    
-    if "idempotency_key" in ctx and ctx["idempotency_key"] is not None:
-        _validate_string_field(ctx["idempotency_key"], "ctx.idempotency_key", case_id)
-    
-    # Warn on unknown fields
-    known = REQUIRED_CTX_KEYS | OPTIONAL_CTX_KEYS
-    unknown = set(ctx.keys()) - known
+        deadline = ctx.get("deadline_ms")
+        if deadline is not None and not isinstance(deadline, int):
+            raise EnvelopeTypeError(
+                f"'ctx.deadline_ms' must be integer|null, got {type(deadline).__name__}",
+                case_id=case_id,
+                field="ctx.deadline_ms",
+            )
+        if isinstance(deadline, int) and deadline < 0:
+            raise CtxValidationError(
+                "'ctx.deadline_ms' must be >= 0",
+                case_id=case_id,
+                field="ctx.deadline_ms",
+                details={"value": deadline},
+            )
+
+    # traceparent: string|null (optional)
+    if "traceparent" in ctx:
+        _validate_optional_string(ctx.get("traceparent"), "ctx.traceparent", case_id)
+
+    # tenant: string|null (optional)
+    if "tenant" in ctx:
+        _validate_optional_string(ctx.get("tenant"), "ctx.tenant", case_id)
+
+    # attrs: object|null (optional)
+    if "attrs" in ctx:
+        attrs = ctx.get("attrs")
+        if attrs is not None and not isinstance(attrs, dict):
+            raise EnvelopeTypeError(
+                f"'ctx.attrs' must be object|null, got {type(attrs).__name__}",
+                case_id=case_id,
+                field="ctx.attrs",
+            )
+
+    unknown = set(ctx.keys()) - KNOWN_CTX_KEYS
     if unknown:
-        logger.debug(f"ctx has extension fields: {sorted(unknown)}")
+        logger.debug(f"ctx has extension fields (allowed): {sorted(unknown)}")
 
 
-def _validate_request_id(ctx: CtxDict, case_id: Optional[str]) -> None:
-    """Validate request_id field."""
-    if "request_id" not in ctx:
-        raise CtxValidationError(
-            "'ctx.request_id' is required",
-            case_id=case_id,
-            field="ctx.request_id",
-        )
-    
-    request_id = ctx["request_id"]
-    
-    if not isinstance(request_id, str):
-        raise EnvelopeTypeError(
-            f"'ctx.request_id' must be string, got {type(request_id).__name__}",
-            case_id=case_id,
-            field="ctx.request_id",
-        )
-    
-    if not (MIN_REQUEST_ID_LENGTH <= len(request_id) <= MAX_REQUEST_ID_LENGTH):
-        raise CtxValidationError(
-            f"'ctx.request_id' length must be {MIN_REQUEST_ID_LENGTH}-{MAX_REQUEST_ID_LENGTH}, "
-            f"got {len(request_id)}",
-            case_id=case_id,
-            field="ctx.request_id",
-            details={"length": len(request_id)},
-        )
-
-
-def _validate_deadline_ms(deadline: Any, case_id: Optional[str]) -> None:
-    """Validate deadline_ms field."""
-    if not isinstance(deadline, int):
-        raise EnvelopeTypeError(
-            f"'ctx.deadline_ms' must be integer, got {type(deadline).__name__}",
-            case_id=case_id,
-            field="ctx.deadline_ms",
-        )
-    
-    if not (MIN_DEADLINE_MS <= deadline <= MAX_DEADLINE_MS):
-        raise CtxValidationError(
-            f"'ctx.deadline_ms' must be {MIN_DEADLINE_MS}-{MAX_DEADLINE_MS}, got {deadline}",
-            case_id=case_id,
-            field="ctx.deadline_ms",
-            details={"value": deadline},
-        )
-
-
-def _validate_tenant(tenant: Any, case_id: Optional[str]) -> None:
-    """Validate tenant field."""
-    if not isinstance(tenant, str):
-        raise EnvelopeTypeError(
-            f"'ctx.tenant' must be string, got {type(tenant).__name__}",
-            case_id=case_id,
-            field="ctx.tenant",
-        )
-    
-    if len(tenant) > MAX_TENANT_LENGTH:
-        raise CtxValidationError(
-            f"'ctx.tenant' length must be <= {MAX_TENANT_LENGTH}, got {len(tenant)}",
-            case_id=case_id,
-            field="ctx.tenant",
-        )
-
-
-def _validate_priority(priority: Any, case_id: Optional[str]) -> None:
-    """Validate priority field."""
-    valid_priorities = {"low", "normal", "high", "critical"}
-    
-    if not isinstance(priority, str):
-        raise EnvelopeTypeError(
-            f"'ctx.priority' must be string, got {type(priority).__name__}",
-            case_id=case_id,
-            field="ctx.priority",
-        )
-    
-    if priority not in valid_priorities:
-        raise CtxValidationError(
-            f"'ctx.priority' must be one of {sorted(valid_priorities)}, got '{priority}'",
-            case_id=case_id,
-            field="ctx.priority",
-        )
-
-
-def _validate_string_field(value: Any, field_name: str, case_id: Optional[str]) -> None:
-    """Validate a generic string field."""
+def _validate_optional_string(value: Any, field_name: str, case_id: Optional[str]) -> None:
+    """Validate string|null."""
+    if value is None:
+        return
     if not isinstance(value, str):
         raise EnvelopeTypeError(
-            f"'{field_name}' must be string, got {type(value).__name__}",
+            f"'{field_name}' must be string|null, got {type(value).__name__}",
             case_id=case_id,
             field=field_name,
         )
 
 
-def validate_args_field(
-    envelope: EnvelopeDict,
-    case_id: Optional[str] = None,
-) -> None:
-    """
-    Validate 'args' field is an object.
-    
-    Args:
-        envelope: The envelope to validate.
-        case_id: Optional case ID for error messages.
-    
-    Raises:
-        EnvelopeTypeError: If args is not a dict.
-    """
+def validate_args_field(envelope: EnvelopeDict, case_id: Optional[str] = None) -> None:
+    """Validate args is an object."""
     args = envelope["args"]
-    
     if not isinstance(args, dict):
         raise EnvelopeTypeError(
             f"'args' must be object, got {type(args).__name__}",
@@ -490,22 +474,8 @@ def validate_args_field(
         )
 
 
-def validate_envelope_common(
-    envelope: EnvelopeDict,
-    expected_op: str,
-    case_id: Optional[str] = None,
-) -> None:
-    """
-    Run all common envelope validations.
-    
-    Args:
-        envelope: The envelope to validate.
-        expected_op: Expected operation name.
-        case_id: Optional case ID for error messages.
-    
-    Raises:
-        ValidationError: If any validation fails.
-    """
+def validate_envelope_common(envelope: EnvelopeDict, expected_op: str, case_id: Optional[str] = None) -> None:
+    """Run common envelope validations (shape + op conformance + ctx types + args type)."""
     validate_envelope_shape(envelope, case_id)
     validate_op_field(envelope, expected_op, case_id)
     validate_ctx_field(envelope, case_id)
@@ -516,32 +486,13 @@ def validate_envelope_common(
 # JSON Round-Trip Validation
 # ---------------------------------------------------------------------------
 
-def json_roundtrip(
-    envelope: EnvelopeDict,
-    case_id: Optional[str] = None,
-    skip_if_disabled: bool = True,
-) -> EnvelopeDict:
+def json_roundtrip(envelope: EnvelopeDict, case_id: Optional[str] = None, skip_if_disabled: bool = True) -> EnvelopeDict:
     """
     Force JSON serialization round-trip to validate wire format.
-    
-    This catches:
-      - Non-serializable types (datetime, Decimal, custom classes)
-      - Hidden encoding issues
-      - Objects that serialize differently than expected
-    
-    Args:
-        envelope: The envelope to round-trip.
-        case_id: Optional case ID for error messages.
-        skip_if_disabled: If True, returns envelope unchanged when disabled.
-    
-    Returns:
-        The deserialized envelope.
-    
-    Raises:
-        SerializationError: If serialization or deserialization fails.
+
+    When disabled, still ensures serializability without a full decode/encode cycle.
     """
     if skip_if_disabled and not CONFIG.enable_json_roundtrip:
-        # Quick serializability check without full round-trip
         try:
             json.dumps(envelope, ensure_ascii=False)
             return envelope
@@ -551,22 +502,25 @@ def json_roundtrip(
                 case_id=case_id,
                 details={"error": str(e)},
             )
-    
+
     try:
-        payload = json.dumps(
-            envelope,
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
+        payload = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
     except (TypeError, ValueError) as e:
         raise SerializationError(
             f"JSON serialization failed: {e}",
             case_id=case_id,
             details={"error": str(e)},
         )
-    
+
     try:
-        return json.loads(payload)
+        roundtripped = json.loads(payload)
+        if not isinstance(roundtripped, dict):
+            raise SerializationError(
+                "JSON round-trip did not produce an object envelope",
+                case_id=case_id,
+                details={"actual_type": type(roundtripped).__name__},
+            )
+        return roundtripped
     except json.JSONDecodeError as e:
         raise SerializationError(
             f"JSON deserialization failed: {e}",
@@ -575,22 +529,8 @@ def json_roundtrip(
         )
 
 
-def assert_roundtrip_equality(
-    original: EnvelopeDict,
-    roundtripped: EnvelopeDict,
-    case_id: Optional[str] = None,
-) -> None:
-    """
-    Assert envelope wasn't mutated by serialization.
-    
-    Args:
-        original: Original envelope before round-trip.
-        roundtripped: Envelope after JSON round-trip.
-        case_id: Optional case ID for error messages.
-    
-    Raises:
-        SerializationError: If envelopes don't match.
-    """
+def assert_roundtrip_equality(original: EnvelopeDict, roundtripped: EnvelopeDict, case_id: Optional[str] = None) -> None:
+    """Assert envelope wasn't mutated by serialization."""
     if roundtripped != original:
         diff = _find_dict_diff(original, roundtripped)
         raise SerializationError(
@@ -600,18 +540,13 @@ def assert_roundtrip_equality(
         )
 
 
-def _find_dict_diff(
-    original: Dict[str, Any],
-    modified: Dict[str, Any],
-    path: str = "",
-) -> List[str]:
-    """Find differences between two dicts for debugging."""
-    diffs = []
+def _find_dict_diff(original: Dict[str, Any], modified: Dict[str, Any], path: str = "") -> List[str]:
+    diffs: List[str] = []
     all_keys = set(original.keys()) | set(modified.keys())
-    
+
     for key in sorted(all_keys):
         key_path = f"{path}.{key}" if path else key
-        
+
         if key not in original:
             diffs.append(f"Added: {key_path}")
         elif key not in modified:
@@ -623,13 +558,22 @@ def _find_dict_diff(
                 orig_type = type(original[key]).__name__
                 mod_type = type(modified[key]).__name__
                 diffs.append(f"Changed: {key_path} ({orig_type} -> {mod_type})")
-    
+
     return diffs
 
 
 # ---------------------------------------------------------------------------
-# Schema Validation
+# Schema Validation (STRICT conformance + SCHEMA.md version tolerance)
 # ---------------------------------------------------------------------------
+
+def _schema_registry_available() -> bool:
+    """Check if schema registry module can be imported."""
+    try:
+        import tests.utils.schema_registry  # noqa: F401
+        return True
+    except Exception:
+        return False
+
 
 def validate_against_schema(
     schema_id: str,
@@ -638,41 +582,41 @@ def validate_against_schema(
     use_cache: bool = True,
 ) -> None:
     """
-    Validate envelope against JSON Schema.
-    
-    Args:
-        schema_id: Schema $id URL.
-        envelope: Envelope to validate.
-        case_id: Optional case ID for error messages.
-        use_cache: Whether to use validation cache.
-    
-    Raises:
-        SchemaValidationError: If validation fails.
+    Validate envelope against JSON Schema using the schema registry.
+
+    Conformance posture:
+      - STRICT: missing registry => FAIL
+      - BEST_EFFORT: missing registry => WARN + continue
     """
-    # Check cache first
     if use_cache:
         cached = _schema_cache.get(schema_id, envelope)
         if cached is True:
             return
-        elif cached is False:
+        if cached is False:
             raise SchemaValidationError(
                 "Schema validation failed (cached)",
                 case_id=case_id,
                 details={"schema_id": schema_id},
             )
-    
-    # Perform validation
+
     try:
-        # Import here to avoid circular dependency and allow this module
-        # to be used without the schema registry
-        from tests.utils.schema_registry import assert_valid
+        from tests.utils.schema_registry import assert_valid  # type: ignore
+
         assert_valid(schema_id, envelope, context=f"wire:{case_id or 'unknown'}")
-        
         if use_cache:
             _schema_cache.set(schema_id, envelope, True)
-            
-    except ImportError:
-        logger.warning("Schema registry not available, skipping schema validation")
+
+    except ImportError as e:
+        # Registry missing: strict vs best_effort behavior
+        if CONFIG.schema_validation_mode == "strict":
+            raise SchemaValidationError(
+                "Schema registry not available in STRICT mode",
+                case_id=case_id,
+                details={"schema_id": schema_id, "import_error": str(e)},
+            ) from e
+        logger.warning("Schema registry not available; skipping schema validation (best_effort mode)")
+        return
+
     except Exception as e:
         if use_cache:
             _schema_cache.set(schema_id, envelope, False)
@@ -683,975 +627,459 @@ def validate_against_schema(
         )
 
 
+def _build_versioned_schema_id(base_schema_id: str, version: str) -> str:
+    """
+    Build SCHEMA.md version-tolerant schema id: <base>#version/<semver>.
+
+    Accepts:
+      - semver: "1.2.3" -> "#version/1.2.3"
+      - already-prefixed: "version/1.2.3" -> "#version/1.2.3"
+      - already-fragmented: "<base>#version/1.2.3" -> returned as-is
+    """
+    if "#" in base_schema_id:
+        # If caller already passed a fragment, do not rewrite the base.
+        # This keeps behavior explicit.
+        return base_schema_id
+
+    v = version.strip()
+    if v.startswith(_VERSION_FRAGMENT_PREFIX):
+        frag = v
+    else:
+        frag = f"{_VERSION_FRAGMENT_PREFIX}{v}"
+    return f"{base_schema_id}#{frag}"
+
+
 def validate_with_version_tolerance(
     envelope: EnvelopeDict,
     primary_schema_id: str,
-    schema_versions: Tuple[str, ...],
-    component: str,
+    accepted_versions: Tuple[str, ...],
     case_id: Optional[str] = None,
 ) -> None:
     """
-    Validate against schema with version fallback support.
-    
-    In strict mode, only validates against primary_schema_id.
-    In tolerant/warn mode, tries primary_schema_id first, then falls back
-    to version-derived URLs.
-    
-    Args:
-        envelope: Envelope to validate.
-        primary_schema_id: Primary schema URL (tried first in all modes).
-        schema_versions: Tuple of version strings for fallback URLs.
-        component: Component name for building versioned URLs.
-        case_id: Optional case ID for error messages.
-    
-    Raises:
-        SchemaValidationError: If all versions fail validation.
+    Validate against schema with SCHEMA.md version tolerance.
+
+    Modes:
+      - strict: validate only primary_schema_id
+      - tolerant: validate primary, then try primary#version/<semver> in order
+      - warn: same as tolerant + logs when fallback version succeeds
+
+    Notes:
+      - This relies on the schema registry/resolution layer supporting the SCHEMA.md
+        fragment convention (#version/<semver>).
+      - accepted_versions should be semver strings (e.g., "1.2.3") or "version/1.2.3".
     """
-    if CONFIG.schema_version_tolerance == "strict":
+    mode = CONFIG.schema_version_tolerance
+    if mode == "strict":
         validate_against_schema(primary_schema_id, envelope, case_id)
         return
-    
-    # Try primary schema first
-    errors = []
+
+    # Always try primary first
+    primary_error: Optional[SchemaValidationError] = None
     try:
         validate_against_schema(primary_schema_id, envelope, case_id)
         return
     except SchemaValidationError as e:
-        errors.append(("primary", str(e)))
-    
-    # Fall back to version-derived URLs
-    for version in schema_versions:
-        schema_id = f"{CONFIG.schema_base_url}/{component}/{version}/{component}.envelope.request.json"
-        
-        # Skip if this would be the same as primary (avoid duplicate attempt)
-        if schema_id == primary_schema_id:
+        primary_error = e
+
+    # If no accepted versions provided, fail with primary error
+    if not accepted_versions:
+        raise primary_error
+
+    # Try versioned schema ids in order
+    errors: List[Tuple[str, str]] = [("primary", str(primary_error))]
+    for ver in accepted_versions:
+        v = (ver or "").strip()
+        if not v:
             continue
-        
+
+        # Permit passing a fully-qualified schema_id directly (rare but explicit)
+        if v.startswith(("http://", "https://")):
+            candidate = v
+        else:
+            # Validate semver format when possible; if it doesn't match, still attempt (spec may allow)
+            if not v.startswith(_VERSION_FRAGMENT_PREFIX) and _SEMVER_RE.match(v) is None:
+                logger.debug(f"{case_id}: accepted_versions entry {v!r} is not strict semver; attempting anyway")
+            candidate = _build_versioned_schema_id(primary_schema_id, v)
+
         try:
-            validate_against_schema(schema_id, envelope, case_id)
-            if CONFIG.schema_version_tolerance == "warn":
-                logger.warning(f"{case_id}: Validated with fallback schema version {version}")
+            validate_against_schema(candidate, envelope, case_id)
+            if mode == "warn":
+                logger.warning(f"{case_id}: validated using SCHEMA.md version fallback {candidate}")
             return
         except SchemaValidationError as e:
-            errors.append((version, str(e)))
-    
+            errors.append((candidate, str(e)))
+
     raise SchemaValidationError(
-        f"Validation failed against primary schema and all fallback versions: {schema_versions}",
+        "Validation failed against primary schema and all SCHEMA.md version fallbacks",
         case_id=case_id,
-        details={"version_errors": errors},
+        details={"primary_schema_id": primary_schema_id, "accepted_versions": list(accepted_versions), "errors": errors},
     )
 
 
 # ---------------------------------------------------------------------------
-# Operation-Specific Args Validators
+# Operation-Specific Args Validators (schema-aligned, lightweight)
 # ---------------------------------------------------------------------------
 
-# Type alias for validator functions
 ArgsValidator = Callable[[ArgsDict, Optional[str]], None]
 
 
+# -------------------------- LLM -------------------------- #
+
 def validate_llm_complete_args(args: ArgsDict, case_id: Optional[str] = None) -> None:
-    """Validate llm.complete operation arguments."""
-    if "prompt" not in args and "messages" not in args:
-        raise ArgsValidationError(
-            "llm.complete requires 'prompt' or 'messages'",
-            case_id=case_id,
-            field="args",
-        )
-    
-    if "prompt" in args:
-        prompt = args["prompt"]
-        if not isinstance(prompt, str):
-            raise ArgsValidationError(
-                f"'args.prompt' must be string, got {type(prompt).__name__}",
-                case_id=case_id,
-                field="args.prompt",
-            )
-        if len(prompt) > MAX_TEXT_LENGTH:
-            raise ArgsValidationError(
-                f"'args.prompt' exceeds max length {MAX_TEXT_LENGTH}",
-                case_id=case_id,
-                field="args.prompt",
-            )
-    
-    if "max_tokens" in args:
-        _validate_positive_int(args["max_tokens"], "args.max_tokens", case_id)
-    
-    if "temperature" in args:
-        _validate_temperature(args["temperature"], case_id)
-    
-    if "stream" in args:
-        _validate_bool(args["stream"], "args.stream", case_id)
-    
-    if "stop" in args and args["stop"] is not None:
-        _validate_stop_sequences(args["stop"], case_id)
+    """
+    Lightweight checks aligned to SCHEMA.md llm.complete args shape.
 
-
-def validate_llm_chat_args(args: ArgsDict, case_id: Optional[str] = None) -> None:
-    """Validate llm.chat operation arguments."""
-    if "messages" not in args:
-        raise ArgsValidationError(
-            "llm.chat requires 'messages'",
-            case_id=case_id,
-            field="args.messages",
-        )
-    
+    Note: strictness (additionalProperties, nested type correctness, etc.) is enforced by schema validation.
+    """
+    _require_key(args, "messages", "args.messages", case_id)
     messages = args["messages"]
-    if not isinstance(messages, list):
-        raise ArgsValidationError(
-            f"'args.messages' must be array, got {type(messages).__name__}",
-            case_id=case_id,
-            field="args.messages",
-        )
-    
-    if len(messages) == 0:
-        raise ArgsValidationError(
-            "'args.messages' must not be empty",
-            case_id=case_id,
-            field="args.messages",
-        )
-    
+    if not isinstance(messages, list) or len(messages) < 1:
+        raise ArgsValidationError("'args.messages' must be a non-empty array", case_id=case_id, field="args.messages")
+
     for i, msg in enumerate(messages):
-        _validate_chat_message(msg, i, case_id)
-    
-    if "tools" in args and args["tools"] is not None:
-        _validate_tools(args["tools"], case_id)
-    
-    if "tool_choice" in args and args["tool_choice"] is not None:
-        _validate_tool_choice(args["tool_choice"], case_id)
-    
-    # Shared with llm.complete
-    if "max_tokens" in args:
-        _validate_positive_int(args["max_tokens"], "args.max_tokens", case_id)
-    
-    if "temperature" in args:
-        _validate_temperature(args["temperature"], case_id)
+        _validate_llm_message(msg, i, case_id)
 
+    if "max_tokens" in args and args["max_tokens"] is not None:
+        _validate_int_min(args["max_tokens"], 0, "args.max_tokens", case_id)
 
-def validate_llm_count_tokens_args(args: ArgsDict, case_id: Optional[str] = None) -> None:
-    """Validate llm.count_tokens operation arguments."""
-    if "text" not in args and "messages" not in args:
-        raise ArgsValidationError(
-            "llm.count_tokens requires 'text' or 'messages'",
-            case_id=case_id,
-            field="args",
-        )
-    
-    if "text" in args:
-        if not isinstance(args["text"], str):
-            raise ArgsValidationError(
-                f"'args.text' must be string, got {type(args['text']).__name__}",
-                case_id=case_id,
-                field="args.text",
-            )
+    if "temperature" in args and args["temperature"] is not None:
+        _validate_number_range(args["temperature"], 0.0, 2.0, "args.temperature", case_id)
 
+    if "stop_sequences" in args and args["stop_sequences"] is not None:
+        _validate_string_array(args["stop_sequences"], "args.stop_sequences", case_id)
 
-def validate_vector_query_args(args: ArgsDict, case_id: Optional[str] = None) -> None:
-    """Validate vector.query operation arguments."""
-    if "vector" not in args and "text" not in args:
-        raise ArgsValidationError(
-            "vector.query requires 'vector' or 'text'",
-            case_id=case_id,
-            field="args",
-        )
-    
-    if "vector" in args:
-        _validate_vector(args["vector"], "args.vector", case_id)
-    
-    if "text" in args:
-        if not isinstance(args["text"], str):
-            raise ArgsValidationError(
-                f"'args.text' must be string, got {type(args['text']).__name__}",
-                case_id=case_id,
-                field="args.text",
-            )
-    
-    if "top_k" in args:
-        top_k = args["top_k"]
-        if not isinstance(top_k, int) or not (MIN_TOP_K <= top_k <= MAX_TOP_K):
-            raise ArgsValidationError(
-                f"'args.top_k' must be integer in [{MIN_TOP_K}, {MAX_TOP_K}]",
-                case_id=case_id,
-                field="args.top_k",
-            )
-    
-    if "namespace" in args and args["namespace"] is not None:
-        if not isinstance(args["namespace"], str):
-            raise ArgsValidationError(
-                "'args.namespace' must be string",
-                case_id=case_id,
-                field="args.namespace",
-            )
-    
-    if "filter" in args and args["filter"] is not None:
-        if not isinstance(args["filter"], dict):
-            raise ArgsValidationError(
-                "'args.filter' must be object",
-                case_id=case_id,
-                field="args.filter",
-            )
-    
-    if "include_metadata" in args:
-        _validate_bool(args["include_metadata"], "args.include_metadata", case_id)
-    
-    if "include_values" in args:
-        _validate_bool(args["include_values"], "args.include_values", case_id)
-
-
-def validate_vector_upsert_args(args: ArgsDict, case_id: Optional[str] = None) -> None:
-    """Validate vector.upsert operation arguments."""
-    if "vectors" not in args:
-        raise ArgsValidationError(
-            "vector.upsert requires 'vectors'",
-            case_id=case_id,
-            field="args.vectors",
-        )
-    
-    vectors = args["vectors"]
-    if not isinstance(vectors, list):
-        raise ArgsValidationError(
-            f"'args.vectors' must be array, got {type(vectors).__name__}",
-            case_id=case_id,
-            field="args.vectors",
-        )
-    
-    if len(vectors) == 0:
-        raise ArgsValidationError(
-            "'args.vectors' must not be empty",
-            case_id=case_id,
-            field="args.vectors",
-        )
-    
-    if len(vectors) > MAX_BATCH_SIZE:
-        raise ArgsValidationError(
-            f"'args.vectors' exceeds max batch size {MAX_BATCH_SIZE}",
-            case_id=case_id,
-            field="args.vectors",
-        )
-    
-    expected_dims = None
-    for i, vec in enumerate(vectors):
-        dims = _validate_vector_record(vec, i, case_id)
-        if expected_dims is None:
-            expected_dims = dims
-        elif dims != expected_dims:
-            raise ArgsValidationError(
-                f"Dimension mismatch: vectors[0] has {expected_dims} dims, "
-                f"vectors[{i}] has {dims}",
-                case_id=case_id,
-                field=f"args.vectors[{i}].values",
-            )
-
-
-def validate_vector_delete_args(args: ArgsDict, case_id: Optional[str] = None) -> None:
-    """Validate vector.delete operation arguments."""
-    if "ids" not in args and "filter" not in args and "delete_all" not in args:
-        raise ArgsValidationError(
-            "vector.delete requires 'ids', 'filter', or 'delete_all'",
-            case_id=case_id,
-            field="args",
-        )
-    
-    if "ids" in args:
-        ids = args["ids"]
-        if not isinstance(ids, list):
-            raise ArgsValidationError(
-                "'args.ids' must be array",
-                case_id=case_id,
-                field="args.ids",
-            )
-        if not all(isinstance(id_, str) for id_ in ids):
-            raise ArgsValidationError(
-                "'args.ids' must contain only strings",
-                case_id=case_id,
-                field="args.ids",
-            )
-    
-    if "delete_all" in args:
-        _validate_bool(args["delete_all"], "args.delete_all", case_id)
-
-
-def validate_vector_fetch_args(args: ArgsDict, case_id: Optional[str] = None) -> None:
-    """Validate vector.fetch operation arguments."""
-    if "ids" not in args:
-        raise ArgsValidationError(
-            "vector.fetch requires 'ids'",
-            case_id=case_id,
-            field="args.ids",
-        )
-    
-    ids = args["ids"]
-    if not isinstance(ids, list):
-        raise ArgsValidationError(
-            "'args.ids' must be array",
-            case_id=case_id,
-            field="args.ids",
-        )
-    
-    if not all(isinstance(id_, str) for id_ in ids):
-        raise ArgsValidationError(
-            "'args.ids' must contain only strings",
-            case_id=case_id,
-            field="args.ids",
-        )
-
-
-def validate_embedding_embed_args(args: ArgsDict, case_id: Optional[str] = None) -> None:
-    """Validate embedding.embed operation arguments."""
-    if "text" not in args and "texts" not in args:
-        raise ArgsValidationError(
-            "embedding.embed requires 'text' or 'texts'",
-            case_id=case_id,
-            field="args",
-        )
-    
-    if "text" in args:
-        text = args["text"]
-        if not isinstance(text, str):
-            raise ArgsValidationError(
-                f"'args.text' must be string, got {type(text).__name__}",
-                case_id=case_id,
-                field="args.text",
-            )
-        if len(text) > MAX_TEXT_LENGTH:
-            raise ArgsValidationError(
-                f"'args.text' exceeds max length {MAX_TEXT_LENGTH}",
-                case_id=case_id,
-                field="args.text",
-            )
-    
-    if "texts" in args:
-        texts = args["texts"]
-        if not isinstance(texts, list):
-            raise ArgsValidationError(
-                f"'args.texts' must be array, got {type(texts).__name__}",
-                case_id=case_id,
-                field="args.texts",
-            )
-        if len(texts) > MAX_BATCH_SIZE:
-            raise ArgsValidationError(
-                f"'args.texts' exceeds max batch size {MAX_BATCH_SIZE}",
-                case_id=case_id,
-                field="args.texts",
-            )
-        for i, t in enumerate(texts):
-            if not isinstance(t, str):
-                raise ArgsValidationError(
-                    f"'args.texts[{i}]' must be string",
-                    case_id=case_id,
-                    field=f"args.texts[{i}]",
-                )
-    
-    if "dimensions" in args:
-        _validate_positive_int(args["dimensions"], "args.dimensions", case_id)
-    
-    if "model" in args and args["model"] is not None:
-        if not isinstance(args["model"], str):
-            raise ArgsValidationError(
-                "'args.model' must be string",
-                case_id=case_id,
-                field="args.model",
-            )
-
-
-def validate_graph_query_args(args: ArgsDict, case_id: Optional[str] = None) -> None:
-    """Validate graph.query operation arguments."""
-    if "query" not in args:
-        raise ArgsValidationError(
-            "graph.query requires 'query'",
-            case_id=case_id,
-            field="args.query",
-        )
-    
-    query = args["query"]
-    if not isinstance(query, str):
-        raise ArgsValidationError(
-            f"'args.query' must be string, got {type(query).__name__}",
-            case_id=case_id,
-            field="args.query",
-        )
-    
-    if "language" in args:
-        valid_languages = {"cypher", "gremlin", "sparql", "graphql"}
-        if args["language"] not in valid_languages:
-            raise ArgsValidationError(
-                f"'args.language' must be one of {sorted(valid_languages)}",
-                case_id=case_id,
-                field="args.language",
-            )
-    
-    if "parameters" in args and args["parameters"] is not None:
-        if not isinstance(args["parameters"], dict):
-            raise ArgsValidationError(
-                "'args.parameters' must be object",
-                case_id=case_id,
-                field="args.parameters",
-            )
-    
-    if "timeout_ms" in args:
-        _validate_positive_int(args["timeout_ms"], "args.timeout_ms", case_id)
-
-
-def validate_graph_mutate_args(args: ArgsDict, case_id: Optional[str] = None) -> None:
-    """Validate graph.mutate operation arguments."""
-    if "mutations" not in args:
-        raise ArgsValidationError(
-            "graph.mutate requires 'mutations'",
-            case_id=case_id,
-            field="args.mutations",
-        )
-    
-    mutations = args["mutations"]
-    if not isinstance(mutations, list):
-        raise ArgsValidationError(
-            f"'args.mutations' must be array, got {type(mutations).__name__}",
-            case_id=case_id,
-            field="args.mutations",
-        )
-    
-    valid_types = {
-        "create_node", "create_edge", 
-        "update_node", "update_edge",
-        "delete_node", "delete_edge",
-    }
-    
-    for i, mut in enumerate(mutations):
-        if not isinstance(mut, dict):
-            raise ArgsValidationError(
-                f"'args.mutations[{i}]' must be object",
-                case_id=case_id,
-                field=f"args.mutations[{i}]",
-            )
-        if "type" not in mut:
-            raise ArgsValidationError(
-                f"'args.mutations[{i}].type' is required",
-                case_id=case_id,
-                field=f"args.mutations[{i}].type",
-            )
-        if mut["type"] not in valid_types:
-            raise ArgsValidationError(
-                f"'args.mutations[{i}].type' must be one of {sorted(valid_types)}",
-                case_id=case_id,
-                field=f"args.mutations[{i}].type",
-            )
-
-
-def validate_graph_traverse_args(args: ArgsDict, case_id: Optional[str] = None) -> None:
-    """Validate graph.traverse operation arguments."""
-    if "start_node" not in args:
-        raise ArgsValidationError(
-            "graph.traverse requires 'start_node'",
-            case_id=case_id,
-            field="args.start_node",
-        )
-    
-    if "depth" in args:
-        depth = args["depth"]
-        if not isinstance(depth, int) or depth < 0:
-            raise ArgsValidationError(
-                "'args.depth' must be non-negative integer",
-                case_id=case_id,
-                field="args.depth",
-            )
-    
-    if "direction" in args:
-        valid_directions = {"outbound", "inbound", "both"}
-        if args["direction"] not in valid_directions:
-            raise ArgsValidationError(
-                f"'args.direction' must be one of {sorted(valid_directions)}",
-                case_id=case_id,
-                field="args.direction",
-            )
-    
-    if "edge_types" in args and args["edge_types"] is not None:
-        if not isinstance(args["edge_types"], list):
-            raise ArgsValidationError(
-                "'args.edge_types' must be array",
-                case_id=case_id,
-                field="args.edge_types",
-            )
+    _policy_check_large_strings(args, case_id)
 
 
 def validate_llm_stream_args(args: ArgsDict, case_id: Optional[str] = None) -> None:
-    """Validate llm.stream operation arguments."""
-    # Same validation as llm.complete
+    """llm.stream args match llm.complete shape; schema enforces op-specifics."""
     validate_llm_complete_args(args, case_id)
 
 
+def validate_llm_count_tokens_args(args: ArgsDict, case_id: Optional[str] = None) -> None:
+    _require_key(args, "text", "args.text", case_id)
+    _validate_string(args["text"], "args.text", case_id)
+    _policy_check_large_strings(args, case_id)
+
+
+# -------------------------- Vector -------------------------- #
+
+def validate_vector_query_args(args: ArgsDict, case_id: Optional[str] = None) -> None:
+    _require_key(args, "vector", "args.vector", case_id)
+    _require_key(args, "top_k", "args.top_k", case_id)
+
+    _validate_number_array(args["vector"], "args.vector", case_id, min_items=1)
+    _validate_int_min(args["top_k"], 1, "args.top_k", case_id)
+
+    if isinstance(args.get("top_k"), int) and args["top_k"] > POLICY_MAX_TOP_K:
+        _policy_violation(
+            f"'args.top_k' exceeds policy maximum {POLICY_MAX_TOP_K} (got {args['top_k']})",
+            case_id=case_id,
+            field="args.top_k",
+            details={"value": args["top_k"]},
+        )
+
+
+def validate_vector_batch_query_args(args: ArgsDict, case_id: Optional[str] = None) -> None:
+    _require_key(args, "queries", "args.queries", case_id)
+    queries = args["queries"]
+    if not isinstance(queries, list) or len(queries) < 1:
+        raise ArgsValidationError("'args.queries' must be non-empty array", case_id=case_id, field="args.queries")
+    for i, q in enumerate(queries):
+        if not isinstance(q, dict):
+            raise ArgsValidationError(f"'args.queries[{i}]' must be object", case_id=case_id, field=f"args.queries[{i}]")
+        validate_vector_query_args(q, case_id=case_id)
+
+
+def validate_vector_upsert_args(args: ArgsDict, case_id: Optional[str] = None) -> None:
+    _require_key(args, "vectors", "args.vectors", case_id)
+    vectors = args["vectors"]
+    if not isinstance(vectors, list) or len(vectors) < 1:
+        raise ArgsValidationError("'args.vectors' must be non-empty array", case_id=case_id, field="args.vectors")
+
+    if len(vectors) > POLICY_MAX_BATCH_SIZE:
+        _policy_violation(
+            f"'args.vectors' exceeds policy max batch size {POLICY_MAX_BATCH_SIZE} (got {len(vectors)})",
+            case_id=case_id,
+            field="args.vectors",
+            details={"count": len(vectors)},
+        )
+
+    # Dimension consistency is NOT schema-required (per SCHEMA.md). Keep as policy-gated.
+    ref_dim: Optional[int] = None
+
+    for i, vrec in enumerate(vectors):
+        if not isinstance(vrec, dict):
+            raise ArgsValidationError(f"'args.vectors[{i}]' must be object", case_id=case_id, field=f"args.vectors[{i}]")
+        _require_key(vrec, "id", f"args.vectors[{i}].id", case_id)
+        _require_key(vrec, "vector", f"args.vectors[{i}].vector", case_id)
+
+        _validate_nonempty_string(vrec["id"], f"args.vectors[{i}].id", case_id)
+        _validate_number_array(vrec["vector"], f"args.vectors[{i}].vector", case_id, min_items=1)
+
+        dim = len(vrec["vector"]) if isinstance(vrec["vector"], list) else None
+        if isinstance(dim, int):
+            if ref_dim is None:
+                ref_dim = dim
+            elif dim != ref_dim:
+                _policy_violation(
+                    f"Vector dimension mismatch in batch: expected {ref_dim}, got {dim}",
+                    case_id=case_id,
+                    field=f"args.vectors[{i}].vector",
+                    details={"expected": ref_dim, "actual": dim},
+                )
+
+    _policy_check_large_strings(args, case_id)
+
+
+def validate_vector_delete_args(args: ArgsDict, case_id: Optional[str] = None) -> None:
+    has_ids = "ids" in args
+    has_filter = "filter" in args
+    if not has_ids and not has_filter:
+        raise ArgsValidationError("vector.delete requires 'ids' or 'filter'", case_id=case_id, field="args")
+
+    if has_ids:
+        ids = args.get("ids")
+        if not isinstance(ids, list) or len(ids) < 1 or not all(isinstance(x, str) and x.strip() for x in ids):
+            raise ArgsValidationError("'args.ids' must be non-empty array of non-empty strings", case_id=case_id, field="args.ids")
+
+    if has_filter:
+        flt = args.get("filter")
+        if not isinstance(flt, dict) or len(flt) < 1:
+            raise ArgsValidationError("'args.filter' must be object with at least 1 key", case_id=case_id, field="args.filter")
+
+
 def validate_vector_namespace_args(args: ArgsDict, case_id: Optional[str] = None) -> None:
-    """Validate vector.create_namespace and vector.delete_namespace arguments."""
-    if "namespace" not in args:
+    _require_key(args, "namespace", "args.namespace", case_id)
+    _validate_nonempty_string(args["namespace"], "args.namespace", case_id)
+    if "dimensions" in args and args["dimensions"] is not None:
+        _validate_int_min(args["dimensions"], 1, "args.dimensions", case_id)
+
+
+# -------------------------- Embedding -------------------------- #
+
+def validate_embedding_embed_args(args: ArgsDict, case_id: Optional[str] = None) -> None:
+    _require_key(args, "text", "args.text", case_id)
+    _require_key(args, "model", "args.model", case_id)
+    _validate_nonempty_string(args["text"], "args.text", case_id)
+    _validate_nonempty_string(args["model"], "args.model", case_id)
+
+    # Unary embed: stream must be absent or false
+    if "stream" in args and args["stream"] is not False:
         raise ArgsValidationError(
-            "Namespace operation requires 'namespace'",
+            "embedding.embed must have stream absent or false (streaming uses embedding.stream_embed)",
             case_id=case_id,
-            field="args.namespace",
+            field="args.stream",
         )
-    
-    namespace = args["namespace"]
-    if not isinstance(namespace, str):
-        raise ArgsValidationError(
-            "'args.namespace' must be string",
-            case_id=case_id,
-            field="args.namespace",
-        )
-    
-    if not namespace:
-        raise ArgsValidationError(
-            "'args.namespace' must not be empty",
-            case_id=case_id,
-            field="args.namespace",
-        )
+    _policy_check_large_strings(args, case_id)
 
 
 def validate_embedding_embed_batch_args(args: ArgsDict, case_id: Optional[str] = None) -> None:
-    """Validate embedding.embed_batch operation arguments."""
-    if "texts" not in args:
-        raise ArgsValidationError(
-            "embedding.embed_batch requires 'texts'",
-            case_id=case_id,
-            field="args.texts",
-        )
-    
+    _require_key(args, "texts", "args.texts", case_id)
+    _require_key(args, "model", "args.model", case_id)
+
     texts = args["texts"]
-    if not isinstance(texts, list):
-        raise ArgsValidationError(
-            f"'args.texts' must be array, got {type(texts).__name__}",
+    if not isinstance(texts, list) or len(texts) < 1 or not all(isinstance(t, str) and t.strip() for t in texts):
+        raise ArgsValidationError("'args.texts' must be non-empty array of non-empty strings", case_id=case_id, field="args.texts")
+
+    if len(texts) > POLICY_MAX_BATCH_SIZE:
+        _policy_violation(
+            f"'args.texts' exceeds policy max batch size {POLICY_MAX_BATCH_SIZE} (got {len(texts)})",
             case_id=case_id,
             field="args.texts",
+            details={"count": len(texts)},
         )
-    
-    if len(texts) == 0:
-        raise ArgsValidationError(
-            "'args.texts' must not be empty",
-            case_id=case_id,
-            field="args.texts",
-        )
-    
-    if len(texts) > MAX_BATCH_SIZE:
-        raise ArgsValidationError(
-            f"'args.texts' exceeds max batch size {MAX_BATCH_SIZE}",
-            case_id=case_id,
-            field="args.texts",
-        )
-    
-    for i, t in enumerate(texts):
-        if not isinstance(t, str):
-            raise ArgsValidationError(
-                f"'args.texts[{i}]' must be string",
-                case_id=case_id,
-                field=f"args.texts[{i}]",
-            )
-    
-    if "model" in args and args["model"] is not None:
-        if not isinstance(args["model"], str):
-            raise ArgsValidationError(
-                "'args.model' must be string",
-                case_id=case_id,
-                field="args.model",
-            )
+
+    _validate_nonempty_string(args["model"], "args.model", case_id)
+    _policy_check_large_strings(args, case_id)
+
+
+def validate_embedding_stream_embed_args(args: ArgsDict, case_id: Optional[str] = None) -> None:
+    _require_key(args, "text", "args.text", case_id)
+    _require_key(args, "model", "args.model", case_id)
+    _validate_nonempty_string(args["text"], "args.text", case_id)
+    _validate_nonempty_string(args["model"], "args.model", case_id)
+    _policy_check_large_strings(args, case_id)
 
 
 def validate_embedding_count_tokens_args(args: ArgsDict, case_id: Optional[str] = None) -> None:
-    """Validate embedding.count_tokens operation arguments."""
-    if "text" not in args:
-        raise ArgsValidationError(
-            "embedding.count_tokens requires 'text'",
-            case_id=case_id,
-            field="args.text",
-        )
-    
-    text = args["text"]
-    if not isinstance(text, str):
-        raise ArgsValidationError(
-            f"'args.text' must be string, got {type(text).__name__}",
-            case_id=case_id,
-            field="args.text",
-        )
-    
-    if "model" in args and args["model"] is not None:
-        if not isinstance(args["model"], str):
-            raise ArgsValidationError(
-                "'args.model' must be string",
-                case_id=case_id,
-                field="args.model",
-            )
+    _require_key(args, "text", "args.text", case_id)
+    _require_key(args, "model", "args.model", case_id)
+    _validate_string(args["text"], "args.text", case_id)
+    _validate_nonempty_string(args["model"], "args.model", case_id)
+    _policy_check_large_strings(args, case_id)
+
+
+def validate_embedding_get_stats_args(args: ArgsDict, case_id: Optional[str] = None) -> None:
+    _policy_check_large_strings(args, case_id)
+
+
+# -------------------------- Graph -------------------------- #
+
+def validate_graph_query_args(args: ArgsDict, case_id: Optional[str] = None) -> None:
+    _require_key(args, "text", "args.text", case_id)
+    _validate_nonempty_string(args["text"], "args.text", case_id)
+    _policy_check_large_strings(args, case_id)
 
 
 def validate_graph_upsert_nodes_args(args: ArgsDict, case_id: Optional[str] = None) -> None:
-    """Validate graph.upsert_nodes operation arguments."""
-    if "nodes" not in args:
-        raise ArgsValidationError(
-            "graph.upsert_nodes requires 'nodes'",
-            case_id=case_id,
-            field="args.nodes",
-        )
-    
+    _require_key(args, "nodes", "args.nodes", case_id)
     nodes = args["nodes"]
-    if not isinstance(nodes, list):
-        raise ArgsValidationError(
-            f"'args.nodes' must be array, got {type(nodes).__name__}",
-            case_id=case_id,
-            field="args.nodes",
-        )
-    
-    if len(nodes) == 0:
-        raise ArgsValidationError(
-            "'args.nodes' must not be empty",
-            case_id=case_id,
-            field="args.nodes",
-        )
-    
-    for i, node in enumerate(nodes):
-        if not isinstance(node, dict):
-            raise ArgsValidationError(
-                f"'args.nodes[{i}]' must be object",
-                case_id=case_id,
-                field=f"args.nodes[{i}]",
-            )
-        if "id" not in node:
-            raise ArgsValidationError(
-                f"'args.nodes[{i}].id' is required",
-                case_id=case_id,
-                field=f"args.nodes[{i}].id",
-            )
+    if not isinstance(nodes, list) or len(nodes) < 1:
+        raise ArgsValidationError("'args.nodes' must be non-empty array", case_id=case_id, field="args.nodes")
 
 
 def validate_graph_upsert_edges_args(args: ArgsDict, case_id: Optional[str] = None) -> None:
-    """Validate graph.upsert_edges operation arguments."""
-    if "edges" not in args:
-        raise ArgsValidationError(
-            "graph.upsert_edges requires 'edges'",
-            case_id=case_id,
-            field="args.edges",
-        )
-    
+    _require_key(args, "edges", "args.edges", case_id)
     edges = args["edges"]
-    if not isinstance(edges, list):
-        raise ArgsValidationError(
-            f"'args.edges' must be array, got {type(edges).__name__}",
-            case_id=case_id,
-            field="args.edges",
-        )
-    
-    if len(edges) == 0:
-        raise ArgsValidationError(
-            "'args.edges' must not be empty",
-            case_id=case_id,
-            field="args.edges",
-        )
-    
-    for i, edge in enumerate(edges):
-        if not isinstance(edge, dict):
-            raise ArgsValidationError(
-                f"'args.edges[{i}]' must be object",
-                case_id=case_id,
-                field=f"args.edges[{i}]",
-            )
-        
-        required_fields = ["source", "target", "type"]
-        for field in required_fields:
-            if field not in edge:
-                raise ArgsValidationError(
-                    f"'args.edges[{i}].{field}' is required",
-                    case_id=case_id,
-                    field=f"args.edges[{i}].{field}",
-                )
+    if not isinstance(edges, list) or len(edges) < 1:
+        raise ArgsValidationError("'args.edges' must be non-empty array", case_id=case_id, field="args.edges")
 
 
 def validate_graph_delete_nodes_args(args: ArgsDict, case_id: Optional[str] = None) -> None:
-    """Validate graph.delete_nodes operation arguments."""
-    if "ids" not in args and "label" not in args:
-        raise ArgsValidationError(
-            "graph.delete_nodes requires 'ids' or 'label'",
-            case_id=case_id,
-            field="args",
-        )
-    
-    if "ids" in args:
-        ids = args["ids"]
-        if not isinstance(ids, list):
-            raise ArgsValidationError(
-                "'args.ids' must be array",
-                case_id=case_id,
-                field="args.ids",
-            )
-        if not all(isinstance(id_, str) for id_ in ids):
-            raise ArgsValidationError(
-                "'args.ids' must contain only strings",
-                case_id=case_id,
-                field="args.ids",
-            )
+    _validate_ids_or_filter(args, case_id, ids_field="ids", filter_field="filter")
 
 
 def validate_graph_delete_edges_args(args: ArgsDict, case_id: Optional[str] = None) -> None:
-    """Validate graph.delete_edges operation arguments."""
-    if "ids" not in args and "type" not in args:
-        raise ArgsValidationError(
-            "graph.delete_edges requires 'ids' or 'type'",
-            case_id=case_id,
-            field="args",
-        )
-    
-    if "ids" in args:
-        ids = args["ids"]
-        if not isinstance(ids, list):
-            raise ArgsValidationError(
-                "'args.ids' must be array",
-                case_id=case_id,
-                field="args.ids",
-            )
-        if not all(isinstance(id_, str) for id_ in ids):
-            raise ArgsValidationError(
-                "'args.ids' must contain only strings",
-                case_id=case_id,
-                field="args.ids",
-            )
+    _validate_ids_or_filter(args, case_id, ids_field="ids", filter_field="filter")
 
 
 def validate_graph_bulk_vertices_args(args: ArgsDict, case_id: Optional[str] = None) -> None:
-    """Validate graph.bulk_vertices operation arguments."""
-    if "source" not in args:
-        raise ArgsValidationError(
-            "graph.bulk_vertices requires 'source'",
-            case_id=case_id,
-            field="args.source",
-        )
-    
-    source = args["source"]
-    if not isinstance(source, dict):
-        raise ArgsValidationError(
-            "'args.source' must be object",
-            case_id=case_id,
-            field="args.source",
-        )
-    
-    if "type" not in source:
-        raise ArgsValidationError(
-            "'args.source.type' is required",
-            case_id=case_id,
-            field="args.source.type",
-        )
-    
-    valid_source_types = {"csv", "json", "parquet", "url"}
-    if source["type"] not in valid_source_types:
-        raise ArgsValidationError(
-            f"'args.source.type' must be one of {sorted(valid_source_types)}",
-            case_id=case_id,
-            field="args.source.type",
-        )
+    # Keep lightweight; schema enforces strictness.
+    if "limit" in args and args["limit"] is not None:
+        _validate_int_min(args["limit"], 1, "args.limit", case_id)
+
+
+def validate_graph_batch_args(args: ArgsDict, case_id: Optional[str] = None) -> None:
+    _require_key(args, "ops", "args.ops", case_id)
+    ops = args["ops"]
+    if not isinstance(ops, list) or len(ops) < 1:
+        raise ArgsValidationError("'args.ops' must be non-empty array", case_id=case_id, field="args.ops")
+    for i, op in enumerate(ops):
+        if not isinstance(op, dict):
+            raise ArgsValidationError(f"'args.ops[{i}]' must be object", case_id=case_id, field=f"args.ops[{i}]")
+        _require_key(op, "op", f"args.ops[{i}].op", case_id)
+        _require_key(op, "args", f"args.ops[{i}].args", case_id)
+        _validate_nonempty_string(op["op"], f"args.ops[{i}].op", case_id)
+        if not isinstance(op["args"], dict):
+            raise ArgsValidationError(f"'args.ops[{i}].args' must be object", case_id=case_id, field=f"args.ops[{i}].args")
 
 
 # ---------------------------------------------------------------------------
-# Helper Validators
+# Helper Validators (shared)
 # ---------------------------------------------------------------------------
 
-def _validate_vector(vector: Any, field_name: str, case_id: Optional[str]) -> None:
-    """Validate a vector array."""
-    if not isinstance(vector, list):
-        raise ArgsValidationError(
-            f"'{field_name}' must be array, got {type(vector).__name__}",
+def _require_key(obj: Dict[str, Any], key: str, field_name: str, case_id: Optional[str]) -> None:
+    if key not in obj:
+        raise ArgsValidationError(f"Missing required field '{field_name}'", case_id=case_id, field=field_name)
+
+
+def _validate_int_min(value: Any, minimum: int, field_name: str, case_id: Optional[str]) -> None:
+    if not isinstance(value, int):
+        raise ArgsValidationError(f"'{field_name}' must be integer", case_id=case_id, field=field_name)
+    if value < minimum:
+        raise ArgsValidationError(f"'{field_name}' must be >= {minimum}", case_id=case_id, field=field_name)
+
+
+def _validate_number_range(value: Any, lo: float, hi: float, field_name: str, case_id: Optional[str]) -> None:
+    if not isinstance(value, (int, float)):
+        raise ArgsValidationError(f"'{field_name}' must be number", case_id=case_id, field=field_name)
+    v = float(value)
+    if v < lo or v > hi:
+        raise ArgsValidationError(f"'{field_name}' must be in [{lo}, {hi}]", case_id=case_id, field=field_name)
+
+
+def _validate_string(value: Any, field_name: str, case_id: Optional[str]) -> None:
+    if not isinstance(value, str):
+        raise ArgsValidationError(f"'{field_name}' must be string", case_id=case_id, field=field_name)
+
+
+def _validate_nonempty_string(value: Any, field_name: str, case_id: Optional[str]) -> None:
+    _validate_string(value, field_name, case_id)
+    if not value.strip():
+        raise ArgsValidationError(f"'{field_name}' must be non-empty", case_id=case_id, field=field_name)
+
+
+def _validate_string_array(value: Any, field_name: str, case_id: Optional[str]) -> None:
+    if not isinstance(value, list):
+        raise ArgsValidationError(f"'{field_name}' must be array[string]", case_id=case_id, field=field_name)
+    if not all(isinstance(x, str) for x in value):
+        raise ArgsValidationError(f"'{field_name}' must contain only strings", case_id=case_id, field=field_name)
+
+
+def _validate_number_array(value: Any, field_name: str, case_id: Optional[str], *, min_items: int = 0) -> None:
+    if not isinstance(value, list):
+        raise ArgsValidationError(f"'{field_name}' must be array[number]", case_id=case_id, field=field_name)
+    if len(value) < min_items:
+        raise ArgsValidationError(f"'{field_name}' must have at least {min_items} item(s)", case_id=case_id, field=field_name)
+    if not all(isinstance(x, (int, float)) for x in value):
+        raise ArgsValidationError(f"'{field_name}' must contain only numbers", case_id=case_id, field=field_name)
+    if len(value) > POLICY_MAX_VECTOR_DIMENSIONS:
+        _policy_violation(
+            f"'{field_name}' exceeds policy maximum dimensions {POLICY_MAX_VECTOR_DIMENSIONS} (got {len(value)})",
             case_id=case_id,
             field=field_name,
-        )
-    
-    if not (MIN_VECTOR_DIMENSIONS <= len(vector) <= MAX_VECTOR_DIMENSIONS):
-        raise ArgsValidationError(
-            f"'{field_name}' dimensions must be {MIN_VECTOR_DIMENSIONS}-"
-            f"{MAX_VECTOR_DIMENSIONS}, got {len(vector)}",
-            case_id=case_id,
-            field=field_name,
-        )
-    
-    if not all(isinstance(v, (int, float)) for v in vector):
-        raise ArgsValidationError(
-            f"'{field_name}' must contain only numbers",
-            case_id=case_id,
-            field=field_name,
+            details={"dims": len(value)},
         )
 
 
-def _validate_vector_record(record: Any, index: int, case_id: Optional[str]) -> int:
-    """Validate a vector record in upsert. Returns dimension count."""
-    field_prefix = f"args.vectors[{index}]"
-    
-    if not isinstance(record, dict):
-        raise ArgsValidationError(
-            f"'{field_prefix}' must be object",
-            case_id=case_id,
-            field=field_prefix,
-        )
-    
-    if "id" not in record:
-        raise ArgsValidationError(
-            f"'{field_prefix}.id' is required",
-            case_id=case_id,
-            field=f"{field_prefix}.id",
-        )
-    
-    if not isinstance(record["id"], str):
-        raise ArgsValidationError(
-            f"'{field_prefix}.id' must be string",
-            case_id=case_id,
-            field=f"{field_prefix}.id",
-        )
-    
-    if "values" not in record:
-        raise ArgsValidationError(
-            f"'{field_prefix}.values' is required",
-            case_id=case_id,
-            field=f"{field_prefix}.values",
-        )
-    
-    values = record["values"]
-    _validate_vector(values, f"{field_prefix}.values", case_id)
-    
-    if "metadata" in record and record["metadata"] is not None:
-        if not isinstance(record["metadata"], dict):
-            raise ArgsValidationError(
-                f"'{field_prefix}.metadata' must be object",
-                case_id=case_id,
-                field=f"{field_prefix}.metadata",
-            )
-    
-    return len(values)
+def _validate_ids_or_filter(args: ArgsDict, case_id: Optional[str], *, ids_field: str, filter_field: str) -> None:
+    has_ids = ids_field in args
+    has_filter = filter_field in args
+    if not has_ids and not has_filter:
+        raise ArgsValidationError(f"Requires '{ids_field}' or '{filter_field}'", case_id=case_id, field="args")
+    if has_ids:
+        ids = args.get(ids_field)
+        if not isinstance(ids, list) or len(ids) < 1 or not all(isinstance(x, str) and x.strip() for x in ids):
+            raise ArgsValidationError(f"'args.{ids_field}' must be non-empty array of non-empty strings", case_id=case_id, field=f"args.{ids_field}")
+    if has_filter:
+        flt = args.get(filter_field)
+        if not isinstance(flt, dict) or len(flt) < 1:
+            raise ArgsValidationError(f"'args.{filter_field}' must be object with at least 1 key", case_id=case_id, field=f"args.{filter_field}")
 
 
-def _validate_chat_message(msg: Any, index: int, case_id: Optional[str]) -> None:
-    """Validate a chat message."""
+def _validate_llm_message(msg: Any, index: int, case_id: Optional[str]) -> None:
     field_prefix = f"args.messages[{index}]"
-    
     if not isinstance(msg, dict):
-        raise ArgsValidationError(
-            f"'{field_prefix}' must be object",
-            case_id=case_id,
-            field=field_prefix,
-        )
-    
+        raise ArgsValidationError(f"'{field_prefix}' must be object", case_id=case_id, field=field_prefix)
     if "role" not in msg:
-        raise ArgsValidationError(
-            f"'{field_prefix}.role' is required",
-            case_id=case_id,
-            field=f"{field_prefix}.role",
-        )
-    
-    valid_roles = {"system", "user", "assistant", "tool"}
-    if msg["role"] not in valid_roles:
-        raise ArgsValidationError(
-            f"'{field_prefix}.role' must be one of {sorted(valid_roles)}",
-            case_id=case_id,
-            field=f"{field_prefix}.role",
-        )
-    
+        raise ArgsValidationError(f"'{field_prefix}.role' is required", case_id=case_id, field=f"{field_prefix}.role")
     if "content" not in msg:
-        raise ArgsValidationError(
-            f"'{field_prefix}.content' is required",
+        raise ArgsValidationError(f"'{field_prefix}.content' is required", case_id=case_id, field=f"{field_prefix}.content")
+
+    if not isinstance(msg["role"], str):
+        raise ArgsValidationError(f"'{field_prefix}.role' must be string", case_id=case_id, field=f"{field_prefix}.role")
+    if not isinstance(msg["content"], str):
+        raise ArgsValidationError(f"'{field_prefix}.content' must be string", case_id=case_id, field=f"{field_prefix}.content")
+
+    # Role enums may be schema-defined or left as string in SCHEMA.md; keep non-standard roles policy-only.
+    if msg["role"] not in {"system", "user", "assistant", "tool"}:
+        _policy_violation(
+            f"'{field_prefix}.role' is non-standard role {msg['role']!r}",
             case_id=case_id,
-            field=f"{field_prefix}.content",
+            field=f"{field_prefix}.role",
+            details={"role": msg["role"]},
         )
 
 
-def _validate_tools(tools: Any, case_id: Optional[str]) -> None:
-    """Validate tools array."""
-    if not isinstance(tools, list):
-        raise ArgsValidationError(
-            "'args.tools' must be array",
-            case_id=case_id,
-            field="args.tools",
-        )
-    
-    for i, tool in enumerate(tools):
-        if not isinstance(tool, dict):
-            raise ArgsValidationError(
-                f"'args.tools[{i}]' must be object",
-                case_id=case_id,
-                field=f"args.tools[{i}]",
-            )
-        if "name" not in tool:
-            raise ArgsValidationError(
-                f"'args.tools[{i}].name' is required",
-                case_id=case_id,
-                field=f"args.tools[{i}].name",
-            )
-
-
-def _validate_tool_choice(choice: Any, case_id: Optional[str]) -> None:
-    """Validate tool_choice field."""
-    if isinstance(choice, str):
-        valid_choices = {"auto", "none", "required"}
-        if choice not in valid_choices:
-            raise ArgsValidationError(
-                f"'args.tool_choice' string must be one of {sorted(valid_choices)}",
-                case_id=case_id,
-                field="args.tool_choice",
-            )
-    elif isinstance(choice, dict):
-        if "type" not in choice:
-            raise ArgsValidationError(
-                "'args.tool_choice.type' is required when tool_choice is object",
-                case_id=case_id,
-                field="args.tool_choice.type",
-            )
-    else:
-        raise ArgsValidationError(
-            f"'args.tool_choice' must be string or object, got {type(choice).__name__}",
-            case_id=case_id,
-            field="args.tool_choice",
-        )
-
-
-def _validate_temperature(temp: Any, case_id: Optional[str]) -> None:
-    """Validate temperature field."""
-    if not isinstance(temp, (int, float)):
-        raise ArgsValidationError(
-            f"'args.temperature' must be number, got {type(temp).__name__}",
-            case_id=case_id,
-            field="args.temperature",
-        )
-    if not (0 <= temp <= 2):
-        raise ArgsValidationError(
-            f"'args.temperature' must be in [0, 2], got {temp}",
-            case_id=case_id,
-            field="args.temperature",
-        )
-
-
-def _validate_stop_sequences(stop: Any, case_id: Optional[str]) -> None:
-    """Validate stop sequences."""
-    if isinstance(stop, str):
-        return
-    if isinstance(stop, list):
-        if not all(isinstance(s, str) for s in stop):
-            raise ArgsValidationError(
-                "'args.stop' array must contain only strings",
-                case_id=case_id,
-                field="args.stop",
-            )
-        return
-    raise ArgsValidationError(
-        f"'args.stop' must be string or array, got {type(stop).__name__}",
-        case_id=case_id,
-        field="args.stop",
-    )
-
-
-def _validate_positive_int(value: Any, field_name: str, case_id: Optional[str]) -> None:
-    """Validate a positive integer field."""
-    if not isinstance(value, int) or value <= 0:
-        raise ArgsValidationError(
-            f"'{field_name}' must be positive integer",
-            case_id=case_id,
-            field=field_name,
-        )
-
-
-def _validate_bool(value: Any, field_name: str, case_id: Optional[str]) -> None:
-    """Validate a boolean field."""
-    if not isinstance(value, bool):
-        raise ArgsValidationError(
-            f"'{field_name}' must be boolean, got {type(value).__name__}",
-            case_id=case_id,
-            field=field_name,
-        )
+def _policy_check_large_strings(args: ArgsDict, case_id: Optional[str]) -> None:
+    """Warn/enforce on unexpectedly large strings without breaking schema conformance by default."""
+    def walk(obj: Any) -> None:
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if isinstance(v, str) and len(v) > POLICY_MAX_TEXT_LENGTH:
+                    _policy_violation(
+                        f"String field '{k}' exceeds policy max length {POLICY_MAX_TEXT_LENGTH} (got {len(v)})",
+                        case_id=case_id,
+                        field=k,
+                        details={"length": len(v)},
+                    )
+                else:
+                    walk(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                walk(v)
+    walk(args)
 
 
 # ---------------------------------------------------------------------------
@@ -1661,118 +1089,215 @@ def _validate_bool(value: Any, field_name: str, case_id: Optional[str]) -> None:
 ARGS_VALIDATORS: Dict[str, ArgsValidator] = {
     # LLM
     "validate_llm_complete_args": validate_llm_complete_args,
-    "validate_llm_chat_args": validate_llm_chat_args,
     "validate_llm_stream_args": validate_llm_stream_args,
     "validate_llm_count_tokens_args": validate_llm_count_tokens_args,
     # Vector
     "validate_vector_query_args": validate_vector_query_args,
+    "validate_vector_batch_query_args": validate_vector_batch_query_args,
     "validate_vector_upsert_args": validate_vector_upsert_args,
     "validate_vector_delete_args": validate_vector_delete_args,
-    "validate_vector_fetch_args": validate_vector_fetch_args,
     "validate_vector_namespace_args": validate_vector_namespace_args,
     # Embedding
     "validate_embedding_embed_args": validate_embedding_embed_args,
     "validate_embedding_embed_batch_args": validate_embedding_embed_batch_args,
+    "validate_embedding_stream_embed_args": validate_embedding_stream_embed_args,
     "validate_embedding_count_tokens_args": validate_embedding_count_tokens_args,
+    "validate_embedding_get_stats_args": validate_embedding_get_stats_args,
     # Graph
     "validate_graph_query_args": validate_graph_query_args,
-    "validate_graph_mutate_args": validate_graph_mutate_args,
-    "validate_graph_traverse_args": validate_graph_traverse_args,
     "validate_graph_upsert_nodes_args": validate_graph_upsert_nodes_args,
     "validate_graph_upsert_edges_args": validate_graph_upsert_edges_args,
     "validate_graph_delete_nodes_args": validate_graph_delete_nodes_args,
     "validate_graph_delete_edges_args": validate_graph_delete_edges_args,
     "validate_graph_bulk_vertices_args": validate_graph_bulk_vertices_args,
+    "validate_graph_batch_args": validate_graph_batch_args,
 }
 
 
 def get_args_validator(name: str) -> Optional[ArgsValidator]:
-    """Get an args validator by name."""
     return ARGS_VALIDATORS.get(name)
 
 
-def validate_args_for_operation(
-    args: ArgsDict,
-    validator_name: Optional[str],
-    case_id: Optional[str] = None,
-) -> None:
+def validate_args_for_operation(args: ArgsDict, validator_name: Optional[str], case_id: Optional[str] = None) -> None:
     """
     Run operation-specific args validation if validator is defined.
-    
-    Args:
-        args: The args dict to validate.
-        validator_name: Name of the validator function, or None.
-        case_id: Optional case ID for error messages.
-    
-    Raises:
-        ArgsValidationError: If validation fails.
+
+    Unknown validator_name => warn + continue (schema is authoritative in STRICT mode).
     """
     if validator_name is None:
         return
-    
     validator = get_args_validator(validator_name)
     if validator is None:
         logger.warning(f"Unknown args validator: {validator_name}")
         return
-    
     validator(args, case_id)
 
 
 # ---------------------------------------------------------------------------
-# Convenience Functions
+# Coverage gates (schema request ops <-> tests/live/wire_cases.py)
+# ---------------------------------------------------------------------------
+
+def list_request_operation_schema_ids() -> List[str]:
+    """
+    Enumerate request operation schema IDs from the loaded schema registry.
+
+    Filters out:
+      - common/*
+      - type schemas (*.types.*)
+      - envelope request schemas (*.envelope.request.json)
+
+    This is intentionally conservative and relies on SCHEMA.md naming conventions:
+      <component>/<component>.<op>.request.json
+    """
+    try:
+        from tests.utils.schema_registry import list_schemas  # type: ignore
+    except ImportError as e:
+        if CONFIG.schema_validation_mode == "strict":
+            raise SchemaValidationError(
+                "Schema registry not available in STRICT mode (cannot enumerate schemas)",
+                details={"import_error": str(e)},
+            ) from e
+        logger.warning("Schema registry not available; cannot enumerate request op schemas (best_effort mode)")
+        return []
+
+    registry = list_schemas()  # {schema_id: file_path}
+    out: List[str] = []
+    for sid in registry.keys():
+        if "/common/" in sid:
+            continue
+        if ".types." in sid:
+            continue
+        if sid.endswith(".envelope.request.json"):
+            continue
+        if sid.endswith(".request.json"):
+            out.append(sid)
+    return sorted(out)
+
+
+def _schema_id_to_request_op(schema_id: str) -> Optional[str]:
+    """
+    Convert an operation request schema_id into an op string.
+
+    Expected filename: <component>.<op>.request.json
+      e.g. https://.../llm/llm.complete.request.json -> "llm.complete"
+
+    Returns None for non-op schemas (envelopes, types, common, non-request, etc.).
+    """
+    if not schema_id.endswith(".request.json"):
+        return None
+    if schema_id.endswith(".envelope.request.json"):
+        return None
+    if "/common/" in schema_id:
+        return None
+    if ".types." in schema_id:
+        return None
+
+    fname = schema_id.rsplit("/", 1)[-1]
+    if not fname.endswith(".request.json"):
+        return None
+    op = fname[: -len(".request.json")]
+    return op or None
+
+
+def assert_all_wire_case_args_validators_exist() -> None:
+    """
+    Sanity gate: every args_validator referenced by tests/live/wire_cases.py must exist in ARGS_VALIDATORS.
+    """
+    try:
+        from tests.live.wire_cases import WIRE_REQUEST_CASES  # type: ignore
+    except Exception as e:
+        raise ValidationError(
+            "Failed to import wire cases from tests/live/wire_cases.py",
+            details={"error": str(e)},
+        ) from e
+
+    missing: List[str] = []
+    for c in WIRE_REQUEST_CASES:
+        if c.args_validator and c.args_validator not in ARGS_VALIDATORS:
+            missing.append(f"{c.id}: {c.args_validator}")
+
+    if missing:
+        raise ValidationError(
+            "Some wire request cases reference unknown args validators",
+            details={"missing": missing, "missing_count": len(missing)},
+        )
+
+
+def assert_all_schema_request_ops_have_cases() -> None:
+    """
+    Conformance gate: ensure every request op schema has at least one wire case.
+
+    Wire cases are defined in tests/live/wire_cases.py (canonical path).
+    """
+    # Import wire cases from the canonical wire path.
+    try:
+        from tests.live.wire_cases import WIRE_REQUEST_CASES  # type: ignore
+    except Exception as e:
+        raise ValidationError(
+            "Failed to import wire cases from tests/live/wire_cases.py",
+            details={"error": str(e)},
+        ) from e
+
+    covered_ops = {c.op for c in WIRE_REQUEST_CASES}
+    request_op_schema_ids = list_request_operation_schema_ids()
+
+    missing_ops: List[str] = []
+    for sid in request_op_schema_ids:
+        op = _schema_id_to_request_op(sid)
+        if op is None:
+            continue
+        if op not in covered_ops:
+            missing_ops.append(f"{op}  (schema_id={sid})")
+
+    if missing_ops:
+        raise ValidationError(
+            "Some request operation schemas have no wire test cases (coverage drift)",
+            details={"missing_ops": missing_ops, "missing_count": len(missing_ops)},
+        )
+
+
+# ---------------------------------------------------------------------------
+# Convenience pipeline
 # ---------------------------------------------------------------------------
 
 def validate_wire_envelope(
     envelope: EnvelopeDict,
     expected_op: str,
     schema_id: str,
-    schema_versions: Tuple[str, ...] = ("v1",),
-    component: str = "",
+    accepted_versions: Tuple[str, ...] = (),
     args_validator: Optional[str] = None,
     case_id: Optional[str] = None,
 ) -> EnvelopeDict:
     """
     Complete wire envelope validation pipeline.
-    
-    Runs all validation steps:
-      1. Envelope structure
-      2. JSON round-trip
-      3. Schema validation (with version tolerance)
-      4. Operation-specific args validation
-    
-    Args:
-        envelope: The envelope to validate.
-        expected_op: Expected operation name.
-        schema_id: Primary JSON Schema URL.
-        schema_versions: Tuple of supported versions.
-        component: Component name for schema URL construction.
-        args_validator: Name of args validator function.
-        case_id: Optional case ID for error messages.
-    
-    Returns:
-        The validated (possibly round-tripped) envelope.
-    
-    Raises:
-        ValidationError: If any validation step fails.
+
+    Steps:
+      1) Envelope structure validation (SCHEMA.md request envelope + op conformance)
+      2) JSON round-trip validation (wire safety)
+      3) Schema validation:
+           - strict: schema_id only
+           - tolerant/warn: schema_id, then schema_id#version/<semver> for accepted_versions
+      4) Args validation (lightweight, schema-aligned; schema remains authoritative)
+
+    accepted_versions:
+      - SCHEMA.md version tolerance list (semver strings like "1.2.3")
+      - used only when CONFIG.schema_version_tolerance != "strict"
     """
-    # 1. Structure validation
+    # 1) Envelope validation
     validate_envelope_common(envelope, expected_op, case_id)
-    
-    # 2. JSON round-trip
+
+    # 2) JSON round-trip
     wire_envelope = json_roundtrip(envelope, case_id)
-    
     if CONFIG.enable_json_roundtrip:
         assert_roundtrip_equality(envelope, wire_envelope, case_id)
-    
-    # 3. Schema validation
-    if component:
-        validate_with_version_tolerance(
-            wire_envelope, schema_id, schema_versions, component, case_id
-        )
-    else:
+
+    # 3) Schema validation (+ SCHEMA.md version tolerance)
+    if CONFIG.schema_version_tolerance == "strict":
         validate_against_schema(schema_id, wire_envelope, case_id)
-    
-    # 4. Args validation
+    else:
+        validate_with_version_tolerance(wire_envelope, schema_id, accepted_versions, case_id)
+
+    # 4) Args validation
     validate_args_for_operation(wire_envelope["args"], args_validator, case_id)
-    
+
     return wire_envelope
