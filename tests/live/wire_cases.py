@@ -25,6 +25,19 @@ This registry uses operation-level request schemas (e.g., llm.complete.request.j
 not just envelope.request schemas, to ensure:
 - op is const-bound to the correct operation name
 - args are validated against the operation-specific args schema
+
+COVERAGE NOTE (BOTH SCENARIOS)
+------------------------------
+Some operations may be present in SCHEMA.md but not yet implemented by a given adapter,
+or not yet shipped in a given repo's schema bundle. To "cover both scenarios" without
+commenting cases out, each case includes explicit gates:
+
+  - requires_schema: if True, the harness should confirm schema_id exists in the loaded schema registry;
+    if missing, the harness should skip (not fail) the case.
+  - requires_builder: if True, the harness should confirm the adapter implements build_method;
+    if missing, the harness should skip (not fail) the case.
+
+These gates are pure metadata: they do not change runtime performance of this registry.
 """
 
 from __future__ import annotations
@@ -97,11 +110,14 @@ class WireRequestCase:
         component: Protocol component - one of: llm, vector, embedding, graph.
         op: Canonical operation name (e.g., "llm.complete", "vector.query").
         build_method: Name of the adapter method that builds the envelope.
-        schema_id: Primary JSON Schema $id URL for this operation's envelope.
+        schema_id: Primary JSON Schema $id URL for this operation's request envelope.
         schema_versions: Supported schema versions for backward compatibility (SemVer).
         args_validator: Name of the validator function for operation-specific args.
         description: Human-readable description for documentation/reports.
         tags: Set of tags for selective test execution and filtering.
+
+        requires_schema: If True, harness should skip if schema_id not present in registry.
+        requires_builder: If True, harness should skip if adapter lacks build_method.
     """
 
     id: str
@@ -113,6 +129,10 @@ class WireRequestCase:
     args_validator: Optional[str] = None
     description: str = ""
     tags: FrozenSet[str] = field(default_factory=frozenset)
+
+    # Coverage gates (metadata only; harness uses these to decide skip vs fail)
+    requires_schema: bool = True
+    requires_builder: bool = True
 
     def __post_init__(self) -> None:
         """Validate case invariants on construction."""
@@ -158,6 +178,8 @@ class WireRequestCase:
             args_validator=data.get("args_validator"),
             description=data.get("description", ""),
             tags=frozenset(data.get("tags", [])),
+            requires_schema=bool(data.get("requires_schema", True)),
+            requires_builder=bool(data.get("requires_builder", True)),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -172,6 +194,8 @@ class WireRequestCase:
             "args_validator": self.args_validator,
             "description": self.description,
             "tags": sorted(self.tags),
+            "requires_schema": self.requires_schema,
+            "requires_builder": self.requires_builder,
         }
 
     def matches_filter(
@@ -258,6 +282,9 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
       <base_url>/<component>/<component>.<operation>.request.json
 
     Variants reuse the same build method and operation schema; the harness supplies variant args.
+
+    NOTE: For operations that may not exist in all adapters or schema bundles, we still include
+    cases but rely on requires_schema/requires_builder gates for skip behavior in the harness.
     """
     return [
         # ========================== LLM ========================== #
@@ -373,6 +400,19 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             args_validator="validate_vector_query_args",
             description="Vector query with metadata filtering",
             tags=frozenset({"core", "vector", "query", "filter"}),
+        ),
+        WireRequestCase(
+            id="vector_batch_query",
+            component="vector",
+            op="vector.batch_query",
+            build_method="build_vector_batch_query_envelope",
+            schema_id=f"{base_url}/vector/vector.batch_query.request.json",
+            args_validator="validate_vector_batch_query_args",
+            description="Batch vector similarity search queries",
+            tags=frozenset({"vector", "query", "batch"}),
+            # Cover both scenarios: some adapters may not implement yet, some schema bundles may not include yet.
+            requires_schema=True,
+            requires_builder=True,
         ),
         WireRequestCase(
             id="vector_upsert",
@@ -525,6 +565,18 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             tags=frozenset({"embedding", "batch", "large"}),
         ),
         WireRequestCase(
+            id="embedding_stream_embed",
+            component="embedding",
+            op="embedding.stream_embed",
+            build_method="build_embedding_stream_embed_envelope",
+            schema_id=f"{base_url}/embedding/embedding.stream_embed.request.json",
+            args_validator="validate_embedding_stream_embed_args",
+            description="Stream embedding generation for a single text",
+            tags=frozenset({"embedding", "streaming", "embed"}),
+            requires_schema=True,
+            requires_builder=True,
+        ),
+        WireRequestCase(
             id="embedding_count_tokens",
             component="embedding",
             op="embedding.count_tokens",
@@ -533,6 +585,18 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             args_validator="validate_embedding_count_tokens_args",
             description="Count tokens for embedding model",
             tags=frozenset({"embedding", "tokens"}),
+        ),
+        WireRequestCase(
+            id="embedding_get_stats",
+            component="embedding",
+            op="embedding.get_stats",
+            build_method="build_embedding_get_stats_envelope",
+            schema_id=f"{base_url}/embedding/embedding.get_stats.request.json",
+            args_validator="validate_embedding_get_stats_args",
+            description="Retrieve embedding service statistics (counters, cache, timings)",
+            tags=frozenset({"embedding", "stats", "operational"}),
+            requires_schema=True,
+            requires_builder=True,
         ),
         WireRequestCase(
             id="embedding_health",
@@ -694,18 +758,18 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             description="Stream Gremlin query results (variant args)",
             tags=frozenset({"graph", "query", "streaming", "gremlin"}),
         ),
-        # NOTE: graph.bulk_vertices and graph.get_schema are intentionally left commented out
-        # to preserve the existing registry surface area and harness expectations.
-        # WireRequestCase(
-        #     id="graph_bulk_vertices",
-        #     component="graph",
-        #     op="graph.bulk_vertices",
-        #     build_method="build_graph_bulk_vertices_envelope",
-        #     schema_id=f"{base_url}/graph/graph.bulk_vertices.request.json",
-        #     args_validator="validate_graph_bulk_vertices_args",
-        #     description="Bulk operations on vertices (import/export)",
-        #     tags=frozenset({"graph", "write", "bulk", "nodes"}),
-        # ),
+        WireRequestCase(
+            id="graph_bulk_vertices",
+            component="graph",
+            op="graph.bulk_vertices",
+            build_method="build_graph_bulk_vertices_envelope",
+            schema_id=f"{base_url}/graph/graph.bulk_vertices.request.json",
+            args_validator="validate_graph_bulk_vertices_args",
+            description="Bulk vertices export/import via cursor pagination",
+            tags=frozenset({"graph", "bulk", "nodes", "read"}),
+            requires_schema=True,
+            requires_builder=True,
+        ),
         WireRequestCase(
             id="graph_batch",
             component="graph",
@@ -716,15 +780,42 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             description="Execute multiple graph operations in a batch",
             tags=frozenset({"graph", "batch", "write"}),
         ),
-        # WireRequestCase(
-        #     id="graph_get_schema",
-        #     component="graph",
-        #     op="graph.get_schema",
-        #     build_method="build_graph_get_schema_envelope",
-        #     schema_id=f"{base_url}/graph/graph.get_schema.request.json",
-        #     description="Retrieve graph schema (node labels, edge types, properties)",
-        #     tags=frozenset({"graph", "schema", "discovery"}),
-        # ),
+        WireRequestCase(
+            id="graph_get_schema",
+            component="graph",
+            op="graph.get_schema",
+            build_method="build_graph_get_schema_envelope",
+            schema_id=f"{base_url}/graph/graph.get_schema.request.json",
+            args_validator=None,
+            description="Retrieve graph schema (node labels, edge types, properties)",
+            tags=frozenset({"graph", "schema", "discovery"}),
+            requires_schema=True,
+            requires_builder=True,
+        ),
+        WireRequestCase(
+            id="graph_transaction",
+            component="graph",
+            op="graph.transaction",
+            build_method="build_graph_transaction_envelope",
+            schema_id=f"{base_url}/graph/graph.transaction.request.json",
+            args_validator=None,
+            description="Execute graph operations as a single transaction",
+            tags=frozenset({"graph", "transaction", "write"}),
+            requires_schema=True,
+            requires_builder=True,
+        ),
+        WireRequestCase(
+            id="graph_traversal",
+            component="graph",
+            op="graph.traversal",
+            build_method="build_graph_traversal_envelope",
+            schema_id=f"{base_url}/graph/graph.traversal.request.json",
+            args_validator=None,
+            description="Traverse graph from start nodes with filters and depth",
+            tags=frozenset({"graph", "traversal", "query"}),
+            requires_schema=True,
+            requires_builder=True,
+        ),
         WireRequestCase(
             id="graph_health",
             component="graph",
@@ -927,6 +1018,7 @@ def print_cases_table(cases: List[WireRequestCase], verbose: bool = False) -> No
             print(f"  Schema:       {case.schema_id}")
             print(f"  Validator:    {case.args_validator or 'none'}")
             print(f"  Tags:         {', '.join(sorted(case.tags)) or 'none'}")
+            print(f"  Gates:        requires_schema={case.requires_schema}, requires_builder={case.requires_builder}")
             print(f"  Description:  {case.description or 'none'}")
     else:
         print(f"{'ID':<40} {'Component':<12} {'Tags'}")
