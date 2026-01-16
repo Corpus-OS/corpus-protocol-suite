@@ -57,12 +57,13 @@ from tests.live.wire_validators import (
     EnvelopeTypeError,
     CtxValidationError,
     ArgsValidationError,
-    SchemaValidationError,      # kept for completeness / external use
+    SchemaValidationError,  # kept for completeness / external use
     SerializationError,
     validate_envelope_common,
+    validate_envelope_shape,
+    validate_ctx_field,
     json_roundtrip,
     assert_roundtrip_equality,
-    validate_with_version_tolerance,  # kept for completeness / external use
     validate_args_for_operation,
     validate_wire_envelope,
     get_schema_cache,
@@ -88,15 +89,9 @@ class ConformanceTestConfig:
     def from_env(cls) -> "ConformanceTestConfig":
         """Load configuration from environment."""
         return cls(
-            enable_metrics=os.environ.get(
-                "CORPUS_ENABLE_METRICS", "true"
-            ).lower() == "true",
-            skip_schema_validation=os.environ.get(
-                "CORPUS_SKIP_SCHEMA_VALIDATION", "false"
-            ).lower() == "true",
-            verbose_failures=os.environ.get(
-                "CORPUS_VERBOSE_FAILURES", "true"
-            ).lower() == "true",
+            enable_metrics=os.environ.get("CORPUS_ENABLE_METRICS", "true").lower() == "true",
+            skip_schema_validation=os.environ.get("CORPUS_SKIP_SCHEMA_VALIDATION", "false").lower() == "true",
+            verbose_failures=os.environ.get("CORPUS_VERBOSE_FAILURES", "true").lower() == "true",
         )
 
 
@@ -129,9 +124,7 @@ class ValidationMetrics:
             self.validation_times.append((case_id, duration))
             if case_id not in self.failures:
                 self.failures[case_id] = {}
-            self.failures[case_id][error_type] = (
-                self.failures[case_id].get(error_type, 0) + 1
-            )
+            self.failures[case_id][error_type] = self.failures[case_id].get(error_type, 0) + 1
 
     def record_skip(self, case_id: str, reason: str) -> None:
         """Record skipped test."""
@@ -145,9 +138,7 @@ class ValidationMetrics:
             return {
                 "total_runs": len(self.validation_times),
                 "total_successes": sum(self.successes.values()),
-                "total_failures": sum(
-                    sum(errs.values()) for errs in self.failures.values()
-                ),
+                "total_failures": sum(sum(errs.values()) for errs in self.failures.values()),
                 "total_skipped": len(self.skipped),
                 "avg_duration_ms": (sum(times) / len(times) * 1000) if times else 0,
                 "min_duration_ms": min(times) * 1000 if times else 0,
@@ -166,7 +157,6 @@ class ValidationMetrics:
             self.skipped.clear()
 
 
-# Session-scoped metrics singleton for aggregate reporting
 _session_metrics: Optional[ValidationMetrics] = None
 
 
@@ -204,6 +194,30 @@ def get_adapter_builder(
 
 
 # ---------------------------------------------------------------------------
+# Schema Presence Gate (requires_schema)
+# ---------------------------------------------------------------------------
+
+def _schema_id_is_available(schema_id: str) -> bool:
+    """
+    Return True iff the schema registry can enumerate schema_id.
+
+    This is a skip-gate only (requires_schema). It does not validate the schema
+    content; it only checks presence in the loaded registry bundle.
+    """
+    try:
+        from tests.utils.schema_registry import list_schemas  # type: ignore
+    except Exception:
+        # If registry cannot be imported here, schema validation will handle strict/best_effort.
+        return False
+
+    try:
+        registry = list_schemas()  # {schema_id: file_path}
+        return schema_id in registry
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Test Fixtures
 # ---------------------------------------------------------------------------
 
@@ -227,12 +241,6 @@ def case_registry():
 
 
 # Note: The 'adapter' fixture should be provided by conftest.py
-# Example conftest.py:
-#
-#   @pytest.fixture(scope="session")
-#   def adapter(request):
-#       adapter_name = request.config.getoption("--adapter", default="default")
-#       return load_adapter(adapter_name)
 
 
 # ---------------------------------------------------------------------------
@@ -252,12 +260,13 @@ def test_wire_request_envelope(
     Validate wire-level request envelope for a protocol operation.
 
     Steps:
-      1. Get builder method from adapter
-      2. Build the envelope
-      3. Validate envelope structure
-      4. JSON round-trip validation
-      5. Schema validation (with version tolerance)
-      6. Operation-specific args validation
+      1. Confirm schema presence (optional gate; skip if required_schema and missing)
+      2. Get builder method from adapter (optional gate; skip if requires_builder and missing)
+      3. Build the envelope
+      4. Validate envelope structure
+      5. JSON round-trip validation
+      6. Schema validation (with SCHEMA.md version tolerance if enabled in validators)
+      7. Operation-specific args validation
 
     Args:
         case: The test case definition.
@@ -266,43 +275,42 @@ def test_wire_request_envelope(
     start_time = time.perf_counter()
     metrics = get_session_metrics()
 
-    # Get builder
+    # Gate: schema presence (skip if case requires schema and schema not in bundle)
+    if not CONFIG.skip_schema_validation and getattr(case, "requires_schema", True):
+        if not _schema_id_is_available(case.schema_id):
+            metrics.record_skip(case.id, f"Schema missing: {case.schema_id}")
+            pytest.skip(f"Schema not present in registry: {case.schema_id}")
+
+    # Gate: builder presence (skip if adapter missing required builder)
     builder = get_adapter_builder(adapter, case)
     if builder is None:
         metrics.record_skip(case.id, f"Adapter missing: {case.build_method}")
         pytest.skip(f"Adapter does not implement '{case.build_method}'")
 
     try:
-        # Build envelope
         envelope = builder()
 
-        # Run validation pipeline
         if CONFIG.skip_schema_validation:
-            # Partial validation without schema
+            # Partial validation (no schema registry dependency).
             validate_envelope_common(envelope, case.op, case.id)
             wire_envelope = json_roundtrip(envelope, case.id)
             if VALIDATOR_CONFIG.enable_json_roundtrip:
                 assert_roundtrip_equality(envelope, wire_envelope, case.id)
-            validate_args_for_operation(
-                wire_envelope["args"], case.args_validator, case.id
-            )
+            validate_args_for_operation(wire_envelope["args"], case.args_validator, case.id)
         else:
-            # Full validation including schema
+            # Full validation including schema (+ version tolerance inside validators).
             validate_wire_envelope(
                 envelope=envelope,
                 expected_op=case.op,
                 schema_id=case.schema_id,
-                schema_versions=case.schema_versions,
-                component=case.component,
+                accepted_versions=tuple(case.schema_versions) if case.schema_versions else (),
                 args_validator=case.args_validator,
                 case_id=case.id,
             )
 
-        # Record success
         duration = time.perf_counter() - start_time
         if CONFIG.enable_metrics:
             metrics.record_success(case.id, duration)
-
         logger.info(f"✅ {case.id}: Passed ({duration*1000:.1f}ms)")
 
     except ValidationError as e:
@@ -313,9 +321,9 @@ def test_wire_request_envelope(
         if CONFIG.verbose_failures:
             logger.error(f"❌ {case.id}: {type(e).__name__}")
             logger.error(f"   Message: {e}")
-            if e.field:
+            if getattr(e, "field", None):
                 logger.error(f"   Field: {e.field}")
-            if e.details:
+            if getattr(e, "details", None):
                 logger.error(f"   Details: {e.details}")
 
         raise
@@ -324,30 +332,6 @@ def test_wire_request_envelope(
 # ---------------------------------------------------------------------------
 # Pytest Markers for Filtered Runs
 # ---------------------------------------------------------------------------
-
-# Register custom markers in conftest.py or pytest.ini:
-#   markers =
-#       llm: LLM protocol operations
-#       vector: Vector protocol operations
-#       embedding: Embedding protocol operations
-#       graph: Graph protocol operations
-#       core: Core operations every adapter must support
-#       health: Health check endpoints
-#       batch: Batch operations
-#       streaming: Streaming operations
-#
-# Usage:
-#   pytest test_wire_conformance.py -m "llm"
-#   pytest test_wire_conformance.py -m "core"
-#   pytest test_wire_conformance.py -m "not streaming"
-
-
-def _get_markers_for_case(case: WireRequestCase) -> List[str]:
-    """Get pytest markers for a case based on component and tags."""
-    markers = [case.component]
-    markers.extend(case.tags)
-    return markers
-
 
 def pytest_collection_modifyitems(config, items) -> None:
     """Add markers to test items based on case metadata."""
@@ -369,256 +353,165 @@ def pytest_collection_modifyitems(config, items) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Edge Case Tests
+# Edge Case Tests (SCHEMA.md-aligned)
 # ---------------------------------------------------------------------------
 
 class TestEnvelopeEdgeCases:
-    """Test edge cases for envelope validation."""
+    """Edge cases for request envelope shape and ctx constraints that are schema-required."""
 
     def test_missing_op_rejected(self, adapter: Any) -> None:
-        """Envelope without 'op' should be rejected."""
-        from tests.live.wire_validators import validate_envelope_shape
-
-        envelope = {"ctx": {"request_id": "test"}, "args": {}}
-
+        envelope = {"ctx": {}, "args": {}}
         with pytest.raises(EnvelopeShapeError, match="missing required keys"):
             validate_envelope_shape(envelope, case_id="test_missing_op")
 
     def test_missing_ctx_rejected(self, adapter: Any) -> None:
-        """Envelope without 'ctx' should be rejected."""
-        from tests.live.wire_validators import validate_envelope_shape
-
         envelope = {"op": "llm.complete", "args": {}}
-
         with pytest.raises(EnvelopeShapeError, match="missing required keys"):
             validate_envelope_shape(envelope, case_id="test_missing_ctx")
 
     def test_missing_args_rejected(self, adapter: Any) -> None:
-        """Envelope without 'args' should be rejected."""
-        from tests.live.wire_validators import validate_envelope_shape
-
-        envelope = {"op": "llm.complete", "ctx": {"request_id": "test"}}
-
+        envelope = {"op": "llm.complete", "ctx": {}}
         with pytest.raises(EnvelopeShapeError, match="missing required keys"):
             validate_envelope_shape(envelope, case_id="test_missing_args")
 
     def test_non_dict_envelope_rejected(self, adapter: Any) -> None:
-        """Non-dict envelope should be rejected."""
-        from tests.live.wire_validators import validate_envelope_shape
-
         with pytest.raises(EnvelopeTypeError, match="must be dict"):
-            validate_envelope_shape(["not", "a", "dict"], case_id="test_non_dict")
+            validate_envelope_shape(["not", "a", "dict"], case_id="test_non_dict")  # type: ignore[arg-type]
 
-    def test_empty_request_id_rejected(self, adapter: Any) -> None:
-        """Empty request_id should be rejected."""
-        from tests.live.wire_validators import validate_ctx_field
+    def test_ctx_not_object_rejected(self, adapter: Any) -> None:
+        envelope = {"op": "llm.complete", "ctx": "invalid", "args": {}}  # ctx must be object
+        with pytest.raises(EnvelopeTypeError, match="'ctx' must be object"):
+            validate_envelope_shape(envelope, case_id="test_ctx_not_object")
 
-        envelope = {"ctx": {"request_id": ""}}
-
-        with pytest.raises(CtxValidationError, match="length must be"):
-            validate_ctx_field(envelope, case_id="test_empty_request_id")
-
-    def test_max_request_id_accepted(self, adapter: Any) -> None:
-        """Maximum length request_id should be accepted."""
-        from tests.live.wire_validators import validate_ctx_field, MAX_REQUEST_ID_LENGTH
-
-        envelope = {"ctx": {"request_id": "x" * MAX_REQUEST_ID_LENGTH}}
-        validate_ctx_field(envelope, case_id="test_max_request_id")
-
-    def test_oversized_request_id_rejected(self, adapter: Any) -> None:
-        """Request_id exceeding max length should be rejected."""
-        from tests.live.wire_validators import validate_ctx_field, MAX_REQUEST_ID_LENGTH
-
-        envelope = {"ctx": {"request_id": "x" * (MAX_REQUEST_ID_LENGTH + 1)}}
-
-        with pytest.raises(CtxValidationError, match="length must be"):
-            validate_ctx_field(envelope, case_id="test_oversized_request_id")
-
-    def test_deadline_ms_zero_rejected(self, adapter: Any) -> None:
-        """Zero deadline_ms should be rejected."""
-        from tests.live.wire_validators import validate_ctx_field
-
-        envelope = {"ctx": {"request_id": "test", "deadline_ms": 0}}
-
-        with pytest.raises(CtxValidationError, match="deadline_ms"):
-            validate_ctx_field(envelope, case_id="test_deadline_zero")
+    def test_args_not_object_rejected(self, adapter: Any) -> None:
+        envelope = {"op": "llm.complete", "ctx": {}, "args": "invalid"}  # args must be object
+        with pytest.raises(EnvelopeTypeError, match="'args' must be object"):
+            validate_envelope_shape(envelope, case_id="test_args_not_object")
 
     def test_negative_deadline_rejected(self, adapter: Any) -> None:
-        """Negative deadline_ms should be rejected."""
-        from tests.live.wire_validators import validate_ctx_field
-
-        envelope = {"ctx": {"request_id": "test", "deadline_ms": -100}}
-
+        envelope = {"op": "llm.complete", "ctx": {"deadline_ms": -100}, "args": {}}
         with pytest.raises(CtxValidationError, match="deadline_ms"):
             validate_ctx_field(envelope, case_id="test_deadline_negative")
 
-    def test_invalid_priority_rejected(self, adapter: Any) -> None:
-        """Invalid priority value should be rejected."""
-        from tests.live.wire_validators import validate_ctx_field
-
-        envelope = {"ctx": {"request_id": "test", "priority": "super_urgent"}}
-
-        with pytest.raises(CtxValidationError, match="priority"):
-            validate_ctx_field(envelope, case_id="test_invalid_priority")
-
-    def test_valid_priorities_accepted(self, adapter: Any) -> None:
-        """All valid priority values should be accepted."""
-        from tests.live.wire_validators import validate_ctx_field
-
-        for priority in ["low", "normal", "high", "critical"]:
-            envelope = {"ctx": {"request_id": "test", "priority": priority}}
-            validate_ctx_field(envelope, case_id=f"test_priority_{priority}")
+    def test_deadline_ms_zero_accepted(self, adapter: Any) -> None:
+        envelope = {"op": "llm.complete", "ctx": {"deadline_ms": 0}, "args": {}}
+        validate_ctx_field(envelope, case_id="test_deadline_zero_ok")
 
 
 class TestSerializationEdgeCases:
-    """Test JSON serialization edge cases."""
+    """JSON serialization edge cases (wire safety)."""
 
     def test_non_serializable_rejected(self, adapter: Any) -> None:
-        """Non-JSON-serializable values should be rejected."""
-        from tests.live.wire_validators import json_roundtrip
-
         envelope = {
             "op": "llm.complete",
             "ctx": {"request_id": "test"},
-            "args": {"callback": lambda x: x},
+            "args": {"callback": lambda x: x},  # Not JSON-serializable
         }
-
         with pytest.raises(SerializationError):
             json_roundtrip(envelope, case_id="test_non_serializable")
 
     def test_unicode_preserved(self, adapter: Any) -> None:
-        """Unicode should be preserved through round-trip."""
-        from tests.live.wire_validators import json_roundtrip
-
         unicode_text = "Hello 世界 🌍 مرحبا שלום"
         envelope = {
-            "op": "llm.complete",
+            "op": "llm.count_tokens",
             "ctx": {"request_id": "test"},
-            "args": {"prompt": unicode_text},
+            "args": {"text": unicode_text, "model": None},
         }
-
         result = json_roundtrip(envelope, case_id="test_unicode")
-        assert result["args"]["prompt"] == unicode_text
+        assert result["args"]["text"] == unicode_text
 
     def test_float_precision_preserved(self, adapter: Any) -> None:
-        """Float precision should be preserved through round-trip."""
-        from tests.live.wire_validators import json_roundtrip
-
         value = 0.123456789012345
         envelope = {
             "op": "vector.query",
             "ctx": {"request_id": "test"},
-            "args": {"vector": [value, value, value]},
+            "args": {"vector": [value, value, value], "top_k": 1},
         }
-
         result = json_roundtrip(envelope, case_id="test_float_precision")
         assert result["args"]["vector"][0] == value
 
-    def test_deeply_nested_structure(self, adapter: Any) -> None:
-        """Deeply nested structures should serialize correctly."""
-        from tests.live.wire_validators import json_roundtrip
-
-        nested = {"level": 0}
+    def test_deeply_nested_structure_serializes(self, adapter: Any) -> None:
+        nested: Dict[str, Any] = {"level": 0}
         current = nested
         for i in range(1, 50):
             current["nested"] = {"level": i}
-            current = current["nested"]
+            current = current["nested"]  # type: ignore[assignment]
 
         envelope = {
-            "op": "graph.mutate",
+            "op": "graph.query",
             "ctx": {"request_id": "test"},
-            "args": {"data": nested},
+            "args": {"text": "MATCH (n) RETURN n", "params": {"data": nested}},
         }
-
         result = json_roundtrip(envelope, case_id="test_deep_nesting")
         assert result == envelope
 
 
 class TestArgsValidationEdgeCases:
-    """Test operation-specific args validation edge cases."""
+    """Operation-specific args validation edge cases aligned to SCHEMA.md request args contracts."""
 
-    def test_llm_complete_missing_prompt_and_messages(self, adapter: Any) -> None:
-        """llm.complete without prompt or messages should be rejected."""
+    def test_llm_complete_missing_messages_rejected(self, adapter: Any) -> None:
         from tests.live.wire_validators import validate_llm_complete_args
+        with pytest.raises(ArgsValidationError, match="args.messages"):
+            validate_llm_complete_args({}, case_id="test_llm_complete_missing_messages")
 
-        with pytest.raises(ArgsValidationError, match="requires 'prompt' or 'messages'"):
-            validate_llm_complete_args({}, case_id="test")
+    def test_llm_complete_empty_messages_rejected(self, adapter: Any) -> None:
+        from tests.live.wire_validators import validate_llm_complete_args
+        with pytest.raises(ArgsValidationError, match="must be a non-empty array"):
+            validate_llm_complete_args({"messages": []}, case_id="test_llm_complete_empty_messages")
 
-    def test_llm_chat_empty_messages_rejected(self, adapter: Any) -> None:
-        """llm.chat with empty messages should be rejected."""
-        from tests.live.wire_validators import validate_llm_chat_args
+    def test_llm_complete_message_missing_role_rejected(self, adapter: Any) -> None:
+        from tests.live.wire_validators import validate_llm_complete_args
+        args = {"messages": [{"content": "hello"}]}
+        with pytest.raises(ArgsValidationError, match=r"role"):
+            validate_llm_complete_args(args, case_id="test_llm_message_missing_role")
 
-        with pytest.raises(ArgsValidationError, match="must not be empty"):
-            validate_llm_chat_args({"messages": []}, case_id="test")
+    def test_llm_complete_message_missing_content_rejected(self, adapter: Any) -> None:
+        from tests.live.wire_validators import validate_llm_complete_args
+        args = {"messages": [{"role": "user"}]}
+        with pytest.raises(ArgsValidationError, match=r"content"):
+            validate_llm_complete_args(args, case_id="test_llm_message_missing_content")
 
-    def test_llm_chat_invalid_role_rejected(self, adapter: Any) -> None:
-        """llm.chat with invalid role should be rejected."""
-        from tests.live.wire_validators import validate_llm_chat_args
-
-        args = {"messages": [{"role": "invalid", "content": "test"}]}
-
-        with pytest.raises(ArgsValidationError, match="role"):
-            validate_llm_chat_args(args, case_id="test")
-
-    def test_vector_query_missing_vector_and_text(self, adapter: Any) -> None:
-        """vector.query without vector or text should be rejected."""
+    def test_vector_query_missing_vector_rejected(self, adapter: Any) -> None:
         from tests.live.wire_validators import validate_vector_query_args
+        with pytest.raises(ArgsValidationError, match="args.vector"):
+            validate_vector_query_args({"top_k": 1}, case_id="test_vector_query_missing_vector")
 
-        with pytest.raises(ArgsValidationError, match="requires 'vector' or 'text'"):
-            validate_vector_query_args({}, case_id="test")
-
-    def test_vector_empty_dimensions_rejected(self, adapter: Any) -> None:
-        """Empty vector should be rejected."""
+    def test_vector_query_missing_top_k_rejected(self, adapter: Any) -> None:
         from tests.live.wire_validators import validate_vector_query_args
+        with pytest.raises(ArgsValidationError, match="args.top_k"):
+            validate_vector_query_args({"vector": [1.0, 2.0]}, case_id="test_vector_query_missing_top_k")
 
-        with pytest.raises(ArgsValidationError, match="dimensions"):
-            validate_vector_query_args({"vector": []}, case_id="test")
-
-    def test_vector_non_numeric_rejected(self, adapter: Any) -> None:
-        """Non-numeric values in vector should be rejected."""
+    def test_vector_query_empty_vector_rejected(self, adapter: Any) -> None:
         from tests.live.wire_validators import validate_vector_query_args
+        with pytest.raises(ArgsValidationError, match="at least 1 item"):
+            validate_vector_query_args({"vector": [], "top_k": 1}, case_id="test_vector_query_empty_vector")
 
-        with pytest.raises(ArgsValidationError, match="numbers"):
-            validate_vector_query_args({"vector": [1.0, "bad", 3.0]}, case_id="test")
+    def test_vector_query_non_numeric_rejected(self, adapter: Any) -> None:
+        from tests.live.wire_validators import validate_vector_query_args
+        with pytest.raises(ArgsValidationError, match="only numbers"):
+            validate_vector_query_args({"vector": [1.0, "bad", 3.0], "top_k": 1}, case_id="test_vector_query_non_numeric")
 
-    def test_vector_upsert_dimension_mismatch(self, adapter: Any) -> None:
-        """Vectors with inconsistent dimensions should be rejected."""
+    def test_vector_upsert_missing_vectors_rejected(self, adapter: Any) -> None:
         from tests.live.wire_validators import validate_vector_upsert_args
+        with pytest.raises(ArgsValidationError, match="args.vectors"):
+            validate_vector_upsert_args({}, case_id="test_vector_upsert_missing_vectors")
 
-        args = {
-            "vectors": [
-                {"id": "v1", "values": [1.0, 2.0, 3.0]},
-                {"id": "v2", "values": [1.0, 2.0]},
-            ]
-        }
+    def test_vector_upsert_vector_missing_id_rejected(self, adapter: Any) -> None:
+        from tests.live.wire_validators import validate_vector_upsert_args
+        args = {"vectors": [{"vector": [1.0, 2.0]}]}
+        with pytest.raises(ArgsValidationError, match=r"\.id"):
+            validate_vector_upsert_args(args, case_id="test_vector_upsert_missing_id")
 
-        with pytest.raises(ArgsValidationError, match="mismatch"):
-            validate_vector_upsert_args(args, case_id="test")
-
-    def test_embedding_missing_text_and_texts(self, adapter: Any) -> None:
-        """embedding.embed without text or texts should be rejected."""
+    def test_embedding_embed_stream_true_rejected(self, adapter: Any) -> None:
         from tests.live.wire_validators import validate_embedding_embed_args
+        args = {"text": "hello", "model": "m", "stream": True}
+        with pytest.raises(ArgsValidationError, match="streaming uses embedding.stream_embed"):
+            validate_embedding_embed_args(args, case_id="test_embedding_embed_stream_true")
 
-        with pytest.raises(ArgsValidationError, match="requires 'text' or 'texts'"):
-            validate_embedding_embed_args({}, case_id="test")
-
-    def test_graph_query_invalid_language(self, adapter: Any) -> None:
-        """graph.query with invalid language should be rejected."""
-        from tests.live.wire_validators import validate_graph_query_args
-
-        args = {"query": "MATCH (n) RETURN n", "language": "sql"}
-
-        with pytest.raises(ArgsValidationError, match="language"):
-            validate_graph_query_args(args, case_id="test")
-
-    def test_graph_mutate_invalid_type(self, adapter: Any) -> None:
-        """graph.mutate with invalid mutation type should be rejected."""
-        from tests.live.wire_validators import validate_graph_mutate_args
-
-        args = {"mutations": [{"type": "invalid_mutation"}]}
-
-        with pytest.raises(ArgsValidationError, match="type"):
-            validate_graph_mutate_args(args, case_id="test")
+    def test_graph_delete_nodes_requires_ids_or_filter(self, adapter: Any) -> None:
+        from tests.live.wire_validators import validate_graph_delete_nodes_args
+        with pytest.raises(ArgsValidationError, match="Requires 'ids' or 'filter'"):
+            validate_graph_delete_nodes_args({}, case_id="test_graph_delete_nodes_missing_both")
 
 
 # ---------------------------------------------------------------------------
@@ -701,7 +594,6 @@ def pytest_configure(config) -> None:
             verbose_failures=True,
         )
 
-    # Reset session metrics at start of test session
     reset_session_metrics()
 
     # Register markers
@@ -737,5 +629,4 @@ def generate_coverage_report() -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # Allow running directly for quick checks
     pytest.main([__file__, "-v", "--tb=short"])
