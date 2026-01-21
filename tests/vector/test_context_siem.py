@@ -236,20 +236,9 @@ async def test_observability_query_metrics_include_namespace(adapter):
     from corpus_sdk.vector.vector_base import Vector, VectorID, UpsertSpec
     
     # Add a vector to the test namespace first
-    test_namespace = "test-namespace"
-    try:
-        await adapter.upsert(UpsertSpec(
-            namespace=test_namespace,
-            vectors=[Vector(id=VectorID("test-vector"), vector=[0.2, 0.3])]
-        ))
-    except Exception:
-        # If namespace doesn't exist or other error, use default namespace
-        test_namespace = "default"
-        await adapter.upsert(UpsertSpec(
-            namespace=test_namespace,
-            vectors=[Vector(id=VectorID("test-vector"), vector=[0.2, 0.3])]
-        ))
-    
+    # FIX (determinism): do not assume "default" exists; create/prime a queryable namespace.
+    test_namespace = await _ensure_queryable_namespace(adapter, dims=2)
+
     metrics = CaptureMetrics()
     original_metrics = getattr(adapter, "_metrics", None)
     if _can_patch_metrics(adapter):
@@ -278,9 +267,12 @@ async def test_observability_upsert_metrics_include_vector_count(adapter):
     if _can_patch_metrics(adapter):
         adapter._metrics = metrics  # type: ignore[attr-defined]
 
+    # FIX (determinism): ensure a namespace exists for the mock by using index-management path.
+    namespace = await _ensure_queryable_namespace(adapter, dims=2)
+
     ctx = OperationContext(request_id="v_up", tenant="test-tenant")
     spec = UpsertSpec(
-        namespace="default",
+        namespace=namespace,
         vectors=[Vector(id=VectorID("m1"), vector=[0.1, 0.2])],
     )
     await adapter.upsert(spec, ctx=ctx)
