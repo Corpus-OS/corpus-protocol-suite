@@ -408,8 +408,6 @@ interface EmbeddingCountTokensSpec {
 > **Note:** There is no single shared `CountTokensSpec` type across protocols. LLM and Embedding protocols define their own specifications with different `model` field requirements.
 
 ### 3.9 JSON Schema Requirements
-- **Type schemas are strict (`additionalProperties: false`) unless explicitly allowed.**
-- **Envelopes and some args specs are intentionally permissive (`additionalProperties: true`) for forward-compatibility.**
 - **Nullability:** Fields explicitly marked optional vs required
 - **String formats:** UUID, ISO8601, email where semantically meaningful
 - **Array bounds:** Minimum/maximum lengths specified per capability
