@@ -19,6 +19,17 @@ Conformance Guarantees:
 - Cache behavior is configurable but defaults to deterministic
 - Streaming counters are accurate and never leak
 - All capabilities accurately reflect actual behavior
+
+IMPORTANT ALIGNMENT WITH BaseEmbeddingAdapter
+--------------------------------------------
+BaseEmbeddingAdapter will use caching whenever:
+  - self._cache.supports_ttl is True, AND
+  - self._cache_embed_ttl_s > 0
+
+That logic is mode-agnostic. Therefore, this mock reports supports_caching=True
+whenever BaseEmbeddingAdapter would actually cache, regardless of mode.
+Additionally, the mock can simulate caching in thin mode ONLY when base caching
+is not active (to avoid double-caching / capability mismatches).
 """
 
 from __future__ import annotations
@@ -64,8 +75,8 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
     - Configurable normalization during streaming
 
     Cache Testing:
-    - When caching is enabled (mode=standalone with cache), uses actual cache (BaseEmbeddingAdapter)
-    - Optional deterministic simulated cache behavior for thin-mode testing (when enabled via knobs)
+    - When BaseEmbeddingAdapter caching is enabled (supports_ttl + ttl>0), mock reports supports_caching=True.
+    - Optional deterministic simulated cache behavior for thin-mode testing (only when base caching is NOT enabled).
     - Deterministic by default (no simulated cache unless configured)
 
     Statistics:
@@ -100,7 +111,7 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
     # ----- Cache Testing Configuration -----
     cache_behavior: str  # "deterministic" | "force_hit" | "force_miss" | "simulate_error"
     cache_hit_rate: float  # 0.0-1.0, probability of cache hit when behavior="deterministic"
-    cache_set_failure_rate: float  # 0.0-1.0, probability of cache.set() failure
+    cache_set_failure_rate: float  # 0.0-1.0, probability of cache.set() failure (simulated)
 
     # ----- Internal Statistics -----
     _stats: Dict[str, Any]
@@ -147,7 +158,7 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
         stream_abandonment_rate: float = 0.0,
         # Cache testing configuration
         cache_behavior: str = "deterministic",
-        cache_hit_rate: float = 0.0,  # Default 0.0 for deterministic no-cache behavior
+        cache_hit_rate: float = 0.0,  # Default 0.0 for deterministic no simulated-cache behavior
         cache_set_failure_rate: float = 0.0,
     ) -> None:
         super().__init__(
@@ -185,13 +196,12 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
         self.stream_chunk_pattern = stream_chunk_pattern
         self.stream_min_chunks = max(1, int(stream_min_chunks))
         self.stream_max_chunks = max(self.stream_min_chunks, int(stream_max_chunks))
-        # FIXED: Use local variables to compute stream_yield_interval_ms
         lo = max(0, int(stream_yield_interval_ms[0]))
         hi = max(lo, int(stream_yield_interval_ms[1]))
         self.stream_yield_interval_ms = (lo, hi)
         self.stream_abandonment_rate = max(0.0, min(1.0, float(stream_abandonment_rate)))
 
-        # Cache testing config - defaults to deterministic no-cache for conformance
+        # Cache testing config
         self.cache_behavior = cache_behavior
         self.cache_hit_rate = max(0.0, min(1.0, float(cache_hit_rate)))
         self.cache_set_failure_rate = max(0.0, min(1.0, float(cache_set_failure_rate)))
@@ -247,35 +257,43 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
     # ---------------------------------------------------------------------
     # Capability helpers
     # ---------------------------------------------------------------------
-    def _real_cache_enabled(self) -> bool:
-        """True when BaseEmbeddingAdapter's actual cache path is enabled and meaningful."""
+    def _base_cache_enabled(self) -> bool:
+        """
+        True when BaseEmbeddingAdapter's embed() cache path will be used.
+
+        Must mirror BaseEmbeddingAdapter._embed_core's logic exactly:
+          supports_ttl && cache_embed_ttl_s > 0
+        (Mode is intentionally NOT part of this decision.)
+        """
         return bool(
-            self._mode == "standalone"
-            and getattr(self._cache, "supports_ttl", False)
-            and self._cache_embed_ttl_s > 0
+            getattr(self._cache, "supports_ttl", False)
+            and getattr(self, "_cache_embed_ttl_s", 0) > 0
         )
 
     def _simulated_cache_enabled(self) -> bool:
         """
-        True when we are intentionally simulating caching in thin mode.
-        (Used only for tests/demos; must align with capabilities.)
+        True when we intentionally simulate caching in thin mode.
+
+        IMPORTANT:
+        - Only simulate when base caching is NOT enabled, to avoid double-caching
+          and to keep capabilities truthful.
         """
+        if self._base_cache_enabled():
+            return False
         if self._mode != "thin":
             return False
         if self.cache_behavior != "deterministic":
             return True
-        # Deterministic behavior can still simulate hits/misses if rates are non-zero.
         return (self.cache_hit_rate > 0.0) or (self.cache_set_failure_rate > 0.0)
 
     def _supports_caching(self) -> bool:
-        """Capability truth: real cache enabled OR simulated cache enabled (thin-mode test harness)."""
-        return self._real_cache_enabled() or self._simulated_cache_enabled()
+        """Capability truth: caching will happen (base) OR is simulated (thin-only)."""
+        return self._base_cache_enabled() or self._simulated_cache_enabled()
 
     # ---------------------------------------------------------------------
     # Capabilities & Health
     # ---------------------------------------------------------------------
     async def _do_capabilities(self) -> EmbeddingCapabilities:
-        """Return accurate capabilities reflecting actual mock behavior."""
         return EmbeddingCapabilities(
             server=self.name,
             version="1.0.0",
@@ -298,26 +316,22 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
 
     async def _do_health(self, *, ctx: Optional[EmbeddingContext] = None) -> Dict[str, Any]:
         degraded = bool((ctx and ctx.attrs.get("health") == "degraded"))
-        if degraded:
-            return {
-                "ok": False,
-                "server": self.name,
-                "version": "1.0.0",
-                "models": {m: "degraded" for m in self.supported_models},
-                "mock_stats": self._get_current_stats(),
-            }
-        return {
-            "ok": True,
+        payload = {
             "server": self.name,
             "version": "1.0.0",
-            "models": {m: "ok" for m in self.supported_models},
+            "models": {m: ("degraded" if degraded else "ok") for m in self.supported_models},
             "mock_stats": self._get_current_stats(),
         }
+        if degraded:
+            payload["ok"] = False
+            return payload
+        payload["ok"] = True
+        return payload
 
     # ---------------------------------------------------------------------
     # Single embed
-    #   - Real caching (standalone) is handled by BaseEmbeddingAdapter outside _do_embed.
-    #   - Simulated caching (thin mode) is only enabled when capabilities say supports_caching=True.
+    #   - Real caching is handled by BaseEmbeddingAdapter outside _do_embed.
+    #   - Simulated caching (thin mode) is only enabled when base caching is NOT enabled.
     # ---------------------------------------------------------------------
     async def _do_embed(
         self,
@@ -325,7 +339,6 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
         *,
         ctx: Optional[EmbeddingContext] = None,
     ) -> EmbedResult:
-        """Single embed with OPTIONAL simulated cache behavior for thin-mode tests."""
         self._stats["embed_calls"] += 1
         start_time = time.monotonic()
 
@@ -334,19 +347,17 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
         if spec.model not in self.supported_models:
             raise ModelNotAvailable(f"Model '{spec.model}' is not supported")
 
-        # --- Simulated caching only when thin-mode simulation is enabled (and capability says caching supported) ---
+        # Simulated caching only when explicitly enabled (and base caching is not active)
         if self._simulated_cache_enabled():
-            # Cache key generation sanity (not used further; useful for tests to validate tenant isolation)
             _ = self._embed_cache_key(spec.model, spec.normalize, spec.text, ctx)
 
-            should_hit = self._should_cache_hit("embed", spec.text, ctx)
-            if should_hit:
+            if self._should_cache_hit("embed", spec.text, ctx):
                 self._stats["cache_hits"] += 1
                 cached_vec = self._make_cached_vector(spec.model, spec.text)
                 if self.normalizes_at_source and spec.normalize:
                     cached_vec = self._normalize(cached_vec)
 
-                elapsed_ms = (time.monotonic() - start_time) * 1000
+                elapsed_ms = (time.monotonic() - start_time) * 1000.0
                 self._stats["total_processing_time_ms"] += elapsed_ms
 
                 return EmbedResult(
@@ -362,15 +373,15 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
                     truncated=False,
                 )
 
-            # Miss: simulate a cache set attempt (and possibly a failure)
+            # Miss: count miss and deterministically count a set-attempt (and maybe failure)
             self._stats["cache_misses"] += 1
-            self._stats["cache_set_attempts"] += 1  # FIXED: attempts are counted deterministically
+            self._stats["cache_set_attempts"] += 1
             if self._should_cache_set_fail():
                 self._stats["cache_set_failures"] += 1
                 if self.cache_behavior == "simulate_error":
                     raise Unavailable("Cache set failed (simulated for testing)")
 
-        # --- Normal computation path (deterministic vectors) ---
+        # Normal deterministic vector generation
         await self._sleep_random()
 
         dim = self._dimensions_for(spec.model)
@@ -382,7 +393,7 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
 
         tokens = self._approx_tokens(spec.text)
 
-        elapsed_ms = (time.monotonic() - start_time) * 1000
+        elapsed_ms = (time.monotonic() - start_time) * 1000.0
         self._stats["total_processing_time_ms"] += elapsed_ms
         self._stats["total_texts_embedded"] += 1
         self._stats["total_tokens_processed"] += tokens
@@ -401,7 +412,7 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
         )
 
     # ---------------------------------------------------------------------
-    # Streaming Implementation with reliable counter tracking
+    # Streaming
     # ---------------------------------------------------------------------
     async def _do_stream_embed(
         self,
@@ -409,7 +420,6 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
         *,
         ctx: Optional[EmbeddingContext] = None,
     ) -> AsyncIterator[EmbedChunk]:
-        """Implement streaming text embedding with configurable chunk patterns."""
         self._stats["stream_embed_calls"] += 1
         self._stream_active_count += 1
 
@@ -425,18 +435,16 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
             dim = self._dimensions_for(spec.model)
             rng = self._rng_for(spec.model, spec.text)
 
-            # Determine chunking pattern
             if self.stream_chunk_pattern == "single":
                 chunks = await self._generate_single_chunk(spec, dim, rng, ctx)
             elif self.stream_chunk_pattern == "progressive":
                 chunks = await self._generate_progressive_chunks(spec, dim, rng, ctx)
-            else:  # multi_vector
+            else:
                 chunks = await self._generate_multi_vector_chunks(spec, dim, rng, ctx)
 
             total_chunks = len(chunks)
 
             for chunk_idx, chunk_data in enumerate(chunks):
-                # Check for simulated abandonment
                 if (
                     self.stream_abandonment_rate > 0
                     and random.random() < self.stream_abandonment_rate
@@ -445,7 +453,6 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
                     self._stats["abandoned_streams"] += 1
                     raise asyncio.CancelledError(f"Stream {stream_id} abandoned (simulated)")
 
-                # Simulate inter-chunk latency
                 if self.simulate_latency and chunk_idx > 0:
                     await self._sleep_random_range(*self.stream_yield_interval_ms)
 
@@ -467,11 +474,11 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
             self._stats["total_texts_embedded"] += 1
             self._stats["total_tokens_processed"] += self._approx_tokens(spec.text)
 
-            elapsed_ms = (time.monotonic() - start_time) * 1000
+            elapsed_ms = (time.monotonic() - start_time) * 1000.0
             self._stats["total_processing_time_ms"] += elapsed_ms
 
         finally:
-            # CHANGE #3: Decrement exactly once and never go negative (robust even if closed early)
+            # Robust: decrement exactly once, never go negative
             self._stream_active_count = max(0, self._stream_active_count - 1)
 
     async def _generate_single_chunk(
@@ -494,10 +501,7 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
             dimensions=dim,
         )
 
-        return [{
-            "embeddings": [embedding],
-            "usage": {"tokens": self._approx_tokens(spec.text)}
-        }]
+        return [{"embeddings": [embedding], "usage": {"tokens": self._approx_tokens(spec.text)}}]
 
     async def _generate_progressive_chunks(
         self,
@@ -528,7 +532,7 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
                 model=spec.model,
                 dimensions=current_dim,
                 index=chunk_idx,
-                metadata={"partial": True, "total_dimensions": dim} if current_dim < dim else None
+                metadata={"partial": True, "total_dimensions": dim} if current_dim < dim else None,
             )
 
             is_final = (chunk_idx == num_chunks - 1 or len(accumulated_vector) >= dim)
@@ -542,10 +546,9 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
                     metadata=embedding.metadata,
                 )
 
-            chunks.append({
-                "embeddings": [embedding],
-                "usage": {"tokens": self._approx_tokens(spec.text)} if is_final else None
-            })
+            chunks.append(
+                {"embeddings": [embedding], "usage": {"tokens": self._approx_tokens(spec.text)} if is_final else None}
+            )
 
         return chunks
 
@@ -581,15 +584,18 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
                 total_vectors_generated += 1
 
             is_final = (chunk_idx == num_chunks - 1)
-            chunks.append({
-                "embeddings": chunk_embeddings,
-                "usage": {"tokens": self._approx_tokens(spec.text) * len(chunk_embeddings)} if is_final else None
-            })
+            chunks.append(
+                {
+                    "embeddings": chunk_embeddings,
+                    "usage": {"tokens": self._approx_tokens(spec.text) * len(chunk_embeddings)} if is_final else None,
+                }
+            )
 
         return chunks
 
     # ---------------------------------------------------------------------
-    # Batch embed — public override to ensure fallback-per-item validation
+    # Batch embed — override to preserve the legacy conformance semantics:
+    # allow empty texts through to become item-level failures on fallback.
     # ---------------------------------------------------------------------
     async def embed_batch(
         self,
@@ -652,7 +658,7 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
             if result.total_tokens is not None:
                 self._stats["total_tokens_processed"] += result.total_tokens
 
-            elapsed_ms = (time.monotonic() - start_time) * 1000
+            elapsed_ms = (time.monotonic() - start_time) * 1000.0
             self._stats["total_processing_time_ms"] += elapsed_ms
 
             self._metrics.counter(
@@ -693,6 +699,13 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
         *,
         ctx: Optional[EmbeddingContext],
     ) -> BatchEmbedResult:
+        """
+        Fallback batch path when native batch is NotSupported.
+
+        IMPORTANT FIXES:
+        - Successful embeddings get index=idx (batch semantics).
+        - Successful embeddings get metadata attached from eff_spec.metadatas (if provided).
+        """
         embeddings: List[EmbeddingVector] = []
         failed: List[Dict[str, Any]] = []
 
@@ -705,7 +718,9 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
                     text=text,
                     model=eff_spec.model,
                     truncate=eff_spec.truncate,
-                    normalize=False,
+                    normalize=False,   # normalize uniformly below
+                    metadata=None,     # provider does not see caller metadata
+                    stream=False,
                 )
                 single = await self._do_embed(single_spec, ctx=ctx)
                 ev = single.embedding
@@ -723,6 +738,17 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
                             index=ev.index,
                             metadata=ev.metadata,
                         )
+
+                # FIX: enforce batch index + attach per-item metadata
+                md = eff_spec.metadatas[idx] if eff_spec.metadatas and idx < len(eff_spec.metadatas) else None
+                ev = EmbeddingVector(
+                    vector=ev.vector,
+                    text=ev.text,
+                    model=ev.model,
+                    dimensions=ev.dimensions,
+                    index=idx,
+                    metadata=md,
+                )
 
                 embeddings.append(ev)
 
@@ -751,6 +777,9 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
             failed_texts=failed,
         )
 
+    # ---------------------------------------------------------------------
+    # Native batch hook (used when supports_batch=True)
+    # ---------------------------------------------------------------------
     async def _do_embed_batch(
         self,
         spec: BatchEmbedSpec,
@@ -834,6 +863,9 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
             failed_texts=failures if self.collect_failures_in_native_batch else [],
         )
 
+    # ---------------------------------------------------------------------
+    # Token counting
+    # ---------------------------------------------------------------------
     async def _do_count_tokens(
         self,
         text: str,
@@ -851,10 +883,13 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
 
         result = self._approx_tokens(text)
 
-        elapsed_ms = (time.monotonic() - start_time) * 1000
+        elapsed_ms = (time.monotonic() - start_time) * 1000.0
         self._stats["total_processing_time_ms"] += elapsed_ms
         return result
 
+    # ---------------------------------------------------------------------
+    # Stats
+    # ---------------------------------------------------------------------
     async def _do_get_stats(self, ctx: Optional[EmbeddingContext] = None) -> EmbeddingStats:
         total_requests = (
             self._stats["embed_calls"]
@@ -881,7 +916,7 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
         )
 
     # ---------------------------------------------------------------------
-    # Cache Testing Helpers - SIMULATION ONLY for thin mode testing
+    # Simulated cache helpers (thin-mode only)
     # ---------------------------------------------------------------------
     def _should_cache_hit(self, operation: str, text: str, ctx: Optional[EmbeddingContext]) -> bool:
         if self.cache_behavior == "force_hit":
@@ -898,7 +933,6 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
         return rng.random() < self.cache_hit_rate
 
     def _should_cache_set_fail(self) -> bool:
-        # Deterministic failure patterns
         if self.cache_behavior == "simulate_error":
             # deterministic: fail every other attempt
             return (self._stats["cache_set_attempts"] % 2) == 1
@@ -908,7 +942,7 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
 
     def _make_cached_vector(self, model: str, text: str) -> List[float]:
         dim = self._dimensions_for(model)
-        _ = self._rng_for(model, f"CACHED_{text}")  # keep seed-based determinism in case you extend patterns later
+        _ = self._rng_for(model, f"CACHED_{text}")  # keep deterministic anchor
         if self.test_vector_pattern == "zeros":
             return [0.0] * dim
         if self.test_vector_pattern == "ones":
@@ -943,7 +977,7 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
             if "[RATE_LIMIT]" in text:
                 raise ResourceExhausted(f"Mocked {op} rate-limited (text sentinel)", retry_after_ms=800)
             if "[TRANSIENT]" in text:
-                raise TransientNetwork(f"Mocked {op} transient network", retry_after_ms=600)
+                raise TransientNetwork(f"Mocked {op} transient (text sentinel)", retry_after_ms=600)
             if "[DEADLINE]" in text:
                 raise DeadlineExceeded(f"Mocked {op} deadline (text sentinel)", retry_after_ms=0)
             if "[NO_CACHE]" in text:
