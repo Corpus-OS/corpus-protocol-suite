@@ -24,7 +24,6 @@ pytestmark = pytest.mark.asyncio
 
 async def test_token_counting_returns_non_negative_int(adapter: BaseEmbeddingAdapter):
     """§10.3: count_tokens must return non-negative integer OR raise NotSupported if capability says so."""
-    # ✅ CHANGED: no skips; behavior must match capabilities
     caps = await adapter.capabilities()
     model = caps.supported_models[0]
 
@@ -41,7 +40,6 @@ async def test_token_counting_returns_non_negative_int(adapter: BaseEmbeddingAda
 
 async def test_token_counting_context_propagation(adapter: BaseEmbeddingAdapter):
     """§6.1: Context must be accepted and not break count_tokens behavior."""
-    # ✅ CHANGED: ctx does not carry metrics; we validate context plumbing doesn't break.
     caps = await adapter.capabilities()
     model = caps.supported_models[0]
 
@@ -63,7 +61,6 @@ async def test_token_counting_context_propagation(adapter: BaseEmbeddingAdapter)
 
 async def test_token_counting_monotonic_with_text_length(adapter: BaseEmbeddingAdapter):
     """§10.3: Token count should generally increase with text length (allow heuristic variance)."""
-    # ✅ CHANGED: no skips; enforce NotSupported if capability is false
     caps = await adapter.capabilities()
     model = caps.supported_models[0]
 
@@ -88,7 +85,6 @@ async def test_token_counting_monotonic_with_text_length(adapter: BaseEmbeddingA
 
 async def test_token_counting_empty_string_handling(adapter: BaseEmbeddingAdapter):
     """§10.3: Empty string should return minimal token count (or NotSupported if unsupported)."""
-    # ✅ CHANGED: no skips
     caps = await adapter.capabilities()
     model = caps.supported_models[0]
 
@@ -104,7 +100,6 @@ async def test_token_counting_empty_string_handling(adapter: BaseEmbeddingAdapte
 
 async def test_token_counting_unicode_boundary_cases(adapter: BaseEmbeddingAdapter):
     """§10.3: Token counting should handle Unicode correctly (or NotSupported if unsupported)."""
-    # ✅ CHANGED: no skips
     caps = await adapter.capabilities()
     model = caps.supported_models[0]
 
@@ -131,7 +126,6 @@ async def test_token_counting_unicode_boundary_cases(adapter: BaseEmbeddingAdapt
 
 async def test_token_counting_consistent_for_identical_inputs(adapter: BaseEmbeddingAdapter):
     """§10.3: Identical inputs should produce identical token counts (if supported)."""
-    # ✅ CHANGED: no skips
     caps = await adapter.capabilities()
     model = caps.supported_models[0]
     text = "consistent token counting test"
@@ -148,7 +142,6 @@ async def test_token_counting_consistent_for_identical_inputs(adapter: BaseEmbed
 
 async def test_token_counting_unknown_model_raises_model_not_available(adapter: BaseEmbeddingAdapter):
     """§10.4: Unknown models must raise ModelNotAvailable (if supported)."""
-    # ✅ CHANGED: if token counting unsupported, raise NotSupported first is acceptable
     caps = await adapter.capabilities()
     if not caps.supports_token_counting:
         with pytest.raises(NotSupported):
@@ -166,7 +159,6 @@ async def test_token_counting_unknown_model_raises_model_not_available(adapter: 
 
 async def test_token_counting_invalid_input_raises_bad_request(adapter: BaseEmbeddingAdapter):
     """§10.4: Invalid inputs should raise BadRequest (for clearly invalid types) if supported."""
-    # ✅ CHANGED: no skips; if not supported, NotSupported is correct.
     caps = await adapter.capabilities()
     model = caps.supported_models[0]
 
@@ -181,7 +173,6 @@ async def test_token_counting_invalid_input_raises_bad_request(adapter: BaseEmbe
 
 async def test_token_counting_various_whitespace_handling(adapter: BaseEmbeddingAdapter):
     """§10.3: Token counting should handle various whitespace patterns (or NotSupported)."""
-    # ✅ CHANGED: no skips
     caps = await adapter.capabilities()
     model = caps.supported_models[0]
 
