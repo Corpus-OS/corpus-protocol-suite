@@ -291,8 +291,11 @@ All adapters MUST use protocol-specific base errors:
 * **Dynamic discovery:** Clients probe `capabilities()` to determine supported features.
 * **Truthful reporting:** Adapters MUST accurately report actual capabilities.
 * **Protocol field (schema-governed):**
-  * When present, `protocol` MUST equal the canonical protocol ID (e.g., `"llm/v1.0"`, `"graph/v1.0"`, `"vector/v1.0"`).
-  * For **EmbeddingCapabilities**, `protocol` is **REQUIRED** and MUST equal `"embedding/v1.0"`.
+  * `protocol` is **REQUIRED** in all `*Capabilities` results and MUST equal the canonical protocol ID:
+    * LLM: `"llm/v1.0"`
+    * Graph: `"graph/v1.0"`
+    * Vector: `"vector/v1.0"`
+    * Embedding: `"embedding/v1.0"`
 * **Caching:** Capabilities may be cached with appropriate TTL (typically 5–60 minutes).
 
 ### 2.13 Idempotency Expectations
@@ -310,7 +313,7 @@ All adapters MUST use protocol-specific base errors:
 - Emit metrics for every operation with tenant hashing
 - Propagate `deadline_ms` to provider APIs with safety buffer when possible
 - Map provider errors to canonical error taxonomy
-- Report capabilities truthfully (protocol field is recommended but not required except for Embedding)
+- Report capabilities truthfully (**`protocol` field is REQUIRED** in all Capabilities results and MUST match the canonical protocol ID)
 - Enforce SIEM-safe requirements for all telemetry
 - Use canonical wire envelopes for all responses
 - Include `op`, `ctx`, and `args` keys in all request envelopes
@@ -462,7 +465,7 @@ interface GraphCapabilities {
   version: string;                // REQUIRED
 
   // Schema-optional (recommended when known):
-  protocol?: "graph/v1.0";        // OPTIONAL in schema (const when present)
+  protocol?: "graph/v1.0";        //// REQUIRED (const)
 
   supports_stream_query?: boolean;
   supported_query_dialects?: string[];
@@ -1455,6 +1458,7 @@ interface LLMCapabilities {
   version: string;                // REQUIRED
   model_family: string;           // REQUIRED
   max_context_length: number;     // REQUIRED (integer in schema)
+  protocol: "llm/v1.0";           // REQUIRED (const)
 
   // Schema-optional (recommended when known):
   protocol?: string;              // OPTIONAL
@@ -1473,7 +1477,7 @@ interface LLMCapabilities {
   max_tool_calls_per_turn?: number | null; // integer|null in schema
 }
 ```
-> **Guidance:** Adapters SHOULD populate optional capability fields truthfully when available. Schema validation requires only the fields listed as "Schema-required." LLM capabilities schema is closed (`additionalProperties: false`).
+> **Guidance:** Adapters SHOULD populate optional capability fields truthfully when available. Schema validation requires all fields listed as "Schema-required" above (including `protocol`). LLM capabilities schema is closed (`additionalProperties: false`).
 
 ### 9.2 Model Family & Supported Models
 - **Model listing:** Accurate list of available provider models
@@ -1874,9 +1878,10 @@ interface VectorCapabilities {
   // Schema-required:
   server: string;                 // REQUIRED
   version: string;                // REQUIRED
+  protocol: "vector/v1.0";      // REQUIRED (const) 
+  
 
   // Schema-optional (recommended when known):
-  protocol?: "vector/v1.0";       // OPTIONAL in schema (const when present)
   max_dimensions?: number;        // integer in schema
   supported_metrics?: string[];
   supports_namespaces?: boolean;
@@ -2002,7 +2007,7 @@ interface DeleteResult {
 interface NamespaceSpec {
   namespace: string;              // REQUIRED
   dimensions: number;             // REQUIRED (integer in schema)
-  distance_metric: string;        // e.g., "cosine", "euclidean"
+  distance_metric?: "cosine" | "euclidean" | "dotproduct"; // OPTIONAL, default: "cosine"
 }
 ```
 
@@ -2369,7 +2374,7 @@ interface NamespaceResult {
 
 **Capabilities Enforcement:**
 - If `max_dimensions` and `dimensions > max_dimensions` → `BAD_REQUEST`
-- If `distance_metric` not in `supported_metrics` → `NOT_SUPPORTED`
+- If `distance_metric` is provided, it MUST be one of supported metrics; if omitted, it defaults to `"cosine"`
 
 **Request Body:**
 ```json
