@@ -139,12 +139,12 @@ async def test_capabilities_consistency_with_count_tokens(adapter):
     ctx = OperationContext(tenant="test", request_id="test-caps-001")
 
     if caps.supports_count_tokens:
-        count = await adapter.count_tokens("test text for counting", ctx=ctx)
+        count = await adapter.count_tokens("test text for counting", model=caps.supported_models[0], ctx=ctx)
         assert isinstance(count, int), "count_tokens should return integer when supported"
         assert count >= 0, "count_tokens should return non-negative integer"
     else:
         with pytest.raises(NotSupported):
-            await adapter.count_tokens("test text for counting", ctx=ctx)
+            await adapter.count_tokens("test text for counting", model=caps.supported_models[0], ctx=ctx)
 
 
 async def test_capabilities_consistency_with_streaming(adapter):
@@ -168,7 +168,6 @@ async def test_capabilities_consistency_with_streaming(adapter):
                 break
 
         assert len(chunks) > 0, "stream() should yield chunks when supported"
-
         for chunk in chunks:
             assert hasattr(chunk, "text"), "Stream chunks should have text attribute"
             assert hasattr(chunk, "is_final"), "Stream chunks should have is_final attribute"
@@ -189,18 +188,15 @@ async def test_capabilities_all_fields_present(adapter):
     """
     caps = await adapter.capabilities()
 
-    # Identity fields (required)
     required_fields = ["server", "version", "model_family"]
     for field in required_fields:
         assert hasattr(caps, field), f"Missing required field: {field}"
         value = getattr(caps, field)
         assert isinstance(value, str) and value.strip(), f"{field} must be non-empty string"
 
-    # Resource limits (required)
     assert hasattr(caps, "max_context_length"), "Missing max_context_length"
     assert isinstance(caps.max_context_length, int) and caps.max_context_length > 0
 
-    # Feature flags (all should be present and boolean)
     feature_flags = [
         "supports_streaming",
         "supports_roles",
@@ -220,13 +216,11 @@ async def test_capabilities_all_fields_present(adapter):
             f"{flag} must be boolean, got {type(getattr(caps, flag)).__name__}"
         )
 
-    # Tool limits (nullable but must be valid if present)
     assert hasattr(caps, "max_tool_calls_per_turn"), "Missing max_tool_calls_per_turn"
     if caps.max_tool_calls_per_turn is not None:
         assert isinstance(caps.max_tool_calls_per_turn, int), "max_tool_calls_per_turn must be int when present"
         assert caps.max_tool_calls_per_turn >= 1, "max_tool_calls_per_turn must be >= 1 when present"
 
-    # Model enumeration (required)
     assert hasattr(caps, "supported_models"), "Missing supported_models"
     assert isinstance(caps.supported_models, tuple), "supported_models must be tuple"
     assert len(caps.supported_models) >= 1, "Must support at least one model"
@@ -262,7 +256,7 @@ async def test_capabilities_idempotency(adapter):
         val1 = getattr(caps1, flag)
         val2 = getattr(caps2, flag)
         val3 = getattr(caps3, flag)
-        assert val1 == val2 == val3, f"Feature flag {flag} should be consistent: {val1}, {val2}, {val3}"
+        assert val1 == val2 == val3, f"Feature flag {flag} should be consistent"
 
     assert caps1.supported_models == caps2.supported_models == caps3.supported_models, "Supported models should be consistent"
 
@@ -272,7 +266,6 @@ async def test_capabilities_reasonable_model_names(adapter):
     Model names should be reasonable identifiers (not garbage).
     """
     caps = await adapter.capabilities()
-
     for model in caps.supported_models:
         assert len(model) <= 100, f"Model name too long: {model}"
         assert not model.startswith(" "), f"Model name should not start with space: '{model}'"
@@ -285,11 +278,10 @@ async def test_capabilities_no_duplicate_models(adapter):
     Supported models list should not contain duplicates.
     """
     caps = await adapter.capabilities()
-
     unique_models = set(caps.supported_models)
     if len(unique_models) != len(caps.supported_models):
         from collections import Counter
-        duplicates = [model for model, count in Counter(caps.supported_models).items() if count > 1]
+        duplicates = [m for m, c in Counter(caps.supported_models).items() if c > 1]
         pytest.fail(f"Supported models contain duplicates: {duplicates}")
 
 
@@ -302,34 +294,24 @@ async def test_capabilities_model_gate_enforced_when_supported_models_listed(ada
         pytest.fail("supported_models must be a non-empty tuple for conformance")
 
     ctx = OperationContext(tenant="test", request_id="test-model-gate-001")
-    bad_model = "__no_such_model__"
-
     with pytest.raises(BadRequest):
         await adapter.complete(
             messages=[{"role": "user", "content": "hello"}],
-            model=bad_model,
+            model="__no_such_model__",
             ctx=ctx,
         )
 
 
 async def test_capabilities_tools_consistency_with_complete(adapter):
     """
-    Capability↔behavior alignment for tool calling:
-
-      - If supports_tools is False:
-          complete(tools=...) MUST raise NotSupported.
-      - If supports_tools is True:
-          complete(tools=...) MUST NOT raise NotSupported solely due to tools presence.
+    Capability↔behavior alignment for tool calling.
     """
     caps = await adapter.capabilities()
     ctx = OperationContext(tenant="test", request_id="test-tools-gate-001")
 
-    tools = [
-        {"type": "function", "function": {"name": "echo", "parameters": {"type": "object"}}},
-    ]
+    tools = [{"type": "function", "function": {"name": "echo", "parameters": {"type": "object"}}}]
 
     if caps.supports_tools:
-        # Should not fail just because tools are provided.
         res = await adapter.complete(
             messages=[{"role": "user", "content": "call: please echo"}],
             model=caps.supported_models[0],
