@@ -3,33 +3,17 @@
 """
 Mock Embedding adapter used in example scripts and conformance tests.
 
-Deterministic behavior suitable for conformance runs. Supports:
-- deterministic retryable failures via ctx attrs or text sentinels
-- optional native batch or base fallback
-- stable health reporting with explicit degraded trigger
-- configuration validation (failure_rate, latency range, dimensions)
-- optional vector patterns (zeros/ones/etc) for targeted tests
-- optional native-batch partial failure collection
-- streaming with configurable chunking patterns
-- cache-aware testing with configurable hit/miss behavior
-- enhanced metrics and statistics collection
+Goals:
+- Deterministic vectors (seed-based RNG) for stable conformance runs
+- Clean alignment with BaseEmbeddingAdapter semantics (no overrides of public ops)
+- Partial-failure batch semantics are enforced by the BaseEmbeddingAdapter contract
+- Streaming support with deterministic chunk patterns
+- Stats suitable for tests/monitoring
 
-Conformance Guarantees:
-- Deterministic by default (seed-based RNG for vectors)
-- Cache behavior is configurable but defaults to deterministic
-- Streaming counters are accurate and never leak
-- All capabilities accurately reflect actual behavior
-
-IMPORTANT ALIGNMENT WITH BaseEmbeddingAdapter
---------------------------------------------
-BaseEmbeddingAdapter will use caching whenever:
-  - self._cache.supports_ttl is True, AND
-  - self._cache_embed_ttl_s > 0
-
-That logic is mode-agnostic. Therefore, this mock reports supports_caching=True
-whenever BaseEmbeddingAdapter would actually cache, regardless of mode.
-Additionally, the mock can simulate caching in thin mode ONLY when base caching
-is not active (to avoid double-caching / capability mismatches).
+IMPORTANT:
+- This mock does NOT override embed_batch(). The base owns batch validation + fallback semantics.
+- This mock does NOT simulate caching. Tests should validate caching via an injected cache
+  implementation (e.g., a counting TTL cache) and BaseEmbeddingAdapter’s cache logic.
 """
 
 from __future__ import annotations
@@ -52,7 +36,6 @@ from corpus_sdk.embedding.embedding_base import (
     EmbedChunk,
     EmbeddingStats,
     OperationContext as EmbeddingContext,
-    # Canonical error types for correct wire codes
     BadRequest,
     NotSupported,
     Unavailable,
@@ -65,26 +48,20 @@ from corpus_sdk.embedding.embedding_base import (
 
 class MockEmbeddingAdapter(BaseEmbeddingAdapter):
     """
-    A mock Embedding adapter for protocol demonstrations & conformance.
-    Defaults are deterministic and non-flaky. Dials can be toggled for demos.
+    Mock Embedding adapter.
 
-    Streaming Support:
-    - Configurable chunk patterns: "single" (one chunk), "progressive" (vector built piecewise),
-      "multi_vector" (multiple complete vectors per chunk)
-    - Supports mid-stream abandonment testing
-    - Configurable normalization during streaming
+    Streaming patterns:
+      - "single": one final chunk containing one full vector
+      - "progressive": multiple chunks containing partial vectors growing over time
+      - "multi_vector": multiple chunks, each chunk contains 1-3 complete vectors
 
-    Cache Testing:
-    - When BaseEmbeddingAdapter caching is enabled (supports_ttl + ttl>0), mock reports supports_caching=True.
-    - Optional deterministic simulated cache behavior for thin-mode testing (only when base caching is NOT enabled).
-    - Deterministic by default (no simulated cache unless configured)
-
-    Statistics:
-    - Tracks detailed operation counts, latency, and streaming metrics
-    - Configurable to simulate various backend behaviors
+    Notes:
+      - _do_embed validates non-empty text (item-level validation).
+      - _do_embed_batch may optionally collect per-item failures when enabled, but
+        BaseEmbeddingAdapter may also choose to pre-split invalid items depending on the contract.
     """
 
-    # ----- Tunables (safe defaults for conformance) -----
+    # ----- Tunables -----
     name: str
     supported_models: Tuple[str, ...]
     dimensions_by_model: Dict[str, int]
@@ -95,34 +72,27 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
     supports_streaming: bool
     token_factor: float
     latency_ms: Tuple[int, int]
-    failure_rate: float  # kept for demos; default 0.0 for conformance
-    test_vector_pattern: Optional[str]  # None | "zeros" | "ones" | "unit_x" | "gaussian"
-    collect_failures_in_native_batch: bool  # opt-in to report per-item failures in native batch
-    yield_every_n: int  # how often to yield in large batches (0 = no yielding)
-    simulate_latency: bool  # if False, skips all artificial sleeps
+    failure_rate: float  # demos only; keep 0.0 for conformance stability
+    test_vector_pattern: Optional[str]  # None|"zeros"|"ones"|"unit_x"|"gaussian"
+    collect_failures_in_native_batch: bool
+    yield_every_n: int
+    simulate_latency: bool
 
-    # ----- Streaming Configuration -----
+    # ----- Streaming config -----
     stream_chunk_pattern: str  # "single" | "progressive" | "multi_vector"
     stream_min_chunks: int
     stream_max_chunks: int
-    stream_yield_interval_ms: Tuple[int, int]  # between chunks
-    stream_abandonment_rate: float  # 0.0-1.0, probability of mid-stream cancellation simulation
+    stream_yield_interval_ms: Tuple[int, int]
+    stream_abandonment_rate: float
 
-    # ----- Cache Testing Configuration -----
-    cache_behavior: str  # "deterministic" | "force_hit" | "force_miss" | "simulate_error"
-    cache_hit_rate: float  # 0.0-1.0, probability of cache hit when behavior="deterministic"
-    cache_set_failure_rate: float  # 0.0-1.0, probability of cache.set() failure (simulated)
-
-    # ----- Internal Statistics -----
+    # ----- Stats -----
     _stats: Dict[str, Any]
-    _operation_counts: Dict[str, int]
-    _streaming_metrics: Dict[str, Any]
-    _stream_active_count: int  # Separate counter for reliable tracking
+    _stream_active_count: int
 
     def __init__(
         self,
         *,
-        # Base adapter mode/infra
+        # Base adapter infra
         mode: str = "thin",
         metrics=None,
         deadline_policy=None,
@@ -134,7 +104,7 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
         tag_model_in_metrics: Optional[bool] = None,
         cache_embed_ttl_s: int = 60,
         cache_caps_ttl_s: int = 30,
-        # Mock-specific knobs
+        # Mock knobs
         name: str = "mock-embedding",
         supported_models: Tuple[str, ...] = ("mock-embed-512", "mock-embed-1024"),
         dimensions_by_model: Optional[Dict[str, int]] = None,
@@ -145,21 +115,17 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
         supports_streaming: bool = True,
         token_factor: float = 0.75,
         latency_ms: Tuple[int, int] = (10, 25),
-        failure_rate: float = 0.0,  # 0.0 to avoid test flakes
+        failure_rate: float = 0.0,
         test_vector_pattern: Optional[str] = None,
         collect_failures_in_native_batch: bool = False,
         yield_every_n: int = 50,
         simulate_latency: bool = True,
-        # Streaming configuration
+        # Streaming
         stream_chunk_pattern: str = "single",
         stream_min_chunks: int = 1,
         stream_max_chunks: int = 3,
         stream_yield_interval_ms: Tuple[int, int] = (5, 15),
         stream_abandonment_rate: float = 0.0,
-        # Cache testing configuration
-        cache_behavior: str = "deterministic",
-        cache_hit_rate: float = 0.0,  # Default 0.0 for deterministic no simulated-cache behavior
-        cache_set_failure_rate: float = 0.0,
     ) -> None:
         super().__init__(
             mode=mode,
@@ -174,6 +140,7 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
             cache_embed_ttl_s=cache_embed_ttl_s,
             cache_caps_ttl_s=cache_caps_ttl_s,
         )
+
         self.name = name
         self.supported_models = tuple(supported_models)
         self.dimensions_by_model = dict(
@@ -192,7 +159,6 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
         self.yield_every_n = int(yield_every_n)
         self.simulate_latency = bool(simulate_latency)
 
-        # Streaming config
         self.stream_chunk_pattern = stream_chunk_pattern
         self.stream_min_chunks = max(1, int(stream_min_chunks))
         self.stream_max_chunks = max(self.stream_min_chunks, int(stream_max_chunks))
@@ -201,21 +167,11 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
         self.stream_yield_interval_ms = (lo, hi)
         self.stream_abandonment_rate = max(0.0, min(1.0, float(stream_abandonment_rate)))
 
-        # Cache testing config
-        self.cache_behavior = cache_behavior
-        self.cache_hit_rate = max(0.0, min(1.0, float(cache_hit_rate)))
-        self.cache_set_failure_rate = max(0.0, min(1.0, float(cache_set_failure_rate)))
-
-        # Initialize statistics
         self._stats = {
             "embed_calls": 0,
             "embed_batch_calls": 0,
             "stream_embed_calls": 0,
             "count_tokens_calls": 0,
-            "cache_hits": 0,
-            "cache_misses": 0,
-            "cache_set_attempts": 0,
-            "cache_set_failures": 0,
             "total_texts_embedded": 0,
             "total_tokens_processed": 0,
             "total_stream_chunks": 0,
@@ -223,17 +179,9 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
             "completed_streams": 0,
             "total_processing_time_ms": 0.0,
         }
-
-        self._operation_counts = {}
-        self._streaming_metrics = {
-            "total_chunks_generated": 0,
-            "chunks_by_pattern": {"single": 0, "progressive": 0, "multi_vector": 0},
-        }
         self._stream_active_count = 0
 
-        # -----------------------------
-        # Configuration validation
-        # -----------------------------
+        # Validation
         if not self.supported_models:
             raise ValueError("supported_models must be a non-empty tuple")
         if self.failure_rate < 0.0 or self.failure_rate > 1.0:
@@ -251,49 +199,15 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
             raise ValueError("yield_every_n must be >= 0")
         if self.stream_chunk_pattern not in ("single", "progressive", "multi_vector"):
             raise ValueError("stream_chunk_pattern must be one of: single, progressive, multi_vector")
-        if self.cache_behavior not in ("deterministic", "force_hit", "force_miss", "simulate_error"):
-            raise ValueError("cache_behavior must be one of: deterministic, force_hit, force_miss, simulate_error")
-
-    # ---------------------------------------------------------------------
-    # Capability helpers
-    # ---------------------------------------------------------------------
-    def _base_cache_enabled(self) -> bool:
-        """
-        True when BaseEmbeddingAdapter's embed() cache path will be used.
-
-        Must mirror BaseEmbeddingAdapter._embed_core's logic exactly:
-          supports_ttl && cache_embed_ttl_s > 0
-        (Mode is intentionally NOT part of this decision.)
-        """
-        return bool(
-            getattr(self._cache, "supports_ttl", False)
-            and getattr(self, "_cache_embed_ttl_s", 0) > 0
-        )
-
-    def _simulated_cache_enabled(self) -> bool:
-        """
-        True when we intentionally simulate caching in thin mode.
-
-        IMPORTANT:
-        - Only simulate when base caching is NOT enabled, to avoid double-caching
-          and to keep capabilities truthful.
-        """
-        if self._base_cache_enabled():
-            return False
-        if self._mode != "thin":
-            return False
-        if self.cache_behavior != "deterministic":
-            return True
-        return (self.cache_hit_rate > 0.0) or (self.cache_set_failure_rate > 0.0)
-
-    def _supports_caching(self) -> bool:
-        """Capability truth: caching will happen (base) OR is simulated (thin-only)."""
-        return self._base_cache_enabled() or self._simulated_cache_enabled()
 
     # ---------------------------------------------------------------------
     # Capabilities & Health
     # ---------------------------------------------------------------------
     async def _do_capabilities(self) -> EmbeddingCapabilities:
+        # IMPORTANT: must match base cache decision (mode-agnostic)
+        supports_caching = bool(
+            getattr(self._cache, "supports_ttl", False) and getattr(self, "_cache_embed_ttl_s", 0) > 0
+        )
         return EmbeddingCapabilities(
             server=self.name,
             version="1.0.0",
@@ -306,7 +220,7 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
             supports_token_counting=True,
             supports_streaming=self.supports_streaming,
             supports_batch_embedding=self.supports_batch,
-            supports_caching=self._supports_caching(),
+            supports_caching=supports_caching,
             idempotent_writes=False,
             supports_multi_tenant=True,
             normalizes_at_source=self.normalizes_at_source,
@@ -316,87 +230,42 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
 
     async def _do_health(self, *, ctx: Optional[EmbeddingContext] = None) -> Dict[str, Any]:
         degraded = bool((ctx and ctx.attrs.get("health") == "degraded"))
-        payload = {
+        return {
+            "ok": not degraded,
             "server": self.name,
             "version": "1.0.0",
             "models": {m: ("degraded" if degraded else "ok") for m in self.supported_models},
-            "mock_stats": self._get_current_stats(),
         }
-        if degraded:
-            payload["ok"] = False
-            return payload
-        payload["ok"] = True
-        return payload
 
     # ---------------------------------------------------------------------
-    # Single embed
-    #   - Real caching is handled by BaseEmbeddingAdapter outside _do_embed.
-    #   - Simulated caching (thin mode) is only enabled when base caching is NOT enabled.
+    # Single embed (item-level validation lives here)
     # ---------------------------------------------------------------------
-    async def _do_embed(
-        self,
-        spec: EmbedSpec,
-        *,
-        ctx: Optional[EmbeddingContext] = None,
-    ) -> EmbedResult:
+    async def _do_embed(self, spec: EmbedSpec, *, ctx: Optional[EmbeddingContext] = None) -> EmbedResult:
         self._stats["embed_calls"] += 1
-        start_time = time.monotonic()
+        t0 = time.monotonic()
 
         self._maybe_fail(op="embed", ctx=ctx, text=spec.text)
 
         if spec.model not in self.supported_models:
             raise ModelNotAvailable(f"Model '{spec.model}' is not supported")
 
-        # Simulated caching only when explicitly enabled (and base caching is not active)
-        if self._simulated_cache_enabled():
-            _ = self._embed_cache_key(spec.model, spec.normalize, spec.text, ctx)
+        # Item-level validation (contract-friendly for batch partial failures)
+        if not isinstance(spec.text, str) or not spec.text.strip():
+            raise BadRequest("text must be a non-empty string")
 
-            if self._should_cache_hit("embed", spec.text, ctx):
-                self._stats["cache_hits"] += 1
-                cached_vec = self._make_cached_vector(spec.model, spec.text)
-                if self.normalizes_at_source and spec.normalize:
-                    cached_vec = self._normalize(cached_vec)
-
-                elapsed_ms = (time.monotonic() - start_time) * 1000.0
-                self._stats["total_processing_time_ms"] += elapsed_ms
-
-                return EmbedResult(
-                    embedding=EmbeddingVector(
-                        vector=cached_vec,
-                        text=spec.text,
-                        model=spec.model,
-                        dimensions=len(cached_vec),
-                    ),
-                    model=spec.model,
-                    text=spec.text,
-                    tokens_used=self._approx_tokens(spec.text),
-                    truncated=False,
-                )
-
-            # Miss: count miss and deterministically count a set-attempt (and maybe failure)
-            self._stats["cache_misses"] += 1
-            self._stats["cache_set_attempts"] += 1
-            if self._should_cache_set_fail():
-                self._stats["cache_set_failures"] += 1
-                if self.cache_behavior == "simulate_error":
-                    raise Unavailable("Cache set failed (simulated for testing)")
-
-        # Normal deterministic vector generation
         await self._sleep_random()
 
         dim = self._dimensions_for(spec.model)
         rng = self._rng_for(spec.model, spec.text)
         vec = self._make_vector(dim, rng)
-
         if self.normalizes_at_source and spec.normalize:
             vec = self._normalize(vec)
 
         tokens = self._approx_tokens(spec.text)
 
-        elapsed_ms = (time.monotonic() - start_time) * 1000.0
-        self._stats["total_processing_time_ms"] += elapsed_ms
         self._stats["total_texts_embedded"] += 1
         self._stats["total_tokens_processed"] += tokens
+        self._stats["total_processing_time_ms"] += (time.monotonic() - t0) * 1000.0
 
         return EmbedResult(
             embedding=EmbeddingVector(
@@ -404,6 +273,8 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
                 text=spec.text,
                 model=spec.model,
                 dimensions=len(vec),
+                index=None,
+                metadata=spec.metadata,
             ),
             model=spec.model,
             text=spec.text,
@@ -415,15 +286,12 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
     # Streaming
     # ---------------------------------------------------------------------
     async def _do_stream_embed(
-        self,
-        spec: EmbedSpec,
-        *,
-        ctx: Optional[EmbeddingContext] = None,
+        self, spec: EmbedSpec, *, ctx: Optional[EmbeddingContext] = None
     ) -> AsyncIterator[EmbedChunk]:
         self._stats["stream_embed_calls"] += 1
         self._stream_active_count += 1
+        t0 = time.monotonic()
 
-        start_time = time.monotonic()
         stream_id = f"stream_{int(time.time() * 1000)}_{hash(spec.text) % 10000:04d}"
 
         try:
@@ -432,360 +300,128 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
             if spec.model not in self.supported_models:
                 raise ModelNotAvailable(f"Model '{spec.model}' is not supported")
 
+            if not isinstance(spec.text, str) or not spec.text.strip():
+                raise BadRequest("text must be a non-empty string")
+
             dim = self._dimensions_for(spec.model)
             rng = self._rng_for(spec.model, spec.text)
 
             if self.stream_chunk_pattern == "single":
-                chunks = await self._generate_single_chunk(spec, dim, rng, ctx)
+                chunks = await self._generate_single_chunk(spec, dim, rng)
             elif self.stream_chunk_pattern == "progressive":
-                chunks = await self._generate_progressive_chunks(spec, dim, rng, ctx)
+                chunks = await self._generate_progressive_chunks(spec, dim, rng)
             else:
-                chunks = await self._generate_multi_vector_chunks(spec, dim, rng, ctx)
+                chunks = await self._generate_multi_vector_chunks(spec, dim, rng)
 
             total_chunks = len(chunks)
 
-            for chunk_idx, chunk_data in enumerate(chunks):
+            for i, chunk_data in enumerate(chunks):
                 if (
                     self.stream_abandonment_rate > 0
                     and random.random() < self.stream_abandonment_rate
-                    and chunk_idx < total_chunks - 1
+                    and i < total_chunks - 1
                 ):
                     self._stats["abandoned_streams"] += 1
                     raise asyncio.CancelledError(f"Stream {stream_id} abandoned (simulated)")
 
-                if self.simulate_latency and chunk_idx > 0:
+                if self.simulate_latency and i > 0:
                     await self._sleep_random_range(*self.stream_yield_interval_ms)
 
-                is_final = (chunk_idx == total_chunks - 1)
-                chunk = EmbedChunk(
+                is_final = (i == total_chunks - 1)
+                self._stats["total_stream_chunks"] += 1
+
+                yield EmbedChunk(
                     embeddings=chunk_data["embeddings"],
                     is_final=is_final,
                     usage=chunk_data.get("usage"),
                     model=spec.model,
                 )
 
-                self._stats["total_stream_chunks"] += 1
-                self._streaming_metrics["total_chunks_generated"] += 1
-                self._streaming_metrics["chunks_by_pattern"][self.stream_chunk_pattern] += 1
-
-                yield chunk
-
             self._stats["completed_streams"] += 1
             self._stats["total_texts_embedded"] += 1
             self._stats["total_tokens_processed"] += self._approx_tokens(spec.text)
-
-            elapsed_ms = (time.monotonic() - start_time) * 1000.0
-            self._stats["total_processing_time_ms"] += elapsed_ms
+            self._stats["total_processing_time_ms"] += (time.monotonic() - t0) * 1000.0
 
         finally:
-            # Robust: decrement exactly once, never go negative
             self._stream_active_count = max(0, self._stream_active_count - 1)
 
-    async def _generate_single_chunk(
-        self,
-        spec: EmbedSpec,
-        dim: int,
-        rng: random.Random,
-        ctx: Optional[EmbeddingContext],
-    ) -> List[Dict[str, Any]]:
+    async def _generate_single_chunk(self, spec: EmbedSpec, dim: int, rng: random.Random) -> List[Dict[str, Any]]:
         await self._sleep_random()
-
         vec = self._make_vector(dim, rng)
         if self.normalizes_at_source and spec.normalize:
             vec = self._normalize(vec)
+        ev = EmbeddingVector(vector=vec, text=spec.text, model=spec.model, dimensions=dim)
+        return [{"embeddings": [ev], "usage": {"tokens": self._approx_tokens(spec.text)}}]
 
-        embedding = EmbeddingVector(
-            vector=vec,
-            text=spec.text,
-            model=spec.model,
-            dimensions=dim,
-        )
-
-        return [{"embeddings": [embedding], "usage": {"tokens": self._approx_tokens(spec.text)}}]
-
-    async def _generate_progressive_chunks(
-        self,
-        spec: EmbedSpec,
-        dim: int,
-        rng: random.Random,
-        ctx: Optional[EmbeddingContext],
-    ) -> List[Dict[str, Any]]:
+    async def _generate_progressive_chunks(self, spec: EmbedSpec, dim: int, rng: random.Random) -> List[Dict[str, Any]]:
         num_chunks = random.randint(self.stream_min_chunks, self.stream_max_chunks)
-        vectors_per_chunk = max(1, dim // num_chunks)
+        per = max(1, dim // num_chunks)
 
         chunks: List[Dict[str, Any]] = []
-        accumulated_vector: List[float] = []
+        acc: List[float] = []
 
-        for chunk_idx in range(num_chunks):
-            remaining = dim - len(accumulated_vector)
+        for idx in range(num_chunks):
+            remaining = dim - len(acc)
             if remaining <= 0:
                 break
+            chunk_size = min(per, remaining)
+            acc.extend(self._make_vector(chunk_size, rng))
 
-            chunk_size = min(vectors_per_chunk, remaining)
-            partial_vec = self._make_vector(chunk_size, rng)
-            accumulated_vector.extend(partial_vec)
-
-            current_dim = len(accumulated_vector)
-            embedding = EmbeddingVector(
-                vector=accumulated_vector.copy(),
-                text=spec.text if chunk_idx == 0 else "",
+            cur_dim = len(acc)
+            ev = EmbeddingVector(
+                vector=acc.copy(),
+                text=spec.text if idx == 0 else "",
                 model=spec.model,
-                dimensions=current_dim,
-                index=chunk_idx,
-                metadata={"partial": True, "total_dimensions": dim} if current_dim < dim else None,
+                dimensions=cur_dim,
+                index=idx,
+                metadata={"partial": True, "total_dimensions": dim} if cur_dim < dim else None,
             )
 
-            is_final = (chunk_idx == num_chunks - 1 or len(accumulated_vector) >= dim)
-            if is_final and self.normalizes_at_source and spec.normalize:
-                embedding = EmbeddingVector(
-                    vector=self._normalize(accumulated_vector),
-                    text=embedding.text,
-                    model=embedding.model,
-                    dimensions=embedding.dimensions,
-                    index=embedding.index,
-                    metadata=embedding.metadata,
-                )
-
+            is_final = (idx == num_chunks - 1 or cur_dim >= dim)
             chunks.append(
-                {"embeddings": [embedding], "usage": {"tokens": self._approx_tokens(spec.text)} if is_final else None}
+                {"embeddings": [ev], "usage": {"tokens": self._approx_tokens(spec.text)} if is_final else None}
             )
 
         return chunks
 
-    async def _generate_multi_vector_chunks(
-        self,
-        spec: EmbedSpec,
-        dim: int,
-        rng: random.Random,
-        ctx: Optional[EmbeddingContext],
-    ) -> List[Dict[str, Any]]:
+    async def _generate_multi_vector_chunks(self, spec: EmbedSpec, dim: int, rng: random.Random) -> List[Dict[str, Any]]:
         num_chunks = random.randint(self.stream_min_chunks, self.stream_max_chunks)
-        vectors_per_chunk = random.randint(1, 3)
+        vectors_per = random.randint(1, 3)
 
         chunks: List[Dict[str, Any]] = []
-        total_vectors_generated = 0
+        global_i = 0
 
         for chunk_idx in range(num_chunks):
-            chunk_embeddings: List[EmbeddingVector] = []
-
-            for vec_idx in range(vectors_per_chunk):
+            embs: List[EmbeddingVector] = []
+            for j in range(vectors_per):
                 vec = self._make_vector(dim, rng)
                 if self.normalizes_at_source and spec.normalize:
                     vec = self._normalize(vec)
-
-                embedding = EmbeddingVector(
-                    vector=vec,
-                    text=spec.text if vec_idx == 0 else f"{spec.text} [variation {vec_idx}]",
-                    model=spec.model,
-                    dimensions=dim,
-                    index=total_vectors_generated,
+                embs.append(
+                    EmbeddingVector(
+                        vector=vec,
+                        text=spec.text if j == 0 else f"{spec.text} [variation {j}]",
+                        model=spec.model,
+                        dimensions=dim,
+                        index=global_i,
+                    )
                 )
-                chunk_embeddings.append(embedding)
-                total_vectors_generated += 1
+                global_i += 1
 
             is_final = (chunk_idx == num_chunks - 1)
             chunks.append(
-                {
-                    "embeddings": chunk_embeddings,
-                    "usage": {"tokens": self._approx_tokens(spec.text) * len(chunk_embeddings)} if is_final else None,
-                }
+                {"embeddings": embs, "usage": {"tokens": self._approx_tokens(spec.text) * len(embs)} if is_final else None}
             )
 
         return chunks
 
     # ---------------------------------------------------------------------
-    # Batch embed — override to preserve the legacy conformance semantics:
-    # allow empty texts through to become item-level failures on fallback.
+    # Native batch hook (BaseEmbeddingAdapter will call this)
     # ---------------------------------------------------------------------
-    async def embed_batch(
-        self,
-        spec: BatchEmbedSpec,
-        *,
-        ctx: Optional[EmbeddingContext] = None,
-    ) -> BatchEmbedResult:
+    async def _do_embed_batch(self, spec: BatchEmbedSpec, *, ctx: Optional[EmbeddingContext] = None) -> BatchEmbedResult:
         self._stats["embed_batch_calls"] += 1
-        start_time = time.monotonic()
+        t0 = time.monotonic()
 
-        async def _run() -> BatchEmbedResult:
-            caps = await self._do_capabilities()
-            if spec.model not in caps.supported_models:
-                raise ModelNotAvailable(f"Model '{spec.model}' is not supported")
-
-            if caps.max_batch_size and len(spec.texts) > caps.max_batch_size:
-                raise BadRequest(
-                    f"Batch size {len(spec.texts)} exceeds maximum of {caps.max_batch_size}",
-                    details={"max_batch_size": caps.max_batch_size},
-                )
-
-            eff_texts: List[str] = []
-            for text in spec.texts:
-                if caps.max_text_length:
-                    new_text, _ = self._trunc.apply(text, caps.max_text_length, spec.truncate)
-                    eff_texts.append(new_text)
-                else:
-                    eff_texts.append(text)
-
-            eff_spec = BatchEmbedSpec(
-                texts=eff_texts,
-                model=spec.model,
-                truncate=spec.truncate,
-                normalize=spec.normalize,
-                metadatas=spec.metadatas,
-            )
-
-            try:
-                if not self.supports_batch:
-                    raise NotSupported("native batch not supported in this mode")
-                result = await self._do_embed_batch(eff_spec, ctx=ctx)
-            except NotSupported:
-                result = await self._embed_batch_fallback(eff_spec, spec, caps, ctx=ctx)
-
-            if eff_spec.normalize and not self.normalizes_at_source:
-                if not caps.supports_normalization:
-                    raise NotSupported("normalization not supported for this adapter")
-                for i, ev in enumerate(result.embeddings):
-                    vec = self._norm.normalize(ev.vector)
-                    result.embeddings[i] = EmbeddingVector(
-                        vector=vec,
-                        text=ev.text,
-                        model=ev.model,
-                        dimensions=len(vec),
-                        index=ev.index,
-                        metadata=ev.metadata,
-                    )
-
-            self._stats["total_texts_embedded"] += len(result.embeddings)
-            if result.total_tokens is not None:
-                self._stats["total_tokens_processed"] += result.total_tokens
-
-            elapsed_ms = (time.monotonic() - start_time) * 1000.0
-            self._stats["total_processing_time_ms"] += elapsed_ms
-
-            self._metrics.counter(
-                component=self._component,
-                name="texts_embedded",
-                value=len(result.embeddings),
-            )
-            if result.total_tokens is not None:
-                self._metrics.counter(
-                    component=self._component,
-                    name="tokens_processed",
-                    value=int(result.total_tokens),
-                )
-
-            return result
-
-        metric_extra: Dict[str, Any] = {"batch_size": len(spec.texts)}
-        error_extra: Dict[str, Any] = {"batch_size": len(spec.texts)}
-        if getattr(self, "_tag_model_in_metrics", False):
-            model_tag = self._safe_model_tag(spec.model)
-            if model_tag:
-                metric_extra["model"] = model_tag
-                error_extra["model"] = model_tag
-
-        return await self._with_gates_unary(
-            op="embed_batch",
-            ctx=ctx,
-            call=_run,
-            metric_extra=metric_extra,
-            error_extra=error_extra,
-        )
-
-    async def _embed_batch_fallback(
-        self,
-        eff_spec: BatchEmbedSpec,
-        original_spec: BatchEmbedSpec,
-        caps: EmbeddingCapabilities,
-        *,
-        ctx: Optional[EmbeddingContext],
-    ) -> BatchEmbedResult:
-        """
-        Fallback batch path when native batch is NotSupported.
-
-        IMPORTANT FIXES:
-        - Successful embeddings get index=idx (batch semantics).
-        - Successful embeddings get metadata attached from eff_spec.metadatas (if provided).
-        """
-        embeddings: List[EmbeddingVector] = []
-        failed: List[Dict[str, Any]] = []
-
-        for idx, text in enumerate(eff_spec.texts):
-            try:
-                if not isinstance(text, str) or not text.strip():
-                    raise BadRequest("text must be a non-empty string")
-
-                single_spec = EmbedSpec(
-                    text=text,
-                    model=eff_spec.model,
-                    truncate=eff_spec.truncate,
-                    normalize=False,   # normalize uniformly below
-                    metadata=None,     # provider does not see caller metadata
-                    stream=False,
-                )
-                single = await self._do_embed(single_spec, ctx=ctx)
-                ev = single.embedding
-
-                if eff_spec.normalize:
-                    if not caps.supports_normalization:
-                        raise NotSupported("normalization not supported for this adapter")
-                    if not caps.normalizes_at_source:
-                        vec = self._norm.normalize(ev.vector)
-                        ev = EmbeddingVector(
-                            vector=vec,
-                            text=ev.text,
-                            model=ev.model,
-                            dimensions=len(vec),
-                            index=ev.index,
-                            metadata=ev.metadata,
-                        )
-
-                # FIX: enforce batch index + attach per-item metadata
-                md = eff_spec.metadatas[idx] if eff_spec.metadatas and idx < len(eff_spec.metadatas) else None
-                ev = EmbeddingVector(
-                    vector=ev.vector,
-                    text=ev.text,
-                    model=ev.model,
-                    dimensions=ev.dimensions,
-                    index=idx,
-                    metadata=md,
-                )
-
-                embeddings.append(ev)
-
-            except (BadRequest, ModelNotAvailable, NotSupported, Unavailable, ResourceExhausted, TransientNetwork) as item_err:
-                self._record_failure(
-                    failed,
-                    index=idx,
-                    text=text,
-                    err=item_err,
-                    metadatas=eff_spec.metadatas,
-                )
-            except Exception as item_err:
-                self._record_failure(
-                    failed,
-                    index=idx,
-                    text=text,
-                    err=item_err,
-                    metadatas=eff_spec.metadatas,
-                )
-
-        return BatchEmbedResult(
-            embeddings=embeddings,
-            model=eff_spec.model,
-            total_texts=len(original_spec.texts),
-            total_tokens=None,
-            failed_texts=failed,
-        )
-
-    # ---------------------------------------------------------------------
-    # Native batch hook (used when supports_batch=True)
-    # ---------------------------------------------------------------------
-    async def _do_embed_batch(
-        self,
-        spec: BatchEmbedSpec,
-        *,
-        ctx: Optional[EmbeddingContext] = None,
-    ) -> BatchEmbedResult:
         self._maybe_fail(op="embed_batch", ctx=ctx)
 
         if spec.model not in self.supported_models:
@@ -798,14 +434,15 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
 
         dim = self._dimensions_for(spec.model)
         embeddings: List[EmbeddingVector] = []
-        total_tokens = 0
         failures: List[Dict[str, Any]] = []
+        total_tokens = 0
 
         for i, text in enumerate(spec.texts):
             try:
                 self._maybe_fail(op="embed_batch:item", ctx=ctx, text=text, per_item=True)
 
-                if self.collect_failures_in_native_batch and (not isinstance(text, str) or not text.strip()):
+                # Item-level validation: either collect per-item failures or raise (provider choice)
+                if not isinstance(text, str) or not text.strip():
                     raise BadRequest("text must be a non-empty string")
 
                 rng = self._rng_for(spec.model, text)
@@ -813,9 +450,7 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
                 if self.normalizes_at_source and spec.normalize:
                     vec = self._normalize(vec)
 
-                metadata = None
-                if spec.metadatas and i < len(spec.metadatas):
-                    metadata = spec.metadatas[i]
+                md = spec.metadatas[i] if spec.metadatas and i < len(spec.metadatas) else None
 
                 embeddings.append(
                     EmbeddingVector(
@@ -824,36 +459,44 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
                         model=spec.model,
                         dimensions=len(vec),
                         index=i,
-                        metadata=metadata,
+                        metadata=md,
                     )
                 )
                 total_tokens += self._approx_tokens(text)
 
-            except (Unavailable, ResourceExhausted, TransientNetwork, BadRequest, ModelNotAvailable) as item_err:
+            except (BadRequest, Unavailable, ResourceExhausted, TransientNetwork, ModelNotAvailable) as item_err:
                 if self.collect_failures_in_native_batch:
-                    self._record_failure(
-                        failures,
-                        index=i,
-                        text=None,
-                        err=item_err,
-                        metadatas=spec.metadatas,
+                    failures.append(
+                        {
+                            "index": i,
+                            "error": type(item_err).__name__,
+                            "code": getattr(item_err, "code", None) or type(item_err).__name__.upper(),
+                            "message": getattr(item_err, "message", None) or str(item_err),
+                            **({"metadata": spec.metadatas[i]} if spec.metadatas and i < len(spec.metadatas) else {}),
+                        }
                     )
                 else:
                     raise
             except Exception as item_err:
                 if self.collect_failures_in_native_batch:
-                    self._record_failure(
-                        failures,
-                        index=i,
-                        text=None,
-                        err=item_err,
-                        metadatas=spec.metadatas,
+                    failures.append(
+                        {
+                            "index": i,
+                            "error": type(item_err).__name__,
+                            "code": "UNAVAILABLE",
+                            "message": str(item_err) or "internal error",
+                            **({"metadata": spec.metadatas[i]} if spec.metadatas and i < len(spec.metadatas) else {}),
+                        }
                     )
                 else:
                     raise
 
             if self.yield_every_n and (i + 1) % self.yield_every_n == 0:
                 await asyncio.sleep(0)
+
+        self._stats["total_texts_embedded"] += len(embeddings)
+        self._stats["total_tokens_processed"] += total_tokens
+        self._stats["total_processing_time_ms"] += (time.monotonic() - t0) * 1000.0
 
         return BatchEmbedResult(
             embeddings=embeddings,
@@ -866,26 +509,18 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
     # ---------------------------------------------------------------------
     # Token counting
     # ---------------------------------------------------------------------
-    async def _do_count_tokens(
-        self,
-        text: str,
-        model: str,
-        *,
-        ctx: Optional[EmbeddingContext] = None,
-    ) -> int:
+    async def _do_count_tokens(self, text: str, model: str, *, ctx: Optional[EmbeddingContext] = None) -> int:
         self._stats["count_tokens_calls"] += 1
-        start_time = time.monotonic()
+        t0 = time.monotonic()
 
         if model not in self.supported_models:
             raise ModelNotAvailable(f"Model '{model}' is not supported")
         if self.simulate_latency:
             await asyncio.sleep(0.005)
 
-        result = self._approx_tokens(text)
-
-        elapsed_ms = (time.monotonic() - start_time) * 1000.0
-        self._stats["total_processing_time_ms"] += elapsed_ms
-        return result
+        n = self._approx_tokens(text)
+        self._stats["total_processing_time_ms"] += (time.monotonic() - t0) * 1000.0
+        return n
 
     # ---------------------------------------------------------------------
     # Stats
@@ -897,57 +532,21 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
             + self._stats["stream_embed_calls"]
             + self._stats["count_tokens_calls"]
         )
+        avg = (self._stats["total_processing_time_ms"] / total_requests) if total_requests else 0.0
 
-        avg_time = 0.0
-        if total_requests > 0:
-            avg_time = self._stats["total_processing_time_ms"] / total_requests
-
+        # Cache hit/miss counters are owned by BaseEmbeddingAdapter metrics; this mock keeps them 0.
         return EmbeddingStats(
             total_requests=total_requests,
             total_texts=self._stats["total_texts_embedded"],
             total_tokens=self._stats["total_tokens_processed"],
-            cache_hits=self._stats["cache_hits"],
-            cache_misses=self._stats["cache_misses"],
-            avg_processing_time_ms=avg_time,
+            cache_hits=0,
+            cache_misses=0,
+            avg_processing_time_ms=avg,
             error_count=0,
             stream_requests=self._stats["stream_embed_calls"],
             stream_chunks_generated=self._stats["total_stream_chunks"],
             stream_abandoned=self._stats["abandoned_streams"],
         )
-
-    # ---------------------------------------------------------------------
-    # Simulated cache helpers (thin-mode only)
-    # ---------------------------------------------------------------------
-    def _should_cache_hit(self, operation: str, text: str, ctx: Optional[EmbeddingContext]) -> bool:
-        if self.cache_behavior == "force_hit":
-            return True
-        if self.cache_behavior == "force_miss":
-            return False
-        if self.cache_behavior == "simulate_error":
-            return False
-
-        if text and "[NO_CACHE]" in text:
-            return False
-
-        rng = random.Random(hash(f"{operation}|{text}") % 1_000_000)
-        return rng.random() < self.cache_hit_rate
-
-    def _should_cache_set_fail(self) -> bool:
-        if self.cache_behavior == "simulate_error":
-            # deterministic: fail every other attempt
-            return (self._stats["cache_set_attempts"] % 2) == 1
-
-        rng = random.Random(self._stats["cache_set_attempts"])
-        return rng.random() < self.cache_set_failure_rate
-
-    def _make_cached_vector(self, model: str, text: str) -> List[float]:
-        dim = self._dimensions_for(model)
-        _ = self._rng_for(model, f"CACHED_{text}")  # keep deterministic anchor
-        if self.test_vector_pattern == "zeros":
-            return [0.0] * dim
-        if self.test_vector_pattern == "ones":
-            return [1.0] * dim
-        return [0.5 + 0.3 * math.sin(i * 0.5) for i in range(dim)]
 
     # ---------------------------------------------------------------------
     # Internals
@@ -980,8 +579,6 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
                 raise TransientNetwork(f"Mocked {op} transient (text sentinel)", retry_after_ms=600)
             if "[DEADLINE]" in text:
                 raise DeadlineExceeded(f"Mocked {op} deadline (text sentinel)", retry_after_ms=0)
-            if "[NO_CACHE]" in text:
-                pass
 
         if not per_item and self.failure_rate > 0.0 and random.random() < self.failure_rate:
             if random.random() < 0.5:
@@ -1040,47 +637,13 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
         return [v / norm for v in vec]
 
     def _approx_tokens(self, text: str) -> int:
-        if not text:
+        if not isinstance(text, str) or not text:
             return 0
         words = max(1, len(text.split()))
         return int(math.ceil(words / max(0.1, self.token_factor))) + 2
 
-    def _record_failure(
-        self,
-        failures: List[Dict[str, Any]],
-        *,
-        index: int,
-        text: Optional[str],
-        err: Exception,
-        metadatas: Optional[List[Dict[str, Any]]] = None,
-        default_code: str = "UNAVAILABLE",
-        default_message: str = "internal error",
-    ) -> None:
-        code = getattr(err, "code", None) or type(err).__name__.upper() or default_code
-        message = getattr(err, "message", None) or str(err) or default_message
-
-        entry: Dict[str, Any] = {
-            "index": index,
-            "error": type(err).__name__,
-            "code": code,
-            "message": message,
-        }
-        if text is not None:
-            entry["text"] = text
-        if metadatas and index < len(metadatas):
-            entry["metadata"] = metadatas[index]
-        failures.append(entry)
-
-    def _get_current_stats(self) -> Dict[str, Any]:
-        return {
-            **self._stats,
-            "streaming_metrics": dict(self._streaming_metrics),
-            "active_streams": self._stream_active_count,
-            "timestamp": time.time(),
-        }
-
     # ---------------------------------------------------------------------
-    # Test Helper Methods
+    # Test helpers
     # ---------------------------------------------------------------------
     def reset_stats(self) -> None:
         self._stats = {
@@ -1088,20 +651,12 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
             "embed_batch_calls": 0,
             "stream_embed_calls": 0,
             "count_tokens_calls": 0,
-            "cache_hits": 0,
-            "cache_misses": 0,
-            "cache_set_attempts": 0,
-            "cache_set_failures": 0,
             "total_texts_embedded": 0,
             "total_tokens_processed": 0,
             "total_stream_chunks": 0,
             "abandoned_streams": 0,
             "completed_streams": 0,
             "total_processing_time_ms": 0.0,
-        }
-        self._streaming_metrics = {
-            "total_chunks_generated": 0,
-            "chunks_by_pattern": {"single": 0, "progressive": 0, "multi_vector": 0},
         }
         self._stream_active_count = 0
 
@@ -1112,34 +667,9 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
             + self._stats["stream_embed_calls"]
             + self._stats["count_tokens_calls"]
         )
-
-        avg_time_per_op = 0.0
-        if total_ops > 0:
-            avg_time_per_op = self._stats["total_processing_time_ms"] / total_ops
-
-        cache_effectiveness = 0.0
-        total_cache_accesses = self._stats["cache_hits"] + self._stats["cache_misses"]
-        if total_cache_accesses > 0:
-            cache_effectiveness = self._stats["cache_hits"] / total_cache_accesses
-
-        computed = {
-            "avg_time_per_op_ms": avg_time_per_op,
-            "cache_effectiveness": cache_effectiveness,
-        }
-
-        if self._stats["cache_set_attempts"] > 0:
-            computed["cache_set_failure_rate"] = (
-                self._stats["cache_set_failures"] / self._stats["cache_set_attempts"]
-            )
-
-        if self._stats["stream_embed_calls"] > 0:
-            computed["stream_completion_rate"] = (
-                self._stats["completed_streams"] / self._stats["stream_embed_calls"]
-            )
-
+        avg = (self._stats["total_processing_time_ms"] / total_ops) if total_ops else 0.0
         return {
             "operations": dict(self._stats),
-            "streaming": dict(self._streaming_metrics),
             "active_streams": self._stream_active_count,
-            "computed": computed,
+            "computed": {"avg_time_per_op_ms": avg},
         }
