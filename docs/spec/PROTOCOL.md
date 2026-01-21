@@ -1461,7 +1461,6 @@ interface LLMCapabilities {
   protocol: "llm/v1.0";           // REQUIRED (const)
 
   // Schema-optional (recommended when known):
-  protocol?: string;              // OPTIONAL
   supported_models?: string[];    // OPTIONAL
   supports_streaming?: boolean;
   supports_roles?: boolean;
