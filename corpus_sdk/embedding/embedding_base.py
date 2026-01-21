@@ -1228,6 +1228,22 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         except Exception:
             return obj
 
+    @staticmethod
+    def _bucket_wait_ms(ms: float) -> str:
+        """
+        Low-cardinality buckets for limiter wait-time metrics.
+
+        Keeps SIEM/metrics cardinality bounded while still giving operational signal
+        for backpressure under load.
+        """
+        if ms < 1.0:
+            return "<1ms"
+        if ms < 10.0:
+            return "1-10ms"
+        if ms < 100.0:
+            return "10-100ms"
+        return ">=100ms"
+
     def _record(
         self,
         op: str,
@@ -1322,8 +1338,13 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
 
     @staticmethod
     def _caps_cache_key() -> str:
-        """Cache key for capabilities() when cached."""
-        return BaseEmbeddingAdapter._format_cache_key("embedding:capabilities")
+        """
+        Cache key for capabilities() when cached.
+
+        Versioned to prevent cross-version cache pollution if the capabilities
+        dataclass grows additively across minor protocol versions.
+        """
+        return BaseEmbeddingAdapter._format_cache_key("embedding:capabilities:v1")
 
     def _embed_cache_key(
         self,
@@ -1349,14 +1370,33 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         )
 
     @asynccontextmanager
-    async def _rate_limited(self):
+    async def _rate_limited(self, *, op: str):
         """
         Async context manager to wrap an operation with rate limiting.
 
         Ensures that acquire/release semantics remain correct even in the
         presence of exceptions, while keeping the main call site readable.
+
+        Observability (conformance-safe):
+          - Records limiter wait time in low-cardinality buckets.
+          - Does not include raw text, raw tenant, or other sensitive payloads.
         """
+        t_wait = time.monotonic()
         await self._limiter.acquire()
+        waited_ms = (time.monotonic() - t_wait) * 1000.0
+
+        # Emit a low-cardinality counter to observe backpressure.
+        if waited_ms > 0:
+            try:
+                self._metrics.counter(
+                    component=self._component,
+                    name="limiter_wait_buckets_total",
+                    value=1,
+                    extra={"op": op, "bucket": self._bucket_wait_ms(waited_ms)},
+                )
+            except Exception:
+                pass
+
         try:
             yield
         finally:
@@ -1385,9 +1425,19 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
 
         # Circuit breaker gate
         if not self._breaker.allow():
+            # Conformance-safe observability: breaker open counter
+            try:
+                self._metrics.counter(
+                    component=self._component,
+                    name="breaker_open_total",
+                    value=1,
+                    extra={"op": op},
+                )
+            except Exception:
+                pass
             raise Unavailable("circuit open")
 
-        async with self._rate_limited():
+        async with self._rate_limited(op=op):
             t0 = time.monotonic()
             try:
                 result = await self._apply_deadline(call(), ctx)
@@ -1448,9 +1498,32 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         self._fail_if_expired(ctx)
 
         if not self._breaker.allow():
+            try:
+                self._metrics.counter(
+                    component=self._component,
+                    name="breaker_open_total",
+                    value=1,
+                    extra={"op": op},
+                )
+            except Exception:
+                pass
             raise Unavailable("circuit open")
 
+        # Rate limiter acquire with backpressure observability (bucketed).
+        t_wait = time.monotonic()
         await self._limiter.acquire()
+        waited_ms = (time.monotonic() - t_wait) * 1000.0
+        if waited_ms > 0:
+            try:
+                self._metrics.counter(
+                    component=self._component,
+                    name="limiter_wait_buckets_total",
+                    value=1,
+                    extra={"op": op, "bucket": self._bucket_wait_ms(waited_ms)},
+                )
+            except Exception:
+                pass
+
         t0 = time.monotonic()
         check_n = self._stream_deadline_check_every_n_chunks
 
@@ -1830,8 +1903,6 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         """
         Generate embedding for a single text with validation, gates, and metrics.
 
-        See EmbeddingProtocolV1.embed for full documentation.
-
         NOTE:
             Streaming is served by stream_embed() to align with LLM and Graph.
             If spec.stream is True, this method raises NotSupported.
@@ -1869,13 +1940,6 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         Stream embedding generation for a single text.
 
         This method is the canonical streaming API, aligned with LLM.stream and Graph.stream_query.
-
-        Notes:
-            - Validates inputs (text/model).
-            - Enforces capability gating (supports_streaming).
-            - Applies deterministic truncation (if supported) before invoking backend stream.
-            - Applies normalization at base if requested and not done at source.
-            - Ensures underlying backend generator is closed on abandonment to avoid resource leaks.
         """
         self._require_non_empty("text", spec.text)
         self._require_non_empty("model", spec.model)
@@ -2455,6 +2519,11 @@ def _error_to_wire(e: Exception, ms: float) -> Dict[str, Any]:
     Map EmbeddingAdapterError (or unexpected Exception) to canonical error envelope.
 
     Single source of truth for wire-level error normalization.
+
+    Conformance constraints (per embedding wire tests):
+      - Unexpected Exception MUST map to code="UNAVAILABLE"
+      - error MUST reflect the underlying exception type name
+      - message MUST surface the original exception message (e.g., "boom")
     """
     if isinstance(e, EmbeddingAdapterError):
         payload = e.asdict()
@@ -2467,14 +2536,15 @@ def _error_to_wire(e: Exception, ms: float) -> Dict[str, Any]:
             "details": payload.get("details") or None,
             "ms": ms,
         }
-    # Fallback: treat as UNAVAILABLE/INTERNAL for unknown exceptions.
+
+    # Unexpected exceptions: preserve message for conformance; add SIEM-safe detail for triage.
     return {
         "ok": False,
         "code": "UNAVAILABLE",
         "error": type(e).__name__,
         "message": str(e) or "internal error",
         "retry_after_ms": None,
-        "details": None,
+        "details": {"error_type": type(e).__name__},
         "ms": ms,
     }
 
@@ -2584,7 +2654,8 @@ class WireEmbeddingHandler:
 
             if op == "embedding.capabilities":
                 res = await self._adapter.capabilities()
-                return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
+                # NOTE: _success_to_wire already asdict()s dataclasses; avoid redundant asdict().
+                return _success_to_wire(res, (time.monotonic() - t0) * 1000.0)
 
             if op == "embedding.embed":
                 # Unary embed only; streaming has its own operation.
@@ -2600,7 +2671,7 @@ class WireEmbeddingHandler:
                     metadata=None,  # metadata not in wire contract
                 )
                 res = await self._adapter.embed(spec, ctx=ctx)
-                return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
+                return _success_to_wire(res, (time.monotonic() - t0) * 1000.0)
 
             if op == "embedding.embed_batch":
                 texts = args.get("texts")
@@ -2614,7 +2685,7 @@ class WireEmbeddingHandler:
                     metadatas=None,  # metadatas not in wire contract
                 )
                 res = await self._adapter.embed_batch(spec, ctx=ctx)
-                return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
+                return _success_to_wire(res, (time.monotonic() - t0) * 1000.0)
 
             if op == "embedding.count_tokens":
                 text = args.get("text")
@@ -2632,7 +2703,8 @@ class WireEmbeddingHandler:
 
             if op == "embedding.get_stats":
                 res = await self._adapter.get_stats(ctx=ctx)
-                return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
+                # NOTE: _success_to_wire already asdict()s dataclasses; avoid redundant asdict().
+                return _success_to_wire(res, (time.monotonic() - t0) * 1000.0)
 
             raise NotSupported(f"unknown operation '{op}'")
 
