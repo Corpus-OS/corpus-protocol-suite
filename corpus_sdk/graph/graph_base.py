@@ -345,6 +345,14 @@ class GraphTraversalSpec:
     namespace: Optional[str] = None
 
     def __post_init__(self) -> None:
+        # Validate start_nodes are non-empty strings (wire-safe)
+        for i, n in enumerate(self.start_nodes or []):
+            if not isinstance(n, str) or not n:
+                raise BadRequest(
+                    f"start_nodes[{i}] must be a non-empty string, got {type(n).__name__}",
+                    details={"index": i},
+                )
+
         # Validate direction
         if self.direction not in {"OUTGOING", "INCOMING", "BOTH"}:
             raise BadRequest(
@@ -1233,6 +1241,41 @@ class BaseGraphAdapter(GraphProtocolV1):
             return None
         return hashlib.sha256(tenant.encode("utf-8")).hexdigest()[:12]
 
+    @staticmethod
+    def _bucket_wait_ms(ms: float) -> str:
+        """
+        Low-cardinality buckets for limiter wait-time metrics.
+
+        Keeps SIEM/metrics cardinality bounded while still giving
+        operational signal for backpressure.
+        """
+        if ms < 1.0:
+            return "<1ms"
+        if ms < 10.0:
+            return "1-10ms"
+        if ms < 100.0:
+            return "10-100ms"
+        return ">=100ms"
+
+    @staticmethod
+    def _unwrap_result_mapping(maybe_result: Any) -> Any:
+        """
+        Best-effort unwrapping for batch operation results.
+
+        Adapters may return:
+          - typed dataclasses (UpsertResult/DeleteResult)
+          - plain dict payloads ({"upserted_count": ...})
+          - wire-like success envelopes ({"ok": True, "result": {...}})
+
+        This helper normalizes common wrappers to a mapping payload without
+        changing external schemas.
+        """
+        if isinstance(maybe_result, Mapping):
+            # Common wire envelope convention: {"ok": true, "result": {...}}
+            if maybe_result.get("ok") is True and isinstance(maybe_result.get("result"), Mapping):
+                return maybe_result["result"]
+        return maybe_result
+
     def _record(
         self,
         op: str,
@@ -1274,10 +1317,16 @@ class BaseGraphAdapter(GraphProtocolV1):
         awaitable: Awaitable[Any],
         ctx: Optional[OperationContext],
     ) -> Any:
-        try:
-            return await self._deadline.wrap(awaitable, ctx)
-        except asyncio.TimeoutError as e:
-            raise DeadlineExceeded("operation timed out", details={"remaining_ms": 0}) from e
+        """
+        Apply the configured DeadlinePolicy.
+
+        Note: DeadlinePolicy implementations are expected to raise
+        DeadlineExceeded (GraphAdapterError) on deadline expiry rather than
+        bubbling asyncio.TimeoutError. This method does not translate
+        TimeoutError to avoid duplicate translation and to keep behavior
+        centralized in DeadlinePolicy.
+        """
+        return await self._deadline.wrap(awaitable, ctx)
 
     def _extract_namespace_from_spec(self, spec: Any) -> Optional[str]:
         """
@@ -1289,6 +1338,33 @@ class BaseGraphAdapter(GraphProtocolV1):
         if hasattr(spec, "namespace"):
             return getattr(spec, "namespace")
         return None
+
+    def _effective_namespaces_for_nodes(self, spec: UpsertNodesSpec) -> List[str]:
+        """
+        Determine all namespaces impacted by an upsert_nodes call.
+
+        Spec-level namespace is an override; per-node namespace wins when set.
+        This avoids under-invalidation when callers mix namespaces per batch.
+        """
+        ns: set[str] = set()
+        for n in spec.nodes or []:
+            eff = n.namespace or spec.namespace
+            if eff:
+                ns.add(eff)
+        return list(ns)
+
+    def _effective_namespaces_for_edges(self, spec: UpsertEdgesSpec) -> List[str]:
+        """
+        Determine all namespaces impacted by an upsert_edges call.
+
+        Spec-level namespace is an override; per-edge namespace wins when set.
+        """
+        ns: set[str] = set()
+        for e in spec.edges or []:
+            eff = e.namespace or spec.namespace
+            if eff:
+                ns.add(eff)
+        return list(ns)
 
     def _make_cache_key(
         self,
@@ -1388,19 +1464,32 @@ class BaseGraphAdapter(GraphProtocolV1):
 
         This inspects the batch result to see if the operation at the given
         index actually modified data, allowing for smarter cache invalidation.
+
+        Supports both typed dataclass results and mapping/dict payloads
+        to maximize adapter interoperability.
         """
         if idx >= len(batch_result.results):
             return False
 
-        result = batch_result.results[idx]
+        result = self._unwrap_result_mapping(batch_result.results[idx])
 
         # For write operations, check if they actually succeeded
         if op.op in {"upsert_nodes", "upsert_edges"}:
             if isinstance(result, UpsertResult):
                 return result.upserted_count > 0
+            if isinstance(result, Mapping):
+                try:
+                    return int(result.get("upserted_count", 0)) > 0
+                except Exception:
+                    return False
         elif op.op in {"delete_nodes", "delete_edges"}:
             if isinstance(result, DeleteResult):
                 return result.deleted_count > 0
+            if isinstance(result, Mapping):
+                try:
+                    return int(result.get("deleted_count", 0)) > 0
+                except Exception:
+                    return False
 
         # For query operations or unknown result types, assume no cache invalidation needed
         return False
@@ -1436,12 +1525,37 @@ class BaseGraphAdapter(GraphProtocolV1):
         self._fail_if_deadline_expired(ctx)
 
         if not self._breaker.allow():
+            # Emit explicit breaker-open counter (low cardinality)
+            try:
+                self._metrics.counter(
+                    component=self._component,
+                    name="breaker_open_total",
+                    value=1,
+                    extra={"op": op},
+                )
+            except Exception:
+                pass
+
             e = Unavailable("circuit open")
             t0 = time.monotonic()
             self._record(op, t0, False, code=e.code, ctx=ctx, **metric_extra)
             raise e
 
+        # Measure limiter wait time for observability (low-cardinality buckets)
+        wait_t0 = time.monotonic()
         await self._limiter.acquire()
+        wait_ms = (time.monotonic() - wait_t0) * 1000.0
+        if wait_ms > 0:
+            try:
+                self._metrics.counter(
+                    component=self._component,
+                    name="limiter_wait_buckets_total",
+                    value=1,
+                    extra={"op": op, "bucket": self._bucket_wait_ms(wait_ms)},
+                )
+            except Exception:
+                pass
+
         t0 = time.monotonic()
         try:
             result = await self._apply_deadline(call(), ctx)
@@ -1480,9 +1594,33 @@ class BaseGraphAdapter(GraphProtocolV1):
         self._fail_if_deadline_expired(ctx)
 
         if not self._breaker.allow():
+            # Emit explicit breaker-open counter (low cardinality)
+            try:
+                self._metrics.counter(
+                    component=self._component,
+                    name="breaker_open_total",
+                    value=1,
+                    extra={"op": op},
+                )
+            except Exception:
+                pass
             raise Unavailable("circuit open")
 
+        # Measure limiter wait time for observability (low-cardinality buckets)
+        wait_t0 = time.monotonic()
         await self._limiter.acquire()
+        wait_ms = (time.monotonic() - wait_t0) * 1000.0
+        if wait_ms > 0:
+            try:
+                self._metrics.counter(
+                    component=self._component,
+                    name="limiter_wait_buckets_total",
+                    value=1,
+                    extra={"op": op, "bucket": self._bucket_wait_ms(wait_ms)},
+                )
+            except Exception:
+                pass
+
         t0 = time.monotonic()
         check_n = self._stream_deadline_check_every_n_chunks
 
@@ -1602,6 +1740,10 @@ class BaseGraphAdapter(GraphProtocolV1):
             if not isinstance(spec.text, str) or not spec.text.strip():
                 raise BadRequest("query.text must be a non-empty string")
 
+            # HARDENING: validate query params are JSON-serializable to prevent wire-time failures.
+            if spec.params is not None:
+                self._validate_properties_map(spec.params)
+
             caps = await self.capabilities()
             if spec.dialect and caps.supported_query_dialects:
                 if spec.dialect not in caps.supported_query_dialects:
@@ -1648,6 +1790,10 @@ class BaseGraphAdapter(GraphProtocolV1):
         async def _stream_impl() -> AsyncIterator[QueryChunk]:
             if not isinstance(spec.text, str) or not spec.text.strip():
                 raise BadRequest("query.text must be a non-empty string")
+
+            # HARDENING: validate query params are JSON-serializable to prevent wire-time failures.
+            if spec.params is not None:
+                self._validate_properties_map(spec.params)
 
             caps = await self.capabilities()
             if not caps.supports_stream_query:
@@ -1717,10 +1863,10 @@ class BaseGraphAdapter(GraphProtocolV1):
             else:
                 result = await self._do_upsert_nodes(spec, ctx=ctx)
 
-            # Invalidate relevant caches only if writes succeeded and we have a namespace
+            # HARDENING: invalidate all impacted namespaces (per-node namespace wins).
             if result.upserted_count > 0:
-                namespace = self._extract_namespace_from_spec(spec)
-                await self._invalidate_namespace_cache(namespace)
+                for ns in self._effective_namespaces_for_nodes(spec):
+                    await self._invalidate_namespace_cache(ns)
 
             return result
 
@@ -1775,10 +1921,10 @@ class BaseGraphAdapter(GraphProtocolV1):
             else:
                 result = await self._do_upsert_edges(spec, ctx=ctx)
 
-            # Invalidate relevant caches only if writes succeeded and we have a namespace
+            # HARDENING: invalidate all impacted namespaces (per-edge namespace wins).
             if result.upserted_count > 0:
-                namespace = self._extract_namespace_from_spec(spec)
-                await self._invalidate_namespace_cache(namespace)
+                for ns in self._effective_namespaces_for_edges(spec):
+                    await self._invalidate_namespace_cache(ns)
 
             return result
 
@@ -2324,6 +2470,11 @@ def _ctx_from_wire(ctx_dict: Mapping[str, Any]) -> OperationContext:
 def _error_to_wire(e: Exception, ms: float) -> Dict[str, Any]:
     """
     Map GraphAdapterError (or unexpected Exception) to canonical error envelope.
+
+    SECURITY HARDENING:
+        For unexpected exceptions, return a stable, non-leaky message and
+        SIEM-safe details. This preserves the wire schema while avoiding
+        accidental disclosure of sensitive backend internals.
     """
     if isinstance(e, GraphAdapterError):
         return {
@@ -2339,9 +2490,9 @@ def _error_to_wire(e: Exception, ms: float) -> Dict[str, Any]:
         "ok": False,
         "code": "UNAVAILABLE",  # Wire-level code remains UNAVAILABLE
         "error": type(e).__name__,
-        "message": str(e) or "internal error",
+        "message": "internal error",
         "retry_after_ms": None,
-        "details": None,
+        "details": {"error_type": type(e).__name__},
         "ms": ms,
     }
 
@@ -2526,7 +2677,7 @@ class WireGraphHandler:
 
             if op == "graph.capabilities":
                 res = await self._adapter.capabilities()
-                return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
+                return _success_to_wire(res, (time.monotonic() - t0) * 1000.0)
 
             if op == "graph.query":
                 try:
@@ -2534,21 +2685,21 @@ class WireGraphHandler:
                 except (TypeError, ValueError) as spec_err:
                     raise BadRequest(f"Invalid query spec: {spec_err}") from spec_err
                 res = await self._adapter.query(spec, ctx=ctx)
-                return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
+                return _success_to_wire(res, (time.monotonic() - t0) * 1000.0)
 
             if op == "graph.upsert_nodes":
                 nodes_raw = self._require_mapping_list("nodes", args.get("nodes"))
                 nodes = [Node(**self._coerce_node_dict(n, i)) for i, n in enumerate(nodes_raw)]
                 spec = UpsertNodesSpec(nodes=nodes, namespace=args.get("namespace"))
                 res = await self._adapter.upsert_nodes(spec, ctx=ctx)
-                return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
+                return _success_to_wire(res, (time.monotonic() - t0) * 1000.0)
 
             if op == "graph.upsert_edges":
                 edges_raw = self._require_mapping_list("edges", args.get("edges"))
                 edges = [Edge(**self._coerce_edge_dict(e, i)) for i, e in enumerate(edges_raw)]
                 spec = UpsertEdgesSpec(edges=edges, namespace=args.get("namespace"))
                 res = await self._adapter.upsert_edges(spec, ctx=ctx)
-                return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
+                return _success_to_wire(res, (time.monotonic() - t0) * 1000.0)
 
             if op == "graph.delete_nodes":
                 ids = [GraphID(i) for i in self._require_string_list("ids", args.get("ids"))]
@@ -2558,7 +2709,7 @@ class WireGraphHandler:
                     filter=args.get("filter"),
                 )
                 res = await self._adapter.delete_nodes(spec, ctx=ctx)
-                return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
+                return _success_to_wire(res, (time.monotonic() - t0) * 1000.0)
 
             if op == "graph.delete_edges":
                 ids = [GraphID(i) for i in self._require_string_list("ids", args.get("ids"))]
@@ -2568,7 +2719,7 @@ class WireGraphHandler:
                     filter=args.get("filter"),
                 )
                 res = await self._adapter.delete_edges(spec, ctx=ctx)
-                return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
+                return _success_to_wire(res, (time.monotonic() - t0) * 1000.0)
 
             if op == "graph.bulk_vertices":
                 try:
@@ -2576,17 +2727,17 @@ class WireGraphHandler:
                 except (TypeError, ValueError) as spec_err:
                     raise BadRequest(f"Invalid bulk_vertices spec: {spec_err}") from spec_err
                 res = await self._adapter.bulk_vertices(spec, ctx=ctx)
-                return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
+                return _success_to_wire(res, (time.monotonic() - t0) * 1000.0)
 
             if op == "graph.batch":
                 ops_raw = self._require_mapping_list("ops", args.get("ops"))
                 ops = [BatchOperation(**dict(o)) for o in ops_raw]
                 res = await self._adapter.batch(ops, ctx=ctx)
-                return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
+                return _success_to_wire(res, (time.monotonic() - t0) * 1000.0)
 
             if op == "graph.get_schema":
                 res = await self._adapter.get_schema(ctx=ctx)
-                return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
+                return _success_to_wire(res, (time.monotonic() - t0) * 1000.0)
 
             if op == "graph.health":
                 res = await self._adapter.health(ctx=ctx)
@@ -2596,7 +2747,7 @@ class WireGraphHandler:
                 ops_raw = self._require_mapping_list("operations", args.get("operations"))
                 ops = [BatchOperation(**dict(o)) for o in ops_raw]
                 res = await self._adapter.transaction(ops, ctx=ctx)
-                return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
+                return _success_to_wire(res, (time.monotonic() - t0) * 1000.0)
 
             if op == "graph.traversal":
                 try:
@@ -2604,7 +2755,7 @@ class WireGraphHandler:
                 except (TypeError, ValueError) as spec_err:
                     raise BadRequest(f"Invalid traversal spec: {spec_err}") from spec_err
                 res = await self._adapter.traversal(spec, ctx=ctx)
-                return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
+                return _success_to_wire(res, (time.monotonic() - t0) * 1000.0)
 
             raise NotSupported(f"unknown or non-unary operation '{op}'")
         except Exception as e:
