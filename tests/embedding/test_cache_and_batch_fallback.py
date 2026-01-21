@@ -1,5 +1,3 @@
-okay how many of the test would this base file and adapter pass. go through test by test and provide pass or fail and the logic behind each decision
-
 # SPDX-License-Identifier: Apache-2.0
 """
 Embedding Conformance — Cache behavior & batch fallback semantics.
