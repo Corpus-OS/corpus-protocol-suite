@@ -1,4 +1,5 @@
-# tests/mock/mock_embedding_adapter.py
+# tests/mock/mock_embedding_adapter
+
 # SPDX-License-Identifier: Apache-2.0
 """
 Mock Embedding adapter used in example scripts and conformance tests.
@@ -13,7 +14,11 @@ Goals:
 IMPORTANT:
 - This mock does NOT override embed_batch(). The base owns batch validation + fallback semantics.
 - This mock does NOT simulate caching. Tests should validate caching via an injected cache
-  implementation (e.g., a counting TTL cache) and BaseEmbeddingAdapter’s cache logic.
+  implementation (e.g., a counting TTL cache) and BaseEmbeddingAdapter's cache logic.
+
+CACHE STATS NOTE:
+- Cache hits/misses are tracked by BaseEmbeddingAdapter, not this mock.
+- This mock only returns stats it actually knows about (calls, tokens, time).
 """
 
 from __future__ import annotations
@@ -469,6 +474,7 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
                     failures.append(
                         {
                             "index": i,
+                            "text": text,
                             "error": type(item_err).__name__,
                             "code": getattr(item_err, "code", None) or type(item_err).__name__.upper(),
                             "message": getattr(item_err, "message", None) or str(item_err),
@@ -482,6 +488,7 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
                     failures.append(
                         {
                             "index": i,
+                            "text": text,
                             "error": type(item_err).__name__,
                             "code": "UNAVAILABLE",
                             "message": str(item_err) or "internal error",
@@ -523,7 +530,7 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
         return n
 
     # ---------------------------------------------------------------------
-    # Stats
+    # Stats (UPDATED: cache stats removed, base handles them)
     # ---------------------------------------------------------------------
     async def _do_get_stats(self, ctx: Optional[EmbeddingContext] = None) -> EmbeddingStats:
         total_requests = (
@@ -534,18 +541,15 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
         )
         avg = (self._stats["total_processing_time_ms"] / total_requests) if total_requests else 0.0
 
-        # Cache hit/miss counters are owned by BaseEmbeddingAdapter metrics; this mock keeps them 0.
+        # Cache hit/miss counters are owned by BaseEmbeddingAdapter - NOT tracked here
         return EmbeddingStats(
             total_requests=total_requests,
             total_texts=self._stats["total_texts_embedded"],
             total_tokens=self._stats["total_tokens_processed"],
-            cache_hits=0,
-            cache_misses=0,
             avg_processing_time_ms=avg,
             error_count=0,
-            stream_requests=self._stats["stream_embed_calls"],
-            stream_chunks_generated=self._stats["total_stream_chunks"],
-            stream_abandoned=self._stats["abandoned_streams"],
+            # Note: cache_hits and cache_misses omitted - base will populate these
+            # Note: stream stats omitted - base will populate from its _stream_stats
         )
 
     # ---------------------------------------------------------------------
