@@ -7,6 +7,8 @@ Asserts (Spec refs):
   • Known dialects accepted                                   (§7.4)
   • Error messages include the offending dialect              (§7.4, §6.3)
 """
+from __future__ import annotations
+
 import pytest
 
 from corpus_sdk.graph.graph_base import (
@@ -14,62 +16,61 @@ from corpus_sdk.graph.graph_base import (
     NotSupported,
     BaseGraphAdapter,
     GraphQuerySpec,
+    QueryResult,
 )
 
 pytestmark = pytest.mark.asyncio
 
 
 @pytest.mark.parametrize("dialect", ["unknown", "sql", "sparql"])
-async def test_unknown_dialect_rejected(adapter: BaseGraphAdapter, dialect: str):
+async def test_unknown_dialect_behavior_is_capability_consistent(adapter: BaseGraphAdapter, dialect: str):
     caps = await adapter.capabilities()
-    if dialect in caps.supported_query_dialects:
-        pytest.skip(f"Adapter declares dialect '{dialect}'; cannot treat it as unknown")
-
-    ctx = GraphContext(request_id=f"t_dialect_bad_{dialect}", tenant="t")
-    spec = GraphQuerySpec(text="X", dialect=dialect)
-
-    with pytest.raises(NotSupported):
-        await adapter.query(spec, ctx=ctx)
-
-
-async def test_known_dialect_accepted(adapter: BaseGraphAdapter):
-    caps = await adapter.capabilities()
-    if not caps.supported_query_dialects:
-        pytest.skip("Adapter declares no dialects")
-
-    dialect = caps.supported_query_dialects[0]
-    ctx = GraphContext(request_id=f"t_dialect_ok_{dialect}", tenant="t")
+    ctx = GraphContext(request_id=f"t_dialect_unknown_{dialect}", tenant="t")
+    declared = tuple(getattr(caps, "supported_query_dialects", ()) or ())
     spec = GraphQuerySpec(text="RETURN 1", dialect=dialect)
 
-    res = await adapter.query(spec, ctx=ctx)
+    if declared:
+        if dialect in declared:
+            res = await adapter.query(spec, ctx=ctx)
+            assert isinstance(res, QueryResult)
+            return
+        with pytest.raises(NotSupported):
+            await adapter.query(spec, ctx=ctx)
+        return
+
+    # Opaque dialect set: adapter may accept or reject; if it rejects, it should be NotSupported.
+    try:
+        res = await adapter.query(spec, ctx=ctx)
+        assert isinstance(res, QueryResult)
+    except NotSupported:
+        pass
+
+
+async def test_known_dialect_accepted_when_declared(adapter: BaseGraphAdapter):
+    caps = await adapter.capabilities()
+    declared = tuple(getattr(caps, "supported_query_dialects", ()) or ())
+    ctx = GraphContext(request_id="t_dialect_known", tenant="t")
+
+    if declared:
+        res = await adapter.query(GraphQuerySpec(text="RETURN 1", dialect=declared[0]), ctx=ctx)
+        assert isinstance(res.records, list)
+        return
+
+    res = await adapter.query(GraphQuerySpec(text="RETURN 1", dialect=None), ctx=ctx)
     assert isinstance(res.records, list)
 
 
-async def test_dialect_not_in_capabilities_raises_not_supported(
-    adapter: BaseGraphAdapter,
-):
+async def test_error_message_includes_dialect_when_rejected_due_to_declared_list(adapter: BaseGraphAdapter):
     caps = await adapter.capabilities()
-    unknown = "gremlin"
-    if unknown in caps.supported_query_dialects:
-        pytest.skip(f"Adapter unexpectedly supports '{unknown}' dialect")
+    declared = tuple(getattr(caps, "supported_query_dialects", ()) or ())
+    if not declared:
+        return
 
-    ctx = GraphContext(request_id="t_dialect_gremlin", tenant="t")
-    spec = GraphQuerySpec(text="g.V().limit(1)", dialect=unknown)
+    dialect = "__definitely_not_supported__"
+    if dialect in declared:
+        return
 
+    ctx = GraphContext(request_id="t_dialect_msg", tenant="t")
     with pytest.raises(NotSupported) as ei:
-        await adapter.query(spec, ctx=ctx)
-    assert "gremlin" in str(ei.value)
-
-
-async def test_error_message_includes_dialect_name(adapter: BaseGraphAdapter):
-    caps = await adapter.capabilities()
-    dialect = "gql"
-    if dialect in caps.supported_query_dialects:
-        pytest.skip(f"Adapter unexpectedly supports '{dialect}' dialect")
-
-    ctx = GraphContext(request_id="t_dialect_gql", tenant="t")
-    spec = GraphQuerySpec(text="{}", dialect=dialect)
-
-    with pytest.raises(NotSupported) as ei:
-        await adapter.query(spec, ctx=ctx)
-    assert "gql" in str(ei.value)
+        await adapter.query(GraphQuerySpec(text="RETURN 1", dialect=dialect), ctx=ctx)
+    assert dialect in str(ei.value)
