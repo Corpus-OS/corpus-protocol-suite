@@ -1106,9 +1106,23 @@ class BaseLLMAdapter(LLMProtocolV1):
         if isinstance(tool_choice, str):
             valid_choices = {"auto", "none", "required"}
             if tool_choice not in valid_choices:
-                raise BadRequest(f"tool_choice must be one of {valid_choices} or a tool specification")
+                raise BadRequest(
+                    f"tool_choice must be one of {valid_choices} or a tool specification"
+                )
         elif not isinstance(tool_choice, dict):
             raise BadRequest("tool_choice must be a string or dictionary")
+
+    @staticmethod
+    def _validate_stop_sequences(stop_sequences: Optional[List[str]]) -> None:
+        """
+        Validate stop_sequences parameter if provided.
+        """
+        if stop_sequences is None:
+            return
+        if not isinstance(stop_sequences, list) or any(
+            not isinstance(s, str) for s in stop_sequences
+        ):
+            raise BadRequest("stop_sequences must be a list of strings")
 
     @staticmethod
     def _validate_message_content_serializable(messages: List[Mapping[str, str]]) -> None:
@@ -1256,6 +1270,23 @@ class BaseLLMAdapter(LLMProtocolV1):
         except Exception:
             return True
 
+    async def _maybe_apply_deadline(
+        self,
+        awaitable: Awaitable[Any],
+        ctx: Optional[OperationContext],
+        *,
+        enabled: bool,
+    ) -> Any:
+        """
+        Apply DeadlinePolicy only when enabled.
+
+        This preserves capability↔behavior alignment when a provider/adapter
+        explicitly reports supports_deadline == False.
+        """
+        if not enabled:
+            return await awaitable
+        return await self._apply_deadline(awaitable, ctx)
+
     def _make_complete_cache_key(
         self,
         *,
@@ -1302,7 +1333,9 @@ class BaseLLMAdapter(LLMProtocolV1):
             "supported_models": caps.supported_models,
         }
         caps_hash = hashlib.sha256(
-            json.dumps(caps_fingerprint_payload, sort_keys=True, default=str).encode("utf-8")
+            json.dumps(caps_fingerprint_payload, sort_keys=True, default=str).encode(
+                "utf-8"
+            )
         ).hexdigest()
 
         # Hash tools/choice stably
@@ -1357,6 +1390,7 @@ class BaseLLMAdapter(LLMProtocolV1):
         model: Optional[str],
         ctx: Optional[OperationContext],
         caps: LLMCapabilities,
+        enforce_deadline: bool,
     ) -> None:
         """
         Optional context-window preflight using count_tokens() if supported.
@@ -1380,9 +1414,10 @@ class BaseLLMAdapter(LLMProtocolV1):
         combined = "\n".join(parts)
 
         try:
-            prompt_tokens = await self._apply_deadline(
+            prompt_tokens = await self._maybe_apply_deadline(
                 self._do_count_tokens(text=combined, model=model, ctx=ctx),
                 ctx,
+                enabled=enforce_deadline,
             )
         except NotSupported:
             return
@@ -1419,14 +1454,18 @@ class BaseLLMAdapter(LLMProtocolV1):
         Shared wrapper for unary operations.
 
         Applies:
-            - deadline preflight
             - circuit breaker allow/on_{success,error}
             - rate limiter acquire/release
             - metrics recording (timing + status)
             - optional after_success hook for extra metrics
+
+        NOTE (capability↔behavior alignment):
+            Deadline semantics are enforced by the operation itself after it
+            evaluates capabilities.supports_deadline. This avoids applying
+            deadlines for adapters that explicitly declare they do not support
+            deadline enforcement.
         """
         metric_extra = dict(metric_extra or {})
-        self._preflight_deadline(ctx)
 
         if not self._breaker.allow():
             e = Unavailable("circuit open")
@@ -1470,14 +1509,15 @@ class BaseLLMAdapter(LLMProtocolV1):
         *,
         op: str,
         ctx: Optional[OperationContext],
-        agen_factory: Callable[[], AsyncIterator[LLMChunk]],
+        # IMPORTANT: to reduce cognitive load and remove nonlocal toggles,
+        # the factory returns (agen, deadline_on) explicitly.
+        agen_factory: Callable[[], Awaitable[Tuple[AsyncIterator[LLMChunk], bool]]],
         metric_extra: Mapping[str, Any] = None,
     ) -> AsyncIterator[LLMChunk]:
         """
         Shared wrapper for streaming operations.
 
         Applies:
-            - deadline preflight
             - circuit breaker allow/on_{success,error}
             - rate limiter acquire/release
             - metrics for overall stream duration and outcome
@@ -1491,9 +1531,12 @@ class BaseLLMAdapter(LLMProtocolV1):
               are only produced as fast as the consumer awaits them.
             - For more aggressive backpressure, supply a custom RateLimiter
               that enforces per-chunk limits in the adapter's _do_stream.
+
+        Capability↔behavior alignment:
+            - Deadline checks are enabled/disabled using the deadline_on boolean
+              returned by agen_factory (derived from capabilities.supports_deadline).
         """
         metric_extra = dict(metric_extra or {})
-        self._preflight_deadline(ctx)
 
         if not self._breaker.allow():
             e = Unavailable("circuit open")
@@ -1509,11 +1552,22 @@ class BaseLLMAdapter(LLMProtocolV1):
         async def _gen() -> AsyncIterator[LLMChunk]:
             chunk_count = 0
             tokens_total = 0
+            saw_final = False
             agen: Optional[AsyncIterator[LLMChunk]] = None
+            deadline_on: bool = True
+
             try:
-                agen = agen_factory()
+                agen, deadline_on = await agen_factory()
+
                 async for chunk in agen:
                     chunk_count += 1
+
+                    # Enforce protocol surface: adapters must yield LLMChunk instances.
+                    if not isinstance(chunk, LLMChunk):
+                        raise Unavailable("stream yielded non-LLMChunk item")
+
+                    if bool(getattr(chunk, "is_final", False)):
+                        saw_final = True
 
                     # Robust usage tracking: update accumulated usage if present in this chunk
                     # This handles cases where usage is only in the final chunk or sent progressively.
@@ -1522,8 +1576,9 @@ class BaseLLMAdapter(LLMProtocolV1):
                         # Assume usage is cumulative (so far); latest non-zero value wins
                         tokens_total = int(usage.total_tokens)
 
-                    if check_n > 0 and (chunk_count % check_n) == 0:
+                    if deadline_on and check_n > 0 and (chunk_count % check_n) == 0:
                         self._preflight_deadline(ctx)
+
                     yield chunk
 
                 metric_extra["chunks"] = chunk_count
@@ -1538,6 +1593,13 @@ class BaseLLMAdapter(LLMProtocolV1):
                     name="stream_chunks_total",
                     value=chunk_count,
                 )
+                if chunk_count > 0 and not saw_final:
+                    # Observability-only: stream ended without any is_final=True chunk.
+                    self._metrics.counter(
+                        component=self._component,
+                        name="stream_missing_final_chunk_total",
+                        value=1,
+                    )
                 if tokens_total > 0:
                     # Total tokens for this stream (captured from usage_so_far).
                     self._metrics.counter(
@@ -1656,10 +1718,23 @@ class BaseLLMAdapter(LLMProtocolV1):
         )
         self._validate_tools(tools)
         self._validate_tool_choice(tool_choice)
+        self._validate_stop_sequences(stop_sequences)
+
+        if max_tokens is not None and int(max_tokens) < 0:
+            raise BadRequest("max_tokens must be >= 0")
 
         async def _call() -> LLMCompletion:
             caps = await self.capabilities()
             self._gate_model_if_listed(model=model, caps=caps)
+
+            # Capability↔behavior alignment: system_message gating.
+            if system_message is not None and system_message != "" and not caps.supports_system_message:
+                raise NotSupported("system_message is not supported by this adapter")
+
+            # Capability↔behavior alignment: deadline enforcement.
+            enforce_deadline = bool(caps.supports_deadline)
+            if enforce_deadline:
+                self._preflight_deadline(ctx)
 
             if (tools or tool_choice) and not caps.supports_tools:
                 raise NotSupported("tools are not supported by this adapter")
@@ -1671,6 +1746,7 @@ class BaseLLMAdapter(LLMProtocolV1):
                 model=model,
                 ctx=ctx,
                 caps=caps,
+                enforce_deadline=enforce_deadline,
             )
 
             # Respect cache_ttl_s == 0 as a hard disable.
@@ -1702,7 +1778,7 @@ class BaseLLMAdapter(LLMProtocolV1):
                     )
                     return cached  # type: ignore[return-value]
 
-            result = await self._apply_deadline(
+            result = await self._maybe_apply_deadline(
                 self._do_complete(
                     messages=messages,
                     max_tokens=max_tokens,
@@ -1718,6 +1794,7 @@ class BaseLLMAdapter(LLMProtocolV1):
                     ctx=ctx,
                 ),
                 ctx,
+                enabled=enforce_deadline,
             )
 
             if use_cache and cache_key is not None:
@@ -1788,17 +1865,36 @@ class BaseLLMAdapter(LLMProtocolV1):
         )
         self._validate_tools(tools)
         self._validate_tool_choice(tool_choice)
+        self._validate_stop_sequences(stop_sequences)
+
+        if max_tokens is not None and int(max_tokens) < 0:
+            raise BadRequest("max_tokens must be >= 0")
 
         metric_extra: Dict[str, Any] = {}
         if self._tag_model_in_metrics and model:
             metric_extra["model"] = model
 
-        async def agen_factory() -> AsyncIterator[LLMChunk]:
+        async def agen_factory() -> Tuple[AsyncIterator[LLMChunk], bool]:
+            """
+            Create the underlying adapter stream generator and return a boolean
+            indicating whether deadline semantics are enabled for this stream.
+
+            This removes the need for nonlocal toggles and keeps capability↔behavior
+            alignment explicit and easy to reason about.
+            """
             caps = await self.capabilities()
             self._gate_model_if_listed(model=model, caps=caps)
 
+            deadline_on = bool(caps.supports_deadline)
+
             if not caps.supports_streaming:
                 raise NotSupported("stream is not supported by this adapter")
+
+            if system_message is not None and system_message != "" and not caps.supports_system_message:
+                raise NotSupported("system_message is not supported by this adapter")
+
+            if deadline_on:
+                self._preflight_deadline(ctx)
 
             if (tools or tool_choice) and not caps.supports_tools:
                 raise NotSupported("tools are not supported by this adapter")
@@ -1810,6 +1906,7 @@ class BaseLLMAdapter(LLMProtocolV1):
                 model=model,
                 ctx=ctx,
                 caps=caps,
+                enforce_deadline=deadline_on,
             )
 
             agen = self._do_stream(
@@ -1826,9 +1923,7 @@ class BaseLLMAdapter(LLMProtocolV1):
                 tool_choice=tool_choice,
                 ctx=ctx,
             )
-
-            async for chunk in agen:
-                yield chunk
+            return agen, deadline_on
 
         generator = await self._with_gates_stream(
             op="stream",
@@ -1852,7 +1947,7 @@ class BaseLLMAdapter(LLMProtocolV1):
         Honors:
             - capabilities.supported_models (if enumerated)
             - capabilities.supports_count_tokens
-            - ctx.deadline_ms via DeadlinePolicy
+            - ctx.deadline_ms via DeadlinePolicy when capabilities.supports_deadline is True
         """
         if not isinstance(text, str):
             raise BadRequest("text must be a string")
@@ -1868,10 +1963,14 @@ class BaseLLMAdapter(LLMProtocolV1):
             if not caps.supports_count_tokens:
                 raise NotSupported("count_tokens is not supported by this adapter")
 
-            self._preflight_deadline(ctx)
-            result = await self._apply_deadline(
+            enforce_deadline = bool(caps.supports_deadline)
+            if enforce_deadline:
+                self._preflight_deadline(ctx)
+
+            result = await self._maybe_apply_deadline(
                 self._do_count_tokens(text=text, model=model, ctx=ctx),
                 ctx,
+                enabled=enforce_deadline,
             )
 
             self._record(
@@ -1893,7 +1992,7 @@ class BaseLLMAdapter(LLMProtocolV1):
                 "count_tokens",
                 t0,
                 False,
-                code=type(e).__name__,
+                code=(e.code or type(e).__name__),
                 ctx=ctx,
                 **extra,
             )
@@ -1926,8 +2025,16 @@ class BaseLLMAdapter(LLMProtocolV1):
         """
         t0 = time.monotonic()
         try:
-            self._preflight_deadline(ctx)
-            h = await self._apply_deadline(self._do_health(ctx=ctx), ctx)
+            caps = await self.capabilities()
+            enforce_deadline = bool(caps.supports_deadline)
+            if enforce_deadline:
+                self._preflight_deadline(ctx)
+
+            h = await self._maybe_apply_deadline(
+                self._do_health(ctx=ctx),
+                ctx,
+                enabled=enforce_deadline,
+            )
             self._record("health", t0, True, ctx=ctx)
             return {
                 "ok": bool(h.get("ok", True)),
@@ -1935,7 +2042,7 @@ class BaseLLMAdapter(LLMProtocolV1):
                 "version": str(h.get("version", "")),
             }
         except LLMAdapterError as e:
-            self._record("health", t0, False, code=type(e).__name__, ctx=ctx)
+            self._record("health", t0, False, code=(e.code or type(e).__name__), ctx=ctx)
             raise
         except Exception as e:
             self._record("health", t0, False, code="UnhandledException", ctx=ctx)
@@ -2042,6 +2149,24 @@ def _ctx_from_wire(ctx_dict: Mapping[str, Any]) -> OperationContext:
         attrs=ctx_dict.get("attrs") or {},
     )
 
+
+def _ensure_json_serializable(payload: Any, *, field: str) -> None:
+    """
+    Ensure a payload is JSON-serializable.
+
+    Wire contract requires canonical JSON; if an adapter returns objects that
+    cannot be serialized, hard-fail at the boundary with a stable error.
+
+    SECURITY NOTE:
+        This intentionally does NOT include the payload in error messages.
+        Payload values may contain secrets/PII.
+    """
+    try:
+        json.dumps(payload)
+    except (TypeError, ValueError) as e:
+        raise Unavailable(f"{field} is not JSON-serializable") from e
+
+
 def _success_to_wire(result: Any, ms: float) -> Dict[str, Any]:
     """
     Wrap successful (unary) results into canonical success envelope.
@@ -2054,6 +2179,9 @@ def _success_to_wire(result: Any, ms: float) -> Dict[str, Any]:
         payload = asdict(result)
     else:
         payload = result
+
+    _ensure_json_serializable(payload, field="result")
+
     return {
         "ok": True,
         "code": "OK",
@@ -2090,6 +2218,8 @@ def _chunk_to_wire(chunk: LLMChunk, ms: float) -> Dict[str, Any]:
             ],
         }
 
+    _ensure_json_serializable(payload, field="chunk")
+
     return {
         "ok": True,
         "code": "STREAMING",
@@ -2105,6 +2235,9 @@ def _error_to_wire(e: Exception, ms: float) -> Dict[str, Any]:
     Cross-SDK alignment:
       - Always includes retry_after_ms and details (nullable)
       - Always includes ms
+
+    Security hardening:
+      - For unknown/unhandled exceptions, return a stable, non-leaky message.
     """
     if isinstance(e, LLMAdapterError):
         details = dict(e.details or {})
@@ -2126,11 +2259,13 @@ def _error_to_wire(e: Exception, ms: float) -> Dict[str, Any]:
         "ok": False,
         "code": "UNAVAILABLE",
         "error": type(e).__name__,
-        "message": str(e) or "internal error",
+        # Unknown exception: stable message; do not echo raw exception text (may leak internals).
+        "message": "internal error",
         "retry_after_ms": None,
         "details": None,
         "ms": ms,
     }
+
 
 class WireLLMHandler:
     """
@@ -2197,7 +2332,7 @@ class WireLLMHandler:
 
             if op == "llm.capabilities":
                 res = await self._adapter.capabilities()
-                return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
+                return _success_to_wire(res, (time.monotonic() - t0) * 1000.0)
 
             if op == "llm.complete":
                 res = await self._adapter.complete(
@@ -2214,7 +2349,7 @@ class WireLLMHandler:
                     tool_choice=args.get("tool_choice"),
                     ctx=ctx,
                 )
-                return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
+                return _success_to_wire(res, (time.monotonic() - t0) * 1000.0)
 
             if op == "llm.count_tokens":
                 text = args.get("text")
