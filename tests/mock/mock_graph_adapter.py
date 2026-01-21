@@ -8,7 +8,9 @@ Implements BaseGraphAdapter hooks with deterministic behavior:
 - Query + Stream Query (with chunks and final summary)
 - Upsert/Delete for nodes and edges (idempotent deletes)
 - Bulk vertex scanning with pagination
-- Batch operations with per-op results and overflow hinting
+- Batch operations with per-op mapping envelopes
+- Transaction operations (configurable; deterministic)
+- Traversal operations (configurable; deterministic)
 - Health reporting (ctx-driven degraded mode)
 - Optional deterministic failure injection via ctx.attrs["simulate_error"]
 
@@ -16,9 +18,10 @@ No legacy overloads. Pure V1 surface only.
 
 ALIGNMENT NOTES (Non-breaking):
 - This mock aligns its capabilities with the features it actually implements.
-- Batch per-op results are shaped to interoperate with BaseGraphAdapter cache invalidation logic.
-- Batch processing uses public adapter APIs (query/upsert/delete) to exercise BaseGraphAdapter
-  validation and hardening consistently (params JSON validation, dialect checks, gates/metrics).
+- Batch/transaction per-op results are mapping envelopes {"ok": True, "result": {...}} to
+  interoperate with BaseGraphAdapter batch cache invalidation unwrapping logic.
+- Batch/transaction processing avoids nested gates by calling hook methods directly while still
+  applying minimal contract-level validation for dialects and JSON-serializable fields.
 """
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ import asyncio
 import hashlib
 import json
 import math
+from dataclasses import asdict
 from typing import Any, AsyncIterator, Dict, List, Mapping, Optional, Tuple
 
 from corpus_sdk.graph.graph_base import (
@@ -46,6 +50,8 @@ from corpus_sdk.graph.graph_base import (
     BatchOperation,
     BatchResult,
     GraphSchema,
+    GraphTraversalSpec,
+    TraversalResult,
     QueryResult,
     QueryChunk,
     UpsertResult,
@@ -74,6 +80,9 @@ class MockGraphAdapter(BaseGraphAdapter):
     supports_bulk: bool
     supports_batch_ops: bool
     supports_schema_ops: bool
+    supports_transaction_ops: bool
+    supports_traversal_ops: bool
+    max_traversal_depth: Optional[int]
     max_ops_per_batch: int
     latency_ms: Tuple[int, int]  # small, bounded sleeps
     failure_rate: float  # keep 0.0 for conformance (can be raised for demos)
@@ -87,6 +96,10 @@ class MockGraphAdapter(BaseGraphAdapter):
         supports_bulk: bool = True,
         supports_batch_ops: bool = True,
         supports_schema_ops: bool = True,
+        # NEW: configurable advanced ops
+        supports_transaction_ops: bool = False,
+        supports_traversal_ops: bool = False,
+        max_traversal_depth: Optional[int] = None,
         max_ops_per_batch: int = 1000,
         latency_ms: Tuple[int, int] = (2, 5),  # small, bounded sleeps
         failure_rate: float = 0.0,  # deterministic default for conformance
@@ -133,6 +146,9 @@ class MockGraphAdapter(BaseGraphAdapter):
         self.supports_bulk = bool(supports_bulk)
         self.supports_batch_ops = bool(supports_batch_ops)
         self.supports_schema_ops = bool(supports_schema_ops)
+        self.supports_transaction_ops = bool(supports_transaction_ops)
+        self.supports_traversal_ops = bool(supports_traversal_ops)
+        self.max_traversal_depth = max_traversal_depth if max_traversal_depth is None else int(max_traversal_depth)
         self.max_ops_per_batch = int(max_ops_per_batch)
         self.latency_ms = latency_ms
         self.failure_rate = float(failure_rate)
@@ -149,13 +165,13 @@ class MockGraphAdapter(BaseGraphAdapter):
             raise ValueError("Invalid latency range (min >= 0 and max >= min)")
         if self.max_ops_per_batch <= 0:
             raise ValueError("max_ops_per_batch must be positive")
+        if self.max_traversal_depth is not None and self.max_traversal_depth < 1:
+            raise ValueError("max_traversal_depth must be >= 1 when provided")
 
     # -------------------------------------------------------------------------
     # Capabilities & Health
     # -------------------------------------------------------------------------
     async def _do_capabilities(self) -> GraphCapabilities:
-        # Explicitly advertise only what is implemented to keep routing predictable.
-        # (Transactions/traversal are intentionally not implemented in this mock.)
         return GraphCapabilities(
             server=self.name,
             version="1.0.0",
@@ -170,17 +186,15 @@ class MockGraphAdapter(BaseGraphAdapter):
             supports_multi_tenant=True,
             supports_deadline=True,
             max_batch_ops=self.max_ops_per_batch,
-            supports_transaction=False,
-            supports_traversal=False,
-            max_traversal_depth=None,
+            supports_transaction=self.supports_transaction_ops,
+            supports_traversal=self.supports_traversal_ops,
+            max_traversal_depth=self.max_traversal_depth,
             supports_path_queries=False,
         )
 
     async def _do_health(self, *, ctx: Optional[OperationContext] = None) -> Mapping[str, Any]:
-        # Deterministic; allow ctx to force degraded/ok for tests
         status = (ctx and ctx.attrs.get("health")) or "ok"
         ok = (status == "ok")
-        # Avoid tuple bug: namespace status must be a stable scalar value.
         return {
             "ok": ok,
             "status": status,
@@ -205,7 +219,6 @@ class MockGraphAdapter(BaseGraphAdapter):
         if not isinstance(spec.text, str) or not spec.text.strip():
             raise BadRequest("query.text must be a non-empty string")
 
-        # Keep hook-level dialect validation aligned with capabilities.
         caps = await self._do_capabilities()
         if spec.dialect and caps.supported_query_dialects:
             if spec.dialect not in caps.supported_query_dialects:
@@ -216,7 +229,6 @@ class MockGraphAdapter(BaseGraphAdapter):
 
         await self._sleep()
 
-        # Deterministic records based on (text, params)
         seed = self._stable_int((spec.text, self._stable_params(spec.params))) % 3 + 1
         records = [{"row": i + 1, "ok": True, "dialect": spec.dialect or "native"} for i in range(seed)]
 
@@ -261,7 +273,6 @@ class MockGraphAdapter(BaseGraphAdapter):
             await self._sleep()
             yield QueryChunk(records=[{"row": i + 1, "ok": True}], is_final=False)
 
-        # final chunk with summary
         await self._sleep()
         yield QueryChunk(
             records=[{"row": total, "ok": True}],
@@ -285,11 +296,9 @@ class MockGraphAdapter(BaseGraphAdapter):
 
         for idx, n in enumerate(spec.nodes):
             try:
-                # Alignment: labels are optional; validate only if present.
                 if n.labels:
                     if any((not isinstance(l, str) or not l) for l in n.labels):
                         raise BadRequest("node.labels must be a tuple of non-empty strings when provided")
-                # Hard requirement: JSON-serializable properties
                 json.dumps(n.properties or {})
                 upserted += 1
             except Exception as e:
@@ -299,7 +308,6 @@ class MockGraphAdapter(BaseGraphAdapter):
                         "id": str(n.id) if getattr(n, "id", None) else None,
                         "error": type(e).__name__,
                         "code": getattr(e, "code", None) or type(e).__name__.upper(),
-                        # Keep message stable; Base wire handler hardens unexpected errors separately.
                         "message": str(e) or type(e).__name__,
                     }
                 )
@@ -359,25 +367,17 @@ class MockGraphAdapter(BaseGraphAdapter):
     ) -> DeleteResult:
         self._maybe_fail(op="delete_nodes", ctx=ctx)
 
-        # Alignment: accept deletes by ids and/or filter. This mock is idempotent.
         deleted = 0
         failures: List[Mapping[str, Any]] = []
 
         if spec.ids:
-            # Idempotent: treat all provided IDs as deletable.
             deleted += len(spec.ids)
 
-        if spec.filter and not spec.ids:
-            # Deterministic filter-only behavior to reflect "supports_property_filters=True".
-            # Bounded to avoid unrealistic large deletes; stable across runs.
+        if spec.filter:
             deleted += (self._stable_int(("delete_nodes", spec.namespace, self._stable_params(spec.filter))) % 5)
 
         await self._sleep()
-        return DeleteResult(
-            deleted_count=deleted,
-            failed_count=len(failures),
-            failures=failures,
-        )
+        return DeleteResult(deleted_count=deleted, failed_count=len(failures), failures=failures)
 
     async def _do_delete_edges(
         self,
@@ -393,15 +393,11 @@ class MockGraphAdapter(BaseGraphAdapter):
         if spec.ids:
             deleted += len(spec.ids)
 
-        if spec.filter and not spec.ids:
+        if spec.filter:
             deleted += (self._stable_int(("delete_edges", spec.namespace, self._stable_params(spec.filter))) % 5)
 
         await self._sleep()
-        return DeleteResult(
-            deleted_count=deleted,
-            failed_count=len(failures),
-            failures=failures,
-        )
+        return DeleteResult(deleted_count=deleted, failed_count=len(failures), failures=failures)
 
     # -------------------------------------------------------------------------
     # Bulk Vertices (scan/paginate hook)
@@ -421,23 +417,14 @@ class MockGraphAdapter(BaseGraphAdapter):
         if spec.limit <= 0:
             raise BadRequest("limit must be positive")
 
-        # Deterministic dataset per namespace
-        total = 250  # pretend dataset size
+        total = 250
         start = int(spec.cursor or 0)
         end = min(start + spec.limit, total)
 
         nodes: List[Node] = []
         for i in range(start, end):
-            # Stable node ID
             nid = GraphID(f"v:{spec.namespace or 'default'}:{i}")
-            nodes.append(
-                Node(
-                    id=nid,
-                    labels=("Vertex",),
-                    properties={"i": i},
-                    namespace=spec.namespace,
-                )
-            )
+            nodes.append(Node(id=nid, labels=("Vertex",), properties={"i": i}, namespace=spec.namespace))
             if (i - start + 1) % 50 == 0:
                 await asyncio.sleep(0)
 
@@ -445,64 +432,62 @@ class MockGraphAdapter(BaseGraphAdapter):
         has_more = end < total
 
         await self._sleep()
-        return BulkVerticesResult(
-            nodes=nodes,
-            next_cursor=next_cursor,
-            has_more=has_more,
-        )
+        return BulkVerticesResult(nodes=nodes, next_cursor=next_cursor, has_more=has_more)
 
     # -------------------------------------------------------------------------
-    # Batch (hook)
+    # Shared op executor for batch/transaction (no nested gates)
     # -------------------------------------------------------------------------
-    async def _do_batch(
+    async def _execute_ops_as_envelopes(
         self,
         ops: List[BatchOperation],
         *,
-        ctx: Optional[OperationContext] = None,
-    ) -> BatchResult:
-        self._maybe_fail(op="batch", ctx=ctx)
+        ctx: Optional[OperationContext],
+        caps: GraphCapabilities,
+    ) -> List[Mapping[str, Any]]:
+        results: List[Mapping[str, Any]] = []
 
-        caps = await self._do_capabilities()
-        if not caps.supports_batch:
-            raise NotSupported("batch is not supported by this adapter")
-
-        if self.max_ops_per_batch and len(ops) > self.max_ops_per_batch:
-            raise BadRequest(
-                f"batch ops size {len(ops)} exceeds maximum {self.max_ops_per_batch}",
-                details={"suggested_batch_reduction": int(math.ceil(len(ops) * 0.5))},
-            )
-
-        results: List[Any] = []
-
-        # NOTE: This hook intentionally uses public adapter APIs (query/upsert/delete)
-        # to align behavior with BaseGraphAdapter hardening (params validation, dialect
-        # checks, deadline/metrics) without changing the wire schema.
         for idx, op in enumerate(ops):
             try:
                 kind = op.op
                 args = dict(op.args or {})
 
-                if kind == "upsert_nodes":
+                if kind == "query":
+                    qspec = GraphQuerySpec(**args)
+                    if qspec.params is not None:
+                        self._validate_properties_map(qspec.params)
+                    if qspec.dialect and caps.supported_query_dialects and qspec.dialect not in caps.supported_query_dialects:
+                        raise NotSupported(
+                            f"dialect '{qspec.dialect}' not supported",
+                            details={"supported_query_dialects": caps.supported_query_dialects},
+                        )
+                    qres = await self._do_query(qspec, ctx=ctx)
+                    results.append(
+                        {
+                            "ok": True,
+                            "result": {
+                                "rows": len(qres.records),
+                                "dialect": qres.dialect or (qspec.dialect or "native"),
+                                "namespace": qres.namespace,
+                            },
+                        }
+                    )
+
+                elif kind == "upsert_nodes":
                     nodes_raw = args.get("nodes", []) or []
                     if not isinstance(nodes_raw, list):
                         raise BadRequest("upsert_nodes requires 'nodes' array", details={"index": idx})
+                    if not nodes_raw:
+                        raise BadRequest("upsert_nodes requires non-empty 'nodes' array", details={"index": idx})
 
                     nodes: List[Node] = []
                     for j, raw in enumerate(nodes_raw):
                         if not isinstance(raw, Mapping):
-                            raise BadRequest(
-                                "upsert_nodes nodes[*] must be an object",
-                                details={"index": idx, "node_index": j},
-                            )
+                            raise BadRequest("upsert_nodes nodes[*] must be an object", details={"index": idx, "node_index": j})
                         d = dict(raw)
                         nid = d.get("id")
                         if not isinstance(nid, str) or not nid:
-                            raise BadRequest(
-                                "nodes[*].id must be a non-empty string",
-                                details={"index": idx, "node_index": j},
-                            )
+                            raise BadRequest("nodes[*].id must be a non-empty string", details={"index": idx, "node_index": j})
                         d["id"] = GraphID(nid)
-                        # Normalize labels to tuple[str, ...] when provided.
                         if "labels" in d and d["labels"] is not None:
                             if isinstance(d["labels"], list):
                                 d["labels"] = tuple(d["labels"])
@@ -516,22 +501,20 @@ class MockGraphAdapter(BaseGraphAdapter):
                         nodes.append(Node(**d))
 
                     spec = UpsertNodesSpec(nodes=nodes, namespace=args.get("namespace"))
-                    res = await self.upsert_nodes(spec, ctx=ctx)
-                    # Return typed result to fully align with BaseGraphAdapter invalidation logic.
-                    results.append(res)
+                    res = await self._do_upsert_nodes(spec, ctx=ctx)
+                    results.append({"ok": True, "result": asdict(res)})
 
                 elif kind == "upsert_edges":
                     edges_raw = args.get("edges", []) or []
                     if not isinstance(edges_raw, list):
                         raise BadRequest("upsert_edges requires 'edges' array", details={"index": idx})
+                    if not edges_raw:
+                        raise BadRequest("upsert_edges requires non-empty 'edges' array", details={"index": idx})
 
                     edges: List[Edge] = []
                     for j, raw in enumerate(edges_raw):
                         if not isinstance(raw, Mapping):
-                            raise BadRequest(
-                                "upsert_edges edges[*] must be an object",
-                                details={"index": idx, "edge_index": j},
-                            )
+                            raise BadRequest("upsert_edges edges[*] must be an object", details={"index": idx, "edge_index": j})
                         d = dict(raw)
                         for field in ("id", "src", "dst", "label"):
                             if field not in d:
@@ -548,15 +531,15 @@ class MockGraphAdapter(BaseGraphAdapter):
                                 )
                             d[id_field] = GraphID(v)
                         if not isinstance(d.get("label"), str) or not d.get("label"):
-                            raise BadRequest(
-                                "edges[*].label must be a non-empty string",
-                                details={"index": idx, "edge_index": j},
-                            )
-                        edges.append(Edge(**d))
+                            raise BadRequest("edges[*].label must be a non-empty string", details={"index": idx, "edge_index": j})
+
+                        edge = Edge(**d)
+                        self._validate_edge(edge)
+                        edges.append(edge)
 
                     spec = UpsertEdgesSpec(edges=edges, namespace=args.get("namespace"))
-                    res = await self.upsert_edges(spec, ctx=ctx)
-                    results.append(res)
+                    res = await self._do_upsert_edges(spec, ctx=ctx)
+                    results.append({"ok": True, "result": asdict(res)})
 
                 elif kind == "delete_nodes":
                     ids_raw = args.get("ids", []) or []
@@ -565,14 +548,18 @@ class MockGraphAdapter(BaseGraphAdapter):
                     ids = []
                     for j, v in enumerate(ids_raw):
                         if not isinstance(v, str):
-                            raise BadRequest(
-                                "delete_nodes ids[*] must be strings",
-                                details={"index": idx, "id_index": j},
-                            )
+                            raise BadRequest("delete_nodes ids[*] must be strings", details={"index": idx, "id_index": j})
                         ids.append(GraphID(v))
-                    spec = DeleteNodesSpec(ids=ids, namespace=args.get("namespace"), filter=args.get("filter"))
-                    res = await self.delete_nodes(spec, ctx=ctx)
-                    results.append(res)
+
+                    filt = args.get("filter")
+                    if filt is not None:
+                        self._validate_properties_map(filt)
+                    if not ids and not filt:
+                        raise BadRequest("delete_nodes requires ids or filter", details={"index": idx})
+
+                    spec = DeleteNodesSpec(ids=ids, namespace=args.get("namespace"), filter=filt)
+                    res = await self._do_delete_nodes(spec, ctx=ctx)
+                    results.append({"ok": True, "result": asdict(res)})
 
                 elif kind == "delete_edges":
                     ids_raw = args.get("ids", []) or []
@@ -581,30 +568,18 @@ class MockGraphAdapter(BaseGraphAdapter):
                     ids = []
                     for j, v in enumerate(ids_raw):
                         if not isinstance(v, str):
-                            raise BadRequest(
-                                "delete_edges ids[*] must be strings",
-                                details={"index": idx, "id_index": j},
-                            )
+                            raise BadRequest("delete_edges ids[*] must be strings", details={"index": idx, "id_index": j})
                         ids.append(GraphID(v))
-                    spec = DeleteEdgesSpec(ids=ids, namespace=args.get("namespace"), filter=args.get("filter"))
-                    res = await self.delete_edges(spec, ctx=ctx)
-                    results.append(res)
 
-                elif kind == "query":
-                    qspec = GraphQuerySpec(**args)
-                    qres = await self.query(qspec, ctx=ctx)
-                    # Return a mapping payload with stable fields for batch consumers.
-                    # (Batch semantics are adapter-defined; this shape is deterministic.)
-                    results.append(
-                        {
-                            "ok": True,
-                            "result": {
-                                "rows": len(qres.records),
-                                "dialect": qres.dialect or (qspec.dialect or "native"),
-                                "namespace": qres.namespace,
-                            },
-                        }
-                    )
+                    filt = args.get("filter")
+                    if filt is not None:
+                        self._validate_properties_map(filt)
+                    if not ids and not filt:
+                        raise BadRequest("delete_edges requires ids or filter", details={"index": idx})
+
+                    spec = DeleteEdgesSpec(ids=ids, namespace=args.get("namespace"), filter=filt)
+                    res = await self._do_delete_edges(spec, ctx=ctx)
+                    results.append({"ok": True, "result": asdict(res)})
 
                 else:
                     results.append(
@@ -627,10 +602,145 @@ class MockGraphAdapter(BaseGraphAdapter):
                         "index": idx,
                     }
                 )
-            # let unexpected exceptions bubble via BaseGraphAdapter error mapping
+
+        return results
+
+    # -------------------------------------------------------------------------
+    # Batch (hook)
+    # -------------------------------------------------------------------------
+    async def _do_batch(
+        self,
+        ops: List[BatchOperation],
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> BatchResult:
+        self._maybe_fail(op="batch", ctx=ctx)
+
+        caps = await self._do_capabilities()
+        if not caps.supports_batch:
+            raise NotSupported("batch is not supported by this adapter")
+
+        results = await self._execute_ops_as_envelopes(ops, ctx=ctx, caps=caps)
+        await self._sleep()
+        return BatchResult(results=list(results))
+
+    # -------------------------------------------------------------------------
+    # Transaction (hook)
+    # -------------------------------------------------------------------------
+    async def _do_transaction(
+        self,
+        operations: List[BatchOperation],
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> BatchResult:
+        self._maybe_fail(op="transaction", ctx=ctx)
+
+        caps = await self._do_capabilities()
+        if not caps.supports_transaction:
+            raise NotSupported("transactions are not supported by this adapter")
+
+        results = await self._execute_ops_as_envelopes(operations, ctx=ctx, caps=caps)
+
+        # Deterministic "atomic" success marker:
+        # if any op produced ok:false, mark entire transaction failed.
+        all_ok = all(bool(r.get("ok")) for r in results)
+        tx_id = f"tx:{self._stable_int((self.name, getattr(ctx, 'request_id', None), len(operations)))}"
 
         await self._sleep()
-        return BatchResult(results=results)
+        return BatchResult(
+            results=list(results),
+            success=all_ok,
+            error=None if all_ok else "transaction failed",
+            transaction_id=tx_id,
+        )
+
+    # -------------------------------------------------------------------------
+    # Traversal (hook)
+    # -------------------------------------------------------------------------
+    async def _do_traversal(
+        self,
+        spec: GraphTraversalSpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> TraversalResult:
+        self._maybe_fail(op="traversal", ctx=ctx)
+
+        caps = await self._do_capabilities()
+        if not caps.supports_traversal:
+            raise NotSupported("traversal operations are not supported by this adapter")
+
+        # Deterministic traversal: for each start node, create a single path of length max_depth.
+        nodes: List[Node] = []
+        edges: List[Edge] = []
+        paths: List[List[Any]] = []
+
+        for s_idx, start in enumerate(spec.start_nodes):
+            # Start node
+            start_id = GraphID(start)
+            n0 = Node(
+                id=start_id,
+                labels=("Vertex",),
+                properties={"id": start, "depth": 0},
+                namespace=spec.namespace,
+            )
+            nodes.append(n0)
+
+            prev = n0
+            path: List[Any] = [n0]
+
+            for depth in range(1, int(spec.max_depth) + 1):
+                # Create a deterministic neighbor id
+                nxt_raw = f"{start}|d={depth}|i={s_idx}"
+                nxt_id = GraphID(f"v:{spec.namespace or 'default'}:{self._stable_int(nxt_raw)}")
+                nxt = Node(
+                    id=nxt_id,
+                    labels=("Vertex",),
+                    properties={"id": str(nxt_id), "depth": depth},
+                    namespace=spec.namespace,
+                )
+                nodes.append(nxt)
+
+                e_id = GraphID(f"e:{prev.id}->{nxt.id}:{depth}")
+                rel = Edge(
+                    id=e_id,
+                    src=prev.id,
+                    dst=nxt.id,
+                    label="TRAVERSE",
+                    properties={"depth": depth, "direction": spec.direction},
+                    namespace=spec.namespace,
+                )
+                edges.append(rel)
+
+                path.extend([rel, nxt])
+                prev = nxt
+
+            paths.append(path)
+
+        # Deduplicate nodes by id while preserving deterministic order
+        seen: set[str] = set()
+        uniq_nodes: List[Node] = []
+        for n in nodes:
+            if str(n.id) in seen:
+                continue
+            seen.add(str(n.id))
+            uniq_nodes.append(n)
+
+        summary: Dict[str, Any] = {
+            "start_nodes": list(spec.start_nodes),
+            "max_depth": int(spec.max_depth),
+            "direction": spec.direction,
+            "nodes": len(uniq_nodes),
+            "relationships": len(edges),
+        }
+
+        await self._sleep()
+        return TraversalResult(
+            nodes=uniq_nodes,
+            relationships=edges,
+            paths=paths,
+            summary=summary,
+            namespace=spec.namespace,
+        )
 
     # -------------------------------------------------------------------------
     # Schema (hook)
@@ -661,7 +771,6 @@ class MockGraphAdapter(BaseGraphAdapter):
         return int((lo + hi) / 2)
 
     async def _sleep(self) -> None:
-        # Use fixed small sleep to keep deterministic and deadline-friendly
         await asyncio.sleep(self._avg_latency_ms() / 1000.0)
 
     def _stable_int(self, obj: Any) -> int:
@@ -671,7 +780,7 @@ class MockGraphAdapter(BaseGraphAdapter):
     def _stable_params(self, params: Optional[Mapping[str, Any]]) -> Tuple[Tuple[str, Any], ...]:
         if not params:
             return ()
-        # Make JSON-safe, sorted tuple for stable hashing
+
         def _jsonable(v: Any) -> Any:
             try:
                 json.dumps(v)
@@ -685,10 +794,6 @@ class MockGraphAdapter(BaseGraphAdapter):
         """
         Deterministic, opt-in failure injection:
           ctx.attrs["simulate_error"] ∈ {"unavailable","rate_limited","transient"}
-
-        SECURITY/OBSERVABILITY:
-          - Keep messages stable and SIEM-safe.
-          - Use details for structured context rather than leaking through free-form text.
         """
         key = ctx and ctx.attrs.get("simulate_error")
         if key == "unavailable":
@@ -705,50 +810,20 @@ class MockGraphAdapter(BaseGraphAdapter):
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     async def _demo() -> None:
-        adapter = MockGraphAdapter()
+        adapter = MockGraphAdapter(supports_transaction_ops=True, supports_traversal_ops=True, max_traversal_depth=3)
 
         caps = await adapter.capabilities()
         print("[CAPABILITIES]", caps)
 
-        health = await adapter.health()
-        print("[HEALTH]", health)
-
-        qres = await adapter.query(GraphQuerySpec(text="MATCH (n) RETURN n LIMIT 3", dialect="cypher"))
-        print("[QUERY rows]", len(qres.records))
-
-        print("[STREAM]")
-        async for chunk in adapter.stream_query(GraphQuerySpec(text="MATCH () RETURN 1", dialect="cypher")):
-            print("  chunk", chunk.records, "final:", chunk.is_final)
-
-        ures = await adapter.upsert_nodes(
-            UpsertNodesSpec(
-                nodes=[Node(id=GraphID("n1"), labels=("User",), properties={"id": "u1"})]
-            )
-        )
-        print("[UPSERT NODES]", ures.upserted_count)
-
-        bres = await adapter.bulk_vertices(BulkVerticesSpec(namespace="default", limit=5, cursor=None))
-        print("[BULK] nodes", len(bres.nodes), "has_more", bres.has_more)
-
-        batch = await adapter.batch(
+        tx = await adapter.transaction(
             [
                 BatchOperation(op="query", args={"text": "RETURN 1", "dialect": "cypher"}),
-                BatchOperation(op="delete_nodes", args={"ids": ["v:default:1", "v:default:2"]}),
-                BatchOperation(
-                    op="upsert_nodes",
-                    args={
-                        "namespace": "default",
-                        "nodes": [{"id": "n2", "labels": ["User"], "properties": {"id": "u2"}}],
-                    },
-                ),
                 BatchOperation(op="unknown_op", args={}),
             ]
         )
-        print("[BATCH] results", len(batch.results))
-        for i, r in enumerate(batch.results):
-            print("  -", i, type(r).__name__, r if isinstance(r, dict) else {"typed": True})
+        print("[TX]", tx.success, "txid:", tx.transaction_id, "results:", tx.results)
 
-        schema = await adapter.get_schema()
-        print("[SCHEMA] keys", list(schema.nodes.keys()), list(schema.edges.keys()))
+        trav = await adapter.traversal(GraphTraversalSpec(start_nodes=["v:start:1"], max_depth=2))
+        print("[TRAV] nodes", len(trav.nodes), "rels", len(trav.relationships), "paths", len(trav.paths))
 
     asyncio.run(_demo())
