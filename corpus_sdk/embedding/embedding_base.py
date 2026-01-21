@@ -1176,6 +1176,9 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
             "completed_streams": 0,
         }
 
+        # Add cache stats tracking (base owns cache ops, so base owns cache stats)
+        self._cache_stats = {"hits": 0, "misses": 0}
+
     # --- internal helpers (validation, hashing, metrics, deadlines) ---
 
     @staticmethod
@@ -1648,6 +1651,8 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
             if use_cache:
                 cached = await self._cache.get(self._caps_cache_key())
                 if cached:
+                    # TRACK CAPABILITIES HIT
+                    self._cache_stats["hits"] += 1
                     self._metrics.counter(
                         component=self._component,
                         name="cache_hits",
@@ -1657,6 +1662,8 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
                     self._record("capabilities", t0, True)
                     return self._safe_deepcopy(cached)
                 else:
+                    # TRACK CAPABILITIES MISS
+                    self._cache_stats["misses"] += 1
                     self._metrics.counter(
                         component=self._component,
                         name="cache_misses",
@@ -1740,6 +1747,8 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
             )
             cached = await self._cache.get(cache_key)
             if cached:
+                # TRACK HIT
+                self._cache_stats["hits"] += 1
                 self._metrics.counter(
                     component=self._component,
                     name="cache_hits",
@@ -1748,6 +1757,8 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
                 )
                 base_result = self._safe_deepcopy(cached)
             else:
+                # TRACK MISS
+                self._cache_stats["misses"] += 1
                 self._metrics.counter(
                     component=self._component,
                     name="cache_misses",
@@ -2305,13 +2316,13 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         """
         base_stats = await self._do_get_stats(ctx)
 
-        # Enhance with real-time streaming metrics
+        # Enhance with real-time streaming metrics AND BASE'S CACHE STATS
         return EmbeddingStats(
             total_requests=base_stats.total_requests,
             total_texts=base_stats.total_texts,
             total_tokens=base_stats.total_tokens,
-            cache_hits=base_stats.cache_hits,
-            cache_misses=base_stats.cache_misses,
+            cache_hits=int(self._cache_stats.get("hits", 0)),
+            cache_misses=int(self._cache_stats.get("misses", 0)),
             avg_processing_time_ms=base_stats.avg_processing_time_ms,
             error_count=base_stats.error_count,
             stream_requests=self._stream_stats["completed_streams"] + self._stream_stats["abandoned_streams"],
@@ -2336,6 +2347,11 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         Default implementation is a no-op.
         """
         return None
+
+    # Add Reset Method (Optional but Recommended)
+    async def reset_cache_stats(self) -> None:
+        """Reset cache hit/miss counters for testing."""
+        self._cache_stats = {"hits": 0, "misses": 0}
 
     # --- hooks to implement per backend (override these) ---
 
