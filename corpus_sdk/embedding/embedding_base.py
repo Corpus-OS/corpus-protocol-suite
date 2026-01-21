@@ -206,7 +206,7 @@ class EmbeddingVector:
 #   - EmbedChunk / EmbeddingStats
 #
 # Non-protocol convenience types (e.g., EmbeddingResult / EmbeddingBatch) were removed
-# to align the Python surface area with PROTOCOLS.md §18 “Embedding Types”.
+# to align the Python surface area with PROTOCOLS.md §18 "Embedding Types".
 
 
 # =============================================================================
@@ -1972,7 +1972,7 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
 
         eff_texts: List[str] = []
         for text in spec.texts:
-            self._require_non_empty("text", text)
+            # NOTE: Removed per-text validation here to support partial success semantics
             if caps.max_text_length:
                 new_text, _ = self._trunc.apply(
                     text,
@@ -2014,6 +2014,10 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
                 else None
             )
             try:
+                # Validate per-item text
+                if not isinstance(text, str) or not text.strip():
+                    raise BadRequest("text must be a non-empty string")
+
                 single_spec = EmbedSpec(
                     text=text,
                     model=eff_spec.model,
