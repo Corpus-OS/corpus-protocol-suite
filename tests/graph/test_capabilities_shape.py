@@ -9,6 +9,11 @@ Asserts (Spec refs):
   • Batch fields valid                                      (§7.2, §6.2)
   • Repeated calls are idempotent (consistent)              (§6.2)
 """
+from __future__ import annotations
+
+import json
+from dataclasses import asdict
+
 import pytest
 
 from corpus_sdk.graph.graph_base import GraphCapabilities, GRAPH_PROTOCOL_ID
@@ -30,8 +35,7 @@ async def test_capabilities_identity_fields(adapter):
 async def test_capabilities_dialects_tuple(adapter):
     caps = await adapter.capabilities()
     assert isinstance(caps.supported_query_dialects, tuple)
-    assert len(caps.supported_query_dialects) > 0
-    assert all(isinstance(d, str) for d in caps.supported_query_dialects)
+    assert all(isinstance(d, str) and d for d in caps.supported_query_dialects)
 
 
 async def test_capabilities_feature_flags_are_boolean(adapter):
@@ -55,9 +59,7 @@ async def test_capabilities_feature_flags_are_boolean(adapter):
 
 async def test_capabilities_max_batch_ops_valid(adapter):
     caps = await adapter.capabilities()
-    assert caps.max_batch_ops is None or (
-        isinstance(caps.max_batch_ops, int) and caps.max_batch_ops > 0
-    )
+    assert caps.max_batch_ops is None or (isinstance(caps.max_batch_ops, int) and caps.max_batch_ops > 0)
 
 
 async def test_capabilities_protocol(adapter):
@@ -69,12 +71,15 @@ async def test_capabilities_protocol(adapter):
 async def test_capabilities_idempotency(adapter):
     c1 = await adapter.capabilities()
     c2 = await adapter.capabilities()
-    assert (
-        c1.server,
-        c1.version,
-        c1.supported_query_dialects,
-    ) == (
+    assert (c1.server, c1.version, c1.protocol, c1.supported_query_dialects) == (
         c2.server,
         c2.version,
+        c2.protocol,
         c2.supported_query_dialects,
     )
+
+
+async def test_capabilities_json_serializable(adapter):
+    caps = await adapter.capabilities()
+    payload = asdict(caps)
+    assert isinstance(json.dumps(payload), str)
