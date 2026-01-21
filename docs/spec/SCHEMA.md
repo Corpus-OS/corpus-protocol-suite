@@ -861,7 +861,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     "version": { "type": "string" },
     "model_family": { "type": "string" },
     "max_context_length": { "type": "integer" },
-    "protocol": { "type": "string" },
+    "protocol": { "type": "string", "const": "llm/v1.0" },
     "supports_streaming": { "type": "boolean" },
     "supports_roles": { "type": "boolean" },
     "supports_json_output": { "type": "boolean" },
@@ -876,7 +876,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     "supports_count_tokens": { "type": "boolean" },
     "supported_models": { "type": "array", "items": { "type": "string" } }
   },
-  "required": ["server", "version", "model_family", "max_context_length"],
+  "required": ["server", "version", "model_family", "max_context_length", "protocol"],
   "additionalProperties": false
 }
 ```
@@ -1588,7 +1588,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     "max_text_length": { "type": ["integer", "null"] },
     "supports_batch_queries": { "type": "boolean" }
   },
-  "required": ["server", "version"],
+  "required": ["server", "version", "protocol"],
   "additionalProperties": true
 }
 ```
@@ -3166,7 +3166,7 @@ https://corpusos.com/schemas/llm/llm.complete.request.json
     "max_traversal_depth": { "type": ["integer", "null"], "minimum": 1 },
     "supports_path_queries": { "type": "boolean", "default": false }
   },
-  "required": ["server", "version"],
+  "required": ["server", "version", "protocol"],
   "additionalProperties": false
 }
 ```
