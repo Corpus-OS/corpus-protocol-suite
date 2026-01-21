@@ -60,7 +60,7 @@ SPDX-License-Identifier: Apache-2.0
 
 ### 0.1 protocols_version: "1.0"
 - **Status:** Stable / Normative
-- **Effective Date:** 2025-01-01
+- **Effective Date:** 2026-01-19
 - **Replaces:** None (initial version)
 
 ### 0.2 Canonical Protocol IDs
