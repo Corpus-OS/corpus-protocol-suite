@@ -126,13 +126,8 @@ class TrackingMockEmbeddingAdapter(MockEmbeddingAdapter):
         ctx: OperationContext | None = None,
     ):
         self._store("health", ctx)
-        # keep health deterministic for tests
-        return {
-            "ok": True,
-            "server": "mock-embedding",
-            "version": "1.0.0",
-            "models": {m: "ok" for m in self.supported_models},
-        }
+        # Call super to get consistent health response
+        return await super()._do_health(ctx=ctx)
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +293,8 @@ async def test_wire_contract_missing_op_rejected_with_bad_request():
     out = await h.handle({"ctx": {}, "args": {}})
 
     _assert_error_envelope(out)
-    assert out["code"] in ("BAD_REQUEST", "NOT_SUPPORTED")
+    # Wire handler raises BadRequest for missing op
+    assert out["code"] == "BAD_REQUEST"
 
 
 async def test_wire_contract_unknown_op_rejected_with_not_supported():
@@ -309,7 +305,9 @@ async def test_wire_contract_unknown_op_rejected_with_not_supported():
         {"op": "embedding.unknown_op", "ctx": {}, "args": {}}
     )
 
-    _assert_error_envelope(out, code="NOT_SUPPORTED")
+    _assert_error_envelope(out)
+    # Wire handler raises NotSupported for unknown operation
+    assert out["code"] == "NOT_SUPPORTED"
 
 
 async def test_wire_contract_embed_missing_required_fields_yields_bad_request():
@@ -325,6 +323,7 @@ async def test_wire_contract_embed_missing_required_fields_yields_bad_request():
         }
     )
     _assert_error_envelope(out1)
+    # Wire handler validates args before calling adapter
     assert out1["code"] == "BAD_REQUEST"
 
     # Missing model
@@ -352,7 +351,8 @@ async def test_wire_contract_embed_unknown_model_maps_model_not_available():
     )
 
     _assert_error_envelope(out)
-    assert out["code"] in ("MODEL_NOT_AVAILABLE", "NOT_SUPPORTED")
+    # Mock adapter raises ModelNotAvailable for unknown models
+    assert out["code"] == "MODEL_NOT_AVAILABLE"
 
 
 async def test_wire_contract_embed_batch_missing_texts_yields_bad_request():
@@ -368,6 +368,24 @@ async def test_wire_contract_embed_batch_missing_texts_yields_bad_request():
     )
 
     _assert_error_envelope(out)
+    # Wire handler validates texts is a list
+    assert out["code"] == "BAD_REQUEST"
+
+
+async def test_wire_contract_embed_batch_empty_texts_list_yields_bad_request():
+    a = MockEmbeddingAdapter(failure_rate=0.0)
+    h = WireEmbeddingHandler(a)
+
+    out = await h.handle(
+        {
+            "op": "embedding.embed_batch",
+            "ctx": {},
+            "args": {"texts": [], "model": a.supported_models[0]},
+        }
+    )
+
+    _assert_error_envelope(out)
+    # Wire handler passes empty list to adapter, adapter validates
     assert out["code"] == "BAD_REQUEST"
 
 
@@ -384,7 +402,8 @@ async def test_wire_contract_embed_batch_unknown_model_maps_model_not_available(
     )
 
     _assert_error_envelope(out)
-    assert out["code"] in ("MODEL_NOT_AVAILABLE", "NOT_SUPPORTED")
+    # Mock adapter raises ModelNotAvailable for unknown models
+    assert out["code"] == "MODEL_NOT_AVAILABLE"
 
 
 async def test_wire_contract_count_tokens_unknown_model_maps_model_not_available():
@@ -400,7 +419,8 @@ async def test_wire_contract_count_tokens_unknown_model_maps_model_not_available
     )
 
     _assert_error_envelope(out)
-    assert out["code"] in ("MODEL_NOT_AVAILABLE", "NOT_SUPPORTED")
+    # Mock adapter raises ModelNotAvailable for unknown models
+    assert out["code"] == "MODEL_NOT_AVAILABLE"
 
 
 async def test_wire_contract_error_envelope_includes_message_and_type():
@@ -423,9 +443,11 @@ async def test_wire_contract_error_envelope_includes_message_and_type():
         }
     )
 
-    _assert_error_envelope(out, code="BAD_REQUEST")
-    # error is the type name; message is top-level
-    assert out["error"] in ("BadRequest", "BAD_REQUEST")
+    _assert_error_envelope(out)
+    # BadRequest has code="BAD_REQUEST"
+    assert out["code"] == "BAD_REQUEST"
+    # error is the type name
+    assert out["error"] == "BadRequest"
     assert isinstance(out["message"], str) and out["message"]
 
 
@@ -450,7 +472,9 @@ async def test_wire_contract_text_too_long_maps_to_text_too_long_code_when_expos
     )
 
     _assert_error_envelope(out)
-    assert out["code"] in ("TEXT_TOO_LONG", "BAD_REQUEST")
+    # TextTooLong has code="TEXT_TOO_LONG"
+    assert out["code"] == "TEXT_TOO_LONG"
+    assert out["error"] == "TextTooLong"
 
 
 # ---------------------------------------------------------------------------
@@ -482,8 +506,45 @@ async def test_wire_contract_unexpected_exception_maps_to_unavailable():
     )
 
     _assert_error_envelope(out)
+    # Unexpected exceptions map to UNAVAILABLE
     assert out["code"] == "UNAVAILABLE"
     # error should be the underlying exception type name
     assert out["error"] == "RuntimeError"
     # message should surface the original message
     assert "boom" in out.get("message", "")
+
+
+async def test_wire_contract_invalid_envelope_structure_rejected():
+    a = MockEmbeddingAdapter(failure_rate=0.0)
+    h = WireEmbeddingHandler(a)
+
+    # ctx not an object
+    out1 = await h.handle({"op": "embedding.capabilities", "ctx": "not-an-object", "args": {}})
+    _assert_error_envelope(out1)
+    assert out1["code"] == "BAD_REQUEST"
+
+    # args not an object
+    out2 = await h.handle({"op": "embedding.capabilities", "ctx": {}, "args": "not-an-object"})
+    _assert_error_envelope(out2)
+    assert out2["code"] == "BAD_REQUEST"
+
+    # Missing both ctx and args
+    out3 = await h.handle({"op": "embedding.capabilities"})
+    _assert_error_envelope(out3)
+    assert out3["code"] == "BAD_REQUEST"
+
+
+async def test_wire_contract_batch_invalid_texts_type_rejected():
+    a = MockEmbeddingAdapter(failure_rate=0.0)
+    h = WireEmbeddingHandler(a)
+
+    # texts not a list
+    out = await h.handle(
+        {
+            "op": "embedding.embed_batch",
+            "ctx": {},
+            "args": {"texts": "not-a-list", "model": a.supported_models[0]},
+        }
+    )
+    _assert_error_envelope(out)
+    assert out["code"] == "BAD_REQUEST"
