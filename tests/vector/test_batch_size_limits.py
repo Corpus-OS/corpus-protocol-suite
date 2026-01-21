@@ -19,6 +19,7 @@ from corpus_sdk.vector.vector_base import (
     QuerySpec,
     NotSupported,
     NamespaceSpec,
+    BatchQuerySpec,  # FIX: required for test_batch_limits_batch_query_respects_supports_batch_queries
 )
 
 pytestmark = pytest.mark.asyncio
