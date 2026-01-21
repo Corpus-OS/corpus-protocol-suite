@@ -178,7 +178,10 @@ PROTOCOLS_CONFIG: Dict[str, ProtocolConfig] = {
                 "test_wire_envelope_validation": {
                     "error_patterns": {
                         "missing_required_fields": "Wire envelope missing required fields per §4.1",
-                        "invalid_field_types": "Field types don't match canonical form requirements",
+                        "invalid_field_types": (
+                            "Field types don't match canonical form requirements "
+                            "(e.g., ctx.deadline_ms is integer|null with minimum 0)"
+                        ),
                     },
                     "quick_fix": "Ensure all wire envelopes include required fields with correct types",
                     "examples": "See §4.1 for wire envelope format and field requirements",
@@ -187,12 +190,28 @@ PROTOCOLS_CONFIG: Dict[str, ProtocolConfig] = {
             "streaming": {
                 "test_stream_finalization": {
                     "error_patterns": {
-                        "missing_final_chunk": "Ensure stream ends with terminal frame per §4.1.3",
-                        "premature_close": "Connection must remain open until terminal frame per §7.3.2 Streaming Finalization",
-                        "chunk_format": "Each frame must follow §4.1.3 Streaming Frames format",
+                        "missing_final_chunk": (
+                            "Ensure stream terminates with a terminal condition per §4.1.3 "
+                            "(either a final streaming chunk with chunk.is_final=true or an error envelope)"
+                        ),
+                        "premature_close": (
+                            "Connection must remain open until the terminal condition per §7.3.2 "
+                            "(final chunk is_final=true or an error envelope)"
+                        ),
+                        "chunk_format": (
+                            "Each streaming success frame must use the streaming success envelope "
+                            "and code='STREAMING' per §4.1.3"
+                        ),
                     },
-                    "quick_fix": "Add terminal frame (event: 'end' or event: 'error') after all data frames",
-                    "examples": "See §4.1.3 for frame format and §7.3.2 for streaming finalization rules",
+                    "quick_fix": (
+                        "Ensure streams terminate with exactly one terminal condition: "
+                        "either a streaming success frame whose chunk.is_final is true, "
+                        "or a standard error envelope. No frames after the terminal condition."
+                    ),
+                    "examples": (
+                        "See §4.1.3 for streaming success envelope format (code='STREAMING' + chunk) "
+                        "and §7.3.2 for terminal condition rules (chunk.is_final=true OR error envelope)."
+                    ),
                 }
             },
             "sampling_params": {
@@ -216,11 +235,14 @@ PROTOCOLS_CONFIG: Dict[str, ProtocolConfig] = {
             "core_ops": {
                 "test_chat_completion": {
                     "error_patterns": {
-                        "invalid_message_roles": "Message roles must conform to §8.3.1 allowed values",
+                        "invalid_message_roles": (
+                            "Message roles should follow recommended values per §8.3.1 "
+                            "(schema allows any string, but interoperability expects common roles)."
+                        ),
                         "missing_messages": "Request must contain non-empty messages array per §8.3",
                     },
-                    "quick_fix": "Validate message structure and role enumeration before processing",
-                    "examples": "See §8.3.1 for message format and role requirements",
+                    "quick_fix": "Validate message structure and use interoperable role values before processing",
+                    "examples": "See §8.3.1 for message format and role guidance",
                 }
             },
         },
@@ -266,7 +288,10 @@ PROTOCOLS_CONFIG: Dict[str, ProtocolConfig] = {
                 "test_wire_envelope_validation": {
                     "error_patterns": {
                         "missing_required_fields": "Wire envelope missing required fields per §4.1",
-                        "invalid_field_types": "Field types don't match canonical form requirements",
+                        "invalid_field_types": (
+                            "Field types don't match canonical form requirements "
+                            "(e.g., ctx.deadline_ms is integer|null with minimum 0)"
+                        ),
                     },
                     "quick_fix": "Ensure all wire envelopes include required fields with correct types",
                     "examples": "See §4.1 for wire envelope format and field requirements",
@@ -285,7 +310,10 @@ PROTOCOLS_CONFIG: Dict[str, ProtocolConfig] = {
             "dimension_validation": {
                 "test_dimension_mismatch": {
                     "error_patterns": {
-                        "dimension_mismatch": "Vector dimensions must match index dimensions per §9.5",
+                        "dimension_mismatch": (
+                            "Adapters should detect and report vector dimension mismatches per §9.5 "
+                            "(schema alone may not encode all backend/index dimension constraints)."
+                        ),
                         "invalid_dimension": "Dimensions must be positive integers per §4.1 Numeric Types",
                     },
                     "quick_fix": "Validate vector dimensions before upsert operations",
@@ -343,7 +371,10 @@ PROTOCOLS_CONFIG: Dict[str, ProtocolConfig] = {
                 "test_wire_envelope_validation": {
                     "error_patterns": {
                         "missing_required_fields": "Wire envelope missing required fields per §4.1",
-                        "invalid_field_types": "Field types don't match canonical form requirements",
+                        "invalid_field_types": (
+                            "Field types don't match canonical form requirements "
+                            "(e.g., ctx.deadline_ms is integer|null with minimum 0)"
+                        ),
                     },
                     "quick_fix": "Ensure all wire envelopes include required fields with correct types",
                     "examples": "See §4.1 for wire envelope format and field requirements",
@@ -408,7 +439,10 @@ PROTOCOLS_CONFIG: Dict[str, ProtocolConfig] = {
                 "test_wire_envelope_validation": {
                     "error_patterns": {
                         "missing_required_fields": "Wire envelope missing required fields per §4.1",
-                        "invalid_field_types": "Field types don't match canonical form requirements",
+                        "invalid_field_types": (
+                            "Field types don't match canonical form requirements "
+                            "(e.g., ctx.deadline_ms is integer|null with minimum 0)"
+                        ),
                     },
                     "quick_fix": "Ensure all wire envelopes include required fields with correct types",
                     "examples": "See §4.1 for wire envelope format and field requirements",
@@ -585,10 +619,16 @@ PROTOCOLS_CONFIG: Dict[str, ProtocolConfig] = {
             "ndjson_stream": {
                 "test_llm_stream_ndjson_union_validates": {
                     "error_patterns": {
-                        "invalid_frame_sequence": "Stream frames violate terminal frame rules",
-                        "missing_terminal_frame": "Stream missing required end or error frame",
+                        "invalid_frame_sequence": "Stream frames violate terminal condition rules",
+                        "missing_terminal_frame": (
+                            "Stream missing required terminal condition (final chunk with is_final=true "
+                            "or an error envelope)"
+                        ),
                     },
-                    "quick_fix": "Ensure streams have exactly one terminal frame (end/error) after data frames",
+                    "quick_fix": (
+                        "Ensure streams have exactly one terminal condition (final chunk with is_final:true OR "
+                        "an error envelope) and no frames after the terminal condition."
+                    ),
                     "examples": "See SCHEMA_CONFORMANCE.md - NDJSON Stream Validation",
                 }
             },
