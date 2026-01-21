@@ -1,4 +1,4 @@
-# examples/embedding/mock_embedding_adapter.py
+# tests/mock/embedding/mock_embedding_adapter.py
 # SPDX-License-Identifier: Apache-2.0
 """
 Mock Embedding adapter used in example scripts and conformance tests.
