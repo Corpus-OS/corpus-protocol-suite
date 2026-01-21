@@ -465,7 +465,7 @@ interface GraphCapabilities {
   version: string;                // REQUIRED
 
   // Schema-optional (recommended when known):
-  protocol?: "graph/v1.0";        //// REQUIRED (const)
+  protocol: "graph/v1.0";        //// REQUIRED (const)
 
   supports_stream_query?: boolean;
   supported_query_dialects?: string[];
