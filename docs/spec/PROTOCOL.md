@@ -140,7 +140,7 @@ interface OperationContext {
   deadline_ms?: number | null;          // Absolute epoch milliseconds
   traceparent?: string | null;          // W3C trace context
   tenant?: string | null;               // Tenant identifier (hashed in metrics)
-  attrs?: Map<string, any>;             // Opaque extension attributes
+  attrs?: Record<string, any> | null;   // Opaque extension attributes
 }
 ```
 
@@ -150,28 +150,32 @@ interface OperationContext {
 - **Isolation:** Adapters enforce tenant boundaries in provider API calls
 
 ### 2.3 Deadlines & Budgets
-- **Propagation:** Adapters MUST propagate `deadline_ms` to provider APIs
+- **Propagation:** Adapters MUST propagate `deadline_ms` to provider APIs when possible
 - **Safety buffer:** Subtract 50-100ms from remaining time for network overhead
 - **Expiration:** Reject operations where context deadline has expired with `DeadlineExceeded("deadline already exceeded")`
-- **Enforcement:** Adapters use `DeadlinePolicy` to normalize `asyncio.TimeoutError` into `DEADLINE_EXCEEDED`
+- **Enforcement:** Standalone mode adapters use `DeadlinePolicy` to normalize `asyncio.TimeoutError` into `DEADLINE_EXCEEDED`
 
 ### 2.4 Wire-Level Envelope Standardization
 
 **Wire Format Requirements:**
 
+* **Request envelope flexibility:** Request envelopes MAY include additional top-level fields beyond `op`, `ctx`, and `args`. Adapters MUST ignore unknown top-level fields in request envelopes.
+
 * **Required keys (requests):** All request envelopes MUST include top-level `op`, `ctx`, and `args` keys.
-* **`ctx` forward compatibility:** Unknown fields in `ctx` MUST be ignored by adapters. The `OperationContext` JSON Schema MUST allow additional fields (`additionalProperties: true`).
+
+* **`ctx` forward compatibility:** Unknown fields in `ctx` MUST be ignored by adapters. The `OperationContext` JSON Schema allows additional fields (`additionalProperties: true`).
+
 * **`args` forward compatibility:**
-
   * Per-operation `args` schemas are authoritative for what is allowed.
-  * If an operation’s `args` schema is **permissive** (`additionalProperties: true`), adapters MUST ignore unknown fields in `args` (they are allowed and treated as no-ops).
-  * If an operation’s `args` schema is **strict** (`additionalProperties: false`), unknown fields in `args` MUST cause schema validation to fail (typically returning a `BAD_REQUEST` error).
-* **Closed response envelopes:**
+  * If an operation's `args` schema is **permissive** (`additionalProperties: true`), adapters MUST ignore unknown fields in `args` (they are allowed and treated as no-ops).
+  * If an operation's `args` schema is **strict** (`additionalProperties: false`), unknown fields in `args` MUST cause schema validation to fail (typically returning a `BAD_REQUEST` error).
 
+* **Closed response envelopes:**
   * **Success envelopes** for unary operations are **closed objects**: they MUST NOT contain any top-level keys other than `{ "ok", "code", "ms", "result" }`.
-  * **Error envelopes** are **closed objects**: they MUST NOT contain any top-level keys other than `{ "ok", "code", "error", "message", "retry_after_ms", "details", "ms" }`.
+  * **Error envelopes** are **closed objects**: they MUST NOT contain any top-level keys other than `{ "ok", "code", "error", "message", "retry_after_ms", "details", "ms" }`. Error envelopes MUST include `retry_after_ms` and `details` keys; values MAY be null.
   * **Streaming success frames** are **closed objects**: they MUST NOT contain any top-level keys other than `{ "ok", "code", "ms", "chunk" }`.
   * These constraints are enforced in SCHEMA.md via `additionalProperties: false` on the corresponding envelope schemas.
+
 * **Empty objects:** `ctx` and `args` MAY be empty objects `{}`, but they MUST be present.
 
 **Canonical Request Envelope:**
@@ -233,17 +237,16 @@ interface OperationContext {
 - **Important:** The event-stream shape is not part of the base adapter wire protocol; it's a router/gateway abstraction that may wrap base protocol envelopes
 
 ### 2.6 Mode Strategy: Thin vs Standalone
-- **Thin mode:** For composition under external control planes. All policies are no-op: no caching, no rate limiting, no circuit breaker, no deadline enforcement.
+- **Thin mode:** For composition under external control planes. All policies are no-op: no caching, no rate limiting, no circuit breaker, no internal deadline enforcement. **Thin mode MUST still reject already-expired `ctx.deadline_ms` and MUST propagate deadlines to downstream providers when possible.**
 - **Standalone mode:** For direct use. Enables basic deadline enforcement, circuit breaker, in-memory TTL cache, and token-bucket rate limiter.
 - **Implementation detail:** These are recommended infra patterns, not part of the wire contract.
 
 ### 2.7 Stream Semantics
 * **Single terminal:** Exactly one terminal condition per stream:
-
   * A success stream ends with a chunk where `is_final: true`, OR
   * An error envelope terminates the stream.
 * **No content after terminal:** A stream MUST end immediately after the terminal frame.
-* **Heartbeats:** Optional keep-alive messages are allowed only if they validate as standard streaming success envelopes and do not violate terminal rules.
+* **Heartbeats:** Optional keep-alive messages are allowed only if they validate as standard streaming success envelopes and do not violate terminal rules. **Heartbeat frames MUST still validate as the protocol's chunk schema (e.g., include `is_final: false` and all required fields); "empty chunk" heartbeats are not valid unless the schema allows them.**
 * **Backpressure:** Clients control consumption rate; adapters MUST implement bounded buffering and flow control.
 * **Streaming code:** **ALL streaming success frames MUST use `code: "STREAMING"`** (per streaming envelope schema).
 * **Output envelope strictness:** Streaming success frames MUST NOT include any extra top-level fields beyond `{ok, code, ms, chunk}`.
@@ -288,11 +291,9 @@ All adapters MUST use protocol-specific base errors:
 * **Dynamic discovery:** Clients probe `capabilities()` to determine supported features.
 * **Truthful reporting:** Adapters MUST accurately report actual capabilities.
 * **Protocol field (schema-governed):**
-
   * When present, `protocol` MUST equal the canonical protocol ID (e.g., `"llm/v1.0"`, `"graph/v1.0"`, `"vector/v1.0"`).
   * For **EmbeddingCapabilities**, `protocol` is **REQUIRED** and MUST equal `"embedding/v1.0"`.
 * **Caching:** Capabilities may be cached with appropriate TTL (typically 5–60 minutes).
-
 
 ### 2.13 Idempotency Expectations
 | Operation Type | Idempotent? | Notes |
@@ -307,13 +308,14 @@ All adapters MUST use protocol-specific base errors:
 
 **All adapters MUST:**
 - Emit metrics for every operation with tenant hashing
-- Propagate `deadline_ms` to provider APIs with safety buffer
+- Propagate `deadline_ms` to provider APIs with safety buffer when possible
 - Map provider errors to canonical error taxonomy
-- Report capabilities truthfully (protocol field is recommended but not required)
+- Report capabilities truthfully (protocol field is recommended but not required except for Embedding)
 - Enforce SIEM-safe requirements for all telemetry
 - Use canonical wire envelopes for all responses
 - Include `op`, `ctx`, and `args` keys in all request envelopes
 - **Use `code: "STREAMING"` for all streaming success frames**
+- Reject already-expired `ctx.deadline_ms` with `DeadlineExceeded("deadline already exceeded")`
 
 **All adapters MUST NOT:**
 - Log raw prompts, vectors, embeddings, or tenant IDs
@@ -335,29 +337,22 @@ All adapters MUST use protocol-specific base errors:
 
 ### 3.2 Metadata Maps
 ```typescript
-type Metadata = {
-  [key: string]: string | number | boolean | null | string[] | number[];
-};
+type Metadata = Record<string, any>;
 ```
 - **Constraints:** JSON-serializable values only
 - **Cardinality:** Bounded key sets recommended for filter performance
 
 ### 3.3 Filter Expressions
 ```typescript
-type FilterValue = string | number | boolean | null | (string | number)[];
-type FilterOperator = { 
-  gt?: number; gte?: number; lt?: number; lte?: number; 
-  in?: (string | number)[];
-};
-type FilterExpression = {
-  [field: string]: FilterValue | FilterOperator;
-};
+type FilterExpression = Record<string, any>;
 ```
 - **Implementation-defined mapping:** Filter field names are implementation-defined; adapters map them to provider-specific query syntax
-- **Range queries:** `{ field: { gt: value } }` for greater than
-- **Set membership:** `{ field: [value1, value2] }` for IN queries
-- **Equality:** `{ field: value }` for exact matching
-- **Combination:** Multiple conditions combined with AND
+- **Recommended canonical shape:** A recommended canonical filter shape supports:
+  - **Range queries:** `{ field: { gt: value } }` for greater than
+  - **Set membership:** `{ field: [value1, value2] }` for IN queries
+  - **Equality:** `{ field: value }` for exact matching
+  - **Combination:** Multiple conditions combined with AND
+- **Schema flexibility:** Individual operation schemas define the actual shape accepted for filters; adapters MUST accept whatever shape the operation's schema allows.
 
 ### 3.4 Paging / Streaming Tokens
 - **Opaque:** Clients treat as black strings
@@ -387,7 +382,7 @@ interface TokenUsage {
 }
 ```
 
-> **Invariant:** `total_tokens` MUST equal `prompt_tokens + completion_tokens`. In streaming contexts before completion, `usage` may be omitted entirely or provided only on the final chunk depending on adapter implementation, but when present it MUST include `completion_tokens` and satisfy the total tokens invariant.
+> **Invariant:** `total_tokens` MUST equal `prompt_tokens + completion_tokens` as a protocol semantic invariant. When present in streaming contexts, `usage` MUST include `completion_tokens` and satisfy the total tokens invariant.
 
 ### 3.8 Protocol-Specific Count Tokens Specifications
 
@@ -417,7 +412,6 @@ interface EmbeddingCountTokensSpec {
 - **Array bounds:** Minimum/maximum lengths specified per capability
 - **Type schemas are strict (`additionalProperties: false`) unless explicitly allowed.**
 - **Certain envelopes (e.g. request envelopes, `ctx`, health and capability results) and some args specs are intentionally permissive (`additionalProperties: true`) for forward-compatibility; core response envelopes (success, error, streaming) are closed.**
-
 
 ## 4. Protocol Overview
 
@@ -485,8 +479,8 @@ interface GraphCapabilities {
   supports_multi_tenant?: boolean;
   supports_deadline?: boolean;
 
-  max_batch_ops?: number | null;
-  max_traversal_depth?: number | null;
+  max_batch_ops?: number | null;   // integer|null in schema
+  max_traversal_depth?: number | null; // integer|null in schema
 }
 ```
 
@@ -509,7 +503,7 @@ interface Node {
   id: string;                     // REQUIRED
   labels?: string[];              // Optional, defaults to []
   properties: Metadata;           // REQUIRED
-  namespace?: string;             // Optional namespace isolation
+  namespace?: string;             // Optional namespace isolation (string, not nullable)
   created_at?: number;            // Optional: epoch milliseconds
   updated_at?: number;            // Optional: epoch milliseconds
 }
@@ -523,7 +517,7 @@ interface Edge {
   dst: string;                    // Target node ID (REQUIRED)  
   label: string;                  // REQUIRED
   properties: Metadata;           // REQUIRED
-  namespace?: string;             // Optional namespace isolation
+  namespace?: string;             // Optional namespace isolation (string, not nullable)
   created_at?: number;            // Optional: epoch milliseconds
   updated_at?: number;            // Optional: epoch milliseconds
 }
@@ -534,9 +528,9 @@ interface Edge {
 interface GraphQuerySpec {
   text: string;                   // Query in supported dialect (REQUIRED)
   params?: Metadata;              // Named parameters for query
-  timeout_ms?: number;            // Query-specific timeout (overrides context deadline)
-  dialect?: string;               // Preferred query dialect
-  namespace?: string;             // Namespace context
+  timeout_ms?: number | null;     // Query-specific timeout (overrides context deadline)
+  dialect?: string | null;        // Preferred query dialect
+  namespace?: string | null;      // Namespace context
   stream?: boolean;               // Stream results
 }
 ```
@@ -544,33 +538,31 @@ interface GraphQuerySpec {
 ### 6.4 GraphQueryResult
 ```typescript
 interface GraphQueryResult {
-  records: Record<string, any>[]; // Query result data - each record is a map of column→value
+  records: any[];                 // Query result data - each record can be any JSON value
   summary: {                      // Execution summary (REQUIRED, provider/adapter-defined)
     [key: string]: any;           // Implementation-defined keys; may include query_time_ms, results_count, etc.
   };
-  dialect?: string;               // Optional dialect used
-  namespace?: string;             // Optional namespace context
+  dialect?: string | null;        // Optional dialect used
+  namespace?: string | null;      // Optional namespace context
 }
 ```
 
 ### 6.5 QueryChunk
 ```typescript
 interface QueryChunk {
-  records: Record<string, any>[]; // Incremental result data
-  is_final: boolean;              // True for final chunk
-  summary?: {                     // Final execution summary (provider/adapter-defined)
-    [key: string]: any;
-  };
+  records: any[];                 // Incremental result data
+  is_final: boolean;              // True for final chunk (REQUIRED)
+  summary?: Record<string, any> | null; // Final execution summary (provider/adapter-defined)
 }
 ```
 
 ### 6.6 BulkVerticesSpec
 ```typescript
 interface BulkVerticesSpec {
-  namespace?: string;
+  namespace?: string | null;      // Optional
   limit?: number;                 // Default: 100
-  cursor?: string;                // Opaque pagination token
-  filter?: FilterExpression;      // Property filter conditions
+  cursor?: string | null;         // Opaque pagination token (nullable)
+  filter?: Record<string, any> | null; // Property filter conditions (nullable)
 }
 ```
 
@@ -588,8 +580,8 @@ interface BulkVerticesResult {
 interface GraphBatchResult {
   results: any[];                 // Operation-specific results
   success: boolean;               // Overall batch success
-  error?: string;                 // Error message if batch failed
-  transaction_id?: string;        // Optional transaction identifier
+  error?: string | null;          // Error message if batch failed
+  transaction_id?: string | null; // Optional transaction identifier
 }
 ```
 
@@ -602,10 +594,10 @@ interface GraphTraversalSpec {
   max_depth: number;              // Maximum traversal depth
   direction: "OUTGOING" | "INCOMING" | "BOTH";
   relationship_types?: string[];  // Filter by edge types
-  node_filters?: FilterExpression; // Filter nodes during traversal
-  relationship_filters?: FilterExpression; // Filter edges during traversal
+  node_filters?: Record<string, any>; // Filter nodes during traversal
+  relationship_filters?: Record<string, any>; // Filter edges during traversal
   return_properties?: string[];   // Properties to return
-  namespace?: string;             // Namespace context
+  namespace?: string | null;      // Namespace context
 }
 ```
 
@@ -618,7 +610,7 @@ interface TraversalResult {
   summary: {                      // Traversal summary (provider/adapter-defined)
     [key: string]: any;
   };
-  namespace?: string;             // Namespace context
+  namespace?: string | null;      // Namespace context
 }
 ```
 
@@ -690,13 +682,15 @@ interface GraphSchema {
 ```typescript
 interface UpsertNodesSpec {
   nodes: Node[];
-  namespace?: string;
+  namespace?: string;             // Optional (string, not nullable)
 }
 ```
 
 **Validation:**
 - `nodes` MUST be non-empty
 - Each `Node.properties` MUST be JSON-serializable
+- **Unknown keys in `args` MUST be rejected** (schema has `additionalProperties: false`)
+- **Namespace precedence:** If `namespace` is provided in `args` and individual nodes have `namespace` set, the per-item namespace takes precedence. If they differ, the operation proceeds with per-item namespaces.
 
 **Request Body:**
 ```json
@@ -751,7 +745,7 @@ interface UpsertNodesSpec {
 ```typescript
 interface UpsertEdgesSpec {
   edges: Edge[];
-  namespace?: string;
+  namespace?: string;             // Optional (string, not nullable)
 }
 ```
 
@@ -759,6 +753,8 @@ interface UpsertEdgesSpec {
 - `edges` MUST be non-empty
 - `edge.label` MUST be non-empty string
 - Each `Edge.properties` MUST be JSON-serializable
+- **Unknown keys in `args` MUST be rejected** (schema has `additionalProperties: false`)
+- **Namespace precedence:** If `namespace` is provided in `args` and individual edges have `namespace` set, the per-item namespace takes precedence. If they differ, the operation proceeds with per-item namespaces.
 
 **Request Body:**
 ```json
@@ -812,8 +808,8 @@ interface UpsertEdgesSpec {
 ```typescript
 interface DeleteNodesSpec {
   ids?: string[];                // Delete by IDs
-  filter?: FilterExpression;     // Delete by property filter
-  namespace?: string;
+  filter?: Record<string, any>;  // Delete by property filter
+  namespace?: string | null;     // Optional
 }
 ```
 
@@ -880,8 +876,8 @@ interface DeleteNodesSpec {
 ```typescript
 interface DeleteEdgesSpec {
   ids?: string[];                // Delete by IDs
-  filter?: FilterExpression;     // Delete by property filter
-  namespace?: string;
+  filter?: Record<string, any>;  // Delete by property filter
+  namespace?: string | null;     // Optional
 }
 ```
 
@@ -1373,11 +1369,10 @@ interface GraphHealthStatus {
   namespaces?: Record<string, any>; // Optional namespace info
   read_only?: boolean;            // Optional read-only flag
   degraded?: boolean;             // Optional degraded flag
-  // Additional fields allowed per schema
 }
 ```
 
-> **Note:** Graph health responses MUST include `ok`, `status`, `server`, and `version` fields. Additional fields are allowed for forward compatibility.
+> **Note:** Graph health responses MUST include `ok`, `status`, `server`, and `version` fields. The Graph health result is a closed contract (`additionalProperties: false`); only schema-defined fields are permitted.
 
 **Response Body:**
 ```json
@@ -1459,7 +1454,7 @@ interface LLMCapabilities {
   server: string;                 // REQUIRED
   version: string;                // REQUIRED
   model_family: string;           // REQUIRED
-  max_context_length: number;     // REQUIRED
+  max_context_length: number;     // REQUIRED (integer in schema)
 
   // Schema-optional (recommended when known):
   protocol?: string;              // OPTIONAL
@@ -1475,10 +1470,10 @@ interface LLMCapabilities {
   supports_count_tokens?: boolean;
   idempotent_writes?: boolean;
   supports_multi_tenant?: boolean;
-  max_tool_calls_per_turn?: number | null;
+  max_tool_calls_per_turn?: number | null; // integer|null in schema
 }
 ```
-> **Guidance:** Adapters SHOULD populate optional capability fields truthfully when available. Schema validation requires only the fields listed as "Schema-required."
+> **Guidance:** Adapters SHOULD populate optional capability fields truthfully when available. Schema validation requires only the fields listed as "Schema-required." LLM capabilities schema is closed (`additionalProperties: false`).
 
 ### 9.2 Model Family & Supported Models
 - **Model listing:** Accurate list of available provider models
@@ -1490,11 +1485,11 @@ interface LLMCapabilities {
 ### 10.1 Message Schema
 ```typescript
 interface Message {
-  role: 'system' | 'user' | 'assistant' | 'tool';
+  role: string;                   // Schema: string (not restricted)
   content: string;
-  name?: string;                  // Tool call function name
-  tool_call_id?: string;          // Associate tool calls with responses
-  tool_calls?: ToolCall[];        // Function calls from model
+  name?: string | null;           // Tool call function name
+  tool_call_id?: string | null;   // Associate tool calls with responses
+  tool_calls?: ToolCall[] | null; // Function calls from model
 }
 
 interface ToolCall {
@@ -1521,13 +1516,13 @@ interface ToolDefinition {
 interface CompletionSpec {
   model?: string | null;          // RECOMMENDED but optional and nullable
   messages: Message[];
-  max_tokens?: number;
-  temperature?: number;          // Range: [0.0, 2.0]
-  top_p?: number;                // Range: (0.0, 1.0]
-  frequency_penalty?: number;    // Range: [-2.0, 2.0]
-  presence_penalty?: number;     // Range: [-2.0, 2.0]
-  stop_sequences?: string[];
-  system_message?: string;       // System message override
+  max_tokens?: number | null;     // integer|null in schema
+  temperature?: number | null;    // Range: [0.0, 2.0], nullable in schema
+  top_p?: number | null;          // Range: (0.0, 1.0], nullable in schema
+  frequency_penalty?: number | null;    // Range: [-2.0, 2.0], nullable in schema
+  presence_penalty?: number | null;     // Range: [-2.0, 2.0], nullable in schema
+  stop_sequences?: string[] | null; // nullable in schema
+  system_message?: string | null; // System message override, nullable
   
   // Advanced features (availability depends on capabilities)
   seed?: number;                 // For deterministic outputs
@@ -1560,8 +1555,8 @@ interface LLMChunk {
   text: string;                  // Incremental text content
   is_final: boolean;             // True for final chunk
   model?: string | null;         // Optional model identifier (nullable)
-  usage_so_far?: TokenUsage;     // Cumulative token usage (MAY be omitted in non-final chunks)
-  tool_calls?: ToolCall[];       // Optional tool calls (may appear in chunks)
+  usage_so_far?: TokenUsage | null; // Cumulative token usage (MAY be omitted in non-final chunks)
+  tool_calls?: ToolCall[] | null; // Optional tool calls (may appear in chunks)
 }
 ```
 
@@ -1627,10 +1622,10 @@ interface LLMChunk {
 - `messages` MUST be JSON-serializable
 - `model` is RECOMMENDED but optional and nullable
 - Parameter ranges MUST satisfy:
-  - `temperature ∈ [0.0, 2.0]`
-  - `top_p ∈ (0.0, 1.0]`
-  - `frequency_penalty ∈ [-2.0, 2.0]`
-  - `presence_penalty ∈ [-2.0, 2.0]`
+  - `temperature ∈ [0.0, 2.0]` (when not null)
+  - `top_p ∈ (0.0, 1.0]` (when not null)
+  - `frequency_penalty ∈ [-2.0, 2.0]` (when not null)
+  - `presence_penalty ∈ [-2.0, 2.0]` (when not null)
 
 **Request Body:**
 ```json
@@ -1753,7 +1748,7 @@ interface LLMChunk {
 }
 ```
 
-**Output:** `number` (bare integer)
+**Output:** `number` (integer)
 
 **Response Body:**
 ```json
@@ -1788,11 +1783,11 @@ interface LLMHealthStatus {
   ok: boolean;                    // REQUIRED per schema
   server: string;                 // REQUIRED per schema
   version: string;                // REQUIRED per schema
-  // Additional fields allowed per schema
+  // Additional fields allowed per schema (additionalProperties: true)
 }
 ```
 
-> **Note:** LLM health responses MUST include `ok`, `server`, and `version` fields. Additional fields are allowed for forward compatibility.
+> **Note:** LLM health responses MUST include `ok`, `server`, and `version` fields. Additional fields are allowed for forward compatibility (`additionalProperties: true`).
 
 **Response Body:**
 ```json
@@ -1815,6 +1810,7 @@ interface LLMHealthStatus {
 - **System message:** Only one system message at conversation start
 - **Tool calls:** Assistant messages may contain tool calls
 - **Tool results:** Tool role messages follow corresponding tool calls
+- **Role flexibility:** While the schema allows any string role, for interoperability roles SHOULD be one of `system`, `user`, `assistant`, or `tool`. Adapters MUST accept and forward any string role provided by clients.
 
 ### 12.2 Determinism Requirements
 - **Same inputs:** Identical messages + parameters → identical outputs when `temperature=0`
@@ -1881,27 +1877,27 @@ interface VectorCapabilities {
 
   // Schema-optional (recommended when known):
   protocol?: "vector/v1.0";       // OPTIONAL in schema (const when present)
-  max_dimensions?: number;
+  max_dimensions?: number;        // integer in schema
   supported_metrics?: string[];
   supports_namespaces?: boolean;
   supports_metadata_filtering?: boolean;
   supports_batch_operations?: boolean;
   supports_batch_queries?: boolean;
-  max_batch_size?: number | null;
-  max_top_k?: number | null;
-  max_filter_terms?: number | null;
+  max_batch_size?: number | null; // integer|null in schema
+  max_top_k?: number | null;      // integer|null in schema
+  max_filter_terms?: number | null; // integer|null in schema
   supports_index_management?: boolean;
   supports_deadline?: boolean;
   idempotent_writes?: boolean;
   supports_multi_tenant?: boolean;
   text_storage_strategy?: "metadata" | "docstore" | "none";
-  max_text_length?: number | null;
+  max_text_length?: number | null; // integer|null in schema
 
   // Additional vendor fields MAY appear (schema allows additionalProperties: true).
   [k: string]: any;
 }
 ```
-> **Guidance:** Because the schema permits additional properties for VectorCapabilities, vendor-specific capability fields MAY be included. Clients MUST ignore unknown fields
+> **Guidance:** Because the schema permits additional properties for VectorCapabilities, vendor-specific capability fields MAY be included. Clients MUST ignore unknown fields.
 
 ### 13.2 Supported Metrics
 - **cosine:** Cosine similarity (1 - cosine distance)
@@ -1920,9 +1916,9 @@ interface VectorCapabilities {
 interface Vector {
   id: string;                     // REQUIRED
   vector: number[];               // REQUIRED
-  metadata?: Metadata;
-  namespace?: string;
-  text?: string;                  // Original text (optional)
+  metadata?: Record<string, any> | null; // Optional metadata
+  namespace?: string | null;      // Optional namespace (nullable)
+  text?: string | null;           // Original text (optional, nullable)
 }
 ```
 
@@ -1941,8 +1937,8 @@ interface VectorMatch {
 interface VectorQuerySpec {
   vector: number[];               // REQUIRED
   top_k: number;                  // Default: 10 (REQUIRED)
-  namespace?: string;             // Default: "default"
-  filter?: FilterExpression;      // Metadata filter conditions
+  namespace?: string;             // Default: "default" (string, not nullable)
+  filter?: Record<string, any> | null; // Metadata filter conditions (nullable)
   include_metadata?: boolean;     // Default: true
   include_vectors?: boolean;      // Default: false
 }
@@ -1962,7 +1958,7 @@ interface VectorQueryResult {
 ```typescript
 interface BatchQuerySpec {
   queries: VectorQuerySpec[];     // REQUIRED
-  namespace?: string;
+  namespace?: string;             // Optional (string, not nullable)
 }
 ```
 
@@ -1970,7 +1966,7 @@ interface BatchQuerySpec {
 ```typescript
 interface UpsertSpec {
   vectors: Vector[];              // REQUIRED
-  namespace?: string;
+  namespace?: string;             // Optional (string, not nullable)
 }
 ```
 
@@ -1979,11 +1975,7 @@ interface UpsertSpec {
 interface UpsertResult {
   upserted_count: number;         // REQUIRED
   failed_count: number;           // REQUIRED
-  failures: Array<{               // REQUIRED
-    id: string;
-    error: string;
-    detail: string;
-  }>;
+  failures: object[];             // REQUIRED - each failure object SHOULD include id, error, detail
 }
 ```
 
@@ -1991,8 +1983,8 @@ interface UpsertResult {
 ```typescript
 interface DeleteSpec {
   ids?: string[];                 // Delete by IDs (optional)
-  filter?: FilterExpression;      // Delete by metadata filter (optional)
-  namespace?: string;
+  filter?: Record<string, any>;   // Delete by metadata filter (optional)
+  namespace?: string;             // Optional (string, not nullable)
 }
 ```
 
@@ -2001,11 +1993,7 @@ interface DeleteSpec {
 interface DeleteResult {
   deleted_count: number;          // REQUIRED
   failed_count: number;           // REQUIRED
-  failures: Array<{               // REQUIRED
-    id: string;
-    error: string;
-    detail: string;
-  }>;
+  failures: object[];             // REQUIRED - each failure object SHOULD include id, error, detail
 }
 ```
 
@@ -2013,7 +2001,7 @@ interface DeleteResult {
 ```typescript
 interface NamespaceSpec {
   namespace: string;              // REQUIRED
-  dimensions: number;             // REQUIRED
+  dimensions: number;             // REQUIRED (integer in schema)
   distance_metric: string;        // e.g., "cosine", "euclidean"
 }
 ```
@@ -2023,7 +2011,7 @@ interface NamespaceSpec {
 interface NamespaceResult {
   success: boolean;               // REQUIRED
   namespace: string;              // REQUIRED
-  details: Metadata;              // Additional namespace details (vector_count, ready, index_status, etc.) - REQUIRED
+  details: Record<string, any>;   // Additional namespace details (vector_count, ready, index_status, etc.) - REQUIRED
 }
 ```
 
@@ -2087,7 +2075,7 @@ interface NamespaceResult {
 **Validation:**
 - `vector` MUST be non-empty list of numeric values
 - `top_k` MUST be positive integer
-- `namespace` MUST be non-empty string
+- `namespace` MUST be non-empty string when provided
 - `filter`, if present, MUST be JSON-serializable mapping
 
 **Capabilities Enforcement:**
@@ -2246,11 +2234,11 @@ interface NamespaceResult {
 **Input:** `UpsertSpec`
 
 **Validation:**
-- `namespace` MUST be non-empty
 - `vectors` MUST be non-empty
 - Each vector `id` MUST be non-empty string
 - Each `vector` MUST be non-empty numeric list
 - Each `metadata`, if present, MUST be JSON-serializable
+- **Namespace precedence:** If `namespace` is provided in `args` and individual vectors have `namespace` set, the per-item namespace takes precedence. If they differ, the operation proceeds with per-item namespaces.
 
 **Capabilities Enforcement:**
 - If `max_batch_size` is set and `len(vectors) > max_batch_size` → `BAD_REQUEST`
@@ -2310,7 +2298,6 @@ interface NamespaceResult {
 **Input:** `DeleteSpec`
 
 **Validation:**
-- `namespace` MUST be non-empty
 - MUST provide at least one of: non-empty `ids` or `filter`
 - `filter`, if present, MUST be JSON-serializable
 - Each `id` MUST be non-empty string
@@ -2490,11 +2477,11 @@ interface VectorHealthStatus {
   server: string;                 // REQUIRED per schema
   version: string;                // REQUIRED per schema
   namespaces: Record<string, any>; // REQUIRED per schema
-  // Additional fields allowed per schema
+  // Additional fields allowed per schema (additionalProperties: true)
 }
 ```
 
-> **Note:** Vector health responses MUST include `ok`, `server`, `version`, and `namespaces` fields. Additional fields are allowed for forward compatibility.
+> **Note:** Vector health responses MUST include `ok`, `server`, `version`, and `namespaces` fields. Additional fields are allowed for forward compatibility (`additionalProperties: true`).
 
 **Response Body:**
 ```json
@@ -2535,6 +2522,7 @@ interface VectorHealthStatus {
 - **Range queries:** `{ field: { gt: value } }` for greater than
 - **Combination:** Multiple conditions combined with AND
 - **Field mapping:** Filter field names are implementation-defined; adapters map them to provider-specific query syntax
+- **Schema flexibility:** Vector query schemas accept `object|null` for filters; adapters MUST accept whatever shape the operation's schema allows
 
 ### 16.3 Metrics & Scoring Rules
 - **Normalization:** Scores normalized to [0, 1] range where possible
@@ -2595,9 +2583,9 @@ interface EmbeddingCapabilities {
   protocol: "embedding/v1.0";     // REQUIRED (const)
 
   // Schema-optional:
-  max_batch_size?: number | null;
-  max_text_length?: number | null;
-  max_dimensions?: number | null;
+  max_batch_size?: number | null; // integer|null in schema
+  max_text_length?: number | null; // integer|null in schema
+  max_dimensions?: number | null; // integer|null in schema
 
   supports_normalization?: boolean;
   supports_truncation?: boolean;
@@ -2616,6 +2604,7 @@ interface EmbeddingCapabilities {
   [k: string]: any;
 }
 ```
+
 ### 17.2 Model Support
 - **Model listing:** Available embedding models with dimensions
 - **Batch capabilities:** Maximum batch sizes per model
@@ -2626,18 +2615,18 @@ interface EmbeddingCapabilities {
 ### 18.1 EmbedSpec
 ```typescript
 interface EmbedSpec {
-  text: string;                   // REQUIRED
+  text: string;                   // REQUIRED (schema enforces non-whitespace pattern)
   model: string;                  // REQUIRED
   truncate?: boolean;             // Allow automatic truncation
   normalize?: boolean;            // Return normalized vectors
-  // Note: stream field MUST be false or absent for unary embed operation
+  stream?: false;                 // If present, must be false (unary embed operation)
 }
 ```
 
 ### 18.2 EmbedBatchSpec
 ```typescript
 interface EmbedBatchSpec {
-  texts: string[];                // REQUIRED
+  texts: string[];                // REQUIRED (each must satisfy non-whitespace pattern)
   model: string;                  // REQUIRED
   truncate?: boolean;
   normalize?: boolean;
@@ -2650,7 +2639,7 @@ interface EmbedResult {
   embedding: EmbeddingVector;     // REQUIRED
   model: string;                  // REQUIRED
   text: string;                   // Possibly truncated (REQUIRED)
-  tokens_used?: number;
+  tokens_used?: number | null;    // integer|null in schema
   truncated: boolean;             // REQUIRED: True if text was truncated
 }
 ```
@@ -2661,9 +2650,9 @@ interface EmbeddingVector {
   vector: number[];               // REQUIRED
   text: string;                   // Denormalized for convenience (REQUIRED)
   model: string;                  // Denormalized for convenience (REQUIRED)
-  dimensions: number;             // REQUIRED
-  index?: number;                 // Optional: index in original batch
-  metadata?: Metadata;            // Optional: additional metadata
+  dimensions: number;             // REQUIRED (integer in schema)
+  index?: number | null;          // Optional: index in original batch (integer|null in schema)
+  metadata?: Record<string, any> | null; // Optional: additional metadata
 }
 ```
 
@@ -2672,10 +2661,10 @@ interface EmbeddingVector {
 interface EmbedBatchResult {
   embeddings: EmbeddingVector[];  // REQUIRED
   model: string;                  // REQUIRED
-  total_texts: number;            // REQUIRED
-  total_tokens?: number;
+  total_texts: number;            // REQUIRED (integer in schema)
+  total_tokens?: number | null;   // integer|null in schema
   failed_texts: Array<{           // REQUIRED
-    index: number;                // Index in original batch
+    index: number;                // Index in original batch (integer in schema)
     text: string;
     error: string;
     code: string;                 // REQUIRED per schema
@@ -2689,24 +2678,24 @@ interface EmbedBatchResult {
 interface EmbedChunk {
   embeddings: EmbeddingVector[];  // REQUIRED
   is_final: boolean;              // True for final chunk (REQUIRED)
-  usage?: object;                 // Optional usage information
-  model?: string;                 // Optional model identifier
+  usage?: Record<string, any> | null; // Optional usage information
+  model?: string | null;          // Optional model identifier
 }
 ```
 
 ### 18.7 EmbeddingStats
 ```typescript
 interface EmbeddingStats {
-  total_requests: number;         // REQUIRED
-  total_texts: number;            // REQUIRED
-  total_tokens: number;           // REQUIRED
-  cache_hits?: number;
-  cache_misses?: number;
+  total_requests: number;         // REQUIRED (integer in schema)
+  total_texts: number;            // REQUIRED (integer in schema)
+  total_tokens: number;           // REQUIRED (integer in schema)
+  cache_hits?: number;            // integer in schema
+  cache_misses?: number;          // integer in schema
   avg_processing_time_ms?: number;
-  error_count?: number;
-  stream_requests?: number;
-  stream_chunks_generated?: number;
-  stream_abandoned?: number;
+  error_count?: number;           // integer in schema
+  stream_requests?: number;       // integer in schema
+  stream_chunks_generated?: number; // integer in schema
+  stream_abandoned?: number;      // integer in schema
 }
 ```
 
@@ -2768,7 +2757,7 @@ interface EmbeddingStats {
 **Input:** `EmbedSpec`
 
 **Validation:**
-- `text` MUST be non-empty string
+- `text` MUST be non-empty string with at least one non-whitespace character
 - `model` MUST be non-empty string
 - `stream` field MUST be false or absent (streaming uses separate `embedding.stream_embed` operation)
 
@@ -2823,6 +2812,7 @@ interface EmbeddingStats {
 **Validation:**
 - `model` MUST be non-empty string
 - `texts` MUST be non-empty list
+- Each text in `texts` MUST be non-empty string with at least one non-whitespace character
 
 **Request Body:**
 ```json
@@ -2893,7 +2883,7 @@ interface EmbeddingStats {
 **Input:** `EmbedSpec` (single text, not batch)
 
 **Validation:**
-- `text` MUST be non-empty string
+- `text` MUST be non-empty string with at least one non-whitespace character
 - `model` MUST be non-empty string
 - Operation is for single text only (not batch)
 - `stream` field is not used (streaming is implied by operation)
@@ -2918,10 +2908,12 @@ interface EmbeddingStats {
 
 **Stream Response Frames:**
 ```json
-{"ok": true, "code": "STREAMING", "ms": 12.3, "chunk": {"embeddings": [{"vector": [0.1, 0.2], "text": "Text for streaming embeddings", "model": "text-embedding-3-large", "dimensions": 3072}], "is_final": false}}
-{"ok": true, "code": "STREAMING", "ms": 15.7, "chunk": {"embeddings": [{"vector": [0.3, 0.4], "text": "Text for streaming embeddings", "model": "text-embedding-3-large", "dimensions": 3072}], "is_final": false}}
-{"ok": true, "code": "STREAMING", "ms": 18.2, "chunk": {"embeddings": [{"vector": [0.5, 0.6], "text": "Text for streaming embeddings", "model": "text-embedding-3-large", "dimensions": 3072}], "is_final": true, "usage": {"total_tokens": 8}}}
+{"ok": true, "code": "STREAMING", "ms": 12.3, "chunk": {"embeddings": [{"vector": [0.1, 0.2, 0.3, 0.4, 0.5], "text": "Text for streaming embeddings", "model": "text-embedding-3-large", "dimensions": 5}], "is_final": false}}
+{"ok": true, "code": "STREAMING", "ms": 15.7, "chunk": {"embeddings": [{"vector": [0.6, 0.7, 0.8, 0.9, 1.0], "text": "Text for streaming embeddings", "model": "text-embedding-3-large", "dimensions": 5}], "is_final": false}}
+{"ok": true, "code": "STREAMING", "ms": 18.2, "chunk": {"embeddings": [{"vector": [1.1, 1.2, 1.3, 1.4, 1.5], "text": "Text for streaming embeddings", "model": "text-embedding-3-large", "dimensions": 5}], "is_final": true, "usage": {"total_tokens": 8}}}
 ```
+
+> **Note:** The `dimensions` field should reflect the vector length and MUST be consistent within an adapter implementation. Embedding streaming semantics are schema-defined and implementations must document their specific behavior.
 
 ### 19.5 count_tokens
 **Purpose:** Count tokens in text for embedding model
@@ -2945,7 +2937,7 @@ interface EmbeddingStats {
 }
 ```
 
-**Output:** `number` (bare integer)
+**Output:** `number` (integer)
 
 **Response Body:**
 ```json
@@ -3021,11 +3013,11 @@ interface EmbeddingHealthStatus {
   server: string;                 // REQUIRED per schema
   version: string;                // REQUIRED per schema
   models: Record<string, any>;    // REQUIRED per schema
-  // Additional fields allowed per schema
+  // Additional fields allowed per schema (additionalProperties: true)
 }
 ```
 
-> **Note:** Embedding health responses MUST include `ok`, `server`, `version`, and `models` fields. Additional fields are allowed for forward compatibility.
+> **Note:** Embedding health responses MUST include `ok`, `server`, `version`, and `models` fields. Additional fields are allowed for forward compatibility (`additionalProperties: true`).
 
 **Response Body:**
 ```json
@@ -3071,7 +3063,7 @@ interface EmbeddingHealthStatus {
 
 ### 20.4 Empty Input Handling
 - **Zero-length texts:** Reject empty inputs with `BAD_REQUEST` error
-- **Whitespace-only:** Treat as normal text, not empty
+- **Whitespace-only:** Reject whitespace-only text with `BAD_REQUEST` (treated as empty)
 - **Error preference:** Prefer error over zero vector for empty inputs
 
 ### 20.5 Batch Semantics
@@ -3084,6 +3076,7 @@ interface EmbeddingHealthStatus {
 - **Incremental delivery:** Embeddings delivered as they become available
 - **Streaming code:** All streaming success frames MUST use `code: "STREAMING"`
 - **Final chunk:** Last chunk must have `is_final: true`
+- **Dimension consistency:** The `dimensions` field should reflect the vector length and MUST be consistent within an adapter implementation
 
 ### 20.7 Determinism
 - **Same inputs:** Identical text + model → identical embedding vector
@@ -3150,9 +3143,9 @@ All adapters MUST map provider errors to the canonical taxonomy defined in **ERR
 - **Graph:** `QueryParseError`, `VertexNotFound`, `SchemaValidationError`
 
 ### 22.3 Batch Result Patterns
-**Vector operations** use `{upserted_count|deleted_count, failed_count, failures[]}` for upsert and delete operations.
+**Vector operations** use `{upserted_count|deleted_count, failed_count, failures[]}` for upsert and delete operations, with `failures` as object arrays.
 
-**Embedding batch operations** use `{embeddings, total_texts, total_tokens?, failed_texts[]}`.
+**Embedding batch operations** use `{embeddings, total_texts, total_tokens?, failed_texts[]}` with structured failure objects.
 
 **Graph batch/transaction operations** use `GraphBatchResult` with `{results[], success, error?, transaction_id?}`.
 
@@ -3201,7 +3194,7 @@ All adapters MUST map provider errors to the canonical taxonomy defined in **ERR
 - **No content logging:** Prompts, vectors, embeddings excluded from logs
 - **Structured errors:** Error messages contain no sensitive data
 - **Tenant hashing:** Tenant identifiers hashed in telemetry
-- **Cardinality control:** Bounded label sets in metrics
+- **Cardinality control:** Bounded label sets in all telemetry
 
 ### 24.2 Required Redaction List
 **MUST NOT log or include in telemetry:**
@@ -3261,7 +3254,7 @@ All adapters MUST map provider errors to the canonical taxonomy defined in **ERR
 - [ ] Tenant hashing applied in all telemetry
 - [ ] Deadline propagation with safety buffer
 - [ ] SIEM-safe requirements enforced
-- [ ] Capabilities reported truthfully (protocol field is recommended)
+- [ ] Capabilities reported truthfully (protocol field is recommended except for Embedding where it's REQUIRED)
 - [ ] Wire envelopes follow standardization
 - [ ] Streaming semantics followed
 - [ ] All request envelopes include `op`, `ctx`, `args` keys
@@ -3280,7 +3273,13 @@ All adapters MUST map provider errors to the canonical taxonomy defined in **ERR
 - [ ] Graph delete operations accept IDs or filter (not IDs only)
 - [ ] Graph batch/transaction inner ops use fully-qualified names (e.g., `"graph.upsert_nodes"`)
 - [ ] Graph batch result uses `GraphBatchResult` shape (`results`, `success`, `error`, `transaction_id`)
-- [ ] Graph health includes required fields: `ok`, `status`, `server`, `version`
+- [ ] Graph health includes required fields: `ok`, `status`, `server`, `version` (closed contract)
+- [ ] Namespace precedence defined (per-item namespace takes precedence over args namespace)
+- [ ] `Node.namespace` and `Edge.namespace` are string (not nullable)
+- [ ] Graph upsert operations reject unknown args (schema closed)
+- [ ] `GraphQueryResult.records` accepts any JSON value array
+- [ ] `BulkVerticesSpec.cursor` and `filter` are nullable
+- [ ] `QueryChunk.summary` is `Record<string, any> | null`
 
 **LLM:**
 - [ ] Stop sequence precedence followed
@@ -3293,32 +3292,44 @@ All adapters MUST map provider errors to the canonical taxonomy defined in **ERR
 - [ ] Completion results include `model_family`
 - [ ] TokenUsage follows invariant: `total_tokens = prompt_tokens + completion_tokens`
 - [ ] Streaming `usage_so_far` may be omitted in non-final chunks; when present follows TokenUsage schema
-- [ ] LLM health includes required fields: `ok`, `server`, `version`
+- [ ] LLM health includes required fields: `ok`, `server`, `version` (open contract)
+- [ ] `Message.role` accepts any string (not restricted union)
+- [ ] `CompletionSpec` nullable fields handled correctly (`max_tokens`, `stop_sequences`, etc.)
+- [ ] LLM capabilities are closed contract (`additionalProperties: false`)
 
 **Vector:**
 - [ ] Dimension enforcement strict
-- [ ] Filter semantics consistent
+- [ ] Filter semantics consistent with schema flexibility
 - [ ] Metric scoring normalized
 - [ ] Batch size limits enforced
 - [ ] Namespace validation implemented
 - [ ] Text storage strategy behavior implemented
 - [ ] Batch query operation implemented
-- [ ] Namespace result places details in `details` object (not top-level)
+- [ ] Namespace result places details in `details` object
 - [ ] VectorMatch includes both `score` and `distance` (synthesize if needed)
-- [ ] Vector health includes required fields: `ok`, `server`, `version`, `namespaces`
+- [ ] Vector health includes required fields: `ok`, `server`, `version`, `namespaces` (open contract)
+- [ ] Namespace precedence defined (per-item namespace takes precedence over args namespace)
+- [ ] Vector operation args `namespace` is string (not nullable)
+- [ ] `VectorQuerySpec.namespace` is string (not nullable)
+- [ ] Failure arrays accept `object[]` (not strictly typed)
+- [ ] Vector capabilities allow vendor extensions (`additionalProperties: true`)
 
 **Embedding:**
 - [ ] Truncation rules followed
 - [ ] Normalization consistent
 - [ ] Dimension matching enforced
-- [ ] Empty input handling defined
+- [ ] Empty and whitespace-only input handling defined (reject with BAD_REQUEST)
 - [ ] Batch fallback behavior implemented
 - [ ] Streaming embedding operation for single text only (not batch)
 - [ ] Caching support implemented where available
 - [ ] Failed batch items include required `code` field
 - [ ] Unary embed operation rejects `stream=true` (streaming uses separate `embedding.stream_embed`)
 - [ ] Statistics operation (`embedding.get_stats`) implemented
-- [ ] Embedding health includes required fields: `ok`, `server`, `version`, `models`
+- [ ] Embedding health includes required fields: `ok`, `server`, `version`, `models` (open contract)
+- [ ] `EmbedSpec` includes `stream?: false`
+- [ ] `EmbedResult.tokens_used` and `EmbedBatchResult.total_tokens` are integer|null
+- [ ] Embedding streaming example shows consistent dimensions
+- [ ] Embedding chunk schema is closed (`additionalProperties: false`)
 
 ## 27. Cross-Protocol Standardization Tables
 
@@ -3334,14 +3345,15 @@ All adapters MUST map provider errors to the canonical taxonomy defined in **ERR
 | `read_only` | OPTIONAL | ✓ | OPTIONAL | OPTIONAL | OPTIONAL |
 | `degraded` | OPTIONAL | ✓ | OPTIONAL | OPTIONAL | OPTIONAL |
 | `message` | OPTIONAL | OPTIONAL | OPTIONAL | OPTIONAL | OPTIONAL |
+| **Schema Openness** | **Varies** | **Closed** | **Open** | **Open** | **Open** |
 
-> **Note:** Health responses MAY include additional fields beyond those listed. All health schemas allow `additionalProperties: true` for forward compatibility. Specific required fields per schema: Graph requires `ok`, `status`, `server`, `version`; LLM requires `ok`, `server`, `version`; Vector requires `ok`, `server`, `version`, `namespaces`; Embedding requires `ok`, `server`, `version`, `models`.
+> **Note:** Health response openness varies by protocol: Graph health is closed (`additionalProperties: false`); LLM, Vector, and Embedding health responses are open (`additionalProperties: true`). All health responses MUST include their schema-required fields.
 
 ### 27.2 Batch Operation Standardization
 | Protocol | Batch Result Shape | Notes |
 |----------|-------------------|-------|
-| **Vector** | `{upserted_count|deleted_count, failed_count, failures[]}` | Used for upsert and delete operations |
-| **Embedding** | `{embeddings, total_texts, total_tokens?, failed_texts[]}` | Used for batch embedding operations |
+| **Vector** | `{upserted_count|deleted_count, failed_count, failures[]}` | `failures` is `object[]` (not strictly typed) |
+| **Embedding** | `{embeddings, total_texts, total_tokens?, failed_texts[]}` | `failed_texts` items include `index`, `text`, `error`, `code`, `message` |
 | **Graph** | `GraphBatchResult` | Protocol-specific shape: `{results[], success, error?, transaction_id?}` |
 | **LLM** | N/A | No batch operations defined |
 
@@ -3358,7 +3370,7 @@ All adapters MUST map provider errors to the canonical taxonomy defined in **ERR
 | Error delivery | REQUIRED | Single error event terminates |
 | Order preservation | REQUIRED | Maintains semantic order |
 | Backpressure | RECOMMENDED | Respect client consumption |
-| Heartbeats | OPTIONAL | Keep-alive messages |
+| Heartbeats | OPTIONAL | Keep-alive messages (must validate as chunk schema) |
 | **Streaming code** | **REQUIRED** | **MUST use `code: "STREAMING"`** |
 | **Embedding streaming** | **SINGLE-TEXT** | **embedding.stream_embed processes single text only** |
 
@@ -3390,7 +3402,7 @@ All adapters MUST map provider errors to the canonical taxonomy defined in **ERR
 - **Tenant:** Logical isolation boundary for multi-tenant deployments
 - **Namespace:** Protocol-specific isolation scope (collections, graphs, etc.)
 - **OperationContext:** Request-scoped context for deadlines, tracing, etc.
-- **Thin mode:** Adapter composition under external control plane (no-op policies)
+- **Thin mode:** Adapter composition under external control plane (no-op policies but still rejects expired deadlines)
 - **Standalone mode:** Direct use with built-in resiliency patterns
 - **Wire envelope:** Canonical JSON format for all protocol communications
 - **SIEM-safe:** Telemetry design that prevents sensitive data exposure
@@ -3540,9 +3552,9 @@ All adapters MUST map provider errors to the canonical taxonomy defined in **ERR
 
 **Embedding Stream Frames:**
 ```json
-{"ok": true, "code": "STREAMING", "ms": 12.3, "chunk": {"embeddings": [{"vector": [0.1, 0.2], "text": "Text for streaming embeddings", "model": "text-embedding-3-large", "dimensions": 3072}], "is_final": false}}
-{"ok": true, "code": "STREAMING", "ms": 15.7, "chunk": {"embeddings": [{"vector": [0.3, 0.4], "text": "Text for streaming embeddings", "model": "text-embedding-3-large", "dimensions": 3072}], "is_final": false}}
-{"ok": true, "code": "STREAMING", "ms": 18.2, "chunk": {"embeddings": [{"vector": [0.5, 0.6], "text": "Text for streaming embeddings", "model": "text-embedding-3-large", "dimensions": 3072}], "is_final": true, "usage": {"total_tokens": 8}}}
+{"ok": true, "code": "STREAMING", "ms": 12.3, "chunk": {"embeddings": [{"vector": [0.1, 0.2, 0.3, 0.4, 0.5], "text": "Text for streaming embeddings", "model": "text-embedding-3-large", "dimensions": 5}], "is_final": false}}
+{"ok": true, "code": "STREAMING", "ms": 15.7, "chunk": {"embeddings": [{"vector": [0.6, 0.7, 0.8, 0.9, 1.0], "text": "Text for streaming embeddings", "model": "text-embedding-3-large", "dimensions": 5}], "is_final": false}}
+{"ok": true, "code": "STREAMING", "ms": 18.2, "chunk": {"embeddings": [{"vector": [1.1, 1.2, 1.3, 1.4, 1.5], "text": "Text for streaming embeddings", "model": "text-embedding-3-large", "dimensions": 5}], "is_final": true, "usage": {"total_tokens": 8}}}
 ```
 
 ### 29.5 Context Deadline Examples
@@ -3567,7 +3579,7 @@ All adapters MUST map provider errors to the canonical taxonomy defined in **ERR
 ```python
 # Thin mode (external control plane)
 adapter = BaseLLMAdapter(mode="thin")
-# Result: NoopDeadline, NoopBreaker, NoopCache, NoopLimiter
+# Result: NoopDeadline (but still rejects expired deadlines), NoopBreaker, NoopCache, NoopLimiter
 
 # Standalone mode (direct use)  
 adapter = BaseLLMAdapter(mode="standalone")
@@ -3612,3 +3624,4 @@ adapter = BaseLLMAdapter(mode="standalone")
 ---
 
 *End of PROTOCOLS.md (protocols_version 1.0)*
+```
