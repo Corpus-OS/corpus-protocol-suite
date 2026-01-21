@@ -1814,7 +1814,7 @@ interface LLMHealthStatus {
 - **Role flexibility:** While the schema allows any string role, for interoperability roles SHOULD be one of `system`, `user`, `assistant`, or `tool`. Adapters MUST accept and forward any string role provided by clients.
 
 ### 12.2 Determinism Requirements
-- **Same inputs:** Identical messages + parameters → identical outputs when `temperature=0`
+- **Same inputs:** Identical messages + parameters SHOULD lead to relatively identical outputs when `temperature=0`
 - **Stream equivalence:** Concatenated stream chunks MUST match non-streamed completion
 - **Seed behavior:** When `seed` provided, identical outputs across requests
 
