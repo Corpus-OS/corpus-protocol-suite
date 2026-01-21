@@ -81,3 +81,23 @@ async def test_capabilities_all_required_fields_present(adapter):
     assert caps.version and isinstance(caps.version, str)
     assert caps.protocol == VECTOR_PROTOCOL_ID
     assert isinstance(caps.supported_metrics, tuple) and caps.supported_metrics
+
+
+async def test_capabilities_text_storage_strategy_enum_and_text_limits(adapter):
+    """NEW: Verify text storage strategy is a known enum and text limits are well-typed."""
+    caps = await adapter.capabilities()
+
+    # Strategy enum: contract-level shape.
+    assert isinstance(caps.text_storage_strategy, str)
+    assert caps.text_storage_strategy in {"metadata", "docstore", "none"}
+
+    # max_text_length is optional; when provided must be positive int.
+    if caps.max_text_length is not None:
+        assert isinstance(caps.max_text_length, int)
+        assert caps.max_text_length > 0
+
+
+async def test_capabilities_supports_batch_queries_flag_boolean(adapter):
+    """NEW: Verify supports_batch_queries is present and boolean."""
+    caps = await adapter.capabilities()
+    assert isinstance(getattr(caps, "supports_batch_queries"), bool)
