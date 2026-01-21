@@ -84,6 +84,36 @@ The Corpus Schema Reference provides the definitive JSON Schema definitions for 
 
 **Scope:** This document covers all JSON Schema definitions, validation rules, and testing infrastructure for protocol compliance. It does not define provider-specific implementations or transport-layer specifics.
 
+### Enforcement & Extensibility Model (Normative)
+
+This specification defines **two contracts**:
+
+**(A) Wire Contract (handler-enforced)**
+- The wire handler validates only the **envelope shape** and a small set of cross-protocol invariants.
+- For all requests, the handler enforces:
+  - `op` is a string
+  - `ctx` is an object (mapping)
+  - `args` is an object (mapping)
+- For streaming operations, the handler enforces the streaming envelope shape and terminal rules in §5.3.
+- The wire handler does **not** fully validate adapter/provider return payloads at runtime.
+
+**(B) Conformance Contract (schemas/tests/SDK-enforced)**
+- All protocol-specific request/response schemas, type schemas, and invariants in this document are **normative for adapters, SDKs, golden fixtures, and CI/CD conformance**.
+- Production deployments MAY validate at runtime (STRICT/SAMPLED/LAZY), but conformance remains the source of truth.
+
+#### Extension Boundaries (Normative)
+
+Extensibility is **allowed only at the input boundary**:
+- Request envelopes MAY include additional fields beyond `op`, `ctx`, and `args`.
+- `ctx` and `args` are pass-through extension points; `ctx.attrs` is the preferred location for structured extensions.
+
+Extensibility is **prohibited for outputs/contracts** unless explicitly stated:
+- Success/error/streaming envelopes and type definitions are closed where `additionalProperties: false` is specified.
+- When vendor extensions are permitted, keys MUST be `x-` prefixed (e.g., `x-provider-*`) to avoid collisions.
+
+**Reading rule:** `additionalProperties: true` indicates an explicit extension point; `additionalProperties: false` indicates a closed contract.
+
+
 ### 1.2 Document Relationships
 
 | Document | Purpose | Relationship to SCHEMA.md |
