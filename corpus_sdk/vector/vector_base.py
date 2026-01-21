@@ -150,6 +150,7 @@ and is aligned with the canonical envelope contract.
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import logging
@@ -791,12 +792,15 @@ class InMemoryTTLCache:
     async def invalidate_namespace(self, namespace: str) -> None:
         """
         Best-effort namespace invalidation based on the standard cache key
-        pattern used by BaseVectorAdapter (`ns=<namespace>:`).
+        pattern used by BaseVectorAdapter (`:ns=<namespace>:`).
+
+        This is intentionally strict: it requires a trailing ':' delimiter so
+        namespaces like "a" won't match "ab".
         """
         if not namespace:
             return
-        pattern = f"ns={namespace}:"
-        keys_to_remove = [k for k in list(self._store.keys()) if pattern in k]
+        needle = f":ns={namespace}:"
+        keys_to_remove = [k for k in list(self._store.keys()) if needle in k]
         for k in keys_to_remove:
             self._store.pop(k, None)
 
@@ -1189,6 +1193,19 @@ class BaseVectorAdapter(VectorProtocolV1):
       - Includes optimization to skip normalization if vector is already unit length
       - Applied consistently to query, batch_query, and upsert operations
 
+    Namespace Semantics (Footgun Prevention):
+      - UpsertSpec.namespace is authoritative.
+        Vector.namespace MAY be provided for convenience, but MUST match spec.namespace if present.
+        All vectors are canonicalized so Vector.namespace == UpsertSpec.namespace before backend calls.
+
+      - BatchQuerySpec.namespace is authoritative.
+        QuerySpec.namespace MUST match batch namespace.
+        All queries are canonicalized so QuerySpec.namespace == BatchQuerySpec.namespace.
+
+    Cache Safety:
+      - InMemoryTTLCache stores by reference. Cached values are defensively deep-copied
+        on store and on return to prevent mutation poisoning across requests.
+
     Threading:
         - In-memory infra (cache, breaker, limiter) is not thread-safe.
         - Intended for single-threaded async event loops. Use external distributed
@@ -1326,6 +1343,37 @@ class BaseVectorAdapter(VectorProtocolV1):
         if not isinstance(value, str) or not value.strip():
             raise BadRequest(f"{name} must be a non-empty string")
 
+    @staticmethod
+    def _cache_safe_copy_for_store(value: Any) -> Any:
+        """
+        Best-effort defensive copy before placing values into an in-memory cache.
+
+        Why:
+            InMemoryTTLCache stores objects by reference. If a caller mutates a returned
+            object (or an adapter mutates a previously returned object), cached values
+            can become corrupted or leak across requests.
+
+        Behavior:
+            - Uses copy.deepcopy for strong isolation.
+            - Fail-open: if deepcopy fails, stores the original object (preserves legacy behavior).
+        """
+        try:
+            return copy.deepcopy(value)
+        except Exception:
+            return value
+
+    @staticmethod
+    def _cache_safe_copy_for_return(value: Any) -> Any:
+        """
+        Best-effort defensive copy when returning a cached value to callers.
+
+        This prevents callers from mutating a cached instance in-place.
+        """
+        try:
+            return copy.deepcopy(value)
+        except Exception:
+            return value
+
     def _validate_vector(self, vector: List[float], normalize: bool = False) -> List[float]:
         """
         Validate that a vector is properly formed and optionally normalize it.
@@ -1333,6 +1381,7 @@ class BaseVectorAdapter(VectorProtocolV1):
         Requirements:
             - non-empty list
             - all elements numeric (int/float)
+            - all elements finite (reject NaN/Inf for backend determinism)
 
         Args:
             vector: The input vector list.
@@ -1344,17 +1393,28 @@ class BaseVectorAdapter(VectorProtocolV1):
         """
         if not isinstance(vector, list) or not vector:
             raise BadRequest("vector must be a non-empty list of floats")
-        if not all(isinstance(x, (int, float)) for x in vector):
-            raise BadRequest("vector must contain only numeric values")
+
+        # Validate numeric + finite. NaN/Inf are a common production footgun; reject early.
+        for i, x in enumerate(vector):
+            if not isinstance(x, (int, float)):
+                raise BadRequest(
+                    "vector must contain only numeric values",
+                    details={"index": i, "type": type(x).__name__},
+                )
+            if not math.isfinite(float(x)):
+                raise BadRequest(
+                    "vector must contain only finite values (no NaN/Inf)",
+                    details={"index": i},
+                )
 
         if normalize:
-            norm = math.sqrt(sum(x * x for x in vector))
+            norm = math.sqrt(sum(float(x) * float(x) for x in vector))
             if norm == 0:
                 raise BadRequest("cannot normalize zero-length vector")
             # Optimization: if already close to 1.0, return as-is
             if abs(norm - 1.0) < 1e-6:
                 return vector
-            return [x / norm for x in vector]
+            return [float(x) / norm for x in vector]
 
         return vector
 
@@ -1439,7 +1499,6 @@ class BaseVectorAdapter(VectorProtocolV1):
         try:
             return await self._deadline.wrap(awaitable, ctx)
         except DeadlineExceeded:
-            # Propagate adapter-specific deadline errors
             raise
         except asyncio.TimeoutError:
             raise DeadlineExceeded("operation timed out", details={"remaining_ms": 0})
@@ -1469,12 +1528,9 @@ class BaseVectorAdapter(VectorProtocolV1):
         for different types that serialize to identical JSON.
         """
         if isinstance(obj, (list, dict)):
-            # Stable JSON with type prefix
             payload = json.dumps(obj, sort_keys=True, separators=(",", ":"))
             return hashlib.sha256(f"j:{payload}".encode()).hexdigest()
-        else:
-            # Use repr for non-JSON types with prefix
-            return hashlib.sha256(f"p:{repr(obj)}".encode()).hexdigest()
+        return hashlib.sha256(f"p:{repr(obj)}".encode()).hexdigest()
 
     def _query_cache_key(
         self,
@@ -1521,7 +1577,6 @@ class BaseVectorAdapter(VectorProtocolV1):
         caps_part = f"{caps.server}:{caps.version}" if caps else "unknown"
         text_strategy = caps.text_storage_strategy if caps else "unknown"
 
-        # Hash all queries for the cache key
         queries_hash = self._hash_obj([
             {
                 "vector": q.vector,
@@ -1547,11 +1602,10 @@ class BaseVectorAdapter(VectorProtocolV1):
         Return a string pattern for cache keys belonging to a specific namespace.
         Used for cache invalidation on write operations.
 
-        Note: This uses simple substring matching for in-memory cache.
-        For distributed caches, cache implementations can provide their own
-        `invalidate_namespace(namespace: str)` hook.
+        Note: This uses a strict, delimiter-aware pattern used by BaseVectorAdapter
+        cache keys (':ns=<namespace>:') to prevent overlap between namespaces.
         """
-        return f"ns={namespace}:"
+        return f":ns={namespace}:"
 
     async def _invalidate_namespace_cache(self, namespace: str) -> None:
         """
@@ -1561,20 +1615,191 @@ class BaseVectorAdapter(VectorProtocolV1):
             - If the underlying cache exposes an async `invalidate_namespace(namespace)`
               method, it is called directly.
             - Otherwise, this is a no-op and TTL-based expiry is relied upon.
-
-        This avoids reaching into cache internals (e.g., _store) and allows
-        distributed caches to provide their own invalidation semantics.
         """
         if isinstance(self._cache, NoopCache):
             return
-
         try:
             invalidate = getattr(self._cache, "invalidate_namespace", None)
             if callable(invalidate):
                 await invalidate(namespace)
         except Exception:
-            # Never let cache invalidation break the main operation
             LOG.debug("Cache invalidation failed for namespace %s", namespace)
+
+    # --- docstore helpers (centralized to avoid duplication) -----------------
+
+    async def _docstore_hydrate_matches(
+        self,
+        matches: List[VectorMatch],
+        *,
+        op: str,
+        namespace: str,
+    ) -> List[VectorMatch]:
+        """
+        Best-effort hydration of VectorMatch.vector.text via docstore.
+
+        Optimization:
+            - De-duplicates doc IDs while preserving first-seen order to avoid
+              redundant docstore fetches in batch-heavy workloads.
+
+        Contract notes:
+            - Hydration failures NEVER fail the main operation.
+            - Missing docs simply result in text remaining None.
+
+        Metrics:
+            - docstore_docs_requested / docstore_docs_returned (low-cardinality)
+            - docstore_hydration_errors on exceptions
+        """
+        if self._docstore is None or not matches:
+            return matches
+
+        raw_ids = [str(m.vector.id) for m in matches]
+        unique_ids = list(dict.fromkeys(raw_ids))
+
+        try:
+            self._metrics.counter(
+                component=self._component,
+                name="docstore_docs_requested",
+                value=len(unique_ids),
+                extra={"op": op},
+            )
+
+            docs = await self._docstore.batch_get(unique_ids)
+
+            self._metrics.counter(
+                component=self._component,
+                name="docstore_docs_returned",
+                value=len(docs),
+                extra={"op": op},
+            )
+
+            hydrated: List[VectorMatch] = []
+            for m in matches:
+                doc = docs.get(str(m.vector.id))
+                if doc is not None:
+                    hydrated_vector = Vector(
+                        id=m.vector.id,
+                        vector=m.vector.vector,
+                        metadata=m.vector.metadata,
+                        namespace=m.vector.namespace,
+                        text=doc.text,
+                    )
+                    hydrated.append(VectorMatch(vector=hydrated_vector, score=m.score, distance=m.distance))
+                else:
+                    hydrated.append(m)
+            return hydrated
+        except Exception as e:
+            LOG.debug(
+                "Docstore hydration failed for op=%s namespace=%s: %r",
+                op,
+                namespace,
+                e,
+            )
+            self._metrics.counter(
+                component=self._component,
+                name="docstore_hydration_errors",
+                value=1,
+                extra={"op": op},
+            )
+            return matches
+
+    async def _docstore_hydrate_query_result(self, res: QueryResult, *, op: str) -> QueryResult:
+        """Hydrate a single QueryResult in a best-effort manner."""
+        if self._docstore is None or not res.matches:
+            return res
+        hydrated_matches = await self._docstore_hydrate_matches(res.matches, op=op, namespace=res.namespace)
+        if hydrated_matches is res.matches:
+            return res
+        return QueryResult(
+            matches=hydrated_matches,
+            query_vector=res.query_vector,
+            namespace=res.namespace,
+            total_matches=res.total_matches,
+        )
+
+    async def _docstore_hydrate_query_results(
+        self,
+        results: List[QueryResult],
+        *,
+        op: str,
+        namespace: str,
+    ) -> List[QueryResult]:
+        """
+        Hydrate a list of QueryResult objects efficiently.
+
+        Optimization:
+            - De-duplicates doc IDs across all results while preserving order,
+              preventing redundant docstore fetches when the same vector appears
+              in multiple result sets.
+        """
+        if self._docstore is None or not results:
+            return results
+
+        all_matches: List[VectorMatch] = []
+        for r in results:
+            if r.matches:
+                all_matches.extend(r.matches)
+
+        if not all_matches:
+            return results
+
+        raw_ids = [str(m.vector.id) for m in all_matches]
+        unique_ids = list(dict.fromkeys(raw_ids))
+
+        try:
+            self._metrics.counter(
+                component=self._component,
+                name="docstore_docs_requested",
+                value=len(unique_ids),
+                extra={"op": op},
+            )
+
+            docs = await self._docstore.batch_get(unique_ids)
+
+            self._metrics.counter(
+                component=self._component,
+                name="docstore_docs_returned",
+                value=len(docs),
+                extra={"op": op},
+            )
+
+            hydrated_results: List[QueryResult] = []
+            for r in results:
+                if not r.matches:
+                    hydrated_results.append(r)
+                    continue
+
+                hydrated_matches: List[VectorMatch] = []
+                for m in r.matches:
+                    doc = docs.get(str(m.vector.id))
+                    if doc is not None:
+                        hydrated_vector = Vector(
+                            id=m.vector.id,
+                            vector=m.vector.vector,
+                            metadata=m.vector.metadata,
+                            namespace=m.vector.namespace,
+                            text=doc.text,
+                        )
+                        hydrated_matches.append(VectorMatch(vector=hydrated_vector, score=m.score, distance=m.distance))
+                    else:
+                        hydrated_matches.append(m)
+
+                hydrated_results.append(QueryResult(
+                    matches=hydrated_matches,
+                    query_vector=r.query_vector,
+                    namespace=r.namespace,
+                    total_matches=r.total_matches,
+                ))
+
+            return hydrated_results
+        except Exception as e:
+            LOG.debug("Docstore hydration failed for op=%s namespace=%s: %r", op, namespace, e)
+            self._metrics.counter(
+                component=self._component,
+                name="docstore_hydration_errors",
+                value=1,
+                extra={"op": op},
+            )
+            return results
 
     # --- unified unary gate wrapper (for data-path ops) ----------------------
 
@@ -1596,18 +1821,12 @@ class BaseVectorAdapter(VectorProtocolV1):
             - Rate limiter acquire/release
             - DeadlinePolicy enforcement
             - Metrics emission (success/failure) with optional result-derived fields
-
-        Behavior is aligned with the explicit per-method logic:
-            - Same error types and codes
-            - Same breaker semantics
-            - Same limiter semantics
         """
         extras = dict(metric_extra or {})
         self._fail_if_expired(ctx)
 
         if not self._breaker.allow():
             e = Unavailable("circuit open")
-            # Record immediately to preserve observability for hard rejections
             self._record(op, time.monotonic(), False, code=e.code or type(e).__name__, ctx=ctx, **extras)
             raise e
 
@@ -1616,39 +1835,22 @@ class BaseVectorAdapter(VectorProtocolV1):
         try:
             result = await self._apply_deadline(call(), ctx)
 
-            # Allow per-op enrichment based on the result (e.g., matches, counts, cache hit)
             if on_result is not None:
                 try:
                     res_extras = on_result(result) or {}
                     extras.update(res_extras)
                 except Exception:
-                    # Never let metrics enrichment break the main path
                     pass
 
             self._record(op, t0, True, ctx=ctx, **extras)
             self._breaker.on_success()
             return result
         except VectorAdapterError as e:
-            self._record(
-                op,
-                t0,
-                False,
-                code=e.code or type(e).__name__,
-                ctx=ctx,
-                **extras,
-            )
+            self._record(op, t0, False, code=e.code or type(e).__name__, ctx=ctx, **extras)
             self._breaker.on_error(e)
             raise
         except Exception as e:
-            # Cross-SDK alignment: standardize unknown exception metrics code.
-            self._record(
-                op,
-                t0,
-                False,
-                code="UNAVAILABLE",
-                ctx=ctx,
-                **extras,
-            )
+            self._record(op, t0, False, code="UNAVAILABLE", ctx=ctx, **extras)
             self._breaker.on_error(e)
             raise
         finally:
@@ -1666,7 +1868,6 @@ class BaseVectorAdapter(VectorProtocolV1):
         """
         t0 = time.monotonic()
         try:
-            # Check cache if TTL is non-zero
             if self._mode == "standalone" and self._cache_caps_ttl_s > 0:
                 cached = await self._cache.get(self._caps_cache_key)
                 if cached:
@@ -1676,19 +1877,22 @@ class BaseVectorAdapter(VectorProtocolV1):
                         value=1,
                         extra={"op": "capabilities"},
                     )
-                    self._record("capabilities", t0, True)
-                    return cached
+                    self._record("capabilities", t0, True, cache_hit=True)
+                    return self._cache_safe_copy_for_return(cached)
 
             caps = await self._apply_deadline(self._do_capabilities(), ctx=None)
 
-            # Cache if TTL is non-zero
             if self._mode == "standalone" and self._cache_caps_ttl_s > 0:
                 try:
-                    await self._cache.set(self._caps_cache_key, caps, ttl_s=self._cache_caps_ttl_s)
+                    await self._cache.set(
+                        self._caps_cache_key,
+                        self._cache_safe_copy_for_store(caps),
+                        ttl_s=self._cache_caps_ttl_s,
+                    )
                 except Exception:
                     pass
 
-            self._record("capabilities", t0, True)
+            self._record("capabilities", t0, True, cache_hit=False)
             return caps
         except VectorAdapterError as e:
             self._record("capabilities", t0, False, code=e.code or type(e).__name__)
@@ -1706,25 +1910,14 @@ class BaseVectorAdapter(VectorProtocolV1):
         """
         Execute a vector similarity search query with validation and metrics.
 
-        See VectorProtocolV1.query for full documentation.
-
         Docstore Behavior:
             - If docstore is configured and text hydration fails, the query continues
               but vectors will have text=None (graceful degradation).
 
         Auto-Normalization:
-            - If auto_normalize is enabled, query vectors are normalized to unit length
-            - Particularly useful for cosine similarity searches
-
-        Backpressure note:
-            - For high top_k values or very hot namespaces, consider using a
-              distributed rate limiter in addition to the built-in per-process
-              token bucket to avoid overload in large clusters.
+            - If auto_normalize is enabled, query vectors are normalized to unit length.
         """
-        # Structural validation and optional normalization
         spec_vector = self._validate_vector(spec.vector, normalize=self._auto_normalize)
-
-        # Track if normalization occurred for metrics
         normalization_occurred = self._auto_normalize and spec_vector is not spec.vector
 
         self._require_non_empty("namespace", spec.namespace)
@@ -1735,7 +1928,6 @@ class BaseVectorAdapter(VectorProtocolV1):
         if not isinstance(spec.include_metadata, bool) or not isinstance(spec.include_vectors, bool):
             raise BadRequest("include_metadata/include_vectors must be booleans")
 
-        # If normalization changed the vector, create new spec
         if normalization_occurred:
             spec = QuerySpec(
                 vector=spec_vector,
@@ -1743,17 +1935,17 @@ class BaseVectorAdapter(VectorProtocolV1):
                 namespace=spec.namespace,
                 filter=spec.filter,
                 include_metadata=spec.include_metadata,
-                include_vectors=spec.include_vectors
+                include_vectors=spec.include_vectors,
             )
 
-        # JSON-serializability validation for filters (wire/caching safety)
         if spec.filter is not None:
             self._ensure_json_serializable(spec.filter, "filter")
+
+        cache_hit_flag: Dict[str, bool] = {"hit": False}
 
         async def _call() -> QueryResult:
             caps = await self.capabilities()
 
-            # Capability gating
             if caps.max_dimensions and len(spec.vector) > int(caps.max_dimensions):
                 raise DimensionMismatch(
                     f"vector dimension {len(spec.vector)} exceeds max {caps.max_dimensions}",
@@ -1767,86 +1959,26 @@ class BaseVectorAdapter(VectorProtocolV1):
             if spec.filter and not caps.supports_metadata_filtering:
                 raise NotSupported("metadata filtering is not supported by this adapter")
 
-            # Read-path cache (standalone only with non-zero TTL)
-            cache_hit = False
             if self._mode == "standalone" and self._cache_query_ttl_s > 0:
                 ck = self._query_cache_key(spec, caps, ctx)
                 cached = await self._cache.get(ck)
                 if cached:
-                    cache_hit = True
-                    self._metrics.counter(
-                        component=self._component,
-                        name="cache_hits",
-                        value=1,
-                        extra={"op": "query"},
-                    )
-                    return cached
-                else:
-                    self._metrics.counter(
-                        component=self._component,
-                        name="cache_misses",
-                        value=1,
-                        extra={"op": "query"},
-                    )
+                    cache_hit_flag["hit"] = True
+                    self._metrics.counter(component=self._component, name="cache_hits", value=1, extra={"op": "query"})
+                    return self._cache_safe_copy_for_return(cached)
+                self._metrics.counter(component=self._component, name="cache_misses", value=1, extra={"op": "query"})
 
-            # Execute backend query
             result = await self._do_query(spec, ctx=ctx)
+            result = await self._docstore_hydrate_query_result(result, op="query")
 
-            # Hydrate text from docstore if configured (graceful degradation on failure)
-            if self._docstore is not None and result.matches:
-                try:
-                    doc_ids = [str(match.vector.id) for match in result.matches]
-                    docs = await self._docstore.batch_get(doc_ids)
-
-                    # Rebuild matches with hydrated text
-                    hydrated_matches = []
-                    for match in result.matches:
-                        doc = docs.get(str(match.vector.id))
-                        if doc is not None:
-                            # Create new vector with text populated
-                            hydrated_vector = Vector(
-                                id=match.vector.id,
-                                vector=match.vector.vector,
-                                metadata=match.vector.metadata,
-                                namespace=match.vector.namespace,
-                                text=doc.text  # Hydrated from docstore
-                            )
-                            hydrated_matches.append(VectorMatch(
-                                vector=hydrated_vector,
-                                score=match.score,
-                                distance=match.distance
-                            ))
-                        else:
-                            # No text found, pass through as-is
-                            hydrated_matches.append(match)
-
-                    # Replace matches with hydrated version
-                    result = QueryResult(
-                        matches=hydrated_matches,
-                        query_vector=result.query_vector,
-                        namespace=result.namespace,
-                        total_matches=result.total_matches
-                    )
-                except Exception as e:
-                    # Graceful degradation: log but don't fail the query
-                    LOG.debug(
-                        "Docstore hydration failed for query in namespace %s: %r",
-                        result.namespace,
-                        e,
-                    )
-                    self._metrics.counter(
-                        component=self._component,
-                        name="docstore_hydration_errors",
-                        value=1,
-                        extra={"op": "query"},
-                    )
-                    # Continue with original result (text will be None)
-
-            # Populate cache if eligible (non-zero TTL and not already cached)
-            if self._mode == "standalone" and self._cache_query_ttl_s > 0 and not cache_hit:
+            if self._mode == "standalone" and self._cache_query_ttl_s > 0 and not cache_hit_flag["hit"]:
                 try:
                     ck = self._query_cache_key(spec, caps, ctx)
-                    await self._cache.set(ck, result, ttl_s=self._cache_query_ttl_s)
+                    await self._cache.set(
+                        ck,
+                        self._cache_safe_copy_for_store(result),
+                        ttl_s=self._cache_query_ttl_s,
+                    )
                 except Exception:
                     pass
 
@@ -1856,45 +1988,23 @@ class BaseVectorAdapter(VectorProtocolV1):
             extra: Dict[str, Any] = {
                 "namespace": spec.namespace,
                 "top_k": spec.top_k,
+                "cache_hit": bool(cache_hit_flag["hit"]),
             }
             try:
                 extra["matches"] = len(res.matches)
             except Exception:
                 pass
-            # Record normalization metrics if it occurred
             if normalization_occurred:
                 extra["vector_normalized"] = True
             return extra
 
-        result = await self._with_gates_unary(
-            op="query",
-            ctx=ctx,
-            call=_call,
-            on_result=_on_result,
-        )
+        result = await self._with_gates_unary(op="query", ctx=ctx, call=_call, on_result=_on_result)
 
-        # Record normalization metric if it occurred
         if normalization_occurred:
-            self._metrics.counter(
-                component=self._component,
-                name="vectors_normalized",
-                value=1,
-                extra={"op": "query"},
-            )
+            self._metrics.counter(component=self._component, name="vectors_normalized", value=1, extra={"op": "query"})
 
-        # Request counters (keep legacy name and add cross-component-friendly name)
-        self._metrics.counter(
-            component=self._component,
-            name="queries",
-            value=1,
-        )
-        self._metrics.counter(
-            component=self._component,
-            name="requests_total",
-            value=1,
-            extra={"op": "query"},
-        )
-
+        self._metrics.counter(component=self._component, name="queries", value=1)
+        self._metrics.counter(component=self._component, name="requests_total", value=1, extra={"op": "query"})
         return result
 
     async def batch_query(
@@ -1906,31 +2016,39 @@ class BaseVectorAdapter(VectorProtocolV1):
         """
         Execute multiple vector similarity search queries in batch.
 
-        This can be more efficient than individual queries for some backends.
-        Adapters that don't support batch queries should raise NotSupported.
+        Namespace Semantics:
+            - BatchQuerySpec.namespace is authoritative.
+            - QuerySpec.namespace MUST match batch namespace (prevents silent cross-namespace behavior).
+            - Queries are canonicalized so QuerySpec.namespace == BatchQuerySpec.namespace.
 
         Docstore Behavior:
-            - If docstore is configured and text hydration fails, the batch query continues
-              but vectors will have text=None (graceful degradation).
+            - Hydration is best-effort and does not fail the query on errors.
 
         Auto-Normalization:
-            - If auto_normalize is enabled, all query vectors are normalized to unit length
+            - If auto_normalize is enabled, all query vectors are normalized to unit length.
         """
         self._require_non_empty("namespace", spec.namespace)
         if not spec.queries:
             raise BadRequest("queries must not be empty")
 
-        # Validate each query and track normalization
-        normalized_queries = []
-        queries_changed = False
+        normalized_queries: List[QuerySpec] = []
         normalization_count = 0
 
         for i, query in enumerate(spec.queries):
-            norm_vec = self._validate_vector(query.vector, normalize=self._auto_normalize)
+            # Enforce namespace match (authoritative batch namespace)
+            if query.namespace != spec.namespace:
+                raise BadRequest(
+                    f"query[{i}].namespace must match batch namespace",
+                    details={
+                        "index": i,
+                        "batch_namespace": spec.namespace,
+                        "query_namespace": query.namespace,
+                    },
+                )
 
-            # Track if this vector was normalized
-            if self._auto_normalize and norm_vec is not query.vector:
-                queries_changed = True
+            norm_vec = self._validate_vector(query.vector, normalize=self._auto_normalize)
+            normalized = self._auto_normalize and norm_vec is not query.vector
+            if normalized:
                 normalization_count += 1
 
             if not isinstance(query.top_k, int) or query.top_k <= 0:
@@ -1940,22 +2058,20 @@ class BaseVectorAdapter(VectorProtocolV1):
             if query.filter is not None:
                 self._ensure_json_serializable(query.filter, f"query[{i}].filter")
 
-            if self._auto_normalize and norm_vec is not query.vector:
-                # Create updated query spec
-                normalized_queries.append(QuerySpec(
-                    vector=norm_vec,
-                    top_k=query.top_k,
-                    namespace=query.namespace,
-                    filter=query.filter,
-                    include_metadata=query.include_metadata,
-                    include_vectors=query.include_vectors
-                ))
-            else:
-                normalized_queries.append(query)
+            # Canonicalize namespace in all query specs (authoritative batch namespace)
+            normalized_queries.append(QuerySpec(
+                vector=norm_vec if normalized else query.vector,
+                top_k=query.top_k,
+                namespace=spec.namespace,
+                filter=query.filter,
+                include_metadata=query.include_metadata,
+                include_vectors=query.include_vectors,
+            ))
 
-        # Update spec if normalization occurred
-        if queries_changed:
-            spec = BatchQuerySpec(queries=normalized_queries, namespace=spec.namespace)
+        # Always use canonicalized queries to remove any ambiguity.
+        spec = BatchQuerySpec(queries=normalized_queries, namespace=spec.namespace)
+
+        cache_hit_flag: Dict[str, bool] = {"hit": False}
 
         async def _call() -> List[QueryResult]:
             caps = await self.capabilities()
@@ -1963,7 +2079,6 @@ class BaseVectorAdapter(VectorProtocolV1):
             if not caps.supports_batch_queries:
                 raise NotSupported("batch queries are not supported by this adapter")
 
-            # Validate capabilities for all queries
             for i, query in enumerate(spec.queries):
                 if caps.max_dimensions and len(query.vector) > int(caps.max_dimensions):
                     raise DimensionMismatch(
@@ -1978,114 +2093,51 @@ class BaseVectorAdapter(VectorProtocolV1):
                 if query.filter and not caps.supports_metadata_filtering:
                     raise NotSupported(f"query[{i}] metadata filtering is not supported by this adapter")
 
-            # Read-path cache (standalone only with non-zero TTL)
-            cache_hit = False
             if self._mode == "standalone" and self._cache_query_ttl_s > 0:
                 ck = self._batch_query_cache_key(spec, caps, ctx)
                 cached = await self._cache.get(ck)
                 if cached:
-                    cache_hit = True
-                    self._metrics.counter(
-                        component=self._component,
-                        name="cache_hits",
-                        value=1,
-                        extra={"op": "batch_query"},
-                    )
-                    return cached
-                else:
-                    self._metrics.counter(
-                        component=self._component,
-                        name="cache_misses",
-                        value=1,
-                        extra={"op": "batch_query"},
-                    )
+                    cache_hit_flag["hit"] = True
+                    self._metrics.counter(component=self._component, name="cache_hits", value=1, extra={"op": "batch_query"})
+                    return self._cache_safe_copy_for_return(cached)
+                self._metrics.counter(component=self._component, name="cache_misses", value=1, extra={"op": "batch_query"})
 
-            # Execute backend batch query
             results = await self._do_batch_query(spec, ctx=ctx)
 
-            # Hydrate text from docstore if configured (graceful degradation on failure)
-            if self._docstore is not None:
-                try:
-                    # Collect all document IDs from all results
-                    all_doc_ids = []
-                    for result in results:
-                        for match in result.matches:
-                            all_doc_ids.append(str(match.vector.id))
+            # Efficient docstore hydration with cross-result de-duplication.
+            results = await self._docstore_hydrate_query_results(results, op="batch_query", namespace=spec.namespace)
 
-                    if all_doc_ids:
-                        docs = await self._docstore.batch_get(all_doc_ids)
-
-                        # Rebuild all results with hydrated text
-                        hydrated_results = []
-                        for result in results:
-                            hydrated_matches = []
-                            for match in result.matches:
-                                doc = docs.get(str(match.vector.id))
-                                if doc is not None:
-                                    hydrated_vector = Vector(
-                                        id=match.vector.id,
-                                        vector=match.vector.vector,
-                                        metadata=match.vector.metadata,
-                                        namespace=match.vector.namespace,
-                                        text=doc.text
-                                    )
-                                    hydrated_matches.append(VectorMatch(
-                                        vector=hydrated_vector,
-                                        score=match.score,
-                                        distance=match.distance
-                                    ))
-                                else:
-                                    hydrated_matches.append(match)
-
-                            hydrated_results.append(QueryResult(
-                                matches=hydrated_matches,
-                                query_vector=result.query_vector,
-                                namespace=result.namespace,
-                                total_matches=result.total_matches
-                            ))
-
-                        results = hydrated_results
-                except Exception as e:
-                    # Graceful degradation: log but don't fail the batch query
-                    LOG.debug("Docstore hydration failed for batch query in namespace %s: %r", spec.namespace, e)
-                    self._metrics.counter(
-                        component=self._component,
-                        name="docstore_hydration_errors",
-                        value=1,
-                        extra={"op": "batch_query"},
-                    )
-                    # Continue with original results (text will be None)
-
-            # Populate cache if eligible
-            if self._mode == "standalone" and self._cache_query_ttl_s > 0 and not cache_hit:
+            if self._mode == "standalone" and self._cache_query_ttl_s > 0 and not cache_hit_flag["hit"]:
                 try:
                     ck = self._batch_query_cache_key(spec, caps, ctx)
-                    await self._cache.set(ck, results, ttl_s=self._cache_query_ttl_s)
+                    await self._cache.set(
+                        ck,
+                        self._cache_safe_copy_for_store(results),
+                        ttl_s=self._cache_query_ttl_s,
+                    )
                 except Exception:
                     pass
 
             return results
 
         def _on_result(results: List[QueryResult]) -> Mapping[str, Any]:
-            total_matches = sum(len(result.matches) for result in results)
-            extra = {
+            total_matches = 0
+            try:
+                total_matches = sum(len(result.matches) for result in results)
+            except Exception:
+                pass
+            extra: Dict[str, Any] = {
                 "namespace": spec.namespace,
                 "query_count": len(spec.queries),
                 "total_matches": total_matches,
+                "cache_hit": bool(cache_hit_flag["hit"]),
             }
-            # Record normalization metrics if any occurred
             if normalization_count > 0:
                 extra["vectors_normalized"] = normalization_count
             return extra
 
-        results = await self._with_gates_unary(
-            op="batch_query",
-            ctx=ctx,
-            call=_call,
-            on_result=_on_result,
-        )
+        results = await self._with_gates_unary(op="batch_query", ctx=ctx, call=_call, on_result=_on_result)
 
-        # Record normalization metrics if any occurred
         if normalization_count > 0:
             self._metrics.counter(
                 component=self._component,
@@ -2094,23 +2146,9 @@ class BaseVectorAdapter(VectorProtocolV1):
                 extra={"op": "batch_query"},
             )
 
-        self._metrics.counter(
-            component=self._component,
-            name="batch_queries",
-            value=1,
-        )
-        self._metrics.counter(
-            component=self._component,
-            name="queries_in_batch",
-            value=len(spec.queries),
-        )
-        self._metrics.counter(
-            component=self._component,
-            name="requests_total",
-            value=1,
-            extra={"op": "batch_query"},
-        )
-
+        self._metrics.counter(component=self._component, name="batch_queries", value=1)
+        self._metrics.counter(component=self._component, name="queries_in_batch", value=len(spec.queries))
+        self._metrics.counter(component=self._component, name="requests_total", value=1, extra={"op": "batch_query"})
         return results
 
     async def upsert(
@@ -2122,37 +2160,41 @@ class BaseVectorAdapter(VectorProtocolV1):
         """
         Upsert vectors into the vector store with validation and metrics.
 
-        See VectorProtocolV1.upsert for full documentation.
+        Namespace Semantics:
+            - UpsertSpec.namespace is authoritative.
+            - Vector.namespace may be present for convenience, but MUST match spec.namespace if present.
+            - All vectors are canonicalized so Vector.namespace == UpsertSpec.namespace before backend calls.
 
         Docstore Behavior:
-            - If docstore is configured and text storage fails, the entire upsert
-              operation fails (atomicity).
+            - If docstore is configured and text storage fails, the entire upsert fails (atomicity).
 
         Auto-Normalization:
-            - If auto_normalize is enabled, all vectors are normalized to unit length
-              before storage
-
-        Guidance:
-            - For very large batches, respect capabilities.max_batch_size and
-              chunk requests accordingly to avoid memory pressure.
+            - If auto_normalize is enabled, vectors are normalized to unit length before storage.
         """
         self._require_non_empty("namespace", spec.namespace)
         if not spec.vectors:
             raise BadRequest("vectors must not be empty")
 
-        # Validate each vector, id, and its metadata
-        # Normalize vectors if auto_normalize is enabled
-        validated_vectors = []
-        vectors_changed = False
+        validated_vectors: List[Vector] = []
         normalization_count = 0
 
         for v in spec.vectors:
             self._require_non_empty("vector.id", str(v.id))
-            norm_vec = self._validate_vector(v.vector, normalize=self._auto_normalize)
 
-            # Track if this vector was normalized
-            if self._auto_normalize and norm_vec is not v.vector:
-                vectors_changed = True
+            # Namespace footgun prevention: vector.namespace must match spec.namespace if present.
+            if v.namespace is not None and v.namespace != spec.namespace:
+                raise BadRequest(
+                    "vector.namespace must match UpsertSpec.namespace",
+                    details={
+                        "spec_namespace": spec.namespace,
+                        "vector_namespace": v.namespace,
+                        "vector_id": str(v.id),
+                    },
+                )
+
+            norm_vec = self._validate_vector(v.vector, normalize=self._auto_normalize)
+            normalized = self._auto_normalize and norm_vec is not v.vector
+            if normalized:
                 normalization_count += 1
 
             if v.metadata is not None and not isinstance(v.metadata, Mapping):
@@ -2160,31 +2202,27 @@ class BaseVectorAdapter(VectorProtocolV1):
             if v.metadata is not None:
                 self._ensure_json_serializable(v.metadata, "metadata")
 
-            if self._auto_normalize and norm_vec is not v.vector:
-                validated_vectors.append(Vector(
-                    id=v.id,
-                    vector=norm_vec,
-                    metadata=v.metadata,
-                    namespace=v.namespace,
-                    text=v.text
-                ))
-            else:
-                validated_vectors.append(v)
+            # Canonicalize namespace always to eliminate ambiguity.
+            validated_vectors.append(Vector(
+                id=v.id,
+                vector=norm_vec if normalized else v.vector,
+                metadata=v.metadata,
+                namespace=spec.namespace,
+                text=v.text,
+            ))
 
-        if vectors_changed:
-            spec = UpsertSpec(vectors=validated_vectors, namespace=spec.namespace)
+        # Always use canonicalized vectors (removes spec vs vector namespace ambiguity).
+        spec = UpsertSpec(vectors=validated_vectors, namespace=spec.namespace)
 
         async def _call() -> UpsertResult:
             caps = await self.capabilities()
 
-            # Enforce batch operation support
             if not caps.supports_batch_operations and len(spec.vectors) > 1:
                 raise NotSupported(
                     "batch upsert is not supported by this adapter",
                     details={"requested": len(spec.vectors)},
                 )
 
-            # Validate text storage capabilities
             texts_present = any(v.text for v in spec.vectors)
             if texts_present:
                 if caps.text_storage_strategy == "none":
@@ -2198,15 +2236,13 @@ class BaseVectorAdapter(VectorProtocolV1):
                             )
 
             if caps.max_batch_size is not None and len(spec.vectors) > caps.max_batch_size:
-                suggested = (
-                    int(100 * (len(spec.vectors) - caps.max_batch_size) / len(spec.vectors))
-                    if spec.vectors else None
-                )
+                suggested = int(100 * (len(spec.vectors) - caps.max_batch_size) / len(spec.vectors)) if spec.vectors else None
                 raise BadRequest(
                     f"batch size {len(spec.vectors)} exceeds maximum of {caps.max_batch_size}",
                     details={"max_batch_size": caps.max_batch_size},
                     suggested_batch_reduction=suggested,
                 )
+
             if caps.max_dimensions:
                 for v in spec.vectors:
                     if len(v.vector) > caps.max_dimensions:
@@ -2215,101 +2251,61 @@ class BaseVectorAdapter(VectorProtocolV1):
                             details={"provided": len(v.vector), "max": int(caps.max_dimensions)},
                         )
 
-            # Handle text storage if docstore is configured (atomic operation)
             backend_vectors = spec.vectors
             if self._docstore is not None and texts_present:
-                # Store texts in docstore and create cleaned vectors for backend
-                texts_to_store = []
-                cleaned_vectors = []
+                texts_to_store: List[Document] = []
+                cleaned_vectors: List[Vector] = []
 
                 for v in spec.vectors:
                     if v.text is not None:
-                        # Store in docstore
                         texts_to_store.append(Document(
                             id=str(v.id),
                             text=v.text,
-                            metadata=v.metadata or {}
+                            metadata=v.metadata or {},
                         ))
-
-                        # Create cleaned vector without text
                         cleaned_vectors.append(Vector(
                             id=v.id,
                             vector=v.vector,
                             metadata=v.metadata,
-                            namespace=v.namespace,
-                            text=None  # Removed
+                            namespace=v.namespace,  # already canonicalized to spec.namespace
+                            text=None,
                         ))
                     else:
-                        # No text, pass through as-is
                         cleaned_vectors.append(v)
 
-                # Batch store texts (failure here fails the entire upsert)
                 if texts_to_store:
                     await self._docstore.batch_put(texts_to_store)
 
                 backend_vectors = cleaned_vectors
 
-            # Call backend with cleaned vectors (no text in metadata/vector)
-            result = await self._do_upsert(
-                UpsertSpec(vectors=backend_vectors, namespace=spec.namespace),
-                ctx=ctx
-            )
+            result = await self._do_upsert(UpsertSpec(vectors=backend_vectors, namespace=spec.namespace), ctx=ctx)
 
-            # Invalidate cache for this namespace on successful upsert
             if result.upserted_count > 0:
                 try:
                     await self._invalidate_namespace_cache(spec.namespace)
                 except Exception:
-                    # Never let cache invalidation break the operation
                     pass
 
             return result
 
         def _on_result(res: UpsertResult) -> Mapping[str, Any]:
-            extra = {
+            extra: Dict[str, Any] = {
                 "namespace": spec.namespace,
                 "vectors_processed": len(spec.vectors),
                 "upserted_count": res.upserted_count,
             }
-            # Record normalization metrics if any occurred
             if normalization_count > 0:
                 extra["vectors_normalized"] = normalization_count
             return extra
 
-        result = await self._with_gates_unary(
-            op="upsert",
-            ctx=ctx,
-            call=_call,
-            on_result=_on_result,
-        )
+        result = await self._with_gates_unary(op="upsert", ctx=ctx, call=_call, on_result=_on_result)
 
-        # Record normalization metrics if any occurred
         if normalization_count > 0:
-            self._metrics.counter(
-                component=self._component,
-                name="vectors_normalized",
-                value=normalization_count,
-                extra={"op": "upsert"},
-            )
+            self._metrics.counter(component=self._component, name="vectors_normalized", value=normalization_count, extra={"op": "upsert"})
 
-        # Token-style counters for upserted vectors and requests
-        self._metrics.counter(
-            component=self._component,
-            name="vectors_upserted",
-            value=int(result.upserted_count),
-        )
-        self._metrics.counter(
-            component=self._component,
-            name="upsert_batches",
-            value=1,
-        )
-        self._metrics.counter(
-            component=self._component,
-            name="requests_total",
-            value=1,
-            extra={"op": "upsert"},
-        )
-
+        self._metrics.counter(component=self._component, name="vectors_upserted", value=int(result.upserted_count))
+        self._metrics.counter(component=self._component, name="upsert_batches", value=1)
+        self._metrics.counter(component=self._component, name="requests_total", value=1, extra={"op": "upsert"})
         return result
 
     async def delete(
@@ -2320,8 +2316,6 @@ class BaseVectorAdapter(VectorProtocolV1):
     ) -> DeleteResult:
         """
         Delete vectors from the vector store with validation and metrics.
-
-        See VectorProtocolV1.delete for full documentation.
         """
         self._require_non_empty("namespace", spec.namespace)
         if not spec.ids and not spec.filter:
@@ -2337,40 +2331,30 @@ class BaseVectorAdapter(VectorProtocolV1):
         async def _call() -> DeleteResult:
             caps = await self.capabilities()
 
-            # Enforce batch operation support for multi-id deletes
             if not caps.supports_batch_operations and spec.ids and len(spec.ids) > 1:
-                raise NotSupported(
-                    "batch delete is not supported by this adapter",
-                    details={"requested": len(spec.ids)},
-                )
+                raise NotSupported("batch delete is not supported by this adapter", details={"requested": len(spec.ids)})
 
             if caps.max_batch_size is not None and spec.ids and len(spec.ids) > caps.max_batch_size:
-                suggested = (
-                    int(100 * (len(spec.ids) - caps.max_batch_size) / len(spec.ids))
-                    if spec.ids else None
-                )
+                suggested = int(100 * (len(spec.ids) - caps.max_batch_size) / len(spec.ids)) if spec.ids else None
                 raise BadRequest(
                     f"batch size {len(spec.ids)} exceeds maximum of {caps.max_batch_size}",
                     details={"max_batch_size": caps.max_batch_size},
                     suggested_batch_reduction=suggested,
                 )
+
             if spec.filter and not caps.supports_metadata_filtering:
                 raise NotSupported("metadata filtering is not supported by this adapter")
 
             result = await self._do_delete(spec, ctx=ctx)
 
-            # Clean up docstore entries and cache on successful delete
             if result.deleted_count > 0:
-                # Clean up docstore entries (using efficient batch_delete)
                 if self._docstore is not None and spec.ids:
                     try:
                         doc_ids = [str(doc_id) for doc_id in spec.ids]
                         await self._docstore.batch_delete(doc_ids)
                     except Exception:
-                        # Log but don't fail the operation
                         LOG.debug("Failed to clean up docstore entries after delete")
 
-                # Invalidate cache for this namespace
                 try:
                     await self._invalidate_namespace_cache(spec.namespace)
                 except Exception:
@@ -2380,36 +2364,13 @@ class BaseVectorAdapter(VectorProtocolV1):
 
         def _on_result(res: DeleteResult) -> Mapping[str, Any]:
             targeted = len(spec.ids) if spec.ids else 0
-            return {
-                "namespace": spec.namespace,
-                "vectors_targeted": targeted,
-                "deleted_count": res.deleted_count,
-            }
+            return {"namespace": spec.namespace, "vectors_targeted": targeted, "deleted_count": res.deleted_count}
 
-        result = await self._with_gates_unary(
-            op="delete",
-            ctx=ctx,
-            call=_call,
-            on_result=_on_result,
-        )
+        result = await self._with_gates_unary(op="delete", ctx=ctx, call=_call, on_result=_on_result)
 
-        self._metrics.counter(
-            component=self._component,
-            name="vectors_deleted",
-            value=int(result.deleted_count),
-        )
-        self._metrics.counter(
-            component=self._component,
-            name="delete_batches",
-            value=1,
-        )
-        self._metrics.counter(
-            component=self._component,
-            name="requests_total",
-            value=1,
-            extra={"op": "delete"},
-        )
-
+        self._metrics.counter(component=self._component, name="vectors_deleted", value=int(result.deleted_count))
+        self._metrics.counter(component=self._component, name="delete_batches", value=1)
+        self._metrics.counter(component=self._component, name="requests_total", value=1, extra={"op": "delete"})
         return result
 
     async def create_namespace(
@@ -2420,8 +2381,6 @@ class BaseVectorAdapter(VectorProtocolV1):
     ) -> NamespaceResult:
         """
         Create a new namespace/collection with validation and metrics.
-
-        See VectorProtocolV1.create_namespace for full documentation.
         """
         self._require_non_empty("namespace", spec.namespace)
         if spec.dimensions <= 0:
@@ -2445,23 +2404,14 @@ class BaseVectorAdapter(VectorProtocolV1):
 
             return await self._do_create_namespace(spec, ctx=ctx)
 
-        def _on_result(_: NamespaceResult) -> Mapping[str, Any]:
-            return {"namespace": spec.namespace}
-
         result = await self._with_gates_unary(
             op="create_namespace",
             ctx=ctx,
             call=_call,
-            on_result=_on_result,
+            on_result=lambda _: {"namespace": spec.namespace},
         )
 
-        self._metrics.counter(
-            component=self._component,
-            name="requests_total",
-            value=1,
-            extra={"op": "create_namespace"},
-        )
-
+        self._metrics.counter(component=self._component, name="requests_total", value=1, extra={"op": "create_namespace"})
         return result
 
     async def delete_namespace(
@@ -2472,48 +2422,31 @@ class BaseVectorAdapter(VectorProtocolV1):
     ) -> NamespaceResult:
         """
         Delete a namespace/collection with validation and metrics.
-
-        See VectorProtocolV1.delete_namespace for full documentation.
         """
         self._require_non_empty("namespace", namespace)
 
         async def _call() -> NamespaceResult:
             result = await self._do_delete_namespace(namespace, ctx=ctx)
-
-            # Invalidate all cache entries for this namespace
             if result.success:
                 try:
                     await self._invalidate_namespace_cache(namespace)
                 except Exception:
                     pass
-
             return result
-
-        def _on_result(_: NamespaceResult) -> Mapping[str, Any]:
-            return {"namespace": namespace}
 
         result = await self._with_gates_unary(
             op="delete_namespace",
             ctx=ctx,
             call=_call,
-            on_result=_on_result,
+            on_result=lambda _: {"namespace": namespace},
         )
 
-        self._metrics.counter(
-            component=self._component,
-            name="requests_total",
-            value=1,
-            extra={"op": "delete_namespace"},
-        )
-
+        self._metrics.counter(component=self._component, name="requests_total", value=1, extra={"op": "delete_namespace"})
         return result
 
     async def health(self, *, ctx: Optional[OperationContext] = None) -> Dict[str, Any]:
         """
         Check health status with metrics instrumentation.
-
-        Returns a small mapping; adapters may include extra fields, but callers
-        must treat unknown keys as informational only.
         """
         self._fail_if_expired(ctx)
 
@@ -2540,57 +2473,27 @@ class BaseVectorAdapter(VectorProtocolV1):
         """Implement to return adapter-specific capabilities."""
         raise NotImplementedError
 
-    async def _do_query(
-        self,
-        spec: QuerySpec,
-        *,
-        ctx: Optional[OperationContext] = None,
-    ) -> QueryResult:
+    async def _do_query(self, spec: QuerySpec, *, ctx: Optional[OperationContext] = None) -> QueryResult:
         """Implement vector similarity search with validated inputs."""
         raise NotImplementedError
 
-    async def _do_batch_query(
-        self,
-        spec: BatchQuerySpec,
-        *,
-        ctx: Optional[OperationContext] = None,
-    ) -> List[QueryResult]:
+    async def _do_batch_query(self, spec: BatchQuerySpec, *, ctx: Optional[OperationContext] = None) -> List[QueryResult]:
         """Implement batch vector similarity search with validated inputs."""
         raise NotImplementedError
 
-    async def _do_upsert(
-        self,
-        spec: UpsertSpec,
-        *,
-        ctx: Optional[OperationContext] = None,
-    ) -> UpsertResult:
+    async def _do_upsert(self, spec: UpsertSpec, *, ctx: Optional[OperationContext] = None) -> UpsertResult:
         """Implement vector upsert operations with validated inputs."""
         raise NotImplementedError
 
-    async def _do_delete(
-        self,
-        spec: DeleteSpec,
-        *,
-        ctx: Optional[OperationContext] = None,
-    ) -> DeleteResult:
+    async def _do_delete(self, spec: DeleteSpec, *, ctx: Optional[OperationContext] = None) -> DeleteResult:
         """Implement vector deletion operations with validated inputs."""
         raise NotImplementedError
 
-    async def _do_create_namespace(
-        self,
-        spec: NamespaceSpec,
-        *,
-        ctx: Optional[OperationContext] = None,
-    ) -> NamespaceResult:
+    async def _do_create_namespace(self, spec: NamespaceSpec, *, ctx: Optional[OperationContext] = None) -> NamespaceResult:
         """Implement namespace creation with validated inputs."""
         raise NotImplementedError
 
-    async def _do_delete_namespace(
-        self,
-        namespace: str,
-        *,
-        ctx: Optional[OperationContext] = None,
-    ) -> NamespaceResult:
+    async def _do_delete_namespace(self, namespace: str, *, ctx: Optional[OperationContext] = None) -> NamespaceResult:
         """Implement namespace deletion."""
         raise NotImplementedError
 
@@ -2608,16 +2511,31 @@ def _ctx_from_wire(ctx_dict: Mapping[str, Any]) -> OperationContext:
     Convert a wire-level ctx dict into an OperationContext.
 
     Unknown keys are ignored per protocol rules (forward compatible).
+
+    Wire strictness (ctx.attrs):
+        - attrs MUST be an object if present; otherwise BadRequest.
     """
     if ctx_dict is None:
         return OperationContext()
+
+    attrs = ctx_dict.get("attrs")
+    if attrs is None:
+        attrs_map: Mapping[str, Any] = {}
+    elif isinstance(attrs, Mapping):
+        attrs_map = attrs
+    else:
+        raise BadRequest(
+            "ctx.attrs must be an object",
+            details={"field": "ctx.attrs", "type": type(attrs).__name__},
+        )
+
     return OperationContext(
         request_id=ctx_dict.get("request_id"),
         idempotency_key=ctx_dict.get("idempotency_key"),
         deadline_ms=ctx_dict.get("deadline_ms"),
         traceparent=ctx_dict.get("traceparent"),
         tenant=ctx_dict.get("tenant"),
-        attrs=ctx_dict.get("attrs") or {},
+        attrs=attrs_map,
     )
 
 
@@ -2638,7 +2556,6 @@ def _error_to_wire(e: Exception, ms: float) -> Dict[str, Any]:
             "details": payload.get("details") or None,
             "ms": ms,
         }
-    # Fallback: treat as UNAVAILABLE/INTERNAL
     return {
         "ok": False,
         "code": "UNAVAILABLE",
@@ -2660,12 +2577,7 @@ def _success_to_wire(result: Any, ms: float) -> Dict[str, Any]:
         result_payload = asdict(result)
     else:
         result_payload = result
-    return {
-        "ok": True,
-        "code": "OK",
-        "ms": ms,
-        "result": result_payload,
-    }
+    return {"ok": True, "code": "OK", "ms": ms, "result": result_payload}
 
 
 class WireVectorHandler:
@@ -2688,37 +2600,21 @@ class WireVectorHandler:
 
     @staticmethod
     def _require_mapping_field(envelope: Mapping[str, Any], field: str) -> Mapping[str, Any]:
-        """
-        Enforce that envelope[field] exists and is a mapping.
-
-        This makes ctx/args strict at the wire handler boundary to match the
-        canonical envelope contract.
-        """
+        """Enforce that envelope[field] exists and is a mapping."""
         if field not in envelope:
             raise BadRequest(f"missing required '{field}'")
         v = envelope.get(field)
         if not isinstance(v, Mapping):
-            raise BadRequest(
-                f"'{field}' must be an object",
-                details={"field": field, "type": type(v).__name__},
-            )
+            raise BadRequest(f"'{field}' must be an object", details={"field": field, "type": type(v).__name__})
         return v
 
     @staticmethod
     def _require_mapping_list(name: str, value: Any) -> List[Mapping[str, Any]]:
-        """
-        Defensive parsing helper for wire lists.
-
-        Ensures list elements are mappings so malformed input becomes BadRequest
-        (not a generic UNAVAILABLE).
-        """
+        """Strictly require a list of objects (mappings)."""
         if value is None:
             return []
         if not isinstance(value, list):
-            raise BadRequest(
-                f"{name} must be a list",
-                details={"field": name, "type": type(value).__name__},
-            )
+            raise BadRequest(f"{name} must be a list", details={"field": name, "type": type(value).__name__})
         out: List[Mapping[str, Any]] = []
         for i, item in enumerate(value):
             if not isinstance(item, Mapping):
@@ -2731,14 +2627,11 @@ class WireVectorHandler:
 
     @staticmethod
     def _require_string_list(name: str, value: Any) -> List[str]:
-        """Strictly require a list of strings for wire ID lists."""
+        """Strictly require a list of strings."""
         if value is None:
             return []
         if not isinstance(value, list):
-            raise BadRequest(
-                f"{name} must be a list",
-                details={"field": name, "type": type(value).__name__},
-            )
+            raise BadRequest(f"{name} must be a list", details={"field": name, "type": type(value).__name__})
         out: List[str] = []
         for i, item in enumerate(value):
             if not isinstance(item, str):
@@ -2749,6 +2642,144 @@ class WireVectorHandler:
             out.append(item)
         return out
 
+    @staticmethod
+    def _require_field(args: Mapping[str, Any], name: str, expected_type: Optional[type] = None) -> Any:
+        """Require that args contains a field, optionally enforcing its type."""
+        if name not in args:
+            raise BadRequest(f"missing required field '{name}'", details={"field": name})
+        v = args.get(name)
+        if expected_type is not None and not isinstance(v, expected_type):
+            raise BadRequest(
+                f"'{name}' must be {expected_type.__name__}",
+                details={"field": name, "type": type(v).__name__},
+            )
+        return v
+
+    @staticmethod
+    def _parse_query_spec(args: Mapping[str, Any]) -> QuerySpec:
+        """Strict parse for QuerySpec with stable error messages."""
+        vector = WireVectorHandler._require_field(args, "vector", list)
+        top_k = WireVectorHandler._require_field(args, "top_k", int)
+        namespace = args.get("namespace", "default")
+        if not isinstance(namespace, str):
+            raise BadRequest("'namespace' must be a string", details={"field": "namespace", "type": type(namespace).__name__})
+
+        flt = args.get("filter")
+        include_metadata = args.get("include_metadata", True)
+        include_vectors = args.get("include_vectors", False)
+
+        if not isinstance(include_metadata, bool) or not isinstance(include_vectors, bool):
+            raise BadRequest(
+                "'include_metadata'/'include_vectors' must be booleans",
+                details={
+                    "include_metadata": type(include_metadata).__name__,
+                    "include_vectors": type(include_vectors).__name__,
+                },
+            )
+        if flt is not None and not isinstance(flt, Mapping):
+            raise BadRequest("'filter' must be an object", details={"field": "filter", "type": type(flt).__name__})
+
+        return QuerySpec(
+            vector=list(vector),
+            top_k=int(top_k),
+            namespace=str(namespace),
+            filter=dict(flt) if isinstance(flt, Mapping) else None,
+            include_metadata=include_metadata,
+            include_vectors=include_vectors,
+        )
+
+    @staticmethod
+    def _parse_query_spec_for_batch(q: Mapping[str, Any], *, batch_namespace: str, index: int) -> QuerySpec:
+        """
+        Parse QuerySpec for batch_query with authoritative namespace semantics.
+
+        Rules:
+            - BatchQuerySpec.namespace is authoritative for all queries.
+            - If query includes 'namespace', it MUST match batch_namespace.
+            - If query omits 'namespace', it is treated as batch_namespace.
+        """
+        if "namespace" in q:
+            ns = q.get("namespace")
+            if not isinstance(ns, str):
+                raise BadRequest(
+                    f"queries[{index}].namespace must be a string",
+                    details={"index": index, "field": f"queries[{index}].namespace", "type": type(ns).__name__},
+                )
+            if ns != batch_namespace:
+                raise BadRequest(
+                    f"queries[{index}].namespace must match batch namespace",
+                    details={"index": index, "batch_namespace": batch_namespace, "query_namespace": ns},
+                )
+
+        # Build a spec using the batch namespace regardless (canonicalization).
+        q2 = dict(q)
+        q2["namespace"] = batch_namespace
+        return WireVectorHandler._parse_query_spec(q2)
+
+    @staticmethod
+    def _parse_vector(v: Mapping[str, Any], *, index: int, spec_namespace: str) -> Vector:
+        """
+        Strict parse for Vector with explicit VectorID coercion and authoritative namespace.
+
+        Rules:
+            - Wire 'id' is a string, coerced to VectorID.
+            - If vector includes 'namespace', it MUST match UpsertSpec.namespace.
+            - Vector.namespace is canonicalized to UpsertSpec.namespace to eliminate ambiguity.
+        """
+        if "id" not in v:
+            raise BadRequest("Invalid vector: missing 'id'", details={"index": index, "field": "id"})
+        if "vector" not in v:
+            raise BadRequest("Invalid vector: missing 'vector'", details={"index": index, "field": "vector"})
+
+        raw_id = v.get("id")
+        if not isinstance(raw_id, str) or not raw_id.strip():
+            raise BadRequest(
+                "Invalid vector: 'id' must be a non-empty string",
+                details={"index": index, "field": "id", "type": type(raw_id).__name__},
+            )
+
+        raw_vec = v.get("vector")
+        if not isinstance(raw_vec, list):
+            raise BadRequest(
+                "Invalid vector: 'vector' must be a list",
+                details={"index": index, "field": "vector", "type": type(raw_vec).__name__},
+            )
+
+        metadata = v.get("metadata")
+        if metadata is not None and not isinstance(metadata, Mapping):
+            raise BadRequest(
+                "Invalid vector: 'metadata' must be an object",
+                details={"index": index, "field": "metadata", "type": type(metadata).__name__},
+            )
+
+        ns = v.get("namespace")
+        if ns is not None:
+            if not isinstance(ns, str):
+                raise BadRequest(
+                    "Invalid vector: 'namespace' must be a string",
+                    details={"index": index, "field": "namespace", "type": type(ns).__name__},
+                )
+            if ns != spec_namespace:
+                raise BadRequest(
+                    "vector.namespace must match UpsertSpec.namespace",
+                    details={"index": index, "spec_namespace": spec_namespace, "vector_namespace": ns, "vector_id": raw_id},
+                )
+
+        text = v.get("text")
+        if text is not None and not isinstance(text, str):
+            raise BadRequest(
+                "Invalid vector: 'text' must be a string",
+                details={"index": index, "field": "text", "type": type(text).__name__},
+            )
+
+        return Vector(
+            id=VectorID(str(raw_id)),
+            vector=list(raw_vec),
+            metadata=dict(metadata) if isinstance(metadata, Mapping) else None,
+            namespace=spec_namespace,  # authoritative + canonical
+            text=str(text) if isinstance(text, str) else None,
+        )
+
     async def handle(self, envelope: Mapping[str, Any]) -> Dict[str, Any]:
         """
         Handle a single unary request envelope and return a response envelope.
@@ -2756,7 +2787,7 @@ class WireVectorHandler:
         Supports:
             - vector.capabilities
             - vector.query
-            - vector.batch_query (V1.0+)
+            - vector.batch_query
             - vector.upsert
             - vector.delete
             - vector.create_namespace
@@ -2772,7 +2803,6 @@ class WireVectorHandler:
             if not isinstance(op, str):
                 raise BadRequest("missing or invalid 'op'")
 
-            # REQUIRED fields (ctx + args must be present; may be empty objects)
             ctx_map = self._require_mapping_field(envelope, "ctx")
             args = self._require_mapping_field(envelope, "args")
             ctx = _ctx_from_wire(ctx_map)
@@ -2782,77 +2812,76 @@ class WireVectorHandler:
                 return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
 
             if op == "vector.query":
-                try:
-                    spec = QuerySpec(**dict(args))
-                except TypeError as te:
-                    raise BadRequest(f"missing required field(s): {str(te)}") from te
+                spec = self._parse_query_spec(args)
                 res = await self._adapter.query(spec, ctx=ctx)
                 return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
 
             if op == "vector.batch_query":
+                batch_namespace = args.get("namespace", "default")
+                if not isinstance(batch_namespace, str):
+                    raise BadRequest("'namespace' must be a string", details={"field": "namespace", "type": type(batch_namespace).__name__})
+
                 queries_raw = self._require_mapping_list("queries", args.get("queries"))
                 if not queries_raw:
                     raise BadRequest("queries must not be empty")
+
                 queries: List[QuerySpec] = []
                 for i, q in enumerate(queries_raw):
-                    try:
-                        queries.append(QuerySpec(**dict(q)))
-                    except TypeError as te:
-                        raise BadRequest(
-                            f"Invalid query spec at queries[{i}]: {te}",
-                            details={"index": i},
-                        ) from te
-                    except Exception as e:
-                        raise BadRequest(
-                            f"Invalid query spec at queries[{i}]: {e}",
-                            details={"index": i, "type": type(e).__name__},
-                        ) from e
-                spec = BatchQuerySpec(
-                    queries=queries,
-                    namespace=str(args.get("namespace", "default")),
-                )
+                    queries.append(self._parse_query_spec_for_batch(q, batch_namespace=str(batch_namespace), index=i))
+
+                spec = BatchQuerySpec(queries=queries, namespace=str(batch_namespace))
                 res = await self._adapter.batch_query(spec, ctx=ctx)
                 return _success_to_wire([asdict(r) for r in res], (time.monotonic() - t0) * 1000.0)
 
             if op == "vector.upsert":
+                spec_namespace = args.get("namespace", "default")
+                if not isinstance(spec_namespace, str):
+                    raise BadRequest("'namespace' must be a string", details={"field": "namespace", "type": type(spec_namespace).__name__})
+
                 vectors_raw = self._require_mapping_list("vectors", args.get("vectors"))
+                if not vectors_raw:
+                    raise BadRequest("vectors must not be empty")
+
                 vectors: List[Vector] = []
                 for i, v in enumerate(vectors_raw):
-                    try:
-                        vectors.append(Vector(**dict(v)))
-                    except TypeError as te:
-                        raise BadRequest(
-                            f"Invalid vector at vectors[{i}]: {te}",
-                            details={"index": i},
-                        ) from te
-                    except Exception as e:
-                        raise BadRequest(
-                            f"Invalid vector at vectors[{i}]: {e}",
-                            details={"index": i, "type": type(e).__name__},
-                        ) from e
-                spec = UpsertSpec(
-                    vectors=vectors,
-                    namespace=str(args.get("namespace", "default")),
-                )
+                    vectors.append(self._parse_vector(v, index=i, spec_namespace=str(spec_namespace)))
+
+                spec = UpsertSpec(vectors=vectors, namespace=str(spec_namespace))
                 res = await self._adapter.upsert(spec, ctx=ctx)
                 return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
 
             if op == "vector.delete":
                 ids_raw = self._require_string_list("ids", args.get("ids"))
                 ids = [VectorID(v) for v in ids_raw]
+
+                namespace = args.get("namespace", "default")
+                if not isinstance(namespace, str):
+                    raise BadRequest("'namespace' must be a string", details={"field": "namespace", "type": type(namespace).__name__})
+
+                flt = args.get("filter")
+                if flt is not None and not isinstance(flt, Mapping):
+                    raise BadRequest("'filter' must be an object", details={"field": "filter", "type": type(flt).__name__})
+
                 spec = DeleteSpec(
                     ids=ids,
-                    namespace=str(args.get("namespace", "default")),
-                    filter=args.get("filter"),
+                    namespace=str(namespace),
+                    filter=dict(flt) if isinstance(flt, Mapping) else None,
                 )
                 res = await self._adapter.delete(spec, ctx=ctx)
                 return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
 
             if op == "vector.create_namespace":
-                try:
-                    spec = NamespaceSpec(**dict(args))
-                except TypeError as te:
-                    raise BadRequest(f"Invalid namespace spec: {te}") from te
+                namespace = self._require_field(args, "namespace", str)
+                dimensions = self._require_field(args, "dimensions", int)
+                distance_metric = args.get("distance_metric", "cosine")
+                if not isinstance(distance_metric, str):
+                    raise BadRequest("'distance_metric' must be a string", details={"field": "distance_metric", "type": type(distance_metric).__name__})
+
+                spec = NamespaceSpec(
+                    namespace=str(namespace),
+                    dimensions=int(dimensions),
+                    distance_metric=str(distance_metric),
+                )
                 res = await self._adapter.create_namespace(spec, ctx=ctx)
                 return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
 
