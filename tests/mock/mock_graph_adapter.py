@@ -1,3 +1,5 @@
+this is the updated adapter we are going with now. highlight differences from pervious version
+
 # examples/graph/mock_graph_adapter.py
 # SPDX-License-Identifier: Apache-2.0
 """
@@ -97,9 +99,9 @@ class MockGraphAdapter(BaseGraphAdapter):
         supports_batch_ops: bool = True,
         supports_schema_ops: bool = True,
         # NEW: configurable advanced ops
-        supports_transaction_ops: bool = False,
-        supports_traversal_ops: bool = False,
-        max_traversal_depth: Optional[int] = None,
+        supports_transaction_ops: bool = True,
+        supports_traversal_ops: bool = True,
+        max_traversal_depth: Optional[int] = 3,
         max_ops_per_batch: int = 1000,
         latency_ms: Tuple[int, int] = (2, 5),  # small, bounded sleeps
         failure_rate: float = 0.0,  # deterministic default for conformance
