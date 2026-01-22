@@ -31,8 +31,9 @@ from corpus_sdk.graph.graph_base import (
     BaseGraphAdapter,
 )
 
-pytestmark = pytest.mark.asyncio
-
+# NOTE: Do NOT set a global pytestmark=asyncio here because this file contains
+# both sync taxonomy-level tests and async adapter-surface tests. Mark only the
+# async tests to avoid PytestWarning spam.
 
 # ---------------------------------------------------------------------------
 # Taxonomy-level (adapter-independent) checks
@@ -99,6 +100,7 @@ def test_error_string_includes_code_when_present():
 # Adapter-surface checks (capability-driven)
 # ---------------------------------------------------------------------------
 
+@pytest.mark.asyncio
 async def test_error_handling_bad_request_on_empty_edge_label(adapter: BaseGraphAdapter):
     """
     Invalid edge label must surface BadRequest from BaseGraphAdapter validation.
@@ -121,6 +123,7 @@ async def test_error_handling_bad_request_on_empty_edge_label(adapter: BaseGraph
         await adapter.upsert_edges(spec, ctx=ctx)
 
 
+@pytest.mark.asyncio
 async def test_not_supported_on_unknown_dialect_when_declared(adapter: BaseGraphAdapter):
     """
     If supported_query_dialects is declared non-empty, unknown dialects must raise NotSupported.
@@ -145,6 +148,7 @@ async def test_not_supported_on_unknown_dialect_when_declared(adapter: BaseGraph
         pass
 
 
+@pytest.mark.asyncio
 async def test_error_message_includes_dialect_name_when_rejected_due_to_declared_list(adapter: BaseGraphAdapter):
     """
     When dialect is rejected due to declared supported_query_dialects, include the dialect in the message.
