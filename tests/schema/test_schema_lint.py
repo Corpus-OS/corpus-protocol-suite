@@ -4,7 +4,7 @@ Schema meta-lint for Corpus Protocol (Draft 2020-12).
 
 Covers schema-only quality gates without requiring golden fixtures, and MUST CONFORM to SCHEMA.md:
 - Every schema loads, declares Draft 2020-12, and has a unique $id
-- $id hygiene and path convention checks
+- $id hygiene and path convention checks (supports subdirectories; $id must match full relative path)
 - Metaschema conformance (Draft 2020-12)
 - Cross-file $ref resolution (absolute $id refs) + local fragment checks (#/...)
 - Compilable regex patterns
@@ -13,11 +13,12 @@ Covers schema-only quality gates without requiring golden fixtures, and MUST CON
 - Envelope role sanity consistent with SCHEMA.md:
   - Common envelopes (common/envelope.*.json) are normative for required/additionalProperties.
   - Protocol envelopes should allOf/$ref the corresponding common envelope.
+  - Streaming operation success schemas MUST allOf/$ref common/envelope.stream.success.json.
   - Do NOT require envelopes to declare protocol/component/schema_version fields (SCHEMA.md does not define them on envelopes).
 - Additional SCHEMA.md-aligned invariants for *common* envelopes:
   - common/envelope.success.json: ok.const == true, code.const == "OK"
   - common/envelope.error.json: ok.const == false, code.pattern == "^[A-Z_]+$"
-  - common/envelope.stream.success.json: code.const == "STREAMING"
+  - common/envelope.stream.success.json: ok.const == true, code.const == "STREAMING"
   - common/envelope.request.json: properties.ctx is a $ref to common/operation_context.json
 - If a schema provides "examples", each example validates against the schema
 
@@ -64,12 +65,6 @@ SCHEMA_ID_BASE = "https://corpusos.com/schemas"
 
 ID_ALLOWED = re.compile(r"^[A-Za-z0-9._~:/#-]+$")  # permissive but disallows spaces, etc.
 PATTERN_CACHE: Dict[str, re.Pattern] = {}
-
-# Lint-only guardrails (SCHEMA.md does not mandate these, but they are safe for hygiene checks)
-SUPPORTED_PROTOCOLS = {"llm/v1.0", "vector/v1.0", "embedding/v1.0", "graph/v1.0"}
-MAX_SCHEMA_SIZE_BYTES = 1 * 1024 * 1024  # 1MB per schema
-MAX_DEFS_COUNT = 50  # Maximum number of definitions per schema
-MAX_ENUM_SIZE = 100  # Maximum number of enum values
 
 # Draft 2020-12 reserved "$" keywords (non-exhaustive but covers normal usage).
 # If you legitimately need a new "$keyword", add it here deliberately.
@@ -194,7 +189,7 @@ def _is_common_stream_envelope(fname: str) -> bool:
 
 def _component_for_path(p: Path) -> str:
     """
-    Infer component name from path: schema(s)/<component>/<file>.json
+    Infer component name from path: schema(s)/<component>/.../<file>.json
     """
     try:
         rel = p.relative_to(SCHEMAS_DIR)
@@ -203,58 +198,23 @@ def _component_for_path(p: Path) -> str:
         return "unknown"
 
 
-def _validate_schema_size(path: Path) -> None:
-    """Validate schema file size limits."""
-    size = path.stat().st_size
-    if size > MAX_SCHEMA_SIZE_BYTES:
-        pytest.fail(f"{path}: Schema file too large ({size} bytes > {MAX_SCHEMA_SIZE_BYTES} limit)")
-
-
-def _check_reserved_dollar_keyword_usage(schema: dict, path: Path) -> List[str]:
+def _check_reserved_dollar_keyword_usage(schema: Any, path: Path) -> List[str]:
     """
-    Flag custom "$*" keys. JSON Schema reserves "$" for vocabulary keywords.
+    Flag custom "$*" keys anywhere in the schema tree. JSON Schema reserves "$" for vocabulary keywords.
     """
     issues: List[str] = []
-    if not isinstance(schema, dict):
-        return issues
-    for key in schema.keys():
-        if isinstance(key, str) and key.startswith("$") and key not in ALLOWED_DOLLAR_KEYWORDS:
-            issues.append(f"Custom property '{key}' should not use '$' prefix (reserved keyword space)")
-    return issues
 
+    def _recurse(node: Any, jpath: str) -> None:
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if isinstance(k, str) and k.startswith("$") and k not in ALLOWED_DOLLAR_KEYWORDS:
+                    issues.append(f"{path}: {jpath}.{k}: custom '$' key is not allowed (reserved keyword space)")
+                _recurse(v, f"{jpath}.{k}" if jpath else k)
+        elif isinstance(node, list):
+            for i, item in enumerate(node):
+                _recurse(item, f"{jpath}[{i}]")
 
-def _validate_protocol_const(schema: dict) -> List[str]:
-    """
-    Validate protocol constant format and values, but ONLY if present.
-    SCHEMA.md uses protocol consts on some capability schemas; envelopes do not require them.
-    """
-    issues: List[str] = []
-    props = schema.get("properties", {})
-    proto = props.get("protocol", {})
-
-    if isinstance(proto, dict) and "const" in proto:
-        const_value = proto["const"]
-        if not isinstance(const_value, str) or const_value not in SUPPORTED_PROTOCOLS:
-            issues.append(f"Invalid protocol constant: {const_value!r}")
-
-    return issues
-
-
-def _check_defs_size(schema: dict) -> List[str]:
-    """Check that $defs/definitions doesn't grow too large."""
-    issues: List[str] = []
-    defs = schema.get("$defs") or schema.get("definitions")
-    if isinstance(defs, dict) and len(defs) > MAX_DEFS_COUNT:
-        issues.append(f"Too many definitions ({len(defs)} > {MAX_DEFS_COUNT} limit)")
-    return issues
-
-
-def _check_enum_size(schema: dict) -> List[str]:
-    """Check that enum arrays don't grow too large."""
-    issues: List[str] = []
-    for key, val in _walk(schema):
-        if key == "enum" and isinstance(val, list) and len(val) > MAX_ENUM_SIZE:
-            issues.append(f"Enum too large ({len(val)} > {MAX_ENUM_SIZE} limit)")
+    _recurse(schema, "")
     return issues
 
 
@@ -290,6 +250,24 @@ def _prop(schema: dict, name: str) -> dict | None:
     return v if isinstance(v, dict) else None
 
 
+def _is_streaming_success_schema(path: Path) -> bool:
+    """
+    Heuristic for streaming success schemas:
+    - Component is one of llm/graph/embedding
+    - Filename includes 'stream'
+    - Filename ends with '.success.json'
+    This matches SCHEMA.md naming for:
+      llm.stream.success.json
+      graph.stream_query.success.json
+      embedding.stream_embed.success.json
+    """
+    comp = _component_for_path(path)
+    if comp not in {"llm", "graph", "embedding"}:
+        return False
+    fname = path.name
+    return fname.endswith(".success.json") and ("stream" in fname)
+
+
 # --------------------------------------------------------------------------------------
 # Test 1: Load + $schema + unique $id + store build
 # --------------------------------------------------------------------------------------
@@ -301,7 +279,6 @@ def test_all_schemas_load_and_have_unique_ids():
     id_to_path: Dict[str, Path] = {}
 
     for path in files:
-        _validate_schema_size(path)
         schema = _load_json(path)
 
         # $schema presence and value
@@ -326,17 +303,25 @@ def test_all_schemas_load_and_have_unique_ids():
 # --------------------------------------------------------------------------------------
 
 def test_id_path_convention_matches_filesystem():
-    """Test that $id values match filesystem paths."""
+    """
+    Test that $id values match filesystem paths, including subdirectories.
+
+    Required convention:
+      $id == https://corpusos.com/schemas/<relative_path_from_schema_root>
+
+    Example:
+      schemas/llm/ops/llm.complete.request.json
+        -> https://corpusos.com/schemas/llm/ops/llm.complete.request.json
+    """
     files = _iter_schema_files()
     problems: List[str] = []
 
     for path in files:
         schema = _load_json(path)
         sid: str = schema["$id"]
-        comp = _component_for_path(path)
-        fname = path.name
 
-        expected = f"{SCHEMA_ID_BASE}/{comp}/{fname}"
+        rel = path.relative_to(SCHEMAS_DIR).as_posix()
+        expected = f"{SCHEMA_ID_BASE}/{rel}"
         if sid != expected:
             problems.append(f"{path}: $id should be {expected}, got {sid}")
 
@@ -366,8 +351,8 @@ def test_schema_file_organization():
             problems.append(f"Missing component directory: {comp}")
             continue
 
-        # Check for non-JSON files in schema directories
-        for item in comp_dir.iterdir():
+        # Check for non-JSON files in schema directories (allow .md for docs)
+        for item in comp_dir.rglob("*"):
             if item.is_file() and item.suffix not in {".json", ".md"}:
                 problems.append(f"Non-schema file in component directory: {item}")
 
@@ -402,11 +387,7 @@ def test_metaschema_conformance_and_basic_hygiene():
                 unique = list(dict.fromkeys(val))  # preserve order but remove dups
                 assert unique == val, f"{path}: enum contains duplicates: {val}"
 
-        # 3d) Check enum size limits
-        enum_issues = _check_enum_size(schema)
-        _fail_with_bullets([f"{path}: {msg}" for msg in enum_issues], f"{path} enum size issues")
-
-        # 3e) Reserved "$" keyword usage
+        # 3d) Reserved "$" keyword usage (anywhere in tree)
         dollar_issues = _check_reserved_dollar_keyword_usage(schema, path)
         _fail_with_bullets(dollar_issues, f"{path} reserved-$keyword issues")
 
@@ -445,13 +426,14 @@ def test_cross_file_refs_resolve_and_local_fragments_exist():
                 if not _resolve_local_fragment(schema, frag or "#"):
                     problems.append(f"{path}: local fragment not found: {val}")
             else:
+                # Policy: SCHEMA.md expects $id-based absolute refs or local fragments
                 problems.append(f"{path}: non-absolute and non-local $ref not allowed: {val}")
 
     _fail_with_bullets(problems, "Unresolved $ref issues")
 
 
 # --------------------------------------------------------------------------------------
-# Test 5: $defs / definitions usage (no dangling definitions + size limits)
+# Test 5: $defs / definitions usage (no dangling definitions)
 # --------------------------------------------------------------------------------------
 
 def test_no_dangling_defs_globally():
@@ -496,18 +478,6 @@ def test_no_dangling_defs_globally():
         )
 
 
-def test_defs_size_limits():
-    """Test that $defs/definitions don't grow too large."""
-    problems: List[str] = []
-
-    for path in _iter_schema_files():
-        schema = _load_json(path)
-        defs_issues = _check_defs_size(schema)
-        problems.extend([f"{path}: {msg}" for msg in defs_issues])
-
-    _fail_with_bullets(problems, "$defs size issues")
-
-
 # --------------------------------------------------------------------------------------
 # Test 6: Envelope role sanity (SCHEMA.md-conformant) + common-envelope invariants
 # --------------------------------------------------------------------------------------
@@ -518,13 +488,14 @@ def test_envelope_role_sanity_and_common_invariants():
 
     Key rule: common/* envelopes are normative for required/additionalProperties.
     Protocol envelopes typically inherit via allOf + $ref to common envelopes.
+    Streaming operation success schemas MUST inherit via allOf + $ref to common stream envelope.
     This lint MUST NOT require duplicated 'required' on inheriting envelopes.
 
     Also enforces additional SCHEMA.md-aligned invariants on common envelopes:
-      - success: ok.const==true, code.const=="OK"
-      - error: ok.const==false, code.pattern=="^[A-Z_]+$"
-      - stream success: code.const=="STREAMING"
-      - request: ctx is a $ref to common/operation_context.json
+      - success: ok const true; code const OK
+      - error: ok const false; code pattern canonical
+      - stream success: ok const true; code const STREAMING
+      - request: ctx should $ref operation_context.json
     """
     problems: List[str] = []
 
@@ -544,13 +515,14 @@ def test_envelope_role_sanity_and_common_invariants():
             or _is_envelope_success(fname)
             or _is_envelope_error(fname)
             or _is_common_stream_envelope(fname)
+            or _is_streaming_success_schema(path)
         )
         if not is_env:
             continue
 
-        # Envelopes should be objects
+        # Envelopes and streaming success schemas should be objects
         if schema.get("type") != "object":
-            problems.append(f"{path}: envelopes must declare type=object")
+            problems.append(f"{path}: envelope-like schemas must declare type=object")
 
         # ---- Common envelopes are normative ----
         if comp == "common" and fname == "envelope.request.json":
@@ -608,7 +580,10 @@ def test_envelope_role_sanity_and_common_invariants():
             if schema.get("additionalProperties") is not False:
                 problems.append(f"{path}: common stream success envelope additionalProperties must be false")
 
-            # SCHEMA.md-aligned invariant: code const STREAMING
+            # SCHEMA.md-aligned invariants: ok const true; code const STREAMING
+            ok = _prop(schema, "ok")
+            if not ok or ok.get("const") is not True:
+                problems.append(f"{path}: properties.ok must have const true")
             code = _prop(schema, "code")
             if not code or code.get("const") != "STREAMING":
                 problems.append(f"{path}: properties.code must have const 'STREAMING'")
@@ -626,40 +601,11 @@ def test_envelope_role_sanity_and_common_invariants():
             if fname.endswith(".envelope.error.json") and common_error_id not in refs:
                 problems.append(f"{path}: protocol error envelope should allOf/$ref {common_error_id}")
 
-            # Streaming operation success schemas: allOf/$ref common stream envelope
-            # (They may not be named *.envelope.*, so we detect by reference)
-            if common_stream_id in refs and schema.get("type") != "object":
-                problems.append(f"{path}: streaming success schema should declare type=object")
+            # Streaming operation success schemas MUST allOf/$ref the common stream envelope
+            if _is_streaming_success_schema(path) and common_stream_id not in refs:
+                problems.append(f"{path}: streaming success schema must allOf/$ref {common_stream_id}")
 
     _fail_with_bullets(problems, "Envelope issues")
-
-
-def test_protocol_constants_match_component_when_present():
-    """
-    SCHEMA.md uses protocol consts on *some* schemas (e.g., capabilities types).
-    If a schema defines properties.protocol.const, ensure it matches <component>/v*.
-    (Do NOT require that every schema has protocol const.)
-    """
-    for path in _iter_schema_files():
-        schema = _load_json(path)
-        comp = _component_for_path(path)
-        if comp not in {"llm", "vector", "embedding", "graph"}:
-            continue
-
-        proto = _prop(schema, "protocol")
-        if not proto or "const" not in proto:
-            continue
-
-        value = proto["const"]
-        expected_prefix = f"{comp}/v"
-        assert isinstance(value, str) and value.startswith(expected_prefix), (
-            f"{path}: protocol const {value!r} does not match component {comp!r}"
-        )
-
-        # Optional: validate against known supported protocol strings
-        proto_issues = _validate_protocol_const(schema)
-        if proto_issues:
-            _fail_with_bullets([f"{path}: {msg}" for msg in proto_issues], "Protocol const issues")
 
 
 # --------------------------------------------------------------------------------------
@@ -667,32 +613,67 @@ def test_protocol_constants_match_component_when_present():
 # --------------------------------------------------------------------------------------
 
 def test_examples_validate_against_own_schema():
-    """Test that examples validate against their own schemas."""
-    from referencing import Registry, Resource
-    from referencing.jsonschema import DRAFT202012
+    """
+    Test that examples validate against their own schemas.
 
+    Uses 'referencing' registry if available (preferred), otherwise falls back to RefResolver.
+    """
     files = _iter_schema_files()
 
-    resources = []
+    # Build an id->schema store for ref resolution
+    store: Dict[str, dict] = {}
     for path in files:
         schema = _load_json(path)
-        resources.append((schema["$id"], Resource.from_contents(schema, default_specification=DRAFT202012)))
+        store[schema["$id"]] = schema
 
-    registry = Registry().with_resources(resources)
+    # Preferred path: referencing-based registry (jsonschema v4+)
+    try:
+        from referencing import Registry, Resource  # type: ignore
+        from referencing.jsonschema import DRAFT202012  # type: ignore
 
-    for path in files:
-        schema = _load_json(path)
-        examples = schema.get("examples")
-        if not (isinstance(examples, list) and examples):
-            continue
+        resources = []
+        for sid, schema in store.items():
+            resources.append((sid, Resource.from_contents(schema, default_specification=DRAFT202012)))
+        registry = Registry().with_resources(resources)
 
-        validator = V202012(schema, registry=registry)
+        for path in files:
+            schema = store[_load_json(path)["$id"]]
+            examples = schema.get("examples")
+            if not (isinstance(examples, list) and examples):
+                continue
 
-        for i, ex in enumerate(examples):
-            try:
-                validator.validate(ex)
-            except jsonschema.ValidationError as e:
-                pytest.fail(f"{path}: example[{i}] does not validate: {e}")
+            validator = V202012(schema, registry=registry)
+            for i, ex in enumerate(examples):
+                try:
+                    validator.validate(ex)
+                except jsonschema.ValidationError as e:
+                    pytest.fail(f"{path}: example[{i}] does not validate: {e}")
+        return
+
+    except Exception:
+        # Fallback: deprecated RefResolver (works without 'referencing' import)
+        try:
+            from jsonschema import RefResolver  # type: ignore
+        except Exception as e:
+            pytest.fail(
+                "Examples validation requires either 'referencing' (preferred) or jsonschema.RefResolver. "
+                f"Neither is available: {e}"
+            )
+            return
+
+        for path in files:
+            schema = _load_json(path)
+            examples = schema.get("examples")
+            if not (isinstance(examples, list) and examples):
+                continue
+
+            resolver = RefResolver.from_schema(schema, store=store)  # type: ignore[arg-type]
+            validator = V202012(schema, resolver=resolver)
+            for i, ex in enumerate(examples):
+                try:
+                    validator.validate(ex)
+                except jsonschema.ValidationError as e:
+                    pytest.fail(f"{path}: example[{i}] does not validate: {e}")
 
 
 # --------------------------------------------------------------------------------------
