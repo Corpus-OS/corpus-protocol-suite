@@ -1,5 +1,3 @@
-this is the updated adapter we are going with now. highlight differences from pervious version
-
 # examples/graph/mock_graph_adapter.py
 # SPDX-License-Identifier: Apache-2.0
 """
