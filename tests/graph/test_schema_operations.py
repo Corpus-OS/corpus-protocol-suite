@@ -6,10 +6,6 @@ Asserts (Spec refs):
   • get_schema returns GraphSchema with expected structure     (§7.5)
   • schema is stable and JSON-serializable                     (§7.5)
 """
-# SPDX-License-Identifier: Apache-2.0
-"""
-Graph Conformance — Schema operations.
-"""
 from __future__ import annotations
 
 import json
