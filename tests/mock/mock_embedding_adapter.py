@@ -24,11 +24,43 @@ CACHE STATS NOTE:
 from __future__ import annotations
 
 import asyncio
+import datetime
 import hashlib
 import math
 import random
 import time
 from typing import Any, Dict, List, Optional, Tuple, AsyncIterator
+
+
+# Async DummyCache for testing
+class DummyCache:
+    def __init__(self):
+        self._store = {}
+        self.supports_ttl = True
+
+    async def get(self, key):
+        entry = self._store.get(key)
+        if entry is None:
+            return None
+        value, expires_at = entry
+        if expires_at and expires_at < datetime.datetime.now():
+            del self._store[key]
+            return None
+        return value
+
+    async def set(self, key, value, ttl=None):
+        expires_at = None
+        if ttl:
+            expires_at = datetime.datetime.now() + datetime.timedelta(seconds=ttl)
+        self._store[key] = (value, expires_at)
+
+    async def delete(self, key):
+        if key in self._store:
+            del self._store[key]
+
+    async def clear(self):
+        self._store.clear()
+
 
 from corpus_sdk.embedding.embedding_base import (
     BaseEmbeddingAdapter,
@@ -132,6 +164,10 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
         stream_yield_interval_ms: Tuple[int, int] = (5, 15),
         stream_abandonment_rate: float = 0.0,
     ) -> None:
+        # Use DummyCache if no cache provided
+        if cache is None:
+            cache = DummyCache()
+
         super().__init__(
             mode=mode,
             metrics=metrics,
@@ -415,7 +451,10 @@ class MockEmbeddingAdapter(BaseEmbeddingAdapter):
 
             is_final = (chunk_idx == num_chunks - 1)
             chunks.append(
-                {"embeddings": embs, "usage": {"tokens": self._approx_tokens(spec.text) * len(embs)} if is_final else None}
+                {
+                    "embeddings": embs,
+                    "usage": {"tokens": self._approx_tokens(spec.text) * len(embs)} if is_final else None,
+                }
             )
 
         return chunks
