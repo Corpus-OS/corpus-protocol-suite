@@ -7,21 +7,20 @@ Validates:
 - Envelope invariants for success/error/streaming envelopes (aligned to SCHEMA.md)
 - NDJSON stream validation (stream success frames + error termination)
 - Cross-schema invariants (token totals, vector dims)
-- BatchResult invariants (only when result is batch-shaped)
+- Failure list invariants when batch-like failure keys are present (failed_count + failures)
 - Capabilities core fields (protocol/server/version)
 - Performance/guardrails: parse-time, fixture size, large string checks
 - Duplicate fixture content advisory
-- Schema registry health (schemas load, metaschema-valid, refs resolve)
+- Schema registry health (schemas load, refs resolve)
 
 Auto-discovery:
 - Scans tests/golden/** for *.json and *.ndjson
-- Infers schema IDs from filenames (preferred)
-- Uses small OVERRIDES maps for legacy/special names
+- Infers schema IDs from filenames (preferred; no legacy maps)
+- Enforces a closed-loop check: every inferred schema_id must exist in the registry BEFORE validation.
 
-Closed-loop checks:
-- Verifies every inferred schema_id exists in the loaded schema registry BEFORE validation.
-- Produces clear failure messages when a golden filename implies a missing schema.
-- Performs the same closed-loop check for NDJSON fixtures.
+Notes:
+- This suite intentionally minimizes special-casing. If a golden filename does not match the
+  naming convention, the correct fix is to rename the fixture to match the contract.
 """
 
 from __future__ import annotations
@@ -66,57 +65,41 @@ ID_PATTERN = re.compile(r"^[A-Za-z0-9._~:-]{1,256}$")
 MAX_STRING_FIELD_SIZES = {"text": 5_000_000, "content": 5_000_000}
 
 SUPPORTED_COMPONENTS = {"llm", "vector", "embedding", "graph"}
+SUPPORTED_STREAM_COMPONENTS = {"llm", "embedding", "graph"}
 
-# Guardrail: if legacy "stream_frame_*" goldens appear, fail.
-# (If you truly keep frame schemas, add explicit mapping instead of these leftovers.)
-STREAM_FRAME_LEFTOVER_RE = re.compile(
-    r"^(llm|graph|embedding)_stream_frame_(data|end|error)\.json$"
-)
-
-# ------------------------------------------------------------------------------
-# Overrides (keep tiny; prefer renaming files to match convention)
-# ------------------------------------------------------------------------------
-# JSON: relpath -> schema_id
-OVERRIDES_JSON: Dict[str, str] = {
-    # Legacy error envelope names
-    "llm/llm_error_envelope.json": f"{SCHEMA_BASE}/llm/llm.envelope.error.json",
-    "vector/vector_error_dimension_mismatch.json": f"{SCHEMA_BASE}/vector/vector.envelope.error.json",
-    # Stream chunk examples (single-frame JSON)
-    "llm/llm_stream_chunk.json": f"{SCHEMA_BASE}/llm/llm.stream.success.json",
-    "graph/graph_stream_chunk.json": f"{SCHEMA_BASE}/graph/graph.stream_query.success.json",
-    "embedding/embedding_stream_chunk.json": f"{SCHEMA_BASE}/embedding/embedding.stream_embed.success.json",
-    # Dotted schema filenames as goldens (type-ish)
-    "llm/llm_sampling_params.json": f"{SCHEMA_BASE}/llm/llm.sampling.params.json",
-    "llm/llm_tools_schema.json": f"{SCHEMA_BASE}/llm/llm.tools.schema.json",
+# Canonical streaming success schema per component (SCHEMA.md)
+STREAMING_SUCCESS_SCHEMA_BY_COMPONENT: Dict[str, str] = {
+    "llm": f"{SCHEMA_BASE}/llm/llm.stream.success.json",
+    "embedding": f"{SCHEMA_BASE}/embedding/embedding.stream_embed.success.json",
+    "graph": f"{SCHEMA_BASE}/graph/graph.stream_query.success.json",
 }
 
-# NDJSON: relpath -> (schema_id, component)
-OVERRIDES_NDJSON: Dict[str, Tuple[str, str]] = {
-    "llm/llm_stream.ndjson": (f"{SCHEMA_BASE}/llm/llm.stream.success.json", "llm"),
-    "llm/llm_stream_error.ndjson": (f"{SCHEMA_BASE}/llm/llm.stream.success.json", "llm"),
-    "graph/graph_stream.ndjson": (f"{SCHEMA_BASE}/graph/graph.stream_query.success.json", "graph"),
-    "graph/graph_stream_error.ndjson": (f"{SCHEMA_BASE}/graph/graph.stream_query.success.json", "graph"),
-    "embedding/embedding_stream.ndjson": (f"{SCHEMA_BASE}/embedding/embedding.stream_embed.success.json", "embedding"),
-}
-
-# Aliases to match SCHEMA.md op naming if goldens use alternate tokens
-OP_ALIASES: Dict[str, Dict[str, str]] = {
-    "vector": {"namespace_create": "create_namespace", "namespace_delete": "delete_namespace"},
-    "graph": {"edge_create": "upsert_edges"},
+# Canonical error envelope schema per component (SCHEMA.md)
+ERROR_ENVELOPE_SCHEMA_BY_COMPONENT: Dict[str, str] = {
+    "llm": f"{SCHEMA_BASE}/llm/llm.envelope.error.json",
+    "vector": f"{SCHEMA_BASE}/vector/vector.envelope.error.json",
+    "embedding": f"{SCHEMA_BASE}/embedding/embedding.envelope.error.json",
+    "graph": f"{SCHEMA_BASE}/graph/graph.envelope.error.json",
 }
 
 # ------------------------------------------------------------------------------
 # Discovery + inference
 # ------------------------------------------------------------------------------
+
+
 def _infer_graph_dot_variant_schema_id(component: str, filename: str) -> str:
     """
-    Handles:
+    Handles graph dot-variant fixtures that encode scenario qualifiers:
+
       graph.delete_nodes.by_id.request.json
       graph.upsert_nodes.single.success.json
 
     Canonicalizes to:
       graph.delete_nodes.request.json
       graph.upsert_nodes.success.json
+
+    Output schema id:
+      https://corpusos.com/schemas/graph/graph.<op>.<request|success>.json
     """
     stem = filename[:-5]  # strip .json
     parts = stem.split(".")
@@ -127,6 +110,7 @@ def _infer_graph_dot_variant_schema_id(component: str, filename: str) -> str:
     if kind not in {"request", "success"}:
         raise ValueError(f"Graph dot-variant must end with request/success: {filename}")
 
+    # Strip a single recognized variant token if present (keeps scheme stable)
     variants = {"by_id", "single"}
     if parts[-2] in variants:
         op_parts = parts[1:-2]
@@ -144,31 +128,34 @@ def _infer_schema_id_from_json_relpath(relpath: str) -> str:
     """
     Supported golden JSON naming patterns:
 
-    A) Operation fixtures:
+    1) Operation fixtures:
        <component>_<op>_<request|success|error>.json
-       -> <component>.<op>.<kind>.json (with optional aliases)
+       -> <component>.<op>.<kind>.json
 
-    B) Type fixtures:
-       <component>_types_<name>.json -> <component>.types.<name>.json
+    2) Type fixtures:
+       <component>_types_<name>.json
+       -> <component>.types.<name>.json
 
-    C) Embedding count_tokens split by single/batch OR no suffix:
-       embedding_count_tokens_request.json
-       embedding_count_tokens_request_single.json
-       embedding_count_tokens_request_batch.json
-         -> embedding.count_tokens.request.json
+    3) Embedding count_tokens request/success with optional single/batch suffix:
+       embedding_count_tokens_request(_single|_batch).json -> embedding.count_tokens.request.json
+       embedding_count_tokens_success(_single|_batch).json -> embedding.count_tokens.success.json
 
-       embedding_count_tokens_success.json
-       embedding_count_tokens_success_single.json
-       embedding_count_tokens_success_batch.json
-         -> embedding.count_tokens.success.json
+    4) Envelope error fixtures:
+       <component>_envelope_error.json  OR  <component>_error_*.json
+       -> <component>.envelope.error.json
 
-    D) Graph dot variants:
-       graph.delete_nodes.by_id.request.json -> graph.delete_nodes.request.json
-       graph.upsert_nodes.single.success.json -> graph.upsert_nodes.success.json
+    5) Streaming single-frame JSON fixtures (stream envelope example):
+       <component>_stream_chunk.json
+       -> canonical streaming success schema for that component
+
+    6) Selected dotted-schema goldens (non-op/type but schema-backed, SCHEMA.md):
+       llm_sampling_params.json -> llm/llm.sampling.params.json
+       llm_tools_schema.json    -> llm/llm.tools.schema.json
+
+    7) Graph dot-variant request/success:
+       graph.delete_nodes.by_id.request.json -> graph.delete_nodes.request.json (schema id)
+       graph.upsert_nodes.single.success.json -> graph.upsert_nodes.success.json (schema id)
     """
-    if relpath in OVERRIDES_JSON:
-        return OVERRIDES_JSON[relpath]
-
     p = Path(relpath)
     if len(p.parts) < 2:
         raise ValueError(f"Golden JSON must be under tests/golden/<component>/: {relpath}")
@@ -180,12 +167,7 @@ def _infer_schema_id_from_json_relpath(relpath: str) -> str:
     filename = p.name
     stem = p.stem
 
-    if STREAM_FRAME_LEFTOVER_RE.match(filename):
-        raise ValueError(
-            f"Legacy stream-frame golden exists but SCHEMA.md does not define it: {relpath}"
-        )
-
-    # Graph dot-variant request/success
+    # 7) Graph dot-variant request/success fixtures
     if (
         component == "graph"
         and (filename.endswith(".request.json") or filename.endswith(".success.json"))
@@ -193,7 +175,17 @@ def _infer_schema_id_from_json_relpath(relpath: str) -> str:
     ):
         return _infer_graph_dot_variant_schema_id(component, filename)
 
-    # Embedding count_tokens request/success (suffix optional)
+    # 5) Streaming single-frame JSON fixtures
+    if stem == f"{component}_stream_chunk":
+        if component not in STREAMING_SUCCESS_SCHEMA_BY_COMPONENT:
+            raise ValueError(f"No streaming schema mapping configured for component={component}")
+        return STREAMING_SUCCESS_SCHEMA_BY_COMPONENT[component]
+
+    # 4) Envelope error fixtures
+    if stem == f"{component}_envelope_error" or stem.startswith(f"{component}_error_"):
+        return ERROR_ENVELOPE_SCHEMA_BY_COMPONENT[component]
+
+    # 3) Embedding count_tokens request/success (suffix optional)
     if component == "embedding":
         if stem in {
             "embedding_count_tokens_request",
@@ -209,21 +201,27 @@ def _infer_schema_id_from_json_relpath(relpath: str) -> str:
         }:
             return f"{SCHEMA_BASE}/embedding/embedding.count_tokens.success.json"
 
-    # Type fixtures: <component>_types_<name>.json
+    # 6) Selected dotted-schema goldens (SCHEMA.md-backed)
+    if component == "llm":
+        if stem == "llm_sampling_params":
+            return f"{SCHEMA_BASE}/llm/llm.sampling.params.json"
+        if stem == "llm_tools_schema":
+            return f"{SCHEMA_BASE}/llm/llm.tools.schema.json"
+
+    # 2) Type fixtures: <component>_types_<name>.json
     if stem.startswith(f"{component}_types_"):
         tname = stem[len(f"{component}_types_") :]
         if not tname:
             raise ValueError(f"Missing type name in {relpath}")
         return f"{SCHEMA_BASE}/{component}/{component}.types.{tname}.json"
 
-    # Standard operation fixtures: <component>_<op>_<kind>.json
+    # 1) Standard operation fixtures: <component>_<op>_<kind>.json
     parts = stem.split("_")
     if len(parts) >= 3 and parts[0] == component and parts[-1] in {"request", "success", "error"}:
         kind = parts[-1]
         op = "_".join(parts[1:-1]).strip()
         if not op:
             raise ValueError(f"Missing op in golden filename: {relpath}")
-        op = OP_ALIASES.get(component, {}).get(op, op)
         return f"{SCHEMA_BASE}/{component}/{component}.{op}.{kind}.json"
 
     raise ValueError(f"Cannot infer schema id for golden: {relpath}")
@@ -231,11 +229,34 @@ def _infer_schema_id_from_json_relpath(relpath: str) -> str:
 
 def _infer_ndjson_case(relpath: str) -> Tuple[str, str]:
     """
-    NDJSON fixtures are short-named in your repo; rely on OVERRIDES_NDJSON.
+    NDJSON fixtures inference (v1-aligned, no manual overrides):
+
+      - Component inferred from folder: tests/golden/<component>/*.ndjson
+      - Schema id inferred from component using canonical streaming success schema
+      - Names must include "_stream" to avoid accidental inclusion of unrelated ndjson fixtures
+
+    Examples:
+      llm/llm_stream.ndjson
+      llm/llm_stream_error.ndjson
+      graph/graph_stream.ndjson
+      embedding/embedding_stream_error.ndjson
     """
-    if relpath in OVERRIDES_NDJSON:
-        return OVERRIDES_NDJSON[relpath]
-    raise ValueError(f"NDJSON schema inference not configured for {relpath}. Add override.")
+    p = Path(relpath)
+    if len(p.parts) < 2:
+        raise ValueError(f"Golden NDJSON must be under tests/golden/<component>/: {relpath}")
+
+    component = p.parts[0]
+    if component not in SUPPORTED_STREAM_COMPONENTS:
+        raise ValueError(f"Unsupported NDJSON component '{component}' in {relpath}")
+
+    if component not in STREAMING_SUCCESS_SCHEMA_BY_COMPONENT:
+        raise ValueError(f"No streaming schema mapping configured for component={component}")
+
+    # Guardrail: enforce intentional naming
+    if "_stream" not in p.name:
+        raise ValueError(f"NDJSON fixture name must include '_stream': {relpath}")
+
+    return STREAMING_SUCCESS_SCHEMA_BY_COMPONENT[component], component
 
 
 def _discover_cases_and_errors() -> Tuple[List[Tuple[str, str]], Optional[str]]:
@@ -280,13 +301,18 @@ STREAM_NDJSON_CASES, NDJSON_DISCOVERY_ERROR = _discover_ndjson_cases_and_errors(
 # ------------------------------------------------------------------------------
 # Session setup
 # ------------------------------------------------------------------------------
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _load_registry_once():
     load_all_schemas_into_registry(SCHEMAS_ROOT)
 
+
 # ------------------------------------------------------------------------------
 # Discovery guardrails
 # ------------------------------------------------------------------------------
+
+
 def test_golden_discovery_succeeds():
     if CASES_DISCOVERY_ERROR:
         pytest.fail(CASES_DISCOVERY_ERROR)
@@ -301,9 +327,12 @@ def test_inferred_schema_ids_follow_convention():
             f"{fname}: schema_id not under {SCHEMA_BASE}: {schema_id}"
         )
 
+
 # ------------------------------------------------------------------------------
 # Closed-loop registry checks
 # ------------------------------------------------------------------------------
+
+
 def _closest_schema_id_matches(schema_id: str, known_ids: List[str], limit: int = 8) -> List[str]:
     hits: List[str] = []
     needle = schema_id.lower()
@@ -343,7 +372,7 @@ def test_inferred_schema_ids_exist_in_registry():
         pytest.fail(
             "Some golden files imply schema IDs that do not exist in the schema registry.\n"
             "This usually means: (a) the golden filename is wrong, (b) the schema file/$id is missing, "
-            "or (c) SCHEMA.md and /schema/** drifted.\n\n"
+            "or (c) SCHEMA.md and /schema(s)/** drifted.\n\n"
             + "\n\n".join(missing)
         )
 
@@ -373,9 +402,12 @@ def test_inferred_ndjson_schema_ids_exist_in_registry():
             + "\n\n".join(missing)
         )
 
+
 # ------------------------------------------------------------------------------
 # Core: golden validates against inferred schema
 # ------------------------------------------------------------------------------
+
+
 @pytest.mark.parametrize("fname,schema_id", CASES)
 def test_golden_validates(fname: str, schema_id: str):
     p = GOLDEN / fname
@@ -385,12 +417,15 @@ def test_golden_validates(fname: str, schema_id: str):
     doc = json.loads(p.read_text(encoding="utf-8"))
     assert_valid(schema_id, doc, context=fname)
 
+
 # ------------------------------------------------------------------------------
 # Envelope compliance heuristics (aligned to SCHEMA.md)
 # ------------------------------------------------------------------------------
+
+
 def test_success_envelopes_follow_common_success_contract():
     """
-    For any golden validated against a *non-streaming* success schema:
+    For any golden validated against a non-streaming success schema:
       - ok == True
       - code == "OK"
       - ms is non-negative number
@@ -399,9 +434,6 @@ def test_success_envelopes_follow_common_success_contract():
     """
     for fname, schema_id in CASES:
         if not schema_id.endswith(".success.json"):
-            continue
-        # Exclude streaming success schemas (handled in test_stream_envelope_contract)
-        if ".stream" in schema_id:
             continue
 
         p = GOLDEN / fname
@@ -412,6 +444,10 @@ def test_success_envelopes_follow_common_success_contract():
         if not isinstance(doc, dict) or "ok" not in doc or "code" not in doc:
             continue
 
+        # Streaming is validated separately (must use STREAMING code)
+        if doc.get("code") == "STREAMING":
+            continue
+
         assert doc.get("ok") is True, f"{fname}: ok must be true"
         assert doc.get("code") == "OK", f"{fname}: code must be 'OK' (got {doc.get('code')!r})"
         assert "ms" in doc and isinstance(doc["ms"], (int, float)) and doc["ms"] >= 0, f"{fname}: ms must be >= 0"
@@ -420,7 +456,7 @@ def test_success_envelopes_follow_common_success_contract():
 
 def test_error_envelopes_follow_common_error_contract():
     """
-    For any golden validated against an error envelope schema:
+    For any golden validated against an envelope error schema:
       - ok == False
       - required fields exist
     """
@@ -443,26 +479,30 @@ def test_error_envelopes_follow_common_error_contract():
 def test_stream_envelope_contract():
     """
     Streaming single-frame JSON goldens must use protocol STREAMING envelope with chunk.
-    Detected by schema_id (future-proof; no hardcoded filenames).
+    Triggered by envelope content (code == "STREAMING").
     """
-    for fname, schema_id in CASES:
-        if ".stream" not in schema_id or not schema_id.endswith(".success.json"):
-            continue
-
+    for fname, _schema_id in CASES:
         p = GOLDEN / fname
         if not p.exists():
             continue
 
         doc = json.loads(p.read_text(encoding="utf-8"))
-        assert isinstance(doc, dict), f"{fname}: streaming golden must be a JSON object"
+        if not isinstance(doc, dict):
+            continue
+
+        if doc.get("code") != "STREAMING":
+            continue
+
         assert doc.get("ok") is True, f"{fname}: ok must be true"
-        assert doc.get("code") == "STREAMING", f"{fname}: code must be 'STREAMING' (got {doc.get('code')!r})"
         assert "ms" in doc and isinstance(doc["ms"], (int, float)) and doc["ms"] >= 0, f"{fname}: ms must be >= 0"
         assert "chunk" in doc, f"{fname}: missing chunk"
+
 
 # ------------------------------------------------------------------------------
 # Request envelope context sanity (aligned to SCHEMA.md)
 # ------------------------------------------------------------------------------
+
+
 def test_request_envelopes_have_valid_context_and_args():
     """
     For request envelopes:
@@ -497,9 +537,12 @@ def test_request_envelopes_have_valid_context_and_args():
         if "attrs" in ctx and ctx["attrs"] is not None:
             assert isinstance(ctx["attrs"], dict), f"{fname}: ctx.attrs must be object"
 
+
 # ------------------------------------------------------------------------------
 # Embedding unary stream flag (aligned to SCHEMA.md)
 # ------------------------------------------------------------------------------
+
+
 def test_embedding_embed_request_stream_flag_is_absent_or_false():
     """
     embedding.embed is unary; streaming uses embedding.stream_embed.
@@ -521,9 +564,12 @@ def test_embedding_embed_request_stream_flag_is_absent_or_false():
                 f"{fname}: embedding.embed must have stream=false if present"
             )
 
+
 # ------------------------------------------------------------------------------
 # NDJSON stream validation
 # ------------------------------------------------------------------------------
+
+
 @pytest.mark.parametrize("fname,schema_id,component", STREAM_NDJSON_CASES)
 def test_streaming_ndjson_validates_with_stream_validator(fname: str, schema_id: str, component: str):
     p = GOLDEN / fname
@@ -538,9 +584,12 @@ def test_streaming_ndjson_validates_with_stream_validator(fname: str, schema_id:
     )
     assert report.is_valid, report.error_summary
 
+
 # ------------------------------------------------------------------------------
 # Capabilities semantic check
 # ------------------------------------------------------------------------------
+
+
 def test_capabilities_have_core_fields():
     """Capabilities success results should include protocol/server/version."""
     for fname, schema_id in CASES:
@@ -558,13 +607,18 @@ def test_capabilities_have_core_fields():
         assert "server" in result, f"{fname}: missing result.server"
         assert "version" in result, f"{fname}: missing result.version"
 
+
 # ------------------------------------------------------------------------------
-# Batch invariants (conditional; only if result looks batch-shaped)
+# Failure list invariants (schema-aligned; conditional)
 # ------------------------------------------------------------------------------
-def test_all_batch_operations_use_protocol_batchresult_pattern():
+
+
+def test_failure_list_matches_failed_count_when_present():
     """
-    If a success result contains any BatchResult keys, require the full pattern:
-      processed_count, failed_count, failures[]
+    Schema-aligned invariant:
+      If result contains failed_count and failures, require failed_count == len(failures).
+
+    This matches SCHEMA.md patterns used by graph/vector write operations.
     """
     for fname, schema_id in CASES:
         if not schema_id.endswith(".success.json"):
@@ -577,34 +631,6 @@ def test_all_batch_operations_use_protocol_batchresult_pattern():
         doc = json.loads(p.read_text(encoding="utf-8"))
         result = doc.get("result", {})
         if not isinstance(result, dict):
-            continue
-
-        batch_keys = {"processed_count", "failed_count", "failures"}
-        if not (batch_keys & set(result.keys())):
-            continue  # not a batch-shaped result
-
-        assert "processed_count" in result, f"{fname}: missing result.processed_count"
-        assert "failed_count" in result, f"{fname}: missing result.failed_count"
-        assert "failures" in result, f"{fname}: missing result.failures"
-        assert isinstance(result["failures"], list), f"{fname}: result.failures must be a list"
-
-
-def test_batch_operations_track_failures_in_result():
-    """If failed_count is present, it must match len(failures) (when failures present)."""
-    for fname, schema_id in CASES:
-        if not schema_id.endswith(".success.json"):
-            continue
-
-        p = GOLDEN / fname
-        if not p.exists():
-            continue
-
-        doc = json.loads(p.read_text(encoding="utf-8"))
-        result = doc.get("result", {})
-        if not isinstance(result, dict):
-            continue
-
-        if "failed_count" not in result:
             continue
 
         failed_count = result.get("failed_count")
@@ -615,9 +641,12 @@ def test_batch_operations_track_failures_in_result():
                 f"{fname}: failed_count ({failed_count}) != len(failures) ({len(failures)})"
             )
 
+
 # ------------------------------------------------------------------------------
 # Cross-schema invariants (lightweight)
 # ------------------------------------------------------------------------------
+
+
 def test_llm_token_totals_invariant():
     p = GOLDEN / "llm/llm_complete_success.json"
     if not p.exists():
@@ -681,9 +710,12 @@ def test_vector_dimension_invariants_and_limits():
                 f"{vf}: vector[{i}] too large: {len(v)} > {MAX_VECTOR_DIMENSIONS}"
             )
 
+
 # ------------------------------------------------------------------------------
 # Heuristics: timestamps, ids, size guardrails
 # ------------------------------------------------------------------------------
+
+
 def test_timestamp_and_id_validation():
     for fname, _sid in CASES:
         p = GOLDEN / fname
@@ -691,6 +723,8 @@ def test_timestamp_and_id_validation():
             continue
 
         doc = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(doc, dict):
+            continue
 
         if "timestamp" in doc and doc["timestamp"]:
             assert isinstance(doc["timestamp"], str) and RFC3339_ZULU_PATTERN.match(doc["timestamp"]), (
@@ -741,9 +775,12 @@ def test_large_fixture_performance():
         if issues:
             pytest.fail(f"{fname} string field size issues:\n" + "\n".join(issues))
 
+
 # ------------------------------------------------------------------------------
 # Parse-time performance & reliability
 # ------------------------------------------------------------------------------
+
+
 def test_golden_file_loading_performance():
     """Fail if any golden JSON file takes too long to parse (guard against accidental huge/slow fixtures)."""
     import time
@@ -776,9 +813,12 @@ def test_golden_file_loading_performance():
             "Fix: shrink the fixture(s), reduce large strings, or split into smaller samples."
         )
 
+
 # ------------------------------------------------------------------------------
 # Duplicate content check (advisory; skip rather than fail)
 # ------------------------------------------------------------------------------
+
+
 def test_golden_file_unique_checksums():
     checksums: Dict[str, List[str]] = {}
     for fname, _sid in CASES:
@@ -793,9 +833,12 @@ def test_golden_file_unique_checksums():
         dup_info = "; ".join(str(v) for v in duplicates.values())
         pytest.skip(f"Duplicate golden file content: {dup_info}")
 
+
 # ------------------------------------------------------------------------------
 # Schema registry health (belt + suspenders)
 # ------------------------------------------------------------------------------
+
+
 def test_all_schemas_load_and_refs_resolve():
     """
     load_all_schemas_into_registry() runs in the session fixture; if it returns,
