@@ -18,6 +18,8 @@ Covers:
   • Unexpected Exception → UNAVAILABLE mapping
 """
 
+from typing import Optional
+
 import pytest
 
 from corpus_sdk.embedding.embedding_base import (
@@ -44,7 +46,7 @@ def _assert_ok_envelope(out):
     assert "error" not in out or out["error"] in (None, {})
 
 
-def _assert_error_envelope(out, *, code: str | None = None):
+def _assert_error_envelope(out, *, code: Optional[str] = None):
     assert isinstance(out, dict)
     assert out.get("ok") is False
 
@@ -83,7 +85,7 @@ class TrackingMockEmbeddingAdapter(MockEmbeddingAdapter):
         self.last_call = None
         self.last_args = None
 
-    def _store(self, op: str, ctx: OperationContext | None, **kwargs):
+    def _store(self, op: str, ctx: Optional[OperationContext], **kwargs):
         self.last_call = op
         self.last_ctx = ctx
         self.last_args = dict(kwargs)
@@ -96,7 +98,7 @@ class TrackingMockEmbeddingAdapter(MockEmbeddingAdapter):
         self,
         spec: EmbedSpec,
         *,
-        ctx: OperationContext | None = None,
+        ctx: Optional[OperationContext] = None,
     ):
         self._store("embed", ctx, spec=spec)
         return await super()._do_embed(spec, ctx=ctx)
@@ -105,7 +107,7 @@ class TrackingMockEmbeddingAdapter(MockEmbeddingAdapter):
         self,
         spec: BatchEmbedSpec,
         *,
-        ctx: OperationContext | None = None,
+        ctx: Optional[OperationContext] = None,
     ):
         self._store("embed_batch", ctx, spec=spec)
         return await super()._do_embed_batch(spec, ctx=ctx)
@@ -115,7 +117,7 @@ class TrackingMockEmbeddingAdapter(MockEmbeddingAdapter):
         text: str,
         model: str,
         *,
-        ctx: OperationContext | None = None,
+        ctx: Optional[OperationContext] = None,
     ) -> int:
         self._store("count_tokens", ctx, text=text, model=model)
         return await super()._do_count_tokens(text, model, ctx=ctx)
@@ -123,7 +125,7 @@ class TrackingMockEmbeddingAdapter(MockEmbeddingAdapter):
     async def _do_health(
         self,
         *,
-        ctx: OperationContext | None = None,
+        ctx: Optional[OperationContext] = None,
     ):
         self._store("health", ctx)
         # Call super to get consistent health response
@@ -487,7 +489,7 @@ async def test_wire_contract_unexpected_exception_maps_to_unavailable():
             self,
             spec: EmbedSpec,
             *,
-            ctx: OperationContext | None = None,
+            ctx: Optional[OperationContext] = None,
         ):
             raise RuntimeError("boom")
 
