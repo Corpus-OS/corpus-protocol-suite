@@ -519,7 +519,6 @@ test-wire-fast:
 - 🔬 **Development:** 38+ tests (50%+)
 
 **Badge Suggestion:**
-```markdown
 [![Corpus Wire Protocol](https://img.shields.io/badge/CorpusWire%20Protocol-100%25%20Conformant-brightgreen)](./wire_conformance_report.json)
 ```
 
