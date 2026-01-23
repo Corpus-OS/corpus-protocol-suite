@@ -1,0 +1,24 @@
+{
+  "op": "graph.upsert_nodes",
+  "ctx": {
+    "request_id": "t_graph_upsert_nodes_single",
+    "tenant": "test"
+  },
+  "args": {
+    "nodes": [
+      {
+        "id": "node_1",
+        "labels": [
+          "Person"
+        ],
+        "properties": {
+          "name": "Ada"
+        },
+        "namespace": "default",
+        "created_at": 0,
+        "updated_at": 0
+      }
+    ],
+    "namespace": "default"
+  }
+}

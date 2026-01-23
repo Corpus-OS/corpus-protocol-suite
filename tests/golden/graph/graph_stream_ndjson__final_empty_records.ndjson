@@ -1,0 +1,2 @@
+{"ok":true,"code":"STREAMING","ms":2.2,"chunk":{"records":[{"id":"node_1"}],"is_final":false,"summary":null}}
+{"ok":true,"code":"STREAMING","ms":3.7,"chunk":{"records":[],"is_final":true,"summary":{"rows":1}}}

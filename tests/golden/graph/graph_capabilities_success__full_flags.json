@@ -1,0 +1,28 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 4.9,
+  "result": {
+    "server": "corpus-graph",
+    "version": "1.0.0",
+    "protocol": "graph/v1.0",
+    "supports_stream_query": true,
+    "supported_query_dialects": [
+      "cypher",
+      "gremlin"
+    ],
+    "supports_namespaces": true,
+    "supports_property_filters": true,
+    "supports_bulk_vertices": true,
+    "supports_batch": true,
+    "supports_schema": true,
+    "idempotent_writes": true,
+    "supports_multi_tenant": true,
+    "supports_deadline": true,
+    "max_batch_ops": 50,
+    "supports_transaction": true,
+    "supports_traversal": true,
+    "max_traversal_depth": 10,
+    "supports_path_queries": false
+  }
+}

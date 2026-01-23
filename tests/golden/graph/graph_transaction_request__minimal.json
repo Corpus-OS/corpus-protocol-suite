@@ -1,0 +1,22 @@
+{
+  "op": "graph.transaction",
+  "ctx": {
+    "request_id": "t_graph_tx_min",
+    "tenant": "test"
+  },
+  "args": {
+    "operations": [
+      {
+        "op": "graph.upsert_nodes",
+        "args": {
+          "nodes": [
+            {
+              "id": "node_tx_1",
+              "properties": {}
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

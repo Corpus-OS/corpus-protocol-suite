@@ -1,0 +1,10 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 3.1,
+  "result": {
+    "server": "corpus-graph",
+    "version": "1.0.0",
+    "protocol": "graph/v1.0"
+  }
+}

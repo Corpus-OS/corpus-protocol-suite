@@ -1,0 +1,18 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 5.5,
+  "result": {
+    "ok": true,
+    "status": "ok",
+    "server": "corpus-graph",
+    "version": "1.0.0",
+    "namespaces": {
+      "default": {
+        "ok": true
+      }
+    },
+    "read_only": false,
+    "degraded": false
+  }
+}

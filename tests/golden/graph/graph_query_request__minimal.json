@@ -1,0 +1,10 @@
+{
+  "op": "graph.query",
+  "ctx": {
+    "request_id": "t_graph_query_min",
+    "tenant": "test"
+  },
+  "args": {
+    "text": "MATCH (n) RETURN n LIMIT 1"
+  }
+}

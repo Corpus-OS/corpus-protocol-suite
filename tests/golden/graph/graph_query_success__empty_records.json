@@ -1,0 +1,13 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 10.2,
+  "result": {
+    "records": [],
+    "summary": {
+      "rows": 0
+    },
+    "dialect": "cypher",
+    "namespace": "default"
+  }
+}

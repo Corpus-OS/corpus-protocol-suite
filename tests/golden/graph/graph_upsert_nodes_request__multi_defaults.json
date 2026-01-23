@@ -1,0 +1,23 @@
+{
+  "op": "graph.upsert_nodes",
+  "ctx": {
+    "request_id": "t_graph_upsert_nodes_multi_defaults",
+    "tenant": "test"
+  },
+  "args": {
+    "nodes": [
+      {
+        "id": "node_2",
+        "labels": [],
+        "properties": {}
+      },
+      {
+        "id": "node_3",
+        "properties": {
+          "age": 37
+        }
+      }
+    ],
+    "namespace": "default"
+  }
+}

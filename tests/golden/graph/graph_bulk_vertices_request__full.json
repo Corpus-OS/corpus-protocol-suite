@@ -1,0 +1,15 @@
+{
+  "op": "graph.bulk_vertices",
+  "ctx": {
+    "request_id": "t_graph_bulk_vertices_full",
+    "tenant": "test"
+  },
+  "args": {
+    "namespace": "default",
+    "limit": 100,
+    "cursor": null,
+    "filter": {
+      "label": "Person"
+    }
+  }
+}

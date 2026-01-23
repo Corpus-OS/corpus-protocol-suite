@@ -1,0 +1,14 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 6.8,
+  "result": {
+    "ok": true,
+    "status": "degraded",
+    "server": "corpus-graph",
+    "version": "1.0.0",
+    "namespaces": {},
+    "read_only": true,
+    "degraded": true
+  }
+}

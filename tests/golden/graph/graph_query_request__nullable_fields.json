@@ -1,0 +1,14 @@
+{
+  "op": "graph.query",
+  "ctx": {
+    "request_id": "t_graph_query_nullable",
+    "tenant": "test"
+  },
+  "args": {
+    "text": "MATCH (n) RETURN n",
+    "dialect": null,
+    "namespace": null,
+    "timeout_ms": null,
+    "params": {}
+  }
+}

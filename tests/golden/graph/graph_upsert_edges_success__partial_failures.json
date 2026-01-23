@@ -1,0 +1,16 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 23.9,
+  "result": {
+    "upserted_count": 1,
+    "failed_count": 1,
+    "failures": [
+      {
+        "index": 0,
+        "error": "ConstraintViolationError",
+        "message": "Edge label violates constraint"
+      }
+    ]
+  }
+}
