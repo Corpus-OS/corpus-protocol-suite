@@ -13,6 +13,7 @@ authors = [{ name = "Corpus", email = "standards@adaptersdk.org" }]
 dependencies = []
 
 [project.optional-dependencies]
+# Keep "test" runnable on Python 3.9+ by avoiding framework deps that require 3.10+
 test = [
   "pytest>=7.0.0,<9.0.0",
   "pytest-asyncio>=0.21.0,<0.24.0",
@@ -21,42 +22,34 @@ test = [
   # Schema validation stack (required by tests/utils/schema_registry.py)
   "jsonschema>=4.18.0,<5.0.0",
   "referencing>=0.35.0,<1.0.0",
-
-  # Optional framework integrations used by some tests/examples
-  "langchain-core>=0.1.0",
-  "llama-index-core>=0.10.0",
-  "semantic-kernel>=0.9.0",
-  "pyautogen>=0.10.0",
-  "crewai>=0.1.0",
-  "pysqlite3-binary>=0.5.0",
 ]
 
-# Per-framework extras
+# Per-framework extras (install only on py>=3.10 to avoid 3.9 resolver failures)
 langchain = [
-  "langchain-core>=0.1.0",
+  "langchain-core>=0.1.0; python_version>='3.10'",
 ]
 llamaindex = [
-  "llama-index-core>=0.10.0",
+  "llama-index-core>=0.10.0; python_version>='3.10'",
 ]
 semantic-kernel = [
-  "semantic-kernel>=0.9.0",
+  "semantic-kernel>=0.9.0; python_version>='3.10'",
 ]
 autogen = [
-  "pyautogen>=0.10.0",
+  "pyautogen>=0.10.0; python_version>='3.10'",
 ]
 crewai = [
-  "crewai>=0.1.0",
-  "pysqlite3-binary>=0.5.0",
+  "crewai>=0.1.0; python_version>='3.10'",
+  "pysqlite3-binary>=0.5.0; python_version>='3.10'",
 ]
 
-# Convenience "everything" extra for all framework integrations
+# Convenience "everything" extra for all framework integrations (py>=3.10 only)
 frameworks = [
-  "langchain-core>=0.1.0",
-  "llama-index-core>=0.10.0",
-  "semantic-kernel>=0.9.0",
-  "pyautogen>=0.10.0",
-  "crewai>=0.1.0",
-  "pysqlite3-binary>=0.5.0",
+  "langchain-core>=0.1.0; python_version>='3.10'",
+  "llama-index-core>=0.10.0; python_version>='3.10'",
+  "semantic-kernel>=0.9.0; python_version>='3.10'",
+  "pyautogen>=0.10.0; python_version>='3.10'",
+  "crewai>=0.1.0; python_version>='3.10'",
+  "pysqlite3-binary>=0.5.0; python_version>='3.10'",
 ]
 
 [project.scripts]
@@ -67,10 +60,10 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 addopts = "-v --strict-markers --strict-config"
 markers = [
-    "skip_if_not_supported: skip tests if feature is not supported by the adapter",
-    "concurrency: marks tests as concurrency/thread-safety tests",
-    "integration: marks tests as integration tests with real frameworks",
-    "asyncio: mark test as an asyncio test",
+  "skip_if_not_supported: skip tests if feature is not supported by the adapter",
+  "concurrency: marks tests as concurrency/thread-safety tests",
+  "integration: marks tests as integration tests with real frameworks",
+  "asyncio: mark test as an asyncio test",
 ]
 
 # --- Formatting/Linting/Typing (recommended, optional) ---
