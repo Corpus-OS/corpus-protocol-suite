@@ -32,9 +32,13 @@ from corpus_sdk.embedding.embedding_base import (
     NotSupported,
 )
 
-pytestmark = pytest.mark.asyncio
+# NOTE:
+# Do NOT set a global pytestmark=asyncio because this file contains a sync test.
+# Instead mark async tests individually.
+# This avoids: PytestWarning: marked with '@pytest.mark.asyncio' but it is not an async function.
 
 
+@pytest.mark.asyncio
 async def test_error_handling_text_too_long_maps_correctly(adapter: BaseEmbeddingAdapter):
     """§10.4: If max_text_length is declared, TextTooLong must map to TEXT_TOO_LONG and be non-retryable."""
     caps = await adapter.capabilities()
@@ -62,6 +66,7 @@ async def test_error_handling_text_too_long_maps_correctly(adapter: BaseEmbeddin
             raise AssertionError("Adapter raised TextTooLong but capabilities.max_text_length is None")
 
 
+@pytest.mark.asyncio
 async def test_error_handling_model_not_available_maps_correctly(adapter: BaseEmbeddingAdapter):
     """§10.4: Unsupported models must raise ModelNotAvailable with correct code."""
     with pytest.raises(ModelNotAvailable) as exc_info:
@@ -75,6 +80,7 @@ async def test_error_handling_model_not_available_maps_correctly(adapter: BaseEm
     assert any(term in error_msg for term in ["model", "available", "support"])
 
 
+@pytest.mark.asyncio
 async def test_error_handling_bad_request_validation(adapter: BaseEmbeddingAdapter):
     """§10.4: Invalid inputs must raise BadRequest with clear messages."""
     caps = await adapter.capabilities()
@@ -93,6 +99,7 @@ async def test_error_handling_bad_request_validation(adapter: BaseEmbeddingAdapt
     assert any(term in error_msg for term in ["model", "empty", "invalid"])
 
 
+@pytest.mark.asyncio
 async def test_error_handling_not_supported_clear_messages(adapter: BaseEmbeddingAdapter):
     """§10.4: NotSupported errors must indicate missing features clearly, consistent with capabilities."""
     caps = await adapter.capabilities()
@@ -119,6 +126,7 @@ async def test_error_handling_not_supported_clear_messages(adapter: BaseEmbeddin
         assert any(term in error_msg for term in ["batch", "support", "implement"])
 
 
+@pytest.mark.asyncio
 async def test_error_handling_deadline_exceeded_maps_correctly(adapter: BaseEmbeddingAdapter):
     """§12.4: DeadlineExceeded must have correct code and message."""
     caps = await adapter.capabilities()
@@ -138,6 +146,7 @@ async def test_error_handling_deadline_exceeded_maps_correctly(adapter: BaseEmbe
     assert any(term in error_msg for term in ["deadline", "timeout", "exceeded"])
 
 
+@pytest.mark.asyncio
 async def test_error_handling_batch_partial_failure_codes(adapter: BaseEmbeddingAdapter):
     """§12.5: If batch returns failed_texts, they must use normalized flat codes (uppercase)."""
     caps = await adapter.capabilities()
@@ -188,6 +197,7 @@ def test_error_handling_retryable_errors_have_retry_after_ms():
     assert err4.retry_after_ms is None
 
 
+@pytest.mark.asyncio
 async def test_error_handling_error_inheritance_hierarchy(adapter: BaseEmbeddingAdapter):
     """§12.1: Error types must follow proper inheritance hierarchy."""
     assert issubclass(TextTooLong, EmbeddingAdapterError)
@@ -200,6 +210,7 @@ async def test_error_handling_error_inheritance_hierarchy(adapter: BaseEmbedding
     assert issubclass(NotSupported, EmbeddingAdapterError)
 
 
+@pytest.mark.asyncio
 async def test_error_handling_context_preserved_in_errors(adapter: BaseEmbeddingAdapter):
     """§6.1: Context may be provided on error paths; error objects must remain well-formed and SIEM-safe."""
     caps = await adapter.capabilities()
