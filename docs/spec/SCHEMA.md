@@ -165,6 +165,7 @@ schemas/
 │   ├── llm.response_format.json      # JSON/text output mode
 │   ├── llm.sampling.params.json      # Temperature/top_p etc.
 │   ├── llm.tools.schema.json         # Tool/tool_call definitions
+│   ├── llm.types.tools.json          # Tool/tool_call selection
 │   ├── llm.types.chunk.json          # Streaming chunk type
 │   ├── llm.types.completion.json     # Completion result type
 │   ├── llm.types.completion_spec.json # Complete operation args
@@ -172,6 +173,7 @@ schemas/
 │   ├── llm.types.count_tokens_spec.json # Count tokens args
 │   ├── llm.types.logprobs.json       # Log probabilities type
 │   ├── llm.types.message.json        # Message type definition
+│   ├── llm.types.tool_choice.json    # Tool choice selection
 │   ├── llm.types.token_usage.json    # Token usage reporting
 │   ├── llm.types.tool.json           # Tool definition type
 │   ├── llm.types.warning.json        # Warning type definition
