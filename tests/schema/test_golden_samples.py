@@ -129,6 +129,9 @@ def _strip_variant_suffix(stem: str) -> str:
     """
     Allow fixture variants by suffixing "__<variant>".
     Example: embedding_capabilities_request__args_extensions -> embedding_capabilities_request
+
+    NOTE: This is applied to Path.stem, so it also works for dotted stems like:
+      graph.delete_nodes.by_id.request__alt -> graph.delete_nodes.by_id.request
     """
     return stem.split("__", 1)[0]
 
@@ -177,16 +180,12 @@ def _infer_schema_id_from_json_relpath(relpath: str) -> str:
     if component not in SUPPORTED_COMPONENTS:
         raise ValueError(f"Unknown component folder '{component}' in {relpath}")
 
-    filename = p.name
+    # Apply "__<variant>" stripping to the stem for all inference branches
     stem = _strip_variant_suffix(p.stem)
 
-    # 7) Graph dot-variant request/success fixtures
-    if (
-        component == "graph"
-        and (filename.endswith(".request.json") or filename.endswith(".success.json"))
-        and "." in filename
-    ):
-        return _infer_graph_dot_variant_schema_id(component, filename)
+    # 7) Graph dot-variant request/success fixtures (support "__<variant>" too)
+    if component == "graph" and "." in stem and (stem.endswith(".request") or stem.endswith(".success")):
+        return _infer_graph_dot_variant_schema_id(component, f"{stem}.json")
 
     # 5) Streaming single-frame JSON fixtures
     if stem == f"{component}_stream_chunk":
