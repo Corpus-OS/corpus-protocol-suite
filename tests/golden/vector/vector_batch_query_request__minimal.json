@@ -1,0 +1,22 @@
+{
+  "op": "vector.batch_query",
+  "ctx": {
+    "request_id": "t_vector_batch_query_min",
+    "tenant": "test"
+  },
+  "args": {
+    "queries": [
+      {
+        "vector": [
+          0.1,
+          0.2
+        ],
+        "top_k": 2,
+        "namespace": "default",
+        "filter": null,
+        "include_metadata": true,
+        "include_vectors": false
+      }
+    ]
+  }
+}

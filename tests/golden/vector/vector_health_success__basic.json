@@ -1,0 +1,16 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 6.0,
+  "result": {
+    "ok": true,
+    "server": "corpus-vector",
+    "version": "1.0.0",
+    "namespaces": {
+      "default": {
+        "ok": true,
+        "dimensions": 1536
+      }
+    }
+  }
+}

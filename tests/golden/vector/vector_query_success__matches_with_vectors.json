@@ -1,0 +1,48 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 19.4,
+  "result": {
+    "matches": [
+      {
+        "vector": {
+          "id": "vec_2",
+          "vector": [
+            0.9,
+            0.8,
+            0.7
+          ],
+          "metadata": null,
+          "namespace": "default",
+          "text": "optional text payload"
+        },
+        "score": 0.75,
+        "distance": 0.25
+      },
+      {
+        "vector": {
+          "id": "vec_3",
+          "vector": [
+            0.2,
+            0.1,
+            0.0
+          ],
+          "metadata": {
+            "tag": "a"
+          },
+          "namespace": "default",
+          "text": null
+        },
+        "score": 0.7,
+        "distance": 0.3
+      }
+    ],
+    "query_vector": [
+      0.95,
+      0.85,
+      0.75
+    ],
+    "namespace": "default",
+    "total_matches": 2
+  }
+}

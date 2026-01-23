@@ -1,0 +1,21 @@
+{
+  "op": "vector.upsert",
+  "ctx": {
+    "request_id": "t_vector_upsert_nulls",
+    "tenant": "test"
+  },
+  "args": {
+    "vectors": [
+      {
+        "id": "vec_3",
+        "vector": [
+          0.01
+        ],
+        "metadata": null,
+        "namespace": null,
+        "text": null
+      }
+    ],
+    "namespace": "default"
+  }
+}
