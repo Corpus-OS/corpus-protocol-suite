@@ -2,8 +2,7 @@
 
 **Corpus Protocol Suite — Versioning & Compatibility Policy**
 
-> This document describes how we version the **spec**, **wire contracts (schemas/envelopes)**,
-> **SDK libraries**, and **adapters** across the Corpus Protocol Suite (Graph, LLM, Vector, Embedding).
+> This document describes how we version the **spec**, **wire contracts (schemas/envelopes)**, **SDK libraries**, and **adapters** across the Corpus Protocol Suite (Graph, LLM, Vector, Embedding).  
 > It complements `SCHEMA.md` (wire shapes) and `PROTOCOLS.md` (operation semantics).
 
 ---
@@ -20,12 +19,12 @@
 ## 2) What we version (at a glance)
 
 | Thing | Example | Scheme | Compatibility Contract |
-| --- | --- | --- | --- |
+|---|---|---|---|
 | **Protocol ID** (wire-level major identifier, per component) | `llm/v1.0`, `vector/v1.0` | **Major-stable identifier** | **Stable for the entire MAJOR**; does not change on MINOR/PATCH spec updates |
 | **Protocol spec** (per component) | `protocols_version: 1.2` | **SemVer** (`MAJOR.MINOR[.PATCH]`) | Same-**MAJOR** wire compatibility; **MINOR** strictly additive; **MAJOR** may break |
 | **Wire envelopes / JSON schemas** | `schema_version: 1.0.3` | **SemVer** (`MAJOR.MINOR.PATCH`) | Adding optional fields = **MINOR**; changing/removing required fields or types = **MAJOR** |
-| **SDK packages** (language libs) | `corpus-sdk-py 1.7.2` | **SemVer** | Public API stability aligned with protocol **MAJOR**; SDK **MINOR/PATCH** must not break user code |
-| **Adapters** (provider impls) | `corpus-adapter-qdrant 2.3.0` | **SemVer** | Adapter **MAJOR** may drop old protocol **MAJOR**; MUST truthfully advertise its `protocol` in `capabilities()` |
+| **SDK packages** (language libs) | `corpus-sdk-py 1.7.2` | **SemVer** | Public API stability aligned with spec **MAJOR**; SDK **MINOR/PATCH** must not break user code |
+| **Adapters** (provider impls) | `corpus-adapter-qdrant 2.3.0` | **SemVer** | Adapter `MAJOR` may drop support for old protocol **MAJOR**; must advertise `protocol: <component>/v<major>.0` in `capabilities()` |
 | **Spec repository snapshot** | Git tag `spec/v1.2.0` | **SemVer** tags | Tags track immutable snapshots for citations + conformance suites |
 
 > **Key invariant:** If a client and adapter both speak `<component>/v1.0`, they must interoperate on the wire, regardless of SDK/package versions.
@@ -38,27 +37,26 @@ We follow **SemVer 2.0.0** for all artifacts.
 
 ### 3.1 Protocol & wire contracts (normative)
 
-- **MAJOR** (`2.0.0`): breaking change to required fields, field types, error semantics, or operation signatures.
-  - Examples: rename/remove required field; change meaning of `score`; tighten validation so previously-valid inputs are rejected.
-- **MINOR** (`1.2.0`): additive change.
-  - Examples: new optional fields; new optional operation; new capability flag; new error subtype.
-- **PATCH** (`1.1.3`): editorial clarifications, typos, non-behavioral fixes, test updates that do not change the normative contract.
+- **MAJOR** (`2.0.0`): Any **breaking** change in required fields, field types, error semantics, or operation signatures.  
+  *Examples:* renaming or removing a required field; changing meaning of `score` from "higher is better" to the opposite; tightening validation that rejects previously valid requests.
+- **MINOR** (`1.2.0`): Any **additive** change.  
+  *Examples:* new optional fields; new error subtype; new capability flag; new operation that is optional to implement.
+- **PATCH** (`1.1.3`): Editorial clarifications, typos, non-behavioral fixes, and test suite updates that don't change the normative contract.
 
 ### 3.2 SDK libraries & adapters (public API)
 
-- **MAJOR:** breaking public API changes.
-- **MINOR:** additive APIs and safe defaults; performance improvements.
-- **PATCH:** bug fixes, docs, tooling, non-breaking typing.
+- **MAJOR:** Removing/renaming public classes/functions; changing parameter types; altering default behavior in a way that breaks existing apps.
+- **MINOR:** Adding public functions/classes/flags; introducing optional parameters with safe defaults; performance improvements; new adapters.
+- **PATCH:** Bug fixes, docs, build tooling, non-breaking typing annotations.
 
 ---
 
 ## 4) Compatibility Matrix
 
-**Within the same protocol MAJOR, wire compatibility is required.** Additive fields must be ignored
-*only where the schema explicitly permits extension*.
+**Within the same protocol MAJOR, wire compatibility is required.** Additive fields must be ignored **only where the schema explicitly permits extension**.
 
 | Client Protocol | Adapter Protocol | Expectation |
-| --- | --- | --- |
+|---|---|---|
 | `v1.x` | `v1.y` | **Must** interoperate. Extension points are ignored as defined by schema. |
 | `v1.x` | `v2.y` | **May fail**. Adapter SHOULD reject with `NotSupported` and include supported protocols in `error.details`. |
 | `v2.x` | `v1.y` | **May fail**. Client should probe `capabilities()` and downgrade. |
@@ -82,210 +80,247 @@ If unsupported, adapter MUST return `NotSupported` and include:
   "details": { "supported_protocols": ["llm/v1.0"] },
   "ms": 0.0
 }
+```
 
-Note: capabilities.protocol is a single value (const per schema). Supported protocol sets must be communicated via error.details (or via an explicitly versioned capabilities schema in a future MAJOR).
+> **Note:** `capabilities.protocol` is a single value (const per schema). Supported protocol sets must be communicated via `error.details` (or via an explicitly versioned capabilities schema in a future MAJOR).
 
-⸻
+---
 
-5) Backward/Forward Compatibility Rules (Normative)
+## 5) Backward/Forward Compatibility Rules (Normative)
 
-5.1 Unknown JSON keys
-	•	Request envelopes: MAY include extra top-level keys beyond op, ctx, args. Adapters MUST ignore them.
-	•	ctx: unknown fields MUST be ignored (additionalProperties: true).
-	•	args: behavior is schema-governed per operation:
-	•	If the op’s args schema is open (additionalProperties: true), unknown keys MUST be ignored.
-	•	If the op’s args schema is closed (additionalProperties: false), unknown keys MUST cause validation failure (BAD_REQUEST).
-	•	Response envelopes:
-	•	Unary success, error, and streaming success envelopes are closed objects where schema says so.
-	•	Unknown top-level keys in closed envelopes MUST NOT be emitted.
+### 5.1 Unknown JSON keys (schema-governed)
 
-5.2 Error taxonomy
-	•	Adding new error subtypes = MINOR.
-	•	Renaming/removing existing classes, changing retryability semantics, or changing canonical codes = MAJOR.
+- **Request envelopes:** Top-level unknown keys MAY be present and MUST be ignored by adapters (request envelope is open).
+- **ctx:** Unknown keys MUST be ignored by adapters (OperationContext is open).
+- **args:** Unknown keys:
+  - MUST be ignored only when the operation's args schema allows them (`additionalProperties: true`).
+  - MUST be rejected (typically `BAD_REQUEST`) when the operation's args schema is closed (`additionalProperties: false`).
+- **Success / Error / Streaming envelopes:** Closed by schema; unknown top-level keys MUST be rejected by schema validation.
 
-5.3 Observability fields
-	•	Adding optional low-cardinality attributes = MINOR/PATCH (must remain SIEM-safe).
-	•	Removing a previously-emitted attribute expected by consumers = MAJOR.
+### 5.2 Error taxonomy changes
 
-5.4 Security/Privacy
-	•	Tightening redaction / expanding “do-not-log” rules = MINOR.
-	•	Loosening redaction guarantees = MAJOR.
+- Adding new error subtypes (and associated wire codes) is **MINOR** (additive).
+- Renaming/removing existing error classes or changing retryability guidance is **MAJOR**.
+- Error payload extensions must go in `details` (which is `object|null` and open by schema).
 
-5.5 Vector scoring conventions
-	•	“Higher is better” (or any scoring direction invariant) is MAJOR if changed.
+### 5.3 Observability
 
-⸻
+- Adding optional, low-cardinality metric attributes is **MINOR/PATCH** depending on impact.
+- Removing or reinterpreting a previously-emitted attribute that downstream systems rely on is **MAJOR**.
+- Privacy tightening (more redaction) is **MINOR**; loosening is **MAJOR**.
 
-6) Deprecation Policy
+### 5.4 Streaming lifecycle
 
-We implement the deprecation process with the following operational details:
-	1.	Announce in release notes + CHANGELOG.md with rationale and migration hints.
-	2.	Warn at runtime where feasible (e.g., a low-cardinality deprecation indicator in metrics).
-	3.	Minimum support window: keep deprecated features for ≥ 6 months or one full MAJOR, whichever is longer (except urgent security issues).
-	4.	Removal occurs only at the next MAJOR.
+- Streaming success frames MUST remain `{ok, code:"STREAMING", ms, chunk}` with no extra top-level keys (schema-closed).
+- Chunk schema changes follow SemVer rules:
+  - Adding optional fields where allowed = **MINOR**
+  - Removing/changing required fields = **MAJOR**
 
-On the wire: mark deprecated fields with "deprecated": true in JSON Schema (when applicable) and keep accepting/parsing until the next MAJOR.
+### 5.5 Vector scoring conventions
 
-⸻
+- The "higher is better" score convention is normative; changing it is **MAJOR**.
+- If a backend provides only one of `score` or `distance`, adapters MUST synthesize the other (where schema requires both).
 
-7) Release Process & Tagging
+---
 
-Git tags (recommended)
-	•	Suite/spec snapshots: spec/vX.Y.Z (e.g., spec/v1.2.0)
-	•	SDKs: <lang>/vX.Y.Z (e.g., python/v1.7.2)
-	•	Adapters: adapter-<name>/vX.Y.Z (e.g., adapter-qdrant/v2.3.0)
+## 6) Deprecation Policy
 
-Branches (recommended)
-	•	main: active development (next MINOR).
-	•	release/vX.Y: stabilization branch.
-	•	maint/vX.Y: maintenance branch for backports.
+We implement a standard deprecation lifecycle:
 
-Artifacts
-	•	Every release updates CHANGELOG.md with: Added / Changed / Fixed / Deprecated / Removed / Security.
-	•	If schemas touched: bump schema_version and update golden/conformance coverage accordingly.
-	•	If protocol semantics touched: bump protocols_version and update conformance tests.
+1. **Announce** in release notes and `CHANGELOG.md` with rationale + migration hints.
+2. **Warn** where feasible (e.g., log a deprecation code in telemetry without leaking PII).
+3. **Minimum support window:**
+   - Keep deprecated features for at least one full **MAJOR** after announcement, or **6 months**, whichever is longer, unless there is a security issue.
+4. **Removal** occurs at the next **MAJOR** release.
 
-⸻
+On the wire: mark deprecated fields with `"deprecated": true` in published JSON Schema (when applicable) and continue accepting them until removal in the next MAJOR.
 
-8) Pre-Releases, RCs, and Experimental Features
-	•	Pre-releases: v1.2.0-rc.1, v1.2.0-beta.2 (no compatibility guarantees).
-	•	Experimental flags (code): explicit opt-in; default off.
-	•	Experimental wire features: only via explicit extension points; do not rely on for cross-vendor compatibility.
+---
 
-⸻
+## 7) Release Process & Tagging
 
-9) Long-Term Support (LTS)
-	•	Designate certain MINOR lines as LTS (e.g., 1.4.x) supported 12 months for security/critical fixes.
-	•	LTS releases are PATCH-only; no new features; no breaking behavior.
+### 7.1 Git tags
 
-⸻
+- **Spec changes:** `spec/vX.Y.Z` (repo snapshot)
+- **Optional component tags:** `spec/<component>/vX.Y.Z` (when component-specific release notes are maintained)
+- **SDKs:** `<lang>/vX.Y.Z` (e.g., `python/v1.7.2`)
+- **Adapters:** `adapter-<name>/vX.Y.Z` (e.g., `adapter-qdrant/v2.3.0`)
 
-10) Multi-Language Package Versioning
+### 7.2 Branches
+
+- **main:** active development (next MINOR)
+- **release/vX.Y:** stabilization branch for imminent release
+- **maint/vX.Y:** maintenance branch for backports to an older MINOR
+
+### 7.3 Artifacts
+
+- Every release updates `CHANGELOG.md` (format: Added/Changed/Fixed/Deprecated/Removed/Security).
+- If wire/spec touched: update conformance suites and publish updated schema bundle.
+- If schemas touched: bump `schema_version` and publish under a stable path.
+
+---
+
+## 8) Pre-Releases, RCs, and Experimental Features
+
+- **Pre-releases:** `v1.2.0-rc.1`, `v1.2.0-beta.2`. No long-term compatibility guarantees; APIs may change before GA.
+- **Experimental flags (code):** opt-in via explicit environment variable or constructor parameter; default off.
+- **Experimental capabilities (wire):** expose under explicit vendor/extension namespaces (e.g., `x-` prefixed keys) and do not rely on them for cross-vendor compatibility.
+
+---
+
+## 9) Long-Term Support (LTS)
+
+- Certain **MINOR** lines may be designated as LTS (e.g., `1.4.x`) supporting **12 months** of security and critical fixes.
+- LTS backports must **not** change public APIs; no new features.
+- LTS releases are **PATCH** increments only.
+
+---
+
+## 10) Multi-Language Package Versioning
 
 To reduce cross-language drift:
-	•	Source of truth: spec tag spec/vX.Y.Z + protocols_version.
-	•	Language SDKs SHOULD ship a machine-readable mapping of supported protocol MAJORs (and optionally spec MINORs):
 
+- **Source of truth:** spec tags (`spec/vX.Y.Z`) and schema bundle versions (`schema_version`).
+- SDKs must include a machine-readable mapping (e.g., `sdk_support.json`) indicating supported protocol majors:
+
+```json
 {
   "llm": "v1.0",
   "vector": "v1.0",
   "graph": "v1.0",
   "embedding": "v1.0"
 }
+```
 
-	•	Go: /v2 module path only on SDK MAJOR.
-	•	Python: __version__ SemVer; publish wheels; include protocol support mapping in package metadata.
-	•	TypeScript/Java: publish SemVer; keep generated types in lockstep with spec tag.
+**Language-specific notes:**
 
-⸻
+- **Go:** Module path remains stable across MINOR/PATCH; MAJOR increments add `/v2` per Go module rules.
+- **Python:** `__version__` follows SemVer; publish wheels with parity; pin protocol compatibility in package metadata.
+- **TypeScript/Java:** publish with SemVer; keep generated types in lockstep with schema bundles.
 
-11) Capability Gating & Negotiation
+---
 
-Adapters MUST return capabilities() with:
-	•	protocol: "<component>/v<major>.0" (schema-const per component),
-	•	feature flags and limits as defined by that component’s schema,
-	•	vendor extensions only where the schema permits openness.
+## 11) Capability Gating & Negotiation
 
-Clients SHOULD:
-	•	probe capabilities() at startup,
-	•	gate optional features on flags,
-	•	avoid assuming presence of non-advertised fields.
+Adapters **MUST** return `capabilities()` with:
 
-Adding a new capability flag is MINOR only if it is compatible with the schema strategy for that component (open vs closed). If the capability result schema is closed, introducing new fields requires a schema/versioning plan consistent with SemVer and validation expectations.
+- `protocol: "<component>/v<major>.0"` (schema const),
+- feature flags (e.g., `supports_deadline`),
+- limits (e.g., `max_top_k`, `max_dimensions`),
+- vendor extensions only where schema allows (e.g., open capabilities schemas).
 
-⸻
+Clients **SHOULD**:
 
-12) Migration Checklist (for maintainers)
-	1.	Classify: breaking vs additive vs editorial.
-	2.	Bump versions: protocols_version, schema_version, SDK/adapters as applicable.
-	3.	Ensure negotiation/fallback: use capability flags or explicit error.details for supported protocols.
-	4.	Docs: update CHANGELOG.md, and any migration notes.
-	5.	Tests:
-	•	Breaking → add negative tests for old behavior.
-	•	Additive → add positive tests + ensure older peers ignore via extension points.
-	6.	Deprecation: mark + timeline.
-	7.	Security: re-confirm SIEM-safe invariants.
+- probe `capabilities()` at startup,
+- gate optional features based on flags,
+- avoid assuming presence of non-advertised fields.
 
-⸻
+Adding a new capability flag is **MINOR**. Removing or inverting its semantics is **MAJOR**.
 
-13) Examples
+---
 
-13.1 Add a new optional match attribute (Vector)
-	•	Change: add normalized_score to VectorMatch.
-	•	Version: spec MINOR + schema MINOR.
-	•	Behavior: adapters may emit; clients ignore only if the type schema permits it (or schema is bumped + validators updated).
+## 12) Migration Checklist (for maintainers)
 
-13.2 Tighten error retryability (LLM)
-	•	Change: classify ContentFiltered from retryable → non-retryable.
-	•	Version: MAJOR (changes client behavior guidance).
-	•	Migration: document new handling; add tests.
+Before merging a change that affects public API/spec:
 
-13.3 Add supports_deadline capability flag (Embedding)
-	•	Change: capability flag addition.
-	•	Version: spec/schema MINOR (if schema already includes the field; otherwise requires schema plan).
-	•	Behavior: adapters not supporting deadlines keep it false; clients check before use.
+1. **Classify:** breaking vs additive vs editorial.
+2. **Bump:** version(s) in spec/schemas/SDKs/adapters accordingly.
+3. **Negotiate:** ensure fallback behavior or capability flag for optional features.
+4. **Docs:** update `CHANGELOG.md` and any migration notes.
+5. **Tests:** extend conformance tests.
+   - Breaking → add negative tests for old behavior.
+   - Additive → add positive tests showing older peers ignore fields where allowed.
+6. **Deprecation:** mark deprecated and document timeline if applicable.
+7. **Security/Privacy:** reconfirm SIEM-safe invariants.
 
-⸻
+---
 
-14) Documentation & Examples
-	•	Examples are Non-Normative unless explicitly marked “Normative Example”.
-	•	Example updates don’t bump protocol MAJOR unless they introduce new normative requirements.
-	•	Conformance tracking should reflect test deltas per spec/schema version.
+## 13) Examples
 
-⸻
+### 13.1 Add a new optional match attribute (Vector)
 
-15) Security, CVEs, and Backports
-	•	Security fixes may be backported to supported LTS + latest stable MINOR.
-	•	If a security fix changes normative behavior:
-	•	prefer opt-in flags defaulting to safe behavior; otherwise document clearly even for PATCH.
+- **Change:** add `normalized_score` to `VectorMatch` only if the VectorMatch schema permits additional properties (or via a schema MINOR that adds an optional field).
+- **Version:** **MINOR**.
+- **Behavior:** Adapters may populate; clients not expecting it ignore the field (only if schema allows).
 
-⸻
+### 13.2 Tighten error retryability (LLM)
 
-16) Notices & Legal
-	•	Maintain NOTICE and license headers per Apache 2.0.
-	•	Tags/changelogs must not include confidential vendor details.
+- **Change:** classify an error from retryable → non-retryable.
+- **Version:** **MAJOR** (changes client behavior).
+- **Migration:** document new handling; optionally add a transitional capability flag if both behaviors exist temporarily.
 
-⸻
+### 13.3 Add `supports_deadline` to capabilities (Embedding)
 
-17) FAQ
+- **Change:** capability flag addition.
+- **Version:** **MINOR**.
+- **Behavior:** Adapters not supporting deadlines keep flag false; clients must check before using.
 
-Q: Can an SDK 1.9.0 support protocol vector/v2?
-A: Only if it explicitly advertises support and negotiates v2. Otherwise expect NotSupported.
+---
 
-Q: Are additive validation checks breaking?
-A: If they reject previously-valid inputs, yes → MAJOR. If they only reject previously-undefined/invalid inputs, PATCH/MINOR (document rationale).
+## 14) Versioning for Documentation & Examples
 
-Q: Can we add a new error hint (e.g., suggested_batch_reduction)?
-A: Yes as MINOR, placed under error.details so unknown hints are ignored.
+- Examples are non-normative unless explicitly marked.
+- Example updates are typically **PATCH** unless they demonstrate new normative behavior (which must be versioned accordingly).
+- Conformance suites track coverage deltas per protocol/spec version.
 
-⸻
+---
 
-18) Quick Decision Table
+## 15) Security, CVEs, and Backports
 
-Change Type	Bump	Notes
-Add optional field / capability flag	MINOR	Must be ignorable via schema-defined extension points (or schema/version plan)
-Add new operation (optional)	MINOR	Gate by capability
-Tighten validation that rejects previously valid input	MAJOR	Document migration
-Rename/remove required field	MAJOR	Breaking wire change
-Change error retryability guidance	MAJOR	Alters client behavior
-Add new error subtype	MINOR	Additive taxonomy
-Observability: add low-cardinality attribute	MINOR/PATCH	Preserve privacy invariants
-Doc/typo/edit only	PATCH	No behavior change
+- Security fixes may be backported to supported LTS lines and latest stable MINOR.
+- If a security fix changes normative behavior:
+  - Prefer an opt-in flag defaulting to safe behavior, or
+  - ship as **PATCH** with explicit release notes if the change is clearly in-scope for safety.
+- Publish advisories with fixed versions and upgrade guidance.
 
+---
 
-⸻
+## 16) Notices & Legal
 
-19) Checklist for Release Managers
-	•	Versions bumped across spec/schema/SDK/adapter as applicable
-	•	Changelog complete (Added/Changed/Deprecated/Removed/Fixed/Security)
-	•	Conformance tests updated/passing
-	•	Deprecations noted with timeline
-	•	Capabilities + negotiation tested end-to-end
-	•	Tags pushed; packages published
-	•	NOTICE/LICENSE updated if needed
+- `NOTICE` and license headers are maintained per Apache 2.0.
+- Version tags and changelogs must not include vendor confidential material.
 
-⸻
+---
 
-Change History
-	•	v1.0 (Initial): Establishes SemVer policy across spec/wire/SDK/adapters; defines negotiation rules, deprecation, LTS, and migration procedures.
+## 17) FAQ
 
+**Q: Can an SDK 1.9.0 support protocol vector/v2?**  
+A: Only if it explicitly advertises support (e.g., via `sdk_support.json`) and negotiates the requested protocol major. Otherwise, expect `NotSupported`.
+
+**Q: Are additive validation checks breaking?**  
+A: If they reject previously valid inputs, yes → **MAJOR**. If they only reject previously undefined/invalid inputs, it's **PATCH/MINOR** (document rationale).
+
+**Q: Can we add a new error hint (e.g., `suggested_batch_reduction`)?**  
+A: **MINOR** additive; put it in `error.details` and require clients to ignore unknown hints.
+
+---
+
+## 18) Quick Decision Table
+
+| Change Type | Bump | Notes |
+|---|---|---|
+| Add optional field / capability flag | MINOR | Must be ignorable by older peers where schema allows |
+| Add new operation (optional) | MINOR | Gate by capability |
+| Tighten validation that rejects previously valid input | MAJOR | Document migration |
+| Rename/remove required field | MAJOR | Breaking wire change |
+| Change error retryability guidance | MAJOR | Alters client behavior |
+| Add new error subtype | MINOR | Additive taxonomy |
+| Observability: add low-cardinality attribute | MINOR/PATCH | Ensure privacy invariants |
+| Doc/typo/edit only | PATCH | No behavior change |
+
+---
+
+## 19) Checklist for Release Managers
+
+- [ ] Version(s) bumped across spec, schemas, SDKs, adapters
+- [ ] Changelog entries complete (Added/Changed/Deprecated/Removed/Fixed/Security)
+- [ ] Conformance tests updated/passing
+- [ ] Deprecations noted with timeline
+- [ ] Capabilities and negotiation tested end-to-end
+- [ ] Tags pushed; artifacts published
+- [ ] NOTICE/LICENSE updated if new third-party code included
+
+---
+
+## Change History
+- **v1.0** (Initial): Establishes SemVer policy across spec/wire/SDK/adapters; defines negotiation rules, deprecation, LTS, and migration procedures.
