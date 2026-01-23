@@ -3,13 +3,13 @@
   "code": "OK",
   "ms": 12.4,
   "result": {
-    "text": "Hello!",
+    "text": "Bye!",
     "model": "test-model-1",
     "model_family": "test-family",
     "usage": {
-      "prompt_tokens": 2,
-      "completion_tokens": 1,
-      "total_tokens": 3
+      "prompt_tokens": 98,
+      "completion_tokens": 2,
+      "total_tokens": 100
     },
     "finish_reason": "stop"
   }
