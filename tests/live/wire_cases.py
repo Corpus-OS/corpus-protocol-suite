@@ -44,7 +44,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Any, Dict, FrozenSet, List, Optional, Sequence
+from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -67,17 +67,34 @@ VALID_COMPONENTS: FrozenSet[str] = frozenset({"llm", "vector", "embedding", "gra
 SCHEMA_VERSION = "1.0.0"
 DEFAULT_SCHEMA_BASE_URL = "https://corpusos.com/schemas"
 
+# SCHEMA.md normative operation counts (unique ops across four domains)
+EXPECTED_UNIQUE_OPS = 33
+EXPECTED_OP_COUNTS_BY_COMPONENT: Dict[str, int] = {
+    "llm": 5,
+    "vector": 8,
+    "embedding": 7,
+    "graph": 13,
+}
+
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
+
+def _normalize_base_url(url: str) -> str:
+    """Normalize schema base URL (strip trailing slashes)."""
+    u = (url or "").strip()
+    while u.endswith("/"):
+        u = u[:-1]
+    return u or DEFAULT_SCHEMA_BASE_URL
+
 
 @dataclass(frozen=True)
 class CasesConfig:
     """Configuration for case registry loading."""
 
     schema_base_url: str = DEFAULT_SCHEMA_BASE_URL
-    config_paths: tuple[str, ...] = (
+    config_paths: Tuple[str, ...] = (
         "config/wire_test_cases.yaml",
         "config/wire_test_cases.yml",
         "config/wire_test_cases.json",
@@ -96,14 +113,6 @@ class CasesConfig:
         paths = tuple(p for p in paths if p)
 
         return cls(schema_base_url=base_url, config_paths=paths)
-
-
-def _normalize_base_url(url: str) -> str:
-    """Normalize schema base URL (strip trailing slashes)."""
-    u = (url or "").strip()
-    while u.endswith("/"):
-        u = u[:-1]
-    return u or DEFAULT_SCHEMA_BASE_URL
 
 
 # ---------------------------------------------------------------------------
@@ -135,7 +144,7 @@ class WireRequestCase:
     op: str
     build_method: str
     schema_id: str
-    schema_versions: tuple[str, ...] = (SCHEMA_VERSION,)
+    schema_versions: Tuple[str, ...] = (SCHEMA_VERSION,)
     args_validator: Optional[str] = None
     description: str = ""
     tags: FrozenSet[str] = field(default_factory=frozenset)
@@ -146,24 +155,24 @@ class WireRequestCase:
 
     def __post_init__(self) -> None:
         """Validate case invariants on construction."""
-        if not self.id:
-            raise ValueError("Case 'id' must be non-empty")
+        if not self.id or not isinstance(self.id, str):
+            raise ValueError("Case 'id' must be a non-empty string")
 
         if self.component not in VALID_COMPONENTS:
             raise ValueError(
                 f"Invalid component '{self.component}', must be one of {sorted(VALID_COMPONENTS)}"
             )
 
-        if not self.op.startswith(f"{self.component}."):
+        if not isinstance(self.op, str) or not self.op.startswith(f"{self.component}."):
             raise ValueError(
                 f"Operation '{self.op}' must start with component prefix '{self.component}.'"
             )
 
-        if not self.build_method:
-            raise ValueError("Case 'build_method' must be non-empty")
+        if not self.build_method or not isinstance(self.build_method, str):
+            raise ValueError("Case 'build_method' must be a non-empty string")
 
-        if not self.schema_id:
-            raise ValueError("Case 'schema_id' must be non-empty")
+        if not self.schema_id or not isinstance(self.schema_id, str):
+            raise ValueError("Case 'schema_id' must be a non-empty string")
 
         if not isinstance(self.schema_versions, tuple) or not self.schema_versions:
             raise ValueError("Case 'schema_versions' must be a non-empty tuple")
@@ -176,6 +185,9 @@ class WireRequestCase:
             if not isinstance(t, str) or not t.strip():
                 raise ValueError(f"Invalid tag entry (must be non-empty string): {t!r}")
 
+        if self.args_validator is not None and not isinstance(self.args_validator, str):
+            raise ValueError("args_validator must be a string or None")
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "WireRequestCase":
         """
@@ -184,7 +196,9 @@ class WireRequestCase:
         Supports loading from external YAML/JSON configuration.
         """
         if not isinstance(data, dict):
-            raise ValueError(f"WireRequestCase entry must be an object, got {type(data).__name__}")
+            raise ValueError(
+                f"WireRequestCase entry must be an object, got {type(data).__name__}"
+            )
 
         required = {"id", "component", "op", "build_method", "schema_id"}
         missing = required - set(data.keys())
@@ -194,6 +208,10 @@ class WireRequestCase:
         tags = _normalize_tags(data.get("tags", []))
         versions = _normalize_versions(data.get("schema_versions", (SCHEMA_VERSION,)))
 
+        args_validator = data.get("args_validator")
+        if args_validator is not None and not isinstance(args_validator, str):
+            raise ValueError("args_validator must be a string or None")
+
         return cls(
             id=str(data["id"]),
             component=str(data["component"]),
@@ -201,7 +219,7 @@ class WireRequestCase:
             build_method=str(data["build_method"]),
             schema_id=str(data["schema_id"]),
             schema_versions=versions,
-            args_validator=data.get("args_validator"),
+            args_validator=args_validator,
             description=str(data.get("description", "")),
             tags=tags,
             requires_schema=bool(data.get("requires_schema", True)),
@@ -269,7 +287,7 @@ def _normalize_tags(raw: Any) -> FrozenSet[str]:
     return frozenset(out)
 
 
-def _normalize_versions(raw: Any) -> tuple[str, ...]:
+def _normalize_versions(raw: Any) -> Tuple[str, ...]:
     """
     Normalize schema_versions into tuple[str, ...].
 
@@ -285,7 +303,9 @@ def _normalize_versions(raw: Any) -> tuple[str, ...]:
     elif isinstance(raw, (list, tuple)):
         raw_list = list(raw)
     else:
-        raise ValueError(f"schema_versions must be a string or array of strings, got {type(raw).__name__}")
+        raise ValueError(
+            f"schema_versions must be a string or array of strings, got {type(raw).__name__}"
+        )
 
     out: List[str] = []
     for v in raw_list:
@@ -334,7 +354,7 @@ def _load_json_file(path: str) -> Dict[str, Any]:
     return loaded
 
 
-def load_external_config(paths: Optional[tuple[str, ...]] = None) -> Optional[Dict[str, Any]]:
+def load_external_config(paths: Optional[Tuple[str, ...]] = None) -> Optional[Dict[str, Any]]:
     """
     Load test case configuration from external files.
 
@@ -370,6 +390,7 @@ def load_external_config(paths: Optional[tuple[str, ...]] = None) -> Optional[Di
 def _validate_external_cases_blob(external: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Validate external config shape and return the list of case dicts.
+
     Expected:
       {"wire_request_cases": [ {case}, {case}, ... ] }
     """
@@ -383,9 +404,135 @@ def _validate_external_cases_blob(external: Dict[str, Any]) -> List[Dict[str, An
     out: List[Dict[str, Any]] = []
     for i, entry in enumerate(cases):
         if not isinstance(entry, dict):
-            raise ValueError(f"wire_request_cases[{i}] must be an object, got {type(entry).__name__}")
+            raise ValueError(
+                f"wire_request_cases[{i}] must be an object, got {type(entry).__name__}"
+            )
         out.append(entry)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Registry Alignment Validators (schema-first posture; no skip semantics)
+# ---------------------------------------------------------------------------
+
+def _expected_schema_id(schema_base_url: str, component: str, op: str) -> str:
+    """
+    SCHEMA.md convention for op-level request schema $id:
+      <base_url>/<component>/<op>.request.json
+    where op includes the component prefix (e.g., "llm.complete").
+    """
+    base = _normalize_base_url(schema_base_url)
+    return f"{base}/{component}/{op}.request.json"
+
+
+def _validate_registry_alignment(
+    cases: List[WireRequestCase], *, schema_base_url: str, context: str
+) -> None:
+    """
+    Enforce alignment constraints that prevent drift between SCHEMA.md, schema bundles, and wire cases.
+
+    Notes:
+      - This does NOT perform schema-registry lookups; it enforces naming / mapping invariants.
+      - Strict harness behavior must still FAIL if schema_id is missing in the loaded registry, or
+        if the adapter lacks build_method.
+    """
+    problems: List[str] = []
+
+    # Unique case IDs
+    seen_ids: set[str] = set()
+    for c in cases:
+        if c.id in seen_ids:
+            problems.append(f"Duplicate case.id: {c.id}")
+        seen_ids.add(c.id)
+
+    # Schema ID pattern checks
+    base = _normalize_base_url(schema_base_url)
+    for c in cases:
+        expected = _expected_schema_id(base, c.component, c.op)
+        if c.schema_id != expected:
+            problems.append(
+                f"{c.id}: schema_id mismatch for op={c.op!r} "
+                f"(expected {expected!r}, got {c.schema_id!r})"
+            )
+
+        # Basic builder naming hygiene (non-breaking, catches typos early)
+        if not c.build_method.startswith("build_") or not c.build_method.endswith("_envelope"):
+            problems.append(
+                f"{c.id}: build_method should follow 'build_<...>_envelope' naming, got {c.build_method!r}"
+            )
+
+    # SCHEMA.md normative unique op coverage (variants permitted)
+    unique_ops = sorted({c.op for c in cases})
+    if len(unique_ops) != EXPECTED_UNIQUE_OPS:
+        problems.append(
+            f"{context}: expected {EXPECTED_UNIQUE_OPS} unique ops, found {len(unique_ops)} "
+            f"(unique_ops={unique_ops})"
+        )
+
+    # Per-component op counts
+    by_comp: Dict[str, set[str]] = {k: set() for k in VALID_COMPONENTS}
+    for c in cases:
+        by_comp.setdefault(c.component, set()).add(c.op)
+
+    for comp, expected_count in EXPECTED_OP_COUNTS_BY_COMPONENT.items():
+        actual_count = len(by_comp.get(comp, set()))
+        if actual_count != expected_count:
+            problems.append(
+                f"{context}: component {comp!r} expected {expected_count} unique ops, found {actual_count} "
+                f"(ops={sorted(by_comp.get(comp, set()))})"
+            )
+
+    if problems:
+        msg = "Wire request case registry alignment errors:\n- " + "\n- ".join(problems)
+        raise ValueError(msg)
+
+
+def assert_cases_schema_ids_exist_in_registry(cases: Optional[List[WireRequestCase]] = None) -> None:
+    """
+    Strict conformance helper: fail if any case.schema_id is missing from the loaded schema registry.
+
+    This is a convenience wrapper for harnesses. It intentionally hard-fails in strict posture
+    (no skip behavior). If the schema registry tooling is missing, this fails with a clear error.
+    """
+    # Soft import: registry lives in test tooling, but strict conformance requires it.
+    try:
+        from tests.utils.schema_registry import list_schemas  # type: ignore
+    except Exception as e:
+        raise RuntimeError(
+            "Schema registry tooling is not available; strict conformance requires tests.utils.schema_registry"
+        ) from e
+
+    registry = list_schemas()  # {schema_id: file_path}
+    known_ids = set(registry.keys())
+
+    missing: List[str] = []
+    for c in (cases or WIRE_REQUEST_CASES):
+        if c.schema_id not in known_ids:
+            missing.append(f"{c.id}: {c.schema_id}")
+
+    if missing:
+        raise AssertionError(
+            "Some wire request cases reference schema_ids that are not present in the loaded schema registry:\n"
+            + "\n".join(f"- {m}" for m in missing)
+        )
+
+
+def assert_adapter_supports_all_build_methods(adapter: Any, cases: Optional[List[WireRequestCase]] = None) -> None:
+    """
+    Strict conformance helper: fail if the adapter is missing any required builder methods.
+
+    Harnesses should call this before running cases so missing builders fail fast (not skip).
+    """
+    missing: List[str] = []
+    for c in (cases or WIRE_REQUEST_CASES):
+        if not hasattr(adapter, c.build_method):
+            missing.append(f"{c.id}: missing {c.build_method} for op={c.op}")
+
+    if missing:
+        raise AssertionError(
+            "Adapter missing required wire builder methods (strict conformance):\n"
+            + "\n".join(f"- {m}" for m in missing)
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -397,7 +544,7 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
     Build the default registry of wire request test cases.
 
     This set is aligned to SCHEMA.md operation naming and operation-level request schemas:
-      <base_url>/<component>/<component>.<operation>.request.json
+      <base_url>/<component>/<op>.request.json
 
     Variants reuse the same build method and operation schema; the harness supplies variant args.
 
@@ -405,8 +552,8 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
     """
     base_url = _normalize_base_url(base_url)
 
-    return [
-        # ========================== LLM (5) ========================== #
+    cases: List[WireRequestCase] = [
+        # ========================== LLM (5 unique ops) ========================== #
         WireRequestCase(
             id="llm_capabilities",
             component="llm",
@@ -426,6 +573,7 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             description="Generate LLM completion for given messages",
             tags=frozenset({"core", "llm", "completion"}),
         ),
+        # Variant: tools (same op + builder; different args fixture)
         WireRequestCase(
             id="llm_complete_with_tools",
             component="llm",
@@ -436,6 +584,7 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             description="LLM completion with tool/function calling",
             tags=frozenset({"core", "llm", "completion", "tools"}),
         ),
+        # Variant: JSON mode (same op + builder; different args fixture)
         WireRequestCase(
             id="llm_complete_json_mode",
             component="llm",
@@ -456,6 +605,7 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             description="Stream LLM completion incrementally",
             tags=frozenset({"core", "llm", "streaming"}),
         ),
+        # Variant: streaming + tools (same op + builder; different args fixture)
         WireRequestCase(
             id="llm_stream_with_tools",
             component="llm",
@@ -486,7 +636,7 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             tags=frozenset({"llm", "health", "operational"}),
         ),
 
-        # ======================== VECTOR (8) ========================= #
+        # ======================== VECTOR (8 unique ops) ========================= #
         WireRequestCase(
             id="vector_capabilities",
             component="vector",
@@ -506,6 +656,7 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             description="Vector similarity search query",
             tags=frozenset({"core", "vector", "query"}),
         ),
+        # Variant: filter (same op + builder; different args fixture)
         WireRequestCase(
             id="vector_query_with_filter",
             component="vector",
@@ -606,7 +757,7 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             tags=frozenset({"vector", "health", "operational"}),
         ),
 
-        # ======================= EMBEDDING (7) ======================= #
+        # ======================= EMBEDDING (7 unique ops) ======================= #
         WireRequestCase(
             id="embedding_capabilities",
             component="embedding",
@@ -716,7 +867,7 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             tags=frozenset({"embedding", "health", "operational"}),
         ),
 
-        # ========================= GRAPH (13) ========================= #
+        # ========================= GRAPH (13 unique ops) ========================= #
         WireRequestCase(
             id="graph_capabilities",
             component="graph",
@@ -924,6 +1075,11 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
         ),
     ]
 
+    # Enforce SCHEMA.md-aligned invariants for the in-repo default registry
+    _validate_registry_alignment(cases, schema_base_url=base_url, context="default_registry")
+
+    return cases
+
 
 # ---------------------------------------------------------------------------
 # Registry
@@ -935,11 +1091,18 @@ class WireRequestCaseRegistry:
 
     Provides efficient lookup by ID, operation, component, and tags.
     Supports loading from external configuration or using defaults.
+
+    Strict posture note:
+      - This registry does not "skip" cases. Missing schema/builder must be treated as FAIL
+        by the harness. Helper assertions are provided for fail-fast behavior.
     """
 
     def __init__(self, cases: Optional[List[WireRequestCase]] = None):
         if cases is not None:
             self._cases = list(cases)
+            # When passed explicitly, alignment checks are still applied for strict hygiene.
+            cfg = CasesConfig.from_env()
+            _validate_registry_alignment(self._cases, schema_base_url=cfg.schema_base_url, context="custom_cases")
         else:
             self._cases = self._load_cases()
 
@@ -951,8 +1114,10 @@ class WireRequestCaseRegistry:
 
         if external is not None:
             case_dicts = _validate_external_cases_blob(external)
+            cases = [WireRequestCase.from_dict(case) for case in case_dicts]
+            _validate_registry_alignment(cases, schema_base_url=config.schema_base_url, context="external_config")
             logger.info("Loading wire request cases from external configuration")
-            return [WireRequestCase.from_dict(case) for case in case_dicts]
+            return cases
 
         return _build_default_cases(config.schema_base_url)
 
@@ -1116,7 +1281,7 @@ def print_cases_table(cases: List[WireRequestCase], verbose: bool = False) -> No
             print(f"  Schema:       {case.schema_id}")
             print(f"  Validator:    {case.args_validator or 'none'}")
             print(f"  Tags:         {', '.join(sorted(case.tags)) or 'none'}")
-            print(f"  Strict:       missing schema/builder MUST FAIL")
+            print("  Strict:       missing schema/builder MUST FAIL")
             print(f"  Description:  {case.description or 'none'}")
     else:
         print(f"{'ID':<40} {'Component':<12} {'Tags'}")
