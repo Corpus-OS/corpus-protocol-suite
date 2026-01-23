@@ -546,25 +546,6 @@ Use this when implementing or validating a new **Embedding adapter** against `Em
 
    Status: Production Ready
 ```
-
----
-
-## Maintenance
-
-### Adding New Tests
-
-* `../../SPECIFICATION.md` - Full protocol specification (§10 Vector Protocol)
-* `../../ERRORS.md` - Error taxonomy reference
-* `../../METRICS.md` - Observability guidelines
-* `../README.md` - General testing guidelines
-
-### Updating for Specification Changes
-
-1. Review `SPECIFICATION.md` Appendix F for Embedding-related changes.
-2. Add or adjust tests for any new normative behavior.
-3. Bump documented protocol version if required.
-4. Update the conformance badge and checklist to match.
-
 ---
 
 **Last Updated:** 2026-01-19
