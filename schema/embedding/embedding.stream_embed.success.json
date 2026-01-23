@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.stream_embed.success.json",
+  "title": "Embedding Stream Embed Success Frame",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "https://corpusos.com/schemas/common/envelope.stream.success.json"
+    },
+    {
+      "properties": {
+        "chunk": {
+          "$ref": "https://corpusos.com/schemas/embedding/embedding.types.chunk.json"
+        }
+      }
+    }
+  ]
+}

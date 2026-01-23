@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.types.failure.json",
+  "title": "Embedding Failure Item",
+  "type": "object",
+  "properties": {
+    "index": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "text": {
+      "type": "string"
+    },
+    "error": {
+      "type": "string"
+    },
+    "code": {
+      "type": "string"
+    },
+    "message": {
+      "type": "string"
+    },
+    "metadata": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": true
+    }
+  },
+  "required": [
+    "index",
+    "text",
+    "error",
+    "code",
+    "message"
+  ],
+  "additionalProperties": true
+}

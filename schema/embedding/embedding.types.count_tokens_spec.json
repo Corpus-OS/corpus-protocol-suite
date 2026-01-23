@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.types.count_tokens_spec.json",
+  "title": "Embedding Count Tokens Spec",
+  "type": "object",
+  "properties": {
+    "text": {
+      "type": "string"
+    },
+    "model": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": ".*\\S.*"
+    }
+  },
+  "required": [
+    "text",
+    "model"
+  ],
+  "additionalProperties": true
+}

@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.capabilities.success.json",
+  "title": "Embedding Capabilities Success",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "https://corpusos.com/schemas/embedding/embedding.envelope.success.json"
+    },
+    {
+      "properties": {
+        "result": {
+          "$ref": "https://corpusos.com/schemas/embedding/embedding.capabilities.json"
+        }
+      }
+    }
+  ]
+}

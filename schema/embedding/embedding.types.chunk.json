@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.types.chunk.json",
+  "title": "Embedding Streaming Chunk",
+  "type": "object",
+  "properties": {
+    "embeddings": {
+      "type": "array",
+      "items": {
+        "$ref": "https://corpusos.com/schemas/embedding/embedding.types.vector.json"
+      }
+    },
+    "is_final": {
+      "type": "boolean"
+    },
+    "usage": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": true
+    },
+    "model": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "embeddings",
+    "is_final"
+  ],
+  "additionalProperties": false
+}

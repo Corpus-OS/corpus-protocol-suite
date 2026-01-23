@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.types.vector.json",
+  "title": "Embedding Vector",
+  "type": "object",
+  "properties": {
+    "vector": {
+      "type": "array",
+      "items": {
+        "type": "number"
+      },
+      "minItems": 1
+    },
+    "text": {
+      "type": "string"
+    },
+    "model": {
+      "type": "string"
+    },
+    "dimensions": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "index": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "metadata": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": true
+    }
+  },
+  "required": [
+    "vector",
+    "text",
+    "model",
+    "dimensions"
+  ],
+  "additionalProperties": false
+}

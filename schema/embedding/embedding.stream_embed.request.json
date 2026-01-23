@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.stream_embed.request.json",
+  "title": "Embedding Stream Embed Request",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "https://corpusos.com/schemas/embedding/embedding.envelope.request.json"
+    },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "embedding.stream_embed"
+        },
+        "args": {
+          "$ref": "https://corpusos.com/schemas/embedding/embedding.types.stream_embed_spec.json"
+        }
+      }
+    }
+  ]
+}

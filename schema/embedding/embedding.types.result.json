@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.types.result.json",
+  "title": "Embedding Embed Result",
+  "type": "object",
+  "properties": {
+    "embedding": {
+      "$ref": "https://corpusos.com/schemas/embedding/embedding.types.vector.json"
+    },
+    "model": {
+      "type": "string"
+    },
+    "text": {
+      "type": "string"
+    },
+    "tokens_used": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "truncated": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "embedding",
+    "model",
+    "text",
+    "truncated"
+  ],
+  "additionalProperties": false
+}

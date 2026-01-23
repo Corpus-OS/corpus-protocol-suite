@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.types.batch_result.json",
+  "title": "Embedding Batch Result",
+  "type": "object",
+  "properties": {
+    "embeddings": {
+      "type": "array",
+      "items": {
+        "$ref": "https://corpusos.com/schemas/embedding/embedding.types.vector.json"
+      }
+    },
+    "model": {
+      "type": "string"
+    },
+    "total_texts": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "total_tokens": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "failed_texts": {
+      "type": "array",
+      "items": {
+        "$ref": "https://corpusos.com/schemas/embedding/embedding.types.failure.json"
+      }
+    }
+  },
+  "required": [
+    "embeddings",
+    "model",
+    "total_texts",
+    "failed_texts"
+  ],
+  "additionalProperties": false
+}

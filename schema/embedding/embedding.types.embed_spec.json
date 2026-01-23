@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.types.embed_spec.json",
+  "title": "Embedding Embed Spec",
+  "type": "object",
+  "properties": {
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": ".*\\S.*"
+    },
+    "model": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": ".*\\S.*"
+    },
+    "truncate": {
+      "type": "boolean",
+      "default": true
+    },
+    "normalize": {
+      "type": "boolean",
+      "default": false
+    },
+    "stream": {
+      "type": "boolean",
+      "const": false
+    }
+  },
+  "required": [
+    "text",
+    "model"
+  ],
+  "additionalProperties": true
+}
