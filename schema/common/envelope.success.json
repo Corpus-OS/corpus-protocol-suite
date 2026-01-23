@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/common/envelope.success.json",
+  "title": "Protocol Success Envelope",
+  "type": "object",
+  "properties": {
+    "ok": {
+      "type": "boolean",
+      "const": true
+    },
+    "code": {
+      "type": "string",
+      "const": "OK"
+    },
+    "ms": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Operation duration in milliseconds"
+    },
+    "result": {
+      "description": "Operation-specific result (any JSON value)",
+      "anyOf": [
+        {
+          "type": "object"
+        },
+        {
+          "type": "array"
+        },
+        {
+          "type": "string"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "integer"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "required": [
+    "ok",
+    "code",
+    "ms",
+    "result"
+  ],
+  "additionalProperties": false
+}

@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/common/envelope.error.json",
+  "title": "Protocol Error Envelope",
+  "type": "object",
+  "properties": {
+    "ok": {
+      "type": "boolean",
+      "const": false
+    },
+    "code": {
+      "type": "string",
+      "pattern": "^[A-Z_]+$",
+      "description": "Canonical error code"
+    },
+    "error": {
+      "type": "string",
+      "description": "Error type name"
+    },
+    "message": {
+      "type": "string",
+      "description": "Human-readable error message"
+    },
+    "retry_after_ms": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0,
+      "description": "Suggested retry delay in milliseconds"
+    },
+    "details": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "Error-specific details",
+      "additionalProperties": true
+    },
+    "ms": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Time spent before error in milliseconds"
+    }
+  },
+  "required": [
+    "ok",
+    "code",
+    "error",
+    "message",
+    "retry_after_ms",
+    "details",
+    "ms"
+  ],
+  "additionalProperties": false
+}
