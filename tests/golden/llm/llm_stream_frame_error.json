@@ -1,7 +1,0 @@
-{
-  "event": "error",
-  "code": "TRANSIENT_NETWORK",
-  "error": "TransientNetwork",
-  "message": "Transient network failure during streaming.",
-  "retry_after_ms": 500
-}

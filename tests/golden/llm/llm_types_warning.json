@@ -1,8 +1,0 @@
-{
-  "code": "LLM:TRUNCATED",
-  "message": "Response truncated due to max_tokens limit.",
-  "details": {
-    "max_tokens": 256,
-    "provided_tokens": 300
-  }
-}

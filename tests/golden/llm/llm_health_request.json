@@ -1,9 +1,0 @@
-{
-  "op": "llm.health",
-  "ctx": {
-    "request_id": "req_llm_health_01",
-    "deadline_ms": 253402214400000,
-    "tenant": "acme"
-  },
-  "args": {}
-}

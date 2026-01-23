@@ -1,3 +1,0 @@
-{"ok":true,"code":"OK","ms":0.3,"chunk":{"id":"cmpl_01J0NDJSON","model":"example-llm-1","index":0,"text":"Hello","is_final":false,"delta":{"role":"assistant","content":"Hello"},"finish_reason":null,"logprobs":null}}
-{"ok":true,"code":"OK","ms":0.5,"chunk":{"id":"cmpl_01J0NDJSON","model":"example-llm-1","index":1,"text":", world!","is_final":false,"delta":{"content":", world!"},"finish_reason":null,"logprobs":null}}
-{"ok":true,"code":"OK","ms":1.2,"chunk":{"id":"cmpl_01J0NDJSON","model":"example-llm-1","index":2,"text":"","is_final":true,"delta":{},"finish_reason":"stop","logprobs":null}}

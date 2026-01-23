@@ -1,9 +1,0 @@
-{
-  "tokens": ["Hello", " world", "!"],
-  "token_logprobs": [-0.05, -0.1, -0.2],
-  "top_logprobs": [
-    { "Hello": -0.05, "Hi": -0.3 },
-    { " world": -0.1, " earth": -0.4 },
-    { "!": -0.2, ".": -0.6 }
-  ]
-}

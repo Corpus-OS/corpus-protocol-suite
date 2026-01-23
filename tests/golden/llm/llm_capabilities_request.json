@@ -1,9 +1,0 @@
-{
-  "op": "llm.capabilities",
-  "ctx": {
-    "request_id": "req_llm_caps_01",
-    "deadline_ms": 253402214400000,
-    "tenant": "acme"
-  },
-  "args": {}
-}
