@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/llm/llm.envelope.request.json",
+  "title": "LLM Protocol Request Envelope",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "https://corpusos.com/schemas/common/envelope.request.json"
+    },
+    {
+      "properties": {
+        "op": {
+          "type": "string"
+        }
+      }
+    }
+  ]
+}
