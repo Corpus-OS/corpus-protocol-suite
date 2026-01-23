@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/llm/llm.response_format.json",
+  "title": "LLM Response Format",
+  "description": "Output formatting preferences for LLM responses (text/JSON/etc.). Designed to be forward-compatible.",
+  "anyOf": [
+    {
+      "type": "null"
+    },
+    {
+      "type": "string"
+    },
+    {
+      "type": "object",
+      "additionalProperties": true
+    }
+  ]
+}
