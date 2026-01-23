@@ -525,6 +525,17 @@ Use this checklist when implementing or validating a new LLM adapter:
 
    Status: Production Ready
 ```
+## **LLM Protocol Conformance**
+
+**Certification Levels:**
+- 🏆 **Gold:** 132/132 tests (100%)
+- 🥈 **Silver:** 106+ tests (80%+)
+- 🔬 **Development:** 66+ tests (50%+)
+
+**Badge Suggestion:**
+
+[![Corpus LLM Protocol](https://img.shields.io/badge/CorpusLLM%20Protocol-100%25%20Conformant-brightgreen)](./llm_conformance_report.json)
+
 ---
 
 **Last Updated:** 2026-01-19
