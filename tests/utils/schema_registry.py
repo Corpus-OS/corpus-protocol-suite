@@ -284,7 +284,7 @@ def _load_all_schemas() -> None:
 def _make_validator(schema_id: str) -> Draft202012Validator:
     """Create a validator for the given schema ID with comprehensive error handling."""
     global _REGISTRY  # FIX: Declare global to avoid UnboundLocalError
-    
+
     with _STORE_LOCK:
         if not _LOADED:
             _load_all_schemas()
@@ -344,7 +344,7 @@ def _make_validator(schema_id: str) -> Draft202012Validator:
             validator = Draft202012Validator(
                 schema,
                 registry=_REGISTRY,
-                format_checker=jsonschema.draft202012_format_checker,
+                format_checker=Draft202012Validator.FORMAT_CHECKER,
             )
         except Exception as e:
             raise RuntimeError(
@@ -615,11 +615,7 @@ Environment:
             if not matches:
                 # Try filename matching
                 schema_filename = Path(base_requested).name
-                matches = [
-                    sid
-                    for sid, path in _SCHEMA_PATHS.items()
-                    if Path(path).name == schema_filename
-                ]
+                matches = [sid for sid, path in _SCHEMA_PATHS.items() if Path(path).name == schema_filename]
 
             if len(matches) == 1:
                 # Preserve the fragment the user supplied (if any) by re-attaching it.
