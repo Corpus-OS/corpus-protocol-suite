@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.types.batch_op.json",
+  "title": "Graph Batch Operation",
+  "type": "object",
+  "properties": {
+    "op": {
+      "type": "string",
+      "minLength": 1
+    },
+    "args": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  },
+  "required": [
+    "op",
+    "args"
+  ],
+  "additionalProperties": false
+}

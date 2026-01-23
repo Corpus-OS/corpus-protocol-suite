@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.types.health_result.json",
+  "title": "Graph Health Result",
+  "type": "object",
+  "properties": {
+    "ok": {
+      "type": "boolean"
+    },
+    "status": {
+      "type": "string"
+    },
+    "server": {
+      "type": "string"
+    },
+    "version": {
+      "type": "string"
+    },
+    "namespaces": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "read_only": {
+      "type": "boolean",
+      "default": false
+    },
+    "degraded": {
+      "type": "boolean",
+      "default": false
+    }
+  },
+  "required": [
+    "ok",
+    "status",
+    "server",
+    "version"
+  ],
+  "additionalProperties": false
+}

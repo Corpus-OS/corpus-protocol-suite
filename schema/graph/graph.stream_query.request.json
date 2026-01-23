@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.stream_query.request.json",
+  "title": "Graph Stream Query Request",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "https://corpusos.com/schemas/graph/graph.envelope.request.json"
+    },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "graph.stream_query"
+        },
+        "args": {
+          "$ref": "https://corpusos.com/schemas/graph/graph.types.query_spec.json"
+        }
+      }
+    }
+  ]
+}

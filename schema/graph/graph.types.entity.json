@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.types.entity.json",
+  "title": "Graph Entity",
+  "description": "Union of node and edge entities.",
+  "oneOf": [
+    {
+      "$ref": "https://corpusos.com/schemas/graph/graph.types.node.json"
+    },
+    {
+      "$ref": "https://corpusos.com/schemas/graph/graph.types.edge.json"
+    }
+  ]
+}

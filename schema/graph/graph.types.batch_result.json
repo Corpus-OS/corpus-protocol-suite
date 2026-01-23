@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.types.batch_result.json",
+  "title": "Graph Batch Result",
+  "type": "object",
+  "properties": {
+    "results": {
+      "type": "array",
+      "description": "Batch operation results (any JSON value)"
+    },
+    "success": {
+      "type": "boolean"
+    },
+    "error": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "transaction_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "results",
+    "success"
+  ],
+  "additionalProperties": false
+}

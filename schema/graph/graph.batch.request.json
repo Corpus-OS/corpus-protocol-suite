@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.batch.request.json",
+  "title": "Graph Batch Request",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "https://corpusos.com/schemas/graph/graph.envelope.request.json"
+    },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "graph.batch"
+        },
+        "args": {
+          "type": "object",
+          "properties": {
+            "ops": {
+              "type": "array",
+              "items": {
+                "$ref": "https://corpusos.com/schemas/graph/graph.types.batch_op.json"
+              },
+              "minItems": 1
+            }
+          },
+          "required": [
+            "ops"
+          ],
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}

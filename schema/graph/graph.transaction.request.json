@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.transaction.request.json",
+  "title": "Graph Transaction Request",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "https://corpusos.com/schemas/graph/graph.envelope.request.json"
+    },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "graph.transaction"
+        },
+        "args": {
+          "type": "object",
+          "properties": {
+            "operations": {
+              "type": "array",
+              "items": {
+                "$ref": "https://corpusos.com/schemas/graph/graph.types.batch_op.json"
+              },
+              "minItems": 1
+            }
+          },
+          "required": [
+            "operations"
+          ],
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}

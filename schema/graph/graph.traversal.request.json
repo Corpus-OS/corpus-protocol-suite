@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.traversal.request.json",
+  "title": "Graph Traversal Request",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "https://corpusos.com/schemas/graph/graph.envelope.request.json"
+    },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "graph.traversal"
+        },
+        "args": {
+          "$ref": "https://corpusos.com/schemas/graph/graph.types.traversal_spec.json"
+        }
+      }
+    }
+  ]
+}

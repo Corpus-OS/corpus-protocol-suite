@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.types.traversal_spec.json",
+  "title": "Graph Traversal Specification",
+  "type": "object",
+  "properties": {
+    "start_nodes": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "minItems": 1
+    },
+    "max_depth": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 1
+    },
+    "direction": {
+      "type": "string",
+      "enum": [
+        "OUTGOING",
+        "INCOMING",
+        "BOTH"
+      ],
+      "default": "OUTGOING"
+    },
+    "relationship_types": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "string"
+      }
+    },
+    "node_filters": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": true
+    },
+    "relationship_filters": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": true
+    },
+    "return_properties": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "string"
+      }
+    },
+    "namespace": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "start_nodes"
+  ],
+  "additionalProperties": false
+}

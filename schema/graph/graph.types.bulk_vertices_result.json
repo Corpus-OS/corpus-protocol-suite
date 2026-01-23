@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.types.bulk_vertices_result.json",
+  "title": "Bulk Vertices Result",
+  "type": "object",
+  "properties": {
+    "nodes": {
+      "type": "array",
+      "items": {
+        "$ref": "https://corpusos.com/schemas/graph/graph.types.node.json"
+      }
+    },
+    "next_cursor": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "has_more": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "nodes",
+    "has_more"
+  ],
+  "additionalProperties": false
+}

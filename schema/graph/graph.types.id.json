@@ -1,0 +1,8 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.types.id.json",
+  "title": "Graph ID",
+  "description": "Canonical identifier type for graph elements.",
+  "type": "string",
+  "minLength": 1
+}
