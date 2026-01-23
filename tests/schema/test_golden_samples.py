@@ -19,8 +19,9 @@ Auto-discovery:
 - Enforces a closed-loop check: every inferred schema_id must exist in the registry BEFORE validation.
 
 Notes:
-- This suite intentionally minimizes special-casing. If a golden filename does not match the
-  naming convention, the correct fix is to rename the fixture to match the contract.
+- This suite intentionally minimizes special-casing.
+- Variant suffixes are allowed via "__<variant>" (e.g. embedding_capabilities_request__args_extensions.json)
+  and are ignored for schema-id inference.
 """
 
 from __future__ import annotations
@@ -124,6 +125,14 @@ def _infer_graph_dot_variant_schema_id(component: str, filename: str) -> str:
     return f"{SCHEMA_BASE}/{component}/{component}.{op}.{kind}.json"
 
 
+def _strip_variant_suffix(stem: str) -> str:
+    """
+    Allow fixture variants by suffixing "__<variant>".
+    Example: embedding_capabilities_request__args_extensions -> embedding_capabilities_request
+    """
+    return stem.split("__", 1)[0]
+
+
 def _infer_schema_id_from_json_relpath(relpath: str) -> str:
     """
     Supported golden JSON naming patterns:
@@ -155,6 +164,10 @@ def _infer_schema_id_from_json_relpath(relpath: str) -> str:
     7) Graph dot-variant request/success:
        graph.delete_nodes.by_id.request.json -> graph.delete_nodes.request.json (schema id)
        graph.upsert_nodes.single.success.json -> graph.upsert_nodes.success.json (schema id)
+
+    Variant suffixes:
+       Any of the above may include "__<variant>" before ".json" and still be inferred.
+       Example: embedding_capabilities_request__args_extensions.json
     """
     p = Path(relpath)
     if len(p.parts) < 2:
@@ -165,7 +178,7 @@ def _infer_schema_id_from_json_relpath(relpath: str) -> str:
         raise ValueError(f"Unknown component folder '{component}' in {relpath}")
 
     filename = p.name
-    stem = p.stem
+    stem = _strip_variant_suffix(p.stem)
 
     # 7) Graph dot-variant request/success fixtures
     if (
@@ -579,7 +592,7 @@ def test_streaming_ndjson_validates_with_stream_validator(fname: str, schema_id:
     ndjson_text = p.read_text(encoding="utf-8")
     report = validate_ndjson_stream(
         ndjson_text,
-        envelope_schema_id=schema_id,
+        stream_frame_schema_id=schema_id,
         component=component,
     )
     assert report.is_valid, report.error_summary
