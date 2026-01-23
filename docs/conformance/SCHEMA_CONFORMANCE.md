@@ -555,5 +555,3 @@ After meta-lint (13 tests) + golden schema suites (90+ tests) pass unmodified:
 **Scope:** Schema contracts & wire shapes only (behavioral semantics are documented and tested elsewhere)
 
 ---
-
-*End of SCHEMA_CONFORMANCE.md*
