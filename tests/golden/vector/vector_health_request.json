@@ -1,9 +1,0 @@
-{
-  "op": "vector.health",
-  "ctx": {
-    "request_id": "req_vec_health_01",
-    "deadline_ms": 253402300800000,
-    "tenant": "acme"
-  },
-  "args": {}
-}
