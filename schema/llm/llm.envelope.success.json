@@ -1,0 +1,7 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/llm/llm.envelope.success.json",
+  "title": "LLM Envelope Success (alias)",
+  "description": "Alias to common success envelope to keep component-local $refs stable.",
+  "$ref": "https://corpusos.com/schemas/common/envelope.success.json"
+}
