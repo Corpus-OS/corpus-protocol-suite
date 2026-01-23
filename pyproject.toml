@@ -17,6 +17,12 @@ test = [
   "pytest>=7.0.0,<9.0.0",
   "pytest-asyncio>=0.21.0,<0.24.0",
   "pytest-cov>=4.0.0,<6.0.0",
+
+  # Schema validation stack (required by tests/utils/schema_registry.py)
+  "jsonschema>=4.18.0,<5.0.0",
+  "referencing>=0.35.0,<1.0.0",
+
+  # Optional framework integrations used by some tests/examples
   "langchain-core>=0.1.0",
   "llama-index-core>=0.10.0",
   "semantic-kernel>=0.9.0",
