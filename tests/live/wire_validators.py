@@ -9,10 +9,10 @@ This module provides validation logic for wire-level request envelopes:
   - JSON serialization round-trip validation
   - Strict JSON Schema validation (Draft 2020-12) with SCHEMA.md version tolerance
   - Operation-specific argument validators (lightweight, schema-aligned checks)
-  - Coverage gates: ensure schema request-ops are covered by tests/live/wire_cases.py
+  - Coverage gates: ensure schema request-ops are covered by tests/live/wire_cases.py (TEST-ONLY)
 
 Separated from test execution to allow:
-  - Reuse in production code for request validation (best-effort mode)
+  - Reuse in production code for request validation (best-effort mode is policy-only; see CONFIG)
   - Unit testing of validators in isolation
   - Clear separation between "what to validate" and "how to validate"
 
@@ -39,7 +39,7 @@ import os
 import re
 import threading
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, FrozenSet, List, Optional, Tuple
+from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -101,11 +101,12 @@ class ValidatorConfig:
 
     schema_validation_mode:
       - "strict": schema registry missing => FAIL (conformance posture)
-      - "best_effort": schema registry missing => WARN + continue (production reuse posture)
+      - "best_effort": (deprecated for conformance) treated as strict in this module
+        to avoid "skip" behavior during alignment checks
 
     schema_version_tolerance:
       - "strict": validate only primary schema_id
-      - "tolerant": try primary, then #version/<semver> variants (no extra warnings)
+      - "tolerant": try primary, then #version/<semver> variants
       - "warn": same as tolerant but logs when fallback is used
 
     policy_enforcement:
@@ -115,7 +116,7 @@ class ValidatorConfig:
     """
 
     enable_json_roundtrip: bool = True
-    schema_validation_mode: str = "strict"          # strict | best_effort
+    schema_validation_mode: str = "strict"          # strict | best_effort (treated as strict here)
     schema_version_tolerance: str = "strict"        # strict | tolerant | warn
     policy_enforcement: str = "warn"                # off | warn | enforce
 
@@ -130,6 +131,9 @@ class ValidatorConfig:
 
 
 CONFIG = ValidatorConfig.from_env()
+
+# Only these components should be considered "request op schemas" for coverage gates.
+_PROTOCOL_COMPONENTS: FrozenSet[str] = frozenset({"llm", "vector", "embedding", "graph"})
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +184,67 @@ class SerializationError(ValidationError):
 
 
 # ---------------------------------------------------------------------------
+# Helpers: Mapping normalization (SCHEMA.md "object" == mapping)
+# ---------------------------------------------------------------------------
+
+def _deep_convert_mappings(obj: Any) -> Any:
+    """
+    Convert Mapping instances to plain dict recursively, so JSON serialization is stable.
+
+    This is intentionally conservative and does not attempt to coerce arbitrary objects—
+    non-JSONable values are handled by json_roundtrip() / schema validation errors.
+    """
+    if isinstance(obj, dict):
+        # Already a dict; still convert nested mappings.
+        return {k: _deep_convert_mappings(v) for k, v in obj.items()}
+    if isinstance(obj, Mapping):
+        return {k: _deep_convert_mappings(v) for k, v in dict(obj).items()}
+    if isinstance(obj, list):
+        return [_deep_convert_mappings(v) for v in obj]
+    return obj
+
+
+def _coerce_envelope_to_dict(envelope: Any, case_id: Optional[str] = None) -> EnvelopeDict:
+    """
+    Coerce an envelope-like Mapping into a plain dict (including ctx/args/ctx.attrs).
+
+    This aligns with SCHEMA.md: "object" == mapping. We accept any Mapping at the boundary,
+    and canonicalize to dict for stable JSON round-trips, hashing, and downstream validators.
+    """
+    if isinstance(envelope, dict):
+        env: Dict[str, Any] = envelope
+    elif isinstance(envelope, Mapping):
+        env = dict(envelope)
+    else:
+        raise EnvelopeTypeError(
+            f"Envelope must be object (mapping), got {type(envelope).__name__}",
+            case_id=case_id,
+            details={"actual_type": type(envelope).__name__},
+        )
+
+    # Do not force exact keys; SCHEMA.md request envelope is extensible.
+    # But we canonicalize ctx/args if present and mapping-like.
+    if "ctx" in env and isinstance(env["ctx"], Mapping) and not isinstance(env["ctx"], dict):
+        env["ctx"] = dict(env["ctx"])
+    if "args" in env and isinstance(env["args"], Mapping) and not isinstance(env["args"], dict):
+        env["args"] = dict(env["args"])
+
+    # Canonicalize ctx.attrs if mapping-like
+    ctx = env.get("ctx")
+    if isinstance(ctx, Mapping):
+        attrs = ctx.get("attrs") if isinstance(ctx, dict) else None
+        if isinstance(attrs, Mapping) and not isinstance(attrs, dict):
+            # Ensure we write back into a dict ctx
+            if not isinstance(ctx, dict):
+                ctx = dict(ctx)
+                env["ctx"] = ctx
+            ctx["attrs"] = dict(attrs)
+
+    # Deep-convert nested mappings for stable JSON behavior.
+    return _deep_convert_mappings(env)
+
+
+# ---------------------------------------------------------------------------
 # Helpers: Policy checks (warn-only by default)
 # ---------------------------------------------------------------------------
 
@@ -219,6 +284,10 @@ class SchemaValidationCache:
 
     Caches results keyed by (schema_id, envelope_hash) to avoid redundant validation.
     Note: schema_id may include fragments (e.g., #version/1.2.3).
+
+    Hardening:
+      - If an envelope cannot be deterministically JSON-dumped (non-serializable),
+        caching is skipped rather than raising raw exceptions.
     """
 
     def __init__(self, max_size: int = 256) -> None:
@@ -230,13 +299,18 @@ class SchemaValidationCache:
         self._misses = 0
 
     @staticmethod
-    def _envelope_to_key(schema_id: str, envelope: EnvelopeDict) -> str:
-        canonical = json.dumps(envelope, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    def _envelope_to_key(schema_id: str, envelope: EnvelopeDict) -> Optional[str]:
+        try:
+            canonical = json.dumps(envelope, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        except Exception:
+            return None
         envelope_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
         return f"{schema_id}:{envelope_hash}"
 
     def get(self, schema_id: str, envelope: EnvelopeDict) -> Optional[bool]:
         key = self._envelope_to_key(schema_id, envelope)
+        if key is None:
+            return None
         with self._lock:
             if key in self._cache:
                 # Refresh LRU
@@ -253,6 +327,8 @@ class SchemaValidationCache:
 
     def set(self, schema_id: str, envelope: EnvelopeDict, valid: bool) -> None:
         key = self._envelope_to_key(schema_id, envelope)
+        if key is None:
+            return
         with self._lock:
             if key in self._cache:
                 try:
@@ -305,11 +381,12 @@ def validate_envelope_shape(envelope: Any, case_id: Optional[str] = None) -> Non
     Validate envelope has correct top-level structure per common/envelope.request.json.
 
     Requires: op, ctx, args
-    Types: envelope dict; ctx dict; args dict
+    Types: envelope object (mapping); ctx object (mapping); args object (mapping)
     """
-    if not isinstance(envelope, dict):
+    # Accept Mapping at the boundary; treat "object" as mapping per SCHEMA.md
+    if not isinstance(envelope, Mapping):
         raise EnvelopeTypeError(
-            f"Envelope must be dict, got {type(envelope).__name__}",
+            f"Envelope must be object (mapping), got {type(envelope).__name__}",
             case_id=case_id,
             details={"actual_type": type(envelope).__name__},
         )
@@ -323,15 +400,17 @@ def validate_envelope_shape(envelope: Any, case_id: Optional[str] = None) -> Non
         )
 
     # ctx + args must be objects on the wire
-    if not isinstance(envelope.get("ctx"), dict):
+    ctx = envelope.get("ctx")
+    args = envelope.get("args")
+    if not isinstance(ctx, Mapping):
         raise EnvelopeTypeError(
-            f"'ctx' must be object, got {type(envelope.get('ctx')).__name__}",
+            f"'ctx' must be object (mapping), got {type(ctx).__name__}",
             case_id=case_id,
             field="ctx",
         )
-    if not isinstance(envelope.get("args"), dict):
+    if not isinstance(args, Mapping):
         raise EnvelopeTypeError(
-            f"'args' must be object, got {type(envelope.get('args')).__name__}",
+            f"'args' must be object (mapping), got {type(args).__name__}",
             case_id=case_id,
             field="args",
         )
@@ -346,8 +425,8 @@ def validate_op_field(envelope: EnvelopeDict, expected_op: str, case_id: Optiona
     """
     Validate 'op' field matches expected operation.
 
-    Note: common/envelope.request.json only enforces string; op-specific request schemas enforce const.
-    This equality check enforces operation conformance.
+    SCHEMA.md request envelope only requires op is a string. Operation-level schemas enforce const.
+    This equality check enforces operation conformance at the wire-case level.
     """
     op = envelope["op"]
     if not isinstance(op, str):
@@ -379,13 +458,16 @@ def validate_ctx_field(envelope: EnvelopeDict, case_id: Optional[str] = None) ->
 
     Unknown ctx keys are permitted (additionalProperties: true).
     """
-    ctx = envelope["ctx"]
-    if not isinstance(ctx, dict):
+    ctx_any = envelope["ctx"]
+    if not isinstance(ctx_any, Mapping):
         raise EnvelopeTypeError(
-            f"'ctx' must be object, got {type(ctx).__name__}",
+            f"'ctx' must be object (mapping), got {type(ctx_any).__name__}",
             case_id=case_id,
             field="ctx",
         )
+
+    # Canonicalize to dict so downstream code can mutate safely (e.g., converting attrs)
+    ctx: Dict[str, Any] = dict(ctx_any)
 
     # request_id: string|null (optional)
     if "request_id" in ctx:
@@ -436,10 +518,10 @@ def validate_ctx_field(envelope: EnvelopeDict, case_id: Optional[str] = None) ->
     if "tenant" in ctx:
         _validate_optional_string(ctx.get("tenant"), "ctx.tenant", case_id)
 
-    # attrs: object|null (optional)
+    # attrs: object|null (optional) — accept any Mapping
     if "attrs" in ctx:
         attrs = ctx.get("attrs")
-        if attrs is not None and not isinstance(attrs, dict):
+        if attrs is not None and not isinstance(attrs, Mapping):
             raise EnvelopeTypeError(
                 f"'ctx.attrs' must be object|null, got {type(attrs).__name__}",
                 case_id=case_id,
@@ -464,11 +546,11 @@ def _validate_optional_string(value: Any, field_name: str, case_id: Optional[str
 
 
 def validate_args_field(envelope: EnvelopeDict, case_id: Optional[str] = None) -> None:
-    """Validate args is an object."""
-    args = envelope["args"]
-    if not isinstance(args, dict):
+    """Validate args is an object (mapping)."""
+    args_any = envelope["args"]
+    if not isinstance(args_any, Mapping):
         raise EnvelopeTypeError(
-            f"'args' must be object, got {type(args).__name__}",
+            f"'args' must be object (mapping), got {type(args_any).__name__}",
             case_id=case_id,
             field="args",
         )
@@ -566,15 +648,6 @@ def _find_dict_diff(original: Dict[str, Any], modified: Dict[str, Any], path: st
 # Schema Validation (STRICT conformance + SCHEMA.md version tolerance)
 # ---------------------------------------------------------------------------
 
-def _schema_registry_available() -> bool:
-    """Check if schema registry module can be imported."""
-    try:
-        import tests.utils.schema_registry  # noqa: F401
-        return True
-    except Exception:
-        return False
-
-
 def validate_against_schema(
     schema_id: str,
     envelope: EnvelopeDict,
@@ -584,9 +657,9 @@ def validate_against_schema(
     """
     Validate envelope against JSON Schema using the schema registry.
 
-    Conformance posture:
-      - STRICT: missing registry => FAIL
-      - BEST_EFFORT: missing registry => WARN + continue
+    Alignment posture:
+      - Missing schema registry is always a FAILURE here to avoid "skip" behavior during alignment.
+        (CONFIG.schema_validation_mode='best_effort' is treated as strict.)
     """
     if use_cache:
         cached = _schema_cache.get(schema_id, envelope)
@@ -607,15 +680,17 @@ def validate_against_schema(
             _schema_cache.set(schema_id, envelope, True)
 
     except ImportError as e:
-        # Registry missing: strict vs best_effort behavior
-        if CONFIG.schema_validation_mode == "strict":
-            raise SchemaValidationError(
-                "Schema registry not available in STRICT mode",
-                case_id=case_id,
-                details={"schema_id": schema_id, "import_error": str(e)},
-            ) from e
-        logger.warning("Schema registry not available; skipping schema validation (best_effort mode)")
-        return
+        # Do not skip: alignment/conformance requires registry.
+        if CONFIG.schema_validation_mode == "best_effort":
+            logger.warning(
+                "CORPUS_SCHEMA_VALIDATION_MODE='best_effort' is treated as strict in this validator module "
+                "to avoid skipping schema validation during alignment checks."
+            )
+        raise SchemaValidationError(
+            "Schema registry not available",
+            case_id=case_id,
+            details={"schema_id": schema_id, "import_error": str(e)},
+        ) from e
 
     except Exception as e:
         if use_cache:
@@ -627,26 +702,32 @@ def validate_against_schema(
         )
 
 
-def _build_versioned_schema_id(base_schema_id: str, version: str) -> str:
+def _split_schema_id(schema_id: str) -> Tuple[str, Optional[str]]:
+    """Split schema_id into (base, fragment-with-# or None)."""
+    if "#" in schema_id:
+        base, frag = schema_id.split("#", 1)
+        return base, "#" + frag
+    return schema_id, None
+
+
+def _build_versioned_schema_id(primary_schema_id: str, version: str) -> str:
     """
     Build SCHEMA.md version-tolerant schema id: <base>#version/<semver>.
 
-    Accepts:
-      - semver: "1.2.3" -> "#version/1.2.3"
-      - already-prefixed: "version/1.2.3" -> "#version/1.2.3"
-      - already-fragmented: "<base>#version/1.2.3" -> returned as-is
+    If primary_schema_id already contains a fragment, the fallback is built from the *base*,
+    ensuring the fallback attempt is actually distinct.
     """
-    if "#" in base_schema_id:
-        # If caller already passed a fragment, do not rewrite the base.
-        # This keeps behavior explicit.
-        return base_schema_id
+    base, _frag = _split_schema_id(primary_schema_id)
 
-    v = version.strip()
+    v = (version or "").strip()
+    if not v:
+        return base
+
     if v.startswith(_VERSION_FRAGMENT_PREFIX):
         frag = v
     else:
         frag = f"{_VERSION_FRAGMENT_PREFIX}{v}"
-    return f"{base_schema_id}#{frag}"
+    return f"{base}#{frag}"
 
 
 def validate_with_version_tolerance(
@@ -660,13 +741,10 @@ def validate_with_version_tolerance(
 
     Modes:
       - strict: validate only primary_schema_id
-      - tolerant: validate primary, then try primary#version/<semver> in order
+      - tolerant: validate primary, then try <base>#version/<semver> in order
       - warn: same as tolerant + logs when fallback version succeeds
 
-    Notes:
-      - This relies on the schema registry/resolution layer supporting the SCHEMA.md
-        fragment convention (#version/<semver>).
-      - accepted_versions should be semver strings (e.g., "1.2.3") or "version/1.2.3".
+    accepted_versions should be semver strings (e.g., "1.2.3") or "version/1.2.3".
     """
     mode = CONFIG.schema_version_tolerance
     if mode == "strict":
@@ -681,25 +759,25 @@ def validate_with_version_tolerance(
     except SchemaValidationError as e:
         primary_error = e
 
-    # If no accepted versions provided, fail with primary error
     if not accepted_versions:
         raise primary_error
 
-    # Try versioned schema ids in order
     errors: List[Tuple[str, str]] = [("primary", str(primary_error))]
+    base, _frag = _split_schema_id(primary_schema_id)
+
     for ver in accepted_versions:
         v = (ver or "").strip()
         if not v:
             continue
 
-        # Permit passing a fully-qualified schema_id directly (rare but explicit)
+        # Permit passing a fully-qualified schema_id directly (explicit).
         if v.startswith(("http://", "https://")):
             candidate = v
         else:
-            # Validate semver format when possible; if it doesn't match, still attempt (spec may allow)
+            # If not strict semver, still attempt; log at debug to avoid noise.
             if not v.startswith(_VERSION_FRAGMENT_PREFIX) and _SEMVER_RE.match(v) is None:
                 logger.debug(f"{case_id}: accepted_versions entry {v!r} is not strict semver; attempting anyway")
-            candidate = _build_versioned_schema_id(primary_schema_id, v)
+            candidate = _build_versioned_schema_id(base, v)
 
         try:
             validate_against_schema(candidate, envelope, case_id)
@@ -1052,7 +1130,7 @@ def _validate_llm_message(msg: Any, index: int, case_id: Optional[str]) -> None:
     if not isinstance(msg["content"], str):
         raise ArgsValidationError(f"'{field_prefix}.content' must be string", case_id=case_id, field=f"{field_prefix}.content")
 
-    # Role enums may be schema-defined or left as string in SCHEMA.md; keep non-standard roles policy-only.
+    # SCHEMA.md keeps role as string; treat non-standard roles as policy-only.
     if msg["role"] not in {"system", "user", "assistant", "tool"}:
         _policy_violation(
             f"'{field_prefix}.role' is non-standard role {msg['role']!r}",
@@ -1134,43 +1212,65 @@ def validate_args_for_operation(args: ArgsDict, validator_name: Optional[str], c
 
 
 # ---------------------------------------------------------------------------
-# Coverage gates (schema request ops <-> tests/live/wire_cases.py)
+# Coverage gates (schema request ops <-> tests/live/wire_cases.py) — TEST-ONLY
 # ---------------------------------------------------------------------------
+
+def _schema_id_component(schema_id: str) -> Optional[str]:
+    """
+    Extract component from schema_id path:
+      https://corpusos.com/schemas/<component>/<filename>.json
+    """
+    marker = "/schemas/"
+    if marker not in schema_id:
+        return None
+    tail = schema_id.split(marker, 1)[1]
+    parts = tail.split("/", 1)
+    if not parts or len(parts) < 2:
+        return None
+    comp = parts[0]
+    return comp
+
 
 def list_request_operation_schema_ids() -> List[str]:
     """
     Enumerate request operation schema IDs from the loaded schema registry.
 
-    Filters out:
+    Includes ONLY protocol components (llm/vector/embedding/graph) and ONLY operation request schemas.
+
+    Excludes:
       - common/*
       - type schemas (*.types.*)
       - envelope request schemas (*.envelope.request.json)
-
-    This is intentionally conservative and relies on SCHEMA.md naming conventions:
-      <component>/<component>.<op>.request.json
+      - non-protocol components (e.g., ndjson)
     """
     try:
         from tests.utils.schema_registry import list_schemas  # type: ignore
     except ImportError as e:
-        if CONFIG.schema_validation_mode == "strict":
-            raise SchemaValidationError(
-                "Schema registry not available in STRICT mode (cannot enumerate schemas)",
-                details={"import_error": str(e)},
-            ) from e
-        logger.warning("Schema registry not available; cannot enumerate request op schemas (best_effort mode)")
-        return []
+        raise SchemaValidationError(
+            "Schema registry not available (cannot enumerate schemas)",
+            details={"import_error": str(e)},
+        ) from e
 
     registry = list_schemas()  # {schema_id: file_path}
     out: List[str] = []
     for sid in registry.keys():
-        if "/common/" in sid:
+        comp = _schema_id_component(sid)
+        if comp not in _PROTOCOL_COMPONENTS:
             continue
         if ".types." in sid:
             continue
         if sid.endswith(".envelope.request.json"):
             continue
-        if sid.endswith(".request.json"):
-            out.append(sid)
+        if not sid.endswith(".request.json"):
+            continue
+
+        # Ensure filename prefix matches component: <component>.<op>.request.json
+        fname = sid.rsplit("/", 1)[-1]
+        if not fname.startswith(f"{comp}."):
+            continue
+
+        out.append(sid)
+
     return sorted(out)
 
 
@@ -1181,33 +1281,39 @@ def _schema_id_to_request_op(schema_id: str) -> Optional[str]:
     Expected filename: <component>.<op>.request.json
       e.g. https://.../llm/llm.complete.request.json -> "llm.complete"
 
-    Returns None for non-op schemas (envelopes, types, common, non-request, etc.).
+    Returns None for non-op schemas.
     """
+    comp = _schema_id_component(schema_id)
+    if comp not in _PROTOCOL_COMPONENTS:
+        return None
     if not schema_id.endswith(".request.json"):
         return None
     if schema_id.endswith(".envelope.request.json"):
-        return None
-    if "/common/" in schema_id:
         return None
     if ".types." in schema_id:
         return None
 
     fname = schema_id.rsplit("/", 1)[-1]
+    if not fname.startswith(f"{comp}."):
+        return None
     if not fname.endswith(".request.json"):
         return None
+
     op = fname[: -len(".request.json")]
     return op or None
 
 
 def assert_all_wire_case_args_validators_exist() -> None:
     """
-    Sanity gate: every args_validator referenced by tests/live/wire_cases.py must exist in ARGS_VALIDATORS.
+    Test-only sanity gate: every args_validator referenced by tests/live/wire_cases.py must exist.
+
+    Note: This function imports from tests/, so it should only be executed in the test environment.
     """
     try:
         from tests.live.wire_cases import WIRE_REQUEST_CASES  # type: ignore
     except Exception as e:
         raise ValidationError(
-            "Failed to import wire cases from tests/live/wire_cases.py",
+            "Failed to import wire cases from tests/live/wire_cases.py (test-only gate)",
             details={"error": str(e)},
         ) from e
 
@@ -1225,16 +1331,15 @@ def assert_all_wire_case_args_validators_exist() -> None:
 
 def assert_all_schema_request_ops_have_cases() -> None:
     """
-    Conformance gate: ensure every request op schema has at least one wire case.
+    Conformance gate (test-only): ensure every request op schema has at least one wire case.
 
-    Wire cases are defined in tests/live/wire_cases.py (canonical path).
+    Wire cases are defined in tests/live/wire_cases.py.
     """
-    # Import wire cases from the canonical wire path.
     try:
         from tests.live.wire_cases import WIRE_REQUEST_CASES  # type: ignore
     except Exception as e:
         raise ValidationError(
-            "Failed to import wire cases from tests/live/wire_cases.py",
+            "Failed to import wire cases from tests/live/wire_cases.py (test-only gate)",
             details={"error": str(e)},
         ) from e
 
@@ -1261,7 +1366,7 @@ def assert_all_schema_request_ops_have_cases() -> None:
 # ---------------------------------------------------------------------------
 
 def validate_wire_envelope(
-    envelope: EnvelopeDict,
+    envelope: Any,
     expected_op: str,
     schema_id: str,
     accepted_versions: Tuple[str, ...] = (),
@@ -1272,24 +1377,28 @@ def validate_wire_envelope(
     Complete wire envelope validation pipeline.
 
     Steps:
+      0) Canonicalize Mapping -> dict (SCHEMA.md "object" semantics)
       1) Envelope structure validation (SCHEMA.md request envelope + op conformance)
       2) JSON round-trip validation (wire safety)
       3) Schema validation:
            - strict: schema_id only
-           - tolerant/warn: schema_id, then schema_id#version/<semver> for accepted_versions
+           - tolerant/warn: schema_id, then <base>#version/<semver> for accepted_versions
       4) Args validation (lightweight, schema-aligned; schema remains authoritative)
 
     accepted_versions:
       - SCHEMA.md version tolerance list (semver strings like "1.2.3")
       - used only when CONFIG.schema_version_tolerance != "strict"
     """
-    # 1) Envelope validation
-    validate_envelope_common(envelope, expected_op, case_id)
+    # 0) Canonicalize to dict form for stable hashing / JSON behavior
+    env_dict = _coerce_envelope_to_dict(envelope, case_id=case_id)
 
-    # 2) JSON round-trip
-    wire_envelope = json_roundtrip(envelope, case_id)
+    # 1) Envelope validation
+    validate_envelope_common(env_dict, expected_op, case_id)
+
+    # 2) JSON round-trip (also produces a canonical JSON-safe dict)
+    wire_envelope = json_roundtrip(env_dict, case_id)
     if CONFIG.enable_json_roundtrip:
-        assert_roundtrip_equality(envelope, wire_envelope, case_id)
+        assert_roundtrip_equality(env_dict, wire_envelope, case_id)
 
     # 3) Schema validation (+ SCHEMA.md version tolerance)
     if CONFIG.schema_version_tolerance == "strict":
