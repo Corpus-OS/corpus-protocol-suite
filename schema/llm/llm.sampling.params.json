@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/llm/llm.sampling.params.json",
+  "title": "LLM Sampling Parameters",
+  "description": "Shared sampling and decoding parameters used by llm.complete/llm.stream.",
+  "type": "object",
+  "properties": {
+    "max_tokens": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "temperature": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": 0.0,
+      "maximum": 2.0
+    },
+    "top_p": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "exclusiveMinimum": 0.0,
+      "maximum": 1.0
+    },
+    "frequency_penalty": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": -2.0,
+      "maximum": 2.0
+    },
+    "presence_penalty": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": -2.0,
+      "maximum": 2.0
+    },
+    "stop_sequences": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "additionalProperties": true
+}
