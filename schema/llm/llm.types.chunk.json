@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/llm/llm.types.chunk.json",
+  "title": "LLM Streaming Chunk",
+  "type": "object",
+  "properties": {
+    "text": {
+      "type": "string"
+    },
+    "is_final": {
+      "type": "boolean"
+    },
+    "model": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "usage_so_far": {
+      "anyOf": [
+        {
+          "$ref": "https://corpusos.com/schemas/llm/llm.types.token_usage.json"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "tool_calls": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "$ref": "https://corpusos.com/schemas/llm/llm.types.message.json#/$defs/ToolCall"
+      }
+    }
+  },
+  "required": [
+    "text",
+    "is_final"
+  ],
+  "additionalProperties": true
+}
