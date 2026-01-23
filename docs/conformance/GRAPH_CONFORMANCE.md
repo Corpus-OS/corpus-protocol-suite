@@ -584,7 +584,7 @@ Use this when implementing or validating a new **Graph adapter** against `GraphP
 - 🔬 **Development:** 50+ tests (50%+)
 
 **Badge Suggestion:**
-```markdown
+
 [![Corpus Graph Protocol](https://img.shields.io/badge/CorpusGraph%20Protocol-100%25%20Conformant-brightgreen)](./graph_conformance_report.json)
 
 Implementations that pass all tests in `tests/graph/` without modification MAY display this badge in their documentation.
