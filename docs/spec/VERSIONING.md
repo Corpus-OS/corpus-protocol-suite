@@ -1,15 +1,3 @@
-Here are the only changes I’d make so this doc is fully consistent with your current SCHEMA.md + PROTOCOLS.md v1 model (especially: protocol IDs are const, capabilities openness differs by domain, request is extensible but responses are closed where specified).
-
-What I’m fixing (high-impact alignment issues)
-	1.	Protocol ID vs spec/minor versioning: your schemas treat capabilities.protocol as a const like "llm/v1.0", "graph/v1.0", etc. So MINOR spec releases should not change that string to v1.1. Keep protocol ID stable for the whole MAJOR, and version the spec separately (tags / protocols_version / changelog).
-	2.	Negotiation (“supported versions”): since capabilities.protocol is a single const string, it can’t list multiple supported versions. Put supported_protocols in NotSupported.details (allowed by common/envelope.error.json), not in capabilities.
-	3.	Unknown keys rule: must match your enforcement model: request envelope is open, but success/error/stream envelopes are closed; and per-op args may be open/closed depending on schema.
-
-Below is a fully updated VERSIONING.md reflecting those fixes while preserving your intent.
-
-⸻
-
-
 # VERSIONING
 
 **Corpus Protocol Suite — Versioning & Compatibility Policy**
