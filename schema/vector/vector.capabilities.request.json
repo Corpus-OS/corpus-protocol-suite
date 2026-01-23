@@ -1,9 +1,0 @@
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://corpusos.com/schemas/vector/vector.capabilities.request.json",
-  "title": "vector.capabilities Args",
-  "description": "Explicit empty-args schema for vector.capabilities().",
-  "type": "object",
-  "additionalProperties": false,
-  "maxProperties": 0
-}
