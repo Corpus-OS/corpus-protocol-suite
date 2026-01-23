@@ -14,8 +14,7 @@
     }
   },
   "required": [
-    "text",
-    "model"
+    "text"
   ],
   "additionalProperties": true
 }
