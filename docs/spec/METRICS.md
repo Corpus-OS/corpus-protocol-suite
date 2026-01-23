@@ -21,7 +21,7 @@
 ---
 
 **Cross-Protocol Observability (Agnostic)**  
-**Metrics Version:** `1.1`
+**Metrics Version:** `1.0`
 
 > This document defines an *implementation-agnostic* metrics contract for **Graph**, **LLM**, **Vector**, and **Embedding** adapters. It aligns with the specification's Observability sections (see §13.1–§13.3) and the Common Foundation. Providers, stacks, and exporters are **not** mandated; the shapes below are semantic contracts that any telemetry pipeline can map to.
 
@@ -65,7 +65,7 @@ All adapters (Graph/LLM/Vector/Embedding) MUST emit at least:
 
   * `component` ∈ `{graph|llm|vector|embedding}`
   * `op` — adapter operation (see §2.4 for canonical names)
-  * `code` — normalized status (e.g., `OK`, `BAD_REQUEST`, `UNAVAILABLE`, …) from the shared error taxonomy (ALL_CAPS_SNAKE case)
+  * `code` — normalized status from the 7 canonical error wire codes plus `OK`: `"OK"`, `"BAD_REQUEST"`, `"AUTH_ERROR"`, `"RESOURCE_EXHAUSTED"`, `"TRANSIENT_NETWORK"`, `"UNAVAILABLE"`, `"NOT_SUPPORTED"`, `"DEADLINE_EXCEEDED"`
   * `deadline_bucket` — **one of** `"<1s" | "<5s" | "<15s" | "<60s" | ">=60s"` *(see §3; normative set — MUST NOT add values without a version bump)*. **Required only if `ctx.deadline_ms` is present; otherwise omit.**
   * `tenant_hash` — deterministic hash (or omitted if no tenant)
   * Optional **bounded** extras (see §5)
@@ -80,7 +80,7 @@ All adapters (Graph/LLM/Vector/Embedding) MUST emit at least:
 
 * **Instrument:** monotonic counter
 * **Name (semantic):** `count_stream_final_outcome`
-* **Semantics:** Emitted **exactly once per stream** with the terminal outcome code. For successful streams, use `code="OK"`. For errored streams, use the error's wire code (e.g., `DEADLINE_EXCEEDED`, `UNAVAILABLE`).
+* **Semantics:** Emitted **exactly once per stream** with the terminal outcome code. For successful streams, use `code="OK"`. For errored streams, use the error's canonical wire code (e.g., `"DEADLINE_EXCEEDED"`, `"UNAVAILABLE"`).
 * **Dimensions:** `component`, `op`, `code`, `tenant_hash` (optional), and **no** content-derived labels.
 
 > Rationale: Streaming can emit many interim events; only a single *terminal* metric provides reliable SLO/SLA-like insight without inflating cardinality.
@@ -130,7 +130,7 @@ The `op` dimension MUST be chosen from the following finite protocol-specific se
 * `traversal`
 * `health`
 
-Adapters MUST NOT invent new `op` values under `metrics_version=1.1`. If additional operation types are required in the future, they MUST be introduced alongside a `metrics_version` bump and documented.
+Adapters MUST NOT invent new `op` values under `metrics_version=1.0`. If additional operation types are required in the future, they MUST be introduced alongside a `metrics_version` bump and documented.
 
 ## 3) **Deadline Buckets** (Normative, Frozen Set)
 
@@ -140,7 +140,7 @@ Adapters compute remaining time (`ctx.deadline_ms - now`) and place operations i
 
 **Rules:**
 
-* These **five** categories are **normative** for `metrics_version=1.1`.
+* These **five** categories are **normative** for `metrics_version=1.0`.
 * Clients and exporters **MUST NOT** introduce additional buckets without a **metrics_version** increment.
 * If there is no deadline (`ctx.deadline_ms` absent or null), **omit** the `deadline_bucket` dimension entirely.
 * **Units:** All time measurements MUST be reported in **milliseconds**.
@@ -181,7 +181,7 @@ Do not introduce free-form labels (file names, doc IDs, user IDs, GUIDs, arbitra
 
 * **Operations:** `capabilities`, `complete`, `stream`, `count_tokens`, `health`
 * **Streaming MUST** emit exactly one `count_stream_final_outcome` per stream with the terminal code.
-* **Streaming success outcome:** For streams ending with `is_final: true`, use `code="OK"`. For errored streams, use the error's wire code.
+* **Streaming success outcome:** For streams ending with `is_final: true`, use `code="OK"`. For errored streams, use the error's canonical wire code.
 * **Optional numeric fields:**
   * `tokens_processed` (prompt + completion)
   * `prompt_tokens`
@@ -191,8 +191,8 @@ Do not introduce free-form labels (file names, doc IDs, user IDs, GUIDs, arbitra
 ### 6.3 Graph
 
 * **Operations:** `capabilities`, `query`, `stream_query`, `upsert_nodes`, `upsert_edges`, `delete_nodes`, `delete_edges`, `bulk_vertices`, `batch`, `get_schema`, `transaction`, `traversal`, `health`
+* **Streaming queries** (`stream_query`) MUST emit a single terminal outcome event via `count_stream_final_outcome`.
 * `bulk_vertices` SHOULD include numeric fields like `nodes_returned` where supported.
-* **Streaming queries** (`stream_query`) MUST also fire a single terminal outcome event via `count_stream_final_outcome`.
 
 ### 6.4 Embedding
 
@@ -205,36 +205,32 @@ Do not introduce free-form labels (file names, doc IDs, user IDs, GUIDs, arbitra
 
 ## 7) Error Taxonomy Integration
 
-The `code` label MUST be drawn from the shared error taxonomy defined in the main Corpus specification. Use the **wire code format** (ALL_CAPS_SNAKE case).
+The `code` label MUST be drawn from the **7 canonical error wire codes plus `OK`** defined in the shared error taxonomy:
 
-**Example code values (non-exhaustive):**
-* `"OK"`
-* `"BAD_REQUEST"`
-* `"AUTH_ERROR"`
-* `"RESOURCE_EXHAUSTED"`
-* `"TRANSIENT_NETWORK"`
-* `"UNAVAILABLE"`
-* `"NOT_SUPPORTED"`
-* `"DIMENSION_MISMATCH"`
-* `"INDEX_NOT_READY"`
-* `"DEADLINE_EXCEEDED"`
+* `"OK"` (successful operations only)
+* `"BAD_REQUEST"` (error envelopes only)
+* `"AUTH_ERROR"` (error envelopes only)
+* `"RESOURCE_EXHAUSTED"` (error envelopes only)
+* `"TRANSIENT_NETWORK"` (error envelopes only)
+* `"UNAVAILABLE"` (error envelopes only)
+* `"NOT_SUPPORTED"` (error envelopes only)
+* `"DEADLINE_EXCEEDED"` (error envelopes only)
 
 **Rules:**
-* Keep code values finite and aligned with the shared taxonomy.
-* Use wire codes exactly as they appear in error envelopes.
-* If the main spec introduces a new error class, you MAY:
-  * add it to metrics under the same metrics_version only if it does not increase cardinality in an unbounded way, and
-  * no existing code values are removed or repurposed.
-* If adding new codes would break comparability or cardinality assumptions, bump metrics_version and document the change.
+* Use `"OK"` only for successful operations.
+* Use the 7 canonical error codes only when an error envelope would be returned.
+* Do NOT use subtype codes in the `code` dimension (they belong in error envelope `details.subtype_code` only).
+* If the main spec introduces a new canonical error class, it requires a `metrics_version` bump to add to this list.
 
 ## 8) Versioning & Deprecation Policy (Metrics)
 
-* **metrics_version:** 1.1 (this document)
+* **metrics_version:** 1.0 (this document)
 
 **Stability guarantees (within a metrics_version):**
 * Names and required dimensions (e.g., `observe_operation`, `count_operation`, `deadline_bucket`) are stable.
 * Deadline buckets are frozen (see §3).
 * Canonical op values are frozen (see §2.4).
+* Canonical `code` values are frozen (see §7).
 
 **Deprecation policy:**
 
@@ -243,18 +239,19 @@ When changing names, semantics, or buckets:
 2. Remove deprecated items in the next minor release.
 3. Bump metrics_version if:
    * bucket sets change,
-   * canonical op sets change, or
+   * canonical op sets change,
+   * canonical code sets change, or
    * changes break historical comparability.
 
 ## 9) Minimal Emission Rules
 
-* Emit one latency observation per operation (`observe_operation`) recording duration and outcome.
-* Increment one counter per operation (`count_operation`) with the same labels.
-* For streaming operations (e.g., `op="stream"` for LLM, `op="stream_query"` for Graph), increment exactly one `count_stream_final_outcome` after the terminal condition:
+* **MUST** emit one latency observation per operation (`observe_operation`) recording duration and outcome.
+* **MUST** increment one counter per operation (`count_operation`) with the same labels.
+* For high-volume deployments, latency observations **MAY** be sampled (e.g., 10% sample rate) but counters **MUST NOT** be sampled.
+* For streaming operations (e.g., `op="stream"` for LLM, `op="stream_query"` for Graph), **MUST** increment exactly one `count_stream_final_outcome` after the terminal condition:
   * For successful streams: when `is_final: true` is received, use `code="OK"`
-  * For errored streams: when error envelope is received, use the error's wire code
+  * For errored streams: when error envelope is received, use the error's canonical wire code
 * Never emit intermediate chunk content or high-cardinality identifiers as labels.
-* **Sampling:** For high-volume deployments, consider sampling latency observations (e.g., 10% sample rate) but always emit counters fully.
 
 ## 10) Example Semantic Records (Agnostic Pseudo)
 
@@ -326,12 +323,12 @@ count_operation:
 - [ ] No prompts, vectors, embeddings, or raw tenant IDs in telemetry
 - [ ] `tenant_hash` used where tenant is relevant (HMAC-SHA256 with secret or salted hash)
 - [ ] `deadline_bucket` ∈ fixed set (`<1s`|`<5s`|`<15s`|`<60s`|`>=60s`) and present only when `ctx.deadline_ms` exists
-- [ ] One `observe_operation` + one `count_operation` per operation
+- [ ] One `observe_operation` + one `count_operation` per operation (latency observations may be sampled at reasonable rates)
 - [ ] One `count_stream_final_outcome` per streaming operation with correct terminal code
 - [ ] Optional labels are bounded; model tagging gated by capability
 - [ ] Histogram buckets consistent with §4 (or documented alternative)
 - [ ] `op` values drawn from canonical sets in §2.4
-- [ ] `code` values use wire format (ALL_CAPS_SNAKE) from shared error taxonomy
+- [ ] `code` values use only 7 canonical error codes plus `OK` from §7
 - [ ] Deprecations follow §8
 - [ ] All time measurements in milliseconds
 
@@ -346,7 +343,7 @@ count_operation:
 ## 13) FAQ (Agnostic)
 
 **Q: Can we add a new deadline bucket for sub-millisecond calls?**
-**A:** Not under `metrics_version=1.1`. Propose a new version if truly needed.
+**A:** Not under `metrics_version=1.0`. Propose a new version if truly needed.
 
 **Q: Can we tag model names on every call?**
 **A:** Only if `extensions.tag_model_in_metrics=true`. Otherwise omit to protect cardinality and privacy.
@@ -355,7 +352,7 @@ count_operation:
 **A:** Allowed for internal debug, but not part of the stable contract. The only required streaming metric is the single final outcome counter (`count_stream_final_outcome`).
 
 **Q: Can we introduce new op values specific to our adapter?**
-**A:** Not under `metrics_version=1.1`. Use the canonical sets in §2.4. If you need additional operation types, propose a spec and metrics_version update.
+**A:** Not under `metrics_version=1.0`. Use the canonical sets in §2.4. If you need additional operation types, propose a spec and metrics_version update.
 
 **Q: What if metrics collection is disabled?**
 **A:** Adapters MUST still function correctly; metrics emission is optional for functional correctness but required for compliance when enabled.
@@ -365,7 +362,7 @@ count_operation:
 * Conformance test suites MUST validate:
   - No raw content in emitted metrics
   - Correct `op` values from canonical sets
-  - Proper `code` values (wire format)
+  - Proper `code` values (only 7 canonical error codes plus `OK`)
   - Correct `deadline_bucket` usage (present only with deadlines)
   - Single `count_stream_final_outcome` per stream
 * Test tools SHOULD verify cardinality bounds on labels
@@ -380,7 +377,7 @@ count_operation:
 
 **Sampling recommendations:**
 - **Counters:** Never sample - always emit
-- **Latency observations:** Consider sampling (e.g., 10-20%) for high-volume deployments
+- **Latency observations:** MAY sample (e.g., 10-20%) for high-volume deployments while maintaining statistical significance
 - **Stream outcomes:** Never sample - always emit
 
 **Cardinality monitoring:**
@@ -389,7 +386,4 @@ count_operation:
 
 ---
 
-  *End of METRICS.md (metrics_version 1.0)*
-
-**Change History:**
-- **v1.0**: Initial version
+*End of METRICS.md (metrics_version 1.0)*
