@@ -546,6 +546,18 @@ Use this when implementing or validating a new **Embedding adapter** against `Em
 
    Status: Production Ready
 ```
+## **Embedding Protocol Conformance**
+
+**Certification Levels:**
+- 🏆 **Gold:** 135/135 tests (100%)
+- 🥈 **Silver:** 108+ tests (80%+)
+- 🔬 **Development:** 68+ tests (50%+)
+
+**Badge Suggestion:**
+
+[![Corpus Embedding Protocol](https://img.shields.io/badge/CorpusEmbedding%20Protocol-100%25%20Conformant-brightgreen)](./embedding_conformance_report.json)
+
+
 ---
 
 **Last Updated:** 2026-01-19
