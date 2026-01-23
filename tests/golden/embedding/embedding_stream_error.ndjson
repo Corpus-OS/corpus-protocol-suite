@@ -1,0 +1,2 @@
+{"ok":true,"code":"STREAMING","ms":4.8,"chunk":{"embeddings":[{"vector":[0.1,0.2],"text":"hello streaming","model":"embed-small","dimensions":2,"index":0,"metadata":null}],"is_final":false,"usage":null,"model":"embed-small"}}
+{"ok":false,"code":"TRANSIENT_NETWORK","error":"TransientNetworkError","message":"Connection lost","retry_after_ms":250,"details":{"phase":"download"},"ms":12.0}

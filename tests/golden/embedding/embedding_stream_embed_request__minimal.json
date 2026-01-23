@@ -1,0 +1,11 @@
+{
+  "op": "embedding.stream_embed",
+  "ctx": {
+    "request_id": "t_embedding_stream_embed_min",
+    "tenant": "test"
+  },
+  "args": {
+    "text": "hello streaming",
+    "model": "embed-small"
+  }
+}

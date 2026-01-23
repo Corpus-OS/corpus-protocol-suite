@@ -1,0 +1,13 @@
+{
+  "op": "embedding.embed",
+  "ctx": {
+    "request_id": "t_embedding_embed_trunc_norm",
+    "tenant": "test"
+  },
+  "args": {
+    "text": "hello world",
+    "model": "embed-small",
+    "truncate": false,
+    "normalize": true
+  }
+}

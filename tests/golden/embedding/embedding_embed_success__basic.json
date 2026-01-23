@@ -1,0 +1,23 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 10.8,
+  "result": {
+    "embedding": {
+      "vector": [
+        0.1,
+        0.2,
+        0.3
+      ],
+      "text": "hello world",
+      "model": "embed-small",
+      "dimensions": 3,
+      "index": null,
+      "metadata": null
+    },
+    "model": "embed-small",
+    "text": "hello world",
+    "tokens_used": 2,
+    "truncated": false
+  }
+}

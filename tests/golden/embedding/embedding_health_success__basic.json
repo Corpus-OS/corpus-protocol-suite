@@ -1,0 +1,18 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 6.6,
+  "result": {
+    "ok": true,
+    "server": "corpus-embedding",
+    "version": "1.0.0",
+    "models": {
+      "embed-small": {
+        "ok": true
+      },
+      "embed-large": {
+        "ok": true
+      }
+    }
+  }
+}
