@@ -357,26 +357,27 @@ This suite constitutes the **official Corpus Protocol Suite V1.0 Reference Confo
 ### Certified Implementation Badges
 
 #### 🏆 Platinum Certification
-```markdown
+
 ![Corpus Protocol Suite](https://img.shields.io/badge/CorpusProtocol%20Suite-Platinum%20Certified-gold)
-```
+
 **Usage:** Production systems with full protocol suite compliance (749/749 tests)
 
 #### 🥈 Silver Certification  
-```markdown
+
 ![Corpus Protocol Suite](https://img.shields.io/badge/CorpusProtocol%20Suite-Silver%20Certified-silver)
-```
+
 **Usage:** Major protocol implementations in production (599+ tests)
 
 #### 🔬 Development Certification
-```markdown
+
 ![Corpus Protocol Suite](https://img.shields.io/badge/CorpusProtocol%20Suite-Development%20Certified-blue)
-```
+
 **Usage:** Active development and testing phases (375+ tests)
 
 ### Protocol-Specific Badges
 
-```markdown
+#### Individual Protocol Badges
+
 ![LLM Protocol](https://img.shields.io/badge/CorpusLLM%20Protocol-100%25%20Conformant-brightgreen)
 ![Vector Protocol](https://img.shields.io/badge/CorpusVector%20Protocol-100%25%20Conformant-brightgreen)
 ![Graph Protocol](https://img.shields.io/badge/CorpusGraph%20Protocol-100%25%20Conformant-brightgreen)
@@ -384,22 +385,36 @@ This suite constitutes the **official Corpus Protocol Suite V1.0 Reference Confo
 ![Schema Conformance](https://img.shields.io/badge/CorpusSchema-100%25%20Conformant-blue)
 ![Wire Protocol](https://img.shields.io/badge/CorpusWire%20Protocol-100%25%20Conformant-orange)
 ```
+```
+#### Certification Levels by Protocol:
+- **LLM Protocol:** 🏆 Gold (132/132 tests), 🥈 Silver (106+ tests), 🔬 Development (66+ tests)
+- **Vector Protocol:** 🏆 Gold (108/108 tests), 🥈 Silver (86+ tests), 🔬 Development (54+ tests)
+- **Graph Protocol:** 🏆 Gold (99/99 tests), 🥈 Silver (79+ tests), 🔬 Development (50+ tests)
+- **Embedding Protocol:** 🏆 Gold (135/135 tests), 🥈 Silver (108+ tests), 🔬 Development (68+ tests)
+- **Schema Conformance:** 🏆 Gold (199/199 tests), 🥈 Silver (159+ tests), 🔬 Development (100+ tests)
+- **Wire Protocol:** 🏆 Gold (76/76 tests), 🥈 Silver (61+ tests), 🔬 Development (38+ tests)
 
 ### Badge Placement Guidelines
 
-**README.md (Primary)**
-```markdown
+#### README.md (Primary)
+
 # Project Name
 ![Corpus Protocol Suite](https://img.shields.io/badge/CorpusProtocol%20Suite-Platinum%20Certified-gold)
 
 A Corpus Protocol Suite implementation supporting Graph, LLM, Vector, and Embedding protocols.
-```
 
-**API Documentation**
-```markdown
+## Certifications
+- ![LLM Protocol](https://img.shields.io/badge/CorpusLLM%20Protocol-100%25%20Conformant-brightgreen)
+- ![Vector Protocol](https://img.shields.io/badge/CorpusVector%20Protocol-100%25%20Conformant-brightgreen)
+- ![Graph Protocol](https://img.shields.io/badge/CorpusGraph%20Protocol-100%25%20Conformant-brightgreen)
+- ![Embedding Protocol](https://img.shields.io/badge/CorpusEmbedding%20Protocol-100%25%20Conformant-brightgreen)
+- ![Schema Conformance](https://img.shields.io/badge/CorpusSchema-100%25%20Conformant-blue)
+- ![Wire Protocol](https://img.shields.io/badge/CorpusWire%20Protocol-100%25%20Conformant-orange)
+  
+---
+
 > **Certification Level**: Platinum  
 > **Protocol Coverage**: Graph (99/99) • LLM (132/132) • Vector (108/108) • Embedding (135/135) • Schema (199/199) • Wire (76/76)  
 > **Total Tests**: 749/749 (100%)  
+> **Test Suite**: protocol-tests@v1.0.0
 ```
-
----
