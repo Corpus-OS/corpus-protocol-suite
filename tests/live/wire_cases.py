@@ -13,31 +13,29 @@ protocol operations. Each case specifies:
 
 IMPORTANT ALIGNMENT NOTE
 ------------------------
-This registry is aligned to the production WireAdapter we just created:
+This registry is aligned to the production WireAdapter:
 - One builder method per *protocol operation* (no variant-specific builders).
 - Variants (tools/json/filter/batch/etc.) remain separate CASES, but they reuse
-  the same base operation builder method. The test harness must supply
+  the same base operation builder method. The test harness supplies
   variant args payloads based on case.id / tags / args_validator.
 
 SCHEMA.md ALIGNMENT NOTE
 ------------------------
-This registry uses operation-level request schemas (e.g., llm.complete.request.json),
-not just envelope.request schemas, to ensure:
+SCHEMA.md is normative for op strings and schema $ids. This registry uses
+operation-level request schemas (e.g., llm.complete.request.json), not just
+envelope.request schemas, to ensure:
 - op is const-bound to the correct operation name
 - args are validated against the operation-specific args schema
 
-COVERAGE NOTE (BOTH SCENARIOS)
-------------------------------
-Some operations may be present in SCHEMA.md but not yet implemented by a given adapter,
-or not yet shipped in a given repo's schema bundle. To "cover both scenarios" without
-commenting cases out, each case includes explicit gates:
+STRICT CONFORMANCE POSTURE
+--------------------------
+This registry is intended for strict alignment checks:
+- Missing schema_id in the loaded schema registry is a FAILURE (not a skip).
+- Missing adapter build_method is a FAILURE (not a skip).
 
-  - requires_schema: if True, the harness should confirm schema_id exists in the loaded schema registry;
-    if missing, the harness should skip (not fail) the case.
-  - requires_builder: if True, the harness should confirm the adapter implements build_method;
-    if missing, the harness should skip (not fail) the case.
-
-These gates are pure metadata: they do not change runtime performance of this registry.
+The requires_schema/requires_builder flags remain as metadata for compatibility
+with older harness code, but strict harness behavior MUST treat missing schema
+or builder as FAIL.
 """
 
 from __future__ import annotations
@@ -46,11 +44,11 @@ import json
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Any, Dict, FrozenSet, List, Optional
+from typing import Any, Dict, FrozenSet, List, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
-# Optional YAML support
+# Optional YAML support (soft dependency)
 try:
     import yaml  # type: ignore
 
@@ -65,7 +63,7 @@ except ImportError:
 
 VALID_COMPONENTS: FrozenSet[str] = frozenset({"llm", "vector", "embedding", "graph"})
 
-# Schema versioning (SCHEMA.md uses SemVer, and $id paths are not versioned by directory)
+# Schema versioning (SCHEMA.md uses SemVer; $id paths are not versioned by directory)
 SCHEMA_VERSION = "1.0.0"
 DEFAULT_SCHEMA_BASE_URL = "https://corpusos.com/schemas"
 
@@ -79,7 +77,7 @@ class CasesConfig:
     """Configuration for case registry loading."""
 
     schema_base_url: str = DEFAULT_SCHEMA_BASE_URL
-    config_paths: tuple = (
+    config_paths: tuple[str, ...] = (
         "config/wire_test_cases.yaml",
         "config/wire_test_cases.yml",
         "config/wire_test_cases.json",
@@ -89,11 +87,23 @@ class CasesConfig:
     def from_env(cls) -> "CasesConfig":
         """Create configuration from environment variables."""
         base_url = os.environ.get("CORPUS_SCHEMA_BASE_URL", DEFAULT_SCHEMA_BASE_URL)
+        base_url = _normalize_base_url(base_url)
 
         env_config = os.environ.get("CORPUS_TEST_CASES_CONFIG")
         paths = (env_config,) if env_config else cls.config_paths
 
+        # Filter out empty strings defensively
+        paths = tuple(p for p in paths if p)
+
         return cls(schema_base_url=base_url, config_paths=paths)
+
+
+def _normalize_base_url(url: str) -> str:
+    """Normalize schema base URL (strip trailing slashes)."""
+    u = (url or "").strip()
+    while u.endswith("/"):
+        u = u[:-1]
+    return u or DEFAULT_SCHEMA_BASE_URL
 
 
 # ---------------------------------------------------------------------------
@@ -116,8 +126,8 @@ class WireRequestCase:
         description: Human-readable description for documentation/reports.
         tags: Set of tags for selective test execution and filtering.
 
-        requires_schema: If True, harness should skip if schema_id not present in registry.
-        requires_builder: If True, harness should skip if adapter lacks build_method.
+        requires_schema / requires_builder:
+            Compatibility-only metadata. In strict conformance, missing schema/builder MUST FAIL.
     """
 
     id: str
@@ -130,7 +140,7 @@ class WireRequestCase:
     description: str = ""
     tags: FrozenSet[str] = field(default_factory=frozenset)
 
-    # Coverage gates (metadata only; harness uses these to decide skip vs fail)
+    # Compatibility metadata (strict harness should treat missing as FAIL).
     requires_schema: bool = True
     requires_builder: bool = True
 
@@ -141,8 +151,7 @@ class WireRequestCase:
 
         if self.component not in VALID_COMPONENTS:
             raise ValueError(
-                f"Invalid component '{self.component}', "
-                f"must be one of {sorted(VALID_COMPONENTS)}"
+                f"Invalid component '{self.component}', must be one of {sorted(VALID_COMPONENTS)}"
             )
 
         if not self.op.startswith(f"{self.component}."):
@@ -156,6 +165,17 @@ class WireRequestCase:
         if not self.schema_id:
             raise ValueError("Case 'schema_id' must be non-empty")
 
+        if not isinstance(self.schema_versions, tuple) or not self.schema_versions:
+            raise ValueError("Case 'schema_versions' must be a non-empty tuple")
+
+        for v in self.schema_versions:
+            if not isinstance(v, str) or not v.strip():
+                raise ValueError(f"Invalid schema version entry: {v!r}")
+
+        for t in self.tags:
+            if not isinstance(t, str) or not t.strip():
+                raise ValueError(f"Invalid tag entry (must be non-empty string): {t!r}")
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "WireRequestCase":
         """
@@ -163,21 +183,27 @@ class WireRequestCase:
 
         Supports loading from external YAML/JSON configuration.
         """
+        if not isinstance(data, dict):
+            raise ValueError(f"WireRequestCase entry must be an object, got {type(data).__name__}")
+
         required = {"id", "component", "op", "build_method", "schema_id"}
         missing = required - set(data.keys())
         if missing:
-            raise ValueError(f"Missing required fields: {missing}")
+            raise ValueError(f"Missing required fields: {sorted(missing)}")
+
+        tags = _normalize_tags(data.get("tags", []))
+        versions = _normalize_versions(data.get("schema_versions", (SCHEMA_VERSION,)))
 
         return cls(
-            id=data["id"],
-            component=data["component"],
-            op=data["op"],
-            build_method=data["build_method"],
-            schema_id=data["schema_id"],
-            schema_versions=tuple(data.get("schema_versions", (SCHEMA_VERSION,))),
+            id=str(data["id"]),
+            component=str(data["component"]),
+            op=str(data["op"]),
+            build_method=str(data["build_method"]),
+            schema_id=str(data["schema_id"]),
+            schema_versions=versions,
             args_validator=data.get("args_validator"),
-            description=data.get("description", ""),
-            tags=frozenset(data.get("tags", [])),
+            description=str(data.get("description", "")),
+            tags=tags,
             requires_schema=bool(data.get("requires_schema", True)),
             requires_builder=bool(data.get("requires_builder", True)),
         )
@@ -214,46 +240,118 @@ class WireRequestCase:
         return True
 
 
+def _normalize_tags(raw: Any) -> FrozenSet[str]:
+    """
+    Normalize tags into FrozenSet[str].
+
+    Accepts:
+      - list/tuple/set of strings
+      - single string
+      - None/empty -> empty set
+    """
+    if raw is None:
+        return frozenset()
+    if isinstance(raw, str):
+        raw_list: Sequence[Any] = [raw]
+    elif isinstance(raw, (list, tuple, set, frozenset)):
+        raw_list = list(raw)
+    else:
+        raise ValueError(f"tags must be a string or array of strings, got {type(raw).__name__}")
+
+    out: List[str] = []
+    for t in raw_list:
+        if not isinstance(t, str):
+            raise ValueError(f"tag entries must be strings, got {type(t).__name__}")
+        s = t.strip()
+        if not s:
+            raise ValueError("tag entries must be non-empty strings")
+        out.append(s)
+    return frozenset(out)
+
+
+def _normalize_versions(raw: Any) -> tuple[str, ...]:
+    """
+    Normalize schema_versions into tuple[str, ...].
+
+    Accepts:
+      - list/tuple of strings
+      - single string
+      - None -> default (SCHEMA_VERSION,)
+    """
+    if raw is None:
+        return (SCHEMA_VERSION,)
+    if isinstance(raw, str):
+        raw_list: Sequence[Any] = [raw]
+    elif isinstance(raw, (list, tuple)):
+        raw_list = list(raw)
+    else:
+        raise ValueError(f"schema_versions must be a string or array of strings, got {type(raw).__name__}")
+
+    out: List[str] = []
+    for v in raw_list:
+        if not isinstance(v, str):
+            raise ValueError(f"schema_versions entries must be strings, got {type(v).__name__}")
+        s = v.strip()
+        if not s:
+            raise ValueError("schema_versions entries must be non-empty strings")
+        out.append(s)
+    return tuple(out) or (SCHEMA_VERSION,)
+
+
 # ---------------------------------------------------------------------------
-# External Configuration Loading
+# External Configuration Loading (strict hygiene)
 # ---------------------------------------------------------------------------
 
-def _load_yaml_file(path: str) -> Optional[Dict[str, Any]]:
-    """Load YAML configuration file."""
+def _load_yaml_file(path: str) -> Dict[str, Any]:
+    """Load YAML configuration file (strict)."""
     if not YAML_AVAILABLE:
-        logger.warning(f"YAML not available, cannot load {path}")
-        return None
+        raise RuntimeError(
+            f"YAML config file '{path}' was found but PyYAML is not installed. "
+            "Install PyYAML or use JSON config."
+        )
 
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return yaml.safe_load(f)
+            loaded = yaml.safe_load(f)
     except Exception as e:
-        logger.warning(f"Failed to load YAML from {path}: {e}")
-        return None
+        raise RuntimeError(f"Failed to load YAML from {path}: {e}") from e
+
+    if not isinstance(loaded, dict):
+        raise ValueError(f"YAML config root must be an object, got {type(loaded).__name__}")
+    return loaded
 
 
-def _load_json_file(path: str) -> Optional[Dict[str, Any]]:
-    """Load JSON configuration file."""
+def _load_json_file(path: str) -> Dict[str, Any]:
+    """Load JSON configuration file (strict)."""
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            loaded = json.load(f)
     except Exception as e:
-        logger.warning(f"Failed to load JSON from {path}: {e}")
-        return None
+        raise RuntimeError(f"Failed to load JSON from {path}: {e}") from e
+
+    if not isinstance(loaded, dict):
+        raise ValueError(f"JSON config root must be an object, got {type(loaded).__name__}")
+    return loaded
 
 
-def load_external_config(paths: Optional[tuple] = None) -> Optional[Dict[str, Any]]:
+def load_external_config(paths: Optional[tuple[str, ...]] = None) -> Optional[Dict[str, Any]]:
     """
     Load test case configuration from external files.
 
     Searches paths in order, returns first successful load.
     Supports both YAML and JSON formats.
+
+    Strict posture:
+      - If a referenced config file exists but cannot be loaded/parsed/validated, raise.
+      - If no config file exists, return None and fall back to defaults.
     """
     config = CasesConfig.from_env()
     search_paths = paths or config.config_paths
 
     for path in search_paths:
-        if not path or not os.path.exists(path):
+        if not path:
+            continue
+        if not os.path.exists(path):
             continue
 
         if path.endswith((".yaml", ".yml")):
@@ -261,17 +359,37 @@ def load_external_config(paths: Optional[tuple] = None) -> Optional[Dict[str, An
         elif path.endswith(".json"):
             loaded = _load_json_file(path)
         else:
-            continue
+            raise ValueError(f"Unsupported config file extension: {path}")
 
-        if loaded:
-            logger.info(f"Loaded test case configuration from {path}")
-            return loaded
+        logger.info(f"Loaded test case configuration from {path}")
+        return loaded
 
     return None
 
 
+def _validate_external_cases_blob(external: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Validate external config shape and return the list of case dicts.
+    Expected:
+      {"wire_request_cases": [ {case}, {case}, ... ] }
+    """
+    if "wire_request_cases" not in external:
+        raise ValueError("External config missing required top-level key: 'wire_request_cases'")
+
+    cases = external["wire_request_cases"]
+    if not isinstance(cases, list):
+        raise ValueError(f"'wire_request_cases' must be an array, got {type(cases).__name__}")
+
+    out: List[Dict[str, Any]] = []
+    for i, entry in enumerate(cases):
+        if not isinstance(entry, dict):
+            raise ValueError(f"wire_request_cases[{i}] must be an object, got {type(entry).__name__}")
+        out.append(entry)
+    return out
+
+
 # ---------------------------------------------------------------------------
-# Case Registry Builder
+# Case Registry Builder (SCHEMA.md-aligned 33 ops)
 # ---------------------------------------------------------------------------
 
 def _build_default_cases(base_url: str) -> List[WireRequestCase]:
@@ -283,11 +401,12 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
 
     Variants reuse the same build method and operation schema; the harness supplies variant args.
 
-    NOTE: For operations that may not exist in all adapters or schema bundles, we still include
-    cases but rely on requires_schema/requires_builder gates for skip behavior in the harness.
+    Strict posture: all 33 request ops are expected to exist in schema bundles and in the WireAdapter.
     """
+    base_url = _normalize_base_url(base_url)
+
     return [
-        # ========================== LLM ========================== #
+        # ========================== LLM (5) ========================== #
         WireRequestCase(
             id="llm_capabilities",
             component="llm",
@@ -307,7 +426,6 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             description="Generate LLM completion for given messages",
             tags=frozenset({"core", "llm", "completion"}),
         ),
-        # Variant: tools (same builder; different args fixture)
         WireRequestCase(
             id="llm_complete_with_tools",
             component="llm",
@@ -318,7 +436,6 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             description="LLM completion with tool/function calling",
             tags=frozenset({"core", "llm", "completion", "tools"}),
         ),
-        # Variant: JSON mode (same builder; different args fixture)
         WireRequestCase(
             id="llm_complete_json_mode",
             component="llm",
@@ -339,7 +456,6 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             description="Stream LLM completion incrementally",
             tags=frozenset({"core", "llm", "streaming"}),
         ),
-        # Variant: streaming + tools (same builder; different args fixture)
         WireRequestCase(
             id="llm_stream_with_tools",
             component="llm",
@@ -370,7 +486,7 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             tags=frozenset({"llm", "health", "operational"}),
         ),
 
-        # ======================== VECTOR ========================= #
+        # ======================== VECTOR (8) ========================= #
         WireRequestCase(
             id="vector_capabilities",
             component="vector",
@@ -390,7 +506,6 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             description="Vector similarity search query",
             tags=frozenset({"core", "vector", "query"}),
         ),
-        # Variant: filter (same builder; different args fixture)
         WireRequestCase(
             id="vector_query_with_filter",
             component="vector",
@@ -410,9 +525,6 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             args_validator="validate_vector_batch_query_args",
             description="Batch vector similarity search queries",
             tags=frozenset({"vector", "query", "batch"}),
-            # Cover both scenarios: some adapters may not implement yet, some schema bundles may not include yet.
-            requires_schema=True,
-            requires_builder=True,
         ),
         WireRequestCase(
             id="vector_upsert",
@@ -494,7 +606,7 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             tags=frozenset({"vector", "health", "operational"}),
         ),
 
-        # ======================= EMBEDDING ======================= #
+        # ======================= EMBEDDING (7) ======================= #
         WireRequestCase(
             id="embedding_capabilities",
             component="embedding",
@@ -573,8 +685,6 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             args_validator="validate_embedding_stream_embed_args",
             description="Stream embedding generation for a single text",
             tags=frozenset({"embedding", "streaming", "embed"}),
-            requires_schema=True,
-            requires_builder=True,
         ),
         WireRequestCase(
             id="embedding_count_tokens",
@@ -595,8 +705,6 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             args_validator="validate_embedding_get_stats_args",
             description="Retrieve embedding service statistics (counters, cache, timings)",
             tags=frozenset({"embedding", "stats", "operational"}),
-            requires_schema=True,
-            requires_builder=True,
         ),
         WireRequestCase(
             id="embedding_health",
@@ -608,7 +716,7 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             tags=frozenset({"embedding", "health", "operational"}),
         ),
 
-        # ========================= GRAPH ========================= #
+        # ========================= GRAPH (13) ========================= #
         WireRequestCase(
             id="graph_capabilities",
             component="graph",
@@ -644,7 +752,7 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             op="graph.upsert_edges",
             build_method="build_graph_upsert_edges_envelope",
             schema_id=f"{base_url}/graph/graph.upsert_edges.request.json",
-            args_validator=None,  # Using schema validation only (args shape enforced by schema_id above)
+            args_validator="validate_graph_upsert_edges_args",
             description="Create/upsert graph edges/relationships",
             tags=frozenset({"core", "graph", "write", "edges"}),
         ),
@@ -654,7 +762,7 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             op="graph.upsert_edges",
             build_method="build_graph_upsert_edges_envelope",
             schema_id=f"{base_url}/graph/graph.upsert_edges.request.json",
-            args_validator=None,  # Using schema validation only (args shape enforced by schema_id above)
+            args_validator="validate_graph_upsert_edges_args",
             description="Batch create/upsert graph edges",
             tags=frozenset({"graph", "write", "edges", "batch"}),
         ),
@@ -665,18 +773,18 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             build_method="build_graph_delete_nodes_envelope",
             schema_id=f"{base_url}/graph/graph.delete_nodes.request.json",
             args_validator="validate_graph_delete_nodes_args",
-            description="Delete graph nodes by ID",
+            description="Delete graph nodes by ID or filter",
             tags=frozenset({"core", "graph", "write", "delete", "nodes"}),
         ),
         WireRequestCase(
-            id="graph_delete_nodes_by_label",
+            id="graph_delete_nodes_by_filter",
             component="graph",
             op="graph.delete_nodes",
             build_method="build_graph_delete_nodes_envelope",
             schema_id=f"{base_url}/graph/graph.delete_nodes.request.json",
             args_validator="validate_graph_delete_nodes_args",
-            description="Delete graph nodes by label (variant args)",
-            tags=frozenset({"graph", "write", "delete", "nodes", "label"}),
+            description="Delete graph nodes by filter (variant args)",
+            tags=frozenset({"graph", "write", "delete", "nodes", "filter"}),
         ),
         WireRequestCase(
             id="graph_delete_edges",
@@ -684,29 +792,19 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             op="graph.delete_edges",
             build_method="build_graph_delete_edges_envelope",
             schema_id=f"{base_url}/graph/graph.delete_edges.request.json",
-            args_validator=None,  # Using schema validation only (args shape enforced by schema_id above)
-            description="Delete graph edges by ID",
+            args_validator="validate_graph_delete_edges_args",
+            description="Delete graph edges by ID or filter",
             tags=frozenset({"core", "graph", "write", "delete", "edges"}),
         ),
         WireRequestCase(
-            id="graph_delete_edges_by_type",
+            id="graph_delete_edges_by_filter",
             component="graph",
             op="graph.delete_edges",
             build_method="build_graph_delete_edges_envelope",
             schema_id=f"{base_url}/graph/graph.delete_edges.request.json",
-            args_validator=None,  # Using schema validation only (args shape enforced by schema_id above)
-            description="Delete graph edges by type (variant args)",
-            tags=frozenset({"graph", "write", "delete", "edges", "type"}),
-        ),
-        WireRequestCase(
-            id="graph_query_gremlin",
-            component="graph",
-            op="graph.query",
-            build_method="build_graph_query_envelope",
-            schema_id=f"{base_url}/graph/graph.query.request.json",
-            args_validator=None,  # Using schema validation only (dialect/text enforced by schema_id above)
-            description="Execute Gremlin graph query (variant args)",
-            tags=frozenset({"core", "graph", "query", "gremlin"}),
+            args_validator="validate_graph_delete_edges_args",
+            description="Delete graph edges by filter (variant args)",
+            tags=frozenset({"graph", "write", "delete", "edges", "filter"}),
         ),
         WireRequestCase(
             id="graph_query_cypher",
@@ -714,9 +812,19 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             op="graph.query",
             build_method="build_graph_query_envelope",
             schema_id=f"{base_url}/graph/graph.query.request.json",
-            args_validator=None,  # Using schema validation only (dialect/text enforced by schema_id above)
-            description="Execute Cypher graph query (variant args)",
-            tags=frozenset({"graph", "query", "cypher"}),
+            args_validator="validate_graph_query_args",
+            description="Execute graph query (Cypher variant args)",
+            tags=frozenset({"core", "graph", "query", "cypher"}),
+        ),
+        WireRequestCase(
+            id="graph_query_gremlin",
+            component="graph",
+            op="graph.query",
+            build_method="build_graph_query_envelope",
+            schema_id=f"{base_url}/graph/graph.query.request.json",
+            args_validator="validate_graph_query_args",
+            description="Execute graph query (Gremlin variant args)",
+            tags=frozenset({"graph", "query", "gremlin"}),
         ),
         WireRequestCase(
             id="graph_query_sparql",
@@ -724,8 +832,8 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             op="graph.query",
             build_method="build_graph_query_envelope",
             schema_id=f"{base_url}/graph/graph.query.request.json",
-            args_validator=None,  # Using schema validation only (dialect/text enforced by schema_id above)
-            description="Execute SPARQL query (variant args; may be NOT_SUPPORTED by provider)",
+            args_validator="validate_graph_query_args",
+            description="Execute graph query (SPARQL variant args; may be NOT_SUPPORTED)",
             tags=frozenset({"graph", "query", "sparql"}),
         ),
         WireRequestCase(
@@ -734,8 +842,8 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             op="graph.query",
             build_method="build_graph_query_envelope",
             schema_id=f"{base_url}/graph/graph.query.request.json",
-            args_validator=None,  # Using schema validation only (params enforced by schema_id above)
-            description="Graph query with parameterized bindings",
+            args_validator="validate_graph_query_args",
+            description="Graph query with parameter bindings",
             tags=frozenset({"graph", "query", "parameters"}),
         ),
         WireRequestCase(
@@ -744,7 +852,7 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             op="graph.stream_query",
             build_method="build_graph_stream_query_envelope",
             schema_id=f"{base_url}/graph/graph.stream_query.request.json",
-            args_validator=None,  # Using schema validation only (args enforced by schema_id above)
+            args_validator="validate_graph_query_args",
             description="Stream graph query results incrementally",
             tags=frozenset({"core", "graph", "query", "streaming"}),
         ),
@@ -754,7 +862,7 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             op="graph.stream_query",
             build_method="build_graph_stream_query_envelope",
             schema_id=f"{base_url}/graph/graph.stream_query.request.json",
-            args_validator=None,  # Using schema validation only (args enforced by schema_id above)
+            args_validator="validate_graph_query_args",
             description="Stream Gremlin query results (variant args)",
             tags=frozenset({"graph", "query", "streaming", "gremlin"}),
         ),
@@ -767,8 +875,6 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             args_validator="validate_graph_bulk_vertices_args",
             description="Bulk vertices export/import via cursor pagination",
             tags=frozenset({"graph", "bulk", "nodes", "read"}),
-            requires_schema=True,
-            requires_builder=True,
         ),
         WireRequestCase(
             id="graph_batch",
@@ -776,7 +882,7 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             op="graph.batch",
             build_method="build_graph_batch_envelope",
             schema_id=f"{base_url}/graph/graph.batch.request.json",
-            args_validator=None,
+            args_validator="validate_graph_batch_args",
             description="Execute multiple graph operations in a batch",
             tags=frozenset({"graph", "batch", "write"}),
         ),
@@ -786,11 +892,8 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             op="graph.get_schema",
             build_method="build_graph_get_schema_envelope",
             schema_id=f"{base_url}/graph/graph.get_schema.request.json",
-            args_validator=None,
             description="Retrieve graph schema (node labels, edge types, properties)",
             tags=frozenset({"graph", "schema", "discovery"}),
-            requires_schema=True,
-            requires_builder=True,
         ),
         WireRequestCase(
             id="graph_transaction",
@@ -798,11 +901,8 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             op="graph.transaction",
             build_method="build_graph_transaction_envelope",
             schema_id=f"{base_url}/graph/graph.transaction.request.json",
-            args_validator=None,
             description="Execute graph operations as a single transaction",
             tags=frozenset({"graph", "transaction", "write"}),
-            requires_schema=True,
-            requires_builder=True,
         ),
         WireRequestCase(
             id="graph_traversal",
@@ -810,11 +910,8 @@ def _build_default_cases(base_url: str) -> List[WireRequestCase]:
             op="graph.traversal",
             build_method="build_graph_traversal_envelope",
             schema_id=f"{base_url}/graph/graph.traversal.request.json",
-            args_validator=None,
             description="Traverse graph from start nodes with filters and depth",
             tags=frozenset({"graph", "traversal", "query"}),
-            requires_schema=True,
-            requires_builder=True,
         ),
         WireRequestCase(
             id="graph_health",
@@ -850,11 +947,12 @@ class WireRequestCaseRegistry:
 
     def _load_cases(self) -> List[WireRequestCase]:
         config = CasesConfig.from_env()
-        external = load_external_config()
+        external = load_external_config(config.config_paths)
 
-        if external and "wire_request_cases" in external:
+        if external is not None:
+            case_dicts = _validate_external_cases_blob(external)
             logger.info("Loading wire request cases from external configuration")
-            return [WireRequestCase.from_dict(case) for case in external["wire_request_cases"]]
+            return [WireRequestCase.from_dict(case) for case in case_dicts]
 
         return _build_default_cases(config.schema_base_url)
 
@@ -911,7 +1009,7 @@ class WireRequestCaseRegistry:
         tags_all: Optional[List[str]] = None,
         tags_any: Optional[List[str]] = None,
     ) -> List[WireRequestCase]:
-        result = []
+        result: List[WireRequestCase] = []
 
         for case in self._cases:
             if component and case.component != component:
@@ -1018,7 +1116,7 @@ def print_cases_table(cases: List[WireRequestCase], verbose: bool = False) -> No
             print(f"  Schema:       {case.schema_id}")
             print(f"  Validator:    {case.args_validator or 'none'}")
             print(f"  Tags:         {', '.join(sorted(case.tags)) or 'none'}")
-            print(f"  Gates:        requires_schema={case.requires_schema}, requires_builder={case.requires_builder}")
+            print(f"  Strict:       missing schema/builder MUST FAIL")
             print(f"  Description:  {case.description or 'none'}")
     else:
         print(f"{'ID':<40} {'Component':<12} {'Tags'}")
