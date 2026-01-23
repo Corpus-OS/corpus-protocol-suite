@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/llm/llm.count_tokens.request.json",
+  "title": "LLM Count Tokens Request",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "https://corpusos.com/schemas/llm/llm.envelope.request.json"
+    },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "llm.count_tokens"
+        },
+        "args": {
+          "$ref": "https://corpusos.com/schemas/llm/llm.types.count_tokens_spec.json"
+        }
+      }
+    }
+  ]
+}
