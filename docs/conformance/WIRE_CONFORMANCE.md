@@ -520,8 +520,8 @@ test-wire-fast:
 
 **Badge Suggestion:**
 [![Corpus Wire Protocol](https://img.shields.io/badge/CorpusWire%20Protocol-100%25%20Conformant-brightgreen)](./wire_conformance_report.json)
-```
 
+```
 **Last Updated:** 2026-01-19  
 **Maintained By:** Corpus SDK Team  
 **Test Suite:** `tests/live/test_wire_conformance.py`  
