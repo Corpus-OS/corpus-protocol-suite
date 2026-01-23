@@ -1,8 +1,0 @@
-{
-  "op": "query",
-  "dialect": "cypher",
-  "text": "MATCH (u:User) RETURN u LIMIT 10",
-  "params": {
-    "limit": 10
-  }
-}

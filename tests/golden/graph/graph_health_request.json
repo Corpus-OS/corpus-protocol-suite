@@ -1,9 +1,0 @@
-{
-  "op": "graph.health",
-  "ctx": {
-    "request_id": "req_graph_health_001",
-    "deadline_ms": 253402214400000,
-    "tenant": "acme-corp"
-  },
-  "args": {}
-}

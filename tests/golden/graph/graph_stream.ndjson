@@ -1,3 +1,0 @@
-{"ok":true,"code":"OK","ms":0.2,"chunk":{"records":[{"id":"user:123","label":"User","name":"Alice","friend_count":3}],"is_final":false}}
-{"ok":true,"code":"OK","ms":0.4,"chunk":{"records":[{"id":"user:456","label":"User","name":"Bob","friend_count":1}],"is_final":false}}
-{"ok":true,"code":"OK","ms":0.6,"chunk":{"records":[],"is_final":true}}

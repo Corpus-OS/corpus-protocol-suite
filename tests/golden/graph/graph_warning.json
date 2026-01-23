@@ -1,4 +1,0 @@
-{
-  "code": "GRAPH_CARDINALITY_WARNING",
-  "message": "Query returned more rows than expected."
-}

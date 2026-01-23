@@ -1,7 +1,0 @@
-{
-  "event": "error",
-  "code": "UNAVAILABLE",
-  "error": "Unavailable",
-  "message": "Graph streaming backend unavailable",
-  "retry_after_ms": 1500
-}

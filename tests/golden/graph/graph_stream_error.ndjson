@@ -1,2 +1,0 @@
-{"event":"data","data":{"id":"user:123","label":"User","name":"Alice","friend_count":3}}
-{"event":"error","code":"UNAVAILABLE","error":"Unavailable","message":"Graph streaming backend unavailable","retry_after_ms":1500}
