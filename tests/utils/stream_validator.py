@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Optional
 
-from tests.utils.schema_registry import assert_valid, SchemaRegistry
+from tests.utils.schema_registry import SchemaRegistry, assert_valid
 
 
 class StreamFormat(Enum):
@@ -137,6 +137,11 @@ class ValidationConfig:
         https://corpusos.com/schemas/llm/llm.stream.success.json
         https://corpusos.com/schemas/graph/graph.stream_query.success.json
         https://corpusos.com/schemas/embedding/embedding.stream_embed.success.json
+
+    NOTE:
+    - If the stream terminates with an error envelope (ok=false), schema validation MUST
+      validate that terminal frame against an error-envelope schema (component-specific
+      if available, else common/envelope.error.json).
     """
 
     stream_frame_schema_id: str
@@ -529,6 +534,7 @@ class StreamValidationEngine:
             StreamFormat.NDJSON: NDJSONParser(),
             StreamFormat.SSE: SSEParser(),
         }
+        self._cached_error_schema_id: Optional[str] = None
 
     def _emit_performance_warning(self, message: str) -> None:
         if self.config.on_performance_warning:
@@ -568,9 +574,66 @@ class StreamValidationEngine:
             return _deterministic_sample_hit(frame_num, self.config.sample_rate, self.config.sampling_seed)
         return False  # LAZY
 
+    def _resolve_error_schema_id(self) -> str:
+        """
+        Prefer component-specific envelope.error schema when available, else fall back to common.
+
+        Tries (in order):
+          1) https://corpusos.com/schemas/<component>/<component>.envelope.error.json   (if component provided)
+          2) https://corpusos.com/schemas/common/envelope.error.json
+        """
+        if self._cached_error_schema_id is not None:
+            return self._cached_error_schema_id
+
+        candidates: list[str] = []
+        comp = (self.config.component or "").strip()
+        if comp:
+            candidates.append(f"https://corpusos.com/schemas/{comp}/{comp}.envelope.error.json")
+        candidates.append("https://corpusos.com/schemas/common/envelope.error.json")
+
+        # Verify existence by attempting to validate an empty-ish frame would be noisy;
+        # instead, we optimistically cache the first candidate and fall back on KeyError
+        # at validation time.
+        self._cached_error_schema_id = candidates[0]
+        self._error_schema_candidates = candidates  # type: ignore[attr-defined]
+        return self._cached_error_schema_id
+
+    def _schema_id_for_frame(self, frame: dict[str, Any]) -> str:
+        if frame.get("ok") is True:
+            return self.config.stream_frame_schema_id
+        return self._resolve_error_schema_id()
+
     def _schema_validate_sync(self, frame: dict[str, Any], frame_num: int) -> None:
+        """
+        Schema-validate a frame.
+
+        - ok=true frames validate against config.stream_frame_schema_id
+        - ok=false frames validate against a standard error-envelope schema
+        """
+        schema_id = self._schema_id_for_frame(frame)
+
+        # If we picked a component-specific error schema that doesn't exist, fall back to common.
+        if frame.get("ok") is False:
+            candidates: list[str] = getattr(self, "_error_schema_candidates", [schema_id])  # type: ignore[attr-defined]
+            last_keyerr: Optional[KeyError] = None
+            for cand in candidates:
+                try:
+                    assert_valid(
+                        cand,
+                        frame,
+                        context=f"{self.config.component}.stream frame #{frame_num}",
+                        registry=self.config.schema_registry,
+                    )
+                    return
+                except KeyError as e:
+                    last_keyerr = e
+                    continue
+            if last_keyerr is not None:
+                raise last_keyerr
+            return
+
         assert_valid(
-            self.config.stream_frame_schema_id,
+            schema_id,
             frame,
             context=f"{self.config.component}.stream frame #{frame_num}",
             registry=self.config.schema_registry,
