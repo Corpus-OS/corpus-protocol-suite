@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/llm/llm.types.stream_spec.json",
+  "title": "LLM Stream Specification",
+  "type": "object",
+  "properties": {
+    "messages": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "https://corpusos.com/schemas/llm/llm.types.message.json"
+      }
+    },
+    "max_tokens": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "temperature": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": 0.0,
+      "maximum": 2.0
+    },
+    "top_p": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "exclusiveMinimum": 0.0,
+      "maximum": 1.0
+    },
+    "frequency_penalty": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": -2.0,
+      "maximum": 2.0
+    },
+    "presence_penalty": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": -2.0,
+      "maximum": 2.0
+    },
+    "stop_sequences": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "string"
+      }
+    },
+    "model": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "system_message": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "tools": {
+      "$ref": "https://corpusos.com/schemas/llm/llm.types.tools.json"
+    },
+    "tool_choice": {
+      "$ref": "https://corpusos.com/schemas/llm/llm.types.tool_choice.json"
+    }
+  },
+  "required": [
+    "messages"
+  ],
+  "additionalProperties": true
+}
