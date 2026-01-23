@@ -1,8 +1,0 @@
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://corpusos.com/schemas/llm/llm.count_tokens.success.json",
-  "title": "llm.count_tokens Result",
-  "description": "Result for llm.count_tokens per protocol §11.4",
-  "type": "integer",
-  "minimum": 0
-}

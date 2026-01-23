@@ -1,7 +1,0 @@
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://corpusos.com/schemas/llm/llm.types.tool.json",
-  "title": "LLM Tool Types",
-  "description": "Tool types aligned with protocol \u00a710.1 - used when capabilities.supports_function_calling = true",
-  "type": "object"
-}
