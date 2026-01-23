@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/llm/llm.complete.request.json",
+  "title": "LLM Complete Request",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "https://corpusos.com/schemas/llm/llm.envelope.request.json"
+    },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "llm.complete"
+        },
+        "args": {
+          "$ref": "https://corpusos.com/schemas/llm/llm.types.completion_spec.json"
+        }
+      }
+    }
+  ]
+}
