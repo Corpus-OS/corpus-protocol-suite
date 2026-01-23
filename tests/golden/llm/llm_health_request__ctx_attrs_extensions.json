@@ -1,0 +1,12 @@
+{
+  "op": "llm.health",
+  "ctx": {
+    "request_id": "t_llm_health_ctx_attrs",
+    "tenant": "test",
+    "attrs": {
+      "x-client": "golden-tests",
+      "x-run": "ci"
+    }
+  },
+  "args": {}
+}

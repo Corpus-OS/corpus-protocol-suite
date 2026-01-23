@@ -1,0 +1,13 @@
+{
+  "ok": false,
+  "code": "RESOURCE_EXHAUSTED",
+  "error": "RateLimitError",
+  "message": "Rate limit exceeded",
+  "retry_after_ms": 1500,
+  "details": {
+    "limit": "rpm",
+    "remaining": 0,
+    "x-scope": "tenant:test"
+  },
+  "ms": 8.9
+}

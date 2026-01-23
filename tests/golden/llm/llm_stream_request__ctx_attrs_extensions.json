@@ -1,0 +1,25 @@
+{
+  "op": "llm.stream",
+  "ctx": {
+    "request_id": "t_llm_stream_ctx_attrs",
+    "tenant": "test",
+    "attrs": {
+      "x-client": "golden-tests",
+      "x-run": "ci"
+    },
+    "x-pass-through": {
+      "note": "ctx extra fields allowed"
+    }
+  },
+  "args": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Stream ping."
+      }
+    ],
+    "x-extra-arg": {
+      "note": "args extension boundary"
+    }
+  }
+}

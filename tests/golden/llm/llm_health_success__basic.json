@@ -1,0 +1,10 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 5.4,
+  "result": {
+    "ok": true,
+    "server": "corpus-llm",
+    "version": "1.0.0"
+  }
+}

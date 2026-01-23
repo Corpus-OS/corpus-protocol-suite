@@ -1,0 +1,12 @@
+{
+  "ok": false,
+  "code": "UNAVAILABLE",
+  "error": "ServiceUnavailableError",
+  "message": "Service is temporarily unavailable",
+  "retry_after_ms": null,
+  "details": {
+    "x-provider": "test",
+    "hint": "try again later"
+  },
+  "ms": 25.6
+}

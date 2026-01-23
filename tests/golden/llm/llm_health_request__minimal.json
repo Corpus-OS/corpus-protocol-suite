@@ -1,0 +1,8 @@
+{
+  "op": "llm.health",
+  "ctx": {
+    "request_id": "t_llm_health_min",
+    "tenant": "test"
+  },
+  "args": {}
+}

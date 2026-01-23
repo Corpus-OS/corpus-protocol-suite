@@ -1,0 +1,17 @@
+{
+  "op": "llm.capabilities",
+  "ctx": {
+    "request_id": "t_llm_caps_ctx_attrs",
+    "tenant": "test",
+    "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    "attrs": {
+      "x-trace": "capabilities",
+      "x-env": "ci",
+      "feature_flags": {
+        "x-fast-path": true
+      }
+    },
+    "x-extra-field": "ctx pass-through is allowed"
+  },
+  "args": {}
+}

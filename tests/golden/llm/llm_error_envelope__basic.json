@@ -1,0 +1,9 @@
+{
+  "ok": false,
+  "code": "BAD_REQUEST",
+  "error": "BadRequestError",
+  "message": "Invalid request parameters",
+  "retry_after_ms": null,
+  "details": null,
+  "ms": 1.2
+}

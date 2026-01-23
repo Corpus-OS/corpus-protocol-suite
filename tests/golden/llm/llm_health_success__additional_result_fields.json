@@ -1,0 +1,16 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 6.3,
+  "result": {
+    "ok": true,
+    "server": "corpus-llm",
+    "version": "1.0.0",
+    "region": "local",
+    "models": {
+      "test-model-1": {
+        "ok": true
+      }
+    }
+  }
+}

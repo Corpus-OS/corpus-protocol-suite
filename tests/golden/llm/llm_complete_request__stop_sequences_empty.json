@@ -1,0 +1,16 @@
+{
+  "op": "llm.complete",
+  "ctx": {
+    "request_id": "t_llm_complete_stop_empty",
+    "tenant": "test"
+  },
+  "args": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "List three colors."
+      }
+    ],
+    "stop_sequences": []
+  }
+}

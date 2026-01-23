@@ -1,0 +1,19 @@
+{
+  "op": "llm.complete",
+  "ctx": {
+    "request_id": "t_llm_complete_system_role_message",
+    "tenant": "test"
+  },
+  "args": {
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are a helpful assistant. Answer concisely."
+      },
+      {
+        "role": "user",
+        "content": "What is 2+2?"
+      }
+    ]
+  }
+}
