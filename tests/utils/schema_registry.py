@@ -283,6 +283,8 @@ def _load_all_schemas() -> None:
 
 def _make_validator(schema_id: str) -> Draft202012Validator:
     """Create a validator for the given schema ID with comprehensive error handling."""
+    global _REGISTRY  # FIX: Declare global to avoid UnboundLocalError
+    
     with _STORE_LOCK:
         if not _LOADED:
             _load_all_schemas()
