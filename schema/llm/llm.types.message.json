@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/llm/llm.types.message.json",
+  "title": "LLM Message",
+  "type": "object",
+  "properties": {
+    "role": {
+      "type": "string"
+    },
+    "content": {
+      "type": "string"
+    },
+    "name": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "tool_call_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "tool_calls": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "$ref": "#/$defs/ToolCall"
+      }
+    }
+  },
+  "required": [
+    "role",
+    "content"
+  ],
+  "additionalProperties": true,
+  "$defs": {
+    "ToolCall": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string"
+        },
+        "function": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "arguments": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "arguments"
+          ],
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "function"
+      ],
+      "additionalProperties": true
+    }
+  }
+}
