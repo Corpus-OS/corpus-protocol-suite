@@ -386,7 +386,7 @@ def validate_envelope_shape(envelope: Any, case_id: Optional[str] = None) -> Non
     # Accept Mapping at the boundary; treat "object" as mapping per SCHEMA.md
     if not isinstance(envelope, Mapping):
         raise EnvelopeTypeError(
-            f"Envelope must be object (mapping), got {type(envelope).__name__}",
+            f"Envelope must be dict, got {type(envelope).__name__}",
             case_id=case_id,
             details={"actual_type": type(envelope).__name__},
         )
