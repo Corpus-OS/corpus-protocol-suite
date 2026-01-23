@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/vector/vector.types.vector_match.json",
+  "title": "Vector Match",
+  "type": "object",
+  "properties": {
+    "vector": {
+      "$ref": "https://corpusos.com/schemas/vector/vector.types.vector.json"
+    },
+    "score": {
+      "type": "number"
+    },
+    "distance": {
+      "type": "number"
+    }
+  },
+  "required": [
+    "vector",
+    "score",
+    "distance"
+  ],
+  "additionalProperties": false
+}

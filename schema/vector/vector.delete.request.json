@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/vector/vector.delete.request.json",
+  "title": "Vector Delete Request",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "https://corpusos.com/schemas/vector/vector.envelope.request.json"
+    },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "vector.delete"
+        },
+        "args": {
+          "type": "object",
+          "properties": {
+            "ids": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": ".*\\S.*"
+              },
+              "minItems": 1
+            },
+            "namespace": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": ".*\\S.*",
+              "default": "default"
+            },
+            "filter": {
+              "type": "object",
+              "minProperties": 1,
+              "additionalProperties": true
+            }
+          },
+          "additionalProperties": true,
+          "anyOf": [
+            {
+              "required": [
+                "ids"
+              ]
+            },
+            {
+              "required": [
+                "filter"
+              ]
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

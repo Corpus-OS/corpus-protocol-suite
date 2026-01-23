@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/vector/vector.health.success.json",
+  "title": "Vector Health Success",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "https://corpusos.com/schemas/vector/vector.envelope.success.json"
+    },
+    {
+      "properties": {
+        "result": {
+          "$ref": "https://corpusos.com/schemas/vector/vector.types.health_result.json"
+        }
+      }
+    }
+  ]
+}

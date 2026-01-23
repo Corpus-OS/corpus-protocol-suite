@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/vector/vector.types.failure_item.json",
+  "title": "Vector Failure Item",
+  "type": "object",
+  "properties": {
+    "id": {},
+    "error": {},
+    "detail": {}
+  },
+  "additionalProperties": true
+}

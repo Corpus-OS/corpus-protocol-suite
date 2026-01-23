@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/vector/vector.batch_query.success.json",
+  "title": "Vector Batch Query Success",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "https://corpusos.com/schemas/vector/vector.envelope.success.json"
+    },
+    {
+      "properties": {
+        "result": {
+          "type": "array",
+          "items": {
+            "$ref": "https://corpusos.com/schemas/vector/vector.types.query_result.json"
+          }
+        }
+      }
+    }
+  ]
+}

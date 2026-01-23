@@ -1,0 +1,7 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/vector/vector.types.filter.json",
+  "title": "Vector Filter Expression",
+  "type": "object",
+  "additionalProperties": true
+}

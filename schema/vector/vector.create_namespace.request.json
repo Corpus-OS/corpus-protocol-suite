@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/vector/vector.create_namespace.request.json",
+  "title": "Vector Create Namespace Request",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "https://corpusos.com/schemas/vector/vector.envelope.request.json"
+    },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "vector.create_namespace"
+        },
+        "args": {
+          "$ref": "https://corpusos.com/schemas/vector/vector.types.namespace_spec.json"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/vector/vector.envelope.request.json",
+  "title": "Vector Protocol Request Envelope",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "https://corpusos.com/schemas/common/envelope.request.json"
+    },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "description": "Operation identifier. The wire handler only enforces that this is a string; unknown ops are handled at runtime."
+        }
+      }
+    }
+  ]
+}

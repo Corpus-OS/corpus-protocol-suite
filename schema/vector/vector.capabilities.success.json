@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/vector/vector.capabilities.success.json",
+  "title": "Vector Capabilities Success",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "https://corpusos.com/schemas/vector/vector.envelope.success.json"
+    },
+    {
+      "properties": {
+        "result": {
+          "$ref": "https://corpusos.com/schemas/vector/vector.capabilities.json"
+        }
+      }
+    }
+  ]
+}
