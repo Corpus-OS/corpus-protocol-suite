@@ -322,7 +322,8 @@ class FrameValidator:
     STREAMING_CODE = "STREAMING"
     _ERROR_CODE_RE = re.compile(r"^[A-Z_]+$")
 
-    # SCHEMA.md canonical envelopes are closed contracts (additionalProperties: false).
+    # For conformance, treat envelopes as closed (additionalProperties: false).
+    # In warnings-enabled mode, unexpected keys are warnings; otherwise they are errors.
     _STREAM_SUCCESS_KEYS = frozenset({"ok", "code", "ms", "chunk"})
     _ERROR_KEYS = frozenset({"ok", "code", "error", "message", "retry_after_ms", "details", "ms"})
 
@@ -378,10 +379,11 @@ class FrameValidator:
             )
 
         if frame["ok"] is True:
-            # Closed contract check (additionalProperties: false)
             extra = set(frame.keys()) - set(FrameValidator._STREAM_SUCCESS_KEYS)
             if extra:
-                FrameValidator._warn_or_raise(extra, frame_num, "streaming success", enable_warnings=enable_content_warnings)
+                FrameValidator._warn_or_raise(
+                    extra, frame_num, "streaming success", enable_warnings=enable_content_warnings
+                )
 
             if frame.get("code") != FrameValidator.STREAMING_CODE:
                 raise StreamProtocolError(
@@ -409,7 +411,6 @@ class FrameValidator:
                 )
 
         else:
-            # Closed contract check (additionalProperties: false)
             extra = set(frame.keys()) - set(FrameValidator._ERROR_KEYS)
             if extra:
                 FrameValidator._warn_or_raise(extra, frame_num, "error", enable_warnings=enable_content_warnings)
@@ -424,7 +425,6 @@ class FrameValidator:
             code = frame.get("code")
             if not isinstance(code, str) or not code:
                 raise StreamProtocolError(f"Frame #{frame_num}: 'code' must be non-empty string")
-            # Schema: pattern ^[A-Z_]+$
             if FrameValidator._ERROR_CODE_RE.match(code) is None:
                 raise StreamProtocolError(
                     f"Frame #{frame_num}: 'code' must match ^[A-Z_]+$, got {code!r}"
@@ -477,8 +477,6 @@ def _deterministic_sample_hit(frame_num: int, sample_rate: float, seed: str) -> 
 class _StreamState:
     """
     Shared state machine for streaming semantics.
-
-    Extracted to avoid DRY violations between sync/async loops.
     """
     def __init__(self) -> None:
         self.data_count = 0
@@ -496,7 +494,6 @@ class _StreamState:
 
         if frame.get("ok") is True:
             self.data_count += 1
-            # validate_protocol_envelope guarantees chunk is dict + is_final boolean
             chunk = frame["chunk"]
             if chunk.get("is_final") is True:
                 self.terminal_seen = True
@@ -592,7 +589,7 @@ class StreamValidationEngine:
             total = frame_num
             frame = item.frame
 
-            # size accounting (no double-serialization when raw_bytes is provided by parser)
+            # size accounting
             try:
                 b = self._frame_bytes(item)
                 total_bytes += b
@@ -604,7 +601,7 @@ class StreamValidationEngine:
                     continue
                 raise
 
-            # protocol envelope check (always; keeps LAZY SCHEMA.md-correct)
+            # protocol envelope check (always)
             try:
                 FrameValidator.validate_protocol_envelope(
                     frame,
@@ -631,7 +628,7 @@ class StreamValidationEngine:
             else:
                 frames_skipped += 1
 
-            # streaming semantics (shared state machine)
+            # streaming semantics
             try:
                 state.apply_stream_semantics(frame, frame_num)
             except Exception as e:
