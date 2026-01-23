@@ -19,3 +19,8 @@ types-requests>=2.31.0,<3.0.0
 # --- Build tooling (if you want to build locally) ---
 setuptools>=68,<71
 wheel>=0.41.0,<0.45.0
+
+
+# --- JSON (if you want to build locally) ---
+jsonschema>=4.18,<5
+referencing>=0.35,<1
