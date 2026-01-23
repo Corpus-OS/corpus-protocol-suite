@@ -524,9 +524,18 @@ After meta-lint (13 tests) + golden schema suites (90+ tests) pass unmodified:
    • Reference adapter aligned
 ```
 
-**Badge suggestion** (link to your generated artifact or CI run):
+**Badge suggestion** 
 
-[![Corpus Protocol Schema Conformance](https://img.shields.io/badge/Corpus_Protocol-100%2B_Schema_Tests-green)](./conformance_report.json)
+## **Schema Conformance**
+
+**Certification Levels:**
+- 🏆 **Gold:** 199/199 tests (100%)
+- 🥈 **Silver:** 159+ tests (80%+)
+- 🔬 **Development:** 100+ tests (50%+)
+
+**Badge Suggestion:**
+
+[![Corpus Schema](https://img.shields.io/badge/CorpusSchema-100%25%20Conformant-blue)](./schema_conformance_report.json)
 
 ---
 
