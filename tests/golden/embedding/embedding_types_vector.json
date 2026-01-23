@@ -1,7 +1,0 @@
-{
-  "vector": [0.1, 0.2, 0.3],
-  "model": "example-embed-1",
-  "dimensions": 3,
-  "text": "hello world",
-  "vendor:shard": "s1"
-}

@@ -1,9 +1,0 @@
-{
-  "op": "embedding.capabilities",
-  "ctx": {
-    "request_id": "req_emb_capabilities_001",
-    "deadline_ms": 253402300800000,
-    "tenant": "acme-corp"
-  },
-  "args": {}
-}

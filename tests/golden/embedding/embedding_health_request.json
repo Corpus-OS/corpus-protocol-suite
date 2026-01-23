@@ -1,9 +1,0 @@
-{
-  "op": "embedding.health",
-  "ctx": {
-    "request_id": "req_emb_health_001",
-    "deadline_ms": 253402300800000,
-    "tenant": "acme-corp"
-  },
-  "args": {}
-}
