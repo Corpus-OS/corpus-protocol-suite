@@ -25,10 +25,11 @@ Also exposes a SchemaRegistry class suitable for dependency injection
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import jsonschema
 from jsonschema import Draft202012Validator
@@ -37,8 +38,15 @@ from jsonschema.exceptions import ValidationError
 from referencing import Registry, Resource
 from referencing.jsonschema import DRAFT202012
 
+logger = logging.getLogger(__name__)
 
 _SCHEMAS_ROOT_ENV = "CORPUS_SCHEMAS_ROOT"
+_ALLOW_NON_SCHEMA_JSON_ENV = "CORPUS_ALLOW_NON_SCHEMA_JSON"
+
+# SCHEMA.md version tolerance fragment prefix (convention):
+# schema_id#version/<semver>
+_VERSION_FRAGMENT_PREFIX = "#version/"
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_SCHEMAS_DIR = (_REPO_ROOT / "schemas") if (_REPO_ROOT / "schemas").exists() else (_REPO_ROOT / "schema")
 
@@ -52,6 +60,46 @@ _LOADED = False  # Track loading state explicitly
 
 # Explicit override root (preferred over env var). Does NOT mutate os.environ.
 _SCHEMAS_ROOT_OVERRIDE: Optional[Path] = None
+
+
+def _allow_non_schema_json() -> bool:
+    """
+    Strict posture per SCHEMA.md: schema root should contain schemas, not arbitrary JSON.
+
+    If you must allow non-schema JSON under schema root (legacy tooling, transitional states),
+    set CORPUS_ALLOW_NON_SCHEMA_JSON=true to skip those files rather than failing.
+    """
+    v = os.environ.get(_ALLOW_NON_SCHEMA_JSON_ENV, "false").strip().lower()
+    return v in {"1", "true", "yes", "y", "on"}
+
+
+def _split_schema_id(schema_id: str) -> Tuple[str, Optional[str]]:
+    """
+    Split schema_id into (base_id, fragment).
+
+    Returns:
+      - base_id: everything before '#'
+      - fragment: '#...' including leading '#', or None
+    """
+    s = (schema_id or "").strip()
+    if "#" not in s:
+        return s, None
+    base, frag = s.split("#", 1)
+    return base, "#" + frag
+
+
+def _base_schema_id(schema_id: str) -> str:
+    """
+    Normalize a schema_id for store lookup and caching.
+
+    SCHEMA.md version tolerance uses schema_id#version/<semver>. The on-disk schemas'
+    $id values do NOT include these fragments (per SCHEMA.md $id convention), so we
+    always look up by the base $id (fragment stripped).
+
+    We still keep the original schema_id for error/context reporting.
+    """
+    base, _frag = _split_schema_id(schema_id)
+    return base
 
 
 def _set_schemas_root_override(root: Optional[Path]) -> None:
@@ -94,7 +142,7 @@ def _schemas_root() -> Path:
 
 
 def _iter_schema_files(root: Path) -> List[Path]:
-    """Find all JSON schema files, skipping obvious non-schema files."""
+    """Find all JSON files under schema root, skipping obvious non-schema files."""
     schema_files: List[Path] = []
     for p in root.rglob("*.json"):
         # Skip common non-schema files and build directories
@@ -108,33 +156,30 @@ def _iter_schema_files(root: Path) -> List[Path]:
 
 
 def _validate_schema_metadata(schema: dict, file_path: Path) -> None:
-    """Validate basic schema structure and metadata."""
+    """Validate basic schema structure and metadata per SCHEMA.md."""
     if not isinstance(schema, dict):
         raise ValueError(f"Schema must be a JSON object: {file_path}")
 
-    # Skip if not a JSON Schema (no $schema)
-    if "$schema" not in schema:
-        return
-
-    # Check for Draft 2020-12 compliance
+    # $schema is required for schemas and must be Draft 2020-12
     schema_version = schema.get("$schema")
     if schema_version != "https://json-schema.org/draft/2020-12/schema":
         raise ValueError(
-            f"Schema must declare $schema as Draft 2020-12: {file_path} (got {schema_version})"
+            f"Schema must declare $schema as Draft 2020-12: {file_path} (got {schema_version!r})"
         )
 
     if "$id" not in schema:
         raise ValueError(f"Schema must declare $id: {file_path}")
 
     schema_id = schema["$id"]
-    if not isinstance(schema_id, str):
-        raise ValueError(f"Schema $id must be a string: {file_path}")
+    if not isinstance(schema_id, str) or not schema_id.strip():
+        raise ValueError(f"Schema $id must be a non-empty string: {file_path}")
 
-    # Validate URI format more thoroughly (SCHEMA.md uses https://...; allow urn/tag for tooling)
-    if not (schema_id.startswith(("http://", "https://", "urn:", "tag:"))):
-        raise ValueError(
-            f"Schema $id must be a valid URI (http/https/urn/tag): {file_path} -> {schema_id}"
-        )
+    # SCHEMA.md $id convention is https://corpusos.com/schemas/{component}/{filename}
+    # Keep it strict for conformance tooling: require http(s) + "/schemas/" namespace.
+    if not schema_id.startswith(("http://", "https://")):
+        raise ValueError(f"Schema $id must be an http(s) URI: {file_path} -> {schema_id!r}")
+    if "/schemas/" not in schema_id:
+        raise ValueError(f"Schema $id must include '/schemas/' namespace: {file_path} -> {schema_id!r}")
 
 
 def _build_registry_from_store(store: Dict[str, dict]) -> Registry:
@@ -161,23 +206,32 @@ def _load_all_schemas() -> None:
         if not root.exists():
             raise RuntimeError(f"Schemas root not found: {root}")
 
-        loaded_files: List[str] = []
+        loaded_relpaths: List[str] = []
         duplicate_ids: List[str] = []
         schema_count = 0
 
         # Track duplicates with file context
         seen_ids: Dict[str, Path] = {}
 
+        allow_non_schema = _allow_non_schema_json()
+
         for file_path in _iter_schema_files(root):
             try:
                 with file_path.open("r", encoding="utf-8") as f:
-                    schema = json.load(f)
+                    doc = json.load(f)
             except json.JSONDecodeError as e:
-                raise RuntimeError(f"Invalid JSON in schema {file_path}: {e}") from e
+                raise RuntimeError(f"Invalid JSON in schema file {file_path}: {e}") from e
 
-            # Skip if not a JSON Schema
-            if not isinstance(schema, dict) or "$schema" not in schema:
-                continue
+            # In strict mode, anything under schema root should be a Draft 2020-12 schema object.
+            if not isinstance(doc, dict) or "$schema" not in doc:
+                if allow_non_schema:
+                    logger.debug("Skipping non-schema JSON under schema root: %s", file_path)
+                    continue
+                raise RuntimeError(
+                    f"Non-schema JSON found under schema root (missing Draft 2020-12 $schema): {file_path}"
+                )
+
+            schema = doc
 
             # Validate schema structure
             try:
@@ -199,19 +253,30 @@ def _load_all_schemas() -> None:
             # Store schema (pristine) and separate metadata mappings
             _SCHEMA_STORE[schema_id] = schema
             _SCHEMA_PATHS[schema_id] = str(file_path)
-            loaded_files.append(file_path.name)
+
+            try:
+                rel = file_path.relative_to(root)
+                loaded_relpaths.append(rel.as_posix())
+            except ValueError:
+                loaded_relpaths.append(file_path.as_posix())
+
             schema_count += 1
 
         if duplicate_ids:
             raise RuntimeError("Duplicate schema $id detected:\n" + "\n".join(duplicate_ids))
 
+        if schema_count == 0:
+            # Strict posture: schema infra must load schemas.
+            raise RuntimeError(
+                f"No JSON Schemas found under {root}. "
+                f"Check {_SCHEMAS_ROOT_ENV} or schema root layout."
+            )
+
         # Build the referencing registry once, after store is complete
         _REGISTRY = _build_registry_from_store(_SCHEMA_STORE)
 
-        if schema_count > 0:
-            print(f"✅ Loaded {schema_count} schemas from {root}: {', '.join(sorted(loaded_files))}")
-        else:
-            print("⚠️  No JSON schemas found - check schema root configuration")
+        logger.info("Loaded %d schemas from %s", schema_count, root)
+        logger.debug("Loaded schema files: %s", ", ".join(sorted(loaded_relpaths)))
 
         _LOADED = True
 
@@ -222,30 +287,34 @@ def _make_validator(schema_id: str) -> Draft202012Validator:
         if not _LOADED:
             _load_all_schemas()
 
-        if schema_id not in _SCHEMA_STORE:
+        requested_id = (schema_id or "").strip()
+        base_id = _base_schema_id(requested_id)
+
+        if base_id not in _SCHEMA_STORE:
             available_ids = list(_SCHEMA_STORE.keys())
 
             if not available_ids:
                 raise KeyError(
-                    f"Schema not found: {schema_id}\nNo schemas loaded. "
+                    f"Schema not found: {requested_id}\nNo schemas loaded. "
                     f"Check {_SCHEMAS_ROOT_ENV} or pass schemas_root explicitly."
                 )
 
             suggestions: List[str] = []
 
-            # Exact suffix or substring matching
+            # Exact suffix or substring matching (against base IDs)
             for available_id in available_ids:
-                if available_id.endswith(schema_id) or schema_id in available_id:
+                if available_id.endswith(base_id) or base_id in available_id:
                     suggestions.append(available_id)
 
             # Also try filename matching
-            schema_filename = Path(schema_id).name
+            schema_filename = Path(base_id).name
             for available_id in available_ids:
-                if Path(_SCHEMA_PATHS[available_id]).name == schema_filename:
+                ap = _SCHEMA_PATHS.get(available_id)
+                if ap and Path(ap).name == schema_filename:
                     if available_id not in suggestions:
                         suggestions.append(available_id)
 
-            error_msg = f"Schema not found: {schema_id}"
+            error_msg = f"Schema not found: {requested_id}"
             if suggestions:
                 error_msg += "\nDid you mean one of:\n  " + "\n  ".join(sorted(suggestions)[:5])
             else:
@@ -258,8 +327,8 @@ def _make_validator(schema_id: str) -> Draft202012Validator:
 
             raise KeyError(error_msg)
 
-        schema = _SCHEMA_STORE[schema_id]
-        schema_path = _SCHEMA_PATHS.get(schema_id, "unknown")
+        schema = _SCHEMA_STORE[base_id]
+        schema_path = _SCHEMA_PATHS.get(base_id, "unknown")
 
         if _REGISTRY is None:
             # Should not happen if _load_all_schemas ran, but be defensive.
@@ -277,25 +346,32 @@ def _make_validator(schema_id: str) -> Draft202012Validator:
             )
         except Exception as e:
             raise RuntimeError(
-                f"Failed to create validator for schema '{schema_id}' ({schema_path}): {e}"
+                f"Failed to create validator for schema '{requested_id}' ({schema_path}): {e}"
             ) from e
 
         return validator
 
 
 def get_validator(schema_id: str) -> Draft202012Validator:
-    """Return a cached Draft202012 validator for the given $id."""
+    """
+    Return a cached Draft202012 validator for the given $id.
+
+    Caching is keyed by the base schema $id (fragments stripped), so callers may pass
+    SCHEMA.md version-tolerant IDs like:
+      https://.../llm/llm.complete.request.json#version/1.0.0
+    """
+    base_id = _base_schema_id(schema_id)
     with _STORE_LOCK:
-        if schema_id in _VALIDATOR_CACHE:
-            return _VALIDATOR_CACHE[schema_id]
+        if base_id in _VALIDATOR_CACHE:
+            return _VALIDATOR_CACHE[base_id]
 
         validator = _make_validator(schema_id)
-        _VALIDATOR_CACHE[schema_id] = validator
+        _VALIDATOR_CACHE[base_id] = validator
         return validator
 
 
 def validate_json(schema_id: str, obj: Any) -> None:
-    """Validate an object against the schema identified by $id."""
+    """Validate an object against the schema identified by $id (version fragments tolerated)."""
     validator = get_validator(schema_id)
     validator.validate(obj)
 
@@ -361,11 +437,14 @@ def assert_valid(
     Pytest-friendly validation with rich error messages.
     Raises AssertionError on validation failure.
     """
+    requested_id = (schema_id or "").strip()
+    base_id = _base_schema_id(requested_id)
+
     try:
         if registry is None:
-            validate_json(schema_id, obj)
+            validate_json(requested_id, obj)
         else:
-            registry.validate_json(schema_id, obj)
+            registry.validate_json(requested_id, obj)
     except ValidationError as e:
         # Prefer registry's paths if present, else fall back to global mapping
         if registry is not None:
@@ -377,8 +456,8 @@ def assert_valid(
             paths = _SCHEMA_PATHS
 
         error_parts = [
-            f"JSON validation failed against {schema_id}",
-            f"Schema file: {paths.get(schema_id, 'unknown')}",
+            f"JSON validation failed against {requested_id}",
+            f"Schema file: {paths.get(base_id, 'unknown')}",
             f"Error: {e.message}",
             (
                 f"Failing value: {_format_value(e.instance)}"
@@ -428,19 +507,25 @@ def load_all_schemas_into_registry(schemas_root: Optional[Path] = None) -> None:
 
 
 def list_schemas() -> Dict[str, str]:
-    """Get mapping of all schema IDs to their file paths."""
+    """Get mapping of all base schema IDs to their file paths."""
     _load_all_schemas()
     with _STORE_LOCK:
         return _SCHEMA_PATHS.copy()
 
 
 def get_schema(schema_id: str) -> dict:
-    """Get the raw schema document by $id (copy to prevent mutation)."""
+    """
+    Get the raw schema document by $id (copy to prevent mutation).
+
+    Version fragments (e.g., #version/1.0.0) are tolerated and resolved to the base schema $id.
+    """
     _load_all_schemas()
+    requested_id = (schema_id or "").strip()
+    base_id = _base_schema_id(requested_id)
     with _STORE_LOCK:
-        if schema_id not in _SCHEMA_STORE:
-            raise KeyError(f"Schema not found: {schema_id}")
-        return _SCHEMA_STORE[schema_id].copy()
+        if base_id not in _SCHEMA_STORE:
+            raise KeyError(f"Schema not found: {requested_id}")
+        return _SCHEMA_STORE[base_id].copy()
 
 
 def clear_cache() -> None:
@@ -467,12 +552,14 @@ if __name__ == "__main__":
 Examples:
   %(prog)s llm.envelope.request.json sample_request.json
   %(prog)s https://corpusos.com/schemas/llm/llm.envelope.request.json sample_request.json
+  %(prog)s https://corpusos.com/schemas/llm/llm.complete.request.json#version/1.0.0 sample_request.json
 
 Environment:
-  {_SCHEMAS_ROOT_ENV}    Override the default schemas directory
+  {_SCHEMAS_ROOT_ENV}                 Override the default schemas directory
+  {_ALLOW_NON_SCHEMA_JSON_ENV}        If true, skip non-schema JSON under schema root (default false)
         """,
     )
-    parser.add_argument("schema_id", nargs="?", help="Schema $id (exact) or file name suffix")
+    parser.add_argument("schema_id", nargs="?", help="Schema $id (exact), versioned id, or file name suffix")
     parser.add_argument("json_file", nargs="?", help="Path to JSON document to validate")
     parser.add_argument("--list", action="store_true", help="List all available schemas")
     parser.add_argument("--preload", action="store_true", help="Preload and validate all schemas")
@@ -497,7 +584,7 @@ Environment:
 
         if args.preload:
             preload_all_schemas()
-            print("✅ All schemas loaded and validated successfully")
+            print("✅ All schemas loaded and validators created successfully")
             sys.exit(0)
 
         if args.stats:
@@ -514,17 +601,28 @@ Environment:
 
         preload_all_schemas()
 
-        target_id = args.schema_id
-        if target_id not in _SCHEMA_STORE:
-            # Try suffix matching
-            matches = [sid for sid in _SCHEMA_STORE.keys() if sid.endswith(target_id)]
+        requested = args.schema_id.strip()
+        base_requested = _base_schema_id(requested)
+
+        target_id = requested
+
+        # If user passed a filename suffix (or base id not found), try matching.
+        if base_requested not in _SCHEMA_STORE:
+            # Try suffix matching against base IDs
+            matches = [sid for sid in _SCHEMA_STORE.keys() if sid.endswith(base_requested)]
             if not matches:
                 # Try filename matching
-                schema_filename = Path(target_id).name
-                matches = [sid for sid, path in _SCHEMA_PATHS.items() if Path(path).name == schema_filename]
+                schema_filename = Path(base_requested).name
+                matches = [
+                    sid
+                    for sid, path in _SCHEMA_PATHS.items()
+                    if Path(path).name == schema_filename
+                ]
 
             if len(matches) == 1:
-                target_id = matches[0]
+                # Preserve the fragment the user supplied (if any) by re-attaching it.
+                _base, frag = _split_schema_id(requested)
+                target_id = matches[0] + (frag or "")
                 print(f"🔍 Using schema: {target_id}")
             elif len(matches) > 1:
                 print(f"❌ Multiple schemas match '{args.schema_id}':")
