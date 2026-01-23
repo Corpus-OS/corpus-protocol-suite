@@ -43,6 +43,7 @@ from tests.utils.schema_registry import assert_valid, SchemaRegistry
 
 class StreamFormat(Enum):
     """Supported stream formats."""
+
     NDJSON = "ndjson"
     SSE = "sse"
     RAW_JSON = "raw_json"
@@ -50,15 +51,17 @@ class StreamFormat(Enum):
 
 class ValidationMode(Enum):
     """Validation strictness modes."""
-    STRICT = "strict"                 # Validate every frame
-    SAMPLED = "sampled"               # Validate deterministic sample of frames
-    LAZY = "lazy"                     # Validate only protocol rules, skip schema validation
-    COLLECT_ERRORS = "collect_errors" # Collect all errors instead of failing fast
+
+    STRICT = "strict"  # Validate every frame
+    SAMPLED = "sampled"  # Validate deterministic sample of frames
+    LAZY = "lazy"  # Validate only protocol rules, skip schema validation
+    COLLECT_ERRORS = "collect_errors"  # Collect all errors instead of failing fast
 
 
 @dataclass(frozen=True)
 class ValidationError:
     """A single validation error."""
+
     frame_number: int
     error_type: str
     message: str
@@ -68,6 +71,7 @@ class ValidationError:
 @dataclass(frozen=True)
 class StreamValidationReport:
     """Comprehensive report of stream validation results."""
+
     total_frames: int
     data_frames: int
     ended_ok: bool
@@ -90,9 +94,17 @@ class StreamValidationReport:
 
     def __post_init__(self) -> None:
         seconds = self.validation_time_ms / 1000.0
-        object.__setattr__(self, "bytes_per_second", self.total_bytes / seconds if seconds > 0 else float("inf"))
-        object.__setattr__(self, "frames_per_second", self.total_frames / seconds if seconds > 0 else float("inf"))
-        object.__setattr__(self, "validation_coverage", self.frames_validated / self.total_frames if self.total_frames > 0 else 1.0)
+        object.__setattr__(
+            self, "bytes_per_second", self.total_bytes / seconds if seconds > 0 else float("inf")
+        )
+        object.__setattr__(
+            self, "frames_per_second", self.total_frames / seconds if seconds > 0 else float("inf")
+        )
+        object.__setattr__(
+            self,
+            "validation_coverage",
+            self.frames_validated / self.total_frames if self.total_frames > 0 else 1.0,
+        )
 
     @property
     def is_valid(self) -> bool:
@@ -126,6 +138,7 @@ class ValidationConfig:
         https://corpusos.com/schemas/graph/graph.stream_query.success.json
         https://corpusos.com/schemas/embedding/embedding.stream_embed.success.json
     """
+
     stream_frame_schema_id: str
     component: str
     max_frame_bytes: Optional[int] = 1_048_576  # 1 MiB
@@ -145,11 +158,13 @@ class ValidationConfig:
 
 class StreamProtocolError(AssertionError):
     """Raised when stream protocol invariants are violated."""
+
     pass
 
 
 class FrameSizeExceededError(StreamProtocolError):
     """Raised when frame exceeds size limits."""
+
     pass
 
 
@@ -160,6 +175,7 @@ class FrameItem:
 
     For NDJSON/SSE, parsers can provide raw byte sizes without re-serializing dicts.
     """
+
     frame: dict[str, Any]
     raw_bytes: Optional[int] = None
 
@@ -222,7 +238,9 @@ class NDJSONParser(StreamParser):
                 raise StreamProtocolError(f"Invalid NDJSON at line #{line_num}: {e}") from e
 
             if not isinstance(frame, dict):
-                raise StreamProtocolError(f"Frame #{line_num} must be a JSON object, got {type(frame).__name__}")
+                raise StreamProtocolError(
+                    f"Frame #{line_num} must be a JSON object, got {type(frame).__name__}"
+                )
 
             yield FrameItem(frame=frame, raw_bytes=raw_bytes)
 
@@ -360,7 +378,9 @@ class FrameValidator:
             raise StreamProtocolError(msg)
 
     @staticmethod
-    def validate_protocol_envelope(frame: dict[str, Any], frame_num: int, *, enable_content_warnings: bool = True) -> None:
+    def validate_protocol_envelope(
+        frame: dict[str, Any], frame_num: int, *, enable_content_warnings: bool = True
+    ) -> None:
         """
         Validate SCHEMA.md envelope invariants:
 
@@ -418,17 +438,13 @@ class FrameValidator:
             required_fields = FrameValidator._ERROR_KEYS - {"ok"}
             missing = [f for f in sorted(required_fields) if f not in frame]
             if missing:
-                raise StreamProtocolError(
-                    f"Frame #{frame_num}: error envelope missing field(s): {', '.join(missing)}"
-                )
+                raise StreamProtocolError(f"Frame #{frame_num}: error envelope missing field(s): {', '.join(missing)}")
 
             code = frame.get("code")
             if not isinstance(code, str) or not code:
                 raise StreamProtocolError(f"Frame #{frame_num}: 'code' must be non-empty string")
             if FrameValidator._ERROR_CODE_RE.match(code) is None:
-                raise StreamProtocolError(
-                    f"Frame #{frame_num}: 'code' must match ^[A-Z_]+$, got {code!r}"
-                )
+                raise StreamProtocolError(f"Frame #{frame_num}: 'code' must match ^[A-Z_]+$, got {code!r}")
 
             err = frame.get("error")
             if not isinstance(err, str) or not err:
@@ -475,9 +491,8 @@ def _deterministic_sample_hit(frame_num: int, sample_rate: float, seed: str) -> 
 
 
 class _StreamState:
-    """
-    Shared state machine for streaming semantics.
-    """
+    """Shared state machine for streaming semantics."""
+
     def __init__(self) -> None:
         self.data_count = 0
         self.terminal_seen = False
@@ -568,11 +583,7 @@ class StreamValidationEngine:
     def _frame_bytes(self, item: FrameItem) -> int:
         return item.raw_bytes if item.raw_bytes is not None else FrameValidator.estimate_frame_size(item.frame)
 
-    def validate_items(
-        self,
-        items: Iterable[FrameItem],
-        format: StreamFormat,
-    ) -> StreamValidationReport:
+    def validate_items(self, items: Iterable[FrameItem], format: StreamFormat) -> StreamValidationReport:
         start_time = time.time()
 
         total = 0
@@ -647,7 +658,10 @@ class StreamValidationEngine:
             self._handle_validation_error(e, total, "stream_integrity", collect_errors, validation_errors)
 
         # performance warning
-        if total > self.config.large_stream_threshold and validation_time_ms > self.config.performance_warning_threshold_ms:
+        if (
+            total > self.config.large_stream_threshold
+            and validation_time_ms > self.config.performance_warning_threshold_ms
+        ):
             coverage = frames_validated / total if total > 0 else 0.0
             self._emit_performance_warning(
                 f"Large stream validation took {validation_time_ms:.0f}ms for {total} frames "
@@ -671,11 +685,7 @@ class StreamValidationEngine:
             validation_errors=validation_errors,
         )
 
-    async def validate_items_async(
-        self,
-        items: AsyncIterable[FrameItem],
-        format: StreamFormat,
-    ) -> StreamValidationReport:
+    async def validate_items_async(self, items: AsyncIterable[FrameItem], format: StreamFormat) -> StreamValidationReport:
         start_time = time.time()
 
         total = 0
@@ -745,7 +755,10 @@ class StreamValidationEngine:
         except Exception as e:
             self._handle_validation_error(e, total, "stream_integrity", collect_errors, validation_errors)
 
-        if total > self.config.large_stream_threshold and validation_time_ms > self.config.performance_warning_threshold_ms:
+        if (
+            total > self.config.large_stream_threshold
+            and validation_time_ms > self.config.performance_warning_threshold_ms
+        ):
             coverage = frames_validated / total if total > 0 else 0.0
             self._emit_performance_warning(
                 f"Large async stream validation took {validation_time_ms:.0f}ms for {total} frames "
@@ -814,32 +827,58 @@ class StreamValidationEngine:
     # Public helpers (already-parsed frames)
 
     def validate_frames(self, frames: Iterable[dict[str, Any]]) -> StreamValidationReport:
-        """
-        Validate an iterable of already-parsed frames (no raw byte metadata available).
-        """
+        """Validate an iterable of already-parsed frames (no raw byte metadata available)."""
         items = (FrameItem(frame=f, raw_bytes=None) for f in frames)
         return self.validate_items(items, StreamFormat.RAW_JSON)
 
     async def validate_frames_async(self, frames: AsyncIterable[dict[str, Any]]) -> StreamValidationReport:
-        """
-        Validate an async iterable of already-parsed frames (no raw byte metadata available).
-        """
+        """Validate an async iterable of already-parsed frames (no raw byte metadata available)."""
+
         async def items() -> AsyncIterator[FrameItem]:
             async for f in frames:
                 yield FrameItem(frame=f, raw_bytes=None)
+
         return await self.validate_items_async(items(), StreamFormat.RAW_JSON)
 
 
+# ------------------------------------------------------------------------------
 # Convenience functions
+# ------------------------------------------------------------------------------
+
+
+def _coalesce_stream_schema_id(
+    *,
+    stream_frame_schema_id: Optional[str],
+    envelope_schema_id: Optional[str],
+) -> str:
+    """
+    Backward-compatible schema ID selection.
+
+    Historical callers used envelope_schema_id=...
+    Canonical callers use stream_frame_schema_id=...
+
+    Exactly one must be provided.
+    """
+    schema_id = stream_frame_schema_id or envelope_schema_id
+    if not schema_id:
+        raise TypeError("Missing required argument: stream_frame_schema_id (or legacy envelope_schema_id)")
+    return schema_id
+
 
 def validate_ndjson_stream(
     ndjson_text: str,
-    stream_frame_schema_id: str,
-    component: str,
+    stream_frame_schema_id: Optional[str] = None,
+    component: str = "",
+    *,
+    envelope_schema_id: Optional[str] = None,
     **kwargs: Any,
 ) -> StreamValidationReport:
-    config = ValidationConfig(
+    schema_id = _coalesce_stream_schema_id(
         stream_frame_schema_id=stream_frame_schema_id,
+        envelope_schema_id=envelope_schema_id,
+    )
+    config = ValidationConfig(
+        stream_frame_schema_id=schema_id,
         component=component,
         **kwargs,
     )
@@ -848,12 +887,18 @@ def validate_ndjson_stream(
 
 def validate_sse_stream(
     sse_text: str,
-    stream_frame_schema_id: str,
-    component: str,
+    stream_frame_schema_id: Optional[str] = None,
+    component: str = "",
+    *,
+    envelope_schema_id: Optional[str] = None,
     **kwargs: Any,
 ) -> StreamValidationReport:
-    config = ValidationConfig(
+    schema_id = _coalesce_stream_schema_id(
         stream_frame_schema_id=stream_frame_schema_id,
+        envelope_schema_id=envelope_schema_id,
+    )
+    config = ValidationConfig(
+        stream_frame_schema_id=schema_id,
         component=component,
         **kwargs,
     )
@@ -862,12 +907,18 @@ def validate_sse_stream(
 
 async def validate_ndjson_stream_async(
     ndjson_text: str,
-    stream_frame_schema_id: str,
-    component: str,
+    stream_frame_schema_id: Optional[str] = None,
+    component: str = "",
+    *,
+    envelope_schema_id: Optional[str] = None,
     **kwargs: Any,
 ) -> StreamValidationReport:
-    config = ValidationConfig(
+    schema_id = _coalesce_stream_schema_id(
         stream_frame_schema_id=stream_frame_schema_id,
+        envelope_schema_id=envelope_schema_id,
+    )
+    config = ValidationConfig(
+        stream_frame_schema_id=schema_id,
         component=component,
         **kwargs,
     )
@@ -876,12 +927,18 @@ async def validate_ndjson_stream_async(
 
 async def validate_sse_stream_async(
     sse_text: str,
-    stream_frame_schema_id: str,
-    component: str,
+    stream_frame_schema_id: Optional[str] = None,
+    component: str = "",
+    *,
+    envelope_schema_id: Optional[str] = None,
     **kwargs: Any,
 ) -> StreamValidationReport:
-    config = ValidationConfig(
+    schema_id = _coalesce_stream_schema_id(
         stream_frame_schema_id=stream_frame_schema_id,
+        envelope_schema_id=envelope_schema_id,
+    )
+    config = ValidationConfig(
+        stream_frame_schema_id=schema_id,
         component=component,
         **kwargs,
     )
