@@ -18,7 +18,8 @@ Validation modes:
 - LAZY: enforce protocol invariants only (still SCHEMA.md-correct)
 
 Transport:
-- NDJSON / SSE / RAW_JSON supported.
+- NDJSON / SSE supported.
+- RAW_JSON is supported via validate_frames / validate_frames_async (already-parsed frames).
 - Parsers preserve full frames (do NOT strip unknown keys).
 - Parsers attach raw byte-lengths when available to avoid double-serialization for sizing.
 """
@@ -27,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 import warnings
 import zlib
@@ -202,7 +204,7 @@ class NDJSONParser(StreamParser):
         return items
 
     async def parse_async(self, content: str) -> list[FrameItem]:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self.parse, content)
 
     async def parse_streaming(self, lines: AsyncIterable[str]) -> AsyncIterator[FrameItem]:
@@ -269,7 +271,7 @@ class SSEParser(StreamParser):
         return items
 
     async def parse_async(self, content: str) -> list[FrameItem]:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self.parse, content)
 
     async def parse_streaming(self, lines: AsyncIterable[str]) -> AsyncIterator[FrameItem]:
@@ -318,6 +320,11 @@ class FrameValidator:
     """Protocol envelope validation logic (SCHEMA.md-aligned)."""
 
     STREAMING_CODE = "STREAMING"
+    _ERROR_CODE_RE = re.compile(r"^[A-Z_]+$")
+
+    # SCHEMA.md canonical envelopes are closed contracts (additionalProperties: false).
+    _STREAM_SUCCESS_KEYS = frozenset({"ok", "code", "ms", "chunk"})
+    _ERROR_KEYS = frozenset({"ok", "code", "error", "message", "retry_after_ms", "details", "ms"})
 
     @staticmethod
     def estimate_frame_size(frame: dict[str, Any]) -> int:
@@ -338,12 +345,30 @@ class FrameValidator:
             )
 
     @staticmethod
-    def validate_protocol_envelope(frame: dict[str, Any], frame_num: int) -> None:
+    def _warn_or_raise(extra_keys: set[str], frame_num: int, kind: str, *, enable_warnings: bool) -> None:
+        """
+        Outputs/contracts are closed by schema (additionalProperties: false).
+        For conformance, extra keys are a violation. In production-style usage, warnings may be enabled.
+        """
+        if not extra_keys:
+            return
+        msg = f"Frame #{frame_num}: {kind} envelope contains unexpected key(s): {', '.join(sorted(extra_keys))}"
+        if enable_warnings:
+            warnings.warn(msg, UserWarning)
+        else:
+            raise StreamProtocolError(msg)
+
+    @staticmethod
+    def validate_protocol_envelope(frame: dict[str, Any], frame_num: int, *, enable_content_warnings: bool = True) -> None:
         """
         Validate SCHEMA.md envelope invariants:
 
-        - Streaming success: ok=true, code="STREAMING", ms>=0, chunk present, no 'result'
-        - Error envelope: ok=false, fields include retry_after_ms + details, ms>=0
+        - Streaming success: ok=true, code="STREAMING", ms>=0, chunk present, no extra keys (closed contract)
+        - Error envelope: ok=false, required fields present, required types, ms>=0, no extra keys (closed contract)
+
+        Note:
+        - This function is used in all validation modes, including LAZY, to keep protocol-only validation
+          SCHEMA.md-correct without requiring JSON Schema evaluation.
         """
         if "ok" not in frame:
             raise StreamProtocolError(f"Frame #{frame_num}: missing 'ok' field")
@@ -353,30 +378,83 @@ class FrameValidator:
             )
 
         if frame["ok"] is True:
+            # Closed contract check (additionalProperties: false)
+            extra = set(frame.keys()) - set(FrameValidator._STREAM_SUCCESS_KEYS)
+            if extra:
+                FrameValidator._warn_or_raise(extra, frame_num, "streaming success", enable_warnings=enable_content_warnings)
+
             if frame.get("code") != FrameValidator.STREAMING_CODE:
                 raise StreamProtocolError(
                     f"Frame #{frame_num}: streaming success code must be {FrameValidator.STREAMING_CODE!r}, "
                     f"got {frame.get('code')!r}"
                 )
 
-            if "ms" not in frame or not isinstance(frame.get("ms"), (int, float)) or frame["ms"] < 0:
+            ms = frame.get("ms")
+            if not isinstance(ms, (int, float)) or float(ms) < 0.0:
                 raise StreamProtocolError(f"Frame #{frame_num}: 'ms' must be non-negative number")
 
             if "chunk" not in frame:
                 raise StreamProtocolError(f"Frame #{frame_num}: streaming frame missing 'chunk' field")
 
-            if "result" in frame:
-                raise StreamProtocolError(f"Frame #{frame_num}: streaming frame must NOT contain 'result'")
+            chunk = frame.get("chunk")
+            if not isinstance(chunk, dict):
+                raise StreamProtocolError(
+                    f"Frame #{frame_num}: 'chunk' must be an object, got {type(chunk).__name__}"
+                )
+            if "is_final" not in chunk:
+                raise StreamProtocolError(f"Frame #{frame_num}: chunk missing required 'is_final' field")
+            if not isinstance(chunk.get("is_final"), bool):
+                raise StreamProtocolError(
+                    f"Frame #{frame_num}: chunk.is_final must be boolean, got {type(chunk.get('is_final')).__name__}"
+                )
 
         else:
-            required_fields = {"code", "error", "message", "retry_after_ms", "details", "ms"}
+            # Closed contract check (additionalProperties: false)
+            extra = set(frame.keys()) - set(FrameValidator._ERROR_KEYS)
+            if extra:
+                FrameValidator._warn_or_raise(extra, frame_num, "error", enable_warnings=enable_content_warnings)
+
+            required_fields = FrameValidator._ERROR_KEYS - {"ok"}
             missing = [f for f in sorted(required_fields) if f not in frame]
             if missing:
                 raise StreamProtocolError(
                     f"Frame #{frame_num}: error envelope missing field(s): {', '.join(missing)}"
                 )
 
-            if not isinstance(frame.get("ms"), (int, float)) or frame["ms"] < 0:
+            code = frame.get("code")
+            if not isinstance(code, str) or not code:
+                raise StreamProtocolError(f"Frame #{frame_num}: 'code' must be non-empty string")
+            # Schema: pattern ^[A-Z_]+$
+            if FrameValidator._ERROR_CODE_RE.match(code) is None:
+                raise StreamProtocolError(
+                    f"Frame #{frame_num}: 'code' must match ^[A-Z_]+$, got {code!r}"
+                )
+
+            err = frame.get("error")
+            if not isinstance(err, str) or not err:
+                raise StreamProtocolError(f"Frame #{frame_num}: 'error' must be non-empty string")
+
+            msg = frame.get("message")
+            if not isinstance(msg, str):
+                raise StreamProtocolError(f"Frame #{frame_num}: 'message' must be string")
+
+            retry_after_ms = frame.get("retry_after_ms")
+            if retry_after_ms is not None:
+                if not isinstance(retry_after_ms, int):
+                    raise StreamProtocolError(
+                        f"Frame #{frame_num}: 'retry_after_ms' must be integer|null, got {type(retry_after_ms).__name__}"
+                    )
+                if retry_after_ms < 0:
+                    raise StreamProtocolError(f"Frame #{frame_num}: 'retry_after_ms' must be >= 0")
+
+            details = frame.get("details")
+            if details is not None and not isinstance(details, dict):
+                raise StreamProtocolError(
+                    f"Frame #{frame_num}: 'details' must be object|null, got {type(details).__name__}"
+                )
+
+            ms = frame.get("ms")
+            if not isinstance(ms, (int, float)) or float(ms) < 0.0:
                 raise StreamProtocolError(f"Frame #{frame_num}: 'ms' must be non-negative number")
 
 
@@ -418,8 +496,9 @@ class _StreamState:
 
         if frame.get("ok") is True:
             self.data_count += 1
-            chunk = frame.get("chunk")
-            if isinstance(chunk, dict) and chunk.get("is_final") is True:
+            # validate_protocol_envelope guarantees chunk is dict + is_final boolean
+            chunk = frame["chunk"]
+            if chunk.get("is_final") is True:
                 self.terminal_seen = True
                 self.ended_ok = True
                 self.terminal_frame_position = frame_num
@@ -486,7 +565,7 @@ class StreamValidationEngine:
         )
 
     async def _schema_validate_async(self, frame: dict[str, Any], frame_num: int) -> None:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, lambda: self._schema_validate_sync(frame, frame_num))
 
     def _frame_bytes(self, item: FrameItem) -> int:
@@ -525,9 +604,13 @@ class StreamValidationEngine:
                     continue
                 raise
 
-            # protocol envelope check (always)
+            # protocol envelope check (always; keeps LAZY SCHEMA.md-correct)
             try:
-                FrameValidator.validate_protocol_envelope(frame, frame_num)
+                FrameValidator.validate_protocol_envelope(
+                    frame,
+                    frame_num,
+                    enable_content_warnings=self.config.enable_content_warnings,
+                )
             except Exception as e:
                 self._handle_validation_error(e, frame_num, "protocol_envelope", collect_errors, validation_errors)
                 if collect_errors:
@@ -625,7 +708,11 @@ class StreamValidationEngine:
                 raise
 
             try:
-                FrameValidator.validate_protocol_envelope(frame, frame_num)
+                FrameValidator.validate_protocol_envelope(
+                    frame,
+                    frame_num,
+                    enable_content_warnings=self.config.enable_content_warnings,
+                )
             except Exception as e:
                 self._handle_validation_error(e, frame_num, "protocol_envelope", collect_errors, validation_errors)
                 if collect_errors:
@@ -700,18 +787,21 @@ class StreamValidationEngine:
     async def validate_ndjson_async(self, ndjson_text: str) -> StreamValidationReport:
         parser = self._parsers[StreamFormat.NDJSON]
         items = await parser.parse_async(ndjson_text)
-        # list -> async iterable
+
         async def gen() -> AsyncIterator[FrameItem]:
             for it in items:
                 yield it
+
         return await self.validate_items_async(gen(), StreamFormat.NDJSON)
 
     async def validate_sse_async(self, sse_text: str) -> StreamValidationReport:
         parser = self._parsers[StreamFormat.SSE]
         items = await parser.parse_async(sse_text)
+
         async def gen() -> AsyncIterator[FrameItem]:
             for it in items:
                 yield it
+
         return await self.validate_items_async(gen(), StreamFormat.SSE)
 
     async def validate_ndjson_streaming(self, lines: AsyncIterable[str]) -> StreamValidationReport:
