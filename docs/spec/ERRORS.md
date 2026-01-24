@@ -198,7 +198,7 @@ Transport-layer mappings are recommendations, not part of the wire envelope. The
 | VertexNotFound | BadRequest | No | Fix vertex ids or query |
 | EdgeNotFound | BadRequest | No | Fix edge ids or query |
 
-*Subtype retry guidance is informative; canonical class retryability is normative.*
+> **Note:** Subtype-level retry guidance is **informative** only. Client retry behavior MUST be driven by the **canonical class** retryability rules, which are **normative** and binding.
 
 ## 5) Observability & Privacy (SIEM-Safe)
 
