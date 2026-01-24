@@ -83,7 +83,7 @@ All adapters (Graph/LLM/Vector/Embedding) MUST emit at least:
 * **Semantics:** Emitted **exactly once per stream** with the terminal outcome code. For successful streams, use `code="OK"`. For errored streams, use the error's canonical wire code (e.g., `"DEADLINE_EXCEEDED"`, `"UNAVAILABLE"`).
 * **Dimensions:** `component`, `op`, `code`, `tenant_hash` (optional), and **no** content-derived labels.
 
-> Rationale: Streaming can emit many interim events; only a single *terminal* metric provides reliable SLO/SLA-like insight without inflating cardinality.
+> **Rationale:** Streaming can emit many interim events; only a single **terminal** metric provides reliable SLO/SLA-like insight without inflating cardinality.
 
 ### 2.4 Canonical Operation Names (Normative)
 
