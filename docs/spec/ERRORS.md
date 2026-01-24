@@ -19,6 +19,11 @@
 - [15) Conformance Testing](#15-conformance-testing)
 
 ---
+## Copyright Notice
+
+Copyright © 2026 Interoperable Intelligence Inc.
+SPDX-License-Identifier: Apache-2.0
+---
 
 **Errors Version:** `1.0`
 
