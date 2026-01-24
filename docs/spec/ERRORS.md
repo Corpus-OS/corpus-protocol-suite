@@ -149,8 +149,6 @@ Transport-layer mappings are recommendations, not part of the wire envelope. The
 | Unavailable | 503 |
 | DeadlineExceeded | 504 |
 
-*Note: HTTP status may be recorded in `details.transport.http_status` but is not required.*
-
 ### 3.2 gRPC (Informative)
 
 | Canonical Class | gRPC Code |
