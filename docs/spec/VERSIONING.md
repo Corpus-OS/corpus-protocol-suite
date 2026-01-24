@@ -200,7 +200,7 @@ On the wire: mark deprecated fields with `"deprecated": true` in published JSON 
 
 ## 8) Pre-Releases, RCs, and Experimental Features
 
-- **Pre-releases:** `v1.2.0-rc.1`, `v1.2.0-beta.2`. No long-term compatibility guarantees; APIs may change before General Availability..
+- **Pre-releases:** `v1.2.0-rc.1`, `v1.2.0-beta.2`. No long-term compatibility guarantees; APIs may change before General Availability (GA).
 - **Experimental flags (code):** opt-in via explicit environment variable or constructor parameter; default off.
 - **Experimental capabilities (wire):** expose under explicit vendor/extension namespaces (e.g., `x-` prefixed keys) and do not rely on them for cross-vendor compatibility.
 
