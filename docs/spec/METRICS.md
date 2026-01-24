@@ -19,6 +19,12 @@
 - [15) Aggregation & Sampling Guidance](#15-aggregation--sampling-guidance)
 
 ---
+## Copyright Notice
+
+Copyright © 2026 Interoperable Intelligence Inc.
+SPDX-License-Identifier: Apache-2.0
+
+---
 
 **Cross-Protocol Observability (Agnostic)**  
 **Metrics Version:** `1.0`
