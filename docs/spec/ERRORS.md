@@ -337,8 +337,7 @@ Batch APIs MUST surface per-item status, not just aggregate failure:
   ]
 }
 ```
-
-*Note: Per-item error strings are not required to be canonical error names (they are not full envelopes).*
+> **Note:** Per-item error strings in batch failure arrays (e.g., `failures[]`, `failed_texts[]`) are **not required** to be canonical error class names because they are **not full error envelopes**. Only the top-level error envelope fields (`error`, `code`, etc.) are subject to canonical taxonomy requirements.
 
 **Embedding Example (schema-enforced):**
 ```json
