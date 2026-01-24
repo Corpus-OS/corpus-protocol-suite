@@ -270,7 +270,7 @@ Graph adapters SHOULD handle:
 - Index not ready
 - Shard unavailable
 
-**Streaming Note:** For streaming operations, streams terminate with a standard error envelope (not a streaming success frame).
+Streaming note (normative): Streaming success frames MUST always be {ok:true, code:"STREAMING", ms, chunk}. If an error occurs, the stream MUST terminate by emitting exactly one standard error envelope {ok:false, ...} (not a streaming success frame), and no further frames may follow.
 
 ## 7) Error Hints (Machine-Readable Mitigations)
 
