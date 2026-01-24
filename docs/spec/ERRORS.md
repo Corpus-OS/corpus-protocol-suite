@@ -279,7 +279,7 @@ Adapters SHOULD attach structured hints in `details.hints`:
 - `throttle_scope` — bounded identifier for throttling domain (e.g., `"tenant:acme:llm"`, `"tenant:acme:graph"`).
 - `suggested_batch_reduction` — percentage [0..100].
 
-*Note: `retry_after_ms` is a top-level field, not included in hints.*
+> **Note:** `retry_after_ms` is a **top-level** error envelope field and MUST NOT be duplicated inside `details.hints`.
 
 **Client rule:**
 
