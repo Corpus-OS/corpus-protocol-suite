@@ -30,7 +30,7 @@
 
 ### Goals
 
-- One **cross-protocol taxonomy** with consistent semantics across all domains.
+- One **cross-protocol taxonomy** with consistent semantics for Graph, LLM, Vector, and Embedding adapters.
 - Deterministic, machine-readable **retryability** and **hints**.
 - Privacy-preserving, SIEM-safe payloads.
 - Predictable transport mappings for HTTP/gRPC.
