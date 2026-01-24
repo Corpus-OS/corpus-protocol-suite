@@ -30,7 +30,7 @@
 
 ### Goals
 
-- One **cross-protocol taxonomy** with consistent semantics.
+- One **cross-protocol taxonomy** with consistent semantics across all domains.
 - Deterministic, machine-readable **retryability** and **hints**.
 - Privacy-preserving, SIEM-safe payloads.
 - Predictable transport mappings for HTTP/gRPC.
