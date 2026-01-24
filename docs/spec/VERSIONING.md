@@ -204,6 +204,8 @@ On the wire: mark deprecated fields with `"deprecated": true` in published JSON 
 - **Experimental flags (code):** opt-in via explicit environment variable or constructor parameter; default off.
 - **Experimental capabilities (wire):** expose under explicit vendor/extension namespaces (e.g., `x-` prefixed keys) and do not rely on them for cross-vendor compatibility.
 
+Example progression:
+> **v1.2.0-beta.2 → v1.2.0-rc.1 → v1.2.0 (GA)
 ---
 
 ## 9) Long-Term Support (LTS)
