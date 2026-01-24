@@ -460,5 +460,3 @@ Batch APIs MUST surface per-item status, not just aggregate failure:
 - Per-item error strings in batch failures are not validated as canonical errors
 
 ---
-
-*End of ERRORS.md (errors_version 1.0)*
