@@ -385,5 +385,3 @@ count_operation:
 - Monitor growth of `namespace`, `model`, and other optional dimensions
 
 ---
-
-*End of METRICS.md (metrics_version 1.0)*
