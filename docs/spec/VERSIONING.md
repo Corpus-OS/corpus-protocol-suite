@@ -7,6 +7,44 @@
 
 ---
 
+## Table of Contents
+
+1. [Goals](#1-goals)
+2. [What we version (at a glance)](#2-what-we-version-at-a-glance)
+3. [Semantic Versioning (how to decide MAJOR/MINOR/PATCH)](#3-semantic-versioning-how-to-decide-majorminorpatch)
+   - [3.1 Protocol & wire contracts (normative)](#31-protocol--wire-contracts-normative)
+   - [3.2 SDK libraries & adapters (public API)](#32-sdk-libraries--adapters-public-api)
+4. [Compatibility Matrix](#4-compatibility-matrix)
+5. [Backward/Forward Compatibility Rules (Normative)](#5-backwardforward-compatibility-rules-normative)
+   - [5.1 Unknown JSON keys (schema-governed)](#51-unknown-json-keys-schema-governed)
+   - [5.2 Error taxonomy changes](#52-error-taxonomy-changes)
+   - [5.3 Observability](#53-observability)
+   - [5.4 Streaming lifecycle](#54-streaming-lifecycle)
+   - [5.5 Vector scoring conventions](#55-vector-scoring-conventions)
+6. [Deprecation Policy](#6-deprecation-policy)
+7. [Release Process & Tagging](#7-release-process--tagging)
+   - [7.1 Git tags](#71-git-tags)
+   - [7.2 Branches](#72-branches)
+   - [7.3 Artifacts](#73-artifacts)
+8. [Pre-Releases, RCs, and Experimental Features](#8-pre-releases-rcs-and-experimental-features)
+9. [Long-Term Support (LTS)](#9-long-term-support-lts)
+10. [Multi-Language Package Versioning](#10-multi-language-package-versioning)
+11. [Capability Gating & Negotiation](#11-capability-gating--negotiation)
+12. [Migration Checklist (for maintainers)](#12-migration-checklist-for-maintainers)
+13. [Examples](#13-examples)
+   - [13.1 Add a new optional match attribute (Vector)](#131-add-a-new-optional-match-attribute-vector)
+   - [13.2 Tighten error retryability (LLM)](#132-tighten-error-retryability-llm)
+   - [13.3 Add `supports_deadline` to capabilities (Embedding)](#133-add-supports_deadline-to-capabilities-embedding)
+14. [Versioning for Documentation & Examples](#14-versioning-for-documentation--examples)
+15. [Security, CVEs, and Backports](#15-security-cves-and-backports)
+16. [Notices & Legal](#16-notices--legal)
+17. [FAQ](#17-faq)
+18. [Quick Decision Table](#18-quick-decision-table)
+19. [Checklist for Release Managers](#19-checklist-for-release-managers)
+20. [Change History](#20-change-history)
+
+---
+
 ## 1) Goals
 
 - **Predictability.** Consumers can upgrade with clear expectations about breakage risk and compatibility.
@@ -322,5 +360,6 @@ A: **MINOR** additive; put it in `error.details` and require clients to ignore u
 
 ---
 
-## Change History
+## 20) Change History
+
 - **v1.0** (Initial): Establishes SemVer policy across spec/wire/SDK/adapters; defines negotiation rules, deprecation, LTS, and migration procedures.
