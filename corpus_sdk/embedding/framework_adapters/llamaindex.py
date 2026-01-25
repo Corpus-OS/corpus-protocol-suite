@@ -102,8 +102,14 @@ except Exception:  # noqa: BLE001
 #
 
 try:
-    from llama_index.core.embeddings import BaseEmbedding, DEFAULT_EMBED_BATCH_SIZE
-    from llama_index.core.callbacks import CallbackManager
+    from llama_index.core.embeddings import BaseEmbedding  # type: ignore
+    from llama_index.core.callbacks import CallbackManager  # type: ignore
+
+    # DEFAULT_EMBED_BATCH_SIZE has moved across LlamaIndex versions; never hard-fail.
+    try:
+        from llama_index.core.embeddings import DEFAULT_EMBED_BATCH_SIZE  # type: ignore
+    except Exception:  # noqa: BLE001
+        DEFAULT_EMBED_BATCH_SIZE = 512  # type: ignore[assignment]
 
     LLAMAINDEX_AVAILABLE = True
 except ImportError:  # pragma: no cover
@@ -253,9 +259,10 @@ def _safe_snapshot(value: Any, *, max_items: int = 200, max_str: int = 5_000) ->
                     break
                 out[str(k)] = _safe_snapshot(v, max_items=max_items, max_str=max_str)
             return out
-        if isinstance(value, (list, tuple)):
+        # Include set for improved observability robustness (e.g., tags)
+        if isinstance(value, (list, tuple, set)):
             out_list: List[Any] = []
-            for idx, v in enumerate(value):
+            for idx, v in enumerate(list(value)):
                 if idx >= max_items:
                     out_list.append(f"… truncated after {max_items} items")
                     break
@@ -271,7 +278,7 @@ def _looks_like_operation_context(obj: Any) -> bool:
     OperationContext may be a concrete class or a Protocol/alias depending on runtime.
 
     Prefer isinstance when it works; fall back to a lightweight structural heuristic
-    to avoid false negatives and keep this adapter resilient across SDK versions.
+    aligned with corpus_sdk.embedding.embedding_base.OperationContext.
     """
     if obj is None:
         return False
@@ -282,15 +289,18 @@ def _looks_like_operation_context(obj: Any) -> bool:
         # OperationContext may be a Protocol/typing alias at runtime
         pass
 
+    # Structural heuristic aligned with OperationContext fields/behaviors.
     return any(
         hasattr(obj, attr)
         for attr in (
-            "trace_id",
             "request_id",
-            "user_id",
-            "tags",
-            "metadata",
-            "to_dict",
+            "idempotency_key",
+            "deadline_ms",
+            "traceparent",
+            "tenant",
+            "attrs",
+            "remaining_ms",
+            "to_dict",  # tolerated if some impls provide it
         )
     )
 
@@ -316,7 +326,31 @@ def _filter_llamaindex_context_from_kwargs(kwargs: Mapping[str, Any]) -> LlamaIn
     for key in ("node_ids", "index_id", "callback_manager", "trace_id", "workflow"):
         if key in kwargs:
             ctx[key] = kwargs[key]  # type: ignore[literal-required]
+
+    # Normalize node_ids to a List[str] when feasible (some flows pass tuples/iterables).
+    node_ids = ctx.get("node_ids")
+    if node_ids is not None and not isinstance(node_ids, list):
+        try:
+            ctx["node_ids"] = list(node_ids)  # type: ignore[assignment,arg-type]
+        except Exception:
+            pass
+
     return ctx
+
+
+def _suggest_async_name(sync_api_name: str) -> str:
+    """
+    Provide an accurate async-method hint for error messages.
+
+    LlamaIndex naming conventions:
+    - _get_*  -> _aget_*
+    - health/capabilities -> ahealth/acapabilities
+    """
+    if sync_api_name.startswith("_get_"):
+        return sync_api_name.replace("_get_", "_aget_", 1)
+    if sync_api_name.startswith("_get"):
+        return "_a" + sync_api_name[1:]
+    return "a" + sync_api_name
 
 
 def _ensure_not_in_event_loop(sync_api_name: str) -> None:
@@ -333,11 +367,49 @@ def _ensure_not_in_event_loop(sync_api_name: str) -> None:
         # No running event loop: safe to call sync method.
         return
 
+    async_hint = _suggest_async_name(sync_api_name)
     raise RuntimeError(
         f"{sync_api_name} was called from inside an active asyncio event loop. "
-        f"Use the async variant instead (e.g. 'await {sync_api_name.replace('_', 'a_', 1)}()'). "
+        f"Use the async variant instead (e.g. 'await {async_hint}()'). "
         f"[{ErrorCodes.SYNC_WRAPPER_CALLED_IN_EVENT_LOOP}]"
     )
+
+
+def _maybe_close_sync(obj: Any) -> None:
+    """
+    Best-effort *sync* resource cleanup.
+
+    Preference:
+      1) aclose() if present (awaited via asyncio.run if coroutine)
+      2) close() if present:
+           - awaited via asyncio.run if coroutinefunction
+           - called directly if sync
+           - awaited via asyncio.run if sync returns a coroutine
+
+    IMPORTANT:
+      Callers must ensure they are NOT in a running event loop (use _ensure_not_in_event_loop).
+    """
+    if obj is None:
+        return
+
+    aclose = getattr(obj, "aclose", None)
+    if callable(aclose):
+        res = aclose()
+        if asyncio.iscoroutine(res):
+            asyncio.run(res)
+        return
+
+    close = getattr(obj, "close", None)
+    if not callable(close):
+        return
+
+    if asyncio.iscoroutinefunction(close):
+        asyncio.run(close())
+        return
+
+    res = close()
+    if asyncio.iscoroutine(res):
+        asyncio.run(res)
 
 
 async def _maybe_close_async(obj: Any) -> None:
@@ -353,7 +425,9 @@ async def _maybe_close_async(obj: Any) -> None:
 
     aclose = getattr(obj, "aclose", None)
     if callable(aclose):
-        await aclose()
+        res = aclose()
+        if asyncio.iscoroutine(res):
+            await res
         return
 
     close = getattr(obj, "close", None)
@@ -407,22 +481,21 @@ def _extract_dynamic_context(
         maybe_texts = args[0]
         # Strings are Sequences; guard to avoid miscounting characters as batch size.
         if isinstance(maybe_texts, Sequence) and not isinstance(maybe_texts, (str, bytes)):
-            texts_seq = maybe_texts
+            # More defensive extraction; never let extraction break embeddings.
             try:
-                dynamic_ctx["texts_count"] = len(texts_seq)  # type: ignore[arg-type]
+                dynamic_ctx["texts_count"] = len(maybe_texts)  # type: ignore[arg-type]
             except Exception:
                 pass
-            empty_count = 0
             try:
                 empty_count = sum(
                     1
-                    for text in texts_seq  # type: ignore[assignment]
+                    for text in maybe_texts  # type: ignore[assignment]
                     if not isinstance(text, str) or not text.strip()
                 )
+                if empty_count:
+                    dynamic_ctx["empty_texts_count"] = empty_count
             except Exception:
-                empty_count = 0
-            if empty_count:
-                dynamic_ctx["empty_texts_count"] = empty_count
+                pass
 
     ctx = _filter_llamaindex_context_from_kwargs(kwargs)
 
@@ -602,6 +675,15 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
                 f"llamaindex_config must be a Mapping, got {type(llamaindex_config).__name__}",
             )
 
+        # Strict config validation: reject unknown keys to prevent silent misconfiguration.
+        allowed_keys = {"enable_operation_context_propagation", "strict_text_types", "max_node_ids_in_context"}
+        unknown = set(dict(llamaindex_config).keys()) - allowed_keys
+        if unknown:
+            raise ValueError(
+                f"[{ErrorCodes.LLAMAINDEX_CONFIG_INVALID}] "
+                f"llamaindex_config contains unknown keys: {sorted(unknown)}"
+            )
+
         # Normalize + default-fill config for predictable behavior
         normalized_config: LlamaIndexAdapterConfig = dict(llamaindex_config)  # type: ignore[assignment]
         normalized_config.setdefault("enable_operation_context_propagation", True)
@@ -736,31 +818,11 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
             except TypeError:
                 core_ctx_candidate = context_from_llamaindex(llamaindex_context)
 
+            # IMPORTANT:
+            # - OperationContext is frozen in the base SDK; do NOT rebuild or mutate it here.
+            # - Framework metadata belongs in framework_ctx (already handled separately).
             if _looks_like_operation_context(core_ctx_candidate):
                 core_ctx = core_ctx_candidate  # type: ignore[assignment]
-
-                # Best-effort: enrich attrs with framework metadata.
-                attrs = dict(getattr(core_ctx, "attrs", {}) or {})
-                attrs.setdefault("framework", _FRAMEWORK_NAME)
-                if _FRAMEWORK_VERSION is not None:
-                    attrs.setdefault("framework_version", _FRAMEWORK_VERSION)
-
-                # Try to rebuild OperationContext with enriched attrs; fall back if not possible.
-                try:
-                    core_ctx = OperationContext(
-                        request_id=getattr(core_ctx, "request_id", None),
-                        idempotency_key=getattr(core_ctx, "idempotency_key", None),
-                        deadline_ms=getattr(core_ctx, "deadline_ms", None),
-                        traceparent=getattr(core_ctx, "traceparent", None),
-                        tenant=getattr(core_ctx, "tenant", None),
-                        attrs=attrs,
-                    )
-                except Exception:
-                    try:
-                        setattr(core_ctx, "attrs", attrs)  # type: ignore[attr-defined]
-                    except Exception:
-                        pass
-
                 logger.debug(
                     "Successfully created OperationContext from LlamaIndex context with index_id=%s (framework_version=%s)",
                     llamaindex_context.get("index_id", "unknown"),
@@ -959,14 +1021,17 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         )
         return [0.0] * dim
 
-    def _warn_if_extreme_batch(self, texts: Sequence[str], *, op_name: str) -> None:
+    def _warn_if_extreme_batch(self, texts: Sequence[Any], *, op_name: str) -> None:
         """
         Emit a soft warning if an extremely large batch is requested without an explicit
         BatchConfig.max_batch_size. This is informational only.
         """
+        # warn_if_extreme_batch expects strings; filter defensively so strict_text_types=False
+        # cannot break warnings (warnings should never be a failure mode).
+        safe_texts: List[str] = [t for t in texts if isinstance(t, str)]
         warn_if_extreme_batch(
             framework=_FRAMEWORK_NAME,
-            texts=texts,
+            texts=safe_texts,
             op_name=op_name,
             batch_config=self.batch_config,
             logger=logger,
@@ -1036,15 +1101,20 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         )
         return vec
 
-    def _embed_text_batch(self, texts: Sequence[str], llamaindex_context: LlamaIndexContext) -> List[List[float]]:
-        """Unified batch text embedding implementation (preserves row alignment)."""
+    def _embed_text_batch(self, texts: Sequence[Any], llamaindex_context: LlamaIndexContext) -> List[List[float]]:
+        """
+        Unified batch text embedding implementation (preserves row alignment).
+
+        If strict_text_types=False, non-string items are treated as empty and receive
+        all-zero vectors to preserve output row alignment with the input order.
+        """
         self._warn_if_extreme_batch(texts, op_name="_get_text_embeddings")
 
         texts_list = list(texts)
         if self.llamaindex_config.get("strict_text_types", True):
             _validate_texts_are_strings(texts_list, op_name="_get_text_embeddings")
 
-        non_empty_texts = [t for t in texts_list if isinstance(t, str) and t.strip()]
+        non_empty_texts: List[str] = [t for t in texts_list if isinstance(t, str) and t.strip()]
         empty_indices_list = [i for i, t in enumerate(texts_list) if not isinstance(t, str) or not t.strip()]
         empty_indices = set(empty_indices_list)
 
@@ -1096,15 +1166,20 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         )
         return embeddings
 
-    async def _aembed_text_batch(self, texts: Sequence[str], llamaindex_context: LlamaIndexContext) -> List[List[float]]:
-        """Unified async batch text embedding implementation (preserves row alignment)."""
+    async def _aembed_text_batch(self, texts: Sequence[Any], llamaindex_context: LlamaIndexContext) -> List[List[float]]:
+        """
+        Unified async batch text embedding implementation (preserves row alignment).
+
+        If strict_text_types=False, non-string items are treated as empty and receive
+        all-zero vectors to preserve output row alignment with the input order.
+        """
         self._warn_if_extreme_batch(texts, op_name="_aget_text_embeddings")
 
         texts_list = list(texts)
         if self.llamaindex_config.get("strict_text_types", True):
             _validate_texts_are_strings(texts_list, op_name="_aget_text_embeddings")
 
-        non_empty_texts = [t for t in texts_list if isinstance(t, str) and t.strip()]
+        non_empty_texts: List[str] = [t for t in texts_list if isinstance(t, str) and t.strip()]
         empty_indices_list = [i for i, t in enumerate(texts_list) if not isinstance(t, str) or not t.strip()]
         empty_indices = set(empty_indices_list)
 
@@ -1169,7 +1244,7 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         _ensure_not_in_event_loop("capabilities")
         return self._translator.capabilities()
 
-    @with_async_embedding_error_context("capabilities")
+    @with_async_embedding_error_context("capabilities_async")
     async def acapabilities(self) -> Mapping[str, Any]:
         """
         Async capabilities passthrough.
@@ -1188,7 +1263,7 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         _ensure_not_in_event_loop("health")
         return self._translator.health()
 
-    @with_async_embedding_error_context("health")
+    @with_async_embedding_error_context("health_async")
     async def ahealth(self) -> Mapping[str, Any]:
         """
         Async health passthrough.
@@ -1209,28 +1284,27 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         - The underlying corpus_adapter
         - The EmbeddingTranslator if it was constructed and exposes close()
         """
+        # Deadlock prevention: never run sync close inside a running event loop.
+        _ensure_not_in_event_loop("close")
+
         # Close translator if already initialized (avoid forcing construction).
         translator = self.__dict__.get("_translator")
         if isinstance(translator, EmbeddingTranslator):
-            close_translator = getattr(translator, "close", None)
-            if callable(close_translator):
-                try:
-                    close_translator()
-                except Exception as e:  # noqa: BLE001
-                    logger.warning(
-                        "Error while closing embedding translator in close(): %s",
-                        e,
-                    )
-
-        fn = getattr(self.corpus_adapter, "close", None)
-        if callable(fn):
             try:
-                fn()
+                _maybe_close_sync(translator)
             except Exception as e:  # noqa: BLE001
                 logger.warning(
-                    "Error while closing embedding adapter in close(): %s",
+                    "Error while closing embedding translator in close(): %s",
                     e,
                 )
+
+        try:
+            _maybe_close_sync(self.corpus_adapter)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "Error while closing embedding adapter in close(): %s",
+                e,
+            )
 
     async def aclose(self) -> None:
         """
@@ -1341,7 +1415,7 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         return await self._aembed_single_text(text, context)
 
     @with_embedding_error_context("texts")
-    def _get_text_embeddings(self, texts: Sequence[str], **kwargs: Any) -> List[List[float]]:
+    def _get_text_embeddings(self, texts: Sequence[Any], **kwargs: Any) -> List[List[float]]:
         """
         Batch text embedding implementation for LlamaIndex nodes.
 
@@ -1356,7 +1430,7 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         return self._embed_text_batch(texts, context)
 
     @with_async_embedding_error_context("texts")
-    async def _aget_text_embeddings(self, texts: Sequence[str], **kwargs: Any) -> List[List[float]]:
+    async def _aget_text_embeddings(self, texts: Sequence[Any], **kwargs: Any) -> List[List[float]]:
         """
         Async batch text embedding implementation for LlamaIndex nodes.
 
