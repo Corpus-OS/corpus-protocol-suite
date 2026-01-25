@@ -1,6 +1,8 @@
 # tests/frameworks/embedding/test_embedding_registry_self_check.py
 
 import dataclasses
+from typing import Any, Optional
+
 import pytest
 
 from tests.frameworks.registries.embedding_registry import (
@@ -35,11 +37,14 @@ def test_embedding_registry_keys_match_descriptor_name(all_descriptors) -> None:
 
 def test_embedding_registry_descriptors_validate_cleanly(all_descriptors) -> None:
     """
-    Run the descriptor-level validation hook to catch obvious inconsistencies
-    (e.g. async query defined without async batch).
+    Run the descriptor-level validation hook to catch obvious inconsistencies.
+
+    NOTE:
+    - Descriptors self-validate in __post_init__ (frozen dataclass).
+    - This test is an explicit smoke pass to ensure shipped registry entries
+      remain coherent as the registry contract evolves.
     """
     for descriptor in all_descriptors:
-        # validate() may emit warnings but should not raise
         descriptor.validate()
 
 
@@ -51,9 +56,37 @@ def test_descriptor_is_available_does_not_raise(all_descriptors) -> None:
     unexpected exceptions (ImportError, AttributeError) when called.
     """
     for descriptor in all_descriptors:
-        # Should not raise ImportError or AttributeError
         result = descriptor.is_available()
         assert isinstance(result, bool)
+
+
+def test_get_installed_framework_version_does_not_raise(all_descriptors) -> None:
+    """
+    Ensure get_installed_framework_version() never raises.
+
+    This probe is best-effort (TEST-ONLY): it should return None when unknown or
+    when the underlying framework is not installed.
+    """
+    for descriptor in all_descriptors:
+        v = descriptor.get_installed_framework_version()
+        assert v is None or (isinstance(v, str) and v.strip()), (
+            f"{descriptor.name}: expected None or non-empty version string, got {v!r}"
+        )
+
+
+def test_sample_context_is_dict_when_provided(all_descriptors) -> None:
+    """
+    Registry quality check: if sample_context is provided, it should be a dict.
+
+    sample_context is used by contract tests to exercise context translation
+    deterministically across frameworks.
+    """
+    for descriptor in all_descriptors:
+        if descriptor.sample_context is not None:
+            assert isinstance(descriptor.sample_context, dict), (
+                f"{descriptor.name}: sample_context must be a dict when provided, "
+                f"got {type(descriptor.sample_context).__name__}"
+            )
 
 
 def test_version_range_formatting() -> None:
@@ -109,18 +142,18 @@ def test_async_method_consistency(all_descriptors) -> None:
     """
     Check that async support is properly declared.
 
-    This is a stricter version of the warning check in validate().
-    Our policy: if any async method is declared, both should be present
-    for API consistency.
+    Policy:
+    - supports_async reflects whether ANY async method field is present.
+    - validation requires async to be all-or-nothing: if supports_async is True,
+      both async_batch_method and async_query_method must be present.
     """
     for descriptor in all_descriptors:
         if descriptor.supports_async:
-            # Framework policy: async should be all-or-nothing
             assert descriptor.async_batch_method is not None, (
-                f"{descriptor.name}: has async support but async_batch_method is None"
+                f"{descriptor.name}: supports_async=True but async_batch_method is None"
             )
             assert descriptor.async_query_method is not None, (
-                f"{descriptor.name}: has async support but async_query_method is None"
+                f"{descriptor.name}: supports_async=True but async_query_method is None"
             )
 
 
@@ -131,10 +164,8 @@ def test_register_framework_descriptor() -> None:
     This tests the ability to add new framework descriptors at runtime,
     which is useful for testing experimental or third-party adapters.
     """
-    # Snapshot registry for test isolation
     original_registry = dict(EMBEDDING_FRAMEWORKS)
     try:
-        # Create a test descriptor
         test_desc = EmbeddingFrameworkDescriptor(
             name="test_framework",
             adapter_module="test.module",
@@ -145,19 +176,15 @@ def test_register_framework_descriptor() -> None:
             async_query_method="aquery",
         )
 
-        # Should not exist initially
         assert not has_framework("test_framework")
         assert get_embedding_framework_descriptor_safe("test_framework") is None
 
-        # Test registration without overwrite
         register_framework_descriptor(test_desc)
 
-        # Should now exist
         assert has_framework("test_framework")
         assert get_embedding_framework_descriptor_safe("test_framework") is test_desc
         assert get_embedding_framework_descriptor("test_framework") is test_desc
 
-        # Test registration with existing name fails without overwrite
         duplicate_desc = EmbeddingFrameworkDescriptor(
             name="test_framework",
             adapter_module="other.module",
@@ -169,11 +196,14 @@ def test_register_framework_descriptor() -> None:
         with pytest.raises(KeyError, match="already registered"):
             register_framework_descriptor(duplicate_desc, overwrite=False)
 
-        # Test overwrite works
         register_framework_descriptor(duplicate_desc, overwrite=True)
         assert get_embedding_framework_descriptor("test_framework") is duplicate_desc
+
+        # Smoke-check cache reset behavior via public probes (never raise).
+        assert isinstance(duplicate_desc.is_available(), bool)
+        v = duplicate_desc.get_installed_framework_version()
+        assert v is None or (isinstance(v, str) and v.strip())
     finally:
-        # Restore registry to original state
         EMBEDDING_FRAMEWORKS.clear()
         EMBEDDING_FRAMEWORKS.update(original_registry)
 
@@ -182,8 +212,8 @@ def test_supports_async_property(all_descriptors) -> None:
     """
     Test the supports_async property logic.
 
-    Ensures the property correctly reflects whether ANY async method
-    is declared, not necessarily all of them.
+    supports_async reflects whether ANY async method is declared.
+    Note: validation enforces that if supports_async is True, both async methods exist.
     """
     for descriptor in all_descriptors:
         has_async = (
@@ -194,6 +224,11 @@ def test_supports_async_property(all_descriptors) -> None:
             f"{descriptor.name}: supports_async property mismatch"
         )
 
+        # Policy lock: if supports_async is True, both async methods must be present.
+        if descriptor.supports_async:
+            assert descriptor.async_batch_method is not None
+            assert descriptor.async_query_method is not None
+
 
 def test_get_descriptor_variants() -> None:
     """
@@ -202,21 +237,16 @@ def test_get_descriptor_variants() -> None:
     Verifies that the safe version returns None for unknown frameworks
     while the regular version raises KeyError.
     """
-    # Get a known framework name
     existing_name = list(EMBEDDING_FRAMEWORKS.keys())[0]
 
-    # Test existing framework
     assert get_embedding_framework_descriptor(existing_name) is not None
     assert get_embedding_framework_descriptor_safe(existing_name) is not None
 
-    # Test non-existent framework
     non_existent = "non_existent_framework_xyz123"
 
-    # Regular version should raise
     with pytest.raises(KeyError, match=non_existent):
         get_embedding_framework_descriptor(non_existent)
 
-    # Safe version should return None
     assert get_embedding_framework_descriptor_safe(non_existent) is None
 
 
@@ -232,7 +262,6 @@ def test_descriptor_immutability() -> None:
         query_method="query",
     )
 
-    # Should not be able to modify attributes
     with pytest.raises(dataclasses.FrozenInstanceError):
         descriptor.name = "modified"
 
@@ -244,21 +273,15 @@ def test_iterator_functions() -> None:
     """
     Test that iterator functions return expected results.
     """
-    # Test iter_embedding_framework_descriptors
     all_descs = list(iter_embedding_framework_descriptors())
     assert len(all_descs) == len(EMBEDDING_FRAMEWORKS)
 
-    # All descriptors should be in the registry
     for desc in all_descs:
         assert desc.name in EMBEDDING_FRAMEWORKS
 
-    # Test iter_available_framework_descriptors
     available_descs = list(iter_available_framework_descriptors())
-
-    # Available descriptors should be a subset
     assert len(available_descs) <= len(all_descs)
 
-    # Each available descriptor should pass is_available()
     for desc in available_descs:
         assert desc.is_available()
 
@@ -267,10 +290,8 @@ def test_descriptor_validation_edge_cases() -> None:
     """
     Test descriptor validation with edge cases.
     """
-    # Test missing required methods
-    with pytest.raises(
-        ValueError, match="batch_method and query_method must both be set"
-    ):
+    # Missing required methods => ValueError
+    with pytest.raises(ValueError, match="batch_method and query_method must both be set"):
         EmbeddingFrameworkDescriptor(
             name="bad1",
             adapter_module="test.module",
@@ -279,9 +300,7 @@ def test_descriptor_validation_edge_cases() -> None:
             query_method="query",
         )
 
-    with pytest.raises(
-        ValueError, match="batch_method and query_method must both be set"
-    ):
+    with pytest.raises(ValueError, match="batch_method and query_method must both be set"):
         EmbeddingFrameworkDescriptor(
             name="bad2",
             adapter_module="test.module",
@@ -290,10 +309,8 @@ def test_descriptor_validation_edge_cases() -> None:
             query_method="",
         )
 
-    # Test with dotted adapter_class (should warn but not fail)
-    with pytest.warns(
-        RuntimeWarning, match="adapter_class should be a class name only"
-    ):
+    # Dotted adapter_class => warn (non-fatal)
+    with pytest.warns(RuntimeWarning, match="adapter_class should be a class name only"):
         EmbeddingFrameworkDescriptor(
             name="warn1",
             adapter_module="test.module",
@@ -302,22 +319,102 @@ def test_descriptor_validation_edge_cases() -> None:
             query_method="query",
         )
 
-    # Test async query without batch (should warn but not fail)
-    with pytest.warns(
-        RuntimeWarning,
-        match="async_query_method is set but async_batch_method is None",
-    ):
+    # Partial async declaration => invalid under current registry policy (fatal)
+    with pytest.raises(ValueError, match="requires both async_batch_method and async_query_method"):
         EmbeddingFrameworkDescriptor(
-            name="warn2",
+            name="bad_async_partial",
             adapter_module="test.module",
             adapter_class="TestAdapter",
             batch_method="embed",
             query_method="query",
             async_query_method="aquery",
-            # async_batch_method=None (implicit)
+            # async_batch_method intentionally omitted
+        )
+
+
+def test_descriptor_validation_new_field_edge_cases() -> None:
+    """
+    Validate new descriptor fields and their registry-level constraints/warnings.
+    """
+    # requires_embedding_dimension=True without embedding_dimension_kwarg => warn (tests may not know kwarg name)
+    with pytest.warns(RuntimeWarning, match="embedding_dimension_kwarg"):
+        EmbeddingFrameworkDescriptor(
+            name="dimwarn",
+            adapter_module="test.module",
+            adapter_class="TestAdapter",
+            batch_method="embed",
+            query_method="query",
+            requires_embedding_dimension=True,
+            # embedding_dimension_kwarg intentionally omitted to trigger warning
+        )
+
+    # Aliases must be a dict if provided => ValueError
+    with pytest.raises(ValueError, match="aliases must be a dict"):
+        EmbeddingFrameworkDescriptor(
+            name="bad_aliases_type",
+            adapter_module="test.module",
+            adapter_class="TestAdapter",
+            batch_method="embed",
+            query_method="query",
+            aliases=["not", "a", "dict"],  # type: ignore[arg-type]
+        )
+
+    # Aliases keys/values must be non-empty strings => ValueError
+    with pytest.raises(ValueError, match="aliases keys and values must be non-empty strings"):
+        EmbeddingFrameworkDescriptor(
+            name="bad_aliases_empty",
+            adapter_module="test.module",
+            adapter_class="TestAdapter",
+            batch_method="embed",
+            query_method="query",
+            aliases={"": "embed_documents"},
+        )
+
+    with pytest.raises(ValueError, match="aliases keys and values must be non-empty strings"):
+        EmbeddingFrameworkDescriptor(
+            name="bad_aliases_empty_value",
+            adapter_module="test.module",
+            adapter_class="TestAdapter",
+            batch_method="embed",
+            query_method="query",
+            aliases={"embed_documents": ""},
+        )
+
+    # Self-mapping alias => warn (non-fatal)
+    with pytest.warns(RuntimeWarning, match="self-mapping"):
+        EmbeddingFrameworkDescriptor(
+            name="warn_alias_self",
+            adapter_module="test.module",
+            adapter_class="TestAdapter",
+            batch_method="embed",
+            query_method="query",
+            aliases={"embed_documents": "embed_documents"},
+        )
+
+    # has_capabilities=True but method names not fully set => warn (non-fatal)
+    with pytest.warns(RuntimeWarning, match="has_capabilities=True but capabilities_method"):
+        EmbeddingFrameworkDescriptor(
+            name="warn_caps_methods",
+            adapter_module="test.module",
+            adapter_class="TestAdapter",
+            batch_method="embed",
+            query_method="query",
+            has_capabilities=True,
+            # capabilities_method / async_capabilities_method intentionally omitted
+        )
+
+    # has_health=True but method names not fully set => warn (non-fatal)
+    with pytest.warns(RuntimeWarning, match="has_health=True but health_method"):
+        EmbeddingFrameworkDescriptor(
+            name="warn_health_methods",
+            adapter_module="test.module",
+            adapter_class="TestAdapter",
+            batch_method="embed",
+            query_method="query",
+            has_health=True,
+            # health_method / async_health_method intentionally omitted
         )
 
 
 if __name__ == "__main__":
-    # Allow running as standalone script
     pytest.main([__file__, "-v"])
