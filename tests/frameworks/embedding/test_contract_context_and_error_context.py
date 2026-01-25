@@ -31,7 +31,7 @@ def framework_descriptor_fixture(
     """
     Parameterized over all registered embedding framework descriptors.
 
-    IMPORTANT POLICY (no pytest.skip):
+    
     - We do not skip unavailable frameworks.
     - Tests must pass by asserting correct "unavailable" signaling when a framework
       is not installed, and must fully run when it is available.
@@ -50,7 +50,7 @@ def embedding_adapter_instance(
 
     Mirrors the construction pattern used in the other embedding contract tests.
 
-    IMPORTANT POLICY (no pytest.skip):
+    
     - If a framework is unavailable, this fixture returns None and tests must
       treat that as a validated pass condition (not a skip).
     """
@@ -213,7 +213,7 @@ def _build_error_wrapped_adapter_instance(
 
     Used only for error-context tests (we expect calls to raise).
 
-    IMPORTANT POLICY (no pytest.skip):
+    
     - If framework is unavailable, returns None and tests assert the unavailable contract.
     """
     if not framework_descriptor.is_available():
@@ -346,7 +346,7 @@ def test_rich_mapping_context_is_accepted_and_does_not_break_embeddings(
     - not raise TypeError / ValueError,
     - still return embeddings with valid shapes.
 
-    IMPORTANT POLICY (no pytest.skip):
+    
     - If framework is unavailable, validate the unavailable contract and return.
     - If framework does not declare a context_kwarg, validate that fact and return.
     """
@@ -398,7 +398,7 @@ def test_invalid_context_type_is_tolerated_and_does_not_crash(
 
     In all cases, embeddings should still be returned.
 
-    IMPORTANT POLICY (no pytest.skip):
+    
     - If framework is unavailable, validate the unavailable contract and return.
     - If framework does not declare a context_kwarg, validate that fact and return.
     """
@@ -447,7 +447,7 @@ def test_context_is_optional_and_omitting_it_still_works(
     Even when a framework supports a context kwarg, it must still work
     when no context is provided.
 
-    IMPORTANT POLICY (no pytest.skip):
+    
     - If framework is unavailable, validate the unavailable contract and return.
     """
     if not framework_descriptor.is_available():
@@ -481,7 +481,7 @@ def test_alias_methods_exist_and_behave_consistently_when_declared(
 
     We do not require exact float equality; shape + numeric contract is sufficient.
 
-    IMPORTANT POLICY (no pytest.skip):
+    
     - If framework is unavailable, validate the unavailable contract and return.
     - If no aliases are declared, validate that fact and return.
     """
@@ -557,7 +557,7 @@ def test_error_context_is_attached_on_sync_batch_failure(
     - call attach_context() with the exception and useful metadata, and
     - re-raise the original exception (or a wrapped one).
 
-    IMPORTANT POLICY (no pytest.skip):
+    
     - If framework is unavailable, validate the unavailable contract and return.
     """
     if not framework_descriptor.is_available():
@@ -600,7 +600,7 @@ def test_error_context_is_attached_on_sync_query_failure(
 
     Ensures the query path is also wrapped by the error-context decorator.
 
-    IMPORTANT POLICY (no pytest.skip):
+    
     - If framework is unavailable, validate the unavailable contract and return.
     """
     if not framework_descriptor.is_available():
@@ -643,7 +643,7 @@ async def test_error_context_is_attached_on_async_batch_failure_when_supported(
     When async is supported, async batch failures should also go through
     the error-context decorator and call attach_context().
 
-    IMPORTANT POLICY (no pytest.skip):
+    
     - If framework is unavailable, validate the unavailable contract and return.
     - If async is not supported, validate that and return.
     """
@@ -700,7 +700,7 @@ async def test_error_context_is_attached_on_async_query_failure_when_supported(
     When async is supported, async query failures should also go through
     the error-context decorator and call attach_context().
 
-    IMPORTANT POLICY (no pytest.skip):
+    
     - If framework is unavailable, validate the unavailable contract and return.
     - If async is not supported, validate that and return.
     """
