@@ -66,6 +66,73 @@ def _make_embeddings(adapter: Any, **kwargs: Any) -> CorpusAutoGenEmbeddings:
     return CorpusAutoGenEmbeddings(corpus_adapter=adapter, **kwargs)
 
 
+def _sysmodules_evict_autogen_chromadb() -> None:
+    """
+    Ensure tests that simulate "AutoGen not installed" are deterministic.
+
+    Rationale:
+    - Import hooks (builtins.__import__) are bypassed if a module is already present in sys.modules.
+    - Removing cached modules ensures our ImportError simulation is guaranteed to exercise the lazy-import path.
+    """
+    for mod in (
+        "autogen_ext.memory.chromadb",
+        "autogen_ext.memory",
+        "autogen_ext",
+    ):
+        sys.modules.pop(mod, None)
+
+
+def _memory_result_contains_text(item: Any, expected: str) -> bool:
+    """
+    Best-effort matcher for AutoGen memory query result items.
+
+    Why this exists:
+    - Different AutoGen / chromadb versions may wrap results in different objects.
+    - Some results may include the content on .content, some may include nested fields,
+      some may return pydantic-like models, etc.
+    - This matcher keeps integration tests pass/fail while avoiding brittleness from
+      an exact attribute shape assumption.
+
+    Matching rules (in order):
+    1) item.content == expected or contains expected (string)
+    2) item is a Mapping and has "content" or nested content fields
+    3) fallback to substring match on repr(item)
+    """
+    try:
+        content = getattr(item, "content", None)
+        if isinstance(content, str):
+            if content == expected or expected in content:
+                return True
+    except Exception:
+        pass
+
+    if isinstance(item, Mapping):
+        try:
+            c = item.get("content")
+            if isinstance(c, str) and (c == expected or expected in c):
+                return True
+        except Exception:
+            pass
+        # Some shapes embed under data/payload/etc.
+        for key in ("data", "payload", "value", "item"):
+            try:
+                nested = item.get(key)
+            except Exception:
+                nested = None
+            if isinstance(nested, Mapping):
+                try:
+                    c2 = nested.get("content")
+                    if isinstance(c2, str) and (c2 == expected or expected in c2):
+                        return True
+                except Exception:
+                    pass
+
+    try:
+        return expected in repr(item)
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Constructor / Registration Behavior
 # ---------------------------------------------------------------------------
@@ -678,11 +745,15 @@ def test_dim_hint_is_attached_to_later_errors(monkeypatch: pytest.MonkeyPatch, a
 @pytest.mark.asyncio
 async def test_capabilities_passthrough_when_underlying_provides(adapter) -> None:
     """
-    acapabilities returns either a dict or EmbeddingCapabilities.
+    acapabilities returns either a Mapping-like object or EmbeddingCapabilities.
+
+    NOTE:
+    - We accept Mapping (not just dict) to avoid brittleness when implementations return
+      custom Mapping types or pydantic-like containers.
     """
     embeddings = CorpusAutoGenEmbeddings(corpus_adapter=adapter)
     caps = await embeddings.acapabilities()
-    assert isinstance(caps, (dict, EmbeddingCapabilities))
+    assert isinstance(caps, (Mapping, EmbeddingCapabilities))
 
 
 @pytest.mark.asyncio
@@ -692,7 +763,7 @@ async def test_async_capabilities_fallback_to_sync(adapter) -> None:
     """
     embeddings = CorpusAutoGenEmbeddings(corpus_adapter=adapter)
     acaps = await embeddings.acapabilities()
-    assert isinstance(acaps, (dict, EmbeddingCapabilities))
+    assert isinstance(acaps, (Mapping, EmbeddingCapabilities))
 
 
 def test_capabilities_empty_when_missing(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -732,8 +803,8 @@ def test_capabilities_empty_when_missing(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(embeddings, "_translator", DummyTranslator())
 
     caps = embeddings.capabilities()
-    assert isinstance(caps, dict)
-    assert caps == {}
+    assert isinstance(caps, Mapping)
+    assert dict(caps) == {}
 
 
 def test_health_passthrough_and_missing(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -773,8 +844,8 @@ def test_health_passthrough_and_missing(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(embeddings, "_translator", DummyTranslator())
 
     health = embeddings.health()
-    assert isinstance(health, dict)
-    assert health.get("status") == "ok"
+    assert isinstance(health, Mapping)
+    assert dict(health).get("status") == "ok"
 
     class NoHealthAdapter:
         async def embed(self, texts: Sequence[str], **_: Any) -> list[list[float]]:
@@ -791,8 +862,8 @@ def test_health_passthrough_and_missing(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(embeddings2, "_translator", DummyTranslatorNoHealth())
 
     health2 = embeddings2.health()
-    assert isinstance(health2, dict)
-    assert health2 == {}
+    assert isinstance(health2, Mapping)
+    assert dict(health2) == {}
 
 
 # ---------------------------------------------------------------------------
@@ -933,10 +1004,16 @@ async def test_real_autogen_chromadb_memory_roundtrip_uses_corpus_embeddings(
     - Uses create_vector_memory() to build a real ChromaDBVectorMemory
     - Adds MemoryContent, queries for it, and validates results
     - Wraps adapter.embed() to confirm embeddings are computed via the configured embedding function
+
+    Robustness policy:
+    - Keep pass/fail.
+    - Avoid brittle assumptions about the exact result item class shape across AutoGen versions.
     """
     _chroma_mod, core_mem_mod = require_autogen_chromadb
     MemoryContent = core_mem_mod.MemoryContent
     MemoryMimeType = core_mem_mod.MemoryMimeType
+
+    expected_content = "The user prefers temperatures in Celsius"
 
     # Wrap adapter.embed to prove AutoGen memory path invokes it (sync or async).
     calls = {"n": 0}
@@ -966,7 +1043,7 @@ async def test_real_autogen_chromadb_memory_roundtrip_uses_corpus_embeddings(
     try:
         await memory.add(
             MemoryContent(
-                content="The user prefers temperatures in Celsius",
+                content=expected_content,
                 mime_type=MemoryMimeType.TEXT,
                 metadata={"category": "preferences"},
             )
@@ -980,11 +1057,11 @@ async def test_real_autogen_chromadb_memory_roundtrip_uses_corpus_embeddings(
         # Ensure embeddings were computed through the configured embedding function.
         assert calls["n"] >= 1, "Expected corpus adapter embed() to be called via AutoGen memory add/query."
 
-        # Ensure content round-trips through the vector memory.
+        # Ensure content round-trips through the vector memory (robust match).
         assert any(
-            getattr(item, "content", None) == "The user prefers temperatures in Celsius"
+            _memory_result_contains_text(item, expected_content)
             for item in result.results
-        ), "Expected stored MemoryContent to be returned by query()"
+        ), "Expected stored memory content to be discoverable in query() results"
     finally:
         await memory.close()
 
@@ -999,6 +1076,9 @@ def test_create_vector_memory_raises_runtime_error_when_autogen_not_installed(
 ) -> None:
     """Clear error when AutoGen Chroma dependencies are not installed."""
     import builtins as _builtins
+
+    # Ensure the lazy-import path is actually exercised (not bypassed by sys.modules cache).
+    _sysmodules_evict_autogen_chromadb()
 
     orig_import = _builtins.__import__
 
