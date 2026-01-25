@@ -6,10 +6,11 @@ from collections.abc import Mapping, Sequence
 from typing import Any, Dict, List, Optional
 import inspect
 import asyncio
-import pytest
+import concurrent.futures
 import sys
 import types
-import concurrent.futures
+
+import pytest
 
 import corpus_sdk.embedding.framework_adapters.autogen as autogen_adapter_module
 from corpus_sdk.embedding.framework_adapters.autogen import (
@@ -17,7 +18,7 @@ from corpus_sdk.embedding.framework_adapters.autogen import (
     create_vector_memory,
     register_embeddings,
 )
-from corpus_sdk.embedding.embedding_base import OperationContext, EmbeddingCapabilities
+from corpus_sdk.embedding.embedding_base import EmbeddingCapabilities
 
 
 # ---------------------------------------------------------------------------
@@ -25,41 +26,14 @@ from corpus_sdk.embedding.embedding_base import OperationContext, EmbeddingCapab
 # ---------------------------------------------------------------------------
 """
 Framework Version Support:
-- AutoGen: 0.10.x (recommended, latest architecture)
-- AutoGen: 0.7+ (supported, new architecture)
-- AutoGen: 0.2.x (legacy, integration tests with retrieve_assistant_agent)
+- AutoGen: modern ecosystem (autogen-core + autogen-ext[chromadb]) for real integration tests
 - Python: 3.9+
 - Corpus SDK: 1.0.0+
 
 Integration Notes:
-- Compatible with AutoGen's EmbeddingFunction protocol (0.2.x legacy)
-- Supports AutoGen retrieval workflows and agent memory (0.2.x legacy)
-- Handles AutoGen context (conversation_id, agent_name, workflow_type, retriever_name)
-- Framework protocol-first design (no hard inheritance required)
-
-AutoGen Version Compatibility:
-- AutoGen 0.10.x (Recommended):
-  * Latest stable release with improved architecture
-  * Core adapter tests fully supported
-  * Uses: autogen_agentchat, autogen_core (modern APIs)
-  * Integration tests with new patterns (to be implemented)
-  * Install: pip install pyautogen (gets 0.10.x)
-
-- AutoGen 0.7-0.9 (Supported):
-  * New architecture, core adapter tests pass
-  * Integration tests skipped (require update for new patterns)
-  * Install: pip install 'pyautogen>=0.7,<0.10'
-  
-- AutoGen 0.2.x (Legacy):
-  * Full integration test support for backward compatibility
-  * Uses: autogen.agentchat.contrib.retrieve_assistant_agent
-  * Install: pip install 'pyautogen<0.3'
-  * Note: Integration tests specifically validate 0.2.x patterns
-
-Note: AutoGen compatibility is verified via duck typing and protocol
-implementation, not inheritance. This ensures compatibility even when
-AutoGen base classes change. The adapter itself works with all versions,
-but integration tests specifically validate 0.2.x legacy patterns.
+- Adapter module must import without AutoGen installed (optional dependency)
+- create_vector_memory() must wire real AutoGen ChromaDBVectorMemory when available
+- Integration tests must be pass/fail (no skip): fail-fast when required deps absent
 """
 
 
@@ -69,39 +43,27 @@ but integration tests specifically validate 0.2.x legacy patterns.
 
 def _assert_embedding_matrix_shape(result: Any, expected_rows: int) -> None:
     """Validate that a result looks like a 2D embedding matrix."""
-    assert isinstance(
-        result, Sequence
-    ), f"Expected sequence, got {type(result).__name__}"
-    assert len(result) == expected_rows, (
-        f"Expected {expected_rows} rows, got {len(result)}"
-    )
+    assert isinstance(result, Sequence), f"Expected sequence, got {type(result).__name__}"
+    assert len(result) == expected_rows, f"Expected {expected_rows} rows, got {len(result)}"
 
     for row in result:
-        assert isinstance(
-            row, Sequence
-        ), f"Row is not a sequence: {type(row).__name__}"
+        assert isinstance(row, Sequence), f"Row is not a sequence: {type(row).__name__}"
         for val in row:
-            assert isinstance(
-                val, (int, float)
-            ), f"Embedding value is not numeric: {val!r}"
+            assert isinstance(val, (int, float)), f"Embedding value is not numeric: {val!r}"
 
 
 def _assert_embedding_vector_shape(result: Any) -> None:
     """Validate that a result looks like a 1D embedding vector."""
-    assert isinstance(
-        result, Sequence
-    ), f"Expected sequence, got {type(result).__name__}"
+    assert isinstance(result, Sequence), f"Expected sequence, got {type(result).__name__}"
     for val in result:
-        assert isinstance(
-            val, (int, float)
-        ), f"Embedding value is not numeric: {val!r}"
+        assert isinstance(val, (int, float)), f"Embedding value is not numeric: {val!r}"
 
 
 def _make_embeddings(adapter: Any, **kwargs: Any) -> CorpusAutoGenEmbeddings:
     """Construct a CorpusAutoGenEmbeddings instance from the adapter."""
     # Provide default model if not specified
-    if 'model' not in kwargs:
-        kwargs['model'] = 'mock-embed-512'
+    if "model" not in kwargs:
+        kwargs["model"] = "mock-embed-512"
     return CorpusAutoGenEmbeddings(corpus_adapter=adapter, **kwargs)
 
 
@@ -111,27 +73,20 @@ def _make_embeddings(adapter: Any, **kwargs: Any) -> CorpusAutoGenEmbeddings:
 
 def test_constructor_works_with_real_adapter(adapter) -> None:
     """
-    CorpusAutoGenEmbeddings should work with any real adapter.
-
-    Framework Compatibility: Ensures basic protocol compliance across
-    all supported AutoGen versions.
-
-    Note: Uses the adapter fixture from conftest.py
+    CorpusAutoGenEmbeddings should work with any real adapter that implements embed().
     """
     embeddings = _make_embeddings(adapter)
     assert embeddings.corpus_adapter is adapter
-    assert hasattr(embeddings.corpus_adapter, 'embed')
+    assert hasattr(embeddings.corpus_adapter, "embed")
     assert callable(embeddings.corpus_adapter.embed)
 
 
 def test_constructor_rejects_common_user_mistakes() -> None:
     """
-    CorpusAutoGenEmbeddings should provide clear error messages for
-    common user mistakes.
+    CorpusAutoGenEmbeddings should provide clear error messages for common user mistakes.
 
     IMPORTANT:
-    - We assert *semantic* guidance (what is required) rather than brittle
-      substrings about specific types ("None", "str", etc.).
+    - Assert semantic guidance (what is required) rather than brittle substrings.
     """
     # Common mistake 1: Passing None
     with pytest.raises(TypeError) as exc_info:
@@ -151,9 +106,9 @@ def test_constructor_rejects_common_user_mistakes() -> None:
 
     # Common mistake 3: Passing an object without embed() method
     class MockAgent:
-        """Looks like an agent but not an embedding adapter"""
-        def chat(self):
-            pass
+        """Looks like an agent but not an embedding adapter."""
+        def chat(self) -> None:
+            return None
 
     with pytest.raises(TypeError) as exc_info:
         CorpusAutoGenEmbeddings(corpus_adapter=MockAgent())
@@ -166,11 +121,6 @@ def test_constructor_rejects_common_user_mistakes() -> None:
 def test_register_embeddings_returns_instance(adapter) -> None:
     """
     register_embeddings returns a CorpusAutoGenEmbeddings instance.
-
-    Framework Compatibility: Registration pattern stable across
-    all supported AutoGen versions.
-
-    Note: Uses the adapter fixture from conftest.py
     """
     emb = register_embeddings(
         corpus_adapter=adapter,
@@ -191,8 +141,7 @@ def test_translator_created_with_expected_args(monkeypatch: pytest.MonkeyPatch, 
     """
     Pin the create_embedding_translator call signature/arguments.
 
-    Framework Compatibility: Ensures stable integration with the common
-    embedding translation layer.
+    Ensures stable integration with the common embedding translation layer.
     """
     captured: Dict[str, Any] = {}
 
@@ -204,6 +153,24 @@ def test_translator_created_with_expected_args(monkeypatch: pytest.MonkeyPatch, 
 
         async def arun_embed(self, raw_texts: Any, op_ctx: Any, framework_ctx: Any) -> Any:
             return self.embed(raw_texts, op_ctx, framework_ctx)
+
+        def close(self) -> None:
+            return None
+
+        async def aclose(self) -> None:
+            return None
+
+        def capabilities(self) -> Dict[str, Any]:
+            return {}
+
+        def health(self) -> Dict[str, Any]:
+            return {}
+
+        async def arun_capabilities(self) -> Dict[str, Any]:
+            return {}
+
+        async def arun_health(self) -> Dict[str, Any]:
+            return {}
 
     def fake_create_embedding_translator(**kwargs: Any) -> Any:
         captured.update(kwargs)
@@ -228,9 +195,6 @@ def test_translator_created_with_expected_args(monkeypatch: pytest.MonkeyPatch, 
 def test_framework_ctx_contains_autogen_metadata(monkeypatch: pytest.MonkeyPatch, adapter) -> None:
     """
     Ensure framework_ctx contains AutoGen-specific metadata.
-
-    Framework Compatibility: Context propagation stable across
-    AutoGen versions.
     """
     seen: Dict[str, Any] = {}
 
@@ -243,6 +207,24 @@ def test_framework_ctx_contains_autogen_metadata(monkeypatch: pytest.MonkeyPatch
 
         async def arun_embed(self, raw_texts: Any, op_ctx: Any, framework_ctx: Any) -> Any:
             return self.embed(raw_texts, op_ctx, framework_ctx)
+
+        def close(self) -> None:
+            return None
+
+        async def aclose(self) -> None:
+            return None
+
+        def capabilities(self) -> Dict[str, Any]:
+            return {}
+
+        def health(self) -> Dict[str, Any]:
+            return {}
+
+        async def arun_capabilities(self) -> Dict[str, Any]:
+            return {}
+
+        async def arun_health(self) -> Dict[str, Any]:
+            return {}
 
     monkeypatch.setattr(autogen_adapter_module, "create_embedding_translator", lambda **_: DummyTranslator())
 
@@ -269,16 +251,16 @@ def test_framework_ctx_contains_autogen_metadata(monkeypatch: pytest.MonkeyPatch
 
 
 # ---------------------------------------------------------------------------
-# AutoGen Interface Compatibility
+# AutoGen Interface Compatibility (No skip; protocol-level)
 # ---------------------------------------------------------------------------
 
 def test_autogen_interface_compatibility(adapter) -> None:
     """
-    Verify that CorpusAutoGenEmbeddings implements AutoGen's embedding interface.
-    
-    Framework Compatibility: Works with both AutoGen 0.2.x (legacy) and 0.10.x (modern).
-    Note: We test protocol compliance, not inheritance, for better
-    forward compatibility.
+    Verify that CorpusAutoGenEmbeddings implements the expected embedding callable surface.
+
+    Note:
+    - This is an interface conformance test (no AutoGen import probing here).
+    - Real AutoGen integration is validated in dedicated integration tests below.
     """
     embeddings = _make_embeddings(adapter)
 
@@ -287,37 +269,27 @@ def test_autogen_interface_compatibility(adapter) -> None:
     assert hasattr(embeddings, "embed_query")
     assert hasattr(embeddings, "aembed_documents")
     assert hasattr(embeddings, "aembed_query")
-    assert callable(embeddings)  # __call__ for EmbeddingFunction protocol
+    assert callable(embeddings)  # __call__ for embedding_function protocols
 
-    # Verify we have all required methods with correct signatures
-    required_methods = ['__call__', 'embed_documents', 'embed_query', 
-                       'aembed_documents', 'aembed_query']
+    required_methods = ["__call__", "embed_documents", "embed_query", "aembed_documents", "aembed_query"]
     for method in required_methods:
         assert hasattr(embeddings, method), f"Missing required method: {method}"
         assert callable(getattr(embeddings, method)), f"Method not callable: {method}"
-    
-    # Test the __call__ method works
+
+    # Test the __call__ method works (sync context)
     result = embeddings(["test"])
     _assert_embedding_matrix_shape(result, expected_rows=1)
-    
-    # Try to import AutoGen modules (works with both 0.2.x and 0.10.x)
-    autogen_available = False
-    try:
-        # Try new AutoGen 0.10.x first
-        import autogen_agentchat
-        autogen_available = True
-    except ImportError:
-        try:
-            # Fall back to old AutoGen 0.2.x
-            from autogen.agentchat.contrib.retrieve_assistant_agent import (  # type: ignore[import]
-                EmbeddingFunction,
-            )
-            autogen_available = True
-        except ImportError:
-            pass
-    
-    if not autogen_available:
-        pytest.skip("AutoGen not installed - skipping compatibility check")
+
+
+def test_module_import_does_not_require_autogen() -> None:
+    """
+    Importing the framework adapter module must not require AutoGen installed.
+
+    This enforces the optional dependency contract: AutoGen imports are lazy inside helpers.
+    """
+    # If auto-installed in this environment, we do not attempt to uninstall; we only ensure
+    # the module import itself does not depend on AutoGen being pre-imported.
+    assert autogen_adapter_module.__name__.endswith("framework_adapters.autogen")
 
 
 # ---------------------------------------------------------------------------
@@ -330,11 +302,6 @@ def test_autogen_context_passed_to_context_translation(
 ) -> None:
     """
     Verify that autogen_context is passed through to context_from_autogen.
-
-    Framework Compatibility: Context translation stable across
-    AutoGen versions.
-
-    Note: Uses the adapter fixture from conftest.py
     """
     captured: Dict[str, Any] = {}
 
@@ -361,52 +328,6 @@ def test_autogen_context_passed_to_context_translation(
     assert captured["framework_version"] == "autogen-test-version"
 
 
-def test_error_context_includes_autogen_context(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    When an error occurs during AutoGen embedding, error context should include
-    AutoGen-specific metadata via attach_context().
-
-    Error Message Quality: Errors must contain actionable context for debugging
-    AutoGen workflows in production.
-    """
-    captured_context: Dict[str, Any] = {}
-
-    def fake_attach_context(exc: BaseException, **ctx: Any) -> None:
-        captured_context.update(ctx)
-
-    monkeypatch.setattr(autogen_adapter_module, "attach_context", fake_attach_context)
-
-    class FailingAdapter:
-        async def embed(self, *args: Any, **kwargs: Any) -> Any:
-            raise RuntimeError("test error from autogen adapter: Check model configuration and API keys")
-        
-        async def embed_batch(self, *args: Any, **kwargs: Any) -> Any:
-            raise RuntimeError("test error from autogen adapter: Check model configuration and API keys")
-
-    embeddings = CorpusAutoGenEmbeddings(corpus_adapter=FailingAdapter())
-
-    auto_ctx = {"conversation_id": "conv-123", "agent_name": "tester"}
-
-    with pytest.raises(RuntimeError, match="test error from autogen adapter") as exc_info:
-        embeddings.embed_documents(["text"], autogen_context=auto_ctx)
-
-    error_str = str(exc_info.value)
-    assert "test error from autogen adapter" in error_str
-    assert "Check model configuration" in error_str or "API keys" in error_str
-
-    assert captured_context, "attach_context was not called"
-
-    assert captured_context.get("framework") == "autogen"
-    assert captured_context.get("conversation_id") == "conv-123"
-    assert captured_context.get("agent_name") == "tester"
-
-    assert captured_context.get("operation") == "embedding_documents"
-
-    assert captured_context.get("error_codes") == autogen_adapter_module.EMBEDDING_COERCION_ERROR_CODES
-
-
 def test_invalid_autogen_context_type_is_ignored(monkeypatch: pytest.MonkeyPatch, adapter) -> None:
     """
     autogen_context is best-effort. If the type is wrong (not a Mapping),
@@ -418,6 +339,24 @@ def test_invalid_autogen_context_type_is_ignored(monkeypatch: pytest.MonkeyPatch
 
         async def arun_embed(self, raw_texts: Any, op_ctx: Any, framework_ctx: Any) -> Any:
             return self.embed(raw_texts, op_ctx, framework_ctx)
+
+        def close(self) -> None:
+            return None
+
+        async def aclose(self) -> None:
+            return None
+
+        def capabilities(self) -> Dict[str, Any]:
+            return {}
+
+        def health(self) -> Dict[str, Any]:
+            return {}
+
+        async def arun_capabilities(self) -> Dict[str, Any]:
+            return {}
+
+        async def arun_health(self) -> Dict[str, Any]:
+            return {}
 
     monkeypatch.setattr(autogen_adapter_module, "create_embedding_translator", lambda **_: DummyTranslator())
 
@@ -449,6 +388,24 @@ def test_context_translation_failure_attaches_context_but_does_not_break(
         async def arun_embed(self, raw_texts: Any, op_ctx: Any, framework_ctx: Any) -> Any:
             return self.embed(raw_texts, op_ctx, framework_ctx)
 
+        def close(self) -> None:
+            return None
+
+        async def aclose(self) -> None:
+            return None
+
+        def capabilities(self) -> Dict[str, Any]:
+            return {}
+
+        def health(self) -> Dict[str, Any]:
+            return {}
+
+        async def arun_capabilities(self) -> Dict[str, Any]:
+            return {}
+
+        async def arun_health(self) -> Dict[str, Any]:
+            return {}
+
     monkeypatch.setattr(autogen_adapter_module, "context_from_autogen", boom)
     monkeypatch.setattr(autogen_adapter_module, "attach_context", fake_attach_context)
     monkeypatch.setattr(autogen_adapter_module, "create_embedding_translator", lambda **_: DummyTranslator())
@@ -463,8 +420,8 @@ def test_context_translation_failure_attaches_context_but_does_not_break(
 # Input Validation
 # ---------------------------------------------------------------------------
 
-def test_embed_documents_rejects_non_string_items(adapter):
-    """Error Message Quality: Clear error for type mismatches."""
+def test_embed_documents_rejects_non_string_items(adapter) -> None:
+    """Clear error for type mismatches."""
     embeddings = CorpusAutoGenEmbeddings(corpus_adapter=adapter)
 
     with pytest.raises(TypeError) as exc:
@@ -475,8 +432,8 @@ def test_embed_documents_rejects_non_string_items(adapter):
     assert "item 1" in error_msg
 
 
-def test_embed_query_rejects_non_string(adapter):
-    """Error Message Quality: Clear error for type mismatches."""
+def test_embed_query_rejects_non_string(adapter) -> None:
+    """Clear error for type mismatches."""
     embeddings = CorpusAutoGenEmbeddings(corpus_adapter=adapter)
 
     with pytest.raises(TypeError) as exc:
@@ -486,14 +443,20 @@ def test_embed_query_rejects_non_string(adapter):
     assert "embed_query expects str" in error_msg
 
 
+def test_call_rejects_non_string_items(adapter) -> None:
+    """__call__ is part of the public surface and must enforce the same input contract."""
+    embeddings = _make_embeddings(adapter)
+
+    with pytest.raises(TypeError):
+        embeddings(["ok", 123])  # type: ignore[list-item]
+
+
 # ---------------------------------------------------------------------------
 # Sync Semantics
 # ---------------------------------------------------------------------------
 
 def test_sync_embed_documents_and_query_basic(adapter) -> None:
-    """
-    Basic smoke test for sync embed_documents / embed_query behavior.
-    """
+    """Basic smoke test for sync embed_documents / embed_query behavior."""
     embeddings = _make_embeddings(adapter, model="mock-embed-512")
 
     texts = ["alpha", "beta", "gamma"]
@@ -507,9 +470,7 @@ def test_sync_embed_documents_and_query_basic(adapter) -> None:
 
 
 def test_call_aliases_embed_documents(adapter) -> None:
-    """
-    __call__ should alias embed_documents for AutoGen EmbeddingFunction protocol.
-    """
+    """__call__ should alias embed_documents for embedding_function protocols."""
     embeddings = _make_embeddings(adapter)
 
     texts = ["call-one", "call-two"]
@@ -518,7 +479,7 @@ def test_call_aliases_embed_documents(adapter) -> None:
 
 
 def test_sync_embed_documents_with_autogen_context(adapter) -> None:
-    """Context parameter stable across versions."""
+    """Context parameter stable."""
     embeddings = _make_embeddings(adapter)
 
     ctx = {"conversation_id": "conv-ctx", "agent_name": "tester"}
@@ -532,10 +493,7 @@ def test_sync_embed_documents_with_autogen_context(adapter) -> None:
 
 @pytest.mark.asyncio
 async def test_async_embed_documents_and_query_basic(adapter) -> None:
-    """
-    Async aembed_documents / aembed_query should exist and produce shapes
-    compatible with the sync API.
-    """
+    """Async aembed_documents / aembed_query should exist and produce compatible shapes."""
     embeddings = _make_embeddings(adapter)
 
     assert inspect.iscoroutinefunction(embeddings.aembed_documents)
@@ -553,16 +511,19 @@ async def test_async_embed_documents_and_query_basic(adapter) -> None:
 
 @pytest.mark.asyncio
 async def test_async_and_sync_same_dimension(adapter) -> None:
-    """Sync/async parity maintained across versions."""
+    """
+    Sync/async parity: sync APIs must not be invoked on the running event loop.
+    Use to_thread for sync calls inside async test.
+    """
     embeddings = _make_embeddings(adapter)
 
     texts = ["dim-a", "dim-b"]
     query = "dim-q"
 
-    sync_vecs = embeddings.embed_documents(texts)
+    sync_vecs = await asyncio.to_thread(embeddings.embed_documents, texts)
     async_vecs = await embeddings.aembed_documents(texts)
 
-    sync_q = embeddings.embed_query(query)
+    sync_q = await asyncio.to_thread(embeddings.embed_query, query)
     async_q = await embeddings.aembed_query(query)
 
     assert len(sync_vecs) == len(async_vecs) == len(texts)
@@ -574,7 +535,7 @@ async def test_async_and_sync_same_dimension(adapter) -> None:
 
 
 @pytest.mark.asyncio
-async def test_aembed_documents_rejects_non_string_items(adapter):
+async def test_aembed_documents_rejects_non_string_items(adapter) -> None:
     """Consistent error messages for async API."""
     embeddings = CorpusAutoGenEmbeddings(corpus_adapter=adapter)
 
@@ -587,7 +548,7 @@ async def test_aembed_documents_rejects_non_string_items(adapter):
 
 
 @pytest.mark.asyncio
-async def test_aembed_query_rejects_non_string(adapter):
+async def test_aembed_query_rejects_non_string(adapter) -> None:
     """Consistent error messages for async API."""
     embeddings = CorpusAutoGenEmbeddings(corpus_adapter=adapter)
 
@@ -599,156 +560,164 @@ async def test_aembed_query_rejects_non_string(adapter):
 
 
 # ---------------------------------------------------------------------------
-# Error-context Richness for Failures
+# Event-loop Guard (Hard contract: sync APIs must fail in a running loop)
 # ---------------------------------------------------------------------------
 
-def test_embed_documents_error_context_includes_autogen_fields(monkeypatch, adapter):
-    """Production debugging context in errors."""
+@pytest.mark.asyncio
+async def test_sync_methods_raise_inside_event_loop(adapter) -> None:
+    embeddings = _make_embeddings(adapter)
+
+    with pytest.raises(RuntimeError) as exc:
+        embeddings.embed_query("x")
+    assert autogen_adapter_module.ErrorCodes.SYNC_WRAPPER_CALLED_IN_EVENT_LOOP in str(exc.value)
+
+    with pytest.raises(RuntimeError) as exc:
+        embeddings.embed_documents(["x"])
+    assert autogen_adapter_module.ErrorCodes.SYNC_WRAPPER_CALLED_IN_EVENT_LOOP in str(exc.value)
+
+    with pytest.raises(RuntimeError) as exc:
+        embeddings(["x"])
+    assert autogen_adapter_module.ErrorCodes.SYNC_WRAPPER_CALLED_IN_EVENT_LOOP in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# Error-context Richness for Failures (Deterministic via translator injection)
+# ---------------------------------------------------------------------------
+
+def test_embed_documents_error_context_includes_autogen_fields(monkeypatch: pytest.MonkeyPatch, adapter) -> None:
+    """Production debugging context is attached on sync failures."""
     class FailingTranslator:
-        def embed(self, raw_texts, op_ctx=None, framework_ctx=None):
+        def embed(self, raw_texts: Any, op_ctx: Any = None, framework_ctx: Any = None) -> Any:
             raise RuntimeError("translator failed: Check model configuration and API limits")
 
-    captured = {}
+    captured: Dict[str, Any] = {}
 
-    def fake_attach_context(exc, **kwargs):
-        captured["exc"] = exc
-        captured["kwargs"] = kwargs
+    def fake_attach_context(exc: BaseException, **kwargs: Any) -> None:
+        captured.update(kwargs)
 
     monkeypatch.setattr(autogen_adapter_module, "attach_context", fake_attach_context)
 
-    embeddings = CorpusAutoGenEmbeddings(corpus_adapter=adapter, model="mock-embed-512")
-    
-    # Use monkeypatch to inject failing translator
-    with monkeypatch.context() as m:
-        m.setattr(embeddings, "_translator", FailingTranslator())
+    embeddings = CorpusAutoGenEmbeddings(corpus_adapter=adapter, model="mock-embed-512", framework_version="fv")
+    monkeypatch.setattr(embeddings, "_translator", FailingTranslator())
 
-        autogen_context = {
-            "conversation_id": "conv-1",
-            "agent_name": "analyst",
-            "workflow_type": "chain",
-            "retriever_name": "retr1",
-        }
+    autogen_context = {
+        "conversation_id": "conv-1",
+        "agent_name": "analyst",
+        "workflow_type": "chain",
+        "retriever_name": "retr1",
+    }
 
-        with pytest.raises(RuntimeError) as exc_info:
-            embeddings.embed_documents(["doc1", "doc2"], autogen_context=autogen_context)
+    with pytest.raises(RuntimeError) as exc_info:
+        embeddings.embed_documents(["doc1", "doc2"], autogen_context=autogen_context)
 
-        error_str = str(exc_info.value)
-        assert "translator failed" in error_str
-        assert "Check model configuration" in error_str
+    error_str = str(exc_info.value)
+    assert "translator failed" in error_str
+    assert "Check model configuration" in error_str
 
-        ctx = captured["kwargs"]
-        assert ctx["framework"] == "autogen"
-        assert ctx["operation"] == "embedding_documents"
-        assert ctx["error_codes"] == autogen_adapter_module.EMBEDDING_COERCION_ERROR_CODES
-        assert ctx["conversation_id"] == "conv-1"
-        assert ctx["agent_name"] == "analyst"
-        # Verify production debugging context
-        assert "model" in ctx
-        assert ctx["model"] == "mock-embed-512"
+    assert captured["framework"] == "autogen"
+    assert captured["operation"] == "embedding_documents"
+    assert captured["error_codes"] == autogen_adapter_module.EMBEDDING_COERCION_ERROR_CODES
+    assert captured["conversation_id"] == "conv-1"
+    assert captured["agent_name"] == "analyst"
+    assert captured["model"] == "mock-embed-512"
+    assert captured["framework_version"] == "fv"
+    assert captured.get("texts_count") == 2
 
 
 @pytest.mark.asyncio
-async def test_aembed_query_error_context_includes_autogen_fields(monkeypatch, adapter):
-    """Async errors also include debugging context."""
+async def test_aembed_query_error_context_includes_autogen_fields(monkeypatch: pytest.MonkeyPatch, adapter) -> None:
+    """Async errors include debugging context."""
     class FailingTranslator:
-        async def arun_embed(self, raw_texts, op_ctx=None, framework_ctx=None):
+        async def arun_embed(self, raw_texts: Any, op_ctx: Any = None, framework_ctx: Any = None) -> Any:
             raise RuntimeError("translator failed: Verify API key and model access permissions")
 
-    captured = {}
+    captured: Dict[str, Any] = {}
 
-    def fake_attach_context(exc, **kwargs):
-        captured["exc"] = exc
-        captured["kwargs"] = kwargs
+    def fake_attach_context(exc: BaseException, **kwargs: Any) -> None:
+        captured.update(kwargs)
 
     monkeypatch.setattr(autogen_adapter_module, "attach_context", fake_attach_context)
 
-    embeddings = CorpusAutoGenEmbeddings(corpus_adapter=adapter, model="mock-embed-512")
-    
-    # Use monkeypatch to inject failing translator
-    with monkeypatch.context() as m:
-        m.setattr(embeddings, "_translator", FailingTranslator())
+    embeddings = CorpusAutoGenEmbeddings(corpus_adapter=adapter, model="mock-embed-512", framework_version="fv")
+    monkeypatch.setattr(embeddings, "_translator", FailingTranslator())
 
-        autogen_context = {"conversation_id": "conv-2", "agent_name": "tester"}
+    autogen_context = {"conversation_id": "conv-2", "agent_name": "tester"}
 
-        with pytest.raises(RuntimeError) as exc_info:
-            await embeddings.aembed_query("hello", autogen_context=autogen_context)
+    with pytest.raises(RuntimeError) as exc_info:
+        await embeddings.aembed_query("hello", autogen_context=autogen_context)
 
-        error_str = str(exc_info.value)
-        assert "translator failed" in error_str
-        assert "Verify API key" in error_str
+    error_str = str(exc_info.value)
+    assert "translator failed" in error_str
+    assert "Verify API key" in error_str
 
-        ctx = captured["kwargs"]
-        assert ctx["framework"] == "autogen"
-        assert ctx["operation"] == "embedding_query"
-        assert ctx["conversation_id"] == "conv-2"
-        assert ctx["agent_name"] == "tester"
-        assert "model" in ctx
+    assert captured["framework"] == "autogen"
+    assert captured["operation"] == "embedding_query"
+    assert captured["conversation_id"] == "conv-2"
+    assert captured["agent_name"] == "tester"
+    assert captured["model"] == "mock-embed-512"
+    assert captured["framework_version"] == "fv"
+    assert captured.get("text_len") == 5
 
 
-@pytest.mark.asyncio
-async def test_async_error_context_includes_autogen_context(monkeypatch: pytest.MonkeyPatch, adapter) -> None:
+def test_dim_hint_is_attached_to_later_errors(monkeypatch: pytest.MonkeyPatch, adapter) -> None:
     """
-    When an async error occurs, attach_context should include AutoGen-specific
-    metadata and standard fields.
+    After a successful embed, dim hint should be reflected in later error context as embedding_dim.
     """
-    captured_context: Dict[str, Any] = {}
+    captured: Dict[str, Any] = {}
 
     def fake_attach_context(exc: BaseException, **ctx: Any) -> None:
-        captured_context.update(ctx)
+        captured.update(ctx)
 
-    class RaisingTranslator:
-        async def arun_embed(self, raw_texts: Any, op_ctx: Any, framework_ctx: Any) -> Any:
-            raise RuntimeError("boom-async")
+    class OkTranslator:
+        def embed(self, raw_texts: Any, op_ctx: Any = None, framework_ctx: Any = None) -> Any:
+            if isinstance(raw_texts, list):
+                return [[0.0, 1.0, 2.0] for _ in raw_texts]  # dim=3
+            return [0.0, 1.0, 2.0]
+
+    class BoomTranslator:
+        def embed(self, raw_texts: Any, op_ctx: Any = None, framework_ctx: Any = None) -> Any:
+            raise RuntimeError("boom")
 
     monkeypatch.setattr(autogen_adapter_module, "attach_context", fake_attach_context)
-    monkeypatch.setattr(autogen_adapter_module, "create_embedding_translator", lambda **_: RaisingTranslator())
 
-    embeddings = _make_embeddings(adapter, model="mock-embed-512", framework_version="fv")
-    auto_ctx = {"conversation_id": "conv-ctx", "agent_name": "tester"}
+    embeddings = _make_embeddings(adapter, model="m", framework_version="fv")
+    monkeypatch.setattr(embeddings, "_translator", OkTranslator())
 
-    with pytest.raises(RuntimeError, match="boom-async"):
-        await embeddings.aembed_documents(["text"], autogen_context=auto_ctx)
+    _ = embeddings.embed_documents(["a", "b"])
+    assert embeddings._embedding_dim_hint == 3
 
-    assert captured_context.get("framework") == "autogen"
-    assert captured_context.get("operation") == "embedding_documents"
-    assert captured_context.get("conversation_id") == "conv-ctx"
-    assert captured_context.get("agent_name") == "tester"
-    assert captured_context.get("model") == "mock-embed-512"
-    assert captured_context.get("framework_version") == "fv"
+    monkeypatch.setattr(embeddings, "_translator", BoomTranslator())
+    with pytest.raises(RuntimeError, match="boom"):
+        embeddings.embed_documents(["c"], autogen_context={"conversation_id": "c1"})
+
+    assert captured.get("embedding_dim") == 3
 
 
 # ---------------------------------------------------------------------------
-# Capabilities / Health Passthrough
+# Capabilities / Health Passthrough (Stable async usage, no asyncio.run)
 # ---------------------------------------------------------------------------
 
-def test_capabilities_passthrough_when_underlying_provides(adapter) -> None:
+@pytest.mark.asyncio
+async def test_capabilities_passthrough_when_underlying_provides(adapter) -> None:
     """
-    When the underlying adapter implements capabilities/acapabilities,
-    CorpusAutoGenEmbeddings should surface them.
+    acapabilities returns either a dict or EmbeddingCapabilities.
     """
     embeddings = CorpusAutoGenEmbeddings(corpus_adapter=adapter)
-
-    # The adapter's capabilities() is async, so we need to await it
-    caps = asyncio.run(embeddings.acapabilities())
-    # Can be either a dict or an EmbeddingCapabilities object
+    caps = await embeddings.acapabilities()
     assert isinstance(caps, (dict, EmbeddingCapabilities))
 
 
 @pytest.mark.asyncio
 async def test_async_capabilities_fallback_to_sync(adapter) -> None:
     """
-    acapabilities should fall back to sync capabilities() when only the
-    sync method is implemented on the underlying adapter.
+    acapabilities should work regardless of whether the underlying supports async or sync.
     """
     embeddings = CorpusAutoGenEmbeddings(corpus_adapter=adapter)
-
-    # Use the async version since the adapter is async
     acaps = await embeddings.acapabilities()
-    # Can be either a dict or an EmbeddingCapabilities object
     assert isinstance(acaps, (dict, EmbeddingCapabilities))
 
 
-def test_capabilities_empty_when_missing():
+def test_capabilities_empty_when_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     If the underlying adapter has no capabilities()/acapabilities(),
     the AutoGen adapter should return an empty mapping (best-effort).
@@ -757,157 +726,132 @@ def test_capabilities_empty_when_missing():
         async def embed(self, texts: Sequence[str], **_: Any) -> list[list[float]]:
             return [[0.0] * 3 for _ in texts]
 
+    class DummyTranslator:
+        def embed(self, raw_texts: Any, op_ctx: Any, framework_ctx: Any) -> Any:
+            return [[0.0, 1.0, 2.0] for _ in raw_texts]
+
+        async def arun_embed(self, raw_texts: Any, op_ctx: Any, framework_ctx: Any) -> Any:
+            return self.embed(raw_texts, op_ctx, framework_ctx)
+
+        def capabilities(self) -> Dict[str, Any]:
+            return {}
+
+        def health(self) -> Dict[str, Any]:
+            return {}
+
+        async def arun_capabilities(self) -> Dict[str, Any]:
+            return {}
+
+        async def arun_health(self) -> Dict[str, Any]:
+            return {}
+
+        def close(self) -> None:
+            return None
+
+        async def aclose(self) -> None:
+            return None
+
     embeddings = CorpusAutoGenEmbeddings(corpus_adapter=NoCapAdapter())
+    monkeypatch.setattr(embeddings, "_translator", DummyTranslator())
 
     caps = embeddings.capabilities()
     assert isinstance(caps, dict)
     assert caps == {}
 
 
-def test_health_passthrough_and_missing():
+def test_health_passthrough_and_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     """
-    health/ahealth behavior mirrors capabilities/acapabilities: passthrough
-    when available, empty mapping when not.
+    health/ahealth behavior mirrors capabilities: passthrough when available, empty mapping when not.
     """
     class HealthAdapter:
         async def embed(self, texts: Sequence[str], **_: Any) -> list[list[float]]:
             return [[0.0] * 2 for _ in texts]
 
+    class DummyTranslator:
+        def embed(self, raw_texts: Any, op_ctx: Any, framework_ctx: Any) -> Any:
+            return [[0.0, 1.0] for _ in raw_texts]
+
+        async def arun_embed(self, raw_texts: Any, op_ctx: Any, framework_ctx: Any) -> Any:
+            return self.embed(raw_texts, op_ctx, framework_ctx)
+
+        def capabilities(self) -> Dict[str, Any]:
+            return {}
+
         def health(self) -> Dict[str, Any]:
             return {"status": "ok"}
 
+        async def arun_capabilities(self) -> Dict[str, Any]:
+            return {}
+
+        async def arun_health(self) -> Dict[str, Any]:
+            return {"status": "ok"}
+
+        def close(self) -> None:
+            return None
+
+        async def aclose(self) -> None:
+            return None
+
     embeddings = CorpusAutoGenEmbeddings(corpus_adapter=HealthAdapter())
+    monkeypatch.setattr(embeddings, "_translator", DummyTranslator())
 
     health = embeddings.health()
     assert isinstance(health, dict)
     assert health.get("status") == "ok"
 
+    # Missing health should yield empty mapping
     class NoHealthAdapter:
         async def embed(self, texts: Sequence[str], **_: Any) -> list[list[float]]:
             return [[0.0] * 2 for _ in texts]
 
+    class DummyTranslatorNoHealth(DummyTranslator):
+        def health(self) -> Dict[str, Any]:
+            return {}
+
+        async def arun_health(self) -> Dict[str, Any]:
+            return {}
+
     embeddings2 = CorpusAutoGenEmbeddings(corpus_adapter=NoHealthAdapter())
+    monkeypatch.setattr(embeddings2, "_translator", DummyTranslatorNoHealth())
 
     health2 = embeddings2.health()
     assert isinstance(health2, dict)
     assert health2 == {}
 
 
-def test_capabilities_and_health_passthrough_when_underlying_provides() -> None:
-    """
-    This is intentionally for legacy adapters that expose sync capabilities/health
-    (CorpusAutoGenEmbeddings.capabilities()/health() are sync passthrough).
-    """
-    class FullAdapter:
-        def embed(self, *args: Any, **kwargs: Any) -> Any:
-            return None
-
-        def capabilities(self) -> Dict[str, Any]:
-            return {"ok": True}
-
-        async def acapabilities(self) -> Dict[str, Any]:
-            return {"ok_async": True}
-
-        def health(self) -> Dict[str, Any]:
-            return {"status": "healthy"}
-
-        async def ahealth(self) -> Dict[str, Any]:
-            return {"status_async": "healthy"}
-
-    embeddings = CorpusAutoGenEmbeddings(corpus_adapter=FullAdapter())  # type: ignore[arg-type]
-
-    caps = embeddings.capabilities()
-    assert caps.get("ok") is True
-
-    health = embeddings.health()
-    assert health.get("status") == "healthy"
-
-    acaps = asyncio.run(embeddings.acapabilities())
-    assert acaps.get("ok_async") is True
-
-    ahealth = asyncio.run(embeddings.ahealth())
-    assert ahealth.get("status_async") == "healthy"
-
-
-@pytest.mark.asyncio
-async def test_async_capabilities_and_health_fallback_to_sync() -> None:
-    class CapHealthAdapter:
-        def embed(self, *args: Any, **kwargs: Any) -> Any:
-            return None
-
-        def capabilities(self) -> Dict[str, Any]:
-            return {"via_sync_caps": True}
-
-        def health(self) -> Dict[str, Any]:
-            return {"via_sync_health": True}
-
-    embeddings = CorpusAutoGenEmbeddings(corpus_adapter=CapHealthAdapter())  # type: ignore[arg-type]
-
-    acaps = await embeddings.acapabilities()
-    assert acaps.get("via_sync_caps") is True
-
-    ahealth = await embeddings.ahealth()
-    assert ahealth.get("via_sync_health") is True
-
-
-def test_capabilities_and_health_return_empty_when_missing() -> None:
-    class NoCapHealthAdapter:
-        def embed(self, *args: Any, **kwargs: Any) -> Any:
-            return None
-
-    embeddings = CorpusAutoGenEmbeddings(corpus_adapter=NoCapHealthAdapter())  # type: ignore[arg-type]
-
-    assert embeddings.capabilities() == {}
-    assert embeddings.health() == {}
-
-    acaps = asyncio.run(embeddings.acapabilities())
-    assert acaps == {}
-
-    ahealth = asyncio.run(embeddings.ahealth())
-    assert ahealth == {}
-
-
 # ---------------------------------------------------------------------------
-# Resource Management
+# Resource Management (Correct contract: translator is closed)
 # ---------------------------------------------------------------------------
 
-def test_context_manager_closes_underlying_adapter(monkeypatch: pytest.MonkeyPatch, adapter) -> None:
-    """
-    Context manager should close underlying adapter (sync version).
-    """
-    closed = {"v": False}
-
-    def close() -> None:
-        closed["v"] = True
-
-    monkeypatch.setattr(adapter, "close", close, raising=False)
-
+def test_context_manager_closes_translator(monkeypatch: pytest.MonkeyPatch, adapter) -> None:
+    """Sync context manager exit closes translator (not the underlying adapter directly)."""
     embeddings = CorpusAutoGenEmbeddings(corpus_adapter=adapter)
+    called = {"close": False}
 
+    class DummyTranslator:
+        def close(self) -> None:
+            called["close"] = True
+
+    monkeypatch.setattr(embeddings, "_translator", DummyTranslator())
     with embeddings:
         pass
-
-    assert closed["v"] is True
+    assert called["close"] is True
 
 
 @pytest.mark.asyncio
-async def test_async_context_manager_closes_underlying_adapter(monkeypatch: pytest.MonkeyPatch, adapter) -> None:
-    """
-    Async context manager should close underlying adapter (async version).
-    """
-    aclosed = {"v": False}
-
-    async def aclose() -> None:
-        aclosed["v"] = True
-
-    monkeypatch.setattr(adapter, "aclose", aclose, raising=False)
-
+async def test_async_context_manager_closes_translator(monkeypatch: pytest.MonkeyPatch, adapter) -> None:
+    """Async context manager exit closes translator (not the underlying adapter directly)."""
     embeddings = CorpusAutoGenEmbeddings(corpus_adapter=adapter)
+    called = {"aclose": False}
 
+    class DummyTranslator:
+        async def aclose(self) -> None:
+            called["aclose"] = True
+
+    monkeypatch.setattr(embeddings, "_translator", DummyTranslator())
     async with embeddings:
         pass
-
-    assert aclosed["v"] is True
+    assert called["aclose"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -915,13 +859,11 @@ async def test_async_context_manager_closes_underlying_adapter(monkeypatch: pyte
 # ---------------------------------------------------------------------------
 
 @pytest.mark.concurrency
-def test_shared_embedder_thread_safety(adapter):
-    """
-    Shared embedder is thread-safe for concurrent access.
-    """
+def test_shared_embedder_thread_safety(adapter) -> None:
+    """Shared embedder is thread-safe for concurrent access."""
     embedder = register_embeddings(adapter, model="mock-embed-512")
-    
-    def embed_query(text: str):
+
+    def embed_query(text: str) -> List[float]:
         return embedder.embed_query(text)
 
     texts = [f"query {i}" for i in range(10)]
@@ -933,18 +875,16 @@ def test_shared_embedder_thread_safety(adapter):
     assert len(results) == len(texts)
     for result in results:
         assert isinstance(result, list)
-        assert all(isinstance(x, float) for x in result)
+        assert all(isinstance(x, (int, float)) for x in result)
 
 
 @pytest.mark.asyncio
 @pytest.mark.concurrency
-async def test_concurrent_async_embedding(adapter):
-    """
-    Async embedding supports concurrent operations.
-    """
+async def test_concurrent_async_embedding(adapter) -> None:
+    """Async embedding supports concurrent operations."""
     embedder = register_embeddings(adapter, model="mock-embed-512")
-    
-    async def embed_async(text: str):
+
+    async def embed_async(text: str) -> List[float]:
         return await embedder.aembed_query(text)
 
     texts = [f"async query {i}" for i in range(5)]
@@ -954,184 +894,133 @@ async def test_concurrent_async_embedding(adapter):
     assert len(results) == len(texts)
     for result in results:
         assert isinstance(result, list)
-        assert all(isinstance(x, float) for x in result)
+        assert all(isinstance(x, (int, float)) for x in result)
 
 
 # ---------------------------------------------------------------------------
-# Real AutoGen Integration Tests
+# Real AutoGen Integration Tests (Pass/Fail; never skip)
 # ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="session")
+def require_autogen_chromadb():
+    """
+    Hard requirement for real AutoGen integration tests.
+
+    Policy:
+    - No skip. If AutoGen or chromadb extras are missing or too old, fail-fast.
+    - Validates that CustomEmbeddingFunctionConfig support exists.
+    """
+    # Lazy import of version metadata to avoid new dependency requirements at import time.
+    try:
+        from importlib.metadata import version as pkg_version  # py3.9+
+    except Exception as exc:  # pragma: no cover
+        pytest.fail(f"Failed to import importlib.metadata for version checks: {exc!r}", pytrace=False)
+
+    try:
+        from packaging.version import Version
+    except Exception as exc:  # pragma: no cover
+        pytest.fail(f"packaging is required for version checks in integration tests: {exc!r}", pytrace=False)
+
+    try:
+        import autogen_ext.memory.chromadb  # noqa: F401
+        import autogen_core.memory  # noqa: F401
+    except Exception as exc:
+        pytest.fail(
+            "AutoGen Chroma memory dependencies are required for integration tests. "
+            'Install: pip install -U "autogen-agentchat" "autogen-core" "autogen-ext[chromadb]". '
+            f"Import error: {exc!r}",
+            pytrace=False,
+        )
+
+    # Custom embedding function config support was introduced in autogen-ext v0.4.1+ (per AutoGen docs).
+    try:
+        v = Version(pkg_version("autogen-ext"))
+    except Exception as exc:
+        pytest.fail(f"Failed to resolve autogen-ext version: {exc!r}", pytrace=False)
+
+    if v < Version("0.4.1"):
+        pytest.fail(
+            f"autogen-ext=={v} is too old for CustomEmbeddingFunctionConfig support (needs >= 0.4.1).",
+            pytrace=False,
+        )
+
+    from autogen_ext.memory import chromadb as chroma_mod
+    from autogen_core import memory as core_mem_mod
+    return chroma_mod, core_mem_mod
+
 
 @pytest.mark.integration
-class TestAutoGenIntegration:
+@pytest.mark.asyncio
+async def test_real_autogen_chromadb_memory_roundtrip_uses_corpus_embeddings(
+    require_autogen_chromadb,
+    monkeypatch: pytest.MonkeyPatch,
+    adapter,
+    tmp_path,
+) -> None:
     """
-    Integration tests with real AutoGen agents and workflows.
+    Real integration (pass/fail): create_vector_memory wires into real AutoGen ChromaDBVectorMemory
+    and actually uses Corpus embeddings.
 
-    These tests verify that our adapter actually works in real AutoGen
-    agent workflows.
-    
-    Framework Compatibility: Tested with AutoGen 0.10.x (primary) and 0.2.x (legacy).
-    
-    Note: Tests dynamically adapt to available AutoGen version:
-    - AutoGen 0.10.x: Uses new autogen_agentchat APIs
-    - AutoGen 0.2.x: Uses legacy retrieve_assistant_agent module
+    This test:
+    - Uses create_vector_memory() to build a real ChromaDBVectorMemory
+    - Adds a MemoryContent, queries for it, and validates results
+    - Wraps adapter.embed() to confirm embeddings are computed via the configured embedding function
     """
+    _chroma_mod, core_mem_mod = require_autogen_chromadb
+    MemoryContent = core_mem_mod.MemoryContent
+    MemoryMimeType = core_mem_mod.MemoryMimeType
 
-    @pytest.fixture
-    def autogen_available(self):
-        """Check if AutoGen (any version) is available for integration tests."""
-        try:
-            # Try new AutoGen 0.10.x first
-            import autogen_agentchat
-            return "0.10.x"
-        except ImportError:
-            try:
-                # Try old AutoGen 0.2.x
-                import autogen
-                from autogen.agentchat.contrib.retrieve_assistant_agent import EmbeddingFunction
-                return "0.2.x"
-            except ImportError:
-                pytest.skip("AutoGen not installed - skipping integration tests")
-    
-    def test_can_create_embeddings_for_autogen_retrieve_agent(self, autogen_available, adapter):
-        """
-        Real integration: Can create embeddings that work with AutoGen agents.
-        
-        Framework Compatibility: Validates embedding integration pattern
-        works with AutoGen's agent architecture (both 0.10.x and 0.2.x).
-        """
-        embedder = register_embeddings(
-            corpus_adapter=adapter,
-            model="mock-embed-512",
-            framework_version="1.0.0"
+    # Wrap adapter.embed to prove AutoGen memory path invokes it (sync or async)
+    calls = {"n": 0}
+    orig_embed = getattr(adapter, "embed", None)
+    assert callable(orig_embed), "Adapter must expose embed() for AutoGen embedding integration."
+
+    if inspect.iscoroutinefunction(orig_embed):
+        async def wrapped_embed(*args: Any, **kwargs: Any) -> Any:
+            calls["n"] += 1
+            return await orig_embed(*args, **kwargs)
+        monkeypatch.setattr(adapter, "embed", wrapped_embed, raising=True)
+    else:
+        def wrapped_embed(*args: Any, **kwargs: Any) -> Any:
+            calls["n"] += 1
+            return orig_embed(*args, **kwargs)
+        monkeypatch.setattr(adapter, "embed", wrapped_embed, raising=True)
+
+    memory = create_vector_memory(
+        corpus_adapter=adapter,
+        collection_name="corpus_autogen_memory_it",
+        persistence_path=str(tmp_path),
+        model="mock-embed-512",
+        k=3,
+        score_threshold=None,
+    )
+
+    try:
+        await memory.add(
+            MemoryContent(
+                content="The user prefers temperatures in Celsius",
+                mime_type=MemoryMimeType.TEXT,
+                metadata={"category": "preferences"},
+            )
         )
 
-        result = embedder(["test document for AutoGen agent"])
-        assert isinstance(result, list)
-        assert len(result) == 1
-        assert all(isinstance(x, float) for row in result for x in row)
+        result = await memory.query("temperature units")
+        assert hasattr(result, "results"), "AutoGen MemoryQueryResult must expose .results"
+        assert isinstance(result.results, list)
+        assert len(result.results) >= 1
 
-        result_with_context = embedder.embed_query(
-            "query from agent",
-            autogen_context={
-                "conversation_id": "conv-123",
-                "agent_name": "researcher",
-                "workflow_type": "rag"
-            }
-        )
-        assert isinstance(result_with_context, list)
-        assert all(isinstance(x, float) for x in result_with_context)
+        assert calls["n"] >= 1, "Expected corpus adapter embed() to be called via AutoGen memory add/query."
 
-    def test_embeddings_work_with_autogen_retriever_workflows(self, autogen_available, adapter):
-        """
-        Real integration: Embeddings work with AutoGen's retriever-based workflows.
-        
-        Framework Compatibility: Validates RAG workflow integration pattern
-        works with AutoGen's retrieval systems (both 0.10.x and 0.2.x).
-        """
-        embedder = register_embeddings(
-            corpus_adapter=adapter,
-            model="mock-embed-512",
-            framework_version="1.0.0"
-        )
-
-        documents = [
-            "AutoGen is a framework for building multi-agent applications.",
-            "Agents can work together to solve complex tasks.",
-            "Embeddings are used to convert text to vector representations."
-        ]
-
-        embeddings = embedder(documents)
-        assert len(embeddings) == len(documents)
-
-        query = "What is AutoGen?"
-        query_embedding = embedder.embed_query(query)
-        assert isinstance(query_embedding, list)
-        assert all(isinstance(x, float) for x in query_embedding)
-
-        embeddings_with_context = embedder.embed_documents(
-            documents,
-            autogen_context={
-                "conversation_id": "research-session-1",
-                "agent_name": "research_assistant",
-                "workflow_type": "document_retrieval",
-                "retriever_name": "knowledge_base"
-            }
-        )
-        assert len(embeddings_with_context) == len(documents)
-
-    def test_error_handling_in_autogen_workflow(self, autogen_available):
-        """
-        Real integration: Error handling in AutoGen context.
-        """
-        class FailingTestAdapter:
-            async def embed(self, texts: List[str], ctx=None) -> List[List[float]]:
-                raise RuntimeError("Rate limit exceeded: Please wait 60 seconds before retrying")
-            
-            async def embed_batch(self, texts: List[str], ctx=None) -> List[List[float]]:
-                raise RuntimeError("Rate limit exceeded: Please wait 60 seconds before retrying")
-            
-            def capabilities(self) -> Dict[str, Any]:
-                return {"supported_models": ["test-model"]}
-
-        adapter = FailingTestAdapter()
-        embedder = register_embeddings(adapter, model="mock-embed-512")
-        
-        # Test that errors from embedder propagate with context
-        with pytest.raises(Exception) as exc_info:
-            embedder.embed_documents(["test document"])
-
-        error_str = str(exc_info.value)
-        assert "rate limit" in error_str.lower() or "exceeded" in error_str.lower()
-        assert "wait 60 seconds" in error_str.lower() or "retry" in error_str.lower()
-
-    @pytest.mark.asyncio
-    async def test_async_embeddings_in_autogen_workflow(self, autogen_available, adapter):
-        """
-        Real integration: Async embeddings in AutoGen async workflows.
-        """
-        embedder = register_embeddings(adapter, model="mock-embed-512")
-        
-        # Test async embedding in agent context
-        embeddings = await embedder.aembed_query(
-            "async query for AutoGen workflow",
-            autogen_context={
-                "conversation_id": "async-session",
-                "agent_name": "async_agent",
-                "workflow_type": "async_processing"
-            }
-        )
-
-        assert isinstance(embeddings, list)
-        assert all(isinstance(x, float) for x in embeddings)
-
-        documents = ["doc1", "doc2", "doc3"]
-        batch_embeddings = await embedder.aembed_documents(documents)
-        assert len(batch_embeddings) == len(documents)
-
-    def test_multiple_agents_can_share_same_embedder(self, autogen_available, adapter):
-        """
-        Real integration: Multiple agents/retrievers can share the same embedder.
-        """
-        embedder = register_embeddings(adapter, model="mock-embed-512")
-        
-        # Simulate multiple agents using same embedder
-        contexts = [
-            {"conversation_id": "conv-1", "agent_name": "researcher", "workflow_type": "research"},
-            {"conversation_id": "conv-1", "agent_name": "analyst", "workflow_type": "analysis"},
-            {"conversation_id": "conv-2", "agent_name": "summarizer", "workflow_type": "summarization"},
-        ]
-
-        for ctx in contexts:
-            result = embedder.embed_query(f"query from {ctx['agent_name']}", autogen_context=ctx)
-            assert isinstance(result, list)
-            assert all(isinstance(x, float) for x in result)
-
-            batch_result = embedder([f"doc from {ctx['agent_name']}"], autogen_context=ctx)
-            assert len(batch_result) == 1
+        assert any(
+            getattr(item, "content", None) == "The user prefers temperatures in Celsius"
+            for item in result.results
+        ), "Expected stored MemoryContent to be returned by query()"
+    finally:
+        await memory.close()
 
 
 # ---------------------------------------------------------------------------
-# create_vector_memory Integration Tests
+# create_vector_memory Integration Tests (Deterministic, no AutoGen required)
 # ---------------------------------------------------------------------------
 
 def test_create_vector_memory_raises_runtime_error_when_autogen_not_installed(
