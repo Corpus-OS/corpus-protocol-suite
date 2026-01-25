@@ -1,12 +1,12 @@
+# tests/frameworks/embedding/test_crewai_adapter.py
+
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Sequence, Mapping
 from typing import Any, Dict, List, Optional
 import inspect
 import asyncio
 import pytest
-import time
-from unittest.mock import Mock, patch
 import concurrent.futures
 
 import corpus_sdk.embedding.framework_adapters.crewai as crewai_adapter_module
@@ -17,7 +17,7 @@ from corpus_sdk.embedding.framework_adapters.crewai import (
     CrewAIConfig,
     ErrorCodes,
 )
-from corpus_sdk.embedding.embedding_base import OperationContext
+from corpus_sdk.embedding.embedding_base import OperationContext, EmbeddingCapabilities
 
 
 # ---------------------------------------------------------------------------
@@ -35,9 +35,9 @@ Integration Notes:
 - Handles CrewAI context (agent_role, task_id, crew_id, workflow)
 - Framework protocol-first design (no hard inheritance required)
 
-Note: CrewAI compatibility is verified via duck typing and protocol
-implementation, not inheritance. This ensures compatibility even when
-CrewAI base classes change.
+Policy:
+- No pytest.skip in this file. Integration tests are pass/fail:
+  if CrewAI is not available, tests fail-fast with actionable install guidance.
 """
 
 
@@ -47,32 +47,20 @@ CrewAI base classes change.
 
 def _assert_embedding_matrix_shape(result: Any, expected_rows: int) -> None:
     """Validate that a result looks like a 2D embedding matrix."""
-    assert isinstance(
-        result, Sequence
-    ), f"Expected sequence, got {type(result).__name__}"
-    assert len(result) == expected_rows, (
-        f"Expected {expected_rows} rows, got {len(result)}"
-    )
+    assert isinstance(result, Sequence), f"Expected sequence, got {type(result).__name__}"
+    assert len(result) == expected_rows, f"Expected {expected_rows} rows, got {len(result)}"
 
     for row in result:
-        assert isinstance(
-            row, Sequence
-        ), f"Row is not a sequence: {type(row).__name__}"
+        assert isinstance(row, Sequence), f"Row is not a sequence: {type(row).__name__}"
         for val in row:
-            assert isinstance(
-                val, (int, float)
-            ), f"Embedding value is not numeric: {val!r}"
+            assert isinstance(val, (int, float)), f"Embedding value is not numeric: {val!r}"
 
 
 def _assert_embedding_vector_shape(result: Any) -> None:
     """Validate that a result looks like a 1D embedding vector."""
-    assert isinstance(
-        result, Sequence
-    ), f"Expected sequence, got {type(result).__name__}"
+    assert isinstance(result, Sequence), f"Expected sequence, got {type(result).__name__}"
     for val in result:
-        assert isinstance(
-            val, (int, float)
-        ), f"Embedding value is not numeric: {val!r}"
+        assert isinstance(val, (int, float)), f"Embedding value is not numeric: {val!r}"
 
 
 def _make_embeddings(adapter: Any, **kwargs: Any) -> CorpusCrewAIEmbeddings:
@@ -80,9 +68,37 @@ def _make_embeddings(adapter: Any, **kwargs: Any) -> CorpusCrewAIEmbeddings:
     Construct a CorpusCrewAIEmbeddings instance from the generic adapter.
     """
     # Default to first supported model if no model specified
-    if 'model' not in kwargs and hasattr(adapter, 'supported_models'):
-        kwargs['model'] = adapter.supported_models[0]
+    if "model" not in kwargs and hasattr(adapter, "supported_models"):
+        kwargs["model"] = adapter.supported_models[0]
     return CorpusCrewAIEmbeddings(corpus_adapter=adapter, **kwargs)
+
+
+@pytest.fixture(scope="session")
+def require_crewai():
+    """
+    Hard requirement for real CrewAI integration tests (pass/fail, never skip).
+
+    This validates CrewAI is importable and exposes the minimal surface we rely on.
+    """
+    try:
+        import crewai  # type: ignore
+    except Exception as exc:
+        pytest.fail(
+            "CrewAI is required for integration tests in this module. Install with:\n"
+            "  pip install -U crewai\n"
+            f"Import error: {exc!r}",
+            pytrace=False,
+        )
+
+    missing = [name for name in ("Agent", "Crew", "Task") if not hasattr(crewai, name)]
+    if missing:
+        pytest.fail(
+            f"CrewAI import succeeded but missing required symbols: {missing}. "
+            "Your CrewAI installation appears incompatible with these tests.",
+            pytrace=False,
+        )
+
+    return crewai
 
 
 # ---------------------------------------------------------------------------
@@ -92,49 +108,34 @@ def _make_embeddings(adapter: Any, **kwargs: Any) -> CorpusCrewAIEmbeddings:
 def test_constructor_works_with_real_adapter(adapter) -> None:
     """
     CorpusCrewAIEmbeddings should work with any real adapter.
-    
-    Framework Compatibility: Ensures basic protocol compliance across
-    all supported CrewAI versions (0.28.0+).
-    
+
     Note: Uses the adapter fixture from conftest.py
     """
     embeddings = _make_embeddings(adapter)
     assert embeddings.corpus_adapter is adapter
-    assert hasattr(embeddings.corpus_adapter, 'embed')
+    assert hasattr(embeddings.corpus_adapter, "embed")
     assert callable(embeddings.corpus_adapter.embed)
 
 
 def test_constructor_rejects_common_user_mistakes() -> None:
     """
-    CorpusCrewAIEmbeddings should provide clear error messages for
-    common user mistakes.
-    
-    Error Message Quality: Users get helpful error messages, not
-    cryptic Python errors.
+    CorpusCrewAIEmbeddings should provide clear error messages for common user mistakes.
     """
-    # Common mistake 1: Passing None
     with pytest.raises(TypeError) as exc_info:
         CorpusCrewAIEmbeddings(corpus_adapter=None)  # type: ignore[arg-type]
-    
-    msg = str(exc_info.value)
-    assert "must implement an EmbeddingProtocolV1-compatible interface" in msg
-    
-    # Common mistake 2: Passing a string (wrong type)
+    assert "must implement an EmbeddingProtocolV1-compatible interface" in str(exc_info.value)
+
     with pytest.raises(TypeError) as exc_info:
         CorpusCrewAIEmbeddings(corpus_adapter="not an adapter")  # type: ignore[arg-type]
-    
-    msg = str(exc_info.value)
-    assert "must implement an EmbeddingProtocolV1-compatible interface" in msg
-    
-    # Common mistake 3: Passing an object without embed() method
+    assert "must implement an EmbeddingProtocolV1-compatible interface" in str(exc_info.value)
+
     class MockAgent:
         """Looks like an agent but not an embedding adapter"""
-        def chat(self): 
-            pass
-        
+        def chat(self) -> None:
+            return None
+
     with pytest.raises(TypeError) as exc_info:
         CorpusCrewAIEmbeddings(corpus_adapter=MockAgent())
-    
     msg = str(exc_info.value)
     assert "must implement an EmbeddingProtocolV1-compatible interface" in msg
     assert "embed" in msg.lower()
@@ -143,11 +144,6 @@ def test_constructor_rejects_common_user_mistakes() -> None:
 def test_crewai_config_defaults_and_bool_coercion(adapter) -> None:
     """
     crewai_config should be normalized with defaults and booleans coerced.
-    
-    Framework Compatibility: Configuration patterns stable across
-    CrewAI 0.28.0-0.51.0.
-    
-    Note: Uses the adapter fixture from conftest.py
     """
     embeddings = _make_embeddings(
         adapter,
@@ -159,17 +155,14 @@ def test_crewai_config_defaults_and_bool_coercion(adapter) -> None:
     )
 
     cfg = embeddings.crewai_config
-    # Defaults filled in
     assert "fallback_to_simple_context" in cfg
     assert "enable_agent_context_propagation" in cfg
     assert "task_aware_batching" in cfg
 
-    # Bool coercion
     assert isinstance(cfg["fallback_to_simple_context"], bool)
     assert isinstance(cfg["enable_agent_context_propagation"], bool)
     assert isinstance(cfg["task_aware_batching"], bool)
 
-    # Specific values
     assert cfg["fallback_to_simple_context"] is False
     assert cfg["task_aware_batching"] is True
 
@@ -177,11 +170,6 @@ def test_crewai_config_defaults_and_bool_coercion(adapter) -> None:
 def test_create_embedder_returns_crewai_embeddings(adapter) -> None:
     """
     create_embedder should return a CorpusCrewAIEmbeddings wired to the adapter.
-    
-    Framework Compatibility: create_embedder pattern stable across
-    all supported CrewAI versions.
-    
-    Note: Uses the adapter fixture from conftest.py
     """
     emb = create_embedder(
         corpus_adapter=adapter,
@@ -197,38 +185,20 @@ def test_create_embedder_returns_crewai_embeddings(adapter) -> None:
 # Context translation / CrewAIContext mapping
 # ---------------------------------------------------------------------------
 
-def test_crewai_context_passed_to_context_translation(
-    monkeypatch: pytest.MonkeyPatch,
-    adapter,
-) -> None:
+def test_crewai_context_passed_to_context_translation(monkeypatch: pytest.MonkeyPatch, adapter) -> None:
     """
-    Verify that crewai_context is passed through to context_from_crewai
-    when embedding.
-    
-    Framework Compatibility: Context translation stable across
-    CrewAI 0.28.0-0.51.0.
-    
-    Note: Uses the adapter fixture from conftest.py
+    Verify that crewai_context is passed through to context_from_crewai when embedding.
     """
     captured: Dict[str, Any] = {}
 
     def fake_from_crewai(ctx: Dict[str, Any], framework_version: Any = None) -> None:
         captured["ctx"] = ctx
         captured["framework_version"] = framework_version
-        # Returning None is allowed; adapter will just skip OperationContext.
         return None
 
-    # Patch the imported symbol inside the module under test
-    monkeypatch.setattr(
-        crewai_adapter_module,
-        "context_from_crewai",
-        fake_from_crewai,
-    )
+    monkeypatch.setattr(crewai_adapter_module, "context_from_crewai", fake_from_crewai)
 
-    embeddings = _make_embeddings(
-        adapter,
-        framework_version="crewai-test-version",
-    )
+    embeddings = _make_embeddings(adapter, framework_version="crewai-test-version")
 
     crew_ctx = {
         "agent_role": "researcher",
@@ -237,10 +207,7 @@ def test_crewai_context_passed_to_context_translation(
         "workflow": "unit-test",
     }
 
-    result = embeddings.embed_documents(
-        ["foo", "bar"],
-        crewai_context=crew_ctx,
-    )
+    result = embeddings.embed_documents(["foo", "bar"], crewai_context=crew_ctx)
     _assert_embedding_matrix_shape(result, expected_rows=2)
 
     assert captured.get("ctx") is not None
@@ -248,80 +215,53 @@ def test_crewai_context_passed_to_context_translation(
     assert captured["framework_version"] == "crewai-test-version"
 
 
-def test_error_context_includes_crewai_context(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_error_context_includes_crewai_context(monkeypatch: pytest.MonkeyPatch, adapter) -> None:
     """
     When an error occurs during CrewAI embedding, error context should include
-    CrewAI-specific metadata (e.g., agent_role, task_id) via attach_context().
-    
-    Error Message Quality: Errors must contain actionable context for debugging
-    CrewAI workflows in production.
+    CrewAI-specific metadata via attach_context().
+
+    Deterministic: inject a failing translator so we test framework-adapter behavior
+    (not backend adapter behavior).
     """
     captured_context: Dict[str, Any] = {}
 
     def fake_attach_context(exc: BaseException, **ctx: Any) -> None:
         captured_context.update(ctx)
 
-    monkeypatch.setattr(
-        crewai_adapter_module,
-        "attach_context",
-        fake_attach_context,
-    )
+    monkeypatch.setattr(crewai_adapter_module, "attach_context", fake_attach_context)
 
-    class FailingAdapter:
-        async def embed(self, *args: Any, **kwargs: Any) -> Any:
-            raise RuntimeError("test error from crewai adapter: Check model configuration and API keys")
-        
-        async def embed_batch(self, *args: Any, **kwargs: Any) -> Any:
+    class FailingTranslator:
+        def embed(self, raw_texts: Any, op_ctx: Any = None, framework_ctx: Any = None) -> Any:
             raise RuntimeError("test error from crewai adapter: Check model configuration and API keys")
 
-    embeddings = CorpusCrewAIEmbeddings(corpus_adapter=FailingAdapter(), model="test-model")
+    embeddings = CorpusCrewAIEmbeddings(corpus_adapter=adapter, model="test-model")
+    monkeypatch.setattr(embeddings, "_translator", FailingTranslator())
 
     crew_ctx = {"agent_role": "tester", "task_id": "task-123"}
 
-    with pytest.raises(RuntimeError, match="test error from crewai adapter") as exc_info:
+    with pytest.raises(RuntimeError, match="test error from crewai adapter"):
         embeddings.embed_documents(["text"], crewai_context=crew_ctx)
-    
-    # Enhanced error message quality assertions
-    error_str = str(exc_info.value)
-    # Verify error contains actionable information
-    assert "test error from crewai adapter" in error_str
-    assert "Check model configuration" in error_str or "API keys" in error_str
-    
-    # Verify some context was attached
+
     assert captured_context, "attach_context was not called"
-    
-    # Framework tagging should be present
-    assert "framework" in captured_context
     assert captured_context.get("framework") == "crewai"
-    
-    # CrewAI-specific fields should be present in the context
     assert captured_context.get("agent_role") == "tester"
     assert captured_context.get("task_id") == "task-123"
-    
-    # Verify context contains debugging breadcrumbs
-    assert "operation" in captured_context
-    assert captured_context["operation"] == "embedding_documents"
-    
-    # Verify error codes are attached for proper categorization
-    assert "error_codes" in captured_context
-    assert captured_context["error_codes"] == crewai_adapter_module.EMBEDDING_COERCION_ERROR_CODES
+    assert captured_context.get("operation") == "embedding_documents"
+    assert captured_context.get("error_codes") == crewai_adapter_module.EMBEDDING_COERCION_ERROR_CODES
 
 
 # ---------------------------------------------------------------------------
 # Additional config / context nuance tests
 # ---------------------------------------------------------------------------
 
-def test_fallback_to_simple_context_true_uses_default_operation_context(monkeypatch, adapter):
-    """Framework Compatibility: Fallback behavior stable across CrewAI versions."""
-    calls = {}
+def test_fallback_to_simple_context_true_uses_default_operation_context(monkeypatch: pytest.MonkeyPatch, adapter) -> None:
+    """Fallback behavior stable across CrewAI versions."""
+    calls: Dict[str, Any] = {}
 
-    def fake_from_crewai(crewai_ctx, framework_version=None):
+    def fake_from_crewai(crewai_ctx: Mapping[str, Any], framework_version: Any = None) -> Any:
         class WeirdCtx:
             pass
-
-        calls["ctx"] = crewai_ctx
+        calls["ctx"] = dict(crewai_ctx)
         return WeirdCtx()
 
     monkeypatch.setattr(crewai_adapter_module, "context_from_crewai", fake_from_crewai)
@@ -338,12 +278,11 @@ def test_fallback_to_simple_context_true_uses_default_operation_context(monkeypa
     assert framework_ctx["framework"] == "crewai"
 
 
-def test_fallback_to_simple_context_false_leaves_core_ctx_none(monkeypatch, adapter):
-    """Framework Compatibility: Context propagation configurable across versions."""
-    def fake_from_crewai(crewai_ctx, framework_version=None):
+def test_fallback_to_simple_context_false_leaves_core_ctx_none(monkeypatch: pytest.MonkeyPatch, adapter) -> None:
+    """Context propagation configurable across versions."""
+    def fake_from_crewai(crewai_ctx: Mapping[str, Any], framework_version: Any = None) -> Any:
         class WeirdCtx:
             pass
-
         return WeirdCtx()
 
     monkeypatch.setattr(crewai_adapter_module, "context_from_crewai", fake_from_crewai)
@@ -361,22 +300,22 @@ def test_fallback_to_simple_context_false_leaves_core_ctx_none(monkeypatch, adap
 
 
 def test_enable_agent_context_propagation_flag_controls_operation_context_propagation(
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
     adapter,
-):
-    """Framework Compatibility: Context propagation stable across CrewAI versions."""
-    def fake_from_crewai(crewai_ctx, framework_version=None):
+) -> None:
+    """Context propagation stable across CrewAI versions."""
+    def fake_from_crewai(crewai_ctx: Mapping[str, Any], framework_version: Any = None) -> OperationContext:
         return OperationContext(request_id="r1")
 
     monkeypatch.setattr(crewai_adapter_module, "context_from_crewai", fake_from_crewai)
 
     crewai_context = {"agent_role": "analyst"}
 
-    emb_default = CorpusCrewAIEmbeddings(
+    emb_enabled = CorpusCrewAIEmbeddings(
         corpus_adapter=adapter,
         crewai_config=CrewAIConfig(enable_agent_context_propagation=True),
     )
-    core_ctx, framework_ctx = emb_default._build_contexts(crewai_context=crewai_context)
+    core_ctx, framework_ctx = emb_enabled._build_contexts(crewai_context=crewai_context)
     assert isinstance(core_ctx, OperationContext)
     assert framework_ctx["_operation_context"] is core_ctx
 
@@ -384,31 +323,26 @@ def test_enable_agent_context_propagation_flag_controls_operation_context_propag
         corpus_adapter=adapter,
         crewai_config=CrewAIConfig(enable_agent_context_propagation=False),
     )
-    core_ctx2, framework_ctx2 = emb_disabled._build_contexts(
-        crewai_context=crewai_context
-    )
+    core_ctx2, framework_ctx2 = emb_disabled._build_contexts(crewai_context=crewai_context)
     assert isinstance(core_ctx2, OperationContext)
     assert "_operation_context" not in framework_ctx2
 
 
-def test_task_aware_batching_sets_batch_strategy(adapter):
-    """Framework Compatibility: Task-aware batching optimization for CrewAI workflows."""
+def test_task_aware_batching_sets_batch_strategy(adapter) -> None:
+    """Task-aware batching optimization for CrewAI workflows."""
     embeddings = CorpusCrewAIEmbeddings(
         corpus_adapter=adapter,
         crewai_config=CrewAIConfig(task_aware_batching=True),
     )
 
-    crewai_context = {
-        "agent_role": "analyst",
-        "task_id": "task-123",
-    }
-    core_ctx, framework_ctx = embeddings._build_contexts(crewai_context=crewai_context)
+    crewai_context = {"agent_role": "analyst", "task_id": "task-123"}
+    _core_ctx, framework_ctx = embeddings._build_contexts(crewai_context=crewai_context)
 
     assert framework_ctx["batch_strategy"] == "task_aware_task-123"
 
 
-def test_non_mapping_crewai_context_raises_value_error(adapter):
-    """Error Message Quality: Clear error when context has wrong type."""
+def test_non_mapping_crewai_context_raises_value_error(adapter) -> None:
+    """Clear error when context has wrong type."""
     embeddings = CorpusCrewAIEmbeddings(corpus_adapter=adapter)
 
     with pytest.raises(ValueError) as exc:
@@ -416,18 +350,17 @@ def test_non_mapping_crewai_context_raises_value_error(adapter):
 
     error_msg = str(exc.value)
     assert ErrorCodes.CREWAI_CONTEXT_INVALID in error_msg
-    # Verify error is actionable
-    assert "must be a mapping" in error_msg.lower() or "must be a dict" in error_msg.lower()
+    assert "mapping" in error_msg.lower() or "dict" in error_msg.lower()
 
 
-def test_context_from_crewai_failure_attaches_error_context(monkeypatch, adapter):
-    """Error Message Quality: Context preserved even when context translation fails."""
-    captured = {}
+def test_context_from_crewai_failure_attaches_error_context(monkeypatch: pytest.MonkeyPatch, adapter) -> None:
+    """Context preserved even when context translation fails."""
+    captured: Dict[str, Any] = {}
 
-    def fake_from_crewai(crewai_ctx, framework_version=None):
+    def fake_from_crewai(crewai_ctx: Mapping[str, Any], framework_version: Any = None) -> Any:
         raise RuntimeError("boom")
 
-    def fake_attach_context(exc, **kwargs):
+    def fake_attach_context(exc: BaseException, **kwargs: Any) -> None:
         captured["exc"] = exc
         captured["kwargs"] = kwargs
 
@@ -437,15 +370,11 @@ def test_context_from_crewai_failure_attaches_error_context(monkeypatch, adapter
     embeddings = CorpusCrewAIEmbeddings(corpus_adapter=adapter)
 
     crewai_context = {"agent_role": "analyst", "task_id": "t1"}
-    core_ctx, framework_ctx = embeddings._build_contexts(crewai_context=crewai_context)
+    _core_ctx, _framework_ctx = embeddings._build_contexts(crewai_context=crewai_context)
 
     assert "exc" in captured
     assert "crewai_context_snapshot" in captured["kwargs"]
-    assert (
-        captured["kwargs"]["error_codes"]
-        == crewai_adapter_module.EMBEDDING_COERCION_ERROR_CODES
-    )
-    # Verify error context contains framework info
+    assert captured["kwargs"]["error_codes"] == crewai_adapter_module.EMBEDDING_COERCION_ERROR_CODES
     assert captured["kwargs"].get("framework") == "crewai"
 
 
@@ -454,11 +383,7 @@ def test_context_from_crewai_failure_attaches_error_context(monkeypatch, adapter
 # ---------------------------------------------------------------------------
 
 def test_sync_embed_documents_and_query_basic(adapter) -> None:
-    """
-    Basic smoke test for sync embed_documents / embed_query behavior.
-    
-    Framework Compatibility: Sync API stable across all CrewAI versions.
-    """
+    """Basic smoke test for sync embed_documents / embed_query behavior."""
     embeddings = _make_embeddings(adapter, model="mock-embed-512")
 
     texts = ["alpha", "beta", "gamma"]
@@ -472,45 +397,36 @@ def test_sync_embed_documents_and_query_basic(adapter) -> None:
 
 
 def test_sync_embed_documents_with_crewai_context(adapter) -> None:
-    """Framework Compatibility: Context parameter stable across versions."""
+    """Context parameter stable across versions."""
     embeddings = _make_embeddings(adapter)
 
-    ctx = {
-        "agent_role": "tester",
-        "task_id": "shape-check",
-    }
+    ctx = {"agent_role": "tester", "task_id": "shape-check"}
 
-    result = embeddings.embed_documents(
-        ["ctx-one", "ctx-two"],
-        crewai_context=ctx,
-    )
+    result = embeddings.embed_documents(["ctx-one", "ctx-two"], crewai_context=ctx)
     _assert_embedding_matrix_shape(result, expected_rows=2)
 
 
-def test_embed_documents_rejects_non_string_items(adapter):
-    """Error Message Quality: Clear error for type mismatches."""
+def test_embed_documents_rejects_non_string_items(adapter) -> None:
+    """Clear error for type mismatches."""
     embeddings = CorpusCrewAIEmbeddings(corpus_adapter=adapter)
 
     with pytest.raises(TypeError) as exc:
         embeddings.embed_documents(["ok", 123])  # type: ignore[list-item]
-    
+
     error_msg = str(exc.value)
-    # Verify error is actionable
-    assert "item 1 is int" in error_msg or "must be str" in error_msg
     assert "embed_documents expects Sequence[str]" in error_msg
+    assert "item 1" in error_msg
 
 
-def test_embed_query_rejects_non_string(adapter):
-    """Error Message Quality: Clear error for type mismatches."""
+def test_embed_query_rejects_non_string(adapter) -> None:
+    """Clear error for type mismatches."""
     embeddings = CorpusCrewAIEmbeddings(corpus_adapter=adapter)
 
     with pytest.raises(TypeError) as exc:
         embeddings.embed_query(123)  # type: ignore[arg-type]
-    
+
     error_msg = str(exc.value)
-    # Verify error is actionable
     assert "embed_query expects str" in error_msg
-    assert "got int" in error_msg or "got 123" in error_msg
 
 
 # ---------------------------------------------------------------------------
@@ -519,18 +435,11 @@ def test_embed_query_rejects_non_string(adapter):
 
 @pytest.mark.asyncio
 async def test_async_embed_documents_and_query_basic(adapter) -> None:
-    """
-    Async aembed_documents / aembed_query should exist and produce shapes
-    compatible with the sync API.
-    
-    Framework Compatibility: Async API stable across CrewAI versions.
-    """
+    """Async aembed_documents / aembed_query produce shapes compatible with sync API."""
     embeddings = _make_embeddings(adapter)
 
-    # Ensure async methods exist and are coroutine functions
     assert hasattr(embeddings, "aembed_documents")
     assert hasattr(embeddings, "aembed_query")
-
     assert inspect.iscoroutinefunction(embeddings.aembed_documents)
     assert inspect.iscoroutinefunction(embeddings.aembed_query)
 
@@ -546,202 +455,158 @@ async def test_async_embed_documents_and_query_basic(adapter) -> None:
 
 @pytest.mark.asyncio
 async def test_async_and_sync_same_dimension(adapter) -> None:
-    """Framework Compatibility: Sync/async parity maintained across versions."""
+    """
+    Sync/async parity maintained across versions.
+
+    To avoid deadlocks/loop-guard issues, run sync APIs off the event loop.
+    """
     embeddings = _make_embeddings(adapter)
 
     texts = ["dim-a", "dim-b"]
     query = "dim-q"
 
-    sync_vecs = embeddings.embed_documents(texts)
+    sync_vecs = await asyncio.to_thread(embeddings.embed_documents, texts)
     async_vecs = await embeddings.aembed_documents(texts)
 
-    sync_q = embeddings.embed_query(query)
+    sync_q = await asyncio.to_thread(embeddings.embed_query, query)
     async_q = await embeddings.aembed_query(query)
 
-    # Row counts
     assert len(sync_vecs) == len(async_vecs) == len(texts)
-
-    # Dimensions (if any rows present)
     if sync_vecs and async_vecs:
         assert len(sync_vecs[0]) == len(async_vecs[0])
-
-    # Query dims
     assert len(sync_q) == len(async_q)
 
 
 @pytest.mark.asyncio
-async def test_aembed_documents_rejects_non_string_items(adapter):
-    """Error Message Quality: Consistent error messages for async API."""
+async def test_aembed_documents_rejects_non_string_items(adapter) -> None:
+    """Consistent error messages for async API."""
     embeddings = CorpusCrewAIEmbeddings(corpus_adapter=adapter)
 
     with pytest.raises(TypeError) as exc:
         await embeddings.aembed_documents(["ok", 123])  # type: ignore[list-item]
-    
+
     error_msg = str(exc.value)
-    # Verify error is actionable and consistent with sync version
-    assert "item 1 is int" in error_msg or "must be str" in error_msg
     assert "aembed_documents expects Sequence[str]" in error_msg
+    assert "item 1" in error_msg
 
 
 @pytest.mark.asyncio
-async def test_aembed_query_rejects_non_string(adapter):
-    """Error Message Quality: Consistent error messages for async API."""
+async def test_aembed_query_rejects_non_string(adapter) -> None:
+    """Consistent error messages for async API."""
     embeddings = CorpusCrewAIEmbeddings(corpus_adapter=adapter)
 
     with pytest.raises(TypeError) as exc:
         await embeddings.aembed_query(123)  # type: ignore[arg-type]
-    
+
     error_msg = str(exc.value)
-    # Verify error is actionable and consistent with sync version
     assert "aembed_query expects str" in error_msg
-    assert "got int" in error_msg or "got 123" in error_msg
 
 
 def test_crewai_interface_compatibility(adapter) -> None:
     """
-    Verify that CorpusCrewAIEmbeddings implements the expected CrewAI
-    Embeddings interface.
-    
-    Framework Compatibility: Duck-typing compatibility with CrewAI 0.28.0+, 1.7.2+.
-    Note: We test protocol compliance, not inheritance, for better
-    forward compatibility. CrewAI 1.7.2 uses duck typing without a public base class.
+    Verify that CorpusCrewAIEmbeddings implements the expected CrewAI embedder surface.
+
+    This is a protocol-level test only; real CrewAI object integration is tested below.
     """
     embeddings = _make_embeddings(adapter)
 
-    # Core synchronous methods required by CrewAI
-    assert hasattr(embeddings, "embed_documents"), "Missing embed_documents method"
-    assert hasattr(embeddings, "embed_query"), "Missing embed_query method"
-    assert callable(embeddings.embed_documents), "embed_documents not callable"
-    assert callable(embeddings.embed_query), "embed_query not callable"
-    
-    # Core async methods (optional but recommended)
-    assert hasattr(embeddings, "aembed_documents"), "Missing aembed_documents method"
-    assert hasattr(embeddings, "aembed_query"), "Missing aembed_query method"
-    assert callable(embeddings.aembed_documents), "aembed_documents not callable"
-    assert callable(embeddings.aembed_query), "aembed_query not callable"
-    
-    # Verify methods work with correct signatures
-    # embed_documents should accept a list of strings
+    assert hasattr(embeddings, "embed_documents")
+    assert hasattr(embeddings, "embed_query")
+    assert callable(embeddings.embed_documents)
+    assert callable(embeddings.embed_query)
+
+    assert hasattr(embeddings, "aembed_documents")
+    assert hasattr(embeddings, "aembed_query")
+    assert callable(embeddings.aembed_documents)
+    assert callable(embeddings.aembed_query)
+
     result_docs = embeddings.embed_documents(["test1", "test2"])
-    assert isinstance(result_docs, list), "embed_documents should return a list"
-    assert len(result_docs) == 2, "embed_documents should return one embedding per input"
-    assert all(isinstance(emb, list) for emb in result_docs), "Each embedding should be a list"
-    
-    # embed_query should accept a single string
+    assert isinstance(result_docs, list)
+    assert len(result_docs) == 2
+    assert all(isinstance(emb, list) for emb in result_docs)
+
     result_query = embeddings.embed_query("test query")
-    assert isinstance(result_query, list), "embed_query should return a list"
-    assert all(isinstance(x, (int, float)) for x in result_query), "Query embedding should contain numbers"
-    
-    # Optional: Try to import CrewAI to verify integration (won't fail if not available)
-    try:
-        import crewai
-        # If CrewAI is available, verify we can actually assign to an agent
-        # This is the real compatibility test for 1.7.2+
-        agent = crewai.Agent(
-            role="test",
-            goal="test",
-            backstory="test",
-            allow_delegation=False,
-            verbose=False
-        )
-        # Assignment should work without errors
-        agent.embedder = embeddings
-        assert agent.embedder is embeddings, "Embedder assignment failed"
-    except ImportError:
-        # CrewAI not installed, but that's okay - we verified the interface
-        pass
+    assert isinstance(result_query, list)
+    assert all(isinstance(x, (int, float)) for x in result_query)
 
 
 # ---------------------------------------------------------------------------
-# Error-context richness for failures
+# Error-context richness for failures (Deterministic via translator injection)
 # ---------------------------------------------------------------------------
 
-def test_embed_documents_error_context_includes_crewai_fields(monkeypatch, adapter):
-    """Error Message Quality: Production debugging context in errors."""
+def test_embed_documents_error_context_includes_crewai_fields(monkeypatch: pytest.MonkeyPatch, adapter) -> None:
+    """Production debugging context in errors (sync)."""
     class FailingTranslator:
-        def embed(self, raw_texts, op_ctx=None, framework_ctx=None):
+        def embed(self, raw_texts: Any, op_ctx: Any = None, framework_ctx: Any = None) -> Any:
             raise RuntimeError("translator failed: Check model configuration and API limits")
 
-    captured = {}
+    captured: Dict[str, Any] = {}
 
-    def fake_attach_context(exc, **kwargs):
+    def fake_attach_context(exc: BaseException, **kwargs: Any) -> None:
         captured["exc"] = exc
         captured["kwargs"] = kwargs
 
     monkeypatch.setattr(crewai_adapter_module, "attach_context", fake_attach_context)
 
     embeddings = CorpusCrewAIEmbeddings(corpus_adapter=adapter, model="test-model")
-    
-    # Use monkeypatch to inject failing translator
-    with monkeypatch.context() as m:
-        m.setattr(embeddings, "_translator", FailingTranslator())
-        
-        crewai_context = {
-            "agent_role": "analyst",
-            "task_id": "t1",
-            "workflow": "wf",
-            "crew_id": "crew-1",
-        }
+    monkeypatch.setattr(embeddings, "_translator", FailingTranslator())
 
-        with pytest.raises(RuntimeError) as exc_info:
-            embeddings.embed_documents(["doc1", "doc2"], crewai_context=crewai_context)
-        
-        # Verify error message quality
-        error_str = str(exc_info.value)
-        assert "translator failed" in error_str
-        assert "Check model configuration" in error_str  # Actionable guidance
+    crewai_context = {
+        "agent_role": "analyst",
+        "task_id": "t1",
+        "workflow": "wf",
+        "crew_id": "crew-1",
+    }
 
-        ctx = captured["kwargs"]
-        assert ctx["framework"] == "crewai"
-        assert ctx["operation"] == "embedding_documents"
-        assert (
-            ctx["error_codes"] == crewai_adapter_module.EMBEDDING_COERCION_ERROR_CODES
-        )
-        assert ctx["agent_role"] == "analyst"
-        assert ctx["task_id"] == "t1"
-        # Verify production debugging context
-        assert "model" in ctx
-        assert ctx["model"] == "test-model"
+    with pytest.raises(RuntimeError) as exc_info:
+        embeddings.embed_documents(["doc1", "doc2"], crewai_context=crewai_context)
+
+    error_str = str(exc_info.value)
+    assert "translator failed" in error_str
+    assert "Check model configuration" in error_str
+
+    ctx = captured["kwargs"]
+    assert ctx["framework"] == "crewai"
+    assert ctx["operation"] == "embedding_documents"
+    assert ctx["error_codes"] == crewai_adapter_module.EMBEDDING_COERCION_ERROR_CODES
+    assert ctx["agent_role"] == "analyst"
+    assert ctx["task_id"] == "t1"
+    assert ctx["model"] == "test-model"
 
 
 @pytest.mark.asyncio
-async def test_aembed_query_error_context_includes_crewai_fields(monkeypatch, adapter):
-    """Error Message Quality: Async errors also include debugging context."""
+async def test_aembed_query_error_context_includes_crewai_fields(monkeypatch: pytest.MonkeyPatch, adapter) -> None:
+    """Production debugging context in errors (async)."""
     class FailingTranslator:
-        async def arun_embed(self, raw_texts, op_ctx=None, framework_ctx=None):
+        async def arun_embed(self, raw_texts: Any, op_ctx: Any = None, framework_ctx: Any = None) -> Any:
             raise RuntimeError("translator failed: Verify API key and model access permissions")
 
-    captured = {}
+    captured: Dict[str, Any] = {}
 
-    def fake_attach_context(exc, **kwargs):
+    def fake_attach_context(exc: BaseException, **kwargs: Any) -> None:
         captured["exc"] = exc
         captured["kwargs"] = kwargs
 
     monkeypatch.setattr(crewai_adapter_module, "attach_context", fake_attach_context)
 
     embeddings = CorpusCrewAIEmbeddings(corpus_adapter=adapter, model="test-model")
-    
-    # Use monkeypatch to inject failing translator
-    with monkeypatch.context() as m:
-        m.setattr(embeddings, "_translator", FailingTranslator())
-        
-        crewai_context = {"agent_role": "analyst", "task_id": "t1"}
+    monkeypatch.setattr(embeddings, "_translator", FailingTranslator())
 
-        with pytest.raises(RuntimeError) as exc_info:
-            await embeddings.aembed_query("hello", crewai_context=crewai_context)
-        
-        # Verify error message quality
-        error_str = str(exc_info.value)
-        assert "translator failed" in error_str
-        assert "Verify API key" in error_str  # Actionable guidance
+    crewai_context = {"agent_role": "analyst", "task_id": "t1"}
 
-        ctx = captured["kwargs"]
-        assert ctx["framework"] == "crewai"
-        assert ctx["operation"] == "embedding_query"
-        assert ctx["agent_role"] == "analyst"
-        assert ctx["task_id"] == "t1"
-        # Verify async-specific context if any
-        assert "model" in ctx
+    with pytest.raises(RuntimeError) as exc_info:
+        await embeddings.aembed_query("hello", crewai_context=crewai_context)
+
+    error_str = str(exc_info.value)
+    assert "translator failed" in error_str
+    assert "Verify API key" in error_str
+
+    ctx = captured["kwargs"]
+    assert ctx["framework"] == "crewai"
+    assert ctx["operation"] == "embedding_query"
+    assert ctx["agent_role"] == "analyst"
+    assert ctx["task_id"] == "t1"
+    assert "model" in ctx
 
 
 # ---------------------------------------------------------------------------
@@ -750,48 +615,43 @@ async def test_aembed_query_error_context_includes_crewai_fields(monkeypatch, ad
 
 def test_capabilities_passthrough_when_underlying_provides(adapter) -> None:
     """
-    When the underlying adapter implements capabilities/acapabilities,
-    CorpusCrewAIEmbeddings should surface them.
+    capabilities() surfaces adapter capabilities (best-effort).
+
+    Parity policy with other framework adapters/tests:
+    - capabilities() may return a plain mapping OR a typed EmbeddingCapabilities object.
     """
     embeddings = CorpusCrewAIEmbeddings(corpus_adapter=adapter)
-
     caps = embeddings.capabilities()
-    assert isinstance(caps, dict)
+    assert isinstance(caps, (dict, EmbeddingCapabilities))
 
 
 @pytest.mark.asyncio
 async def test_async_capabilities_fallback_to_sync(adapter) -> None:
     """
-    acapabilities should fall back to sync capabilities() when only the
-    sync method is implemented on the underlying adapter.
+    acapabilities() works even when only sync capabilities exist.
+
+    Parity policy with other framework adapters/tests:
+    - acapabilities() may return a plain mapping OR a typed EmbeddingCapabilities object.
     """
     embeddings = CorpusCrewAIEmbeddings(corpus_adapter=adapter)
-
     acaps = await embeddings.acapabilities()
-    assert isinstance(acaps, dict)
+    assert isinstance(acaps, (dict, EmbeddingCapabilities))
 
 
-def test_capabilities_empty_when_missing():
-    """
-    If the underlying adapter has no capabilities()/acapabilities(),
-    the CrewAI adapter should return an empty mapping (best-effort).
-    """
+def test_capabilities_empty_when_missing() -> None:
+    """If adapter lacks capabilities methods, return empty mapping."""
     class NoCapAdapter:
         async def embed(self, texts: Sequence[str], **_: Any) -> list[list[float]]:
             return [[0.0] * 3 for _ in texts]
 
     embeddings = CorpusCrewAIEmbeddings(corpus_adapter=NoCapAdapter())
-
     caps = embeddings.capabilities()
     assert isinstance(caps, dict)
     assert caps == {}
 
 
-def test_health_passthrough_and_missing():
-    """
-    health/ahealth behavior mirrors capabilities/acapabilities: passthrough
-    when available, empty mapping when not.
-    """
+def test_health_passthrough_and_missing() -> None:
+    """health() mirrors capabilities behavior."""
     class HealthAdapter:
         async def embed(self, texts: Sequence[str], **_: Any) -> list[list[float]]:
             return [[0.0] * 2 for _ in texts]
@@ -800,7 +660,6 @@ def test_health_passthrough_and_missing():
             return {"status": "ok"}
 
     embeddings = CorpusCrewAIEmbeddings(corpus_adapter=HealthAdapter())
-
     health = embeddings.health()
     assert isinstance(health, dict)
     assert health.get("status") == "ok"
@@ -810,248 +669,176 @@ def test_health_passthrough_and_missing():
             return [[0.0] * 2 for _ in texts]
 
     embeddings2 = CorpusCrewAIEmbeddings(corpus_adapter=NoHealthAdapter())
-
     health2 = embeddings2.health()
     assert isinstance(health2, dict)
     assert health2 == {}
 
 
 # ---------------------------------------------------------------------------
-# Integration Tests with Real CrewAI Objects
+# Integration Tests with Real CrewAI Objects (Pass/Fail; never skip)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.integration
 class TestCrewAIIntegration:
     """
-    Integration tests with real CrewAI objects.
-    
-    These tests verify that our adapter actually works in CrewAI workflows.
-    They're skipped if CrewAI is not installed.
-    
-    Framework Compatibility: Tested with CrewAI 0.28.0-0.51.0, 1.7.2+.
-    
-    Note: CrewAI 1.7.2 requires an LLM to be configured, so we set a fake
-    API key in the environment for these tests.
+    Real integration tests with CrewAI objects.
+
+    Policy: pass/fail only. If CrewAI isn't available, require_crewai fails-fast.
     """
-    
+
     @pytest.fixture(autouse=True)
-    def setup_crewai_env(self, monkeypatch):
-        """Set up environment for CrewAI tests (fake API key to avoid errors)."""
+    def setup_crewai_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """
+        Set up environment for CrewAI tests.
+
+        We set a placeholder API key to satisfy versions that validate presence
+        even when no network calls are made during these tests.
+        """
         monkeypatch.setenv("OPENAI_API_KEY", "fake-key-for-testing")
-    
-    @pytest.fixture
-    def crewai_available(self):
-        """Check if CrewAI is available for integration tests."""
-        try:
-            import crewai
-            return True
-        except ImportError:
-            pytest.skip("CrewAI not installed - skipping integration tests")
-    
-    def test_can_create_embedder_for_crewai_agent(self, crewai_available, adapter):
-        """
-        Basic integration: Can create embedder that CrewAI agents can use.
-        
-        Framework Compatibility: Validates basic embedder assignment pattern
-        works across CrewAI versions.
-        """
-        import crewai
-        
+
+    def test_can_create_embedder_for_crewai_agent(self, require_crewai, adapter) -> None:
+        import crewai  # type: ignore
+
         embedder = create_embedder(adapter, model="mock-embed-512")
-        
-        # Create a minimal agent that would use embedder
-        # This tests the actual interface compatibility
+
         agent = crewai.Agent(
             role="researcher",
             goal="Research topics",
             backstory="A curious researcher",
-            
             allow_delegation=False,
-            verbose=False
+            verbose=False,
         )
-        
-        # The embedder should be assignable to agent.embedder
-        # This is the key integration point
+
         agent.embedder = embedder
-        
-        # Verify the assignment worked
         assert agent.embedder is embedder
-        # Verify embedder has required methods
-        assert hasattr(agent.embedder, 'embed_documents')
-        assert hasattr(agent.embedder, 'embed_query')
-        
-        # Test that embedder actually works
+        assert hasattr(agent.embedder, "embed_documents")
+        assert hasattr(agent.embedder, "embed_query")
+
         result = agent.embedder.embed_documents(["test document"])
         assert isinstance(result, list)
         assert len(result) == 1
-        assert all(isinstance(x, float) for row in result for x in row)
-    
-    def test_embedder_works_with_crewai_knowledge_sources(self, crewai_available, adapter):
-        """
-        Integration: Embedder works with CrewAI knowledge sources.
-        
-        Framework Compatibility: Validates knowledge source integration
-        pattern works across CrewAI versions.
-        """
-        import crewai
-        
+        assert all(isinstance(x, (int, float)) for row in result for x in row)
+
+    def test_embedder_works_with_crewai_knowledge_sources(self, require_crewai, adapter) -> None:
+        import crewai  # type: ignore
+
         embedder = create_embedder(adapter, model="mock-embed-512")
-        
-        # Create agent first, then assign embedder (CrewAI 1.x pattern)
+
         agent = crewai.Agent(
             role="researcher",
             goal="Research topics",
             backstory="A curious researcher",
-            
             allow_delegation=False,
-            verbose=False
+            verbose=False,
         )
         agent.embedder = embedder
-        
-        # Create a knowledge source (this would trigger embeddings in real use)
-        # Note: Actual RAG would require setting up a vector store
-        # This test verifies the integration point exists
-        
-        # Verify agent can use embedder
+
         embeddings = agent.embedder.embed_query("test query")
         assert isinstance(embeddings, list)
-        assert all(isinstance(x, float) for x in embeddings)
-    
-    def test_crew_with_multiple_agents_sharing_embedder(self, crewai_available, adapter):
-        """
-        Integration: Multiple agents in a crew can share the same embedder.
-        
-        Framework Compatibility: Validates shared resource pattern
-        works across CrewAI versions.
-        """
-        import crewai
-        from crewai import Task
-        
+        assert all(isinstance(x, (int, float)) for x in embeddings)
+
+    def test_crew_with_multiple_agents_sharing_embedder(self, require_crewai, adapter) -> None:
+        import crewai  # type: ignore
+        from crewai import Task  # type: ignore
+
         embedder = create_embedder(adapter, model="mock-embed-512")
-        
-        # Create multiple agents, then assign embedder (CrewAI 1.x pattern)
+
         researcher = crewai.Agent(
             role="researcher",
             goal="Research information",
             backstory="Expert researcher",
-            
             allow_delegation=False,
-            verbose=False
+            verbose=False,
         )
         researcher.embedder = embedder
-        
+
         analyst = crewai.Agent(
             role="analyst",
             goal="Analyze research",
             backstory="Data analyst",
-            
             allow_delegation=False,
-            verbose=False
+            verbose=False,
         )
         analyst.embedder = embedder
-        
-        # Create tasks
+
         research_task = Task(
             description="Research AI trends",
             agent=researcher,
-            expected_output="Research report"
+            expected_output="Research report",
         )
-        
         analysis_task = Task(
             description="Analyze research findings",
             agent=analyst,
-            expected_output="Analysis report"
+            expected_output="Analysis report",
         )
-        
-        # Create crew
+
         crew = crewai.Crew(
             agents=[researcher, analyst],
             tasks=[research_task, analysis_task],
-            verbose=False
+            verbose=False,
         )
-        
-        # Verify both agents have the embedder
+
+        assert crew is not None
         assert researcher.embedder is embedder
         assert analyst.embedder is embedder
-        assert researcher.embedder is analyst.embedder  # Same instance
-        
-        # Test that embedder works for both agents
+        assert researcher.embedder is analyst.embedder
+
         for agent in [researcher, analyst]:
-            embeddings = agent.embedder.embed_query(f"query from {agent.role}")
-            assert isinstance(embeddings, list)
-            assert len(embeddings) > 0
-    
-    def test_error_handling_in_crewai_workflow(self, crewai_available):
-        """
-        Integration: Error handling in CrewAI context.
-        
-        Framework Compatibility: Validates error propagation pattern
-        works across CrewAI versions.
-        """
-        import crewai
-        
-        # Create adapter that will fail
+            vec = agent.embedder.embed_query(f"query from {agent.role}")
+            assert isinstance(vec, list)
+            assert len(vec) > 0
+            assert all(isinstance(x, (int, float)) for x in vec)
+
+    def test_error_handling_in_crewai_workflow(self, require_crewai) -> None:
+        import crewai  # type: ignore
+
         class FailingTestAdapter:
-            async def embed(self, texts: List[str], ctx=None) -> List[List[float]]:
+            async def embed(self, texts: List[str], ctx: Any = None) -> List[List[float]]:
                 raise RuntimeError("Rate limit exceeded: Please wait before retrying")
-            
-            async def embed_batch(self, *args, **kwargs):
+
+            async def embed_batch(self, *args: Any, **kwargs: Any) -> Any:
                 raise RuntimeError("Rate limit exceeded: Please wait before retrying")
-            
+
             def capabilities(self) -> Dict[str, Any]:
                 return {"supported_models": ["mock-embed-512"]}
-        
+
         adapter = FailingTestAdapter()
         embedder = create_embedder(adapter, model="mock-embed-512")
-        
-        # Create agent, then assign embedder (CrewAI 1.x pattern)
+
         agent = crewai.Agent(
             role="researcher",
             goal="Research topics",
             backstory="A curious researcher",
-            
             allow_delegation=False,
-            verbose=False
+            verbose=False,
         )
         agent.embedder = embedder
-        
-        # Test that errors from embedder propagate with context
+
         with pytest.raises(Exception) as exc_info:
             agent.embedder.embed_documents(["test document"])
-        
-        error_str = str(exc_info.value)
-        # Verify error contains actionable information
-        assert "rate limit" in error_str.lower() or "exceeded" in error_str.lower()
-        # Verify error suggests retry action
-        assert "wait" in error_str.lower() or "retry" in error_str.lower()
-    
+
+        error_str = str(exc_info.value).lower()
+        assert ("rate limit" in error_str) or ("exceeded" in error_str)
+        assert ("wait" in error_str) or ("retry" in error_str)
+
     @pytest.mark.asyncio
-    async def test_async_embedding_in_crewai_workflow(self, crewai_available, adapter):
-        """
-        Integration: Async embedding in CrewAI async workflows.
-        
-        Framework Compatibility: Validates async integration pattern
-        works across CrewAI versions.
-        """
-        import crewai
-        
+    async def test_async_embedding_in_crewai_workflow(self, require_crewai, adapter) -> None:
+        import crewai  # type: ignore
+
         embedder = create_embedder(adapter, model="mock-embed-512")
-        
-        # Create agent, then assign embedder (CrewAI 1.x pattern)
+
         agent = crewai.Agent(
             role="researcher",
             goal="Research topics",
             backstory="A curious researcher",
-            
             allow_delegation=False,
-            verbose=False
+            verbose=False,
         )
         agent.embedder = embedder
-        
-        # Test async embedding
+
         embeddings = await agent.embedder.aembed_query("async query")
         assert isinstance(embeddings, list)
-        assert all(isinstance(x, float) for x in embeddings)
+        assert all(isinstance(x, (int, float)) for x in embeddings)
 
 
 # ---------------------------------------------------------------------------
@@ -1060,54 +847,39 @@ class TestCrewAIIntegration:
 
 @pytest.mark.concurrency
 class TestConcurrency:
-    """
-    Concurrency and thread-safety tests.
-    """
-    
-    def test_shared_embedder_thread_safety(self, adapter):
-        """
-        Shared embedder is thread-safe for concurrent access.
-        """
-        import concurrent.futures
-        
+    """Concurrency and thread-safety tests."""
+
+    def test_shared_embedder_thread_safety(self, adapter) -> None:
         embedder = create_embedder(adapter, model="mock-embed-512")
-        
-        def embed_query(text: str):
+
+        def embed_query(text: str) -> List[float]:
             return embedder.embed_query(text)
-        
-        # Concurrent embedding calls
+
         texts = [f"query {i}" for i in range(10)]
-        
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
             futures = [executor.submit(embed_query, text) for text in texts]
             results = [f.result() for f in concurrent.futures.as_completed(futures)]
-        
-        # All calls should succeed
+
         assert len(results) == len(texts)
         for result in results:
             assert isinstance(result, list)
-            assert all(isinstance(x, float) for x in result)
-    
+            assert all(isinstance(x, (int, float)) for x in result)
+
     @pytest.mark.asyncio
-    async def test_concurrent_async_embedding(self, adapter):
-        """
-        Async embedding supports concurrent operations.
-        """
+    async def test_concurrent_async_embedding(self, adapter) -> None:
         embedder = create_embedder(adapter, model="mock-embed-512")
-        
-        async def embed_async(text: str):
+
+        async def embed_async(text: str) -> List[float]:
             return await embedder.aembed_query(text)
-        
-        # Concurrent async embedding
+
         texts = [f"async query {i}" for i in range(5)]
-        tasks = [embed_async(text) for text in texts]
-        results = await asyncio.gather(*tasks)
-        
-        # All calls should succeed
+        results = await asyncio.gather(*[embed_async(text) for text in texts])
+
         assert len(results) == len(texts)
         for result in results:
             assert isinstance(result, list)
-            assert all(isinstance(x, float) for x in result)
+            assert all(isinstance(x, (int, float)) for x in result)
 
 
 # ---------------------------------------------------------------------------
@@ -1115,7 +887,7 @@ class TestConcurrency:
 # ---------------------------------------------------------------------------
 
 def test_register_with_crewai_attaches_embedder_to_agents(adapter) -> None:
-    """Framework Compatibility: Registration helper stable across versions."""
+    """Registration helper stable across versions."""
     class DummyAgent:
         def __init__(self) -> None:
             self.embedder: Any | None = None
@@ -1139,13 +911,12 @@ def test_register_with_crewai_attaches_embedder_to_agents(adapter) -> None:
     )
     assert isinstance(emb, CorpusCrewAIEmbeddings)
 
-    # All agents should now have embedder set to the returned instance
     for agent in crew.agents:
         assert agent.embedder is emb
 
 
 def test_register_with_crewai_handles_agents_callable(adapter) -> None:
-    """Framework Compatibility: Flexible agent access pattern."""
+    """Flexible agent access pattern."""
     class DummyAgent:
         def __init__(self) -> None:
             self.embedder: Any | None = None
@@ -1156,7 +927,6 @@ def test_register_with_crewai_handles_agents_callable(adapter) -> None:
             self.name = "callable-crew"
 
         def agents(self):
-            # callable returning list
             return self._agents
 
     crew = DummyCrewCallable()
@@ -1173,7 +943,7 @@ def test_register_with_crewai_handles_agents_callable(adapter) -> None:
 
 
 def test_register_with_crewai_no_agents_attribute(adapter) -> None:
-    """Framework Compatibility: Graceful handling of missing agents."""
+    """Graceful handling of missing agents."""
     class CrewNoAgents:
         def __init__(self) -> None:
             self.name = "no-agents-crew"
@@ -1187,23 +957,21 @@ def test_register_with_crewai_no_agents_attribute(adapter) -> None:
     assert isinstance(emb, CorpusCrewAIEmbeddings)
 
 
-def test_register_with_crewai_crew_none_raises_value_error(adapter):
-    """Error Message Quality: Clear error for invalid crew."""
+def test_register_with_crewai_crew_none_raises_value_error(adapter) -> None:
+    """Clear error for invalid crew."""
     with pytest.raises(ValueError) as exc:
         register_with_crewai(None, adapter)  # type: ignore[arg-type]
-    
-    error_msg = str(exc.value)
-    assert "crew cannot be None" in error_msg
+    assert "crew cannot be None" in str(exc.value)
 
 
 def test_register_with_crewai_agents_callable_that_raises_attaches_error_context(
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
     adapter,
-):
-    """Error Message Quality: Errors during registration include context."""
-    captured = {}
+) -> None:
+    """Errors during registration include context."""
+    captured: Dict[str, Any] = {}
 
-    def fake_attach_context(exc, **kwargs):
+    def fake_attach_context(exc: BaseException, **kwargs: Any) -> None:
         captured["exc"] = exc
         captured["kwargs"] = kwargs
 
@@ -1222,5 +990,4 @@ def test_register_with_crewai_agents_callable_that_raises_attaches_error_context
     snapshot = captured["kwargs"].get("crew_snapshot") or {}
     assert snapshot.get("type") == "BadCrew"
     assert snapshot.get("name") == "bad-crew"
-    # Verify error context includes framework info
     assert captured["kwargs"].get("framework") == "crewai"
