@@ -192,6 +192,10 @@ def _safe_snapshot(value: Any, *, max_items: int = 100, max_str: int = 5_000) ->
     - Limits container size to reduce log bloat
     - Truncates long strings
     - Falls back to repr() for unknown objects
+
+    NOTE:
+    - This is intended for observability payloads; it does not guarantee
+      redaction of secrets, but it significantly reduces accidental large dumps.
     """
     try:
         if value is None or isinstance(value, (bool, int, float)):
@@ -206,9 +210,10 @@ def _safe_snapshot(value: Any, *, max_items: int = 100, max_str: int = 5_000) ->
                     break
                 out[str(k)] = _safe_snapshot(v, max_items=max_items, max_str=max_str)
             return out
-        if isinstance(value, (list, tuple)):
+        # Include set support for parity with other framework adapters (e.g., tags)
+        if isinstance(value, (list, tuple, set)):
             out_list: List[Any] = []
-            for idx, v in enumerate(value):
+            for idx, v in enumerate(list(value)):
                 if idx >= max_items:
                     out_list.append(f"… truncated after {max_items} items")
                     break
@@ -226,12 +231,27 @@ def _validate_text_is_string(text: Any, *, op_name: str) -> None:
 
 def _validate_texts_are_strings(texts: Sequence[Any], *, op_name: str) -> None:
     for i, t in enumerate(texts):
+        # Tests look for "item 1 is int"/"item 1 is object" style wording.
         if not isinstance(t, str):
-            # Tests look for "item 1 is int"/"item 1 is object" style wording.
             raise TypeError(f"{op_name} expects Sequence[str]; item {i} is {type(t).__name__}")
 
 
 def _normalize_sk_config(sk_config: Mapping[str, Any]) -> SemanticKernelAdapterConfig:
+    """
+    Validate and normalize adapter-level Semantic Kernel configuration.
+
+    IMPORTANT:
+    - Rejects unknown keys to prevent silent misconfiguration.
+    - Coerces bool/int values defensively for robustness.
+    """
+    allowed_keys = {"enable_operation_context_propagation", "strict_text_types", "max_items_in_context"}
+    unknown = set(dict(sk_config).keys()) - allowed_keys
+    if unknown:
+        raise ValueError(
+            f"[{ErrorCodes.SEMANTIC_KERNEL_CONFIG_INVALID}] "
+            f"sk_config contains unknown keys: {sorted(unknown)}"
+        )
+
     cfg: SemanticKernelAdapterConfig = dict(sk_config)  # type: ignore[assignment]
     cfg.setdefault("enable_operation_context_propagation", True)
     cfg.setdefault("strict_text_types", True)
@@ -270,11 +290,48 @@ def _ensure_not_in_event_loop(
     )
 
 
+def _maybe_close_sync(obj: Any) -> None:
+    """
+    Best-effort *sync* resource cleanup.
+
+    Preference:
+      1) aclose() if present:
+           - if it returns a coroutine, run it via asyncio.run
+      2) close() if present:
+           - if coroutinefunction: asyncio.run(close())
+           - else call directly; if return is coroutine: asyncio.run(return)
+
+    IMPORTANT:
+      Callers must ensure they are NOT in a running event loop (use _ensure_not_in_event_loop).
+    """
+    if obj is None:
+        return
+
+    aclose = getattr(obj, "aclose", None)
+    if callable(aclose):
+        res = aclose()
+        if asyncio.iscoroutine(res):
+            asyncio.run(res)
+        return
+
+    close = getattr(obj, "close", None)
+    if not callable(close):
+        return
+
+    if asyncio.iscoroutinefunction(close):
+        asyncio.run(close())
+        return
+
+    res = close()
+    if asyncio.iscoroutine(res):
+        asyncio.run(res)
+
+
 async def _maybe_close_async(obj: Any) -> None:
     """
     Best-effort async resource cleanup with prioritization.
 
-    - Prefer an async `aclose()` method if present.
+    - Prefer an async `aclose()` method if present (supports both async def and sync-returning-coroutine).
     - Fall back to a coroutine `close()` if defined.
     - Fall back to a sync `close()` executed in a worker thread.
     """
@@ -283,7 +340,9 @@ async def _maybe_close_async(obj: Any) -> None:
 
     aclose = getattr(obj, "aclose", None)
     if callable(aclose):
-        await aclose()
+        res = aclose()
+        if asyncio.iscoroutine(res):
+            await res
         return
 
     close = getattr(obj, "close", None)
@@ -329,46 +388,68 @@ def _extract_dynamic_context(
     if isinstance(dim_hint, int):
         ctx["embedding_dim"] = dim_hint
 
-    # Metrics
-    if operation == "embedding_query":
-        if args and isinstance(args[0], str):
-            ctx["text_len"] = len(args[0])
-    elif operation == "embedding_documents":
-        if args:
-            maybe_texts = args[0]
-            # Strings are Sequences; avoid counting characters as documents.
-            if isinstance(maybe_texts, Sequence) and not isinstance(maybe_texts, (str, bytes)):
-                texts_seq = maybe_texts
-                try:
-                    ctx["texts_count"] = len(texts_seq)  # type: ignore[arg-type]
-                    empty_count = 0
-                    for t in texts_seq:  # type: ignore[assignment]
-                        if not isinstance(t, str) or not t.strip():
-                            empty_count += 1
-                    if empty_count:
-                        ctx["empty_texts_count"] = empty_count
-                except Exception:
-                    pass
+    # Metrics (defensive: extraction must never break attach_context)
+    try:
+        if operation == "embedding_query":
+            if args and isinstance(args[0], str):
+                ctx["text_len"] = len(args[0])
+        elif operation == "embedding_documents":
+            if args:
+                maybe_texts = args[0]
+                # Strings are Sequences; avoid counting characters as documents.
+                if isinstance(maybe_texts, Sequence) and not isinstance(maybe_texts, (str, bytes)):
+                    try:
+                        ctx["texts_count"] = len(maybe_texts)  # type: ignore[arg-type]
+                    except Exception:
+                        pass
+                    try:
+                        empty_count = 0
+                        for t in maybe_texts:  # type: ignore[assignment]
+                            if not isinstance(t, str) or not t.strip():
+                                empty_count += 1
+                        if empty_count:
+                            ctx["empty_texts_count"] = empty_count
+                    except Exception:
+                        pass
+    except Exception:
+        pass
 
     sk_context = kwargs.get("sk_context")
     if isinstance(sk_context, Mapping) and sk_context:
-        for key in (
-            "plugin_name",
-            "function_name",
-            "kernel_id",
-            "memory_type",
-            "request_id",
-            "user_id",
-        ):
-            if key in sk_context:
-                ctx[key] = sk_context[key]
-        # Include a snapshot so nested fields (like execution_settings) appear in str(ctx)
-        cfg = getattr(instance, "sk_config", {}) or {}
-        max_items = int(cfg.get("max_items_in_context", 100)) if isinstance(cfg, Mapping) else 100
-        ctx["sk_context_snapshot"] = _safe_snapshot(sk_context, max_items=max_items)
+        # Extract known routing fields
+        try:
+            for key in (
+                "plugin_name",
+                "function_name",
+                "kernel_id",
+                "memory_type",
+                "request_id",
+                "user_id",
+            ):
+                if key in sk_context:
+                    ctx[key] = sk_context[key]
+        except Exception:
+            pass
+
+        # Snapshot for nested/complex cases (execution_settings, etc.)
+        try:
+            cfg = getattr(instance, "sk_config", {}) or {}
+            max_items = 100
+            if isinstance(cfg, Mapping):
+                try:
+                    max_items = int(cfg.get("max_items_in_context", 100))
+                except Exception:
+                    max_items = 100
+            ctx["sk_context_snapshot"] = _safe_snapshot(sk_context, max_items=max_items)
+        except Exception:
+            pass
+
     elif sk_context is not None and not isinstance(sk_context, Mapping):
         # Non-mapping contexts are tolerated; include a snapshot for debugging.
-        ctx["sk_context_snapshot"] = _safe_snapshot({"repr": repr(sk_context)})
+        try:
+            ctx["sk_context_snapshot"] = _safe_snapshot({"repr": repr(sk_context)})
+        except Exception:
+            pass
 
     return ctx
 
@@ -499,6 +580,7 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
         self.text_normalization_config = text_normalization_config
 
         self._embedding_dimension_override = embedding_dimension
+        # Strict config validation + normalization
         self.sk_config: SemanticKernelAdapterConfig = _normalize_sk_config(sk_config)
 
         # Thread-safe translator lazy init
@@ -624,7 +706,6 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
         try:
             dim_hint = self._embedding_dim_hint or self.embedding_dimension
         except Exception:
-            # If embedding_dimension resolution fails, we still want embeddings to work.
             dim_hint = self._embedding_dim_hint
         framework_ctx["embedding_dim_hint"] = dim_hint
 
@@ -660,7 +741,7 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
                 if isinstance(candidate, OperationContext):
                     core_ctx = candidate
             except Exception as e:  # noqa: BLE001
-                # Tests expect attach_context on translation failures in similar patterns.
+                # Context translation failures must never break embeddings.
                 try:
                     attach_context(
                         e,
@@ -706,10 +787,17 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
         dim = self.embedding_dimension
         return [0.0] * dim
 
-    def _warn_if_extreme_batch(self, texts: Sequence[str], *, op_name: str) -> None:
+    def _warn_if_extreme_batch(self, texts: Sequence[Any], *, op_name: str) -> None:
+        """
+        Soft warning for extremely large batches.
+
+        IMPORTANT:
+        - Warnings must never fail. Filter to strings so lenient mode cannot break this.
+        """
+        safe_texts: List[str] = [t for t in texts if isinstance(t, str)]
         warn_if_extreme_batch(
             framework=_FRAMEWORK_NAME,
-            texts=texts,
+            texts=safe_texts,
             op_name=op_name,
             batch_config=self.batch_config,
             logger=logger,
@@ -730,7 +818,7 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
         _ensure_not_in_event_loop("capabilities", async_alternative="acapabilities")
         return self._translator.capabilities()
 
-    @with_async_embedding_error_context("capabilities")
+    @with_async_embedding_error_context("capabilities_async")
     async def acapabilities(self) -> Mapping[str, Any]:
         """
         Async capabilities passthrough.
@@ -749,7 +837,7 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
         _ensure_not_in_event_loop("health", async_alternative="ahealth")
         return self._translator.health()
 
-    @with_async_embedding_error_context("health")
+    @with_async_embedding_error_context("health_async")
     async def ahealth(self) -> Mapping[str, Any]:
         """
         Async health passthrough.
@@ -769,28 +857,30 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
         This includes:
         - The underlying corpus_adapter
         - The EmbeddingTranslator if it was constructed and exposes close()
+
+        Deadlock prevention:
+        - Sync close must not be called from an active event loop.
+          Use aclose() instead.
         """
+        _ensure_not_in_event_loop("close", async_alternative="aclose")
+
         translator = self._translator_instance
         if isinstance(translator, EmbeddingTranslator):
-            close_translator = getattr(translator, "close", None)
-            if callable(close_translator):
-                try:
-                    close_translator()
-                except Exception as e:  # noqa: BLE001
-                    logger.warning(
-                        "Error while closing embedding translator in close(): %s",
-                        e,
-                    )
-
-        fn = getattr(self.corpus_adapter, "close", None)
-        if callable(fn):
             try:
-                fn()
+                _maybe_close_sync(translator)
             except Exception as e:  # noqa: BLE001
                 logger.warning(
-                    "Error while closing embedding adapter in close(): %s",
+                    "Error while closing embedding translator in close(): %s",
                     e,
                 )
+
+        try:
+            _maybe_close_sync(self.corpus_adapter)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "Error while closing embedding adapter in close(): %s",
+                e,
+            )
 
     async def aclose(self) -> None:
         """
@@ -887,10 +977,7 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
             else:
                 empty_indices.append(i)
 
-        self._warn_if_extreme_batch(
-            [t if isinstance(t, str) else "" for t in texts_list],
-            op_name=op_name,
-        )
+        self._warn_if_extreme_batch(texts_list, op_name=op_name)
 
         if not normalized:
             dim = self.embedding_dimension
@@ -946,10 +1033,7 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
             else:
                 empty_indices.append(i)
 
-        self._warn_if_extreme_batch(
-            [t if isinstance(t, str) else "" for t in texts_list],
-            op_name=op_name,
-        )
+        self._warn_if_extreme_batch(texts_list, op_name=op_name)
 
         if not normalized:
             dim = self.embedding_dimension
