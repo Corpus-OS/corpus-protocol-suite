@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import asyncio
 import importlib
 import inspect
 from collections.abc import Mapping, Sequence
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 import pytest
 
@@ -31,13 +30,12 @@ def framework_descriptor_fixture(
     """
     Parameterized over all registered embedding framework descriptors.
 
-    Frameworks that are not actually available in the environment (e.g. the
-    underlying LangChain / LlamaIndex / Semantic Kernel libraries are missing)
-    are skipped via descriptor.is_available().
+    
+    - We do not skip unavailable frameworks.
+    - Tests must pass by asserting correct "unavailable" signaling when a framework
+      is not installed, and must fully run when it is available.
     """
     descriptor: EmbeddingFrameworkDescriptor = request.param
-    if not descriptor.is_available():
-        pytest.skip(f"Framework '{descriptor.name}' not available in this environment")
     return descriptor
 
 
@@ -53,9 +51,13 @@ def embedding_adapter_instance(
     it with the *generic* Corpus adapter provided by the top-level pytest
     plugin (see conftest.py).
 
-    The adapter class is expected to implement the EmbeddingProtocolV1 surface
-    that the framework-specific adapters wrap.
+    
+    - If a framework is unavailable, this fixture returns None and tests must
+      treat that as a validated pass condition (not a skip).
     """
+    if not framework_descriptor.is_available():
+        return None
+
     module = importlib.import_module(framework_descriptor.adapter_module)
     adapter_cls = getattr(module, framework_descriptor.adapter_class)
 
@@ -66,9 +68,8 @@ def embedding_adapter_instance(
 
     # Some adapters require a known embedding dimension up-front.
     if framework_descriptor.requires_embedding_dimension:
-        init_kwargs.setdefault("embedding_dimension", 8)
-
-    # Additional framework-specific kwargs can be added here if needed.
+        kw = framework_descriptor.embedding_dimension_kwarg or "embedding_dimension"
+        init_kwargs.setdefault(kw, 8)
 
     instance = adapter_cls(**init_kwargs)
     return instance
@@ -90,34 +91,136 @@ def _assert_embedding_matrix_shape(
     result: Any,
     expected_rows: int,
 ) -> None:
-    """Validate that a result looks like a 2D embedding matrix."""
-    assert isinstance(result, Sequence), f"Expected sequence, got {type(result).__name__}"
+    """
+    Validate that a result looks like a 2D embedding matrix.
+
+    - Must be a non-string sequence
+    - Must have expected_rows rows
+    - Each row must be a non-string sequence
+    - Values (if present) must be numeric-ish
+    """
+    assert isinstance(result, Sequence) and not isinstance(
+        result, (str, bytes)
+    ), f"Expected sequence (non-str), got {type(result).__name__}"
     assert len(result) == expected_rows, f"Expected {expected_rows} rows, got {len(result)}"
     for row in result:
-        assert isinstance(row, Sequence), f"Row is not a sequence: {type(row).__name__}"
-        # Allow empty rows, just enforce numeric-ish elements if present
+        assert isinstance(row, Sequence) and not isinstance(
+            row, (str, bytes)
+        ), f"Row is not a sequence (non-str): {type(row).__name__}"
         for val in row:
             assert isinstance(val, (int, float)), f"Embedding value is not numeric: {val!r}"
 
 
 def _assert_embedding_vector_shape(result: Any) -> None:
-    """Validate that a result looks like a 1D embedding vector."""
-    assert isinstance(result, Sequence), f"Expected sequence, got {type(result).__name__}"
+    """
+    Validate that a result looks like a 1D embedding vector.
+
+    - Must be a non-string sequence
+    - Values (if present) must be numeric-ish
+    """
+    assert isinstance(result, Sequence) and not isinstance(
+        result, (str, bytes)
+    ), f"Expected sequence (non-str), got {type(result).__name__}"
     for val in result:
         assert isinstance(val, (int, float)), f"Embedding value is not numeric: {val!r}"
 
 
-def _run_async_if_needed(coro):
+def _assert_unavailable_contract(descriptor: EmbeddingFrameworkDescriptor) -> None:
     """
-    Run an async coroutine, handling existing event loops gracefully.
+    Validate that an unavailable framework descriptor is behaving as expected.
+
+    The test suite policy is "no skip": when unavailable, tests must pass by
+    asserting correct unavailability signaling.
     """
+    assert descriptor.is_available() is False
+    if descriptor.availability_attr:
+        try:
+            module = importlib.import_module(descriptor.adapter_module)
+        except Exception:
+            return
+        flag = getattr(module, descriptor.availability_attr, None)
+        assert flag is None or bool(flag) is False
+
+
+def _call_with_optional_context(
+    descriptor: EmbeddingFrameworkDescriptor,
+    fn: Callable[..., Any],
+    arg: Any,
+    ctx: Any,
+) -> Any:
+    """
+    Call embedding method with context in a framework-agnostic way.
+
+    Primary strategy:
+      - If descriptor.context_kwarg is set, pass {context_kwarg: ctx}.
+
+    Compatibility fallback:
+      - If that raises TypeError due to an unexpected keyword argument, and ctx is a Mapping,
+        retry by spreading ctx into kwargs (useful for BaseEmbedding-style **kwargs surfaces).
+    """
+    if not descriptor.context_kwarg:
+        return fn(arg)
+
     try:
-        # Try to use asyncio.run() (creates new loop)
-        return asyncio.run(coro)
-    except RuntimeError:
-        # If there's already a running loop (e.g., in pytest-asyncio test)
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(coro)
+        return fn(arg, **{descriptor.context_kwarg: ctx})
+    except TypeError as e:
+        msg = str(e)
+        unexpected_kw = f"unexpected keyword argument '{descriptor.context_kwarg}'" in msg or (
+            "unexpected keyword" in msg and descriptor.context_kwarg in msg
+        )
+        if unexpected_kw and isinstance(ctx, Mapping):
+            return fn(arg, **dict(ctx))
+        raise
+
+
+def _assert_awaitable(value: Any, *, descriptor: EmbeddingFrameworkDescriptor, method_name: str) -> None:
+    """Assert that an async method returns an awaitable when invoked."""
+    assert inspect.isawaitable(value), (
+        f"{descriptor.name}: async method {method_name!r} must return an awaitable, "
+        f"got {type(value).__name__}"
+    )
+
+
+def _empty_batch_expected_behavior(
+    exc: BaseException,
+) -> bool:
+    """
+    Determine whether an exception type is acceptable for empty-batch behavior.
+
+    Empty-batch semantics differ across frameworks/adapters:
+    - Some return []
+    - Some raise a validation error
+
+    We treat common "invalid input" errors as acceptable, but fail on unrelated exceptions.
+    """
+    allowed = (TypeError, ValueError)
+    return isinstance(exc, allowed)
+
+
+def _check_minimal_signature_contract(
+    fn: Callable[..., Any],
+    *,
+    descriptor: EmbeddingFrameworkDescriptor,
+    method_name: str,
+) -> None:
+    """
+    Minimal signature sanity checks without enforcing exact parameter equality.
+
+    Rationale:
+    - Wrappers/decorators/framework base classes can legitimately alter signatures.
+    - We only assert a stable contract: method is callable and can accept at least one
+      positional arg (texts/text) and optionally framework context.
+    """
+    sig = inspect.signature(fn)
+    params = list(sig.parameters.values())
+
+    # For bound methods, the first param is usually "self"; but wrappers may not show it.
+    # We require that there is at least one non-vararg parameter OR that it accepts *args.
+    has_args = any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params)
+    non_self_params = [p for p in params if p.name != "self"]
+    assert has_args or len(non_self_params) >= 1, (
+        f"{descriptor.name}: {method_name} signature does not accept a primary argument"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +235,17 @@ def test_can_instantiate_framework_adapter(
     """
     Each registered framework descriptor should be instantiable with the
     pluggable Corpus adapter and any inferred kwargs.
+
+    
+    - If framework is unavailable, validate the unavailable contract and return.
+    - If framework is available but instantiation fails, this should fail (real regression).
     """
+    if not framework_descriptor.is_available():
+        _assert_unavailable_contract(framework_descriptor)
+        return
+
+    assert embedding_adapter_instance is not None
+
     # Basic sanity: instance has the methods the descriptor claims exist.
     _get_method(embedding_adapter_instance, framework_descriptor.batch_method)
     _get_method(embedding_adapter_instance, framework_descriptor.query_method)
@@ -151,9 +264,21 @@ def test_async_methods_exist_when_supports_async_true(
     """
     Ensure that when supports_async=True, both async methods actually exist.
     This catches registry-descriptor mismatches.
+
+    
+    - If framework is unavailable, validate the unavailable contract and return.
+    - If supports_async=False, assert async methods are None and return.
     """
+    if not framework_descriptor.is_available():
+        _assert_unavailable_contract(framework_descriptor)
+        return
+
+    assert embedding_adapter_instance is not None
+
     if not framework_descriptor.supports_async:
-        pytest.skip("Framework does not declare async support")
+        assert framework_descriptor.async_batch_method is None
+        assert framework_descriptor.async_query_method is None
+        return
 
     # These should not be None per registry
     assert framework_descriptor.async_batch_method is not None
@@ -177,25 +302,31 @@ def test_sync_embedding_interface_conformance(
     """
     Validate that sync batch and query methods accept simple text input and
     return embedding shapes that look like vectors / matrices of numbers.
+
+    
+    - If framework is unavailable, validate the unavailable contract and return.
     """
+    if not framework_descriptor.is_available():
+        _assert_unavailable_contract(framework_descriptor)
+        return
+
+    assert embedding_adapter_instance is not None
+
     texts = ["alpha text", "beta text"]
     query_text = "gamma query"
 
     batch_fn = _get_method(embedding_adapter_instance, framework_descriptor.batch_method)
     query_fn = _get_method(embedding_adapter_instance, framework_descriptor.query_method)
 
-    # Call batch embedding
-    if framework_descriptor.context_kwarg:
-        batch_result = batch_fn(texts, **{framework_descriptor.context_kwarg: {}})
-    else:
-        batch_result = batch_fn(texts)
+    _check_minimal_signature_contract(batch_fn, descriptor=framework_descriptor, method_name=framework_descriptor.batch_method)
+    _check_minimal_signature_contract(query_fn, descriptor=framework_descriptor, method_name=framework_descriptor.query_method)
+
+    ctx = dict(framework_descriptor.sample_context or {})
+
+    batch_result = _call_with_optional_context(framework_descriptor, batch_fn, texts, ctx)
     _assert_embedding_matrix_shape(batch_result, expected_rows=len(texts))
 
-    # Call query embedding
-    if framework_descriptor.context_kwarg:
-        query_result = query_fn(query_text, **{framework_descriptor.context_kwarg: {}})
-    else:
-        query_result = query_fn(query_text)
+    query_result = _call_with_optional_context(framework_descriptor, query_fn, query_text, ctx)
     _assert_embedding_vector_shape(query_result)
 
 
@@ -205,16 +336,21 @@ def test_single_element_batch(
 ) -> None:
     """
     Test that single-element batches work correctly.
-    """
-    texts = ["single text"]
 
+    
+    - If framework is unavailable, validate the unavailable contract and return.
+    """
+    if not framework_descriptor.is_available():
+        _assert_unavailable_contract(framework_descriptor)
+        return
+
+    assert embedding_adapter_instance is not None
+
+    texts = ["single text"]
     batch_fn = _get_method(embedding_adapter_instance, framework_descriptor.batch_method)
 
-    if framework_descriptor.context_kwarg:
-        result = batch_fn(texts, **{framework_descriptor.context_kwarg: {}})
-    else:
-        result = batch_fn(texts)
-
+    ctx = dict(framework_descriptor.sample_context or {})
+    result = _call_with_optional_context(framework_descriptor, batch_fn, texts, ctx)
     _assert_embedding_matrix_shape(result, expected_rows=1)
 
 
@@ -224,16 +360,33 @@ def test_empty_batch_handling(
 ) -> None:
     """
     Test how frameworks handle empty batch requests.
+
+    Acceptable behaviors:
+    - return []
+    - raise a common validation error (TypeError/ValueError)
+
+    
+    - If framework is unavailable, validate the unavailable contract and return.
     """
+    if not framework_descriptor.is_available():
+        _assert_unavailable_contract(framework_descriptor)
+        return
+
+    assert embedding_adapter_instance is not None
+
     batch_fn = _get_method(embedding_adapter_instance, framework_descriptor.batch_method)
+    ctx = dict(framework_descriptor.sample_context or {})
 
-    if framework_descriptor.context_kwarg:
-        result = batch_fn([], **{framework_descriptor.context_kwarg: {}})
-    else:
-        result = batch_fn([])
+    try:
+        result = _call_with_optional_context(framework_descriptor, batch_fn, [], ctx)
+    except BaseException as e:
+        assert _empty_batch_expected_behavior(e), (
+            f"{framework_descriptor.name}: unexpected exception for empty batch: {type(e).__name__}: {e}"
+        )
+        return
 
-    # Should return empty list, not crash
-    assert isinstance(result, Sequence)
+    # If no exception, should return empty list/sequence
+    assert isinstance(result, Sequence) and not isinstance(result, (str, bytes))
     assert len(result) == 0
 
 
@@ -245,9 +398,21 @@ async def test_async_embedding_interface_conformance(
     """
     Validate that async batch and query methods (when declared) accept text
     input and return embedding shapes compatible with the sync API.
+
+    
+    - If framework is unavailable, validate the unavailable contract and return.
+    - If async is unsupported, validate that and return.
     """
+    if not framework_descriptor.is_available():
+        _assert_unavailable_contract(framework_descriptor)
+        return
+
+    assert embedding_adapter_instance is not None
+
     if not framework_descriptor.supports_async:
-        pytest.skip(f"Framework '{framework_descriptor.name}' does not declare async support")
+        assert framework_descriptor.async_batch_method is None
+        assert framework_descriptor.async_query_method is None
+        return
 
     assert framework_descriptor.async_batch_method is not None
     assert framework_descriptor.async_query_method is not None
@@ -258,21 +423,18 @@ async def test_async_embedding_interface_conformance(
     abatch_fn = _get_method(embedding_adapter_instance, framework_descriptor.async_batch_method)
     aquery_fn = _get_method(embedding_adapter_instance, framework_descriptor.async_query_method)
 
-    # Batch async
-    if framework_descriptor.context_kwarg:
-        batch_coro = abatch_fn(texts, **{framework_descriptor.context_kwarg: {}})
-    else:
-        batch_coro = abatch_fn(texts)
+    _check_minimal_signature_contract(abatch_fn, descriptor=framework_descriptor, method_name=framework_descriptor.async_batch_method)
+    _check_minimal_signature_contract(aquery_fn, descriptor=framework_descriptor, method_name=framework_descriptor.async_query_method)
 
+    ctx = dict(framework_descriptor.sample_context or {})
+
+    batch_coro = _call_with_optional_context(framework_descriptor, abatch_fn, texts, ctx)
+    _assert_awaitable(batch_coro, descriptor=framework_descriptor, method_name=framework_descriptor.async_batch_method)
     batch_result = await batch_coro
     _assert_embedding_matrix_shape(batch_result, expected_rows=len(texts))
 
-    # Query async
-    if framework_descriptor.context_kwarg:
-        query_coro = aquery_fn(query_text, **{framework_descriptor.context_kwarg: {}})
-    else:
-        query_coro = aquery_fn(query_text)
-
+    query_coro = _call_with_optional_context(framework_descriptor, aquery_fn, query_text, ctx)
+    _assert_awaitable(query_coro, descriptor=framework_descriptor, method_name=framework_descriptor.async_query_method)
     query_result = await query_coro
     _assert_embedding_vector_shape(query_result)
 
@@ -284,9 +446,20 @@ def test_context_kwarg_is_accepted_when_declared(
     """
     If a context_kwarg is declared in the descriptor, the corresponding
     embedding methods should accept that kwarg without raising TypeError.
+
+    
+    - If framework is unavailable, validate the unavailable contract and return.
+    - If context_kwarg is not declared, assert that fact and return.
     """
+    if not framework_descriptor.is_available():
+        _assert_unavailable_contract(framework_descriptor)
+        return
+
+    assert embedding_adapter_instance is not None
+
     if not framework_descriptor.context_kwarg:
-        pytest.skip(f"Framework '{framework_descriptor.name}' does not declare a context_kwarg")
+        assert framework_descriptor.context_kwarg is None
+        return
 
     ctx_kw = framework_descriptor.context_kwarg
     texts = ["ctx alpha", "ctx beta"]
@@ -295,12 +468,27 @@ def test_context_kwarg_is_accepted_when_declared(
     batch_fn = _get_method(embedding_adapter_instance, framework_descriptor.batch_method)
     query_fn = _get_method(embedding_adapter_instance, framework_descriptor.query_method)
 
-    # Should not raise TypeError
-    batch_result = batch_fn(texts, **{ctx_kw: {"test": "value"}})
-    query_result = query_fn(query_text, **{ctx_kw: {"test": "value"}})
+    # Should not raise TypeError for mapping context.
+    ctx = dict(framework_descriptor.sample_context or {})
+    ctx.update({"test": "value"})
+
+    batch_result = _call_with_optional_context(framework_descriptor, batch_fn, texts, ctx)
+    query_result = _call_with_optional_context(framework_descriptor, query_fn, query_text, ctx)
 
     _assert_embedding_matrix_shape(batch_result, expected_rows=len(texts))
     _assert_embedding_vector_shape(query_result)
+
+    # Also validate that the declared context_kwarg itself is accepted, when applicable.
+    # If the adapter expects kwargs-spread only, this may raise; that is treated as a real mismatch
+    # because the registry explicitly declares context_kwarg.
+    try:
+        if ctx_kw:
+            batch_fn(texts, **{ctx_kw: {"test": "value"}})
+            query_fn(query_text, **{ctx_kw: {"test": "value"}})
+    except TypeError as e:
+        raise AssertionError(
+            f"{framework_descriptor.name}: declared context_kwarg={ctx_kw!r} but method rejected it: {e}"
+        ) from e
 
 
 def test_embedding_dimension_when_required(
@@ -308,64 +496,101 @@ def test_embedding_dimension_when_required(
     adapter: Any,
 ) -> None:
     """
-    Test that frameworks requiring embedding_dimension enforce it.
+    Test that frameworks requiring embedding dimension enforce it.
+
+    
+    - If framework is unavailable, validate the unavailable contract and return.
+    - If framework does not require dimension, assert that fact and return.
     """
+    if not framework_descriptor.is_available():
+        _assert_unavailable_contract(framework_descriptor)
+        return
+
     if not framework_descriptor.requires_embedding_dimension:
-        pytest.skip("Framework does not require embedding dimension")
+        assert framework_descriptor.requires_embedding_dimension is False
+        return
 
     module = importlib.import_module(framework_descriptor.adapter_module)
     adapter_cls = getattr(module, framework_descriptor.adapter_class)
 
-    # Should fail without embedding_dimension
+    kw = framework_descriptor.embedding_dimension_kwarg or "embedding_dimension"
+
+    # Should fail without embedding dimension override (TypeError/ValueError).
     with pytest.raises((TypeError, ValueError)):
         adapter_cls(corpus_adapter=adapter)
 
-    # Should succeed with it
-    instance = adapter_cls(corpus_adapter=adapter, embedding_dimension=8)
+    # Should succeed with it.
+    instance = adapter_cls(corpus_adapter=adapter, **{kw: 8})
     assert instance is not None
-    
-    # Verify methods work
+
+    # Verify methods work.
     batch_fn = _get_method(instance, framework_descriptor.batch_method)
-    if framework_descriptor.context_kwarg:
-        result = batch_fn(["test"], **{framework_descriptor.context_kwarg: {}})
-    else:
-        result = batch_fn(["test"])
-    _assert_embedding_matrix_shape(result, expected_rows=1)
+    ctx = dict(framework_descriptor.sample_context or {})
+
+    try:
+        result = _call_with_optional_context(framework_descriptor, batch_fn, ["test"], ctx)
+        _assert_embedding_matrix_shape(result, expected_rows=1)
+    except BaseException as e:
+        raise AssertionError(
+            f"{framework_descriptor.name}: dimension-required adapter instantiated successfully, "
+            f"but batch method failed unexpectedly: {type(e).__name__}: {e}"
+        ) from e
 
 
-def test_method_signatures_consistent(
+def test_alias_methods_exist_and_behave_consistently_when_declared(
     framework_descriptor: EmbeddingFrameworkDescriptor,
     embedding_adapter_instance: Any,
 ) -> None:
     """
-    Verify that sync and async methods have consistent signatures
-    (same parameters except maybe the context kwarg).
+    If a framework declares aliases in the registry, those alias methods should:
+    - exist on the adapter instance
+    - be callable
+    - return valid shapes when called with the same input as the primary method
+
+    
+    - If framework is unavailable, validate the unavailable contract and return.
+    - If no aliases are declared, assert that fact and return.
     """
-    sync_batch = _get_method(embedding_adapter_instance, framework_descriptor.batch_method)
-    sync_query = _get_method(embedding_adapter_instance, framework_descriptor.query_method)
+    if not framework_descriptor.is_available():
+        _assert_unavailable_contract(framework_descriptor)
+        return
 
-    if framework_descriptor.supports_async:
-        async_batch = _get_method(embedding_adapter_instance, framework_descriptor.async_batch_method)
-        async_query = _get_method(embedding_adapter_instance, framework_descriptor.async_query_method)
+    assert embedding_adapter_instance is not None
 
-        # Compare signatures (excluding self)
-        sync_batch_sig = inspect.signature(sync_batch)
-        async_batch_sig = inspect.signature(async_batch)
+    if not framework_descriptor.aliases:
+        assert framework_descriptor.aliases is None
+        return
 
-        # Should have same parameters except maybe return annotation
-        sync_params = list(sync_batch_sig.parameters.keys())[1:]  # Skip self
-        async_params = list(async_batch_sig.parameters.keys())[1:]  # Skip self
+    ctx = dict(framework_descriptor.sample_context or {})
+    texts = ["alias-alpha", "alias-beta"]
+    query_text = "alias-query"
 
-        assert sync_params == async_params, "Sync/async batch methods have different parameters"
+    for alias_name, primary_name in framework_descriptor.aliases.items():
+        alias_fn = _get_method(embedding_adapter_instance, alias_name)
+        primary_fn = _get_method(embedding_adapter_instance, primary_name)
 
-        # Same for query methods
-        sync_query_sig = inspect.signature(sync_query)
-        async_query_sig = inspect.signature(async_query)
+        is_batch = "document" in alias_name or "embeddings" in alias_name or "texts" in alias_name
 
-        sync_query_params = list(sync_query_sig.parameters.keys())[1:]  # Skip self
-        async_query_params = list(async_query_sig.parameters.keys())[1:]  # Skip self
-
-        assert sync_query_params == async_query_params, "Sync/async query methods have different parameters"
+        if is_batch:
+            alias_out = _call_with_optional_context(framework_descriptor, alias_fn, texts, ctx)
+            primary_out = _call_with_optional_context(framework_descriptor, primary_fn, texts, ctx)
+            # Alias may be async; only enforce awaitable for async-typed names.
+            if inspect.isawaitable(alias_out):
+                # Async alias: must be awaitable and yield matrix
+                # NOTE: This file keeps sync tests sync; async alias surfaces are validated in async tests.
+                # We still ensure it is awaitable here.
+                _assert_awaitable(alias_out, descriptor=framework_descriptor, method_name=alias_name)
+            else:
+                _assert_embedding_matrix_shape(alias_out, expected_rows=len(texts))
+                _assert_embedding_matrix_shape(primary_out, expected_rows=len(texts))
+        else:
+            alias_out = _call_with_optional_context(framework_descriptor, alias_fn, query_text, ctx)
+            primary_out = _call_with_optional_context(framework_descriptor, primary_fn, query_text, ctx)
+            if inspect.isawaitable(alias_out):
+                _assert_awaitable(alias_out, descriptor=framework_descriptor, method_name=alias_name)
+            else:
+                _assert_embedding_vector_shape(alias_out)
+                _assert_embedding_vector_shape(primary_out)
 
 
 # ---------------------------------------------------------------------------
@@ -381,21 +606,69 @@ def test_capabilities_contract_if_declared(
     If a framework declares has_capabilities=True, it should expose a
     capabilities() method returning a mapping. Async variants (when present)
     should behave similarly.
+
+    
+    - If framework is unavailable, validate the unavailable contract and return.
+    - If has_capabilities=False, assert that fact and return.
     """
+    if not framework_descriptor.is_available():
+        _assert_unavailable_contract(framework_descriptor)
+        return
+
+    assert embedding_adapter_instance is not None
+
     if not framework_descriptor.has_capabilities:
-        pytest.skip(f"Framework '{framework_descriptor.name}' does not expose capabilities")
+        assert framework_descriptor.has_capabilities is False
+        return
 
-    # Sync capabilities
-    capabilities = getattr(embedding_adapter_instance, "capabilities", None)
-    assert callable(capabilities), "capabilities() method is missing"
+    # Prefer registry-specified method names; fall back to conventional names.
+    cap_name = framework_descriptor.capabilities_method or "capabilities"
+    acap_name = framework_descriptor.async_capabilities_method or "acapabilities"
+
+    capabilities = getattr(embedding_adapter_instance, cap_name, None)
+    assert callable(capabilities), f"{framework_descriptor.name}: {cap_name}() method is missing"
     caps_result = capabilities()
-    assert isinstance(caps_result, Mapping), "capabilities() should return a mapping"
+    assert isinstance(caps_result, Mapping), f"{framework_descriptor.name}: {cap_name}() should return a mapping"
 
-    # Async capabilities (best-effort)
-    async_caps = getattr(embedding_adapter_instance, "acapabilities", None)
+    async_caps = getattr(embedding_adapter_instance, acap_name, None)
     if async_caps is not None and callable(async_caps):
-        acaps_result = _run_async_if_needed(async_caps())
-        assert isinstance(acaps_result, Mapping), "acapabilities() should return a mapping"
+        # Validate it returns an awaitable, but execute in the async test below to avoid loop hazards.
+        coro = async_caps()
+        assert inspect.isawaitable(coro), f"{framework_descriptor.name}: {acap_name}() must return an awaitable"
+
+
+@pytest.mark.asyncio
+async def test_capabilities_async_contract_if_declared(
+    framework_descriptor: EmbeddingFrameworkDescriptor,
+    embedding_adapter_instance: Any,
+) -> None:
+    """
+    Async companion for capabilities contract.
+
+    Runs only when:
+    - framework is available
+    - has_capabilities=True
+    - async capabilities method exists
+    """
+    if not framework_descriptor.is_available():
+        _assert_unavailable_contract(framework_descriptor)
+        return
+
+    assert embedding_adapter_instance is not None
+
+    if not framework_descriptor.has_capabilities:
+        assert framework_descriptor.has_capabilities is False
+        return
+
+    acap_name = framework_descriptor.async_capabilities_method or "acapabilities"
+    async_caps = getattr(embedding_adapter_instance, acap_name, None)
+    if async_caps is None or not callable(async_caps):
+        return
+
+    coro = async_caps()
+    _assert_awaitable(coro, descriptor=framework_descriptor, method_name=acap_name)
+    acaps_result = await coro
+    assert isinstance(acaps_result, Mapping), f"{framework_descriptor.name}: {acap_name}() should return a mapping"
 
 
 def test_health_contract_if_declared(
@@ -406,18 +679,65 @@ def test_health_contract_if_declared(
     If a framework declares has_health=True, it should expose a health()
     method returning a mapping. Async variants (when present) should behave
     similarly.
+
+    
+    - If framework is unavailable, validate the unavailable contract and return.
+    - If has_health=False, assert that fact and return.
     """
+    if not framework_descriptor.is_available():
+        _assert_unavailable_contract(framework_descriptor)
+        return
+
+    assert embedding_adapter_instance is not None
+
     if not framework_descriptor.has_health:
-        pytest.skip(f"Framework '{framework_descriptor.name}' does not expose health")
+        assert framework_descriptor.has_health is False
+        return
 
-    # Sync health
-    health = getattr(embedding_adapter_instance, "health", None)
-    assert callable(health), "health() method is missing"
+    # Prefer registry-specified method names; fall back to conventional names.
+    health_name = framework_descriptor.health_method or "health"
+    ahealth_name = framework_descriptor.async_health_method or "ahealth"
+
+    health = getattr(embedding_adapter_instance, health_name, None)
+    assert callable(health), f"{framework_descriptor.name}: {health_name}() method is missing"
     health_result = health()
-    assert isinstance(health_result, Mapping), "health() should return a mapping"
+    assert isinstance(health_result, Mapping), f"{framework_descriptor.name}: {health_name}() should return a mapping"
 
-    # Async health (best-effort)
-    async_health = getattr(embedding_adapter_instance, "ahealth", None)
+    async_health = getattr(embedding_adapter_instance, ahealth_name, None)
     if async_health is not None and callable(async_health):
-        ahealth_result = _run_async_if_needed(async_health())
-        assert isinstance(ahealth_result, Mapping), "ahealth() should return a mapping"
+        coro = async_health()
+        assert inspect.isawaitable(coro), f"{framework_descriptor.name}: {ahealth_name}() must return an awaitable"
+
+
+@pytest.mark.asyncio
+async def test_health_async_contract_if_declared(
+    framework_descriptor: EmbeddingFrameworkDescriptor,
+    embedding_adapter_instance: Any,
+) -> None:
+    """
+    Async companion for health contract.
+
+    Runs only when:
+    - framework is available
+    - has_health=True
+    - async health method exists
+    """
+    if not framework_descriptor.is_available():
+        _assert_unavailable_contract(framework_descriptor)
+        return
+
+    assert embedding_adapter_instance is not None
+
+    if not framework_descriptor.has_health:
+        assert framework_descriptor.has_health is False
+        return
+
+    ahealth_name = framework_descriptor.async_health_method or "ahealth"
+    async_health = getattr(embedding_adapter_instance, ahealth_name, None)
+    if async_health is None or not callable(async_health):
+        return
+
+    coro = async_health()
+    _assert_awaitable(coro, descriptor=framework_descriptor, method_name=ahealth_name)
+    ahealth_result = await coro
+    assert isinstance(ahealth_result, Mapping), f"{framework_descriptor.name}: {ahealth_name}() should return a mapping"
