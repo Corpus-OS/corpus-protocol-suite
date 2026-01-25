@@ -1,5 +1,39 @@
 # tests/frameworks/embedding/test_semantickernel_adapter.py
 
+# ---------------------------------------------------------------------------
+# Framework Version Support Matrix
+# ---------------------------------------------------------------------------
+"""
+Framework Version Support:
+- Semantic Kernel: 1.x+ (tested across common 1.x connector layouts; best-effort across minor moves)
+- Python: 3.9+
+- Corpus SDK: 1.0.0+
+
+Integration Notes:
+- Validates real compatibility with Semantic Kernel embedding service patterns:
+  * EmbeddingGeneratorBase-derived service object (when SK installed)
+  * Sync + async embedding entrypoints:
+      - generate_embeddings / generate_embedding
+      - generate_embeddings_async / generate_embedding_async
+      - convenience aliases: embed_documents/embed_query + aembed_documents/aembed_query
+- Ensures Semantic Kernel execution context is accepted and forwarded best-effort:
+  plugin_name, function_name, kernel_id, memory_type, request_id, user_id, execution_settings
+- Confirms strict, protocol-first behavior:
+  * `corpus_adapter` must expose `embed` (duck-typed EmbeddingProtocolV1)
+  * strict_text_types controls whether non-string items raise vs. zero-vector padded
+  * sync methods refuse to run inside an active event loop (prevents deadlocks)
+- Verifies adapter-level config normalization:
+  enable_operation_context_propagation, strict_text_types, max_items_in_context
+- Validates observability hardening:
+  attach_context() receives framework identity, operation, model_id, batch metrics,
+  SK routing fields and safe snapshots, and error_codes
+
+Policy:
+- Integration checks are PASS/FAIL (not skip): the suite asserts Semantic Kernel is installed
+  (SEMANTIC_KERNEL_AVAILABLE=True) so failures reflect real integration regressions.
+"""
+
+
 from __future__ import annotations
 
 from collections.abc import Sequence
