@@ -26,7 +26,7 @@ framework version.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Optional
 import importlib
 import warnings
 
@@ -36,7 +36,29 @@ except Exception:  # pragma: no cover - packaging may not be installed
     Version = None  # type: ignore[assignment]
 
 # Simple in-memory cache to avoid repeatedly importing modules for availability checks.
+#
+# IMPORTANT: cache key must be stable across descriptor overwrites. Caching only by
+# descriptor.name can lead to stale results when a test overwrites the registry entry.
+# We therefore cache on a composite key derived from adapter_module + availability_attr.
 _AVAILABILITY_CACHE: Dict[str, bool] = {}
+
+# Best-effort cache for framework version probes (avoid repeated imports).
+_VERSION_CACHE: Dict[str, Optional[str]] = {}
+
+
+def _availability_cache_key(adapter_module: str, availability_attr: Optional[str]) -> str:
+    """
+    Build a stable cache key for availability checks.
+
+    We intentionally do NOT use descriptor.name, because tests may dynamically overwrite
+    entries with the same name but different module / attribute.
+    """
+    return f"{adapter_module}:{availability_attr or ''}"
+
+
+def _version_cache_key(adapter_module: str) -> str:
+    """Cache key for best-effort framework version probes."""
+    return f"{adapter_module}:framework_version"
 
 
 @dataclass(frozen=True)
@@ -76,13 +98,44 @@ class EmbeddingFrameworkDescriptor:
         True if the adapter requires a known embedding dimension up-front
         (either via adapter.get_embedding_dimension() or an explicit override).
 
+    embedding_dimension_kwarg:
+        If requires_embedding_dimension=True, this indicates the constructor kwarg
+        used to pass an explicit embedding dimension override (e.g. "embedding_dimension").
+        This allows tests to satisfy the contract without guessing kwarg names.
+
     has_capabilities:
         True if tests expect the adapter to expose a capabilities()/acapabilities()
         surface (it may still raise NotImplementedError at runtime).
 
+    capabilities_method / async_capabilities_method:
+        Optional explicit method names for capabilities surfaces when present.
+        If provided, tests can call these methods directly without guessing.
+
     has_health:
         True if tests expect the adapter to expose a health()/ahealth() surface
         (it may still raise NotImplementedError at runtime).
+
+    health_method / async_health_method:
+        Optional explicit method names for health surfaces when present.
+        If provided, tests can call these methods directly without guessing.
+
+    primary_surface:
+        Optional marker describing the adapter's primary interface shape.
+        Examples:
+          - "embedder": standard embed_documents/embed_query-style surface
+          - "baseembedding": LlamaIndex BaseEmbedding internal surfaces (_get_*)
+          - "embedding_generator": Semantic Kernel embedding generator surfaces
+        This is a hint for tests; it is not enforced at runtime here.
+
+    aliases:
+        Optional mapping of alternate method names to primary ones.
+        Useful when frameworks expose both "native" names and adapter-provided aliases.
+        Example for Semantic Kernel:
+          {"embed_documents": "generate_embeddings", "embed_query": "generate_embedding"}
+
+    sample_context:
+        Optional minimal context payload that tests can pass for this framework to
+        exercise context translation in a stable way.
 
     availability_attr:
         Optional module-level boolean that indicates whether the underlying
@@ -111,12 +164,23 @@ class EmbeddingFrameworkDescriptor:
     context_kwarg: Optional[str] = None
 
     requires_embedding_dimension: bool = False
+    embedding_dimension_kwarg: Optional[str] = None
+
     has_capabilities: bool = False
+    capabilities_method: Optional[str] = None
+    async_capabilities_method: Optional[str] = None
+
     has_health: bool = False
+    health_method: Optional[str] = None
+    async_health_method: Optional[str] = None
 
     availability_attr: Optional[str] = None
     minimum_framework_version: Optional[str] = None
     tested_up_to_version: Optional[str] = None
+
+    primary_surface: Optional[str] = None
+    aliases: Optional[Dict[str, str]] = None
+    sample_context: Optional[Dict[str, Any]] = None
 
     def __post_init__(self) -> None:
         """
@@ -140,10 +204,10 @@ class EmbeddingFrameworkDescriptor:
         If availability_attr is set, this checks that boolean on the adapter
         module. Otherwise assumes the framework is available.
 
-        Results are cached per-descriptor name to avoid repeated imports in
-        large test suites.
+        Results are cached using a composite key derived from adapter_module and
+        availability_attr to avoid stale cache results when descriptors are overwritten.
         """
-        cache_key = self.name
+        cache_key = _availability_cache_key(self.adapter_module, self.availability_attr)
         if cache_key in _AVAILABILITY_CACHE:
             return _AVAILABILITY_CACHE[cache_key]
 
@@ -171,6 +235,68 @@ class EmbeddingFrameworkDescriptor:
 
         _AVAILABILITY_CACHE[cache_key] = available
         return available
+
+    def get_installed_framework_version(self) -> Optional[str]:
+        """
+        Best-effort runtime framework version probe (TEST-ONLY).
+
+        Strategy:
+        1) Import adapter module and look for module-level _FRAMEWORK_VERSION
+           (this is the preferred pattern across Corpus framework adapters).
+        2) If missing, attempt to infer from common framework packages using
+           adapter_module name heuristics.
+        3) Never raise; returns None when unknown/unavailable.
+
+        Results are cached per adapter_module to avoid repeated imports in large
+        test suites.
+        """
+        cache_key = _version_cache_key(self.adapter_module)
+        if cache_key in _VERSION_CACHE:
+            return _VERSION_CACHE[cache_key]
+
+        version: Optional[str] = None
+
+        try:
+            module = importlib.import_module(self.adapter_module)
+            v = getattr(module, "_FRAMEWORK_VERSION", None)
+            if isinstance(v, str) and v.strip():
+                version = v.strip()
+        except Exception:
+            version = None
+
+        if version is None:
+            # Heuristic fallback based on framework name (best-effort only).
+            try:
+                if self.name == "langchain":
+                    import langchain_core as _lc  # type: ignore
+
+                    version = getattr(_lc, "__version__", None)
+                elif self.name == "llamaindex":
+                    import llama_index as _li  # type: ignore
+
+                    version = getattr(_li, "__version__", None)
+                elif self.name == "semantic_kernel":
+                    import semantic_kernel as _sk  # type: ignore
+
+                    version = getattr(_sk, "__version__", None)
+                elif self.name == "autogen":
+                    # Microsoft AutoGen versioning varies by package; best-effort only.
+                    import autogen_core as _ac  # type: ignore
+
+                    version = getattr(_ac, "__version__", None)
+                elif self.name == "crewai":
+                    import crewai as _cw  # type: ignore
+
+                    version = getattr(_cw, "__version__", None)
+            except Exception:
+                version = None
+
+        # Normalize empty/whitespace to None
+        if isinstance(version, str):
+            version = version.strip() or None
+
+        _VERSION_CACHE[cache_key] = version
+        return version
 
     def version_range(self) -> Optional[str]:
         """
@@ -203,14 +329,17 @@ class EmbeddingFrameworkDescriptor:
                 f"{self.name}: batch_method and query_method must both be set",
             )
 
-        # Async consistency: if you declare async_query_method, we strongly expect
-        # async_batch_method as well. This keeps tests and adapters aligned.
-        if self.async_query_method and not self.async_batch_method:
-            warnings.warn(
-                f"{self.name}: async_query_method is set but async_batch_method is None",
-                RuntimeWarning,
-                stacklevel=2,
-            )
+        # Async consistency:
+        # If you declare ANY async method, tests expect BOTH async batch + async query
+        # to be present. This keeps tests and updated adapters aligned.
+        if self.supports_async:
+            if not self.async_batch_method or not self.async_query_method:
+                raise ValueError(
+                    f"{self.name}: supports_async=True requires both async_batch_method "
+                    f"and async_query_method to be set "
+                    f"(got async_batch_method={self.async_batch_method!r}, "
+                    f"async_query_method={self.async_query_method!r})",
+                )
 
         # adapter_class should be a bare class name, not a dotted path
         if "." in self.adapter_class:
@@ -220,6 +349,49 @@ class EmbeddingFrameworkDescriptor:
                 RuntimeWarning,
                 stacklevel=2,
             )
+
+        # Dimension requirement coherence:
+        # If requires_embedding_dimension=True, we strongly recommend embedding_dimension_kwarg.
+        if self.requires_embedding_dimension and not self.embedding_dimension_kwarg:
+            warnings.warn(
+                f"{self.name}: requires_embedding_dimension=True but embedding_dimension_kwarg is None; "
+                "tests may not know how to satisfy the constructor requirement",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+        # Capabilities/health surface coherence:
+        if self.has_capabilities:
+            if not (self.capabilities_method and self.async_capabilities_method):
+                # Not fatal: older descriptors may only use booleans; keep compatibility.
+                warnings.warn(
+                    f"{self.name}: has_capabilities=True but capabilities_method/async_capabilities_method "
+                    "are not fully set; tests may need to guess method names",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+        if self.has_health:
+            if not (self.health_method and self.async_health_method):
+                warnings.warn(
+                    f"{self.name}: has_health=True but health_method/async_health_method "
+                    "are not fully set; tests may need to guess method names",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+
+        # Aliases sanity: avoid self-referential loops and empty strings.
+        if self.aliases is not None:
+            if not isinstance(self.aliases, dict):
+                raise ValueError(f"{self.name}: aliases must be a dict if provided")
+            for k, v in self.aliases.items():
+                if not isinstance(k, str) or not k.strip() or not isinstance(v, str) or not v.strip():
+                    raise ValueError(f"{self.name}: aliases keys and values must be non-empty strings")
+                if k == v:
+                    warnings.warn(
+                        f"{self.name}: aliases contains a self-mapping {k!r} -> {v!r}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
 
         # Version ordering validation (best-effort)
         if self.minimum_framework_version and self.tested_up_to_version:
@@ -280,8 +452,20 @@ EMBEDDING_FRAMEWORKS: Dict[str, EmbeddingFrameworkDescriptor] = {
         context_kwarg="autogen_context",
         requires_embedding_dimension=False,
         has_capabilities=True,  # capabilities / acapabilities (best-effort)
+        capabilities_method="capabilities",
+        async_capabilities_method="acapabilities",
         has_health=True,        # health / ahealth (best-effort)
+        health_method="health",
+        async_health_method="ahealth",
         availability_attr=None,
+        primary_surface="embedder",
+        aliases=None,
+        sample_context={
+            "agent_name": "test_agent",
+            "conversation_id": "conv_test_1",
+            "workflow_type": "conformance",
+            "request_id": "req_test_1",
+        },
     ),
 
     # ------------------------------------------------------------------ #
@@ -298,8 +482,20 @@ EMBEDDING_FRAMEWORKS: Dict[str, EmbeddingFrameworkDescriptor] = {
         context_kwarg="crewai_context",
         requires_embedding_dimension=False,
         has_capabilities=True,  # may raise NotImplementedError depending on adapter
+        capabilities_method="capabilities",
+        async_capabilities_method="acapabilities",
         has_health=True,        # may raise NotImplementedError depending on adapter
+        health_method="health",
+        async_health_method="ahealth",
         availability_attr=None,
+        primary_surface="embedder",
+        aliases=None,
+        sample_context={
+            "agent_role": "test_agent",
+            "task_id": "task_test_1",
+            "workflow": "conformance",
+            "crew_id": "crew_test_1",
+        },
     ),
 
     # ------------------------------------------------------------------ #
@@ -318,6 +514,15 @@ EMBEDDING_FRAMEWORKS: Dict[str, EmbeddingFrameworkDescriptor] = {
         has_capabilities=False,
         has_health=False,
         availability_attr="LANGCHAIN_AVAILABLE",
+        primary_surface="embedder",
+        aliases=None,
+        sample_context={
+            "run_id": "run_test_1",
+            "run_name": "conformance",
+            "tags": ["conformance", "embedding"],
+            "metadata": {"suite": "embedding_conformance"},
+            "configurable": {"tenant": "test"},
+        },
     ),
 
     # ------------------------------------------------------------------ #
@@ -335,9 +540,18 @@ EMBEDDING_FRAMEWORKS: Dict[str, EmbeddingFrameworkDescriptor] = {
         async_query_method="_aget_query_embedding",
         context_kwarg="llamaindex_context",
         requires_embedding_dimension=True,  # enforced by __init__
+        embedding_dimension_kwarg="embedding_dimension",
         has_capabilities=False,
         has_health=False,
         availability_attr="LLAMAINDEX_AVAILABLE",
+        primary_surface="baseembedding",
+        aliases=None,
+        sample_context={
+            "node_ids": ["node_test_1", "node_test_2"],
+            "index_id": "index_test_1",
+            "trace_id": "trace_test_1",
+            "workflow": "conformance",
+        },
     ),
 
     # ------------------------------------------------------------------ #
@@ -356,9 +570,24 @@ EMBEDDING_FRAMEWORKS: Dict[str, EmbeddingFrameworkDescriptor] = {
         async_query_method="generate_embedding_async",
         context_kwarg="sk_context",
         requires_embedding_dimension=True,  # enforced by __init__
+        embedding_dimension_kwarg="embedding_dimension",
         has_capabilities=False,
         has_health=False,
         availability_attr="SEMANTIC_KERNEL_AVAILABLE",
+        primary_surface="embedding_generator",
+        aliases={
+            "embed_documents": "generate_embeddings",
+            "embed_query": "generate_embedding",
+            "aembed_documents": "generate_embeddings_async",
+            "aembed_query": "generate_embedding_async",
+        },
+        sample_context={
+            "plugin_name": "test_plugin",
+            "function_name": "test_function",
+            "kernel_id": "kernel_test_1",
+            "memory_type": "conformance",
+            "request_id": "req_test_1",
+        },
     ),
 }
 
@@ -439,8 +668,10 @@ def register_framework_descriptor(
         )
 
     EMBEDDING_FRAMEWORKS[descriptor.name] = descriptor
+
     # Reset availability cache for this descriptor so future checks re-evaluate.
-    _AVAILABILITY_CACHE.pop(descriptor.name, None)
+    _AVAILABILITY_CACHE.pop(_availability_cache_key(descriptor.adapter_module, descriptor.availability_attr), None)
+    _VERSION_CACHE.pop(_version_cache_key(descriptor.adapter_module), None)
 
 
 def unregister_framework_descriptor(
@@ -461,8 +692,10 @@ def unregister_framework_descriptor(
         If True (default), missing entries are ignored.
     """
     if name in EMBEDDING_FRAMEWORKS:
+        desc = EMBEDDING_FRAMEWORKS[name]
         del EMBEDDING_FRAMEWORKS[name]
-        _AVAILABILITY_CACHE.pop(name, None)
+        _AVAILABILITY_CACHE.pop(_availability_cache_key(desc.adapter_module, desc.availability_attr), None)
+        _VERSION_CACHE.pop(_version_cache_key(desc.adapter_module), None)
     elif not ignore_missing:
         raise KeyError(f"Framework {name!r} is not registered")
 
