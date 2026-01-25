@@ -50,19 +50,18 @@ def _assert_embedding_matrix_shape(
     expected_rows: int,
 ) -> None:
     """Validate that a result looks like a 2D embedding matrix."""
-    assert isinstance(
-        result,
-        Sequence,
-    ), f"Expected sequence, got {type(result).__name__}"
+    # NOTE: strings/bytes are Sequences but are never valid embedding matrices.
+    assert isinstance(result, Sequence) and not isinstance(
+        result, (str, bytes)
+    ), f"Expected sequence (non-str), got {type(result).__name__}"
     assert len(result) == expected_rows, (
         f"Expected {expected_rows} rows, got {len(result)}"
     )
 
     for row in result:
-        assert isinstance(
-            row,
-            Sequence,
-        ), f"Row is not a sequence: {type(row).__name__}"
+        assert isinstance(row, Sequence) and not isinstance(
+            row, (str, bytes)
+        ), f"Row is not a sequence (non-str): {type(row).__name__}"
         for val in row:
             assert isinstance(
                 val,
@@ -72,10 +71,10 @@ def _assert_embedding_matrix_shape(
 
 def _assert_embedding_vector_shape(result: Any) -> None:
     """Validate that a result looks like a 1D embedding vector."""
-    assert isinstance(
-        result,
-        Sequence,
-    ), f"Expected sequence, got {type(result).__name__}"
+    # NOTE: strings/bytes are Sequences but are never valid embedding vectors.
+    assert isinstance(result, Sequence) and not isinstance(
+        result, (str, bytes)
+    ), f"Expected sequence (non-str), got {type(result).__name__}"
     for val in result:
         assert isinstance(
             val,
@@ -86,6 +85,35 @@ def _assert_embedding_vector_shape(result: Any) -> None:
 def _make_embeddings(adapter: Any, **kwargs: Any) -> CorpusLangChainEmbeddings:
     """Construct a CorpusLangChainEmbeddings instance from the adapter."""
     return CorpusLangChainEmbeddings(corpus_adapter=adapter, **kwargs)
+
+
+@pytest.fixture(scope="session")
+def require_langchain() -> bool:
+    """
+    Pass/fail gating for *real* LangChain integration tests.
+
+    Policy: no skip. If langchain-core isn't installed or importable, fail fast.
+    """
+    try:
+        import langchain_core  # noqa: F401
+        from langchain_core.embeddings import Embeddings  # noqa: F401
+    except Exception as exc:
+        pytest.fail(
+            "LangChain integration tests require langchain-core. Install with:\n"
+            "  pip install -U langchain-core\n"
+            f"Import error: {exc!r}",
+            pytrace=False,
+        )
+
+    # If imports succeed but adapter flag is false, that's an internal inconsistency.
+    if not LANGCHAIN_AVAILABLE:
+        pytest.fail(
+            "LANGCHAIN_AVAILABLE is False but langchain_core imports succeeded. "
+            "This indicates an internal inconsistency in the adapter module.",
+            pytrace=False,
+        )
+
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +231,10 @@ def test_langchain_interface_compatibility(adapter: Any) -> None:
     Verify that CorpusLangChainEmbeddings implements the expected LangChain
     Embeddings interface when LangChain is available, and that the core
     embedding methods are present regardless.
+
+    IMPORTANT POLICY (Path A): no pytest.skip here.
+    - If LANGCHAIN_AVAILABLE is True, assert real langchain_core Embeddings compatibility.
+    - If LANGCHAIN_AVAILABLE is False, assert fallback base class compatibility.
     """
     embeddings = _make_embeddings(adapter, model="iface-model")
 
@@ -212,20 +244,24 @@ def test_langchain_interface_compatibility(adapter: Any) -> None:
     assert hasattr(embeddings, "aembed_documents")
     assert hasattr(embeddings, "aembed_query")
 
-    if not LANGCHAIN_AVAILABLE:
-        pytest.skip("LangChain is not available; cannot assert base class compatibility")
+    if LANGCHAIN_AVAILABLE:
+        # Adapter is implemented against langchain_core, not legacy langchain.embeddings.base.
+        try:
+            from langchain_core.embeddings import Embeddings  # type: ignore[import]
+        except Exception as exc:
+            pytest.fail(
+                "LANGCHAIN_AVAILABLE is True but importing langchain_core.embeddings.Embeddings failed. "
+                f"Import error: {exc!r}",
+                pytrace=False,
+            )
 
-    try:
-        from langchain.embeddings.base import Embeddings  # type: ignore[import]
-    except Exception:
-        pytest.skip(
-            "LANGCHAIN_AVAILABLE is True but importing langchain.embeddings.base failed",
-        )
-
-    assert isinstance(
-        embeddings,
-        Embeddings,
-    ), "CorpusLangChainEmbeddings should subclass LangChain Embeddings when available"
+        assert isinstance(
+            embeddings,
+            Embeddings,
+        ), "CorpusLangChainEmbeddings should be an Embeddings instance when LangChain is available"
+    else:
+        # When LangChain isn't installed, adapter still uses module-local fallback Embeddings base.
+        assert isinstance(embeddings, langchain_adapter_module.Embeddings)
 
 
 # ---------------------------------------------------------------------------
@@ -977,6 +1013,9 @@ async def test_async_and_sync_same_dimension(adapter: Any) -> None:
     """
     Check that sync and async embeddings for the same input produce vectors
     of the same dimensionality (not necessarily identical values).
+
+    NOTE: Some adapters enforce sync loop-guards. If your adapter raises when sync
+    methods are called inside an event loop, run sync calls via asyncio.to_thread.
     """
     embeddings = configure_langchain_embeddings(
         corpus_adapter=adapter,
@@ -986,8 +1025,9 @@ async def test_async_and_sync_same_dimension(adapter: Any) -> None:
     texts = ["same-dim-1", "same-dim-2"]
     query = "same-dim-query"
 
-    sync_docs = embeddings.embed_documents(texts)
-    sync_query = embeddings.embed_query(query)
+    # Prefer safe parity pattern: run sync calls off-loop to avoid loop-guard deadlocks.
+    sync_docs = await asyncio.to_thread(embeddings.embed_documents, texts)
+    sync_query = await asyncio.to_thread(embeddings.embed_query, query)
 
     async_docs = await embeddings.aembed_documents(texts)
     async_query = await embeddings.aembed_query(query)
@@ -1205,7 +1245,7 @@ def test_shared_embedder_thread_safety(adapter: Any) -> None:
     assert len(results) == len(texts)
     for result in results:
         assert isinstance(result, list)
-        assert all(isinstance(x, float) for x in result)
+        assert all(isinstance(x, (int, float)) for x in result)
 
 
 @pytest.mark.asyncio
@@ -1229,7 +1269,7 @@ async def test_concurrent_async_embedding(adapter: Any) -> None:
     assert len(results) == len(texts)
     for result in results:
         assert isinstance(result, list)
-        assert all(isinstance(x, float) for x in result)
+        assert all(isinstance(x, (int, float)) for x in result)
 
 
 # ---------------------------------------------------------------------------
@@ -1242,34 +1282,21 @@ class TestLangChainIntegration:
     """
     Integration tests with real LangChain objects.
 
-    These tests verify that our adapter actually works in LangChain-style
-    workflows. They're skipped if LangChain (or langchain_core) is not installed.
+    Policy (Path A):
+    - No pytest.skip inside the integration tests.
+    - Pass/fail gating is handled by require_langchain fixture.
     """
-
-    @pytest.fixture
-    def langchain_available(self) -> bool:
-        try:
-            import langchain  # noqa: F401
-            return True
-        except ImportError:
-            pytest.skip("LangChain not installed - skipping integration tests")
 
     def test_can_use_with_langchain_embeddings_base(
         self,
-        langchain_available: bool,
+        require_langchain: bool,
         adapter: Any,
     ) -> None:
         """
         Integration: CorpusLangChainEmbeddings should be usable anywhere
         LangChain's Embeddings base class is expected.
         """
-        if not LANGCHAIN_AVAILABLE:
-            pytest.skip("LANGCHAIN_AVAILABLE is False - skipping Embeddings integration")
-
-        try:
-            from langchain.embeddings.base import Embeddings  # type: ignore[import]
-        except Exception:
-            pytest.skip("Failed to import langchain.embeddings.base")
+        from langchain_core.embeddings import Embeddings  # type: ignore[import]
 
         embedder = configure_langchain_embeddings(
             corpus_adapter=adapter,
@@ -1287,17 +1314,14 @@ class TestLangChainIntegration:
 
     def test_embeddings_work_in_runnable_chain(
         self,
-        langchain_available: bool,
+        require_langchain: bool,
         adapter: Any,
     ) -> None:
         """
         Integration: Embeddings can be used inside a simple Runnable chain,
         if langchain_core is available.
         """
-        try:
-            from langchain_core.runnables import RunnableLambda  # type: ignore[import]
-        except Exception:
-            pytest.skip("langchain_core.runnables not available")
+        from langchain_core.runnables import RunnableLambda  # type: ignore[import]
 
         embedder = configure_langchain_embeddings(
             corpus_adapter=adapter,
@@ -1310,7 +1334,7 @@ class TestLangChainIntegration:
 
     def test_integration_error_propagation_is_actionable(
         self,
-        langchain_available: bool,
+        require_langchain: bool,
     ) -> None:
         """
         Integration: Errors from a failing adapter used in a LangChain-style
