@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-from typing import Any, Dict, List, Optional
-import inspect
 import asyncio
 import concurrent.futures
+import inspect
 import sys
 import types
+from collections.abc import Mapping, Sequence
+from typing import Any, Dict, List, Optional
 
 import pytest
 
@@ -31,9 +31,9 @@ Framework Version Support:
 - Corpus SDK: 1.0.0+
 
 Integration Notes:
-- Adapter module must import without AutoGen installed (optional dependency)
-- create_vector_memory() must wire real AutoGen ChromaDBVectorMemory when available
-- Integration tests must be pass/fail (no skip): fail-fast when required deps absent
+- Adapter module must import without AutoGen installed (optional dependency contract).
+- create_vector_memory() must wire real AutoGen ChromaDBVectorMemory when available.
+- Integration tests are pass/fail (no skip): fail-fast if required deps are absent or incompatible.
 """
 
 
@@ -61,7 +61,6 @@ def _assert_embedding_vector_shape(result: Any) -> None:
 
 def _make_embeddings(adapter: Any, **kwargs: Any) -> CorpusAutoGenEmbeddings:
     """Construct a CorpusAutoGenEmbeddings instance from the adapter."""
-    # Provide default model if not specified
     if "model" not in kwargs:
         kwargs["model"] = "mock-embed-512"
     return CorpusAutoGenEmbeddings(corpus_adapter=adapter, **kwargs)
@@ -88,23 +87,16 @@ def test_constructor_rejects_common_user_mistakes() -> None:
     IMPORTANT:
     - Assert semantic guidance (what is required) rather than brittle substrings.
     """
-    # Common mistake 1: Passing None
     with pytest.raises(TypeError) as exc_info:
         CorpusAutoGenEmbeddings(corpus_adapter=None)  # type: ignore[arg-type]
-
     msg = str(exc_info.value)
-    assert "EmbeddingProtocolV1-compatible" in msg or "EmbeddingProtocolV1" in msg
-    assert "embed" in msg.lower()
+    assert ("EmbeddingProtocolV1-compatible" in msg or "EmbeddingProtocolV1" in msg) and "embed" in msg.lower()
 
-    # Common mistake 2: Passing a string (wrong type)
     with pytest.raises(TypeError) as exc_info:
         CorpusAutoGenEmbeddings(corpus_adapter="not an adapter")  # type: ignore[arg-type]
-
     msg = str(exc_info.value)
-    assert "EmbeddingProtocolV1-compatible" in msg or "EmbeddingProtocolV1" in msg
-    assert "embed" in msg.lower()
+    assert ("EmbeddingProtocolV1-compatible" in msg or "EmbeddingProtocolV1" in msg) and "embed" in msg.lower()
 
-    # Common mistake 3: Passing an object without embed() method
     class MockAgent:
         """Looks like an agent but not an embedding adapter."""
         def chat(self) -> None:
@@ -112,10 +104,8 @@ def test_constructor_rejects_common_user_mistakes() -> None:
 
     with pytest.raises(TypeError) as exc_info:
         CorpusAutoGenEmbeddings(corpus_adapter=MockAgent())
-
     msg = str(exc_info.value)
-    assert "EmbeddingProtocolV1-compatible" in msg or "EmbeddingProtocolV1" in msg
-    assert "embed" in msg.lower()
+    assert ("EmbeddingProtocolV1-compatible" in msg or "EmbeddingProtocolV1" in msg) and "embed" in msg.lower()
 
 
 def test_register_embeddings_returns_instance(adapter) -> None:
@@ -127,7 +117,6 @@ def test_register_embeddings_returns_instance(adapter) -> None:
         model="mock-embed-512",
         framework_version="autogen-fw-1.0",
     )
-
     assert isinstance(emb, CorpusAutoGenEmbeddings)
     assert emb.corpus_adapter is adapter
     assert emb.model == "mock-embed-512"
@@ -264,31 +253,28 @@ def test_autogen_interface_compatibility(adapter) -> None:
     """
     embeddings = _make_embeddings(adapter)
 
-    # Core methods should always exist
     assert hasattr(embeddings, "embed_documents")
     assert hasattr(embeddings, "embed_query")
     assert hasattr(embeddings, "aembed_documents")
     assert hasattr(embeddings, "aembed_query")
-    assert callable(embeddings)  # __call__ for embedding_function protocols
+    assert callable(embeddings)
 
     required_methods = ["__call__", "embed_documents", "embed_query", "aembed_documents", "aembed_query"]
     for method in required_methods:
         assert hasattr(embeddings, method), f"Missing required method: {method}"
         assert callable(getattr(embeddings, method)), f"Method not callable: {method}"
 
-    # Test the __call__ method works (sync context)
     result = embeddings(["test"])
     _assert_embedding_matrix_shape(result, expected_rows=1)
 
 
 def test_module_import_does_not_require_autogen() -> None:
     """
-    Importing the framework adapter module must not require AutoGen installed.
+    The adapter module must remain importable regardless of whether AutoGen is installed.
 
-    This enforces the optional dependency contract: AutoGen imports are lazy inside helpers.
+    This validates the optional dependency contract: AutoGen imports occur lazily
+    inside integration helpers such as create_vector_memory().
     """
-    # If auto-installed in this environment, we do not attempt to uninstall; we only ensure
-    # the module import itself does not depend on AutoGen being pre-imported.
     assert autogen_adapter_module.__name__.endswith("framework_adapters.autogen")
 
 
@@ -296,10 +282,7 @@ def test_module_import_does_not_require_autogen() -> None:
 # Context Translation / AutoGenContext Mapping
 # ---------------------------------------------------------------------------
 
-def test_autogen_context_passed_to_context_translation(
-    monkeypatch: pytest.MonkeyPatch,
-    adapter,
-) -> None:
+def test_autogen_context_passed_to_context_translation(monkeypatch: pytest.MonkeyPatch, adapter) -> None:
     """
     Verify that autogen_context is passed through to context_from_autogen.
     """
@@ -330,8 +313,7 @@ def test_autogen_context_passed_to_context_translation(
 
 def test_invalid_autogen_context_type_is_ignored(monkeypatch: pytest.MonkeyPatch, adapter) -> None:
     """
-    autogen_context is best-effort. If the type is wrong (not a Mapping),
-    embeddings should still work.
+    autogen_context is best-effort. If the type is wrong (not a Mapping), embeddings should still work.
     """
     class DummyTranslator:
         def embed(self, raw_texts: Any, op_ctx: Any, framework_ctx: Any) -> Any:
@@ -365,9 +347,7 @@ def test_invalid_autogen_context_type_is_ignored(monkeypatch: pytest.MonkeyPatch
     _assert_embedding_matrix_shape(out, expected_rows=1)
 
 
-def test_context_translation_failure_attaches_context_but_does_not_break(
-    monkeypatch: pytest.MonkeyPatch, adapter
-) -> None:
+def test_context_translation_failure_attaches_context_but_does_not_break(monkeypatch: pytest.MonkeyPatch, adapter) -> None:
     """
     If context_from_autogen raises, embeddings proceed without OperationContext,
     and attach_context is invoked with operation="context_build".
@@ -474,7 +454,7 @@ def test_call_aliases_embed_documents(adapter) -> None:
     embeddings = _make_embeddings(adapter)
 
     texts = ["call-one", "call-two"]
-    result = embeddings(texts)  # __call__
+    result = embeddings(texts)
     _assert_embedding_matrix_shape(result, expected_rows=len(texts))
 
 
@@ -527,10 +507,8 @@ async def test_async_and_sync_same_dimension(adapter) -> None:
     async_q = await embeddings.aembed_query(query)
 
     assert len(sync_vecs) == len(async_vecs) == len(texts)
-
     if sync_vecs and async_vecs:
         assert len(sync_vecs[0]) == len(async_vecs[0])
-
     assert len(sync_q) == len(async_q)
 
 
@@ -719,8 +697,7 @@ async def test_async_capabilities_fallback_to_sync(adapter) -> None:
 
 def test_capabilities_empty_when_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     """
-    If the underlying adapter has no capabilities()/acapabilities(),
-    the AutoGen adapter should return an empty mapping (best-effort).
+    If the underlying adapter has no capabilities()/acapabilities(), the adapter should return {}.
     """
     class NoCapAdapter:
         async def embed(self, texts: Sequence[str], **_: Any) -> list[list[float]]:
@@ -761,7 +738,7 @@ def test_capabilities_empty_when_missing(monkeypatch: pytest.MonkeyPatch) -> Non
 
 def test_health_passthrough_and_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     """
-    health/ahealth behavior mirrors capabilities: passthrough when available, empty mapping when not.
+    health/ahealth mirrors capabilities: passthrough when available, {} when not.
     """
     class HealthAdapter:
         async def embed(self, texts: Sequence[str], **_: Any) -> list[list[float]]:
@@ -799,7 +776,6 @@ def test_health_passthrough_and_missing(monkeypatch: pytest.MonkeyPatch) -> None
     assert isinstance(health, dict)
     assert health.get("status") == "ok"
 
-    # Missing health should yield empty mapping
     class NoHealthAdapter:
         async def embed(self, texts: Sequence[str], **_: Any) -> list[list[float]]:
             return [[0.0] * 2 for _ in texts]
@@ -888,8 +864,7 @@ async def test_concurrent_async_embedding(adapter) -> None:
         return await embedder.aembed_query(text)
 
     texts = [f"async query {i}" for i in range(5)]
-    tasks = [embed_async(text) for text in texts]
-    results = await asyncio.gather(*tasks)
+    results = await asyncio.gather(*[embed_async(text) for text in texts])
 
     assert len(results) == len(texts)
     for result in results:
@@ -907,23 +882,12 @@ def require_autogen_chromadb():
     Hard requirement for real AutoGen integration tests.
 
     Policy:
-    - No skip. If AutoGen or chromadb extras are missing or too old, fail-fast.
-    - Validates that CustomEmbeddingFunctionConfig support exists.
+    - No skip. If AutoGen or chromadb extras are missing or incompatible, fail-fast.
+    - Capability-based checks (feature detection) rather than brittle version comparisons.
     """
-    # Lazy import of version metadata to avoid new dependency requirements at import time.
     try:
-        from importlib.metadata import version as pkg_version  # py3.9+
-    except Exception as exc:  # pragma: no cover
-        pytest.fail(f"Failed to import importlib.metadata for version checks: {exc!r}", pytrace=False)
-
-    try:
-        from packaging.version import Version
-    except Exception as exc:  # pragma: no cover
-        pytest.fail(f"packaging is required for version checks in integration tests: {exc!r}", pytrace=False)
-
-    try:
-        import autogen_ext.memory.chromadb  # noqa: F401
-        import autogen_core.memory  # noqa: F401
+        from autogen_ext.memory import chromadb as chroma_mod  # type: ignore[import-not-found]
+        from autogen_core import memory as core_mem_mod  # type: ignore[import-not-found]
     except Exception as exc:
         pytest.fail(
             "AutoGen Chroma memory dependencies are required for integration tests. "
@@ -932,20 +896,24 @@ def require_autogen_chromadb():
             pytrace=False,
         )
 
-    # Custom embedding function config support was introduced in autogen-ext v0.4.1+ (per AutoGen docs).
-    try:
-        v = Version(pkg_version("autogen-ext"))
-    except Exception as exc:
-        pytest.fail(f"Failed to resolve autogen-ext version: {exc!r}", pytrace=False)
+    required_chroma_attrs = ("ChromaDBVectorMemory", "PersistentChromaDBVectorMemoryConfig", "CustomEmbeddingFunctionConfig")
+    for attr in required_chroma_attrs:
+        if not hasattr(chroma_mod, attr):
+            pytest.fail(
+                f"AutoGen chromadb module missing required attribute '{attr}'. "
+                "Your autogen-ext[chromadb] installation appears incompatible with this integration.",
+                pytrace=False,
+            )
 
-    if v < Version("0.4.1"):
-        pytest.fail(
-            f"autogen-ext=={v} is too old for CustomEmbeddingFunctionConfig support (needs >= 0.4.1).",
-            pytrace=False,
-        )
+    required_core_attrs = ("MemoryContent", "MemoryMimeType")
+    for attr in required_core_attrs:
+        if not hasattr(core_mem_mod, attr):
+            pytest.fail(
+                f"AutoGen core memory module missing required attribute '{attr}'. "
+                "Your autogen-core installation appears incompatible with this integration.",
+                pytrace=False,
+            )
 
-    from autogen_ext.memory import chromadb as chroma_mod
-    from autogen_core import memory as core_mem_mod
     return chroma_mod, core_mem_mod
 
 
@@ -963,14 +931,14 @@ async def test_real_autogen_chromadb_memory_roundtrip_uses_corpus_embeddings(
 
     This test:
     - Uses create_vector_memory() to build a real ChromaDBVectorMemory
-    - Adds a MemoryContent, queries for it, and validates results
+    - Adds MemoryContent, queries for it, and validates results
     - Wraps adapter.embed() to confirm embeddings are computed via the configured embedding function
     """
     _chroma_mod, core_mem_mod = require_autogen_chromadb
     MemoryContent = core_mem_mod.MemoryContent
     MemoryMimeType = core_mem_mod.MemoryMimeType
 
-    # Wrap adapter.embed to prove AutoGen memory path invokes it (sync or async)
+    # Wrap adapter.embed to prove AutoGen memory path invokes it (sync or async).
     calls = {"n": 0}
     orig_embed = getattr(adapter, "embed", None)
     assert callable(orig_embed), "Adapter must expose embed() for AutoGen embedding integration."
@@ -1009,8 +977,10 @@ async def test_real_autogen_chromadb_memory_roundtrip_uses_corpus_embeddings(
         assert isinstance(result.results, list)
         assert len(result.results) >= 1
 
+        # Ensure embeddings were computed through the configured embedding function.
         assert calls["n"] >= 1, "Expected corpus adapter embed() to be called via AutoGen memory add/query."
 
+        # Ensure content round-trips through the vector memory.
         assert any(
             getattr(item, "content", None) == "The user prefers temperatures in Celsius"
             for item in result.results
@@ -1082,7 +1052,6 @@ def test_create_vector_memory_configures_chroma_with_custom_embedding_function(
     chroma_mod.PersistentChromaDBVectorMemoryConfig = DummyConfig
     chroma_mod.ChromaDBVectorMemory = DummyMemory
 
-    # Make the dotted package path resolvable
     monkeypatch.setitem(sys.modules, "autogen_ext", types.ModuleType("autogen_ext"))
     monkeypatch.setitem(sys.modules, "autogen_ext.memory", types.ModuleType("autogen_ext.memory"))
     monkeypatch.setitem(sys.modules, "autogen_ext.memory.chromadb", chroma_mod)
@@ -1110,7 +1079,6 @@ def test_create_vector_memory_configures_chroma_with_custom_embedding_function(
     emb_cfg = cfg.embedding_function_config
     assert isinstance(emb_cfg, DummyEmbeddingFunctionConfig)
 
-    # Exercise embedding function factory
     embedding_fn = emb_cfg.function(**emb_cfg.params)
     assert isinstance(embedding_fn, CorpusAutoGenEmbeddings)
     assert embedding_fn.corpus_adapter is adapter
@@ -1162,7 +1130,6 @@ def test_create_vector_memory_uses_defaults_when_optional_args_omitted(
 
     assert isinstance(memory, DummyMemory)
     cfg = memory.config
-    # Defaults from create_vector_memory signature
     assert cfg.collection_name == "corpus_autogen_memory"
     assert cfg.persistence_path is None
     assert cfg.k == 3
@@ -1174,6 +1141,5 @@ def test_create_vector_memory_uses_defaults_when_optional_args_omitted(
     embedding_fn = emb_cfg.function(**emb_cfg.params)
     assert isinstance(embedding_fn, CorpusAutoGenEmbeddings)
     assert embedding_fn.corpus_adapter is adapter
-    # Defaults: model, batch_config, text_normalization_config, autogen_config, framework_version
     assert embedding_fn.model is None
-    assert embedding_fn.autogen_config == {}  # we passed autogen_config=None
+    assert embedding_fn.autogen_config == {}
