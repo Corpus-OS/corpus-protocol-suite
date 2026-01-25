@@ -7,6 +7,7 @@ import concurrent.futures
 import inspect
 import sys
 import types
+import uuid
 from collections.abc import Mapping, Sequence
 from typing import Any, Dict, List, Optional
 
@@ -66,71 +67,9 @@ def _make_embeddings(adapter: Any, **kwargs: Any) -> CorpusAutoGenEmbeddings:
     return CorpusAutoGenEmbeddings(corpus_adapter=adapter, **kwargs)
 
 
-def _sysmodules_evict_autogen_chromadb() -> None:
-    """
-    Ensure tests that simulate "AutoGen not installed" are deterministic.
-
-    Rationale:
-    - Import hooks (builtins.__import__) are bypassed if a module is already present in sys.modules.
-    - Removing cached modules ensures our ImportError simulation is guaranteed to exercise the lazy-import path.
-    """
-    for mod in (
-        "autogen_ext.memory.chromadb",
-        "autogen_ext.memory",
-        "autogen_ext",
-    ):
-        sys.modules.pop(mod, None)
-
-
-def _memory_result_contains_text(item: Any, expected: str) -> bool:
-    """
-    Best-effort matcher for AutoGen memory query result items.
-
-    Why this exists:
-    - Different AutoGen / chromadb versions may wrap results in different objects.
-    - Some results may include the content on .content, some may include nested fields,
-      some may return pydantic-like models, etc.
-    - This matcher keeps integration tests pass/fail while avoiding brittleness from
-      an exact attribute shape assumption.
-
-    Matching rules (in order):
-    1) item.content == expected or contains expected (string)
-    2) item is a Mapping and has "content" or nested content fields
-    3) fallback to substring match on repr(item)
-    """
-    try:
-        content = getattr(item, "content", None)
-        if isinstance(content, str):
-            if content == expected or expected in content:
-                return True
-    except Exception:
-        pass
-
-    if isinstance(item, Mapping):
-        try:
-            c = item.get("content")
-            if isinstance(c, str) and (c == expected or expected in c):
-                return True
-        except Exception:
-            pass
-        # Some shapes embed under data/payload/etc.
-        for key in ("data", "payload", "value", "item"):
-            try:
-                nested = item.get(key)
-            except Exception:
-                nested = None
-            if isinstance(nested, Mapping):
-                try:
-                    c2 = nested.get("content")
-                    if isinstance(c2, str) and (c2 == expected or expected in c2):
-                        return True
-                except Exception:
-                    pass
-
-    try:
-        return expected in repr(item)
-    except Exception:
-        return False
+def _unique_collection(prefix: str) -> str:
+    """Generate a unique collection name to avoid cross-test contamination."""
+    return f"{prefix}_{uuid.uuid4().hex[:10]}"
 
 
 # ---------------------------------------------------------------------------
@@ -745,15 +684,11 @@ def test_dim_hint_is_attached_to_later_errors(monkeypatch: pytest.MonkeyPatch, a
 @pytest.mark.asyncio
 async def test_capabilities_passthrough_when_underlying_provides(adapter) -> None:
     """
-    acapabilities returns either a Mapping-like object or EmbeddingCapabilities.
-
-    NOTE:
-    - We accept Mapping (not just dict) to avoid brittleness when implementations return
-      custom Mapping types or pydantic-like containers.
+    acapabilities returns either a dict or EmbeddingCapabilities.
     """
     embeddings = CorpusAutoGenEmbeddings(corpus_adapter=adapter)
     caps = await embeddings.acapabilities()
-    assert isinstance(caps, (Mapping, EmbeddingCapabilities))
+    assert isinstance(caps, (dict, EmbeddingCapabilities))
 
 
 @pytest.mark.asyncio
@@ -763,7 +698,7 @@ async def test_async_capabilities_fallback_to_sync(adapter) -> None:
     """
     embeddings = CorpusAutoGenEmbeddings(corpus_adapter=adapter)
     acaps = await embeddings.acapabilities()
-    assert isinstance(acaps, (Mapping, EmbeddingCapabilities))
+    assert isinstance(acaps, (dict, EmbeddingCapabilities))
 
 
 def test_capabilities_empty_when_missing(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -803,8 +738,8 @@ def test_capabilities_empty_when_missing(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(embeddings, "_translator", DummyTranslator())
 
     caps = embeddings.capabilities()
-    assert isinstance(caps, Mapping)
-    assert dict(caps) == {}
+    assert isinstance(caps, dict)
+    assert caps == {}
 
 
 def test_health_passthrough_and_missing(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -844,8 +779,8 @@ def test_health_passthrough_and_missing(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(embeddings, "_translator", DummyTranslator())
 
     health = embeddings.health()
-    assert isinstance(health, Mapping)
-    assert dict(health).get("status") == "ok"
+    assert isinstance(health, dict)
+    assert health.get("status") == "ok"
 
     class NoHealthAdapter:
         async def embed(self, texts: Sequence[str], **_: Any) -> list[list[float]]:
@@ -862,8 +797,8 @@ def test_health_passthrough_and_missing(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(embeddings2, "_translator", DummyTranslatorNoHealth())
 
     health2 = embeddings2.health()
-    assert isinstance(health2, Mapping)
-    assert dict(health2) == {}
+    assert isinstance(health2, dict)
+    assert health2 == {}
 
 
 # ---------------------------------------------------------------------------
@@ -1004,18 +939,11 @@ async def test_real_autogen_chromadb_memory_roundtrip_uses_corpus_embeddings(
     - Uses create_vector_memory() to build a real ChromaDBVectorMemory
     - Adds MemoryContent, queries for it, and validates results
     - Wraps adapter.embed() to confirm embeddings are computed via the configured embedding function
-
-    Robustness policy:
-    - Keep pass/fail.
-    - Avoid brittle assumptions about the exact result item class shape across AutoGen versions.
     """
     _chroma_mod, core_mem_mod = require_autogen_chromadb
     MemoryContent = core_mem_mod.MemoryContent
     MemoryMimeType = core_mem_mod.MemoryMimeType
 
-    expected_content = "The user prefers temperatures in Celsius"
-
-    # Wrap adapter.embed to prove AutoGen memory path invokes it (sync or async).
     calls = {"n": 0}
     orig_embed = getattr(adapter, "embed", None)
     assert callable(orig_embed), "Adapter must expose embed() for AutoGen embedding integration."
@@ -1033,7 +961,7 @@ async def test_real_autogen_chromadb_memory_roundtrip_uses_corpus_embeddings(
 
     memory = create_vector_memory(
         corpus_adapter=adapter,
-        collection_name="corpus_autogen_memory_it",
+        collection_name=_unique_collection("corpus_autogen_memory_it"),
         persistence_path=str(tmp_path),
         model="mock-embed-512",
         k=3,
@@ -1043,7 +971,7 @@ async def test_real_autogen_chromadb_memory_roundtrip_uses_corpus_embeddings(
     try:
         await memory.add(
             MemoryContent(
-                content=expected_content,
+                content="The user prefers temperatures in Celsius",
                 mime_type=MemoryMimeType.TEXT,
                 metadata={"category": "preferences"},
             )
@@ -1054,14 +982,472 @@ async def test_real_autogen_chromadb_memory_roundtrip_uses_corpus_embeddings(
         assert isinstance(result.results, list)
         assert len(result.results) >= 1
 
-        # Ensure embeddings were computed through the configured embedding function.
         assert calls["n"] >= 1, "Expected corpus adapter embed() to be called via AutoGen memory add/query."
 
-        # Ensure content round-trips through the vector memory (robust match).
         assert any(
-            _memory_result_contains_text(item, expected_content)
+            getattr(item, "content", None) == "The user prefers temperatures in Celsius"
             for item in result.results
-        ), "Expected stored memory content to be discoverable in query() results"
+        ), "Expected stored MemoryContent to be returned by query()"
+    finally:
+        await memory.close()
+
+# ---------------------------------------------------------------------------
+# Additional Real Chroma Coverage (6 tests)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_real_autogen_chromadb_persistence_reload_roundtrip(
+    require_autogen_chromadb,
+    adapter,
+    tmp_path,
+) -> None:
+    """
+    Real integration: persistence_path must actually persist content across memory instances.
+
+    Contract:
+    - Add content to a persistent store
+    - Close memory
+    - Re-open a new memory pointed at the same persistence_path + collection_name
+    - Query and confirm stored content is returned
+    """
+    _chroma_mod, core_mem_mod = require_autogen_chromadb
+    MemoryContent = core_mem_mod.MemoryContent
+    MemoryMimeType = core_mem_mod.MemoryMimeType
+
+    collection = _unique_collection("corpus_autogen_persist")
+    persist_path = tmp_path / "persist_db"
+
+    memory1 = create_vector_memory(
+        corpus_adapter=adapter,
+        collection_name=collection,
+        persistence_path=str(persist_path),
+        model="mock-embed-512",
+        k=5,
+        score_threshold=None,
+    )
+
+    try:
+        await memory1.add(
+            MemoryContent(
+                content="Persistent memory: apples are red",
+                mime_type=MemoryMimeType.TEXT,
+                metadata={"category": "facts"},
+            )
+        )
+    finally:
+        await memory1.close()
+
+    memory2 = create_vector_memory(
+        corpus_adapter=adapter,
+        collection_name=collection,
+        persistence_path=str(persist_path),
+        model="mock-embed-512",
+        k=5,
+        score_threshold=None,
+    )
+
+    try:
+        result = await memory2.query("apples color")
+        assert hasattr(result, "results")
+        assert isinstance(result.results, list)
+        assert any(getattr(item, "content", None) == "Persistent memory: apples are red" for item in result.results), (
+            "Expected persisted content to be returned after reopening the vector memory"
+        )
+    finally:
+        await memory2.close()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_real_autogen_chromadb_k_is_respected_on_query_results(
+    require_autogen_chromadb,
+    adapter,
+    tmp_path,
+) -> None:
+    """
+    Real integration: the configured `k` should cap the number of returned results.
+
+    We do NOT assume perfect ranking stability; we enforce only:
+      - len(results) <= k
+      - len(results) >= 1 after adding content
+    """
+    _chroma_mod, core_mem_mod = require_autogen_chromadb
+    MemoryContent = core_mem_mod.MemoryContent
+    MemoryMimeType = core_mem_mod.MemoryMimeType
+
+    persist_path = tmp_path / "k_respected_db"
+
+    async def _seed(memory) -> None:
+        # Add multiple distinct items so a capped k has an opportunity to matter.
+        for i in range(10):
+            await memory.add(
+                MemoryContent(
+                    content=f"k-test-item-{i}: fruit facts",
+                    mime_type=MemoryMimeType.TEXT,
+                    metadata={"i": i},
+                )
+            )
+
+    # k=1
+    col1 = _unique_collection("corpus_autogen_k1")
+    mem_k1 = create_vector_memory(
+        corpus_adapter=adapter,
+        collection_name=col1,
+        persistence_path=str(persist_path),
+        model="mock-embed-512",
+        k=1,
+        score_threshold=None,
+    )
+    try:
+        await _seed(mem_k1)
+        r1 = await mem_k1.query("fruit")
+        assert hasattr(r1, "results")
+        assert isinstance(r1.results, list)
+        assert 1 <= len(r1.results) <= 1, f"Expected k=1 to cap results at 1, got {len(r1.results)}"
+    finally:
+        await mem_k1.close()
+
+    # k=5
+    col5 = _unique_collection("corpus_autogen_k5")
+    mem_k5 = create_vector_memory(
+        corpus_adapter=adapter,
+        collection_name=col5,
+        persistence_path=str(persist_path),
+        model="mock-embed-512",
+        k=5,
+        score_threshold=None,
+    )
+    try:
+        await _seed(mem_k5)
+        r5 = await mem_k5.query("fruit")
+        assert hasattr(r5, "results")
+        assert isinstance(r5.results, list)
+        assert 1 <= len(r5.results) <= 5, f"Expected k=5 to cap results at 5, got {len(r5.results)}"
+    finally:
+        await mem_k5.close()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_real_autogen_chromadb_score_threshold_filters_results_in_some_direction(
+    require_autogen_chromadb,
+    adapter,
+    tmp_path,
+) -> None:
+    """
+    Real integration: `score_threshold` should have a filtering effect.
+
+    Because different AutoGen/Chroma versions interpret "score_threshold" differently
+    (similarity >= threshold vs distance <= threshold), this test is direction-agnostic:
+
+    - Run a baseline query with score_threshold=None (expect >1 results).
+    - Re-open with extremely-low and extremely-high thresholds.
+    - Assert that at least one of those extremes reduces result count vs baseline.
+      If neither reduces, score_threshold is being ignored and this test fails.
+    """
+    _chroma_mod, core_mem_mod = require_autogen_chromadb
+    MemoryContent = core_mem_mod.MemoryContent
+    MemoryMimeType = core_mem_mod.MemoryMimeType
+
+    collection = _unique_collection("corpus_autogen_threshold")
+    persist_path = tmp_path / "threshold_db"
+
+    mem_base = create_vector_memory(
+        corpus_adapter=adapter,
+        collection_name=collection,
+        persistence_path=str(persist_path),
+        model="mock-embed-512",
+        k=10,
+        score_threshold=None,
+    )
+
+    try:
+        for i in range(10):
+            await mem_base.add(
+                MemoryContent(
+                    content=f"threshold-item-{i}: animals and facts",
+                    mime_type=MemoryMimeType.TEXT,
+                    metadata={"i": i},
+                )
+            )
+        base = await mem_base.query("animals")
+        assert hasattr(base, "results")
+        assert isinstance(base.results, list)
+        assert len(base.results) >= 2, (
+            "Baseline query should return multiple results so threshold filtering can be observed"
+        )
+        base_n = len(base.results)
+    finally:
+        await mem_base.close()
+
+    mem_low = create_vector_memory(
+        corpus_adapter=adapter,
+        collection_name=collection,
+        persistence_path=str(persist_path),
+        model="mock-embed-512",
+        k=10,
+        score_threshold=0.0,
+    )
+    try:
+        low = await mem_low.query("animals")
+        assert hasattr(low, "results")
+        assert isinstance(low.results, list)
+        low_n = len(low.results)
+    finally:
+        await mem_low.close()
+
+    mem_high = create_vector_memory(
+        corpus_adapter=adapter,
+        collection_name=collection,
+        persistence_path=str(persist_path),
+        model="mock-embed-512",
+        k=10,
+        score_threshold=1e9,
+    )
+    try:
+        high = await mem_high.query("animals")
+        assert hasattr(high, "results")
+        assert isinstance(high.results, list)
+        high_n = len(high.results)
+    finally:
+        await mem_high.close()
+
+    assert (low_n < base_n) or (high_n < base_n), (
+        "score_threshold did not reduce result count under either extreme (0.0 or 1e9). "
+        "This suggests score_threshold is ignored by the installed AutoGen/Chroma integration."
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_real_autogen_chromadb_batch_embedding_path_is_exercised_when_supported(
+    require_autogen_chromadb,
+    monkeypatch: pytest.MonkeyPatch,
+    adapter,
+    tmp_path,
+) -> None:
+    """
+    Real integration: exercise batch embedding behavior.
+
+    Strategy:
+    - Wrap adapter.embed() and record the largest batch size observed.
+    - Attempt to call memory.add() with a list of MemoryContent objects (batch add).
+      If the installed AutoGen memory only supports single-item add(), we fall back
+      to sequential adds and assert that embed() was called multiple times.
+    - The test passes when either:
+      (A) a batch add is supported and we observe a batch size >= 2, OR
+      (B) batch add is not supported but the system still performs multiple embed calls
+          (reflecting the actual backend behavior).
+    """
+    _chroma_mod, core_mem_mod = require_autogen_chromadb
+    MemoryContent = core_mem_mod.MemoryContent
+    MemoryMimeType = core_mem_mod.MemoryMimeType
+
+    observed: Dict[str, Any] = {"max_batch": 0, "calls": 0}
+
+    orig_embed = getattr(adapter, "embed", None)
+    assert callable(orig_embed), "Adapter must expose embed() for batch-path integration test."
+
+    def _maybe_batch_len_from_args(args: tuple[Any, ...], kwargs: dict[str, Any]) -> int:
+        # Common patterns:
+        #   embed(texts=[...]) or embed([...]) or embed(raw_texts=[...])
+        if args:
+            first = args[0]
+            if isinstance(first, Sequence) and not isinstance(first, (str, bytes)):
+                try:
+                    return len(first)
+                except Exception:
+                    return 0
+        for key in ("texts", "raw_texts", "input", "inputs"):
+            v = kwargs.get(key)
+            if isinstance(v, Sequence) and not isinstance(v, (str, bytes)):
+                try:
+                    return len(v)
+                except Exception:
+                    return 0
+        return 0
+
+    if inspect.iscoroutinefunction(orig_embed):
+        async def wrapped_embed(*args: Any, **kwargs: Any) -> Any:
+            observed["calls"] += 1
+            observed["max_batch"] = max(observed["max_batch"], _maybe_batch_len_from_args(args, kwargs))
+            return await orig_embed(*args, **kwargs)
+        monkeypatch.setattr(adapter, "embed", wrapped_embed, raising=True)
+    else:
+        def wrapped_embed(*args: Any, **kwargs: Any) -> Any:
+            observed["calls"] += 1
+            observed["max_batch"] = max(observed["max_batch"], _maybe_batch_len_from_args(args, kwargs))
+            return orig_embed(*args, **kwargs)
+        monkeypatch.setattr(adapter, "embed", wrapped_embed, raising=True)
+
+    memory = create_vector_memory(
+        corpus_adapter=adapter,
+        collection_name=_unique_collection("corpus_autogen_batch"),
+        persistence_path=str(tmp_path / "batch_db"),
+        model="mock-embed-512",
+        k=5,
+        score_threshold=None,
+    )
+
+    try:
+        items = [
+            MemoryContent(content="Batch item one: dogs", mime_type=MemoryMimeType.TEXT, metadata={"i": 1}),
+            MemoryContent(content="Batch item two: cats", mime_type=MemoryMimeType.TEXT, metadata={"i": 2}),
+            MemoryContent(content="Batch item three: birds", mime_type=MemoryMimeType.TEXT, metadata={"i": 3}),
+        ]
+
+        batch_add_supported = True
+        try:
+            await memory.add(items)  # type: ignore[arg-type]
+        except TypeError:
+            batch_add_supported = False
+            for it in items:
+                await memory.add(it)
+
+        _ = await memory.query("pets")
+
+        if batch_add_supported:
+            assert observed["max_batch"] >= 2, (
+                "memory.add(list[MemoryContent]) succeeded, but adapter.embed() was never invoked with a batch >= 2. "
+                "This suggests batching is not flowing through to the embedding function as expected."
+            )
+        else:
+            assert observed["calls"] >= 2, (
+                "AutoGen memory does not support batch add() in this environment, but we still expect multiple "
+                "embedding calls across sequential adds and query."
+            )
+    finally:
+        await memory.close()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_real_autogen_chromadb_collection_isolation_same_persistence_path(
+    require_autogen_chromadb,
+    adapter,
+    tmp_path,
+) -> None:
+    """
+    Real integration: two collections under the same persistence_path should be isolated.
+
+    Contract:
+    - Add content to collection A
+    - Query collection B for the same concept
+    - Collection B must NOT return the content from collection A
+    """
+    _chroma_mod, core_mem_mod = require_autogen_chromadb
+    MemoryContent = core_mem_mod.MemoryContent
+    MemoryMimeType = core_mem_mod.MemoryMimeType
+
+    persist_path = tmp_path / "isolation_db"
+    col_a = _unique_collection("corpus_autogen_iso_a")
+    col_b = _unique_collection("corpus_autogen_iso_b")
+
+    mem_a = create_vector_memory(
+        corpus_adapter=adapter,
+        collection_name=col_a,
+        persistence_path=str(persist_path),
+        model="mock-embed-512",
+        k=5,
+        score_threshold=None,
+    )
+    mem_b = create_vector_memory(
+        corpus_adapter=adapter,
+        collection_name=col_b,
+        persistence_path=str(persist_path),
+        model="mock-embed-512",
+        k=5,
+        score_threshold=None,
+    )
+
+    try:
+        await mem_a.add(
+            MemoryContent(
+                content="Isolation test content: Jupiter is a gas giant",
+                mime_type=MemoryMimeType.TEXT,
+                metadata={"category": "astronomy"},
+            )
+        )
+
+        rb = await mem_b.query("Jupiter gas giant")
+        assert hasattr(rb, "results")
+        assert isinstance(rb.results, list)
+
+        assert not any(
+            getattr(item, "content", None) == "Isolation test content: Jupiter is a gas giant"
+            for item in rb.results
+        ), (
+            "Collection isolation violated: collection B returned content stored only in collection A"
+        )
+    finally:
+        await mem_a.close()
+        await mem_b.close()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_real_autogen_chromadb_metadata_roundtrip_on_retrieved_items(
+    require_autogen_chromadb,
+    adapter,
+    tmp_path,
+) -> None:
+    """
+    Real integration: metadata must round-trip for stored MemoryContent.
+
+    Contract:
+    - Add MemoryContent with metadata
+    - Query for it
+    - Retrieved result item corresponding to that content must preserve metadata keys/values
+    """
+    _chroma_mod, core_mem_mod = require_autogen_chromadb
+    MemoryContent = core_mem_mod.MemoryContent
+    MemoryMimeType = core_mem_mod.MemoryMimeType
+
+    collection = _unique_collection("corpus_autogen_meta")
+    memory = create_vector_memory(
+        corpus_adapter=adapter,
+        collection_name=collection,
+        persistence_path=str(tmp_path / "meta_db"),
+        model="mock-embed-512",
+        k=5,
+        score_threshold=None,
+    )
+
+    content_text = "Metadata roundtrip: user likes espresso"
+    meta = {"category": "preferences", "drink": "espresso"}
+
+    try:
+        await memory.add(
+            MemoryContent(
+                content=content_text,
+                mime_type=MemoryMimeType.TEXT,
+                metadata=dict(meta),
+            )
+        )
+
+        result = await memory.query("espresso preference")
+        assert hasattr(result, "results")
+        assert isinstance(result.results, list)
+        assert result.results, "Expected at least one result after storing MemoryContent"
+
+        matched = None
+        for item in result.results:
+            if getattr(item, "content", None) == content_text:
+                matched = item
+                break
+
+        assert matched is not None, "Expected stored content to appear in query results"
+
+        retrieved_meta = getattr(matched, "metadata", None)
+        assert isinstance(retrieved_meta, Mapping), (
+            "Expected retrieved MemoryContent to expose a Mapping metadata attribute"
+        )
+        for k, v in meta.items():
+            assert retrieved_meta.get(k) == v, (
+                f"Expected metadata key {k!r} to round-trip with value {v!r}; "
+                f"got {retrieved_meta.get(k)!r}"
+            )
     finally:
         await memory.close()
 
@@ -1076,9 +1462,6 @@ def test_create_vector_memory_raises_runtime_error_when_autogen_not_installed(
 ) -> None:
     """Clear error when AutoGen Chroma dependencies are not installed."""
     import builtins as _builtins
-
-    # Ensure the lazy-import path is actually exercised (not bypassed by sys.modules cache).
-    _sysmodules_evict_autogen_chromadb()
 
     orig_import = _builtins.__import__
 
