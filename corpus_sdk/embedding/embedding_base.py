@@ -1244,6 +1244,20 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
             return "10-100ms"
         return ">=100ms"
 
+    @staticmethod
+    def _model_supported(caps: EmbeddingCapabilities, model: str) -> bool:
+        """
+        Return True if `model` is supported by capabilities.
+
+        Convention:
+          - If caps.supported_models contains "*", treat it as "all models allowed"
+            (useful for mocks / framework adapters).
+        """
+        supported = tuple(getattr(caps, "supported_models", ()) or ())
+        if "*" in supported:
+            return True
+        return model in supported
+
     def _record(
         self,
         op: str,
@@ -1780,7 +1794,7 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         Metadata is attached per call on top of the cached base.
         """
         caps = await self._do_capabilities()
-        if spec.model not in caps.supported_models:
+        if not self._model_supported(caps, spec.model):
             raise ModelNotAvailable(f"Model '{spec.model}' is not supported")
 
         # Deterministic truncation if needed.
@@ -1954,7 +1968,7 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
             caps = await self._do_capabilities()
             if not caps.supports_streaming:
                 raise NotSupported("streaming embeddings not supported by this adapter")
-            if spec.model not in caps.supported_models:
+            if not self._model_supported(caps, spec.model):
                 raise ModelNotAvailable(f"Model '{spec.model}' is not supported")
 
             # Deterministic truncation if needed.
@@ -2027,7 +2041,7 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         Validate the incoming BatchEmbedSpec against capabilities and apply
         deterministic truncation, returning an effective spec for execution.
         """
-        if spec.model not in caps.supported_models:
+        if not self._model_supported(caps, spec.model):
             raise ModelNotAvailable(f"Model '{spec.model}' is not supported")
 
         if caps.max_batch_size and len(spec.texts) > caps.max_batch_size:
@@ -2297,7 +2311,7 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         Core implementation of count_tokens() separated for easier testing.
         """
         caps = await self._do_capabilities()
-        if model not in caps.supported_models:
+        if not self._model_supported(caps, model):
             raise ModelNotAvailable(f"Model '{model}' is not supported")
         if not caps.supports_token_counting:
             raise NotSupported("count_tokens is not supported by this adapter")
