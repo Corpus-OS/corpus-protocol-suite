@@ -1188,6 +1188,7 @@ def test_capabilities_and_health_return_empty_when_missing() -> None:
     assert ahealth == {}
 
 
+
 # ---------------------------------------------------------------------------
 # Resource management (context managers)
 # ---------------------------------------------------------------------------
@@ -1199,31 +1200,45 @@ async def test_context_manager_closes_underlying_adapter() -> None:
     __enter__/__exit__ and __aenter__/__aexit__ should call close/aclose on
     the underlying adapter when those methods exist.
     """
+    # IMPORTANT:
+    # The Corpus embedding stack calls adapter.embed() with an EmbedSpec-like object,
+    # and expects an EmbedResult / BatchEmbedResult flow. So this test MUST use a
+    # protocol-conformant adapter. We wrap the existing mock adapter and only add
+    # close()/aclose() flags.
+    from tests.mock.mock_embedding_adapter import MockEmbeddingAdapter
 
-    class ClosingAdapter:
+    class SyncClosingAdapter(MockEmbeddingAdapter):
         def __init__(self) -> None:
+            super().__init__()
             self.closed = False
-            self.aclosed = False
-
-        def embed(self, texts: Sequence[str], **_: Any) -> list[list[float]]:
-            return [[0.0] * 2 for _ in texts]
 
         def close(self) -> None:
             self.closed = True
 
+    class AsyncClosingAdapter(MockEmbeddingAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.aclosed = False
+
         async def aclose(self) -> None:
             self.aclosed = True
 
-    adapter = ClosingAdapter()
-
     # Sync context manager
-    with CorpusLangChainEmbeddings(corpus_adapter=adapter, model="ctx-model") as emb:
-        _ = emb.embed_documents(["x"])  # smoke
+    adapter = SyncClosingAdapter()
+
+    # IMPORTANT:
+    # This test is async, so we must not call sync APIs inside the running event loop.
+    # Run the sync context manager + sync embed_documents off-loop.
+    def _run_sync_context_manager() -> None:
+        with CorpusLangChainEmbeddings(corpus_adapter=adapter, model="ctx-model") as emb:
+            _ = emb.embed_documents(["x"])  # smoke
+
+    await asyncio.to_thread(_run_sync_context_manager)
 
     assert adapter.closed is True
 
     # Async context manager
-    adapter2 = ClosingAdapter()
+    adapter2 = AsyncClosingAdapter()
     emb2 = CorpusLangChainEmbeddings(corpus_adapter=adapter2, model="ctx-model-2")
 
     async with emb2:
