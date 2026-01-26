@@ -46,10 +46,20 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Coroutine, Optional, TypeVar, ParamSpec, ClassVar, Set
+from typing import Any, Callable, Coroutine, Optional, TypeVar, ClassVar, Set
 from time import perf_counter
 import os
 import sys
+
+# ---------------------------------------------------------------------------
+# Python compatibility: ParamSpec
+# ---------------------------------------------------------------------------
+# ParamSpec is in typing starting Python 3.10.
+# For Python 3.9 (and some 3.8 builds), it must come from typing_extensions.
+try:
+    from typing import ParamSpec  # type: ignore[attr-defined]
+except ImportError:  # pragma: no cover
+    from typing_extensions import ParamSpec  # type: ignore[no-redef]
 
 T = TypeVar("T")
 P = ParamSpec("P")
