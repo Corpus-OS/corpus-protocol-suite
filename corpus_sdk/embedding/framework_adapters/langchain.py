@@ -1,1703 +1,1340 @@
-# corpus_sdk/embedding/framework_adapters/common/embedding_translation.py
+# corpus_sdk/embedding/framework_adapters/langchain.py
 # SPDX-License-Identifier: Apache-2.0
+
 """
-Framework-agnostic Embedding → Framework translation layer.
+LangChain adapter for Corpus Embedding protocol.
 
-Purpose
--------
-Provide a high-level orchestration and translation layer between:
+This module exposes Corpus `EmbeddingProtocolV1` implementations as
+`langchain_core.embeddings.Embeddings`, with:
 
-- The Corpus Embedding Protocol V1 (`EmbeddingProtocolV1` / `BaseEmbeddingAdapter`), and
-- Framework-specific embedding integrations (LangChain, LlamaIndex, SK, AutoGen, CrewAI, custom).
+- Sync + async embedding for documents and queries
+- Context normalization via `context_translation.from_langchain`
+- Framework-agnostic orchestration via `EmbeddingTranslator`
+- Async → sync bridging handled in the common embedding layer
+- Rich error context attachment for observability
+- Model selection via framework_ctx / OperationContext attrs
 
-This module is intentionally *framework-neutral* and focuses on:
+Design notes / philosophy
+-------------------------
+- **Protocol-first**: we require only an `embed` method (duck-typed) instead of
+  strict inheritance from a specific adapter base class.
+- **Resilient to framework evolution**: LangChain’s RunnableConfig and invocation
+  APIs evolve; we normalize/validate context defensively and keep our adapter
+  surface stable.
+- **Observability-first**: all embedding operations attach rich error context:
+  framework identity, model info, batch sizes, node IDs, trace/workflow IDs, etc.
+- **Fail-safe context translation**: context translation must never break embeddings.
+  If translation fails, we proceed without `OperationContext` (optionally falling
+  back to a simple one) and attach diagnostic context.
+- **Strict by default**: non-string inputs in batch operations are rejected with
+  `TypeError` instead of being coerced, to avoid silently embedding repr() outputs.
 
-- Building `EmbedSpec` / `BatchEmbedSpec` from framework-level inputs
-- Translating `EmbedResult` / `EmbedChunk` / `BatchEmbedResult` back to framework-facing shapes
-- Applying text normalization (whitespace, encoding, truncation)
-- Providing sync + async APIs, including streaming via a sync bridge
-- Attaching rich error context for observability
-- Passing through token usage / stats data from adapters
-
-Text normalization
-------------------
-This layer supports configurable text preprocessing:
-
-- Whitespace normalization and cleaning
-- Encoding validation and enforcement
-- Length truncation with multiple strategies
-- Empty text filtering
-- Case normalization
-
-Batch handling
---------------
-Batch configuration is passed through to adapters, but this layer does not
-implement automatic batch splitting. The `BatchConfig` is a hint object
-for adapters or higher-level orchestrators to use.
-
-Streaming
----------
-For streaming embeddings, this module exposes:
-
-- An async API that yields translated framework chunks, and
-- A sync API that wraps the async generator via `SyncStreamBridge`, preserving
-  proper cancellation and error propagation.
-
-Note that some adapters may ignore `stream=True` and return unary results;
-this layer handles that gracefully by wrapping the result as a single chunk.
-
-Registry
---------
-A small registry lets you register per-framework embedding translators:
-
-- `register_embedding_translator("my_framework", factory)`
-- `create_embedding_translator("my_framework", adapter, ...)`
-
-This makes it straightforward to plug in framework-specific behaviors while
-reusing the common orchestration logic here.
+Resilience (retries, caching, rate limiting, etc.) is expected to be provided
+by the underlying adapter, typically a BaseEmbeddingAdapter subclass.
 """
 
 from __future__ import annotations
 
 import asyncio
-import inspect
 import logging
-import re
 import threading
-from dataclasses import asdict, dataclass, replace
+import time
+from collections.abc import Mapping, Sequence
+from functools import wraps
 from typing import (
     Any,
-    AsyncIterator,
-    Awaitable,
     Callable,
     Dict,
-    Iterator,
     List,
-    Mapping,
     Optional,
-    Protocol,
-    Sequence,
+    Tuple,
     TypeVar,
-    Union,
 )
 
-from corpus_sdk.core.async_bridge import AsyncBridge
-from corpus_sdk.core.context_translation import from_dict as ctx_from_dict
+from typing_extensions import TypedDict
+
+from pydantic import BaseModel, ConfigDict, PrivateAttr, field_validator
+
+from corpus_sdk.core.context_translation import (
+    from_langchain as context_from_langchain,
+)
 from corpus_sdk.core.error_context import attach_context
-from corpus_sdk.core.sync_bridge import SyncStreamBridge
 from corpus_sdk.embedding.embedding_base import (
-    BadRequest,
-    BatchEmbedResult,
-    BatchEmbedSpec,
-    EmbedChunk,
-    EmbedResult,
-    EmbedSpec,
-    EmbeddingProtocolV1,
-    EmbeddingStats,
     OperationContext,
 )
+from corpus_sdk.embedding.framework_adapters.common.embedding_translation import (
+    BatchConfig,
+    EmbeddingTranslator,
+    TextNormalizationConfig,
+    create_embedding_translator,
+)
+from corpus_sdk.embedding.framework_adapters.common.framework_utils import (
+    CoercionErrorCodes,
+    coerce_embedding_matrix,
+    coerce_embedding_vector,
+    warn_if_extreme_batch,
+)
 
-LOG = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
-R = TypeVar("R")
+T = TypeVar("T")
+
+_FRAMEWORK_NAME = "langchain"
+
+# ---------------------------------------------------------------------------
+# Safe conditional import for LangChain Embeddings
+# ---------------------------------------------------------------------------
+
+try:
+    from langchain_core.embeddings import Embeddings  # type: ignore[no-redef]
+
+    LANGCHAIN_AVAILABLE = True
+except ImportError:  # pragma: no cover - only used when LangChain isn't installed
+
+    class Embeddings:  # type: ignore[no-redef]
+        """
+        Minimal fallback base class when LangChain is not installed.
+
+        This is only to keep imports from failing. Using the adapter without
+        LangChain installed is effectively a misconfiguration.
+        """
+
+        pass
+
+    LANGCHAIN_AVAILABLE = False
 
 
-# =============================================================================
-# Helpers: OperationContext normalization
-# =============================================================================
-
-
-def _operation_context_kwargs(**kwargs: Any) -> Dict[str, Any]:
+class ErrorCodes:
     """
-    Filter kwargs to only those accepted by OperationContext.__init__.
+    Error code constants for LangChain embedding adapter.
 
-    This keeps this translation layer compatible across OperationContext
-    revisions (e.g., older versions without `metrics`).
+    This is a simple namespace for framework-specific codes. The shared
+    coercion helpers use `EMBEDDING_COERCION_ERROR_CODES`, which is a
+    `CoercionErrorCodes` instance derived from these values.
+    """
+
+    # Coercion-level (used by framework_utils)
+    INVALID_EMBEDDING_RESULT = "INVALID_EMBEDDING_RESULT"
+    EMPTY_EMBEDDING_RESULT = "EMPTY_EMBEDDING_RESULT"
+    EMBEDDING_CONVERSION_ERROR = "EMBEDDING_CONVERSION_ERROR"
+
+    # LangChain-specific config errors
+    LANGCHAIN_CONFIG_INVALID = "LANGCHAIN_CONFIG_INVALID"
+
+    # Sync wrapper misuse errors
+    SYNC_WRAPPER_CALLED_IN_EVENT_LOOP = "SYNC_WRAPPER_CALLED_IN_EVENT_LOOP"
+
+
+# Coercion configuration for the common embedding utils
+EMBEDDING_COERCION_ERROR_CODES: CoercionErrorCodes = CoercionErrorCodes(
+    invalid_result=ErrorCodes.INVALID_EMBEDDING_RESULT,
+    empty_result=ErrorCodes.EMPTY_EMBEDDING_RESULT,
+    conversion_error=ErrorCodes.EMBEDDING_CONVERSION_ERROR,
+    framework_label=_FRAMEWORK_NAME,
+)
+
+
+class LangChainConfig(TypedDict, total=False):
+    """
+    Structured type for LangChain RunnableConfig-like context.
+
+    This mirrors the common fields exposed by LangChain's RunnableConfig /
+    invocation layer and is used both for type safety and for observability
+    context extraction.
+    """
+
+    configurable: Optional[Dict[str, Any]]
+    tags: Optional[List[str]]
+    metadata: Optional[Dict[str, Any]]
+    callbacks: Optional[Any]
+    run_name: Optional[str]
+    run_id: Optional[str]
+
+
+class LangChainAdapterConfig(TypedDict, total=False):
+    """
+    Structured configuration for LangChain adapter behavior.
+
+    This is *adapter-level* configuration (not to be confused with the per-call
+    LangChain RunnableConfig-like `config` dict passed into embed calls).
+
+    Fields
+    ------
+    fallback_to_simple_context:
+        If context translation fails or returns a non-OperationContext value,
+        optionally fall back to an empty OperationContext() instead of proceeding
+        with no core context. Defaults to False to preserve compatibility.
+
+    enable_operation_context_propagation:
+        If True, include the OperationContext instance in framework_ctx as
+        `_operation_context` for downstream inspection. Defaults to True.
+    """
+
+    fallback_to_simple_context: bool
+    enable_operation_context_propagation: bool
+
+
+# ---------------------------------------------------------------------------
+# Safety / robustness utilities (input validation + safe snapshots)
+# ---------------------------------------------------------------------------
+
+
+def _validate_texts_are_strings(texts: Sequence[Any], *, op_name: str) -> None:
+    """
+    Fail fast if a caller provides non-string items.
+
+    We intentionally do not coerce arbitrary objects to str here, because that can
+    silently embed repr() outputs and lead to confusing retrieval behavior.
+    """
+    for i, t in enumerate(texts):
+        if not isinstance(t, str):
+            raise TypeError(
+                f"{op_name} expects Sequence[str]; item {i} is {type(t).__name__}",
+            )
+
+
+def _safe_snapshot(value: Any, *, max_items: int = 200, max_str: int = 5_000) -> Any:
+    """
+    Best-effort conversion into a JSON-ish, safe-to-log snapshot.
+
+    - Limits container size to reduce log bloat
+    - Truncates long strings
+    - Falls back to repr() for unknown objects
+
+    NOTE: This is intended for observability payloads; it does not guarantee
+    redaction of secrets, but it significantly reduces accidental large dumps.
     """
     try:
-        params = set(inspect.signature(OperationContext).parameters.keys())
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        if isinstance(value, str):
+            return value if len(value) <= max_str else value[:max_str] + "…"
+        if isinstance(value, Mapping):
+            out: Dict[str, Any] = {}
+            for idx, (k, v) in enumerate(value.items()):
+                if idx >= max_items:
+                    out["…"] = f"truncated after {max_items} items"
+                    break
+                out[str(k)] = _safe_snapshot(v, max_items=max_items, max_str=max_str)
+            return out
+        if isinstance(value, (list, tuple)):
+            out_list: List[Any] = []
+            for idx, v in enumerate(value):
+                if idx >= max_items:
+                    out_list.append(f"… truncated after {max_items} items")
+                    break
+                out_list.append(_safe_snapshot(v, max_items=max_items, max_str=max_str))
+            return out_list
+        return repr(value)
     except Exception:  # noqa: BLE001
-        # Conservative fallback to the most common stable fields.
-        params = {
+        return {"repr": repr(value)}
+
+
+def _looks_like_operation_context(obj: Any) -> bool:
+    """
+    OperationContext may be a concrete type or a Protocol/alias depending on the SDK.
+
+    Prefer isinstance when it works; fall back to a lightweight structural
+    heuristic aligned with corpus_sdk.embedding.embedding_base.OperationContext.
+    """
+    if obj is None:
+        return False
+    try:
+        if isinstance(obj, OperationContext):
+            return True
+    except TypeError:
+        # OperationContext may be a Protocol/typing alias at runtime
+        pass
+
+    return any(
+        hasattr(obj, attr)
+        for attr in (
             "request_id",
             "idempotency_key",
             "deadline_ms",
             "traceparent",
             "tenant",
             "attrs",
-        }
-
-    params.discard("self")
-    return {k: v for k, v in kwargs.items() if k in params}
-
-
-def _ensure_operation_context(
-    ctx: Optional[Union[OperationContext, Mapping[str, Any]]],
-) -> OperationContext:
-    """Normalize various context shapes into an embedding OperationContext."""
-    # 1) No context → build from empty dict
-    if ctx is None:
-        core_ctx = ctx_from_dict({})
-        return OperationContext(
-            **_operation_context_kwargs(
-                request_id=getattr(core_ctx, "request_id", None),
-                idempotency_key=getattr(core_ctx, "idempotency_key", None),
-                deadline_ms=getattr(core_ctx, "deadline_ms", None),
-                traceparent=getattr(core_ctx, "traceparent", None),
-                tenant=getattr(core_ctx, "tenant", None),
-                metrics=getattr(core_ctx, "metrics", None),
-                attrs=getattr(core_ctx, "attrs", None) or {},
-            )
+            "remaining_ms",
+            "to_dict",
         )
-
-    # 2) Already our embedding OperationContext → just use it
-    if isinstance(ctx, OperationContext):
-        return ctx
-
-    # 3) Mapping → go through core context translation
-    if isinstance(ctx, Mapping):
-        core_ctx = ctx_from_dict(ctx)
-        return OperationContext(
-            **_operation_context_kwargs(
-                request_id=getattr(core_ctx, "request_id", None),
-                idempotency_key=getattr(core_ctx, "idempotency_key", None),
-                deadline_ms=getattr(core_ctx, "deadline_ms", None),
-                traceparent=getattr(core_ctx, "traceparent", None),
-                tenant=getattr(core_ctx, "tenant", None),
-                metrics=getattr(core_ctx, "metrics", None),
-                attrs=getattr(core_ctx, "attrs", None) or {},
-            )
-        )
-
-    # 4) Duck-typed context
-    if hasattr(ctx, "request_id") or hasattr(ctx, "attrs"):
-        return OperationContext(
-            **_operation_context_kwargs(
-                request_id=getattr(ctx, "request_id", None),
-                idempotency_key=getattr(ctx, "idempotency_key", None),
-                deadline_ms=getattr(ctx, "deadline_ms", None),
-                traceparent=getattr(ctx, "traceparent", None),
-                tenant=getattr(ctx, "tenant", None),
-                metrics=getattr(ctx, "metrics", None),
-                attrs=getattr(ctx, "attrs", None) or {},
-            )
-        )
-
-    # 5) Everything else → hard error
-    raise BadRequest(
-        f"Unsupported context type: {type(ctx).__name__}",
-        code="BAD_OPERATION_CONTEXT",
     )
 
 
-# =============================================================================
-# Batching configuration
-# =============================================================================
-
-
-@dataclass(frozen=True)
-class BatchConfig:
-    """
-    Configuration for batching behavior.
-
-    Note
-    ----
-    This class *does not* implement batching logic itself. It is a shared
-    configuration object that can be passed to components that actually
-    perform batching (e.g., adapters or higher-level orchestrators).
-
-    The EmbeddingTranslator stores this config for inspection / wiring, but it
-    never splits or groups texts on its own.
-
-    Important
-    ---------
-    - `max_tokens_per_batch` requires tokenization support from the underlying
-      adapter. Without tokenization hints, this setting may be ignored.
-    - Batch splitting based on token limits is typically handled by the
-      underlying embedding provider or a dedicated batching layer.
-    """
-
-    enabled: bool = True
-    max_batch_size: int = 32
-    max_tokens_per_batch: Optional[int] = None
-    sort_by_length: bool = True
-    retry_on_partial_failure: bool = True
-
-    def __post_init__(self) -> None:
-        """Validate batch configuration parameters."""
-        if self.enabled:
-            if self.max_batch_size <= 0:
-                raise ValueError(f"max_batch_size must be positive, got {self.max_batch_size}")
-            if self.max_tokens_per_batch is not None and self.max_tokens_per_batch <= 0:
-                raise ValueError(
-                    f"max_tokens_per_batch must be positive, got {self.max_tokens_per_batch}"
-                )
-
-
-# =============================================================================
-# Text normalization configuration
-# =============================================================================
-
-
-@dataclass(frozen=True)
-class TextNormalizationConfig:
-    """
-    Configuration for text preprocessing before embedding.
-
-    Attributes:
-        normalize_whitespace:
-            Collapse multiple whitespace characters to single spaces and strip
-            leading/trailing whitespace.
-
-        remove_empty:
-            If True, filter out empty or whitespace-only texts.
-
-        max_length:
-            Optional character limit. Texts longer than this are truncated.
-
-        truncate_strategy:
-            How to truncate long texts:
-            - "end": Keep beginning, truncate end (default)
-            - "start": Keep end, truncate beginning
-            - "middle": Keep beginning and end, truncate middle.
-
-        encoding:
-            Text encoding to validate/enforce. Default "utf-8".
-
-        lowercase:
-            If True, convert all text to lowercase.
-
-        strict_encoding:
-            If True, raise an error when text cannot be encoded/decoded with
-            the specified encoding. If False, use replacement characters.
-
-        strict_type:
-            If True, reject non-string inputs with an error. If False,
-            attempt to convert to string.
-    """
-
-    normalize_whitespace: bool = True
-    remove_empty: bool = True
-    max_length: Optional[int] = None
-    truncate_strategy: str = "end"
-    encoding: str = "utf-8"
-    lowercase: bool = False
-    strict_encoding: bool = True
-    strict_type: bool = True
-
-    def __post_init__(self) -> None:
-        """Validate text normalization configuration."""
-        if self.truncate_strategy not in ("end", "start", "middle"):
-            raise ValueError(
-                "truncate_strategy must be 'end', 'start', or 'middle', "
-                f"got {self.truncate_strategy!r}"
-            )
-        if self.max_length is not None and self.max_length <= 0:
-            raise ValueError(f"max_length must be positive, got {self.max_length}")
-
-
-# =============================================================================
-# Text normalization helpers
-# =============================================================================
-
-
-class TextNormalizer:
-    """Helper for normalizing text before embedding."""
-
-    def __init__(self, config: TextNormalizationConfig) -> None:
-        self.config = config
-
-    def normalize(self, text: str) -> Optional[str]:
-        """
-        Normalize a single text according to configuration.
-
-        Returns:
-            Normalized text, or None if text should be filtered out.
-
-        Raises:
-            BadRequest: If strict_type=True and input is not a string,
-                        or if strict_encoding=True and encoding fails.
-        """
-        # Type handling
-        if not isinstance(text, str):
-            if self.config.strict_type:
-                raise BadRequest(
-                    f"Text must be a string, got {type(text).__name__}",
-                    code="BAD_TEXT_TYPE",
-                    details={"type": type(text).__name__},
-                )
-            else:
-                LOG.warning("TextNormalizer: non-string text %r, converting", type(text))
-                text = str(text)
-
-        # Validate / enforce encoding
-        if self.config.encoding:
-            try:
-                text.encode(self.config.encoding, errors="strict")
-                if not self.config.strict_encoding:
-                    text = text.encode(self.config.encoding, errors="replace").decode(self.config.encoding)
-            except UnicodeEncodeError:
-                if self.config.strict_encoding:
-                    raise BadRequest(
-                        f"Text cannot be encoded as {self.config.encoding}",
-                        code="BAD_TEXT_ENCODING",
-                        details={"encoding": self.config.encoding},
-                    )
-                else:
-                    LOG.debug("TextNormalizer: encoding error, using replacement chars")
-                    text = text.encode(self.config.encoding, errors="replace").decode(self.config.encoding)
-
-        if self.config.normalize_whitespace:
-            text = re.sub(r"\s+", " ", text).strip()
-
-        if self.config.remove_empty and not text.strip():
-            return None
-
-        if self.config.lowercase:
-            text = text.lower()
-
-        if self.config.max_length is not None and len(text) > self.config.max_length:
-            text = self._truncate(text, self.config.max_length, self.config.truncate_strategy)
-
-        return text
-
-    def normalize_batch(self, texts: Sequence[str]) -> List[str]:
-        """
-        Normalize a batch of texts, filtering out None results.
-
-        Returns:
-            List of normalized texts (may be shorter than input if texts filtered).
-
-        Raises:
-            BadRequest: If any text fails normalization based on strict settings.
-        """
-        normalized: List[str] = []
-        for idx, text in enumerate(texts):
-            try:
-                result = self.normalize(text)
-                if result is not None:
-                    normalized.append(result)
-            except BadRequest as e:
-                raise BadRequest(
-                    f"Text at index {idx} failed normalization: {str(e)}",
-                    code=e.code,
-                    details={**e.details, "index": idx} if e.details else {"index": idx},
-                ) from e
-        return normalized
-
-    @staticmethod
-    def _truncate(text: str, max_length: int, strategy: str) -> str:
-        """Truncate text according to strategy."""
-        if len(text) <= max_length:
-            return text
-
-        if strategy == "end":
-            return text[:max_length]
-        if strategy == "start":
-            return text[-max_length:]
-        if strategy == "middle":
-            keep_each = max_length // 2
-            remaining = max_length - (keep_each * 2)
-            return text[: keep_each + remaining] + text[-keep_each:]
-
-        return text[:max_length]
-
-
-# =============================================================================
-# Framework-agnostic translator protocol
-# =============================================================================
-
-
-class EmbeddingFrameworkTranslator(Protocol):
-    """
-    Per-framework translator contract.
-
-    Implementations are responsible for:
-        - Converting framework-level embed inputs into Embed*Spec types
-        - Converting embedding results into framework-level outputs
-        - Handling framework-specific document/text representations
-    """
-
-    def build_embed_spec(
-        self,
-        raw_texts: Any,
-        *,
-        op_ctx: OperationContext,
-        framework_ctx: Optional[Any] = None,
-        stream: bool = False,
-    ) -> EmbedSpec:
-        ...
-
-    def translate_embed_result(
-        self,
-        result: EmbedResult,
-        *,
-        op_ctx: OperationContext,
-        framework_ctx: Optional[Any] = None,
-    ) -> Any:
-        ...
-
-    def translate_embed_chunk(
-        self,
-        chunk: EmbedChunk,
-        *,
-        op_ctx: OperationContext,
-        framework_ctx: Optional[Any] = None,
-    ) -> Any:
-        ...
-
-    def build_batch_embed_spec(
-        self,
-        raw_batch: Any,
-        *,
-        op_ctx: OperationContext,
-        framework_ctx: Optional[Any] = None,
-    ) -> BatchEmbedSpec:
-        ...
-
-    def translate_batch_embed_result(
-        self,
-        result: BatchEmbedResult,
-        *,
-        op_ctx: OperationContext,
-        framework_ctx: Optional[Any] = None,
-    ) -> Any:
-        ...
-
-    def translate_stats(
-        self,
-        stats: EmbeddingStats,
-        *,
-        op_ctx: OperationContext,
-        framework_ctx: Optional[Any] = None,
-    ) -> Any:
-        ...
-
-    def preferred_model(
-        self,
-        *,
-        op_ctx: OperationContext,
-        framework_ctx: Optional[Any] = None,
-    ) -> Optional[str]:
-        """
-        Optional hook for translators to derive a default model name.
-
-        This can come from:
-            - framework_ctx (e.g., configured model)
-            - op_ctx.attrs (e.g., "embedding_model" key)
-
-        Returns:
-            Model name string, or None if no model is preferred.
-        """
-        ...
-
-
-# =============================================================================
-# Default generic translator implementation
-# =============================================================================
-
-
-class DefaultEmbeddingFrameworkTranslator:
-    """
-    Generic, framework-neutral translator implementation.
-
-    Behaviors:
-        - `embed` is single-text oriented (string or mapping with "text")
-        - `batch_embed` handles lists/tuples or mappings with "texts"
-        - Applies text normalization if configured
-        - Results are translated into simple dicts that mirror dataclasses
-    """
-
-    def __init__(
-        self,
-        *,
-        text_normalizer: Optional[TextNormalizer] = None,
-    ) -> None:
-        self._text_normalizer = text_normalizer or TextNormalizer(TextNormalizationConfig())
-
-    def preferred_model(
-        self,
-        *,
-        op_ctx: OperationContext,
-        framework_ctx: Optional[Any] = None,
-    ) -> Optional[str]:
-        if isinstance(framework_ctx, Mapping):
-            model = framework_ctx.get("model")
-            if model is not None:
-                return str(model)
-
-        attrs = op_ctx.attrs or {}
-        model = attrs.get("embedding_model")
-        if model is not None:
-            return str(model)
-
-        model = attrs.get("model")
-        if model is not None:
-            return str(model)
-
+def _infer_dim_from_matrix(mat: List[List[float]]) -> Optional[int]:
+    """Best-effort embedding dimension inference from a 2D embedding matrix."""
+    if not mat:
         return None
-
-    def _extract_single_text(self, raw_texts: Any) -> str:
-        if isinstance(raw_texts, str):
-            return raw_texts
-
-        if isinstance(raw_texts, Mapping):
-            if "text" in raw_texts:
-                return str(raw_texts["text"])
-            raise BadRequest(
-                "Mapping input for embed must contain 'text'",
-                code="BAD_TEXTS",
-            )
-
-        raise BadRequest(
-            "embed expects a single string or mapping with 'text'; "
-            "use batch_embed for multiple texts",
-            code="BAD_TEXTS",
-        )
-
-    def build_embed_spec(
-        self,
-        raw_texts: Any,
-        *,
-        op_ctx: OperationContext,
-        framework_ctx: Optional[Any] = None,
-        stream: bool = False,
-    ) -> EmbedSpec:
-        model = self.preferred_model(op_ctx=op_ctx, framework_ctx=framework_ctx)
-        fallback_model = model or ""
-
-        if isinstance(raw_texts, Mapping):
-            req_model = raw_texts.get("model")
-            truncate = bool(raw_texts.get("truncate", True))
-            normalize_vec = bool(raw_texts.get("normalize", False))
-            text = self._extract_single_text(raw_texts)
-            normalized = self._text_normalizer.normalize(text)
-            if normalized is None:
-                raise BadRequest(
-                    "Text was filtered out during normalization (empty after processing)",
-                    code="BAD_TEXT_EMPTY",
-                )
-            return EmbedSpec(
-                text=normalized,
-                model=str(req_model) if req_model is not None else fallback_model,
-                truncate=truncate,
-                normalize=normalize_vec,
-                metadata=None,
-                stream=bool(raw_texts.get("stream", stream)),
-            )
-
-        text = self._extract_single_text(raw_texts)
-        normalized = self._text_normalizer.normalize(text)
-        if normalized is None:
-            raise BadRequest(
-                "Text was filtered out during normalization (empty after processing)",
-                code="BAD_TEXT_EMPTY",
-            )
-
-        return EmbedSpec(
-            text=normalized,
-            model=fallback_model,
-            truncate=True,
-            normalize=False,
-            metadata=None,
-            stream=stream,
-        )
-
-    def translate_embed_result(
-        self,
-        result: EmbedResult,
-        *,
-        op_ctx: OperationContext,  # noqa: ARG002
-        framework_ctx: Optional[Any] = None,  # noqa: ARG002
-    ) -> Any:
-        ev = result.embedding
-        return {
-            "embedding": ev.vector,
-            "dimensions": ev.dimensions,
-            "model": result.model,
-            "text": result.text,
-            "tokens_used": result.tokens_used,
-            "truncated": result.truncated,
-            "metadata": ev.metadata,
-        }
-
-    def translate_embed_chunk(
-        self,
-        chunk: EmbedChunk,
-        *,
-        op_ctx: OperationContext,  # noqa: ARG002
-        framework_ctx: Optional[Any] = None,  # noqa: ARG002
-    ) -> Any:
-        return {
-            "embeddings": [e.vector for e in (chunk.embeddings or [])],
-            "model": chunk.model,
-            "is_final": bool(chunk.is_final),
-            "usage": dict(chunk.usage or {}) if chunk.usage is not None else None,
-        }
-
-    def _extract_text_list(self, raw_batch: Any) -> List[str]:
-        if isinstance(raw_batch, Mapping):
-            texts = raw_batch.get("texts")
-            if texts is None:
-                raise BadRequest(
-                    "raw_batch mapping must contain 'texts'",
-                    code="BAD_BATCH",
-                )
-        else:
-            texts = raw_batch
-
-        if isinstance(texts, str):
-            texts = [texts]
-
-        if not isinstance(texts, (list, tuple)):
-            raise BadRequest(
-                "texts must be a list (or tuple) of strings",
-                code="BAD_BATCH",
-            )
-
-        if not texts:
-            raise BadRequest(
-                "texts must contain at least one item",
-                code="BAD_BATCH_EMPTY",
-            )
-
-        return [str(t) for t in texts]
-
-    def build_batch_embed_spec(
-        self,
-        raw_batch: Any,
-        *,
-        op_ctx: OperationContext,
-        framework_ctx: Optional[Any] = None,
-    ) -> BatchEmbedSpec:
-        model = self.preferred_model(op_ctx=op_ctx, framework_ctx=framework_ctx)
-        fallback_model = model or ""
-
-        texts = self._extract_text_list(raw_batch)
-        normalized = self._text_normalizer.normalize_batch(texts)
-        if not normalized:
-            raise BadRequest(
-                "All texts were filtered out during normalization",
-                code="BAD_BATCH_ALL_EMPTY",
-            )
-
-        truncate = True
-        normalize_vec = False
-        req_model: Optional[str] = None
-
-        if isinstance(raw_batch, Mapping):
-            truncate = bool(raw_batch.get("truncate", True))
-            normalize_vec = bool(raw_batch.get("normalize", False))
-            req_model = raw_batch.get("model")
-
-        return BatchEmbedSpec(
-            texts=normalized,
-            model=str(req_model) if req_model is not None else fallback_model,
-            truncate=truncate,
-            normalize=normalize_vec,
-            metadatas=None,
-        )
-
-    def translate_batch_embed_result(
-        self,
-        result: BatchEmbedResult,
-        *,
-        op_ctx: OperationContext,  # noqa: ARG002
-        framework_ctx: Optional[Any] = None,  # noqa: ARG002
-    ) -> Any:
-        return {
-            "embeddings": [e.vector for e in (result.embeddings or [])],
-            "model": result.model,
-            "total_texts": result.total_texts,
-            "total_tokens": result.total_tokens,
-            "failed_texts": list(result.failed_texts or []),
-        }
-
-    def translate_stats(
-        self,
-        stats: EmbeddingStats,
-        *,
-        op_ctx: OperationContext,  # noqa: ARG002
-        framework_ctx: Optional[Any] = None,  # noqa: ARG002
-    ) -> Any:
-        return asdict(stats)
+    first = mat[0]
+    if not isinstance(first, list):
+        return None
+    return len(first)
 
 
-# =============================================================================
-# Embedding Translator Orchestrator
-# =============================================================================
-
-
-class EmbeddingTranslator:
+def _ensure_not_in_event_loop(sync_api_name: str) -> None:
     """
-    Framework-agnostic orchestrator for embedding operations.
+    Prevent deadlocks from calling sync APIs in async contexts.
 
-    This class:
-        - Accepts framework-level inputs and a normalized OperationContext
-        - Delegates to an EmbeddingFrameworkTranslator to build specs and translate results
-        - Calls into an EmbeddingProtocolV1 adapter to execute operations
-        - Provides sync + async variants for all core operations
-        - Handles streaming via SyncStreamBridge for sync callers
-        - Attaches rich error context for diagnostics
+    This guard enforces a clear contract:
+    - In async code, use `a...` async variants.
+    - In sync code, use sync methods directly.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        # No running event loop: safe to call sync method.
+        return
 
-    Note: This layer does not perform automatic batch splitting. BatchConfig
-    is a hint object stored here for adapters/orchestrators to inspect.
+    raise RuntimeError(
+        f"{sync_api_name} was called from inside an active asyncio event loop. "
+        f"Use the async variant instead (e.g. 'await a{sync_api_name}()'). "
+        f"[{ErrorCodes.SYNC_WRAPPER_CALLED_IN_EVENT_LOOP}]"
+    )
+
+
+def _maybe_close_sync(obj: Any) -> None:
+    """
+    Best-effort *sync* resource cleanup.
+
+    Preference:
+      1) aclose() if present (awaited via asyncio.run if coroutine)
+      2) close() if present:
+           - awaited via asyncio.run if coroutinefunction
+           - called directly if sync
+           - awaited via asyncio.run if sync returns a coroutine
+
+    IMPORTANT:
+      Callers must ensure they are NOT in a running event loop (use _ensure_not_in_event_loop).
+    """
+    if obj is None:
+        return
+
+    aclose = getattr(obj, "aclose", None)
+    if callable(aclose):
+        res = aclose()
+        if asyncio.iscoroutine(res):
+            asyncio.run(res)
+        return
+
+    close = getattr(obj, "close", None)
+    if not callable(close):
+        return
+
+    if asyncio.iscoroutinefunction(close):
+        asyncio.run(close())
+        return
+
+    res = close()
+    if asyncio.iscoroutine(res):
+        asyncio.run(res)
+
+
+async def _maybe_close_async(obj: Any) -> None:
+    """
+    Best-effort async resource cleanup with prioritization.
+
+    - Prefer an async `aclose()` method if present.
+    - Fall back to a coroutine `close()` if the object defines one.
+    - Fall back to a sync `close()` executed in a worker thread.
+    """
+    if obj is None:
+        return
+
+    aclose = getattr(obj, "aclose", None)
+    if callable(aclose):
+        res = aclose()
+        if asyncio.iscoroutine(res):
+            await res
+        return
+
+    close = getattr(obj, "close", None)
+    if not callable(close):
+        return
+
+    if asyncio.iscoroutinefunction(close):
+        await close()
+    else:
+        await asyncio.to_thread(close)
+
+
+# ---------------------------------------------------------------------------
+# Error-context decorators with dynamic context extraction
+# ---------------------------------------------------------------------------
+
+
+def _extract_dynamic_context(
+    instance: Any,
+    args: Tuple[Any, ...],
+    kwargs: Dict[str, Any],
+    operation: str,
+) -> Dict[str, Any]:
+    """
+    Extract rich dynamic context from a LangChain embedding call.
+
+    Captures:
+    - model identifier from the embedding instance
+    - framework_version if present
+    - text_len for single-text operations
+    - texts_count / empty_texts_count for batch operations
+    - LangChain routing fields (run_id, run_name) and safe snapshots of tags/metadata
+    """
+    dynamic_ctx: Dict[str, Any] = {
+        "model": getattr(instance, "model", "unknown"),
+        "framework_version": getattr(instance, "framework_version", None),
+        "framework_name": _FRAMEWORK_NAME,
+    }
+
+    dim_hint = getattr(instance, "_embedding_dim_hint", None)
+    if isinstance(dim_hint, int):
+        dynamic_ctx["embedding_dim"] = dim_hint
+
+    if operation == "query" and args and isinstance(args[0], str):
+        dynamic_ctx["text_len"] = len(args[0])
+    elif operation == "documents" and args:
+        maybe_texts = args[0]
+        if isinstance(maybe_texts, Sequence) and not isinstance(maybe_texts, (str, bytes)):
+            texts_seq = maybe_texts
+            dynamic_ctx["texts_count"] = len(texts_seq)
+            empty_count = sum(1 for text in texts_seq if not isinstance(text, str) or not text.strip())
+            if empty_count:
+                dynamic_ctx["empty_texts_count"] = empty_count
+
+    config = kwargs.get("config") or {}
+    if isinstance(config, Mapping):
+        if "run_id" in config:
+            dynamic_ctx["run_id"] = config.get("run_id")
+        if "run_name" in config:
+            dynamic_ctx["run_name"] = config.get("run_name")
+
+        # Snapshot bulky/sensitive structures for observability.
+        if "tags" in config:
+            dynamic_ctx["tags_snapshot"] = _safe_snapshot(config.get("tags"))
+        if "metadata" in config:
+            dynamic_ctx["metadata_snapshot"] = _safe_snapshot(config.get("metadata"))
+
+    return dynamic_ctx
+
+
+def _create_error_context_decorator(
+    operation: str,
+    is_async: bool = False,
+) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    """
+    Factory for creating error-context decorators with rich per-call metrics.
+
+    Mirrors the pattern used in other framework adapters (LlamaIndex,
+    Semantic Kernel, AutoGen, CrewAI) for consistent observability.
     """
 
-    def __init__(
-        self,
-        *,
-        adapter: EmbeddingProtocolV1,
-        framework: str = "generic",
-        translator: Optional[EmbeddingFrameworkTranslator] = None,
-        batch_config: Optional[BatchConfig] = None,
-    ) -> None:
-        self._adapter = adapter
-        self._framework = framework
-        self._translator = translator or DefaultEmbeddingFrameworkTranslator()
-        self._batch_config = batch_config or BatchConfig()
+    def decorator_factory(**static_context: Any) -> Callable[[Callable[..., T]], Callable[..., T]]:
+        def decorator(func: Callable[..., T]) -> Callable[..., T]:
+            if is_async:
 
-    # --------------------------------------------------------------------- #
-    # Internal helpers
-    # --------------------------------------------------------------------- #
+                @wraps(func)
+                async def async_wrapper(self: Any, *args: Any, **kwargs: Any) -> T:
+                    dynamic_context = _extract_dynamic_context(self, args, kwargs, operation)
+                    full_context = {**static_context, **dynamic_context}
+                    try:
+                        return await func(self, *args, **kwargs)
+                    except Exception as exc:  # noqa: BLE001
+                        attach_context(
+                            exc,
+                            framework=_FRAMEWORK_NAME,
+                            operation=f"embedding_{operation}",
+                            **full_context,
+                        )
+                        raise
 
-    async def _get_supported_models(self) -> Optional[Sequence[str]]:
-        """
-        Best-effort supported model discovery.
+                return async_wrapper  # type: ignore[return-value]
 
-        Uses adapter.acapabilities()/capabilities() if present.
-        """
-        adapter = self._adapter
-        caps = None
-
-        acaps = getattr(adapter, "acapabilities", None)
-        if callable(acaps):
-            try:
-                caps = await acaps()
-            except Exception:
-                caps = None
-
-        if caps is None:
-            caps_fn = getattr(adapter, "capabilities", None)
-            if callable(caps_fn):
+            @wraps(func)
+            def sync_wrapper(self: Any, *args: Any, **kwargs: Any) -> T:
+                dynamic_context = _extract_dynamic_context(self, args, kwargs, operation)
+                full_context = {**static_context, **dynamic_context}
                 try:
-                    if asyncio.iscoroutinefunction(caps_fn):
-                        caps = await caps_fn()
-                    else:
-                        caps = await asyncio.to_thread(caps_fn)
-                except Exception:
-                    caps = None
-
-        if caps is None:
-            return None
-
-        if hasattr(caps, "supported_models"):
-            sm = getattr(caps, "supported_models")
-            if isinstance(sm, (list, tuple)) and all(isinstance(x, str) for x in sm):
-                return sm
-
-        if isinstance(caps, Mapping):
-            sm = caps.get("supported_models") or caps.get("models")
-            if isinstance(sm, (list, tuple)) and all(isinstance(x, str) for x in sm):
-                return sm
-
-        return None
-
-    async def _coerce_model_unary(self, spec: EmbedSpec) -> EmbedSpec:
-        """
-        If spec.model is not supported, deterministically fall back to the first supported model.
-        """
-        supported = await self._get_supported_models()
-        if not supported:
-            return spec
-        if spec.model in supported:
-            return spec
-
-        fallback = supported[0]
-        attach_context(
-            Exception("model_fallback"),
-            framework=self._framework,
-            operation="embedding.model_fallback",
-            requested_model=spec.model,
-            fallback_model=fallback,
-        )
-        return replace(spec, model=fallback)
-
-    async def _coerce_model_batch(self, spec: BatchEmbedSpec) -> BatchEmbedSpec:
-        supported = await self._get_supported_models()
-        if not supported:
-            return spec
-        if spec.model in supported:
-            return spec
-
-        fallback = supported[0]
-        attach_context(
-            Exception("model_fallback"),
-            framework=self._framework,
-            operation="embedding.model_fallback",
-            requested_model=spec.model,
-            fallback_model=fallback,
-        )
-        return replace(spec, model=fallback)
-
-    def _extract_vector_from_translated(self, translated: Any) -> List[float]:
-        """
-        Best-effort extraction for unary->batch fallback.
-        """
-        if isinstance(translated, list) and all(isinstance(x, (int, float)) for x in translated):
-            return [float(x) for x in translated]
-
-        if isinstance(translated, Mapping):
-            emb = translated.get("embedding")
-            if isinstance(emb, list) and all(isinstance(x, (int, float)) for x in emb):
-                return [float(x) for x in emb]
-
-            embs = translated.get("embeddings")
-            if isinstance(embs, list) and embs and isinstance(embs[0], list):
-                first = embs[0]
-                if all(isinstance(x, (int, float)) for x in first):
-                    return [float(x) for x in first]
-
-        raise BadRequest(
-            "Unable to coerce unary translated result into embedding vector",
-            code="BAD_TRANSLATION_RESULT",
-        )
-
-    # --------------------------------------------------------------------- #
-    # Internal execution helpers (The "Executor Pattern")
-    # --------------------------------------------------------------------- #
-
-    def _run_operation(
-        self,
-        *,
-        op_name: str,
-        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]],
-        sync: bool,
-        logic: Callable[[OperationContext], Awaitable[R]],
-    ) -> Union[R, Awaitable[R]]:
-        """
-        Centralized execution for non-streaming operations.
-
-        - Normalizes OperationContext
-        - Wraps `logic` with consistent error-context attachment
-        - Uses AsyncBridge for sync variants, returns coroutine for async variants
-        """
-        ctx = _ensure_operation_context(op_ctx)
-
-        async def _wrapped() -> R:
-            try:
-                return await logic(ctx)
-            except Exception as exc:
-                attach_context(
-                    exc,
-                    framework=self._framework,
-                    operation=f"embedding.{op_name}",
-                    request_id=getattr(ctx, "request_id", None),
-                    tenant=getattr(ctx, "tenant", None),
-                )
-                raise
-
-        if sync:
-            timeout = getattr(ctx, "deadline_ms", None)
-            timeout_s = (timeout / 1000.0) if isinstance(timeout, (int, float)) else None
-            return AsyncBridge.run_async(_wrapped(), timeout=timeout_s)
-        return _wrapped()
-
-    def _run_stream_operation(
-        self,
-        *,
-        op_name: str,
-        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]],
-        sync: bool,
-        factory: Callable[[OperationContext], AsyncIterator[R]],
-    ) -> Union[Iterator[R], AsyncIterator[R]]:
-        """
-        Centralized execution for streaming operations.
-
-        Args:
-            factory: A function that takes context and returns an AsyncIterator.
-        """
-        ctx = _ensure_operation_context(op_ctx)
-
-        async def _async_gen() -> AsyncIterator[R]:
-            try:
-                async for chunk in factory(ctx):
-                    yield chunk
-            except Exception as exc:
-                attach_context(
-                    exc,
-                    framework=self._framework,
-                    operation=f"embedding.{op_name}",
-                    request_id=getattr(ctx, "request_id", None),
-                    tenant=getattr(ctx, "tenant", None),
-                )
-                raise
-
-        if sync:
-            return SyncStreamBridge(
-                coro_factory=_async_gen,
-                framework=self._framework,
-                error_context={
-                    "operation": f"embedding.{op_name}",
-                    "request_id": getattr(ctx, "request_id", None),
-                    "tenant": getattr(ctx, "tenant", None),
-                },
-            ).run()
-        return _async_gen()
-
-    # --------------------------------------------------------------------- #
-    # Embed APIs
-    # --------------------------------------------------------------------- #
-
-    def embed(
-        self,
-        raw_texts: Any,
-        *,
-        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
-        framework_ctx: Optional[Any] = None,
-    ) -> Any:
-        """
-        Synchronous embed API.
-
-        Ergonomics:
-            - If raw_texts is a single text / mapping → adapter.embed
-            - If raw_texts is a list/tuple:
-                * If adapter has embed_batch → use batch_embed
-                * Else → unary-per-item fallback and return batch-shaped output
-        """
-        if isinstance(raw_texts, (list, tuple)) and not isinstance(raw_texts, Mapping):
-            # Empty list should be a no-op and return empty matrix (frameworks expect this).
-            if not raw_texts:
-                return {
-                    "embeddings": [],
-                    "model": None,
-                    "total_texts": 0,
-                    "total_tokens": 0,
-                    "failed_texts": [],
-                }
-
-            if hasattr(self._adapter, "embed_batch") and callable(getattr(self._adapter, "embed_batch", None)):
-                return self.batch_embed(
-                    {"texts": list(raw_texts)},
-                    op_ctx=op_ctx,
-                    framework_ctx=framework_ctx,
-                )
-
-            async def _logic_many(ctx: OperationContext) -> Any:
-                vectors: List[List[float]] = []
-                for t in list(raw_texts):
-                    spec = self._translator.build_embed_spec(
-                        t,
-                        op_ctx=ctx,
-                        framework_ctx=framework_ctx,
-                        stream=False,
+                    return func(self, *args, **kwargs)
+                except Exception as exc:  # noqa: BLE001
+                    attach_context(
+                        exc,
+                        framework=_FRAMEWORK_NAME,
+                        operation=f"embedding_{operation}",
+                        **full_context,
                     )
-                    spec = await self._coerce_model_unary(spec)
-                    result = await self._adapter.embed(spec, ctx=ctx)
-                    if not isinstance(result, EmbedResult):
-                        raise BadRequest(
-                            f"adapter.embed returned unsupported type: {type(result).__name__}",
-                            code="BAD_ADAPTER_RESULT",
-                        )
-                    translated = self._translator.translate_embed_result(
-                        result,
-                        op_ctx=ctx,
-                        framework_ctx=framework_ctx,
-                    )
-                    vectors.append(self._extract_vector_from_translated(translated))
+                    raise
 
-                return {
-                    "embeddings": vectors,
-                    "model": getattr(result, "model", None) if vectors else None,
-                    "total_texts": len(vectors),
-                    "total_tokens": 0,
-                    "failed_texts": [],
-                }
+            return sync_wrapper  # type: ignore[return-value]
 
-            return self._run_operation(
-                op_name="embed_many_unary_fallback",
-                op_ctx=op_ctx,
-                sync=True,
-                logic=_logic_many,
-            )
+        return decorator
 
-        async def _logic(ctx: OperationContext) -> Any:
-            spec = self._translator.build_embed_spec(
-                raw_texts,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-                stream=False,
-            )
-            spec = await self._coerce_model_unary(spec)
-            result = await self._adapter.embed(spec, ctx=ctx)
+    return decorator_factory
 
-            if not isinstance(result, EmbedResult):
-                raise BadRequest(
-                    f"adapter.embed returned unsupported type: {type(result).__name__}",
-                    code="BAD_ADAPTER_RESULT",
-                )
 
-            return self._translator.translate_embed_result(
-                result,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
+def with_embedding_error_context(operation: str, **static_context: Any) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    """Decorator for sync methods with rich dynamic context extraction."""
+    static_context.setdefault("error_codes", EMBEDDING_COERCION_ERROR_CODES)
+    return _create_error_context_decorator(operation, is_async=False)(**static_context)
 
-        return self._run_operation(
-            op_name="embed",
-            op_ctx=op_ctx,
-            sync=True,
-            logic=_logic,
-        )
 
-    async def arun_embed(
-        self,
-        raw_texts: Any,
-        *,
-        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
-        framework_ctx: Optional[Any] = None,
-    ) -> Any:
-        """
-        Async embed API (preferred for async applications).
+def with_async_embedding_error_context(operation: str, **static_context: Any) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    """Decorator for async methods with rich dynamic context extraction."""
+    static_context.setdefault("error_codes", EMBEDDING_COERCION_ERROR_CODES)
+    return _create_error_context_decorator(operation, is_async=True)(**static_context)
 
-        Ergonomics:
-            - If raw_texts is a single text / mapping → adapter.embed
-            - If raw_texts is a list/tuple:
-                * If adapter has embed_batch → use arun_batch_embed
-                * Else → unary-per-item fallback and return batch-shaped output
-        """
-        if isinstance(raw_texts, (list, tuple)) and not isinstance(raw_texts, Mapping):
-            if not raw_texts:
-                return {
-                    "embeddings": [],
-                    "model": None,
-                    "total_texts": 0,
-                    "total_tokens": 0,
-                    "failed_texts": [],
-                }
 
-            if hasattr(self._adapter, "embed_batch") and callable(getattr(self._adapter, "embed_batch", None)):
-                return await self.arun_batch_embed(
-                    {"texts": list(raw_texts)},
-                    op_ctx=op_ctx,
-                    framework_ctx=framework_ctx,
-                )
-
-            async def _logic_many(ctx: OperationContext) -> Any:
-                vectors: List[List[float]] = []
-                last_model: Optional[str] = None
-                for t in list(raw_texts):
-                    spec = self._translator.build_embed_spec(
-                        t,
-                        op_ctx=ctx,
-                        framework_ctx=framework_ctx,
-                        stream=False,
-                    )
-                    spec = await self._coerce_model_unary(spec)
-                    result = await self._adapter.embed(spec, ctx=ctx)
-                    if not isinstance(result, EmbedResult):
-                        raise BadRequest(
-                            f"adapter.embed returned unsupported type: {type(result).__name__}",
-                            code="BAD_ADAPTER_RESULT",
-                        )
-                    last_model = result.model
-                    translated = self._translator.translate_embed_result(
-                        result,
-                        op_ctx=ctx,
-                        framework_ctx=framework_ctx,
-                    )
-                    vectors.append(self._extract_vector_from_translated(translated))
-
-                return {
-                    "embeddings": vectors,
-                    "model": last_model,
-                    "total_texts": len(vectors),
-                    "total_tokens": 0,
-                    "failed_texts": [],
-                }
-
-            return await self._run_operation(
-                op_name="embed_many_unary_fallback",
-                op_ctx=op_ctx,
-                sync=False,
-                logic=_logic_many,
-            )
-
-        async def _logic(ctx: OperationContext) -> Any:
-            spec = self._translator.build_embed_spec(
-                raw_texts,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-                stream=False,
-            )
-            spec = await self._coerce_model_unary(spec)
-            result = await self._adapter.embed(spec, ctx=ctx)
-
-            if not isinstance(result, EmbedResult):
-                raise BadRequest(
-                    f"adapter.embed returned unsupported type: {type(result).__name__}",
-                    code="BAD_ADAPTER_RESULT",
-                )
-
-            return self._translator.translate_embed_result(
-                result,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-
-        return await self._run_operation(
-            op_name="embed",
-            op_ctx=op_ctx,
-            sync=False,
-            logic=_logic,
-        )
-
-    # --------------------------------------------------------------------- #
-    # Streaming Embed APIs (unchanged)
-    # --------------------------------------------------------------------- #
-
-    def _prepare_stream_factory(
-        self,
-        raw_texts: Any,
-        framework_ctx: Any,
-    ) -> Callable[[OperationContext], AsyncIterator[Any]]:
-        """Shared logic to prepare the stream generator."""
-        if isinstance(raw_texts, (list, tuple)) and not isinstance(raw_texts, Mapping):
-            raise BadRequest(
-                "embed_stream only supports single-text inputs. "
-                "For multiple texts:\n"
-                "- Use batch_embed() for non-streaming batch embedding\n"
-                "- Iterate and call embed_stream() per text for streaming multiple texts",
-                code="BAD_STREAM_BATCH",
-            )
-
-        async def _factory(ctx: OperationContext) -> AsyncIterator[Any]:
-            spec = self._translator.build_embed_spec(
-                raw_texts,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-                stream=True,
-            )
-            spec = await self._coerce_model_unary(spec)
-            stream_or_result = await self._adapter.embed(spec, ctx=ctx)
-
-            if isinstance(stream_or_result, EmbedResult):
-                chunk = EmbedChunk(
-                    embeddings=[stream_or_result.embedding],
-                    is_final=True,
-                    usage=None,
-                    model=stream_or_result.model,
-                )
-                yield self._translator.translate_embed_chunk(
-                    chunk,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
-                return
-
-            if not hasattr(stream_or_result, "__aiter__"):
-                raise BadRequest(
-                    "adapter.embed did not return a streaming iterator",
-                    code="BAD_ADAPTER_RESULT",
-                )
-
-            async for chunk in stream_or_result:
-                if not isinstance(chunk, EmbedChunk):
-                    raise BadRequest(
-                        f"adapter.embed stream yielded unsupported type: {type(chunk).__name__}",
-                        code="BAD_ADAPTER_RESULT",
-                    )
-                yield self._translator.translate_embed_chunk(
-                    chunk,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                )
-
-        return _factory
-
-    def embed_stream(
-        self,
-        raw_texts: Any,
-        *,
-        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
-        framework_ctx: Optional[Any] = None,
-    ) -> Iterator[Any]:
-        return self._run_stream_operation(
-            op_name="embed_stream",
-            op_ctx=op_ctx,
-            sync=True,
-            factory=self._prepare_stream_factory(raw_texts, framework_ctx),
-        )
-
-    def arun_embed_stream(
-        self,
-        raw_texts: Any,
-        *,
-        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
-        framework_ctx: Optional[Any] = None,
-    ) -> AsyncIterator[Any]:
-        return self._run_stream_operation(
-            op_name="embed_stream",
-            op_ctx=op_ctx,
-            sync=False,
-            factory=self._prepare_stream_factory(raw_texts, framework_ctx),
-        )
-
-    async def arun_embed_stream_collect(
-        self,
-        raw_texts: Any,
-        *,
-        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
-        framework_ctx: Optional[Any] = None,
-    ) -> Dict[str, Any]:
-        vectors: List[List[float]] = []
-        last_chunk: Optional[Mapping[str, Any]] = None
-
-        async for chunk in self.arun_embed_stream(
-            raw_texts,
-            op_ctx=op_ctx,
-            framework_ctx=framework_ctx,
-        ):
-            if isinstance(chunk, Mapping):
-                embeddings = chunk.get("embeddings") or []
-                if isinstance(embeddings, list):
-                    for v in embeddings:
-                        vectors.append(v)
-            last_chunk = chunk
-
-        return {
-            "embedding": vectors,
-            "last_chunk": last_chunk,
-        }
-
-    # --------------------------------------------------------------------- #
-    # Batch Embed APIs
-    # --------------------------------------------------------------------- #
-
-    def batch_embed(
-        self,
-        raw_batch: Any,
-        *,
-        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
-        framework_ctx: Optional[Any] = None,
-    ) -> Any:
-        async def _logic(ctx: OperationContext) -> Any:
-            spec = self._translator.build_batch_embed_spec(
-                raw_batch,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-            spec = await self._coerce_model_batch(spec)
-            result = await self._adapter.embed_batch(spec, ctx=ctx)
-
-            if not isinstance(result, BatchEmbedResult):
-                raise BadRequest(
-                    f"adapter.embed_batch returned unsupported type: {type(result).__name__}",
-                    code="BAD_ADAPTER_RESULT",
-                )
-
-            return self._translator.translate_batch_embed_result(
-                result,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-
-        return self._run_operation(
-            op_name="batch_embed",
-            op_ctx=op_ctx,
-            sync=True,
-            logic=_logic,
-        )
-
-    async def arun_batch_embed(
-        self,
-        raw_batch: Any,
-        *,
-        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
-        framework_ctx: Optional[Any] = None,
-    ) -> Any:
-        async def _logic(ctx: OperationContext) -> Any:
-            spec = self._translator.build_batch_embed_spec(
-                raw_batch,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-            spec = await self._coerce_model_batch(spec)
-            result = await self._adapter.embed_batch(spec, ctx=ctx)
-
-            if not isinstance(result, BatchEmbedResult):
-                raise BadRequest(
-                    f"adapter.embed_batch returned unsupported type: {type(result).__name__}",
-                    code="BAD_ADAPTER_RESULT",
-                )
-
-            return self._translator.translate_batch_embed_result(
-                result,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-
-        return await self._run_operation(
-            op_name="batch_embed",
-            op_ctx=op_ctx,
-            sync=False,
-            logic=_logic,
-        )
-
-    # --------------------------------------------------------------------- #
-    # Capabilities / Health (unchanged)
-    # --------------------------------------------------------------------- #
-
-    def capabilities(
-        self,
-        *,
-        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
-        framework_ctx: Optional[Any] = None,  # noqa: ARG002
-    ) -> Mapping[str, Any]:
-        async def _logic(ctx: OperationContext) -> Mapping[str, Any]:
-            caps = getattr(self._adapter, "capabilities", None)
-            acaps = getattr(self._adapter, "acapabilities", None)
-
-            if callable(acaps):
-                result = await acaps()  # type: ignore[no-any-return]
-            elif callable(caps):
-                if asyncio.iscoroutinefunction(caps):
-                    result = await caps()  # type: ignore[no-any-return]
-                else:
-                    result = caps()  # type: ignore[no-any-return]
-            else:
-                return {}
-
-            if not isinstance(result, Mapping):
-                raise BadRequest(
-                    f"adapter.capabilities returned unsupported type: {type(result).__name__}",
-                    code="BAD_ADAPTER_RESULT",
-                )
-            return dict(result)
-
-        return self._run_operation(
-            op_name="capabilities",
-            op_ctx=op_ctx,
-            sync=True,
-            logic=_logic,
-        )
-
-    async def arun_capabilities(
-        self,
-        *,
-        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
-        framework_ctx: Optional[Any] = None,  # noqa: ARG002
-    ) -> Mapping[str, Any]:
-        async def _logic(ctx: OperationContext) -> Mapping[str, Any]:
-            caps = getattr(self._adapter, "capabilities", None)
-            acaps = getattr(self._adapter, "acapabilities", None)
-
-            if callable(acaps):
-                result = await acaps()  # type: ignore[no-any-return]
-            elif callable(caps):
-                if asyncio.iscoroutinefunction(caps):
-                    result = await caps()  # type: ignore[no-any-return]
-                else:
-                    result = await asyncio.to_thread(caps)  # type: ignore[arg-type]
-            else:
-                return {}
-
-            if not isinstance(result, Mapping):
-                raise BadRequest(
-                    f"adapter.capabilities returned unsupported type: {type(result).__name__}",
-                    code="BAD_ADAPTER_RESULT",
-                )
-            return dict(result)
-
-        return await self._run_operation(
-            op_name="capabilities",
-            op_ctx=op_ctx,
-            sync=False,
-            logic=_logic,
-        )
-
-    def health(
-        self,
-        *,
-        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
-        framework_ctx: Optional[Any] = None,  # noqa: ARG002
-    ) -> Mapping[str, Any]:
-        async def _logic(ctx: OperationContext) -> Mapping[str, Any]:
-            health = getattr(self._adapter, "health", None)
-            ahealth = getattr(self._adapter, "ahealth", None)
-
-            if callable(ahealth):
-                result = await ahealth()  # type: ignore[no-any-return]
-            elif callable(health):
-                if asyncio.iscoroutinefunction(health):
-                    result = await health()  # type: ignore[no-any-return]
-                else:
-                    result = health()  # type: ignore[no-any-return]
-            else:
-                return {}
-
-            if not isinstance(result, Mapping):
-                raise BadRequest(
-                    f"adapter.health returned unsupported type: {type(result).__name__}",
-                    code="BAD_ADAPTER_RESULT",
-                )
-            return dict(result)
-
-        return self._run_operation(
-            op_name="health",
-            op_ctx=op_ctx,
-            sync=True,
-            logic=_logic,
-        )
-
-    async def arun_health(
-        self,
-        *,
-        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
-        framework_ctx: Optional[Any] = None,  # noqa: ARG002
-    ) -> Mapping[str, Any]:
-        async def _logic(ctx: OperationContext) -> Mapping[str, Any]:
-            health = getattr(self._adapter, "health", None)
-            ahealth = getattr(self._adapter, "ahealth", None)
-
-            if callable(ahealth):
-                result = await ahealth()  # type: ignore[no-any-return]
-            elif callable(health):
-                if asyncio.iscoroutinefunction(health):
-                    result = await health()  # type: ignore[no-any-return]
-                else:
-                    result = await asyncio.to_thread(health)  # type: ignore[arg-type]
-            else:
-                return {}
-
-            if not isinstance(result, Mapping):
-                raise BadRequest(
-                    f"adapter.health returned unsupported type: {type(result).__name__}",
-                    code="BAD_ADAPTER_RESULT",
-                )
-            return dict(result)
-
-        return await self._run_operation(
-            op_name="health",
-            op_ctx=op_ctx,
-            sync=False,
-            logic=_logic,
-        )
-
-    # --------------------------------------------------------------------- #
-    # Resource Management / Cleanup (unchanged)
-    # --------------------------------------------------------------------- #
-
-    async def aclose(
-        self,
-        *,
-        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
-        framework_ctx: Optional[Any] = None,  # noqa: ARG002
-    ) -> None:
-        async def _logic(ctx: OperationContext) -> None:  # noqa: ARG001
-            adapter = self._adapter
-            aclose = getattr(adapter, "aclose", None)
-            if callable(aclose):
-                await aclose()
-                return
-
-            close = getattr(adapter, "close", None)
-            if not callable(close):
-                return
-
-            if asyncio.iscoroutinefunction(close):
-                await close()
-            else:
-                await asyncio.to_thread(close)
-
-        await self._run_operation(
-            op_name="close",
-            op_ctx=op_ctx,
-            sync=False,
-            logic=_logic,
-        )
-
-    def close(
-        self,
-        *,
-        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
-        framework_ctx: Optional[Any] = None,  # noqa: ARG002
-    ) -> None:
-        async def _logic(ctx: OperationContext) -> None:  # noqa: ARG001
-            adapter = self._adapter
-            aclose = getattr(adapter, "aclose", None)
-            if callable(aclose):
-                await aclose()
-                return
-
-            close = getattr(adapter, "close", None)
-            if not callable(close):
-                return
-
-            if asyncio.iscoroutinefunction(close):
-                await close()
-            else:
-                await asyncio.to_thread(close)
-
-        self._run_operation(
-            op_name="close",
-            op_ctx=op_ctx,
-            sync=True,
-            logic=_logic,
-        )
-
-    # --------------------------------------------------------------------- #
-    # Stats / Inspection (unchanged)
-    # --------------------------------------------------------------------- #
-
-    def get_stats(
-        self,
-        *,
-        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
-        framework_ctx: Optional[Any] = None,
-    ) -> Any:
-        async def _logic(ctx: OperationContext) -> Any:
-            stats = await self._adapter.get_stats(ctx=ctx)
-
-            if not isinstance(stats, EmbeddingStats):
-                raise BadRequest(
-                    f"adapter.get_stats returned unsupported type: {type(stats).__name__}",
-                    code="BAD_ADAPTER_RESULT",
-                )
-
-            return self._translator.translate_stats(
-                stats,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-
-        return self._run_operation(
-            op_name="get_stats",
-            op_ctx=op_ctx,
-            sync=True,
-            logic=_logic,
-        )
-
-    async def arun_get_stats(
-        self,
-        *,
-        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
-        framework_ctx: Optional[Any] = None,
-    ) -> Any:
-        async def _logic(ctx: OperationContext) -> Any:
-            stats = await self._adapter.get_stats(ctx=ctx)
-
-            if not isinstance(stats, EmbeddingStats):
-                raise BadRequest(
-                    f"adapter.get_stats returned unsupported type: {type(stats).__name__}",
-                    code="BAD_ADAPTER_RESULT",
-                )
-
-            return self._translator.translate_stats(
-                stats,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-
-        return await self._run_operation(
-            op_name="get_stats",
-            op_ctx=op_ctx,
-            sync=False,
-            logic=_logic,
-        )
-
-
-# =============================================================================
-# Registry for per-framework translators
-# =============================================================================
-
-
-_TranslatorFactory = Callable[[EmbeddingProtocolV1], EmbeddingFrameworkTranslator]
-_EMBEDDING_TRANSLATOR_FACTORIES: Dict[str, _TranslatorFactory] = {}
-_REGISTRY_LOCK = threading.Lock()
-
-
-def register_embedding_translator(
-    framework: str,
-    factory: _TranslatorFactory,
-) -> None:
+class CorpusLangChainEmbeddings(BaseModel, Embeddings):
     """
-    Register or override an EmbeddingFrameworkTranslator factory for a given framework.
+    LangChain `Embeddings` backed by a Corpus `EmbeddingProtocolV1` adapter.
+
+    Inherits from `BaseModel` to support Pydantic-style initialization (standard
+    in LangChain) and `Embeddings` to satisfy the interface contract.
 
     Example
     -------
-        def make_langchain_translator(
-            adapter: EmbeddingProtocolV1,
-        ) -> EmbeddingFrameworkTranslator:
-            return LangChainEmbeddingTranslator(adapter=adapter)
+    ```python
+    from langchain.vectorstores import Chroma
+    from corpus_sdk.embedding.framework_adapters.langchain import (
+        configure_langchain_embeddings,
+    )
 
-        register_embedding_translator("langchain", make_langchain_translator)
-    """
-    if not framework or not isinstance(framework, str):
-        raise BadRequest(
-            "framework name must be a non-empty string",
-            code="BAD_TRANSLATOR_REGISTRATION",
+    embeddings = configure_langchain_embeddings(
+        corpus_adapter=my_adapter,
+        model="text-embedding-3-large",
+        batch_config=BatchConfig(max_batch_size=1000),
+    )
+
+    vectorstore = Chroma.from_documents(
+        documents=documents,
+        embedding=embeddings,
+        collection_name="research_papers",
+    )
+
+    retriever = vectorstore.as_retriever(
+        search_type="similarity",
+        search_kwargs={"k": 10},
+    )
+    ```
+
+    Error Handling Example
+    ----------------------
+    ```python
+    try:
+        results = embeddings.embed_documents(
+            texts=research_docs,
+            config={
+                "tags": ["research", "batch-processing"],
+                "metadata": {"pipeline": "document-indexing"},
+            },
         )
-    if not callable(factory):
-        raise BadRequest(
-            "translator factory must be callable",
-            code="BAD_TRANSLATOR_REGISTRATION",
+    except Exception as e:
+        # Rich error context automatically attached
+        logger.error("Embedding failed with context", exc_info=e)
+    ```
+
+    Attributes
+    ----------
+    corpus_adapter:
+        Underlying Corpus embedding adapter implementing the EmbeddingProtocolV1
+        *behavior* (duck-typed).
+
+    model:
+        Optional default model identifier. Can be overridden per call by
+        passing `model=...` to `embed_documents` / `embed_query` or their
+        async variants.
+
+    framework_version:
+        Optional framework version string for observability and context
+        translation (e.g., LangChain version).
+
+    batch_config:
+        Optional `BatchConfig` to control batching behavior. If None, the
+        defaults in the common embedding layer are used.
+
+    text_normalization_config:
+        Optional `TextNormalizationConfig` to control whitespace cleanup,
+        truncation, casing, encoding, etc.
+
+    langchain_config:
+        Optional adapter-level configuration for this LangChain embedding adapter.
+        This is separate from per-call LangChain RunnableConfig-like `config`.
+    """
+
+    # IMPORTANT: keep this duck-typed to avoid Pydantic enforcing instance-of checks.
+    corpus_adapter: Any
+    model: Optional[str] = None
+    framework_version: Optional[str] = None
+    batch_config: Optional[BatchConfig] = None
+    text_normalization_config: Optional[TextNormalizationConfig] = None
+    langchain_config: LangChainAdapterConfig = {}  # validated + normalized via field validator
+
+    # Pydantic v2 configuration
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    # Private attribute for caching the translator instance (or a test-injected stub)
+    _translator_cache: Optional[Any] = PrivateAttr(default=None)
+
+    # Private attribute lock to avoid duplicate translator construction under concurrency
+    _translator_lock: threading.Lock = PrivateAttr(default_factory=threading.Lock)
+
+    # Best-effort embedding dimension hint (populated after first successful embed)
+    _embedding_dim_hint: Optional[int] = PrivateAttr(default=None)
+
+    def model_post_init(self, __context: Any) -> None:
+        """
+        Post-init hook (Pydantic v2) for lightweight diagnostics.
+
+        We keep LangChain an optional dependency, but warn if the integration is being
+        constructed without LangChain installed.
+        """
+        if not LANGCHAIN_AVAILABLE:
+            logger.warning(
+                "LangChain is not installed (langchain_core not importable). "
+                "CorpusLangChainEmbeddings can still be constructed, but using it in "
+                "LangChain pipelines will not work as intended."
+            )
+
+    @field_validator("corpus_adapter")
+    @classmethod
+    def validate_corpus_adapter(cls, v: Any) -> Any:
+        """
+        Validate that corpus_adapter implements the required embedding protocol behavior.
+
+        We do a behavioral check (presence of `embed`) instead of strict type
+        checking to remain flexible with Protocol-based adapters and simple stubs.
+        """
+        if not hasattr(v, "embed") or not callable(getattr(v, "embed", None)):
+            raise ValueError(
+                "corpus_adapter must implement EmbeddingProtocolV1 with an 'embed' method"
+            )
+        return v
+
+    @field_validator("langchain_config", mode="before")
+    @classmethod
+    def validate_langchain_adapter_config(cls, v: Any) -> LangChainAdapterConfig:
+        """
+        Validate and normalize adapter-level LangChain configuration.
+
+        Defaults are chosen to preserve existing behavior:
+        - fallback_to_simple_context defaults to False
+        - enable_operation_context_propagation defaults to True
+
+        This validator is intentionally strict: unknown keys are rejected to prevent
+        silent misconfiguration.
+        """
+        if v is None:
+            v = {}
+        if not isinstance(v, Mapping):
+            raise ValueError(
+                f"[{ErrorCodes.LANGCHAIN_CONFIG_INVALID}] "
+                f"langchain_config must be a Mapping, got {type(v).__name__}",
+            )
+
+        validated: Dict[str, Any] = dict(v)
+
+        allowed_keys = {"fallback_to_simple_context", "enable_operation_context_propagation"}
+        unknown = set(validated.keys()) - allowed_keys
+        if unknown:
+            raise ValueError(
+                f"[{ErrorCodes.LANGCHAIN_CONFIG_INVALID}] "
+                f"langchain_config contains unknown keys: {sorted(unknown)}"
+            )
+
+        validated.setdefault("fallback_to_simple_context", False)
+        validated.setdefault("enable_operation_context_propagation", True)
+
+        validated["fallback_to_simple_context"] = bool(validated["fallback_to_simple_context"])
+        validated["enable_operation_context_propagation"] = bool(
+            validated["enable_operation_context_propagation"]
         )
 
-    with _REGISTRY_LOCK:
-        _EMBEDDING_TRANSLATOR_FACTORIES[framework] = factory
-    LOG.debug("Registered embedding translator factory for framework=%s", framework)
+        return validated  # type: ignore[return-value]
+
+    # ------------------------------------------------------------------ #
+    # Resource management / lifecycle helpers
+    # ------------------------------------------------------------------ #
+
+    def __enter__(self) -> "CorpusLangChainEmbeddings":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        """
+        Best-effort synchronous cleanup.
+
+        This method closes both the underlying adapter and the translator,
+        supporting sync and async closers safely. Sync cleanup is not allowed inside
+        an active event loop.
+        """
+        try:
+            _ensure_not_in_event_loop("close")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "Sync close called inside event loop; use async context manager instead: %s",
+                e,
+            )
+            return
+
+        translator = self._translator_cache
+        if isinstance(translator, EmbeddingTranslator):
+            try:
+                _maybe_close_sync(translator)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Error while closing embedding translator in __exit__: %s", e)
+
+        try:
+            _maybe_close_sync(self.corpus_adapter)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Error while closing embedding adapter in __exit__: %s", e)
+
+    async def __aenter__(self) -> "CorpusLangChainEmbeddings":
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        """
+        Best-effort async cleanup.
+
+        This path can safely await async closers or offload sync closers
+        without blocking the event loop.
+        """
+        translator = self._translator_cache
+        if isinstance(translator, EmbeddingTranslator):
+            try:
+                await _maybe_close_async(translator)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Error while closing embedding translator in __aexit__: %s", e)
+
+        try:
+            await _maybe_close_async(self.corpus_adapter)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Error while closing embedding adapter in __aexit__: %s", e)
+
+    # ------------------------------------------------------------------ #
+    # Internal helpers
+    # ------------------------------------------------------------------ #
+
+    @property
+    def _translator(self) -> Any:
+        """
+        Lazily construct and cache the `EmbeddingTranslator`.
+
+        Uses a PrivateAttr cache so this remains compatible with Pydantic v2.
+        Also guards initialization with a lock to avoid duplicate construction
+        under concurrent first access.
+
+        NOTE (testing / injection):
+        - Tests may monkeypatch `_translator` with a stub translator. To support
+          that without fighting Pydantic's setattr rules, we provide a setter.
+        """
+        if self._translator_cache is None:
+            with self._translator_lock:
+                if self._translator_cache is None:
+                    self._translator_cache = create_embedding_translator(
+                        adapter=self.corpus_adapter,
+                        framework=_FRAMEWORK_NAME,
+                        translator=None,  # use registry/default generic translator
+                        batch_config=self.batch_config,
+                        text_normalization_config=self.text_normalization_config,
+                    )
+                    logger.debug(
+                        "EmbeddingTranslator initialized for LangChain with model: %s",
+                        self.model or "default",
+                    )
+        return self._translator_cache
+
+    @_translator.setter
+    def _translator(self, value: Any) -> None:
+        # Allow tests to inject a stub translator via `embeddings._translator = ...`
+        self._translator_cache = value
+
+    def _update_dim_hint(self, dim: Optional[int]) -> None:
+        """
+        Thread-safe, best-effort dimension hint update.
+
+        First-write-wins semantics are used so that concurrent calls do not
+        cause the hint to oscillate; the first successful embedding defines
+        the observed dimension.
+        """
+        if dim is None:
+            return
+        if self._embedding_dim_hint is not None:
+            return
+
+        with self._translator_lock:
+            if self._embedding_dim_hint is None:
+                self._embedding_dim_hint = dim
+
+    def _build_core_context(
+        self,
+        *,
+        config: Optional[LangChainConfig] = None,
+    ) -> Optional[OperationContext]:
+        """
+        Build a core OperationContext from LangChain config with comprehensive error handling.
+
+        This function focuses purely on translating framework-specific context into the
+        core OperationContext structure used by the embedding layer.
+        """
+        if config is None:
+            return None
+
+        try:
+            self._validate_langchain_config_structure(config)
+
+            core_ctx_candidate = context_from_langchain(
+                config,
+                framework_version=self.framework_version,
+            )
+            if _looks_like_operation_context(core_ctx_candidate):
+                logger.debug(
+                    "Successfully created OperationContext from LangChain config with run_id: %s",
+                    config.get("run_id", "unknown") if isinstance(config, Mapping) else "unknown",
+                )
+                return core_ctx_candidate  # type: ignore[return-value]
+
+            logger.warning(
+                "context_from_langchain returned non-OperationContext type: %s. Proceeding without OperationContext.",
+                type(core_ctx_candidate).__name__,
+            )
+            if self.langchain_config.get("fallback_to_simple_context"):
+                return OperationContext()
+            return None
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "Failed to create OperationContext from LangChain config: %s. Proceeding without OperationContext.",
+                e,
+            )
+            attach_context(
+                e,
+                framework=_FRAMEWORK_NAME,
+                operation="context_build",
+                config_snapshot=_safe_snapshot(config),
+                framework_version=self.framework_version,
+                error_codes=EMBEDDING_COERCION_ERROR_CODES,
+                langchain_config=_safe_snapshot(self.langchain_config),
+            )
+            if self.langchain_config.get("fallback_to_simple_context"):
+                return OperationContext()
+            return None
+
+    def _build_framework_context(
+        self,
+        *,
+        core_ctx: Optional[OperationContext],
+        config: Optional[LangChainConfig] = None,
+        model: Optional[str] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """
+        Build framework-specific context for the LangChain execution environment.
+
+        This includes:
+        - Framework identity and version
+        - LangChain adapter configuration flags
+        - Best-effort dimension hint
+        - Model selection
+        - LangChain routing fields and configurable sub-context (snapshotted)
+        - Any extra call-specific hints (excluding private/internal keys)
+        """
+        framework_ctx: Dict[str, Any] = {
+            "framework": _FRAMEWORK_NAME,
+            "error_codes": EMBEDDING_COERCION_ERROR_CODES,
+            "langchain_config": dict(self.langchain_config),
+        }
+
+        if self.framework_version is not None:
+            framework_ctx["framework_version"] = self.framework_version
+
+        if isinstance(self._embedding_dim_hint, int):
+            framework_ctx["embedding_dim_hint"] = self._embedding_dim_hint
+
+        effective_model = model or self.model
+        if effective_model:
+            framework_ctx["model"] = effective_model
+
+        if isinstance(config, Mapping):
+            framework_ctx.update({"run_name": config.get("run_name"), "run_id": config.get("run_id")})
+
+            # IMPORTANT: do not propagate raw metadata/tags/configurable; store snapshots instead.
+            if "tags" in config:
+                framework_ctx["tags_snapshot"] = _safe_snapshot(config.get("tags"))
+            if "metadata" in config:
+                framework_ctx["metadata_snapshot"] = _safe_snapshot(config.get("metadata"))
+            if "configurable" in config:
+                framework_ctx["configurable_snapshot"] = _safe_snapshot(config.get("configurable"))
+
+        # Include any extra call-specific hints while preserving structure.
+        # Private/internal kwargs (starting with "_") are not propagated.
+        framework_ctx.update({k: v for k, v in kwargs.items() if not k.startswith("_")})
+
+        # Also surface the OperationContext itself for downstream inspection, if present.
+        if core_ctx is not None and self.langchain_config.get("enable_operation_context_propagation", True):
+            framework_ctx["_operation_context"] = core_ctx
+
+        return framework_ctx
+
+    def _build_contexts(
+        self,
+        *,
+        config: Optional[LangChainConfig] = None,
+        model: Optional[str] = None,
+        **kwargs: Any,
+    ) -> Tuple[Optional[OperationContext], Dict[str, Any]]:
+        """
+        Build contexts for LangChain execution environment with comprehensive validation.
+
+        Returns
+        -------
+        Tuple of:
+        - core_ctx: OperationContext instance (or None if unavailable)
+        - framework_ctx: LangChain-specific context for translator
+        """
+        core_ctx = self._build_core_context(config=config)
+        framework_ctx = self._build_framework_context(core_ctx=core_ctx, config=config, model=model, **kwargs)
+        return core_ctx, framework_ctx
+
+    def _validate_langchain_config_structure(self, config: Mapping[str, Any]) -> None:
+        """
+        Validate LangChain config structure and log warnings for anomalies.
+
+        This is intentionally non-fatal for maximal compatibility: we only
+        log and enrich context instead of raising hard errors.
+        """
+        if not isinstance(config, Mapping):
+            logger.warning(
+                "[%s] LangChain config is not a Mapping (got %s); context translation may be degraded.",
+                ErrorCodes.LANGCHAIN_CONFIG_INVALID,
+                type(config).__name__,
+            )
+            return
+
+        if not any(key in config for key in ("tags", "metadata", "run_name", "run_id", "callbacks")):
+            logger.debug(
+                "LangChain config missing common fields (tags, metadata, run_name, run_id, callbacks) – reduced context for embeddings.",
+            )
+
+    def _coerce_embedding_matrix(self, result: Any) -> List[List[float]]:
+        """
+        Coerce translator result into a List[List[float]] embedding matrix.
+
+        Delegates to the shared framework_utils implementation so behavior
+        is consistent across all framework adapters.
+        """
+        return coerce_embedding_matrix(
+            result=result,
+            framework=_FRAMEWORK_NAME,
+            error_codes=EMBEDDING_COERCION_ERROR_CODES,
+            logger=logger,
+        )
+
+    def _coerce_embedding_vector(self, result: Any) -> List[float]:
+        """
+        Coerce translator result for a single-text embed into List[float].
+
+        Delegates to the shared framework_utils implementation and preserves
+        the existing semantics (first row when multiple are returned).
+        """
+        return coerce_embedding_vector(
+            result=result,
+            framework=_FRAMEWORK_NAME,
+            error_codes=EMBEDDING_COERCION_ERROR_CODES,
+            logger=logger,
+        )
+
+    def _warn_if_extreme_batch(self, texts: Sequence[str], *, op_name: str) -> None:
+        """
+        Soft warning for extremely large batches when no batch_config limit
+        is configured. Actual batching / chunking is handled by the translator.
+        """
+        warn_if_extreme_batch(
+            framework=_FRAMEWORK_NAME,
+            texts=texts,
+            op_name=op_name,
+            batch_config=self.batch_config,
+            logger=logger,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Capabilities and health API - via EmbeddingTranslator
+    # ------------------------------------------------------------------ #
+
+    @with_embedding_error_context("capabilities")
+    def capabilities(self) -> Mapping[str, Any]:
+        """
+        Best-effort synchronous capabilities passthrough.
+
+        Delegates to EmbeddingTranslator.capabilities(), which centralizes
+        async/sync bridging and error-context wiring for the embedding layer.
+        """
+        _ensure_not_in_event_loop("capabilities")
+        return self._translator.capabilities()
+
+    @with_async_embedding_error_context("capabilities_async")
+    async def acapabilities(self) -> Mapping[str, Any]:
+        """
+        Best-effort asynchronous capabilities passthrough.
+
+        Delegates to EmbeddingTranslator.arun_capabilities().
+        """
+        return await self._translator.arun_capabilities()
+
+    @with_embedding_error_context("health")
+    def health(self) -> Mapping[str, Any]:
+        """
+        Best-effort synchronous health passthrough.
+
+        Delegates to EmbeddingTranslator.health().
+        """
+        _ensure_not_in_event_loop("health")
+        return self._translator.health()
+
+    @with_async_embedding_error_context("health_async")
+    async def ahealth(self) -> Mapping[str, Any]:
+        """
+        Best-effort asynchronous health passthrough.
+
+        Delegates to EmbeddingTranslator.arun_health().
+        """
+        return await self._translator.arun_health()
+
+    # ------------------------------------------------------------------ #
+    # Async API
+    # ------------------------------------------------------------------ #
+
+    @with_async_embedding_error_context("documents")
+    async def aembed_documents(
+        self,
+        texts: Sequence[str],
+        *,
+        config: Optional[LangChainConfig] = None,
+        model: Optional[str] = None,
+        **kwargs: Any,
+    ) -> List[List[float]]:
+        """
+        Async embedding for multiple documents.
+
+        Parameters
+        ----------
+        texts:
+            Sequence of documents to embed.
+        config:
+            Optional LangChain RunnableConfig-like dict. Used only for
+            context translation (request_id, tenant, deadline, tags, etc.).
+        model:
+            Optional per-call model override.
+        **kwargs:
+            Additional framework-specific parameters.
+        """
+        texts_list = list(texts)
+        _validate_texts_are_strings(texts_list, op_name="aembed_documents")
+        self._warn_if_extreme_batch(texts_list, op_name="aembed_documents")
+
+        core_ctx, framework_ctx = self._build_contexts(config=config, model=model, **kwargs)
+
+        logger.debug(
+            "Async embedding %d documents for LangChain run: %s",
+            len(texts_list),
+            config.get("run_id", "unknown") if isinstance(config, Mapping) else "unknown",
+        )
+
+        start = time.perf_counter()
+        translated = await self._translator.arun_embed(
+            raw_texts=texts_list,
+            op_ctx=core_ctx,
+            framework_ctx=framework_ctx,
+        )
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+
+        mat = self._coerce_embedding_matrix(translated)
+        dim = _infer_dim_from_matrix(mat)
+        self._update_dim_hint(dim)
+
+        logger.debug(
+            "LangChain aembed_documents completed: docs=%d dim=%s latency_ms=%.2f",
+            len(mat),
+            dim,
+            elapsed_ms,
+        )
+        return mat
+
+    @with_async_embedding_error_context("query")
+    async def aembed_query(
+        self,
+        text: str,
+        *,
+        config: Optional[LangChainConfig] = None,
+        model: Optional[str] = None,
+        **kwargs: Any,
+    ) -> List[float]:
+        """
+        Async embedding for a single query.
+
+        Parameters
+        ----------
+        text:
+            Query text to embed.
+        config:
+            Optional LangChain RunnableConfig-like dict.
+        model:
+            Optional per-call model override.
+        **kwargs:
+            Additional framework-specific parameters.
+        """
+        if not isinstance(text, str):
+            raise TypeError(f"aembed_query expects str; got {type(text).__name__}")
+
+        core_ctx, framework_ctx = self._build_contexts(config=config, model=model, **kwargs)
+
+        logger.debug(
+            "Async embedding query for LangChain run: %s",
+            config.get("run_id", "unknown") if isinstance(config, Mapping) else "unknown",
+        )
+
+        start = time.perf_counter()
+        translated = await self._translator.arun_embed(
+            raw_texts=text,
+            op_ctx=core_ctx,
+            framework_ctx=framework_ctx,
+        )
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+
+        vec = self._coerce_embedding_vector(translated)
+        self._update_dim_hint(len(vec))
+
+        logger.debug(
+            "LangChain aembed_query completed: dim=%d latency_ms=%.2f",
+            len(vec),
+            elapsed_ms,
+        )
+        return vec
+
+    # ------------------------------------------------------------------ #
+    # Sync API
+    # ------------------------------------------------------------------ #
+
+    @with_embedding_error_context("documents")
+    def embed_documents(
+        self,
+        texts: Sequence[str],
+        *,
+        config: Optional[LangChainConfig] = None,
+        model: Optional[str] = None,
+        **kwargs: Any,
+    ) -> List[List[float]]:
+        """
+        Sync embedding for multiple documents.
+
+        Uses the synchronous `EmbeddingTranslator.embed` API, which internally
+        bridges async protocol calls and respects any `deadline_ms` timeout
+        encoded in the OperationContext.
+        """
+        _ensure_not_in_event_loop("embed_documents")
+
+        texts_list = list(texts)
+        _validate_texts_are_strings(texts_list, op_name="embed_documents")
+        self._warn_if_extreme_batch(texts_list, op_name="embed_documents")
+
+        core_ctx, framework_ctx = self._build_contexts(config=config, model=model, **kwargs)
+
+        logger.debug(
+            "Sync embedding %d documents for LangChain run: %s",
+            len(texts_list),
+            config.get("run_name", "unknown") if isinstance(config, Mapping) else "unknown",
+        )
+
+        start = time.perf_counter()
+        translated = self._translator.embed(
+            raw_texts=texts_list,
+            op_ctx=core_ctx,
+            framework_ctx=framework_ctx,
+        )
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+
+        mat = self._coerce_embedding_matrix(translated)
+        dim = _infer_dim_from_matrix(mat)
+        self._update_dim_hint(dim)
+
+        logger.debug(
+            "LangChain embed_documents completed: docs=%d dim=%s latency_ms=%.2f",
+            len(mat),
+            dim,
+            elapsed_ms,
+        )
+        return mat
+
+    @with_embedding_error_context("query")
+    def embed_query(
+        self,
+        text: str,
+        *,
+        config: Optional[LangChainConfig] = None,
+        model: Optional[str] = None,
+        **kwargs: Any,
+    ) -> List[float]:
+        """
+        Sync embedding for a single query.
+
+        Uses the synchronous `EmbeddingTranslator.embed` API, which internally
+        bridges async protocol calls and respects any `deadline_ms` timeout
+        encoded in the OperationContext.
+        """
+        _ensure_not_in_event_loop("embed_query")
+
+        if not isinstance(text, str):
+            raise TypeError(f"embed_query expects str; got {type(text).__name__}")
+
+        core_ctx, framework_ctx = self._build_contexts(config=config, model=model, **kwargs)
+
+        logger.debug(
+            "Sync embedding query for LangChain run: %s",
+            config.get("run_name", "unknown") if isinstance(config, Mapping) else "unknown",
+        )
+
+        start = time.perf_counter()
+        translated = self._translator.embed(
+            raw_texts=text,
+            op_ctx=core_ctx,
+            framework_ctx=framework_ctx,
+        )
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+
+        vec = self._coerce_embedding_vector(translated)
+        self._update_dim_hint(len(vec))
+
+        logger.debug(
+            "LangChain embed_query completed: dim=%d latency_ms=%.2f",
+            len(vec),
+            elapsed_ms,
+        )
+        return vec
+
+    @with_embedding_error_context("function_call")
+    def __call__(
+        self,
+        texts: Sequence[str],
+        *,
+        config: Optional[LangChainConfig] = None,
+        model: Optional[str] = None,
+        **kwargs: Any,
+    ) -> List[List[float]]:
+        """
+        Callable interface for vector-store style protocols.
+
+        This allows the adapter to be passed directly as an `embedding_function`
+        where a simple callable is expected.
+        """
+        _ensure_not_in_event_loop("__call__")
+        return self.embed_documents(texts, config=config, model=model, **kwargs)
 
 
-def get_embedding_translator_factory(framework: str) -> Optional[_TranslatorFactory]:
-    """Return a previously registered translator factory for a framework, if any."""
-    with _REGISTRY_LOCK:
-        return _EMBEDDING_TRANSLATOR_FACTORIES.get(framework)
+# ------------------------------------------------------------------ #
+# LangChain "configuration / registration" helpers
+# ------------------------------------------------------------------ #
 
 
-def create_embedding_translator(
-    *,
-    adapter: EmbeddingProtocolV1,
-    framework: str = "generic",
-    translator: Optional[EmbeddingFrameworkTranslator] = None,
-    batch_config: Optional[BatchConfig] = None,
-    text_normalization_config: Optional[TextNormalizationConfig] = None,
-) -> EmbeddingTranslator:
+def configure_langchain_embeddings(
+    corpus_adapter: Any,
+    model: Optional[str] = None,
+    framework_version: Optional[str] = None,
+    langchain_config: Optional[LangChainAdapterConfig] = None,
+    **kwargs: Any,
+) -> CorpusLangChainEmbeddings:
     """
-    Convenience helper to construct an EmbeddingTranslator for a given framework.
+    Configure and return Corpus embeddings for LangChain usage.
 
-    Behavior:
-        - If `translator` is provided explicitly, it is used as-is.
-        - Else, if a factory is registered for `framework`, it is used.
-        - Else, DefaultEmbeddingFrameworkTranslator is used with optional
-          text normalization.
+    This mirrors the *shape* of the Semantic Kernel / LlamaIndex helpers:
+
+    - Always constructs and returns a `CorpusLangChainEmbeddings` instance.
+    - If LangChain is not installed, the adapter still constructs, but you
+      obviously won't be able to plug it into real LangChain pipelines.
+
+    Unlike Semantic Kernel or LlamaIndex, LangChain does not expose a single
+    global "Settings" object for embeddings, so this helper does *not* attempt
+    any global registration; you pass the returned instance into vectorstores,
+    retrievers, chains, etc.
+
+    Example
+    -------
+    ```python
+    from corpus_sdk.embedding.framework_adapters.langchain import (
+        configure_langchain_embeddings,
+    )
+    embeddings = configure_langchain_embeddings(
+        corpus_adapter=my_adapter,
+        model="text-embedding-3-large",
+        langchain_config={"fallback_to_simple_context": False},
+    )
+    ```
+    Parameters
+    ----------
+    corpus_adapter:
+        Corpus embedding protocol adapter implementing the EmbeddingProtocolV1 behavior.
+    model:
+        Optional default model identifier.
+    framework_version:
+        Optional framework version string (e.g. LangChain version).
+    langchain_config:
+        Optional adapter-level configuration (separate from per-call `config`).
+    **kwargs:
+        Additional arguments for `CorpusLangChainEmbeddings`
+        (e.g. batch_config, text_normalization_config).
+
+    Returns
+    -------
+    CorpusLangChainEmbeddings
+        Configured embeddings instance ready for LangChain integration.
     """
-    if translator is None:
-        factory = get_embedding_translator_factory(framework)
-        if factory is not None:
-            translator = factory(adapter)
-        else:
-            text_normalizer = None
-            if text_normalization_config is not None:
-                text_normalizer = TextNormalizer(text_normalization_config)
-            translator = DefaultEmbeddingFrameworkTranslator(text_normalizer=text_normalizer)
+    embeddings = CorpusLangChainEmbeddings(
+        corpus_adapter=corpus_adapter,
+        model=model,
+        framework_version=framework_version,
+        langchain_config=langchain_config,
+        **kwargs,
+    )
 
-    return EmbeddingTranslator(
-        adapter=adapter,
-        framework=framework,
-        translator=translator,
-        batch_config=batch_config,
+    if not LANGCHAIN_AVAILABLE:
+        logger.debug(
+            "LangChain is not installed; returning embeddings without any framework-level integration.",
+        )
+    else:
+        logger.info(
+            "Corpus LangChain embeddings configured with model=%s, framework_version=%s",
+            model or "default",
+            framework_version or "unknown",
+        )
+
+    return embeddings
+
+
+def register_with_langchain(
+    corpus_adapter: Any,
+    model: Optional[str] = None,
+    framework_version: Optional[str] = None,
+    langchain_config: Optional[LangChainAdapterConfig] = None,
+    **kwargs: Any,
+) -> CorpusLangChainEmbeddings:
+    """
+    Alias for `configure_langchain_embeddings` to mirror the
+    `register_with_semantic_kernel` / `register_with_llamaindex`
+    naming convention.
+
+    This helper is primarily for API symmetry across framework adapters,
+    rather than actual global registration.
+    """
+    return configure_langchain_embeddings(
+        corpus_adapter=corpus_adapter,
+        model=model,
+        framework_version=framework_version,
+        langchain_config=langchain_config,
+        **kwargs,
     )
 
 
 __all__ = [
-    "BatchConfig",
-    "TextNormalizationConfig",
-    "TextNormalizer",
-    "EmbeddingFrameworkTranslator",
-    "DefaultEmbeddingFrameworkTranslator",
-    "EmbeddingTranslator",
-    "register_embedding_translator",
-    "get_embedding_translator_factory",
-    "create_embedding_translator",
+    "CorpusLangChainEmbeddings",
+    "LangChainConfig",
+    "LangChainAdapterConfig",
+    "ErrorCodes",
+    "configure_langchain_embeddings",
+    "register_with_langchain",
+    "with_embedding_error_context",
+    "with_async_embedding_error_context",
+    "LANGCHAIN_AVAILABLE",
 ]
