@@ -7,7 +7,7 @@ import asyncio
 import concurrent.futures
 import inspect
 import pytest
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
 import corpus_sdk.embedding.framework_adapters.langchain as langchain_adapter_module
 from corpus_sdk.embedding.framework_adapters.langchain import (
@@ -219,6 +219,20 @@ def test_LANGCHAIN_AVAILABLE_is_bool() -> None:
     whether LangChain is actually installed.
     """
     assert isinstance(LANGCHAIN_AVAILABLE, bool)
+
+
+def test_typed_dicts_are_pydantic_compatible_on_py_lt_312() -> None:
+    """
+    Regression test for Pydantic v2 + Python < 3.12.
+
+    If the adapter defines TypedDicts using `typing.TypedDict` on Python < 3.12,
+    Pydantic raises `PydanticUserError` during schema generation (often at import time).
+    This test ensures LangChainConfig and LangChainAdapterConfig remain schema-compatible.
+    """
+    # These will raise PydanticUserError if TypedDict was imported from `typing`
+    # (instead of `typing_extensions`) on Python < 3.12.
+    TypeAdapter(langchain_adapter_module.LangChainConfig).json_schema()
+    TypeAdapter(langchain_adapter_module.LangChainAdapterConfig).json_schema()
 
 
 # ---------------------------------------------------------------------------
