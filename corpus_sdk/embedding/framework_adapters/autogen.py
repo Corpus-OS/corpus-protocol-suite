@@ -460,6 +460,19 @@ class CorpusAutoGenEmbeddings:
         )
 
     # ------------------------------------------------------------------ #
+    # ChromaDB embedding function interface requirements
+    # ------------------------------------------------------------------ #
+
+    def name(self) -> str:
+        """
+        Return a unique name for this embedding function.
+        
+        ChromaDB uses this to validate embedding function consistency
+        when reopening persisted collections.
+        """
+        return "corpus-autogen-embeddings"
+
+    # ------------------------------------------------------------------ #
     # Resource management (context managers)
     # ------------------------------------------------------------------ #
 
@@ -718,25 +731,22 @@ class CorpusAutoGenEmbeddings:
     @with_embedding_error_context("function_call")
     def __call__(
         self,
-        texts: Sequence[str],
-        *,
-        autogen_context: Optional[Mapping[str, Any]] = None,
-        model: Optional[str] = None,
-        **kwargs: Any,
+        input: Sequence[str],
     ) -> List[List[float]]:
         """
-        Callable interface expected by many vector stores:
-          embedding_function(texts: Sequence[str]) -> List[List[float]]
+        Callable interface expected by ChromaDB:
+          embedding_function(input: Sequence[str]) -> List[List[float]]
 
         This is a thin wrapper over `embed_documents`, with an event-loop guard
         to prevent misuse from async contexts.
+        
+        ChromaDB requires this exact signature: __call__(self, input)
         """
         _ensure_not_in_event_loop("__call__")
         return self.embed_documents(
-            list(texts),
-            autogen_context=autogen_context,
-            model=model,
-            **kwargs,
+            list(input),
+            autogen_context=None,
+            model=None,
         )
 
     @with_embedding_error_context("documents")
