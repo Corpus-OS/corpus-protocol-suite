@@ -56,12 +56,40 @@ from corpus_sdk.embedding.framework_adapters.semantic_kernel import (
 from corpus_sdk.embedding.embedding_base import OperationContext
 
 
-# PASS/FAIL policy: do not skip, hard fail if SK is missing.
-if not SEMANTIC_KERNEL_AVAILABLE:
-    raise RuntimeError(
-        "Semantic Kernel is required for this test suite (SEMANTIC_KERNEL_AVAILABLE=False). "
-        "Install semantic-kernel to run PASS/FAIL integration coverage."
-    )
+# ---------------------------------------------------------------------------
+# PASS/FAIL gate (NO SKIPS): fail cleanly (as a test failure) if SK is missing.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="session", autouse=True)
+def require_semantic_kernel_installed() -> None:
+    """
+    PASS/FAIL policy (no skips):
+    - If Semantic Kernel isn't installed/importable, FAIL the suite clearly.
+    - We fail via pytest.fail (not skip, not collection error) so CI output is clean.
+    """
+    if not SEMANTIC_KERNEL_AVAILABLE:
+        pytest.fail(
+            "Semantic Kernel is required for this test suite (SEMANTIC_KERNEL_AVAILABLE=False). "
+            "Install semantic-kernel to run PASS/FAIL integration coverage.\n\n"
+            "Install with:\n"
+            "  pip install -U semantic-kernel\n",
+            pytrace=False,
+        )
+
+    # Sanity check: if SEMANTIC_KERNEL_AVAILABLE is True, ensure core imports work.
+    try:
+        import semantic_kernel  # noqa: F401
+        from semantic_kernel.connectors.ai.embeddings.embedding_generator_base import (  # type: ignore
+            EmbeddingGeneratorBase,  # noqa: F401
+        )
+    except Exception as exc:
+        pytest.fail(
+            "SEMANTIC_KERNEL_AVAILABLE is True but importing Semantic Kernel failed. "
+            "This indicates an internal inconsistency or broken install.\n"
+            f"Import error: {exc!r}",
+            pytrace=False,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Helpers
