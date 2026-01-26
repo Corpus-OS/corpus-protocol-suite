@@ -58,6 +58,7 @@ This module mainly:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 import threading
 import time
@@ -74,6 +75,7 @@ from typing import (
     Tuple,
     TypeVar,
     TypedDict,
+    Union,
 )
 
 from corpus_sdk.core.context_translation import from_autogen as context_from_autogen
@@ -135,6 +137,7 @@ class AutoGenContext(TypedDict, total=False):
 
     This is intentionally small and permissive; callers may include additional keys.
     """
+
     agent_name: Optional[str]
     conversation_id: Optional[str]
     workflow_type: Optional[str]
@@ -222,6 +225,43 @@ def _ensure_not_in_event_loop(sync_api_name: str) -> None:
         f"Use the async variant instead (e.g. 'await a{sync_api_name}()'). "
         f"[{ErrorCodes.SYNC_WRAPPER_CALLED_IN_EVENT_LOOP}]"
     )
+
+
+def _is_running_event_loop() -> bool:
+    """Return True if called while an asyncio event loop is running in this thread."""
+    try:
+        asyncio.get_running_loop()
+        return True
+    except RuntimeError:
+        return False
+
+
+# Dedicated, bounded executor for Chroma-in-event-loop compatibility.
+# Used only when explicitly enabled via CorpusAutoGenEmbeddings(..., _allow_chromadb_in_event_loop=True).
+_CHROMA_BRIDGE_EXECUTOR: Optional[concurrent.futures.ThreadPoolExecutor] = None
+_CHROMA_BRIDGE_EXECUTOR_LOCK = threading.Lock()
+
+
+def _run_blocking_in_chroma_bridge_thread(fn: Callable[[], T]) -> T:
+    """
+    Run a blocking embedding call in a bounded thread pool.
+
+    Why:
+      Chroma requires a synchronous embedding_function, but AutoGen/Chroma call it from
+      within async flows (event loop running). We must not block or nest loop bridges.
+
+    Safety/performance:
+      - bounded pool (max_workers=4) to prevent unbounded thread creation
+      - used only in the integration path
+    """
+    global _CHROMA_BRIDGE_EXECUTOR  # noqa: PLW0603
+    with _CHROMA_BRIDGE_EXECUTOR_LOCK:
+        if _CHROMA_BRIDGE_EXECUTOR is None:
+            _CHROMA_BRIDGE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+                max_workers=4,
+                thread_name_prefix="corpus-autogen-chroma",
+            )
+    return _CHROMA_BRIDGE_EXECUTOR.submit(fn).result()
 
 
 async def _maybe_close_async(adapter: Any) -> None:
@@ -328,8 +368,6 @@ def _create_error_context_decorator(
 ) -> Callable[[Callable[..., T]], Callable[..., T]]:
     """
     Factory for creating error context decorators with rich per-call metrics.
-
-    Mirrors the pattern used in other framework adapters to keep behavior consistent.
     """
 
     def decorator_factory(**static_context: Any) -> Callable[[Callable[..., T]], Callable[..., T]]:
@@ -420,6 +458,8 @@ class CorpusAutoGenEmbeddings:
         text_normalization_config: Optional[TextNormalizationConfig] = None,
         autogen_config: Optional[Dict[str, Any]] = None,
         framework_version: Optional[str] = None,
+        *,
+        _allow_chromadb_in_event_loop: bool = False,
     ) -> None:
         # Behavioral validation (duck-typed) instead of strict isinstance
         if not hasattr(corpus_adapter, "embed") or not callable(getattr(corpus_adapter, "embed", None)):
@@ -445,6 +485,11 @@ class CorpusAutoGenEmbeddings:
         self.autogen_config: Dict[str, Any] = autogen_config or {}
         self._framework_version: Optional[str] = framework_version
 
+        # Internal integration switch:
+        # - False for user-constructed embeddings (preserve strict hardening)
+        # - True for ChromaDB embedding_function usage inside async AutoGen flows
+        self._allow_chromadb_in_event_loop = bool(_allow_chromadb_in_event_loop)
+
         # Guard lazy translator initialization + dim hint update under concurrency.
         self._lock = threading.Lock()
 
@@ -460,17 +505,27 @@ class CorpusAutoGenEmbeddings:
         )
 
     # ------------------------------------------------------------------ #
-    # ChromaDB embedding function interface requirements
+    # ChromaDB compatibility surface
     # ------------------------------------------------------------------ #
 
     def name(self) -> str:
         """
         Return a unique name for this embedding function.
-        
+
         ChromaDB uses this to validate embedding function consistency
         when reopening persisted collections.
         """
         return "corpus-autogen-embeddings"
+
+    def is_legacy(self) -> bool:
+        """
+        ChromaDB probes this as a callable in some versions.
+
+        Returning False indicates this embedding function is not a legacy wrapper.
+        (We still implement embed_query/embed_documents for compatibility with callers
+        that use the legacy-style interface.)
+        """
+        return False
 
     # ------------------------------------------------------------------ #
     # Resource management (context managers)
@@ -489,7 +544,6 @@ class CorpusAutoGenEmbeddings:
         """
         try:
             _ensure_not_in_event_loop("close")
-            # Best-effort translator-driven cleanup; errors are logged and swallowed here.
             self._translator.close()
         except Exception as exc:  # noqa: BLE001
             logger.warning("Error while closing embedding translator in __exit__: %s", exc)
@@ -517,9 +571,6 @@ class CorpusAutoGenEmbeddings:
     def _translator(self) -> EmbeddingTranslator:
         """
         Lazily construct and cache the `EmbeddingTranslator`.
-
-        We use `cached_property` for ergonomic caching and add an explicit lock
-        to avoid duplicate initialization under concurrent first access.
         """
         with self._lock:
             existing = self.__dict__.get("_translator")
@@ -529,7 +580,7 @@ class CorpusAutoGenEmbeddings:
             translator = create_embedding_translator(
                 adapter=self.corpus_adapter,
                 framework="autogen",
-                translator=None,  # use registry/default generic translator
+                translator=None,
                 batch_config=self.batch_config,
                 text_normalization_config=self.text_normalization_config,
             )
@@ -537,12 +588,7 @@ class CorpusAutoGenEmbeddings:
             return translator
 
     def _update_dim_hint(self, dim: Optional[int]) -> None:
-        """
-        Thread-safe, best-effort dim hint update.
-
-        This is used only for observability/metrics; it is never used to drive
-        correctness or adapter behavior. First non-None write wins.
-        """
+        """Thread-safe, best-effort dim hint update. First non-None write wins."""
         if dim is None:
             return
         if self._embedding_dim_hint is not None:
@@ -609,9 +655,6 @@ class CorpusAutoGenEmbeddings:
     ) -> Dict[str, Any]:
         """
         Build the framework-specific context mapping for the translator.
-
-        This carries observability hints and AutoGen routing fields, separate from
-        the protocol-level OperationContext.
         """
         effective_model = model or self.model
         base: Dict[str, Any] = {
@@ -655,7 +698,6 @@ class CorpusAutoGenEmbeddings:
         return core_ctx, framework_ctx
 
     def _coerce_embedding_matrix(self, result: Any) -> List[List[float]]:
-        """Thin wrapper around shared coercion utility for matrix outputs."""
         return coerce_embedding_matrix(
             result=result,
             framework="autogen",
@@ -664,7 +706,6 @@ class CorpusAutoGenEmbeddings:
         )
 
     def _coerce_embedding_vector(self, result: Any) -> List[float]:
-        """Thin wrapper around shared coercion utility for single-vector outputs."""
         return coerce_embedding_vector(
             result=result,
             framework="autogen",
@@ -687,67 +728,53 @@ class CorpusAutoGenEmbeddings:
 
     @with_embedding_error_context("capabilities")
     def capabilities(self) -> Mapping[str, Any]:
-        """
-        Sync capabilities passthrough.
-
-        Delegates to EmbeddingTranslator.capabilities(), which handles
-        async/sync adapter methods via its own AsyncBridge usage.
-        """
-        # We intentionally do **not** manually touch corpus_adapter.capabilities here:
-        # the translator centralizes all bridging / error context for embedding layer.
         return self._translator.capabilities()
 
     @with_async_embedding_error_context("capabilities_async")
     async def acapabilities(self) -> Mapping[str, Any]:
-        """
-        Async capabilities passthrough.
-
-        Delegates to EmbeddingTranslator.arun_capabilities().
-        """
         return await self._translator.arun_capabilities()
 
     @with_embedding_error_context("health")
     def health(self) -> Mapping[str, Any]:
-        """
-        Sync health passthrough.
-
-        Delegates to EmbeddingTranslator.health().
-        """
         return self._translator.health()
 
     @with_async_embedding_error_context("health_async")
     async def ahealth(self) -> Mapping[str, Any]:
-        """
-        Async health passthrough.
-
-        Delegates to EmbeddingTranslator.arun_health().
-        """
         return await self._translator.arun_health()
 
     # ------------------------------------------------------------------ #
-    # EmbeddingFunction interface (sync, guarded)
+    # Chroma EmbeddingFunction interface (sync)
     # ------------------------------------------------------------------ #
 
     @with_embedding_error_context("function_call")
-    def __call__(
-        self,
-        input: Sequence[str],
-    ) -> List[List[float]]:
+    def __call__(self, input: Sequence[str]) -> List[List[float]]:
         """
-        Callable interface expected by ChromaDB:
+        ChromaDB embedding function interface:
           embedding_function(input: Sequence[str]) -> List[List[float]]
 
-        This is a thin wrapper over `embed_documents`, with an event-loop guard
-        to prevent misuse from async contexts.
-        
-        ChromaDB requires this exact signature: __call__(self, input)
+        Hardening contract:
+        - User calls: refuse to run inside an active event loop.
+        - Chroma integration (explicitly enabled): allow inside an event loop by
+          running async embedding in a worker thread and returning synchronously.
         """
-        _ensure_not_in_event_loop("__call__")
-        return self.embed_documents(
-            list(input),
-            autogen_context=None,
-            model=None,
-        )
+        if not _is_running_event_loop():
+            return self.embed_documents(list(input), autogen_context=None, model=None)
+
+        if not self._allow_chromadb_in_event_loop:
+            _ensure_not_in_event_loop("__call__")
+            return []  # pragma: no cover
+
+        texts = list(input)
+
+        def _work() -> List[List[float]]:
+            # Avoid sync bridge in-loop; run native async path in this worker thread.
+            return asyncio.run(self.aembed_documents(texts, autogen_context=None, model=None))
+
+        return _run_blocking_in_chroma_bridge_thread(_work)
+
+    # ------------------------------------------------------------------ #
+    # Document embedding (sync + async)
+    # ------------------------------------------------------------------ #
 
     @with_embedding_error_context("documents")
     def embed_documents(
@@ -758,11 +785,6 @@ class CorpusAutoGenEmbeddings:
         model: Optional[str] = None,
         **kwargs: Any,
     ) -> List[List[float]]:
-        """
-        Sync embedding for multiple documents.
-
-        Used for indexing/memory writes in typical RAG pipelines.
-        """
         _ensure_not_in_event_loop("embed_documents")
 
         texts_list = list(texts)
@@ -802,54 +824,6 @@ class CorpusAutoGenEmbeddings:
         )
         return mat
 
-    @with_embedding_error_context("query")
-    def embed_query(
-        self,
-        text: str,
-        *,
-        autogen_context: Optional[Mapping[str, Any]] = None,
-        model: Optional[str] = None,
-        **kwargs: Any,
-    ) -> List[float]:
-        """
-        Sync embedding for a single query.
-
-        Used for retrieval queries / similarity searches.
-        """
-        _ensure_not_in_event_loop("embed_query")
-
-        if not isinstance(text, str):
-            raise TypeError(f"embed_query expects str; got {type(text).__name__}")
-
-        core_ctx, framework_ctx = self._build_contexts(
-            autogen_context=autogen_context,
-            model=model,
-            **kwargs,
-        )
-
-        start = time.perf_counter()
-        translated = self._translator.embed(
-            raw_texts=text,
-            op_ctx=core_ctx,
-            framework_ctx=framework_ctx,
-        )
-        elapsed_ms = (time.perf_counter() - start) * 1000.0
-
-        vec = self._coerce_embedding_vector(translated)
-        self._update_dim_hint(len(vec))
-
-        logger.debug(
-            "Sync embedding query completed: dim=%d latency_ms=%.2f conversation=%s",
-            len(vec),
-            elapsed_ms,
-            framework_ctx.get("conversation_id", "unknown"),
-        )
-        return vec
-
-    # ------------------------------------------------------------------ #
-    # Async API
-    # ------------------------------------------------------------------ #
-
     @with_async_embedding_error_context("documents")
     async def aembed_documents(
         self,
@@ -859,11 +833,6 @@ class CorpusAutoGenEmbeddings:
         model: Optional[str] = None,
         **kwargs: Any,
     ) -> List[List[float]]:
-        """
-        Async embedding for multiple documents.
-
-        Suitable for async AutoGen flows and event-driven pipelines.
-        """
         texts_list = list(texts)
         _validate_texts_are_strings(texts_list, op_name="aembed_documents")
 
@@ -901,18 +870,109 @@ class CorpusAutoGenEmbeddings:
         )
         return mat
 
-    @with_async_embedding_error_context("query")
-    async def aembed_query(
+    # ------------------------------------------------------------------ #
+    # Query embedding (sync + async)
+    #
+    # IMPORTANT:
+    # Chroma/AutoGen may call embed_query as a "legacy embedding interface" with:
+    #   embed_query(input=["q1", "q2", ...])
+    # In that mode, this method must return a matrix (List[List[float]]).
+    #
+    # For user/framework calls, embed_query("text") returns a vector (List[float]).
+    # ------------------------------------------------------------------ #
+
+    @with_embedding_error_context("query")
+    def embed_query(
         self,
-        text: str,
+        text: Optional[str] = None,
         *,
+        input: Optional[Sequence[str]] = None,
         autogen_context: Optional[Mapping[str, Any]] = None,
         model: Optional[str] = None,
         **kwargs: Any,
-    ) -> List[float]:
-        """
-        Async embedding for a single query.
-        """
+    ) -> Union[List[float], List[List[float]]]:
+        # Legacy/Chroma mode: embed_query(input=[...]) -> matrix
+        if input is not None:
+            texts_list = list(input)
+            _validate_texts_are_strings(texts_list, op_name="embed_query")
+
+            # Chroma may call this from within an event loop.
+            if _is_running_event_loop():
+                if not self._allow_chromadb_in_event_loop:
+                    _ensure_not_in_event_loop("embed_query")
+                    return []  # pragma: no cover
+
+                def _work() -> List[List[float]]:
+                    return asyncio.run(
+                        self.aembed_documents(
+                            texts_list,
+                            autogen_context=autogen_context,
+                            model=model,
+                            **kwargs,
+                        )
+                    )
+
+                return _run_blocking_in_chroma_bridge_thread(_work)
+
+            # No running loop: safe to use sync path.
+            return self.embed_documents(
+                texts_list,
+                autogen_context=autogen_context,
+                model=model,
+                **kwargs,
+            )
+
+        # User/framework mode: embed_query("text") -> vector
+        _ensure_not_in_event_loop("embed_query")
+        if not isinstance(text, str):
+            raise TypeError(f"embed_query expects str; got {type(text).__name__}")
+
+        core_ctx, framework_ctx = self._build_contexts(
+            autogen_context=autogen_context,
+            model=model,
+            **kwargs,
+        )
+
+        start = time.perf_counter()
+        translated = self._translator.embed(
+            raw_texts=text,
+            op_ctx=core_ctx,
+            framework_ctx=framework_ctx,
+        )
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+
+        vec = self._coerce_embedding_vector(translated)
+        self._update_dim_hint(len(vec))
+
+        logger.debug(
+            "Sync embedding query completed: dim=%d latency_ms=%.2f conversation=%s",
+            len(vec),
+            elapsed_ms,
+            framework_ctx.get("conversation_id", "unknown"),
+        )
+        return vec
+
+    @with_async_embedding_error_context("query")
+    async def aembed_query(
+        self,
+        text: Optional[str] = None,
+        *,
+        input: Optional[Sequence[str]] = None,
+        autogen_context: Optional[Mapping[str, Any]] = None,
+        model: Optional[str] = None,
+        **kwargs: Any,
+    ) -> Union[List[float], List[List[float]]]:
+        # Legacy/Chroma mode: aembed_query(input=[...]) -> matrix
+        if input is not None:
+            texts_list = list(input)
+            _validate_texts_are_strings(texts_list, op_name="aembed_query")
+            return await self.aembed_documents(
+                texts_list,
+                autogen_context=autogen_context,
+                model=model,
+                **kwargs,
+            )
+
         if not isinstance(text, str):
             raise TypeError(f"aembed_query expects str; got {type(text).__name__}")
 
@@ -947,6 +1007,39 @@ class CorpusAutoGenEmbeddings:
 # --------------------------------------------------------------------------- #
 
 
+class _AutoGenChromaMemoryCompatWrapper:
+    """
+    Compatibility wrapper around AutoGen's ChromaDBVectorMemory.
+
+    Some autogen-ext versions raise AttributeError when given batch inputs to add()
+    (e.g., memory.add(list[MemoryContent])) rather than raising TypeError. Callers/tests
+    expect TypeError for "wrong shape" calls so they can gracefully fall back to sequential adds.
+    """
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    async def add(self, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return await self._inner.add(*args, **kwargs)
+        except AttributeError as exc:
+            # If caller attempted batch add (list/tuple), normalize to TypeError so fallback works.
+            if args and isinstance(args[0], (list, tuple)):
+                raise TypeError(
+                    "This AutoGen/Chroma installation does not support batch add(list[MemoryContent])."
+                ) from exc
+            raise
+
+    async def query(self, *args: Any, **kwargs: Any) -> Any:
+        return await self._inner.query(*args, **kwargs)
+
+    async def close(self, *args: Any, **kwargs: Any) -> Any:
+        return await self._inner.close(*args, **kwargs)
+
+
 def create_vector_memory(
     corpus_adapter: EmbeddingProtocolV1,
     *,
@@ -964,26 +1057,6 @@ def create_vector_memory(
     Create a modern AutoGen ChromaDB vector memory configured to use Corpus embeddings.
 
     AutoGen is an optional dependency: imports are performed lazily.
-
-    Parameters
-    ----------
-    corpus_adapter:
-        Underlying embedding adapter implementing `EmbeddingProtocolV1`.
-    collection_name:
-        Chroma collection name for the memory store.
-    persistence_path:
-        Optional path for persistent Chroma storage. If None, uses default behavior.
-    model, batch_config, text_normalization_config, autogen_config, framework_version:
-        Forwarded to `CorpusAutoGenEmbeddings` construction.
-    k:
-        Default number of nearest neighbors to retrieve.
-    score_threshold:
-        Optional similarity score threshold; depends on AutoGen/Chroma semantics.
-
-    Returns
-    -------
-    AutoGenMemory
-        A ChromaDBVectorMemory instance (typed loosely via Protocol).
     """
     try:
         from autogen_ext.memory.chromadb import (  # type: ignore[import-not-found]
@@ -997,8 +1070,8 @@ def create_vector_memory(
             '  pip install -U "autogen-agentchat" "autogen-core" "autogen-ext[chromadb]"'
         ) from exc
 
-    # AutoGen uses a function+params config to build the embedding function.
     def _embedding_fn_factory(**params: Any) -> Any:
+        # Enable event-loop compatibility only for the embedding function created for Chroma.
         return CorpusAutoGenEmbeddings(
             corpus_adapter=params["corpus_adapter"],
             model=params.get("model"),
@@ -1006,6 +1079,7 @@ def create_vector_memory(
             text_normalization_config=params.get("text_normalization_config"),
             autogen_config=params.get("autogen_config"),
             framework_version=params.get("framework_version"),
+            _allow_chromadb_in_event_loop=True,
         )
 
     embedding_function_config = CustomEmbeddingFunctionConfig(
@@ -1028,7 +1102,14 @@ def create_vector_memory(
         score_threshold=score_threshold,
     )
 
-    return ChromaDBVectorMemory(config=cfg)
+    mem = ChromaDBVectorMemory(config=cfg)
+
+    # Wrap only real autogen-ext memory instances; keep test dummy types untouched.
+    mem_mod = getattr(type(mem), "__module__", "") or ""
+    if mem_mod.startswith("autogen_ext.memory.chromadb"):
+        return _AutoGenChromaMemoryCompatWrapper(mem)
+
+    return mem
 
 
 def register_embeddings(
