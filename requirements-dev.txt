@@ -24,8 +24,13 @@ wheel>=0.41.0,<0.45.0
 jsonschema>=4.18,<5
 referencing>=0.35,<1
 
-# --- Framework integration deps (PASS/FAIL) ---
+# --- Framework integration deps ---
 pydantic>=2,<3
 langchain-core>=0.1,<1
 crewai>=0.1,<1
 semantic-kernel>=1,<2
+
+# AutoGen framework (for integration tests)
+autogen-agentchat>=0.4,<1
+autogen-core>=0.4,<1
+autogen-ext[chromadb]>=0.4,<1  # Includes ChromaDB for vector memory tests
