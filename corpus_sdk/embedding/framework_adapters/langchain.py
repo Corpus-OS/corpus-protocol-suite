@@ -31,8 +31,6 @@ Design notes / philosophy
 
 Resilience (retries, caching, rate limiting, etc.) is expected to be provided
 by the underlying adapter, typically a BaseEmbeddingAdapter subclass.
-
-
 """
 
 from __future__ import annotations
@@ -62,12 +60,11 @@ from corpus_sdk.core.context_translation import (
 )
 from corpus_sdk.core.error_context import attach_context
 from corpus_sdk.embedding.embedding_base import (
-    EmbeddingProtocolV1,
     OperationContext,
 )
 from corpus_sdk.embedding.framework_adapters.common.embedding_translation import (
-    EmbeddingTranslator,
     BatchConfig,
+    EmbeddingTranslator,
     TextNormalizationConfig,
     create_embedding_translator,
 )
@@ -398,11 +395,7 @@ def _extract_dynamic_context(
         if isinstance(maybe_texts, Sequence) and not isinstance(maybe_texts, (str, bytes)):
             texts_seq = maybe_texts
             dynamic_ctx["texts_count"] = len(texts_seq)
-            empty_count = sum(
-                1
-                for text in texts_seq
-                if not isinstance(text, str) or not text.strip()
-            )
+            empty_count = sum(1 for text in texts_seq if not isinstance(text, str) or not text.strip())
             if empty_count:
                 dynamic_ctx["empty_texts_count"] = empty_count
 
@@ -433,20 +426,13 @@ def _create_error_context_decorator(
     Semantic Kernel, AutoGen, CrewAI) for consistent observability.
     """
 
-    def decorator_factory(
-        **static_context: Any,
-    ) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    def decorator_factory(**static_context: Any) -> Callable[[Callable[..., T]], Callable[..., T]]:
         def decorator(func: Callable[..., T]) -> Callable[..., T]:
             if is_async:
 
                 @wraps(func)
                 async def async_wrapper(self: Any, *args: Any, **kwargs: Any) -> T:
-                    dynamic_context = _extract_dynamic_context(
-                        self,
-                        args,
-                        kwargs,
-                        operation,
-                    )
+                    dynamic_context = _extract_dynamic_context(self, args, kwargs, operation)
                     full_context = {**static_context, **dynamic_context}
                     try:
                         return await func(self, *args, **kwargs)
@@ -463,12 +449,7 @@ def _create_error_context_decorator(
 
             @wraps(func)
             def sync_wrapper(self: Any, *args: Any, **kwargs: Any) -> T:
-                dynamic_context = _extract_dynamic_context(
-                    self,
-                    args,
-                    kwargs,
-                    operation,
-                )
+                dynamic_context = _extract_dynamic_context(self, args, kwargs, operation)
                 full_context = {**static_context, **dynamic_context}
                 try:
                     return func(self, *args, **kwargs)
@@ -478,7 +459,7 @@ def _create_error_context_decorator(
                         framework=_FRAMEWORK_NAME,
                         operation=f"embedding_{operation}",
                         **full_context,
-                        )
+                    )
                     raise
 
             return sync_wrapper  # type: ignore[return-value]
@@ -488,19 +469,13 @@ def _create_error_context_decorator(
     return decorator_factory
 
 
-def with_embedding_error_context(
-    operation: str,
-    **static_context: Any,
-) -> Callable[[Callable[..., T]], Callable[..., T]]:
+def with_embedding_error_context(operation: str, **static_context: Any) -> Callable[[Callable[..., T]], Callable[..., T]]:
     """Decorator for sync methods with rich dynamic context extraction."""
     static_context.setdefault("error_codes", EMBEDDING_COERCION_ERROR_CODES)
     return _create_error_context_decorator(operation, is_async=False)(**static_context)
 
 
-def with_async_embedding_error_context(
-    operation: str,
-    **static_context: Any,
-) -> Callable[[Callable[..., T]], Callable[..., T]]:
+def with_async_embedding_error_context(operation: str, **static_context: Any) -> Callable[[Callable[..., T]], Callable[..., T]]:
     """Decorator for async methods with rich dynamic context extraction."""
     static_context.setdefault("error_codes", EMBEDDING_COERCION_ERROR_CODES)
     return _create_error_context_decorator(operation, is_async=True)(**static_context)
@@ -558,7 +533,8 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
     Attributes
     ----------
     corpus_adapter:
-        Underlying Corpus embedding adapter implementing `EmbeddingProtocolV1`.
+        Underlying Corpus embedding adapter implementing the EmbeddingProtocolV1
+        *behavior* (duck-typed).
 
     model:
         Optional default model identifier. Can be overridden per call by
@@ -582,7 +558,8 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         This is separate from per-call LangChain RunnableConfig-like `config`.
     """
 
-    corpus_adapter: EmbeddingProtocolV1
+    # IMPORTANT: keep this duck-typed to avoid Pydantic enforcing instance-of checks.
+    corpus_adapter: Any
     model: Optional[str] = None
     framework_version: Optional[str] = None
     batch_config: Optional[BatchConfig] = None
@@ -592,8 +569,8 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
     # Pydantic v2 configuration
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    # Private attribute for caching the translator instance
-    _translator_cache: Optional[EmbeddingTranslator] = PrivateAttr(default=None)
+    # Private attribute for caching the translator instance (or a test-injected stub)
+    _translator_cache: Optional[Any] = PrivateAttr(default=None)
 
     # Private attribute lock to avoid duplicate translator construction under concurrency
     _translator_lock: threading.Lock = PrivateAttr(default_factory=threading.Lock)
@@ -617,14 +594,14 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
 
     @field_validator("corpus_adapter")
     @classmethod
-    def validate_corpus_adapter(cls, v: EmbeddingProtocolV1) -> EmbeddingProtocolV1:
+    def validate_corpus_adapter(cls, v: Any) -> Any:
         """
-        Validate that corpus_adapter implements the required embedding protocol.
+        Validate that corpus_adapter implements the required embedding protocol behavior.
 
         We do a behavioral check (presence of `embed`) instead of strict type
-        checking to remain flexible with Protocol-based adapters.
+        checking to remain flexible with Protocol-based adapters and simple stubs.
         """
-        if not hasattr(v, "embed") or not callable(getattr(v, "embed")):
+        if not hasattr(v, "embed") or not callable(getattr(v, "embed", None)):
             raise ValueError(
                 "corpus_adapter must implement EmbeddingProtocolV1 with an 'embed' method"
             )
@@ -734,13 +711,17 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
     # ------------------------------------------------------------------ #
 
     @property
-    def _translator(self) -> EmbeddingTranslator:
+    def _translator(self) -> Any:
         """
         Lazily construct and cache the `EmbeddingTranslator`.
 
         Uses a PrivateAttr cache so this remains compatible with Pydantic v2.
         Also guards initialization with a lock to avoid duplicate construction
         under concurrent first access.
+
+        NOTE (testing / injection):
+        - Tests may monkeypatch `_translator` with a stub translator. To support
+          that without fighting Pydantic's setattr rules, we provide a setter.
         """
         if self._translator_cache is None:
             with self._translator_lock:
@@ -757,6 +738,11 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
                         self.model or "default",
                     )
         return self._translator_cache
+
+    @_translator.setter
+    def _translator(self, value: Any) -> None:
+        # Allow tests to inject a stub translator via `embeddings._translator = ...`
+        self._translator_cache = value
 
     def _update_dim_hint(self, dim: Optional[int]) -> None:
         """
@@ -864,12 +850,7 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
             framework_ctx["model"] = effective_model
 
         if isinstance(config, Mapping):
-            framework_ctx.update(
-                {
-                    "run_name": config.get("run_name"),
-                    "run_id": config.get("run_id"),
-                }
-            )
+            framework_ctx.update({"run_name": config.get("run_name"), "run_id": config.get("run_id")})
 
             # IMPORTANT: do not propagate raw metadata/tags/configurable; store snapshots instead.
             if "tags" in config:
@@ -884,10 +865,7 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         framework_ctx.update({k: v for k, v in kwargs.items() if not k.startswith("_")})
 
         # Also surface the OperationContext itself for downstream inspection, if present.
-        if core_ctx is not None and self.langchain_config.get(
-            "enable_operation_context_propagation",
-            True,
-        ):
+        if core_ctx is not None and self.langchain_config.get("enable_operation_context_propagation", True):
             framework_ctx["_operation_context"] = core_ctx
 
         return framework_ctx
@@ -909,18 +887,10 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         - framework_ctx: LangChain-specific context for translator
         """
         core_ctx = self._build_core_context(config=config)
-        framework_ctx = self._build_framework_context(
-            core_ctx=core_ctx,
-            config=config,
-            model=model,
-            **kwargs,
-        )
+        framework_ctx = self._build_framework_context(core_ctx=core_ctx, config=config, model=model, **kwargs)
         return core_ctx, framework_ctx
 
-    def _validate_langchain_config_structure(
-        self,
-        config: Mapping[str, Any],
-    ) -> None:
+    def _validate_langchain_config_structure(self, config: Mapping[str, Any]) -> None:
         """
         Validate LangChain config structure and log warnings for anomalies.
 
@@ -929,20 +899,15 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         """
         if not isinstance(config, Mapping):
             logger.warning(
-                "[%s] LangChain config is not a Mapping (got %s); "
-                "context translation may be degraded.",
+                "[%s] LangChain config is not a Mapping (got %s); context translation may be degraded.",
                 ErrorCodes.LANGCHAIN_CONFIG_INVALID,
                 type(config).__name__,
             )
             return
 
-        if not any(
-            key in config
-            for key in ("tags", "metadata", "run_name", "run_id", "callbacks")
-        ):
+        if not any(key in config for key in ("tags", "metadata", "run_name", "run_id", "callbacks")):
             logger.debug(
-                "LangChain config missing common fields (tags, metadata, run_name, "
-                "run_id, callbacks) – reduced context for embeddings.",
+                "LangChain config missing common fields (tags, metadata, run_name, run_id, callbacks) – reduced context for embeddings.",
             )
 
     def _coerce_embedding_matrix(self, result: Any) -> List[List[float]]:
@@ -973,12 +938,7 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
             logger=logger,
         )
 
-    def _warn_if_extreme_batch(
-        self,
-        texts: Sequence[str],
-        *,
-        op_name: str,
-    ) -> None:
+    def _warn_if_extreme_batch(self, texts: Sequence[str], *, op_name: str) -> None:
         """
         Soft warning for extremely large batches when no batch_config limit
         is configured. Actual batching / chunking is handled by the translator.
@@ -1066,11 +1026,7 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         _validate_texts_are_strings(texts_list, op_name="aembed_documents")
         self._warn_if_extreme_batch(texts_list, op_name="aembed_documents")
 
-        core_ctx, framework_ctx = self._build_contexts(
-            config=config,
-            model=model,
-            **kwargs,
-        )
+        core_ctx, framework_ctx = self._build_contexts(config=config, model=model, **kwargs)
 
         logger.debug(
             "Async embedding %d documents for LangChain run: %s",
@@ -1087,7 +1043,6 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         elapsed_ms = (time.perf_counter() - start) * 1000.0
 
         mat = self._coerce_embedding_matrix(translated)
-
         dim = _infer_dim_from_matrix(mat)
         self._update_dim_hint(dim)
 
@@ -1125,11 +1080,7 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         if not isinstance(text, str):
             raise TypeError(f"aembed_query expects str; got {type(text).__name__}")
 
-        core_ctx, framework_ctx = self._build_contexts(
-            config=config,
-            model=model,
-            **kwargs,
-        )
+        core_ctx, framework_ctx = self._build_contexts(config=config, model=model, **kwargs)
 
         logger.debug(
             "Async embedding query for LangChain run: %s",
@@ -1180,11 +1131,7 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         _validate_texts_are_strings(texts_list, op_name="embed_documents")
         self._warn_if_extreme_batch(texts_list, op_name="embed_documents")
 
-        core_ctx, framework_ctx = self._build_contexts(
-            config=config,
-            model=model,
-            **kwargs,
-        )
+        core_ctx, framework_ctx = self._build_contexts(config=config, model=model, **kwargs)
 
         logger.debug(
             "Sync embedding %d documents for LangChain run: %s",
@@ -1201,7 +1148,6 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         elapsed_ms = (time.perf_counter() - start) * 1000.0
 
         mat = self._coerce_embedding_matrix(translated)
-
         dim = _infer_dim_from_matrix(mat)
         self._update_dim_hint(dim)
 
@@ -1234,11 +1180,7 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         if not isinstance(text, str):
             raise TypeError(f"embed_query expects str; got {type(text).__name__}")
 
-        core_ctx, framework_ctx = self._build_contexts(
-            config=config,
-            model=model,
-            **kwargs,
-        )
+        core_ctx, framework_ctx = self._build_contexts(config=config, model=model, **kwargs)
 
         logger.debug(
             "Sync embedding query for LangChain run: %s",
@@ -1279,12 +1221,7 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
         where a simple callable is expected.
         """
         _ensure_not_in_event_loop("__call__")
-        return self.embed_documents(
-            texts,
-            config=config,
-            model=model,
-            **kwargs,
-        )
+        return self.embed_documents(texts, config=config, model=model, **kwargs)
 
 
 # ------------------------------------------------------------------ #
@@ -1293,7 +1230,7 @@ class CorpusLangChainEmbeddings(BaseModel, Embeddings):
 
 
 def configure_langchain_embeddings(
-    corpus_adapter: EmbeddingProtocolV1,
+    corpus_adapter: Any,
     model: Optional[str] = None,
     framework_version: Optional[str] = None,
     langchain_config: Optional[LangChainAdapterConfig] = None,
@@ -1313,7 +1250,7 @@ def configure_langchain_embeddings(
     any global registration; you pass the returned instance into vectorstores,
     retrievers, chains, etc.
 
-     Example
+    Example
     -------
     ```python
     from corpus_sdk.embedding.framework_adapters.langchain import (
@@ -1328,7 +1265,7 @@ def configure_langchain_embeddings(
     Parameters
     ----------
     corpus_adapter:
-        Corpus embedding protocol adapter implementing `EmbeddingProtocolV1`.
+        Corpus embedding protocol adapter implementing the EmbeddingProtocolV1 behavior.
     model:
         Optional default model identifier.
     framework_version:
@@ -1338,6 +1275,7 @@ def configure_langchain_embeddings(
     **kwargs:
         Additional arguments for `CorpusLangChainEmbeddings`
         (e.g. batch_config, text_normalization_config).
+
     Returns
     -------
     CorpusLangChainEmbeddings
@@ -1353,8 +1291,7 @@ def configure_langchain_embeddings(
 
     if not LANGCHAIN_AVAILABLE:
         logger.debug(
-            "LangChain is not installed; returning embeddings without any "
-            "framework-level integration.",
+            "LangChain is not installed; returning embeddings without any framework-level integration.",
         )
     else:
         logger.info(
@@ -1367,7 +1304,7 @@ def configure_langchain_embeddings(
 
 
 def register_with_langchain(
-    corpus_adapter: EmbeddingProtocolV1,
+    corpus_adapter: Any,
     model: Optional[str] = None,
     framework_version: Optional[str] = None,
     langchain_config: Optional[LangChainAdapterConfig] = None,
