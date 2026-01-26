@@ -20,7 +20,11 @@ types-requests>=2.31.0,<3.0.0
 setuptools>=68,<71
 wheel>=0.41.0,<0.45.0
 
-
 # --- JSON (if you want to build locally) ---
 jsonschema>=4.18,<5
 referencing>=0.35,<1
+
+# --- Framework integration deps (PASS/FAIL) ---
+pydantic>=2,<3
+langchain-core>=0.1,<1
+semantic-kernel>=1,<2
