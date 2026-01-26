@@ -64,7 +64,7 @@ import inspect
 import logging
 import re
 import threading
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from typing import (
     Any,
     AsyncIterator,
@@ -223,6 +223,54 @@ def _extract_supported_models(caps: Any) -> List[str]:
     return []
 
 
+def _coerce_mapping_best_effort(value: Any) -> Optional[Mapping[str, Any]]:
+    """
+    Best-effort conversion of arbitrary objects to a Mapping.
+
+    This is intentionally conservative:
+      - Pydantic v2: model_dump()
+      - Pydantic v1: dict()
+      - Dataclasses: asdict()
+      - Plain objects: __dict__ / vars()
+    """
+    if value is None:
+        return None
+    if isinstance(value, Mapping):
+        return value
+
+    # Pydantic v2 / v1
+    try:
+        if hasattr(value, "model_dump") and callable(getattr(value, "model_dump")):
+            dumped = value.model_dump()
+            if isinstance(dumped, Mapping):
+                return dumped
+        if hasattr(value, "dict") and callable(getattr(value, "dict")):
+            dumped = value.dict()
+            if isinstance(dumped, Mapping):
+                return dumped
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Dataclass
+    try:
+        if is_dataclass(value):
+            dumped = asdict(value)
+            if isinstance(dumped, Mapping):
+                return dumped
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Plain object
+    try:
+        dumped2 = vars(value)
+        if isinstance(dumped2, Mapping):
+            return dumped2
+    except Exception:  # noqa: BLE001
+        return None
+
+    return None
+
+
 # =============================================================================
 # Batching configuration
 # =============================================================================
@@ -307,6 +355,15 @@ class TextNormalizationConfig:
         strict_type:
             If True, reject non-string inputs with an error. If False,
             attempt to convert to string.
+
+        allow_partial_filtering:
+            If remove_empty=True and one or more texts become empty after normalization,
+            this controls behavior for *batch* inputs:
+              - False (default): raise an error listing the empty indices to preserve
+                positional expectations across frameworks.
+              - True: silently drop empty texts (legacy behavior). Use only if your
+                framework explicitly expects filtered batches and does not require
+                output alignment with inputs.
     """
 
     normalize_whitespace: bool = True
@@ -317,6 +374,7 @@ class TextNormalizationConfig:
     lowercase: bool = False
     strict_encoding: bool = True
     strict_type: bool = True
+    allow_partial_filtering: bool = False
 
     def __post_init__(self) -> None:
         """Validate text normalization configuration."""
@@ -403,20 +461,33 @@ class TextNormalizer:
 
     def normalize_batch(self, texts: Sequence[str]) -> List[str]:
         """
-        Normalize a batch of texts, filtering out None results.
+        Normalize a batch of texts.
+
+        Behavior notes
+        --------------
+        - If remove_empty=True and allow_partial_filtering=False (default), this
+          raises a BadRequest if any items would be filtered out, to preserve
+          positional expectations across frameworks.
+        - If allow_partial_filtering=True, empty/whitespace-only texts are dropped
+          (legacy behavior).
 
         Returns:
-            List of normalized texts (may be shorter than input if texts filtered).
+            List of normalized texts.
 
         Raises:
-            BadRequest: If any text fails normalization based on strict settings.
+            BadRequest: If any text fails normalization based on strict settings,
+                        or if empty filtering would drop items and allow_partial_filtering=False.
         """
         normalized: List[str] = []
+        filtered_indices: List[int] = []
+
         for idx, text in enumerate(texts):
             try:
                 result = self.normalize(text)
-                if result is not None:
-                    normalized.append(result)
+                if result is None:
+                    filtered_indices.append(idx)
+                    continue
+                normalized.append(result)
             except BadRequest as e:
                 # Attach index information to the error
                 raise BadRequest(
@@ -424,6 +495,16 @@ class TextNormalizer:
                     code=e.code,
                     details={**e.details, "index": idx} if e.details else {"index": idx},
                 ) from e
+
+        if filtered_indices and self.config.remove_empty and not self.config.allow_partial_filtering:
+            raise BadRequest(
+                "One or more texts became empty after normalization; refusing to drop items "
+                "to preserve batch alignment. Set allow_partial_filtering=True if your framework "
+                "explicitly expects filtered batches.",
+                code="BAD_BATCH_EMPTY_TEXTS",
+                details={"empty_indices": filtered_indices},
+            )
+
         return normalized
 
     @staticmethod
@@ -622,7 +703,8 @@ class DefaultEmbeddingFrameworkTranslator:
     ) -> EmbedSpec:
         model = self.preferred_model(op_ctx=op_ctx, framework_ctx=framework_ctx)
 
-        # Ensure model is not None when passed to EmbedSpec
+        # NOTE: If no model is provided, we allow empty string here and rely on the
+        # orchestrator to best-effort resolve it via adapter capabilities.
         fallback_model = model or ""
 
         if isinstance(raw_texts, Mapping):
@@ -731,7 +813,8 @@ class DefaultEmbeddingFrameworkTranslator:
     ) -> BatchEmbedSpec:
         model = self.preferred_model(op_ctx=op_ctx, framework_ctx=framework_ctx)
 
-        # Ensure model is not None when passed to BatchEmbedSpec
+        # NOTE: If no model is provided, we allow empty string here and rely on the
+        # orchestrator to best-effort resolve it via adapter capabilities.
         fallback_model = model or ""
 
         texts = self._extract_text_list(raw_batch)
@@ -1256,8 +1339,15 @@ class EmbeddingTranslator:
                 )
 
             # Fallback: adapter does not provide embed_batch → call unary embed per item
-            out: List[List[float]] = []
-            for text in list(getattr(spec, "texts", []) or []):
+            # IMPORTANT (LangChain + error propagation):
+            # - DO NOT swallow exceptions here.
+            # - If any unary call fails, re-raise immediately so framework adapters
+            #   see the original exception (and attach_context records metadata).
+            embeddings: List[Any] = []
+            total_tokens: int = 0
+
+            texts_list = list(getattr(spec, "texts", []) or [])
+            for text in texts_list:
                 unary = EmbedSpec(
                     text=text,
                     model=getattr(spec, "model", "") or "",
@@ -1270,14 +1360,28 @@ class EmbeddingTranslator:
                 if unary_model and unary_model != getattr(unary, "model", ""):
                     unary = replace(unary, model=unary_model)
 
-                r = await self._adapter.embed(unary, ctx=ctx)
+                r = await self._adapter.embed(unary, ctx=ctx)  # let exceptions propagate
                 if not isinstance(r, EmbedResult):
                     raise BadRequest(
                         f"adapter.embed returned unsupported type: {type(r).__name__}",
                         code="BAD_ADAPTER_RESULT",
                     )
-                out.append(r.embedding.vector)
-            return out
+                embeddings.append(r.embedding)
+                if isinstance(getattr(r, "tokens_used", None), int):
+                    total_tokens += int(getattr(r, "tokens_used", 0) or 0)
+
+            batch_result = BatchEmbedResult(
+                embeddings=embeddings,
+                model=getattr(spec, "model", "") or "",
+                total_texts=len(texts_list),
+                total_tokens=total_tokens,
+                failed_texts=[],
+            )
+            return self._translator.translate_batch_embed_result(
+                batch_result,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
 
         return self._run_operation(
             op_name="batch_embed",
@@ -1323,8 +1427,16 @@ class EmbeddingTranslator:
                     framework_ctx=framework_ctx,
                 )
 
-            out: List[List[float]] = []
-            for text in list(getattr(spec, "texts", []) or []):
+            # Fallback: adapter does not provide embed_batch → call unary embed per item
+            # IMPORTANT (LangChain + error propagation):
+            # - DO NOT swallow exceptions here.
+            # - If any unary call fails, re-raise immediately so framework adapters
+            #   see the original exception (and attach_context records metadata).
+            embeddings: List[Any] = []
+            total_tokens: int = 0
+
+            texts_list = list(getattr(spec, "texts", []) or [])
+            for text in texts_list:
                 unary = EmbedSpec(
                     text=text,
                     model=getattr(spec, "model", "") or "",
@@ -1337,14 +1449,28 @@ class EmbeddingTranslator:
                 if unary_model and unary_model != getattr(unary, "model", ""):
                     unary = replace(unary, model=unary_model)
 
-                r = await self._adapter.embed(unary, ctx=ctx)
+                r = await self._adapter.embed(unary, ctx=ctx)  # let exceptions propagate
                 if not isinstance(r, EmbedResult):
                     raise BadRequest(
                         f"adapter.embed returned unsupported type: {type(r).__name__}",
                         code="BAD_ADAPTER_RESULT",
                     )
-                out.append(r.embedding.vector)
-            return out
+                embeddings.append(r.embedding)
+                if isinstance(getattr(r, "tokens_used", None), int):
+                    total_tokens += int(getattr(r, "tokens_used", 0) or 0)
+
+            batch_result = BatchEmbedResult(
+                embeddings=embeddings,
+                model=getattr(spec, "model", "") or "",
+                total_texts=len(texts_list),
+                total_tokens=total_tokens,
+                failed_texts=[],
+            )
+            return self._translator.translate_batch_embed_result(
+                batch_result,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
 
         return await self._run_operation(
             op_name="batch_embed",
@@ -1384,11 +1510,23 @@ class EmbeddingTranslator:
             else:
                 return {}
 
+            # Change (requested) + fix for dataclass/plain-object EmbeddingCapabilities
             if not isinstance(result, Mapping):
-                raise BadRequest(
-                    f"adapter.capabilities returned unsupported type: {type(result).__name__}",
-                    code="BAD_ADAPTER_RESULT",
-                )
+                # Try to convert EmbeddingCapabilities or similar objects to dict
+                if hasattr(result, "model_dump") and callable(getattr(result, "model_dump")):
+                    result = result.model_dump()
+                elif hasattr(result, "dict") and callable(getattr(result, "dict")):
+                    result = result.dict()
+                elif is_dataclass(result):
+                    result = asdict(result)
+                else:
+                    try:
+                        result = vars(result)
+                    except TypeError:
+                        raise BadRequest(
+                            f"adapter.capabilities returned unsupported type: {type(result).__name__}",
+                            code="BAD_ADAPTER_RESULT",
+                        )
             return dict(result)
 
         return self._run_operation(
@@ -1425,11 +1563,23 @@ class EmbeddingTranslator:
             else:
                 return {}
 
+            # Change (requested) + fix for dataclass/plain-object EmbeddingCapabilities
             if not isinstance(result, Mapping):
-                raise BadRequest(
-                    f"adapter.capabilities returned unsupported type: {type(result).__name__}",
-                    code="BAD_ADAPTER_RESULT",
-                )
+                # Try to convert EmbeddingCapabilities or similar objects to dict
+                if hasattr(result, "model_dump") and callable(getattr(result, "model_dump")):
+                    result = result.model_dump()
+                elif hasattr(result, "dict") and callable(getattr(result, "dict")):
+                    result = result.dict()
+                elif is_dataclass(result):
+                    result = asdict(result)
+                else:
+                    try:
+                        result = vars(result)
+                    except TypeError:
+                        raise BadRequest(
+                            f"adapter.capabilities returned unsupported type: {type(result).__name__}",
+                            code="BAD_ADAPTER_RESULT",
+                        )
             return dict(result)
 
         return await self._run_operation(
@@ -1463,11 +1613,16 @@ class EmbeddingTranslator:
             else:
                 return {}
 
+            # Accept Mapping or best-effort coerce (pydantic/dataclass-like objects)
             if not isinstance(result, Mapping):
-                raise BadRequest(
-                    f"adapter.health returned unsupported type: {type(result).__name__}",
-                    code="BAD_ADAPTER_RESULT",
-                )
+                coerced = _coerce_mapping_best_effort(result)
+                if coerced is None:
+                    raise BadRequest(
+                        f"adapter.health returned unsupported type: {type(result).__name__}",
+                        code="BAD_ADAPTER_RESULT",
+                    )
+                result = coerced
+
             return dict(result)
 
         return self._run_operation(
@@ -1501,11 +1656,16 @@ class EmbeddingTranslator:
             else:
                 return {}
 
+            # Accept Mapping or best-effort coerce (pydantic/dataclass-like objects)
             if not isinstance(result, Mapping):
-                raise BadRequest(
-                    f"adapter.health returned unsupported type: {type(result).__name__}",
-                    code="BAD_ADAPTER_RESULT",
-                )
+                coerced = _coerce_mapping_best_effort(result)
+                if coerced is None:
+                    raise BadRequest(
+                        f"adapter.health returned unsupported type: {type(result).__name__}",
+                        code="BAD_ADAPTER_RESULT",
+                    )
+                result = coerced
+
             return dict(result)
 
         return await self._run_operation(
