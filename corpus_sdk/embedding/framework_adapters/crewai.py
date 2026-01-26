@@ -24,6 +24,8 @@ Design notes / philosophy
   framework identity, model info, batch sizes, node IDs, trace/workflow IDs, etc.
 - **Fail-safe context translation**: context translation must never break embeddings.
   If translation fails, we proceed without `OperationContext` and attach diagnostic context.
+  NOTE: Caller-provided crewai_context with an invalid *type* is treated as a usage
+  error and raises ValueError (to keep behavior consistent with adapter tests).
 - **Strict by default** (configurable): non-string inputs in batch operations are rejected
   to avoid silently embedding repr() outputs and confusing retrieval behavior.
 
@@ -746,19 +748,19 @@ class CorpusCrewAIEmbeddings:
         Build a core OperationContext from CrewAI context with comprehensive error handling.
 
         Translation is best-effort: failures do not break embedding calls.
+
+        IMPORTANT (test-aligned behavior):
+          - If a caller supplies crewai_context with an invalid *type* (non-mapping),
+            we raise ValueError rather than silently ignoring it.
         """
         if crewai_context is None:
             return None
 
-        # Soft validation: invalid shapes are logged and ignored instead of raising.
         self._validate_crewai_context_structure(crewai_context)
-
-        if not isinstance(crewai_context, Mapping):
-            return None
 
         try:
             core_ctx_candidate = context_from_crewai(
-                crewai_context,
+                crewai_context,  # type: ignore[arg-type]
                 framework_version=self._framework_version,
             )
             if _looks_like_operation_context(core_ctx_candidate):
@@ -870,19 +872,19 @@ class CorpusCrewAIEmbeddings:
         )
         return core_ctx, framework_ctx
 
-    def _validate_crewai_context_structure(self, context: Mapping[str, Any]) -> None:
+    def _validate_crewai_context_structure(self, context: Any) -> None:
         """
-        Validate CrewAI context structure and log warnings for anomalies.
+        Validate CrewAI context structure.
 
-        Intentionally soft: invalid shapes are logged and ignored rather than raising.
+        IMPORTANT (test-aligned behavior):
+          - Non-mapping context types raise ValueError (clear user error).
+          - Mapping contexts are validated softly (warnings/debug only), and do not
+            prevent embeddings (fail-safe translation principle).
         """
         if not isinstance(context, Mapping):
-            logger.warning(
-                "[%s] CrewAI context must be a mapping, got %s; ignoring context",
-                ErrorCodes.CREWAI_CONTEXT_INVALID,
-                type(context).__name__,
+            raise ValueError(
+                f"[{ErrorCodes.CREWAI_CONTEXT_INVALID}] CrewAI context must be a mapping, got {type(context).__name__}"
             )
-            return
 
         if not context.get("agent_role") and not context.get("task_id"):
             logger.debug(
@@ -924,6 +926,12 @@ class CorpusCrewAIEmbeddings:
         _ensure_not_in_event_loop("embed_documents")
 
         texts_list = list(texts)
+
+        # CrewAI convention + unit test expectation: empty batch is a no-op.
+        if not texts_list:
+            return []
+
+        # REQUIRED by tests: reject non-string items
         _validate_texts_are_strings(texts_list, op_name="embed_documents")
 
         warn_if_extreme_batch(
@@ -1033,6 +1041,12 @@ class CorpusCrewAIEmbeddings:
     ) -> List[List[float]]:
         """Async embedding for multiple documents."""
         texts_list = list(texts)
+
+        # CrewAI convention + unit test expectation: empty batch is a no-op.
+        if not texts_list:
+            return []
+
+        # REQUIRED by tests: reject non-string items
         _validate_texts_are_strings(texts_list, op_name="aembed_documents")
 
         warn_if_extreme_batch(
