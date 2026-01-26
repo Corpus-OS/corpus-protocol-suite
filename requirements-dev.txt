@@ -27,4 +27,5 @@ referencing>=0.35,<1
 # --- Framework integration deps (PASS/FAIL) ---
 pydantic>=2,<3
 langchain-core>=0.1,<1
+crewai>=0.1,<1
 semantic-kernel>=1,<2
