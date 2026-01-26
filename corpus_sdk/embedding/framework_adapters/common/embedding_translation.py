@@ -24,7 +24,7 @@ Text normalization
 This layer supports configurable text preprocessing:
 
 - Whitespace normalization and cleaning
-- Encoding validation and enforcement  
+- Encoding validation and enforcement
 - Length truncation with multiple strategies
 - Empty text filtering
 - Case normalization
@@ -59,10 +59,12 @@ reusing the common orchestration logic here.
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import logging
 import re
 import threading
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from typing import (
     Any,
     AsyncIterator,
@@ -79,24 +81,21 @@ from typing import (
     Union,
 )
 
-import asyncio
-
-from corpus_sdk.embedding.embedding_base import (
-    EmbeddingProtocolV1,
-    OperationContext,
-    EmbedSpec,
-    BatchEmbedSpec,
-    EmbedResult,
-    EmbedChunk,
-    BatchEmbedResult,
-    EmbeddingStats,
-    BadRequest,
-)
-
-from corpus_sdk.core.context_translation import from_dict as ctx_from_dict
-from corpus_sdk.core.sync_bridge import SyncStreamBridge
 from corpus_sdk.core.async_bridge import AsyncBridge
+from corpus_sdk.core.context_translation import from_dict as ctx_from_dict
 from corpus_sdk.core.error_context import attach_context
+from corpus_sdk.core.sync_bridge import SyncStreamBridge
+from corpus_sdk.embedding.embedding_base import (
+    BadRequest,
+    BatchEmbedResult,
+    BatchEmbedSpec,
+    EmbedChunk,
+    EmbedResult,
+    EmbedSpec,
+    EmbeddingProtocolV1,
+    EmbeddingStats,
+    OperationContext,
+)
 
 LOG = logging.getLogger(__name__)
 
@@ -107,6 +106,38 @@ R = TypeVar("R")
 # Helpers: OperationContext normalization
 # =============================================================================
 
+
+def _operation_context_kwargs(**kwargs: Any) -> Dict[str, Any]:
+    """
+    Filter kwargs to only those accepted by OperationContext.__init__.
+
+    This keeps this translation layer compatible across OperationContext
+    revisions (e.g., older versions without `metrics`).
+    """
+    try:
+        params = set(inspect.signature(OperationContext).parameters.keys())
+    except Exception:  # noqa: BLE001
+        # If signature inspection fails for any reason, do a conservative fallback
+        # to the most common core fields.
+        params = {
+            "request_id",
+            "idempotency_key",
+            "deadline_ms",
+            "traceparent",
+            "tenant",
+            "attrs",
+        }
+
+    # Never pass "self"
+    params.discard("self")
+
+    filtered: Dict[str, Any] = {}
+    for k, v in kwargs.items():
+        if k in params:
+            filtered[k] = v
+    return filtered
+
+
 def _ensure_operation_context(
     ctx: Optional[Union[OperationContext, Mapping[str, Any]]],
 ) -> OperationContext:
@@ -115,13 +146,15 @@ def _ensure_operation_context(
     if ctx is None:
         core_ctx = ctx_from_dict({})
         return OperationContext(
-            request_id=getattr(core_ctx, "request_id", None),
-            idempotency_key=getattr(core_ctx, "idempotency_key", None),
-            deadline_ms=getattr(core_ctx, "deadline_ms", None),
-            traceparent=getattr(core_ctx, "traceparent", None),
-            tenant=getattr(core_ctx, "tenant", None),
-            metrics=getattr(core_ctx, "metrics", None),
-            attrs=getattr(core_ctx, "attrs", None) or {},
+            **_operation_context_kwargs(
+                request_id=getattr(core_ctx, "request_id", None),
+                idempotency_key=getattr(core_ctx, "idempotency_key", None),
+                deadline_ms=getattr(core_ctx, "deadline_ms", None),
+                traceparent=getattr(core_ctx, "traceparent", None),
+                tenant=getattr(core_ctx, "tenant", None),
+                metrics=getattr(core_ctx, "metrics", None),
+                attrs=getattr(core_ctx, "attrs", None) or {},
+            )
         )
 
     # 2) Already our embedding OperationContext → just use it
@@ -132,13 +165,15 @@ def _ensure_operation_context(
     if isinstance(ctx, Mapping):
         core_ctx = ctx_from_dict(ctx)
         return OperationContext(
-            request_id=getattr(core_ctx, "request_id", None),
-            idempotency_key=getattr(core_ctx, "idempotency_key", None),
-            deadline_ms=getattr(core_ctx, "deadline_ms", None),
-            traceparent=getattr(core_ctx, "traceparent", None),
-            tenant=getattr(core_ctx, "tenant", None),
-            metrics=getattr(core_ctx, "metrics", None),
-            attrs=getattr(core_ctx, "attrs", None) or {},
+            **_operation_context_kwargs(
+                request_id=getattr(core_ctx, "request_id", None),
+                idempotency_key=getattr(core_ctx, "idempotency_key", None),
+                deadline_ms=getattr(core_ctx, "deadline_ms", None),
+                traceparent=getattr(core_ctx, "traceparent", None),
+                tenant=getattr(core_ctx, "tenant", None),
+                metrics=getattr(core_ctx, "metrics", None),
+                attrs=getattr(core_ctx, "attrs", None) or {},
+            )
         )
 
     # 4) Duck-typed context: something that *looks* like an OperationContext
@@ -146,13 +181,15 @@ def _ensure_operation_context(
     #     isinstance(..., OperationContext) doesn't match for whatever reason).
     if hasattr(ctx, "request_id") or hasattr(ctx, "attrs"):
         return OperationContext(
-            request_id=getattr(ctx, "request_id", None),
-            idempotency_key=getattr(ctx, "idempotency_key", None),
-            deadline_ms=getattr(ctx, "deadline_ms", None),
-            traceparent=getattr(ctx, "traceparent", None),
-            tenant=getattr(ctx, "tenant", None),
-            metrics=getattr(ctx, "metrics", None),
-            attrs=getattr(ctx, "attrs", None) or {},
+            **_operation_context_kwargs(
+                request_id=getattr(ctx, "request_id", None),
+                idempotency_key=getattr(ctx, "idempotency_key", None),
+                deadline_ms=getattr(ctx, "deadline_ms", None),
+                traceparent=getattr(ctx, "traceparent", None),
+                tenant=getattr(ctx, "tenant", None),
+                metrics=getattr(ctx, "metrics", None),
+                attrs=getattr(ctx, "attrs", None) or {},
+            )
         )
 
     # 5) Everything else → still a hard error
@@ -160,6 +197,7 @@ def _ensure_operation_context(
         f"Unsupported context type: {type(ctx).__name__}",
         code="BAD_OPERATION_CONTEXT",
     )
+
 
 # =============================================================================
 # Batching configuration
@@ -284,7 +322,7 @@ class TextNormalizer:
 
         Returns:
             Normalized text, or None if text should be filtered out.
-            
+
         Raises:
             BadRequest: If strict_type=True and input is not a string,
                         or if strict_encoding=True and encoding fails.
@@ -305,13 +343,11 @@ class TextNormalizer:
         if self.config.encoding:
             try:
                 # Validate encoding without altering text
-                text.encode(self.config.encoding, errors='strict')
+                text.encode(self.config.encoding, errors="strict")
                 # For normalization, we might still want to ensure clean round-trip
                 if not self.config.strict_encoding:
                     # Only re-encode if we're not strict, to handle edge cases
-                    text = text.encode(self.config.encoding, errors='replace').decode(
-                        self.config.encoding
-                    )
+                    text = text.encode(self.config.encoding, errors="replace").decode(self.config.encoding)
             except UnicodeEncodeError:
                 if self.config.strict_encoding:
                     raise BadRequest(
@@ -321,9 +357,7 @@ class TextNormalizer:
                     )
                 else:
                     LOG.debug("TextNormalizer: encoding error, using replacement chars")
-                    text = text.encode(self.config.encoding, errors='replace').decode(
-                        self.config.encoding
-                    )
+                    text = text.encode(self.config.encoding, errors="replace").decode(self.config.encoding)
 
         # Normalize whitespace
         if self.config.normalize_whitespace:
@@ -339,9 +373,7 @@ class TextNormalizer:
 
         # Truncate
         if self.config.max_length is not None and len(text) > self.config.max_length:
-            text = self._truncate(
-                text, self.config.max_length, self.config.truncate_strategy
-            )
+            text = self._truncate(text, self.config.max_length, self.config.truncate_strategy)
 
         return text
 
@@ -351,7 +383,7 @@ class TextNormalizer:
 
         Returns:
             List of normalized texts (may be shorter than input if texts filtered).
-            
+
         Raises:
             BadRequest: If any text fails normalization based on strict settings.
         """
@@ -383,7 +415,7 @@ class TextNormalizer:
         if strategy == "middle":
             keep_each = max_length // 2
             remaining = max_length - (keep_each * 2)
-            return text[:keep_each + remaining] + text[-keep_each:]
+            return text[: keep_each + remaining] + text[-keep_each:]
 
         # Fallback (should not be hit if validated in config)
         return text[:max_length]
@@ -479,7 +511,7 @@ class EmbeddingFrameworkTranslator(Protocol):
         This can come from:
             - framework_ctx (e.g., configured model)
             - op_ctx.attrs (e.g., "embedding_model" key)
-            
+
         Returns:
             Model name string, or None if no model is preferred.
         """
@@ -507,9 +539,7 @@ class DefaultEmbeddingFrameworkTranslator:
         *,
         text_normalizer: Optional[TextNormalizer] = None,
     ) -> None:
-        self._text_normalizer = text_normalizer or TextNormalizer(
-            TextNormalizationConfig()
-        )
+        self._text_normalizer = text_normalizer or TextNormalizer(TextNormalizationConfig())
 
     # ---- model helper ----
 
@@ -524,7 +554,7 @@ class DefaultEmbeddingFrameworkTranslator:
             model = framework_ctx.get("model")
             if model is not None:
                 return str(model)
-        
+
         attrs = op_ctx.attrs or {}
         # Try embedding_model first (most specific)
         model = attrs.get("embedding_model")
@@ -567,7 +597,7 @@ class DefaultEmbeddingFrameworkTranslator:
         stream: bool = False,
     ) -> EmbedSpec:
         model = self.preferred_model(op_ctx=op_ctx, framework_ctx=framework_ctx)
-        
+
         # Ensure model is not None when passed to EmbedSpec
         fallback_model = model or ""
 
@@ -680,7 +710,7 @@ class DefaultEmbeddingFrameworkTranslator:
         framework_ctx: Optional[Any] = None,
     ) -> BatchEmbedSpec:
         model = self.preferred_model(op_ctx=op_ctx, framework_ctx=framework_ctx)
-        
+
         # Ensure model is not None when passed to BatchEmbedSpec
         fallback_model = model or ""
 
@@ -803,7 +833,7 @@ class EmbeddingTranslator:
                 raise
 
         if sync:
-            timeout = ctx.deadline_ms / 1000.0 if ctx.deadline_ms else None
+            timeout = ctx.deadline_ms / 1000.0 if getattr(ctx, "deadline_ms", None) else None
             return AsyncBridge.run_async(_wrapped(), timeout=timeout)
         return _wrapped()
 
@@ -817,7 +847,7 @@ class EmbeddingTranslator:
     ) -> Union[Iterator[R], AsyncIterator[R]]:
         """
         Centralized execution for streaming operations.
-        
+
         Args:
             factory: A function that takes context and returns an AsyncIterator.
                      (Note: AsyncGenerator functions return AsyncIterator immediately,
@@ -870,7 +900,7 @@ class EmbeddingTranslator:
         Ergonomics:
             - If raw_texts is a single text / mapping → adapter.embed
             - If raw_texts is a list/tuple → routed to batch_embed for convenience
-            
+
         Note: This behavior differs from embed_stream() which only accepts
         single texts. For streaming multiple texts, use batch_embed() or
         iterate and call embed_stream() per text.
@@ -893,8 +923,7 @@ class EmbeddingTranslator:
 
             if not isinstance(result, EmbedResult):
                 raise BadRequest(
-                    f"adapter.embed returned unsupported type: "
-                    f"{type(result).__name__}",
+                    f"adapter.embed returned unsupported type: {type(result).__name__}",
                     code="BAD_ADAPTER_RESULT",
                 )
 
@@ -924,7 +953,7 @@ class EmbeddingTranslator:
         Ergonomics:
             - If raw_texts is a single text / mapping → adapter.embed
             - If raw_texts is a list/tuple → routed to arun_batch_embed
-            
+
         Note: This behavior differs from arun_embed_stream() which only accepts
         single texts. For streaming multiple texts, use arun_batch_embed() or
         iterate and call arun_embed_stream() per text.
@@ -947,8 +976,7 @@ class EmbeddingTranslator:
 
             if not isinstance(result, EmbedResult):
                 raise BadRequest(
-                    f"adapter.embed returned unsupported type: "
-                    f"{type(result).__name__}",
+                    f"adapter.embed returned unsupported type: {type(result).__name__}",
                     code="BAD_ADAPTER_RESULT",
                 )
 
@@ -1018,8 +1046,7 @@ class EmbeddingTranslator:
             async for chunk in stream_or_result:
                 if not isinstance(chunk, EmbedChunk):
                     raise BadRequest(
-                        f"adapter.embed stream yielded unsupported type: "
-                        f"{type(chunk).__name__}",
+                        f"adapter.embed stream yielded unsupported type: {type(chunk).__name__}",
                         code="BAD_ADAPTER_RESULT",
                     )
                 yield self._translator.translate_embed_chunk(
@@ -1027,7 +1054,7 @@ class EmbeddingTranslator:
                     op_ctx=ctx,
                     framework_ctx=framework_ctx,
                 )
-        
+
         return _factory
 
     def embed_stream(
@@ -1046,7 +1073,7 @@ class EmbeddingTranslator:
         Only single-text streaming is supported. For multiple texts:
         - Use batch_embed() for non-streaming batch embedding
         - Iterate and call embed_stream() per text for streaming multiple texts
-        
+
         Raises:
             BadRequest: If raw_texts is a list/tuple (batch streaming not supported)
         """
@@ -1054,7 +1081,7 @@ class EmbeddingTranslator:
             op_name="embed_stream",
             op_ctx=op_ctx,
             sync=True,
-            factory=self._prepare_stream_factory(raw_texts, framework_ctx)
+            factory=self._prepare_stream_factory(raw_texts, framework_ctx),
         )
 
     def arun_embed_stream(
@@ -1068,11 +1095,11 @@ class EmbeddingTranslator:
         Async streaming embed API.
 
         Returns an async iterator yielding framework-level chunks.
-        
+
         Only single-text streaming is supported. For multiple texts:
         - Use arun_batch_embed() for non-streaming batch embedding
         - Iterate and call arun_embed_stream() per text for streaming multiple texts
-        
+
         Raises:
             BadRequest: If raw_texts is a list/tuple (batch streaming not supported)
         """
@@ -1081,7 +1108,7 @@ class EmbeddingTranslator:
             op_name="embed_stream",
             op_ctx=op_ctx,
             sync=False,
-            factory=self._prepare_stream_factory(raw_texts, framework_ctx)
+            factory=self._prepare_stream_factory(raw_texts, framework_ctx),
         )
 
     async def arun_embed_stream_collect(
@@ -1098,7 +1125,7 @@ class EmbeddingTranslator:
         Behavior (generic):
             - Flattens all chunk["embeddings"] vectors into one list
             - Returns final metadata from the last chunk
-            
+
         Returns:
             Dictionary with:
                 - "embedding": List of all embedding vectors from all chunks
@@ -1106,7 +1133,7 @@ class EmbeddingTranslator:
         """
         vectors: List[List[float]] = []
         last_chunk: Optional[Mapping[str, Any]] = None
-        
+
         # FIX: Iterate directly over the AsyncIterator returned by arun_embed_stream
         async for chunk in self.arun_embed_stream(
             raw_texts,
@@ -1142,6 +1169,7 @@ class EmbeddingTranslator:
         Expects framework-level input that can be translated into a BatchEmbedSpec
         by the configured translator.
         """
+
         async def _logic(ctx: OperationContext) -> Any:
             spec = self._translator.build_batch_embed_spec(
                 raw_batch,
@@ -1152,8 +1180,7 @@ class EmbeddingTranslator:
 
             if not isinstance(result, BatchEmbedResult):
                 raise BadRequest(
-                    f"adapter.embed_batch returned unsupported type: "
-                    f"{type(result).__name__}",
+                    f"adapter.embed_batch returned unsupported type: {type(result).__name__}",
                     code="BAD_ADAPTER_RESULT",
                 )
 
@@ -1178,6 +1205,7 @@ class EmbeddingTranslator:
         framework_ctx: Optional[Any] = None,
     ) -> Any:
         """Async batch_embed API."""
+
         async def _logic(ctx: OperationContext) -> Any:
             spec = self._translator.build_batch_embed_spec(
                 raw_batch,
@@ -1188,8 +1216,7 @@ class EmbeddingTranslator:
 
             if not isinstance(result, BatchEmbedResult):
                 raise BadRequest(
-                    f"adapter.embed_batch returned unsupported type: "
-                    f"{type(result).__name__}",
+                    f"adapter.embed_batch returned unsupported type: {type(result).__name__}",
                     code="BAD_ADAPTER_RESULT",
                 )
 
@@ -1240,8 +1267,7 @@ class EmbeddingTranslator:
 
             if not isinstance(result, Mapping):
                 raise BadRequest(
-                    f"adapter.capabilities returned unsupported type: "
-                    f"{type(result).__name__}",
+                    f"adapter.capabilities returned unsupported type: {type(result).__name__}",
                     code="BAD_ADAPTER_RESULT",
                 )
             return dict(result)
@@ -1282,8 +1308,7 @@ class EmbeddingTranslator:
 
             if not isinstance(result, Mapping):
                 raise BadRequest(
-                    f"adapter.capabilities returned unsupported type: "
-                    f"{type(result).__name__}",
+                    f"adapter.capabilities returned unsupported type: {type(result).__name__}",
                     code="BAD_ADAPTER_RESULT",
                 )
             return dict(result)
@@ -1321,8 +1346,7 @@ class EmbeddingTranslator:
 
             if not isinstance(result, Mapping):
                 raise BadRequest(
-                    f"adapter.health returned unsupported type: "
-                    f"{type(result).__name__}",
+                    f"adapter.health returned unsupported type: {type(result).__name__}",
                     code="BAD_ADAPTER_RESULT",
                 )
             return dict(result)
@@ -1360,8 +1384,7 @@ class EmbeddingTranslator:
 
             if not isinstance(result, Mapping):
                 raise BadRequest(
-                    f"adapter.health returned unsupported type: "
-                    f"{type(result).__name__}",
+                    f"adapter.health returned unsupported type: {type(result).__name__}",
                     code="BAD_ADAPTER_RESULT",
                 )
             return dict(result)
@@ -1463,13 +1486,13 @@ class EmbeddingTranslator:
         framework_ctx: Optional[Any] = None,
     ) -> Any:
         """Synchronous get_stats (uses AsyncBridge)."""
+
         async def _logic(ctx: OperationContext) -> Any:
             stats = await self._adapter.get_stats(ctx=ctx)
 
             if not isinstance(stats, EmbeddingStats):
                 raise BadRequest(
-                    f"adapter.get_stats returned unsupported type: "
-                    f"{type(stats).__name__}",
+                    f"adapter.get_stats returned unsupported type: {type(stats).__name__}",
                     code="BAD_ADAPTER_RESULT",
                 )
 
@@ -1493,13 +1516,13 @@ class EmbeddingTranslator:
         framework_ctx: Optional[Any] = None,
     ) -> Any:
         """Async get_stats."""
+
         async def _logic(ctx: OperationContext) -> Any:
             stats = await self._adapter.get_stats(ctx=ctx)
 
             if not isinstance(stats, EmbeddingStats):
                 raise BadRequest(
-                    f"adapter.get_stats returned unsupported type: "
-                    f"{type(stats).__name__}",
+                    f"adapter.get_stats returned unsupported type: {type(stats).__name__}",
                     code="BAD_ADAPTER_RESULT",
                 )
 
@@ -1553,7 +1576,7 @@ def register_embedding_translator(
             "translator factory must be callable",
             code="BAD_TRANSLATOR_REGISTRATION",
         )
-        
+
     with _REGISTRY_LOCK:
         _EMBEDDING_TRANSLATOR_FACTORIES[framework] = factory
     LOG.debug("Registered embedding translator factory for framework=%s", framework)
@@ -1590,9 +1613,7 @@ def create_embedding_translator(
             text_normalizer = None
             if text_normalization_config is not None:
                 text_normalizer = TextNormalizer(text_normalization_config)
-            translator = DefaultEmbeddingFrameworkTranslator(
-                text_normalizer=text_normalizer
-            )
+            translator = DefaultEmbeddingFrameworkTranslator(text_normalizer=text_normalizer)
 
     return EmbeddingTranslator(
         adapter=adapter,
