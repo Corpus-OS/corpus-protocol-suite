@@ -31,6 +31,8 @@ Design notes / philosophy
 
 Resilience (retries, caching, rate limiting, etc.) is expected to be provided
 by the underlying adapter, typically a BaseEmbeddingAdapter subclass.
+
+
 """
 
 from __future__ import annotations
@@ -49,8 +51,9 @@ from typing import (
     Optional,
     Tuple,
     TypeVar,
-    TypedDict,
 )
+
+from typing_extensions import TypedDict
 
 from pydantic import BaseModel, ConfigDict, PrivateAttr, field_validator
 
@@ -1310,20 +1313,18 @@ def configure_langchain_embeddings(
     any global registration; you pass the returned instance into vectorstores,
     retrievers, chains, etc.
 
-    Example
+     Example
     -------
     ```python
     from corpus_sdk.embedding.framework_adapters.langchain import (
         configure_langchain_embeddings,
     )
-
     embeddings = configure_langchain_embeddings(
         corpus_adapter=my_adapter,
         model="text-embedding-3-large",
         langchain_config={"fallback_to_simple_context": False},
     )
     ```
-
     Parameters
     ----------
     corpus_adapter:
@@ -1337,7 +1338,6 @@ def configure_langchain_embeddings(
     **kwargs:
         Additional arguments for `CorpusLangChainEmbeddings`
         (e.g. batch_config, text_normalization_config).
-
     Returns
     -------
     CorpusLangChainEmbeddings
