@@ -42,6 +42,7 @@ from functools import cached_property, wraps
 from typing import (
     Any,
     Callable,
+    ClassVar,
     Dict,
     List,
     Mapping,
@@ -72,6 +73,22 @@ from corpus_sdk.embedding.framework_adapters.common.framework_utils import (
     coerce_embedding_vector,
     warn_if_extreme_batch,
 )
+
+# ---------------------------------------------------------------------------
+# Optional Pydantic import (module-scoped to avoid Pydantic treating it as a model field)
+# ---------------------------------------------------------------------------
+#
+# Rationale:
+# - Many LlamaIndex versions implement BaseEmbedding as a Pydantic model.
+# - When subclassing, we sometimes need to configure `model_config` at *class definition*
+#   time to allow storing extra runtime state on the instance (e.g., corpus_adapter).
+# - Pydantic v2 will treat un-annotated class attributes as candidate fields; therefore
+#   we keep the ConfigDict import out of the class body to prevent collection-time errors.
+#
+try:  # pragma: no cover - depends on environment
+    from pydantic import ConfigDict as _PYDANTIC_CONFIGDICT  # type: ignore
+except Exception:  # noqa: BLE001
+    _PYDANTIC_CONFIGDICT = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -441,6 +458,179 @@ async def _maybe_close_async(obj: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Adapter shim for compatibility across Corpus adapters and EmbeddingTranslator
+# ---------------------------------------------------------------------------
+#
+# Rationale:
+# - The common embedding translation layer may call `adapter.embed(spec, ctx=...)` where
+#   `spec` is an EmbedSpec-like object. Some lightweight adapters used in tests (and in
+#   downstream integrations) implement `embed(texts: Sequence[str], **kwargs)` instead.
+# - To keep the LlamaIndex adapter protocol-first and resilient, we accept both forms.
+# - The shim:
+#     1) First tries to call the delegate with the modern (spec, ctx=...) signature.
+#     2) If that fails due to a TypeError, it extracts raw text(s) and calls the legacy
+#        `embed(texts)` signature, attempting to pass ctx only when accepted.
+#
+# IMPORTANT:
+# - We never coerce arbitrary objects to str for embedding content; if we cannot safely
+#   extract text(s), we raise TypeError with an actionable message.
+# - The shim is intentionally narrow and does not change output semantics; it only adapts
+#   input calling conventions.
+
+
+def _extract_raw_texts_from_embed_spec(spec: Any) -> Sequence[str]:
+    """
+    Best-effort extraction of raw text(s) from an EmbedSpec-like input.
+
+    Supported patterns:
+    - spec.text: str  (single text)
+    - spec.texts: Sequence[str] (batch)
+    - spec itself is a str (single)
+    - spec itself is a non-string Sequence[str] (batch)
+
+    We intentionally do not stringify arbitrary objects here; doing so can embed repr()
+    and lead to confusing retrieval behavior. If extraction is not possible, we raise.
+    """
+    if isinstance(spec, str):
+        return [spec]
+
+    # EmbedSpec-like single text
+    text = getattr(spec, "text", None)
+    if isinstance(text, str):
+        return [text]
+
+    # EmbedSpec-like batch texts
+    texts = getattr(spec, "texts", None)
+    if isinstance(texts, Sequence) and not isinstance(texts, (str, bytes)):
+        # Enforce string-only to preserve strictness guarantees.
+        for i, t in enumerate(texts):
+            if not isinstance(t, str):
+                raise TypeError(
+                    "EmbedSpec.texts must be Sequence[str]; "
+                    f"item {i} is {type(t).__name__}",
+                )
+        return list(texts)
+
+    # If spec is a sequence of strings, treat it as batch.
+    if isinstance(spec, Sequence) and not isinstance(spec, (str, bytes)):
+        for i, t in enumerate(spec):
+            if not isinstance(t, str):
+                raise TypeError(
+                    "embed expects Sequence[str] when passing raw texts; "
+                    f"item {i} is {type(t).__name__}",
+                )
+        return list(spec)
+
+    raise TypeError(
+        "Unable to extract raw text(s) for embedding from provided spec. "
+        "Expected EmbedSpec-like object with .text or .texts, or raw str/Sequence[str].",
+    )
+
+
+class _TranslatorAdapterShim:
+    """
+    Compatibility shim between EmbeddingTranslator and duck-typed embedding adapters.
+
+    This shim implements an async `embed(spec, ctx=...)` method, matching the calling
+    style used by the common embedding translation layer.
+
+    Delegate behavior:
+    - If delegate.embed accepts (spec, ctx=...), we use it directly.
+    - Otherwise, we extract raw texts and call delegate.embed(texts, ...) as a fallback.
+    """
+
+    def __init__(self, delegate: Any) -> None:
+        self._delegate = delegate
+
+    async def embed(self, spec: Any, *, ctx: Optional[OperationContext] = None, **kwargs: Any) -> Any:
+        """
+        Embed operation used by the common translator.
+
+        We preserve error semantics:
+        - If the delegate raises, we propagate.
+        - If signature mismatch occurs, we fall back; otherwise we do not swallow.
+        """
+        # First attempt: modern signature (spec, ctx=...)
+        try:
+            res = self._delegate.embed(spec, ctx=ctx, **kwargs)
+            if asyncio.iscoroutine(res):
+                return await res
+            return res
+        except TypeError:
+            # Fallback: legacy signature (texts, **kwargs)
+            raw_texts = _extract_raw_texts_from_embed_spec(spec)
+
+            # Attempt to pass ctx only if accepted; many lightweight adapters use **_ and
+            # will accept it, but stricter adapters might not.
+            try:
+                res = self._delegate.embed(raw_texts, ctx=ctx, **kwargs)
+            except TypeError:
+                res = self._delegate.embed(raw_texts, **kwargs)
+
+            if asyncio.iscoroutine(res):
+                return await res
+            return res
+
+    async def capabilities(self, **kwargs: Any) -> Mapping[str, Any]:
+        """
+        Optional capabilities passthrough.
+
+        The common layer uses async entrypoints; we provide async here and wrap sync delegates.
+        """
+        fn = getattr(self._delegate, "capabilities", None)
+        if not callable(fn):
+            return {}
+        res = fn(**kwargs)
+        if asyncio.iscoroutine(res):
+            return await res
+        if isinstance(res, Mapping):
+            return res
+        # Defensive: keep contract stable and avoid surprising crashes.
+        return {}
+
+    async def health(self, **kwargs: Any) -> Mapping[str, Any]:
+        """
+        Optional health passthrough.
+
+        The common layer uses async entrypoints; we provide async here and wrap sync delegates.
+        """
+        fn = getattr(self._delegate, "health", None)
+        if not callable(fn):
+            return {}
+        res = fn(**kwargs)
+        if asyncio.iscoroutine(res):
+            return await res
+        if isinstance(res, Mapping):
+            return res
+        return {}
+
+    def get_embedding_dimension(self) -> int:
+        """Pass through dimension info when available."""
+        fn = getattr(self._delegate, "get_embedding_dimension", None)
+        if callable(fn):
+            return int(fn())
+        raise AttributeError("delegate does not implement get_embedding_dimension()")
+
+    def close(self) -> None:
+        """Best-effort sync close passthrough."""
+        close_fn = getattr(self._delegate, "close", None)
+        if callable(close_fn):
+            close_fn()
+
+    async def aclose(self) -> None:
+        """Best-effort async close passthrough."""
+        aclose_fn = getattr(self._delegate, "aclose", None)
+        if callable(aclose_fn):
+            res = aclose_fn()
+            if asyncio.iscoroutine(res):
+                await res
+            return
+        close_fn = getattr(self._delegate, "close", None)
+        if callable(close_fn):
+            await asyncio.to_thread(close_fn)
+
+
+# ---------------------------------------------------------------------------
 # Error-context decorators with dynamic context extraction
 # ---------------------------------------------------------------------------
 
@@ -620,7 +810,37 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
     All embedding logic lives in:
     - `corpus_sdk.embedding.framework_adapters.common.embedding_translation`
     - Concrete `EmbeddingProtocolV1` adapter implementations.
+
+    Pydantic / BaseEmbedding interoperability notes
+    ----------------------------------------------
+    Many LlamaIndex versions implement `BaseEmbedding` as a Pydantic model. Pydantic
+    restricts setting undeclared attributes by default (extra='forbid'). This adapter
+    stores additional runtime state (e.g., corpus_adapter, translator lock, configs)
+    on the instance for performance and ergonomics.
+
+    To remain compatible across LlamaIndex + Pydantic versions *without* removing
+    security hardening or changing behavior, we explicitly allow extra attributes
+    on this subclass when Pydantic v2 is present. This keeps assignments safe and
+    predictable while avoiding brittle field declarations that may drift with
+    upstream BaseEmbedding changes.
     """
+
+    # ------------------------------------------------------------------ #
+    # Pydantic v2 configuration (best-effort; never hard-fail if pydantic isn't present)
+    # ------------------------------------------------------------------ #
+    #
+    # IMPORTANT:
+    # - Must exist at class definition time to affect BaseModel.__setattr__.
+    # - We avoid duplicate keyword passing by *mutating a dict* before constructing ConfigDict.
+    #   This prevents "got multiple values for keyword argument" errors when upstream config
+    #   already defines values such as arbitrary_types_allowed.
+    #
+    if _PYDANTIC_CONFIGDICT is not None:  # pragma: no cover - depends on environment
+        _base_cfg: ClassVar[Mapping[str, Any]] = getattr(BaseEmbedding, "model_config", {}) or {}
+        _cfg: ClassVar[Dict[str, Any]] = dict(_base_cfg)
+        _cfg["extra"] = "allow"
+        _cfg["arbitrary_types_allowed"] = True
+        model_config = _PYDANTIC_CONFIGDICT(**_cfg)
 
     def __init__(
         self,
@@ -656,6 +876,22 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
             Optional explicit embedding dimension override. Required if the adapter
             does not implement `get_embedding_dimension()`.
         """
+        # ------------------------------------------------------------------
+        # NOTE ON PYDANTIC INITIALIZATION ORDER (CRITICAL FOR TESTS)
+        # ------------------------------------------------------------------
+        # In many LlamaIndex versions, BaseEmbedding is backed by Pydantic BaseModel.
+        # Pydantic initializes internal attributes such as __pydantic_extra__ during
+        # BaseModel.__init__. If we assign attributes *before* calling super().__init__,
+        # Pydantic's __setattr__ can attempt to write into __pydantic_extra__ before it
+        # exists, producing the exact failure your test run shows:
+        #   AttributeError: object has no attribute '__pydantic_extra__'
+        #
+        # To preserve performance and behavior while remaining compatible:
+        # - Perform all validation using local variables first (no self mutation).
+        # - Call BaseEmbedding.__init__ next to ensure Pydantic internals are initialized.
+        # - Then attach our runtime state to self (using object.__setattr__ defensively).
+        #
+
         # Behavioral validation (duck-typed) instead of strict isinstance
         if not hasattr(corpus_adapter, "embed") or not callable(getattr(corpus_adapter, "embed", None)):
             raise TypeError(
@@ -667,17 +903,21 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
             raise ValueError("embed_batch_size must be positive")
 
         # Validate + normalize llamaindex_config
+        raw_llamaindex_config: Mapping[str, Any]
         if llamaindex_config is None:
-            llamaindex_config = {}
-        if not isinstance(llamaindex_config, Mapping):
+            raw_llamaindex_config = {}
+        else:
+            raw_llamaindex_config = llamaindex_config
+
+        if not isinstance(raw_llamaindex_config, Mapping):
             raise ValueError(
                 f"[{ErrorCodes.LLAMAINDEX_CONFIG_INVALID}] "
-                f"llamaindex_config must be a Mapping, got {type(llamaindex_config).__name__}",
+                f"llamaindex_config must be a Mapping, got {type(raw_llamaindex_config).__name__}",
             )
 
         # Strict config validation: reject unknown keys to prevent silent misconfiguration.
         allowed_keys = {"enable_operation_context_propagation", "strict_text_types", "max_node_ids_in_context"}
-        unknown = set(dict(llamaindex_config).keys()) - allowed_keys
+        unknown = set(dict(raw_llamaindex_config).keys()) - allowed_keys
         if unknown:
             raise ValueError(
                 f"[{ErrorCodes.LLAMAINDEX_CONFIG_INVALID}] "
@@ -685,7 +925,7 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
             )
 
         # Normalize + default-fill config for predictable behavior
-        normalized_config: LlamaIndexAdapterConfig = dict(llamaindex_config)  # type: ignore[assignment]
+        normalized_config: LlamaIndexAdapterConfig = dict(raw_llamaindex_config)  # type: ignore[assignment]
         normalized_config.setdefault("enable_operation_context_propagation", True)
         normalized_config.setdefault("strict_text_types", True)
         normalized_config.setdefault("max_node_ids_in_context", 100)
@@ -697,37 +937,51 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         normalized_config["strict_text_types"] = bool(normalized_config["strict_text_types"])
         normalized_config["max_node_ids_in_context"] = int(normalized_config["max_node_ids_in_context"])
 
-        # Store core config + knobs
-        self.corpus_adapter = corpus_adapter
-        self._model_name = model_name
-        self.batch_config = batch_config
-        self.text_normalization_config = text_normalization_config
-        self._embed_batch_size = embed_batch_size
-        self._embedding_dimension_override = embedding_dimension
-        self.llamaindex_config: LlamaIndexAdapterConfig = normalized_config
-
-        # Thread-safety for translator lazy init (multi-threaded ingestion / concurrent calls)
-        self._translator_lock = threading.Lock()
-
-        # Fast-access fields for extractors and batching
-        self._max_node_ids_in_context: int = normalized_config["max_node_ids_in_context"]
-        self._embedding_dim_hint: Optional[int] = None
-
         # Enforce known embedding dimension to avoid incorrect fallbacks
-        if (not hasattr(self.corpus_adapter, "get_embedding_dimension")) and (self._embedding_dimension_override is None):
+        #
+        # IMPORTANT:
+        # - If the adapter does not expose get_embedding_dimension(), the caller must supply
+        #   embedding_dimension. This is required to provide correct zero-vector fallbacks
+        #   and preserve strict, predictable dimensionality.
+        if (not hasattr(corpus_adapter, "get_embedding_dimension")) and (embedding_dimension is None):
             raise ValueError(
                 "Embedding dimension is unknown. Either implement "
                 "`get_embedding_dimension()` on the corpus_adapter or pass "
                 "`embedding_dimension=...` to CorpusLlamaIndexEmbeddings.",
             )
 
-        # Initialize BaseEmbedding with LlamaIndex expected parameters
+        # Initialize BaseEmbedding with LlamaIndex expected parameters.
+        #
+        # IMPORTANT:
+        # This must happen before setting extra attributes when BaseEmbedding is Pydantic-backed.
         super().__init__(
-            model_name=self._model_name,
-            embed_batch_size=self._embed_batch_size,
+            model_name=model_name,
+            embed_batch_size=embed_batch_size,
             callback_manager=callback_manager,
             **kwargs,
         )
+
+        # Store core config + knobs (post-super to ensure Pydantic internals exist).
+        #
+        # We use object.__setattr__ defensively to:
+        # - Avoid validate_assignment overhead (performance),
+        # - Avoid extra handling differences across Pydantic configs/versions,
+        # - Preserve predictable behavior in non-Pydantic environments.
+        object.__setattr__(self, "corpus_adapter", corpus_adapter)
+        object.__setattr__(self, "_translator_adapter", _TranslatorAdapterShim(corpus_adapter))
+        object.__setattr__(self, "_model_name", model_name)
+        object.__setattr__(self, "batch_config", batch_config)
+        object.__setattr__(self, "text_normalization_config", text_normalization_config)
+        object.__setattr__(self, "_embed_batch_size", embed_batch_size)
+        object.__setattr__(self, "_embedding_dimension_override", embedding_dimension)
+        object.__setattr__(self, "llamaindex_config", normalized_config)
+
+        # Thread-safety for translator lazy init (multi-threaded ingestion / concurrent calls)
+        object.__setattr__(self, "_translator_lock", threading.Lock())
+
+        # Fast-access fields for extractors and batching
+        object.__setattr__(self, "_max_node_ids_in_context", int(normalized_config["max_node_ids_in_context"]))
+        object.__setattr__(self, "_embedding_dim_hint", None)
 
         logger.info(
             "CorpusLlamaIndexEmbeddings initialized with model_name=%s, embed_batch_size=%d, "
@@ -766,7 +1020,7 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
                 return existing
 
             translator = create_embedding_translator(
-                adapter=self.corpus_adapter,
+                adapter=self._translator_adapter,
                 framework=_FRAMEWORK_NAME,
                 translator=None,  # use registry/default generic translator
                 batch_config=self.batch_config,
@@ -931,6 +1185,17 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         - core_ctx: core OperationContext or None if no/invalid context
         - framework_ctx: LlamaIndex-specific context for translator
         """
+        # Defensive normalization:
+        # - Some call paths may pass non-mapping values by mistake.
+        # - Context translation should be best-effort and must never break embeddings.
+        if llamaindex_context is not None and not isinstance(llamaindex_context, Mapping):
+            logger.warning(
+                "[%s] llamaindex_context should be a Mapping, got %s; ignoring context",
+                ErrorCodes.LLAMAINDEX_CONTEXT_INVALID,
+                type(llamaindex_context).__name__,
+            )
+            llamaindex_context = None
+
         core_ctx = self._build_core_context(llamaindex_context=llamaindex_context)
         framework_ctx = self._build_framework_context(
             core_ctx=core_ctx,
@@ -993,18 +1258,22 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         Never guesses; requires either:
         - adapter.get_embedding_dimension(), or
         - embedding_dimension override passed at init.
+
+        Precedence:
+        - If an explicit override was provided, it wins. This guarantees deterministic
+          behavior in environments where adapters may expose dimension metadata but
+          callers require a specific fixed dimension (e.g., compatibility tests).
+        - Otherwise, we fall back to adapter.get_embedding_dimension().
         """
+        if self._embedding_dimension_override is not None:
+            return int(self._embedding_dimension_override)
+
         if hasattr(self.corpus_adapter, "get_embedding_dimension"):
             try:
                 return int(self.corpus_adapter.get_embedding_dimension())
             except Exception as e:  # noqa: BLE001
                 logger.debug("Failed to get embedding dimension from adapter: %s", e)
-                if self._embedding_dimension_override is not None:
-                    return int(self._embedding_dimension_override)
                 raise
-
-        if self._embedding_dimension_override is not None:
-            return int(self._embedding_dimension_override)
 
         # Should be unreachable due to __init__ check
         raise RuntimeError(
