@@ -34,3 +34,6 @@ semantic-kernel>=1,<2
 autogen-agentchat>=0.4,<1
 autogen-core>=0.4,<1
 autogen-ext[chromadb]>=0.4,<1  # Includes ChromaDB for vector memory tests
+
+# --- Framework integration deps ---
+llama-index>=0.10,<1
