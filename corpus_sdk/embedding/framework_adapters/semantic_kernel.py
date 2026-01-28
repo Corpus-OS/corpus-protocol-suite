@@ -39,6 +39,17 @@ Design notes / philosophy
 - **Async-safe sync usage**: sync APIs enforce guard rails to prevent calling
   them from inside an active asyncio event loop; callers are guided to their
   async counterparts with explicit error codes.
+
+Implementation note (Semantic Kernel 1.x / Pydantic-based base class)
+--------------------------------------------------------------------
+Modern Semantic Kernel versions implement `EmbeddingGeneratorBase` as a Pydantic
+model with required fields (`ai_model_id`, `service_id`). Therefore:
+- We must pass `ai_model_id` (and `service_id`) into `super().__init__` when SK
+  is installed.
+- We must set Corpus-specific attributes using `object.__setattr__` so we do not
+  rely on Pydantic's `__setattr__` behavior (which may forbid or validate unknown
+  attributes). This preserves the adapter's existing public surface and test
+  expectations while remaining compatible with SK's evolving internals.
 """
 
 from __future__ import annotations
@@ -91,20 +102,34 @@ except Exception:  # noqa: BLE001
 # ---------------------------------------------------------------------------
 
 try:
-    from semantic_kernel.connectors.ai.embeddings.embedding_generator_base import (  # type: ignore
+    # NOTE:
+    # Semantic Kernel moved EmbeddingGeneratorBase to:
+    #   semantic_kernel.connectors.ai.embedding_generator_base
+    # while keeping a deprecated import path under:
+    #   semantic_kernel.connectors.ai.embeddings.embedding_generator_base
+    #
+    # We prefer the new location but keep compatibility with older SK versions.
+    from semantic_kernel.connectors.ai.embedding_generator_base import (  # type: ignore
         EmbeddingGeneratorBase,
     )
 
     SEMANTIC_KERNEL_AVAILABLE = True
-except ImportError:  # pragma: no cover - only used when SK isn't installed
+except ImportError:
+    try:
+        from semantic_kernel.connectors.ai.embeddings.embedding_generator_base import (  # type: ignore
+            EmbeddingGeneratorBase,
+        )
 
-    class EmbeddingGeneratorBase:  # type: ignore[no-redef]
-        """Fallback base class when Semantic Kernel is not installed."""
+        SEMANTIC_KERNEL_AVAILABLE = True
+    except ImportError:  # pragma: no cover - only used when SK isn't installed
 
-        def __init__(self, *_: Any, **__: Any) -> None:
-            pass
+        class EmbeddingGeneratorBase:  # type: ignore[no-redef]
+            """Fallback base class when Semantic Kernel is not installed."""
 
-    SEMANTIC_KERNEL_AVAILABLE = False
+            def __init__(self, *_: Any, **__: Any) -> None:
+                pass
+
+        SEMANTIC_KERNEL_AVAILABLE = False
 
 
 # ---------------------------------------------------------------------------
@@ -572,23 +597,41 @@ class CorpusSemanticKernelEmbeddings(EmbeddingGeneratorBase):
                 f"sk_config must be a Mapping (dict-like), got {type(sk_config).__name__}"
             )
 
-        super().__init__()  # no-op in fallback, required when SK installed
+        # -------------------------------------------------------------------
+        # IMPORTANT: Semantic Kernel's EmbeddingGeneratorBase is a Pydantic model
+        # in modern SK versions and requires `ai_model_id` (and `service_id`).
+        #
+        # We defensively support older SK versions and non-SK fallback base
+        # classes by:
+        #  - Providing required kwargs when accepted
+        #  - Falling back to a no-arg super().__init__ when necessary
+        # -------------------------------------------------------------------
+        service_id = _.get("service_id", "")
+        try:
+            super().__init__(ai_model_id=(model_id or "unknown"), service_id=(service_id or ""))
+        except TypeError:
+            # Older SK versions or fallback base class: accept no-arg init.
+            super().__init__()
 
-        self.corpus_adapter = corpus_adapter
-        self.model_id = model_id
-        self.batch_config = batch_config
-        self.text_normalization_config = text_normalization_config
+        # NOTE:
+        # If the SK base class is Pydantic-based, its __setattr__ rules may
+        # reject unknown attributes. We use object.__setattr__ to preserve the
+        # adapter's internal state without relying on SK's model configuration.
+        object.__setattr__(self, "corpus_adapter", corpus_adapter)
+        object.__setattr__(self, "model_id", model_id)
+        object.__setattr__(self, "batch_config", batch_config)
+        object.__setattr__(self, "text_normalization_config", text_normalization_config)
 
-        self._embedding_dimension_override = embedding_dimension
+        object.__setattr__(self, "_embedding_dimension_override", embedding_dimension)
         # Strict config validation + normalization
-        self.sk_config: SemanticKernelAdapterConfig = _normalize_sk_config(sk_config)
+        object.__setattr__(self, "sk_config", _normalize_sk_config(sk_config))
 
         # Thread-safe translator lazy init
-        self._translator_lock = threading.Lock()
-        self._translator_instance: Optional[EmbeddingTranslator] = None
+        object.__setattr__(self, "_translator_lock", threading.Lock())
+        object.__setattr__(self, "_translator_instance", None)
 
         # Best-effort embedding dimension hint (populated after first successful embed)
-        self._embedding_dim_hint: Optional[int] = None
+        object.__setattr__(self, "_embedding_dim_hint", None)
 
         # Enforce known embedding dimension to avoid incorrect fallbacks
         if (
@@ -1233,9 +1276,13 @@ def register_with_semantic_kernel(
     if kernel is None:
         raise ValueError("kernel cannot be None")
 
+    # IMPORTANT:
+    # Pass `service_id` through to the embeddings instance. Modern Semantic Kernel
+    # base classes model `service_id` as a first-class field (Pydantic validated).
     embeddings = CorpusSemanticKernelEmbeddings(
         corpus_adapter=corpus_adapter,
         model_id=model_id,
+        service_id=service_id or "",
         **kwargs,
     )
 
