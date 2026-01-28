@@ -411,10 +411,17 @@ async def test_async_and_sync_same_dimension(adapter: Any) -> None:
     texts = ["same-dim-1", "same-dim-2"]
     query = "same-dim-query"
 
-    sync_q = embeddings._get_query_embedding(query)
+    # IMPORTANT:
+    # The adapter explicitly enforces that *sync* embedding methods MUST NOT be called
+    # inside a running asyncio event loop (deadlock prevention + predictable contracts).
+    #
+    # This test still verifies sync/async dimensional parity, but it runs the *sync* calls
+    # in a worker thread via asyncio.to_thread(), where no event loop is running.
+    # This preserves the guard semantics validated by test_sync_methods_called_in_event_loop_raise.
+    sync_q = await asyncio.to_thread(embeddings._get_query_embedding, query)
     async_q = await embeddings._aget_query_embedding(query)
 
-    sync_mat = embeddings._get_text_embeddings(texts)
+    sync_mat = await asyncio.to_thread(embeddings._get_text_embeddings, texts)
     async_mat = await embeddings._aget_text_embeddings(texts)
 
     assert len(sync_q) == len(async_q)
@@ -972,7 +979,10 @@ class TestLlamaIndexIntegration:
             # If Settings exists and is mutable, it should now reference our embedder.
             # If it doesn't, that's still acceptable per adapter contract (best-effort).
             if getattr(Settings, "embed_model", None) is not None:
-                assert getattr(Settings, "embed_model") is embedder or isinstance(getattr(Settings, "embed_model"), type(embedder))
+                assert getattr(Settings, "embed_model") is embedder or isinstance(
+                    getattr(Settings, "embed_model"),
+                    type(embedder),
+                )
         except Exception:
             # Best-effort integration; do not hard-fail on Settings API drift.
             pass
