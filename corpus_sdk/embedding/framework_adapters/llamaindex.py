@@ -397,10 +397,10 @@ def _in_event_loop() -> bool:
     """
     Return True if there is an active asyncio event loop in this thread.
 
-    This is intentionally separate from _ensure_not_in_event_loop so we can preserve the
-    existing hard-guard behavior for non-embedding sync APIs (health/capabilities/close),
-    while enabling safe bridging for embedding sync methods where LlamaIndex/tests may
-    invoke them from async contexts.
+    This helper remains intentionally separate from _ensure_not_in_event_loop for
+    observability and potential future use, but the adapter's contract is enforced via
+    _ensure_not_in_event_loop for all sync APIs (including embeddings) to prevent
+    deadlocks and to match test expectations.
     """
     try:
         asyncio.get_running_loop()
@@ -422,16 +422,22 @@ def _maybe_close_sync(obj: Any) -> None:
 
     IMPORTANT:
       Callers must ensure they are NOT in a running event loop (use _ensure_not_in_event_loop).
+
+    Compatibility note:
+      Some lightweight adapters (including test doubles) expose both `aclose()` and `close()`,
+      but only `close()` updates observable state (e.g., a `.closed` flag). To ensure predictable
+      teardown semantics for sync context managers, we attempt `close()` after `aclose()` when
+      both exist. This preserves safety (no event-loop nesting) while improving compatibility.
     """
     if obj is None:
         return
 
+    # Attempt async-style close first, but do NOT return early: see compatibility note above.
     aclose = getattr(obj, "aclose", None)
     if callable(aclose):
         res = aclose()
         if asyncio.iscoroutine(res):
             asyncio.run(res)
-        return
 
     close = getattr(obj, "close", None)
     if not callable(close):
@@ -1675,15 +1681,12 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         Notes on validation:
         - We raise TypeError for non-string inputs with an actionable message.
         - Empty/whitespace strings return a zero vector of known dimension.
+
+        Event-loop safety:
+        - Sync embedding methods are *not* safe to call inside a running asyncio event loop.
+          We enforce this contract consistently (and tests rely on it). In async contexts,
+          use the corresponding async method (`_aget_query_embedding`) instead.
         """
-        # Fix for test_async_and_sync_same_dimension:
-        # LlamaIndex/tests may call sync embedding methods from async contexts. Rather than
-        # deadlocking (nested asyncio.run), we bridge to the async variant safely.
-        if _in_event_loop():
-            from corpus_sdk.core.async_bridge import AsyncBridge
-
-            return AsyncBridge.run_async(self._aget_query_embedding(query, **kwargs))
-
         _ensure_not_in_event_loop("_get_query_embedding")
 
         if not isinstance(query, str):
@@ -1715,13 +1718,12 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         Sync text embedding implementation for LlamaIndex nodes.
 
         Same validation semantics as query embedding.
+
+        Event-loop safety:
+        - Sync embedding methods are *not* safe to call inside a running asyncio event loop.
+          We enforce this contract consistently (and tests rely on it). In async contexts,
+          use the corresponding async method (`_aget_text_embedding`) instead.
         """
-        # Same bridging semantics as _get_query_embedding for async contexts.
-        if _in_event_loop():
-            from corpus_sdk.core.async_bridge import AsyncBridge
-
-            return AsyncBridge.run_async(self._aget_text_embedding(text, **kwargs))
-
         _ensure_not_in_event_loop("_get_text_embedding")
 
         if not isinstance(text, str):
@@ -1756,14 +1758,12 @@ class CorpusLlamaIndexEmbeddings(BaseEmbedding):
         - When strict_text_types=True (default), non-strings raise TypeError.
         - When strict_text_types=False, non-strings are treated as empty and get zero vectors.
         - Output row alignment always matches input order/length.
+
+        Event-loop safety:
+        - Sync embedding methods are *not* safe to call inside a running asyncio event loop.
+          We enforce this contract consistently (and tests rely on it). In async contexts,
+          use the corresponding async method (`_aget_text_embeddings`) instead.
         """
-        # Same bridging rationale as other sync embedding methods; this prevents
-        # nested asyncio.run patterns when called in async LlamaIndex/test contexts.
-        if _in_event_loop():
-            from corpus_sdk.core.async_bridge import AsyncBridge
-
-            return AsyncBridge.run_async(self._aget_text_embeddings(texts, **kwargs))
-
         _ensure_not_in_event_loop("_get_text_embeddings")
 
         context = _filter_llamaindex_context_from_kwargs(kwargs)
