@@ -938,26 +938,57 @@ async def test_real_autogen_chromadb_memory_roundtrip_uses_corpus_embeddings(
     This test:
     - Uses create_vector_memory() to build a real ChromaDBVectorMemory
     - Adds MemoryContent, queries for it, and validates results
-    - Wraps adapter.embed() to confirm embeddings are computed via the configured embedding function
+    - Wraps adapter embedding entry points to confirm embeddings are computed via the configured
+      Corpus adapter during AutoGen memory add/query.
+
+    IMPORTANT:
+    - The embedding translation layer may legitimately route to either unary `embed()` or
+      batch `embed_batch()` depending on adapter capabilities and batching policy.
+    - This test validates the integration contract ("Corpus adapter is used") without
+      pinning to a specific internal call path.
     """
     _chroma_mod, core_mem_mod = require_autogen_chromadb
     MemoryContent = core_mem_mod.MemoryContent
     MemoryMimeType = core_mem_mod.MemoryMimeType
 
-    calls = {"n": 0}
-    orig_embed = getattr(adapter, "embed", None)
-    assert callable(orig_embed), "Adapter must expose embed() for AutoGen embedding integration."
+    calls: Dict[str, Any] = {"n": 0, "methods": set()}
 
-    if inspect.iscoroutinefunction(orig_embed):
-        async def wrapped_embed(*args: Any, **kwargs: Any) -> Any:
-            calls["n"] += 1
-            return await orig_embed(*args, **kwargs)
-        monkeypatch.setattr(adapter, "embed", wrapped_embed, raising=True)
-    else:
-        def wrapped_embed(*args: Any, **kwargs: Any) -> Any:
-            calls["n"] += 1
-            return orig_embed(*args, **kwargs)
-        monkeypatch.setattr(adapter, "embed", wrapped_embed, raising=True)
+    def _wrap_counter(method_name: str) -> None:
+        """
+        Wrap an adapter method (if present/callable) to count invocations.
+
+        Notes:
+        - We patch the *instance* attribute, which is sufficient for this test and avoids
+          altering global class behavior across the suite.
+        - We preserve async vs sync behavior so the integration stack continues to function.
+        """
+        orig = getattr(adapter, method_name, None)
+        if not callable(orig):
+            return
+
+        if inspect.iscoroutinefunction(orig):
+            async def wrapped(*args: Any, **kwargs: Any) -> Any:
+                calls["n"] += 1
+                calls["methods"].add(method_name)
+                return await orig(*args, **kwargs)
+
+            monkeypatch.setattr(adapter, method_name, wrapped, raising=True)
+        else:
+            def wrapped(*args: Any, **kwargs: Any) -> Any:
+                calls["n"] += 1
+                calls["methods"].add(method_name)
+                return orig(*args, **kwargs)
+
+            monkeypatch.setattr(adapter, method_name, wrapped, raising=True)
+
+    # Count calls across BOTH common embedding surfaces.
+    _wrap_counter("embed")
+    _wrap_counter("embed_batch")
+
+    # If neither exists, this adapter cannot support the integration contract this test validates.
+    assert callable(getattr(adapter, "embed", None)) or callable(getattr(adapter, "embed_batch", None)), (
+        "Adapter must expose embed() and/or embed_batch() for AutoGen embedding integration."
+    )
 
     memory = create_vector_memory(
         corpus_adapter=adapter,
@@ -982,7 +1013,13 @@ async def test_real_autogen_chromadb_memory_roundtrip_uses_corpus_embeddings(
         assert isinstance(result.results, list)
         assert len(result.results) >= 1
 
-        assert calls["n"] >= 1, "Expected corpus adapter embed() to be called via AutoGen memory add/query."
+        # Integration contract: at least one adapter embedding method must be invoked
+        # during add/query. We accept either unary or batch entry points.
+        assert calls["n"] >= 1, (
+            "Expected the Corpus adapter to be used for embedding via AutoGen memory add/query, "
+            "but no embedding method was invoked. "
+            f"Observed methods: {sorted(calls['methods'])}"
+        )
 
         assert any(
             getattr(item, "content", None) == "The user prefers temperatures in Celsius"
@@ -1231,23 +1268,27 @@ async def test_real_autogen_chromadb_batch_embedding_path_is_exercised_when_supp
     Real integration: exercise batch embedding behavior.
 
     Strategy:
-    - Wrap adapter.embed() and record the largest batch size observed.
+    - Wrap adapter embedding entry points and record:
+        * total calls
+        * largest batch size observed across calls
     - Attempt to call memory.add() with a list of MemoryContent objects (batch add).
       If the installed AutoGen memory only supports single-item add(), we fall back
-      to sequential adds and assert that embed() was called multiple times.
+      to sequential adds and assert that embedding was called multiple times.
     - The test passes when either:
-      (A) a batch add is supported and we observe a batch size >= 2, OR
-      (B) batch add is not supported but the system still performs multiple embed calls
+      (A) a batch add is supported and we observe an embedding call with batch size >= 2, OR
+      (B) batch add is not supported but the system still performs multiple embedding calls
           (reflecting the actual backend behavior).
+
+    IMPORTANT:
+    - The translation layer may invoke either `embed()` or `embed_batch()` depending on adapter
+      capabilities and batching decisions. We track both without enforcing internal choices
+      beyond the observable batch-size behavior when batch add is supported.
     """
     _chroma_mod, core_mem_mod = require_autogen_chromadb
     MemoryContent = core_mem_mod.MemoryContent
     MemoryMimeType = core_mem_mod.MemoryMimeType
 
-    observed: Dict[str, Any] = {"max_batch": 0, "calls": 0}
-
-    orig_embed = getattr(adapter, "embed", None)
-    assert callable(orig_embed), "Adapter must expose embed() for batch-path integration test."
+    observed: Dict[str, Any] = {"max_batch": 0, "calls": 0, "methods": set()}
 
     def _maybe_batch_len_from_args(args: tuple[Any, ...], kwargs: dict[str, Any]) -> int:
         # Common patterns:
@@ -1268,18 +1309,42 @@ async def test_real_autogen_chromadb_batch_embedding_path_is_exercised_when_supp
                     return 0
         return 0
 
-    if inspect.iscoroutinefunction(orig_embed):
-        async def wrapped_embed(*args: Any, **kwargs: Any) -> Any:
-            observed["calls"] += 1
-            observed["max_batch"] = max(observed["max_batch"], _maybe_batch_len_from_args(args, kwargs))
-            return await orig_embed(*args, **kwargs)
-        monkeypatch.setattr(adapter, "embed", wrapped_embed, raising=True)
-    else:
-        def wrapped_embed(*args: Any, **kwargs: Any) -> Any:
-            observed["calls"] += 1
-            observed["max_batch"] = max(observed["max_batch"], _maybe_batch_len_from_args(args, kwargs))
-            return orig_embed(*args, **kwargs)
-        monkeypatch.setattr(adapter, "embed", wrapped_embed, raising=True)
+    def _wrap_batch_probe(method_name: str) -> None:
+        """
+        Wrap an adapter method (if present/callable) to count calls and track max batch size.
+
+        Notes:
+        - This wrapper is intentionally tolerant of different adapter signatures.
+        - We patch the *instance* attribute for isolation to this test.
+        """
+        orig = getattr(adapter, method_name, None)
+        if not callable(orig):
+            return
+
+        if inspect.iscoroutinefunction(orig):
+            async def wrapped(*args: Any, **kwargs: Any) -> Any:
+                observed["calls"] += 1
+                observed["methods"].add(method_name)
+                observed["max_batch"] = max(observed["max_batch"], _maybe_batch_len_from_args(args, kwargs))
+                return await orig(*args, **kwargs)
+
+            monkeypatch.setattr(adapter, method_name, wrapped, raising=True)
+        else:
+            def wrapped(*args: Any, **kwargs: Any) -> Any:
+                observed["calls"] += 1
+                observed["methods"].add(method_name)
+                observed["max_batch"] = max(observed["max_batch"], _maybe_batch_len_from_args(args, kwargs))
+                return orig(*args, **kwargs)
+
+            monkeypatch.setattr(adapter, method_name, wrapped, raising=True)
+
+    # Probe both potential embedding surfaces.
+    _wrap_batch_probe("embed")
+    _wrap_batch_probe("embed_batch")
+
+    assert callable(getattr(adapter, "embed", None)) or callable(getattr(adapter, "embed_batch", None)), (
+        "Adapter must expose embed() and/or embed_batch() for batch-path integration test."
+    )
 
     memory = create_vector_memory(
         corpus_adapter=adapter,
@@ -1307,15 +1372,26 @@ async def test_real_autogen_chromadb_batch_embedding_path_is_exercised_when_supp
 
         _ = await memory.query("pets")
 
+        # Sanity: integration must have caused embedding work.
+        assert observed["calls"] >= 1, (
+            "Expected at least one embedding call during add/query, but none were observed. "
+            f"Observed methods: {sorted(observed['methods'])}"
+        )
+
         if batch_add_supported:
+            # Batch add supported: we expect at least one embedding invocation with a batch size >= 2.
             assert observed["max_batch"] >= 2, (
-                "memory.add(list[MemoryContent]) succeeded, but adapter.embed() was never invoked with a batch >= 2. "
-                "This suggests batching is not flowing through to the embedding function as expected."
+                "memory.add(list[MemoryContent]) succeeded, but no adapter embedding call was observed "
+                "with a batch size >= 2. This suggests batching is not flowing through to the embedding "
+                "adapter as expected. "
+                f"Observed max_batch={observed['max_batch']} methods={sorted(observed['methods'])}"
             )
         else:
+            # Batch add not supported: sequential adds should still yield multiple embedding calls.
             assert observed["calls"] >= 2, (
                 "AutoGen memory does not support batch add() in this environment, but we still expect multiple "
-                "embedding calls across sequential adds and query."
+                "embedding calls across sequential adds and query. "
+                f"Observed calls={observed['calls']} methods={sorted(observed['methods'])}"
             )
     finally:
         await memory.close()
