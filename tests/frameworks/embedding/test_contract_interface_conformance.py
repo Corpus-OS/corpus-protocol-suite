@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import inspect
 from collections.abc import Mapping, Sequence
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 import pytest
 
@@ -30,7 +31,6 @@ def framework_descriptor_fixture(
     """
     Parameterized over all registered embedding framework descriptors.
 
-    
     - We do not skip unavailable frameworks.
     - Tests must pass by asserting correct "unavailable" signaling when a framework
       is not installed, and must fully run when it is available.
@@ -51,7 +51,6 @@ def embedding_adapter_instance(
     it with the *generic* Corpus adapter provided by the top-level pytest
     plugin (see conftest.py).
 
-    
     - If a framework is unavailable, this fixture returns None and tests must
       treat that as a validated pass condition (not a skip).
     """
@@ -181,6 +180,48 @@ def _assert_awaitable(value: Any, *, descriptor: EmbeddingFrameworkDescriptor, m
     )
 
 
+def _dispose_awaitable(value: Any) -> None:
+    """
+    Dispose of an awaitable produced in a *sync* test so it doesn't emit
+    "coroutine was never awaited" warnings.
+
+    Rationale:
+    - Several sync tests validate that async methods return awaitables, but they
+      intentionally do not await them to avoid event-loop hazards.
+    - Creating a coroutine object without awaiting it will trigger RuntimeWarning
+      at test teardown.
+    - Safely closing/canceling the awaitable preserves the test's intent while
+      preventing resource warnings.
+
+    Notes:
+    - We prefer coroutine.close() when possible (most common for async def methods).
+    - For Futures/Tasks, cancel() is the safest non-blocking disposal method.
+    """
+    # Coroutine objects (created by calling an `async def`) support .close().
+    if inspect.iscoroutine(value):
+        value.close()
+        return
+
+    # Futures/Tasks support .cancel(). This is safe and does not require a running loop.
+    if isinstance(value, asyncio.Future):
+        value.cancel()
+        return
+
+    # Best-effort fallback for awaitables from third-party libraries.
+    close = getattr(value, "close", None)
+    if callable(close):
+        close()
+        return
+
+    cancel = getattr(value, "cancel", None)
+    if callable(cancel):
+        cancel()
+        return
+
+    # If we can't dispose, we intentionally do nothing; the assertion sites are
+    # still correct, and this preserves compatibility with unusual awaitable types.
+
+
 def _empty_batch_expected_behavior(
     exc: BaseException,
 ) -> bool:
@@ -236,7 +277,6 @@ def test_can_instantiate_framework_adapter(
     Each registered framework descriptor should be instantiable with the
     pluggable Corpus adapter and any inferred kwargs.
 
-    
     - If framework is unavailable, validate the unavailable contract and return.
     - If framework is available but instantiation fails, this should fail (real regression).
     """
@@ -265,7 +305,6 @@ def test_async_methods_exist_when_supports_async_true(
     Ensure that when supports_async=True, both async methods actually exist.
     This catches registry-descriptor mismatches.
 
-    
     - If framework is unavailable, validate the unavailable contract and return.
     - If supports_async=False, assert async methods are None and return.
     """
@@ -303,7 +342,6 @@ def test_sync_embedding_interface_conformance(
     Validate that sync batch and query methods accept simple text input and
     return embedding shapes that look like vectors / matrices of numbers.
 
-    
     - If framework is unavailable, validate the unavailable contract and return.
     """
     if not framework_descriptor.is_available():
@@ -318,8 +356,12 @@ def test_sync_embedding_interface_conformance(
     batch_fn = _get_method(embedding_adapter_instance, framework_descriptor.batch_method)
     query_fn = _get_method(embedding_adapter_instance, framework_descriptor.query_method)
 
-    _check_minimal_signature_contract(batch_fn, descriptor=framework_descriptor, method_name=framework_descriptor.batch_method)
-    _check_minimal_signature_contract(query_fn, descriptor=framework_descriptor, method_name=framework_descriptor.query_method)
+    _check_minimal_signature_contract(
+        batch_fn, descriptor=framework_descriptor, method_name=framework_descriptor.batch_method
+    )
+    _check_minimal_signature_contract(
+        query_fn, descriptor=framework_descriptor, method_name=framework_descriptor.query_method
+    )
 
     ctx = dict(framework_descriptor.sample_context or {})
 
@@ -337,7 +379,6 @@ def test_single_element_batch(
     """
     Test that single-element batches work correctly.
 
-    
     - If framework is unavailable, validate the unavailable contract and return.
     """
     if not framework_descriptor.is_available():
@@ -365,7 +406,6 @@ def test_empty_batch_handling(
     - return []
     - raise a common validation error (TypeError/ValueError)
 
-    
     - If framework is unavailable, validate the unavailable contract and return.
     """
     if not framework_descriptor.is_available():
@@ -399,7 +439,6 @@ async def test_async_embedding_interface_conformance(
     Validate that async batch and query methods (when declared) accept text
     input and return embedding shapes compatible with the sync API.
 
-    
     - If framework is unavailable, validate the unavailable contract and return.
     - If async is unsupported, validate that and return.
     """
@@ -423,8 +462,12 @@ async def test_async_embedding_interface_conformance(
     abatch_fn = _get_method(embedding_adapter_instance, framework_descriptor.async_batch_method)
     aquery_fn = _get_method(embedding_adapter_instance, framework_descriptor.async_query_method)
 
-    _check_minimal_signature_contract(abatch_fn, descriptor=framework_descriptor, method_name=framework_descriptor.async_batch_method)
-    _check_minimal_signature_contract(aquery_fn, descriptor=framework_descriptor, method_name=framework_descriptor.async_query_method)
+    _check_minimal_signature_contract(
+        abatch_fn, descriptor=framework_descriptor, method_name=framework_descriptor.async_batch_method
+    )
+    _check_minimal_signature_contract(
+        aquery_fn, descriptor=framework_descriptor, method_name=framework_descriptor.async_query_method
+    )
 
     ctx = dict(framework_descriptor.sample_context or {})
 
@@ -447,7 +490,6 @@ def test_context_kwarg_is_accepted_when_declared(
     If a context_kwarg is declared in the descriptor, the corresponding
     embedding methods should accept that kwarg without raising TypeError.
 
-    
     - If framework is unavailable, validate the unavailable contract and return.
     - If context_kwarg is not declared, assert that fact and return.
     """
@@ -498,7 +540,6 @@ def test_embedding_dimension_when_required(
     """
     Test that frameworks requiring embedding dimension enforce it.
 
-    
     - If framework is unavailable, validate the unavailable contract and return.
     - If framework does not require dimension, assert that fact and return.
     """
@@ -547,7 +588,6 @@ def test_alias_methods_exist_and_behave_consistently_when_declared(
     - be callable
     - return valid shapes when called with the same input as the primary method
 
-    
     - If framework is unavailable, validate the unavailable contract and return.
     - If no aliases are declared, assert that fact and return.
     """
@@ -574,12 +614,19 @@ def test_alias_methods_exist_and_behave_consistently_when_declared(
         if is_batch:
             alias_out = _call_with_optional_context(framework_descriptor, alias_fn, texts, ctx)
             primary_out = _call_with_optional_context(framework_descriptor, primary_fn, texts, ctx)
+
             # Alias may be async; only enforce awaitable for async-typed names.
             if inspect.isawaitable(alias_out):
-                # Async alias: must be awaitable and yield matrix
+                # Async alias: must be awaitable.
                 # NOTE: This file keeps sync tests sync; async alias surfaces are validated in async tests.
-                # We still ensure it is awaitable here.
+                # We still ensure it is awaitable here, and then dispose of it to avoid teardown warnings.
                 _assert_awaitable(alias_out, descriptor=framework_descriptor, method_name=alias_name)
+                _dispose_awaitable(alias_out)
+
+                # If the primary method also returns an awaitable here, dispose it as well.
+                # This prevents "coroutine was never awaited" warnings without changing behavior.
+                if inspect.isawaitable(primary_out):
+                    _dispose_awaitable(primary_out)
             else:
                 _assert_embedding_matrix_shape(alias_out, expected_rows=len(texts))
                 _assert_embedding_matrix_shape(primary_out, expected_rows=len(texts))
@@ -588,6 +635,9 @@ def test_alias_methods_exist_and_behave_consistently_when_declared(
             primary_out = _call_with_optional_context(framework_descriptor, primary_fn, query_text, ctx)
             if inspect.isawaitable(alias_out):
                 _assert_awaitable(alias_out, descriptor=framework_descriptor, method_name=alias_name)
+                _dispose_awaitable(alias_out)
+                if inspect.isawaitable(primary_out):
+                    _dispose_awaitable(primary_out)
             else:
                 _assert_embedding_vector_shape(alias_out)
                 _assert_embedding_vector_shape(primary_out)
@@ -607,7 +657,6 @@ def test_capabilities_contract_if_declared(
     capabilities() method returning a mapping. Async variants (when present)
     should behave similarly.
 
-    
     - If framework is unavailable, validate the unavailable contract and return.
     - If has_capabilities=False, assert that fact and return.
     """
@@ -633,8 +682,10 @@ def test_capabilities_contract_if_declared(
     async_caps = getattr(embedding_adapter_instance, acap_name, None)
     if async_caps is not None and callable(async_caps):
         # Validate it returns an awaitable, but execute in the async test below to avoid loop hazards.
+        # IMPORTANT: Dispose of the produced awaitable to prevent "coroutine was never awaited" warnings.
         coro = async_caps()
         assert inspect.isawaitable(coro), f"{framework_descriptor.name}: {acap_name}() must return an awaitable"
+        _dispose_awaitable(coro)
 
 
 @pytest.mark.asyncio
@@ -680,7 +731,6 @@ def test_health_contract_if_declared(
     method returning a mapping. Async variants (when present) should behave
     similarly.
 
-    
     - If framework is unavailable, validate the unavailable contract and return.
     - If has_health=False, assert that fact and return.
     """
@@ -705,8 +755,11 @@ def test_health_contract_if_declared(
 
     async_health = getattr(embedding_adapter_instance, ahealth_name, None)
     if async_health is not None and callable(async_health):
+        # Validate it returns an awaitable, but execute in the async test below to avoid loop hazards.
+        # IMPORTANT: Dispose of the produced awaitable to prevent "coroutine was never awaited" warnings.
         coro = async_health()
         assert inspect.isawaitable(coro), f"{framework_descriptor.name}: {ahealth_name}() must return an awaitable"
+        _dispose_awaitable(coro)
 
 
 @pytest.mark.asyncio
