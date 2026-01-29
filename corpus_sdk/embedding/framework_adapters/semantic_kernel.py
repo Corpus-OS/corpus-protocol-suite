@@ -64,6 +64,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import sys
 import threading
 from functools import wraps
 from typing import (
@@ -123,10 +124,13 @@ except Exception:  # noqa: BLE001
 # ---------------------------------------------------------------------------
 
 try:
-    # IMPORTANT (test compatibility):
-    # The conformance tests import EmbeddingGeneratorBase from this *deprecated*
-    # path. To ensure isinstance(embeddings, EmbeddingGeneratorBase) succeeds,
-    # we prefer this import when available.
+    from semantic_kernel.connectors.ai import embedding_generator_base as _sk_egb_mod  # type: ignore
+
+    sys.modules.setdefault(
+        "semantic_kernel.connectors.ai.embeddings.embedding_generator_base",
+        _sk_egb_mod,
+    )
+
     from semantic_kernel.connectors.ai.embeddings.embedding_generator_base import (  # type: ignore
         EmbeddingGeneratorBase,
     )
@@ -134,8 +138,9 @@ try:
     SEMANTIC_KERNEL_AVAILABLE = True
 except ImportError:
     try:
-        # Newer Semantic Kernel versions moved the base here.
-        from semantic_kernel.connectors.ai.embedding_generator_base import (  # type: ignore
+        # Backward-compatible fallback for older Semantic Kernel versions that only
+        # provide the legacy module layout.
+        from semantic_kernel.connectors.ai.embeddings.embedding_generator_base import (  # type: ignore
             EmbeddingGeneratorBase,
         )
 
