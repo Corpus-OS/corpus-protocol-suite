@@ -42,11 +42,12 @@ import asyncio
 import contextvars
 from concurrent.futures import Future, ThreadPoolExecutor
 import functools
+import inspect
 import logging
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Coroutine, Optional, TypeVar, ClassVar, Set
+from typing import Any, Callable, Coroutine, Optional, TypeVar, Set
 from time import perf_counter
 import os
 import sys
@@ -440,6 +441,85 @@ class AsyncBridge:
             cls._metrics.min_duration = min(cls._metrics.min_duration, duration)
             cls._metrics.last_call_time = time.time()
 
+    @staticmethod
+    def _dispose_unawaited_coroutine_best_effort(coro: Any) -> None:
+        """
+        Best-effort disposal for coroutine/awaitable objects that will not be awaited.
+
+        Why this exists:
+        - In certain fail-fast branches (e.g., circuit breaker open, resource rejection),
+          we may have already been handed a coroutine object by the caller.
+        - If we raise before executing/awaiting it, Python will emit
+          "coroutine was never awaited" warnings during garbage collection.
+        - Closing coroutine objects is the correct, low-cost, non-blocking way
+          to prevent those warnings while preserving fail-fast behavior.
+
+        Safety notes:
+        - We only attempt to close/cancel; we never block on completion.
+        - If the object is not a coroutine/awaitable with a close/cancel API,
+          this function becomes a no-op.
+        """
+        try:
+            # Coroutine objects created by calling an `async def` implement `.close()`.
+            if inspect.iscoroutine(coro):
+                coro.close()
+                return
+
+            # Futures/Tasks implement `.cancel()`. This is safe and non-blocking.
+            cancel = getattr(coro, "cancel", None)
+            if callable(cancel):
+                cancel()
+                return
+
+            # As a last resort, if a third-party awaitable provides `.close()`, use it.
+            close = getattr(coro, "close", None)
+            if callable(close):
+                close()
+        except Exception:
+            # Never allow cleanup to mask the real error path.
+            return
+
+    @classmethod
+    def _is_circuit_breaker_failure(cls, exc: BaseException) -> bool:
+        """
+        Determine whether an exception should contribute to circuit breaker failures.
+
+        IMPORTANT DISTINCTION:
+        - This module is protocol infrastructure, not business logic.
+        - Exceptions raised *by the coroutine's business logic* (e.g., adapter/runtime errors)
+          are expected to propagate to callers and should not automatically poison the
+          bridge circuit breaker.
+        - The circuit breaker is intended to protect against *infrastructure-level*
+          failures such as timeouts and execution environment instability.
+
+        Current policy (conservative by design):
+        - Count AsyncBridgeTimeoutError as a failure (represents infrastructure timeout).
+        - Count asyncio.CancelledError as a failure (represents cancellation at the bridge boundary).
+        - Count specific known event-loop/execution RuntimeError patterns as failures.
+
+        This policy prevents expected downstream exceptions from opening the circuit,
+        while still allowing the breaker to engage for genuine infrastructure trouble.
+        """
+        if isinstance(exc, AsyncBridgeTimeoutError):
+            return True
+
+        # Cancellation at the bridge boundary is treated as an infrastructure signal.
+        if isinstance(exc, asyncio.CancelledError):
+            return True
+
+        # Some RuntimeErrors indicate execution environment problems rather than user code.
+        if isinstance(exc, RuntimeError):
+            msg = str(exc)
+            infra_markers = (
+                "asyncio.run() cannot be called from a running event loop",
+                "Event loop is closed",
+                "cannot schedule new futures after shutdown",
+            )
+            if any(marker in msg for marker in infra_markers):
+                return True
+
+        return False
+
     # ------------------------------------------------------------------ #
     # Public API
     # ------------------------------------------------------------------ #
@@ -487,6 +567,12 @@ class AsyncBridge:
         # Check circuit breaker first
         if not cls._circuit_breaker.should_try():
             circuit_tripped = True
+
+            # IMPORTANT:
+            # Fail-fast here means we will not execute/await the coroutine.
+            # Close it to avoid "coroutine was never awaited" warnings.
+            cls._dispose_unawaited_coroutine_best_effort(coro)
+
             exc = AsyncBridgeCircuitOpenError(
                 "AsyncBridge circuit breaker is open due to repeated failures"
             )
@@ -515,8 +601,13 @@ class AsyncBridge:
                         "AsyncBridge.run_async: running loop detected; using executor with contextvars"
                     )
 
-                # Check resource limits before proceeding
-                cls._check_resource_limits()
+                # Check resource limits before proceeding.
+                # If we reject here, we must dispose the coroutine because it will not be awaited.
+                try:
+                    cls._check_resource_limits()
+                except AsyncBridgeResourceError:
+                    cls._dispose_unawaited_coroutine_best_effort(coro)
+                    raise
 
                 # Capture the current contextvars.Context so tracing/logging/context
                 # is preserved when we hop to the worker thread.
@@ -530,6 +621,9 @@ class AsyncBridge:
                         future = executor.submit(cls._run_in_context, coro, effective_timeout, ctx)
                     except RuntimeError as e:
                         # Executor may have been shut down or is unavailable.
+                        # Dispose coroutine because it will not be awaited after this failure.
+                        cls._dispose_unawaited_coroutine_best_effort(coro)
+
                         resource_exc = AsyncBridgeResourceError(
                             "AsyncBridge executor is unavailable or shut down"
                         )
@@ -550,7 +644,9 @@ class AsyncBridge:
                     cls._circuit_breaker.record_success()
                     return result
                 except Exception as exc:
-                    cls._circuit_breaker.record_failure()
+                    # Only count infrastructure-level failures toward the circuit breaker.
+                    if cls._is_circuit_breaker_failure(exc):
+                        cls._circuit_breaker.record_failure()
                     cls._attach_error_context(exc, effective_timeout, True)
                     raise
 
@@ -562,11 +658,13 @@ class AsyncBridge:
                 cls._circuit_breaker.record_success()
                 return result
             except AsyncBridgeTimeoutError:
-                # Re-raise timeout errors as-is
+                # Re-raise timeout errors as-is; timeouts are infrastructure failures.
                 cls._circuit_breaker.record_failure()
                 raise
             except Exception as exc:
-                cls._circuit_breaker.record_failure()
+                # Only count infrastructure-level failures toward the circuit breaker.
+                if cls._is_circuit_breaker_failure(exc):
+                    cls._circuit_breaker.record_failure()
                 cls._attach_error_context(exc, effective_timeout, False)
                 raise
 
