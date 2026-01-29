@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import inspect
+import warnings
 from collections.abc import Mapping as ABCMapping
 from collections.abc import Sequence
 from typing import Any, Callable, Optional
@@ -15,7 +16,6 @@ from tests.frameworks.registries.embedding_registry import (
     EmbeddingFrameworkDescriptor,
     iter_embedding_framework_descriptors,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -263,21 +263,18 @@ def _empty_text_behavior_is_acceptable(exc: BaseException) -> bool:
         return True
 
     # Accept CORPUS SDK BadRequest for the "empty texts in batch" contract case.
-    # We import lazily to keep the test file robust to environments where the SDK
-    # package layout differs (or where only some frameworks are installed).
+    # Import lazily to avoid hard failures in environments where the SDK layout differs.
     try:
         from corpus_sdk.embedding.embedding_base import BadRequest as CorpusBadRequest  # type: ignore
     except Exception:
         CorpusBadRequest = None  # type: ignore[assignment]
 
-    # Prefer code-based identification (stable) but fall back to string matching.
-    code = getattr(exc, "code", None)
-
-    if code == "BAD_BATCH_EMPTY_TEXTS":
+    # Prefer structured identification via the error code. Fall back to string scanning
+    # only when code is not reliably accessible.
+    if getattr(exc, "code", None) == "BAD_BATCH_EMPTY_TEXTS":
         return True
 
     if CorpusBadRequest is not None and isinstance(exc, CorpusBadRequest):
-        # Some SDK builds may not expose code as an attribute consistently; keep this tolerant.
         if getattr(exc, "code", None) == "BAD_BATCH_EMPTY_TEXTS":
             return True
         if "BAD_BATCH_EMPTY_TEXTS" in str(exc):
@@ -637,7 +634,12 @@ async def test_async_batch_shape_matches_sync_when_supported(
     # Many framework adapters intentionally refuse calling sync APIs from within an
     # active asyncio event loop to avoid deadlocks/hangs. Because this test itself
     # is async, we compute the sync reference result in a worker thread.
-    sync_result = await asyncio.to_thread(_maybe_call_with_context, framework_descriptor, batch_fn, texts)
+    sync_result = await asyncio.to_thread(
+        _maybe_call_with_context,
+        framework_descriptor,
+        batch_fn,
+        texts,
+    )
 
     _assert_embedding_matrix_shape(sync_result, expected_rows=len(texts))
     sync_dim = _first_nonempty_row_dim(sync_result)
