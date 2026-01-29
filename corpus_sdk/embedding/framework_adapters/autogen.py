@@ -345,11 +345,7 @@ def _extract_dynamic_context(
         # IMPORTANT: strings are Sequences, but not "batch texts"
         if isinstance(maybe_texts, Sequence) and not isinstance(maybe_texts, (str, bytes)):
             dynamic_ctx["texts_count"] = len(maybe_texts)
-            empty_count = sum(
-                1
-                for text in maybe_texts
-                if not isinstance(text, str) or not text.strip()
-            )
+            empty_count = sum(1 for text in maybe_texts if not isinstance(text, str) or not text.strip())
             if empty_count:
                 dynamic_ctx["empty_texts_count"] = empty_count
 
@@ -455,7 +451,7 @@ class CorpusAutoGenEmbeddings:
     # ------------------------------------------------------------------ #
     #
     # ChromaDB evolves the embedding_function interface over time. In your environment,
-    # the serializer/registry probes these members on the *class* (not an instance),
+    # the serializer/registry sometimes probes these members on the *class* (not an instance),
     # e.g. `CorpusAutoGenEmbeddings.name()`. If these are normal instance methods, that probe
     # fails with: "missing 1 required positional argument: 'self'".
     #
@@ -782,116 +778,6 @@ class CorpusAutoGenEmbeddings:
             return None
         return len(first)
 
-    def _embed_documents_chroma_compat_sync(
-        self,
-        texts_list: List[str],
-        *,
-        core_ctx: Optional[OperationContext],
-        framework_ctx: Dict[str, Any],
-    ) -> List[List[float]]:
-        """
-        Chroma compatibility embedding path (sync).
-
-        Why this exists
-        --------------
-        Certain downstream integrations (including the AutoGen+Chroma wiring exercised in tests)
-        assert that the underlying Corpus adapter's unary `embed()` method is invoked during
-        memory add/query operations.
-
-        At the same time, we must preserve translator-level batching and performance where
-        possible. The translator can legitimately choose `embed_batch()` for list inputs, which
-        bypasses `embed()` entirely.
-
-        Strategy
-        --------
-        - For a single text: pass a unary string through the translator so the adapter `embed()`
-          path is exercised (and we still keep translator orchestration).
-        - For multiple texts: embed the first item unary (exercising adapter `embed()`), then
-          embed the remaining items as a batch (preserving batching and translator behavior for
-          the bulk of the work).
-
-        This hybrid approach is limited to the Chroma integration path only (guarded upstream),
-        so user-constructed embeddings retain their strict/performance characteristics unchanged.
-        """
-        if not texts_list:
-            return []
-
-        if len(texts_list) == 1:
-            translated_one = self._translator.embed(
-                raw_texts=texts_list[0],
-                op_ctx=core_ctx,
-                framework_ctx=framework_ctx,
-            )
-            vec = self._coerce_embedding_vector(translated_one)
-            self._update_dim_hint(len(vec))
-            return [vec]
-
-        # Unary first element: exercises adapter.embed() for integrations/tests that require it.
-        translated_first = self._translator.embed(
-            raw_texts=texts_list[0],
-            op_ctx=core_ctx,
-            framework_ctx=framework_ctx,
-        )
-        first_vec = self._coerce_embedding_vector(translated_first)
-
-        # Batch remainder: preserves translator batching/caching/retry decisions for the bulk.
-        remainder = texts_list[1:]
-        translated_rest = self._translator.embed(
-            raw_texts=remainder,
-            op_ctx=core_ctx,
-            framework_ctx=framework_ctx,
-        )
-        rest_mat = self._coerce_embedding_matrix(translated_rest)
-
-        mat = [first_vec] + rest_mat
-        self._update_dim_hint(self._infer_dim_from_matrix(mat))
-        return mat
-
-    async def _embed_documents_chroma_compat_async(
-        self,
-        texts_list: List[str],
-        *,
-        core_ctx: Optional[OperationContext],
-        framework_ctx: Dict[str, Any],
-    ) -> List[List[float]]:
-        """
-        Chroma compatibility embedding path (async).
-
-        Mirrors `_embed_documents_chroma_compat_sync` while using the async translator API.
-        See the sync variant docstring for the detailed rationale and trade-offs.
-        """
-        if not texts_list:
-            return []
-
-        if len(texts_list) == 1:
-            translated_one = await self._translator.arun_embed(
-                raw_texts=texts_list[0],
-                op_ctx=core_ctx,
-                framework_ctx=framework_ctx,
-            )
-            vec = self._coerce_embedding_vector(translated_one)
-            self._update_dim_hint(len(vec))
-            return [vec]
-
-        translated_first = await self._translator.arun_embed(
-            raw_texts=texts_list[0],
-            op_ctx=core_ctx,
-            framework_ctx=framework_ctx,
-        )
-        first_vec = self._coerce_embedding_vector(translated_first)
-
-        remainder = texts_list[1:]
-        translated_rest = await self._translator.arun_embed(
-            raw_texts=remainder,
-            op_ctx=core_ctx,
-            framework_ctx=framework_ctx,
-        )
-        rest_mat = self._coerce_embedding_matrix(translated_rest)
-
-        mat = [first_vec] + rest_mat
-        self._update_dim_hint(self._infer_dim_from_matrix(mat))
-        return mat
-
     # ------------------------------------------------------------------ #
     # Capabilities / health passthrough via EmbeddingTranslator
     # ------------------------------------------------------------------ #
@@ -928,9 +814,9 @@ class CorpusAutoGenEmbeddings:
           running async embedding in a worker thread and returning synchronously.
 
         Performance/correctness note:
-        - This method delegates to embed_documents(), which includes a narrow Chroma
-          compatibility path (when enabled) that ensures the underlying adapter.embed()
-          is exercised while still preserving batch optimization for the bulk of inputs.
+        - Even in the event-loop bridge path, we delegate batching decisions to the
+          translator by passing the full list of texts. This preserves translator-level
+          efficiency optimizations and consistent behavior across call sites.
         """
         if not _is_running_event_loop():
             return self.embed_documents(list(input), autogen_context=None, model=None)
@@ -942,10 +828,18 @@ class CorpusAutoGenEmbeddings:
         texts = list(input)
 
         def _work() -> List[List[float]]:
-            async def _arun() -> List[List[float]]:
-                return await self.aembed_documents(texts, autogen_context=None, model=None)
+            async def _arun_batch() -> List[List[float]]:
+                core_ctx, framework_ctx = self._build_contexts(autogen_context=None, model=None)
+                translated = await self._translator.arun_embed(
+                    raw_texts=texts,  # preserve translator batching/caching/retry decisions
+                    op_ctx=core_ctx,
+                    framework_ctx=framework_ctx,
+                )
+                mat = self._coerce_embedding_matrix(translated)
+                self._update_dim_hint(self._infer_dim_from_matrix(mat))
+                return mat
 
-            return asyncio.run(_arun())
+            return asyncio.run(_arun_batch())
 
         return _run_blocking_in_chroma_bridge_thread(_work)
 
@@ -982,27 +876,15 @@ class CorpusAutoGenEmbeddings:
         )
 
         start = time.perf_counter()
-
-        # Integration-specific behavior:
-        # When configured for Chroma-in-event-loop compatibility, we also ensure the
-        # underlying adapter.embed() path is exercised (per downstream expectations/tests)
-        # while still preserving batch behavior for the bulk of work.
-        if self._allow_chromadb_in_event_loop:
-            mat = self._embed_documents_chroma_compat_sync(
-                texts_list,
-                core_ctx=core_ctx,
-                framework_ctx=framework_ctx,
-            )
-        else:
-            translated = self._translator.embed(
-                raw_texts=texts_list,
-                op_ctx=core_ctx,
-                framework_ctx=framework_ctx,
-            )
-            mat = self._coerce_embedding_matrix(translated)
-            self._update_dim_hint(self._infer_dim_from_matrix(mat))
-
+        translated = self._translator.embed(
+            raw_texts=texts_list,
+            op_ctx=core_ctx,
+            framework_ctx=framework_ctx,
+        )
         elapsed_ms = (time.perf_counter() - start) * 1000.0
+
+        mat = self._coerce_embedding_matrix(translated)
+        self._update_dim_hint(self._infer_dim_from_matrix(mat))
 
         logger.debug(
             "Sync embedding completed: docs=%d dim=%s latency_ms=%.2f conversation=%s",
@@ -1040,26 +922,15 @@ class CorpusAutoGenEmbeddings:
         )
 
         start = time.perf_counter()
-
-        # Integration-specific behavior:
-        # Mirror the sync logic in the async path to ensure consistent behavior
-        # for AutoGen+Chroma environments.
-        if self._allow_chromadb_in_event_loop:
-            mat = await self._embed_documents_chroma_compat_async(
-                texts_list,
-                core_ctx=core_ctx,
-                framework_ctx=framework_ctx,
-            )
-        else:
-            translated = await self._translator.arun_embed(
-                raw_texts=texts_list,
-                op_ctx=core_ctx,
-                framework_ctx=framework_ctx,
-            )
-            mat = self._coerce_embedding_matrix(translated)
-            self._update_dim_hint(self._infer_dim_from_matrix(mat))
-
+        translated = await self._translator.arun_embed(
+            raw_texts=texts_list,
+            op_ctx=core_ctx,
+            framework_ctx=framework_ctx,
+        )
         elapsed_ms = (time.perf_counter() - start) * 1000.0
+
+        mat = self._coerce_embedding_matrix(translated)
+        self._update_dim_hint(self._infer_dim_from_matrix(mat))
 
         logger.debug(
             "Async embedding completed: docs=%d dim=%s latency_ms=%.2f conversation=%s",
@@ -1103,15 +974,22 @@ class CorpusAutoGenEmbeddings:
                     return []  # pragma: no cover
 
                 def _work() -> List[List[float]]:
-                    async def _arun() -> List[List[float]]:
-                        return await self.aembed_documents(
-                            texts_list,
+                    async def _arun_batch_query() -> List[List[float]]:
+                        core_ctx, framework_ctx = self._build_contexts(
                             autogen_context=autogen_context,
                             model=model,
                             **kwargs,
                         )
+                        translated = await self._translator.arun_embed(
+                            raw_texts=texts_list,  # preserve translator batching/caching/retry decisions
+                            op_ctx=core_ctx,
+                            framework_ctx=framework_ctx,
+                        )
+                        mat = self._coerce_embedding_matrix(translated)
+                        self._update_dim_hint(self._infer_dim_from_matrix(mat))
+                        return mat
 
-                    return asyncio.run(_arun())
+                    return asyncio.run(_arun_batch_query())
 
                 return _run_blocking_in_chroma_bridge_thread(_work)
 
