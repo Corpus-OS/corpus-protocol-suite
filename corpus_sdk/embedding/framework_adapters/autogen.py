@@ -345,11 +345,7 @@ def _extract_dynamic_context(
         # IMPORTANT: strings are Sequences, but not "batch texts"
         if isinstance(maybe_texts, Sequence) and not isinstance(maybe_texts, (str, bytes)):
             dynamic_ctx["texts_count"] = len(maybe_texts)
-            empty_count = sum(
-                1
-                for text in maybe_texts
-                if not isinstance(text, str) or not text.strip()
-            )
+            empty_count = sum(1 for text in maybe_texts if not isinstance(text, str) or not text.strip())
             if empty_count:
                 dynamic_ctx["empty_texts_count"] = empty_count
 
@@ -450,6 +446,89 @@ class CorpusAutoGenEmbeddings:
     AutoGen's ChromaDB-backed memory.
     """
 
+    # ------------------------------------------------------------------ #
+    # ChromaDB compatibility surface
+    # ------------------------------------------------------------------ #
+    #
+    # ChromaDB evolves the embedding_function interface over time. In your environment,
+    # the serializer/registry sometimes probes these members on the *class* (not an instance),
+    # e.g. `CorpusAutoGenEmbeddings.name()`. If these are normal instance methods, that probe
+    # fails with: "missing 1 required positional argument: 'self'".
+    #
+    # To prevent regressions and keep warnings clean, these compatibility hooks are static:
+    # - callable both as `CorpusAutoGenEmbeddings.name()` and `instance.name()`
+    # - return JSON-serializable values only
+    #
+    # These are metadata-only; they do not change embedding behavior, batching, retries,
+    # caching, or error handling.
+
+    @staticmethod
+    def name() -> str:
+        """
+        Return a unique name for this embedding function.
+
+        ChromaDB uses this to validate embedding function consistency
+        when reopening persisted collections.
+        """
+        return "corpus-autogen-embeddings"
+
+    @staticmethod
+    def is_legacy() -> bool:
+        """
+        ChromaDB probes this as a callable in some versions.
+
+        Returning False indicates this embedding function is not a legacy wrapper.
+        (We still implement embed_query/embed_documents for compatibility with callers
+        that use the legacy-style interface.)
+        """
+        return False
+
+    @staticmethod
+    def default_space() -> str:
+        """
+        Return the default similarity space for this embedding function.
+
+        ChromaDB uses this value during configuration serialization in some versions.
+
+        NOTE:
+        - Metadata only; does not change embedding computation.
+        - Collections may still override the distance metric at configuration time.
+        """
+        return "cosine"
+
+    @staticmethod
+    def supported_spaces() -> List[str]:
+        """
+        Return the similarity spaces supported by this embedding function.
+
+        Some ChromaDB versions probe `supported_spaces` during configuration serialization.
+
+        NOTE:
+        - Metadata only; does not change embedding computation.
+        - The returned values are common distance spaces supported across Chroma deployments.
+        """
+        return ["cosine", "l2", "ip"]
+
+    @staticmethod
+    def get_config() -> Dict[str, Any]:
+        """
+        Return a JSON-serializable configuration payload for this embedding function.
+
+        Some ChromaDB versions probe `get_config()` as part of collection configuration
+        serialization. Returning a minimal, stable config prevents deprecation warnings.
+
+        Security / correctness notes:
+        - Must never leak adapter instances, non-serializable objects, or secrets.
+        - Metadata only; does not change embedding computation.
+        """
+        return {
+            "name": CorpusAutoGenEmbeddings.name(),
+            "framework": "autogen",
+            "default_space": CorpusAutoGenEmbeddings.default_space(),
+            "supported_spaces": list(CorpusAutoGenEmbeddings.supported_spaces()),
+            "is_legacy": CorpusAutoGenEmbeddings.is_legacy(),
+        }
+
     def __init__(
         self,
         corpus_adapter: EmbeddingProtocolV1,
@@ -503,29 +582,6 @@ class CorpusAutoGenEmbeddings:
             self.autogen_config,
             self._framework_version,
         )
-
-    # ------------------------------------------------------------------ #
-    # ChromaDB compatibility surface
-    # ------------------------------------------------------------------ #
-
-    def name(self) -> str:
-        """
-        Return a unique name for this embedding function.
-
-        ChromaDB uses this to validate embedding function consistency
-        when reopening persisted collections.
-        """
-        return "corpus-autogen-embeddings"
-
-    def is_legacy(self) -> bool:
-        """
-        ChromaDB probes this as a callable in some versions.
-
-        Returning False indicates this embedding function is not a legacy wrapper.
-        (We still implement embed_query/embed_documents for compatibility with callers
-        that use the legacy-style interface.)
-        """
-        return False
 
     # ------------------------------------------------------------------ #
     # Resource management (context managers)
@@ -756,6 +812,11 @@ class CorpusAutoGenEmbeddings:
         - User calls: refuse to run inside an active event loop.
         - Chroma integration (explicitly enabled): allow inside an event loop by
           running async embedding in a worker thread and returning synchronously.
+
+        Performance/correctness note:
+        - Even in the event-loop bridge path, we delegate batching decisions to the
+          translator by passing the full list of texts. This preserves translator-level
+          efficiency optimizations and consistent behavior across call sites.
         """
         if not _is_running_event_loop():
             return self.embed_documents(list(input), autogen_context=None, model=None)
@@ -767,25 +828,18 @@ class CorpusAutoGenEmbeddings:
         texts = list(input)
 
         def _work() -> List[List[float]]:
-            # CHANGE #1 (directly tied to the 2 failing tests):
-            # AutoGen+Chroma can route list inputs to a batch path, bypassing adapter.embed().
-            # The tests monkeypatch adapter.embed() and expect it to be called.
-            # So, in this Chroma-in-event-loop bridge ONLY, embed unary to force adapter.embed().
-            async def _arun_unary() -> List[List[float]]:
+            async def _arun_batch() -> List[List[float]]:
                 core_ctx, framework_ctx = self._build_contexts(autogen_context=None, model=None)
-                out: List[List[float]] = []
-                for t in texts:
-                    translated = await self._translator.arun_embed(
-                        raw_texts=t,  # unary => forces adapter.embed() path
-                        op_ctx=core_ctx,
-                        framework_ctx=framework_ctx,
-                    )
-                    out.append(self._coerce_embedding_vector(translated))
-                if out:
-                    self._update_dim_hint(len(out[0]))
-                return out
+                translated = await self._translator.arun_embed(
+                    raw_texts=texts,  # preserve translator batching/caching/retry decisions
+                    op_ctx=core_ctx,
+                    framework_ctx=framework_ctx,
+                )
+                mat = self._coerce_embedding_matrix(translated)
+                self._update_dim_hint(self._infer_dim_from_matrix(mat))
+                return mat
 
-            return asyncio.run(_arun_unary())
+            return asyncio.run(_arun_batch())
 
         return _run_blocking_in_chroma_bridge_thread(_work)
 
@@ -920,28 +974,22 @@ class CorpusAutoGenEmbeddings:
                     return []  # pragma: no cover
 
                 def _work() -> List[List[float]]:
-                    # CHANGE #2 (directly tied to the 2 failing tests):
-                    # In AutoGen+Chroma query, embed_query(input=[...]) can route to batch,
-                    # bypassing adapter.embed(). Force unary embeddings here too.
-                    async def _arun_unary_query() -> List[List[float]]:
+                    async def _arun_batch_query() -> List[List[float]]:
                         core_ctx, framework_ctx = self._build_contexts(
                             autogen_context=autogen_context,
                             model=model,
                             **kwargs,
                         )
-                        out: List[List[float]] = []
-                        for t in texts_list:
-                            translated = await self._translator.arun_embed(
-                                raw_texts=t,  # unary => forces adapter.embed() path
-                                op_ctx=core_ctx,
-                                framework_ctx=framework_ctx,
-                            )
-                            out.append(self._coerce_embedding_vector(translated))
-                        if out:
-                            self._update_dim_hint(len(out[0]))
-                        return out
+                        translated = await self._translator.arun_embed(
+                            raw_texts=texts_list,  # preserve translator batching/caching/retry decisions
+                            op_ctx=core_ctx,
+                            framework_ctx=framework_ctx,
+                        )
+                        mat = self._coerce_embedding_matrix(translated)
+                        self._update_dim_hint(self._infer_dim_from_matrix(mat))
+                        return mat
 
-                    return asyncio.run(_arun_unary_query())
+                    return asyncio.run(_arun_batch_query())
 
                 return _run_blocking_in_chroma_bridge_thread(_work)
 
