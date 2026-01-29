@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import inspect
 from collections.abc import Mapping as ABCMapping
@@ -250,8 +251,42 @@ def _empty_text_behavior_is_acceptable(exc: BaseException) -> bool:
 
     We keep this conservative:
       - TypeError / ValueError are accepted as strict input validation signals.
+
+    Additionally:
+      - CORPUS SDK adapters may raise corpus_sdk.embedding.embedding_base.BadRequest with a
+        specific error code when empty/whitespace-only items would be dropped but alignment
+        must be preserved. This is also an explicit, deterministic validation signal and is
+        treated as acceptable strict behavior.
     """
-    return isinstance(exc, (TypeError, ValueError))
+    # Traditional strict validation surfaces
+    if isinstance(exc, (TypeError, ValueError)):
+        return True
+
+    # Accept CORPUS SDK BadRequest for the "empty texts in batch" contract case.
+    # We import lazily to keep the test file robust to environments where the SDK
+    # package layout differs (or where only some frameworks are installed).
+    try:
+        from corpus_sdk.embedding.embedding_base import BadRequest as CorpusBadRequest  # type: ignore
+    except Exception:
+        CorpusBadRequest = None  # type: ignore[assignment]
+
+    # Prefer code-based identification (stable) but fall back to string matching.
+    code = getattr(exc, "code", None)
+
+    if code == "BAD_BATCH_EMPTY_TEXTS":
+        return True
+
+    if CorpusBadRequest is not None and isinstance(exc, CorpusBadRequest):
+        # Some SDK builds may not expose code as an attribute consistently; keep this tolerant.
+        if getattr(exc, "code", None) == "BAD_BATCH_EMPTY_TEXTS":
+            return True
+        if "BAD_BATCH_EMPTY_TEXTS" in str(exc):
+            return True
+
+    if "BAD_BATCH_EMPTY_TEXTS" in str(exc):
+        return True
+
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -597,7 +632,13 @@ async def test_async_batch_shape_matches_sync_when_supported(
     texts = ["async-shape-a", "async-shape-b", "async-shape-c"]
 
     # Sync result
-    sync_result = _maybe_call_with_context(framework_descriptor, batch_fn, texts)
+    #
+    # IMPORTANT:
+    # Many framework adapters intentionally refuse calling sync APIs from within an
+    # active asyncio event loop to avoid deadlocks/hangs. Because this test itself
+    # is async, we compute the sync reference result in a worker thread.
+    sync_result = await asyncio.to_thread(_maybe_call_with_context, framework_descriptor, batch_fn, texts)
+
     _assert_embedding_matrix_shape(sync_result, expected_rows=len(texts))
     sync_dim = _first_nonempty_row_dim(sync_result)
     assert sync_dim is not None and sync_dim > 0, (
