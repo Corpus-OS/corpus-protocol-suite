@@ -229,7 +229,11 @@ def test_register_framework_descriptor() -> None:
         with pytest.raises(KeyError, match="already registered"):
             register_framework_descriptor(duplicate_desc, overwrite=False)
 
-        register_framework_descriptor(duplicate_desc, overwrite=True)
+        # The registry intentionally warns when overwriting an existing framework entry.
+        # This test asserts that the warning is emitted *and* that the overwrite succeeds.
+        with pytest.warns(RuntimeWarning, match=r"Framework 'test_framework' is being overwritten"):
+            register_framework_descriptor(duplicate_desc, overwrite=True)
+
         assert get_embedding_framework_descriptor("test_framework") is duplicate_desc
 
         # Smoke-check cache reset behavior via public probes (never raise).
