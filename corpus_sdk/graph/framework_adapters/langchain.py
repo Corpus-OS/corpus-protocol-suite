@@ -325,10 +325,10 @@ class LangChainGraphClientProtocol(Protocol):
 
     # Capabilities / schema / health -------------------------------------
 
-    def capabilities(self) -> Mapping[str, Any]:
+    def capabilities(self, **kwargs) -> Mapping[str, Any]:
         ...
 
-    async def acapabilities(self) -> Mapping[str, Any]:
+    async def acapabilities(self, **kwargs) -> Mapping[str, Any]:
         ...
 
     def get_schema(
@@ -932,7 +932,7 @@ class CorpusLangChainGraphClient:
     # ------------------------------------------------------------------ #
 
     @with_graph_error_context("capabilities_sync")
-    def capabilities(self) -> Mapping[str, Any]:
+    def capabilities(self, **kwargs) -> Mapping[str, Any]:
         """
         Sync wrapper around capabilities, delegating async→sync bridging
         to GraphTranslator.
@@ -942,7 +942,7 @@ class CorpusLangChainGraphClient:
         return graph_capabilities_to_dict(caps)
 
     @with_async_graph_error_context("capabilities_async")
-    async def acapabilities(self) -> Mapping[str, Any]:
+    async def acapabilities(self, **kwargs) -> Mapping[str, Any]:
         """
         Async capabilities accessor.
 
@@ -1073,7 +1073,7 @@ class CorpusLangChainGraphClient:
         Returns the underlying `QueryResult` from the GraphProtocol adapter.
         """
         _ensure_not_in_event_loop("query")
-        validate_graph_query(query)
+        validate_graph_query(query, operation="query", error_code="INVALID_QUERY")
         self._validate_query_params(params)
 
         ctx = self._build_ctx(config=config, extra_context=extra_context)
@@ -1120,7 +1120,7 @@ class CorpusLangChainGraphClient:
 
         Returns the underlying `QueryResult`.
         """
-        validate_graph_query(query)
+        validate_graph_query(query, operation="aquery", error_code="INVALID_QUERY")
         self._validate_query_params(params)
 
         ctx = self._build_ctx(config=config, extra_context=extra_context)
@@ -1174,7 +1174,7 @@ class CorpusLangChainGraphClient:
         any async→sync bridges directly.
         """
         _ensure_not_in_event_loop("stream_query")
-        validate_graph_query(query)
+        validate_graph_query(query, operation="stream_query", error_code="INVALID_QUERY")
         self._validate_query_params(params)
 
         ctx = self._build_ctx(config=config, extra_context=extra_context)
@@ -1218,7 +1218,7 @@ class CorpusLangChainGraphClient:
         """
         Execute a streaming graph query (async), yielding `QueryChunk` items.
         """
-        validate_graph_query(query)
+        validate_graph_query(query, operation="astream_query", error_code="INVALID_QUERY")
         self._validate_query_params(params)
 
         ctx = self._build_ctx(config=config, extra_context=extra_context)
@@ -1825,7 +1825,7 @@ class CorpusLangChainGraphClient:
         expected by GraphTranslator and returns the underlying `BatchResult`.
         """
         _ensure_not_in_event_loop("batch")
-        validate_batch_operations(self._graph, ops)
+        validate_batch_operations(ops, operation="batch", error_code="INVALID_BATCH_OPS")
 
         ctx = self._build_ctx(config=config, extra_context=extra_context)
 
@@ -1856,7 +1856,7 @@ class CorpusLangChainGraphClient:
         """
         Async wrapper for batch operations.
         """
-        validate_batch_operations(self._graph, ops)
+        validate_batch_operations(ops, operation="abatch", error_code="INVALID_BATCH_OPS")
 
         ctx = self._build_ctx(config=config, extra_context=extra_context)
 
