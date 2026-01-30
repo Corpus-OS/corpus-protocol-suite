@@ -309,8 +309,6 @@ Registry integrity and descriptor validation tests.
 - **Contract Tests**: Each framework is validated by 38 parametrized contract tests (190 total ÷ 5 = 38 per framework)
 - **Total Tests Validating**: Combined coverage showing how thoroughly each framework is tested
 
-**Why 418 total tests, not 404?**
-The 190 parametrized tests run across all 5 frameworks simultaneously, so they're counted once (not 5 times) in the total. The math: 228 framework-specific + 190 parametrized = **418 total**.
 
 ### Execution Time Breakdown
 
