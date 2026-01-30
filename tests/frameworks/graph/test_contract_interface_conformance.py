@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import asyncio
 import importlib
 import inspect
-from collections.abc import Mapping
+from collections.abc import AsyncIterable, Iterable, Mapping
 from typing import Any, Callable
 
 import pytest
@@ -25,6 +24,14 @@ ASYNC_QUERY_TEXT = "graph-async-query"
 ASYNC_STREAM_TEXT = "graph-async-stream"
 CONTEXT_QUERY_TEXT = "graph-context-query"
 
+# A "rich mapping context" that will be splatted as kwargs (mirrors other suites)
+RICH_CONTEXT: dict[str, Any] = {
+    "request_id": "req-123",
+    "user_id": "user-abc",
+    "tags": ["test"],
+    "nested": {"depth": 2, "key": "value"},
+}
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -41,9 +48,8 @@ def framework_descriptor_fixture(
     """
     Parameterized over all registered graph framework descriptors.
 
-    Frameworks that are not actually available in the environment (e.g. the
-    underlying LangChain / LlamaIndex / Semantic Kernel libraries are missing)
-    are skipped via descriptor.is_available().
+    Frameworks that are not actually available in the environment are skipped
+    via descriptor.is_available().
     """
     descriptor: GraphFrameworkDescriptor = request.param
     if not descriptor.is_available():
@@ -58,24 +64,21 @@ def graph_client_instance(
 ) -> Any:
     """
     Construct a concrete graph client instance for the given descriptor.
-
-    This uses the registry metadata to import the client class and instantiate
-    it with the *generic* Corpus graph adapter provided by the top-level pytest
-    plugin (see conftest.py).
-
-    The client class is expected to wrap a GraphProtocolV1 implementation.
     """
-    module = importlib.import_module(framework_descriptor.adapter_module)
+    try:
+        module = importlib.import_module(framework_descriptor.adapter_module)
+    except SyntaxError as e:
+        pytest.fail(
+            f"Adapter module failed to import for {framework_descriptor.name!r}: "
+            f"SyntaxError at line {e.lineno}: {e.msg}\n"
+            f"Text: {e.text!r}",
+            pytrace=True,
+        )
+
     client_cls = getattr(module, framework_descriptor.adapter_class)
 
-    # All graph framework adapters take a adapter implementing the
-    # GraphProtocolV1 surface. The global `adapter` fixture is pluggable.
     init_kwargs: dict[str, Any] = {"adapter": adapter}
-
-    # Additional framework-specific kwargs can be added here if needed.
-
-    instance = client_cls(**init_kwargs)
-    return instance
+    return client_cls(**init_kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -84,30 +87,77 @@ def graph_client_instance(
 
 
 def _get_method(instance: Any, name: str | None) -> Callable[..., Any]:
-    """
-    Helper to fetch a method from the instance and assert it is callable.
-
-    If name is None, this fails fast with a clear assertion message.
-    """
     assert name, "Expected a non-empty method name"
     attr = getattr(instance, name, None)
     assert callable(attr), f"{instance!r} missing expected callable method {name!r}"
     return attr
 
 
-def _run_async_if_needed(coro: Any) -> Any:
-    """
-    Run an async coroutine, handling existing event loops gracefully.
+def _get_unbound_method(owner: type, name: str) -> Callable[..., Any]:
+    attr = getattr(owner, name, None)
+    assert callable(attr), f"{owner!r} missing expected callable method {name!r}"
+    return attr
 
-    Used for optional async surfaces (e.g. acapabilities/ahealth) in tests
-    that are not themselves marked async.
+
+def _context_kwargs_for_descriptor(framework_descriptor: GraphFrameworkDescriptor) -> dict[str, Any]:
     """
-    try:
-        return asyncio.run(coro)
-    except RuntimeError:
-        # Fall back to the current event loop if one is already running.
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(coro)
+    Build kwargs reflecting the framework's declared context parameter.
+    
+    Returns a dict with a single key (the framework's context_kwarg) containing
+    the rich context mapping, or an empty dict if no context_kwarg is declared.
+    """
+    kw: dict[str, Any] = {}
+
+    if framework_descriptor.context_kwarg:
+        # Build a rich context with test data plus framework tag
+        ctx = dict(RICH_CONTEXT)
+        try:
+            tags = list(ctx.get("tags", []))
+            tags.append(framework_descriptor.name)
+            ctx["tags"] = tags
+        except Exception:
+            pass
+        # Pass the entire context under the framework-specific kwarg
+        kw[framework_descriptor.context_kwarg] = ctx
+
+    return kw
+
+
+def _call_with_minimal_args(
+    fn: Callable[..., Any],
+    *,
+    kind: str,
+    text: str,
+    framework_descriptor: GraphFrameworkDescriptor,
+) -> Any:
+    from corpus_sdk.graph.graph_base import BulkVerticesSpec, BatchOperation
+    
+    kw = _context_kwargs_for_descriptor(framework_descriptor)
+
+    if kind in {"query", "stream", "async_query", "async_stream"}:
+        return fn(text, **kw)
+
+    if kind == "bulk":
+        # bulk_vertices expects a BulkVerticesSpec, not a list
+        spec = BulkVerticesSpec(namespace="test", limit=10)
+        return fn(spec, **kw)
+
+    if kind == "batch":
+        # batch expects a list of BatchOperation
+        ops = [BatchOperation(op="test", args={})]
+        return fn(ops, **kw)
+
+    if kind in {"capabilities", "health"}:
+        return fn(**kw)
+
+    raise AssertionError(f"Unknown call kind: {kind!r}")
+
+
+def _params_list(sig: inspect.Signature) -> list[inspect.Parameter]:
+    params = list(sig.parameters.values())
+    if params and params[0].name == "self":
+        return params[1:]
+    return params
 
 
 # ---------------------------------------------------------------------------
@@ -119,107 +169,53 @@ def test_can_instantiate_graph_client(
     framework_descriptor: GraphFrameworkDescriptor,
     graph_client_instance: Any,
 ) -> None:
-    """
-    Each registered framework descriptor should be instantiable with the
-    pluggable Corpus graph adapter and any inferred kwargs.
-
-    Sanity-check that the instance exposes the methods the descriptor claims.
-    """
-    # Required sync query method
     _get_method(graph_client_instance, framework_descriptor.query_method)
 
-    # Optional sync streaming
     if framework_descriptor.stream_query_method:
         _get_method(graph_client_instance, framework_descriptor.stream_query_method)
 
-    # Optional bulk / batch methods (when support flags are declared)
     if framework_descriptor.supports_bulk_vertices:
-        assert (
-            framework_descriptor.bulk_vertices_method is not None
-        ), f"{framework_descriptor.name}: supports_bulk_vertices=True but bulk_vertices_method is None"
+        assert framework_descriptor.bulk_vertices_method is not None, (
+            f"{framework_descriptor.name}: supports_bulk_vertices=True "
+            f"but bulk_vertices_method is None"
+        )
         _get_method(graph_client_instance, framework_descriptor.bulk_vertices_method)
 
     if framework_descriptor.supports_batch:
-        assert (
-            framework_descriptor.batch_method is not None
-        ), f"{framework_descriptor.name}: supports_batch=True but batch_method is None"
+        assert framework_descriptor.batch_method is not None, (
+            f"{framework_descriptor.name}: supports_batch=True but batch_method is None"
+        )
         _get_method(graph_client_instance, framework_descriptor.batch_method)
 
-    # Async surfaces (if any async declared)
     if framework_descriptor.supports_async:
-        # Registry policy: if supports_async=True then async_query_method and
-        # async_stream_query_method must both be non-None.
-        assert (
-            framework_descriptor.async_query_method is not None
-        ), f"{framework_descriptor.name}: supports_async=True but async_query_method is None"
-        assert (
-            framework_descriptor.async_stream_query_method is not None
-        ), f"{framework_descriptor.name}: supports_async=True but async_stream_query_method is None"
+        assert framework_descriptor.async_query_method is not None, (
+            f"{framework_descriptor.name}: supports_async=True but async_query_method is None"
+        )
+        assert framework_descriptor.async_stream_query_method is not None, (
+            f"{framework_descriptor.name}: supports_async=True but async_stream_query_method is None"
+        )
 
         _get_method(graph_client_instance, framework_descriptor.async_query_method)
         _get_method(graph_client_instance, framework_descriptor.async_stream_query_method)
 
-        # Optional async bulk/batch surfaces
         if framework_descriptor.async_bulk_vertices_method:
-            _get_method(
-                graph_client_instance,
-                framework_descriptor.async_bulk_vertices_method,
-            )
+            _get_method(graph_client_instance, framework_descriptor.async_bulk_vertices_method)
 
         if framework_descriptor.async_batch_method:
             _get_method(graph_client_instance, framework_descriptor.async_batch_method)
-
-
-def test_async_methods_exist_when_supports_async_true(
-    framework_descriptor: GraphFrameworkDescriptor,
-    graph_client_instance: Any,
-) -> None:
-    """
-    Ensure that when supports_async=True, async query & stream methods exist.
-
-    This mirrors the stricter policy enforced by the registry tests:
-    if async support is declared, both async query and async stream surfaces
-    must be present and callable.
-    """
-    if not framework_descriptor.supports_async:
-        pytest.skip("Framework does not declare async support")
-
-    # Registry promises these are non-None when supports_async is True
-    assert framework_descriptor.async_query_method is not None
-    assert framework_descriptor.async_stream_query_method is not None
-
-    aquery = getattr(
-        graph_client_instance,
-        framework_descriptor.async_query_method,
-        None,
-    )
-    astream = getattr(
-        graph_client_instance,
-        framework_descriptor.async_stream_query_method,
-        None,
-    )
-
-    assert callable(aquery), "Async query method is not callable"
-    assert callable(astream), "Async stream method is not callable"
 
 
 def test_sync_query_interface_conformance(
     framework_descriptor: GraphFrameworkDescriptor,
     graph_client_instance: Any,
 ) -> None:
-    """
-    Validate that the sync query method accepts a simple text input and
-    returns some non-None result.
-
-    Detailed QueryResult shape is covered by separate shape/batching tests.
-    """
     query_fn = _get_method(graph_client_instance, framework_descriptor.query_method)
-
-    if framework_descriptor.context_kwarg:
-        result = query_fn(SYNC_QUERY_TEXT, **{framework_descriptor.context_kwarg: {}})
-    else:
-        result = query_fn(SYNC_QUERY_TEXT)
-
+    result = _call_with_minimal_args(
+        query_fn,
+        kind="query",
+        text=SYNC_QUERY_TEXT,
+        framework_descriptor=framework_descriptor,
+    )
     assert result is not None
 
 
@@ -227,39 +223,23 @@ def test_sync_streaming_interface_when_declared(
     framework_descriptor: GraphFrameworkDescriptor,
     graph_client_instance: Any,
 ) -> None:
-    """
-    Validate that the sync streaming method (when declared) accepts a text
-    input and returns an iterable of chunks.
-
-    We don't assert detailed chunk shape here; that's covered elsewhere.
-    """
     if not framework_descriptor.stream_query_method:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare sync streaming",
-        )
+        pytest.skip(f"Framework '{framework_descriptor.name}' does not declare sync streaming")
 
-    stream_fn = _get_method(
-        graph_client_instance,
-        framework_descriptor.stream_query_method,
+    stream_fn = _get_method(graph_client_instance, framework_descriptor.stream_query_method)
+
+    iterator = _call_with_minimal_args(
+        stream_fn,
+        kind="stream",
+        text=SYNC_STREAM_TEXT,
+        framework_descriptor=framework_descriptor,
     )
 
-    if framework_descriptor.context_kwarg:
-        iterator = stream_fn(
-            SYNC_STREAM_TEXT,
-            **{framework_descriptor.context_kwarg: {}},
-        )
-    else:
-        iterator = stream_fn(SYNC_STREAM_TEXT)
-
-    # At minimum, the returned object must be iterable.
-    seen_any = False
-    for _ in iterator:  # noqa: B007
-        seen_any = True
-        break
-
-    # It's fine if no chunks are produced; the contract is about iterability.
     assert iterator is not None
-    assert isinstance(seen_any, bool)
+    assert isinstance(iterator, Iterable), "Sync stream must return an iterable"
+
+    for _ in iterator:  # noqa: B007
+        break
 
 
 @pytest.mark.asyncio
@@ -267,28 +247,17 @@ async def test_async_query_interface_conformance_when_supported(
     framework_descriptor: GraphFrameworkDescriptor,
     graph_client_instance: Any,
 ) -> None:
-    """
-    Validate that the async query method (when declared) accepts text input
-    and returns a result compatible with the sync API (non-None).
-    """
     if not framework_descriptor.async_query_method:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare async query",
-        )
+        pytest.skip(f"Framework '{framework_descriptor.name}' does not declare async query")
 
-    aquery_fn = _get_method(
-        graph_client_instance,
-        framework_descriptor.async_query_method,
+    aquery_fn = _get_method(graph_client_instance, framework_descriptor.async_query_method)
+
+    coro = _call_with_minimal_args(
+        aquery_fn,
+        kind="async_query",
+        text=ASYNC_QUERY_TEXT,
+        framework_descriptor=framework_descriptor,
     )
-
-    if framework_descriptor.context_kwarg:
-        coro = aquery_fn(
-            ASYNC_QUERY_TEXT,
-            **{framework_descriptor.context_kwarg: {}},
-        )
-    else:
-        coro = aquery_fn(ASYNC_QUERY_TEXT)
-
     assert inspect.isawaitable(coro), "Async query method must return an awaitable"
 
     result = await coro
@@ -300,194 +269,255 @@ async def test_async_streaming_interface_conformance_when_supported(
     framework_descriptor: GraphFrameworkDescriptor,
     graph_client_instance: Any,
 ) -> None:
-    """
-    Validate that the async streaming method (when declared) accepts text input
-    and produces an async-iterable of chunks.
-
-    The returned object may be an async iterator directly, or an awaitable
-    that resolves to one (mirroring the error-context tests).
-    """
     if not framework_descriptor.async_stream_query_method:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare async streaming",
-        )
+        pytest.skip(f"Framework '{framework_descriptor.name}' does not declare async streaming")
 
-    astream_fn = _get_method(
-        graph_client_instance,
-        framework_descriptor.async_stream_query_method,
+    astream_fn = _get_method(graph_client_instance, framework_descriptor.async_stream_query_method)
+
+    aiter = _call_with_minimal_args(
+        astream_fn,
+        kind="async_stream",
+        text=ASYNC_STREAM_TEXT,
+        framework_descriptor=framework_descriptor,
     )
 
-    if framework_descriptor.context_kwarg:
-        aiter = astream_fn(
-            ASYNC_STREAM_TEXT,
-            **{framework_descriptor.context_kwarg: {}},
-        )
-    else:
-        aiter = astream_fn(ASYNC_STREAM_TEXT)
-
-    # Allow both: awaitable -> async iterator, or async iterator directly.
     if inspect.isawaitable(aiter):
         aiter = await aiter  # type: ignore[assignment]
 
-    # Consume at most one chunk to validate async-iterability.
-    seen_any = False
+    assert isinstance(aiter, AsyncIterable), "Async stream must yield an async-iterable"
+
     async for _ in aiter:  # noqa: B007
-        seen_any = True
         break
 
-    assert isinstance(seen_any, bool)
 
-
-def test_context_kwarg_is_accepted_when_declared(
+def test_context_kwarg_is_accepted_when_declared_on_primary_query(
     framework_descriptor: GraphFrameworkDescriptor,
     graph_client_instance: Any,
 ) -> None:
-    """
-    If a context_kwarg is declared in the descriptor, the corresponding
-    query method should accept that kwarg without raising TypeError.
-    """
     if not framework_descriptor.context_kwarg:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare a context_kwarg",
-        )
-
-    ctx_kw = framework_descriptor.context_kwarg
+        pytest.skip(f"Framework '{framework_descriptor.name}' does not declare a context_kwarg")
 
     query_fn = _get_method(graph_client_instance, framework_descriptor.query_method)
-
-    # Should not raise TypeError
-    result = query_fn(CONTEXT_QUERY_TEXT, **{ctx_kw: {"test": "value"}})
+    result = query_fn(
+        CONTEXT_QUERY_TEXT,
+        **_context_kwargs_for_descriptor(framework_descriptor),
+    )
     assert result is not None
+
+
+def test_bulk_and_batch_methods_are_callable_when_declared(
+    framework_descriptor: GraphFrameworkDescriptor,
+    graph_client_instance: Any,
+) -> None:
+    if framework_descriptor.supports_bulk_vertices and framework_descriptor.bulk_vertices_method:
+        bulk_fn = _get_method(graph_client_instance, framework_descriptor.bulk_vertices_method)
+        _call_with_minimal_args(
+            bulk_fn,
+            kind="bulk",
+            text="",
+            framework_descriptor=framework_descriptor,
+        )
+
+    if framework_descriptor.supports_batch and framework_descriptor.batch_method:
+        batch_fn = _get_method(graph_client_instance, framework_descriptor.batch_method)
+        _call_with_minimal_args(
+            batch_fn,
+            kind="batch",
+            text="",
+            framework_descriptor=framework_descriptor,
+        )
+
+
+@pytest.mark.asyncio
+async def test_async_bulk_and_batch_methods_are_awaitable_when_declared(
+    framework_descriptor: GraphFrameworkDescriptor,
+    graph_client_instance: Any,
+) -> None:
+    if framework_descriptor.async_bulk_vertices_method:
+        abulk_fn = _get_method(graph_client_instance, framework_descriptor.async_bulk_vertices_method)
+        coro = _call_with_minimal_args(
+            abulk_fn,
+            kind="bulk",
+            text="",
+            framework_descriptor=framework_descriptor,
+        )
+        assert inspect.isawaitable(coro)
+        await coro
+
+    if framework_descriptor.async_batch_method:
+        abatch_fn = _get_method(graph_client_instance, framework_descriptor.async_batch_method)
+        coro = _call_with_minimal_args(
+            abatch_fn,
+            kind="batch",
+            text="",
+            framework_descriptor=framework_descriptor,
+        )
+        assert inspect.isawaitable(coro)
+        await coro
 
 
 def test_method_signatures_consistent_between_sync_and_async(
     framework_descriptor: GraphFrameworkDescriptor,
     graph_client_instance: Any,
 ) -> None:
-    """
-    Verify that sync and async methods have consistent signatures
-    (same parameters except maybe the return annotation), where both
-    variants are declared.
-
-    This covers query, stream, bulk_vertices, and batch surfaces.
-    """
+    owner = type(graph_client_instance)
 
     def _compare_signatures(sync_name: str | None, async_name: str | None) -> None:
         if not sync_name or not async_name:
             return
 
-        sync_fn = _get_method(graph_client_instance, sync_name)
-        async_fn = _get_method(graph_client_instance, async_name)
+        sync_unbound = _get_unbound_method(owner, sync_name)
+        async_unbound = _get_unbound_method(owner, async_name)
 
-        sync_sig = inspect.signature(sync_fn)
-        async_sig = inspect.signature(async_fn)
+        sync_sig = inspect.signature(sync_unbound)
+        async_sig = inspect.signature(async_unbound)
 
-        # Skip "self" for bound methods
-        sync_params = list(sync_sig.parameters.keys())[1:]
-        async_params = list(async_sig.parameters.keys())[1:]
+        sync_params = _params_list(sync_sig)
+        async_params = _params_list(async_sig)
 
-        assert (
-            sync_params == async_params
-        ), f"Signature mismatch between {sync_name!r} and {async_name!r}"
+        sync_view = [(p.name, p.kind) for p in sync_params]
+        async_view = [(p.name, p.kind) for p in async_params]
 
-    # Query
-    _compare_signatures(
-        framework_descriptor.query_method,
-        framework_descriptor.async_query_method,
-    )
+        assert sync_view == async_view, (
+            f"Signature mismatch between {sync_name!r} and {async_name!r}: "
+            f"{sync_view} != {async_view}"
+        )
 
-    # Streaming
-    _compare_signatures(
-        framework_descriptor.stream_query_method,
-        framework_descriptor.async_stream_query_method,
-    )
-
-    # Bulk vertices
-    _compare_signatures(
-        framework_descriptor.bulk_vertices_method,
-        framework_descriptor.async_bulk_vertices_method,
-    )
-
-    # Batch
-    _compare_signatures(
-        framework_descriptor.batch_method,
-        framework_descriptor.async_batch_method,
-    )
+    _compare_signatures(framework_descriptor.query_method, framework_descriptor.async_query_method)
+    _compare_signatures(framework_descriptor.stream_query_method, framework_descriptor.async_stream_query_method)
+    _compare_signatures(framework_descriptor.bulk_vertices_method, framework_descriptor.async_bulk_vertices_method)
+    _compare_signatures(framework_descriptor.batch_method, framework_descriptor.async_batch_method)
 
 
 # ---------------------------------------------------------------------------
-# Capabilities / health passthrough contract
+# Capabilities / health passthrough contract (NO SKIPS)
 # ---------------------------------------------------------------------------
 
 
-def test_capabilities_contract_if_declared(
+def test_capabilities_contract_matches_registry_flag(
     framework_descriptor: GraphFrameworkDescriptor,
     graph_client_instance: Any,
 ) -> None:
     """
-    If a framework declares has_capabilities=True, it should expose a
-    capabilities() method returning a mapping. Async variants (when present)
-    should behave similarly.
+    NO SKIPS:
+      - If has_capabilities=True -> capabilities() must exist and return Mapping.
+      - If has_capabilities=False -> capabilities() must NOT exist (or must not be callable).
+        (If it exists, registry is wrong; force a failure so it gets fixed.)
     """
-    if not framework_descriptor.has_capabilities:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not expose capabilities",
-        )
-
-    # Sync capabilities
     capabilities = getattr(graph_client_instance, "capabilities", None)
-    assert callable(capabilities), "capabilities() method is missing"
 
-    caps_result = capabilities()
-    assert isinstance(
-        caps_result,
-        Mapping,
-    ), "capabilities() should return a mapping"
+    if framework_descriptor.has_capabilities:
+        assert callable(capabilities), "Registry says has_capabilities=True but capabilities() is missing"
+        caps_result = _call_with_minimal_args(
+            capabilities,
+            kind="capabilities",
+            text="",
+            framework_descriptor=framework_descriptor,
+        )
+        assert isinstance(caps_result, Mapping), "capabilities() should return a Mapping"
 
-    # Async capabilities (best-effort)
-    async_caps = getattr(graph_client_instance, "acapabilities", None)
-    if async_caps is not None and callable(async_caps):
-        acaps_result = _run_async_if_needed(async_caps())
-        assert isinstance(
-            acaps_result,
-            Mapping,
-        ), "acapabilities() should return a mapping"
+        # Async variant is optional, but if present it must behave correctly
+        async_caps = getattr(graph_client_instance, "acapabilities", None)
+        if async_caps is not None:
+            assert callable(async_caps), "acapabilities exists but is not callable"
+    else:
+        assert not callable(capabilities), (
+            "Registry says has_capabilities=False but capabilities() exists/callable; "
+            "either remove the method or flip has_capabilities=True in the registry"
+        )
+        # If async variant exists while flag is false, that's also inconsistent
+        async_caps = getattr(graph_client_instance, "acapabilities", None)
+        assert not callable(async_caps), (
+            "Registry says has_capabilities=False but acapabilities() exists/callable; "
+            "either remove it or flip has_capabilities=True"
+        )
 
 
-def test_health_contract_if_declared(
+@pytest.mark.asyncio
+async def test_async_capabilities_returns_mapping_if_present(
     framework_descriptor: GraphFrameworkDescriptor,
     graph_client_instance: Any,
 ) -> None:
     """
-    If a framework declares has_health=True, it should expose a health()
-    method returning a mapping. Async variants (when present) should behave
-    similarly.
+    NO SKIPS:
+      - If acapabilities() exists, it must return Mapping.
+      - If it does not exist, test passes (async variant is optional).
     """
-    if not framework_descriptor.has_health:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not expose health",
+    async_caps = getattr(graph_client_instance, "acapabilities", None)
+    if not callable(async_caps):
+        return
+
+    coro = _call_with_minimal_args(
+        async_caps,
+        kind="capabilities",
+        text="",
+        framework_descriptor=framework_descriptor,
+    )
+    assert inspect.isawaitable(coro)
+    result = await coro
+    assert isinstance(result, Mapping), "acapabilities() should return a Mapping"
+
+
+def test_health_contract_matches_registry_flag(
+    framework_descriptor: GraphFrameworkDescriptor,
+    graph_client_instance: Any,
+) -> None:
+    """
+    NO SKIPS:
+      - If has_health=True -> health() must exist and return Mapping.
+      - If has_health=False -> health() must NOT exist (or must not be callable).
+    """
+    health = getattr(graph_client_instance, "health", None)
+
+    if framework_descriptor.has_health:
+        assert callable(health), "Registry says has_health=True but health() is missing"
+        health_result = _call_with_minimal_args(
+            health,
+            kind="health",
+            text="",
+            framework_descriptor=framework_descriptor,
+        )
+        assert isinstance(health_result, Mapping), "health() should return a Mapping"
+
+        async_health = getattr(graph_client_instance, "ahealth", None)
+        if async_health is not None:
+            assert callable(async_health), "ahealth exists but is not callable"
+    else:
+        assert not callable(health), (
+            "Registry says has_health=False but health() exists/callable; "
+            "either remove the method or flip has_health=True in the registry"
+        )
+        async_health = getattr(graph_client_instance, "ahealth", None)
+        assert not callable(async_health), (
+            "Registry says has_health=False but ahealth() exists/callable; "
+            "either remove it or flip has_health=True"
         )
 
-    # Sync health
-    health = getattr(graph_client_instance, "health", None)
-    assert callable(health), "health() method is missing"
 
-    health_result = health()
-    assert isinstance(
-        health_result,
-        Mapping,
-    ), "health() should return a mapping"
-
-    # Async health (best-effort)
+@pytest.mark.asyncio
+async def test_async_health_returns_mapping_if_present(
+    framework_descriptor: GraphFrameworkDescriptor,
+    graph_client_instance: Any,
+) -> None:
+    """
+    NO SKIPS:
+      - If ahealth() exists, it must return Mapping.
+      - If it does not exist, test passes (async variant is optional).
+    """
     async_health = getattr(graph_client_instance, "ahealth", None)
-    if async_health is not None and callable(async_health):
-        ahealth_result = _run_async_if_needed(async_health())
-        assert isinstance(
-            ahealth_result,
-            Mapping,
-        ), "ahealth() should return a mapping"
+    if not callable(async_health):
+        return
+
+    coro = _call_with_minimal_args(
+        async_health,
+        kind="health",
+        text="",
+        framework_descriptor=framework_descriptor,
+    )
+    assert inspect.isawaitable(coro)
+    result = await coro
+    assert isinstance(result, Mapping), "ahealth() should return a Mapping"
 
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
-
