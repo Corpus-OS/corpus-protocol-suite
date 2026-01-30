@@ -117,8 +117,8 @@ class ErrorCodes:
     BAD_DELETE_RESULT = "BAD_DELETE_RESULT"
     BAD_BULK_VERTICES_RESULT = "BAD_BULK_VERTICES_RESULT"
     BAD_TRAVERSAL_RESULT = "BAD_TRAVERSAL_RESULT"
-    BAD_TRANSACTION_RESULT = "BAD_TRANSACTION_RESULT"
     BAD_BATCH_RESULT = "BAD_BATCH_RESULT"
+    BAD_TRANSACTION_RESULT = "BAD_TRANSACTION_RESULT"
     BAD_ADAPTER_RESULT = "BAD_ADAPTER_RESULT"
     SYNC_WRAPPER_CALLED_IN_EVENT_LOOP = "SYNC_WRAPPER_CALLED_IN_EVENT_LOOP"
 
@@ -271,24 +271,6 @@ class LlamaIndexGraphFrameworkTranslator(DefaultGraphFrameworkTranslator):
     ) -> BatchResult:
         return result
 
-    def translate_transaction_result(
-        self,
-        result: BatchResult,
-        *,
-        op_ctx: OperationContext,
-        framework_ctx: Optional[Mapping[str, Any]] = None,
-    ) -> BatchResult:
-        return result
-
-    def translate_traversal_result(
-        self,
-        result: TraversalResult,
-        *,
-        op_ctx: OperationContext,
-        framework_ctx: Optional[Mapping[str, Any]] = None,
-    ) -> TraversalResult:
-        return result
-
     def translate_schema(
         self,
         schema: GraphSchema,
@@ -310,7 +292,7 @@ class LlamaIndexGraphClientProtocol(Protocol):
 
     # Capabilities / schema / health -------------------------------------
 
-    def capabilities(self) -> Mapping[str, Any]:
+    def capabilities(self, **kwargs) -> Mapping[str, Any]:
         ...
 
     async def acapabilities(self) -> Mapping[str, Any]:
@@ -559,9 +541,16 @@ class CorpusLlamaIndexGraphClient:
         Parameters
         ----------
         adapter:
-            Underlying `GraphProtocolV1` implementation (preferred parameter name).
+            Underlying `GraphProtocolV1` implementation. This is the preferred
+            parameter name for new callers.
+
         graph_adapter:
-            Alternate name for `adapter`. Provide only one of `adapter` or `graph_adapter`.
+            Backwards-compatible alias for `adapter`. If both `adapter` and
+            `graph_adapter` are provided, they must refer to the same object.
+        graph_adapter:
+            Backwards-compatible alias for `adapter`. If both `adapter` and
+            `graph_adapter` are provided, they must refer to the same object.
+
         default_dialect:
             Optional default query dialect to use when none is provided per call.
         default_namespace:
@@ -575,7 +564,8 @@ class CorpusLlamaIndexGraphClient:
             Optional `GraphFrameworkTranslator` implementation. If not provided,
             `LlamaIndexGraphFrameworkTranslator` is used by default.
         """
-        if adapter is not None and graph_adapter is not None:
+        # Resolving adapter / graph_adapter with basic duck-typed validation.
+        if graph_adapter is not None and adapter is not None and graph_adapter is not adapter:
             raise TypeError("Provide only one of 'adapter' or 'graph_adapter', not both")
 
         resolved_adapter: Any = graph_adapter if graph_adapter is not None else adapter
@@ -909,7 +899,7 @@ class CorpusLlamaIndexGraphClient:
     # ------------------------------------------------------------------ #
 
     @with_graph_error_context("capabilities_sync")
-    def capabilities(self) -> Mapping[str, Any]:
+    def capabilities(self, **kwargs) -> Mapping[str, Any]:
         """
         Sync wrapper around capabilities, delegating async→sync bridging
         to GraphTranslator.
@@ -919,7 +909,7 @@ class CorpusLlamaIndexGraphClient:
         return graph_capabilities_to_dict(caps)
 
     @with_async_graph_error_context("capabilities_async")
-    async def acapabilities(self) -> Mapping[str, Any]:
+    async def acapabilities(self, **kwargs: Any) -> Mapping[str, Any]:
         """
         Async capabilities accessor.
 
@@ -1062,7 +1052,7 @@ class CorpusLlamaIndexGraphClient:
         Returns the underlying `QueryResult` from the GraphProtocol adapter.
         """
         _ensure_not_in_event_loop("query")
-        validate_graph_query(query)
+        validate_graph_query(query, operation="query", error_code="INVALID_QUERY")
 
         ctx = self._build_ctx(
             callback_manager=callback_manager,
@@ -1111,7 +1101,7 @@ class CorpusLlamaIndexGraphClient:
 
         Returns the underlying `QueryResult`.
         """
-        validate_graph_query(query)
+        validate_graph_query(query, operation="aquery", error_code="INVALID_QUERY")
 
         ctx = self._build_ctx(
             callback_manager=callback_manager,
@@ -1167,7 +1157,7 @@ class CorpusLlamaIndexGraphClient:
         any async→sync bridges directly.
         """
         _ensure_not_in_event_loop("stream_query")
-        validate_graph_query(query)
+        validate_graph_query(query, operation="stream_query", error_code="INVALID_QUERY")
 
         ctx = self._build_ctx(
             callback_manager=callback_manager,
@@ -1213,7 +1203,7 @@ class CorpusLlamaIndexGraphClient:
         """
         Execute a streaming graph query (async), yielding `QueryChunk` items.
         """
-        validate_graph_query(query)
+        validate_graph_query(query, operation="astream_query", error_code="INVALID_QUERY")
 
         ctx = self._build_ctx(
             callback_manager=callback_manager,
@@ -1704,12 +1694,7 @@ class CorpusLlamaIndexGraphClient:
             op_ctx=ctx,
             framework_ctx=framework_ctx,
         )
-        return validate_graph_result_type(
-            result,
-            expected_type=TraversalResult,
-            operation="GraphTranslator.traversal",
-            error_code=ErrorCodes.BAD_TRAVERSAL_RESULT,
-        )
+        return result
 
     @with_async_graph_error_context("traversal_async")
     async def atraversal(
@@ -1748,90 +1733,7 @@ class CorpusLlamaIndexGraphClient:
             op_ctx=ctx,
             framework_ctx=framework_ctx,
         )
-        return validate_graph_result_type(
-            result,
-            expected_type=TraversalResult,
-            operation="GraphTranslator.arun_traversal",
-            error_code=ErrorCodes.BAD_TRAVERSAL_RESULT,
-        )
-
-    # ------------------------------------------------------------------ #
-    # Transaction + Batch (sync + async)
-    # ------------------------------------------------------------------ #
-
-    @with_graph_error_context("transaction_sync")
-    def transaction(
-        self,
-        ops: List[BatchOperation],
-        *,
-        callback_manager: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> BatchResult:
-        """
-        Sync wrapper for transactional batch operations.
-
-        Translates `BatchOperation` dataclasses into the raw mapping shape
-        expected by GraphTranslator and returns the underlying `BatchResult`.
-        """
-        _ensure_not_in_event_loop("transaction")
-
-        # Reuse batch validation; semantics are still a list of BatchOperation.
-        validate_batch_operations(ops, operation="transaction", error_code="INVALID_BATCH_OPS")
-
-        ctx = self._build_ctx(
-            callback_manager=callback_manager,
-            extra_context=extra_context,
-        )
-
-        raw_ops: List[Mapping[str, Any]] = [
-            {"op": op.op, "args": dict(op.args or {})} for op in ops
-        ]
-
-        result = self._translator.transaction(
-            raw_ops,
-            op_ctx=ctx,
-            framework_ctx=self._framework_ctx(operation="transaction"),
-        )
-        return validate_graph_result_type(
-            result,
-            expected_type=BatchResult,
-            operation="GraphTranslator.transaction",
-            error_code=ErrorCodes.BAD_TRANSACTION_RESULT,
-        )
-
-    @with_async_graph_error_context("transaction_async")
-    async def atransaction(
-        self,
-        ops: List[BatchOperation],
-        *,
-        callback_manager: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> BatchResult:
-        """
-        Async wrapper for transactional batch operations.
-        """
-        validate_batch_operations(ops, operation="atransaction", error_code="INVALID_BATCH_OPS")
-
-        ctx = self._build_ctx(
-            callback_manager=callback_manager,
-            extra_context=extra_context,
-        )
-
-        raw_ops: List[Mapping[str, Any]] = [
-            {"op": op.op, "args": dict(op.args or {})} for op in ops
-        ]
-
-        result = await self._translator.arun_transaction(
-            raw_ops,
-            op_ctx=ctx,
-            framework_ctx=self._framework_ctx(operation="transaction"),
-        )
-        return validate_graph_result_type(
-            result,
-            expected_type=BatchResult,
-            operation="GraphTranslator.arun_transaction",
-            error_code=ErrorCodes.BAD_TRANSACTION_RESULT,
-        )
+        return result
 
     # ------------------------------------------------------------------ #
     # Batch (sync + async)
@@ -1852,7 +1754,7 @@ class CorpusLlamaIndexGraphClient:
         expected by GraphTranslator and returns the underlying `BatchResult`.
         """
         _ensure_not_in_event_loop("batch")
-        validate_batch_operations(self._graph, ops)
+        validate_batch_operations(ops, operation="batch", error_code="INVALID_BATCH_OPS")
 
         ctx = self._build_ctx(
             callback_manager=callback_manager,
@@ -1886,7 +1788,7 @@ class CorpusLlamaIndexGraphClient:
         """
         Async wrapper for batch operations.
         """
-        validate_batch_operations(self._graph, ops)
+        validate_batch_operations(ops, operation="batch", error_code="INVALID_BATCH_OPS")
 
         ctx = self._build_ctx(
             callback_manager=callback_manager,
@@ -1908,6 +1810,72 @@ class CorpusLlamaIndexGraphClient:
             operation="GraphTranslator.arun_batch",
             error_code=ErrorCodes.BAD_BATCH_RESULT,
         )
+
+    # ------------------------------------------------------------------ #
+    # Transaction (sync + async)
+    # ------------------------------------------------------------------ #
+
+    @with_graph_error_context("transaction_sync")
+    def transaction(
+        self,
+        ops: List[BatchOperation],
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> BatchResult:
+        """
+        Sync wrapper for transactional batch operations.
+
+        Translates `BatchOperation` dataclasses into the raw mapping shape
+        expected by GraphTranslator and returns the underlying `BatchResult`.
+        """
+        _ensure_not_in_event_loop("transaction")
+        validate_batch_operations(ops, operation="transaction", error_code="INVALID_BATCH_OPS")
+
+        ctx = self._build_ctx(
+            callback_manager=callback_manager,
+            extra_context=extra_context,
+        )
+
+        raw_ops: List[Mapping[str, Any]] = [
+            {"op": op.op, "args": dict(op.args or {})} for op in ops
+        ]
+
+        result = self._translator.transaction(
+            raw_ops,
+            op_ctx=ctx,
+            framework_ctx=self._framework_ctx(operation="transaction"),
+        )
+        return result
+
+    @with_async_graph_error_context("transaction_async")
+    async def atransaction(
+        self,
+        ops: List[BatchOperation],
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> BatchResult:
+        """
+        Async wrapper for transactional batch operations.
+        """
+        validate_batch_operations(ops, operation="transaction", error_code="INVALID_BATCH_OPS")
+
+        ctx = self._build_ctx(
+            callback_manager=callback_manager,
+            extra_context=extra_context,
+        )
+
+        raw_ops: List[Mapping[str, Any]] = [
+            {"op": op.op, "args": dict(op.args or {})} for op in ops
+        ]
+
+        result = await self._translator.arun_transaction(
+            raw_ops,
+            op_ctx=ctx,
+            framework_ctx=self._framework_ctx(operation="transaction"),
+        )
+        return result
 
 
 from typing import TYPE_CHECKING
