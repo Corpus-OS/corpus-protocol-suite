@@ -534,7 +534,7 @@ GRAPH_FRAMEWORKS: Dict[str, GraphFrameworkDescriptor] = {
         supports_streaming=True,
         supports_bulk_vertices=True,
         supports_batch=True,
-        availability_attr="LANGCHAIN_TOOLS_AVAILABLE",
+        availability_attr=None,
     ),
     # ------------------------------------------------------------------ #
     # LlamaIndex

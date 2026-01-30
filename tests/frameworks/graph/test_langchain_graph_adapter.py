@@ -438,8 +438,7 @@ def test_sync_stream_query_accepts_optional_params_and_config(adapter: Any) -> N
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_async_query_and_stream_basic(adapter: Any) -> None:
+def test_async_query_and_stream_basic(adapter: Any) -> None:
     """
     Async aquery / astream_query should exist and produce results compatible
     with the sync API (non-None result / async-iterable of chunks).
@@ -450,21 +449,26 @@ async def test_async_query_and_stream_basic(adapter: Any) -> None:
     """
     client = _make_client(adapter)
 
+    # Run sync outside event loop
     sync_result = client.query("MATCH (n) RETURN n LIMIT 1")
     assert sync_result is not None
 
-    async_result = await client.aquery("MATCH (n) RETURN n LIMIT 1")
-    assert async_result is not None
-    assert type(sync_result) is type(async_result)  # noqa: E721
+    # Run async in separate event loop
+    async def _run_async():
+        async_result = await client.aquery("MATCH (n) RETURN n LIMIT 1")
+        assert async_result is not None
+        assert type(sync_result) is type(async_result)  # noqa: E721
 
-    aiter = client.astream_query("MATCH (n) RETURN n LIMIT 2")
-    assert hasattr(aiter, "__aiter__"), "astream_query must return an async-iterable"
+        aiter = client.astream_query("MATCH (n) RETURN n LIMIT 2")
+        assert hasattr(aiter, "__aiter__"), "astream_query must return an async-iterable"
 
-    seen_any = False
-    async for _ in aiter:  # noqa: B007
-        seen_any = True
-        break
-    assert isinstance(seen_any, bool)
+        seen_any = False
+        async for _ in aiter:  # noqa: B007
+            seen_any = True
+            break
+        assert isinstance(seen_any, bool)
+
+    asyncio.run(_run_async())
 
 
 @pytest.mark.asyncio
@@ -1087,20 +1091,24 @@ def test_capabilities_and_health_basic(adapter: Any) -> None:
     assert isinstance(client.health(), Mapping)
 
 
-@pytest.mark.asyncio
-async def test_async_capabilities_and_health_basic_parity(adapter: Any) -> None:
+def test_async_capabilities_and_health_basic_parity(adapter: Any) -> None:
     client = _make_client(adapter)
 
+    # Run sync outside event loop
     caps = client.capabilities()
     health = client.health()
 
-    acaps = await client.acapabilities()
-    ahealth = await client.ahealth()
+    # Run async in separate event loop
+    async def _run_async():
+        acaps = await client.acapabilities()
+        ahealth = await client.ahealth()
 
-    assert isinstance(acaps, Mapping)
-    assert isinstance(ahealth, Mapping)
-    assert set(acaps.keys()) == set(caps.keys())
-    assert set(ahealth.keys()) == set(health.keys())
+        assert isinstance(acaps, Mapping)
+        assert isinstance(ahealth, Mapping)
+        assert set(acaps.keys()) == set(caps.keys())
+        assert set(ahealth.keys()) == set(health.keys())
+
+    asyncio.run(_run_async())
 
 
 # ---------------------------------------------------------------------------
