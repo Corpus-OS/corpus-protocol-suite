@@ -37,12 +37,26 @@ Non-responsibilities
 - Backend-specific graph behavior (lives in graph adapters)
 - LangChain chain/agent orchestration and config logic
 - MMR and diversification details (handled inside GraphTranslator)
+
+Compatibility notes
+-------------------
+- LangChain is an **optional dependency**. This module intentionally does not
+  hard-import LangChain packages at import time.
+- Real LangChain tool integration is provided through **soft-imported tool helpers**
+  at the bottom of this file (e.g., `create_langchain_graph_tools()` and
+  `create_corpus_graph_tool()`).
+  Importing this module does not require LangChain to be installed.
 """
 
 from __future__ import annotations
 
 import asyncio
+import atexit
+import concurrent.futures
+import inspect
+import json
 import logging
+import threading
 from functools import cached_property
 from typing import (
     Any,
@@ -54,6 +68,7 @@ from typing import (
     Mapping,
     Optional,
     Protocol,
+    Sequence,
     TypeVar,
 )
 
@@ -87,6 +102,7 @@ from corpus_sdk.graph.graph_base import (
     GraphProtocolV1,
     GraphSchema,
     GraphTraversalSpec,
+    NotSupported,
     OperationContext,
     QueryChunk,
     QueryResult,
@@ -98,20 +114,178 @@ from corpus_sdk.graph.graph_base import (
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Optional LangChain Tool import (for CorpusGraphTool)
-# ---------------------------------------------------------------------------
-
-try:  # pragma: no cover - optional dependency
-    from langchain.tools import BaseTool
-
-    LANGCHAIN_TOOLS_AVAILABLE = True
-except ImportError:  # pragma: no cover - environments without LangChain
-    BaseTool = object  # type: ignore[assignment]
-    LANGCHAIN_TOOLS_AVAILABLE = False
-
 # Type variables for decorators
 T = TypeVar("T")
+
+# ---------------------------------------------------------------------------
+# Optional LangChain Tool soft-import + bounded async→sync bridge
+# ---------------------------------------------------------------------------
+
+# Dedicated, bounded executor for tool-in-event-loop compatibility.
+# Used only by create_langchain_graph_tools(...) / create_corpus_graph_tool(...)
+# to keep tool runs safe in async LangChain runtimes.
+_LANGCHAIN_TOOL_BRIDGE_EXECUTOR: Optional[concurrent.futures.ThreadPoolExecutor] = None
+_LANGCHAIN_TOOL_BRIDGE_EXECUTOR_LOCK = threading.Lock()
+
+
+def _shutdown_langchain_tool_bridge_executor() -> None:
+    """
+    Best-effort shutdown for the bounded tool bridge executor.
+
+    Why this exists:
+    - Tool wrappers may run in short-lived processes (tests, CLIs, workers).
+    - If the executor is never shut down, threads can linger and create noise.
+
+    Safety:
+    - Idempotent: safe to call multiple times.
+    - Best-effort: never raises to callers.
+    """
+    global _LANGCHAIN_TOOL_BRIDGE_EXECUTOR  # noqa: PLW0603
+    with _LANGCHAIN_TOOL_BRIDGE_EXECUTOR_LOCK:
+        executor = _LANGCHAIN_TOOL_BRIDGE_EXECUTOR
+        _LANGCHAIN_TOOL_BRIDGE_EXECUTOR = None
+
+    if executor is None:
+        return
+
+    try:
+        executor.shutdown(wait=False, cancel_futures=True)
+    except Exception:  # noqa: BLE001
+        # Never allow shutdown failures to propagate.
+        logger.debug("Failed to shutdown LangChain tool bridge executor", exc_info=True)
+
+
+# Ensure the executor does not leak threads across interpreter shutdown.
+atexit.register(_shutdown_langchain_tool_bridge_executor)
+
+
+def _is_running_event_loop() -> bool:
+    """
+    Return True if called while an asyncio event loop is running in this thread.
+
+    This is used by optional LangChain tool helpers to provide safe sync execution
+    in environments that execute tools from within async runtimes.
+    """
+    try:
+        asyncio.get_running_loop()
+        return True
+    except RuntimeError:
+        return False
+
+
+def _run_blocking_in_langchain_tool_thread(fn: Callable[[], T]) -> T:
+    """
+    Run a blocking graph call in a bounded thread pool.
+
+    Why:
+      LangChain tool execution can occur inside an async runtime (event loop running),
+      but the graph client sync APIs deliberately refuse to run inside event loops.
+
+    Safety/performance:
+      - bounded pool (max_workers=4) to prevent unbounded thread creation
+      - used only in the optional tool integration path
+      - executor is shut down on client close and at interpreter exit (atexit)
+    """
+    global _LANGCHAIN_TOOL_BRIDGE_EXECUTOR  # noqa: PLW0603
+    with _LANGCHAIN_TOOL_BRIDGE_EXECUTOR_LOCK:
+        if _LANGCHAIN_TOOL_BRIDGE_EXECUTOR is None:
+            _LANGCHAIN_TOOL_BRIDGE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+                max_workers=4,
+                thread_name_prefix="corpus-langchain-tool",
+            )
+        executor = _LANGCHAIN_TOOL_BRIDGE_EXECUTOR
+
+    # Block until the work completes; tool wrappers are sync by design.
+    return executor.submit(fn).result()
+
+
+def _json_safe_snapshot(value: Any, *, max_items: int = 200, max_str: int = 10_000) -> Any:
+    """
+    Best-effort conversion into a JSON-ish snapshot for tool-return values and logs.
+
+    Security / correctness:
+    - Limits container sizes to avoid memory bloat.
+    - Truncates long strings to prevent context-window blowups in agent runtimes.
+    - Falls back to repr() for unknown objects.
+
+    NOTE:
+    - This helper is used only in optional LangChain tool helpers below.
+    - Core protocol logic continues to return protocol-level types (QueryResult, etc.).
+    """
+    try:
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        if isinstance(value, str):
+            return value if len(value) <= max_str else value[:max_str] + "…"
+        if isinstance(value, Mapping):
+            out: Dict[str, Any] = {}
+            for i, (k, v) in enumerate(value.items()):
+                if i >= max_items:
+                    out["…"] = f"truncated after {max_items} items"
+                    break
+                out[str(k)] = _json_safe_snapshot(v, max_items=max_items, max_str=max_str)
+            return out
+        if isinstance(value, (list, tuple)):
+            out_list: List[Any] = []
+            for i, v in enumerate(value):
+                if i >= max_items:
+                    out_list.append(f"… truncated after {max_items} items")
+                    break
+                out_list.append(_json_safe_snapshot(v, max_items=max_items, max_str=max_str))
+            return out_list
+        to_dict = getattr(value, "to_dict", None)
+        if callable(to_dict):
+            return _json_safe_snapshot(to_dict(), max_items=max_items, max_str=max_str)
+        # Fallback: ensure representable
+        return repr(value)
+    except Exception:  # noqa: BLE001
+        return {"repr": repr(value)}
+
+
+def _normalize_async_iterator(aiter_or_awaitable: Any) -> "AsyncIterator[Any]":
+    """
+    Normalize either:
+      - an AsyncIterator, OR
+      - an awaitable that resolves to an AsyncIterator,
+    into a concrete AsyncIterator.
+
+    Why:
+      GraphTranslator implementations (or versions) may return either a ready
+      AsyncIterator or an awaitable that yields one. Centralizing this logic
+      keeps adapter streaming semantics stable while allowing translator evolution
+      without brittle tests or duplicated adapter code.
+
+    Compatibility:
+      - This helper mirrors the robust normalization behavior used in other
+        framework adapters and is intentionally dependency-free.
+    """
+
+    async def _await_and_return() -> AsyncIterator[Any]:
+        resolved = await aiter_or_awaitable
+        return resolved
+
+    if inspect.isawaitable(aiter_or_awaitable):
+        return _await_and_return()  # type: ignore[return-value]
+    return aiter_or_awaitable  # type: ignore[return-value]
+
+
+def _require_langchain_base_tool() -> Any:
+    """
+    Soft-import LangChain's BaseTool.
+
+    This intentionally avoids importing LangChain at module import time so that
+    this adapter remains dependency-light and import-safe in minimal environments.
+    """
+    try:
+        # This import path is the typical LangChain tools surface.
+        from langchain.tools import BaseTool  # type: ignore[import-not-found]
+    except ImportError as exc:  # noqa: BLE001
+        raise ImportError(
+            "LangChain tools are not installed. Install with:\n"
+            '  pip install -U "langchain"\n'
+            "Then retry using create_langchain_graph_tools(...) / create_corpus_graph_tool(...)."
+        ) from exc
+    return BaseTool
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +307,11 @@ class ErrorCodes:
     BAD_BATCH_RESULT = "BAD_BATCH_RESULT"
     BAD_ADAPTER_RESULT = "BAD_ADAPTER_RESULT"
     SYNC_WRAPPER_CALLED_IN_EVENT_LOOP = "SYNC_WRAPPER_CALLED_IN_EVENT_LOOP"
+
+    # Validation-level constants used by shared validators in this adapter.
+    # Keeping these as explicit symbolic strings avoids accidental drift.
+    INVALID_QUERY = "INVALID_QUERY"
+    INVALID_BATCH_OPS = "INVALID_BATCH_OPS"
 
 
 # ---------------------------------------------------------------------------
@@ -571,7 +750,7 @@ class CorpusLangChainGraphClient:
         default_namespace: Optional[str] = None,
         default_timeout_ms: Optional[int] = None,
         framework_version: Optional[str] = None,
-        framework_translator: Optional[DefaultGraphFrameworkTranslator] = None,
+        framework_translator: Optional[GraphFrameworkTranslator] = None,
     ) -> None:
         """
         Initialize a LangChain-oriented graph client.
@@ -595,6 +774,11 @@ class CorpusLangChainGraphClient:
         framework_translator:
             Optional custom framework translator. If not provided, the default
             `LangChainGraphFrameworkTranslator` is used.
+
+        Typing note:
+            `framework_translator` is typed as `GraphFrameworkTranslator` so callers
+            can pass either the default translator or any compatible override
+            without narrowing to a concrete base class.
         """
         if adapter is not None and graph_adapter is not None:
             raise TypeError(
@@ -605,16 +789,14 @@ class CorpusLangChainGraphClient:
             raise TypeError(
                 "Must specify either 'adapter' or 'graph_adapter' parameter."
             )
-        
+
         resolved_adapter = graph_adapter if graph_adapter is not None else adapter
         self._graph: GraphProtocolV1 = resolved_adapter
         self._default_dialect: Optional[str] = default_dialect
         self._default_namespace: Optional[str] = default_namespace
         self._default_timeout_ms: Optional[int] = default_timeout_ms
         self._framework_version: Optional[str] = framework_version
-        self._framework_translator: Optional[DefaultGraphFrameworkTranslator] = (
-            framework_translator
-        )
+        self._framework_translator: Optional[GraphFrameworkTranslator] = framework_translator
 
         # Resource management flags (idempotent close semantics)
         self._closed: bool = False
@@ -624,7 +806,7 @@ class CorpusLangChainGraphClient:
     # Resource Management (Context Managers)
     # ------------------------------------------------------------------ #
 
-    def __enter__(self) -> CorpusLangChainGraphClient:
+    def __enter__(self) -> "CorpusLangChainGraphClient":
         """Support context manager protocol for resource cleanup."""
         return self
 
@@ -637,7 +819,7 @@ class CorpusLangChainGraphClient:
         """
         self.close()
 
-    async def __aenter__(self) -> CorpusLangChainGraphClient:
+    async def __aenter__(self) -> "CorpusLangChainGraphClient":
         """Support async context manager protocol."""
         return self
 
@@ -664,10 +846,17 @@ class CorpusLangChainGraphClient:
             try:
                 close_fn()
             except Exception as e:  # noqa: BLE001
+                # Preserve the existing warning-level behavior, but include
+                # stack context for easier debugging without changing semantics.
                 logger.warning(
                     "Error while closing graph adapter in close(): %s",
                     e,
+                    exc_info=True,
                 )
+
+        # Also close the optional bounded tool executor so tests and short-lived
+        # processes do not leak threads. This is safe and idempotent.
+        _shutdown_langchain_tool_bridge_executor()
 
     async def aclose(self) -> None:
         """
@@ -686,16 +875,20 @@ class CorpusLangChainGraphClient:
                 await aclose_fn()
                 # If async close succeeded, we can consider sync-close satisfied.
                 self._closed = True
-                return
             except Exception as e:  # noqa: BLE001
+                # Preserve warning-level behavior, but include stack context.
                 logger.warning(
                     "Error while async-closing graph adapter in aclose(): %s",
                     e,
+                    exc_info=True,
                 )
 
         # Fallback to sync close if we haven't already done so.
         if not self._closed:
             self.close()
+
+        # As above, ensure the optional tool executor is stopped.
+        _shutdown_langchain_tool_bridge_executor()
 
     # ------------------------------------------------------------------ #
     # Translator (lazy, cached) – mirrors CrewAI adapter pattern
@@ -710,7 +903,7 @@ class CorpusLangChainGraphClient:
         the CrewAI adapter patterns. Allows callers to inject a custom
         framework_translator via __init__.
         """
-        framework_translator: DefaultGraphFrameworkTranslator = (
+        framework_translator: GraphFrameworkTranslator = (
             self._framework_translator or LangChainGraphFrameworkTranslator()
         )
         return create_graph_translator(
@@ -1073,7 +1266,7 @@ class CorpusLangChainGraphClient:
         Returns the underlying `QueryResult` from the GraphProtocol adapter.
         """
         _ensure_not_in_event_loop("query")
-        validate_graph_query(query, operation="query", error_code="INVALID_QUERY")
+        validate_graph_query(query, operation="query", error_code=ErrorCodes.INVALID_QUERY)
         self._validate_query_params(params)
 
         ctx = self._build_ctx(config=config, extra_context=extra_context)
@@ -1090,12 +1283,28 @@ class CorpusLangChainGraphClient:
             namespace=namespace,
         )
 
-        result = self._translator.query(
-            raw_query,
-            op_ctx=ctx,
-            framework_ctx=framework_ctx,
-            mmr_config=None,
-        )
+        try:
+            result = self._translator.query(
+                raw_query,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+                mmr_config=None,
+            )
+        except NotSupported:
+            # Dialect fallback mirrors CrewAI/AutoGen adapter behavior:
+            # some backends reject unknown dialects but can execute without it.
+            if dialect is not None:
+                fallback_raw = dict(raw_query)
+                fallback_raw.pop("dialect", None)
+                result = self._translator.query(
+                    fallback_raw,
+                    op_ctx=ctx,
+                    framework_ctx=framework_ctx,
+                    mmr_config=None,
+                )
+            else:
+                raise
+
         return validate_graph_result_type(
             result,
             expected_type=QueryResult,
@@ -1120,7 +1329,7 @@ class CorpusLangChainGraphClient:
 
         Returns the underlying `QueryResult`.
         """
-        validate_graph_query(query, operation="aquery", error_code="INVALID_QUERY")
+        validate_graph_query(query, operation="aquery", error_code=ErrorCodes.INVALID_QUERY)
         self._validate_query_params(params)
 
         ctx = self._build_ctx(config=config, extra_context=extra_context)
@@ -1137,12 +1346,26 @@ class CorpusLangChainGraphClient:
             namespace=namespace,
         )
 
-        result = await self._translator.arun_query(
-            raw_query,
-            op_ctx=ctx,
-            framework_ctx=framework_ctx,
-            mmr_config=None,
-        )
+        try:
+            result = await self._translator.arun_query(
+                raw_query,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+                mmr_config=None,
+            )
+        except NotSupported:
+            if dialect is not None:
+                fallback_raw = dict(raw_query)
+                fallback_raw.pop("dialect", None)
+                result = await self._translator.arun_query(
+                    fallback_raw,
+                    op_ctx=ctx,
+                    framework_ctx=framework_ctx,
+                    mmr_config=None,
+                )
+            else:
+                raise
+
         return validate_graph_result_type(
             result,
             expected_type=QueryResult,
@@ -1174,7 +1397,7 @@ class CorpusLangChainGraphClient:
         any async→sync bridges directly.
         """
         _ensure_not_in_event_loop("stream_query")
-        validate_graph_query(query, operation="stream_query", error_code="INVALID_QUERY")
+        validate_graph_query(query, operation="stream_query", error_code=ErrorCodes.INVALID_QUERY)
         self._validate_query_params(params)
 
         ctx = self._build_ctx(config=config, extra_context=extra_context)
@@ -1217,8 +1440,15 @@ class CorpusLangChainGraphClient:
     ) -> AsyncIterator[QueryChunk]:
         """
         Execute a streaming graph query (async), yielding `QueryChunk` items.
+
+        Compatibility note:
+        Some GraphTranslator implementations return:
+          - an AsyncIterator directly, OR
+          - an awaitable that resolves to an AsyncIterator.
+        This method supports both forms to avoid brittle tests and allow
+        translator evolution without breaking framework adapters.
         """
-        validate_graph_query(query, operation="astream_query", error_code="INVALID_QUERY")
+        validate_graph_query(query, operation="astream_query", error_code=ErrorCodes.INVALID_QUERY)
         self._validate_query_params(params)
 
         ctx = self._build_ctx(config=config, extra_context=extra_context)
@@ -1235,11 +1465,21 @@ class CorpusLangChainGraphClient:
             namespace=namespace,
         )
 
-        async for chunk in self._translator.arun_query_stream(
+        aiter_or_awaitable = self._translator.arun_query_stream(
             raw_query,
             op_ctx=ctx,
             framework_ctx=framework_ctx,
-        ):
+        )
+
+        # Normalize the possible return forms (AsyncIterator vs awaitable->AsyncIterator)
+        # to avoid coupling adapter behavior to a specific GraphTranslator style.
+        aiter_normalized = _normalize_async_iterator(aiter_or_awaitable)
+        if inspect.isawaitable(aiter_normalized):
+            aiter = await aiter_normalized  # type: ignore[assignment]
+        else:
+            aiter = aiter_normalized  # type: ignore[assignment]
+
+        async for chunk in aiter:
             yield validate_graph_result_type(
                 chunk,
                 expected_type=QueryChunk,
@@ -1749,7 +1989,7 @@ class CorpusLangChainGraphClient:
         _ensure_not_in_event_loop("transaction")
 
         # Reuse batch validation; semantics are still a list of BatchOperation.
-        validate_batch_operations(ops, operation="transaction", error_code="INVALID_BATCH_OPS")
+        validate_batch_operations(ops, operation="transaction", error_code=ErrorCodes.INVALID_BATCH_OPS)
 
         ctx = self._build_ctx(
             config=config,
@@ -1783,7 +2023,7 @@ class CorpusLangChainGraphClient:
         """
         Async wrapper for transactional batch operations.
         """
-        validate_batch_operations(ops, operation="atransaction", error_code="INVALID_BATCH_OPS")
+        validate_batch_operations(ops, operation="atransaction", error_code=ErrorCodes.INVALID_BATCH_OPS)
 
         ctx = self._build_ctx(
             config=config,
@@ -1825,7 +2065,7 @@ class CorpusLangChainGraphClient:
         expected by GraphTranslator and returns the underlying `BatchResult`.
         """
         _ensure_not_in_event_loop("batch")
-        validate_batch_operations(ops, operation="batch", error_code="INVALID_BATCH_OPS")
+        validate_batch_operations(ops, operation="batch", error_code=ErrorCodes.INVALID_BATCH_OPS)
 
         ctx = self._build_ctx(config=config, extra_context=extra_context)
 
@@ -1856,7 +2096,7 @@ class CorpusLangChainGraphClient:
         """
         Async wrapper for batch operations.
         """
-        validate_batch_operations(ops, operation="abatch", error_code="INVALID_BATCH_OPS")
+        validate_batch_operations(ops, operation="abatch", error_code=ErrorCodes.INVALID_BATCH_OPS)
 
         ctx = self._build_ctx(config=config, extra_context=extra_context)
 
@@ -1878,11 +2118,10 @@ class CorpusLangChainGraphClient:
 
 
 # ---------------------------------------------------------------------------
-# Optional LangChain Tool wrapper
+# Optional LangChain Tool wrapper (soft import)
 # ---------------------------------------------------------------------------
 
-
-class CorpusGraphTool(BaseTool):
+class CorpusGraphTool:
     """
     LangChain Tool wrapper around `CorpusLangChainGraphClient`.
 
@@ -1899,159 +2138,329 @@ class CorpusGraphTool(BaseTool):
 
     You can subclass this Tool to tighten or reshape the input schema as
     needed for a particular agent.
+
+    IMPORTANT:
+    This symbol is preserved for backwards compatibility, but the real LangChain
+    BaseTool-backed implementations are created via soft-import helpers:
+      - create_langchain_graph_tools(...)
+      - create_corpus_graph_tool(...)
+
+    If LangChain is not installed, attempting to instantiate this class will
+    raise an ImportError with installation instructions.
     """
 
-    # LangChain BaseTool core attributes
-    name: str = "corpus_graph"
-    description: str = (
-        "Run graph queries against the Corpus graph service. "
-        "Input is a JSON-encoded object with fields: "
-        "`query` (required string), and optional `params`, "
-        "`dialect`, `namespace`, `timeout_ms`."
-    )
-
-    def __init__(
-        self,
-        graph_client: CorpusLangChainGraphClient,
-        name: Optional[str] = None,
-        description: Optional[str] = None,
-    ) -> None:
-        # BaseTool may or may not be a real class depending on import guard above
-        if hasattr(super(), "__init__"):
-            super().__init__()  # type: ignore[call-arg]
-
-        self._graph_client = graph_client
-        if name is not None:
-            self.name = name
-        if description is not None:
-            self.description = description
-
-    def _parse_input(self, tool_input: Any) -> Dict[str, Any]:
-        """
-        Normalize LangChain tool input into a dict with the shape:
-
-            {
-                "query": str,
-                "params": Optional[Mapping[str, Any]],
-                "dialect": Optional[str],
-                "namespace": Optional[str],
-                "timeout_ms": Optional[int],
-            }
-
-        Accepts:
-        - Plain string: treated as `query`
-        - Mapping: expects `query` plus optional fields
-        - JSON-encoded string: parsed into a mapping (best-effort)
-        """
-        if isinstance(tool_input, str):
-            # Try to parse JSON if it looks structured; fall back to raw query.
-            stripped = tool_input.strip()
-            if stripped.startswith("{") and stripped.endswith("}"):
-                try:
-                    import json
-
-                    as_obj = json.loads(stripped)
-                    if isinstance(as_obj, Mapping) and "query" in as_obj:
-                        return dict(as_obj)  # type: ignore[arg-type]
-                except Exception:  # noqa: BLE001
-                    # Fall back to treating input as raw query text
-                    pass
-
-            return {"query": tool_input}
-
-        if isinstance(tool_input, Mapping):
-            return dict(tool_input)
-
-        raise BadRequest(
-            f"Unsupported tool input type for CorpusGraphTool: {type(tool_input).__name__}",
-            code=ErrorCodes.BAD_ADAPTER_RESULT,
+    # This class is intentionally *not* a real LangChain BaseTool at import time.
+    # LangChain is an optional dependency; tool integration is provided via the
+    # helper factories below which do a soft import and build real BaseTool types.
+    def __init__(self, *_: Any, **__: Any) -> None:
+        raise ImportError(
+            "CorpusGraphTool requires LangChain to be installed. Install with:\n"
+            '  pip install -U "langchain"\n'
+            "Then create tools via create_langchain_graph_tools(...) or create_corpus_graph_tool(...)."
         )
 
-    # -------------------------- sync --------------------------------- #
 
-    def _run(self, tool_input: Any, *args: Any, **kwargs: Any) -> str:
-        """
-        Synchronous execution of the graph tool.
+def create_langchain_graph_tools(
+    client: CorpusLangChainGraphClient,
+    *,
+    name_prefix: str = "graph",
+    description_prefix: str = "Corpus graph tool",
+) -> List[Any]:
+    """
+    Create LangChain-native BaseTool wrappers for common graph operations.
 
-        Returns a stringified version of the `QueryResult` so it can be
-        consumed by standard LangChain agents. Callers who need structured
-        results should directly use `CorpusLangChainGraphClient`.
+    Why this exists:
+    - The graph adapter itself is intentionally dependency-free and framework-light.
+    - When LangChain is installed, callers often want real LangChain `BaseTool` objects
+      to register on agents (e.g., in a LangChain tool list).
+    - The AutoGen and CrewAI adapters provide real tool-wiring helpers; this mirrors that
+      approach for LangChain while keeping LangChain as a soft dependency.
+
+    Soft dependency:
+    - LangChain is imported lazily. Importing this module does not require LangChain.
+    - If LangChain is not installed, this function raises a clear ImportError with install instructions.
+
+    Notes:
+    - Tools provide both _run (sync) and _arun (async) implementations.
+    - In _run, if called inside an event loop, execution is bridged to a bounded
+      thread pool to preserve the adapter’s sync-in-event-loop safety guarantees.
+    - Return values are JSON strings containing JSON-safe snapshots for tool-calling
+      compatibility. (Protocol-level methods still return QueryResult/QueryChunk/etc.)
+    """
+    BaseTool = _require_langchain_base_tool()
+
+    def _json_result(payload: Mapping[str, Any]) -> str:
         """
-        parsed = self._parse_input(tool_input)
-        query = parsed.get("query")
-        if not isinstance(query, str) or not query.strip():
+        Serialize a tool result to JSON.
+
+        We keep tool outputs strictly serializable and size-bounded via _json_safe_snapshot().
+        """
+        return json.dumps(_json_safe_snapshot(payload), ensure_ascii=False)
+
+    def _bridge_sync_call(fn: Callable[[], Any]) -> Any:
+        """
+        Execute a sync tool operation safely.
+
+        - If no event loop is running, call directly.
+        - If an event loop is running, execute in a bounded worker thread.
+        """
+        if not _is_running_event_loop():
+            return fn()
+        return _run_blocking_in_langchain_tool_thread(fn)
+
+    def _validated_max_chunks(value: Any) -> int:
+        """
+        Validate and normalize max_chunks inputs from LLMs and tool callers.
+
+        This mirrors the defensive approach used in other framework adapters:
+        - accept ints or int-like strings (e.g., "25")
+        - reject non-positive values to avoid edge-case behavior
+        - clamp overly large values to a safe upper bound to prevent runaway
+          memory/time usage when a tool caller supplies an extremely large limit
+          (intentionally or accidentally)
+
+        The upper bound is intentionally conservative: tools should provide a
+        representative sample of chunks, not an unbounded stream dump.
+        """
+        _MAX_TOOL_CHUNKS = 100
+        try:
+            as_int = int(value)
+        except Exception as exc:  # noqa: BLE001
             raise BadRequest(
-                "CorpusGraphTool input must include a non-empty 'query' field",
+                f"max_chunks must be an integer, got {type(value).__name__}",
+                code=ErrorCodes.BAD_ADAPTER_RESULT,
+            ) from exc
+        if as_int <= 0:
+            raise BadRequest(
+                f"max_chunks must be > 0, got {as_int}",
                 code=ErrorCodes.BAD_ADAPTER_RESULT,
             )
+        if as_int > _MAX_TOOL_CHUNKS:
+            # Clamp rather than raise: this keeps tools robust to LLM overreach
+            # while still preventing excessive iteration and output growth.
+            return _MAX_TOOL_CHUNKS
+        return as_int
 
-        params = parsed.get("params")
-        dialect = parsed.get("dialect")
-        namespace = parsed.get("namespace")
-        timeout_ms = parsed.get("timeout_ms")
+    class _GraphQueryTool(BaseTool):
+        name: str
+        description: str
 
-        # Delegate to the underlying graph client.
-        result = self._graph_client.query(
-            query=query,
-            params=params if isinstance(params, Mapping) else None,
-            dialect=str(dialect) if dialect is not None else None,
-            namespace=str(namespace) if namespace is not None else None,
-            timeout_ms=int(timeout_ms) if timeout_ms is not None else None,
-            config=None,
-            extra_context=None,
-        )
+        def _run(
+            self,
+            query: str,
+            params: Optional[Mapping[str, Any]] = None,
+            dialect: Optional[str] = None,
+            namespace: Optional[str] = None,
+            timeout_ms: Optional[int] = None,
+            config: Optional[Mapping[str, Any]] = None,
+            extra_context: Optional[Mapping[str, Any]] = None,
+        ) -> str:
+            def _work() -> str:
+                res = client.query(
+                    query,
+                    params=params,
+                    dialect=dialect,
+                    namespace=namespace,
+                    timeout_ms=timeout_ms,
+                    config=config,
+                    extra_context=extra_context,
+                )
+                return _json_result({"result": _json_safe_snapshot(res)})
 
-        # We return a string so that generic agents can consume the output.
-        try:
-            import json
+            return _bridge_sync_call(_work)
 
-            return json.dumps(
-                result.to_dict() if hasattr(result, "to_dict") else result,
-                default=str,
+        async def _arun(
+            self,
+            query: str,
+            params: Optional[Mapping[str, Any]] = None,
+            dialect: Optional[str] = None,
+            namespace: Optional[str] = None,
+            timeout_ms: Optional[int] = None,
+            config: Optional[Mapping[str, Any]] = None,
+            extra_context: Optional[Mapping[str, Any]] = None,
+        ) -> str:
+            res = await client.aquery(
+                query,
+                params=params,
+                dialect=dialect,
+                namespace=namespace,
+                timeout_ms=timeout_ms,
+                config=config,
+                extra_context=extra_context,
             )
-        except Exception:  # noqa: BLE001
-            return str(result)
+            return _json_result({"result": _json_safe_snapshot(res)})
 
-    # -------------------------- async -------------------------------- #
+    class _GraphStreamQueryTool(BaseTool):
+        name: str
+        description: str
 
-    async def _arun(self, tool_input: Any, *args: Any, **kwargs: Any) -> str:
-        """
-        Asynchronous execution of the graph tool.
+        def _run(
+            self,
+            query: str,
+            params: Optional[Mapping[str, Any]] = None,
+            dialect: Optional[str] = None,
+            namespace: Optional[str] = None,
+            timeout_ms: Optional[int] = None,
+            config: Optional[Mapping[str, Any]] = None,
+            extra_context: Optional[Mapping[str, Any]] = None,
+            max_chunks: Any = 25,
+        ) -> str:
+            def _work() -> str:
+                limit = _validated_max_chunks(max_chunks)
+                chunks: List[Any] = []
+                count = 0
+                for ch in client.stream_query(
+                    query,
+                    params=params,
+                    dialect=dialect,
+                    namespace=namespace,
+                    timeout_ms=timeout_ms,
+                    config=config,
+                    extra_context=extra_context,
+                ):
+                    chunks.append(_json_safe_snapshot(ch))
+                    count += 1
+                    if count >= limit:
+                        break
+                return _json_result({"chunks": chunks, "truncated": count >= limit})
 
-        Mirrors `_run` but delegates to `aquery` on the underlying client.
-        """
-        parsed = self._parse_input(tool_input)
-        query = parsed.get("query")
-        if not isinstance(query, str) or not query.strip():
-            raise BadRequest(
-                "CorpusGraphTool input must include a non-empty 'query' field",
-                code=ErrorCodes.BAD_ADAPTER_RESULT,
-            )
+            return _bridge_sync_call(_work)
 
-        params = parsed.get("params")
-        dialect = parsed.get("dialect")
-        namespace = parsed.get("namespace")
-        timeout_ms = parsed.get("timeout_ms")
+        async def _arun(
+            self,
+            query: str,
+            params: Optional[Mapping[str, Any]] = None,
+            dialect: Optional[str] = None,
+            namespace: Optional[str] = None,
+            timeout_ms: Optional[int] = None,
+            config: Optional[Mapping[str, Any]] = None,
+            extra_context: Optional[Mapping[str, Any]] = None,
+            max_chunks: Any = 25,
+        ) -> str:
+            limit = _validated_max_chunks(max_chunks)
+            chunks: List[Any] = []
+            count = 0
+            async for ch in client.astream_query(
+                query,
+                params=params,
+                dialect=dialect,
+                namespace=namespace,
+                timeout_ms=timeout_ms,
+                config=config,
+                extra_context=extra_context,
+            ):
+                chunks.append(_json_safe_snapshot(ch))
+                count += 1
+                if count >= limit:
+                    break
+            return _json_result({"chunks": chunks, "truncated": count >= limit})
 
-        result = await self._graph_client.aquery(
-            query=query,
-            params=params if isinstance(params, Mapping) else None,
-            dialect=str(dialect) if dialect is not None else None,
-            namespace=str(namespace) if namespace is not None else None,
-            timeout_ms=int(timeout_ms) if timeout_ms is not None else None,
-            config=None,
-            extra_context=None,
-        )
+    class _GraphBulkVerticesTool(BaseTool):
+        name: str
+        description: str
 
-        try:
-            import json
+        def _run(
+            self,
+            namespace: Optional[str] = None,
+            limit: int = 50,
+            cursor: Optional[str] = None,
+            filter: Optional[Mapping[str, Any]] = None,
+            config: Optional[Mapping[str, Any]] = None,
+            extra_context: Optional[Mapping[str, Any]] = None,
+        ) -> str:
+            def _work() -> str:
+                spec = BulkVerticesSpec(namespace=namespace, limit=limit, cursor=cursor, filter=filter)
+                res = client.bulk_vertices(spec, config=config, extra_context=extra_context)
+                return _json_result({"result": _json_safe_snapshot(res)})
 
-            return json.dumps(
-                result.to_dict() if hasattr(result, "to_dict") else result,
-                default=str,
-            )
-        except Exception:  # noqa: BLE001
-            return str(result)
+            return _bridge_sync_call(_work)
+
+        async def _arun(
+            self,
+            namespace: Optional[str] = None,
+            limit: int = 50,
+            cursor: Optional[str] = None,
+            filter: Optional[Mapping[str, Any]] = None,
+            config: Optional[Mapping[str, Any]] = None,
+            extra_context: Optional[Mapping[str, Any]] = None,
+        ) -> str:
+            spec = BulkVerticesSpec(namespace=namespace, limit=limit, cursor=cursor, filter=filter)
+            res = await client.abulk_vertices(spec, config=config, extra_context=extra_context)
+            return _json_result({"result": _json_safe_snapshot(res)})
+
+    class _GraphBatchTool(BaseTool):
+        name: str
+        description: str
+
+        def _run(
+            self,
+            ops: Sequence[Mapping[str, Any]],
+            config: Optional[Mapping[str, Any]] = None,
+            extra_context: Optional[Mapping[str, Any]] = None,
+        ) -> str:
+            def _work() -> str:
+                batch_ops: List[BatchOperation] = []
+                for idx, item in enumerate(list(ops)):
+                    if not isinstance(item, Mapping):
+                        raise TypeError(f"batch ops[{idx}] must be a mapping with keys 'op' and 'args'")
+                    op = item.get("op")
+                    args = item.get("args") or {}
+                    if not isinstance(op, str) or not op:
+                        raise TypeError(f"batch ops[{idx}]['op'] must be a non-empty string")
+                    if not isinstance(args, Mapping):
+                        raise TypeError(f"batch ops[{idx}]['args'] must be a mapping")
+                    batch_ops.append(BatchOperation(op=op, args=dict(args)))
+
+                # Use shared validation so tool behavior matches adapter expectations.
+                validate_batch_operations(batch_ops, operation="batch", error_code=ErrorCodes.INVALID_BATCH_OPS)
+
+                res = client.batch(batch_ops, config=config, extra_context=extra_context)
+                return _json_result({"result": _json_safe_snapshot(res)})
+
+            return _bridge_sync_call(_work)
+
+        async def _arun(
+            self,
+            ops: Sequence[Mapping[str, Any]],
+            config: Optional[Mapping[str, Any]] = None,
+            extra_context: Optional[Mapping[str, Any]] = None,
+        ) -> str:
+            batch_ops: List[BatchOperation] = []
+            for idx, item in enumerate(list(ops)):
+                if not isinstance(item, Mapping):
+                    raise TypeError(f"batch ops[{idx}] must be a mapping with keys 'op' and 'args'")
+                op = item.get("op")
+                args = item.get("args") or {}
+                if not isinstance(op, str) or not op:
+                    raise TypeError(f"batch ops[{idx}]['op'] must be a non-empty string")
+                if not isinstance(args, Mapping):
+                    raise TypeError(f"batch ops[{idx}]['args'] must be a mapping")
+                batch_ops.append(BatchOperation(op=op, args=dict(args)))
+
+            validate_batch_operations(batch_ops, operation="abatch", error_code=ErrorCodes.INVALID_BATCH_OPS)
+
+            res = await client.abatch(batch_ops, config=config, extra_context=extra_context)
+            return _json_result({"result": _json_safe_snapshot(res)})
+
+    tools: List[Any] = [
+        _GraphQueryTool(
+            name=f"{name_prefix}_query",
+            description=f"{description_prefix}: execute a graph query (non-streaming).",
+        ),
+        _GraphStreamQueryTool(
+            name=f"{name_prefix}_stream_query",
+            description=f"{description_prefix}: execute a graph query with streaming chunks (bounded).",
+        ),
+        _GraphBulkVerticesTool(
+            name=f"{name_prefix}_bulk_vertices",
+            description=f"{description_prefix}: bulk-scan vertices with pagination inputs.",
+        ),
+        _GraphBatchTool(
+            name=f"{name_prefix}_batch",
+            description=f"{description_prefix}: execute a batch of graph operations.",
+        ),
+    ]
+    return tools
 
 
 def create_corpus_graph_tool(
@@ -2064,10 +2473,10 @@ def create_corpus_graph_tool(
     name: str = "corpus_graph",
     description: Optional[str] = None,
     framework_translator: Optional[GraphFrameworkTranslator] = None,
-) -> CorpusGraphTool:
+) -> Any:
     """
     Convenience factory to create a `CorpusLangChainGraphClient` and wrap it
-    in a `CorpusGraphTool` in one go.
+    in a LangChain-native tool in one go.
 
     If LangChain tools are not installed, this will raise an ImportError
     so that misuse is surfaced clearly.
@@ -2085,12 +2494,9 @@ def create_corpus_graph_tool(
             agent_type=AgentType.OPENAI_FUNCTIONS,
         )
     """
-    if not LANGCHAIN_TOOLS_AVAILABLE:
-        raise ImportError(
-            "LangChain tools are not installed. Install `langchain` to use "
-            "create_corpus_graph_tool / CorpusGraphTool."
-        )
+    BaseTool = _require_langchain_base_tool()
 
+    # Build the client first; it remains dependency-free and protocol-first.
     client = CorpusLangChainGraphClient(
         graph_adapter=graph_adapter,
         default_dialect=default_dialect,
@@ -2099,11 +2505,34 @@ def create_corpus_graph_tool(
         framework_version=framework_version,
         framework_translator=framework_translator,
     )
-    return CorpusGraphTool(
-        graph_client=client,
-        name=name,
-        description=description,
+
+    # Create a single-tool wrapper for backwards compatibility with the existing
+    # factory shape. This uses the same hardened serialization/bridge patterns
+    # as create_langchain_graph_tools(...).
+    tools = create_langchain_graph_tools(
+        client,
+        name_prefix="corpus",
+        description_prefix="Corpus graph tool",
     )
+
+    # The first tool is the query tool; rename it to match requested defaults.
+    # This avoids duplicating tool code while keeping a stable factory API.
+    query_tool = tools[0]
+    try:
+        query_tool.name = name
+        if description is not None:
+            query_tool.description = description
+    except Exception:
+        # If tool attributes are not assignable for some reason, fall back to
+        # returning the tool as-is; this should still be functional.
+        logger.debug("Failed to override name/description on LangChain tool", exc_info=True)
+
+    # Ensure the returned object is a LangChain BaseTool instance when LangChain is installed.
+    if not isinstance(query_tool, BaseTool):
+        # This should not happen in normal environments; keep a defensive guard.
+        raise RuntimeError("Unexpected tool type returned by create_langchain_graph_tools")
+
+    return query_tool
 
 
 __all__ = [
@@ -2115,6 +2544,8 @@ __all__ = [
     "with_async_graph_error_context",
     "with_error_context",
     "with_async_error_context",
+    # Tool integration (soft import)
     "CorpusGraphTool",
+    "create_langchain_graph_tools",
     "create_corpus_graph_tool",
 ]
