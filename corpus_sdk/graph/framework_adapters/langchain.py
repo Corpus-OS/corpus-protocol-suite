@@ -153,7 +153,6 @@ def with_graph_error_context(
     return create_graph_error_context_decorator(
         framework="langchain",
         is_async=False,
-        attach_context_fn=attach_context,
     )(operation=operation, **static_context)
 
 
@@ -170,7 +169,6 @@ def with_async_graph_error_context(
     return create_graph_error_context_decorator(
         framework="langchain",
         is_async=True,
-        attach_context_fn=attach_context,
     )(operation=operation, **static_context)
 
 

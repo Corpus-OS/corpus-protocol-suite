@@ -1276,7 +1276,6 @@ def create_graph_error_context_decorator(
     *,
     framework: str,
     is_async: bool = False,
-    attach_context_fn: Optional[Callable[..., None]] = None,
 ) -> Callable[..., Callable[[Callable[..., T]], Callable[..., T]]]:
     """
     Create a graph error-context decorator factory.
@@ -1288,8 +1287,7 @@ def create_graph_error_context_decorator(
 
         @create_graph_error_context_decorator(
             framework="autogen",
-            is_async=False,
-            attach_context_fn=attach_context
+            is_async=False
         )(operation="health_sync")
         def health(...): ...
 
@@ -1301,9 +1299,11 @@ def create_graph_error_context_decorator(
     Args:
         framework: Framework name (e.g., "autogen", "langchain")
         is_async: Whether to create async decorator wrappers
-        attach_context_fn: Optional attach_context callable. If provided, uses this
-            instead of lazy-importing. Note: Pass the function object, not a call.
-            The decorator will look it up dynamically to allow test mocking.
+
+    Implementation notes:
+    - Dynamically looks up 'attach_context' from the decorated function's module
+      to support test mocking via monkeypatch
+    - Falls back to lazy import if module lookup fails
     """
     framework_label = str(framework).strip() or "graph"
 
@@ -1321,16 +1321,14 @@ def create_graph_error_context_decorator(
             # - If attach_context cannot be imported or raises internally, we log and
             #   always re-raise the *original* exception (never masking the real failure).
             def _best_effort_attach(exc: BaseException) -> None:
-                # Look up attach_context dynamically to allow test mocking
+                # Try to look up attach_context from the decorated function's module first.
+                # This allows test monkeypatching to work correctly.
                 attach_fn = None
                 
-                # First try to use the provided attach_context_fn, but look it up
-                # dynamically from the function's module to allow mocking
-                if attach_context_fn is not None and fn_module is not None:
-                    # Look up by name in the module to get any monkeypatched version
+                if fn_module is not None:
                     attach_fn = getattr(fn_module, 'attach_context', None)
                 
-                # Fall back to lazy import if not found
+                # Fall back to lazy import if module lookup didn't find it
                 if attach_fn is None:
                     try:
                         # Import lazily to avoid import cycles and keep module framework-neutral.
