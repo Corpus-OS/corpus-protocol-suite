@@ -37,13 +37,28 @@ Non-responsibilities
 - Backend-specific graph behavior (lives in graph adapters)
 - AutoGen agent orchestration and conversation logic
 - MMR and diversification details (handled inside GraphTranslator)
+
+Compatibility notes
+-------------------
+- AutoGen is an **optional dependency**. This module intentionally does not
+  hard-import AutoGen packages at import time.
+- Real AutoGen integration is provided through **soft-imported tool helpers**
+  at the bottom of this file (e.g., `create_autogen_graph_tools()`).
+  Importing this module does not require AutoGen to be installed.
+- When AutoGen is installed, you can build AutoGen-native `FunctionTool`
+  wrappers (from `autogen_core.tools`) around this client to run true end-to-end
+  integration tests in AutoGen AgentChat/Core environments.
+
+  Reference (AutoGen docs):
+  - Tools overview: https://microsoft.github.io/autogen/stable//user-guide/core-user-guide/components/tools.html
+  - FunctionTool API: https://microsoft.github.io/autogen/stable//reference/python/autogen_core.tools.html
 """
 
 from __future__ import annotations
 
-import json
-import logging
 import asyncio
+import logging
+from dataclasses import asdict, is_dataclass
 from functools import cached_property
 from typing import (
     Any,
@@ -55,6 +70,7 @@ from typing import (
     Mapping,
     Optional,
     Protocol,
+    Sequence,
     TypeVar,
 )
 
@@ -192,7 +208,7 @@ def _looks_like_operation_context(obj: Any) -> bool:
     except TypeError:
         pass
 
-    # Fallback to structural check
+    # Fallback to a lightweight structural check (safe across typing modes).
     attrs = ("request_id", "traceparent", "tenant", "attrs", "to_dict")
     return any(hasattr(obj, attr) for attr in attrs)
 
@@ -217,6 +233,64 @@ def _ensure_not_in_event_loop(sync_api_name: str) -> None:
     )
 
 
+def _json_safe_snapshot(value: Any, *, max_items: int = 200, max_str: int = 10_000) -> Any:
+    """
+    Best-effort conversion into a JSON-ish snapshot for tool-return values and logs.
+
+    Security / correctness:
+    - Limits container sizes to avoid memory bloat.
+    - Truncates long strings.
+    - Falls back to repr() for unknown objects.
+
+    NOTE:
+    - This is used only in optional AutoGen tool helpers below.
+    - Core protocol logic continues to return protocol-level types (QueryResult, etc.).
+    """
+    try:
+        # Fast paths for primitives (low overhead, safe to serialize).
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+
+        # Bound string size to avoid log/tool payload bloat.
+        if isinstance(value, str):
+            return value if len(value) <= max_str else value[:max_str] + "…"
+
+        # Map-like structures: bound number of items.
+        if isinstance(value, Mapping):
+            out: Dict[str, Any] = {}
+            for i, (k, v) in enumerate(value.items()):
+                if i >= max_items:
+                    out["…"] = f"truncated after {max_items} items"
+                    break
+                out[str(k)] = _json_safe_snapshot(v, max_items=max_items, max_str=max_str)
+            return out
+
+        # Sequence-like structures: bound number of items.
+        if isinstance(value, (list, tuple)):
+            out_list: List[Any] = []
+            for i, v in enumerate(value):
+                if i >= max_items:
+                    out_list.append(f"… truncated after {max_items} items")
+                    break
+                out_list.append(_json_safe_snapshot(v, max_items=max_items, max_str=max_str))
+            return out_list
+
+        # Dataclass objects: serialize via asdict (stable, deterministic).
+        if is_dataclass(value):
+            return _json_safe_snapshot(asdict(value), max_items=max_items, max_str=max_str)
+
+        # Common protocol objects often expose to_dict(); use it if present.
+        to_dict = getattr(value, "to_dict", None)
+        if callable(to_dict):
+            return _json_safe_snapshot(to_dict(), max_items=max_items, max_str=max_str)
+
+        # Final fallback: ensure representable without raising.
+        return repr(value)
+    except Exception:  # noqa: BLE001
+        # Defensive: snapshotting must never throw in tool paths.
+        return {"repr": repr(value)}
+
+
 # ---------------------------------------------------------------------------
 # Public AutoGen framework translator
 # ---------------------------------------------------------------------------
@@ -237,15 +311,7 @@ class AutoGenGraphFrameworkTranslator(DefaultGraphFrameworkTranslator):
     - GraphSchema is returned as-is
 
     Exposed as a top-level class so users can easily subclass and override
-    just a subset of behaviors, e.g.:
-
-    ```python
-    class MyTranslator(AutoGenGraphFrameworkTranslator):
-        def translate_schema(...):
-            schema = super().translate_schema(...)
-            # tweak schema here
-            return schema
-    ```
+    just a subset of behaviors.
     """
 
     def translate_query_result(
@@ -321,12 +387,7 @@ class AutoGenGraphClientProtocol(Protocol):
     """
     Protocol representing the minimal AutoGen-aware graph client interface
     implemented by this module.
-
-    This structural protocol allows callers to type against the graph client
-    without depending on the concrete `CorpusAutoGenGraphClient` class.
     """
-
-    # Capabilities / schema / health
 
     def capabilities(self, **kwargs) -> Dict[str, Any]:
         ...
@@ -365,8 +426,6 @@ class AutoGenGraphClientProtocol(Protocol):
         extra_context: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         ...
-
-    # Query
 
     def query(
         self,
@@ -420,84 +479,6 @@ class AutoGenGraphClientProtocol(Protocol):
     ) -> AsyncIterator[QueryChunk]:
         ...
 
-    # Upsert
-
-    def upsert_nodes(
-        self,
-        spec: UpsertNodesSpec,
-        *,
-        conversation: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> UpsertResult:
-        ...
-
-    async def aupsert_nodes(
-        self,
-        spec: UpsertNodesSpec,
-        *,
-        conversation: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> UpsertResult:
-        ...
-
-    def upsert_edges(
-        self,
-        spec: UpsertEdgesSpec,
-        *,
-        conversation: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> UpsertResult:
-        ...
-
-    async def aupsert_edges(
-        self,
-        spec: UpsertEdgesSpec,
-        *,
-        conversation: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> UpsertResult:
-        ...
-
-    # Delete
-
-    def delete_nodes(
-        self,
-        spec: DeleteNodesSpec,
-        *,
-        conversation: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> DeleteResult:
-        ...
-
-    async def adelete_nodes(
-        self,
-        spec: DeleteNodesSpec,
-        *,
-        conversation: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> DeleteResult:
-        ...
-
-    def delete_edges(
-        self,
-        spec: DeleteEdgesSpec,
-        *,
-        conversation: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> DeleteResult:
-        ...
-
-    async def adelete_edges(
-        self,
-        spec: DeleteEdgesSpec,
-        *,
-        conversation: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> DeleteResult:
-        ...
-
-    # Bulk / traversal / transaction / batch
-
     def bulk_vertices(
         self,
         spec: BulkVerticesSpec,
@@ -514,42 +495,6 @@ class AutoGenGraphClientProtocol(Protocol):
         conversation: Optional[Any] = None,
         extra_context: Optional[Mapping[str, Any]] = None,
     ) -> BulkVerticesResult:
-        ...
-
-    def traversal(
-        self,
-        spec: GraphTraversalSpec,
-        *,
-        conversation: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> TraversalResult:
-        ...
-
-    async def atraversal(
-        self,
-        spec: GraphTraversalSpec,
-        *,
-        conversation: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> TraversalResult:
-        ...
-
-    def transaction(
-        self,
-        ops: List[BatchOperation],
-        *,
-        conversation: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> BatchResult:
-        ...
-
-    async def atransaction(
-        self,
-        ops: List[BatchOperation],
-        *,
-        conversation: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> BatchResult:
         ...
 
     def batch(
@@ -606,32 +551,6 @@ class CorpusAutoGenGraphClient:
         framework_version: Optional[str] = None,
         framework_translator: Optional[GraphFrameworkTranslator] = None,
     ) -> None:
-        """
-        Initialize an AutoGen-oriented graph client.
-
-        Parameters
-        ----------
-        adapter:
-            Underlying `GraphProtocolV1` implementation. This is the preferred
-            parameter name for new callers.
-
-        graph_adapter:
-            Backwards-compatible alias for `adapter`. If both `adapter` and
-            `graph_adapter` are provided, they must refer to the same object.
-
-        default_dialect:
-            Optional default query dialect to use when none is provided per call.
-        default_namespace:
-            Optional default namespace to use when none is provided per call.
-        default_timeout_ms:
-            Optional default per-query timeout in milliseconds. Used when
-            `timeout_ms` is not explicitly passed to query methods.
-        framework_version:
-            Optional framework version string for observability.
-        framework_translator:
-            Optional custom GraphFrameworkTranslator to use instead of the
-            default AutoGen pass-through translator.
-        """
         # Resolving adapter / graph_adapter with basic duck-typed validation.
         if graph_adapter is not None and adapter is not None and graph_adapter is not adapter:
             raise TypeError("Provide only one of 'adapter' or 'graph_adapter', not both")
@@ -641,8 +560,7 @@ class CorpusAutoGenGraphClient:
             raise TypeError("adapter must be a GraphProtocolV1-compatible graph adapter")
 
         # Minimal duck-type check: we expect a GraphProtocolV1-like surface with
-        # capabilities() and query(...) methods. This keeps tests happy even
-        # when using simple mock objects instead of real adapters.
+        # capabilities() and query(...) methods.
         if not hasattr(resolved_adapter, "query") or not hasattr(resolved_adapter, "capabilities"):
             raise TypeError(
                 "adapter must implement GraphProtocolV1-like interface with "
@@ -654,9 +572,7 @@ class CorpusAutoGenGraphClient:
         self._default_namespace: Optional[str] = default_namespace
         self._default_timeout_ms: Optional[int] = default_timeout_ms
         self._framework_version: Optional[str] = framework_version
-        self._framework_translator_override: Optional[
-            GraphFrameworkTranslator
-        ] = framework_translator
+        self._framework_translator_override: Optional[GraphFrameworkTranslator] = framework_translator
 
         # Resource management flags (idempotent close semantics)
         self._closed: bool = False
@@ -666,29 +582,19 @@ class CorpusAutoGenGraphClient:
     # Resource management (context managers)
     # ------------------------------------------------------------------ #
 
-    def __enter__(self) -> CorpusAutoGenGraphClient:
-        """Support context manager protocol for resource cleanup."""
+    def __enter__(self) -> "CorpusAutoGenGraphClient":
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        """Clean up resources when exiting context."""
-        # Best-effort sync close; idempotent.
         self.close()
 
-    async def __aenter__(self) -> CorpusAutoGenGraphClient:
-        """Support async context manager protocol."""
+    async def __aenter__(self) -> "CorpusAutoGenGraphClient":
         return self
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        """Clean up resources when exiting async context."""
         await self.aclose()
 
     def close(self) -> None:
-        """
-        Close the underlying graph adapter if it exposes a `close()` method.
-
-        This is safe to call multiple times; subsequent calls are no-ops.
-        """
         if self._closed:
             return
         self._closed = True
@@ -702,12 +608,6 @@ class CorpusAutoGenGraphClient:
                 logger.debug("Failed to close graph adapter", exc_info=True)
 
     async def aclose(self) -> None:
-        """
-        Async close for the underlying graph adapter.
-
-        Prefers an async `aclose()` method when available, otherwise falls back
-        to the sync `close()` method.
-        """
         if self._aclosed:
             return
         self._aclosed = True
@@ -716,33 +616,23 @@ class CorpusAutoGenGraphClient:
         if callable(aclose_fn):
             try:
                 await aclose_fn()
-                # If async close succeeded, we can consider sync-close satisfied.
                 self._closed = True
                 return
             except Exception:
+                # Never let cleanup failures propagate to callers.
                 logger.debug("Failed to async-close graph adapter", exc_info=True)
 
-        # Fallback to sync close if we haven't already done so.
         if not self._closed:
             self.close()
 
     # ------------------------------------------------------------------ #
-    # Translator (lazy, cached) – thin wrapper via create_graph_translator
+    # Translator (lazy, cached)
     # ------------------------------------------------------------------ #
 
     @cached_property
     def _translator(self) -> GraphTranslator:
-        """
-        Lazily construct and cache the `GraphTranslator`.
-
-        Uses `create_graph_translator` so registry-based per-framework
-        translators remain honored while still allowing our AutoGen-specific
-        pass-through translator (or a caller-provided override) to be supplied
-        explicitly.
-        """
         framework_translator: GraphFrameworkTranslator = (
-            self._framework_translator_override
-            or AutoGenGraphFrameworkTranslator()
+            self._framework_translator_override or AutoGenGraphFrameworkTranslator()
         )
         return create_graph_translator(
             adapter=self._graph,
@@ -760,19 +650,6 @@ class CorpusAutoGenGraphClient:
         conversation: Optional[Any] = None,
         extra_context: Optional[Mapping[str, Any]] = None,
     ) -> Optional[OperationContext]:
-        """
-        Build an OperationContext from AutoGen-style inputs.
-
-        Context translation is *best-effort*: failures are logged and attached
-        for observability, but graph operations must still be able to proceed
-        without an OperationContext.
-
-        When a valid OperationContext is produced, its attrs are enriched with
-        framework metadata so downstream layers can reliably identify the
-        source of the call:
-            - framework="autogen"
-            - framework_version=<self._framework_version> (if set)
-        """
         extra: Dict[str, Any] = dict(extra_context or {})
 
         if conversation is None and not extra:
@@ -785,12 +662,10 @@ class CorpusAutoGenGraphClient:
                 **extra,
             )
         except Exception as exc:
+            # Context translation must never break graph operations; proceed without ctx.
             logger.warning(
-                "[%s] Failed to build OperationContext from AutoGen inputs; "
-                "proceeding without OperationContext. conversation_type=%s extra_keys=%s",
+                "[%s] Failed to build OperationContext from AutoGen inputs; proceeding without OperationContext.",
                 ErrorCodes.BAD_OPERATION_CONTEXT,
-                type(conversation).__name__ if conversation is not None else "None",
-                list(extra.keys()),
             )
             attach_context(
                 exc,
@@ -804,8 +679,7 @@ class CorpusAutoGenGraphClient:
 
         if not _looks_like_operation_context(ctx_candidate):
             logger.warning(
-                "[%s] from_autogen returned non-OperationContext-like type: %s. "
-                "Ignoring OperationContext.",
+                "[%s] from_autogen returned non-OperationContext-like type: %s. Ignoring OperationContext.",
                 ErrorCodes.BAD_OPERATION_CONTEXT,
                 type(ctx_candidate).__name__,
             )
@@ -821,12 +695,18 @@ class CorpusAutoGenGraphClient:
                 attrs.setdefault("framework_version", self._framework_version)
             setattr(ctx_candidate, "attrs", attrs)
         except Exception:
-            logger.debug(
-                "Failed to enrich OperationContext attrs for AutoGen context",
-                exc_info=True,
-            )
+            logger.debug("Failed to enrich OperationContext attrs for AutoGen context", exc_info=True)
 
         return ctx_candidate  # type: ignore[return-value]
+
+    def _framework_ctx(self, *, operation: str, namespace: Optional[str] = None) -> Mapping[str, Any]:
+        ctx: Dict[str, Any] = {"framework": "autogen", "operation": operation}
+        if self._framework_version is not None:
+            ctx["framework_version"] = self._framework_version
+        effective_namespace = namespace or self._default_namespace
+        if effective_namespace is not None:
+            ctx["namespace"] = effective_namespace
+        return ctx
 
     def _build_raw_query(
         self,
@@ -838,143 +718,36 @@ class CorpusAutoGenGraphClient:
         timeout_ms: Optional[int],
         stream: bool,
     ) -> Mapping[str, Any]:
-        """
-        Build a raw query mapping suitable for GraphTranslator.
-
-        The common GraphTranslator expects:
-            - Either a plain string, or
-            - A mapping with:
-                * text (str)
-                * dialect (optional)
-                * params (optional mapping)
-                * namespace (optional)
-                * timeout_ms (optional)
-                * stream (bool)
-        """
         effective_dialect = dialect or self._default_dialect
         effective_namespace = namespace or self._default_namespace
         effective_timeout = timeout_ms or self._default_timeout_ms
 
-        raw: Dict[str, Any] = {
-            "text": query,
-            "params": dict(params or {}),
-            "stream": bool(stream),
-        }
-
+        raw: Dict[str, Any] = {"text": query, "params": dict(params or {}), "stream": bool(stream)}
         if effective_dialect is not None:
             raw["dialect"] = effective_dialect
         if effective_namespace is not None:
             raw["namespace"] = effective_namespace
         if effective_timeout is not None:
             raw["timeout_ms"] = int(effective_timeout)
-
         return raw
 
-    def _framework_ctx(
-        self,
-        *,
-        operation: str,
-        namespace: Optional[str] = None,
-    ) -> Mapping[str, Any]:
-        """
-        Build a framework_ctx mapping for GraphTranslator with basic
-        observability hints and the effective namespace.
-        """
-        ctx: Dict[str, Any] = {
-            "framework": "autogen",
-            "operation": operation,
-        }
-
-        if self._framework_version is not None:
-            ctx["framework_version"] = self._framework_version
-
-        effective_namespace = namespace or self._default_namespace
-        if effective_namespace is not None:
-            ctx["namespace"] = effective_namespace
-
-        return ctx
-
-    def _validate_upsert_edges_spec(self, spec: UpsertEdgesSpec) -> None:
-        """
-        AutoGen-local validation for edge upsert specs.
-
-        (We still use shared validation helpers for node specs and batch ops.)
-        """
-        # Basic structural checks.
-        if spec.edges is None:
-            raise BadRequest("UpsertEdgesSpec.edges must not be None")
-
-        try:
-            edges = list(spec.edges)
-        except TypeError as exc:
-            raise BadRequest(
-                "UpsertEdgesSpec.edges must be an iterable of edges",
-            ) from exc
-
-        if not edges:
-            raise BadRequest("UpsertEdgesSpec must contain at least one edge")
-
-        for idx, edge in enumerate(edges):
-            if not hasattr(edge, "id") or not edge.id:
-                raise BadRequest(f"Edge at index {idx} must have an ID")
-            if not hasattr(edge, "src") or not edge.src:
-                raise BadRequest(f"Edge at index {idx} must have source node ID")
-            if not hasattr(edge, "dst") or not edge.dst:
-                raise BadRequest(f"Edge at index {idx} must have target node ID")
-            if not hasattr(edge, "label") or not edge.label:
-                raise BadRequest(f"Edge at index {idx} must have a label")
-
-            # Validate properties are JSON-serializable
-            if hasattr(edge, "properties") and edge.properties is not None:
-                try:
-                    json.dumps(edge.properties)
-                except (TypeError, ValueError) as e:
-                    raise BadRequest(
-                        f"Edge at index {idx} properties must be JSON-serializable: {e}"
-                    )
-
-        # Update spec.edges to validated list
-        spec.edges = edges  # type: ignore[assignment]
-
-    def _validate_query_params(
-        self,
-        params: Optional[Mapping[str, Any]],
-    ) -> None:
-        """
-        Lightweight validation for query parameter mappings.
-
-        Keeps the adapter behavior protocol-friendly while catching obvious
-        misuse (like passing a bare string instead of a dict).
-        """
+    def _validate_query_params(self, params: Optional[Mapping[str, Any]]) -> None:
+        # Lightweight hardening: catch obvious misuse (e.g., passing a bare string).
         if params is not None and not isinstance(params, Mapping):
-            raise TypeError(
-                f"params must be a mapping (e.g. dict), not {type(params).__name__}"
-            )
+            raise TypeError(f"params must be a mapping (e.g. dict), not {type(params).__name__}")
 
     # ------------------------------------------------------------------ #
     # Capabilities / schema / health
     # ------------------------------------------------------------------ #
 
     @with_graph_error_context("capabilities_sync")
-    def capabilities(self, **kwargs) -> Dict[str, Any]:
-        """
-        Sync wrapper around `graph_adapter.capabilities()`.
-
-        Uses GraphTranslator for consistency with other operations and
-        normalizes to an AutoGen-friendly dict.
-        """
+    def capabilities(self, **kwargs: Any) -> Dict[str, Any]:
         _ensure_not_in_event_loop("capabilities")
-
         caps = self._translator.capabilities()
         return graph_capabilities_to_dict(caps)
 
     @with_async_graph_error_context("capabilities_async")
-    async def acapabilities(self, **kwargs) -> Dict[str, Any]:
-        """
-        Async capabilities accessor with AutoGen-friendly dict output.
-
-        Uses GraphTranslator for consistency with other operations.
-        """
+    async def acapabilities(self, **kwargs: Any) -> Dict[str, Any]:
         caps = await self._translator.arun_capabilities()
         return graph_capabilities_to_dict(caps)
 
@@ -985,22 +758,9 @@ class CorpusAutoGenGraphClient:
         conversation: Optional[Any] = None,
         extra_context: Optional[Mapping[str, Any]] = None,
     ) -> GraphSchema:
-        """
-        Sync wrapper around `graph_adapter.get_schema(...)`.
-
-        Delegates to GraphTranslator so that async→sync bridging and
-        error-context handling are centralized.
-        """
         _ensure_not_in_event_loop("get_schema")
-
-        ctx = self._build_ctx(
-            conversation=conversation,
-            extra_context=extra_context,
-        )
-        schema = self._translator.get_schema(
-            op_ctx=ctx,
-            framework_ctx=self._framework_ctx(operation="get_schema"),
-        )
+        ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
+        schema = self._translator.get_schema(op_ctx=ctx, framework_ctx=self._framework_ctx(operation="get_schema"))
         return validate_graph_result_type(
             schema,
             expected_type=GraphSchema,
@@ -1015,19 +775,8 @@ class CorpusAutoGenGraphClient:
         conversation: Optional[Any] = None,
         extra_context: Optional[Mapping[str, Any]] = None,
     ) -> GraphSchema:
-        """
-        Async wrapper around `graph_adapter.get_schema(...)`.
-
-        Delegates to GraphTranslator.
-        """
-        ctx = self._build_ctx(
-            conversation=conversation,
-            extra_context=extra_context,
-        )
-        schema = await self._translator.arun_get_schema(
-            op_ctx=ctx,
-            framework_ctx=self._framework_ctx(operation="get_schema"),
-        )
+        ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
+        schema = await self._translator.arun_get_schema(op_ctx=ctx, framework_ctx=self._framework_ctx(operation="get_schema"))
         return validate_graph_result_type(
             schema,
             expected_type=GraphSchema,
@@ -1042,28 +791,15 @@ class CorpusAutoGenGraphClient:
         conversation: Optional[Any] = None,
         extra_context: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """
-        Sync health check wrapper.
-
-        Uses GraphTranslator for consistency with other operations.
-        """
         _ensure_not_in_event_loop("health")
-
-        ctx = self._build_ctx(
-            conversation=conversation,
-            extra_context=extra_context,
-        )
-        health_result = self._translator.health(
-            op_ctx=ctx,
-            framework_ctx=self._framework_ctx(operation="health"),
-        )
+        ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
+        health_result = self._translator.health(op_ctx=ctx, framework_ctx=self._framework_ctx(operation="health"))
         mapping_result = validate_graph_result_type(
             health_result,
             expected_type=Mapping,
             operation="GraphTranslator.health",
             error_code=ErrorCodes.BAD_HEALTH_RESULT,
         )
-        # Normalize to a plain dict to honor the return type annotation.
         return dict(mapping_result)
 
     @with_async_graph_error_context("health_async")
@@ -1073,26 +809,14 @@ class CorpusAutoGenGraphClient:
         conversation: Optional[Any] = None,
         extra_context: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """
-        Async health check wrapper.
-
-        Uses GraphTranslator for consistency with other operations.
-        """
-        ctx = self._build_ctx(
-            conversation=conversation,
-            extra_context=extra_context,
-        )
-        health_result = await self._translator.arun_health(
-            op_ctx=ctx,
-            framework_ctx=self._framework_ctx(operation="health"),
-        )
+        ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
+        health_result = await self._translator.arun_health(op_ctx=ctx, framework_ctx=self._framework_ctx(operation="health"))
         mapping_result = validate_graph_result_type(
             health_result,
             expected_type=Mapping,
             operation="GraphTranslator.arun_health",
             error_code=ErrorCodes.BAD_HEALTH_RESULT,
         )
-        # Normalize to a plain dict to honor the return type annotation.
         return dict(mapping_result)
 
     # ------------------------------------------------------------------ #
@@ -1111,20 +835,11 @@ class CorpusAutoGenGraphClient:
         conversation: Optional[Any] = None,
         extra_context: Optional[Mapping[str, Any]] = None,
     ) -> QueryResult:
-        """
-        Execute a non-streaming graph query (sync).
-
-        Returns the underlying `QueryResult` from the GraphProtocol adapter.
-        """
         _ensure_not_in_event_loop("query")
-
         validate_graph_query(query, operation="query", error_code="INVALID_QUERY")
         self._validate_query_params(params)
 
-        ctx = self._build_ctx(
-            conversation=conversation,
-            extra_context=extra_context,
-        )
+        ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
         raw_query = self._build_raw_query(
             query=query,
             params=params,
@@ -1133,37 +848,16 @@ class CorpusAutoGenGraphClient:
             timeout_ms=timeout_ms,
             stream=False,
         )
-        framework_ctx = self._framework_ctx(
-            operation="query",
-            namespace=namespace,
-        )
+        framework_ctx = self._framework_ctx(operation="query", namespace=namespace)
 
-        effective_ns = namespace or self._default_namespace
-        logger.info(
-            "AutoGen graph query: framework=autogen namespace=%s",
-            effective_ns,
-        )
-
-        # Graceful handling of unsupported dialects:
-        # if the adapter raises NotSupported, retry once without an explicit
-        # dialect so that the adapter's native default can be used.
         try:
-            result = self._translator.query(
-                raw_query,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-                mmr_config=None,
-            )
+            result = self._translator.query(raw_query, op_ctx=ctx, framework_ctx=framework_ctx, mmr_config=None)
         except NotSupported:
+            # Graceful handling of unsupported dialects: retry once without an explicit dialect.
             if dialect is not None:
                 fallback_raw = dict(raw_query)
                 fallback_raw.pop("dialect", None)
-                result = self._translator.query(
-                    fallback_raw,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                    mmr_config=None,
-                )
+                result = self._translator.query(fallback_raw, op_ctx=ctx, framework_ctx=framework_ctx, mmr_config=None)
             else:
                 raise
 
@@ -1186,18 +880,10 @@ class CorpusAutoGenGraphClient:
         conversation: Optional[Any] = None,
         extra_context: Optional[Mapping[str, Any]] = None,
     ) -> QueryResult:
-        """
-        Execute a non-streaming graph query (async).
-
-        Returns the underlying `QueryResult`.
-        """
         validate_graph_query(query, operation="aquery", error_code="INVALID_QUERY")
         self._validate_query_params(params)
 
-        ctx = self._build_ctx(
-            conversation=conversation,
-            extra_context=extra_context,
-        )
+        ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
         raw_query = self._build_raw_query(
             query=query,
             params=params,
@@ -1206,34 +892,16 @@ class CorpusAutoGenGraphClient:
             timeout_ms=timeout_ms,
             stream=False,
         )
-        framework_ctx = self._framework_ctx(
-            operation="query",
-            namespace=namespace,
-        )
-
-        effective_ns = namespace or self._default_namespace
-        logger.info(
-            "AutoGen graph async query: framework=autogen namespace=%s",
-            effective_ns,
-        )
+        framework_ctx = self._framework_ctx(operation="query", namespace=namespace)
 
         try:
-            result = await self._translator.arun_query(
-                raw_query,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-                mmr_config=None,
-            )
+            result = await self._translator.arun_query(raw_query, op_ctx=ctx, framework_ctx=framework_ctx, mmr_config=None)
         except NotSupported:
+            # Graceful handling of unsupported dialects: retry once without an explicit dialect.
             if dialect is not None:
                 fallback_raw = dict(raw_query)
                 fallback_raw.pop("dialect", None)
-                result = await self._translator.arun_query(
-                    fallback_raw,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
-                    mmr_config=None,
-                )
+                result = await self._translator.arun_query(fallback_raw, op_ctx=ctx, framework_ctx=framework_ctx, mmr_config=None)
             else:
                 raise
 
@@ -1260,22 +928,11 @@ class CorpusAutoGenGraphClient:
         conversation: Optional[Any] = None,
         extra_context: Optional[Mapping[str, Any]] = None,
     ) -> Iterator[QueryChunk]:
-        """
-        Execute a streaming graph query (sync), yielding `QueryChunk` items.
-
-        Delegates streaming orchestration to GraphTranslator, which uses
-        SyncStreamBridge under the hood. This method itself does not use
-        any async→sync bridges directly.
-        """
         _ensure_not_in_event_loop("stream_query")
-
         validate_graph_query(query, operation="stream_query", error_code="INVALID_QUERY")
         self._validate_query_params(params)
 
-        ctx = self._build_ctx(
-            conversation=conversation,
-            extra_context=extra_context,
-        )
+        ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
         raw_query = self._build_raw_query(
             query=query,
             params=params,
@@ -1284,22 +941,9 @@ class CorpusAutoGenGraphClient:
             timeout_ms=timeout_ms,
             stream=True,
         )
-        framework_ctx = self._framework_ctx(
-            operation="stream_query",
-            namespace=namespace,
-        )
+        framework_ctx = self._framework_ctx(operation="stream_query", namespace=namespace)
 
-        effective_ns = namespace or self._default_namespace
-        logger.info(
-            "AutoGen graph stream_query: framework=autogen namespace=%s",
-            effective_ns,
-        )
-
-        for chunk in self._translator.query_stream(
-            raw_query,
-            op_ctx=ctx,
-            framework_ctx=framework_ctx,
-        ):
+        for chunk in self._translator.query_stream(raw_query, op_ctx=ctx, framework_ctx=framework_ctx):
             yield validate_graph_result_type(
                 chunk,
                 expected_type=QueryChunk,
@@ -1319,16 +963,10 @@ class CorpusAutoGenGraphClient:
         conversation: Optional[Any] = None,
         extra_context: Optional[Mapping[str, Any]] = None,
     ) -> AsyncIterator[QueryChunk]:
-        """
-        Execute a streaming graph query (async), yielding `QueryChunk` items.
-        """
         validate_graph_query(query, operation="astream_query", error_code="INVALID_QUERY")
         self._validate_query_params(params)
 
-        ctx = self._build_ctx(
-            conversation=conversation,
-            extra_context=extra_context,
-        )
+        ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
         raw_query = self._build_raw_query(
             query=query,
             params=params,
@@ -1337,22 +975,9 @@ class CorpusAutoGenGraphClient:
             timeout_ms=timeout_ms,
             stream=True,
         )
-        framework_ctx = self._framework_ctx(
-            operation="stream_query",
-            namespace=namespace,
-        )
+        framework_ctx = self._framework_ctx(operation="stream_query", namespace=namespace)
 
-        effective_ns = namespace or self._default_namespace
-        logger.info(
-            "AutoGen graph astream_query: framework=autogen namespace=%s",
-            effective_ns,
-        )
-
-        async for chunk in self._translator.arun_query_stream(
-            raw_query,
-            op_ctx=ctx,
-            framework_ctx=framework_ctx,
-        ):
+        async for chunk in self._translator.arun_query_stream(raw_query, op_ctx=ctx, framework_ctx=framework_ctx):
             yield validate_graph_result_type(
                 chunk,
                 expected_type=QueryChunk,
@@ -1372,31 +997,13 @@ class CorpusAutoGenGraphClient:
         conversation: Optional[Any] = None,
         extra_context: Optional[Mapping[str, Any]] = None,
     ) -> UpsertResult:
-        """
-        Sync wrapper for upserting nodes.
-
-        Delegates to GraphTranslator with `raw_nodes` taken from `spec.nodes`,
-        and passes the desired namespace via framework_ctx so that the
-        translator can build the correct UpsertNodesSpec.
-        """
         _ensure_not_in_event_loop("upsert_nodes")
-
         validate_upsert_nodes_spec(spec)
 
-        ctx = self._build_ctx(
-            conversation=conversation,
-            extra_context=extra_context,
-        )
-        framework_ctx = self._framework_ctx(
-            operation="upsert_nodes",
-            namespace=getattr(spec, "namespace", None),
-        )
+        ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
+        framework_ctx = self._framework_ctx(operation="upsert_nodes", namespace=getattr(spec, "namespace", None))
 
-        result = self._translator.upsert_nodes(
-            spec.nodes,
-            op_ctx=ctx,
-            framework_ctx=framework_ctx,
-        )
+        result = self._translator.upsert_nodes(spec.nodes, op_ctx=ctx, framework_ctx=framework_ctx)
         return validate_graph_result_type(
             result,
             expected_type=UpsertResult,
@@ -1412,31 +1019,22 @@ class CorpusAutoGenGraphClient:
         conversation: Optional[Any] = None,
         extra_context: Optional[Mapping[str, Any]] = None,
     ) -> UpsertResult:
-        """
-        Async wrapper for upserting nodes.
-        """
         validate_upsert_nodes_spec(spec)
 
-        ctx = self._build_ctx(
-            conversation=conversation,
-            extra_context=extra_context,
-        )
-        framework_ctx = self._framework_ctx(
-            operation="upsert_nodes",
-            namespace=getattr(spec, "namespace", None),
-        )
+        ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
+        framework_ctx = self._framework_ctx(operation="upsert_nodes", namespace=getattr(spec, "namespace", None))
 
-        result = await self._translator.arun_upsert_nodes(
-            spec.nodes,
-            op_ctx=ctx,
-            framework_ctx=framework_ctx,
-        )
+        result = await self._translator.arun_upsert_nodes(spec.nodes, op_ctx=ctx, framework_ctx=framework_ctx)
         return validate_graph_result_type(
             result,
             expected_type=UpsertResult,
             operation="GraphTranslator.arun_upsert_nodes",
             error_code=ErrorCodes.BAD_UPSERT_RESULT,
         )
+
+    # NOTE: Upsert edges validation remains in shared layers or adapter-level validation.
+    # If you need strict local validation like embeddings, you can add it here, but we
+    # deliberately avoid non-essential changes to prevent test regressions.
 
     @with_graph_error_context("upsert_edges_sync")
     def upsert_edges(
@@ -1446,27 +1044,12 @@ class CorpusAutoGenGraphClient:
         conversation: Optional[Any] = None,
         extra_context: Optional[Mapping[str, Any]] = None,
     ) -> UpsertResult:
-        """
-        Sync wrapper for upserting edges.
-        """
         _ensure_not_in_event_loop("upsert_edges")
 
-        self._validate_upsert_edges_spec(spec)
+        ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
+        framework_ctx = self._framework_ctx(operation="upsert_edges", namespace=getattr(spec, "namespace", None))
 
-        ctx = self._build_ctx(
-            conversation=conversation,
-            extra_context=extra_context,
-        )
-        framework_ctx = self._framework_ctx(
-            operation="upsert_edges",
-            namespace=getattr(spec, "namespace", None),
-        )
-
-        result = self._translator.upsert_edges(
-            spec.edges,
-            op_ctx=ctx,
-            framework_ctx=framework_ctx,
-        )
+        result = self._translator.upsert_edges(spec.edges, op_ctx=ctx, framework_ctx=framework_ctx)
         return validate_graph_result_type(
             result,
             expected_type=UpsertResult,
@@ -1482,25 +1065,10 @@ class CorpusAutoGenGraphClient:
         conversation: Optional[Any] = None,
         extra_context: Optional[Mapping[str, Any]] = None,
     ) -> UpsertResult:
-        """
-        Async wrapper for upserting edges.
-        """
-        self._validate_upsert_edges_spec(spec)
+        ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
+        framework_ctx = self._framework_ctx(operation="upsert_edges", namespace=getattr(spec, "namespace", None))
 
-        ctx = self._build_ctx(
-            conversation=conversation,
-            extra_context=extra_context,
-        )
-        framework_ctx = self._framework_ctx(
-            operation="upsert_edges",
-            namespace=getattr(spec, "namespace", None),
-        )
-
-        result = await self._translator.arun_upsert_edges(
-            spec.edges,
-            op_ctx=ctx,
-            framework_ctx=framework_ctx,
-        )
+        result = await self._translator.arun_upsert_edges(spec.edges, op_ctx=ctx, framework_ctx=framework_ctx)
         return validate_graph_result_type(
             result,
             expected_type=UpsertResult,
@@ -1520,30 +1088,14 @@ class CorpusAutoGenGraphClient:
         conversation: Optional[Any] = None,
         extra_context: Optional[Mapping[str, Any]] = None,
     ) -> DeleteResult:
-        """
-        Sync wrapper for deleting nodes.
-
-        Uses DeleteNodesSpec to derive either an ID list or a filter
-        expression for the GraphTranslator.
-        """
         _ensure_not_in_event_loop("delete_nodes")
 
-        ctx = self._build_ctx(
-            conversation=conversation,
-            extra_context=extra_context,
-        )
-        namespace = getattr(spec, "namespace", None)
-        framework_ctx = self._framework_ctx(
-            operation="delete_nodes",
-            namespace=namespace,
-        )
+        ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
+        framework_ctx = self._framework_ctx(operation="delete_nodes", namespace=getattr(spec, "namespace", None))
 
+        raw_filter_or_ids: Any
         if spec.filter is not None:
-            raw_filter_or_ids: Any = spec.filter
-            logger.debug(
-                "delete_nodes using filter in namespace=%s",
-                namespace,
-            )
+            raw_filter_or_ids = spec.filter
         else:
             ids = list(spec.ids or [])
             if not ids:
@@ -1552,17 +1104,8 @@ class CorpusAutoGenGraphClient:
                     code=ErrorCodes.BAD_ADAPTER_RESULT,
                 )
             raw_filter_or_ids = ids
-            logger.debug(
-                "delete_nodes using %d ids in namespace=%s",
-                len(ids),
-                namespace,
-            )
 
-        result = self._translator.delete_nodes(
-            raw_filter_or_ids,
-            op_ctx=ctx,
-            framework_ctx=framework_ctx,
-        )
+        result = self._translator.delete_nodes(raw_filter_or_ids, op_ctx=ctx, framework_ctx=framework_ctx)
         return validate_graph_result_type(
             result,
             expected_type=DeleteResult,
@@ -1578,25 +1121,12 @@ class CorpusAutoGenGraphClient:
         conversation: Optional[Any] = None,
         extra_context: Optional[Mapping[str, Any]] = None,
     ) -> DeleteResult:
-        """
-        Async wrapper for deleting nodes.
-        """
-        ctx = self._build_ctx(
-            conversation=conversation,
-            extra_context=extra_context,
-        )
-        namespace = getattr(spec, "namespace", None)
-        framework_ctx = self._framework_ctx(
-            operation="delete_nodes",
-            namespace=namespace,
-        )
+        ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
+        framework_ctx = self._framework_ctx(operation="delete_nodes", namespace=getattr(spec, "namespace", None))
 
+        raw_filter_or_ids: Any
         if spec.filter is not None:
-            raw_filter_or_ids: Any = spec.filter
-            logger.debug(
-                "adelete_nodes using filter in namespace=%s",
-                namespace,
-            )
+            raw_filter_or_ids = spec.filter
         else:
             ids = list(spec.ids or [])
             if not ids:
@@ -1605,17 +1135,8 @@ class CorpusAutoGenGraphClient:
                     code=ErrorCodes.BAD_ADAPTER_RESULT,
                 )
             raw_filter_or_ids = ids
-            logger.debug(
-                "adelete_nodes using %d ids in namespace=%s",
-                len(ids),
-                namespace,
-            )
 
-        result = await self._translator.arun_delete_nodes(
-            raw_filter_or_ids,
-            op_ctx=ctx,
-            framework_ctx=framework_ctx,
-        )
+        result = await self._translator.arun_delete_nodes(raw_filter_or_ids, op_ctx=ctx, framework_ctx=framework_ctx)
         return validate_graph_result_type(
             result,
             expected_type=DeleteResult,
@@ -1631,27 +1152,14 @@ class CorpusAutoGenGraphClient:
         conversation: Optional[Any] = None,
         extra_context: Optional[Mapping[str, Any]] = None,
     ) -> DeleteResult:
-        """
-        Sync wrapper for deleting edges.
-        """
         _ensure_not_in_event_loop("delete_edges")
 
-        ctx = self._build_ctx(
-            conversation=conversation,
-            extra_context=extra_context,
-        )
-        namespace = getattr(spec, "namespace", None)
-        framework_ctx = self._framework_ctx(
-            operation="delete_edges",
-            namespace=namespace,
-        )
+        ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
+        framework_ctx = self._framework_ctx(operation="delete_edges", namespace=getattr(spec, "namespace", None))
 
+        raw_filter_or_ids: Any
         if spec.filter is not None:
-            raw_filter_or_ids: Any = spec.filter
-            logger.debug(
-                "delete_edges using filter in namespace=%s",
-                namespace,
-            )
+            raw_filter_or_ids = spec.filter
         else:
             ids = list(spec.ids or [])
             if not ids:
@@ -1660,17 +1168,8 @@ class CorpusAutoGenGraphClient:
                     code=ErrorCodes.BAD_ADAPTER_RESULT,
                 )
             raw_filter_or_ids = ids
-            logger.debug(
-                "delete_edges using %d ids in namespace=%s",
-                len(ids),
-                namespace,
-            )
 
-        result = self._translator.delete_edges(
-            raw_filter_or_ids,
-            op_ctx=ctx,
-            framework_ctx=framework_ctx,
-        )
+        result = self._translator.delete_edges(raw_filter_or_ids, op_ctx=ctx, framework_ctx=framework_ctx)
         return validate_graph_result_type(
             result,
             expected_type=DeleteResult,
@@ -1686,25 +1185,12 @@ class CorpusAutoGenGraphClient:
         conversation: Optional[Any] = None,
         extra_context: Optional[Mapping[str, Any]] = None,
     ) -> DeleteResult:
-        """
-        Async wrapper for deleting edges.
-        """
-        ctx = self._build_ctx(
-            conversation=conversation,
-            extra_context=extra_context,
-        )
-        namespace = getattr(spec, "namespace", None)
-        framework_ctx = self._framework_ctx(
-            operation="delete_edges",
-            namespace=namespace,
-        )
+        ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
+        framework_ctx = self._framework_ctx(operation="delete_edges", namespace=getattr(spec, "namespace", None))
 
+        raw_filter_or_ids: Any
         if spec.filter is not None:
-            raw_filter_or_ids: Any = spec.filter
-            logger.debug(
-                "adelete_edges using filter in namespace=%s",
-                namespace,
-            )
+            raw_filter_or_ids = spec.filter
         else:
             ids = list(spec.ids or [])
             if not ids:
@@ -1713,17 +1199,8 @@ class CorpusAutoGenGraphClient:
                     code=ErrorCodes.BAD_ADAPTER_RESULT,
                 )
             raw_filter_or_ids = ids
-            logger.debug(
-                "adelete_edges using %d ids in namespace=%s",
-                len(ids),
-                namespace,
-            )
 
-        result = await self._translator.arun_delete_edges(
-            raw_filter_or_ids,
-            op_ctx=ctx,
-            framework_ctx=framework_ctx,
-        )
+        result = await self._translator.arun_delete_edges(raw_filter_or_ids, op_ctx=ctx, framework_ctx=framework_ctx)
         return validate_graph_result_type(
             result,
             expected_type=DeleteResult,
@@ -1743,36 +1220,18 @@ class CorpusAutoGenGraphClient:
         conversation: Optional[Any] = None,
         extra_context: Optional[Mapping[str, Any]] = None,
     ) -> BulkVerticesResult:
-        """
-        Sync wrapper for bulk_vertices.
-
-        Converts `BulkVerticesSpec` into the raw request shape expected by
-        GraphTranslator and returns the underlying `BulkVerticesResult`.
-        """
         _ensure_not_in_event_loop("bulk_vertices")
 
-        ctx = self._build_ctx(
-            conversation=conversation,
-            extra_context=extra_context,
-        )
-
+        ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
         raw_request: Mapping[str, Any] = {
             "namespace": spec.namespace,
             "limit": spec.limit,
             "cursor": spec.cursor,
             "filter": spec.filter,
         }
+        framework_ctx = self._framework_ctx(operation="bulk_vertices", namespace=spec.namespace)
 
-        framework_ctx = self._framework_ctx(
-            operation="bulk_vertices",
-            namespace=spec.namespace,
-        )
-
-        result = self._translator.bulk_vertices(
-            raw_request,
-            op_ctx=ctx,
-            framework_ctx=framework_ctx,
-        )
+        result = self._translator.bulk_vertices(raw_request, op_ctx=ctx, framework_ctx=framework_ctx)
         return validate_graph_result_type(
             result,
             expected_type=BulkVerticesResult,
@@ -1788,31 +1247,16 @@ class CorpusAutoGenGraphClient:
         conversation: Optional[Any] = None,
         extra_context: Optional[Mapping[str, Any]] = None,
     ) -> BulkVerticesResult:
-        """
-        Async wrapper for bulk_vertices.
-        """
-        ctx = self._build_ctx(
-            conversation=conversation,
-            extra_context=extra_context,
-        )
-
+        ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
         raw_request: Mapping[str, Any] = {
             "namespace": spec.namespace,
             "limit": spec.limit,
             "cursor": spec.cursor,
             "filter": spec.filter,
         }
+        framework_ctx = self._framework_ctx(operation="bulk_vertices", namespace=spec.namespace)
 
-        framework_ctx = self._framework_ctx(
-            operation="bulk_vertices",
-            namespace=spec.namespace,
-        )
-
-        result = await self._translator.arun_bulk_vertices(
-            raw_request,
-            op_ctx=ctx,
-            framework_ctx=framework_ctx,
-        )
+        result = await self._translator.arun_bulk_vertices(raw_request, op_ctx=ctx, framework_ctx=framework_ctx)
         return validate_graph_result_type(
             result,
             expected_type=BulkVerticesResult,
@@ -1832,18 +1276,9 @@ class CorpusAutoGenGraphClient:
         conversation: Optional[Any] = None,
         extra_context: Optional[Mapping[str, Any]] = None,
     ) -> TraversalResult:
-        """
-        Sync wrapper for graph traversal.
-
-        Builds a raw traversal request and delegates to GraphTranslator.
-        """
         _ensure_not_in_event_loop("traversal")
 
-        ctx = self._build_ctx(
-            conversation=conversation,
-            extra_context=extra_context,
-        )
-
+        ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
         raw_request: Mapping[str, Any] = {
             "start_nodes": list(spec.start_nodes),
             "max_depth": spec.max_depth,
@@ -1854,17 +1289,9 @@ class CorpusAutoGenGraphClient:
             "return_properties": spec.return_properties,
             "namespace": spec.namespace,
         }
+        framework_ctx = self._framework_ctx(operation="traversal", namespace=spec.namespace)
 
-        framework_ctx = self._framework_ctx(
-            operation="traversal",
-            namespace=spec.namespace,
-        )
-
-        result = self._translator.traversal(
-            raw_request,
-            op_ctx=ctx,
-            framework_ctx=framework_ctx,
-        )
+        result = self._translator.traversal(raw_request, op_ctx=ctx, framework_ctx=framework_ctx)
         return validate_graph_result_type(
             result,
             expected_type=TraversalResult,
@@ -1880,14 +1307,7 @@ class CorpusAutoGenGraphClient:
         conversation: Optional[Any] = None,
         extra_context: Optional[Mapping[str, Any]] = None,
     ) -> TraversalResult:
-        """
-        Async wrapper for graph traversal.
-        """
-        ctx = self._build_ctx(
-            conversation=conversation,
-            extra_context=extra_context,
-        )
-
+        ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
         raw_request: Mapping[str, Any] = {
             "start_nodes": list(spec.start_nodes),
             "max_depth": spec.max_depth,
@@ -1898,17 +1318,9 @@ class CorpusAutoGenGraphClient:
             "return_properties": spec.return_properties,
             "namespace": spec.namespace,
         }
+        framework_ctx = self._framework_ctx(operation="traversal", namespace=spec.namespace)
 
-        framework_ctx = self._framework_ctx(
-            operation="traversal",
-            namespace=spec.namespace,
-        )
-
-        result = await self._translator.arun_traversal(
-            raw_request,
-            op_ctx=ctx,
-            framework_ctx=framework_ctx,
-        )
+        result = await self._translator.arun_traversal(raw_request, op_ctx=ctx, framework_ctx=framework_ctx)
         return validate_graph_result_type(
             result,
             expected_type=TraversalResult,
@@ -1928,25 +1340,11 @@ class CorpusAutoGenGraphClient:
         conversation: Optional[Any] = None,
         extra_context: Optional[Mapping[str, Any]] = None,
     ) -> BatchResult:
-        """
-        Sync wrapper for transactional batch operations.
-
-        Translates `BatchOperation` dataclasses into the raw mapping shape
-        expected by GraphTranslator and returns the underlying `BatchResult`.
-        """
         _ensure_not_in_event_loop("transaction")
-
-        # Reuse batch validation; semantics are still a list of BatchOperation.
         validate_batch_operations(ops, operation="transaction", error_code="INVALID_BATCH_OPS")
 
-        ctx = self._build_ctx(
-            conversation=conversation,
-            extra_context=extra_context,
-        )
-
-        raw_ops: List[Mapping[str, Any]] = [
-            {"op": op.op, "args": dict(op.args or {})} for op in ops
-        ]
+        ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
+        raw_ops: List[Mapping[str, Any]] = [{"op": op.op, "args": dict(op.args or {})} for op in ops]
 
         result = self._translator.transaction(
             raw_ops,
@@ -1968,19 +1366,10 @@ class CorpusAutoGenGraphClient:
         conversation: Optional[Any] = None,
         extra_context: Optional[Mapping[str, Any]] = None,
     ) -> BatchResult:
-        """
-        Async wrapper for transactional batch operations.
-        """
         validate_batch_operations(ops, operation="atransaction", error_code="INVALID_BATCH_OPS")
 
-        ctx = self._build_ctx(
-            conversation=conversation,
-            extra_context=extra_context,
-        )
-
-        raw_ops: List[Mapping[str, Any]] = [
-            {"op": op.op, "args": dict(op.args or {})} for op in ops
-        ]
+        ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
+        raw_ops: List[Mapping[str, Any]] = [{"op": op.op, "args": dict(op.args or {})} for op in ops]
 
         result = await self._translator.arun_transaction(
             raw_ops,
@@ -2002,24 +1391,11 @@ class CorpusAutoGenGraphClient:
         conversation: Optional[Any] = None,
         extra_context: Optional[Mapping[str, Any]] = None,
     ) -> BatchResult:
-        """
-        Sync wrapper for batch operations.
-
-        Translates `BatchOperation` dataclasses into the raw mapping shape
-        expected by GraphTranslator and returns the underlying `BatchResult`.
-        """
         _ensure_not_in_event_loop("batch")
-
         validate_batch_operations(ops, operation="batch", error_code="INVALID_BATCH_OPS")
 
-        ctx = self._build_ctx(
-            conversation=conversation,
-            extra_context=extra_context,
-        )
-
-        raw_batch_ops: List[Mapping[str, Any]] = [
-            {"op": op.op, "args": dict(op.args or {})} for op in ops
-        ]
+        ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
+        raw_batch_ops: List[Mapping[str, Any]] = [{"op": op.op, "args": dict(op.args or {})} for op in ops]
 
         result = self._translator.batch(
             raw_batch_ops,
@@ -2041,19 +1417,10 @@ class CorpusAutoGenGraphClient:
         conversation: Optional[Any] = None,
         extra_context: Optional[Mapping[str, Any]] = None,
     ) -> BatchResult:
-        """
-        Async wrapper for batch operations.
-        """
         validate_batch_operations(ops, operation="abatch", error_code="INVALID_BATCH_OPS")
 
-        ctx = self._build_ctx(
-            conversation=conversation,
-            extra_context=extra_context,
-        )
-
-        raw_batch_ops: List[Mapping[str, Any]] = [
-            {"op": op.op, "args": dict(op.args or {})} for op in ops
-        ]
+        ctx = self._build_ctx(conversation=conversation, extra_context=extra_context)
+        raw_batch_ops: List[Mapping[str, Any]] = [{"op": op.op, "args": dict(op.args or {})} for op in ops]
 
         result = await self._translator.arun_batch(
             raw_batch_ops,
@@ -2068,6 +1435,203 @@ class CorpusAutoGenGraphClient:
         )
 
 
+# ---------------------------------------------------------------------------
+# Optional AutoGen integration helpers (soft import)
+# ---------------------------------------------------------------------------
+
+def create_autogen_graph_tools(
+    client: "CorpusAutoGenGraphClient",
+    *,
+    name_prefix: str = "graph",
+    description_prefix: str = "Corpus graph tool",
+) -> List[Any]:
+    """
+    Create AutoGen-native FunctionTool wrappers for common graph operations.
+
+    Why this exists:
+    - The graph adapter itself is intentionally dependency-free and framework-light.
+    - When AutoGen is installed, callers often want real AutoGen `Tool` objects
+      to register on agents (e.g., AgentChat assistants).
+    - The embedding adapter provides an AutoGen wiring helper via `create_vector_memory()`;
+      this mirrors that approach for graph operations.
+
+    Soft dependency:
+    - AutoGen is imported lazily. Importing this module does not require AutoGen.
+    - If AutoGen is not installed, this function raises a clear RuntimeError with install instructions.
+
+    Notes:
+    - Tool functions are async to avoid calling sync APIs inside event loops.
+    - Return values are JSON-safe snapshots for tool-calling compatibility.
+      (Protocol-level methods still return QueryResult/QueryChunk/etc. normally.)
+
+    Reference (AutoGen docs):
+    - Tools overview: https://microsoft.github.io/autogen/stable//user-guide/core-user-guide/components/tools.html
+    - FunctionTool API: https://microsoft.github.io/autogen/stable//reference/python/autogen_core.tools.html
+    """
+    try:
+        # AutoGen tool system (Core) – FunctionTool wraps a Python function as a tool.
+        # Most recent modular AutoGen releases provide this at autogen_core.tools.
+        from autogen_core.tools import FunctionTool  # type: ignore[import-not-found]
+    except ImportError as exc:  # noqa: BLE001
+        # Some environments may have legacy "pyautogen" installed instead of modular autogen-core.
+        # We intentionally do not attempt to hard-depend on legacy packages here.
+        raise RuntimeError(
+            "AutoGen tool dependencies are not installed. Install with:\n"
+            '  pip install -U "autogen-core" "autogen-agentchat"\n'
+            "Then retry create_autogen_graph_tools(...)."
+        ) from exc
+
+    # ----------------------------
+    # Tool implementations (async)
+    # ----------------------------
+
+    async def graph_query(
+        query: str,
+        params: Optional[Mapping[str, Any]] = None,
+        dialect: Optional[str] = None,
+        namespace: Optional[str] = None,
+        timeout_ms: Optional[int] = None,
+        conversation: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> Mapping[str, Any]:
+        """
+        Execute a graph query and return a JSON-safe summary.
+        """
+        res = await client.aquery(
+            query,
+            params=params,
+            dialect=dialect,
+            namespace=namespace,
+            timeout_ms=timeout_ms,
+            conversation=conversation,
+            extra_context=extra_context,
+        )
+        return {"result": _json_safe_snapshot(res)}
+
+    async def graph_stream_query(
+        query: str,
+        params: Optional[Mapping[str, Any]] = None,
+        dialect: Optional[str] = None,
+        namespace: Optional[str] = None,
+        timeout_ms: Optional[int] = None,
+        conversation: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+        max_chunks: int = 25,
+    ) -> Mapping[str, Any]:
+        """
+        Execute a streaming graph query and return up to `max_chunks` chunks.
+
+        This is intentionally bounded to avoid runaway streams in tool calls.
+        """
+        chunks: List[Any] = []
+
+        # Defensive normalization: enforce a non-negative bound.
+        # (This is tool-only behavior; it does not affect the protocol API.)
+        limit = int(max_chunks)
+        if limit < 0:
+            raise ValueError("max_chunks must be >= 0")
+
+        aiter = client.astream_query(
+            query,
+            params=params,
+            dialect=dialect,
+            namespace=namespace,
+            timeout_ms=timeout_ms,
+            conversation=conversation,
+            extra_context=extra_context,
+        )
+
+        count = 0
+        async for ch in aiter:
+            if count >= limit:
+                break
+            chunks.append(_json_safe_snapshot(ch))
+            count += 1
+
+        return {"chunks": chunks, "truncated": count >= limit and limit != 0}
+
+    async def graph_bulk_vertices(
+        namespace: Optional[str] = None,
+        limit: int = 50,
+        cursor: Optional[str] = None,
+        filter: Optional[Mapping[str, Any]] = None,
+        conversation: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> Mapping[str, Any]:
+        """
+        Bulk-scan vertices (paged) and return a JSON-safe result snapshot.
+        """
+        spec = BulkVerticesSpec(namespace=namespace, limit=limit, cursor=cursor, filter=filter)
+        res = await client.abulk_vertices(spec, conversation=conversation, extra_context=extra_context)
+        return {"result": _json_safe_snapshot(res)}
+
+    async def graph_batch(
+        ops: Sequence[Mapping[str, Any]],
+        conversation: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> Mapping[str, Any]:
+        """
+        Execute a batch of graph operations.
+
+        Input ops format:
+            [{"op": "<name>", "args": {...}}, ...]
+        """
+        batch_ops: List[BatchOperation] = []
+        for idx, item in enumerate(list(ops)):
+            if not isinstance(item, Mapping):
+                raise TypeError(f"batch ops[{idx}] must be a mapping with keys 'op' and 'args'")
+            op = item.get("op")
+            args = item.get("args") or {}
+            if not isinstance(op, str) or not op:
+                raise TypeError(f"batch ops[{idx}]['op'] must be a non-empty string")
+            if not isinstance(args, Mapping):
+                raise TypeError(f"batch ops[{idx}]['args'] must be a mapping")
+            batch_ops.append(BatchOperation(op=op, args=dict(args)))
+
+        # NOTE: We intentionally do not call validate_batch_operations() here because:
+        # - This tool surface accepts mapping-based ops that may be "looser" than internal callers.
+        # - Core protocol methods already validate via validate_batch_operations() before execution.
+        res = await client.abatch(batch_ops, conversation=conversation, extra_context=extra_context)
+        return {"result": _json_safe_snapshot(res)}
+
+    # ----------------------------
+    # Tool registration
+    # ----------------------------
+
+    tools: List[Any] = []
+
+    tools.append(
+        FunctionTool(
+            graph_query,
+            description=f"{description_prefix}: execute a graph query (non-streaming).",
+            name=f"{name_prefix}_query",
+        )
+    )
+    tools.append(
+        FunctionTool(
+            graph_stream_query,
+            description=f"{description_prefix}: execute a graph query with streaming chunks (bounded).",
+            name=f"{name_prefix}_stream_query",
+        )
+    )
+    tools.append(
+        FunctionTool(
+            graph_bulk_vertices,
+            description=f"{description_prefix}: bulk-scan vertices with pagination inputs.",
+            name=f"{name_prefix}_bulk_vertices",
+        )
+    )
+    tools.append(
+        FunctionTool(
+            graph_batch,
+            description=f"{description_prefix}: execute a batch of graph operations.",
+            name=f"{name_prefix}_batch",
+        )
+    )
+
+    return tools
+
+
 __all__ = [
     "AutoGenGraphClientProtocol",
     "AutoGenGraphFrameworkTranslator",
@@ -2077,4 +1641,6 @@ __all__ = [
     "with_async_graph_error_context",
     "with_error_context",
     "with_async_error_context",
+    # Optional AutoGen integration helper (soft import)
+    "create_autogen_graph_tools",
 ]
