@@ -30,10 +30,14 @@ Adapters remain responsible for:
 
 from __future__ import annotations
 
+import dataclasses
+import inspect
 import logging
 from dataclasses import dataclass
+from functools import wraps
 from typing import (
     Any,
+    Callable,
     Dict,
     Iterable,
     Iterator,
@@ -43,9 +47,14 @@ from typing import (
     Optional,
     Sequence,
     Tuple,
+    Type,
+    TypeVar,
+    Union,
 )
 
 LOG = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 
 # ---------------------------------------------------------------------------
@@ -1122,6 +1131,262 @@ def iter_graph_events(
         yield event
 
 
+# ---------------------------------------------------------------------------
+# Graph adapter helper utilities (added for conformance + cross-adapter consistency)
+# ---------------------------------------------------------------------------
+
+def graph_capabilities_to_dict(value: Any) -> Dict[str, Any]:
+    """
+    Convert a graph capabilities object into a plain dict.
+
+    This helper intentionally tolerates multiple shapes:
+    - Mapping → shallow-copied to dict
+    - dataclass → converted via dataclasses.asdict
+    - object with __dict__ → vars(obj)
+    - None → {}
+    - unknown → {"value": str(value)} (best-effort)
+    """
+    if value is None:
+        return {}
+    if isinstance(value, Mapping):
+        return dict(value)
+    if dataclasses.is_dataclass(value):
+        try:
+            return dataclasses.asdict(value)  # type: ignore[arg-type]
+        except Exception:  # noqa: BLE001
+            return dict(vars(value)) if hasattr(value, "__dict__") else {"value": str(value)}
+    if hasattr(value, "__dict__"):
+        try:
+            return dict(vars(value))
+        except Exception:  # noqa: BLE001
+            return {"value": str(value)}
+    return {"value": str(value)}
+
+
+def validate_graph_query(
+    query: Any,
+    *,
+    operation: str,
+    error_code: str,
+) -> Any:
+    """
+    Lightweight validation for graph query inputs.
+
+    The conformance suite only requires that framework adapters reject obviously
+    invalid inputs with actionable errors. This helper is intentionally tolerant:
+    - str is accepted (non-empty after stripping)
+    - Mapping is accepted (assumed to be a structured query shape)
+    """
+    if isinstance(query, str):
+        if not query.strip():
+            raise ValueError(f"[{error_code}] {operation}: query must be a non-empty string")
+        return query
+    if isinstance(query, Mapping):
+        if not query:
+            raise ValueError(f"[{error_code}] {operation}: query mapping must not be empty")
+        return query
+    raise TypeError(
+        f"[{error_code}] {operation}: query must be a string or mapping, got {type(query).__name__}"
+    )
+
+
+def validate_upsert_nodes_spec(
+    spec: Any,
+    *,
+    operation: str,
+    error_code: str,
+) -> Any:
+    """
+    Lightweight validation for upsert-nodes specs.
+
+    Accepts:
+    - Mapping (structured spec)
+    - Sequence of mapping-like rows (list of nodes)
+    """
+    if isinstance(spec, Mapping):
+        if not spec:
+            raise ValueError(f"[{error_code}] {operation}: upsert spec mapping must not be empty")
+        return spec
+    if isinstance(spec, Sequence) and not isinstance(spec, (str, bytes)):
+        if len(spec) == 0:
+            raise ValueError(f"[{error_code}] {operation}: upsert spec sequence must not be empty")
+        return spec
+    raise TypeError(
+        f"[{error_code}] {operation}: upsert spec must be mapping or sequence, got {type(spec).__name__}"
+    )
+
+
+def validate_batch_operations(
+    ops: Any,
+    *,
+    operation: str,
+    error_code: str,
+) -> Any:
+    """
+    Lightweight validation for batch operations inputs.
+
+    Accepts:
+    - Sequence of mapping-like operations (best-effort)
+    """
+    if not isinstance(ops, Sequence) or isinstance(ops, (str, bytes)):
+        raise TypeError(
+            f"[{error_code}] {operation}: batch ops must be a non-string sequence, got {type(ops).__name__}"
+        )
+    if len(ops) == 0:
+        raise ValueError(f"[{error_code}] {operation}: batch ops must not be empty")
+    return ops
+
+
+def validate_graph_result_type(
+    result: Any,
+    *,
+    expected_type: Optional[Union[Type[Any], Tuple[Type[Any], ...]]] = None,
+    expected: Optional[Union[Type[Any], Tuple[Type[Any], ...]]] = None,
+    operation: str,
+    error_code: str,
+) -> Any:
+    """
+    Validate a result is an instance of an expected type.
+
+    Compatibility note:
+    - Some framework adapters call this as `expected_type=...`
+    - Others may call it as `expected=...` (older naming)
+    This function supports both and prefers `expected_type` when provided.
+
+    Raises:
+    - TypeError when the result type does not match
+    """
+    exp = expected_type if expected_type is not None else expected
+    if exp is None:
+        # If no expected type was provided, return the result unchanged (best-effort).
+        return result
+    if not isinstance(result, exp):
+        exp_name = (
+            ", ".join(t.__name__ for t in exp)  # type: ignore[arg-type]
+            if isinstance(exp, tuple)
+            else getattr(exp, "__name__", str(exp))
+        )
+        raise TypeError(
+            f"[{error_code}] {operation}: expected {exp_name}, got {type(result).__name__}"
+        )
+    return result
+
+
+def create_graph_error_context_decorator(
+    *,
+    framework: str,
+    is_async: bool = False,
+) -> Callable[..., Callable[[Callable[..., T]], Callable[..., T]]]:
+    """
+    Create a graph error-context decorator factory.
+
+    This is the shared implementation used by framework adapters to ensure
+    consistent error-context attachment across sync/async methods.
+
+    Expected usage pattern (as seen in framework adapters):
+
+        @create_graph_error_context_decorator(framework="autogen", is_async=False)(
+            operation="health_sync"
+        )
+        def health(...): ...
+
+    Conformance expectations:
+    - On exceptions, attach_context(...) is called (best-effort) with at least:
+        framework=<framework>, operation="graph_<operation>"
+    - The original exception is re-raised.
+    """
+    framework_label = str(framework).strip() or "graph"
+
+    def _factory(*, operation: str, **static_context: Any) -> Callable[[Callable[..., T]], Callable[..., T]]:
+        op = str(operation).strip() or "unknown"
+        # Normalize operation for downstream assertions / observability.
+        op_name = op if op.startswith("graph_") else f"graph_{op}"
+
+        def _decorate(fn: Callable[..., Any]) -> Callable[..., Any]:
+            # NOTE: This decorator is intentionally "best-effort" for context attachment:
+            # - If attach_context cannot be imported or raises internally, we log and
+            #   always re-raise the *original* exception (never masking the real failure).
+            def _best_effort_attach(exc: BaseException) -> None:
+                try:
+                    # Import lazily to avoid import cycles and keep module framework-neutral.
+                    from corpus_sdk.core.error_context import attach_context  # type: ignore
+                except Exception:  # noqa: BLE001
+                    # Best-effort only; do not replace the original exception.
+                    LOG.debug(
+                        "%s: failed to import attach_context while handling exception",
+                        framework_label,
+                        exc_info=True,
+                    )
+                    return
+                try:
+                    attach_context(
+                        exc,
+                        framework=framework_label,
+                        operation=op_name,
+                        **static_context,
+                    )
+                except Exception:  # noqa: BLE001
+                    # Best-effort only; do not replace the original exception.
+                    LOG.debug(
+                        "%s: attach_context raised while handling exception",
+                        framework_label,
+                        exc_info=True,
+                    )
+
+            if is_async:
+                # Async generator wrapper: wrap iteration so mid-stream errors also get context.
+                if inspect.isasyncgenfunction(fn):
+                    @wraps(fn)
+                    async def _async_gen_wrapper(*args: Any, **kwargs: Any) -> Any:
+                        try:
+                            async for item in fn(*args, **kwargs):
+                                yield item
+                        except BaseException as exc:  # noqa: BLE001
+                            _best_effort_attach(exc)
+                            raise
+
+                    return _async_gen_wrapper  # type: ignore[return-value]
+
+                # Async wrapper: minimal overhead unless an exception is thrown.
+                @wraps(fn)
+                async def _async_wrapper(*args: Any, **kwargs: Any) -> Any:
+                    try:
+                        return await fn(*args, **kwargs)
+                    except BaseException as exc:  # noqa: BLE001
+                        _best_effort_attach(exc)
+                        raise
+
+                return _async_wrapper  # type: ignore[return-value]
+
+            # Sync generator wrapper: wrap iteration so mid-stream errors also get context.
+            if inspect.isgeneratorfunction(fn):
+                @wraps(fn)
+                def _sync_gen_wrapper(*args: Any, **kwargs: Any) -> Any:
+                    try:
+                        for item in fn(*args, **kwargs):
+                            yield item
+                    except BaseException as exc:  # noqa: BLE001
+                        _best_effort_attach(exc)
+                        raise
+
+                return _sync_gen_wrapper  # type: ignore[return-value]
+
+            # Regular sync wrapper.
+            @wraps(fn)
+            def _sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+                try:
+                    return fn(*args, **kwargs)
+                except BaseException as exc:  # noqa: BLE001
+                    _best_effort_attach(exc)
+                    raise
+
+            return _sync_wrapper  # type: ignore[return-value]
+
+        return _decorate  # type: ignore[return-value]
+
+    return _factory
+
+
 __all__ = [
     "GraphCoercionErrorCodes",
     "GraphResourceLimits",
@@ -1140,4 +1405,11 @@ __all__ = [
     "normalize_graph_context",
     "attach_graph_context_to_framework_ctx",
     "iter_graph_events",
+    # Added exports to satisfy framework adapter imports and conformance checks.
+    "create_graph_error_context_decorator",
+    "graph_capabilities_to_dict",
+    "validate_batch_operations",
+    "validate_graph_query",
+    "validate_upsert_nodes_spec",
+    "validate_graph_result_type",
 ]
