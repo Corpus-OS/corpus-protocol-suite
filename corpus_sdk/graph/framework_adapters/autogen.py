@@ -284,6 +284,24 @@ class AutoGenGraphFrameworkTranslator(DefaultGraphFrameworkTranslator):
     ) -> BatchResult:
         return result
 
+    def translate_transaction_result(
+        self,
+        result: BatchResult,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Mapping[str, Any]] = None,
+    ) -> BatchResult:
+        return result
+
+    def translate_traversal_result(
+        self,
+        result: TraversalResult,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Mapping[str, Any]] = None,
+    ) -> TraversalResult:
+        return result
+
     def translate_schema(
         self,
         schema: GraphSchema,
@@ -1919,7 +1937,7 @@ class CorpusAutoGenGraphClient:
         _ensure_not_in_event_loop("transaction")
 
         # Reuse batch validation; semantics are still a list of BatchOperation.
-        validate_batch_operations(self._graph, ops)
+        validate_batch_operations(ops, operation="transaction", error_code="INVALID_BATCH_OPS")
 
         ctx = self._build_ctx(
             conversation=conversation,
@@ -1953,7 +1971,7 @@ class CorpusAutoGenGraphClient:
         """
         Async wrapper for transactional batch operations.
         """
-        validate_batch_operations(self._graph, ops)
+        validate_batch_operations(ops, operation="atransaction", error_code="INVALID_BATCH_OPS")
 
         ctx = self._build_ctx(
             conversation=conversation,
@@ -1992,7 +2010,7 @@ class CorpusAutoGenGraphClient:
         """
         _ensure_not_in_event_loop("batch")
 
-        validate_batch_operations(self._graph, ops)
+        validate_batch_operations(ops, operation="batch", error_code="INVALID_BATCH_OPS")
 
         ctx = self._build_ctx(
             conversation=conversation,
@@ -2026,7 +2044,7 @@ class CorpusAutoGenGraphClient:
         """
         Async wrapper for batch operations.
         """
-        validate_batch_operations(self._graph, ops)
+        validate_batch_operations(ops, operation="abatch", error_code="INVALID_BATCH_OPS")
 
         ctx = self._build_ctx(
             conversation=conversation,
