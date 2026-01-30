@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import inspect
 import logging
 import queue
 import threading
@@ -58,6 +59,8 @@ from typing import (
     Tuple,
     Type,
     TypeVar,
+    Union,
+    cast,
 )
 
 from corpus_sdk.core.error_context import attach_context
@@ -112,6 +115,12 @@ class SyncStreamBridge:
         Callable that returns an awaitable which resolves to an
         `AsyncIterator[T]` when awaited.
 
+        Note:
+        The preferred contract is "awaitable -> AsyncIterator". For
+        maximum adapter compatibility, this bridge also accepts factories
+        that directly return an AsyncIterator. This is validated and
+        handled explicitly in the worker without weakening error safety.
+
     queue_maxsize:
         Max queue size between worker and consumer. `<= 0` means unbounded.
 
@@ -127,6 +136,11 @@ class SyncStreamBridge:
     cancel_event:
         Optional external cancellation event. If provided and set, both
         worker and consumer will exit as soon as practical.
+
+        Important:
+        The bridge will *not* set this external event; it is treated as
+        input-only. Internally, the bridge uses its own cancellation event
+        for shutdown to avoid surprising side effects on callers.
 
     framework:
         Framework identifier used only for logging / error context
@@ -160,7 +174,13 @@ class SyncStreamBridge:
     def __init__(
         self,
         *,
-        coro_factory: Callable[[], Awaitable[AsyncIterator[T]]],
+        coro_factory: Callable[
+            [],
+            Union[
+                Awaitable[AsyncIterator[T]],
+                AsyncIterator[T],
+            ],
+        ],
         queue_maxsize: int = 0,
         poll_timeout_s: float = 0.1,
         join_timeout_s: float = 5.0,
@@ -174,31 +194,51 @@ class SyncStreamBridge:
         thread_name: Optional[str] = None,
     ) -> None:
         self._coro_factory = coro_factory
-        self._queue: "queue.Queue[Any]" = queue.Queue(
-            maxsize=max(queue_maxsize, 0)
-        )
+        self._queue: "queue.Queue[Any]" = queue.Queue(maxsize=max(queue_maxsize, 0))
         self._poll_timeout_s = float(poll_timeout_s)
         self._join_timeout_s = float(join_timeout_s)
-        self._cancel_event = cancel_event or threading.Event()
+
+        # External cancellation is treated as input-only (never set by the bridge).
+        self._external_cancel_event = cancel_event
+
+        # Internal cancellation is controlled by the bridge for clean shutdown.
+        self._internal_cancel_event = threading.Event()
+
         self._framework = framework or "unknown"
         self._error_context: Dict[str, Any] = dict(error_context or {})
         self._max_transient_retries = max(0, int(max_transient_retries))
         self._transient_backoff_s = max(0.0, float(transient_backoff_s))
         self._transient_error_types = transient_error_types
+
+        # None => unbounded retries. If the user supplies 0 or negative, treat it as None
+        # (unbounded), matching the existing "None means unbounded" behavior and keeping
+        # semantics stable for callers who intentionally pass 0.
         self._max_queue_full_retries = (
             int(max_queue_full_retries)
             if max_queue_full_retries is not None and max_queue_full_retries > 0
             else None
         )
-        self._thread_name = (
-            thread_name or f"corpus_sync_stream_{self._framework}"
-        )
+
+        self._thread_name = thread_name or f"corpus_sync_stream_{self._framework}"
 
         self._lock = threading.RLock()
         self._thread: Optional[threading.Thread] = None
         self._error: Optional[BaseException] = None
+
+        # Sentinel is a control marker in the data queue indicating completion.
+        # The bridge also uses an explicit done event (below) as a robust fallback
+        # in case sentinel insertion cannot complete under extreme backpressure.
         self._sentinel: object = object()
         self._sentinel_enqueued = False
+
+        # Worker lifecycle events:
+        # - _ready_event: set once the worker has either successfully created the stream
+        #   (or produced a terminal error) so that run() can propagate "call-time" errors
+        #   deterministically without using arbitrary sleep.
+        # - _done_event: set when the worker is done producing items (success or error).
+        self._ready_event = threading.Event()
+        self._done_event = threading.Event()
+
         # Capture contextvars so tracing/logging context propagates into the worker.
         self._parent_context = contextvars.copy_context()
 
@@ -212,8 +252,8 @@ class SyncStreamBridge:
 
         This method:
         - Starts the worker thread on first call.
-        - Consumes items from the queue until a sentinel is received or
-          cancellation is signaled.
+        - Checks for immediate call-time errors (brief wait).
+        - Returns an iterator that consumes items from the queue.
         - After iteration, raises any error that occurred in the worker.
 
         Returns
@@ -226,51 +266,79 @@ class SyncStreamBridge:
         BaseException
             Any exception raised by the underlying async stream (or
             internal bridge errors like queue saturation) will be re-raised
-            in the calling thread after iteration completes.
+            in the calling thread, either immediately (for call-time errors)
+            or after iteration completes (for in-stream errors).
         """
         self._ensure_worker_started()
 
-        try:
-            while True:
-                # Check cancellation with proper queue state handling
-                if self._cancel_event.is_set():
-                    # Drain any remaining items before exiting
-                    try:
-                        while True:
-                            item = self._queue.get_nowait()
-                            if item is self._sentinel:
-                                break
-                            yield item  # type: ignore[misc]
-                    except queue.Empty:
-                        pass
-                    break
+        # Brief wait to catch call-time errors before returning iterator.
+        # This ensures that if the adapter's stream method raises immediately,
+        # we propagate that exception synchronously rather than deferring it
+        # until the first iteration attempt.
+        #
+        # Unlike a fixed sleep, waiting on _ready_event is deterministic:
+        # the worker sets _ready_event once it has either created the stream
+        # or recorded an error (including immediate failures).
+        calltime_check_timeout = min(0.05, self._poll_timeout_s)
+        self._ready_event.wait(timeout=calltime_check_timeout)
 
-                try:
-                    item = self._queue.get(timeout=self._poll_timeout_s)
-                except queue.Empty:
-                    # Check if worker is dead and queue is definitively empty
-                    with self._lock:
-                        thread = self._thread
-                        # Worker is dead and we've seen sentinel or queue is empty
-                        if thread is not None and not thread.is_alive():
-                            if self._sentinel_enqueued or self._queue.empty():
-                                break
-                    continue
-
-                if item is self._sentinel:
-                    # Worker signaled completion
-                    with self._lock:
-                        self._sentinel_enqueued = True
-                    break
-
-                # Normal item
-                yield item  # type: ignore[misc]
-        finally:
-            self._shutdown_worker()
-
-        # Propagate worker error, if any.
+        # Check if worker hit an immediate error
         if self._error is not None:
             raise self._error
+
+        def _iterator() -> Iterator[T]:
+            try:
+                while True:
+                    # Check cancellation with proper queue state handling.
+                    # Cancellation may come from an external event (caller-controlled)
+                    # or the internal event (bridge-controlled shutdown).
+                    if self._is_cancelled():
+                        # Drain any remaining items before exiting.
+                        # This preserves as much already-produced data as practical.
+                        try:
+                            while True:
+                                item = self._queue.get_nowait()
+                                if item is self._sentinel:
+                                    break
+                                yield cast(T, item)
+                        except queue.Empty:
+                            pass
+                        break
+
+                    try:
+                        item = self._queue.get(timeout=self._poll_timeout_s)
+                    except queue.Empty:
+                        # If worker is done and the queue is empty, we can exit.
+                        # This is a robust fallback even if sentinel delivery fails
+                        # under extreme backpressure.
+                        if self._done_event.is_set() and self._queue.empty():
+                            break
+
+                        # Also check thread liveness as an additional safety net.
+                        # If thread died and the queue is empty, we should exit.
+                        with self._lock:
+                            thread = self._thread
+                            if thread is not None and not thread.is_alive():
+                                if self._sentinel_enqueued or self._queue.empty():
+                                    break
+                        continue
+
+                    if item is self._sentinel:
+                        # Worker signaled completion
+                        with self._lock:
+                            self._sentinel_enqueued = True
+                        break
+
+                    # Normal item
+                    yield cast(T, item)
+            finally:
+                self._shutdown_worker()
+
+            # Propagate worker error, if any.
+            if self._error is not None:
+                raise self._error
+
+        return _iterator()
 
     # ------------------------------------------------------------------ #
     # Worker management
@@ -280,14 +348,21 @@ class SyncStreamBridge:
         """Start the worker thread if it is not already running."""
         with self._lock:
             # Double-check pattern: another thread might have started it
-            if self._thread is not None:
-                if self._thread.is_alive():
-                    return
-                # Thread died - allow restart
-                logger.debug(
-                    "SyncStreamBridge: previous worker thread for framework=%s died, restarting",
-                    self._framework,
-                )
+            if self._thread is not None and self._thread.is_alive():
+                return
+
+            # If we are restarting (or starting fresh), reset bridge-controlled state.
+            # Note: external cancellation state is not modified.
+            self._internal_cancel_event.clear()
+            self._ready_event.clear()
+            self._done_event.clear()
+            self._sentinel_enqueued = False
+
+            # Preserve "first error wins" behavior, but allow restart if the previous
+            # attempt ended. If callers re-use the instance intentionally, they likely
+            # expect a clean state. This is safe because errors are always surfaced
+            # to the caller via run().
+            self._error = None
 
             def _thread_target() -> None:
                 # Run worker logic under the captured contextvars.
@@ -317,8 +392,8 @@ class SyncStreamBridge:
 
     def _shutdown_worker(self) -> None:
         """Signal cancellation and join the worker thread (best-effort)."""
-        # Signal cancellation first
-        self._cancel_event.set()
+        # Signal bridge-controlled cancellation first (do not mutate external cancel_event).
+        self._internal_cancel_event.set()
 
         with self._lock:
             thread = self._thread
@@ -354,7 +429,11 @@ class SyncStreamBridge:
             )
             self._push_error(exc)
         finally:
-            # Always ensure sentinel is enqueued
+            # Mark done before attempting sentinel insertion so the consumer
+            # can exit even if the queue is saturated.
+            self._done_event.set()
+
+            # Always ensure sentinel is enqueued (best-effort).
             self._ensure_sentinel_enqueued()
 
     async def _worker_coro(self) -> None:
@@ -366,15 +445,37 @@ class SyncStreamBridge:
         """
         attempt = 0
         items_yielded = False
-        
+
         while True:
-            if self._cancel_event.is_set():
+            if self._is_cancelled():
                 return
 
             try:
-                stream = await self._coro_factory()
+                result = self._coro_factory()
+
+                # Explicit, safe normalization:
+                # - If the factory returns an awaitable, await it to get the stream.
+                # - Otherwise, treat it as an AsyncIterator directly (supported for
+                #   adapter compatibility, as documented).
+                if inspect.isawaitable(result):
+                    stream = await cast(Awaitable[AsyncIterator[T]], result)
+                else:
+                    # Validate that it looks like an async iterator.
+                    # This avoids accidental acceptance of arbitrary objects.
+                    if not (hasattr(result, "__aiter__") and hasattr(result, "__anext__")):
+                        raise TypeError(
+                            "SyncStreamBridge coro_factory must return an awaitable "
+                            "resolving to an AsyncIterator, or an AsyncIterator directly; "
+                            f"got {type(result)!r}."
+                        )
+                    stream = cast(AsyncIterator[T], result)
+
+                # Signal readiness after stream creation; if coro_factory fails,
+                # we record the error and set readiness via _push_error.
+                self._ready_event.set()
+
                 async for item in stream:
-                    if self._cancel_event.is_set():
+                    if self._is_cancelled():
                         return
                     self._put_queue_item(item)
                     items_yielded = True
@@ -383,6 +484,10 @@ class SyncStreamBridge:
                 return
 
             except BaseException as exc:  # noqa: BLE001
+                # Ensure call-time readiness is signaled even on immediate errors.
+                # This allows run() to deterministically check and raise without sleeping.
+                self._ready_event.set()
+
                 # Once we've successfully yielded items, treat all errors as terminal
                 if items_yielded:
                     logger.error(
@@ -402,7 +507,7 @@ class SyncStreamBridge:
                 if (
                     is_transient
                     and attempt < self._max_transient_retries
-                    and not self._cancel_event.is_set()
+                    and not self._is_cancelled()
                 ):
                     attempt += 1
                     delay = self._transient_backoff_s * (2 ** (attempt - 1))
@@ -445,7 +550,7 @@ class SyncStreamBridge:
         """
         retries = 0
         while True:
-            if self._cancel_event.is_set():
+            if self._is_cancelled():
                 return
 
             try:
@@ -453,7 +558,7 @@ class SyncStreamBridge:
                 return
             except queue.Full:
                 retries += 1
-                
+
                 if (
                     self._max_queue_full_retries is not None
                     and retries >= self._max_queue_full_retries
@@ -471,7 +576,7 @@ class SyncStreamBridge:
                     )
                     self._push_error(err)
                     return
-                
+
                 if retries % 10 == 0:  # Log every 10th retry to avoid spam
                     logger.warning(
                         "SyncStreamBridge queue full for framework=%s; "
@@ -484,12 +589,19 @@ class SyncStreamBridge:
     def _ensure_sentinel_enqueued(self) -> None:
         """
         Ensure sentinel is enqueued with aggressive retry.
-        
+
         This is critical for consumer to exit properly. Uses multiple
         strategies to ensure sentinel delivery:
         1. Try non-blocking put
         2. If full, drain one item and retry
         3. If still failing after max attempts, set cancel event
+
+        Clarification:
+        The bridge preserves stream ordering and avoids dropping items. For that
+        reason, it does not actually drain and reinsert items (which could reorder
+        or lose data under contention). Instead, it retries sentinel insertion with
+        bounded waits and relies on `_done_event` as a robust fallback so the
+        consumer can still terminate when the worker completes.
         """
         with self._lock:
             if self._sentinel_enqueued:
@@ -498,9 +610,10 @@ class SyncStreamBridge:
 
         max_attempts = 100
         for attempt in range(max_attempts):
-            if self._cancel_event.is_set():
+            if self._is_cancelled():
                 return
 
+            # Strategy: Fast-path non-blocking put.
             try:
                 self._queue.put_nowait(self._sentinel)
                 logger.debug(
@@ -509,31 +622,18 @@ class SyncStreamBridge:
                 )
                 return
             except queue.Full:
-                # Strategy: Aggressively drain one item to make space
-                if attempt < max_attempts - 1:
-                    try:
-                        discarded = self._queue.get_nowait()
-                        logger.debug(
-                            "SyncStreamBridge: drained item to make space for sentinel "
-                            "(framework=%s, attempt=%d/%d)",
-                            self._framework,
-                            attempt + 1,
-                            max_attempts,
-                        )
-                        # Try to put back the item we just removed if it wasn't sentinel
-                        if discarded is not self._sentinel:
-                            try:
-                                self._queue.put_nowait(discarded)
-                            except queue.Full:
-                                logger.warning(
-                                    "SyncStreamBridge: lost item during sentinel insertion "
-                                    "(framework=%s)",
-                                    self._framework,
-                                )
-                    except queue.Empty:
-                        # Queue became empty between check and get - retry put
-                        pass
-                
+                # Fall back to a timed put to avoid busy-waiting while preserving ordering.
+                pass
+
+            # Strategy: Timed put with small waits; does not reorder or drop items.
+            try:
+                self._queue.put(self._sentinel, timeout=self._poll_timeout_s)
+                logger.debug(
+                    "SyncStreamBridge: sentinel enqueued after waiting for space (framework=%s)",
+                    self._framework,
+                )
+                return
+            except queue.Full:
                 if attempt % 10 == 0 and attempt > 0:
                     logger.warning(
                         "SyncStreamBridge: struggling to enqueue sentinel "
@@ -542,18 +642,23 @@ class SyncStreamBridge:
                         max_attempts,
                         self._framework,
                     )
-                
-                # Small sleep to let consumer catch up
+
+                # Small sleep to let consumer catch up.
+                # This is in the worker thread (not the event loop thread), and is only
+                # used in this terminal control-path; it avoids hot-spinning when the
+                # queue is saturated.
                 time.sleep(0.001)
 
-        # Last resort: set cancel event to unblock consumer
+        # Last resort: set internal cancel event to unblock consumer paths that are polling.
+        # Note that `_done_event` is already set in _worker_main(), which allows the consumer
+        # to exit even without sentinel delivery once the queue drains.
         logger.error(
             "SyncStreamBridge: failed to enqueue sentinel after %d attempts "
-            "for framework=%s; setting cancel event as fallback",
+            "for framework=%s; setting internal cancel event as fallback",
             max_attempts,
             self._framework,
         )
-        self._cancel_event.set()
+        self._internal_cancel_event.set()
 
     # ------------------------------------------------------------------ #
     # Error handling
@@ -568,12 +673,12 @@ class SyncStreamBridge:
         - Ensures sentinel is enqueued exactly once per error.
         """
         sentinel_needed = False
-        
+
         with self._lock:
             if self._error is None:
                 self._error = exc
                 sentinel_needed = True
-                
+
                 # Attach error context if available
                 if self._error_context:
                     try:
@@ -597,6 +702,24 @@ class SyncStreamBridge:
         # This prevents multiple sentinels from being enqueued
         if sentinel_needed:
             self._ensure_sentinel_enqueued()
+
+    # ------------------------------------------------------------------ #
+    # Cancellation helpers
+    # ------------------------------------------------------------------ #
+
+    def _is_cancelled(self) -> bool:
+        """
+        Composite cancellation check.
+
+        This preserves the existing behavior that an external cancellation event
+        can terminate both producer and consumer quickly, while also ensuring
+        the bridge can shut itself down without mutating the caller's event.
+        """
+        if self._internal_cancel_event.is_set():
+            return True
+        if self._external_cancel_event is not None and self._external_cancel_event.is_set():
+            return True
+        return False
 
 
 __all__ = [
