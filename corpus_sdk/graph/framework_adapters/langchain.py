@@ -844,7 +844,13 @@ class CorpusLangChainGraphClient:
         close_fn = getattr(self._graph, "close", None)
         if callable(close_fn):
             try:
-                close_fn()
+                result = close_fn()
+                # If close() returns a coroutine, it means the adapter only has async close
+                if inspect.iscoroutine(result):
+                    result.close()  # Suppress the "never awaited" warning
+                    logger.warning(
+                        "Adapter has async-only close() - call aclose() instead or use async context manager"
+                    )
             except Exception as e:  # noqa: BLE001
                 # Preserve the existing warning-level behavior, but include
                 # stack context for easier debugging without changing semantics.
