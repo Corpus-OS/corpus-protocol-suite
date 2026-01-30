@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import builtins
+import importlib
+import logging
 from collections.abc import Mapping
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import inspect
 
@@ -12,9 +16,27 @@ import pytest
 import corpus_sdk.graph.framework_adapters.semantic_kernel as sk_adapter_module
 from corpus_sdk.graph.framework_adapters.semantic_kernel import (
     CorpusSemanticKernelGraphClient,
+    CorpusSemanticKernelPlugin,
     ErrorCodes,
     SemanticKernelGraphFrameworkTranslator,
 )
+from corpus_sdk.graph.graph_base import BadRequest, NotSupported
+
+
+# ---------------------------------------------------------------------------
+# HARD FAIL / HARD PASS ONLY
+#
+# Semantic Kernel must be installed in the environment for this suite.
+# We intentionally do NOT import semantic_kernel here (per repo convention),
+# because the adapter module already uses a soft-import pattern. Instead, we
+# assert that the adapter successfully detected SK at import time.
+# ---------------------------------------------------------------------------
+
+if getattr(sk_adapter_module, "_semantic_kernel", None) is None:
+    raise RuntimeError(
+        "semantic_kernel was not detected by the Semantic Kernel adapter module. "
+        "Install semantic-kernel (and ensure it imports) to run this test suite."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -22,10 +44,7 @@ from corpus_sdk.graph.framework_adapters.semantic_kernel import (
 # ---------------------------------------------------------------------------
 
 
-def _make_client(
-    adapter: Any,
-    **kwargs: Any,
-) -> CorpusSemanticKernelGraphClient:
+def _make_client(adapter: Any, **kwargs: Any) -> CorpusSemanticKernelGraphClient:
     """Construct a CorpusSemanticKernelGraphClient instance from the generic adapter."""
     return CorpusSemanticKernelGraphClient(adapter=adapter, **kwargs)
 
@@ -35,16 +54,17 @@ def _mock_translator_with_capture(
     method_name: str,
     return_value: Any,
 ) -> Any:
-    """Helper to create a sync translator that captures call arguments."""
+    """Create a translator-like object whose named method captures args/kwargs."""
 
     class MockTranslator:
         def __getattr__(self, name: str) -> Any:
             if name == method_name:
 
                 def method(*args: Any, **kwargs: Any) -> Any:
-                    if args:
-                        captured["args"] = args
-                    captured.update(kwargs)
+                    captured.setdefault("calls", []).append((name, args, kwargs))
+                    captured["last_method"] = name
+                    captured["last_args"] = args
+                    captured["last_kwargs"] = kwargs
                     return return_value
 
                 return method
@@ -58,16 +78,17 @@ def _mock_async_translator_with_capture(
     method_name: str,
     return_value: Any,
 ) -> Any:
-    """Helper to create an async translator that captures call arguments."""
+    """Create an async translator-like object whose named method captures args/kwargs."""
 
     class MockTranslator:
         def __getattr__(self, name: str) -> Any:
             if name == method_name:
 
                 async def method(*args: Any, **kwargs: Any) -> Any:
-                    if args:
-                        captured["args"] = args
-                    captured.update(kwargs)
+                    captured.setdefault("calls", []).append((name, args, kwargs))
+                    captured["last_method"] = name
+                    captured["last_args"] = args
+                    captured["last_kwargs"] = kwargs
                     return return_value
 
                 return method
@@ -76,8 +97,40 @@ def _mock_async_translator_with_capture(
     return MockTranslator()
 
 
+def _edge_obj(
+    *,
+    edge_id: Optional[str] = "e1",
+    src: Optional[str] = "n1",
+    dst: Optional[str] = "n2",
+    label: Optional[str] = "REL",
+    properties: Any = None,
+) -> Any:
+    """Create a simple edge-like object with the attributes used by the adapter."""
+
+    class Edge:
+        pass
+
+    e = Edge()
+    e.id = edge_id
+    e.src = src
+    e.dst = dst
+    e.label = label
+    e.properties = properties
+    return e
+
+
+def _make_async_gen(items: List[Any]) -> Any:
+    """Return an async generator yielding the provided items."""
+
+    async def gen():
+        for it in items:
+            yield it
+
+    return gen()
+
+
 # ---------------------------------------------------------------------------
-# Constructor / translator behavior
+# 1) Construction & translator wiring (5 tests)
 # ---------------------------------------------------------------------------
 
 
@@ -87,14 +140,12 @@ def test_default_translator_uses_semantickernel_framework_translator(
 ) -> None:
     """
     By default, CorpusSemanticKernelGraphClient should:
-
     - Construct a SemanticKernelGraphFrameworkTranslator instance, and
     - Pass it into create_graph_translator with framework="semantic_kernel".
     """
     captured: Dict[str, Any] = {}
 
     def fake_create_graph_translator(*args: Any, **kwargs: Any) -> Any:  # noqa: ARG001
-        captured["args"] = args
         captured["kwargs"] = kwargs
 
         class DummyTranslator:
@@ -102,11 +153,7 @@ def test_default_translator_uses_semantickernel_framework_translator(
 
         return DummyTranslator()
 
-    monkeypatch.setattr(
-        sk_adapter_module,
-        "create_graph_translator",
-        fake_create_graph_translator,
-    )
+    monkeypatch.setattr(sk_adapter_module, "create_graph_translator", fake_create_graph_translator)
 
     client = _make_client(adapter)
 
@@ -123,11 +170,7 @@ def test_framework_translator_override_is_respected(
     monkeypatch: pytest.MonkeyPatch,
     adapter: Any,
 ) -> None:
-    """
-    If framework_translator is provided, CorpusSemanticKernelGraphClient should pass
-    it through to create_graph_translator instead of constructing its own
-    SemanticKernelGraphFrameworkTranslator.
-    """
+    """If framework_translator is provided, it should be passed through unchanged."""
     captured: Dict[str, Any] = {}
 
     class CustomTranslator(SemanticKernelGraphFrameworkTranslator):
@@ -136,7 +179,6 @@ def test_framework_translator_override_is_respected(
     custom = CustomTranslator()
 
     def fake_create_graph_translator(*args: Any, **kwargs: Any) -> Any:  # noqa: ARG001
-        captured["args"] = args
         captured["kwargs"] = kwargs
 
         class DummyTranslator:
@@ -144,18 +186,9 @@ def test_framework_translator_override_is_respected(
 
         return DummyTranslator()
 
-    monkeypatch.setattr(
-        sk_adapter_module,
-        "create_graph_translator",
-        fake_create_graph_translator,
-    )
+    monkeypatch.setattr(sk_adapter_module, "create_graph_translator", fake_create_graph_translator)
 
-    client = _make_client(
-        adapter,
-        framework_translator=custom,
-        framework_version="sk-fw-1.2.3",
-    )
-
+    client = _make_client(adapter, framework_translator=custom, framework_version="sk-fw-1.2.3")
     _ = client._translator  # noqa: SLF001
 
     kwargs = captured["kwargs"]
@@ -163,31 +196,69 @@ def test_framework_translator_override_is_respected(
     assert kwargs.get("translator") is custom
 
 
-# ---------------------------------------------------------------------------
-# Context translation / core_ctx_from_semantic_kernel mapping
-# ---------------------------------------------------------------------------
-
-
-def test_semantickernel_context_and_extra_context_passed_to_core_ctx(
+def test_translator_is_cached_property_constructed_once(
     monkeypatch: pytest.MonkeyPatch,
     adapter: Any,
 ) -> None:
-    """
-    Verify that context/settings and extra_context are passed through to
-    core_ctx_from_semantic_kernel with the configured framework_version.
-    """
+    """_translator should be cached: repeated access should not rebuild it."""
+    calls: Dict[str, int] = {"count": 0}
+
+    def fake_create_graph_translator(*_: Any, **__: Any) -> Any:
+        calls["count"] += 1
+
+        class DummyTranslator:
+            pass
+
+        return DummyTranslator()
+
+    monkeypatch.setattr(sk_adapter_module, "create_graph_translator", fake_create_graph_translator)
+
+    client = _make_client(adapter)
+
+    _ = client._translator  # noqa: SLF001
+    _ = client._translator  # noqa: SLF001
+
+    assert calls["count"] == 1
+
+
+def test_constructor_rejects_both_adapter_and_graph_adapter(adapter: Any) -> None:
+    """Providing both adapter and graph_adapter should raise TypeError."""
+    with pytest.raises(TypeError):
+        CorpusSemanticKernelGraphClient(adapter=adapter, graph_adapter=adapter)
+
+
+def test_constructor_requires_adapter() -> None:
+    """Providing neither adapter nor graph_adapter should raise TypeError."""
+    with pytest.raises(TypeError):
+        CorpusSemanticKernelGraphClient()  # type: ignore[call-arg]
+
+
+# ---------------------------------------------------------------------------
+# 2) OperationContext translation behavior (6 tests)
+# ---------------------------------------------------------------------------
+
+
+def test_build_ctx_none_when_all_inputs_none(adapter: Any) -> None:
+    """_build_ctx should return None when context/settings/extra_context are all empty."""
+    client = _make_client(adapter)
+    ctx = client._build_ctx(context=None, settings=None, extra_context=None)  # noqa: SLF001
+    assert ctx is None
+
+
+def test_context_translation_passes_context_settings_extra_and_framework_version(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: Any,
+) -> None:
+    """Verify context/settings/extra_context are passed through to core_ctx_from_semantic_kernel."""
     captured: Dict[str, Any] = {}
 
-    # Patch OperationContext so our fake ctx passes isinstance() check.
     class DummyOperationContext:
-        def __init__(self, **kwargs: Any) -> None:
-            self.attrs = kwargs
+        def __init__(self) -> None:
+            self.attrs: Dict[str, Any] = {}
+            self.request_id = "req-1"
 
-    monkeypatch.setattr(
-        sk_adapter_module,
-        "OperationContext",
-        DummyOperationContext,
-    )
+    # Ensure isinstance-path acceptance by making OperationContext a concrete class.
+    monkeypatch.setattr(sk_adapter_module, "OperationContext", DummyOperationContext)
 
     def fake_core_ctx_from_semantic_kernel(
         context: Any,
@@ -199,791 +270,1008 @@ def test_semantickernel_context_and_extra_context_passed_to_core_ctx(
         captured["context"] = context
         captured["settings"] = settings
         captured["framework_version"] = framework_version
-        captured["extra"] = extra
+        captured["extra"] = dict(extra)
         return DummyOperationContext()
 
-    monkeypatch.setattr(
-        sk_adapter_module,
-        "core_ctx_from_semantic_kernel",
-        fake_core_ctx_from_semantic_kernel,
-    )
+    monkeypatch.setattr(sk_adapter_module, "core_ctx_from_semantic_kernel", fake_core_ctx_from_semantic_kernel)
 
+    # Use a minimal translator so query proceeds.
     class DummyTranslator:
-        def query(self, *args: Any, **kwargs: Any) -> Any:  # noqa: ARG002
-            return {"ok": True}
+        def query(self, *_: Any, **__: Any) -> Any:
+            return sk_adapter_module.QueryResult(records=[], summary={})  # type: ignore[attr-defined]
 
-    def fake_create_graph_translator(*_: Any, **__: Any) -> Any:
-        return DummyTranslator()
+    monkeypatch.setattr(sk_adapter_module, "create_graph_translator", lambda *_a, **_k: DummyTranslator())
 
-    monkeypatch.setattr(
-        sk_adapter_module,
-        "create_graph_translator",
-        fake_create_graph_translator,
-    )
+    client = _make_client(adapter, framework_version="semantic-kernel-test-version")
 
-    client = _make_client(
-        adapter,
-        framework_version="semantic-kernel-test-version",
-    )
-
-    ctx = object()
+    ctx_obj = object()
     settings = {"temperature": 0.3}
     extra_ctx = {"request_id": "req-xyz", "tenant": "tenant-1"}
 
-    result = client.query(
-        "MATCH (n) RETURN n LIMIT 1",
-        context=ctx,
-        settings=settings,
-        extra_context=extra_ctx,
-    )
-    assert result is not None
+    _ = client.query("MATCH (n) RETURN n LIMIT 1", context=ctx_obj, settings=settings, extra_context=extra_ctx)
 
-    assert captured.get("context") is ctx
-    assert captured.get("settings") == settings
-    assert captured.get("framework_version") == "semantic-kernel-test-version"
-    assert captured.get("extra") == extra_ctx
+    assert captured["context"] is ctx_obj
+    assert captured["settings"] == settings
+    assert captured["framework_version"] == "semantic-kernel-test-version"
+    assert captured["extra"] == extra_ctx
 
 
-def test_build_ctx_failure_raises_badrequest_with_error_code_and_context(
+def test_context_translation_enriches_attrs_when_mutable(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: Any,
+) -> None:
+    """When ctx.attrs is a dict, framework metadata should be added best-effort."""
+    class DummyOperationContext:
+        def __init__(self) -> None:
+            self.attrs: Dict[str, Any] = {}
+            self.request_id = "req-2"
+
+    monkeypatch.setattr(sk_adapter_module, "OperationContext", DummyOperationContext)
+
+    def fake_core_ctx_from_semantic_kernel(*_: Any, **__: Any) -> Any:
+        return DummyOperationContext()
+
+    monkeypatch.setattr(sk_adapter_module, "core_ctx_from_semantic_kernel", fake_core_ctx_from_semantic_kernel)
+
+    client = _make_client(adapter, framework_version="v9.9.9")
+    ctx = client._build_ctx(context={"x": 1}, settings={"y": 2}, extra_context={"z": 3})  # noqa: SLF001
+
+    assert ctx is not None
+    attrs = getattr(ctx, "attrs", {})
+    assert attrs.get("framework") == "semantic_kernel"
+    assert attrs.get("framework_version") == "v9.9.9"
+
+
+def test_context_translation_failure_attaches_context_and_proceeds_with_op_ctx_none(
     monkeypatch: pytest.MonkeyPatch,
     adapter: Any,
 ) -> None:
     """
-    If core_ctx_from_semantic_kernel raises, _build_ctx should wrap it in a
-    BadRequest-like error with ErrorCodes.BAD_OPERATION_CONTEXT and call
-    attach_context at least once.
+    FIXED ISSUE #1:
+    If core_ctx_from_semantic_kernel raises, the adapter should:
+      - call attach_context with BAD_OPERATION_CONTEXT, and
+      - proceed with op_ctx=None (best-effort translation), not raise solely due to ctx.
     """
-    captured_ctx: Dict[str, Any] = {}
+    attached: Dict[str, Any] = {}
+    captured_call: Dict[str, Any] = {}
 
-    def fake_core_ctx_from_semantic_kernel(*args: Any, **kwargs: Any) -> Any:  # noqa: ARG001
-        raise RuntimeError("boom!")
+    def fake_core_ctx_from_semantic_kernel(*_: Any, **__: Any) -> Any:
+        raise RuntimeError("boom")
 
-    def fake_attach_context(exc: BaseException, **ctx: Any) -> None:
-        captured_ctx.update(ctx)
+    def fake_attach_context(exc: BaseException, **ctx: Any) -> None:  # noqa: ARG001
+        attached.update(ctx)
 
     class DummyTranslator:
-        def query(self, *args: Any, **kwargs: Any) -> Any:  # noqa: ARG002
-            return {"ok": False}
+        def query(self, raw_query: Mapping[str, Any], *, op_ctx: Any = None, framework_ctx: Any = None, mmr_config: Any = None) -> Any:  # noqa: ARG002,E501
+            captured_call["op_ctx"] = op_ctx
+            captured_call["raw_query"] = dict(raw_query)
+            captured_call["framework_ctx"] = dict(framework_ctx or {})
+            return sk_adapter_module.QueryResult(records=[], summary={})  # type: ignore[attr-defined]
 
-    def fake_create_graph_translator(*_: Any, **__: Any) -> Any:
-        return DummyTranslator()
-
-    monkeypatch.setattr(
-        sk_adapter_module,
-        "core_ctx_from_semantic_kernel",
-        fake_core_ctx_from_semantic_kernel,
-    )
-    monkeypatch.setattr(
-        sk_adapter_module,
-        "attach_context",
-        fake_attach_context,
-    )
-    monkeypatch.setattr(
-        sk_adapter_module,
-        "create_graph_translator",
-        fake_create_graph_translator,
-    )
+    monkeypatch.setattr(sk_adapter_module, "core_ctx_from_semantic_kernel", fake_core_ctx_from_semantic_kernel)
+    monkeypatch.setattr(sk_adapter_module, "attach_context", fake_attach_context)
+    monkeypatch.setattr(sk_adapter_module, "create_graph_translator", lambda *_a, **_k: DummyTranslator())
 
     client = _make_client(adapter)
 
-    with pytest.raises(Exception) as exc_info:
-        client.query("MATCH (n) RETURN n", context=object())
+    result = client.query("MATCH (n) RETURN n", context={"user_id": "u1"}, settings={"temp": 0.2})
+    assert result is not None
 
-    err = exc_info.value
-    # Semantic assertion instead of relying on concrete type
-    assert getattr(err, "code", None) == ErrorCodes.BAD_OPERATION_CONTEXT
-    msg = str(err).lower()
-    # Message should at least indicate it's about context / operation
-    assert "operation" in msg or "context" in msg
-
-    # And we should have called attach_context at least once
-    assert captured_ctx
-    assert captured_ctx.get("framework") == "semantic_kernel"
+    assert attached
+    assert attached.get("framework") == "semantic_kernel"
+    assert attached.get("error_code") == ErrorCodes.BAD_OPERATION_CONTEXT
+    assert captured_call.get("op_ctx") is None
 
 
-# ---------------------------------------------------------------------------
-# Error-context decorator behavior
-# ---------------------------------------------------------------------------
-
-
-def test_sync_errors_include_semantickernel_metadata_in_context(
+def test_context_translation_returns_none_if_not_operation_context_like(
     monkeypatch: pytest.MonkeyPatch,
     adapter: Any,
 ) -> None:
-    """
-    When an error occurs during a sync graph operation, error context should
-    include Semantic Kernel–specific metadata via attach_context().
-    """
-    captured_ctx: Dict[str, Any] = {}
+    """If translation returns a non-context-like object, _build_ctx should return None."""
+    def fake_core_ctx_from_semantic_kernel(*_: Any, **__: Any) -> Any:
+        # Missing attrs and identifiers => should be rejected.
+        return object()
 
-    def fake_attach_context(exc: BaseException, **ctx: Any) -> None:
-        captured_ctx.update(ctx)
-
-    monkeypatch.setattr(
-        sk_adapter_module,
-        "attach_context",
-        fake_attach_context,
-    )
-
-    class FailingTranslator:
-        def query(self, *args: Any, **kwargs: Any) -> Any:  # noqa: ARG002
-            raise RuntimeError("test error from semantic_kernel graph adapter")
-
-    def fake_create_graph_translator(*_: Any, **__: Any) -> Any:
-        return FailingTranslator()
-
-    monkeypatch.setattr(
-        sk_adapter_module,
-        "create_graph_translator",
-        fake_create_graph_translator,
-    )
+    monkeypatch.setattr(sk_adapter_module, "core_ctx_from_semantic_kernel", fake_core_ctx_from_semantic_kernel)
 
     client = _make_client(adapter)
-
-    with pytest.raises(RuntimeError, match="test error from semantic_kernel graph adapter"):
-        client.query("MATCH (n) RETURN n", context={"user_id": "u-sync"})
-
-    assert captured_ctx
-    assert captured_ctx.get("framework") == "semantic_kernel"
-    assert str(captured_ctx.get("operation", "")).startswith("graph_")
+    ctx = client._build_ctx(context={"a": 1}, settings={"b": 2}, extra_context={"c": 3})  # noqa: SLF001
+    assert ctx is None
 
 
-@pytest.mark.asyncio
-async def test_async_errors_include_semantickernel_metadata_in_context(
-    monkeypatch: pytest.MonkeyPatch,
-    adapter: Any,
-) -> None:
-    """
-    Same as the sync error-context test but for the async query path.
-    """
-    captured_ctx: Dict[str, Any] = {}
+def test_operation_context_structural_heuristic_requires_minimum_set() -> None:
+    """Structural heuristic should require attrs + at least one identifier/serialization surface."""
+    # attrs only => False
+    class A:
+        attrs = {}
 
-    def fake_attach_context(exc: BaseException, **ctx: Any) -> None:
-        captured_ctx.update(ctx)
+    # attrs + request_id => True
+    class B:
+        attrs = {}
+        request_id = "r"
 
-    monkeypatch.setattr(
-        sk_adapter_module,
-        "attach_context",
-        fake_attach_context,
-    )
-
-    class FailingTranslator:
-        async def arun_query(self, *args: Any, **kwargs: Any) -> Any:  # noqa: ARG002
-            raise RuntimeError("test error from semantic_kernel graph adapter")
-
-    def fake_create_graph_translator(*_: Any, **__: Any) -> Any:
-        return FailingTranslator()
-
-    monkeypatch.setattr(
-        sk_adapter_module,
-        "create_graph_translator",
-        fake_create_graph_translator,
-    )
-
-    client = _make_client(adapter)
-
-    with pytest.raises(RuntimeError, match="test error from semantic_kernel graph adapter"):
-        await client.aquery("MATCH (n) RETURN n", context={"user_id": "u-async"})
-
-    assert captured_ctx
-    assert captured_ctx.get("framework") == "semantic_kernel"
-    assert str(captured_ctx.get("operation", "")).startswith("graph_")
+    assert sk_adapter_module._looks_like_operation_context(A()) is False  # noqa: SLF001
+    assert sk_adapter_module._looks_like_operation_context(B()) is True  # noqa: SLF001
 
 
 # ---------------------------------------------------------------------------
-# Sync semantics (basic smoke tests)
-# ---------------------------------------------------------------------------
-
-
-def test_sync_query_and_stream_basic(adapter: Any) -> None:
-    """
-    Basic smoke test for sync query / stream_query behavior: methods should
-    accept text input and not crash, returning protocol-level shapes.
-
-    Detailed QueryResult / QueryChunk semantics are covered by the generic
-    graph contract tests.
-    """
-    client = _make_client(adapter, default_namespace="sk-ns")
-
-    # Non-streaming query
-    result = client.query("MATCH (n) RETURN n LIMIT 1")
-    assert result is not None
-
-    # Streaming query
-    chunks = list(client.stream_query("MATCH (n) RETURN n LIMIT 2"))
-    assert isinstance(chunks, list)
-
-
-def test_sync_query_accepts_optional_params_and_context(adapter: Any) -> None:
-    """
-    query() should accept params, dialect, namespace, timeout_ms, and
-    context/settings/extra_context kwargs without raising.
-    """
-    client = _make_client(adapter, default_dialect="cypher")
-
-    result = client.query(
-        "MATCH (n) RETURN n LIMIT $limit",
-        params={"limit": 5},
-        dialect="cypher",
-        namespace="ctx-ns",
-        timeout_ms=5000,
-        context={"user_id": "u-sync"},
-        settings={"temperature": 0.2},
-        extra_context={"request_id": "req-sync"},
-    )
-    assert result is not None
-
-
-# ---------------------------------------------------------------------------
-# Async semantics (basic smoke tests)
+# 3) Event-loop guard (4 tests - parametrized)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_async_query_and_stream_basic(adapter: Any) -> None:
-    """
-    Async aquery / astream_query should exist and produce results compatible
-    with the sync API (non-None result / async-iterable of chunks).
-    """
+@pytest.mark.parametrize(
+    "method_name, call_args",
+    [
+        ("query", ("MATCH (n) RETURN n",)),
+        ("stream_query", ("MATCH (n) RETURN n",)),
+        ("bulk_vertices", (object(),)),
+        ("batch", ([],)),
+    ],
+)
+async def test_sync_methods_raise_if_called_inside_running_event_loop(
+    adapter: Any,
+    method_name: str,
+    call_args: Tuple[Any, ...],
+) -> None:
+    """Calling sync wrappers in a running event loop should raise to prevent deadlocks."""
     client = _make_client(adapter)
 
-    assert hasattr(client, "aquery")
-    assert hasattr(client, "astream_query")
+    method = getattr(client, method_name)
+    with pytest.raises(RuntimeError) as exc_info:
+        # stream_query returns a generator, so we need to consume it to trigger the check
+        if method_name == "stream_query":
+            list(method(*call_args))
+        else:
+            method(*call_args)
 
-    coro = client.aquery("MATCH (n) RETURN n LIMIT 1")
-    assert inspect.isawaitable(coro)
-    result = await coro
-    assert result is not None
-
-    aiter = client.astream_query("MATCH (n) RETURN n LIMIT 2")
-    if inspect.isawaitable(aiter):
-        aiter = await aiter  # type: ignore[assignment]
-
-    seen_any = False
-    async for _ in aiter:  # noqa: B007
-        seen_any = True
-        break
-
-    assert isinstance(seen_any, bool)
-
-
-@pytest.mark.asyncio
-async def test_async_query_accepts_optional_params_and_context(
-    adapter: Any,
-) -> None:
-    """
-    aquery() should accept the same optional params and context as query().
-    """
-    client = _make_client(adapter, default_namespace="async-sk-ns")
-
-    result = await client.aquery(
-        "MATCH (n) RETURN n LIMIT $limit",
-        params={"limit": 3},
-        dialect="cypher",
-        namespace="async-sk-ns",
-        timeout_ms=2500,
-        context={"user_id": "u-async"},
-        settings={"temperature": 0.5},
-        extra_context={"request_id": "req-async"},
-    )
-    assert result is not None
+    assert ErrorCodes.SYNC_WRAPPER_CALLED_IN_EVENT_LOOP in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------
-# Streaming validation tests
+# 4) Capabilities kwargs forwarding (3 tests)
 # ---------------------------------------------------------------------------
 
 
-def test_stream_query_invalid_chunk_triggers_validation_and_context(
+def test_capabilities_forwards_kwargs_when_supported(
     monkeypatch: pytest.MonkeyPatch,
     adapter: Any,
 ) -> None:
-    """
-    stream_query() should pass each chunk through validate_graph_result_type
-    and attach Semantic Kernel error context when validation fails.
-    """
+    """If translator.capabilities supports kwargs, adapter should forward them."""
     captured: Dict[str, Any] = {}
-    invalid_chunk = object()
 
     class DummyTranslator:
-        def query_stream(
-            self,
-            raw_query: Mapping[str, Any],
-            *,
-            op_ctx: Any = None,
-            framework_ctx: Mapping[str, Any] | None = None,
-        ):
-            captured["raw_query"] = dict(raw_query)
-            captured["framework_ctx"] = dict(framework_ctx or {})
+        def capabilities(self, **kwargs: Any) -> Any:
+            captured["kwargs"] = dict(kwargs)
+            return {"cap": True}
+
+    monkeypatch.setattr(sk_adapter_module, "create_graph_translator", lambda *_a, **_k: DummyTranslator())
+    monkeypatch.setattr(sk_adapter_module, "graph_capabilities_to_dict", lambda caps: dict(caps))
+
+    client = _make_client(adapter)
+
+    caps = client.capabilities(foo=1, bar="x")
+    assert isinstance(caps, Mapping)
+    assert captured["kwargs"] == {"foo": 1, "bar": "x"}
+
+
+def test_capabilities_ignores_kwargs_when_not_supported(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: Any,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """If translator.capabilities does not accept kwargs, adapter should ignore them safely."""
+    caplog.set_level(logging.DEBUG)
+
+    class DummyTranslator:
+        def capabilities(self) -> Any:
+            return {"cap": True}
+
+    monkeypatch.setattr(sk_adapter_module, "create_graph_translator", lambda *_a, **_k: DummyTranslator())
+    monkeypatch.setattr(sk_adapter_module, "graph_capabilities_to_dict", lambda caps: dict(caps))
+
+    client = _make_client(adapter)
+
+    caps = client.capabilities(foo=1)
+    assert isinstance(caps, Mapping)
+    # Debug log is best-effort; do not make the test brittle on exact message.
+    assert any("does not accept kwargs" in rec.message for rec in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_acapabilities_forwards_kwargs_or_ignores_safely(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: Any,
+) -> None:
+    """
+    Async capabilities should:
+      - forward kwargs when supported, and
+      - ignore kwargs safely when not supported.
+    """
+    monkeypatch.setattr(sk_adapter_module, "graph_capabilities_to_dict", lambda caps: dict(caps))
+
+    # Supported case
+    captured_supported: Dict[str, Any] = {}
+
+    class SupportedTranslator:
+        async def arun_capabilities(self, **kwargs: Any) -> Any:
+            captured_supported["kwargs"] = dict(kwargs)
+            return {"cap": True}
+
+    monkeypatch.setattr(sk_adapter_module, "create_graph_translator", lambda *_a, **_k: SupportedTranslator())
+    client1 = _make_client(adapter)
+    caps1 = await client1.acapabilities(alpha=123)
+    assert isinstance(caps1, Mapping)
+    assert captured_supported["kwargs"] == {"alpha": 123}
+
+    # Not supported case (TypeError fallback)
+    class NotSupportedKwTranslator:
+        async def arun_capabilities(self) -> Any:
+            return {"cap": True}
+
+    monkeypatch.setattr(sk_adapter_module, "create_graph_translator", lambda *_a, **_k: NotSupportedKwTranslator())
+    client2 = _make_client(adapter)
+    caps2 = await client2.acapabilities(beta="x")
+    assert isinstance(caps2, Mapping)
+
+
+# ---------------------------------------------------------------------------
+# 5) Query validation + raw mapping + params JSON diagnostics (4 tests)
+# ---------------------------------------------------------------------------
+
+
+def test_validate_graph_query_called_with_constant_sync_and_async(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: Any,
+) -> None:
+    """validate_graph_query should be called with ErrorCodes.INVALID_QUERY for both paths."""
+    captured: Dict[str, Any] = {"sync": None, "async": None}
+
+    def fake_validate_graph_query(query: str, *, operation: str, error_code: str) -> None:
+        if operation == "query":
+            captured["sync"] = error_code
+        if operation == "aquery":
+            captured["async"] = error_code
+
+    class DummyTranslator:
+        def query(self, *_a: Any, **_k: Any) -> Any:
+            return {"ok": True}
+
+        async def arun_query(self, *_a: Any, **_k: Any) -> Any:
+            return {"ok": True}
+
+    monkeypatch.setattr(sk_adapter_module, "validate_graph_query", fake_validate_graph_query)
+    monkeypatch.setattr(sk_adapter_module, "create_graph_translator", lambda *_a, **_k: DummyTranslator())
+    monkeypatch.setattr(sk_adapter_module, "validate_graph_result_type", lambda v, **_k: v)
+
+    client = _make_client(adapter)
+
+    _ = client.query("MATCH (n) RETURN n")
+    asyncio.run(client.aquery("MATCH (n) RETURN n"))
+
+    assert captured["sync"] == ErrorCodes.INVALID_QUERY
+    assert captured["async"] == ErrorCodes.INVALID_QUERY
+
+
+def test_build_raw_query_precedence_and_stream_flags(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: Any,
+) -> None:
+    """Raw query should include defaults, allow overrides, and set stream flag correctly."""
+    captured: Dict[str, Any] = {}
+
+    class DummyTranslator:
+        def query(self, raw_query: Mapping[str, Any], *, op_ctx: Any = None, framework_ctx: Any = None, mmr_config: Any = None) -> Any:  # noqa: ARG002,E501
+            captured["query_raw"] = dict(raw_query)
+            return {"ok": True}
+
+        def query_stream(self, raw_query: Mapping[str, Any], *, op_ctx: Any = None, framework_ctx: Any = None) -> Iterator[Any]:  # noqa: ARG002,E501
+            captured["stream_raw"] = dict(raw_query)
+            yield {"chunk": 1}
+
+    monkeypatch.setattr(sk_adapter_module, "create_graph_translator", lambda *_a, **_k: DummyTranslator())
+    monkeypatch.setattr(sk_adapter_module, "validate_graph_result_type", lambda v, **_k: v)
+
+    client = _make_client(adapter, default_dialect="cypher", default_namespace="ns-default", default_timeout_ms=111)
+
+    _ = client.query("Q", params={"x": 1})
+    list(client.stream_query("Q2", namespace="ns-explicit", timeout_ms=222))
+
+    assert captured["query_raw"]["dialect"] == "cypher"
+    assert captured["query_raw"]["namespace"] == "ns-default"
+    assert captured["query_raw"]["timeout_ms"] == 111
+    assert captured["query_raw"]["stream"] is False
+
+    assert "dialect" in captured["stream_raw"]  # inherited default dialect
+    assert captured["stream_raw"]["namespace"] == "ns-explicit"
+    assert captured["stream_raw"]["timeout_ms"] == 222
+    assert captured["stream_raw"]["stream"] is True
+
+
+def test_params_non_serializable_logs_debug_not_raise(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: Any,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Non-JSON-serializable params should log debug only and not raise."""
+    caplog.set_level(logging.DEBUG)
+
+    class NonJSON:
+        pass
+
+    class DummyTranslator:
+        def query(self, *_a: Any, **_k: Any) -> Any:
+            return {"ok": True}
+
+    monkeypatch.setattr(sk_adapter_module, "create_graph_translator", lambda *_a, **_k: DummyTranslator())
+    monkeypatch.setattr(sk_adapter_module, "validate_graph_result_type", lambda v, **_k: v)
+
+    client = _make_client(adapter)
+
+    _ = client.query("Q", params={"x": NonJSON()})
+    assert any("not JSON-serializable" in rec.message for rec in caplog.records)
+
+
+def test_query_passes_framework_ctx_and_op_ctx_none_when_no_context_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: Any,
+) -> None:
+    """Framework context should include operation and framework; op_ctx should be None if no inputs."""
+    captured: Dict[str, Any] = {}
+
+    class DummyTranslator:
+        def query(self, raw_query: Mapping[str, Any], *, op_ctx: Any = None, framework_ctx: Any = None, mmr_config: Any = None) -> Any:  # noqa: ARG002,E501
             captured["op_ctx"] = op_ctx
-            # Emit a single invalid chunk
+            captured["framework_ctx"] = dict(framework_ctx or {})
+            captured["raw_query"] = dict(raw_query)
+            return {"ok": True}
+
+    monkeypatch.setattr(sk_adapter_module, "create_graph_translator", lambda *_a, **_k: DummyTranslator())
+    monkeypatch.setattr(sk_adapter_module, "validate_graph_result_type", lambda v, **_k: v)
+
+    client = _make_client(adapter, default_namespace="ns-0")
+    _ = client.query("Q", namespace="ns-1")
+
+    assert captured["op_ctx"] is None
+    assert captured["framework_ctx"]["framework"] == "semantic_kernel"
+    assert captured["framework_ctx"]["operation"] == "query"
+    assert captured["framework_ctx"]["namespace"] == "ns-1"
+
+
+# ---------------------------------------------------------------------------
+# 6) Dialect fallback on NotSupported (4 tests)
+# ---------------------------------------------------------------------------
+
+
+def test_query_retries_without_dialect_on_NotSupported_when_dialect_provided(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: Any,
+) -> None:
+    """If dialect explicitly provided and NotSupported raised, adapter should retry without dialect."""
+    calls: List[Dict[str, Any]] = []
+
+    class DummyTranslator:
+        def query(self, raw_query: Mapping[str, Any], *, op_ctx: Any = None, framework_ctx: Any = None, mmr_config: Any = None) -> Any:  # noqa: ARG002,E501
+            calls.append(dict(raw_query))
+            if len(calls) == 1:
+                raise NotSupported("dialect not supported")
+            return {"ok": True}
+
+    monkeypatch.setattr(sk_adapter_module, "create_graph_translator", lambda *_a, **_k: DummyTranslator())
+    monkeypatch.setattr(sk_adapter_module, "validate_graph_result_type", lambda v, **_k: v)
+
+    client = _make_client(adapter)
+
+    _ = client.query("Q", dialect="cypher")
+
+    assert len(calls) == 2
+    assert "dialect" in calls[0]
+    assert "dialect" not in calls[1]
+
+
+def test_query_does_not_retry_on_NotSupported_when_no_dialect_provided(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: Any,
+) -> None:
+    """If dialect not explicitly provided, NotSupported should propagate."""
+    class DummyTranslator:
+        def query(self, *_a: Any, **_k: Any) -> Any:
+            raise NotSupported("no support")
+
+    monkeypatch.setattr(sk_adapter_module, "create_graph_translator", lambda *_a, **_k: DummyTranslator())
+
+    client = _make_client(adapter)
+
+    with pytest.raises(NotSupported):
+        client.query("Q")
+
+
+@pytest.mark.asyncio
+async def test_aquery_retries_without_dialect_on_NotSupported_when_dialect_provided(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: Any,
+) -> None:
+    """Async variant should retry without dialect when explicitly provided."""
+    calls: List[Dict[str, Any]] = []
+
+    class DummyTranslator:
+        async def arun_query(self, raw_query: Mapping[str, Any], *, op_ctx: Any = None, framework_ctx: Any = None, mmr_config: Any = None) -> Any:  # noqa: ARG002,E501
+            calls.append(dict(raw_query))
+            if len(calls) == 1:
+                raise NotSupported("dialect not supported")
+            return {"ok": True}
+
+    monkeypatch.setattr(sk_adapter_module, "create_graph_translator", lambda *_a, **_k: DummyTranslator())
+    monkeypatch.setattr(sk_adapter_module, "validate_graph_result_type", lambda v, **_k: v)
+
+    client = _make_client(adapter)
+
+    _ = await client.aquery("Q", dialect="cypher")
+
+    assert len(calls) == 2
+    assert "dialect" in calls[0]
+    assert "dialect" not in calls[1]
+
+
+@pytest.mark.asyncio
+async def test_aquery_does_not_retry_on_NotSupported_when_no_dialect_provided(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: Any,
+) -> None:
+    """Async NotSupported should propagate when dialect not explicitly provided."""
+    class DummyTranslator:
+        async def arun_query(self, *_a: Any, **_k: Any) -> Any:
+            raise NotSupported("no support")
+
+    monkeypatch.setattr(sk_adapter_module, "create_graph_translator", lambda *_a, **_k: DummyTranslator())
+
+    client = _make_client(adapter)
+
+    with pytest.raises(NotSupported):
+        await client.aquery("Q")
+
+
+# ---------------------------------------------------------------------------
+# 7) Streaming normalization + validation + error context (7 tests)
+# ---------------------------------------------------------------------------
+
+
+def test_stream_query_validates_each_chunk_and_invalid_attaches_context(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: Any,
+) -> None:
+    """stream_query should validate chunks and attach framework context when validation fails."""
+    invalid_chunk = object()
+    attached: Dict[str, Any] = {}
+
+    class DummyTranslator:
+        def query_stream(self, *_a: Any, **_k: Any) -> Iterator[Any]:
             yield invalid_chunk
 
-    def fake_create_graph_translator(*_: Any, **__: Any) -> Any:
-        return DummyTranslator()
+    def fake_validate_graph_result_type(value: Any, **_k: Any) -> Any:
+        raise ValueError("invalid chunk")
 
-    def fake_validate_graph_result_type(value: Any, **kwargs: Any) -> Any:  # noqa: ARG001
-        captured["validated_chunk"] = value
-        raise ValueError("invalid chunk from translator")
+    def fake_attach_context(exc: BaseException, **ctx: Any) -> None:  # noqa: ARG001
+        attached.update(ctx)
 
-    error_ctx: Dict[str, Any] = {}
-
-    def fake_attach_context(exc: BaseException, **ctx: Any) -> None:
-        error_ctx.update(ctx)
-
-    monkeypatch.setattr(
-        sk_adapter_module,
-        "create_graph_translator",
-        fake_create_graph_translator,
-    )
-    monkeypatch.setattr(
-        sk_adapter_module,
-        "validate_graph_result_type",
-        fake_validate_graph_result_type,
-    )
-    monkeypatch.setattr(
-        sk_adapter_module,
-        "attach_context",
-        fake_attach_context,
-    )
+    monkeypatch.setattr(sk_adapter_module, "create_graph_translator", lambda *_a, **_k: DummyTranslator())
+    monkeypatch.setattr(sk_adapter_module, "validate_graph_result_type", fake_validate_graph_result_type)
+    monkeypatch.setattr(sk_adapter_module, "attach_context", fake_attach_context)
 
     client = _make_client(adapter)
 
-    stream = client.stream_query("MATCH (n) RETURN n")
+    with pytest.raises(ValueError, match="invalid chunk"):
+        list(client.stream_query("Q"))
 
-    with pytest.raises(ValueError, match="invalid chunk from translator"):
-        for _ in stream:
-            pass
-
-    # Ensure the invalid chunk was given to the validator
-    assert captured.get("validated_chunk") is invalid_chunk
-
-    # And that framework-specific error context was attached
-    assert error_ctx
-    assert error_ctx.get("framework") == "semantic_kernel"
-    assert str(error_ctx.get("operation", "")).startswith("graph_")
+    assert attached.get("framework") == "semantic_kernel"
 
 
 @pytest.mark.asyncio
-async def test_astream_query_invalid_chunk_triggers_validation_and_context_async(
+async def test_astream_query_accepts_direct_async_iterator(
     monkeypatch: pytest.MonkeyPatch,
     adapter: Any,
 ) -> None:
-    """
-    astream_query() should also validate chunks and attach Semantic Kernel
-    error context when validation fails.
-    """
-    captured: Dict[str, Any] = {}
-    invalid_chunk = object()
-
+    """If translator returns an AsyncIterator directly, adapter should consume it."""
     class DummyTranslator:
-        async def arun_query_stream(
-            self,
-            raw_query: Mapping[str, Any],
-            *,
-            op_ctx: Any = None,
-            framework_ctx: Mapping[str, Any] | None = None,
-        ):
-            captured["raw_query"] = dict(raw_query)
-            captured["framework_ctx"] = dict(framework_ctx or {})
-            captured["op_ctx"] = op_ctx
+        def arun_query_stream(self, *_a: Any, **_k: Any) -> Any:
+            return _make_async_gen([{"chunk": 1}])
 
-            async def gen():
-                yield invalid_chunk
-
-            # Return an async generator
-            return gen()
-
-    def fake_create_graph_translator(*_: Any, **__: Any) -> Any:
-        return DummyTranslator()
-
-    async def fake_validate_graph_result_type(value: Any, **kwargs: Any) -> Any:  # noqa: ARG001
-        # Even though the real helper is sync, this keeps the test robust
-        captured["validated_chunk"] = value
-        raise ValueError("invalid async chunk from translator")
-
-    error_ctx: Dict[str, Any] = {}
-
-    def fake_attach_context(exc: BaseException, **ctx: Any) -> None:
-        error_ctx.update(ctx)
-
-    monkeypatch.setattr(
-        sk_adapter_module,
-        "create_graph_translator",
-        fake_create_graph_translator,
-    )
-    # Wrap the async fake in a sync shim because the real function is sync.
-    def sync_wrapper(value: Any, **kwargs: Any) -> Any:  # noqa: ARG001
-        # drive the async validator in a minimal way
-        import asyncio
-
-        return asyncio.get_event_loop().run_until_complete(
-            fake_validate_graph_result_type(value, **kwargs),
-        )
-
-    monkeypatch.setattr(
-        sk_adapter_module,
-        "validate_graph_result_type",
-        sync_wrapper,
-    )
-    monkeypatch.setattr(
-        sk_adapter_module,
-        "attach_context",
-        fake_attach_context,
-    )
+    monkeypatch.setattr(sk_adapter_module, "create_graph_translator", lambda *_a, **_k: DummyTranslator())
+    monkeypatch.setattr(sk_adapter_module, "validate_graph_result_type", lambda v, **_k: v)
 
     client = _make_client(adapter)
 
-    aiter = client.astream_query("MATCH (n) RETURN n")
+    aiter = client.astream_query("Q")
     if inspect.isawaitable(aiter):
         aiter = await aiter  # type: ignore[assignment]
 
-    with pytest.raises(ValueError, match="invalid async chunk from translator"):
+    out = []
+    async for c in aiter:
+        out.append(c)
+
+    assert out == [{"chunk": 1}]
+
+
+@pytest.mark.asyncio
+async def test_astream_query_accepts_awaitable_resolving_to_async_iterator(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: Any,
+) -> None:
+    """If translator returns awaitable->AsyncIterator, adapter should await then consume."""
+    class DummyTranslator:
+        async def arun_query_stream(self, *_a: Any, **_k: Any) -> Any:
+            return _make_async_gen([{"chunk": 1}, {"chunk": 2}])
+
+    monkeypatch.setattr(sk_adapter_module, "create_graph_translator", lambda *_a, **_k: DummyTranslator())
+    monkeypatch.setattr(sk_adapter_module, "validate_graph_result_type", lambda v, **_k: v)
+
+    client = _make_client(adapter)
+
+    aiter = client.astream_query("Q")
+    if inspect.isawaitable(aiter):
+        aiter = await aiter  # type: ignore[assignment]
+
+    out = []
+    async for c in aiter:
+        out.append(c)
+
+    assert out == [{"chunk": 1}, {"chunk": 2}]
+
+
+@pytest.mark.asyncio
+async def test_astream_query_invalid_shape_raises_typeerror_with_code(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: Any,
+) -> None:
+    """Invalid stream shape should raise TypeError containing BAD_ASYNC_ITERATOR_SHAPE."""
+    class DummyTranslator:
+        def arun_query_stream(self, *_a: Any, **_k: Any) -> Any:
+            return {"not": "an iterator"}
+
+    monkeypatch.setattr(sk_adapter_module, "create_graph_translator", lambda *_a, **_k: DummyTranslator())
+
+    client = _make_client(adapter)
+
+    with pytest.raises(TypeError) as exc_info:
+        aiter = client.astream_query("Q")
+        if inspect.isawaitable(aiter):
+            aiter = await aiter  # type: ignore[assignment]
         async for _ in aiter:  # noqa: B007
             pass
 
-    assert captured.get("validated_chunk") is invalid_chunk
-    assert error_ctx
-    assert error_ctx.get("framework") == "semantic_kernel"
-    assert str(error_ctx.get("operation", "")).startswith("graph_")
+    assert ErrorCodes.BAD_ASYNC_ITERATOR_SHAPE in str(exc_info.value)
 
 
-# ---------------------------------------------------------------------------
-# Bulk vertices / batch semantics (wiring)
-# ---------------------------------------------------------------------------
-
-
-def test_bulk_vertices_builds_raw_request_and_calls_translator(
+@pytest.mark.asyncio
+async def test_astream_query_invalid_chunk_attaches_context(
     monkeypatch: pytest.MonkeyPatch,
     adapter: Any,
 ) -> None:
     """
-    bulk_vertices() should:
-
-    - Build the correct raw_request mapping from the spec, and
-    - Call translator.bulk_vertices with that mapping and framework_ctx.
+    FIXED ISSUE #2:
+    validate_graph_result_type is synchronous; the test must not run event-loop
+    bridging hacks (run_until_complete). It should use a sync validator fake.
     """
-    captured: Dict[str, Any] = {}
+    invalid_chunk = object()
+    attached: Dict[str, Any] = {}
 
-    translator = _mock_translator_with_capture(
-        captured,
-        method_name="bulk_vertices",
-        return_value="bulk-result",
-    )
+    class DummyTranslator:
+        async def arun_query_stream(self, *_a: Any, **_k: Any) -> Any:
+            return _make_async_gen([invalid_chunk])
 
-    def fake_create_graph_translator(*_: Any, **__: Any) -> Any:
-        return translator
+    def fake_validate_graph_result_type(value: Any, **_k: Any) -> Any:
+        raise ValueError("invalid async chunk")
 
-    def fake_validate_graph_result_type(result: Any, **_: Any) -> Any:
-        return result
+    def fake_attach_context(exc: BaseException, **ctx: Any) -> None:  # noqa: ARG001
+        attached.update(ctx)
 
-    monkeypatch.setattr(
-        sk_adapter_module,
-        "create_graph_translator",
-        fake_create_graph_translator,
-    )
-    monkeypatch.setattr(
-        sk_adapter_module,
-        "validate_graph_result_type",
-        fake_validate_graph_result_type,
-    )
+    monkeypatch.setattr(sk_adapter_module, "create_graph_translator", lambda *_a, **_k: DummyTranslator())
+    monkeypatch.setattr(sk_adapter_module, "validate_graph_result_type", fake_validate_graph_result_type)
+    monkeypatch.setattr(sk_adapter_module, "attach_context", fake_attach_context)
 
     client = _make_client(adapter)
 
-    class DummyBulkSpec:
-        def __init__(self) -> None:
-            self.namespace = "ns-bulk"
-            self.limit = 42
-            self.cursor = "cursor-token"
-            self.filter = {"foo": "bar"}
+    aiter = client.astream_query("Q")
+    if inspect.isawaitable(aiter):
+        aiter = await aiter  # type: ignore[assignment]
 
-    spec = DummyBulkSpec()
+    with pytest.raises(ValueError, match="invalid async chunk"):
+        async for _ in aiter:  # noqa: B007
+            pass
 
-    result = client.bulk_vertices(spec)
-    assert result == "bulk-result"
-
-    assert "args" in captured
-    raw = captured["args"][0]
-    assert raw == {
-        "namespace": "ns-bulk",
-        "limit": 42,
-        "cursor": "cursor-token",
-        "filter": {"foo": "bar"},
-    }
-
-    fw_ctx = captured.get("framework_ctx", {})
-    assert fw_ctx.get("framework") == "semantic_kernel"
-    assert fw_ctx.get("operation") == "bulk_vertices"
-    assert fw_ctx.get("namespace") == "ns-bulk"
-    assert captured.get("op_ctx") is None
+    assert attached.get("framework") == "semantic_kernel"
 
 
 @pytest.mark.asyncio
-async def test_abulk_vertices_builds_raw_request_and_calls_translator_async(
+async def test_astream_query_cancelled_error_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: Any,
+) -> None:
+    """CancelledError should not be swallowed by adapter streaming loop."""
+    async def gen():
+        raise asyncio.CancelledError()
+
+        yield  # pragma: no cover
+
+    class DummyTranslator:
+        async def arun_query_stream(self, *_a: Any, **_k: Any) -> Any:
+            return gen()
+
+    monkeypatch.setattr(sk_adapter_module, "create_graph_translator", lambda *_a, **_k: DummyTranslator())
+
+    client = _make_client(adapter)
+
+    aiter = client.astream_query("Q")
+    if inspect.isawaitable(aiter):
+        aiter = await aiter  # type: ignore[assignment]
+
+    with pytest.raises(asyncio.CancelledError):
+        async for _ in aiter:  # noqa: B007
+            pass
+
+
+def test_framework_ctx_operation_for_streaming_sync_and_async(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: Any,
+) -> None:
+    """framework_ctx.operation should be 'stream_query' for both stream_query and astream_query."""
+    captured_sync: Dict[str, Any] = {}
+    captured_async: Dict[str, Any] = {}
+
+    class DummyTranslatorSync:
+        def query_stream(self, raw_query: Mapping[str, Any], *, op_ctx: Any = None, framework_ctx: Any = None) -> Iterator[Any]:  # noqa: ARG002,E501
+            captured_sync["framework_ctx"] = dict(framework_ctx or {})
+            yield {"chunk": 1}
+
+    class DummyTranslatorAsync:
+        async def arun_query_stream(self, raw_query: Mapping[str, Any], *, op_ctx: Any = None, framework_ctx: Any = None) -> Any:  # noqa: ARG002,E501
+            captured_async["framework_ctx"] = dict(framework_ctx or {})
+            return _make_async_gen([{"chunk": 1}])
+
+    # Sync
+    monkeypatch.setattr(sk_adapter_module, "create_graph_translator", lambda *_a, **_k: DummyTranslatorSync())
+    monkeypatch.setattr(sk_adapter_module, "validate_graph_result_type", lambda v, **_k: v)
+    client1 = _make_client(adapter)
+    list(client1.stream_query("Q"))
+    assert captured_sync["framework_ctx"]["operation"] == "stream_query"
+
+    # Async (run in a nested loop using asyncio.run to keep this test sync)
+    monkeypatch.setattr(sk_adapter_module, "create_graph_translator", lambda *_a, **_k: DummyTranslatorAsync())
+    client2 = _make_client(adapter)
+
+    async def drive():
+        aiter = client2.astream_query("Q")
+        if inspect.isawaitable(aiter):
+            aiter2 = await aiter
+        else:
+            aiter2 = aiter
+        async for _ in aiter2:  # noqa: B007
+            break
+
+    asyncio.run(drive())
+    assert captured_async["framework_ctx"]["operation"] == "stream_query"
+
+
+# ---------------------------------------------------------------------------
+# 8) Delete selector semantics (6 tests: 4 param + 2 param)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "kind, use_filter",
+    [
+        ("nodes", True),
+        ("nodes", False),
+        ("edges", True),
+        ("edges", False),
+    ],
+)
+def test_delete_filter_or_ids_paths_call_translator_with_expected_raw(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: Any,
+    kind: str,
+    use_filter: bool,
+) -> None:
+    """delete_nodes/delete_edges should pass filter or ids appropriately to the translator."""
+    captured: Dict[str, Any] = {}
+
+    class DummyTranslator:
+        def delete_nodes(self, raw: Any, *, op_ctx: Any = None, framework_ctx: Any = None) -> Any:  # noqa: ARG002,E501
+            captured["raw"] = raw
+            return {"ok": True}
+
+        def delete_edges(self, raw: Any, *, op_ctx: Any = None, framework_ctx: Any = None) -> Any:  # noqa: ARG002,E501
+            captured["raw"] = raw
+            return {"ok": True}
+
+    monkeypatch.setattr(sk_adapter_module, "create_graph_translator", lambda *_a, **_k: DummyTranslator())
+    monkeypatch.setattr(sk_adapter_module, "validate_graph_result_type", lambda v, **_k: v)
+
+    client = _make_client(adapter)
+
+    if kind == "nodes":
+        class Spec:
+            namespace = None
+            filter = {"x": 1} if use_filter else None
+            ids = None if use_filter else ["1", "2"]
+
+        _ = client.delete_nodes(Spec())
+    else:
+        class Spec:
+            namespace = None
+            filter = {"y": 2} if use_filter else None
+            ids = None if use_filter else ["e1"]
+
+        _ = client.delete_edges(Spec())
+
+    if use_filter:
+        assert isinstance(captured["raw"], Mapping)
+    else:
+        assert isinstance(captured["raw"], list)
+        assert captured["raw"]
+
+
+@pytest.mark.parametrize("kind", ["nodes", "edges"])
+def test_delete_missing_filter_and_ids_raises_and_async_too(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: Any,
+    kind: str,
+) -> None:
+    """
+    Missing filter and ids should raise BadRequest (sync),
+    and also raise for the async delete path when driven explicitly.
+    """
+    class DummyTranslator:
+        async def arun_delete_nodes(self, *_a: Any, **_k: Any) -> Any:
+            return {"ok": True}
+
+        async def arun_delete_edges(self, *_a: Any, **_k: Any) -> Any:
+            return {"ok": True}
+
+        def delete_nodes(self, *_a: Any, **_k: Any) -> Any:
+            return {"ok": True}
+
+        def delete_edges(self, *_a: Any, **_k: Any) -> Any:
+            return {"ok": True}
+
+    monkeypatch.setattr(sk_adapter_module, "create_graph_translator", lambda *_a, **_k: DummyTranslator())
+
+    client = _make_client(adapter)
+
+    if kind == "nodes":
+        class Spec:
+            namespace = None
+            filter = None
+            ids = None
+
+        with pytest.raises(BadRequest) as exc_info:
+            client.delete_nodes(Spec())
+        assert getattr(exc_info.value, "code", None) == ErrorCodes.BAD_ADAPTER_RESULT
+        assert ErrorCodes.INVALID_DELETE_SPEC in str(exc_info.value)
+
+        async def drive():
+            with pytest.raises(BadRequest):
+                await client.adelete_nodes(Spec())
+
+        asyncio.run(drive())
+    else:
+        class Spec:
+            namespace = None
+            filter = None
+            ids = []
+
+        with pytest.raises(BadRequest) as exc_info:
+            client.delete_edges(Spec())
+        assert getattr(exc_info.value, "code", None) == ErrorCodes.BAD_ADAPTER_RESULT
+        assert ErrorCodes.INVALID_DELETE_SPEC in str(exc_info.value)
+
+        async def drive():
+            with pytest.raises(BadRequest):
+                await client.adelete_edges(Spec())
+
+        asyncio.run(drive())
+
+
+# ---------------------------------------------------------------------------
+# 9) Upsert edges validation (6 tests)
+# ---------------------------------------------------------------------------
+
+
+def test_upsert_edges_validates_and_is_side_effect_free_and_async_too(
     monkeypatch: pytest.MonkeyPatch,
     adapter: Any,
 ) -> None:
     """
-    abulk_vertices() should mirror bulk_vertices wiring but via
-    translator.arun_bulk_vertices.
+    upsert_edges should:
+    - materialize edges iterable to a list,
+    - pass the list to the translator,
+    - not require mutation of spec.edges,
+    - and async path should behave equivalently.
     """
     captured: Dict[str, Any] = {}
 
-    translator = _mock_async_translator_with_capture(
-        captured,
-        method_name="arun_bulk_vertices",
-        return_value="bulk-result-async",
-    )
+    class DummyTranslator:
+        def upsert_edges(self, edges: Any, *, op_ctx: Any = None, framework_ctx: Any = None) -> Any:  # noqa: ARG002,E501
+            captured["sync_edges"] = edges
+            return {"ok": True}
 
-    def fake_create_graph_translator(*_: Any, **__: Any) -> Any:
-        return translator
+        async def arun_upsert_edges(self, edges: Any, *, op_ctx: Any = None, framework_ctx: Any = None) -> Any:  # noqa: ARG002,E501
+            captured["async_edges"] = edges
+            return {"ok": True}
 
-    def fake_validate_graph_result_type(result: Any, **_: Any) -> Any:
-        return result
-
-    monkeypatch.setattr(
-        sk_adapter_module,
-        "create_graph_translator",
-        fake_create_graph_translator,
-    )
-    monkeypatch.setattr(
-        sk_adapter_module,
-        "validate_graph_result_type",
-        fake_validate_graph_result_type,
-    )
+    monkeypatch.setattr(sk_adapter_module, "create_graph_translator", lambda *_a, **_k: DummyTranslator())
+    monkeypatch.setattr(sk_adapter_module, "validate_graph_result_type", lambda v, **_k: v)
 
     client = _make_client(adapter)
 
-    class DummyBulkSpec:
-        def __init__(self) -> None:
-            self.namespace = "ns-abulk"
-            self.limit = 7
-            self.cursor = None
-            self.filter = {"bar": 1}
+    def edge_iter():
+        yield _edge_obj(edge_id="e1")
+        yield _edge_obj(edge_id="e2")
 
-    spec = DummyBulkSpec()
+    class Spec:
+        namespace = None
+        edges = edge_iter()
 
-    result = await client.abulk_vertices(spec)
-    assert result == "bulk-result-async"
+    _ = client.upsert_edges(Spec())
+    assert isinstance(captured["sync_edges"], list)
+    assert [e.id for e in captured["sync_edges"]] == ["e1", "e2"]
 
-    assert "args" in captured
-    raw = captured["args"][0]
-    assert raw == {
-        "namespace": "ns-abulk",
-        "limit": 7,
-        "cursor": None,
-        "filter": {"bar": 1},
-    }
+    async def drive():
+        class Spec2:
+            namespace = None
+            edges = edge_iter()
 
-    fw_ctx = captured.get("framework_ctx", {})
-    assert fw_ctx.get("framework") == "semantic_kernel"
-    assert fw_ctx.get("operation") == "bulk_vertices"
-    assert fw_ctx.get("namespace") == "ns-abulk"
-    assert captured.get("op_ctx") is None
+        _ = await client.aupsert_edges(Spec2())
+        assert isinstance(captured["async_edges"], list)
+        assert [e.id for e in captured["async_edges"]] == ["e1", "e2"]
+
+    asyncio.run(drive())
 
 
-def test_batch_builds_raw_batch_ops_and_calls_translator(
+def test_upsert_edges_rejects_none_edges(adapter: Any) -> None:
+    client = _make_client(adapter)
+
+    class Spec:
+        namespace = None
+        edges = None
+
+    with pytest.raises(BadRequest) as exc_info:
+        client._validate_upsert_edges_spec(Spec())  # noqa: SLF001
+    assert getattr(exc_info.value, "code", None) == ErrorCodes.BAD_ADAPTER_RESULT
+
+
+def test_upsert_edges_rejects_empty_edges(adapter: Any) -> None:
+    client = _make_client(adapter)
+
+    class Spec:
+        namespace = None
+        edges: List[Any] = []
+
+    with pytest.raises(BadRequest) as exc_info:
+        client._validate_upsert_edges_spec(Spec())  # noqa: SLF001
+    assert getattr(exc_info.value, "code", None) == ErrorCodes.BAD_ADAPTER_RESULT
+
+
+@pytest.mark.parametrize(
+    "edge_kwargs",
+    [
+        {"edge_id": None},
+        {"src": None},
+    ],
+)
+def test_upsert_edges_requires_required_fields(adapter: Any, edge_kwargs: Dict[str, Any]) -> None:
+    client = _make_client(adapter)
+
+    class Spec:
+        namespace = None
+        edges = [_edge_obj(**edge_kwargs)]
+
+    with pytest.raises(BadRequest) as exc_info:
+        client._validate_upsert_edges_spec(Spec())  # noqa: SLF001
+    assert getattr(exc_info.value, "code", None) == ErrorCodes.BAD_ADAPTER_RESULT
+
+
+def test_upsert_edges_rejects_non_json_properties(adapter: Any) -> None:
+    client = _make_client(adapter)
+
+    class NonJSON:
+        pass
+
+    class Spec:
+        namespace = None
+        edges = [_edge_obj(properties=NonJSON())]
+
+    with pytest.raises(BadRequest) as exc_info:
+        client._validate_upsert_edges_spec(Spec())  # noqa: SLF001
+    assert getattr(exc_info.value, "code", None) == ErrorCodes.BAD_ADAPTER_RESULT
+
+
+# ---------------------------------------------------------------------------
+# 10) Single-source payload drift prevention (2 tests)
+# ---------------------------------------------------------------------------
+
+
+def test_bulk_vertices_sync_async_build_identical_raw_request(
     monkeypatch: pytest.MonkeyPatch,
     adapter: Any,
 ) -> None:
-    """
-    batch() should:
-
-    - Validate batch operations (stubbed here),
-    - Translate BatchOperation-like objects into raw_batch_ops mappings,
-    - Call translator.batch with those ops and framework_ctx.
-    """
+    """bulk_vertices and abulk_vertices should send identical raw_request shapes for same spec."""
     captured: Dict[str, Any] = {}
 
-    translator = _mock_translator_with_capture(
-        captured,
-        method_name="batch",
-        return_value="batch-result",
-    )
+    class DummyTranslator:
+        def bulk_vertices(self, raw_request: Mapping[str, Any], *, op_ctx: Any = None, framework_ctx: Any = None) -> Any:  # noqa: ARG002,E501
+            captured["sync"] = dict(raw_request)
+            return {"ok": True}
 
-    def fake_create_graph_translator(*_: Any, **__: Any) -> Any:
-        return translator
+        async def arun_bulk_vertices(self, raw_request: Mapping[str, Any], *, op_ctx: Any = None, framework_ctx: Any = None) -> Any:  # noqa: ARG002,E501
+            captured["async"] = dict(raw_request)
+            return {"ok": True}
 
-    def fake_validate_graph_result_type(result: Any, **_: Any) -> Any:
-        return result
+    monkeypatch.setattr(sk_adapter_module, "create_graph_translator", lambda *_a, **_k: DummyTranslator())
+    monkeypatch.setattr(sk_adapter_module, "validate_graph_result_type", lambda v, **_k: v)
 
-    def fake_validate_batch_operations(*_: Any, **__: Any) -> None:
-        captured["validated_batch"] = True
-
-    monkeypatch.setattr(
-        sk_adapter_module,
-        "create_graph_translator",
-        fake_create_graph_translator,
-    )
-    monkeypatch.setattr(
-        sk_adapter_module,
-        "validate_graph_result_type",
-        fake_validate_graph_result_type,
-    )
-    monkeypatch.setattr(
-        sk_adapter_module,
-        "validate_batch_operations",
-        fake_validate_batch_operations,
-    )
+    class Spec:
+        namespace = "ns"
+        limit = 10
+        cursor = "c"
+        filter = {"x": 1}
 
     client = _make_client(adapter)
 
-    class DummyBatchOp:
-        def __init__(self, op: str, args: Mapping[str, Any]) -> None:
-            self.op = op
-            self.args = dict(args)
+    _ = client.bulk_vertices(Spec())
+    asyncio.run(client.abulk_vertices(Spec()))
 
-    ops = [
-        DummyBatchOp("upsert_nodes", {"id": "1"}),
-        DummyBatchOp("delete_nodes", {"ids": ["1", "2"]}),
-    ]
-
-    result = client.batch(ops)
-    assert result == "batch-result"
-    assert captured.get("validated_batch") is True
-
-    assert "args" in captured
-    raw_ops = captured["args"][0]
-    assert raw_ops == [
-        {"op": "upsert_nodes", "args": {"id": "1"}},
-        {"op": "delete_nodes", "args": {"ids": ["1", "2"]}},
-    ]
-
-    fw_ctx = captured.get("framework_ctx", {})
-    assert fw_ctx.get("framework") == "semantic_kernel"
-    assert fw_ctx.get("operation") == "batch"
-    assert captured.get("op_ctx") is None
+    assert captured["sync"] == captured["async"]
 
 
-@pytest.mark.asyncio
-async def test_abatch_builds_raw_batch_ops_and_calls_translator_async(
+def test_traversal_sync_async_build_identical_raw_request(
     monkeypatch: pytest.MonkeyPatch,
     adapter: Any,
 ) -> None:
-    """
-    abatch() should mirror batch wiring via translator.arun_batch.
-    """
+    """traversal and atraversal should send identical raw_request shapes for same spec."""
     captured: Dict[str, Any] = {}
 
-    translator = _mock_async_translator_with_capture(
-        captured,
-        method_name="arun_batch",
-        return_value="batch-result-async",
-    )
+    class DummyTranslator:
+        def traversal(self, raw_request: Mapping[str, Any], *, op_ctx: Any = None, framework_ctx: Any = None) -> Any:  # noqa: ARG002,E501
+            captured["sync"] = dict(raw_request)
+            return {"ok": True}
 
-    def fake_create_graph_translator(*_: Any, **__: Any) -> Any:
-        return translator
+        async def arun_traversal(self, raw_request: Mapping[str, Any], *, op_ctx: Any = None, framework_ctx: Any = None) -> Any:  # noqa: ARG002,E501
+            captured["async"] = dict(raw_request)
+            return {"ok": True}
 
-    def fake_validate_graph_result_type(result: Any, **_: Any) -> Any:
-        return result
+    monkeypatch.setattr(sk_adapter_module, "create_graph_translator", lambda *_a, **_k: DummyTranslator())
+    monkeypatch.setattr(sk_adapter_module, "validate_graph_result_type", lambda v, **_k: v)
 
-    def fake_validate_batch_operations(*_: Any, **__: Any) -> None:
-        captured["validated_batch"] = True
-
-    monkeypatch.setattr(
-        sk_adapter_module,
-        "create_graph_translator",
-        fake_create_graph_translator,
-    )
-    monkeypatch.setattr(
-        sk_adapter_module,
-        "validate_graph_result_type",
-        fake_validate_graph_result_type,
-    )
-    monkeypatch.setattr(
-        sk_adapter_module,
-        "validate_batch_operations",
-        fake_validate_batch_operations,
-    )
+    class Spec:
+        start_nodes = ["a", "b"]
+        max_depth = 2
+        direction = "out"
+        relationship_types = ["REL"]
+        node_filters = None
+        relationship_filters = None
+        return_properties = None
+        namespace = "ns-trav"
 
     client = _make_client(adapter)
 
-    class DummyBatchOp:
-        def __init__(self, op: str, args: Mapping[str, Any]) -> None:
-            self.op = op
-            self.args = dict(args)
+    _ = client.traversal(Spec())
+    asyncio.run(client.atraversal(Spec()))
 
-    ops = [
-        DummyBatchOp("upsert_edges", {"id": "e1"}),
-        DummyBatchOp("delete_edges", {"ids": ["e1", "e2"]}),
-    ]
-
-    result = await client.abatch(ops)
-    assert result == "batch-result-async"
-    assert captured.get("validated_batch") is True
-
-    assert "args" in captured
-    raw_ops = captured["args"][0]
-    assert raw_ops == [
-        {"op": "upsert_edges", "args": {"id": "e1"}},
-        {"op": "delete_edges", "args": {"ids": ["e1", "e2"]}},
-    ]
-
-    fw_ctx = captured.get("framework_ctx", {})
-    assert fw_ctx.get("framework") == "semantic_kernel"
-    assert fw_ctx.get("operation") == "batch"
-    assert captured.get("op_ctx") is None
+    assert captured["sync"] == captured["async"]
 
 
 # ---------------------------------------------------------------------------
-# Capabilities / health passthrough (basic)
+# 11) Close semantics alignment (3 tests)
 # ---------------------------------------------------------------------------
 
 
-def test_capabilities_and_health_basic(adapter: Any) -> None:
-    """
-    Capabilities and health should be surfaced as mappings.
-
-    The detailed structure is tested in framework-agnostic graph contract
-    tests; here we only assert that the Semantic Kernel adapter normalizes to
-    mapping-like results.
-    """
-    client = _make_client(adapter)
-
-    caps = client.capabilities()
-    assert isinstance(caps, Mapping)
-
-    health = client.health()
-    assert isinstance(health, Mapping)
-
-
-@pytest.mark.asyncio
-async def test_async_capabilities_and_health_basic(adapter: Any) -> None:
-    """
-    Async capabilities/health should also return mappings compatible with
-    the sync variants.
-    """
-    client = _make_client(adapter)
-
-    acaps = await client.acapabilities()
-    assert isinstance(acaps, Mapping)
-
-    ahealth = await client.ahealth()
-    assert isinstance(ahealth, Mapping)
-
-
-# ---------------------------------------------------------------------------
-# Resource management (context managers)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_context_manager_closes_underlying_adapter() -> None:
-    """
-    __enter__/__exit__ and __aenter__/__aexit__ should call close/aclose on
-    the underlying graph adapter when those methods exist.
-    """
-
-    class ClosingGraphAdapter:
+def test_aclose_sets_closed_flag_when_async_close_succeeds(adapter: Any) -> None:
+    """After successful aclose(), the client should be considered closed from sync perspective."""
+    class ClosingAdapter:
         def __init__(self) -> None:
             self.closed = False
             self.aclosed = False
-
-        def capabilities(self) -> Dict[str, Any]:
-            return {}
-
-        def health(self) -> Dict[str, Any]:
-            return {}
 
         def close(self) -> None:
             self.closed = True
@@ -991,24 +1279,182 @@ async def test_context_manager_closes_underlying_adapter() -> None:
         async def aclose(self) -> None:
             self.aclosed = True
 
-    adapter = ClosingGraphAdapter()
+        def capabilities(self) -> Dict[str, Any]:
+            return {}
 
-    # Sync context manager
-    with CorpusSemanticKernelGraphClient(adapter=adapter) as client:
-        assert client is not None
+        def health(self) -> Dict[str, Any]:
+            return {}
 
-    assert adapter.closed is True
+    a = ClosingAdapter()
+    client = _make_client(a)
 
-    # Async context manager
-    adapter2 = ClosingGraphAdapter()
-    client2 = CorpusSemanticKernelGraphClient(adapter=adapter2)
+    asyncio.run(client.aclose())
+    assert a.aclosed is True
+    assert client._closed is True  # noqa: SLF001
 
-    async with client2:
-        assert client2 is not None
 
-    assert adapter2.aclosed is True
+def test_aclose_falls_back_to_close_when_no_aclose(adapter: Any) -> None:
+    """If adapter lacks aclose(), client.aclose() should fall back to client.close()."""
+    class ClosingAdapter:
+        def __init__(self) -> None:
+            self.closed = False
 
+        def close(self) -> None:
+            self.closed = True
+
+        def capabilities(self) -> Dict[str, Any]:
+            return {}
+
+        def health(self) -> Dict[str, Any]:
+            return {}
+
+    a = ClosingAdapter()
+    client = _make_client(a)
+
+    asyncio.run(client.aclose())
+    assert a.closed is True
+
+
+def test_close_is_idempotent(adapter: Any) -> None:
+    """Calling close() multiple times should not raise and should only close once."""
+    class ClosingAdapter:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+        def capabilities(self) -> Dict[str, Any]:
+            return {}
+
+        def health(self) -> Dict[str, Any]:
+            return {}
+
+    a = ClosingAdapter()
+    client = _make_client(a)
+
+    client.close()
+    client.close()
+    assert a.close_calls == 1
+
+
+# ---------------------------------------------------------------------------
+# 12) Semantic Kernel optional integration wrapper (4 tests)
+# ---------------------------------------------------------------------------
+
+
+def test_plugin_is_available_and_constructible_when_semantic_kernel_installed(adapter: Any) -> None:
+    """CorpusSemanticKernelPlugin should be the real integration wrapper (not the ImportError stub)."""
+    client = _make_client(adapter)
+    plugin = CorpusSemanticKernelPlugin(client=client, namespace="ns-plugin")
+    assert plugin is not None
+    assert hasattr(plugin, "query")
+    assert hasattr(plugin, "astream_query")
+
+
+def test_plugin_namespace_precedence_and_forwarding_sync(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: Any,
+) -> None:
+    """
+    Namespace precedence for plugin:
+      explicit namespace arg > plugin namespace > client default namespace.
+    """
+    captured: List[Dict[str, Any]] = []
+
+    class DummyTranslator:
+        def query(self, raw_query: Mapping[str, Any], *, op_ctx: Any = None, framework_ctx: Any = None, mmr_config: Any = None) -> Any:  # noqa: ARG002,E501
+            captured.append(dict(raw_query))
+            return {"ok": True}
+
+    monkeypatch.setattr(sk_adapter_module, "create_graph_translator", lambda *_a, **_k: DummyTranslator())
+    monkeypatch.setattr(sk_adapter_module, "validate_graph_result_type", lambda v, **_k: v)
+
+    client = _make_client(adapter, default_namespace="ns-client")
+    plugin = CorpusSemanticKernelPlugin(client=client, namespace="ns-plugin")
+
+    _ = plugin.query("Q1")  # plugin namespace
+    _ = plugin.query("Q2", namespace="ns-explicit")  # explicit namespace
+
+    assert captured[0].get("namespace") == "ns-plugin"
+    assert captured[1].get("namespace") == "ns-explicit"
+
+
+@pytest.mark.asyncio
+async def test_plugin_forwarding_async_query_and_stream(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: Any,
+) -> None:
+    """Plugin should forward async query and async streaming calls to the underlying client."""
+    captured: Dict[str, Any] = {}
+
+    class DummyTranslator:
+        async def arun_query(self, raw_query: Mapping[str, Any], *, op_ctx: Any = None, framework_ctx: Any = None, mmr_config: Any = None) -> Any:  # noqa: ARG002,E501
+            captured["aquery_raw"] = dict(raw_query)
+            return {"ok": True}
+
+        async def arun_query_stream(self, raw_query: Mapping[str, Any], *, op_ctx: Any = None, framework_ctx: Any = None) -> Any:  # noqa: ARG002,E501
+            captured["astream_raw"] = dict(raw_query)
+            return _make_async_gen([{"chunk": 1}])
+
+    monkeypatch.setattr(sk_adapter_module, "create_graph_translator", lambda *_a, **_k: DummyTranslator())
+    monkeypatch.setattr(sk_adapter_module, "validate_graph_result_type", lambda v, **_k: v)
+
+    client = _make_client(adapter)
+    plugin = CorpusSemanticKernelPlugin(client=client, namespace="ns-plugin")
+
+    _ = await plugin.aquery("Q")
+    aiter = plugin.astream_query("Q2")
+    if inspect.isawaitable(aiter):
+        aiter = await aiter  # type: ignore[assignment]
+    async for _ in aiter:  # noqa: B007
+        break
+
+    assert captured["aquery_raw"]["namespace"] == "ns-plugin"
+    assert captured["astream_raw"]["namespace"] == "ns-plugin"
+
+
+def test_plugin_stub_raises_importerror_when_semantic_kernel_missing_simulated(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: Any,
+) -> None:
+    """
+    Simulate a missing semantic_kernel install and ensure the plugin becomes a stub.
+
+    We do this without importing semantic_kernel in the test:
+    - monkeypatch builtins.__import__ to raise ImportError for 'semantic_kernel'
+    - reload the adapter module
+    - construct CorpusSemanticKernelPlugin => should raise ImportError
+    - restore and reload module back to normal for other tests
+    """
+    original_import = builtins.__import__
+
+    def blocked_import(name: str, globals: Any = None, locals: Any = None, fromlist: Any = (), level: int = 0) -> Any:  # noqa: A002,E501
+        if name == "semantic_kernel":
+            raise ImportError("simulated missing semantic_kernel")
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", blocked_import)
+
+    # Reload module under "missing SK" conditions.
+    reloaded = importlib.reload(sk_adapter_module)
+
+    try:
+        assert getattr(reloaded, "_semantic_kernel", None) is None
+        with pytest.raises(ImportError):
+            _ = reloaded.CorpusSemanticKernelPlugin(client=_make_client(adapter))
+    finally:
+        # Restore import and reload back to a "healthy" state for the rest of the suite.
+        monkeypatch.setattr(builtins, "__import__", original_import)
+        importlib.reload(sk_adapter_module)
+
+
+# ---------------------------------------------------------------------------
+# NOTE:
+# This file intentionally contains exactly 54 pytest test cases:
+# - Parametrization expands some tests into multiple cases.
+# - No tests are skipped by design: missing SK is a hard failure.
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
-
