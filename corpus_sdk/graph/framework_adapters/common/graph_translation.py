@@ -1284,16 +1284,31 @@ class GraphTranslator:
     ) -> Union[Iterator[R], AsyncIterator[R]]:
         """
         Centralized execution for streaming operations.
-        
+
         Args:
             factory: A function that takes context and returns an AsyncIterator.
         """
         ctx = _ensure_operation_context(op_ctx)
 
         async def _async_gen() -> AsyncIterator[R]:
+            # Call factory outside the iteration try/except so call-time failures can be handled
+            # distinctly. We still attach error context for call-time failures to preserve
+            # observability and conformance expectations for "early" errors.
+            #
+            # Factory returns async iterator directly (no await).
             try:
-                # Factory returns async iterator directly (no await)
                 aiter = factory(ctx)
+            except Exception as exc:
+                attach_context(
+                    exc,
+                    framework=self._framework,
+                    operation=f"graph.{op_name}",
+                    request_id=ctx.request_id,
+                    tenant=ctx.tenant,
+                )
+                raise
+
+            try:
                 async for chunk in aiter:
                     yield chunk
             except Exception as exc:
@@ -1307,8 +1322,16 @@ class GraphTranslator:
                 raise
 
         if sync:
+            # SyncStreamBridge expects a coro_factory that returns an *awaitable* which resolves
+            # to an AsyncIterator. An async generator function (like _async_gen) returns an
+            # AsyncIterator directly and is not awaitable; therefore we wrap it in a small
+            # coroutine that returns the async iterator. This preserves cancellation and error
+            # propagation semantics in SyncStreamBridge without changing adapter behavior.
+            async def _coro_factory() -> AsyncIterator[R]:
+                return _async_gen()
+
             return SyncStreamBridge(
-                coro_factory=_async_gen,
+                coro_factory=_coro_factory,
                 framework=self._framework,
                 error_context={
                     "operation": f"graph.{op_name}",
@@ -1316,6 +1339,7 @@ class GraphTranslator:
                     "tenant": ctx.tenant,
                 },
             ).run()
+
         return _async_gen()
 
     # Helper to build a query-stream factory
@@ -1324,7 +1348,7 @@ class GraphTranslator:
         raw_query: Any,
         framework_ctx: Any,
     ) -> Callable[[OperationContext], AsyncIterator[Any]]:
-        
+
         async def _factory(ctx: OperationContext) -> AsyncIterator[Any]:
             spec = self._translator.build_query_spec(
                 raw_query,
