@@ -328,10 +328,10 @@ class AutoGenGraphClientProtocol(Protocol):
 
     # Capabilities / schema / health
 
-    def capabilities(self) -> Dict[str, Any]:
+    def capabilities(self, **kwargs) -> Dict[str, Any]:
         ...
 
-    async def acapabilities(self) -> Dict[str, Any]:
+    async def acapabilities(self, **kwargs) -> Dict[str, Any]:
         ...
 
     def get_schema(
@@ -956,7 +956,7 @@ class CorpusAutoGenGraphClient:
     # ------------------------------------------------------------------ #
 
     @with_graph_error_context("capabilities_sync")
-    def capabilities(self) -> Dict[str, Any]:
+    def capabilities(self, **kwargs) -> Dict[str, Any]:
         """
         Sync wrapper around `graph_adapter.capabilities()`.
 
@@ -969,7 +969,7 @@ class CorpusAutoGenGraphClient:
         return graph_capabilities_to_dict(caps)
 
     @with_async_graph_error_context("capabilities_async")
-    async def acapabilities(self) -> Dict[str, Any]:
+    async def acapabilities(self, **kwargs) -> Dict[str, Any]:
         """
         Async capabilities accessor with AutoGen-friendly dict output.
 
@@ -1118,7 +1118,7 @@ class CorpusAutoGenGraphClient:
         """
         _ensure_not_in_event_loop("query")
 
-        validate_graph_query(query)
+        validate_graph_query(query, operation="query", error_code="INVALID_QUERY")
         self._validate_query_params(params)
 
         ctx = self._build_ctx(
@@ -1191,7 +1191,7 @@ class CorpusAutoGenGraphClient:
 
         Returns the underlying `QueryResult`.
         """
-        validate_graph_query(query)
+        validate_graph_query(query, operation="aquery", error_code="INVALID_QUERY")
         self._validate_query_params(params)
 
         ctx = self._build_ctx(
@@ -1269,7 +1269,7 @@ class CorpusAutoGenGraphClient:
         """
         _ensure_not_in_event_loop("stream_query")
 
-        validate_graph_query(query)
+        validate_graph_query(query, operation="stream_query", error_code="INVALID_QUERY")
         self._validate_query_params(params)
 
         ctx = self._build_ctx(
@@ -1322,7 +1322,7 @@ class CorpusAutoGenGraphClient:
         """
         Execute a streaming graph query (async), yielding `QueryChunk` items.
         """
-        validate_graph_query(query)
+        validate_graph_query(query, operation="astream_query", error_code="INVALID_QUERY")
         self._validate_query_params(params)
 
         ctx = self._build_ctx(
