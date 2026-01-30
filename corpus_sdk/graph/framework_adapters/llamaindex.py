@@ -37,11 +37,28 @@ Non-responsibilities
 - Backend-specific graph behavior (lives in graph adapters)
 - LlamaIndex index/query engine orchestration logic
 - MMR and diversification details (handled inside GraphTranslator)
+
+Namespace precedence (clarified)
+--------------------------------
+This adapter supports multiple ways to provide a namespace, depending on the
+operation shape:
+
+- Query APIs accept an explicit `namespace` argument (highest precedence), then
+  fall back to the client defaults.
+- Spec-driven APIs (e.g., UpsertNodesSpec, UpsertEdgesSpec, BulkVerticesSpec,
+  GraphTraversalSpec, Delete*Spec) use `spec.namespace` when present, then fall
+  back to the client defaults.
+- The optional `CorpusGraphStore` wrapper can be configured with its own
+  namespace; that namespace is passed explicitly to the client query calls.
+
+This is a documentation clarification only: the runtime behavior matches the
+existing patterns in this file and across other framework adapters.
 """
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 from functools import cached_property
@@ -88,6 +105,7 @@ from corpus_sdk.graph.graph_base import (
     GraphProtocolV1,
     GraphSchema,
     GraphTraversalSpec,
+    NotSupported,
     OperationContext,
     QueryChunk,
     QueryResult,
@@ -121,6 +139,18 @@ class ErrorCodes:
     BAD_TRANSACTION_RESULT = "BAD_TRANSACTION_RESULT"
     BAD_ADAPTER_RESULT = "BAD_ADAPTER_RESULT"
     SYNC_WRAPPER_CALLED_IN_EVENT_LOOP = "SYNC_WRAPPER_CALLED_IN_EVENT_LOOP"
+
+    # More explicit shape/validation codes used within this adapter.
+    # NOTE: For backwards compatibility, some call sites still raise with
+    # BAD_ADAPTER_RESULT; these constants exist to support clearer future
+    # attribution and logging without changing external behavior unexpectedly.
+    BAD_ASYNC_ITERATOR_SHAPE = "BAD_ASYNC_ITERATOR_SHAPE"
+    INVALID_DELETE_SPEC = "INVALID_DELETE_SPEC"
+
+    # Validation-level constants used by shared validators in this adapter.
+    # Keeping these as explicit symbolic strings avoids accidental drift across frameworks.
+    INVALID_QUERY = "INVALID_QUERY"
+    INVALID_BATCH_OPS = "INVALID_BATCH_OPS"
 
 
 # --------------------------------------------------------------------------- #
@@ -198,6 +228,18 @@ with_async_error_context = with_async_graph_error_context
 def _looks_like_operation_context(obj: Any) -> bool:
     """
     Heuristic check; OperationContext may be a Protocol/alias in some SDK versions.
+
+    This function is intentionally conservative:
+    - If OperationContext is a real runtime class, prefer isinstance().
+    - If OperationContext is a typing-only Protocol, rely on a structural check.
+    - The structural check requires a *minimal coherent set* of attributes,
+      rather than any single attribute, to reduce false positives.
+
+    Rationale:
+    - This adapter performs best-effort context translation. Accepting arbitrary
+      objects as "context" can lead to confusing downstream behavior and harder
+      debugging. A stricter check reduces accidental acceptance of unrelated types
+      while still allowing forward-compatible OperationContext implementations.
     """
     if obj is None:
         return False
@@ -210,9 +252,64 @@ def _looks_like_operation_context(obj: Any) -> bool:
     except TypeError:
         pass
 
-    # Fallback to structural check
-    attrs = ("request_id", "traceparent", "tenant", "attrs", "to_dict")
-    return any(hasattr(obj, attr) for attr in attrs)
+    # Fallback to structural check.
+    # Require attrs + (to_dict OR request_id OR traceparent) as a minimal set.
+    has_attrs = hasattr(obj, "attrs")
+    has_to_dict = hasattr(obj, "to_dict")
+    has_request_id = hasattr(obj, "request_id")
+    has_traceparent = hasattr(obj, "traceparent")
+
+    if not has_attrs:
+        return False
+
+    # A context without any identifier/serialization surface is unlikely to be valid.
+    if has_to_dict or has_request_id or has_traceparent:
+        return True
+
+    return False
+
+
+def _is_async_iterator(obj: Any) -> bool:
+    """
+    Return True if the object looks like an AsyncIterator.
+
+    We check for both __aiter__ and __anext__ to avoid treating arbitrary
+    awaitables or objects with only partial async iteration methods as
+    streaming iterators.
+    """
+    return hasattr(obj, "__aiter__") and hasattr(obj, "__anext__")
+
+
+def _normalize_async_iterator(aiter_or_awaitable: Any) -> Any:
+    """
+    Normalize either:
+      - an AsyncIterator, OR
+      - an awaitable that resolves to an AsyncIterator,
+    into a shape that the caller can safely consume.
+
+    Why:
+      GraphTranslator implementations may choose to return async iterators eagerly
+      or lazily. Supporting both keeps this adapter robust to translator evolution
+      and aligned with other framework adapters that accept both shapes.
+
+    Contract:
+      - If input is an awaitable, return it unchanged (caller awaits it).
+      - If input is already an AsyncIterator, return it unchanged.
+      - Otherwise, raise a TypeError with a clear adapter-specific error code.
+
+    Note:
+      We keep this helper small and dependency-free; it is used only in async
+      streaming code paths and is not on hot query loops beyond streaming setup.
+    """
+    if inspect.isawaitable(aiter_or_awaitable):
+        return aiter_or_awaitable
+    if _is_async_iterator(aiter_or_awaitable):
+        return aiter_or_awaitable
+
+    raise TypeError(
+        "Expected an AsyncIterator or an awaitable resolving to an AsyncIterator "
+        f"from GraphTranslator.arun_query_stream. [{ErrorCodes.BAD_ASYNC_ITERATOR_SHAPE}]",
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -271,6 +368,24 @@ class LlamaIndexGraphFrameworkTranslator(DefaultGraphFrameworkTranslator):
     ) -> BatchResult:
         return result
 
+    def translate_transaction_result(
+        self,
+        result: BatchResult,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Mapping[str, Any]] = None,
+    ) -> BatchResult:
+        return result
+
+    def translate_traversal_result(
+        self,
+        result: TraversalResult,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Mapping[str, Any]] = None,
+    ) -> TraversalResult:
+        return result
+
     def translate_schema(
         self,
         schema: GraphSchema,
@@ -292,10 +407,10 @@ class LlamaIndexGraphClientProtocol(Protocol):
 
     # Capabilities / schema / health -------------------------------------
 
-    def capabilities(self, **kwargs) -> Mapping[str, Any]:
+    def capabilities(self, **kwargs: Any) -> Mapping[str, Any]:
         ...
 
-    async def acapabilities(self) -> Mapping[str, Any]:
+    async def acapabilities(self, **kwargs: Any) -> Mapping[str, Any]:
         ...
 
     def get_schema(
@@ -498,6 +613,46 @@ class LlamaIndexGraphClientProtocol(Protocol):
     ) -> BatchResult:
         ...
 
+    # Transaction ---------------------------------------------------------
+
+    def transaction(
+        self,
+        ops: List[BatchOperation],
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> BatchResult:
+        ...
+
+    async def atransaction(
+        self,
+        ops: List[BatchOperation],
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> BatchResult:
+        ...
+
+    # Traversal -----------------------------------------------------------
+
+    def traversal(
+        self,
+        spec: GraphTraversalSpec,
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> TraversalResult:
+        ...
+
+    async def atraversal(
+        self,
+        spec: GraphTraversalSpec,
+        *,
+        callback_manager: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+    ) -> TraversalResult:
+        ...
+
     # Resource management -------------------------------------------------
 
     def close(self) -> None:
@@ -547,9 +702,6 @@ class CorpusLlamaIndexGraphClient:
         graph_adapter:
             Backwards-compatible alias for `adapter`. If both `adapter` and
             `graph_adapter` are provided, they must refer to the same object.
-        graph_adapter:
-            Backwards-compatible alias for `adapter`. If both `adapter` and
-            `graph_adapter` are provided, they must refer to the same object.
 
         default_dialect:
             Optional default query dialect to use when none is provided per call.
@@ -563,6 +715,14 @@ class CorpusLlamaIndexGraphClient:
         framework_translator:
             Optional `GraphFrameworkTranslator` implementation. If not provided,
             `LlamaIndexGraphFrameworkTranslator` is used by default.
+
+        Notes
+        -----
+        Historical documentation note (preserved for stability of wording/search):
+        - "graph_adapter: Backwards-compatible alias for `adapter`. If both `adapter` and
+           `graph_adapter` are provided, they must refer to the same object."
+        - "graph_adapter: Backwards-compatible alias for `adapter`. If both `adapter` and
+           `graph_adapter` are provided, they must refer to the same object."
         """
         # Resolving adapter / graph_adapter with basic duck-typed validation.
         if graph_adapter is not None and adapter is not None and graph_adapter is not adapter:
@@ -634,6 +794,9 @@ class CorpusLlamaIndexGraphClient:
         if hasattr(self._graph, "aclose"):
             try:
                 await self._graph.aclose()
+                # Align sync/async close semantics: a successful async close also
+                # satisfies the "closed" state from the perspective of callers.
+                self._closed = True
                 return
             except Exception as e:  # noqa: BLE001
                 logger.warning(
@@ -786,14 +949,36 @@ class CorpusLlamaIndexGraphClient:
                 * namespace (optional)
                 * timeout_ms (optional)
                 * stream (bool)
+
+        Notes on params validation (best-effort)
+        ---------------------------------------
+        Some graph adapters serialize params to JSON. This adapter does not
+        require params to be JSON-serializable (to preserve flexibility and
+        avoid breaking existing integrations), but it does emit a debug log if
+        the params are not JSON-serializable to help catch issues earlier.
         """
         effective_dialect = dialect or self._default_dialect
         effective_namespace = namespace or self._default_namespace
         effective_timeout = timeout_ms or self._default_timeout_ms
 
+        # Materialize params to a dict early to ensure stable behavior regardless
+        # of the caller's mapping type.
+        materialized_params: Dict[str, Any] = dict(params or {})
+
+        # Best-effort JSON-serializability check: logs only (no exception),
+        # preserving existing behavior while improving debuggability.
+        if materialized_params:
+            try:
+                json.dumps(materialized_params)
+            except (TypeError, ValueError) as exc:
+                logger.debug(
+                    "Query params are not JSON-serializable (may be OK for some adapters): %s",
+                    exc,
+                )
+
         raw: Dict[str, Any] = {
             "text": query,
-            "params": dict(params or {}),
+            "params": materialized_params,
             "stream": bool(stream),
         }
 
@@ -815,6 +1000,13 @@ class CorpusLlamaIndexGraphClient:
         """
         Build a framework_ctx mapping for GraphTranslator with basic
         observability hints and the effective namespace.
+
+        The effective namespace is derived from (in precedence order):
+          1) The explicit namespace provided to this helper, if any
+          2) The client default namespace, if configured
+
+        This mirrors the existing behavior across this adapter, and is
+        documented at the module level under "Namespace precedence".
         """
         ctx: Dict[str, Any] = {
             "framework": "llamaindex",
@@ -830,7 +1022,7 @@ class CorpusLlamaIndexGraphClient:
 
         return ctx
 
-    def _validate_upsert_edges_spec(self, spec: UpsertEdgesSpec) -> None:
+    def _validate_upsert_edges_spec(self, spec: UpsertEdgesSpec) -> List[Any]:
         """
         LlamaIndex-local validation for edge upsert specs.
 
@@ -891,21 +1083,135 @@ class CorpusLlamaIndexGraphClient:
                         code=ErrorCodes.BAD_ADAPTER_RESULT,
                     )
 
-        # Mutate spec.edges to the validated list for consistency.
-        spec.edges = edges_iter  # type: ignore[assignment]
+        # Previously this function mutated spec.edges to the validated list.
+        # For cross-framework alignment and to avoid surprising side effects
+        # (specs may be reused or treated as immutable), we return the validated
+        # materialized list to the caller instead of mutating the input spec.
+        return edges_iter
+
+    def _select_filter_or_ids(
+        self,
+        *,
+        spec_filter: Any,
+        spec_ids: Any,
+        spec_name: str,
+        empty_message: str,
+    ) -> Any:
+        """
+        Shared helper to select either a filter or a non-empty ID list.
+
+        This improves consistency across delete_nodes/delete_edges sync+async
+        implementations while preserving the original error handling semantics.
+
+        Parameters
+        ----------
+        spec_filter:
+            The filter expression from a Delete*Spec (may be None).
+        spec_ids:
+            The ids field from a Delete*Spec (may be None or iterable).
+        spec_name:
+            Used for logging/debugging and error messages.
+        empty_message:
+            The human-readable message used if both filter and ids are missing.
+
+        Returns
+        -------
+        Any:
+            The raw filter object or a materialized list of ids.
+
+        Raises
+        ------
+        BadRequest:
+            If neither filter nor a non-empty ids list is provided.
+        """
+        if spec_filter is not None:
+            return spec_filter
+
+        ids = list(spec_ids or [])
+        if not ids:
+            # Preserve existing behavior: raise BadRequest with BAD_ADAPTER_RESULT.
+            # We also include a more specific constant (INVALID_DELETE_SPEC) in
+            # the message for easier attribution, without changing external code fields.
+            raise BadRequest(
+                f"{empty_message} [{ErrorCodes.INVALID_DELETE_SPEC}]",
+                code=ErrorCodes.BAD_ADAPTER_RESULT,
+            )
+        return ids
+
+    def _build_bulk_vertices_request(self, spec: BulkVerticesSpec) -> Mapping[str, Any]:
+        """
+        Build the raw bulk vertices request mapping for GraphTranslator.
+
+        Single Source of Truth pattern:
+        -------------------------------
+        Both sync and async bulk_vertices methods call this helper to ensure that
+        additions/changes to BulkVerticesSpec fields are reflected uniformly.
+        This reduces the risk of "payload materialization drift" between parallel
+        code paths without changing semantics or performance characteristics.
+        """
+        return {
+            "namespace": spec.namespace,
+            "limit": spec.limit,
+            "cursor": spec.cursor,
+            "filter": spec.filter,
+        }
+
+    def _build_traversal_request(self, spec: GraphTraversalSpec) -> Mapping[str, Any]:
+        """
+        Build the raw traversal request mapping for GraphTranslator.
+
+        Single Source of Truth pattern:
+        -------------------------------
+        Both sync and async traversal methods call this helper to ensure that
+        additions/changes to GraphTraversalSpec fields are reflected uniformly.
+        This reduces the risk of "payload materialization drift" between parallel
+        code paths without changing semantics or performance characteristics.
+        """
+        return {
+            "start_nodes": list(spec.start_nodes),
+            "max_depth": spec.max_depth,
+            "direction": spec.direction,
+            "relationship_types": spec.relationship_types,
+            "node_filters": spec.node_filters,
+            "relationship_filters": spec.relationship_filters,
+            "return_properties": spec.return_properties,
+            "namespace": spec.namespace,
+        }
 
     # ------------------------------------------------------------------ #
     # Capabilities / schema / health
     # ------------------------------------------------------------------ #
 
     @with_graph_error_context("capabilities_sync")
-    def capabilities(self, **kwargs) -> Mapping[str, Any]:
+    def capabilities(self, **kwargs: Any) -> Mapping[str, Any]:
         """
         Sync wrapper around capabilities, delegating async→sync bridging
         to GraphTranslator.
+
+        kwargs are accepted for forward compatibility:
+        - Future GraphTranslator/adapter implementations may accept capability
+          filters or options.
+        - This adapter forwards kwargs when supported, and falls back to the
+          current signature without raising if not supported.
+
+        This preserves performance characteristics: capabilities is typically
+        a low-frequency call compared to query operations.
         """
         _ensure_not_in_event_loop("capabilities")
-        caps = self._translator.capabilities()
+
+        # Forward kwargs when supported; otherwise fall back without error.
+        # We avoid signature inspection (which can be expensive and brittle)
+        # by using a simple TypeError fallback.
+        try:
+            caps = self._translator.capabilities(**kwargs)  # type: ignore[misc]
+        except TypeError:
+            if kwargs:
+                logger.debug(
+                    "GraphTranslator.capabilities does not accept kwargs; ignoring: %s",
+                    sorted(kwargs.keys()),
+                )
+            caps = self._translator.capabilities()
+
         return graph_capabilities_to_dict(caps)
 
     @with_async_graph_error_context("capabilities_async")
@@ -915,8 +1221,20 @@ class CorpusLlamaIndexGraphClient:
 
         We delegate to GraphTranslator for consistency, then normalize to a
         simple dict for LlamaIndex consumption.
+
+        kwargs are accepted for forward compatibility and forwarded when
+        supported by the underlying translator.
         """
-        caps = await self._translator.arun_capabilities()
+        try:
+            caps = await self._translator.arun_capabilities(**kwargs)  # type: ignore[misc]
+        except TypeError:
+            if kwargs:
+                logger.debug(
+                    "GraphTranslator.arun_capabilities does not accept kwargs; ignoring: %s",
+                    sorted(kwargs.keys()),
+                )
+            caps = await self._translator.arun_capabilities()
+
         return graph_capabilities_to_dict(caps)
 
     @with_graph_error_context("get_schema_sync")
@@ -1052,7 +1370,7 @@ class CorpusLlamaIndexGraphClient:
         Returns the underlying `QueryResult` from the GraphProtocol adapter.
         """
         _ensure_not_in_event_loop("query")
-        validate_graph_query(query, operation="query", error_code="INVALID_QUERY")
+        validate_graph_query(query, operation="query", error_code=ErrorCodes.INVALID_QUERY)
 
         ctx = self._build_ctx(
             callback_manager=callback_manager,
@@ -1071,12 +1389,33 @@ class CorpusLlamaIndexGraphClient:
             namespace=namespace,
         )
 
-        result = self._translator.query(
-            raw_query,
-            op_ctx=ctx,
-            framework_ctx=framework_ctx,
-            mmr_config=None,
-        )
+        try:
+            result = self._translator.query(
+                raw_query,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+                mmr_config=None,
+            )
+        except NotSupported:
+            # Dialect fallback mirrors other framework adapters:
+            # - If the caller explicitly provided a dialect, retry without it.
+            # - If the dialect was not explicitly provided, preserve existing behavior.
+            if dialect is not None:
+                logger.debug(
+                    "Dialect not supported; retrying query without dialect. dialect=%s",
+                    dialect,
+                )
+                fallback_raw = dict(raw_query)
+                fallback_raw.pop("dialect", None)
+                result = self._translator.query(
+                    fallback_raw,
+                    op_ctx=ctx,
+                    framework_ctx=framework_ctx,
+                    mmr_config=None,
+                )
+            else:
+                raise
+
         return validate_graph_result_type(
             result,
             expected_type=QueryResult,
@@ -1101,7 +1440,7 @@ class CorpusLlamaIndexGraphClient:
 
         Returns the underlying `QueryResult`.
         """
-        validate_graph_query(query, operation="aquery", error_code="INVALID_QUERY")
+        validate_graph_query(query, operation="aquery", error_code=ErrorCodes.INVALID_QUERY)
 
         ctx = self._build_ctx(
             callback_manager=callback_manager,
@@ -1120,12 +1459,30 @@ class CorpusLlamaIndexGraphClient:
             namespace=namespace,
         )
 
-        result = await self._translator.arun_query(
-            raw_query,
-            op_ctx=ctx,
-            framework_ctx=framework_ctx,
-            mmr_config=None,
-        )
+        try:
+            result = await self._translator.arun_query(
+                raw_query,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+                mmr_config=None,
+            )
+        except NotSupported:
+            if dialect is not None:
+                logger.debug(
+                    "Dialect not supported; retrying async query without dialect. dialect=%s",
+                    dialect,
+                )
+                fallback_raw = dict(raw_query)
+                fallback_raw.pop("dialect", None)
+                result = await self._translator.arun_query(
+                    fallback_raw,
+                    op_ctx=ctx,
+                    framework_ctx=framework_ctx,
+                    mmr_config=None,
+                )
+            else:
+                raise
+
         return validate_graph_result_type(
             result,
             expected_type=QueryResult,
@@ -1157,7 +1514,7 @@ class CorpusLlamaIndexGraphClient:
         any async→sync bridges directly.
         """
         _ensure_not_in_event_loop("stream_query")
-        validate_graph_query(query, operation="stream_query", error_code="INVALID_QUERY")
+        validate_graph_query(query, operation="stream_query", error_code=ErrorCodes.INVALID_QUERY)
 
         ctx = self._build_ctx(
             callback_manager=callback_manager,
@@ -1203,7 +1560,7 @@ class CorpusLlamaIndexGraphClient:
         """
         Execute a streaming graph query (async), yielding `QueryChunk` items.
         """
-        validate_graph_query(query, operation="astream_query", error_code="INVALID_QUERY")
+        validate_graph_query(query, operation="astream_query", error_code=ErrorCodes.INVALID_QUERY)
 
         ctx = self._build_ctx(
             callback_manager=callback_manager,
@@ -1222,11 +1579,26 @@ class CorpusLlamaIndexGraphClient:
             namespace=namespace,
         )
 
-        async for chunk in self._translator.arun_query_stream(
+        # Accept either AsyncIterator or awaitable -> AsyncIterator, for cross-framework alignment.
+        aiter_or_awaitable = self._translator.arun_query_stream(
             raw_query,
             op_ctx=ctx,
             framework_ctx=framework_ctx,
-        ):
+        )
+        normalized = _normalize_async_iterator(aiter_or_awaitable)
+        if inspect.isawaitable(normalized):
+            aiter = await normalized  # type: ignore[assignment]
+        else:
+            aiter = normalized  # type: ignore[assignment]
+
+        # Additional guard: even if the awaitable resolves, ensure we got an AsyncIterator.
+        if not _is_async_iterator(aiter):
+            raise TypeError(
+                "GraphTranslator.arun_query_stream resolved to a non-AsyncIterator "
+                f"type: {type(aiter).__name__}. [{ErrorCodes.BAD_ASYNC_ITERATOR_SHAPE}]",
+            )
+
+        async for chunk in aiter:
             yield validate_graph_result_type(
                 chunk,
                 expected_type=QueryChunk,
@@ -1323,7 +1695,7 @@ class CorpusLlamaIndexGraphClient:
         Sync wrapper for upserting edges.
         """
         _ensure_not_in_event_loop("upsert_edges")
-        self._validate_upsert_edges_spec(spec)
+        edges = self._validate_upsert_edges_spec(spec)
 
         ctx = self._build_ctx(
             callback_manager=callback_manager,
@@ -1335,7 +1707,7 @@ class CorpusLlamaIndexGraphClient:
         )
 
         result = self._translator.upsert_edges(
-            spec.edges,
+            edges,
             op_ctx=ctx,
             framework_ctx=framework_ctx,
         )
@@ -1357,7 +1729,7 @@ class CorpusLlamaIndexGraphClient:
         """
         Async wrapper for upserting edges.
         """
-        self._validate_upsert_edges_spec(spec)
+        edges = self._validate_upsert_edges_spec(spec)
 
         ctx = self._build_ctx(
             callback_manager=callback_manager,
@@ -1369,7 +1741,7 @@ class CorpusLlamaIndexGraphClient:
         )
 
         result = await self._translator.arun_upsert_edges(
-            spec.edges,
+            edges,
             op_ctx=ctx,
             framework_ctx=framework_ctx,
         )
@@ -1408,16 +1780,14 @@ class CorpusLlamaIndexGraphClient:
             namespace=getattr(spec, "namespace", None),
         )
 
-        if spec.filter is not None:
-            raw_filter_or_ids: Any = spec.filter
-        else:
-            ids = list(spec.ids or [])
-            if not ids:
-                raise BadRequest(
-                    "DeleteNodesSpec must specify either filter or non-empty ids",
-                    code=ErrorCodes.BAD_ADAPTER_RESULT,
-                )
-            raw_filter_or_ids = ids
+        # The selection logic is shared to ensure consistent behavior and
+        # reduce drift between sync/async and nodes/edges variants.
+        raw_filter_or_ids: Any = self._select_filter_or_ids(
+            spec_filter=spec.filter,
+            spec_ids=spec.ids,
+            spec_name="DeleteNodesSpec",
+            empty_message="DeleteNodesSpec must specify either filter or non-empty ids",
+        )
 
         result = self._translator.delete_nodes(
             raw_filter_or_ids,
@@ -1451,16 +1821,12 @@ class CorpusLlamaIndexGraphClient:
             namespace=getattr(spec, "namespace", None),
         )
 
-        if spec.filter is not None:
-            raw_filter_or_ids: Any = spec.filter
-        else:
-            ids = list(spec.ids or [])
-            if not ids:
-                raise BadRequest(
-                    "DeleteNodesSpec must specify either filter or non-empty ids",
-                    code=ErrorCodes.BAD_ADAPTER_RESULT,
-                )
-            raw_filter_or_ids = ids
+        raw_filter_or_ids: Any = self._select_filter_or_ids(
+            spec_filter=spec.filter,
+            spec_ids=spec.ids,
+            spec_name="DeleteNodesSpec",
+            empty_message="DeleteNodesSpec must specify either filter or non-empty ids",
+        )
 
         result = await self._translator.arun_delete_nodes(
             raw_filter_or_ids,
@@ -1486,25 +1852,28 @@ class CorpusLlamaIndexGraphClient:
         Sync wrapper for deleting edges.
         """
         _ensure_not_in_event_loop("delete_edges")
-        ctx = self.__build_ctx(
+
+        # IMPORTANT BUGFIX:
+        # This method must use the same context builder as other operations.
+        # Using a misspelled/mismatched builder breaks runtime behavior and tests.
+        ctx = self._build_ctx(
             callback_manager=callback_manager,
             extra_context=extra_context,
         )
+
         framework_ctx = self._framework_ctx(
             operation="delete_edges",
             namespace=getattr(spec, "namespace", None),
         )
 
-        if spec.filter is not None:
-            raw_filter_or_ids: Any = spec.filter
-        else:
-            ids = list(spec.ids or [])
-            if not ids:
-                raise BadRequest(
-                    "DeleteEdgesSpec must specify either filter or non-empty ids",
-                    code=ErrorCodes.BAD_ADAPTER_RESULT,
-                )
-            raw_filter_or_ids = ids
+        # The selection logic is shared to ensure consistent behavior and
+        # reduce drift between sync/async and nodes/edges variants.
+        raw_filter_or_ids: Any = self._select_filter_or_ids(
+            spec_filter=spec.filter,
+            spec_ids=spec.ids,
+            spec_name="DeleteEdgesSpec",
+            empty_message="DeleteEdgesSpec must specify either filter or non-empty ids",
+        )
 
         result = self._translator.delete_edges(
             raw_filter_or_ids,
@@ -1538,16 +1907,12 @@ class CorpusLlamaIndexGraphClient:
             namespace=getattr(spec, "namespace", None),
         )
 
-        if spec.filter is not None:
-            raw_filter_or_ids: Any = spec.filter
-        else:
-            ids = list(spec.ids or [])
-            if not ids:
-                raise BadRequest(
-                    "DeleteEdgesSpec must specify either filter or non-empty ids",
-                    code=ErrorCodes.BAD_ADAPTER_RESULT,
-                )
-            raw_filter_or_ids = ids
+        raw_filter_or_ids: Any = self._select_filter_or_ids(
+            spec_filter=spec.filter,
+            spec_ids=spec.ids,
+            spec_name="DeleteEdgesSpec",
+            empty_message="DeleteEdgesSpec must specify either filter or non-empty ids",
+        )
 
         result = await self._translator.arun_delete_edges(
             raw_filter_or_ids,
@@ -1585,12 +1950,7 @@ class CorpusLlamaIndexGraphClient:
             extra_context=extra_context,
         )
 
-        raw_request: Mapping[str, Any] = {
-            "namespace": spec.namespace,
-            "limit": spec.limit,
-            "cursor": spec.cursor,
-            "filter": spec.filter,
-        }
+        raw_request = self._build_bulk_vertices_request(spec)
 
         framework_ctx = self._framework_ctx(
             operation="bulk_vertices",
@@ -1625,12 +1985,7 @@ class CorpusLlamaIndexGraphClient:
             extra_context=extra_context,
         )
 
-        raw_request: Mapping[str, Any] = {
-            "namespace": spec.namespace,
-            "limit": spec.limit,
-            "cursor": spec.cursor,
-            "filter": spec.filter,
-        }
+        raw_request = self._build_bulk_vertices_request(spec)
 
         framework_ctx = self._framework_ctx(
             operation="bulk_vertices",
@@ -1673,16 +2028,7 @@ class CorpusLlamaIndexGraphClient:
             extra_context=extra_context,
         )
 
-        raw_request: Mapping[str, Any] = {
-            "start_nodes": list(spec.start_nodes),
-            "max_depth": spec.max_depth,
-            "direction": spec.direction,
-            "relationship_types": spec.relationship_types,
-            "node_filters": spec.node_filters,
-            "relationship_filters": spec.relationship_filters,
-            "return_properties": spec.return_properties,
-            "namespace": spec.namespace,
-        }
+        raw_request = self._build_traversal_request(spec)
 
         framework_ctx = self._framework_ctx(
             operation="traversal",
@@ -1694,7 +2040,12 @@ class CorpusLlamaIndexGraphClient:
             op_ctx=ctx,
             framework_ctx=framework_ctx,
         )
-        return result
+        return validate_graph_result_type(
+            result,
+            expected_type=TraversalResult,
+            operation="GraphTranslator.traversal",
+            error_code=ErrorCodes.BAD_TRAVERSAL_RESULT,
+        )
 
     @with_async_graph_error_context("traversal_async")
     async def atraversal(
@@ -1712,16 +2063,7 @@ class CorpusLlamaIndexGraphClient:
             extra_context=extra_context,
         )
 
-        raw_request: Mapping[str, Any] = {
-            "start_nodes": list(spec.start_nodes),
-            "max_depth": spec.max_depth,
-            "direction": spec.direction,
-            "relationship_types": spec.relationship_types,
-            "node_filters": spec.node_filters,
-            "relationship_filters": spec.relationship_filters,
-            "return_properties": spec.return_properties,
-            "namespace": spec.namespace,
-        }
+        raw_request = self._build_traversal_request(spec)
 
         framework_ctx = self._framework_ctx(
             operation="traversal",
@@ -1733,7 +2075,12 @@ class CorpusLlamaIndexGraphClient:
             op_ctx=ctx,
             framework_ctx=framework_ctx,
         )
-        return result
+        return validate_graph_result_type(
+            result,
+            expected_type=TraversalResult,
+            operation="GraphTranslator.arun_traversal",
+            error_code=ErrorCodes.BAD_TRAVERSAL_RESULT,
+        )
 
     # ------------------------------------------------------------------ #
     # Batch (sync + async)
@@ -1754,7 +2101,11 @@ class CorpusLlamaIndexGraphClient:
         expected by GraphTranslator and returns the underlying `BatchResult`.
         """
         _ensure_not_in_event_loop("batch")
-        validate_batch_operations(ops, operation="batch", error_code="INVALID_BATCH_OPS")
+        validate_batch_operations(
+            ops,
+            operation="batch",
+            error_code=ErrorCodes.INVALID_BATCH_OPS,
+        )
 
         ctx = self._build_ctx(
             callback_manager=callback_manager,
@@ -1788,7 +2139,11 @@ class CorpusLlamaIndexGraphClient:
         """
         Async wrapper for batch operations.
         """
-        validate_batch_operations(ops, operation="batch", error_code="INVALID_BATCH_OPS")
+        validate_batch_operations(
+            ops,
+            operation="abatch",
+            error_code=ErrorCodes.INVALID_BATCH_OPS,
+        )
 
         ctx = self._build_ctx(
             callback_manager=callback_manager,
@@ -1830,7 +2185,11 @@ class CorpusLlamaIndexGraphClient:
         expected by GraphTranslator and returns the underlying `BatchResult`.
         """
         _ensure_not_in_event_loop("transaction")
-        validate_batch_operations(ops, operation="transaction", error_code="INVALID_BATCH_OPS")
+        validate_batch_operations(
+            ops,
+            operation="transaction",
+            error_code=ErrorCodes.INVALID_BATCH_OPS,
+        )
 
         ctx = self._build_ctx(
             callback_manager=callback_manager,
@@ -1846,7 +2205,12 @@ class CorpusLlamaIndexGraphClient:
             op_ctx=ctx,
             framework_ctx=self._framework_ctx(operation="transaction"),
         )
-        return result
+        return validate_graph_result_type(
+            result,
+            expected_type=BatchResult,
+            operation="GraphTranslator.transaction",
+            error_code=ErrorCodes.BAD_TRANSACTION_RESULT,
+        )
 
     @with_async_graph_error_context("transaction_async")
     async def atransaction(
@@ -1859,7 +2223,11 @@ class CorpusLlamaIndexGraphClient:
         """
         Async wrapper for transactional batch operations.
         """
-        validate_batch_operations(ops, operation="transaction", error_code="INVALID_BATCH_OPS")
+        validate_batch_operations(
+            ops,
+            operation="atransaction",
+            error_code=ErrorCodes.INVALID_BATCH_OPS,
+        )
 
         ctx = self._build_ctx(
             callback_manager=callback_manager,
@@ -1875,7 +2243,12 @@ class CorpusLlamaIndexGraphClient:
             op_ctx=ctx,
             framework_ctx=self._framework_ctx(operation="transaction"),
         )
-        return result
+        return validate_graph_result_type(
+            result,
+            expected_type=BatchResult,
+            operation="GraphTranslator.arun_transaction",
+            error_code=ErrorCodes.BAD_TRANSACTION_RESULT,
+        )
 
 
 from typing import TYPE_CHECKING
