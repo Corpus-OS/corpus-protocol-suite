@@ -54,6 +54,19 @@ class GraphFrameworkDescriptor:
     adapter_class:
         Name of the adapter class within adapter_module (bare class name).
 
+    adapter_init_kwarg:
+        Name of the constructor kwarg used to inject the underlying Corpus graph adapter.
+        This keeps the test suite framework-agnostic while still enforcing that the
+        framework adapter is actually wired to the injected backend.
+
+        Examples:
+        - "adapter"        (common in some framework adapters)
+        - "corpus_adapter" (common in other framework adapters)
+
+        IMPORTANT:
+        - Tests should use this field rather than hardcoding `adapter=...`.
+        - If a framework adapter changes its constructor signature, update this value.
+
     query_method:
         Name of the *sync* query method (non-streaming).
     async_query_method:
@@ -73,6 +86,56 @@ class GraphFrameworkDescriptor:
         Name of the *sync* batch method, or None.
     async_batch_method:
         Name of the *async* batch method, or None.
+
+    # ------------------------------------------------------------------
+    # Extended graph protocol surfaces (optional, but testable)
+    # ------------------------------------------------------------------
+    # These method-name fields allow the conformance suite to:
+    #   1) instantiate the framework adapter with an injected Corpus graph adapter, and
+    #   2) call the framework adapter methods to verify wiring, passthrough, and contracts.
+    #
+    # IMPORTANT:
+    # - These are *names only* (strings). Tests use them to get callables from instances.
+    # - If a method is not supported by a framework adapter, leave it as None.
+    #
+    # capabilities_method / async_capabilities_method:
+    #   Framework adapter capability discovery passthrough.
+    #
+    # health_method / async_health_method:
+    #   Framework adapter health passthrough.
+    #
+    # schema_method / async_schema_method:
+    #   Schema discovery (Graph Protocol optional surface).
+    #
+    # transaction_method / async_transaction_method:
+    #   Transaction operation support (Graph Protocol optional surface).
+    #
+    # traversal_method / async_traversal_method:
+    #   Traversal operation support (Graph Protocol optional surface).
+    capabilities_method:
+        Name of the *sync* capabilities method, or None.
+    async_capabilities_method:
+        Name of the *async* capabilities method, or None.
+
+    health_method:
+        Name of the *sync* health method, or None.
+    async_health_method:
+        Name of the *async* health method, or None.
+
+    schema_method:
+        Name of the *sync* get_schema method, or None.
+    async_schema_method:
+        Name of the *async* get_schema method, or None.
+
+    transaction_method:
+        Name of the *sync* transaction method, or None.
+    async_transaction_method:
+        Name of the *async* transaction method, or None.
+
+    traversal_method:
+        Name of the *sync* traversal method, or None.
+    async_traversal_method:
+        Name of the *async* traversal method, or None.
 
     context_kwarg:
         Name of the kwargs parameter used for framework-specific context
@@ -111,7 +174,10 @@ class GraphFrameworkDescriptor:
     adapter_module: str
     adapter_class: str
 
-    query_method: str
+    # Constructor injection kwarg for the underlying Corpus adapter.
+    adapter_init_kwarg: str = "adapter"
+
+    query_method: str = ""
     async_query_method: Optional[str] = None
 
     stream_query_method: Optional[str] = None
@@ -122,6 +188,22 @@ class GraphFrameworkDescriptor:
 
     batch_method: Optional[str] = None
     async_batch_method: Optional[str] = None
+
+    # Extended graph protocol surfaces
+    capabilities_method: Optional[str] = None
+    async_capabilities_method: Optional[str] = None
+
+    health_method: Optional[str] = None
+    async_health_method: Optional[str] = None
+
+    schema_method: Optional[str] = None
+    async_schema_method: Optional[str] = None
+
+    transaction_method: Optional[str] = None
+    async_transaction_method: Optional[str] = None
+
+    traversal_method: Optional[str] = None
+    async_traversal_method: Optional[str] = None
 
     context_kwarg: Optional[str] = None
 
@@ -153,6 +235,11 @@ class GraphFrameworkDescriptor:
             or self.async_stream_query_method
             or self.async_bulk_vertices_method
             or self.async_batch_method
+            or self.async_capabilities_method
+            or self.async_health_method
+            or self.async_schema_method
+            or self.async_transaction_method
+            or self.async_traversal_method
         )
 
     def is_available(self) -> bool:
@@ -203,11 +290,13 @@ class GraphFrameworkDescriptor:
         if not self.minimum_framework_version and not self.tested_up_to_version:
             return None
 
+        # NOTE:
+        # Keep formatting stable and predictable; tests may normalize whitespace,
+        # but this function should remain consistent.
         if self.minimum_framework_version and self.tested_up_to_version:
-            return f">={self.minimum_framework_version}, <= {self.tested_up_to_version}"
+            return f">={self.minimum_framework_version}, <={self.tested_up_to_version}"
         if self.minimum_framework_version:
             return f">={self.minimum_framework_version}"
-        # Keep formatting consistent with the example (no space after "<=" for the single-bound case).
         return f"<={self.tested_up_to_version}"
 
     def validate(self) -> None:
@@ -227,25 +316,15 @@ class GraphFrameworkDescriptor:
                 f"{self.name}: query_method and stream_query_method must both be set",
             )
 
+        # Constructor kwarg must be a non-empty string when provided.
+        if not isinstance(self.adapter_init_kwarg, str) or not self.adapter_init_kwarg.strip():
+            raise ValueError(f"{self.name}: adapter_init_kwarg must be a non-empty string")
+
         # Async consistency warnings (soft)
-        #
-        # NOTE: These are intentionally warnings (not errors) so the registry can describe
-        # partially-supported frameworks while still allowing the test suite to decide how
-        # strict it wants to be for a given adapter.
         if self.async_stream_query_method and not self.stream_query_method:
             warnings.warn(
                 f"{self.name}: async_stream_query_method is set but "
                 f"stream_query_method is None (async should have a sync counterpart)",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-
-        # IMPORTANT: Async streaming without async query is an inconsistency that can break
-        # cross-framework contract expectations. This warning is expected by the graph
-        # registry self-check tests (edge-case validation).
-        if self.async_stream_query_method and not self.async_query_method:
-            warnings.warn(
-                f"{self.name}: async_stream_query_method is set but async_query_method is None",
                 RuntimeWarning,
                 stacklevel=2,
             )
@@ -262,6 +341,15 @@ class GraphFrameworkDescriptor:
             warnings.warn(
                 f"{self.name}: async_batch_method is set but "
                 f"batch_method is None (async should have a sync counterpart)",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+        # IMPORTANT: Async stream without async query is an edge-case inconsistency that
+        # the graph registry self-check tests explicitly validate.
+        if self.async_stream_query_method and not self.async_query_method:
+            warnings.warn(
+                f"{self.name}: async_stream_query_method is set but async_query_method is None",
                 RuntimeWarning,
                 stacklevel=2,
             )
@@ -349,6 +437,7 @@ GRAPH_FRAMEWORKS: Dict[str, GraphFrameworkDescriptor] = {
         name="autogen",
         adapter_module="corpus_sdk.graph.framework_adapters.autogen",
         adapter_class="CorpusAutoGenGraphClient",
+        adapter_init_kwarg="adapter",
         query_method="query",
         async_query_method="aquery",
         stream_query_method="stream_query",
@@ -357,6 +446,17 @@ GRAPH_FRAMEWORKS: Dict[str, GraphFrameworkDescriptor] = {
         async_bulk_vertices_method="abulk_vertices",
         batch_method="batch",
         async_batch_method="abatch",
+        # Extended surfaces (declared so tests can verify wiring)
+        capabilities_method="capabilities",
+        async_capabilities_method="acapabilities",
+        health_method="health",
+        async_health_method="ahealth",
+        schema_method="get_schema",
+        async_schema_method="aget_schema",
+        transaction_method="transaction",
+        async_transaction_method="atransaction",
+        traversal_method="traversal",
+        async_traversal_method="atraversal",
         context_kwarg="conversation",
         has_capabilities=True,
         has_health=True,
@@ -365,7 +465,6 @@ GRAPH_FRAMEWORKS: Dict[str, GraphFrameworkDescriptor] = {
         supports_batch=True,
         availability_attr=None,
     ),
-
     # ------------------------------------------------------------------ #
     # CrewAI
     # ------------------------------------------------------------------ #
@@ -373,6 +472,8 @@ GRAPH_FRAMEWORKS: Dict[str, GraphFrameworkDescriptor] = {
         name="crewai",
         adapter_module="corpus_sdk.graph.framework_adapters.crewai",
         adapter_class="CorpusCrewAIGraphClient",
+        # CrewAI framework adapters use standard adapter injection
+        adapter_init_kwarg="adapter",
         query_method="query",
         async_query_method="aquery",
         stream_query_method="stream_query",
@@ -381,6 +482,17 @@ GRAPH_FRAMEWORKS: Dict[str, GraphFrameworkDescriptor] = {
         async_bulk_vertices_method="abulk_vertices",
         batch_method="batch",
         async_batch_method="abatch",
+        # Extended surfaces (declared so tests can verify wiring)
+        capabilities_method="capabilities",
+        async_capabilities_method="acapabilities",
+        health_method="health",
+        async_health_method="ahealth",
+        schema_method="get_schema",
+        async_schema_method="aget_schema",
+        transaction_method="transaction",
+        async_transaction_method="atransaction",
+        traversal_method="traversal",
+        async_traversal_method="atraversal",
         context_kwarg="task",
         has_capabilities=True,
         has_health=True,
@@ -389,7 +501,6 @@ GRAPH_FRAMEWORKS: Dict[str, GraphFrameworkDescriptor] = {
         supports_batch=True,
         availability_attr=None,
     ),
-
     # ------------------------------------------------------------------ #
     # LangChain
     # ------------------------------------------------------------------ #
@@ -397,6 +508,7 @@ GRAPH_FRAMEWORKS: Dict[str, GraphFrameworkDescriptor] = {
         name="langchain",
         adapter_module="corpus_sdk.graph.framework_adapters.langchain",
         adapter_class="CorpusLangChainGraphClient",
+        adapter_init_kwarg="adapter",
         query_method="query",
         async_query_method="aquery",
         stream_query_method="stream_query",
@@ -405,15 +517,25 @@ GRAPH_FRAMEWORKS: Dict[str, GraphFrameworkDescriptor] = {
         async_bulk_vertices_method="abulk_vertices",
         batch_method="batch",
         async_batch_method="abatch",
+        # Extended surfaces (declared so tests can verify wiring)
+        capabilities_method="capabilities",
+        async_capabilities_method="acapabilities",
+        health_method="health",
+        async_health_method="ahealth",
+        schema_method="get_schema",
+        async_schema_method="aget_schema",
+        transaction_method="transaction",
+        async_transaction_method="atransaction",
+        traversal_method="traversal",
+        async_traversal_method="atraversal",
         context_kwarg="config",
         has_capabilities=True,
         has_health=True,
         supports_streaming=True,
         supports_bulk_vertices=True,
         supports_batch=True,
-        availability_attr="LANGCHAIN_TOOL_AVAILABLE",
+        availability_attr="LANGCHAIN_TOOLS_AVAILABLE",
     ),
-
     # ------------------------------------------------------------------ #
     # LlamaIndex
     # ------------------------------------------------------------------ #
@@ -421,6 +543,8 @@ GRAPH_FRAMEWORKS: Dict[str, GraphFrameworkDescriptor] = {
         name="llamaindex",
         adapter_module="corpus_sdk.graph.framework_adapters.llamaindex",
         adapter_class="CorpusLlamaIndexGraphClient",
+        # LlamaIndex framework adapters use standard adapter injection
+        adapter_init_kwarg="adapter",
         query_method="query",
         async_query_method="aquery",
         stream_query_method="stream_query",
@@ -429,6 +553,17 @@ GRAPH_FRAMEWORKS: Dict[str, GraphFrameworkDescriptor] = {
         async_bulk_vertices_method="abulk_vertices",
         batch_method="batch",
         async_batch_method="abatch",
+        # Extended surfaces (declared so tests can verify wiring)
+        capabilities_method="capabilities",
+        async_capabilities_method="acapabilities",
+        health_method="health",
+        async_health_method="ahealth",
+        schema_method="get_schema",
+        async_schema_method="aget_schema",
+        transaction_method="transaction",
+        async_transaction_method="atransaction",
+        traversal_method="traversal",
+        async_traversal_method="atraversal",
         context_kwarg="callback_manager",
         has_capabilities=True,
         has_health=True,
@@ -437,7 +572,6 @@ GRAPH_FRAMEWORKS: Dict[str, GraphFrameworkDescriptor] = {
         supports_batch=True,
         availability_attr=None,
     ),
-
     # ------------------------------------------------------------------ #
     # Semantic Kernel
     # ------------------------------------------------------------------ #
@@ -445,6 +579,8 @@ GRAPH_FRAMEWORKS: Dict[str, GraphFrameworkDescriptor] = {
         name="semantic_kernel",
         adapter_module="corpus_sdk.graph.framework_adapters.semantic_kernel",
         adapter_class="CorpusSemanticKernelGraphClient",
+        # Semantic Kernel framework adapters use standard adapter injection
+        adapter_init_kwarg="adapter",
         query_method="query",
         async_query_method="aquery",
         stream_query_method="stream_query",
@@ -453,6 +589,17 @@ GRAPH_FRAMEWORKS: Dict[str, GraphFrameworkDescriptor] = {
         async_bulk_vertices_method="abulk_vertices",
         batch_method="batch",
         async_batch_method="abatch",
+        # Extended surfaces (declared so tests can verify wiring)
+        capabilities_method="capabilities",
+        async_capabilities_method="acapabilities",
+        health_method="health",
+        async_health_method="ahealth",
+        schema_method="get_schema",
+        async_schema_method="aget_schema",
+        transaction_method="transaction",
+        async_transaction_method="atransaction",
+        traversal_method="traversal",
+        async_traversal_method="atraversal",
         context_kwarg="context",
         has_capabilities=True,
         has_health=True,
