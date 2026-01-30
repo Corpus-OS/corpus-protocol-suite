@@ -37,13 +37,27 @@ Non-responsibilities
 - Backend-specific graph behavior (lives in graph adapters)
 - CrewAI agent orchestration and task logic
 - MMR and diversification details (handled inside GraphTranslator)
+
+Compatibility notes
+-------------------
+- CrewAI is an **optional dependency**. This module intentionally does not
+  hard-import CrewAI packages at import time.
+- Real CrewAI integration is provided through **soft-imported tool helpers**
+  at the bottom of this file (e.g., `create_crewai_graph_tools()`).
+  Importing this module does not require CrewAI to be installed.
+- When CrewAI is installed, you can build CrewAI-native `BaseTool` wrappers
+  (from `crewai.tools.base_tool`) around this client to run true end-to-end
+  integration tests in CrewAI agent environments.
 """
 
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import inspect
 import json
 import logging
+import threading
 from functools import cached_property
 from typing import (
     Any,
@@ -55,6 +69,7 @@ from typing import (
     Mapping,
     Optional,
     Protocol,
+    Sequence,
     TypeVar,
 )
 
@@ -88,6 +103,7 @@ from corpus_sdk.graph.graph_base import (
     GraphProtocolV1,
     GraphSchema,
     GraphTraversalSpec,
+    NotSupported,
     OperationContext,
     QueryChunk,
     QueryResult,
@@ -118,6 +134,11 @@ class ErrorCodes:
     BAD_BATCH_RESULT = "BAD_BATCH_RESULT"
     BAD_ADAPTER_RESULT = "BAD_ADAPTER_RESULT"
     SYNC_WRAPPER_CALLED_IN_EVENT_LOOP = "SYNC_WRAPPER_CALLED_IN_EVENT_LOOP"
+
+    # Validation-level constants used by shared validators in this adapter.
+    # Keeping these as explicit symbolic strings avoids accidental drift.
+    INVALID_QUERY = "INVALID_QUERY"
+    INVALID_BATCH_OPS = "INVALID_BATCH_OPS"
 
 
 # --------------------------------------------------------------------------- #
@@ -187,6 +208,20 @@ def _looks_like_operation_context(obj: Any) -> bool:
     return any(hasattr(obj, attr) for attr in attrs)
 
 
+def _is_running_event_loop() -> bool:
+    """
+    Return True if called while an asyncio event loop is running in this thread.
+
+    This is used by optional CrewAI tool helpers to provide safe sync execution
+    in environments that execute tools from within async agent runtimes.
+    """
+    try:
+        asyncio.get_running_loop()
+        return True
+    except RuntimeError:
+        return False
+
+
 def _ensure_not_in_event_loop(sync_api_name: str) -> None:
     """
     Prevent deadlocks from calling sync graph APIs in async contexts.
@@ -205,6 +240,77 @@ def _ensure_not_in_event_loop(sync_api_name: str) -> None:
         f"Use the async variant instead (e.g. 'await a{sync_api_name}(...)'). "
         f"[{ErrorCodes.SYNC_WRAPPER_CALLED_IN_EVENT_LOOP}]"
     )
+
+
+def _json_safe_snapshot(value: Any, *, max_items: int = 200, max_str: int = 10_000) -> Any:
+    """
+    Best-effort conversion into a JSON-ish snapshot for tool-return values and logs.
+
+    Security / correctness:
+    - Limits container sizes to avoid memory bloat.
+    - Truncates long strings.
+    - Falls back to repr() for unknown objects.
+
+    NOTE:
+    - This helper is used only in optional CrewAI tool helpers below.
+    - Core protocol logic continues to return protocol-level types (QueryResult, etc.).
+    """
+    try:
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        if isinstance(value, str):
+            return value if len(value) <= max_str else value[:max_str] + "…"
+        if isinstance(value, Mapping):
+            out: Dict[str, Any] = {}
+            for i, (k, v) in enumerate(value.items()):
+                if i >= max_items:
+                    out["…"] = f"truncated after {max_items} items"
+                    break
+                out[str(k)] = _json_safe_snapshot(v, max_items=max_items, max_str=max_str)
+            return out
+        if isinstance(value, (list, tuple)):
+            out_list: List[Any] = []
+            for i, v in enumerate(value):
+                if i >= max_items:
+                    out_list.append(f"… truncated after {max_items} items")
+                    break
+                out_list.append(_json_safe_snapshot(v, max_items=max_items, max_str=max_str))
+            return out_list
+        to_dict = getattr(value, "to_dict", None)
+        if callable(to_dict):
+            return _json_safe_snapshot(to_dict(), max_items=max_items, max_str=max_str)
+        # Fallback: ensure representable
+        return repr(value)
+    except Exception:  # noqa: BLE001
+        return {"repr": repr(value)}
+
+
+# Dedicated, bounded executor for tool-in-event-loop compatibility.
+# Used only by create_crewai_graph_tools(...) to keep tool runs safe in async CrewAI runtimes.
+_CREWAI_TOOL_BRIDGE_EXECUTOR: Optional[concurrent.futures.ThreadPoolExecutor] = None
+_CREWAI_TOOL_BRIDGE_EXECUTOR_LOCK = threading.Lock()
+
+
+def _run_blocking_in_crewai_tool_thread(fn: Callable[[], T]) -> T:
+    """
+    Run a blocking graph call in a bounded thread pool.
+
+    Why:
+      CrewAI tool execution may occur inside an async runtime (event loop running),
+      but graph client sync APIs deliberately refuse to run inside event loops.
+
+    Safety/performance:
+      - bounded pool (max_workers=4) to prevent unbounded thread creation
+      - used only in the optional tool integration path
+    """
+    global _CREWAI_TOOL_BRIDGE_EXECUTOR  # noqa: PLW0603
+    with _CREWAI_TOOL_BRIDGE_EXECUTOR_LOCK:
+        if _CREWAI_TOOL_BRIDGE_EXECUTOR is None:
+            _CREWAI_TOOL_BRIDGE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+                max_workers=4,
+                thread_name_prefix="corpus-crewai-tool",
+            )
+    return _CREWAI_TOOL_BRIDGE_EXECUTOR.submit(fn).result()
 
 
 # --------------------------------------------------------------------------- #
@@ -574,24 +680,37 @@ class CorpusCrewAIGraphClient:
         if resolved_adapter is None:
             raise TypeError("adapter must be a GraphProtocolV1-compatible graph adapter")
 
-        self._graph: GraphProtocolV1 = resolved_adapter
+        # Minimal duck-type check consistent with other framework adapters:
+        # we require the adapter to present a GraphProtocol-like surface.
+        if not hasattr(resolved_adapter, "query") or not hasattr(resolved_adapter, "capabilities"):
+            raise TypeError(
+                "adapter must implement GraphProtocolV1-like interface with "
+                "'query' and 'capabilities' methods"
+            )
+
+        self._graph: GraphProtocolV1 = resolved_adapter  # type: ignore[assignment]
         self._default_dialect: Optional[str] = default_dialect
         self._default_namespace: Optional[str] = default_namespace
         self._default_timeout_ms: Optional[int] = default_timeout_ms
         self._framework_version: Optional[str] = framework_version
-        self._framework_translator_override: Optional[
-            GraphFrameworkTranslator
-        ] = framework_translator
+        self._framework_translator_override: Optional[GraphFrameworkTranslator] = framework_translator
 
         # Resource management flags (idempotent close semantics)
         self._closed: bool = False
         self._aclosed: bool = False
 
+        logger.info(
+            "CorpusCrewAIGraphClient initialized (default_dialect=%r, default_namespace=%r, framework_version=%r)",
+            self._default_dialect,
+            self._default_namespace,
+            self._framework_version,
+        )
+
     # ------------------------------------------------------------------ #
     # Resource Management (Context Managers)
     # ------------------------------------------------------------------ #
 
-    def __enter__(self) -> CorpusCrewAIGraphClient:
+    def __enter__(self) -> "CorpusCrewAIGraphClient":
         """Support context manager protocol for resource cleanup."""
         return self
 
@@ -599,7 +718,7 @@ class CorpusCrewAIGraphClient:
         """Clean up resources when exiting context."""
         self.close()
 
-    async def __aenter__(self) -> CorpusCrewAIGraphClient:
+    async def __aenter__(self) -> "CorpusCrewAIGraphClient":
         """Support async context manager protocol."""
         return self
 
@@ -730,19 +849,21 @@ class CorpusCrewAIGraphClient:
             # downstream observability and GraphTranslator always see the
             # framework identity and version without depending on upstream
             # context translation details.
-            attrs = dict(getattr(ctx_candidate, "attrs", {}) or {})
-            attrs.setdefault("framework", "crewai")
-            if self._framework_version is not None:
-                attrs.setdefault("framework_version", self._framework_version)
+            #
+            # Implementation note:
+            # - We preserve the original OperationContext instance when possible,
+            #   and only normalize attrs to a dict to keep behavior predictable.
+            try:
+                attrs_obj = getattr(ctx_candidate, "attrs", {}) or {}
+                attrs: Dict[str, Any] = dict(attrs_obj) if not isinstance(attrs_obj, dict) else attrs_obj
+                attrs.setdefault("framework", "crewai")
+                if self._framework_version is not None:
+                    attrs.setdefault("framework_version", self._framework_version)
+                setattr(ctx_candidate, "attrs", attrs)
+            except Exception:
+                logger.debug("Failed to enrich OperationContext attrs for CrewAI context", exc_info=True)
 
-            return OperationContext(
-                request_id=ctx_candidate.request_id,
-                idempotency_key=getattr(ctx_candidate, "idempotency_key", None),
-                deadline_ms=getattr(ctx_candidate, "deadline_ms", None),
-                traceparent=getattr(ctx_candidate, "traceparent", None),
-                tenant=getattr(ctx_candidate, "tenant", None),
-                attrs=attrs,
-            )
+            return ctx_candidate  # type: ignore[return-value]
 
         logger.warning(
             "[%s] from_crewai returned non-OperationContext-like type: %s. "
@@ -1029,7 +1150,7 @@ class CorpusCrewAIGraphClient:
         """
         _ensure_not_in_event_loop("query")
 
-        validate_graph_query(query, operation="query", error_code="INVALID_QUERY")
+        validate_graph_query(query, operation="query", error_code=ErrorCodes.INVALID_QUERY)
         self._validate_query_params(params)
 
         ctx = self._build_ctx(task=task, extra_context=extra_context)
@@ -1046,12 +1167,28 @@ class CorpusCrewAIGraphClient:
             namespace=namespace,
         )
 
-        result = self._translator.query(
-            raw_query,
-            op_ctx=ctx,
-            framework_ctx=framework_ctx,
-            mmr_config=None,
-        )
+        try:
+            result = self._translator.query(
+                raw_query,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+                mmr_config=None,
+            )
+        except NotSupported:
+            # Dialect fallback mirrors the AutoGen adapter behavior:
+            # some backends reject unknown dialects but can execute without it.
+            if dialect is not None:
+                fallback_raw = dict(raw_query)
+                fallback_raw.pop("dialect", None)
+                result = self._translator.query(
+                    fallback_raw,
+                    op_ctx=ctx,
+                    framework_ctx=framework_ctx,
+                    mmr_config=None,
+                )
+            else:
+                raise
+
         return validate_graph_result_type(
             result,
             expected_type=QueryResult,
@@ -1076,7 +1213,7 @@ class CorpusCrewAIGraphClient:
 
         Returns the underlying `QueryResult`.
         """
-        validate_graph_query(query, operation="aquery", error_code="INVALID_QUERY")
+        validate_graph_query(query, operation="aquery", error_code=ErrorCodes.INVALID_QUERY)
         self._validate_query_params(params)
 
         ctx = self._build_ctx(task=task, extra_context=extra_context)
@@ -1093,12 +1230,26 @@ class CorpusCrewAIGraphClient:
             namespace=namespace,
         )
 
-        result = await self._translator.arun_query(
-            raw_query,
-            op_ctx=ctx,
-            framework_ctx=framework_ctx,
-            mmr_config=None,
-        )
+        try:
+            result = await self._translator.arun_query(
+                raw_query,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+                mmr_config=None,
+            )
+        except NotSupported:
+            if dialect is not None:
+                fallback_raw = dict(raw_query)
+                fallback_raw.pop("dialect", None)
+                result = await self._translator.arun_query(
+                    fallback_raw,
+                    op_ctx=ctx,
+                    framework_ctx=framework_ctx,
+                    mmr_config=None,
+                )
+            else:
+                raise
+
         return validate_graph_result_type(
             result,
             expected_type=QueryResult,
@@ -1131,7 +1282,7 @@ class CorpusCrewAIGraphClient:
         """
         _ensure_not_in_event_loop("stream_query")
 
-        validate_graph_query(query, operation="stream_query", error_code="INVALID_QUERY")
+        validate_graph_query(query, operation="stream_query", error_code=ErrorCodes.INVALID_QUERY)
         self._validate_query_params(params)
 
         ctx = self._build_ctx(task=task, extra_context=extra_context)
@@ -1174,8 +1325,15 @@ class CorpusCrewAIGraphClient:
     ) -> AsyncIterator[QueryChunk]:
         """
         Execute a streaming graph query (async), yielding `QueryChunk` items.
+
+        Compatibility note:
+        Some GraphTranslator implementations return:
+          - an AsyncIterator directly, OR
+          - an awaitable that resolves to an AsyncIterator.
+        This method supports both forms to avoid brittle tests and allow
+        translator evolution without breaking framework adapters.
         """
-        validate_graph_query(query, operation="astream_query", error_code="INVALID_QUERY")
+        validate_graph_query(query, operation="astream_query", error_code=ErrorCodes.INVALID_QUERY)
         self._validate_query_params(params)
 
         ctx = self._build_ctx(task=task, extra_context=extra_context)
@@ -1192,11 +1350,17 @@ class CorpusCrewAIGraphClient:
             namespace=namespace,
         )
 
-        async for chunk in self._translator.arun_query_stream(
+        aiter_or_awaitable = self._translator.arun_query_stream(
             raw_query,
             op_ctx=ctx,
             framework_ctx=framework_ctx,
-        ):
+        )
+        if inspect.isawaitable(aiter_or_awaitable):
+            aiter = await aiter_or_awaitable  # type: ignore[assignment]
+        else:
+            aiter = aiter_or_awaitable  # type: ignore[assignment]
+
+        async for chunk in aiter:
             yield validate_graph_result_type(
                 chunk,
                 expected_type=QueryChunk,
@@ -1711,7 +1875,7 @@ class CorpusCrewAIGraphClient:
         _ensure_not_in_event_loop("transaction")
 
         # Reuse batch validation; semantics are still a list of BatchOperation.
-        validate_batch_operations(ops, operation="transaction", error_code="INVALID_BATCH_OPS")
+        validate_batch_operations(ops, operation="transaction", error_code=ErrorCodes.INVALID_BATCH_OPS)
 
         ctx = self._build_ctx(
             task=task,
@@ -1745,7 +1909,7 @@ class CorpusCrewAIGraphClient:
         """
         Async wrapper for transactional batch operations.
         """
-        validate_batch_operations(ops, operation="atransaction", error_code="INVALID_BATCH_OPS")
+        validate_batch_operations(ops, operation="atransaction", error_code=ErrorCodes.INVALID_BATCH_OPS)
 
         ctx = self._build_ctx(
             task=task,
@@ -1788,7 +1952,7 @@ class CorpusCrewAIGraphClient:
         """
         _ensure_not_in_event_loop("batch")
 
-        validate_batch_operations(ops, operation="batch", error_code="INVALID_BATCH_OPS")
+        validate_batch_operations(ops, operation="batch", error_code=ErrorCodes.INVALID_BATCH_OPS)
 
         ctx = self._build_ctx(task=task, extra_context=extra_context)
 
@@ -1819,7 +1983,7 @@ class CorpusCrewAIGraphClient:
         """
         Async wrapper for batch operations.
         """
-        validate_batch_operations(ops, operation="abatch", error_code="INVALID_BATCH_OPS")
+        validate_batch_operations(ops, operation="abatch", error_code=ErrorCodes.INVALID_BATCH_OPS)
 
         ctx = self._build_ctx(task=task, extra_context=extra_context)
 
@@ -1840,6 +2004,288 @@ class CorpusCrewAIGraphClient:
         )
 
 
+# ---------------------------------------------------------------------------
+# Optional CrewAI integration helpers (soft import)
+# ---------------------------------------------------------------------------
+
+def create_crewai_graph_tools(
+    client: "CorpusCrewAIGraphClient",
+    *,
+    name_prefix: str = "graph",
+    description_prefix: str = "Corpus graph tool",
+) -> List[Any]:
+    """
+    Create CrewAI-native BaseTool wrappers for common graph operations.
+
+    Why this exists:
+    - The graph adapter itself is intentionally dependency-free and framework-light.
+    - When CrewAI is installed, callers often want real CrewAI `BaseTool` objects
+      to register on agents (e.g., in a Crew task/agent tool list).
+    - The AutoGen adapter provides a real tool-wiring helper; this mirrors that
+      approach for CrewAI.
+
+    Soft dependency:
+    - CrewAI is imported lazily. Importing this module does not require CrewAI.
+    - If CrewAI is not installed, this function raises a clear RuntimeError with install instructions.
+
+    Notes:
+    - Tools provide both _run (sync) and _arun (async) implementations.
+    - In _run, if called inside an event loop, execution is bridged to a bounded
+      thread pool to preserve the adapter’s sync-in-event-loop safety guarantees.
+    - Return values are JSON strings containing JSON-safe snapshots for tool-calling
+      compatibility. (Protocol-level methods still return QueryResult/QueryChunk/etc.)
+    """
+    try:
+        # CrewAI tool system – BaseTool is the canonical integration surface.
+        # This import path matches current CrewAI source layout.
+        from crewai.tools.base_tool import BaseTool  # type: ignore[import-not-found]
+    except ImportError as exc:  # noqa: BLE001
+        raise RuntimeError(
+            "CrewAI dependencies are not installed. Install with:\n"
+            '  pip install -U "crewai"\n'
+            "Then retry create_crewai_graph_tools(...)."
+        ) from exc
+
+    def _json_result(payload: Mapping[str, Any]) -> str:
+        """
+        Serialize a tool result to JSON.
+
+        We keep tool outputs strictly serializable and size-bounded via _json_safe_snapshot().
+        """
+        return json.dumps(_json_safe_snapshot(payload), ensure_ascii=False)
+
+    def _bridge_sync_call(fn: Callable[[], Any]) -> Any:
+        """
+        Execute a sync tool operation safely.
+
+        - If no event loop is running, call directly.
+        - If an event loop is running, execute in a bounded worker thread.
+        """
+        if not _is_running_event_loop():
+            return fn()
+        return _run_blocking_in_crewai_tool_thread(fn)
+
+    class _GraphQueryTool(BaseTool):
+        name: str
+        description: str
+
+        def _run(
+            self,
+            query: str,
+            params: Optional[Mapping[str, Any]] = None,
+            dialect: Optional[str] = None,
+            namespace: Optional[str] = None,
+            timeout_ms: Optional[int] = None,
+            task: Optional[Any] = None,
+            extra_context: Optional[Mapping[str, Any]] = None,
+        ) -> str:
+            def _work() -> str:
+                res = client.query(
+                    query,
+                    params=params,
+                    dialect=dialect,
+                    namespace=namespace,
+                    timeout_ms=timeout_ms,
+                    task=task,
+                    extra_context=extra_context,
+                )
+                return _json_result({"result": _json_safe_snapshot(res)})
+
+            return _bridge_sync_call(_work)
+
+        async def _arun(
+            self,
+            query: str,
+            params: Optional[Mapping[str, Any]] = None,
+            dialect: Optional[str] = None,
+            namespace: Optional[str] = None,
+            timeout_ms: Optional[int] = None,
+            task: Optional[Any] = None,
+            extra_context: Optional[Mapping[str, Any]] = None,
+        ) -> str:
+            res = await client.aquery(
+                query,
+                params=params,
+                dialect=dialect,
+                namespace=namespace,
+                timeout_ms=timeout_ms,
+                task=task,
+                extra_context=extra_context,
+            )
+            return _json_result({"result": _json_safe_snapshot(res)})
+
+    class _GraphStreamQueryTool(BaseTool):
+        name: str
+        description: str
+
+        def _run(
+            self,
+            query: str,
+            params: Optional[Mapping[str, Any]] = None,
+            dialect: Optional[str] = None,
+            namespace: Optional[str] = None,
+            timeout_ms: Optional[int] = None,
+            task: Optional[Any] = None,
+            extra_context: Optional[Mapping[str, Any]] = None,
+            max_chunks: int = 25,
+        ) -> str:
+            def _work() -> str:
+                chunks: List[Any] = []
+                count = 0
+                for ch in client.stream_query(
+                    query,
+                    params=params,
+                    dialect=dialect,
+                    namespace=namespace,
+                    timeout_ms=timeout_ms,
+                    task=task,
+                    extra_context=extra_context,
+                ):
+                    chunks.append(_json_safe_snapshot(ch))
+                    count += 1
+                    if count >= int(max_chunks):
+                        break
+                return _json_result({"chunks": chunks, "truncated": count >= int(max_chunks)})
+
+            return _bridge_sync_call(_work)
+
+        async def _arun(
+            self,
+            query: str,
+            params: Optional[Mapping[str, Any]] = None,
+            dialect: Optional[str] = None,
+            namespace: Optional[str] = None,
+            timeout_ms: Optional[int] = None,
+            task: Optional[Any] = None,
+            extra_context: Optional[Mapping[str, Any]] = None,
+            max_chunks: int = 25,
+        ) -> str:
+            chunks: List[Any] = []
+            count = 0
+            async for ch in client.astream_query(
+                query,
+                params=params,
+                dialect=dialect,
+                namespace=namespace,
+                timeout_ms=timeout_ms,
+                task=task,
+                extra_context=extra_context,
+            ):
+                chunks.append(_json_safe_snapshot(ch))
+                count += 1
+                if count >= int(max_chunks):
+                    break
+            return _json_result({"chunks": chunks, "truncated": count >= int(max_chunks)})
+
+    class _GraphBulkVerticesTool(BaseTool):
+        name: str
+        description: str
+
+        def _run(
+            self,
+            namespace: Optional[str] = None,
+            limit: int = 50,
+            cursor: Optional[str] = None,
+            filter: Optional[Mapping[str, Any]] = None,
+            task: Optional[Any] = None,
+            extra_context: Optional[Mapping[str, Any]] = None,
+        ) -> str:
+            def _work() -> str:
+                spec = BulkVerticesSpec(namespace=namespace, limit=limit, cursor=cursor, filter=filter)
+                res = client.bulk_vertices(spec, task=task, extra_context=extra_context)
+                return _json_result({"result": _json_safe_snapshot(res)})
+
+            return _bridge_sync_call(_work)
+
+        async def _arun(
+            self,
+            namespace: Optional[str] = None,
+            limit: int = 50,
+            cursor: Optional[str] = None,
+            filter: Optional[Mapping[str, Any]] = None,
+            task: Optional[Any] = None,
+            extra_context: Optional[Mapping[str, Any]] = None,
+        ) -> str:
+            spec = BulkVerticesSpec(namespace=namespace, limit=limit, cursor=cursor, filter=filter)
+            res = await client.abulk_vertices(spec, task=task, extra_context=extra_context)
+            return _json_result({"result": _json_safe_snapshot(res)})
+
+    class _GraphBatchTool(BaseTool):
+        name: str
+        description: str
+
+        def _run(
+            self,
+            ops: Sequence[Mapping[str, Any]],
+            task: Optional[Any] = None,
+            extra_context: Optional[Mapping[str, Any]] = None,
+        ) -> str:
+            def _work() -> str:
+                batch_ops: List[BatchOperation] = []
+                for idx, item in enumerate(list(ops)):
+                    if not isinstance(item, Mapping):
+                        raise TypeError(f"batch ops[{idx}] must be a mapping with keys 'op' and 'args'")
+                    op = item.get("op")
+                    args = item.get("args") or {}
+                    if not isinstance(op, str) or not op:
+                        raise TypeError(f"batch ops[{idx}]['op'] must be a non-empty string")
+                    if not isinstance(args, Mapping):
+                        raise TypeError(f"batch ops[{idx}]['args'] must be a mapping")
+                    batch_ops.append(BatchOperation(op=op, args=dict(args)))
+
+                # Use shared validation so tool behavior matches adapter expectations.
+                validate_batch_operations(batch_ops, operation="batch", error_code=ErrorCodes.INVALID_BATCH_OPS)
+
+                res = client.batch(batch_ops, task=task, extra_context=extra_context)
+                return _json_result({"result": _json_safe_snapshot(res)})
+
+            return _bridge_sync_call(_work)
+
+        async def _arun(
+            self,
+            ops: Sequence[Mapping[str, Any]],
+            task: Optional[Any] = None,
+            extra_context: Optional[Mapping[str, Any]] = None,
+        ) -> str:
+            batch_ops: List[BatchOperation] = []
+            for idx, item in enumerate(list(ops)):
+                if not isinstance(item, Mapping):
+                    raise TypeError(f"batch ops[{idx}] must be a mapping with keys 'op' and 'args'")
+                op = item.get("op")
+                args = item.get("args") or {}
+                if not isinstance(op, str) or not op:
+                    raise TypeError(f"batch ops[{idx}]['op'] must be a non-empty string")
+                if not isinstance(args, Mapping):
+                    raise TypeError(f"batch ops[{idx}]['args'] must be a mapping")
+                batch_ops.append(BatchOperation(op=op, args=dict(args)))
+
+            validate_batch_operations(batch_ops, operation="abatch", error_code=ErrorCodes.INVALID_BATCH_OPS)
+
+            res = await client.abatch(batch_ops, task=task, extra_context=extra_context)
+            return _json_result({"result": _json_safe_snapshot(res)})
+
+    tools: List[Any] = [
+        _GraphQueryTool(
+            name=f"{name_prefix}_query",
+            description=f"{description_prefix}: execute a graph query (non-streaming).",
+        ),
+        _GraphStreamQueryTool(
+            name=f"{name_prefix}_stream_query",
+            description=f"{description_prefix}: execute a graph query with streaming chunks (bounded).",
+        ),
+        _GraphBulkVerticesTool(
+            name=f"{name_prefix}_bulk_vertices",
+            description=f"{description_prefix}: bulk-scan vertices with pagination inputs.",
+        ),
+        _GraphBatchTool(
+            name=f"{name_prefix}_batch",
+            description=f"{description_prefix}: execute a batch of graph operations.",
+        ),
+    ]
+
+    return tools
+
+
 __all__ = [
     "CrewAIGraphClientProtocol",
     "CrewAIGraphFrameworkTranslator",
@@ -1849,4 +2295,6 @@ __all__ = [
     "with_async_graph_error_context",
     "with_error_context",
     "with_async_error_context",
+    # Optional CrewAI integration helper (soft import)
+    "create_crewai_graph_tools",
 ]
