@@ -302,10 +302,10 @@ class CrewAIGraphClientProtocol(Protocol):
 
     # Capabilities / schema / health -------------------------------------
 
-    def capabilities(self) -> Dict[str, Any]:
+    def capabilities(self, **kwargs) -> Dict[str, Any]:
         ...
 
-    async def acapabilities(self) -> Dict[str, Any]:
+    async def acapabilities(self, **kwargs) -> Dict[str, Any]:
         ...
 
     def get_schema(
@@ -882,7 +882,7 @@ class CorpusCrewAIGraphClient:
     # ------------------------------------------------------------------ #
 
     @with_graph_error_context("capabilities_sync")
-    def capabilities(self) -> Dict[str, Any]:
+    def capabilities(self, **kwargs) -> Dict[str, Any]:
         """
         Sync wrapper around capabilities, delegating async→sync bridging
         to GraphTranslator.
@@ -893,7 +893,7 @@ class CorpusCrewAIGraphClient:
         return graph_capabilities_to_dict(caps)
 
     @with_async_graph_error_context("capabilities_async")
-    async def acapabilities(self) -> Dict[str, Any]:
+    async def acapabilities(self, **kwargs) -> Dict[str, Any]:
         """
         Async capabilities accessor.
 
@@ -1029,7 +1029,7 @@ class CorpusCrewAIGraphClient:
         """
         _ensure_not_in_event_loop("query")
 
-        validate_graph_query(query)
+        validate_graph_query(query, operation="query", error_code="INVALID_QUERY")
         self._validate_query_params(params)
 
         ctx = self._build_ctx(task=task, extra_context=extra_context)
@@ -1076,7 +1076,7 @@ class CorpusCrewAIGraphClient:
 
         Returns the underlying `QueryResult`.
         """
-        validate_graph_query(query)
+        validate_graph_query(query, operation="aquery", error_code="INVALID_QUERY")
         self._validate_query_params(params)
 
         ctx = self._build_ctx(task=task, extra_context=extra_context)
@@ -1131,7 +1131,7 @@ class CorpusCrewAIGraphClient:
         """
         _ensure_not_in_event_loop("stream_query")
 
-        validate_graph_query(query)
+        validate_graph_query(query, operation="stream_query", error_code="INVALID_QUERY")
         self._validate_query_params(params)
 
         ctx = self._build_ctx(task=task, extra_context=extra_context)
@@ -1175,7 +1175,7 @@ class CorpusCrewAIGraphClient:
         """
         Execute a streaming graph query (async), yielding `QueryChunk` items.
         """
-        validate_graph_query(query)
+        validate_graph_query(query, operation="astream_query", error_code="INVALID_QUERY")
         self._validate_query_params(params)
 
         ctx = self._build_ctx(task=task, extra_context=extra_context)
@@ -1788,7 +1788,7 @@ class CorpusCrewAIGraphClient:
         """
         _ensure_not_in_event_loop("batch")
 
-        validate_batch_operations(self._graph, ops)
+        validate_batch_operations(ops, operation="batch", error_code="INVALID_BATCH_OPS")
 
         ctx = self._build_ctx(task=task, extra_context=extra_context)
 
@@ -1819,7 +1819,7 @@ class CorpusCrewAIGraphClient:
         """
         Async wrapper for batch operations.
         """
-        validate_batch_operations(self._graph, ops)
+        validate_batch_operations(ops, operation="abatch", error_code="INVALID_BATCH_OPS")
 
         ctx = self._build_ctx(task=task, extra_context=extra_context)
 
