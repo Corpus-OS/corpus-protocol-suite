@@ -1285,15 +1285,25 @@ def create_graph_error_context_decorator(
 
     Expected usage pattern (as seen in framework adapters):
 
-        @create_graph_error_context_decorator(framework="autogen", is_async=False)(
-            operation="health_sync"
-        )
+        @create_graph_error_context_decorator(
+            framework="autogen",
+            is_async=False
+        )(operation="health_sync")
         def health(...): ...
 
     Conformance expectations:
     - On exceptions, attach_context(...) is called (best-effort) with at least:
         framework=<framework>, operation="graph_<operation>"
     - The original exception is re-raised.
+
+    Args:
+        framework: Framework name (e.g., "autogen", "langchain")
+        is_async: Whether to create async decorator wrappers
+
+    Implementation notes:
+    - Dynamically looks up 'attach_context' from the decorated function's module
+      to support test mocking via monkeypatch
+    - Falls back to lazy import if module lookup fails
     """
     framework_label = str(framework).strip() or "graph"
 
@@ -1303,23 +1313,37 @@ def create_graph_error_context_decorator(
         op_name = op if op.startswith("graph_") else f"graph_{op}"
 
         def _decorate(fn: Callable[..., Any]) -> Callable[..., Any]:
+            # Capture the module where the decorated function is defined
+            # so we can look up attach_context from its namespace
+            fn_module = inspect.getmodule(fn)
+            
             # NOTE: This decorator is intentionally "best-effort" for context attachment:
             # - If attach_context cannot be imported or raises internally, we log and
             #   always re-raise the *original* exception (never masking the real failure).
             def _best_effort_attach(exc: BaseException) -> None:
+                # Try to look up attach_context from the decorated function's module first.
+                # This allows test monkeypatching to work correctly.
+                attach_fn = None
+                
+                if fn_module is not None:
+                    attach_fn = getattr(fn_module, 'attach_context', None)
+                
+                # Fall back to lazy import if module lookup didn't find it
+                if attach_fn is None:
+                    try:
+                        # Import lazily to avoid import cycles and keep module framework-neutral.
+                        from corpus_sdk.core.error_context import attach_context  # type: ignore
+                        attach_fn = attach_context
+                    except Exception:  # noqa: BLE001
+                        # Best-effort only; do not replace the original exception.
+                        LOG.debug(
+                            "%s: failed to import attach_context while handling exception",
+                            framework_label,
+                            exc_info=True,
+                        )
+                        return
                 try:
-                    # Import lazily to avoid import cycles and keep module framework-neutral.
-                    from corpus_sdk.core.error_context import attach_context  # type: ignore
-                except Exception:  # noqa: BLE001
-                    # Best-effort only; do not replace the original exception.
-                    LOG.debug(
-                        "%s: failed to import attach_context while handling exception",
-                        framework_label,
-                        exc_info=True,
-                    )
-                    return
-                try:
-                    attach_context(
+                    attach_fn(
                         exc,
                         framework=framework_label,
                         operation=op_name,
