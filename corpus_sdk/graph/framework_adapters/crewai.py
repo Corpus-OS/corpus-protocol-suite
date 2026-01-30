@@ -53,6 +53,7 @@ Compatibility notes
 from __future__ import annotations
 
 import asyncio
+import atexit
 import concurrent.futures
 import inspect
 import json
@@ -139,6 +140,10 @@ class ErrorCodes:
     # Keeping these as explicit symbolic strings avoids accidental drift.
     INVALID_QUERY = "INVALID_QUERY"
     INVALID_BATCH_OPS = "INVALID_BATCH_OPS"
+
+    # Optional-tool-specific validation codes. These are not exposed as protocol errors;
+    # they exist to keep tool behavior clear and debuggable when LLMs pass bad inputs.
+    INVALID_TOOL_PARAM = "INVALID_TOOL_PARAM"
 
 
 # --------------------------------------------------------------------------- #
@@ -285,10 +290,71 @@ def _json_safe_snapshot(value: Any, *, max_items: int = 200, max_str: int = 10_0
         return {"repr": repr(value)}
 
 
+async def _normalize_async_iterator(aiter_or_awaitable: Any) -> AsyncIterator[Any]:
+    """
+    Normalize streaming return shapes into a concrete AsyncIterator.
+
+    Some GraphTranslator implementations return:
+      - an AsyncIterator directly, OR
+      - an awaitable that resolves to an AsyncIterator.
+
+    This helper makes the adapter resilient to those implementation choices while:
+      - keeping runtime behavior unchanged, and
+      - providing correct typing (always returns an AsyncIterator when awaited).
+
+    IMPORTANT:
+      This function intentionally does not enforce strict type checks on the resolved
+      value (best-effort). If a backend/translator returns an invalid shape, the
+      subsequent `async for` will raise, and error-context decorators will attach
+      observability context as designed.
+    """
+    if inspect.isawaitable(aiter_or_awaitable):
+        resolved = await aiter_or_awaitable
+        return resolved  # type: ignore[return-value]
+    return aiter_or_awaitable  # type: ignore[return-value]
+
+
 # Dedicated, bounded executor for tool-in-event-loop compatibility.
 # Used only by create_crewai_graph_tools(...) to keep tool runs safe in async CrewAI runtimes.
 _CREWAI_TOOL_BRIDGE_EXECUTOR: Optional[concurrent.futures.ThreadPoolExecutor] = None
 _CREWAI_TOOL_BRIDGE_EXECUTOR_LOCK = threading.Lock()
+
+
+def _shutdown_crewai_tool_bridge_executor() -> None:
+    """
+    Best-effort shutdown of the optional tool bridge executor.
+
+    Rationale:
+      The executor is only used for optional CrewAI tool helpers to run sync
+      graph calls from within running asyncio event loops.
+
+    Why shutdown matters:
+      In test suites and short-lived runtimes, a non-daemon thread pool can
+      outlive intended lifetimes and appear as a resource leak.
+
+    Safety:
+      - This function is idempotent.
+      - Shutdown failures are swallowed to avoid impacting application teardown.
+      - If tools are used again after shutdown, the executor is recreated.
+    """
+    global _CREWAI_TOOL_BRIDGE_EXECUTOR  # noqa: PLW0603
+    with _CREWAI_TOOL_BRIDGE_EXECUTOR_LOCK:
+        ex = _CREWAI_TOOL_BRIDGE_EXECUTOR
+        _CREWAI_TOOL_BRIDGE_EXECUTOR = None
+
+    if ex is None:
+        return
+
+    try:
+        # cancel_futures=True is supported on modern Python versions. If unsupported,
+        # we swallow exceptions (best-effort cleanup) to avoid impacting teardown.
+        ex.shutdown(wait=False, cancel_futures=True)  # type: ignore[call-arg]
+    except Exception:
+        logger.debug("Failed to shutdown CrewAI tool bridge executor", exc_info=True)
+
+
+# Ensure we do not leak threads across interpreter shutdown in test harnesses.
+atexit.register(_shutdown_crewai_tool_bridge_executor)
 
 
 def _run_blocking_in_crewai_tool_thread(fn: Callable[[], T]) -> T:
@@ -302,6 +368,7 @@ def _run_blocking_in_crewai_tool_thread(fn: Callable[[], T]) -> T:
     Safety/performance:
       - bounded pool (max_workers=4) to prevent unbounded thread creation
       - used only in the optional tool integration path
+      - atexit hook and client.close() invoke a best-effort shutdown to avoid leaks
     """
     global _CREWAI_TOOL_BRIDGE_EXECUTOR  # noqa: PLW0603
     with _CREWAI_TOOL_BRIDGE_EXECUTOR_LOCK:
@@ -310,7 +377,49 @@ def _run_blocking_in_crewai_tool_thread(fn: Callable[[], T]) -> T:
                 max_workers=4,
                 thread_name_prefix="corpus-crewai-tool",
             )
-    return _CREWAI_TOOL_BRIDGE_EXECUTOR.submit(fn).result()
+        executor = _CREWAI_TOOL_BRIDGE_EXECUTOR
+
+    # NOTE: .result() is intentional: tools are expected to block (sync interface).
+    return executor.submit(fn).result()
+
+
+def _coerce_bounded_positive_int(
+    value: Any,
+    *,
+    name: str,
+    default: int,
+    min_value: int = 1,
+    max_value: int = 100,
+) -> int:
+    """
+    Convert a possibly-LLM-provided value into a safe bounded positive int.
+
+    Why:
+      Tool parameters are frequently produced by LLMs and can be strings ("25"),
+      floats ("25.0"), or invalid values (None, negative numbers).
+
+    Behavior:
+      - If conversion fails, returns the provided default.
+      - If converted value is out of bounds, clamps to [min_value, max_value].
+    """
+    try:
+        # Allow strings and floats that represent integers ("25", 25.0).
+        ivalue = int(value)
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "[%s] Invalid tool param %s=%r; defaulting to %d",
+            ErrorCodes.INVALID_TOOL_PARAM,
+            name,
+            value,
+            default,
+        )
+        return default
+
+    if ivalue < min_value:
+        return min_value
+    if ivalue > max_value:
+        return max_value
+    return ivalue
 
 
 # --------------------------------------------------------------------------- #
@@ -744,6 +853,11 @@ class CorpusCrewAIGraphClient:
                 # Never let cleanup failures propagate to callers.
                 logger.debug("Failed to close graph adapter", exc_info=True)
 
+        # Also tear down the optional tool bridge executor. This is safe and idempotent:
+        # - It prevents thread leaks in short-lived runtimes (tests).
+        # - If tools are invoked again later, the executor will be recreated.
+        _shutdown_crewai_tool_bridge_executor()
+
     async def aclose(self) -> None:
         """
         Async close for the underlying graph adapter.
@@ -761,6 +875,8 @@ class CorpusCrewAIGraphClient:
                 await aclose_fn()
                 # If async close succeeded, we can consider sync-close satisfied.
                 self._closed = True
+                # As with close(), shut down optional tool bridge resources.
+                _shutdown_crewai_tool_bridge_executor()
                 return
             except Exception:
                 logger.debug("Failed to async-close graph adapter", exc_info=True)
@@ -851,19 +967,22 @@ class CorpusCrewAIGraphClient:
             # context translation details.
             #
             # Implementation note:
-            # - We preserve the original OperationContext instance when possible,
-            #   and only normalize attrs to a dict to keep behavior predictable.
-            try:
-                attrs_obj = getattr(ctx_candidate, "attrs", {}) or {}
-                attrs: Dict[str, Any] = dict(attrs_obj) if not isinstance(attrs_obj, dict) else attrs_obj
-                attrs.setdefault("framework", "crewai")
-                if self._framework_version is not None:
-                    attrs.setdefault("framework_version", self._framework_version)
-                setattr(ctx_candidate, "attrs", attrs)
-            except Exception:
-                logger.debug("Failed to enrich OperationContext attrs for CrewAI context", exc_info=True)
+            # - We avoid mutating the original ctx object to reduce surprising
+            #   side effects if callers reuse/freeze OperationContext instances.
+            attrs_obj = getattr(ctx_candidate, "attrs", {}) or {}
+            attrs: Dict[str, Any] = dict(attrs_obj) if not isinstance(attrs_obj, dict) else dict(attrs_obj)
+            attrs.setdefault("framework", "crewai")
+            if self._framework_version is not None:
+                attrs.setdefault("framework_version", self._framework_version)
 
-            return ctx_candidate  # type: ignore[return-value]
+            return OperationContext(
+                request_id=getattr(ctx_candidate, "request_id", None),
+                idempotency_key=getattr(ctx_candidate, "idempotency_key", None),
+                deadline_ms=getattr(ctx_candidate, "deadline_ms", None),
+                traceparent=getattr(ctx_candidate, "traceparent", None),
+                tenant=getattr(ctx_candidate, "tenant", None),
+                attrs=attrs,
+            )
 
         logger.warning(
             "[%s] from_crewai returned non-OperationContext-like type: %s. "
@@ -939,7 +1058,7 @@ class CorpusCrewAIGraphClient:
 
         return ctx
 
-    def _validate_upsert_edges_spec(self, spec: UpsertEdgesSpec) -> None:
+    def _validate_upsert_edges_spec(self, spec: UpsertEdgesSpec) -> List[Any]:
         """
         CrewAI-local validation for edge upsert specs.
 
@@ -948,6 +1067,13 @@ class CorpusCrewAIGraphClient:
         - edges must be iterable and non-empty
         - each edge must have required structural fields
         - properties (if present) must be JSON-serializable
+
+        IMPORTANT:
+        - This method intentionally avoids mutating `spec.edges`.
+          Mutating input specs is an avoidable footgun if specs become frozen,
+          reused across calls, or treated as immutable by upstream callers.
+        - The validated, materialized edge list is returned to the caller so
+          downstream execution can safely consume it without re-iterating.
         """
         if spec.edges is None:
             raise BadRequest("UpsertEdgesSpec.edges must not be None")
@@ -980,8 +1106,9 @@ class CorpusCrewAIGraphClient:
                         f"Edge at index {idx} properties must be JSON-serializable: {e}"
                     )
 
-        # Normalize spec.edges to the validated list
-        spec.edges = edges  # type: ignore[assignment]
+        # NOTE: We intentionally do NOT assign `spec.edges = edges`.
+        # Returning the validated list avoids side effects while preserving behavior.
+        return edges
 
     def _validate_query_params(
         self,
@@ -1007,6 +1134,10 @@ class CorpusCrewAIGraphClient:
         """
         Sync wrapper around capabilities, delegating async→sync bridging
         to GraphTranslator.
+
+        Compatibility note:
+        - Accepts arbitrary **kwargs and intentionally ignores unknown keys to
+          support "rich context" calling styles in conformance environments.
         """
         _ensure_not_in_event_loop("capabilities")
 
@@ -1020,6 +1151,10 @@ class CorpusCrewAIGraphClient:
 
         We delegate to GraphTranslator for consistency, then normalize to a
         simple dict for CrewAI consumption.
+
+        Compatibility note:
+        - Accepts arbitrary **kwargs and intentionally ignores unknown keys to
+          support "rich context" calling styles in conformance environments.
         """
         caps = await self._translator.arun_capabilities()
         return graph_capabilities_to_dict(caps)
@@ -1355,10 +1490,9 @@ class CorpusCrewAIGraphClient:
             op_ctx=ctx,
             framework_ctx=framework_ctx,
         )
-        if inspect.isawaitable(aiter_or_awaitable):
-            aiter = await aiter_or_awaitable  # type: ignore[assignment]
-        else:
-            aiter = aiter_or_awaitable  # type: ignore[assignment]
+
+        # Normalize translator return shapes into a concrete AsyncIterator with correct typing.
+        aiter = await _normalize_async_iterator(aiter_or_awaitable)
 
         async for chunk in aiter:
             yield validate_graph_result_type(
@@ -1453,7 +1587,7 @@ class CorpusCrewAIGraphClient:
         """
         _ensure_not_in_event_loop("upsert_edges")
 
-        self._validate_upsert_edges_spec(spec)
+        validated_edges = self._validate_upsert_edges_spec(spec)
 
         ctx = self._build_ctx(task=task, extra_context=extra_context)
         framework_ctx = self._framework_ctx(
@@ -1462,7 +1596,7 @@ class CorpusCrewAIGraphClient:
         )
 
         result = self._translator.upsert_edges(
-            spec.edges,
+            validated_edges,
             op_ctx=ctx,
             framework_ctx=framework_ctx,
         )
@@ -1484,7 +1618,7 @@ class CorpusCrewAIGraphClient:
         """
         Async wrapper for upserting edges.
         """
-        self._validate_upsert_edges_spec(spec)
+        validated_edges = self._validate_upsert_edges_spec(spec)
 
         ctx = self._build_ctx(task=task, extra_context=extra_context)
         framework_ctx = self._framework_ctx(
@@ -1493,7 +1627,7 @@ class CorpusCrewAIGraphClient:
         )
 
         result = await self._translator.arun_upsert_edges(
-            spec.edges,
+            validated_edges,
             op_ctx=ctx,
             framework_ctx=framework_ctx,
         )
@@ -2039,20 +2173,50 @@ def create_crewai_graph_tools(
         # CrewAI tool system – BaseTool is the canonical integration surface.
         # This import path matches current CrewAI source layout.
         from crewai.tools.base_tool import BaseTool  # type: ignore[import-not-found]
-    except ImportError as exc:  # noqa: BLE001
-        raise RuntimeError(
-            "CrewAI dependencies are not installed. Install with:\n"
-            '  pip install -U "crewai"\n'
-            "Then retry create_crewai_graph_tools(...)."
-        ) from exc
+    except ImportError:
+        # Some CrewAI versions have moved/aliased BaseTool. Try a compatible fallback
+        # before failing with a clear error.
+        try:
+            from crewai.tools import BaseTool  # type: ignore[import-not-found]
+        except ImportError as exc:  # noqa: BLE001
+            raise RuntimeError(
+                "CrewAI dependencies are not installed or BaseTool import path is unavailable. Install with:\n"
+                '  pip install -U "crewai"\n'
+                "Then retry create_crewai_graph_tools(...)."
+            ) from exc
+
+    # Hard cap for tool outputs to avoid accidental context-window explosions.
+    # This is a best-effort guard; the primary size protection remains _json_safe_snapshot().
+    _TOOL_JSON_MAX_CHARS = 120_000
 
     def _json_result(payload: Mapping[str, Any]) -> str:
         """
         Serialize a tool result to JSON.
 
         We keep tool outputs strictly serializable and size-bounded via _json_safe_snapshot().
+        Additionally, we compact JSON output to reduce token footprint for agents.
         """
-        return json.dumps(_json_safe_snapshot(payload), ensure_ascii=False)
+        snap = _json_safe_snapshot(payload)
+        out = json.dumps(snap, ensure_ascii=False, separators=(",", ":"))
+        if len(out) <= _TOOL_JSON_MAX_CHARS:
+            return out
+
+        # If we still exceeded the hard cap, re-snapshot more aggressively and add a warning.
+        # This preserves tool compatibility (still valid JSON) while protecting the agent.
+        aggressive = dict(payload)
+        aggressive["_warning"] = f"tool output exceeded {_TOOL_JSON_MAX_CHARS} chars; aggressively truncated"
+        snap2 = _json_safe_snapshot(aggressive, max_items=50, max_str=2_000)
+        out2 = json.dumps(snap2, ensure_ascii=False, separators=(",", ":"))
+        if len(out2) <= _TOOL_JSON_MAX_CHARS:
+            return out2
+
+        # Final fallback: guarantee bounded output without returning invalid JSON.
+        # We keep a minimal JSON object rather than returning a raw truncated string.
+        minimal = {
+            "_warning": f"tool output exceeded {_TOOL_JSON_MAX_CHARS} chars even after truncation",
+            "truncated": True,
+        }
+        return json.dumps(minimal, ensure_ascii=False, separators=(",", ":"))
 
     def _bridge_sync_call(fn: Callable[[], Any]) -> Any:
         """
@@ -2089,7 +2253,7 @@ def create_crewai_graph_tools(
                     task=task,
                     extra_context=extra_context,
                 )
-                return _json_result({"result": _json_safe_snapshot(res)})
+                return _json_result({"result": res})
 
             return _bridge_sync_call(_work)
 
@@ -2112,7 +2276,7 @@ def create_crewai_graph_tools(
                 task=task,
                 extra_context=extra_context,
             )
-            return _json_result({"result": _json_safe_snapshot(res)})
+            return _json_result({"result": res})
 
     class _GraphStreamQueryTool(BaseTool):
         name: str
@@ -2130,6 +2294,17 @@ def create_crewai_graph_tools(
             max_chunks: int = 25,
         ) -> str:
             def _work() -> str:
+                # Minor Note on max_chunks:
+                # - LLMs may pass strings ("25") or invalid values (negative numbers).
+                # - We coerce and clamp to protect callers and avoid edge-case errors.
+                max_chunks_i = _coerce_bounded_positive_int(
+                    max_chunks,
+                    name="max_chunks",
+                    default=25,
+                    min_value=1,
+                    max_value=100,
+                )
+
                 chunks: List[Any] = []
                 count = 0
                 for ch in client.stream_query(
@@ -2141,11 +2316,11 @@ def create_crewai_graph_tools(
                     task=task,
                     extra_context=extra_context,
                 ):
-                    chunks.append(_json_safe_snapshot(ch))
+                    chunks.append(ch)
                     count += 1
-                    if count >= int(max_chunks):
+                    if count >= max_chunks_i:
                         break
-                return _json_result({"chunks": chunks, "truncated": count >= int(max_chunks)})
+                return _json_result({"chunks": chunks, "truncated": count >= max_chunks_i})
 
             return _bridge_sync_call(_work)
 
@@ -2160,6 +2335,14 @@ def create_crewai_graph_tools(
             extra_context: Optional[Mapping[str, Any]] = None,
             max_chunks: int = 25,
         ) -> str:
+            max_chunks_i = _coerce_bounded_positive_int(
+                max_chunks,
+                name="max_chunks",
+                default=25,
+                min_value=1,
+                max_value=100,
+            )
+
             chunks: List[Any] = []
             count = 0
             async for ch in client.astream_query(
@@ -2171,11 +2354,11 @@ def create_crewai_graph_tools(
                 task=task,
                 extra_context=extra_context,
             ):
-                chunks.append(_json_safe_snapshot(ch))
+                chunks.append(ch)
                 count += 1
-                if count >= int(max_chunks):
+                if count >= max_chunks_i:
                     break
-            return _json_result({"chunks": chunks, "truncated": count >= int(max_chunks)})
+            return _json_result({"chunks": chunks, "truncated": count >= max_chunks_i})
 
     class _GraphBulkVerticesTool(BaseTool):
         name: str
@@ -2193,7 +2376,7 @@ def create_crewai_graph_tools(
             def _work() -> str:
                 spec = BulkVerticesSpec(namespace=namespace, limit=limit, cursor=cursor, filter=filter)
                 res = client.bulk_vertices(spec, task=task, extra_context=extra_context)
-                return _json_result({"result": _json_safe_snapshot(res)})
+                return _json_result({"result": res})
 
             return _bridge_sync_call(_work)
 
@@ -2208,7 +2391,7 @@ def create_crewai_graph_tools(
         ) -> str:
             spec = BulkVerticesSpec(namespace=namespace, limit=limit, cursor=cursor, filter=filter)
             res = await client.abulk_vertices(spec, task=task, extra_context=extra_context)
-            return _json_result({"result": _json_safe_snapshot(res)})
+            return _json_result({"result": res})
 
     class _GraphBatchTool(BaseTool):
         name: str
@@ -2237,7 +2420,7 @@ def create_crewai_graph_tools(
                 validate_batch_operations(batch_ops, operation="batch", error_code=ErrorCodes.INVALID_BATCH_OPS)
 
                 res = client.batch(batch_ops, task=task, extra_context=extra_context)
-                return _json_result({"result": _json_safe_snapshot(res)})
+                return _json_result({"result": res})
 
             return _bridge_sync_call(_work)
 
@@ -2262,7 +2445,7 @@ def create_crewai_graph_tools(
             validate_batch_operations(batch_ops, operation="abatch", error_code=ErrorCodes.INVALID_BATCH_OPS)
 
             res = await client.abatch(batch_ops, task=task, extra_context=extra_context)
-            return _json_result({"result": _json_safe_snapshot(res)})
+            return _json_result({"result": res})
 
     tools: List[Any] = [
         _GraphQueryTool(
