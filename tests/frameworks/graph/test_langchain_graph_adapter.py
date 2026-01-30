@@ -1,19 +1,23 @@
+# tests/frameworks/graph/test_langchain_graph_adapter.py
+
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import Any, Dict, List
-
+import asyncio
 import inspect
+import json
+from collections.abc import Mapping
+from typing import Any, Dict, List, Sequence, Type
 
 import pytest
 
 import corpus_sdk.graph.framework_adapters.langchain as langchain_adapter_module
 from corpus_sdk.graph.framework_adapters.langchain import (
     CorpusLangChainGraphClient,
-    CorpusGraphTool,
     LangChainGraphFrameworkTranslator,
     create_corpus_graph_tool,
+    create_langchain_graph_tools,
 )
+from corpus_sdk.graph.graph_base import BadRequest, NotSupported
 
 
 # ---------------------------------------------------------------------------
@@ -24,6 +28,81 @@ from corpus_sdk.graph.framework_adapters.langchain import (
 def _make_client(adapter: Any, **kwargs: Any) -> CorpusLangChainGraphClient:
     """Construct a CorpusLangChainGraphClient instance from the generic adapter."""
     return CorpusLangChainGraphClient(adapter=adapter, **kwargs)
+
+
+def _patch_create_graph_translator(
+    monkeypatch: pytest.MonkeyPatch,
+    translator_cls: Type[Any],
+) -> None:
+    """
+    Patch create_graph_translator to always return an instance of translator_cls.
+
+    translator_cls is expected to be a class; instances are created with no args.
+    """
+
+    def fake_create_graph_translator(*_: Any, **__: Any) -> Any:
+        return translator_cls()
+
+    monkeypatch.setattr(
+        langchain_adapter_module,
+        "create_graph_translator",
+        fake_create_graph_translator,
+    )
+
+
+def _patch_validate_graph_result_type_passthrough(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Patch validate_graph_result_type to simply return the result unchanged."""
+
+    def fake_validate_graph_result_type(result: Any, **_: Any) -> Any:
+        return result
+
+    monkeypatch.setattr(
+        langchain_adapter_module,
+        "validate_graph_result_type",
+        fake_validate_graph_result_type,
+    )
+
+
+def _tool_sync_call(tool: Any, tool_input: Any) -> Any:
+    """
+    Invoke a LangChain tool using the highest-level public API available.
+
+    We intentionally do NOT import LangChain in this test suite. Instead, we call
+    whichever standard entrypoint exists on the BaseTool instance:
+
+    - invoke(...) (preferred in newer LangChain)
+    - run(...)    (common across many versions)
+    - _run(...)   (last-resort fallback for compatibility)
+
+    This keeps tests "real integration" while remaining resilient to minor
+    LangChain API surface differences.
+    """
+    if hasattr(tool, "invoke") and callable(getattr(tool, "invoke")):
+        return tool.invoke(tool_input)
+    if hasattr(tool, "run") and callable(getattr(tool, "run")):
+        return tool.run(tool_input)
+    # Fallback: direct internal call only if no public tool API exists.
+    return tool._run(tool_input)  # type: ignore[attr-defined]
+
+
+async def _tool_async_call(tool: Any, tool_input: Any) -> Any:
+    """
+    Async invoke a LangChain tool using the highest-level async API available.
+
+    - ainvoke(...) (preferred in newer LangChain)
+    - arun(...)    (common across many versions)
+    - _arun(...)   (last-resort fallback for compatibility)
+
+    As above, we do not import LangChain here; the adapter owns the soft-import.
+    """
+    if hasattr(tool, "ainvoke") and callable(getattr(tool, "ainvoke")):
+        return await tool.ainvoke(tool_input)
+    if hasattr(tool, "arun") and callable(getattr(tool, "arun")):
+        return await tool.arun(tool_input)
+    # Fallback: direct internal call only if no public async tool API exists.
+    return await tool._arun(tool_input)  # type: ignore[attr-defined]
 
 
 # ---------------------------------------------------------------------------
@@ -130,17 +209,12 @@ def test_langchain_config_and_extra_context_passed_to_core_ctx(
     """
     captured: Dict[str, Any] = {}
 
-    # Patch OperationContext inside the module so our fake can return
-    # a simple dummy instance that passes the isinstance() check.
     class DummyOperationContext:
-        def __init__(self, **kwargs: Any) -> None:
-            self.attrs = kwargs
+        def __init__(self) -> None:
+            self.attrs: Dict[str, Any] = {}
 
-    monkeypatch.setattr(
-        langchain_adapter_module,
-        "OperationContext",
-        DummyOperationContext,
-    )
+    # Patch OperationContext inside the module so our dummy passes isinstance() checks.
+    monkeypatch.setattr(langchain_adapter_module, "OperationContext", DummyOperationContext)
 
     def fake_core_ctx_from_langchain(
         config: Any,
@@ -159,34 +233,69 @@ def test_langchain_config_and_extra_context_passed_to_core_ctx(
         fake_core_ctx_from_langchain,
     )
 
-    client = _make_client(
-        adapter,
-        framework_version="langchain-test-version",
-    )
+    client = _make_client(adapter, framework_version="langchain-test-version")
 
     lc_config = {
-        "configurable": {
-            "user_id": "user-123",
-            "run_id": "run-xyz",
-        },
+        "configurable": {"user_id": "user-123", "run_id": "run-xyz"},
         "tags": ["foo", "bar"],
     }
-    extra_ctx = {
-        "request_id": "req-xyz",
-        "tenant": "tenant-1",
-    }
+    extra_ctx = {"request_id": "req-xyz", "tenant": "tenant-1"}
 
-    result = client.query(
-        "MATCH (n) RETURN n LIMIT 1",
-        config=lc_config,
-        extra_context=extra_ctx,
-    )
+    result = client.query("MATCH (n) RETURN n LIMIT 1", config=lc_config, extra_context=extra_ctx)
     assert result is not None
 
     assert captured.get("config") == lc_config
     assert captured.get("framework_version") == "langchain-test-version"
-    # extra_context should be merged into **extra
     assert captured.get("extra") == extra_ctx
+
+
+def test_build_ctx_translation_failure_returns_none_and_attaches_context(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: Any,
+) -> None:
+    """
+    On core_ctx_from_langchain failure, _build_ctx should:
+
+    - attach error context (framework='langchain', operation='context_translation')
+    - return None (best-effort fallback, does not block graph calls)
+    """
+    captured_ctx: Dict[str, Any] = {}
+
+    def fake_attach_context(exc: BaseException, **ctx: Any) -> None:  # noqa: ARG001
+        captured_ctx.update(ctx)
+
+    def fake_core_ctx_from_langchain(*_: Any, **__: Any) -> Any:
+        raise RuntimeError("boom from ctx builder")
+
+    monkeypatch.setattr(langchain_adapter_module, "attach_context", fake_attach_context)
+    monkeypatch.setattr(langchain_adapter_module, "core_ctx_from_langchain", fake_core_ctx_from_langchain)
+
+    client = _make_client(adapter, framework_version="ctx-fw")
+
+    ctx = client._build_ctx(config={"x": 1}, extra_context={"foo": "bar"})  # noqa: SLF001
+    assert ctx is None
+
+    assert captured_ctx.get("framework") == "langchain"
+    assert captured_ctx.get("operation") == "context_translation"
+    assert captured_ctx.get("error_code") == langchain_adapter_module.ErrorCodes.BAD_OPERATION_CONTEXT
+
+
+def test_build_ctx_non_operation_context_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: Any,
+) -> None:
+    """
+    If from_langchain returns an unsupported type, _build_ctx should return None.
+    """
+
+    def fake_core_ctx_from_langchain(*_: Any, **__: Any) -> Any:
+        return object()
+
+    monkeypatch.setattr(langchain_adapter_module, "core_ctx_from_langchain", fake_core_ctx_from_langchain)
+
+    client = _make_client(adapter)
+    ctx = client._build_ctx(config={"x": 1}, extra_context={"foo": "bar"})  # noqa: SLF001
+    assert ctx is None
 
 
 # ---------------------------------------------------------------------------
@@ -204,34 +313,25 @@ def test_error_context_includes_langchain_metadata_sync(
     """
     captured_context: Dict[str, Any] = {}
 
-    def fake_attach_context(exc: BaseException, **ctx: Any) -> None:
+    def fake_attach_context(exc: BaseException, **ctx: Any) -> None:  # noqa: ARG001
         captured_context.update(ctx)
 
-    monkeypatch.setattr(
-        langchain_adapter_module,
-        "attach_context",
-        fake_attach_context,
-    )
+    monkeypatch.setattr(langchain_adapter_module, "attach_context", fake_attach_context)
 
     class FailingTranslator:
         def query(self, *args: Any, **kwargs: Any) -> Any:  # noqa: ARG002
             raise RuntimeError("test error from langchain graph adapter")
 
-    def fake_create_graph_translator(*_: Any, **__: Any) -> Any:
-        return FailingTranslator()
-
     monkeypatch.setattr(
         langchain_adapter_module,
         "create_graph_translator",
-        fake_create_graph_translator,
+        lambda *_args, **_kwargs: FailingTranslator(),
     )
 
     client = _make_client(adapter)
 
-    config = {"configurable": {"user_id": "u-sync"}}
-
     with pytest.raises(RuntimeError, match="test error from langchain graph adapter"):
-        client.query("MATCH (n) RETURN n", config=config)
+        client.query("MATCH (n) RETURN n", config={"configurable": {"user_id": "u-sync"}})
 
     assert captured_context, "attach_context was not called"
     assert captured_context.get("framework") == "langchain"
@@ -248,34 +348,25 @@ async def test_error_context_includes_langchain_metadata_async(
     """
     captured_context: Dict[str, Any] = {}
 
-    def fake_attach_context(exc: BaseException, **ctx: Any) -> None:
+    def fake_attach_context(exc: BaseException, **ctx: Any) -> None:  # noqa: ARG001
         captured_context.update(ctx)
 
-    monkeypatch.setattr(
-        langchain_adapter_module,
-        "attach_context",
-        fake_attach_context,
-    )
+    monkeypatch.setattr(langchain_adapter_module, "attach_context", fake_attach_context)
 
     class FailingTranslator:
         async def arun_query(self, *args: Any, **kwargs: Any) -> Any:  # noqa: ARG002
             raise RuntimeError("test error from langchain graph adapter")
 
-    def fake_create_graph_translator(*_: Any, **__: Any) -> Any:
-        return FailingTranslator()
-
     monkeypatch.setattr(
         langchain_adapter_module,
         "create_graph_translator",
-        fake_create_graph_translator,
+        lambda *_args, **_kwargs: FailingTranslator(),
     )
 
     client = _make_client(adapter)
 
-    config = {"configurable": {"user_id": "u-async"}}
-
     with pytest.raises(RuntimeError, match="test error from langchain graph adapter"):
-        await client.aquery("MATCH (n) RETURN n", config=config)
+        await client.aquery("MATCH (n) RETURN n", config={"configurable": {"user_id": "u-async"}})
 
     assert captured_context, "attach_context was not called"
     assert captured_context.get("framework") == "langchain"
@@ -297,11 +388,9 @@ def test_sync_query_and_stream_basic(adapter: Any) -> None:
     """
     client = _make_client(adapter, default_namespace="lc-ns")
 
-    # Non-streaming query
     result = client.query("MATCH (n) RETURN n LIMIT 1")
     assert result is not None
 
-    # Streaming query
     chunks = list(client.stream_query("MATCH (n) RETURN n LIMIT 2"))
     assert isinstance(chunks, list)
 
@@ -325,6 +414,25 @@ def test_sync_query_accepts_optional_params_and_config(adapter: Any) -> None:
     assert result is not None
 
 
+def test_sync_stream_query_accepts_optional_params_and_config(adapter: Any) -> None:
+    """
+    stream_query() should accept the same optional parameters as query().
+    """
+    client = _make_client(adapter, default_dialect="cypher")
+    chunks = list(
+        client.stream_query(
+            "MATCH (n) RETURN n LIMIT $limit",
+            params={"limit": 2},
+            dialect="cypher",
+            namespace="ctx-ns",
+            timeout_ms=2500,
+            config={"configurable": {"user_id": "u-sync"}},
+            extra_context={"request_id": "req-sync"},
+        )
+    )
+    assert isinstance(chunks, list)
+
+
 # ---------------------------------------------------------------------------
 # Async semantics (basic smoke tests + sync/async parity)
 # ---------------------------------------------------------------------------
@@ -338,50 +446,29 @@ async def test_async_query_and_stream_basic(adapter: Any) -> None:
 
     Also asserts:
     - aquery() returns the same *type* as query()
-    - astream_query() returns an async-iterable object (after any awaiting).
+    - astream_query() returns an async-iterable object.
     """
     client = _make_client(adapter)
 
-    assert hasattr(client, "aquery")
-    assert hasattr(client, "astream_query")
-
-    # Sync vs async query type parity
     sync_result = client.query("MATCH (n) RETURN n LIMIT 1")
     assert sync_result is not None
 
-    coro = client.aquery("MATCH (n) RETURN n LIMIT 1")
-    assert inspect.isawaitable(coro)
-    async_result = await coro
+    async_result = await client.aquery("MATCH (n) RETURN n LIMIT 1")
     assert async_result is not None
+    assert type(sync_result) is type(async_result)  # noqa: E721
 
-    assert type(sync_result) is type(  # noqa: E721
-        async_result
-    ), "query and aquery should return the same result type"
-
-    # Async streaming contract: awaitable or async-iterable, but must end up
-    # as an async-iterable object.
     aiter = client.astream_query("MATCH (n) RETURN n LIMIT 2")
-    if inspect.isawaitable(aiter):
-        aiter = await aiter  # type: ignore[assignment]
-
-    # Stronger contract: object must be async-iterable
-    assert hasattr(
-        aiter,
-        "__aiter__",
-    ), "astream_query must return an async-iterable (or awaitable resolving to one)"
+    assert hasattr(aiter, "__aiter__"), "astream_query must return an async-iterable"
 
     seen_any = False
     async for _ in aiter:  # noqa: B007
         seen_any = True
         break
-
     assert isinstance(seen_any, bool)
 
 
 @pytest.mark.asyncio
-async def test_async_query_accepts_optional_params_and_config(
-    adapter: Any,
-) -> None:
+async def test_async_query_accepts_optional_params_and_config(adapter: Any) -> None:
     """
     aquery() should accept the same optional params and context as query().
     """
@@ -400,7 +487,436 @@ async def test_async_query_accepts_optional_params_and_config(
 
 
 # ---------------------------------------------------------------------------
-# Bulk vertices / batch semantics (LangChain wiring)
+# Sync-in-event-loop safety guards (must raise on sync APIs)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sync_query_guard_raises_in_event_loop(adapter: Any) -> None:
+    client = _make_client(adapter)
+    with pytest.raises(RuntimeError, match="active asyncio event loop"):
+        client.query("MATCH (n) RETURN n LIMIT 1")
+
+
+@pytest.mark.asyncio
+async def test_sync_stream_query_guard_raises_in_event_loop(adapter: Any) -> None:
+    client = _make_client(adapter)
+    with pytest.raises(RuntimeError, match="active asyncio event loop"):
+        list(client.stream_query("MATCH (n) RETURN n LIMIT 1"))
+
+
+@pytest.mark.asyncio
+async def test_sync_capabilities_guard_raises_in_event_loop(adapter: Any) -> None:
+    client = _make_client(adapter)
+    with pytest.raises(RuntimeError, match="active asyncio event loop"):
+        client.capabilities()
+
+
+@pytest.mark.asyncio
+async def test_sync_get_schema_guard_raises_in_event_loop(adapter: Any) -> None:
+    client = _make_client(adapter)
+    with pytest.raises(RuntimeError, match="active asyncio event loop"):
+        client.get_schema()
+
+
+@pytest.mark.asyncio
+async def test_sync_health_guard_raises_in_event_loop(adapter: Any) -> None:
+    client = _make_client(adapter)
+    with pytest.raises(RuntimeError, match="active asyncio event loop"):
+        client.health()
+
+
+@pytest.mark.asyncio
+async def test_sync_upsert_nodes_guard_raises_in_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: Any,
+) -> None:
+    client = _make_client(adapter)
+
+    # Avoid depending on UpsertNodesSpec shape: the guard triggers before validation.
+    class DummySpec:
+        nodes: List[Any] = []
+
+    with pytest.raises(RuntimeError, match="active asyncio event loop"):
+        client.upsert_nodes(DummySpec())  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_sync_upsert_edges_guard_raises_in_event_loop(adapter: Any) -> None:
+    client = _make_client(adapter)
+
+    class DummySpec:
+        edges: List[Any] = []
+
+    with pytest.raises(RuntimeError, match="active asyncio event loop"):
+        client.upsert_edges(DummySpec())  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_sync_delete_nodes_guard_raises_in_event_loop(adapter: Any) -> None:
+    client = _make_client(adapter)
+
+    class DummySpec:
+        filter = {"x": 1}
+        ids = None
+        namespace = None
+
+    with pytest.raises(RuntimeError, match="active asyncio event loop"):
+        client.delete_nodes(DummySpec())  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_sync_delete_edges_guard_raises_in_event_loop(adapter: Any) -> None:
+    client = _make_client(adapter)
+
+    class DummySpec:
+        filter = {"x": 1}
+        ids = None
+        namespace = None
+
+    with pytest.raises(RuntimeError, match="active asyncio event loop"):
+        client.delete_edges(DummySpec())  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_sync_bulk_vertices_guard_raises_in_event_loop(adapter: Any) -> None:
+    client = _make_client(adapter)
+
+    class DummySpec:
+        namespace = None
+        limit = 10
+        cursor = None
+        filter = None
+
+    with pytest.raises(RuntimeError, match="active asyncio event loop"):
+        client.bulk_vertices(DummySpec())  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_sync_batch_guard_raises_in_event_loop(adapter: Any) -> None:
+    client = _make_client(adapter)
+    with pytest.raises(RuntimeError, match="active asyncio event loop"):
+        client.batch([])  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Dialect fallback (NotSupported) behavior
+# ---------------------------------------------------------------------------
+
+
+def test_query_dialect_fallback_sync_when_not_supported(monkeypatch: pytest.MonkeyPatch, adapter: Any) -> None:
+    """
+    If the translator raises NotSupported and a dialect was explicitly provided,
+    the adapter should retry without dialect (best-effort).
+    """
+    calls: List[Dict[str, Any]] = []
+
+    class Translator:
+        def query(self, raw_query: Mapping[str, Any], **_: Any) -> Any:
+            calls.append(dict(raw_query))
+            if "dialect" in raw_query:
+                raise NotSupported("dialect not supported")
+            return "ok"
+
+    _patch_create_graph_translator(monkeypatch, Translator)
+    _patch_validate_graph_result_type_passthrough(monkeypatch)
+
+    client = _make_client(adapter)
+    out = client.query("MATCH (n) RETURN n", dialect="cypher")
+    assert out == "ok"
+    assert len(calls) == 2
+    assert "dialect" in calls[0]
+    assert "dialect" not in calls[1]
+
+
+@pytest.mark.asyncio
+async def test_query_dialect_fallback_async_when_not_supported(monkeypatch: pytest.MonkeyPatch, adapter: Any) -> None:
+    """
+    Async dialect fallback mirrors sync behavior.
+    """
+    calls: List[Dict[str, Any]] = []
+
+    class Translator:
+        async def arun_query(self, raw_query: Mapping[str, Any], **_: Any) -> Any:
+            calls.append(dict(raw_query))
+            if "dialect" in raw_query:
+                raise NotSupported("dialect not supported")
+            return "ok-async"
+
+    _patch_create_graph_translator(monkeypatch, Translator)
+    _patch_validate_graph_result_type_passthrough(monkeypatch)
+
+    client = _make_client(adapter)
+    out = await client.aquery("MATCH (n) RETURN n", dialect="cypher")
+    assert out == "ok-async"
+    assert len(calls) == 2
+    assert "dialect" in calls[0]
+    assert "dialect" not in calls[1]
+
+
+# ---------------------------------------------------------------------------
+# Query parameter validation
+# ---------------------------------------------------------------------------
+
+
+def test_query_params_rejects_non_mapping_sync(adapter: Any) -> None:
+    client = _make_client(adapter)
+    with pytest.raises(TypeError, match="params must be a mapping"):
+        client.query("MATCH (n) RETURN n", params="not-a-mapping")  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_query_params_rejects_non_mapping_async(adapter: Any) -> None:
+    client = _make_client(adapter)
+    with pytest.raises(TypeError, match="params must be a mapping"):
+        await client.aquery("MATCH (n) RETURN n", params="not-a-mapping")  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Delete spec validation (filter OR non-empty ids required)
+# ---------------------------------------------------------------------------
+
+
+def test_delete_nodes_requires_filter_or_ids_sync(monkeypatch: pytest.MonkeyPatch, adapter: Any) -> None:
+    class DummyTranslator:
+        def delete_nodes(self, *_: Any, **__: Any) -> Any:
+            return "ok"
+
+    _patch_create_graph_translator(monkeypatch, DummyTranslator)
+    _patch_validate_graph_result_type_passthrough(monkeypatch)
+
+    client = _make_client(adapter)
+
+    class Spec:
+        filter = None
+        ids: List[str] = []
+        namespace = None
+
+    with pytest.raises(BadRequest, match="either filter or non-empty ids"):
+        client.delete_nodes(Spec())  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_delete_nodes_requires_filter_or_ids_async(monkeypatch: pytest.MonkeyPatch, adapter: Any) -> None:
+    class DummyTranslator:
+        async def arun_delete_nodes(self, *_: Any, **__: Any) -> Any:
+            return "ok"
+
+    _patch_create_graph_translator(monkeypatch, DummyTranslator)
+    _patch_validate_graph_result_type_passthrough(monkeypatch)
+
+    client = _make_client(adapter)
+
+    class Spec:
+        filter = None
+        ids: List[str] = []
+        namespace = None
+
+    with pytest.raises(BadRequest, match="either filter or non-empty ids"):
+        await client.adelete_nodes(Spec())  # type: ignore[arg-type]
+
+
+def test_delete_edges_requires_filter_or_ids_sync(monkeypatch: pytest.MonkeyPatch, adapter: Any) -> None:
+    class DummyTranslator:
+        def delete_edges(self, *_: Any, **__: Any) -> Any:
+            return "ok"
+
+    _patch_create_graph_translator(monkeypatch, DummyTranslator)
+    _patch_validate_graph_result_type_passthrough(monkeypatch)
+
+    client = _make_client(adapter)
+
+    class Spec:
+        filter = None
+        ids: List[str] = []
+        namespace = None
+
+    with pytest.raises(BadRequest, match="either filter or non-empty ids"):
+        client.delete_edges(Spec())  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_delete_edges_requires_filter_or_ids_async(monkeypatch: pytest.MonkeyPatch, adapter: Any) -> None:
+    class DummyTranslator:
+        async def arun_delete_edges(self, *_: Any, **__: Any) -> Any:
+            return "ok"
+
+    _patch_create_graph_translator(monkeypatch, DummyTranslator)
+    _patch_validate_graph_result_type_passthrough(monkeypatch)
+
+    client = _make_client(adapter)
+
+    class Spec:
+        filter = None
+        ids: List[str] = []
+        namespace = None
+
+    with pytest.raises(BadRequest, match="either filter or non-empty ids"):
+        await client.adelete_edges(Spec())  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Upsert edges validation (no mutation, list returned)
+# ---------------------------------------------------------------------------
+
+
+def test_validate_upsert_edges_returns_list_without_mutating_spec(adapter: Any) -> None:
+    client = _make_client(adapter)
+
+    class Edge:
+        def __init__(self, id: str) -> None:
+            self.id = id
+
+    class Spec:
+        def __init__(self) -> None:
+            self.edges = (Edge("e1"), Edge("e2"))
+
+    spec = Spec()
+    original_edges_obj = spec.edges
+
+    edges = client._validate_upsert_edges_spec(spec)  # noqa: SLF001
+    assert isinstance(edges, list)
+    assert len(edges) == 2
+    # Ensure the original spec attribute is not mutated/reassigned.
+    assert spec.edges is original_edges_obj
+
+
+def test_upsert_edges_uses_validated_edges_list(monkeypatch: pytest.MonkeyPatch, adapter: Any) -> None:
+    captured: Dict[str, Any] = {}
+
+    class DummyTranslator:
+        def upsert_edges(self, raw_edges: Any, **_: Any) -> Any:
+            captured["raw_edges"] = raw_edges
+            return "ok"
+
+    _patch_create_graph_translator(monkeypatch, DummyTranslator)
+    _patch_validate_graph_result_type_passthrough(monkeypatch)
+
+    client = _make_client(adapter)
+
+    class Edge:
+        def __init__(self, id: str) -> None:
+            self.id = id
+
+    class Spec:
+        def __init__(self) -> None:
+            self.edges = (Edge("e1"), Edge("e2"))
+            self.namespace = None
+
+    out = client.upsert_edges(Spec())  # type: ignore[arg-type]
+    assert out == "ok"
+    assert isinstance(captured["raw_edges"], list)
+    assert len(captured["raw_edges"]) == 2
+
+
+# ---------------------------------------------------------------------------
+# Streaming chunk validation + awaitable stream normalization
+# ---------------------------------------------------------------------------
+
+
+def test_stream_query_invalid_chunk_triggers_validation(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: Any,
+) -> None:
+    """
+    If the translator yields invalid chunks, stream_query should pass them
+    through validate_graph_result_type, and failures there should surface
+    to the caller.
+    """
+    captured: Dict[str, Any] = {}
+
+    class BadChunkTranslator:
+        def query_stream(self, *_: Any, **__: Any):
+            yield "not-a-chunk"
+
+    _patch_create_graph_translator(monkeypatch, BadChunkTranslator)
+
+    def fake_validate_graph_result_type(result: Any, **kwargs: Any) -> Any:
+        captured["result"] = result
+        captured["kwargs"] = kwargs
+        raise RuntimeError("forced validation failure for chunk")
+
+    monkeypatch.setattr(langchain_adapter_module, "validate_graph_result_type", fake_validate_graph_result_type)
+
+    client = _make_client(adapter)
+
+    iterator = client.stream_query("MATCH (n) RETURN n")
+    with pytest.raises(RuntimeError, match="forced validation failure for chunk"):
+        next(iterator)
+
+    assert captured.get("result") == "not-a-chunk"
+    assert "expected_type" in captured.get("kwargs", {})
+
+
+@pytest.mark.asyncio
+async def test_astream_query_handles_awaitable_return_from_translator(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: Any,
+) -> None:
+    """
+    astream_query should tolerate translators that return an awaitable resolving
+    to an async iterator (defensive normalization).
+    """
+
+    class Translator:
+        async def arun_query_stream(self, *_: Any, **__: Any) -> Any:
+            async def gen() -> Any:
+                yield {"records": [1], "is_final": True}
+
+            return gen()
+
+    _patch_create_graph_translator(monkeypatch, Translator)
+
+    # Make validation a pass-through so we don't depend on QueryChunk shapes here.
+    _patch_validate_graph_result_type_passthrough(monkeypatch)
+
+    client = _make_client(adapter)
+
+    seen = 0
+    async for _ in client.astream_query("MATCH (n) RETURN n LIMIT 1"):
+        seen += 1
+    assert seen >= 1
+
+
+@pytest.mark.asyncio
+async def test_astream_query_invalid_chunk_triggers_validation_async(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: Any,
+) -> None:
+    """
+    Async streaming path should also exercise validate_graph_result_type when
+    chunks are invalid.
+    """
+    captured: Dict[str, Any] = {}
+
+    class BadChunkTranslator:
+        async def arun_query_stream(self, *_: Any, **__: Any) -> Any:
+            async def gen() -> Any:
+                yield "not-a-chunk-async"
+
+            return gen()
+
+    _patch_create_graph_translator(monkeypatch, BadChunkTranslator)
+
+    def fake_validate_graph_result_type(result: Any, **kwargs: Any) -> Any:
+        captured["result"] = result
+        captured["kwargs"] = kwargs
+        raise RuntimeError("forced validation failure for async chunk")
+
+    monkeypatch.setattr(langchain_adapter_module, "validate_graph_result_type", fake_validate_graph_result_type)
+
+    client = _make_client(adapter)
+
+    with pytest.raises(RuntimeError, match="forced validation failure for async chunk"):
+        async for _ in client.astream_query("MATCH (n) RETURN n"):
+            break
+
+    assert captured.get("result") == "not-a-chunk-async"
+    assert "expected_type" in captured.get("kwargs", {})
+
+
+# ---------------------------------------------------------------------------
+# Bulk vertices / batch wiring (LangChain adapter)
 # ---------------------------------------------------------------------------
 
 
@@ -408,72 +924,39 @@ def test_bulk_vertices_builds_raw_request_and_calls_translator(
     monkeypatch: pytest.MonkeyPatch,
     adapter: Any,
 ) -> None:
-    """
-    bulk_vertices() should:
-
-    - Build the correct raw_request mapping from the spec, and
-    - Call the underlying translator.bulk_vertices with that mapping and
-      appropriate framework_ctx (namespace, framework, operation).
-    """
     captured: Dict[str, Any] = {}
 
     class DummyTranslator:
-        def bulk_vertices(
-            self,
-            raw_request: Mapping[str, Any],
-            *,
-            op_ctx: Any = None,
-            framework_ctx: Mapping[str, Any] | None = None,
-        ) -> Any:
+        def bulk_vertices(self, raw_request: Mapping[str, Any], **kwargs: Any) -> Any:
             captured["raw_request"] = dict(raw_request)
-            captured["op_ctx"] = op_ctx
-            captured["framework_ctx"] = dict(framework_ctx or {})
+            captured["framework_ctx"] = dict(kwargs.get("framework_ctx") or {})
             return "bulk-result"
 
-    def fake_create_graph_translator(*_: Any, **__: Any) -> Any:
-        return DummyTranslator()
+    _patch_create_graph_translator(monkeypatch, DummyTranslator)
+    _patch_validate_graph_result_type_passthrough(monkeypatch)
 
-    def fake_validate_graph_result_type(result: Any, **_: Any) -> Any:
-        return result
+    client = _make_client(adapter, framework_version="fw-bulk-1")
 
-    monkeypatch.setattr(
-        langchain_adapter_module,
-        "create_graph_translator",
-        fake_create_graph_translator,
-    )
-    monkeypatch.setattr(
-        langchain_adapter_module,
-        "validate_graph_result_type",
-        fake_validate_graph_result_type,
-    )
+    class Spec:
+        namespace = "ns-bulk"
+        limit = 42
+        cursor = "cursor-token"
+        filter = {"foo": "bar"}
 
-    client = _make_client(adapter)
-
-    class DummyBulkSpec:
-        def __init__(self) -> None:
-            self.namespace = "ns-bulk"
-            self.limit = 42
-            self.cursor = "cursor-token"
-            self.filter = {"foo": "bar"}
-
-    spec = DummyBulkSpec()
-
-    result = client.bulk_vertices(spec)
+    result = client.bulk_vertices(Spec())  # type: ignore[arg-type]
     assert result == "bulk-result"
 
-    raw = captured["raw_request"]
-    assert raw == {
+    assert captured["raw_request"] == {
         "namespace": "ns-bulk",
         "limit": 42,
         "cursor": "cursor-token",
         "filter": {"foo": "bar"},
     }
-
     fw_ctx = captured["framework_ctx"]
     assert fw_ctx.get("framework") == "langchain"
     assert fw_ctx.get("operation") == "bulk_vertices"
     assert fw_ctx.get("namespace") == "ns-bulk"
-    assert captured["op_ctx"] is None
+    assert fw_ctx.get("framework_version") == "fw-bulk-1"
 
 
 @pytest.mark.asyncio
@@ -481,148 +964,76 @@ async def test_abulk_vertices_builds_raw_request_and_calls_translator_async(
     monkeypatch: pytest.MonkeyPatch,
     adapter: Any,
 ) -> None:
-    """
-    abulk_vertices() should mirror bulk_vertices wiring but via the async
-    translator.arun_bulk_vertices surface.
-    """
     captured: Dict[str, Any] = {}
 
     class DummyTranslator:
-        async def arun_bulk_vertices(
-            self,
-            raw_request: Mapping[str, Any],
-            *,
-            op_ctx: Any = None,
-            framework_ctx: Mapping[str, Any] | None = None,
-        ) -> Any:
+        async def arun_bulk_vertices(self, raw_request: Mapping[str, Any], **kwargs: Any) -> Any:
             captured["raw_request"] = dict(raw_request)
-            captured["op_ctx"] = op_ctx
-            captured["framework_ctx"] = dict(framework_ctx or {})
+            captured["framework_ctx"] = dict(kwargs.get("framework_ctx") or {})
             return "bulk-result-async"
 
-    def fake_create_graph_translator(*_: Any, **__: Any) -> Any:
-        return DummyTranslator()
+    _patch_create_graph_translator(monkeypatch, DummyTranslator)
+    _patch_validate_graph_result_type_passthrough(monkeypatch)
 
-    def fake_validate_graph_result_type(result: Any, **_: Any) -> Any:
-        return result
+    client = _make_client(adapter, framework_version="fw-abulk-1")
 
-    monkeypatch.setattr(
-        langchain_adapter_module,
-        "create_graph_translator",
-        fake_create_graph_translator,
-    )
-    monkeypatch.setattr(
-        langchain_adapter_module,
-        "validate_graph_result_type",
-        fake_validate_graph_result_type,
-    )
+    class Spec:
+        namespace = "ns-abulk"
+        limit = 7
+        cursor = None
+        filter = {"bar": 1}
 
-    client = _make_client(adapter)
-
-    class DummyBulkSpec:
-        def __init__(self) -> None:
-            self.namespace = "ns-abulk"
-            self.limit = 7
-            self.cursor = None
-            self.filter = {"bar": 1}
-
-    spec = DummyBulkSpec()
-
-    result = await client.abulk_vertices(spec)
+    result = await client.abulk_vertices(Spec())  # type: ignore[arg-type]
     assert result == "bulk-result-async"
 
-    raw = captured["raw_request"]
-    assert raw == {
+    assert captured["raw_request"] == {
         "namespace": "ns-abulk",
         "limit": 7,
         "cursor": None,
         "filter": {"bar": 1},
     }
-
     fw_ctx = captured["framework_ctx"]
     assert fw_ctx.get("framework") == "langchain"
     assert fw_ctx.get("operation") == "bulk_vertices"
     assert fw_ctx.get("namespace") == "ns-abulk"
-    assert captured["op_ctx"] is None
+    assert fw_ctx.get("framework_version") == "fw-abulk-1"
 
 
-def test_batch_builds_raw_batch_ops_and_calls_translator(
-    monkeypatch: pytest.MonkeyPatch,
-    adapter: Any,
-) -> None:
-    """
-    batch() should:
-
-    - Validate batch operations (we stub validation here),
-    - Translate BatchOperation-like objects into raw_batch_ops mappings
-      passed to translator.batch(),
-    - Pass a framework_ctx containing framework='langchain' and operation='batch'.
-    """
+def test_batch_builds_raw_batch_ops_and_calls_translator(monkeypatch: pytest.MonkeyPatch, adapter: Any) -> None:
     captured: Dict[str, Any] = {}
 
     class DummyTranslator:
-        def batch(
-            self,
-            raw_batch_ops: List[Mapping[str, Any]],
-            *,
-            op_ctx: Any = None,
-            framework_ctx: Mapping[str, Any] | None = None,
-        ) -> Any:
+        def batch(self, raw_batch_ops: List[Mapping[str, Any]], **kwargs: Any) -> Any:
             captured["raw_batch_ops"] = [dict(op) for op in raw_batch_ops]
-            captured["op_ctx"] = op_ctx
-            captured["framework_ctx"] = dict(framework_ctx or {})
+            captured["framework_ctx"] = dict(kwargs.get("framework_ctx") or {})
             return "batch-result"
 
-    def fake_create_graph_translator(*_: Any, **__: Any) -> Any:
-        return DummyTranslator()
+    _patch_create_graph_translator(monkeypatch, DummyTranslator)
+    _patch_validate_graph_result_type_passthrough(monkeypatch)
 
-    def fake_validate_graph_result_type(result: Any, **_: Any) -> Any:
-        return result
+    # Stub validation for wiring-level test only.
+    monkeypatch.setattr(langchain_adapter_module, "validate_batch_operations", lambda *_a, **_k: None)
 
-    def fake_validate_batch_operations(*_: Any, **__: Any) -> None:
-        return None
-
-    monkeypatch.setattr(
-        langchain_adapter_module,
-        "create_graph_translator",
-        fake_create_graph_translator,
-    )
-    monkeypatch.setattr(
-        langchain_adapter_module,
-        "validate_graph_result_type",
-        fake_validate_graph_result_type,
-    )
-    monkeypatch.setattr(
-        langchain_adapter_module,
-        "validate_batch_operations",
-        fake_validate_batch_operations,
-    )
-
-    client = _make_client(adapter)
+    client = _make_client(adapter, framework_version="fw-batch-1")
 
     class DummyBatchOp:
         def __init__(self, op: str, args: Mapping[str, Any]) -> None:
             self.op = op
             self.args = dict(args)
 
-    ops = [
-        DummyBatchOp("upsert_nodes", {"id": "1"}),
-        DummyBatchOp("delete_nodes", {"ids": ["1", "2"]}),
-    ]
+    ops = [DummyBatchOp("upsert_nodes", {"id": "1"}), DummyBatchOp("delete_nodes", {"ids": ["1", "2"]})]
 
-    result = client.batch(ops)
+    result = client.batch(ops)  # type: ignore[arg-type]
     assert result == "batch-result"
 
-    raw_ops = captured["raw_batch_ops"]
-    assert raw_ops == [
+    assert captured["raw_batch_ops"] == [
         {"op": "upsert_nodes", "args": {"id": "1"}},
         {"op": "delete_nodes", "args": {"ids": ["1", "2"]}},
     ]
-
     fw_ctx = captured["framework_ctx"]
     assert fw_ctx.get("framework") == "langchain"
     assert fw_ctx.get("operation") == "batch"
-    assert captured["op_ctx"] is None
+    assert fw_ctx.get("framework_version") == "fw-batch-1"
 
 
 @pytest.mark.asyncio
@@ -630,74 +1041,39 @@ async def test_abatch_builds_raw_batch_ops_and_calls_translator_async(
     monkeypatch: pytest.MonkeyPatch,
     adapter: Any,
 ) -> None:
-    """
-    abatch() should mirror batch wiring but via translator.arun_batch.
-    """
     captured: Dict[str, Any] = {}
 
     class DummyTranslator:
-        async def arun_batch(
-            self,
-            raw_batch_ops: List[Mapping[str, Any]],
-            *,
-            op_ctx: Any = None,
-            framework_ctx: Mapping[str, Any] | None = None,
-        ) -> Any:
+        async def arun_batch(self, raw_batch_ops: List[Mapping[str, Any]], **kwargs: Any) -> Any:
             captured["raw_batch_ops"] = [dict(op) for op in raw_batch_ops]
-            captured["op_ctx"] = op_ctx
-            captured["framework_ctx"] = dict(framework_ctx or {})
+            captured["framework_ctx"] = dict(kwargs.get("framework_ctx") or {})
             return "batch-result-async"
 
-    def fake_create_graph_translator(*_: Any, **__: Any) -> Any:
-        return DummyTranslator()
+    _patch_create_graph_translator(monkeypatch, DummyTranslator)
+    _patch_validate_graph_result_type_passthrough(monkeypatch)
 
-    def fake_validate_graph_result_type(result: Any, **_: Any) -> Any:
-        return result
+    monkeypatch.setattr(langchain_adapter_module, "validate_batch_operations", lambda *_a, **_k: None)
 
-    def fake_validate_batch_operations(*_: Any, **__: Any) -> None:
-        return None
-
-    monkeypatch.setattr(
-        langchain_adapter_module,
-        "create_graph_translator",
-        fake_create_graph_translator,
-    )
-    monkeypatch.setattr(
-        langchain_adapter_module,
-        "validate_graph_result_type",
-        fake_validate_graph_result_type,
-    )
-    monkeypatch.setattr(
-        langchain_adapter_module,
-        "validate_batch_operations",
-        fake_validate_batch_operations,
-    )
-
-    client = _make_client(adapter)
+    client = _make_client(adapter, framework_version="fw-abatch-1")
 
     class DummyBatchOp:
         def __init__(self, op: str, args: Mapping[str, Any]) -> None:
             self.op = op
             self.args = dict(args)
 
-    ops = [
-        DummyBatchOp("upsert_edges", {"id": "e-1"}),
-        DummyBatchOp("delete_edges", {"ids": ["e-1", "e-2"]}),
-    ]
+    ops = [DummyBatchOp("upsert_edges", {"id": "e-1"}), DummyBatchOp("delete_edges", {"ids": ["e-1", "e-2"]})]
 
-    result = await client.abatch(ops)
+    result = await client.abatch(ops)  # type: ignore[arg-type]
     assert result == "batch-result-async"
 
-    raw_ops = captured["raw_batch_ops"]
-    assert raw_ops == [
+    assert captured["raw_batch_ops"] == [
         {"op": "upsert_edges", "args": {"id": "e-1"}},
         {"op": "delete_edges", "args": {"ids": ["e-1", "e-2"]}},
     ]
-
     fw_ctx = captured["framework_ctx"]
     assert fw_ctx.get("framework") == "langchain"
     assert fw_ctx.get("operation") == "batch"
-    assert captured["op_ctx"] is None
+    assert fw_ctx.get("framework_version") == "fw-abatch-1"
 
 
 # ---------------------------------------------------------------------------
@@ -706,51 +1082,29 @@ async def test_abatch_builds_raw_batch_ops_and_calls_translator_async(
 
 
 def test_capabilities_and_health_basic(adapter: Any) -> None:
-    """
-    Capabilities and health should be surfaced as mappings.
-
-    The detailed structure is tested in framework-agnostic graph contract
-    tests; here we only assert that the LangChain adapter normalizes to
-    mapping-like results.
-    """
     client = _make_client(adapter)
-
-    caps = client.capabilities()
-    assert isinstance(caps, Mapping)
-
-    health = client.health()
-    assert isinstance(health, Mapping)
+    assert isinstance(client.capabilities(), Mapping)
+    assert isinstance(client.health(), Mapping)
 
 
 @pytest.mark.asyncio
-async def test_async_capabilities_and_health_basic(adapter: Any) -> None:
-    """
-    Async capabilities/health should also return mappings compatible with
-    the sync variants, and expose the same key sets for basic parity.
-    """
+async def test_async_capabilities_and_health_basic_parity(adapter: Any) -> None:
     client = _make_client(adapter)
 
-    # Sync values for comparison
     caps = client.capabilities()
     health = client.health()
 
     acaps = await client.acapabilities()
-    assert isinstance(acaps, Mapping)
-
     ahealth = await client.ahealth()
-    assert isinstance(ahealth, Mapping)
 
-    # Parity: async should expose the same keys as sync
-    assert set(acaps.keys()) == set(
-        caps.keys(),
-    ), "acapabilities should expose the same keys as capabilities"
-    assert set(ahealth.keys()) == set(
-        health.keys(),
-    ), "ahealth should expose the same keys as health"
+    assert isinstance(acaps, Mapping)
+    assert isinstance(ahealth, Mapping)
+    assert set(acaps.keys()) == set(caps.keys())
+    assert set(ahealth.keys()) == set(health.keys())
 
 
 # ---------------------------------------------------------------------------
-# Resource management (context managers)
+# Resource management (context managers + executor lifecycle)
 # ---------------------------------------------------------------------------
 
 
@@ -780,132 +1134,173 @@ async def test_context_manager_closes_underlying_adapter() -> None:
 
     adapter = ClosingGraphAdapter()
 
-    # Sync context manager
     with CorpusLangChainGraphClient(adapter=adapter) as client:
         assert client is not None
-
     assert adapter.closed is True
 
-    # Async context manager
     adapter2 = ClosingGraphAdapter()
     client2 = CorpusLangChainGraphClient(adapter=adapter2)
 
     async with client2:
         assert client2 is not None
-
     assert adapter2.aclosed is True
 
 
+def test_close_idempotent_and_shuts_down_tool_executor(adapter: Any) -> None:
+    """
+    close() should be idempotent and also stop the optional bounded tool executor.
+
+    We avoid importing LangChain here; tool creation itself exercises the soft import.
+    """
+    client = _make_client(adapter)
+
+    # First close should succeed.
+    client.close()
+    # Second close should be a no-op.
+    client.close()
+
+    # The executor is a module-level optional; after close it should be cleared.
+    assert getattr(langchain_adapter_module, "_LANGCHAIN_TOOL_BRIDGE_EXECUTOR") is None
+
+
 # ---------------------------------------------------------------------------
-# CorpusGraphTool behavior / LangChain integration
+# Real LangChain tool integration tests (no skips; hard-fail if LangChain missing)
 # ---------------------------------------------------------------------------
 
 
-def test_corpus_graph_tool_parses_string_and_mapping_input(
-    adapter: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_create_langchain_graph_tools_returns_real_tools(adapter: Any) -> None:
     """
-    CorpusGraphTool should:
+    Tool creation should return a list of tool objects.
 
-    - Accept plain string input as a query.
-    - Accept mapping input with 'query' and optional fields.
-    - Delegate to underlying client's query() method.
+    This is a *real integration* test:
+    - It will fail if LangChain is not installed (by design; no skips).
+    - It does not import LangChain in the test; the adapter owns soft import.
     """
-    captured: Dict[str, Any] = {}
-
-    class DummyClient(CorpusLangChainGraphClient):
-        def __init__(self) -> None:
-            # Avoid needing a real graph adapter here
-            pass
-
-        def query(self, *args: Any, **kwargs: Any) -> Any:  # noqa: ARG002
-            captured["kwargs"] = kwargs
-            return {"ok": True, "query": kwargs.get("query")}
-
-    dummy_client = DummyClient()
-    tool = CorpusGraphTool(graph_client=dummy_client)
-
-    # Plain string input
-    out1 = tool._run("MATCH (n) RETURN n")
-    assert "MATCH (n) RETURN n" in out1
-
-    assert captured["kwargs"]["query"] == "MATCH (n) RETURN n"
-    assert captured["kwargs"]["params"] is None
-
-    # Mapping input
-    out2 = tool._run(
-        {
-            "query": "MATCH (m) RETURN m",
-            "params": {"limit": 5},
-            "dialect": "cypher",
-            "namespace": "tool-ns",
-            "timeout_ms": 1234,
-        },
-    )
-    assert "MATCH (m) RETURN m" in out2
-    assert captured["kwargs"]["query"] == "MATCH (m) RETURN m"
-    assert captured["kwargs"]["params"] == {"limit": 5}
-    assert captured["kwargs"]["dialect"] == "cypher"
-    assert captured["kwargs"]["namespace"] == "tool-ns"
-    assert captured["kwargs"]["timeout_ms"] == 1234
+    client = _make_client(adapter)
+    tools = create_langchain_graph_tools(client, name_prefix="graph", description_prefix="Corpus graph tool")
+    assert isinstance(tools, list)
+    assert len(tools) >= 4
+    assert all(hasattr(t, "name") for t in tools)
+    assert all(isinstance(getattr(t, "name"), str) for t in tools)
 
 
-def test_corpus_graph_tool_rejects_invalid_input_type() -> None:
+def test_langchain_query_tool_runs_and_returns_json(adapter: Any) -> None:
     """
-    CorpusGraphTool._parse_input should raise BadRequest when given an
-    unsupported input type (e.g. int).
+    Query tool should be invokable via LangChain tool surface and return JSON.
+
+    This is a real tool-runtime integration check.
     """
+    client = _make_client(adapter)
+    tools = create_langchain_graph_tools(client, name_prefix="graph", description_prefix="Corpus graph tool")
 
-    class DummyClient(CorpusLangChainGraphClient):
-        def __init__(self) -> None:
-            pass
+    query_tool = next(t for t in tools if str(getattr(t, "name", "")).endswith("_query"))
 
-    tool = CorpusGraphTool(graph_client=DummyClient())
+    out = _tool_sync_call(query_tool, "MATCH (n) RETURN n LIMIT 1")
+    assert isinstance(out, str)
 
-    with pytest.raises(Exception) as exc_info:
-        tool._parse_input(123)  # type: ignore[arg-type]
-
-    # We don't depend on the concrete BadRequest type here; just check message.
-    msg = str(exc_info.value)
-    assert "Unsupported tool input type" in msg
+    parsed = json.loads(out)
+    assert "result" in parsed
 
 
 @pytest.mark.asyncio
-async def test_corpus_graph_tool_async_delegates_to_aquery() -> None:
+async def test_langchain_query_tool_async_runs_and_returns_json(adapter: Any) -> None:
     """
-    _arun() should delegate to the underlying client's aquery() method and
-    return a serialized string.
+    Query tool should be async-invokable and return JSON.
+
+    This verifies that tool async entrypoints delegate to client.aquery(...).
     """
-    captured: Dict[str, Any] = {}
+    client = _make_client(adapter)
+    tools = create_langchain_graph_tools(client, name_prefix="graph", description_prefix="Corpus graph tool")
 
-    class DummyClient(CorpusLangChainGraphClient):
-        def __init__(self) -> None:
-            pass
+    query_tool = next(t for t in tools if str(getattr(t, "name", "")).endswith("_query"))
 
-        async def aquery(self, *args: Any, **kwargs: Any) -> Any:  # noqa: ARG002
-            captured["kwargs"] = kwargs
-            return {"async_ok": True, "query": kwargs.get("query")}
+    out = await _tool_async_call(query_tool, "MATCH (n) RETURN n LIMIT 1")
+    assert isinstance(out, str)
 
-    tool = CorpusGraphTool(graph_client=DummyClient())
-
-    out = await tool._arun("MATCH (a) RETURN a")
-    assert "MATCH (a) RETURN a" in out
-    assert captured["kwargs"]["query"] == "MATCH (a) RETURN a"
+    parsed = json.loads(out)
+    assert "result" in parsed
 
 
-def test_create_corpus_graph_tool_wraps_client_and_adapter(
+@pytest.mark.asyncio
+async def test_langchain_sync_tool_called_in_event_loop_uses_thread_bridge(adapter: Any) -> None:
+    """
+    In an async runtime, invoking the *sync* tool entrypoint must not trip
+    the client's sync-in-event-loop guard because the tool bridges work
+    to a bounded worker thread.
+    """
+    client = _make_client(adapter)
+    tools = create_langchain_graph_tools(client, name_prefix="graph", description_prefix="Corpus graph tool")
+
+    query_tool = next(t for t in tools if str(getattr(t, "name", "")).endswith("_query"))
+
+    # This call happens while the pytest-asyncio event loop is running.
+    out = _tool_sync_call(query_tool, "MATCH (n) RETURN n LIMIT 1")
+    parsed = json.loads(out)
+    assert "result" in parsed
+
+
+def test_langchain_stream_tool_max_chunks_validation_and_clamp(adapter: Any) -> None:
+    """
+    Streaming tool should:
+    - reject max_chunks <= 0
+    - clamp extremely large max_chunks to a safe bound
+    """
+    client = _make_client(adapter)
+    tools = create_langchain_graph_tools(client, name_prefix="graph", description_prefix="Corpus graph tool")
+
+    stream_tool = next(t for t in tools if str(getattr(t, "name", "")).endswith("_stream_query"))
+
+    with pytest.raises(Exception, match="max_chunks must be > 0"):
+        _tool_sync_call(stream_tool, {"query": "MATCH (n) RETURN n", "max_chunks": 0})
+
+    out = _tool_sync_call(stream_tool, {"query": "MATCH (n) RETURN n", "max_chunks": 10_000})
+    parsed = json.loads(out)
+    assert "chunks" in parsed
+    assert isinstance(parsed["chunks"], list)
+
+
+def test_langchain_batch_tool_rejects_malformed_ops(adapter: Any) -> None:
+    """
+    Batch tool should reject malformed ops items (non-mapping, missing keys, wrong types).
+    """
+    client = _make_client(adapter)
+    tools = create_langchain_graph_tools(client, name_prefix="graph", description_prefix="Corpus graph tool")
+
+    batch_tool = next(t for t in tools if str(getattr(t, "name", "")).endswith("_batch"))
+
+    with pytest.raises(TypeError, match="must be a mapping"):
+        _tool_sync_call(batch_tool, {"ops": ["not-a-mapping"]})
+
+    with pytest.raises(TypeError, match=r"\['op'\] must be a non-empty string"):
+        _tool_sync_call(batch_tool, {"ops": [{"op": "", "args": {}}]})
+
+
+def test_create_corpus_graph_tool_uses_defaults_via_translator_capture(
+    monkeypatch: pytest.MonkeyPatch,
     adapter: Any,
 ) -> None:
     """
-    create_corpus_graph_tool should:
+    create_corpus_graph_tool should build an internal client with defaults and
+    drive those defaults into raw_query when the tool is invoked.
 
-    - Construct a CorpusLangChainGraphClient wired to the given adapter.
-    - Wrap it in a CorpusGraphTool.
-    - Propagate default namespace/dialect into the client.
+    We verify this by patching create_graph_translator to capture raw_query.
     """
+    captured: Dict[str, Any] = {}
+
+    class CapturingTranslator:
+        def query(self, raw_query: Mapping[str, Any], **_: Any) -> Any:
+            captured["raw_query"] = dict(raw_query)
+            return {"ok": True}
+
+    monkeypatch.setattr(
+        langchain_adapter_module,
+        "create_graph_translator",
+        lambda *_a, **_k: CapturingTranslator(),
+    )
+    _patch_validate_graph_result_type_passthrough(monkeypatch)
+
     tool = create_corpus_graph_tool(
-        adapter=adapter,
+        graph_adapter=adapter,
         default_dialect="cypher",
         default_namespace="prod",
         default_timeout_ms=9999,
@@ -914,19 +1309,38 @@ def test_create_corpus_graph_tool_wraps_client_and_adapter(
         description="My graph tool for LangChain",
     )
 
-    assert isinstance(tool, CorpusGraphTool)
-    assert tool.name == "my_graph_tool"
-    assert "graph" in tool.description.lower()
+    # Invoke the tool so it executes the captured translator.query(...)
+    out = _tool_sync_call(tool, "MATCH (n) RETURN n LIMIT 1")
+    assert isinstance(out, str)
+    assert captured["raw_query"]["dialect"] == "cypher"
+    assert captured["raw_query"]["namespace"] == "prod"
+    assert captured["raw_query"]["timeout_ms"] == 9999
 
-    client = tool._graph_client
-    assert isinstance(client, CorpusLangChainGraphClient)
-    # Inspect private attributes to ensure wiring is correct
-    assert getattr(client, "_graph") is adapter
-    assert getattr(client, "_default_dialect") == "cypher"
-    assert getattr(client, "_default_namespace") == "prod"
-    assert getattr(client, "_default_timeout_ms") == 9999
-    assert getattr(client, "_framework_version") == "lc-fw-2.0"
 
+# ---------------------------------------------------------------------------
+# validate_batch_operations behavior (direct adapter call, not tool)
+# ---------------------------------------------------------------------------
+
+
+def test_batch_validation_rejects_empty_ops(adapter: Any) -> None:
+    """
+    Adapter batch() should reject empty operations via validate_batch_operations.
+    """
+    client = _make_client(adapter)
+    with pytest.raises((ValueError, TypeError)):
+        client.batch([])  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_abatch_validation_rejects_empty_ops(adapter: Any) -> None:
+    client = _make_client(adapter)
+    with pytest.raises((ValueError, TypeError)):
+        await client.abatch([])  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Main entrypoint for local runs
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
