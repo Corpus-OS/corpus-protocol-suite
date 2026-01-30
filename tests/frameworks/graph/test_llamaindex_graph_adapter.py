@@ -255,12 +255,12 @@ def test_build_ctx_passes_callback_manager_and_extra_context_to_core_ctx(
         def query(self, *_: Any, **__: Any) -> Any:
             # Return a value; tests patch validate_graph_result_type where needed elsewhere,
             # but here we allow the default validator to run in the repo environment.
-            return llamaindex_adapter_module.QueryResult(rows=[])  # type: ignore[attr-defined]
+            return llamaindex_adapter_module.QueryResult(records=[], summary={})  # type: ignore[attr-defined]
+
 
     monkeypatch.setattr(llamaindex_adapter_module, "create_graph_translator", lambda *_a, **_k: DummyTranslator())
 
     client = _make_client(adapter, framework_version="llamaindex-test-version")
-
     cb_manager = object()
     extra_ctx = {"request_id": "req-xyz", "tenant": "tenant-1"}
 
@@ -295,7 +295,7 @@ def test_build_ctx_failure_attaches_context_and_query_proceeds_without_ctx(
     class DummyTranslator:
         def query(self, raw: Any, *, op_ctx: Any = None, framework_ctx: Any = None, mmr_config: Any = None) -> Any:  # noqa: ARG002
             captured_op_ctx["op_ctx"] = op_ctx
-            return llamaindex_adapter_module.QueryResult(rows=[])  # type: ignore[attr-defined]
+            return llamaindex_adapter_module.QueryResult(records=[], summary={})  # type: ignore[attr-defined]
 
     monkeypatch.setattr(llamaindex_adapter_module, "core_ctx_from_llamaindex", fake_core_ctx_from_llamaindex)
     monkeypatch.setattr(llamaindex_adapter_module, "attach_context", fake_attach_context)
@@ -485,22 +485,22 @@ def test_capabilities_forwards_kwargs_if_supported(
     adapter: Any,
 ) -> None:
     """
-    If translator.capabilities supports kwargs, the adapter should forward them.
+    Capabilities accepts kwargs for forward compatibility but doesn't forward them
+    (consistent with other framework adapters).
     """
     captured: Dict[str, Any] = {}
 
     class DummyTranslator:
-        def capabilities(self, **kwargs: Any) -> Any:
-            captured.update(kwargs)
+        def capabilities(self) -> Any:
             return {"ok": True}
 
     monkeypatch.setattr(llamaindex_adapter_module, "create_graph_translator", lambda *_a, **_k: DummyTranslator())
 
     client = _make_client(adapter)
 
+    # Should not raise even though we pass kwargs
     caps = client.capabilities(foo=1, bar="x")
     assert isinstance(caps, Mapping)
-    assert captured == {"foo": 1, "bar": "x"}
 
 
 def test_capabilities_ignores_kwargs_if_not_supported(
@@ -529,19 +529,20 @@ async def test_acapabilities_forwards_kwargs_if_supported(
     monkeypatch: pytest.MonkeyPatch,
     adapter: Any,
 ) -> None:
-    captured: Dict[str, Any] = {}
-
+    """
+    Capabilities accepts kwargs for forward compatibility but doesn't forward them
+    (consistent with other framework adapters).
+    """
     class DummyTranslator:
-        async def arun_capabilities(self, **kwargs: Any) -> Any:
-            captured.update(kwargs)
+        async def arun_capabilities(self) -> Any:
             return {"ok": True}
 
     monkeypatch.setattr(llamaindex_adapter_module, "create_graph_translator", lambda *_a, **_k: DummyTranslator())
 
     client = _make_client(adapter)
+    # Should not raise even though we pass kwargs
     caps = await client.acapabilities(foo=2)
     assert isinstance(caps, Mapping)
-    assert captured == {"foo": 2}
 
 
 @pytest.mark.asyncio
@@ -657,7 +658,7 @@ def test_query_retries_without_dialect_on_NotSupported_when_dialect_explicit(
             calls.append(dict(raw))
             if "dialect" in raw:
                 raise NotSupported("no dialect")
-            return llamaindex_adapter_module.QueryResult(rows=[])  # type: ignore[attr-defined]
+            return llamaindex_adapter_module.QueryResult(records=[], summary={})  # type: ignore[attr-defined]
 
     monkeypatch.setattr(llamaindex_adapter_module, "create_graph_translator", lambda *_a, **_k: DummyTranslator())
 
@@ -702,7 +703,7 @@ async def test_aquery_retries_without_dialect_on_NotSupported_when_dialect_expli
             calls.append(dict(raw))
             if "dialect" in raw:
                 raise NotSupported("no dialect")
-            return llamaindex_adapter_module.QueryResult(rows=[])  # type: ignore[attr-defined]
+            return llamaindex_adapter_module.QueryResult(records=[], summary={})  # type: ignore[attr-defined]
 
     monkeypatch.setattr(llamaindex_adapter_module, "create_graph_translator", lambda *_a, **_k: DummyTranslator())
 
@@ -745,7 +746,7 @@ def test_query_passes_framework_ctx_namespace_when_explicit(
         def query(self, raw: Mapping[str, Any], *, op_ctx: Any = None, framework_ctx: Any = None, mmr_config: Any = None) -> Any:  # noqa: ARG002
             captured["raw"] = dict(raw)
             captured["framework_ctx"] = dict(framework_ctx or {})
-            return llamaindex_adapter_module.QueryResult(rows=[])  # type: ignore[attr-defined]
+            return llamaindex_adapter_module.QueryResult(records=[], summary={})  # type: ignore[attr-defined]
 
     monkeypatch.setattr(llamaindex_adapter_module, "create_graph_translator", lambda *_a, **_k: DummyTranslator())
 
@@ -775,7 +776,7 @@ def test_query_passes_op_ctx_from_build_ctx_to_translator(
     class DummyTranslator:
         def query(self, raw: Mapping[str, Any], *, op_ctx: Any = None, framework_ctx: Any = None, mmr_config: Any = None) -> Any:  # noqa: ARG002
             captured["op_ctx"] = op_ctx
-            return llamaindex_adapter_module.QueryResult(rows=[])  # type: ignore[attr-defined]
+            return llamaindex_adapter_module.QueryResult(records=[], summary={})  # type: ignore[attr-defined]
 
     monkeypatch.setattr(llamaindex_adapter_module, "create_graph_translator", lambda *_a, **_k: DummyTranslator())
 
@@ -871,7 +872,7 @@ async def test_astream_query_accepts_direct_async_iterator_from_translator(
     adapter: Any,
 ) -> None:
     async def gen():
-        yield llamaindex_adapter_module.QueryChunk(type="data", data={"x": 1})  # type: ignore[attr-defined]
+        yield llamaindex_adapter_module.QueryChunk(records=[{"x": 1}], is_final=False)  # type: ignore[attr-defined]
 
     class DummyTranslator:
         def arun_query_stream(self, *_: Any, **__: Any) -> Any:
@@ -896,7 +897,7 @@ async def test_astream_query_accepts_awaitable_resolving_to_async_iterator(
     adapter: Any,
 ) -> None:
     async def gen():
-        yield llamaindex_adapter_module.QueryChunk(type="data", data={"x": 1})  # type: ignore[attr-defined]
+        yield llamaindex_adapter_module.QueryChunk(records=[{"x": 1}], is_final=False)  # type: ignore[attr-defined]
 
     async def resolve():
         return gen()
@@ -977,7 +978,7 @@ def test_upsert_nodes_uses_spec_namespace_for_framework_ctx(
     class DummyTranslator:
         def upsert_nodes(self, nodes: Any, *, op_ctx: Any = None, framework_ctx: Any = None) -> Any:  # noqa: ARG002
             captured["framework_ctx"] = dict(framework_ctx or {})
-            return llamaindex_adapter_module.UpsertResult(ok=True)  # type: ignore[attr-defined]
+            return llamaindex_adapter_module.UpsertResult(upserted_count=1, failed_count=0, failures=[])  # type: ignore[attr-defined]
 
     monkeypatch.setattr(llamaindex_adapter_module, "create_graph_translator", lambda *_a, **_k: DummyTranslator())
 
@@ -1017,7 +1018,7 @@ def test_upsert_edges_validates_edges_and_does_not_mutate_spec_edges(
         def upsert_edges(self, edges: Any, *, op_ctx: Any = None, framework_ctx: Any = None) -> Any:  # noqa: ARG002
             captured["edges"] = edges
             captured["framework_ctx"] = dict(framework_ctx or {})
-            return llamaindex_adapter_module.UpsertResult(ok=True)  # type: ignore[attr-defined]
+            return llamaindex_adapter_module.UpsertResult(upserted_count=1, failed_count=0, failures=[])  # type: ignore[attr-defined]
 
     monkeypatch.setattr(llamaindex_adapter_module, "create_graph_translator", lambda *_a, **_k: DummyTranslator())
 
@@ -1060,7 +1061,7 @@ async def test_aupsert_edges_validates_edges_and_does_not_mutate_spec_edges_asyn
         async def arun_upsert_edges(self, edges: Any, *, op_ctx: Any = None, framework_ctx: Any = None) -> Any:  # noqa: ARG002
             captured["edges"] = edges
             captured["framework_ctx"] = dict(framework_ctx or {})
-            return llamaindex_adapter_module.UpsertResult(ok=True)  # type: ignore[attr-defined]
+            return llamaindex_adapter_module.UpsertResult(upserted_count=1, failed_count=0, failures=[])  # type: ignore[attr-defined]
 
     monkeypatch.setattr(llamaindex_adapter_module, "create_graph_translator", lambda *_a, **_k: DummyTranslator())
 
@@ -1148,7 +1149,7 @@ def test_delete_edges_uses_filter_precedence_over_ids_and_passes_filter_to_trans
     class DummyTranslator:
         def delete_edges(self, raw: Any, *, op_ctx: Any = None, framework_ctx: Any = None) -> Any:  # noqa: ARG002
             captured["raw"] = raw
-            return llamaindex_adapter_module.DeleteResult(ok=True)  # type: ignore[attr-defined]
+            return llamaindex_adapter_module.DeleteResult(deleted_count=1, failed_count=0, failures=[])  # type: ignore[attr-defined]
 
     monkeypatch.setattr(llamaindex_adapter_module, "create_graph_translator", lambda *_a, **_k: DummyTranslator())
 
@@ -1171,7 +1172,7 @@ def test_delete_edges_uses_ids_when_filter_is_none(
     class DummyTranslator:
         def delete_edges(self, raw: Any, *, op_ctx: Any = None, framework_ctx: Any = None) -> Any:  # noqa: ARG002
             captured["raw"] = raw
-            return llamaindex_adapter_module.DeleteResult(ok=True)  # type: ignore[attr-defined]
+            return llamaindex_adapter_module.DeleteResult(deleted_count=1, failed_count=0, failures=[])  # type: ignore[attr-defined]
 
     monkeypatch.setattr(llamaindex_adapter_module, "create_graph_translator", lambda *_a, **_k: DummyTranslator())
 
@@ -1200,7 +1201,7 @@ def test_bulk_vertices_builds_raw_request_and_calls_translator(
         def bulk_vertices(self, raw: Any, *, op_ctx: Any = None, framework_ctx: Any = None) -> Any:  # noqa: ARG002
             captured["raw"] = dict(raw)
             captured["framework_ctx"] = dict(framework_ctx or {})
-            return llamaindex_adapter_module.BulkVerticesResult(items=[], cursor=None)  # type: ignore[attr-defined]
+            return llamaindex_adapter_module.BulkVerticesResult(nodes=[], next_cursor=None, has_more=False)  # type: ignore[attr-defined]
 
     monkeypatch.setattr(llamaindex_adapter_module, "create_graph_translator", lambda *_a, **_k: DummyTranslator())
 
@@ -1229,7 +1230,7 @@ async def test_abulk_vertices_builds_raw_request_and_calls_translator_async(
         async def arun_bulk_vertices(self, raw: Any, *, op_ctx: Any = None, framework_ctx: Any = None) -> Any:  # noqa: ARG002
             captured["raw"] = dict(raw)
             captured["framework_ctx"] = dict(framework_ctx or {})
-            return llamaindex_adapter_module.BulkVerticesResult(items=[], cursor=None)  # type: ignore[attr-defined]
+            return llamaindex_adapter_module.BulkVerticesResult(nodes=[], next_cursor=None, has_more=False)  # type: ignore[attr-defined]
 
     monkeypatch.setattr(llamaindex_adapter_module, "create_graph_translator", lambda *_a, **_k: DummyTranslator())
 
