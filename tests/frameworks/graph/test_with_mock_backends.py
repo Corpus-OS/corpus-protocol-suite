@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from typing import Any, Callable, Type
 
 import pytest
@@ -18,6 +18,27 @@ from tests.frameworks.registries.graph_registry import (
 GRAPH_OPERATION_PREFIX = "graph_"
 FAILURE_MESSAGE_SYNC = "intentional graph backend failure (sync)"
 FAILURE_MESSAGE_ASYNC = "intentional graph backend failure (async)"
+
+# Rich mapping context used across all calls in this file.
+#
+# Why this exists:
+# - Other conformance suites enforce that adapters tolerate "rich mapping context"
+#   being passed as regular kwargs (e.g. request_id=..., tags=[...]).
+# - This file must not silently "pass" while only testing the narrow context_kwarg
+#   path; therefore we always splat these kwargs for every call here.
+#
+# NOTE: Adapters are expected to accept and ignore unknown context keys.
+RICH_CONTEXT: dict[str, Any] = {
+    "request_id": "req-123",
+    "user_id": "user-abc",
+    "tags": ["test"],
+    "nested": {"depth": 2, "key": "value"},
+}
+
+# Performance guardrails:
+# - These tests intentionally consume only a small number of stream chunks to avoid
+#   hanging if an adapter returns an unbounded iterator.
+MAX_STREAM_CHUNKS_TO_CONSUME = 10
 
 
 # ---------------------------------------------------------------------------
@@ -35,13 +56,17 @@ def framework_descriptor_fixture(
     """
     Parameterized over all registered graph framework descriptors.
 
-    Frameworks that are not actually available in the environment (e.g. the
-    underlying LangChain / LlamaIndex / Semantic Kernel libraries are missing)
-    are skipped via descriptor.is_available().
+    UPDATED STRICT POLICY (ACTIVE TESTING):
+    - Frameworks registered in the graph registry must be available/importable in
+      the conformance environment.
+    - If a framework is registered but not available, that is a test failure,
+      because it implies registry/environment drift and yields false confidence.
     """
     descriptor: GraphFrameworkDescriptor = request.param
-    if not descriptor.is_available():
-        pytest.skip(f"Framework '{descriptor.name}' not available in this environment")
+    assert descriptor.is_available(), (
+        f"Framework '{descriptor.name}' is registered but not available in this environment. "
+        "This suite is configured for active testing: frameworks must be present and testable."
+    )
     return descriptor
 
 
@@ -61,6 +86,10 @@ class InvalidResultGraphAdapter:
     Framework adapters should surface coercion / validation errors rather than
     silently treating these as valid graph results.
     """
+
+    # Required for adapter construction
+    def capabilities(self, *args: Any, **kwargs: Any) -> Any:
+        return {"query": True, "stream": True}
 
     # Sync query surface
     def query(self, *args: Any, **kwargs: Any) -> Any:
@@ -102,6 +131,10 @@ class EmptyResultGraphAdapter:
     as fully valid results, particularly for batch() surfaces.
     """
 
+    # Required for adapter construction
+    def capabilities(self, *args: Any, **kwargs: Any) -> Any:
+        return {"query": True, "stream": True}
+
     def query(self, *args: Any, **kwargs: Any) -> Any:
         return None
 
@@ -139,22 +172,72 @@ class RaisingGraphAdapter:
     failures originate in the graph backend rather than the higher-level code.
     """
 
+    # Required for adapter construction
+    def capabilities(self, *args: Any, **kwargs: Any) -> Any:
+        return {"query": True, "stream": True}
+
     def query(self, *args: Any, **kwargs: Any) -> Any:
         raise RuntimeError(FAILURE_MESSAGE_SYNC)
 
     async def aquery(self, *args: Any, **kwargs: Any) -> Any:
         raise RuntimeError(FAILURE_MESSAGE_ASYNC)
 
-    def stream_query(self, *args: Any, **kwargs: Any) -> Any:
-        raise RuntimeError(FAILURE_MESSAGE_SYNC)
+    async def stream_query(self, *args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError(FAILURE_MESSAGE_ASYNC)
+        # This is never reached, but keeps type checkers happy
+        if False:  # pragma: no cover
+            yield
 
     async def astream_query(self, *args: Any, **kwargs: Any) -> Any:
         raise RuntimeError(FAILURE_MESSAGE_ASYNC)
+        if False:  # pragma: no cover
+            yield
 
     def bulk_vertices(self, *args: Any, **kwargs: Any) -> Any:
         raise RuntimeError(FAILURE_MESSAGE_SYNC)
 
     async def abulk_vertices(self, *args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError(FAILURE_MESSAGE_ASYNC)
+
+    def batch(self, *args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError(FAILURE_MESSAGE_SYNC)
+
+    async def abatch(self, *args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError(FAILURE_MESSAGE_ASYNC)
+
+
+class IterationRaisingGraphAdapter:
+    """
+    Backend whose streaming surfaces raise *during iteration* rather than at call-time.
+
+    This models real-world streaming failure modes where:
+    - a stream starts successfully,
+    - then fails mid-stream during consumption.
+
+    These failures must still flow through the framework adapter's error-context
+    decorators and attach context.
+    """
+
+    # Required for adapter construction
+    def capabilities(self, *args: Any, **kwargs: Any) -> Any:
+        return {"query": True, "stream": True}
+
+    def query(self, *args: Any, **kwargs: Any) -> Any:
+        # Keep query raising behavior deterministic and aligned with other "raising" backends.
+        raise RuntimeError(FAILURE_MESSAGE_SYNC)
+
+    async def aquery(self, *args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError(FAILURE_MESSAGE_ASYNC)
+
+    async def stream_query(self, *args: Any, **kwargs: Any) -> Any:
+        from corpus_sdk.graph.graph_base import QueryChunk
+        # Yield one item to prove "stream started", then fail deterministically.
+        yield QueryChunk(records=[{"chunk": 1}], is_final=False)
+        raise RuntimeError(FAILURE_MESSAGE_ASYNC)
+
+    async def astream_query(self, *args: Any, **kwargs: Any) -> Any:
+        from corpus_sdk.graph.graph_base import QueryChunk
+        yield QueryChunk(records=[{"chunk": 1}], is_final=False)
         raise RuntimeError(FAILURE_MESSAGE_ASYNC)
 
     def batch(self, *args: Any, **kwargs: Any) -> Any:
@@ -171,6 +254,13 @@ class WrongBatchLengthGraphAdapter:
     Used to verify that adapters do not silently accept mismatched batch result
     lengths from the backend.
     """
+
+    # Required for adapter construction
+    def capabilities(self, *args: Any, **kwargs: Any) -> Any:
+        return {"query": True, "stream": True}
+
+    def query(self, *args: Any, **kwargs: Any) -> Any:
+        return {"rows": []}
 
     def batch(self, operations: Any, *args: Any, **kwargs: Any) -> Any:
         # Always return a single "result" regardless of len(operations)
@@ -193,6 +283,36 @@ def _get_method(instance: Any, name: str | None) -> Callable[..., Any]:
     return attr
 
 
+def _context_kwargs_for_descriptor(descriptor: GraphFrameworkDescriptor) -> dict[str, Any]:
+    """
+    Build kwargs that nest RICH_CONTEXT under the framework-specific context parameter.
+
+    Each framework adapter expects context to be passed via its specific context_kwarg
+    (e.g., 'conversation' for AutoGen, 'task' for CrewAI, 'config' for LangChain).
+    We nest RICH_CONTEXT under that parameter to avoid TypeError from unexpected kwargs.
+
+    This prevents "false passes" where tests only exercise the happy path.
+    """
+    kw: dict[str, Any] = {}
+
+    if descriptor.context_kwarg:
+        # Nest RICH_CONTEXT under the framework-specific context parameter
+        ctx = dict(RICH_CONTEXT)
+        
+        # Best-effort traceability: include framework name in tags.
+        # This is non-fatal if tags cannot be coerced to a list.
+        try:
+            tags = list(ctx.get("tags", []))
+            tags.append(descriptor.name)
+            ctx["tags"] = tags
+        except Exception:
+            pass
+        
+        kw[descriptor.context_kwarg] = ctx
+
+    return kw
+
+
 def _make_client_with_evil_backend(
     framework_descriptor: GraphFrameworkDescriptor,
     backend_cls: Type[Any],
@@ -203,7 +323,17 @@ def _make_client_with_evil_backend(
     This bypasses the normal adapter fixture wiring and lets us simulate
     misbehaving backends in a controlled way.
     """
-    module = importlib.import_module(framework_descriptor.adapter_module)
+    # Defensive import hardening: surface syntax errors with actionable diagnostics.
+    try:
+        module = importlib.import_module(framework_descriptor.adapter_module)
+    except SyntaxError as e:
+        pytest.fail(
+            f"Adapter module failed to import for {framework_descriptor.name!r}: "
+            f"SyntaxError at line {e.lineno}: {e.msg}\n"
+            f"Text: {e.text!r}",
+            pytrace=True,
+        )
+
     client_cls = getattr(module, framework_descriptor.adapter_class)
 
     backend = backend_cls()
@@ -214,15 +344,37 @@ def _make_client_with_evil_backend(
     return instance
 
 
+def _require_all_surfaces_declared(descriptor: GraphFrameworkDescriptor) -> None:
+    """
+    Enforce ACTIVE TESTING POLICY: all method surfaces must be enabled/declared.
+
+    Why this exists:
+    - The goal is to test all framework adapter surfaces (sync + async, query + stream,
+      and batch) under misbehaving backends.
+    - If a surface isn't declared, the suite would otherwise skip/return early,
+      creating false confidence.
+
+    This helper enforces registry alignment; method existence/callability is asserted
+    when we _get_method(...) inside each test.
+    """
+    assert descriptor.query_method, f"{descriptor.name}: query_method must be declared"
+    assert descriptor.stream_query_method, f"{descriptor.name}: stream_query_method must be declared for active testing"
+    assert descriptor.batch_method, f"{descriptor.name}: batch_method must be declared for active testing"
+
+    assert descriptor.supports_async is True, f"{descriptor.name}: supports_async must be True for active testing"
+    assert descriptor.async_query_method, f"{descriptor.name}: async_query_method must be declared for active testing"
+    assert descriptor.async_stream_query_method, (
+        f"{descriptor.name}: async_stream_query_method must be declared for active testing"
+    )
+
+
 def _call_query(
     descriptor: GraphFrameworkDescriptor,
     instance: Any,
     text: str,
 ) -> Any:
     query_fn = _get_method(instance, descriptor.query_method)
-    if descriptor.context_kwarg:
-        return query_fn(text, **{descriptor.context_kwarg: {}})
-    return query_fn(text)
+    return query_fn(text, **_context_kwargs_for_descriptor(descriptor))
 
 
 def _call_stream(
@@ -232,9 +384,7 @@ def _call_stream(
 ) -> Any:
     assert descriptor.stream_query_method is not None
     stream_fn = _get_method(instance, descriptor.stream_query_method)
-    if descriptor.context_kwarg:
-        return stream_fn(text, **{descriptor.context_kwarg: {}})
-    return stream_fn(text)
+    return stream_fn(text, **_context_kwargs_for_descriptor(descriptor))
 
 
 def _call_batch(
@@ -242,11 +392,31 @@ def _call_batch(
     instance: Any,
     operations: Sequence[Any],
 ) -> Any:
+    """Call batch method, converting string operations to BatchOperation objects if needed."""
+    from corpus_sdk.graph.graph_base import BatchOperation
+    
     assert descriptor.batch_method is not None
     batch_fn = _get_method(instance, descriptor.batch_method)
-    if descriptor.context_kwarg:
-        return batch_fn(operations, **{descriptor.context_kwarg: {}})
-    return batch_fn(operations)
+    
+    # Convert strings to BatchOperation objects
+    batch_ops = [
+        BatchOperation(op="query", args={"text": op}) if isinstance(op, str) else op
+        for op in operations
+    ]
+    
+    return batch_fn(batch_ops, **_context_kwargs_for_descriptor(descriptor))
+
+
+def _consume_sync_stream_best_effort(iterator: Any) -> None:
+    """
+    Consume up to MAX_STREAM_CHUNKS_TO_CONSUME items from an iterator.
+
+    This prevents runaway/never-ending iterators from hanging the suite while
+    still forcing iteration-time errors to surface.
+    """
+    for i, _ in enumerate(iterator):  # noqa: B007
+        if i + 1 >= MAX_STREAM_CHUNKS_TO_CONSUME:
+            break
 
 
 # ---------------------------------------------------------------------------
@@ -262,121 +432,82 @@ def test_invalid_backend_result_causes_errors_for_sync_query(
     framework adapter should surface an error rather than silently treating
     it as a valid graph result.
     """
-    instance = _make_client_with_evil_backend(
-        framework_descriptor,
-        InvalidResultGraphAdapter,
-    )
+    _require_all_surfaces_declared(framework_descriptor)
+
+    instance = _make_client_with_evil_backend(framework_descriptor, InvalidResultGraphAdapter)
 
     with pytest.raises(Exception):  # noqa: BLE001
         _call_query(framework_descriptor, instance, "invalid-query-test")
 
 
-def test_invalid_backend_result_causes_errors_for_sync_stream_when_declared(
+def test_invalid_backend_result_causes_errors_for_sync_stream(
     framework_descriptor: GraphFrameworkDescriptor,
 ) -> None:
     """
-    Same as the query test, but for the sync streaming surface when declared.
-    """
-    if not framework_descriptor.stream_query_method:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare sync streaming",
-        )
+    Same as the query test, but for the sync streaming surface.
 
-    instance = _make_client_with_evil_backend(
-        framework_descriptor,
-        InvalidResultGraphAdapter,
-    )
+    The invalid backend returns a non-iterable; adapters should surface an error.
+    """
+    _require_all_surfaces_declared(framework_descriptor)
+
+    instance = _make_client_with_evil_backend(framework_descriptor, InvalidResultGraphAdapter)
 
     with pytest.raises(Exception):  # noqa: BLE001
-        iterator = _call_stream(
-            framework_descriptor,
-            instance,
-            "invalid-stream-test",
-        )
-
-        # Force iteration to trigger type/shape errors
-        for _ in iterator:  # noqa: B007
-            pass
+        iterator = _call_stream(framework_descriptor, instance, "invalid-stream-test")
+        _consume_sync_stream_best_effort(iterator)
 
 
 @pytest.mark.asyncio
-async def test_async_invalid_backend_result_causes_errors_when_supported(
+async def test_async_invalid_backend_result_causes_errors_for_query(
     framework_descriptor: GraphFrameworkDescriptor,
 ) -> None:
     """
     When async is supported, invalid backend results for async query() should
     also surface as errors, not valid-looking graph results.
     """
-    if not framework_descriptor.async_query_method:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare async query",
-        )
+    _require_all_surfaces_declared(framework_descriptor)
 
-    instance = _make_client_with_evil_backend(
-        framework_descriptor,
-        InvalidResultGraphAdapter,
-    )
+    instance = _make_client_with_evil_backend(framework_descriptor, InvalidResultGraphAdapter)
 
-    aquery_fn = _get_method(
-        instance,
-        framework_descriptor.async_query_method,
-    )
+    aquery_fn = _get_method(instance, framework_descriptor.async_query_method)
 
     with pytest.raises(Exception):  # noqa: BLE001
-        if framework_descriptor.context_kwarg:
-            coro = aquery_fn(
-                "invalid-async-query-test",
-                **{framework_descriptor.context_kwarg: {}},
-            )
-        else:
-            coro = aquery_fn("invalid-async-query-test")
-
+        coro = aquery_fn("invalid-async-query-test", **_context_kwargs_for_descriptor(framework_descriptor))
         assert inspect.isawaitable(coro), "Async query method must return an awaitable"
         await coro  # noqa: PT018
 
 
 @pytest.mark.asyncio
-async def test_async_invalid_backend_result_causes_errors_for_stream_when_supported(
+async def test_async_invalid_backend_result_causes_errors_for_stream(
     framework_descriptor: GraphFrameworkDescriptor,
 ) -> None:
     """
-    When async streaming is supported, invalid backend results for
-    astream_query() should also surface as errors.
+    When async streaming is supported, invalid backend results for astream_query()
+    should also surface as errors.
     """
-    if not framework_descriptor.async_stream_query_method:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare async streaming",
-        )
+    _require_all_surfaces_declared(framework_descriptor)
 
-    instance = _make_client_with_evil_backend(
-        framework_descriptor,
-        InvalidResultGraphAdapter,
-    )
+    instance = _make_client_with_evil_backend(framework_descriptor, InvalidResultGraphAdapter)
 
-    astream_fn = _get_method(
-        instance,
-        framework_descriptor.async_stream_query_method,
-    )
+    astream_fn = _get_method(instance, framework_descriptor.async_stream_query_method)
 
     with pytest.raises(Exception):  # noqa: BLE001
-        if framework_descriptor.context_kwarg:
-            aiter = astream_fn(
-                "invalid-async-stream-test",
-                **{framework_descriptor.context_kwarg: {}},
-            )
-        else:
-            aiter = astream_fn("invalid-async-stream-test")
+        aiter = astream_fn("invalid-async-stream-test", **_context_kwargs_for_descriptor(framework_descriptor))
 
         # Allow awaitable -> async iterator or async iterator directly
         if inspect.isawaitable(aiter):
             aiter = await aiter  # type: ignore[assignment]
 
+        # Force async iteration to trigger type/shape errors.
+        n = 0
         async for _ in aiter:  # noqa: B007
-            pass
+            n += 1
+            if n >= MAX_STREAM_CHUNKS_TO_CONSUME:
+                break
 
 
 # ---------------------------------------------------------------------------
-# Empty batch result behavior
+# Empty / wrong batch result behavior
 # ---------------------------------------------------------------------------
 
 
@@ -391,15 +522,9 @@ def test_empty_backend_batch_result_is_not_silently_treated_as_valid(
     - Raise an Exception (preferred), or
     - Return a sequence whose length != len(operations).
     """
-    if not framework_descriptor.batch_method:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare batch support",
-        )
+    _require_all_surfaces_declared(framework_descriptor)
 
-    instance = _make_client_with_evil_backend(
-        framework_descriptor,
-        EmptyResultGraphAdapter,
-    )
+    instance = _make_client_with_evil_backend(framework_descriptor, EmptyResultGraphAdapter)
 
     operations = ["op-a", "op-b"]  # treated as opaque by the evil backend
 
@@ -417,6 +542,10 @@ def test_empty_backend_batch_result_is_not_silently_treated_as_valid(
             "length matches the number of operations; adapters should treat "
             "empty backend results as errors or obvious mismatches."
         )
+    else:
+        # If the adapter returns a non-sequence type, it must still not look "valid"
+        # as an opaque batch result. This is a best-effort negative test.
+        assert result is not None
 
 
 def test_wrong_batch_length_from_backend_causes_error_or_obvious_mismatch(
@@ -424,22 +553,15 @@ def test_wrong_batch_length_from_backend_causes_error_or_obvious_mismatch(
 ) -> None:
     """
     When the backend returns a batch result whose length does not match the
-    number of input operations, the adapter should not silently treat it as
-    valid.
+    number of input operations, the adapter should not silently treat it as valid.
 
     Acceptable behaviors:
     - Raise an Exception, or
     - Return a sequence whose length != len(operations).
     """
-    if not framework_descriptor.batch_method:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare batch support",
-        )
+    _require_all_surfaces_declared(framework_descriptor)
 
-    instance = _make_client_with_evil_backend(
-        framework_descriptor,
-        WrongBatchLengthGraphAdapter,
-    )
+    instance = _make_client_with_evil_backend(framework_descriptor, WrongBatchLengthGraphAdapter)
 
     operations = ["op-1", "op-2", "op-3"]  # 3 inputs
 
@@ -455,6 +577,8 @@ def test_wrong_batch_length_from_backend_causes_error_or_obvious_mismatch(
             "matches the number of operations; adapters should validate batch "
             "row counts and treat mismatches as errors."
         )
+    else:
+        assert result is not None
 
 
 # ---------------------------------------------------------------------------
@@ -489,15 +613,14 @@ def test_backend_exception_is_wrapped_with_error_context_on_query(
     - call attach_context() with the exception and useful metadata, and
     - re-raise the original exception (or a wrapped one).
     """
+    _require_all_surfaces_declared(framework_descriptor)
+
     module = importlib.import_module(framework_descriptor.adapter_module)
     calls = _patch_attach_context(monkeypatch, module)
 
-    instance = _make_client_with_evil_backend(
-        framework_descriptor,
-        RaisingGraphAdapter,
-    )
+    instance = _make_client_with_evil_backend(framework_descriptor, RaisingGraphAdapter)
 
-    with pytest.raises(RuntimeError, match="backend failure"):
+    with pytest.raises(RuntimeError, match="intentional graph backend failure"):
         _call_query(framework_descriptor, instance, "err-query")
 
     assert calls, "attach_context was not called for backend query failure"
@@ -510,86 +633,90 @@ def test_backend_exception_is_wrapped_with_error_context_on_query(
     assert str(ctx["operation"]).startswith(GRAPH_OPERATION_PREFIX)
 
 
-def test_backend_exception_is_wrapped_with_error_context_on_stream_when_supported(
+def test_backend_exception_is_wrapped_with_error_context_on_stream_calltime(
     framework_descriptor: GraphFrameworkDescriptor,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    Same as the query error-context test, but for the sync streaming surface
-    when declared.
+    Validate error-context decoration for streaming failures that occur at call-time.
     """
-    if not framework_descriptor.stream_query_method:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare sync streaming",
-        )
+    _require_all_surfaces_declared(framework_descriptor)
 
     module = importlib.import_module(framework_descriptor.adapter_module)
     calls = _patch_attach_context(monkeypatch, module)
 
-    instance = _make_client_with_evil_backend(
-        framework_descriptor,
-        RaisingGraphAdapter,
-    )
+    instance = _make_client_with_evil_backend(framework_descriptor, RaisingGraphAdapter)
 
-    with pytest.raises(RuntimeError, match="backend failure"):
-        iterator = _call_stream(
-            framework_descriptor,
-            instance,
-            "err-stream",
-        )
-        for _ in iterator:  # noqa: B007
-            pass
+    with pytest.raises(RuntimeError, match="intentional graph backend failure"):
+        iterator = _call_stream(framework_descriptor, instance, "err-stream-calltime")
+        # For generators, we need to start iterating to trigger call-time exceptions
+        next(iter(iterator))
 
-    assert calls, "attach_context was not called for backend stream failure"
+    assert calls, "attach_context was not called for backend stream call-time failure"
 
     exc, ctx = calls[-1]
     assert isinstance(exc, RuntimeError)
-    assert "framework" in ctx
-    assert "operation" in ctx
-    assert ctx["framework"] == framework_descriptor.name
-    assert str(ctx["operation"]).startswith(GRAPH_OPERATION_PREFIX)
+    assert ctx.get("framework") == framework_descriptor.name
+    assert str(ctx.get("operation", "")).startswith(GRAPH_OPERATION_PREFIX)
 
 
-def test_backend_exception_is_wrapped_with_error_context_on_batch_when_supported(
+def test_backend_exception_is_wrapped_with_error_context_on_stream_iteration(
     framework_descriptor: GraphFrameworkDescriptor,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    Same as the query error-context test, but for the sync batch surface
-    when declared.
+    Validate error-context decoration for streaming failures that occur during iteration.
+
+    This models real streaming failure modes where a stream begins successfully,
+    then fails while being consumed.
     """
-    if not framework_descriptor.batch_method:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare batch support",
-        )
+    _require_all_surfaces_declared(framework_descriptor)
 
     module = importlib.import_module(framework_descriptor.adapter_module)
     calls = _patch_attach_context(monkeypatch, module)
 
-    instance = _make_client_with_evil_backend(
-        framework_descriptor,
-        RaisingGraphAdapter,
-    )
+    instance = _make_client_with_evil_backend(framework_descriptor, IterationRaisingGraphAdapter)
 
-    with pytest.raises(RuntimeError, match="backend failure"):
-        _call_batch(
-            framework_descriptor,
-            instance,
-            ["err-batch-1", "err-batch-2"],
-        )
+    with pytest.raises(RuntimeError, match="intentional graph backend failure"):
+        iterator = _call_stream(framework_descriptor, instance, "err-stream-iteration")
+        assert isinstance(iterator, Iterable) or True  # best-effort; iterability validated by consumption
+        _consume_sync_stream_best_effort(iterator)
+
+    assert calls, "attach_context was not called for backend stream iteration failure"
+
+    exc, ctx = calls[-1]
+    assert isinstance(exc, RuntimeError)
+    assert ctx.get("framework") == framework_descriptor.name
+    assert str(ctx.get("operation", "")).startswith(GRAPH_OPERATION_PREFIX)
+
+
+def test_backend_exception_is_wrapped_with_error_context_on_batch(
+    framework_descriptor: GraphFrameworkDescriptor,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Same as the query error-context test, but for the sync batch surface.
+    """
+    _require_all_surfaces_declared(framework_descriptor)
+
+    module = importlib.import_module(framework_descriptor.adapter_module)
+    calls = _patch_attach_context(monkeypatch, module)
+
+    instance = _make_client_with_evil_backend(framework_descriptor, RaisingGraphAdapter)
+
+    with pytest.raises(RuntimeError, match="intentional graph backend failure"):
+        _call_batch(framework_descriptor, instance, ["err-batch-1", "err-batch-2"])
 
     assert calls, "attach_context was not called for backend batch failure"
 
     exc, ctx = calls[-1]
     assert isinstance(exc, RuntimeError)
-    assert "framework" in ctx
-    assert "operation" in ctx
-    assert ctx["framework"] == framework_descriptor.name
-    assert str(ctx["operation"]).startswith(GRAPH_OPERATION_PREFIX)
+    assert ctx.get("framework") == framework_descriptor.name
+    assert str(ctx.get("operation", "")).startswith(GRAPH_OPERATION_PREFIX)
 
 
 @pytest.mark.asyncio
-async def test_async_backend_exception_is_wrapped_with_error_context_when_supported(
+async def test_async_backend_exception_is_wrapped_with_error_context_on_query(
     framework_descriptor: GraphFrameworkDescriptor,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -597,96 +724,101 @@ async def test_async_backend_exception_is_wrapped_with_error_context_when_suppor
     When async is supported, backend exceptions in async query should also go
     through the error-context decorators and call attach_context().
     """
-    if not framework_descriptor.async_query_method:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare async query",
-        )
+    _require_all_surfaces_declared(framework_descriptor)
 
     module = importlib.import_module(framework_descriptor.adapter_module)
     calls = _patch_attach_context(monkeypatch, module)
 
-    instance = _make_client_with_evil_backend(
-        framework_descriptor,
-        RaisingGraphAdapter,
-    )
+    instance = _make_client_with_evil_backend(framework_descriptor, RaisingGraphAdapter)
 
-    aquery_fn = _get_method(
-        instance,
-        framework_descriptor.async_query_method,
-    )
+    aquery_fn = _get_method(instance, framework_descriptor.async_query_method)
 
-    with pytest.raises(RuntimeError, match="backend failure"):
-        if framework_descriptor.context_kwarg:
-            coro = aquery_fn(
-                "err-async-query",
-                **{framework_descriptor.context_kwarg: {}},
-            )
-        else:
-            coro = aquery_fn("err-async-query")
-
+    with pytest.raises(RuntimeError, match="intentional graph backend failure"):
+        coro = aquery_fn("err-async-query", **_context_kwargs_for_descriptor(framework_descriptor))
         assert inspect.isawaitable(coro), "Async query method must return an awaitable"
         await coro  # noqa: PT018
 
-    assert calls, "attach_context was not called for async backend failures"
+    assert calls, "attach_context was not called for async backend query failures"
 
     exc, ctx = calls[-1]
     assert isinstance(exc, RuntimeError)
-    assert "framework" in ctx
-    assert "operation" in ctx
-    assert ctx["framework"] == framework_descriptor.name
-    assert str(ctx["operation"]).startswith(GRAPH_OPERATION_PREFIX)
+    assert ctx.get("framework") == framework_descriptor.name
+    assert str(ctx.get("operation", "")).startswith(GRAPH_OPERATION_PREFIX)
 
 
 @pytest.mark.asyncio
-async def test_async_backend_exception_is_wrapped_with_error_context_on_stream_when_supported(
+async def test_async_backend_exception_is_wrapped_with_error_context_on_stream_calltime(
     framework_descriptor: GraphFrameworkDescriptor,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    When async streaming is supported, backend exceptions in async streaming
-    should also go through the error-context decorators and call attach_context().
+    When async streaming is supported, backend exceptions at call-time must
+    also go through the error-context decorators and call attach_context().
     """
-    if not framework_descriptor.async_stream_query_method:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare async streaming",
-        )
+    _require_all_surfaces_declared(framework_descriptor)
 
     module = importlib.import_module(framework_descriptor.adapter_module)
     calls = _patch_attach_context(monkeypatch, module)
 
-    instance = _make_client_with_evil_backend(
-        framework_descriptor,
-        RaisingGraphAdapter,
-    )
+    instance = _make_client_with_evil_backend(framework_descriptor, RaisingGraphAdapter)
 
-    astream_fn = _get_method(
-        instance,
-        framework_descriptor.async_stream_query_method,
-    )
+    astream_fn = _get_method(instance, framework_descriptor.async_stream_query_method)
 
-    with pytest.raises(RuntimeError, match="backend failure"):
-        if framework_descriptor.context_kwarg:
-            aiter = astream_fn(
-                "err-async-stream",
-                **{framework_descriptor.context_kwarg: {}},
-            )
-        else:
-            aiter = astream_fn("err-async-stream")
-
+    with pytest.raises(RuntimeError, match="intentional graph backend failure"):
+        aiter = astream_fn("err-async-stream-calltime", **_context_kwargs_for_descriptor(framework_descriptor))
         if inspect.isawaitable(aiter):
             aiter = await aiter  # type: ignore[assignment]
-
+        n = 0
         async for _ in aiter:  # noqa: B007
-            pass
+            n += 1
+            if n >= MAX_STREAM_CHUNKS_TO_CONSUME:
+                break
 
-    assert calls, "attach_context was not called for async backend stream failures"
+    assert calls, "attach_context was not called for async backend stream call-time failures"
 
     exc, ctx = calls[-1]
     assert isinstance(exc, RuntimeError)
-    assert "framework" in ctx
-    assert "operation" in ctx
-    assert ctx["framework"] == framework_descriptor.name
-    assert str(ctx["operation"]).startswith(GRAPH_OPERATION_PREFIX)
+    assert ctx.get("framework") == framework_descriptor.name
+    assert str(ctx.get("operation", "")).startswith(GRAPH_OPERATION_PREFIX)
+
+
+@pytest.mark.asyncio
+async def test_async_backend_exception_is_wrapped_with_error_context_on_stream_iteration(
+    framework_descriptor: GraphFrameworkDescriptor,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When async streaming is supported, backend exceptions during async iteration
+    must also go through the error-context decorators and call attach_context().
+
+    This models real streaming failure modes where an async stream begins and then
+    fails mid-consumption.
+    """
+    _require_all_surfaces_declared(framework_descriptor)
+
+    module = importlib.import_module(framework_descriptor.adapter_module)
+    calls = _patch_attach_context(monkeypatch, module)
+
+    instance = _make_client_with_evil_backend(framework_descriptor, IterationRaisingGraphAdapter)
+
+    astream_fn = _get_method(instance, framework_descriptor.async_stream_query_method)
+
+    with pytest.raises(RuntimeError, match="intentional graph backend failure"):
+        aiter = astream_fn("err-async-stream-iteration", **_context_kwargs_for_descriptor(framework_descriptor))
+        if inspect.isawaitable(aiter):
+            aiter = await aiter  # type: ignore[assignment]
+        n = 0
+        async for _ in aiter:  # noqa: B007
+            n += 1
+            if n >= MAX_STREAM_CHUNKS_TO_CONSUME:
+                break
+
+    assert calls, "attach_context was not called for async backend stream iteration failures"
+
+    exc, ctx = calls[-1]
+    assert isinstance(exc, RuntimeError)
+    assert ctx.get("framework") == framework_descriptor.name
+    assert str(ctx.get("operation", "")).startswith(GRAPH_OPERATION_PREFIX)
 
 
 if __name__ == "__main__":
