@@ -1,39 +1,41 @@
-# requirements-dev.txt
-# Install with:  pip install -r requirements-dev.txt
+# --- Test / QA ---
+pytest==9.0.2
+pytest-asyncio==1.3.0
+pytest-cov==7.0.0
 
-# --- Testing ---
-pytest>=9.0,<10            # latest 9.0.2 
-pytest-asyncio>=1.3,<2     # latest 1.3.0 
-pytest-cov>=7.0,<8         # latest 7.0.0 
+# --- Lint / format / typecheck ---
+ruff==0.14.14
+black==26.1.0
+pre-commit==4.5.1
+mypy==1.19.1
 
-# --- Linting/formatting (optional but recommended) ---
-ruff>=0.14,<0.15           # latest 0.14.14 
-black>=26.1,<27            # latest 26.1.0 
-pre-commit>=4.5,<5         # latest 4.5.1
+# --- Typing / tooling ---
+typing-extensions==4.15.0
+types-requests==2.32.4.20260107
+setuptools==80.10.2
+wheel==0.46.3
 
-# --- Typing (optional) ---
-mypy>=1.19,<2              # latest 1.19.1 
-typing-extensions>=4.15,<5 # latest 4.15.0 
-types-requests>=2.32,<3    # latest 2.32.4.20260107 
+# --- JSON schema stack (pin referencing low enough for semantic-kernel/openapi-core deps) ---
+jsonschema==4.26.0
+referencing==0.30.2
 
-# --- Build tooling (if you want to build locally) ---
-setuptools>=80.10,<81      # latest 80.10.2 
-wheel>=0.46,<0.47          # latest 0.46.3 
+# --- LLM / agent frameworks ---
+openai>=1.108.1,<2
+langchain-core==1.2.7
+crewai==0.203.2
+semantic-kernel==1.31.0
 
-# --- JSON / Schema tooling ---
-jsonschema>=4.26,<5        # latest 4.26.0 
-referencing>=0.37,<1       # latest 0.37.0 
+# Helps semantic-kernel resolve cleanly inside its <0.20 range
+openapi-core==0.19.5
 
-# --- Framework integration deps ---
-pydantic>=2.12,<3          # latest 2.12.5 
-langchain-core>=1.2,<2     # latest 1.2.7 
-crewai>=1.9,<2             # latest 1.9.1 
-semantic-kernel>=1.39,<2   # latest 1.39.2 
+# --- AutoGen ---
+autogen-agentchat==0.7.5
+autogen-core==0.7.5
+autogen-ext[chromadb]==0.7.5
 
-# AutoGen framework (for integration tests)
-autogen-agentchat>=0.7,<1
-autogen-core>=0.7,<1
-autogen-ext[chromadb]>=0.7,<1
+# --- LlamaIndex ---
+llama-index==0.14.13
 
-# --- Framework integration deps ---
-llama-index>=0.14,<1       # latest 0.14.13 
+# --- Reduce resolver thrash / keep consistent transitive picks ---
+chromadb==1.1.1
+beautifulsoup4==4.14.3
