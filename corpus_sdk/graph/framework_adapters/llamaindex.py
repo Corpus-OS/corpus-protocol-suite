@@ -1188,30 +1188,11 @@ class CorpusLlamaIndexGraphClient:
         Sync wrapper around capabilities, delegating async→sync bridging
         to GraphTranslator.
 
-        kwargs are accepted for forward compatibility:
-        - Future GraphTranslator/adapter implementations may accept capability
-          filters or options.
-        - This adapter forwards kwargs when supported, and falls back to the
-          current signature without raising if not supported.
-
-        This preserves performance characteristics: capabilities is typically
-        a low-frequency call compared to query operations.
+        kwargs are accepted for forward compatibility but currently not forwarded
+        to the translator (consistent with other framework adapters).
         """
         _ensure_not_in_event_loop("capabilities")
-
-        # Forward kwargs when supported; otherwise fall back without error.
-        # We avoid signature inspection (which can be expensive and brittle)
-        # by using a simple TypeError fallback.
-        try:
-            caps = self._translator.capabilities(**kwargs)  # type: ignore[misc]
-        except TypeError:
-            if kwargs:
-                logger.debug(
-                    "GraphTranslator.capabilities does not accept kwargs; ignoring: %s",
-                    sorted(kwargs.keys()),
-                )
-            caps = self._translator.capabilities()
-
+        caps = self._translator.capabilities()
         return graph_capabilities_to_dict(caps)
 
     @with_async_graph_error_context("capabilities_async")
@@ -1222,19 +1203,10 @@ class CorpusLlamaIndexGraphClient:
         We delegate to GraphTranslator for consistency, then normalize to a
         simple dict for LlamaIndex consumption.
 
-        kwargs are accepted for forward compatibility and forwarded when
-        supported by the underlying translator.
+        kwargs are accepted for forward compatibility but currently not forwarded
+        to the translator (consistent with other framework adapters).
         """
-        try:
-            caps = await self._translator.arun_capabilities(**kwargs)  # type: ignore[misc]
-        except TypeError:
-            if kwargs:
-                logger.debug(
-                    "GraphTranslator.arun_capabilities does not accept kwargs; ignoring: %s",
-                    sorted(kwargs.keys()),
-                )
-            caps = await self._translator.arun_capabilities()
-
+        caps = await self._translator.arun_capabilities()
         return graph_capabilities_to_dict(caps)
 
     @with_graph_error_context("get_schema_sync")
