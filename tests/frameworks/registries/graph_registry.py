@@ -147,23 +147,13 @@ class GraphFrameworkDescriptor:
 
     @property
     def supports_async(self) -> bool:
-        """
-        True if the descriptor declares an async *query surface*.
-
-        IMPORTANT (test-aligned semantics):
-        ----------------------------------
-        The graph framework conformance tests define "async support" as the
-        presence of async query and/or async streaming methods (aquery/astream).
-        Async-only bulk/batch methods do NOT imply a fully async query interface
-        and therefore are intentionally excluded from this predicate.
-
-        This keeps reporting and interface expectations consistent:
-          - If supports_async is True, tests require async_query_method AND
-            async_stream_query_method for API symmetry.
-          - Async bulk/batch can exist independently without triggering those
-            stricter interface expectations.
-        """
-        return bool(self.async_query_method or self.async_stream_query_method)
+        """True if any async method is declared."""
+        return bool(
+            self.async_query_method
+            or self.async_stream_query_method
+            or self.async_bulk_vertices_method
+            or self.async_batch_method
+        )
 
     def is_available(self) -> bool:
         """
@@ -217,7 +207,8 @@ class GraphFrameworkDescriptor:
             return f">={self.minimum_framework_version}, <= {self.tested_up_to_version}"
         if self.minimum_framework_version:
             return f">={self.minimum_framework_version}"
-        return f"<= {self.tested_up_to_version}"
+        # Keep formatting consistent with the example (no space after "<=" for the single-bound case).
+        return f"<={self.tested_up_to_version}"
 
     def validate(self) -> None:
         """
@@ -238,22 +229,23 @@ class GraphFrameworkDescriptor:
 
         # Async consistency warnings (soft)
         #
-        # NOTE: The conformance suite expects async query/stream to be symmetric:
-        # if you declare an async stream method, you should also declare an async
-        # query method. This is a warning (not a hard error) to allow incremental
-        # bring-up while still surfacing likely misconfigurations early.
-        if self.async_stream_query_method and not self.async_query_method:
-            warnings.warn(
-                f"{self.name}: async_stream_query_method is set but "
-                f"async_query_method is None (async should have a query counterpart)",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-
+        # NOTE: These are intentionally warnings (not errors) so the registry can describe
+        # partially-supported frameworks while still allowing the test suite to decide how
+        # strict it wants to be for a given adapter.
         if self.async_stream_query_method and not self.stream_query_method:
             warnings.warn(
                 f"{self.name}: async_stream_query_method is set but "
                 f"stream_query_method is None (async should have a sync counterpart)",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+        # IMPORTANT: Async streaming without async query is an inconsistency that can break
+        # cross-framework contract expectations. This warning is expected by the graph
+        # registry self-check tests (edge-case validation).
+        if self.async_stream_query_method and not self.async_query_method:
+            warnings.warn(
+                f"{self.name}: async_stream_query_method is set but async_query_method is None",
                 RuntimeWarning,
                 stacklevel=2,
             )
