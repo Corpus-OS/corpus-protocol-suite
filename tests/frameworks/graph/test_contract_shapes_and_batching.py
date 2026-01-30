@@ -39,6 +39,32 @@ BATCH_QUERIES_ALT = [
     "batch-op-epsilon",
 ]
 
+# Rich mapping context used across all calls in this file.
+#
+# Why this exists:
+# - Other conformance suites enforce that adapters tolerate "rich mapping context"
+#   being passed as regular kwargs (e.g. request_id=..., tags=[...]).
+# - This file must not silently "pass" while only testing the narrow context_kwarg
+#   path; therefore we always splat these kwargs for every call.
+#
+# NOTE: Adapters are expected to accept and ignore unknown context keys.
+RICH_CONTEXT: dict[str, Any] = {
+    "request_id": "req-123",
+    "user_id": "user-abc",
+    "tags": ["test"],
+    "nested": {"depth": 2, "key": "value"},
+}
+
+# Performance guardrails:
+# - These tests are intentionally lightweight (smoke-style).
+# - We cap stream consumption so a buggy stream cannot hang the suite.
+MAX_STREAM_CHUNKS_TO_SAMPLE = 10
+
+# Stronger stream validation:
+# - To avoid "false coverage" where a stream yields 0 chunks and type checks do nothing,
+#   we require at least this many chunks for the within-stream type-consistency tests.
+MIN_STREAM_CHUNKS_REQUIRED_FOR_TYPE_TEST = 2
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -57,13 +83,19 @@ def framework_descriptor_fixture(
 
     Frameworks that are not actually available in the environment (e.g. the
     underlying LangChain / LlamaIndex / Semantic Kernel / etc. libraries are
-    missing) are skipped via descriptor.is_available().
+    missing) were historically skipped via descriptor.is_available().
+
+    UPDATED STRICT POLICY (ACTIVE TESTING):
+    - This suite is used to validate conformance for certification-like workflows.
+    - Therefore, registered frameworks must be available in the test environment.
+    - If a framework is registered but not available, we fail loudly to prevent
+      false confidence and to force the registry/environment to be aligned.
     """
     descriptor: GraphFrameworkDescriptor = request.param
-    if not descriptor.is_available():
-        pytest.skip(
-            f"Framework '{descriptor.name}' not available in this environment",
-        )
+    assert descriptor.is_available(), (
+        f"Framework '{descriptor.name}' is registered but not available in this environment. "
+        "This suite is configured for active testing: frameworks must be present and testable."
+    )
     return descriptor
 
 
@@ -79,7 +111,18 @@ def graph_client_instance(
     each framework adapter is expected to take a `adapter` kwarg that
     wraps a Corpus GraphProtocolV1 implementation.
     """
-    module = importlib.import_module(framework_descriptor.adapter_module)
+    # Defensive import hardening: syntax errors must fail with a clear message.
+    # This keeps conformance failures actionable (line number + offending text).
+    try:
+        module = importlib.import_module(framework_descriptor.adapter_module)
+    except SyntaxError as e:
+        pytest.fail(
+            f"Adapter module failed to import for {framework_descriptor.name!r}: "
+            f"SyntaxError at line {e.lineno}: {e.msg}\n"
+            f"Text: {e.text!r}",
+            pytrace=True,
+        )
+
     client_cls = getattr(module, framework_descriptor.adapter_class)
 
     init_kwargs: dict[str, Any] = {"adapter": adapter}
@@ -133,13 +176,44 @@ def _assert_async_iterable(obj: Any) -> None:
         )
 
 
+def _context_kwargs_for_descriptor(descriptor: GraphFrameworkDescriptor) -> dict[str, Any]:
+    """
+    Build kwargs that nest RICH_CONTEXT under the framework-specific context parameter.
+
+    Each framework adapter expects context to be passed via its specific context_kwarg
+    (e.g., 'conversation' for AutoGen, 'task' for CrewAI, 'config' for LangChain).
+    We nest RICH_CONTEXT under that parameter to avoid TypeError from unexpected kwargs.
+
+    This prevents "false passes" where tests only exercise the happy path.
+    """
+    kw: dict[str, Any] = {}
+
+    if descriptor.context_kwarg:
+        # Nest RICH_CONTEXT under the framework-specific context parameter
+        ctx = dict(RICH_CONTEXT)
+        
+        # Best-effort traceability: include framework name in tags.
+        # This is non-fatal if tags cannot be coerced to a list.
+        try:
+            tags = list(ctx.get("tags", []))
+            tags.append(descriptor.name)
+            ctx["tags"] = tags
+        except Exception:
+            pass
+        
+        kw[descriptor.context_kwarg] = ctx
+
+    return kw
+
+
 def _maybe_call_with_context(
     descriptor: GraphFrameworkDescriptor,
     fn: Callable[..., Any],
     first_arg: Any,
 ) -> Any:
     """
-    Call a graph client method, respecting descriptor.context_kwarg if present.
+    Call a graph client method, applying rich mapping context kwargs and
+    descriptor.context_kwarg (if declared).
 
     This helper works for all single-arg graph surfaces we test here:
     - query(text)
@@ -147,9 +221,7 @@ def _maybe_call_with_context(
     - aquery(text)
     - astream_query(text)
     """
-    if descriptor.context_kwarg:
-        return fn(first_arg, **{descriptor.context_kwarg: {}})
-    return fn(first_arg)
+    return fn(first_arg, **_context_kwargs_for_descriptor(descriptor))
 
 
 def _build_bulk_spec(namespace: str | None, limit: int) -> BulkVerticesSpec:
@@ -178,10 +250,69 @@ def _build_batch_ops(queries: list[str]) -> list[BatchOperation]:
     return [
         BatchOperation(
             op="query",
-            args={"query": q},
+            args={"text": q},
         )
         for q in queries
     ]
+
+
+def _require_all_surfaces_declared(descriptor: GraphFrameworkDescriptor) -> None:
+    """
+    Enforce ACTIVE TESTING POLICY: all method surfaces must be enabled/declared.
+
+    Why this exists:
+    - The user requirement is to "test everything" and ensure "all methods are set to true".
+    - If the registry marks a surface unsupported/absent, we fail here rather than silently
+      skipping or returning early.
+
+    This test only checks registry metadata. Method existence/callability is validated
+    further below via _get_method(...) in the individual tests.
+    """
+    # Required query surface must always be present
+    assert descriptor.query_method, f"{descriptor.name}: query_method must be declared"
+
+    # Streaming must be declared and supported for active testing
+    assert descriptor.stream_query_method, f"{descriptor.name}: stream_query_method must be declared for active testing"
+
+    # Bulk and batch must be declared and supported for active testing
+    assert descriptor.supports_bulk_vertices is True, (
+        f"{descriptor.name}: supports_bulk_vertices must be True for active testing"
+    )
+    assert descriptor.bulk_vertices_method, f"{descriptor.name}: bulk_vertices_method must be declared for active testing"
+
+    assert descriptor.supports_batch is True, (
+        f"{descriptor.name}: supports_batch must be True for active testing"
+    )
+    assert descriptor.batch_method, f"{descriptor.name}: batch_method must be declared for active testing"
+
+    # Async must be declared and all async methods must be present
+    assert descriptor.supports_async is True, f"{descriptor.name}: supports_async must be True for active testing"
+    assert descriptor.async_query_method, f"{descriptor.name}: async_query_method must be declared for active testing"
+    assert descriptor.async_stream_query_method, (
+        f"{descriptor.name}: async_stream_query_method must be declared for active testing"
+    )
+    assert descriptor.async_bulk_vertices_method, (
+        f"{descriptor.name}: async_bulk_vertices_method must be declared for active testing"
+    )
+    assert descriptor.async_batch_method, f"{descriptor.name}: async_batch_method must be declared for active testing"
+
+
+# ---------------------------------------------------------------------------
+# Registry enforcement (ensures "all methods true" before exercising shapes)
+# ---------------------------------------------------------------------------
+
+
+def test_registry_declares_all_surfaces_enabled_for_active_testing(
+    framework_descriptor: GraphFrameworkDescriptor,
+) -> None:
+    """
+    Ensure the registry is configured for active testing of *all* surfaces.
+
+    This test is intentionally strict and fails when a framework descriptor marks
+    a surface unsupported/absent. The goal is to force registry alignment with the
+    conformance policy rather than silently reducing coverage.
+    """
+    _require_all_surfaces_declared(framework_descriptor)
 
 
 # ---------------------------------------------------------------------------
@@ -201,63 +332,47 @@ def test_query_result_type_stable_across_calls(
     custom result object or list, which would break callers relying on type
     stability.
     """
-    query_fn = _get_method(
-        graph_client_instance,
-        framework_descriptor.query_method,
-    )
+    _require_all_surfaces_declared(framework_descriptor)
 
-    result1 = _maybe_call_with_context(
-        framework_descriptor,
-        query_fn,
-        QUERY_TEXT_FOR_TYPE,
-    )
-    result2 = _maybe_call_with_context(
-        framework_descriptor,
-        query_fn,
-        QUERY_TEXT_FOR_TYPE + "-again",
-    )
+    query_fn = _get_method(graph_client_instance, framework_descriptor.query_method)
+
+    result1 = _maybe_call_with_context(framework_descriptor, query_fn, QUERY_TEXT_FOR_TYPE)
+    result2 = _maybe_call_with_context(framework_descriptor, query_fn, QUERY_TEXT_FOR_TYPE + "-again")
 
     assert result1 is not None
     assert result2 is not None
-    assert type(result1) is type(
-        result2,
-    ), (
+    assert type(result1) is type(result2), (
         "Sync query returned different types across calls: "
         f"{type(result1).__name__} vs {type(result2).__name__}"
     )
 
 
-def test_stream_chunk_type_consistent_within_stream_when_declared(
+def test_stream_chunk_type_consistent_within_stream(
     framework_descriptor: GraphFrameworkDescriptor,
     graph_client_instance: Any,
 ) -> None:
     """
-    When sync streaming is declared, all chunks yielded from a single stream
-    should have a consistent type.
+    All chunks yielded from a single sync stream should have a consistent type.
 
     We don't enforce any particular chunk *shape* here (that's adapter-level),
     only that a single stream doesn't mix, e.g., dicts and strings.
+
+    STRICTNESS NOTE:
+    - To avoid false coverage, we require the stream to yield at least
+      MIN_STREAM_CHUNKS_REQUIRED_FOR_TYPE_TEST chunks for this test.
     """
-    if not framework_descriptor.stream_query_method:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare sync streaming",
-        )
+    _require_all_surfaces_declared(framework_descriptor)
 
-    stream_fn = _get_method(
-        graph_client_instance,
-        framework_descriptor.stream_query_method,
-    )
+    stream_fn = _get_method(graph_client_instance, framework_descriptor.stream_query_method)
 
-    iterator = _maybe_call_with_context(
-        framework_descriptor,
-        stream_fn,
-        STREAM_TEXT_FOR_TYPE,
-    )
-
+    iterator = _maybe_call_with_context(framework_descriptor, stream_fn, STREAM_TEXT_FOR_TYPE)
     _assert_iterable(iterator)
 
     first_chunk_type: type[Any] | None = None
+    chunks_seen = 0
+
     for chunk in iterator:
+        chunks_seen += 1
         if first_chunk_type is None:
             first_chunk_type = type(chunk)
         else:
@@ -266,37 +381,36 @@ def test_stream_chunk_type_consistent_within_stream_when_declared(
                 f"{first_chunk_type.__name__} vs {type(chunk).__name__}"
             )
 
-    # It's acceptable for a stream to yield no chunks at all; the key
-    # contract here is *type* consistency, not minimum length.
+        # Performance guardrail: don't consume unbounded streams.
+        if chunks_seen >= MAX_STREAM_CHUNKS_TO_SAMPLE:
+            break
+
+    assert chunks_seen >= MIN_STREAM_CHUNKS_REQUIRED_FOR_TYPE_TEST, (
+        "Stream did not yield enough chunks to validate type consistency. "
+        f"Expected >= {MIN_STREAM_CHUNKS_REQUIRED_FOR_TYPE_TEST}, saw {chunks_seen}."
+    )
 
 
 @pytest.mark.asyncio
-async def test_async_stream_chunk_type_consistent_within_stream_when_supported(
+async def test_async_stream_chunk_type_consistent_within_stream(
     framework_descriptor: GraphFrameworkDescriptor,
     graph_client_instance: Any,
 ) -> None:
     """
-    When async streaming is declared, all chunks yielded from a single async
-    stream should have a consistent type.
+    All chunks yielded from a single async stream should have a consistent type.
 
     The async streaming surface may be an async iterator directly, or an
     awaitable resolving to one.
+
+    STRICTNESS NOTE:
+    - To avoid false coverage, we require the stream to yield at least
+      MIN_STREAM_CHUNKS_REQUIRED_FOR_TYPE_TEST chunks for this test.
     """
-    if not framework_descriptor.async_stream_query_method:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare async streaming",
-        )
+    _require_all_surfaces_declared(framework_descriptor)
 
-    astream_fn = _get_method(
-        graph_client_instance,
-        framework_descriptor.async_stream_query_method,
-    )
+    astream_fn = _get_method(graph_client_instance, framework_descriptor.async_stream_query_method)
 
-    aiter = _maybe_call_with_context(
-        framework_descriptor,
-        astream_fn,
-        ASYNC_STREAM_TEXT_FOR_TYPE,
-    )
+    aiter = _maybe_call_with_context(framework_descriptor, astream_fn, ASYNC_STREAM_TEXT_FOR_TYPE)
 
     # Allow both: awaitable -> async iterator, or async iterator directly.
     if inspect.isawaitable(aiter):
@@ -305,7 +419,10 @@ async def test_async_stream_chunk_type_consistent_within_stream_when_supported(
     _assert_async_iterable(aiter)
 
     first_chunk_type: type[Any] | None = None
+    chunks_seen = 0
+
     async for chunk in aiter:  # noqa: B007
+        chunks_seen += 1
         if first_chunk_type is None:
             first_chunk_type = type(chunk)
         else:
@@ -314,79 +431,70 @@ async def test_async_stream_chunk_type_consistent_within_stream_when_supported(
                 f"{first_chunk_type.__name__} vs {type(chunk).__name__}"
             )
 
+        # Performance guardrail: don't consume unbounded async streams.
+        if chunks_seen >= MAX_STREAM_CHUNKS_TO_SAMPLE:
+            break
+
+    assert chunks_seen >= MIN_STREAM_CHUNKS_REQUIRED_FOR_TYPE_TEST, (
+        "Async stream did not yield enough chunks to validate type consistency. "
+        f"Expected >= {MIN_STREAM_CHUNKS_REQUIRED_FOR_TYPE_TEST}, saw {chunks_seen}."
+    )
+
 
 # ---------------------------------------------------------------------------
 # Bulk vertices: basic shape + edge cases + async/sync parity
 # ---------------------------------------------------------------------------
 
 
-def test_bulk_vertices_result_type_stable_when_supported(
+def test_bulk_vertices_result_type_stable_across_calls(
     framework_descriptor: GraphFrameworkDescriptor,
     graph_client_instance: Any,
 ) -> None:
     """
-    When bulk_vertices is supported, repeated calls with similar specs should
-    return the same *type*.
+    Repeated bulk_vertices calls with similar specs should return the same *type*.
 
     We intentionally don't over-specify the shape of BulkVerticesResult; that
     is an adapter/protocol concern. Here we just enforce type stability.
     """
-    if not framework_descriptor.supports_bulk_vertices:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare bulk_vertices support",
-        )
+    _require_all_surfaces_declared(framework_descriptor)
 
-    assert framework_descriptor.bulk_vertices_method is not None
-
-    bulk_fn = _get_method(
-        graph_client_instance,
-        framework_descriptor.bulk_vertices_method,
-    )
+    bulk_fn = _get_method(graph_client_instance, framework_descriptor.bulk_vertices_method)
 
     spec1 = _build_bulk_spec(namespace=BULK_NAMESPACE_DEFAULT, limit=BULK_LIMIT_SMALL)
     spec2 = _build_bulk_spec(namespace=BULK_NAMESPACE_DEFAULT, limit=BULK_LIMIT_SMALL - 2)
 
-    result1 = bulk_fn(spec1)
-    result2 = bulk_fn(spec2)
+    result1 = bulk_fn(spec1, **_context_kwargs_for_descriptor(framework_descriptor))
+    result2 = bulk_fn(spec2, **_context_kwargs_for_descriptor(framework_descriptor))
 
     assert result1 is not None
     assert result2 is not None
-    assert type(result1) is type(
-        result2,
-    ), (
+    assert type(result1) is type(result2), (
         "bulk_vertices returned different result types across calls: "
         f"{type(result1).__name__} vs {type(result2).__name__}"
     )
 
 
-def test_bulk_vertices_limit_zero_when_supported(
+def test_bulk_vertices_limit_zero_is_rejected(
     framework_descriptor: GraphFrameworkDescriptor,
     graph_client_instance: Any,
 ) -> None:
     """
-    limit=0 is a valid edge case and should not cause errors.
+    limit=0 is rejected as invalid input per API contract.
 
-    We don't assert specific result semantics here (empty vs non-empty),
-    just that the call is accepted and returns a value.
+    The protocol requires limit to be positive for bulk operations.
     """
-    if not framework_descriptor.supports_bulk_vertices:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare bulk_vertices support",
-        )
+    _require_all_surfaces_declared(framework_descriptor)
 
-    assert framework_descriptor.bulk_vertices_method is not None
-
-    bulk_fn = _get_method(
-        graph_client_instance,
-        framework_descriptor.bulk_vertices_method,
-    )
-
+    from corpus_sdk.graph.graph_base import BadRequest
+    
+    bulk_fn = _get_method(graph_client_instance, framework_descriptor.bulk_vertices_method)
     spec = _build_bulk_spec(namespace=BULK_NAMESPACE_DEFAULT, limit=BULK_LIMIT_ZERO)
-    result = bulk_fn(spec)
-    assert result is not None
+
+    with pytest.raises(BadRequest, match="limit must be positive"):
+        bulk_fn(spec, **_context_kwargs_for_descriptor(framework_descriptor))
 
 
-def test_bulk_vertices_with_explicit_namespace_when_supported(
+def test_bulk_vertices_with_explicit_namespace_is_accepted(
     framework_descriptor: GraphFrameworkDescriptor,
     graph_client_instance: Any,
 ) -> None:
@@ -394,74 +502,45 @@ def test_bulk_vertices_with_explicit_namespace_when_supported(
     Using an explicit namespace should be supported wherever bulk_vertices
     is declared. This is important for multi-tenant / multi-dataset setups.
     """
-    if not framework_descriptor.supports_bulk_vertices:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare bulk_vertices support",
-        )
+    _require_all_surfaces_declared(framework_descriptor)
 
-    assert framework_descriptor.bulk_vertices_method is not None
-
-    bulk_fn = _get_method(
-        graph_client_instance,
-        framework_descriptor.bulk_vertices_method,
-    )
-
+    bulk_fn = _get_method(graph_client_instance, framework_descriptor.bulk_vertices_method)
     spec = _build_bulk_spec(namespace=BULK_NAMESPACE_EXPLICIT, limit=BULK_LIMIT_SMALL)
-    result = bulk_fn(spec)
+
+    result = bulk_fn(spec, **_context_kwargs_for_descriptor(framework_descriptor))
     assert result is not None
 
 
 @pytest.mark.asyncio
-async def test_async_bulk_vertices_type_matches_sync_when_supported(
+async def test_async_bulk_vertices_type_stable_across_calls(
     framework_descriptor: GraphFrameworkDescriptor,
     graph_client_instance: Any,
 ) -> None:
     """
-    When async bulk_vertices is supported, the async result type should match
-    the sync result type for the same spec.
+    Async bulk_vertices should return consistent types across calls.
 
-    This ensures callers can switch between sync/async without having to
-    special-case result handling.
+    We test async consistency without calling sync methods from async context
+    (which would trigger event loop errors in framework adapters).
     """
-    if not framework_descriptor.supports_bulk_vertices:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare bulk_vertices support",
-        )
+    _require_all_surfaces_declared(framework_descriptor)
 
-    if not framework_descriptor.async_bulk_vertices_method:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare async bulk_vertices",
-        )
+    abulk_fn = _get_method(graph_client_instance, framework_descriptor.async_bulk_vertices_method)
 
-    assert framework_descriptor.bulk_vertices_method is not None
+    spec1 = _build_bulk_spec(namespace=BULK_NAMESPACE_DEFAULT, limit=BULK_LIMIT_SMALL)
+    spec2 = _build_bulk_spec(namespace=BULK_NAMESPACE_DEFAULT, limit=BULK_LIMIT_SMALL - 2)
 
-    bulk_fn = _get_method(
-        graph_client_instance,
-        framework_descriptor.bulk_vertices_method,
-    )
-    abulk_fn = _get_method(
-        graph_client_instance,
-        framework_descriptor.async_bulk_vertices_method,
-    )
+    coro1 = abulk_fn(spec1, **_context_kwargs_for_descriptor(framework_descriptor))
+    assert inspect.isawaitable(coro1), "Async bulk_vertices method must return an awaitable"
+    async_result1 = await coro1
+    assert async_result1 is not None
 
-    spec = _build_bulk_spec(namespace=BULK_NAMESPACE_DEFAULT, limit=BULK_LIMIT_SMALL)
+    coro2 = abulk_fn(spec2, **_context_kwargs_for_descriptor(framework_descriptor))
+    async_result2 = await coro2
+    assert async_result2 is not None
 
-    sync_result = bulk_fn(spec)
-    assert sync_result is not None
-
-    coro = abulk_fn(spec)
-    assert inspect.isawaitable(coro), (
-        "Async bulk_vertices method must return an awaitable",
-    )
-
-    async_result = await coro
-    assert async_result is not None
-
-    assert type(async_result) is type(
-        sync_result,
-    ), (
-        "Async bulk_vertices result type does not match sync result type: "
-        f"{type(sync_result).__name__} vs {type(async_result).__name__}"
+    assert type(async_result1) is type(async_result2), (
+        "Async bulk_vertices returned different result types across calls: "
+        f"{type(async_result1).__name__} vs {type(async_result2).__name__}"
     )
 
 
@@ -470,154 +549,106 @@ async def test_async_bulk_vertices_type_matches_sync_when_supported(
 # ---------------------------------------------------------------------------
 
 
-def test_batch_result_length_matches_ops_when_supported(
+def test_batch_result_length_matches_ops_when_sized(
     framework_descriptor: GraphFrameworkDescriptor,
     graph_client_instance: Any,
 ) -> None:
     """
-    When batch operations are supported, the BatchResult (when it is
-    sequence-like) should have length equal to the number of BatchOperation
-    items passed in.
+    BatchResult.results list length should match the number of operations.
 
-    We only enforce this when the result exposes __len__, so adapters are
-    free to return non-sequence result types if desired.
+    Each BatchOperation should produce exactly one result entry in the
+    BatchResult.results list, maintaining 1:1 correspondence.
     """
-    if not framework_descriptor.supports_batch:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare batch support",
-        )
+    _require_all_surfaces_declared(framework_descriptor)
 
-    assert framework_descriptor.batch_method is not None
-
-    batch_fn = _get_method(
-        graph_client_instance,
-        framework_descriptor.batch_method,
-    )
-
+    batch_fn = _get_method(graph_client_instance, framework_descriptor.batch_method)
     ops = _build_batch_ops(BATCH_QUERIES_DEFAULT)
 
-    result = batch_fn(ops)
+    result = batch_fn(ops, **_context_kwargs_for_descriptor(framework_descriptor))
     assert result is not None
+    
+    # BatchResult has a .results attribute that should be a list
+    assert hasattr(result, "results"), "BatchResult must have a 'results' attribute"
+    assert isinstance(result.results, list), "BatchResult.results must be a list"
+    assert len(result.results) == len(ops), (
+        f"BatchResult.results length ({len(result.results)}) does not match "
+        f"number of operations ({len(ops)})"
+    )
 
-    if hasattr(result, "__len__"):
-        assert len(result) == len(
-            ops,
-        ), "BatchResult length does not match number of operations"
 
-
-def test_empty_batch_handling_when_supported(
+def test_empty_batch_is_rejected(
     framework_descriptor: GraphFrameworkDescriptor,
     graph_client_instance: Any,
 ) -> None:
     """
-    Batch methods should gracefully handle an empty list of operations.
+    Empty batch operations are rejected per API validation.
 
-    We don't require any particular result shape here, but if the result is
-    sequence-like, we expect it to have length 0.
+    The protocol requires at least one operation in a batch.
     """
-    if not framework_descriptor.supports_batch:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare batch support",
-        )
+    _require_all_surfaces_declared(framework_descriptor)
 
-    assert framework_descriptor.batch_method is not None
-
-    batch_fn = _get_method(
-        graph_client_instance,
-        framework_descriptor.batch_method,
-    )
-
+    batch_fn = _get_method(graph_client_instance, framework_descriptor.batch_method)
     ops: list[BatchOperation] = []
 
-    result = batch_fn(ops)
-    assert result is not None
-
-    if hasattr(result, "__len__"):
-        assert len(result) == 0, "BatchResult for empty ops list should be length 0"
+    with pytest.raises(ValueError, match="batch ops must not be empty"):
+        batch_fn(ops, **_context_kwargs_for_descriptor(framework_descriptor))
 
 
-def test_batch_result_type_stable_across_calls_when_supported(
+def test_batch_result_type_stable_across_calls(
     framework_descriptor: GraphFrameworkDescriptor,
     graph_client_instance: Any,
 ) -> None:
     """
-    When batch operations are supported, repeated calls should return the same
-    result *type* for similar inputs.
+    Repeated batch() calls should return the same result *type* for similar inputs.
     """
-    if not framework_descriptor.supports_batch:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare batch support",
-        )
+    _require_all_surfaces_declared(framework_descriptor)
 
-    assert framework_descriptor.batch_method is not None
-
-    batch_fn = _get_method(
-        graph_client_instance,
-        framework_descriptor.batch_method,
-    )
+    batch_fn = _get_method(graph_client_instance, framework_descriptor.batch_method)
 
     ops1 = _build_batch_ops([BATCH_QUERIES_DEFAULT[0]])
     ops2 = _build_batch_ops([BATCH_QUERIES_ALT[0]])
 
-    result1 = batch_fn(ops1)
-    result2 = batch_fn(ops2)
+    result1 = batch_fn(ops1, **_context_kwargs_for_descriptor(framework_descriptor))
+    result2 = batch_fn(ops2, **_context_kwargs_for_descriptor(framework_descriptor))
 
     assert result1 is not None
     assert result2 is not None
-    assert type(result1) is type(
-        result2,
-    ), (
+    assert type(result1) is type(result2), (
         "batch() returned different result types across calls: "
         f"{type(result1).__name__} vs {type(result2).__name__}"
     )
 
 
 @pytest.mark.asyncio
-async def test_async_batch_type_matches_sync_when_supported(
+async def test_async_batch_type_stable_across_calls(
     framework_descriptor: GraphFrameworkDescriptor,
     graph_client_instance: Any,
 ) -> None:
     """
-    When async batch is supported, the async result type should match the
-    sync result type for the same operations list.
+    Async batch should return consistent types across calls.
+
+    We test async consistency without calling sync methods from async context
+    (which would trigger event loop errors in framework adapters).
     """
-    if not framework_descriptor.supports_batch:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare batch support",
-        )
+    _require_all_surfaces_declared(framework_descriptor)
 
-    if not framework_descriptor.async_batch_method:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare async batch",
-        )
+    abatch_fn = _get_method(graph_client_instance, framework_descriptor.async_batch_method)
 
-    assert framework_descriptor.batch_method is not None
+    ops1 = _build_batch_ops(BATCH_QUERIES_DEFAULT[:2])
+    ops2 = _build_batch_ops(BATCH_QUERIES_ALT[:2])
 
-    batch_fn = _get_method(
-        graph_client_instance,
-        framework_descriptor.batch_method,
-    )
-    abatch_fn = _get_method(
-        graph_client_instance,
-        framework_descriptor.async_batch_method,
-    )
+    coro1 = abatch_fn(ops1, **_context_kwargs_for_descriptor(framework_descriptor))
+    assert inspect.isawaitable(coro1), "Async batch method must return an awaitable"
+    async_result1 = await coro1
+    assert async_result1 is not None
 
-    ops = _build_batch_ops(BATCH_QUERIES_DEFAULT[:2])
+    coro2 = abatch_fn(ops2, **_context_kwargs_for_descriptor(framework_descriptor))
+    async_result2 = await coro2
+    assert async_result2 is not None
 
-    sync_result = batch_fn(ops)
-    assert sync_result is not None
-
-    coro = abatch_fn(ops)
-    assert inspect.isawaitable(coro), "Async batch method must return an awaitable"
-
-    async_result = await coro
-    assert async_result is not None
-
-    assert type(async_result) is type(
-        sync_result,
-    ), (
-        "Async batch result type does not match sync batch result type: "
-        f"{type(sync_result).__name__} vs {type(async_result).__name__}"
+    assert type(async_result1) is type(async_result2), (
+        "Async batch returned different result types across calls: "
+        f"{type(async_result1).__name__} vs {type(async_result2).__name__}"
     )
 
 
