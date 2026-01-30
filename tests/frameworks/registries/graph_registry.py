@@ -147,13 +147,23 @@ class GraphFrameworkDescriptor:
 
     @property
     def supports_async(self) -> bool:
-        """True if any async method is declared."""
-        return bool(
-            self.async_query_method
-            or self.async_stream_query_method
-            or self.async_bulk_vertices_method
-            or self.async_batch_method
-        )
+        """
+        True if the descriptor declares an async *query surface*.
+
+        IMPORTANT (test-aligned semantics):
+        ----------------------------------
+        The graph framework conformance tests define "async support" as the
+        presence of async query and/or async streaming methods (aquery/astream).
+        Async-only bulk/batch methods do NOT imply a fully async query interface
+        and therefore are intentionally excluded from this predicate.
+
+        This keeps reporting and interface expectations consistent:
+          - If supports_async is True, tests require async_query_method AND
+            async_stream_query_method for API symmetry.
+          - Async bulk/batch can exist independently without triggering those
+            stricter interface expectations.
+        """
+        return bool(self.async_query_method or self.async_stream_query_method)
 
     def is_available(self) -> bool:
         """
@@ -227,6 +237,19 @@ class GraphFrameworkDescriptor:
             )
 
         # Async consistency warnings (soft)
+        #
+        # NOTE: The conformance suite expects async query/stream to be symmetric:
+        # if you declare an async stream method, you should also declare an async
+        # query method. This is a warning (not a hard error) to allow incremental
+        # bring-up while still surfacing likely misconfigurations early.
+        if self.async_stream_query_method and not self.async_query_method:
+            warnings.warn(
+                f"{self.name}: async_stream_query_method is set but "
+                f"async_query_method is None (async should have a query counterpart)",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
         if self.async_stream_query_method and not self.stream_query_method:
             warnings.warn(
                 f"{self.name}: async_stream_query_method is set but "
