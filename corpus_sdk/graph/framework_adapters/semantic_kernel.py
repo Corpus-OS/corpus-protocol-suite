@@ -36,25 +36,44 @@ Non-responsibilities
 - Backend-specific graph behavior (lives in graph adapters)
 - Semantic Kernel orchestration / plugin wiring
 - MMR and diversification details (handled inside GraphTranslator)
+
+Namespace precedence (clarified)
+--------------------------------
+This adapter supports multiple ways to provide a namespace, depending on the
+operation shape:
+
+- Query APIs accept an explicit `namespace` argument (highest precedence), then
+  fall back to the client defaults.
+- Spec-driven APIs (e.g., UpsertNodesSpec, UpsertEdgesSpec, BulkVerticesSpec,
+  GraphTraversalSpec, Delete*Spec) use `spec.namespace` when present, then fall
+  back to the client defaults.
+- Semantic Kernel `settings` and `context` are used to derive OperationContext
+  for observability and policy propagation, but do not override the explicit
+  namespace argument or spec namespace unless your core translation layer
+  intentionally injects such values into attrs for downstream consumption.
+
+This is a documentation clarification only: the runtime behavior matches the
+existing patterns in this file and across other framework adapters.
 """
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 from functools import cached_property
 from typing import (
     Any,
     AsyncIterator,
+    Callable,
+    Dict,
     Iterator,
     List,
     Mapping,
     Optional,
     Protocol,
-    Dict,
     TypeVar,
-    Callable,
 )
 
 from corpus_sdk.core.context_translation import (
@@ -63,16 +82,17 @@ from corpus_sdk.core.context_translation import (
 from corpus_sdk.core.error_context import attach_context
 from corpus_sdk.graph.framework_adapters.common.graph_translation import (
     DefaultGraphFrameworkTranslator,
+    GraphFrameworkTranslator,
     GraphTranslator,
     create_graph_translator,
 )
 from corpus_sdk.graph.framework_adapters.common.framework_utils import (
     create_graph_error_context_decorator,
     graph_capabilities_to_dict,
-    validate_graph_result_type,
-    validate_graph_query,
-    validate_upsert_nodes_spec,
     validate_batch_operations,
+    validate_graph_query,
+    validate_graph_result_type,
+    validate_upsert_nodes_spec,
 )
 from corpus_sdk.graph.graph_base import (
     BadRequest,
@@ -86,6 +106,7 @@ from corpus_sdk.graph.graph_base import (
     GraphProtocolV1,
     GraphSchema,
     GraphTraversalSpec,
+    NotSupported,
     OperationContext,
     QueryChunk,
     QueryResult,
@@ -115,6 +136,15 @@ class ErrorCodes:
     BAD_BATCH_RESULT = "BAD_BATCH_RESULT"
     BAD_ADAPTER_RESULT = "BAD_ADAPTER_RESULT"
     SYNC_WRAPPER_CALLED_IN_EVENT_LOOP = "SYNC_WRAPPER_CALLED_IN_EVENT_LOOP"
+
+    # Validation-level constants used by shared validators in this adapter.
+    # Keeping these as explicit symbolic strings avoids accidental drift across frameworks.
+    INVALID_QUERY = "INVALID_QUERY"
+    INVALID_BATCH_OPS = "INVALID_BATCH_OPS"
+
+    # More explicit constants used by adapter-local guards/helpers.
+    BAD_ASYNC_ITERATOR_SHAPE = "BAD_ASYNC_ITERATOR_SHAPE"
+    INVALID_DELETE_SPEC = "INVALID_DELETE_SPEC"
 
 
 # --------------------------------------------------------------------------- #
@@ -165,6 +195,18 @@ def _looks_like_operation_context(obj: Any) -> bool:
 
     We first try a nominal isinstance check, then fall back to a structural
     check on common attributes used by OperationContext.
+
+    IMPORTANT (tightened for safety and clarity)
+    -------------------------------------------
+    The structural check is intentionally conservative: instead of accepting
+    any object that has *any* attribute matching OperationContext, it requires
+    a minimal coherent set:
+
+    - The object must expose `attrs`, and
+    - It must expose at least one of: `to_dict`, `request_id`, `traceparent`
+
+    This reduces false positives (e.g., accidentally accepting unrelated objects)
+    while remaining forward-compatible with Protocol-based OperationContext shapes.
     """
     if obj is None:
         return False
@@ -176,8 +218,55 @@ def _looks_like_operation_context(obj: Any) -> bool:
         # OperationContext may be a typing.Protocol in some modes.
         pass
 
-    attrs = ("request_id", "traceparent", "tenant", "attrs", "to_dict")
-    return any(hasattr(obj, attr) for attr in attrs)
+    # Require attrs + (to_dict OR request_id OR traceparent) as a minimal set.
+    has_attrs = hasattr(obj, "attrs")
+    has_to_dict = hasattr(obj, "to_dict")
+    has_request_id = hasattr(obj, "request_id")
+    has_traceparent = hasattr(obj, "traceparent")
+
+    if not has_attrs:
+        return False
+
+    return bool(has_to_dict or has_request_id or has_traceparent)
+
+
+def _is_async_iterator(obj: Any) -> bool:
+    """
+    Return True if the object looks like an AsyncIterator.
+
+    We check for both __aiter__ and __anext__ to avoid treating arbitrary
+    awaitables or objects with only partial async iteration methods as
+    streaming iterators.
+    """
+    return hasattr(obj, "__aiter__") and hasattr(obj, "__anext__")
+
+
+def _normalize_async_iterator(aiter_or_awaitable: Any) -> Any:
+    """
+    Normalize either:
+      - an AsyncIterator, OR
+      - an awaitable that resolves to an AsyncIterator,
+    into a shape that the caller can safely consume.
+
+    Why:
+      GraphTranslator implementations may choose to return async iterators eagerly
+      or lazily (as an awaitable). Supporting both keeps this adapter robust to
+      translator evolution and aligned with other framework adapters.
+
+    Contract:
+      - If input is an awaitable, return it unchanged (caller awaits it).
+      - If input is already an AsyncIterator, return it unchanged.
+      - Otherwise, raise a TypeError with a clear adapter-specific error code.
+    """
+    if inspect.isawaitable(aiter_or_awaitable):
+        return aiter_or_awaitable
+    if _is_async_iterator(aiter_or_awaitable):
+        return aiter_or_awaitable
+
+    raise TypeError(
+        "Expected an AsyncIterator or an awaitable resolving to an AsyncIterator "
+        f"from GraphTranslator.arun_query_stream. [{ErrorCodes.BAD_ASYNC_ITERATOR_SHAPE}]",
+    )
 
 
 def _ensure_not_in_event_loop(api_name: str) -> None:
@@ -214,10 +303,10 @@ class SemanticKernelGraphClientProtocol(Protocol):
 
     # Capabilities / schema / health -------------------------------------
 
-    def capabilities(self, **kwargs) -> Mapping[str, Any]:
+    def capabilities(self, **kwargs: Any) -> Mapping[str, Any]:
         ...
 
-    async def acapabilities(self, **kwargs) -> Mapping[str, Any]:
+    async def acapabilities(self, **kwargs: Any) -> Mapping[str, Any]:
         ...
 
     def get_schema(
@@ -554,7 +643,7 @@ class CorpusSemanticKernelGraphClient:
         default_namespace: Optional[str] = None,
         default_timeout_ms: Optional[int] = None,
         framework_version: Optional[str] = None,
-        framework_translator: Optional[DefaultGraphFrameworkTranslator] = None,
+        framework_translator: Optional[GraphFrameworkTranslator] = None,
     ) -> None:
         """
         Initialize a Semantic Kernel–oriented graph client.
@@ -590,9 +679,8 @@ class CorpusSemanticKernelGraphClient:
         self._default_namespace: Optional[str] = default_namespace
         self._default_timeout_ms: Optional[int] = default_timeout_ms
         self._framework_version: Optional[str] = framework_version
-        self._framework_translator: Optional[DefaultGraphFrameworkTranslator] = (
-            framework_translator
-        )
+        self._framework_translator: Optional[GraphFrameworkTranslator] = framework_translator
+
         # Idempotent close flags for explicit close() / aclose() and context managers.
         self._closed: bool = False
         self._aclosed: bool = False
@@ -670,6 +758,13 @@ class CorpusSemanticKernelGraphClient:
 
         This method is idempotent and safe to call multiple times. It will
         call `aclose()` on the underlying graph adapter when available.
+
+        Close semantics alignment (clarified)
+        ------------------------------------
+        - If async close succeeds, we also mark the sync-close flag as closed,
+          because from a caller perspective the underlying adapter is closed.
+        - If async close is unavailable or fails, we fall back to sync close
+          to avoid leaking resources in mixed adapter implementations.
         """
         if self._aclosed:
             return
@@ -678,11 +773,18 @@ class CorpusSemanticKernelGraphClient:
         if hasattr(self._graph, "aclose"):
             try:
                 await self._graph.aclose()
+                # Align sync/async close semantics: a successful async close also
+                # satisfies the "closed" state from the perspective of callers.
+                self._closed = True
+                return
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "Error while closing graph adapter in aclose(): %s",
                     exc,
                 )
+
+        # Fallback to sync close if async close is unavailable or failed.
+        self.close()
 
     # ------------------------------------------------------------------ #
     # Translator (lazy, cached)
@@ -695,9 +797,7 @@ class CorpusSemanticKernelGraphClient:
 
         Uses `cached_property` for thread safety and performance.
         """
-        framework_translator = (
-            self._framework_translator or SemanticKernelGraphFrameworkTranslator()
-        )
+        framework_translator = self._framework_translator or SemanticKernelGraphFrameworkTranslator()
         return create_graph_translator(
             adapter=self._graph,
             framework="semantic_kernel",
@@ -812,14 +912,36 @@ class CorpusSemanticKernelGraphClient:
             - namespace (optional)
             - timeout_ms (optional int)
             - stream (bool)
+
+        Notes on params validation (best-effort)
+        ---------------------------------------
+        Some graph adapters serialize params to JSON. This adapter does not
+        require params to be JSON-serializable (to preserve flexibility and
+        avoid breaking existing integrations), but it does emit a debug log if
+        the params are not JSON-serializable to help catch issues earlier.
         """
         effective_dialect = dialect or self._default_dialect
         effective_namespace = namespace or self._default_namespace
         effective_timeout = timeout_ms or self._default_timeout_ms
 
+        # Materialize params to a dict early to ensure stable behavior regardless
+        # of the caller's mapping type.
+        materialized_params: Dict[str, Any] = dict(params or {})
+
+        # Best-effort JSON-serializability check: logs only (no exception),
+        # preserving existing behavior while improving debuggability.
+        if materialized_params:
+            try:
+                json.dumps(materialized_params)
+            except (TypeError, ValueError) as exc:
+                logger.debug(
+                    "Query params are not JSON-serializable (may be OK for some adapters): %s",
+                    exc,
+                )
+
         raw: Dict[str, Any] = {
             "text": query,
-            "params": dict(params or {}),
+            "params": materialized_params,
             "stream": bool(stream),
         }
         if effective_dialect is not None:
@@ -854,7 +976,74 @@ class CorpusSemanticKernelGraphClient:
 
         return ctx
 
-    def _validate_upsert_edges_spec(self, spec: UpsertEdgesSpec) -> None:
+    def _select_filter_or_ids(
+        self,
+        *,
+        spec_filter: Any,
+        spec_ids: Any,
+        empty_message: str,
+    ) -> Any:
+        """
+        Shared helper to select either a filter or a non-empty ID list.
+
+        This improves consistency across delete_nodes/delete_edges sync+async
+        implementations while preserving the original error handling semantics.
+        """
+        if spec_filter is not None:
+            return spec_filter
+
+        ids = list(spec_ids or [])
+        if not ids:
+            # Preserve existing behavior: raise BadRequest with BAD_ADAPTER_RESULT.
+            # Include an additional stable identifier in the message for easier
+            # attribution without changing external code fields.
+            raise BadRequest(
+                f"{empty_message} [{ErrorCodes.INVALID_DELETE_SPEC}]",
+                code=ErrorCodes.BAD_ADAPTER_RESULT,
+            )
+        return ids
+
+    def _build_bulk_vertices_request(self, spec: BulkVerticesSpec) -> Mapping[str, Any]:
+        """
+        Build the raw bulk vertices request mapping for GraphTranslator.
+
+        Single Source of Truth pattern:
+        -------------------------------
+        Both sync and async bulk_vertices methods call this helper to ensure that
+        additions/changes to BulkVerticesSpec fields are reflected uniformly.
+        This reduces the risk of "payload materialization drift" between parallel
+        code paths without changing semantics or performance characteristics.
+        """
+        return {
+            "namespace": spec.namespace,
+            "limit": spec.limit,
+            "cursor": spec.cursor,
+            "filter": spec.filter,
+        }
+
+    def _build_traversal_request(self, spec: GraphTraversalSpec) -> Mapping[str, Any]:
+        """
+        Build the raw traversal request mapping for GraphTranslator.
+
+        Single Source of Truth pattern:
+        -------------------------------
+        Both sync and async traversal methods call this helper to ensure that
+        additions/changes to GraphTraversalSpec fields are reflected uniformly.
+        This reduces the risk of "payload materialization drift" between parallel
+        code paths without changing semantics or performance characteristics.
+        """
+        return {
+            "start_nodes": list(spec.start_nodes),
+            "max_depth": spec.max_depth,
+            "direction": spec.direction,
+            "relationship_types": spec.relationship_types,
+            "node_filters": spec.node_filters,
+            "relationship_filters": spec.relationship_filters,
+            "return_properties": spec.return_properties,
+            "namespace": spec.namespace,
+        }
+
+    def _validate_upsert_edges_spec(self, spec: UpsertEdgesSpec) -> List[Any]:
         """
         Basic structural validation for UpsertEdgesSpec.edges to provide
         clearer errors before reaching the adapter / translator.
@@ -864,6 +1053,13 @@ class CorpusSemanticKernelGraphClient:
         - edges must be iterable and non-empty
         - each edge must have id, src, dst, label
         - properties (if present) must be JSON-serializable
+
+        IMPORTANT (side-effect avoidance)
+        --------------------------------
+        This helper returns a validated, materialized list of edges instead of
+        mutating spec.edges. Avoiding mutation prevents surprising behavior if
+        the caller reuses a spec object or passes an iterator intended to be
+        consumed once.
         """
         if spec.edges is None:
             raise BadRequest(
@@ -917,33 +1113,62 @@ class CorpusSemanticKernelGraphClient:
                         code=ErrorCodes.BAD_ADAPTER_RESULT,
                     ) from exc
 
-        # Normalize to list to avoid one-shot iterables after validation.
-        spec.edges = edges_list  # type: ignore[assignment]
+        return edges_list
 
     # ------------------------------------------------------------------ #
     # Capabilities / schema / health
     # ------------------------------------------------------------------ #
 
     @with_graph_error_context("capabilities_sync")
-    def capabilities(self, **kwargs) -> Mapping[str, Any]:
+    def capabilities(self, **kwargs: Any) -> Mapping[str, Any]:
         """
         Sync wrapper around capabilities, delegating async→sync bridging
         to GraphTranslator.
+
+        kwargs are accepted for forward compatibility:
+        - Future GraphTranslator/adapter implementations may accept capability
+          filters or options.
+        - This adapter forwards kwargs when supported, and falls back to the
+          current signature without raising if not supported.
         """
         _ensure_not_in_event_loop("capabilities")
-        caps = self._translator.capabilities()
+
+        # Forward kwargs when supported; otherwise fall back without error.
+        # We avoid signature inspection (which can be expensive and brittle)
+        # by using a simple TypeError fallback.
+        try:
+            caps = self._translator.capabilities(**kwargs)  # type: ignore[misc]
+        except TypeError:
+            if kwargs:
+                logger.debug(
+                    "GraphTranslator.capabilities does not accept kwargs; ignoring: %s",
+                    sorted(kwargs.keys()),
+                )
+            caps = self._translator.capabilities()
+
         # Normalize to a simple dict for SK consumption via shared helper.
         return graph_capabilities_to_dict(caps)
 
     @with_async_graph_error_context("capabilities_async")
-    async def acapabilities(self, **kwargs) -> Mapping[str, Any]:
+    async def acapabilities(self, **kwargs: Any) -> Mapping[str, Any]:
         """
         Async capabilities accessor.
 
         We delegate to GraphTranslator for consistency, then normalize to a
         simple dict for SK consumption.
+
+        kwargs are accepted for forward compatibility and forwarded when supported.
         """
-        caps = await self._translator.arun_capabilities()
+        try:
+            caps = await self._translator.arun_capabilities(**kwargs)  # type: ignore[misc]
+        except TypeError:
+            if kwargs:
+                logger.debug(
+                    "GraphTranslator.arun_capabilities does not accept kwargs; ignoring: %s",
+                    sorted(kwargs.keys()),
+                )
+            caps = await self._translator.arun_capabilities()
+
         return graph_capabilities_to_dict(caps)
 
     @with_graph_error_context("get_schema_sync")
@@ -1081,7 +1306,7 @@ class CorpusSemanticKernelGraphClient:
         Returns the underlying `QueryResult`.
         """
         _ensure_not_in_event_loop("query")
-        validate_graph_query(query, operation="query", error_code="INVALID_QUERY")
+        validate_graph_query(query, operation="query", error_code=ErrorCodes.INVALID_QUERY)
 
         ctx = self._build_ctx(
             context=context,
@@ -1101,12 +1326,33 @@ class CorpusSemanticKernelGraphClient:
             namespace=namespace,
         )
 
-        result = self._translator.query(
-            raw_query,
-            op_ctx=ctx,
-            framework_ctx=framework_ctx,
-            mmr_config=None,
-        )
+        try:
+            result = self._translator.query(
+                raw_query,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+                mmr_config=None,
+            )
+        except NotSupported:
+            # Dialect fallback mirrors other framework adapters:
+            # - If the caller explicitly provided a dialect, retry without it.
+            # - If the dialect was not explicitly provided, preserve existing behavior.
+            if dialect is not None:
+                logger.debug(
+                    "Dialect not supported; retrying query without dialect. dialect=%s",
+                    dialect,
+                )
+                fallback_raw = dict(raw_query)
+                fallback_raw.pop("dialect", None)
+                result = self._translator.query(
+                    fallback_raw,
+                    op_ctx=ctx,
+                    framework_ctx=framework_ctx,
+                    mmr_config=None,
+                )
+            else:
+                raise
+
         return validate_graph_result_type(
             result,
             expected_type=QueryResult,
@@ -1132,7 +1378,7 @@ class CorpusSemanticKernelGraphClient:
 
         Returns the underlying `QueryResult`.
         """
-        validate_graph_query(query, operation="aquery", error_code="INVALID_QUERY")
+        validate_graph_query(query, operation="aquery", error_code=ErrorCodes.INVALID_QUERY)
 
         ctx = self._build_ctx(
             context=context,
@@ -1152,12 +1398,30 @@ class CorpusSemanticKernelGraphClient:
             namespace=namespace,
         )
 
-        result = await self._translator.arun_query(
-            raw_query,
-            op_ctx=ctx,
-            framework_ctx=framework_ctx,
-            mmr_config=None,
-        )
+        try:
+            result = await self._translator.arun_query(
+                raw_query,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+                mmr_config=None,
+            )
+        except NotSupported:
+            if dialect is not None:
+                logger.debug(
+                    "Dialect not supported; retrying async query without dialect. dialect=%s",
+                    dialect,
+                )
+                fallback_raw = dict(raw_query)
+                fallback_raw.pop("dialect", None)
+                result = await self._translator.arun_query(
+                    fallback_raw,
+                    op_ctx=ctx,
+                    framework_ctx=framework_ctx,
+                    mmr_config=None,
+                )
+            else:
+                raise
+
         return validate_graph_result_type(
             result,
             expected_type=QueryResult,
@@ -1189,7 +1453,11 @@ class CorpusSemanticKernelGraphClient:
         SyncStreamBridge under the hood.
         """
         _ensure_not_in_event_loop("stream_query")
-        validate_graph_query(query, operation="stream_query", error_code="INVALID_QUERY")
+        validate_graph_query(
+            query,
+            operation="stream_query",
+            error_code=ErrorCodes.INVALID_QUERY,
+        )
 
         ctx = self._build_ctx(
             context=context,
@@ -1236,8 +1504,17 @@ class CorpusSemanticKernelGraphClient:
     ) -> AsyncIterator[QueryChunk]:
         """
         Execute a streaming graph query (async), yielding `QueryChunk` items.
+
+        Note:
+        - Some GraphTranslator implementations return an AsyncIterator directly.
+        - Others return an awaitable that resolves to an AsyncIterator.
+        This adapter supports both shapes to prevent brittle coupling.
         """
-        validate_graph_query(query, operation="astream_query", error_code="INVALID_QUERY")
+        validate_graph_query(
+            query,
+            operation="astream_query",
+            error_code=ErrorCodes.INVALID_QUERY,
+        )
 
         ctx = self._build_ctx(
             context=context,
@@ -1257,11 +1534,25 @@ class CorpusSemanticKernelGraphClient:
             namespace=namespace,
         )
 
-        async for chunk in self._translator.arun_query_stream(
+        aiter_or_awaitable = self._translator.arun_query_stream(
             raw_query,
             op_ctx=ctx,
             framework_ctx=framework_ctx,
-        ):
+        )
+        normalized = _normalize_async_iterator(aiter_or_awaitable)
+        if inspect.isawaitable(normalized):
+            aiter = await normalized  # type: ignore[assignment]
+        else:
+            aiter = normalized  # type: ignore[assignment]
+
+        # Additional guard: even if the awaitable resolves, ensure we got an AsyncIterator.
+        if not _is_async_iterator(aiter):
+            raise TypeError(
+                "GraphTranslator.arun_query_stream resolved to a non-AsyncIterator "
+                f"type: {type(aiter).__name__}. [{ErrorCodes.BAD_ASYNC_ITERATOR_SHAPE}]",
+            )
+
+        async for chunk in aiter:
             yield validate_graph_result_type(
                 chunk,
                 expected_type=QueryChunk,
@@ -1359,7 +1650,7 @@ class CorpusSemanticKernelGraphClient:
         Sync wrapper for upserting edges via GraphTranslator.
         """
         _ensure_not_in_event_loop("upsert_edges")
-        self._validate_upsert_edges_spec(spec)
+        edges = self._validate_upsert_edges_spec(spec)
 
         ctx = self._build_ctx(
             context=context,
@@ -1372,7 +1663,7 @@ class CorpusSemanticKernelGraphClient:
         )
 
         result = self._translator.upsert_edges(
-            spec.edges,
+            edges,
             op_ctx=ctx,
             framework_ctx=framework_ctx,
         )
@@ -1395,7 +1686,7 @@ class CorpusSemanticKernelGraphClient:
         """
         Async wrapper for upserting edges via GraphTranslator.
         """
-        self._validate_upsert_edges_spec(spec)
+        edges = self._validate_upsert_edges_spec(spec)
 
         ctx = self._build_ctx(
             context=context,
@@ -1408,7 +1699,7 @@ class CorpusSemanticKernelGraphClient:
         )
 
         result = await self._translator.arun_upsert_edges(
-            spec.edges,
+            edges,
             op_ctx=ctx,
             framework_ctx=framework_ctx,
         )
@@ -1446,16 +1737,11 @@ class CorpusSemanticKernelGraphClient:
             namespace=getattr(spec, "namespace", None),
         )
 
-        if spec.filter is not None:
-            raw_filter_or_ids: Any = spec.filter
-        else:
-            ids = list(spec.ids or [])
-            if not ids:
-                raise BadRequest(
-                    "DeleteNodesSpec must specify either filter or non-empty ids",
-                    code=ErrorCodes.BAD_ADAPTER_RESULT,
-                )
-            raw_filter_or_ids = ids
+        raw_filter_or_ids: Any = self._select_filter_or_ids(
+            spec_filter=spec.filter,
+            spec_ids=spec.ids,
+            empty_message="DeleteNodesSpec must specify either filter or non-empty ids",
+        )
 
         result = self._translator.delete_nodes(
             raw_filter_or_ids,
@@ -1491,16 +1777,11 @@ class CorpusSemanticKernelGraphClient:
             namespace=getattr(spec, "namespace", None),
         )
 
-        if spec.filter is not None:
-            raw_filter_or_ids: Any = spec.filter
-        else:
-            ids = list(spec.ids or [])
-            if not ids:
-                raise BadRequest(
-                    "DeleteNodesSpec must specify either filter or non-empty ids",
-                    code=ErrorCodes.BAD_ADAPTER_RESULT,
-                )
-            raw_filter_or_ids = ids
+        raw_filter_or_ids: Any = self._select_filter_or_ids(
+            spec_filter=spec.filter,
+            spec_ids=spec.ids,
+            empty_message="DeleteNodesSpec must specify either filter or non-empty ids",
+        )
 
         result = await self._translator.arun_delete_nodes(
             raw_filter_or_ids,
@@ -1537,16 +1818,11 @@ class CorpusSemanticKernelGraphClient:
             namespace=getattr(spec, "namespace", None),
         )
 
-        if spec.filter is not None:
-            raw_filter_or_ids: Any = spec.filter
-        else:
-            ids = list(spec.ids or [])
-            if not ids:
-                raise BadRequest(
-                    "DeleteEdgesSpec must specify either filter or non-empty ids",
-                    code=ErrorCodes.BAD_ADAPTER_RESULT,
-                )
-            raw_filter_or_ids = ids
+        raw_filter_or_ids: Any = self._select_filter_or_ids(
+            spec_filter=spec.filter,
+            spec_ids=spec.ids,
+            empty_message="DeleteEdgesSpec must specify either filter or non-empty ids",
+        )
 
         result = self._translator.delete_edges(
             raw_filter_or_ids,
@@ -1582,16 +1858,11 @@ class CorpusSemanticKernelGraphClient:
             namespace=getattr(spec, "namespace", None),
         )
 
-        if spec.filter is not None:
-            raw_filter_or_ids: Any = spec.filter
-        else:
-            ids = list(spec.ids or [])
-            if not ids:
-                raise BadRequest(
-                    "DeleteEdgesSpec must specify either filter or non-empty ids",
-                    code=ErrorCodes.BAD_ADAPTER_RESULT,
-                )
-            raw_filter_or_ids = ids
+        raw_filter_or_ids: Any = self._select_filter_or_ids(
+            spec_filter=spec.filter,
+            spec_ids=spec.ids,
+            empty_message="DeleteEdgesSpec must specify either filter or non-empty ids",
+        )
 
         result = await self._translator.arun_delete_edges(
             raw_filter_or_ids,
@@ -1627,12 +1898,9 @@ class CorpusSemanticKernelGraphClient:
             settings=settings,
             extra_context=extra_context,
         )
-        raw_request: Mapping[str, Any] = {
-            "namespace": spec.namespace,
-            "limit": spec.limit,
-            "cursor": spec.cursor,
-            "filter": spec.filter,
-        }
+
+        raw_request = self._build_bulk_vertices_request(spec)
+
         framework_ctx = self._framework_ctx(
             operation="bulk_vertices",
             namespace=spec.namespace,
@@ -1667,12 +1935,9 @@ class CorpusSemanticKernelGraphClient:
             settings=settings,
             extra_context=extra_context,
         )
-        raw_request: Mapping[str, Any] = {
-            "namespace": spec.namespace,
-            "limit": spec.limit,
-            "cursor": spec.cursor,
-            "filter": spec.filter,
-        }
+
+        raw_request = self._build_bulk_vertices_request(spec)
+
         framework_ctx = self._framework_ctx(
             operation="bulk_vertices",
             namespace=spec.namespace,
@@ -1716,16 +1981,7 @@ class CorpusSemanticKernelGraphClient:
             extra_context=extra_context,
         )
 
-        raw_request: Mapping[str, Any] = {
-            "start_nodes": list(spec.start_nodes),
-            "max_depth": spec.max_depth,
-            "direction": spec.direction,
-            "relationship_types": spec.relationship_types,
-            "node_filters": spec.node_filters,
-            "relationship_filters": spec.relationship_filters,
-            "return_properties": spec.return_properties,
-            "namespace": spec.namespace,
-        }
+        raw_request = self._build_traversal_request(spec)
 
         framework_ctx = self._framework_ctx(
             operation="traversal",
@@ -1762,16 +2018,7 @@ class CorpusSemanticKernelGraphClient:
             extra_context=extra_context,
         )
 
-        raw_request: Mapping[str, Any] = {
-            "start_nodes": list(spec.start_nodes),
-            "max_depth": spec.max_depth,
-            "direction": spec.direction,
-            "relationship_types": spec.relationship_types,
-            "node_filters": spec.node_filters,
-            "relationship_filters": spec.relationship_filters,
-            "return_properties": spec.return_properties,
-            "namespace": spec.namespace,
-        }
+        raw_request = self._build_traversal_request(spec)
 
         framework_ctx = self._framework_ctx(
             operation="traversal",
@@ -1812,7 +2059,11 @@ class CorpusSemanticKernelGraphClient:
         _ensure_not_in_event_loop("transaction")
 
         # Reuse batch validation; semantics are still a list of BatchOperation.
-        validate_batch_operations(ops, operation="transaction", error_code="INVALID_BATCH_OPS")
+        validate_batch_operations(
+            ops,
+            operation="transaction",
+            error_code=ErrorCodes.INVALID_BATCH_OPS,
+        )
 
         ctx = self._build_ctx(
             context=context,
@@ -1848,7 +2099,11 @@ class CorpusSemanticKernelGraphClient:
         """
         Async wrapper for transactional batch operations.
         """
-        validate_batch_operations(ops, operation="atransaction", error_code="INVALID_BATCH_OPS")
+        validate_batch_operations(
+            ops,
+            operation="atransaction",
+            error_code=ErrorCodes.INVALID_BATCH_OPS,
+        )
 
         ctx = self._build_ctx(
             context=context,
@@ -1889,7 +2144,11 @@ class CorpusSemanticKernelGraphClient:
         Sync wrapper for batch operations via GraphTranslator.
         """
         _ensure_not_in_event_loop("batch")
-        validate_batch_operations(ops, operation="batch", error_code="INVALID_BATCH_OPS")
+        validate_batch_operations(
+            ops,
+            operation="batch",
+            error_code=ErrorCodes.INVALID_BATCH_OPS,
+        )
 
         ctx = self._build_ctx(
             context=context,
@@ -1925,7 +2184,11 @@ class CorpusSemanticKernelGraphClient:
         """
         Async wrapper for batch operations via GraphTranslator.
         """
-        validate_batch_operations(ops, operation="batch", error_code="INVALID_BATCH_OPS")
+        validate_batch_operations(
+            ops,
+            operation="abatch",
+            error_code=ErrorCodes.INVALID_BATCH_OPS,
+        )
 
         ctx = self._build_ctx(
             context=context,
@@ -1950,10 +2213,283 @@ class CorpusSemanticKernelGraphClient:
         )
 
 
+# ------------------------------------------------------------------ #
+# Optional Semantic Kernel dependency – only needed for SK plugin integration
+# ------------------------------------------------------------------ #
+
+try:
+    # The package name for Semantic Kernel in Python is typically "semantic_kernel".
+    # We keep the import optional so this adapter can be imported without SK installed.
+    import semantic_kernel as _semantic_kernel  # type: ignore  # noqa: F401
+except ImportError:  # pragma: no cover - optional dependency
+    _semantic_kernel = None  # type: ignore[assignment]
+
+
+# ------------------------------------------------------------------ #
+# Optional Semantic Kernel Plugin wrapper
+# ------------------------------------------------------------------ #
+
+if _semantic_kernel is not None:
+
+    class CorpusSemanticKernelPlugin:
+        """
+        Semantic Kernel–friendly plugin wrapper backed by CorpusSemanticKernelGraphClient.
+
+        Purpose
+        -------
+        This wrapper mirrors the "soft integration" pattern used by other framework
+        adapters (e.g., LlamaIndex GraphStore):
+
+        - The core adapter remains usable without Semantic Kernel installed.
+        - If Semantic Kernel is installed, this plugin can be registered into a
+          Kernel/plugin system for integration and integration testing.
+
+        Design notes
+        ------------
+        - This class is deliberately lightly opinionated: it exposes graph operations
+          in a SK-friendly shape, but does not assume a specific SK plugin decorator
+          or registration API, which can vary across SK versions.
+        - Methods accept `context` and `settings` as optional `Any` and forward them
+          through to the underlying client, preserving OperationContext propagation.
+        """
+
+        def __init__(
+            self,
+            client: "CorpusSemanticKernelGraphClient",
+            *,
+            namespace: Optional[str] = None,
+        ) -> None:
+            """
+            Parameters
+            ----------
+            client:
+                Underlying CorpusSemanticKernelGraphClient instance.
+            namespace:
+                Optional default namespace to pass explicitly for plugin operations.
+                This mirrors the behavior of other framework wrapper classes: a plugin
+                may be configured with a stable namespace rather than relying on caller
+                defaults.
+            """
+            self._client = client
+            self._namespace = namespace
+
+        @property
+        def client(self) -> Any:
+            """Expose underlying client for advanced callers and integration tests."""
+            return self._client
+
+        # ----------------------------- #
+        # Capabilities / schema / health
+        # ----------------------------- #
+
+        def capabilities(self, **kwargs: Any) -> Mapping[str, Any]:
+            """
+            Capabilities passthrough.
+
+            kwargs are accepted and forwarded for forward compatibility, consistent
+            with the underlying client API.
+            """
+            return self._client.capabilities(**kwargs)
+
+        async def acapabilities(self, **kwargs: Any) -> Mapping[str, Any]:
+            """Async capabilities passthrough."""
+            return await self._client.acapabilities(**kwargs)
+
+        def get_schema(
+            self,
+            *,
+            context: Optional[Any] = None,
+            settings: Optional[Any] = None,
+            extra_context: Optional[Mapping[str, Any]] = None,
+        ) -> GraphSchema:
+            """Schema passthrough."""
+            return self._client.get_schema(
+                context=context,
+                settings=settings,
+                extra_context=extra_context,
+            )
+
+        async def aget_schema(
+            self,
+            *,
+            context: Optional[Any] = None,
+            settings: Optional[Any] = None,
+            extra_context: Optional[Mapping[str, Any]] = None,
+        ) -> GraphSchema:
+            """Async schema passthrough."""
+            return await self._client.aget_schema(
+                context=context,
+                settings=settings,
+                extra_context=extra_context,
+            )
+
+        def health(
+            self,
+            *,
+            context: Optional[Any] = None,
+            settings: Optional[Any] = None,
+            extra_context: Optional[Mapping[str, Any]] = None,
+        ) -> Mapping[str, Any]:
+            """Health passthrough."""
+            return self._client.health(
+                context=context,
+                settings=settings,
+                extra_context=extra_context,
+            )
+
+        async def ahealth(
+            self,
+            *,
+            context: Optional[Any] = None,
+            settings: Optional[Any] = None,
+            extra_context: Optional[Mapping[str, Any]] = None,
+        ) -> Mapping[str, Any]:
+            """Async health passthrough."""
+            return await self._client.ahealth(
+                context=context,
+                settings=settings,
+                extra_context=extra_context,
+            )
+
+        # ----------------------------- #
+        # Query / streaming
+        # ----------------------------- #
+
+        def query(
+            self,
+            query: str,
+            *,
+            params: Optional[Mapping[str, Any]] = None,
+            dialect: Optional[str] = None,
+            namespace: Optional[str] = None,
+            timeout_ms: Optional[int] = None,
+            context: Optional[Any] = None,
+            settings: Optional[Any] = None,
+            extra_context: Optional[Mapping[str, Any]] = None,
+        ) -> QueryResult:
+            """
+            Query passthrough.
+
+            Namespace resolution:
+            - If `namespace` is passed explicitly, it is used.
+            - Otherwise, the plugin-level configured namespace is used (if set).
+            - Otherwise, the client default namespace behavior applies.
+            """
+            effective_namespace = namespace if namespace is not None else self._namespace
+            return self._client.query(
+                query,
+                params=params,
+                dialect=dialect,
+                namespace=effective_namespace,
+                timeout_ms=timeout_ms,
+                context=context,
+                settings=settings,
+                extra_context=extra_context,
+            )
+
+        async def aquery(
+            self,
+            query: str,
+            *,
+            params: Optional[Mapping[str, Any]] = None,
+            dialect: Optional[str] = None,
+            namespace: Optional[str] = None,
+            timeout_ms: Optional[int] = None,
+            context: Optional[Any] = None,
+            settings: Optional[Any] = None,
+            extra_context: Optional[Mapping[str, Any]] = None,
+        ) -> QueryResult:
+            """Async query passthrough (same namespace resolution rules as query)."""
+            effective_namespace = namespace if namespace is not None else self._namespace
+            return await self._client.aquery(
+                query,
+                params=params,
+                dialect=dialect,
+                namespace=effective_namespace,
+                timeout_ms=timeout_ms,
+                context=context,
+                settings=settings,
+                extra_context=extra_context,
+            )
+
+        def stream_query(
+            self,
+            query: str,
+            *,
+            params: Optional[Mapping[str, Any]] = None,
+            dialect: Optional[str] = None,
+            namespace: Optional[str] = None,
+            timeout_ms: Optional[int] = None,
+            context: Optional[Any] = None,
+            settings: Optional[Any] = None,
+            extra_context: Optional[Mapping[str, Any]] = None,
+        ) -> Iterator[QueryChunk]:
+            """Streaming query passthrough (sync)."""
+            effective_namespace = namespace if namespace is not None else self._namespace
+            return self._client.stream_query(
+                query,
+                params=params,
+                dialect=dialect,
+                namespace=effective_namespace,
+                timeout_ms=timeout_ms,
+                context=context,
+                settings=settings,
+                extra_context=extra_context,
+            )
+
+        async def astream_query(
+            self,
+            query: str,
+            *,
+            params: Optional[Mapping[str, Any]] = None,
+            dialect: Optional[str] = None,
+            namespace: Optional[str] = None,
+            timeout_ms: Optional[int] = None,
+            context: Optional[Any] = None,
+            settings: Optional[Any] = None,
+            extra_context: Optional[Mapping[str, Any]] = None,
+        ) -> AsyncIterator[QueryChunk]:
+            """Streaming query passthrough (async)."""
+            effective_namespace = namespace if namespace is not None else self._namespace
+            async for chunk in self._client.astream_query(
+                query,
+                params=params,
+                dialect=dialect,
+                namespace=effective_namespace,
+                timeout_ms=timeout_ms,
+                context=context,
+                settings=settings,
+                extra_context=extra_context,
+            ):
+                yield chunk
+
+        # ----------------------------- #
+        # Resource management
+        # ----------------------------- #
+
+        def close(self) -> None:
+            """Close passthrough for plugin users."""
+            self._client.close()
+
+        async def aclose(self) -> None:
+            """Async close passthrough for plugin users."""
+            await self._client.aclose()
+
+else:
+    # Semantic Kernel not installed – provide a stub that fails loudly at runtime
+    class CorpusSemanticKernelPlugin:  # type: ignore[misc]
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            raise ImportError(
+                "semantic_kernel is not installed; CorpusSemanticKernelPlugin is unavailable. "
+                "Install semantic-kernel to use this integration."
+            )
+
+
 __all__ = [
     "SemanticKernelGraphClientProtocol",
     "CorpusSemanticKernelGraphClient",
     "SemanticKernelGraphFrameworkTranslator",
+    "CorpusSemanticKernelPlugin",
     "ErrorCodes",
     "with_graph_error_context",
     "with_async_graph_error_context",
