@@ -1,369 +1,268 @@
-# corpus_sdk/embedding/framework_adapters/langchain.py
+# corpus_sdk/llm/framework_adapters/langchain.py
 # SPDX-License-Identifier: Apache-2.0
 
 """
-LangChain adapter for Corpus Embedding protocol.
+LangChain adapter for Corpus LLM protocol.
 
-This module exposes Corpus `EmbeddingProtocolV1` implementations as
-`langchain_core.embeddings.Embeddings`, with:
+This module exposes Corpus `LLMProtocolV1` implementations via the shared
+`LLMTranslator` layer as `langchain_core` chat models, with:
 
-- Sync + async embedding for documents and queries
-- Context normalization via `context_translation.from_langchain`
-- Framework-agnostic orchestration via `EmbeddingTranslator`
-- Async → sync bridging handled in the common embedding layer
-- Rich error context attachment for observability
-- Model selection via framework_ctx / OperationContext attrs
+- Async + sync generation
+- Async + sync streaming (true incremental streaming)
+- Proper callback integration (on_llm_end, on_llm_new_token, on_llm_error)
+- Protocol-first, translator-based design (no direct message translation)
+- Production-grade error handling and observability
+- Centralized token counting via LLMTranslator with robust fallbacks
 
-Design notes / philosophy
--------------------------
-- **Protocol-first**: we require only an `embed` method (duck-typed) instead of
-  strict inheritance from a specific adapter base class.
-- **Resilient to framework evolution**: LangChain’s RunnableConfig and invocation
-  APIs evolve; we normalize/validate context defensively and keep our adapter
-  surface stable.
-- **Observability-first**: all embedding operations attach rich error context:
-  framework identity, model info, batch sizes, node IDs, trace/workflow IDs, etc.
-- **Fail-safe context translation**: context translation must never break embeddings.
-  If translation fails, we proceed without `OperationContext` (optionally falling
-  back to a simple one) and attach diagnostic context.
-- **Strict by default**: non-string inputs in batch operations are rejected with
-  `TypeError` instead of being coerced, to avoid silently embedding repr() outputs.
+Design goals
+------------
 
-Resilience (retries, caching, rate limiting, etc.) is expected to be provided
-by the underlying adapter, typically a BaseEmbeddingAdapter subclass.
+1. Protocol + translator first:
+   All calls go through the shared `LLMTranslator` with the `"langchain"`
+   framework, so message normalization, post-processing, tools, and error context
+   are consistent across frameworks.
+
+2. Optional dependency safe:
+   Import of LangChain is guarded. Importing this module is safe even if
+   LangChain is not installed; attempting to *instantiate* the adapter without
+   LangChain will raise a clear ImportError.
+
+3. Simple & explicit interface:
+   Clean API that LangChain can use directly by plugging in this client
+   as a `BaseChatModel` implementation.
+
+4. True streaming:
+   Streaming goes through `LLMTranslator.stream` / `LLMTranslator.arun_stream`,
+   so you get protocol-level streaming semantics with LangChain–friendly outputs.
+
+5. Context + observability:
+   - `OperationContext` built from LangChain config via `ContextTranslator`
+   - Rich error context attached via core `attach_context`
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import threading
-import time
-from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from functools import wraps
 from typing import (
     Any,
+    AsyncIterator,
     Callable,
     Dict,
+    Iterator,
     List,
+    Mapping,
     Optional,
+    Protocol,
+    Sequence,
     Tuple,
     TypeVar,
 )
 
-from typing_extensions import TypedDict
+# ---------------------------------------------------------------------------
+# Optional LangChain imports (guarded)
+# ---------------------------------------------------------------------------
 
-from pydantic import BaseModel, ConfigDict, PrivateAttr, field_validator
+try:  # pragma: no cover - optional dependency
+    from langchain_core.callbacks import (
+        AsyncCallbackManagerForLLMRun,
+        CallbackManagerForLLMRun,
+    )
+    from langchain_core.language_models import BaseChatModel
+    from langchain_core.messages import (
+        AIMessage,
+        AIMessageChunk,
+        BaseMessage,
+        HumanMessage,
+    )
+    from langchain_core.outputs import (
+        ChatGeneration,
+        ChatGenerationChunk,
+        ChatResult,
+    )
 
-from corpus_sdk.core.context_translation import (
-    from_langchain as context_from_langchain,
-)
+    LANGCHAIN_AVAILABLE = True
+except ImportError:  # pragma: no cover - environments without LangChain
+    LANGCHAIN_AVAILABLE = False
+
+    # Minimal shims so the module can be imported and type hints are valid.
+    # These are never *used* at runtime because CorpusLangChainLLM.__init__
+    # raises if LangChain is not available.
+
+    class BaseChatModel:  # type: ignore[no-redef]
+        pass
+
+    class BaseMessage:  # type: ignore[no-redef]
+        def __init__(self, content: Any = "") -> None:
+            self.content = content
+            self.type = "unknown"
+
+    class AIMessage(BaseMessage):  # type: ignore[no-redef]
+        def __init__(self, content: Any = "") -> None:
+            super().__init__(content)
+            self.type = "ai"
+
+    class HumanMessage(BaseMessage):  # type: ignore[no-redef]
+        def __init__(self, content: Any = "") -> None:
+            super().__init__(content)
+            self.type = "human"
+
+    class AIMessageChunk(AIMessage):  # type: ignore[no-redef]
+        pass
+
+    class ChatGeneration:  # type: ignore[no-redef]
+        def __init__(self, message: AIMessage, generation_info: Optional[Dict[str, Any]] = None) -> None:
+            self.message = message
+            self.generation_info = generation_info or {}
+
+    class ChatGenerationChunk:  # type: ignore[no-redef]
+        def __init__(self, message: AIMessageChunk) -> None:
+            self.message = message
+
+    class ChatResult:  # type: ignore[no-redef]
+        def __init__(self, generations: List[ChatGeneration]) -> None:
+            self.generations = generations
+
+    class CallbackManagerForLLMRun:  # type: ignore[no-redef]
+        def on_llm_start(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def on_llm_end(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def on_llm_error(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def on_llm_new_token(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+    class AsyncCallbackManagerForLLMRun:  # type: ignore[no-redef]
+        async def on_llm_start(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def on_llm_end(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def on_llm_error(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def on_llm_new_token(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+from corpus_sdk.core.context_translation import ContextTranslator
 from corpus_sdk.core.error_context import attach_context
-from corpus_sdk.embedding.embedding_base import (
+from corpus_sdk.llm.llm_base import (
+    LLMProtocolV1,
     OperationContext,
 )
-from corpus_sdk.embedding.framework_adapters.common.embedding_translation import (
-    BatchConfig,
-    EmbeddingTranslator,
-    TextNormalizationConfig,
-    create_embedding_translator,
+from corpus_sdk.llm.framework_adapters.common.llm_translation import (
+    JSONRepair,
+    LLMFrameworkTranslator,
+    LLMPostProcessingConfig,
+    LLMTranslator,
+    SafetyFilter,
+    create_llm_translator,
 )
-from corpus_sdk.embedding.framework_adapters.common.framework_utils import (
+from corpus_sdk.llm.framework_adapters.common.framework_utils import (
     CoercionErrorCodes,
-    coerce_embedding_matrix,
-    coerce_embedding_vector,
-    warn_if_extreme_batch,
 )
 
 logger = logging.getLogger(__name__)
 
-T = TypeVar("T")
+# Availability flag for registry checks (set to True as LangChain LLM is now fully implemented)
+LANGCHAIN_LLM_AVAILABLE = True
 
+# Framework identifier used consistently for translator + error context
 _FRAMEWORK_NAME = "langchain"
 
+T = TypeVar("T")
+
 # ---------------------------------------------------------------------------
-# Safe conditional import for LangChain Embeddings
+# Error-code bundle (CoercionErrorCodes alignment)
 # ---------------------------------------------------------------------------
 
-try:
-    from langchain_core.embeddings import Embeddings  # type: ignore[no-redef]
-
-    LANGCHAIN_AVAILABLE = True
-except ImportError:  # pragma: no cover - only used when LangChain isn't installed
-
-    class Embeddings:  # type: ignore[no-redef]
-        """
-        Minimal fallback base class when LangChain is not installed.
-
-        This is only to keep imports from failing. Using the adapter without
-        LangChain installed is effectively a misconfiguration.
-        """
-
-        pass
-
-    LANGCHAIN_AVAILABLE = False
-
-# LLM adapter not yet implemented for LangChain
-LANGCHAIN_LLM_AVAILABLE = False
-
-
-class ErrorCodes:
-    """
-    Error code constants for LangChain embedding adapter.
-
-    This is a simple namespace for framework-specific codes. The shared
-    coercion helpers use `EMBEDDING_COERCION_ERROR_CODES`, which is a
-    `CoercionErrorCodes` instance derived from these values.
-    """
-
-    # Coercion-level (used by framework_utils)
-    INVALID_EMBEDDING_RESULT = "INVALID_EMBEDDING_RESULT"
-    EMPTY_EMBEDDING_RESULT = "EMPTY_EMBEDDING_RESULT"
-    EMBEDDING_CONVERSION_ERROR = "EMBEDDING_CONVERSION_ERROR"
-
-    # LangChain-specific config errors
-    LANGCHAIN_CONFIG_INVALID = "LANGCHAIN_CONFIG_INVALID"
-
-    # Sync wrapper misuse errors
-    SYNC_WRAPPER_CALLED_IN_EVENT_LOOP = "SYNC_WRAPPER_CALLED_IN_EVENT_LOOP"
-
-
-# Coercion configuration for the common embedding utils
-EMBEDDING_COERCION_ERROR_CODES: CoercionErrorCodes = CoercionErrorCodes(
-    invalid_result=ErrorCodes.INVALID_EMBEDDING_RESULT,
-    empty_result=ErrorCodes.EMPTY_EMBEDDING_RESULT,
-    conversion_error=ErrorCodes.EMBEDDING_CONVERSION_ERROR,
+ERROR_CODES = CoercionErrorCodes(
+    invalid_result="LANGCHAIN_LLM_INVALID_RESULT",
+    empty_result="LANGCHAIN_LLM_EMPTY_RESULT",
+    conversion_error="LANGCHAIN_LLM_CONVERSION_ERROR",
     framework_label=_FRAMEWORK_NAME,
 )
 
+# Symbolic code for init/config errors (for log/search friendliness)
+INIT_CONFIG_ERROR = "LANGCHAIN_LLM_BAD_INIT_CONFIG"
 
-class LangChainConfig(TypedDict, total=False):
-    """
-    Structured type for LangChain RunnableConfig-like context.
-
-    This mirrors the common fields exposed by LangChain's RunnableConfig /
-    invocation layer and is used both for type safety and for observability
-    context extraction.
-    """
-
-    configurable: Optional[Dict[str, Any]]
-    tags: Optional[List[str]]
-    metadata: Optional[Dict[str, Any]]
-    callbacks: Optional[Any]
-    run_name: Optional[str]
-    run_id: Optional[str]
-
-
-class LangChainAdapterConfig(TypedDict, total=False):
-    """
-    Structured configuration for LangChain adapter behavior.
-
-    This is *adapter-level* configuration (not to be confused with the per-call
-    LangChain RunnableConfig-like `config` dict passed into embed calls).
-
-    Fields
-    ------
-    fallback_to_simple_context:
-        If context translation fails or returns a non-OperationContext value,
-        optionally fall back to an empty OperationContext() instead of proceeding
-        with no core context. Defaults to False to preserve compatibility.
-
-    enable_operation_context_propagation:
-        If True, include the OperationContext instance in framework_ctx as
-        `_operation_context` for downstream inspection. Defaults to True.
-    """
-
-    fallback_to_simple_context: bool
-    enable_operation_context_propagation: bool
-
+# Symbolic code for misuse of sync APIs inside an event loop
+SYNC_WRAPPER_CALLED_IN_EVENT_LOOP = "LANGCHAIN_LLM_SYNC_WRAPPER_CALLED_IN_EVENT_LOOP"
 
 # ---------------------------------------------------------------------------
-# Safety / robustness utilities (input validation + safe snapshots)
+# Event-loop safety helper
 # ---------------------------------------------------------------------------
-
-
-def _validate_texts_are_strings(texts: Sequence[Any], *, op_name: str) -> None:
-    """
-    Fail fast if a caller provides non-string items.
-
-    We intentionally do not coerce arbitrary objects to str here, because that can
-    silently embed repr() outputs and lead to confusing retrieval behavior.
-    """
-    for i, t in enumerate(texts):
-        if not isinstance(t, str):
-            raise TypeError(
-                f"{op_name} expects Sequence[str]; item {i} is {type(t).__name__}",
-            )
-
-
-def _safe_snapshot(value: Any, *, max_items: int = 200, max_str: int = 5_000) -> Any:
-    """
-    Best-effort conversion into a JSON-ish, safe-to-log snapshot.
-
-    - Limits container size to reduce log bloat
-    - Truncates long strings
-    - Falls back to repr() for unknown objects
-
-    NOTE: This is intended for observability payloads; it does not guarantee
-    redaction of secrets, but it significantly reduces accidental large dumps.
-    """
-    try:
-        if value is None or isinstance(value, (bool, int, float)):
-            return value
-        if isinstance(value, str):
-            return value if len(value) <= max_str else value[:max_str] + "…"
-        if isinstance(value, Mapping):
-            out: Dict[str, Any] = {}
-            for idx, (k, v) in enumerate(value.items()):
-                if idx >= max_items:
-                    out["…"] = f"truncated after {max_items} items"
-                    break
-                out[str(k)] = _safe_snapshot(v, max_items=max_items, max_str=max_str)
-            return out
-        if isinstance(value, (list, tuple)):
-            out_list: List[Any] = []
-            for idx, v in enumerate(value):
-                if idx >= max_items:
-                    out_list.append(f"… truncated after {max_items} items")
-                    break
-                out_list.append(_safe_snapshot(v, max_items=max_items, max_str=max_str))
-            return out_list
-        return repr(value)
-    except Exception:  # noqa: BLE001
-        return {"repr": repr(value)}
-
-
-def _looks_like_operation_context(obj: Any) -> bool:
-    """
-    OperationContext may be a concrete type or a Protocol/alias depending on the SDK.
-
-    Prefer isinstance when it works; fall back to a lightweight structural
-    heuristic aligned with corpus_sdk.embedding.embedding_base.OperationContext.
-    """
-    if obj is None:
-        return False
-    try:
-        if isinstance(obj, OperationContext):
-            return True
-    except TypeError:
-        # OperationContext may be a Protocol/typing alias at runtime
-        pass
-
-    return any(
-        hasattr(obj, attr)
-        for attr in (
-            "request_id",
-            "idempotency_key",
-            "deadline_ms",
-            "traceparent",
-            "tenant",
-            "attrs",
-            "remaining_ms",
-            "to_dict",
-        )
-    )
-
-
-def _infer_dim_from_matrix(mat: List[List[float]]) -> Optional[int]:
-    """Best-effort embedding dimension inference from a 2D embedding matrix."""
-    if not mat:
-        return None
-    first = mat[0]
-    if not isinstance(first, list):
-        return None
-    return len(first)
-
 
 def _ensure_not_in_event_loop(sync_api_name: str) -> None:
     """
-    Prevent deadlocks from calling sync APIs in async contexts.
+    Prevent use of sync LangChain APIs from inside an active asyncio event loop.
 
-    This guard enforces a clear contract:
-    - In async code, use `a...` async variants.
-    - In sync code, use sync methods directly.
+    This mirrors the behavior of other high-quality adapters: calling sync
+    generation/streaming from an async context is a common source of
+    deadlocks and subtle performance bugs.
+
+    Instead of silently allowing it, we raise a clear, actionable error.
     """
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        # No running event loop: safe to call sync method.
+        # No running loop: safe to use sync API.
         return
 
     raise RuntimeError(
         f"{sync_api_name} was called from inside an active asyncio event loop. "
-        f"Use the async variant instead (e.g. 'await a{sync_api_name}()'). "
-        f"[{ErrorCodes.SYNC_WRAPPER_CALLED_IN_EVENT_LOOP}]"
+        f"Use the async LangChain API instead (e.g. `_agenerate` / `_astream`). "
+        f"[{SYNC_WRAPPER_CALLED_IN_EVENT_LOOP}]"
     )
 
-
-def _maybe_close_sync(obj: Any) -> None:
-    """
-    Best-effort *sync* resource cleanup.
-
-    Preference:
-      1) aclose() if present (awaited via asyncio.run if coroutine)
-      2) close() if present:
-           - awaited via asyncio.run if coroutinefunction
-           - called directly if sync
-           - awaited via asyncio.run if sync returns a coroutine
-
-    IMPORTANT:
-      Callers must ensure they are NOT in a running event loop (use _ensure_not_in_event_loop).
-    """
-    if obj is None:
-        return
-
-    aclose = getattr(obj, "aclose", None)
-    if callable(aclose):
-        res = aclose()
-        if asyncio.iscoroutine(res):
-            asyncio.run(res)
-        return
-
-    close = getattr(obj, "close", None)
-    if not callable(close):
-        return
-
-    if asyncio.iscoroutinefunction(close):
-        asyncio.run(close())
-        return
-
-    res = close()
-    if asyncio.iscoroutine(res):
-        asyncio.run(res)
-
-
-async def _maybe_close_async(obj: Any) -> None:
-    """
-    Best-effort async resource cleanup with prioritization.
-
-    - Prefer an async `aclose()` method if present.
-    - Fall back to a coroutine `close()` if the object defines one.
-    - Fall back to a sync `close()` executed in a worker thread.
-    """
-    if obj is None:
-        return
-
-    aclose = getattr(obj, "aclose", None)
-    if callable(aclose):
-        res = aclose()
-        if asyncio.iscoroutine(res):
-            await res
-        return
-
-    close = getattr(obj, "close", None)
-    if not callable(close):
-        return
-
-    if asyncio.iscoroutinefunction(close):
-        await close()
-    else:
-        await asyncio.to_thread(close)
-
-
 # ---------------------------------------------------------------------------
-# Error-context decorators with dynamic context extraction
+# Configuration
 # ---------------------------------------------------------------------------
 
+@dataclass
+class LangChainLLMConfig:
+    """
+    Configuration for `CorpusLangChainLLM`.
+
+    Mirrors shared `LLMTranslator` knobs while remaining LangChain-specific.
+    """
+
+    model: str = "default"
+    temperature: float = 0.7
+    max_tokens: Optional[int] = None
+    framework_version: Optional[str] = None
+
+    post_processing_config: Optional[LLMPostProcessingConfig] = None
+    safety_filter: Optional[SafetyFilter] = None
+    json_repair: Optional[JSONRepair] = None
+
+    # Behavior toggles (kept simple and conservative)
+    enable_metrics: bool = True
+    validate_inputs: bool = True
+
+    def __post_init__(self) -> None:
+        """Validate configuration immediately when constructed."""
+        if not 0.0 <= self.temperature <= 2.0:
+            raise ValueError(
+                f"{INIT_CONFIG_ERROR}: "
+                f"temperature must be between 0.0 and 2.0, got {self.temperature}"
+            )
+        if self.max_tokens is not None and self.max_tokens < 1:
+            raise ValueError(
+                f"{INIT_CONFIG_ERROR}: "
+                f"max_tokens must be positive, got {self.max_tokens}"
+            )
+
+# ---------------------------------------------------------------------------
+# Error context helpers (lazy, decorator-based, aligned)
+# ---------------------------------------------------------------------------
 
 def _extract_dynamic_context(
     instance: Any,
@@ -372,972 +271,1062 @@ def _extract_dynamic_context(
     operation: str,
 ) -> Dict[str, Any]:
     """
-    Extract rich dynamic context from a LangChain embedding call.
+    Extract dynamic context for error attachment.
 
-    Captures:
-    - model identifier from the embedding instance
-    - framework_version if present
-    - text_len for single-text operations
-    - texts_count / empty_texts_count for batch operations
-    - LangChain routing fields (run_id, run_name) and safe snapshots of tags/metadata
+    Called *only* on the error path by the decorators below to avoid overhead
+    on successful calls.
     """
     dynamic_ctx: Dict[str, Any] = {
-        "model": getattr(instance, "model", "unknown"),
-        "framework_version": getattr(instance, "framework_version", None),
         "framework_name": _FRAMEWORK_NAME,
+        "model": getattr(instance, "model", "unknown"),
+        "temperature": getattr(instance, "temperature", 0.7),
+        "operation": operation,
+        "error_codes": ERROR_CODES,
     }
 
-    dim_hint = getattr(instance, "_embedding_dim_hint", None)
-    if isinstance(dim_hint, int):
-        dynamic_ctx["embedding_dim"] = dim_hint
+    # Messages metrics
+    if args:
+        first_arg = args[0]
+        if isinstance(first_arg, Sequence):
+            messages = [m for m in first_arg if isinstance(m, BaseMessage)]
+        elif isinstance(first_arg, BaseMessage):
+            messages = [first_arg]
+        else:
+            messages = []
 
-    if operation == "query" and args and isinstance(args[0], str):
-        dynamic_ctx["text_len"] = len(args[0])
-    elif operation == "documents" and args:
-        maybe_texts = args[0]
-        if isinstance(maybe_texts, Sequence) and not isinstance(maybe_texts, (str, bytes)):
-            texts_seq = maybe_texts
-            dynamic_ctx["texts_count"] = len(texts_seq)
-            empty_count = sum(1 for text in texts_seq if not isinstance(text, str) or not text.strip())
-            if empty_count:
-                dynamic_ctx["empty_texts_count"] = empty_count
+        if messages:
+            dynamic_ctx["messages_count"] = len(messages)
+            roles: Dict[str, int] = {}
+            total_chars = 0
+            for msg in messages:
+                role = getattr(msg, "type", "unknown")
+                roles[role] = roles.get(role, 0) + 1
+                content = getattr(msg, "content", "")
+                if isinstance(content, str):
+                    total_chars += len(content)
+            dynamic_ctx["roles_distribution"] = roles
+            dynamic_ctx["total_content_chars"] = total_chars
 
-    config = kwargs.get("config") or {}
-    if isinstance(config, Mapping):
-        if "run_id" in config:
-            dynamic_ctx["run_id"] = config.get("run_id")
-        if "run_name" in config:
-            dynamic_ctx["run_name"] = config.get("run_name")
+    # Sampling params if present
+    for param in ("max_tokens", "top_p", "frequency_penalty", "presence_penalty"):
+        if param in kwargs:
+            dynamic_ctx[param] = kwargs[param]
 
-        # Snapshot bulky/sensitive structures for observability.
-        if "tags" in config:
-            dynamic_ctx["tags_snapshot"] = _safe_snapshot(config.get("tags"))
-        if "metadata" in config:
-            dynamic_ctx["metadata_snapshot"] = _safe_snapshot(config.get("metadata"))
+    if "stop" in kwargs:
+        dynamic_ctx["stop"] = kwargs["stop"]
+
+    # LangChain config flag
+    if "config" in kwargs:
+        dynamic_ctx["has_config"] = True
 
     return dynamic_ctx
-
 
 def _create_error_context_decorator(
     operation: str,
     is_async: bool = False,
 ) -> Callable[[Callable[..., T]], Callable[..., T]]:
     """
-    Factory for creating error-context decorators with rich per-call metrics.
+    Factory for creating error-context decorators with lazy dynamic context.
 
-    Mirrors the pattern used in other framework adapters (LlamaIndex,
-    Semantic Kernel, AutoGen, CrewAI) for consistent observability.
+    Successful calls are unaffected; on exception we compute metrics and
+    attach them via `attach_context` with a consistent LLM-oriented operation.
     """
 
-    def decorator_factory(**static_context: Any) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    def decorator_factory(
+        **static_context: Any,
+    ) -> Callable[[Callable[..., T]], Callable[..., T]]:
         def decorator(func: Callable[..., T]) -> Callable[..., T]:
             if is_async:
 
                 @wraps(func)
                 async def async_wrapper(self: Any, *args: Any, **kwargs: Any) -> T:
-                    dynamic_context = _extract_dynamic_context(self, args, kwargs, operation)
-                    full_context = {**static_context, **dynamic_context}
                     try:
                         return await func(self, *args, **kwargs)
                     except Exception as exc:  # noqa: BLE001
+                        dynamic_ctx = _extract_dynamic_context(
+                            self,
+                            args,
+                            kwargs,
+                            operation,
+                        )
+                        full_ctx = {
+                            **static_context,
+                            **dynamic_ctx,
+                        }
                         attach_context(
                             exc,
                             framework=_FRAMEWORK_NAME,
-                            operation=f"embedding_{operation}",
-                            **full_context,
+                            operation=f"llm_{operation}",
+                            **full_ctx,
                         )
                         raise
 
-                return async_wrapper  # type: ignore[return-value]
+                return async_wrapper
+            else:
 
-            @wraps(func)
-            def sync_wrapper(self: Any, *args: Any, **kwargs: Any) -> T:
-                dynamic_context = _extract_dynamic_context(self, args, kwargs, operation)
-                full_context = {**static_context, **dynamic_context}
-                try:
-                    return func(self, *args, **kwargs)
-                except Exception as exc:  # noqa: BLE001
-                    attach_context(
-                        exc,
-                        framework=_FRAMEWORK_NAME,
-                        operation=f"embedding_{operation}",
-                        **full_context,
-                    )
-                    raise
+                @wraps(func)
+                def sync_wrapper(self: Any, *args: Any, **kwargs: Any) -> T:
+                    try:
+                        return func(self, *args, **kwargs)
+                    except Exception as exc:  # noqa: BLE001
+                        dynamic_ctx = _extract_dynamic_context(
+                            self,
+                            args,
+                            kwargs,
+                            operation,
+                        )
+                        full_ctx = {
+                            **static_context,
+                            **dynamic_ctx,
+                        }
+                        attach_context(
+                            exc,
+                            framework=_FRAMEWORK_NAME,
+                            operation=f"llm_{operation}",
+                            **full_ctx,
+                        )
+                        raise
 
-            return sync_wrapper  # type: ignore[return-value]
+                return sync_wrapper
 
         return decorator
 
     return decorator_factory
 
-
-def with_embedding_error_context(operation: str, **static_context: Any) -> Callable[[Callable[..., T]], Callable[..., T]]:
-    """Decorator for sync methods with rich dynamic context extraction."""
-    static_context.setdefault("error_codes", EMBEDDING_COERCION_ERROR_CODES)
+def with_llm_error_context(
+    operation: str,
+    **static_context: Any,
+) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    """Decorator for sync LLM methods with rich dynamic context extraction."""
     return _create_error_context_decorator(operation, is_async=False)(**static_context)
 
-
-def with_async_embedding_error_context(operation: str, **static_context: Any) -> Callable[[Callable[..., T]], Callable[..., T]]:
-    """Decorator for async methods with rich dynamic context extraction."""
-    static_context.setdefault("error_codes", EMBEDDING_COERCION_ERROR_CODES)
+def with_async_llm_error_context(
+    operation: str,
+    **static_context: Any,
+) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    """Decorator for async LLM methods with rich dynamic context extraction."""
     return _create_error_context_decorator(operation, is_async=True)(**static_context)
 
+# ---------------------------------------------------------------------------
+# Context construction helper (defensive, ContextTranslator-based)
+# ---------------------------------------------------------------------------
 
-class CorpusLangChainEmbeddings(BaseModel, Embeddings):
+def _build_operation_context_from_config(
+    config: Any,
+    framework_version: Optional[str],
+) -> OperationContext:
     """
-    LangChain `Embeddings` backed by a Corpus `EmbeddingProtocolV1` adapter.
+    Build an OperationContext from a LangChain config via ContextTranslator.
 
-    Inherits from `BaseModel` to support Pydantic-style initialization (standard
-    in LangChain) and `Embeddings` to satisfy the interface contract.
+    Defensive behavior:
+    - If `config` is already an OperationContext, return it.
+    - If `config` is None, construct a default OperationContext.
+    - Else, call `ContextTranslator.from_langchain(config, ...)`.
+    - If that call fails, attach rich context and re-raise.
+    - If it returns a non-OperationContext, attach context and raise TypeError.
+    """
+    if isinstance(config, OperationContext):
+        return config
 
-    Example
-    -------
-    ```python
-    from langchain.vectorstores import Chroma
-    from corpus_sdk.embedding.framework_adapters.langchain import (
-        configure_langchain_embeddings,
-    )
+    if config is None:
+        # Typical LangChain usage does not always provide a config; treat this
+        # as a normal case and create a default OperationContext.
+        return OperationContext()
 
-    embeddings = configure_langchain_embeddings(
-        corpus_adapter=my_adapter,
-        model="text-embedding-3-large",
-        batch_config=BatchConfig(max_batch_size=1000),
-    )
-
-    vectorstore = Chroma.from_documents(
-        documents=documents,
-        embedding=embeddings,
-        collection_name="research_papers",
-    )
-
-    retriever = vectorstore.as_retriever(
-        search_type="similarity",
-        search_kwargs={"k": 10},
-    )
-    ```
-
-    Error Handling Example
-    ----------------------
-    ```python
     try:
-        results = embeddings.embed_documents(
-            texts=research_docs,
-            config={
-                "tags": ["research", "batch-processing"],
-                "metadata": {"pipeline": "document-indexing"},
-            },
+        ctx = ContextTranslator.from_langchain(
+            config=config,
+            framework_version=framework_version,
         )
-    except Exception as e:
-        # Rich error context automatically attached
-        logger.error("Embedding failed with context", exc_info=e)
-    ```
+    except Exception as exc:  # noqa: BLE001
+        attach_context(
+            exc,
+            framework=_FRAMEWORK_NAME,
+            operation="llm_context_translation",
+            framework_version=framework_version,
+            source="langchain_config",
+            config_type=type(config).__name__,
+        )
+        raise
 
-    Attributes
-    ----------
-    corpus_adapter:
-        Underlying Corpus embedding adapter implementing the EmbeddingProtocolV1
-        *behavior* (duck-typed).
+    if not isinstance(ctx, OperationContext):
+        exc = TypeError(
+            "ContextTranslator.from_langchain produced unsupported context type "
+            f"{type(ctx).__name__}"
+        )
+        attach_context(
+            exc,
+            framework=_FRAMEWORK_NAME,
+            operation="llm_context_translation",
+            framework_version=framework_version,
+            returned_type=type(ctx).__name__,
+        )
+        raise exc
 
-    model:
-        Optional default model identifier. Can be overridden per call by
-        passing `model=...` to `embed_documents` / `embed_query` or their
-        async variants.
+    return ctx
 
-    framework_version:
-        Optional framework version string for observability and context
-        translation (e.g., LangChain version).
+# ---------------------------------------------------------------------------
+# Structural protocol for type-checking (unchanged externally)
+# ---------------------------------------------------------------------------
 
-    batch_config:
-        Optional `BatchConfig` to control batching behavior. If None, the
-        defaults in the common embedding layer are used.
-
-    text_normalization_config:
-        Optional `TextNormalizationConfig` to control whitespace cleanup,
-        truncation, casing, encoding, etc.
-
-    langchain_config:
-        Optional adapter-level configuration for this LangChain embedding adapter.
-        This is separate from per-call LangChain RunnableConfig-like `config`.
+class LangChainLLMProtocol(Protocol):
+    """
+    Structural protocol for LangChain-compatible Corpus chat models.
     """
 
-    # IMPORTANT: keep this duck-typed to avoid Pydantic enforcing instance-of checks.
-    corpus_adapter: Any
-    model: Optional[str] = None
-    framework_version: Optional[str] = None
-    batch_config: Optional[BatchConfig] = None
-    text_normalization_config: Optional[TextNormalizationConfig] = None
-    langchain_config: LangChainAdapterConfig = {}  # validated + normalized via field validator
+    async def _agenerate(
+        self,
+        messages: List[BaseMessage],
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        ...
 
-    # Pydantic v2 configuration
-    model_config = ConfigDict(arbitrary_types_allowed=True)
+    def _generate(
+        self,
+        messages: List[BaseMessage],
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        ...
 
-    # Private attribute for caching the translator instance (or a test-injected stub)
-    _translator_cache: Optional[Any] = PrivateAttr(default=None)
+    async def _astream(
+        self,
+        messages: List[BaseMessage],
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[ChatGenerationChunk]:
+        ...
 
-    # Private attribute lock to avoid duplicate translator construction under concurrency
-    _translator_lock: threading.Lock = PrivateAttr(default_factory=threading.Lock)
+    def _stream(
+        self,
+        messages: List[BaseMessage],
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> Iterator[ChatGenerationChunk]:
+        ...
 
-    # Best-effort embedding dimension hint (populated after first successful embed)
-    _embedding_dim_hint: Optional[int] = PrivateAttr(default=None)
+# ---------------------------------------------------------------------------
+# Main adapter
+# ---------------------------------------------------------------------------
 
-    def model_post_init(self, __context: Any) -> None:
+class CorpusLangChainLLM(BaseChatModel):
+    """
+    LangChain `BaseChatModel` implementation backed by a Corpus `LLMTranslator`.
+
+    Key points:
+    - No direct message translation; all message/format handling
+      is delegated to `LLMTranslator` with framework="langchain".
+    - This class:
+        * Validates inputs
+        * Builds `OperationContext` from LangChain config
+        * Builds sampling params + lightweight `framework_ctx`
+        * Wires LangChain callbacks
+        * Uses translator for generation, streaming, and token counting
+        * Exposes health / capabilities via the translator
+    """
+
+    # Pydantic v2-style config
+    model_config = {
+        "arbitrary_types_allowed": True,
+        "protected_namespaces": (),
+    }
+
+    _translator: LLMTranslator
+    _llm_adapter: LLMProtocolV1
+
+    model: str = "default"
+    temperature: float = 0.7
+    max_tokens: Optional[int] = None
+    _framework_version: Optional[str] = None
+    _config: LangChainLLMConfig
+
+    def __init__(
+        self,
+        *,
+        llm_adapter: LLMProtocolV1,
+        model: str = "default",
+        temperature: float = 0.7,
+        max_tokens: Optional[int] = None,
+        framework_version: Optional[str] = None,
+        config: Optional[LangChainLLMConfig] = None,
+        translator: Optional[LLMFrameworkTranslator] = None,
+        post_processing_config: Optional[LLMPostProcessingConfig] = None,
+        safety_filter: Optional[SafetyFilter] = None,
+        json_repair: Optional[JSONRepair] = None,
+        **kwargs: Any,
+    ) -> None:
         """
-        Post-init hook (Pydantic v2) for lightweight diagnostics.
-
-        We keep LangChain an optional dependency, but warn if the integration is being
-        constructed without LangChain installed.
+        Initialize the LangChain adapter.
         """
         if not LANGCHAIN_AVAILABLE:
-            logger.warning(
-                "LangChain is not installed (langchain_core not importable). "
-                "CorpusLangChainEmbeddings can still be constructed, but using it in "
-                "LangChain pipelines will not work as intended."
+            raise ImportError(
+                "CorpusLangChainLLM requires `langchain-core` (and its dependencies) "
+                "to be installed. Please install it with `pip install langchain-core` "
+                "or ensure `langchain` is updated to a version that provides "
+                "`langchain_core`."
             )
 
-    @field_validator("corpus_adapter")
-    @classmethod
-    def validate_corpus_adapter(cls, v: Any) -> Any:
-        """
-        Validate that corpus_adapter implements the required embedding protocol behavior.
+        # Keep a direct reference to the underlying adapter for lifecycle / debugging.
+        self._llm_adapter = llm_adapter
 
-        We do a behavioral check (presence of `embed`) instead of strict type
-        checking to remain flexible with Protocol-based adapters and simple stubs.
-        """
-        if not hasattr(v, "embed") or not callable(getattr(v, "embed", None)):
-            raise ValueError(
-                "corpus_adapter must implement EmbeddingProtocolV1 with an 'embed' method"
+        # Resolve configuration precedence: explicit config > individual params.
+        if config is not None:
+            self._config = config
+            self.model = config.model
+            self.temperature = float(config.temperature)
+            self.max_tokens = config.max_tokens
+            self._framework_version = config.framework_version or framework_version
+
+            effective_post_processing = (
+                post_processing_config or config.post_processing_config
             )
-        return v
-
-    @field_validator("langchain_config", mode="before")
-    @classmethod
-    def validate_langchain_adapter_config(cls, v: Any) -> LangChainAdapterConfig:
-        """
-        Validate and normalize adapter-level LangChain configuration.
-
-        Defaults are chosen to preserve existing behavior:
-        - fallback_to_simple_context defaults to False
-        - enable_operation_context_propagation defaults to True
-
-        This validator is intentionally strict: unknown keys are rejected to prevent
-        silent misconfiguration.
-        """
-        if v is None:
-            v = {}
-        if not isinstance(v, Mapping):
-            raise ValueError(
-                f"[{ErrorCodes.LANGCHAIN_CONFIG_INVALID}] "
-                f"langchain_config must be a Mapping, got {type(v).__name__}",
+            effective_safety_filter = safety_filter or config.safety_filter
+            effective_json_repair = json_repair or config.json_repair
+        else:
+            # Let LangChainLLMConfig handle validation + error messages.
+            self._config = LangChainLLMConfig(
+                model=model,
+                temperature=float(temperature),
+                max_tokens=max_tokens,
+                framework_version=framework_version,
             )
+            self.model = self._config.model
+            self.temperature = self._config.temperature
+            self.max_tokens = self._config.max_tokens
+            self._framework_version = self._config.framework_version
 
-        validated: Dict[str, Any] = dict(v)
+            effective_post_processing = post_processing_config
+            effective_safety_filter = safety_filter
+            effective_json_repair = json_repair
 
-        allowed_keys = {"fallback_to_simple_context", "enable_operation_context_propagation"}
-        unknown = set(validated.keys()) - allowed_keys
-        if unknown:
-            raise ValueError(
-                f"[{ErrorCodes.LANGCHAIN_CONFIG_INVALID}] "
-                f"langchain_config contains unknown keys: {sorted(unknown)}"
-            )
+        # Validate adapter invariants in a single place.
+        self._validate_init_params(llm_adapter)
 
-        validated.setdefault("fallback_to_simple_context", False)
-        validated.setdefault("enable_operation_context_propagation", True)
+        super().__init__(**kwargs)
 
-        validated["fallback_to_simple_context"] = bool(validated["fallback_to_simple_context"])
-        validated["enable_operation_context_propagation"] = bool(
-            validated["enable_operation_context_propagation"]
+        # Build the shared LLMTranslator for the "langchain" framework.
+        self._translator = create_llm_translator(
+            adapter=llm_adapter,
+            framework=_FRAMEWORK_NAME,
+            translator=translator,
+            post_processing_config=effective_post_processing,
+            safety_filter=effective_safety_filter,
+            json_repair=effective_json_repair,
         )
 
-        return validated  # type: ignore[return-value]
+        logger.info(
+            "CorpusLangChainLLM initialized with model=%s, temperature=%.2f, "
+            "max_tokens=%s, framework_version=%s",
+            self.model,
+            self.temperature,
+            self.max_tokens or "default",
+            self._framework_version or "unknown",
+        )
 
     # ------------------------------------------------------------------ #
-    # Resource management / lifecycle helpers
+    # Init validation helper (symbolic error codes for logs/search)
     # ------------------------------------------------------------------ #
 
-    def __enter__(self) -> "CorpusLangChainEmbeddings":
-        return self
-
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+    def _validate_init_params(self, llm_adapter: LLMProtocolV1) -> None:
         """
-        Best-effort synchronous cleanup.
+        Validate initialization parameters and adapter capabilities.
 
-        This method closes both the underlying adapter and the translator,
-        supporting sync and async closers safely. Sync cleanup is not allowed inside
-        an active event loop.
+        - Ensures the adapter exposes core `LLMProtocolV1` methods.
+
+        Configuration values (temperature, max_tokens) have already been
+        validated by LangChainLLMConfig.
         """
-        try:
-            _ensure_not_in_event_loop("close")
-        except Exception as e:  # noqa: BLE001
-            logger.warning(
-                "Sync close called inside event loop; use async context manager instead: %s",
-                e,
+        required_methods = (
+            "complete",
+            "stream",
+            "count_tokens",
+            "health",
+            "capabilities",
+        )
+        missing = [
+            m
+            for m in required_methods
+            if not callable(getattr(llm_adapter, m, None))
+        ]
+        if missing:
+            raise TypeError(
+                f"{INIT_CONFIG_ERROR}: "
+                "llm_adapter must implement LLMProtocolV1; missing methods: "
+                + ", ".join(missing)
             )
-            return
-
-        translator = self._translator_cache
-        if isinstance(translator, EmbeddingTranslator):
-            try:
-                _maybe_close_sync(translator)
-            except Exception as e:  # noqa: BLE001
-                logger.warning("Error while closing embedding translator in __exit__: %s", e)
-
-        try:
-            _maybe_close_sync(self.corpus_adapter)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("Error while closing embedding adapter in __exit__: %s", e)
-
-    async def __aenter__(self) -> "CorpusLangChainEmbeddings":
-        return self
-
-    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
-        """
-        Best-effort async cleanup.
-
-        This path can safely await async closers or offload sync closers
-        without blocking the event loop.
-        """
-        translator = self._translator_cache
-        if isinstance(translator, EmbeddingTranslator):
-            try:
-                await _maybe_close_async(translator)
-            except Exception as e:  # noqa: BLE001
-                logger.warning("Error while closing embedding translator in __aexit__: %s", e)
-
-        try:
-            await _maybe_close_async(self.corpus_adapter)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("Error while closing embedding adapter in __aexit__: %s", e)
 
     # ------------------------------------------------------------------ #
-    # Internal helpers
+    # LangChain-required properties
     # ------------------------------------------------------------------ #
 
     @property
-    def _translator(self) -> Any:
+    def _llm_type(self) -> str:
+        """Identifier used by LangChain in serialization / introspection."""
+        return "corpus"
+
+    @property
+    def _identifying_params(self) -> Dict[str, Any]:
+        """Return identifying parameters for LangChain serialization."""
+        return {
+            "model": self.model,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "framework_version": self._framework_version,
+        }
+
+    # ------------------------------------------------------------------ #
+    # Input validation helpers
+    # ------------------------------------------------------------------ #
+
+    def _validate_messages(self, messages: List[BaseMessage]) -> None:
         """
-        Lazily construct and cache the `EmbeddingTranslator`.
-
-        Uses a PrivateAttr cache so this remains compatible with Pydantic v2.
-        Also guards initialization with a lock to avoid duplicate construction
-        under concurrent first access.
-
-        NOTE (testing / injection):
-        - Tests may monkeypatch `_translator` with a stub translator. To support
-          that without fighting Pydantic's setattr rules, we provide a setter.
+        Validate message structure before handing them to the translator.
         """
-        if self._translator_cache is None:
-            with self._translator_lock:
-                if self._translator_cache is None:
-                    self._translator_cache = create_embedding_translator(
-                        adapter=self.corpus_adapter,
-                        framework=_FRAMEWORK_NAME,
-                        translator=None,  # use registry/default generic translator
-                        batch_config=self.batch_config,
-                        text_normalization_config=self.text_normalization_config,
-                    )
-                    logger.debug(
-                        "EmbeddingTranslator initialized for LangChain with model: %s",
-                        self.model or "default",
-                    )
-        return self._translator_cache
-
-    @_translator.setter
-    def _translator(self, value: Any) -> None:
-        # Allow tests to inject a stub translator via `embeddings._translator = ...`
-        self._translator_cache = value
-
-    def _update_dim_hint(self, dim: Optional[int]) -> None:
-        """
-        Thread-safe, best-effort dimension hint update.
-
-        First-write-wins semantics are used so that concurrent calls do not
-        cause the hint to oscillate; the first successful embedding defines
-        the observed dimension.
-        """
-        if dim is None:
-            return
-        if self._embedding_dim_hint is not None:
+        if not self._config.validate_inputs:
             return
 
-        with self._translator_lock:
-            if self._embedding_dim_hint is None:
-                self._embedding_dim_hint = dim
+        if not messages:
+            raise ValueError("messages list cannot be empty")
 
-    def _build_core_context(
-        self,
-        *,
-        config: Optional[LangChainConfig] = None,
-    ) -> Optional[OperationContext]:
-        """
-        Build a core OperationContext from LangChain config with comprehensive error handling.
-
-        This function focuses purely on translating framework-specific context into the
-        core OperationContext structure used by the embedding layer.
-        """
-        if config is None:
-            return None
-
-        try:
-            self._validate_langchain_config_structure(config)
-
-            core_ctx_candidate = context_from_langchain(
-                config,
-                framework_version=self.framework_version,
-            )
-            if _looks_like_operation_context(core_ctx_candidate):
-                logger.debug(
-                    "Successfully created OperationContext from LangChain config with run_id: %s",
-                    config.get("run_id", "unknown") if isinstance(config, Mapping) else "unknown",
+        for idx, msg in enumerate(messages):
+            if not isinstance(msg, BaseMessage):
+                raise TypeError(
+                    f"messages[{idx}] must be a LangChain BaseMessage, got {type(msg)}"
                 )
-                return core_ctx_candidate  # type: ignore[return-value]
+            if getattr(msg, "content", None) in ("", None):
+                raise ValueError(f"messages[{idx}] has empty content")
 
-            logger.warning(
-                "context_from_langchain returned non-OperationContext type: %s. Proceeding without OperationContext.",
-                type(core_ctx_candidate).__name__,
-            )
-            if self.langchain_config.get("fallback_to_simple_context"):
-                return OperationContext()
-            return None
-        except Exception as e:  # noqa: BLE001
-            logger.warning(
-                "Failed to create OperationContext from LangChain config: %s. Proceeding without OperationContext.",
-                e,
-            )
-            attach_context(
-                e,
-                framework=_FRAMEWORK_NAME,
-                operation="context_build",
-                config_snapshot=_safe_snapshot(config),
-                framework_version=self.framework_version,
-                error_codes=EMBEDDING_COERCION_ERROR_CODES,
-                langchain_config=_safe_snapshot(self.langchain_config),
-            )
-            if self.langchain_config.get("fallback_to_simple_context"):
-                return OperationContext()
-            return None
+    # ------------------------------------------------------------------ #
+    # Context + sampling helpers
+    # ------------------------------------------------------------------ #
 
-    def _build_framework_context(
+    def _build_framework_ctx(
         self,
         *,
-        core_ctx: Optional[OperationContext],
-        config: Optional[LangChainConfig] = None,
-        model: Optional[str] = None,
-        **kwargs: Any,
+        operation: str,
+        stream: bool,
+        model: str,
+        config: Any,
+        stop_sequences: Optional[List[str]],
     ) -> Dict[str, Any]:
         """
-        Build framework-specific context for the LangChain execution environment.
+        Build a framework_ctx payload for the LangChain translator.
 
-        This includes:
-        - Framework identity and version
-        - LangChain adapter configuration flags
-        - Best-effort dimension hint
-        - Model selection
-        - LangChain routing fields and configurable sub-context (snapshotted)
-        - Any extra call-specific hints (excluding private/internal keys)
+        This mirrors the richer context used by other framework adapters:
+        - Identifies operation + streaming mode
+        - Carries model + framework version
+        - Tags whether metrics should be enabled
+        - Optionally embeds LangChain config and stop sequences
         """
         framework_ctx: Dict[str, Any] = {
             "framework": _FRAMEWORK_NAME,
-            "error_codes": EMBEDDING_COERCION_ERROR_CODES,
-            "langchain_config": dict(self.langchain_config),
+            "framework_version": self._framework_version,
+            "operation": operation,
+            "stream": stream,
+            "model": model,
+            "enable_metrics": self._config.enable_metrics,
         }
-
-        if self.framework_version is not None:
-            framework_ctx["framework_version"] = self.framework_version
-
-        if isinstance(self._embedding_dim_hint, int):
-            framework_ctx["embedding_dim_hint"] = self._embedding_dim_hint
-
-        effective_model = model or self.model
-        if effective_model:
-            framework_ctx["model"] = effective_model
-
-        if isinstance(config, Mapping):
-            framework_ctx.update({"run_name": config.get("run_name"), "run_id": config.get("run_id")})
-
-            # IMPORTANT: do not propagate raw metadata/tags/configurable; store snapshots instead.
-            if "tags" in config:
-                framework_ctx["tags_snapshot"] = _safe_snapshot(config.get("tags"))
-            if "metadata" in config:
-                framework_ctx["metadata_snapshot"] = _safe_snapshot(config.get("metadata"))
-            if "configurable" in config:
-                framework_ctx["configurable_snapshot"] = _safe_snapshot(config.get("configurable"))
-
-        # Include any extra call-specific hints while preserving structure.
-        # Private/internal kwargs (starting with "_") are not propagated.
-        framework_ctx.update({k: v for k, v in kwargs.items() if not k.startswith("_")})
-
-        # Also surface the OperationContext itself for downstream inspection, if present.
-        if core_ctx is not None and self.langchain_config.get("enable_operation_context_propagation", True):
-            framework_ctx["_operation_context"] = core_ctx
+        if config is not None:
+            framework_ctx["langchain_config"] = config
+        if stop_sequences:
+            framework_ctx["stop_sequences"] = list(stop_sequences)
 
         return framework_ctx
 
-    def _build_contexts(
+    def _build_context_and_params(
         self,
         *,
-        config: Optional[LangChainConfig] = None,
-        model: Optional[str] = None,
+        stop: Optional[List[str]] = None,
+        operation: str,
+        stream: bool,
         **kwargs: Any,
-    ) -> Tuple[Optional[OperationContext], Dict[str, Any]]:
+    ) -> tuple[OperationContext, Dict[str, Any], Dict[str, Any]]:
         """
-        Build contexts for LangChain execution environment with comprehensive validation.
+        Extract OperationContext, sampling params, and framework_ctx
+        from LangChain kwargs.
 
         Returns
         -------
-        Tuple of:
-        - core_ctx: OperationContext instance (or None if unavailable)
-        - framework_ctx: LangChain-specific context for translator
+        (op_ctx, sampling_params, framework_ctx)
         """
-        core_ctx = self._build_core_context(config=config)
-        framework_ctx = self._build_framework_context(core_ctx=core_ctx, config=config, model=model, **kwargs)
-        return core_ctx, framework_ctx
-
-    def _validate_langchain_config_structure(self, config: Mapping[str, Any]) -> None:
-        """
-        Validate LangChain config structure and log warnings for anomalies.
-
-        This is intentionally non-fatal for maximal compatibility: we only
-        log and enrich context instead of raising hard errors.
-        """
-        if not isinstance(config, Mapping):
-            logger.warning(
-                "[%s] LangChain config is not a Mapping (got %s); context translation may be degraded.",
-                ErrorCodes.LANGCHAIN_CONFIG_INVALID,
-                type(config).__name__,
-            )
-            return
-
-        if not any(key in config for key in ("tags", "metadata", "run_name", "run_id", "callbacks")):
-            logger.debug(
-                "LangChain config missing common fields (tags, metadata, run_name, run_id, callbacks) – reduced context for embeddings.",
-            )
-
-    def _coerce_embedding_matrix(self, result: Any) -> List[List[float]]:
-        """
-        Coerce translator result into a List[List[float]] embedding matrix.
-
-        Delegates to the shared framework_utils implementation so behavior
-        is consistent across all framework adapters.
-        """
-        return coerce_embedding_matrix(
-            result=result,
-            framework=_FRAMEWORK_NAME,
-            error_codes=EMBEDDING_COERCION_ERROR_CODES,
-            logger=logger,
+        config = kwargs.get("config")
+        ctx = _build_operation_context_from_config(
+            config=config,
+            framework_version=self._framework_version,
         )
 
-    def _coerce_embedding_vector(self, result: Any) -> List[float]:
-        """
-        Coerce translator result for a single-text embed into List[float].
+        temperature = kwargs.get("temperature", self.temperature)
+        max_tokens = kwargs.get("max_tokens", self.max_tokens)
 
-        Delegates to the shared framework_utils implementation and preserves
-        the existing semantics (first row when multiple are returned).
-        """
-        return coerce_embedding_vector(
-            result=result,
-            framework=_FRAMEWORK_NAME,
-            error_codes=EMBEDDING_COERCION_ERROR_CODES,
-            logger=logger,
+        params: Dict[str, Any] = {
+            "model": kwargs.get("model", self.model),
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "top_p": kwargs.get("top_p"),
+            "frequency_penalty": kwargs.get("frequency_penalty"),
+            "presence_penalty": kwargs.get("presence_penalty"),
+            "stop_sequences": stop,
+        }
+
+        clean_params = {k: v for k, v in params.items() if v is not None}
+
+        model_for_context = str(clean_params.get("model", self.model))
+
+        framework_ctx = self._build_framework_ctx(
+            operation=operation,
+            stream=stream,
+            model=model_for_context,
+            config=config,
+            stop_sequences=stop,
         )
 
-    def _warn_if_extreme_batch(self, texts: Sequence[str], *, op_name: str) -> None:
-        """
-        Soft warning for extremely large batches when no batch_config limit
-        is configured. Actual batching / chunking is handled by the translator.
-        """
-        warn_if_extreme_batch(
-            framework=_FRAMEWORK_NAME,
-            texts=texts,
-            op_name=op_name,
-            batch_config=self.batch_config,
-            logger=logger,
-        )
+        return ctx, clean_params, framework_ctx
 
     # ------------------------------------------------------------------ #
-    # Capabilities and health API - via EmbeddingTranslator
+    # Result normalization helpers
     # ------------------------------------------------------------------ #
 
-    @with_embedding_error_context("capabilities")
+    @staticmethod
+    def _ensure_chat_result(result: Any) -> ChatResult:
+        """
+        Normalize translator output into a LangChain ChatResult.
+
+        The `"langchain"` framework translator is expected to return ChatResult
+        directly; this helper provides a defensive fallback for dict/string.
+        """
+        if isinstance(result, ChatResult):
+            return result
+
+        if isinstance(result, dict):
+            text = str(
+                result.get("text")
+                or result.get("content")
+                or result.get("message", {}).get("content", "")
+            )
+        else:
+            text = str(result)
+
+        message = AIMessage(content=text)
+        generation = ChatGeneration(message=message)
+        return ChatResult(generations=[generation])
+
+    @staticmethod
+    def _ensure_generation_chunk(chunk: Any) -> ChatGenerationChunk:
+        """
+        Normalize translator streaming output into ChatGenerationChunk.
+        """
+        if isinstance(chunk, ChatGenerationChunk):
+            return chunk
+
+        if isinstance(chunk, dict):
+            text = str(chunk.get("text") or chunk.get("delta") or "")
+        else:
+            text = str(chunk)
+
+        ai_chunk = AIMessageChunk(content=text)
+        return ChatGenerationChunk(message=ai_chunk)
+
+    # ------------------------------------------------------------------ #
+    # Health / capabilities via translator-only
+    # ------------------------------------------------------------------ #
+
+    @with_llm_error_context("capabilities")
     def capabilities(self) -> Mapping[str, Any]:
         """
-        Best-effort synchronous capabilities passthrough.
+        Expose capabilities, via the LLMTranslator.
 
-        Delegates to EmbeddingTranslator.capabilities(), which centralizes
-        async/sync bridging and error-context wiring for the embedding layer.
+        Translator is the single source of truth; the underlying adapter is
+        not called directly to avoid divergent behavior.
         """
-        _ensure_not_in_event_loop("capabilities")
-        return self._translator.capabilities()
+        result = self._translator.capabilities()
 
-    @with_async_embedding_error_context("capabilities_async")
+        if not isinstance(result, Mapping):
+            raise TypeError(
+                f"{INIT_CONFIG_ERROR}: "
+                f"translator capabilities() returned unsupported type: "
+                f"{type(result).__name__}"
+            )
+        return result
+
+    @with_async_llm_error_context("acapabilities")
     async def acapabilities(self) -> Mapping[str, Any]:
         """
-        Best-effort asynchronous capabilities passthrough.
+        Async capabilities wrapper, translator-only.
 
-        Delegates to EmbeddingTranslator.arun_capabilities().
+        Resolution order:
+        1. self._translator.acapabilities()
+        2. self._translator.capabilities() via asyncio.to_thread
         """
-        return await self._translator.arun_capabilities()
+        async_caps = getattr(self._translator, "acapabilities", None)
+        if callable(async_caps):
+            result = await async_caps()
+        else:
+            result = await asyncio.to_thread(self._translator.capabilities)
 
-    @with_embedding_error_context("health")
+        if not isinstance(result, Mapping):
+            raise TypeError(
+                f"{INIT_CONFIG_ERROR}: "
+                f"translator capabilities() returned unsupported type: "
+                f"{type(result).__name__}"
+            )
+        return result
+
+    @with_llm_error_context("health")
     def health(self) -> Mapping[str, Any]:
         """
-        Best-effort synchronous health passthrough.
+        Expose health, via the LLMTranslator.
 
-        Delegates to EmbeddingTranslator.health().
+        Translator is the single source of truth; the underlying adapter is
+        not called directly to avoid divergent behavior.
         """
-        _ensure_not_in_event_loop("health")
-        return self._translator.health()
+        result = self._translator.health()
 
-    @with_async_embedding_error_context("health_async")
+        if not isinstance(result, Mapping):
+            raise TypeError(
+                f"{INIT_CONFIG_ERROR}: "
+                f"translator health() returned unsupported type: "
+                f"{type(result).__name__}"
+            )
+        return result
+
+    @with_async_llm_error_context("ahealth")
     async def ahealth(self) -> Mapping[str, Any]:
         """
-        Best-effort asynchronous health passthrough.
+        Async health wrapper, translator-only.
 
-        Delegates to EmbeddingTranslator.arun_health().
+        Resolution order:
+        1. self._translator.ahealth()
+        2. self._translator.health() via asyncio.to_thread
         """
-        return await self._translator.arun_health()
+        async_health = getattr(self._translator, "ahealth", None)
+        if callable(async_health):
+            result = await async_health()
+        else:
+            result = await asyncio.to_thread(self._translator.health)
+
+        if not isinstance(result, Mapping):
+            raise TypeError(
+                f"{INIT_CONFIG_ERROR}: "
+                f"translator health() returned unsupported type: "
+                f"{type(result).__name__}"
+            )
+        return result
 
     # ------------------------------------------------------------------ #
-    # Async API
+    # LangChain async API (via LLMTranslator)
     # ------------------------------------------------------------------ #
 
-    @with_async_embedding_error_context("documents")
-    async def aembed_documents(
+    @with_async_llm_error_context("agenerate")
+    async def _agenerate(
         self,
-        texts: Sequence[str],
-        *,
-        config: Optional[LangChainConfig] = None,
-        model: Optional[str] = None,
+        messages: List[BaseMessage],
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
         **kwargs: Any,
-    ) -> List[List[float]]:
+    ) -> ChatResult:
         """
-        Async embedding for multiple documents.
-
-        Parameters
-        ----------
-        texts:
-            Sequence of documents to embed.
-        config:
-            Optional LangChain RunnableConfig-like dict. Used only for
-            context translation (request_id, tenant, deadline, tags, etc.).
-        model:
-            Optional per-call model override.
-        **kwargs:
-            Additional framework-specific parameters.
+        Async chat generation entrypoint used by LangChain.
         """
-        texts_list = list(texts)
-        _validate_texts_are_strings(texts_list, op_name="aembed_documents")
-        self._warn_if_extreme_batch(texts_list, op_name="aembed_documents")
+        self._validate_messages(messages)
 
-        core_ctx, framework_ctx = self._build_contexts(config=config, model=model, **kwargs)
-
-        logger.debug(
-            "Async embedding %d documents for LangChain run: %s",
-            len(texts_list),
-            config.get("run_id", "unknown") if isinstance(config, Mapping) else "unknown",
+        ctx, params, framework_ctx = self._build_context_and_params(
+            stop=stop,
+            operation="agenerate",
+            stream=False,
+            **kwargs,
         )
+        model_for_context = params.get("model", self.model)
 
-        start = time.perf_counter()
-        translated = await self._translator.arun_embed(
-            raw_texts=texts_list,
-            op_ctx=core_ctx,
-            framework_ctx=framework_ctx,
-        )
-        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        if run_manager is not None:
+            await run_manager.on_llm_start(
+                self,
+                messages,
+                invocation_params=params,
+                run_id=ctx.request_id,
+            )
 
-        mat = self._coerce_embedding_matrix(translated)
-        dim = _infer_dim_from_matrix(mat)
-        self._update_dim_hint(dim)
+        try:
+            result = await self._translator.arun_complete(
+                raw_messages=messages,
+                model=model_for_context,
+                max_tokens=params.get("max_tokens"),
+                temperature=params.get("temperature"),
+                top_p=params.get("top_p"),
+                frequency_penalty=params.get("frequency_penalty"),
+                presence_penalty=params.get("presence_penalty"),
+                stop_sequences=params.get("stop_sequences"),
+                tools=kwargs.get("tools"),
+                tool_choice=kwargs.get("tool_choice"),
+                system_message=kwargs.get("system_message"),
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
 
-        logger.debug(
-            "LangChain aembed_documents completed: docs=%d dim=%s latency_ms=%.2f",
-            len(mat),
-            dim,
-            elapsed_ms,
-        )
-        return mat
+            chat_result = CorpusLangChainLLM._ensure_chat_result(result)
 
-    @with_async_embedding_error_context("query")
-    async def aembed_query(
+            if run_manager is not None:
+                await run_manager.on_llm_end(chat_result)
+
+            return chat_result
+        except Exception as exc:  # noqa: BLE001
+            if run_manager is not None:
+                await run_manager.on_llm_error(exc)
+            raise
+
+    @with_async_llm_error_context("astream")
+    async def _astream(
         self,
-        text: str,
-        *,
-        config: Optional[LangChainConfig] = None,
-        model: Optional[str] = None,
+        messages: List[BaseMessage],
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
         **kwargs: Any,
-    ) -> List[float]:
+    ) -> AsyncIterator[ChatGenerationChunk]:
         """
-        Async embedding for a single query.
-
-        Parameters
-        ----------
-        text:
-            Query text to embed.
-        config:
-            Optional LangChain RunnableConfig-like dict.
-        model:
-            Optional per-call model override.
-        **kwargs:
-            Additional framework-specific parameters.
+        Async streaming entrypoint used by LangChain.
         """
-        if not isinstance(text, str):
-            raise TypeError(f"aembed_query expects str; got {type(text).__name__}")
+        self._validate_messages(messages)
 
-        core_ctx, framework_ctx = self._build_contexts(config=config, model=model, **kwargs)
-
-        logger.debug(
-            "Async embedding query for LangChain run: %s",
-            config.get("run_id", "unknown") if isinstance(config, Mapping) else "unknown",
+        ctx, params, framework_ctx = self._build_context_and_params(
+            stop=stop,
+            operation="astream",
+            stream=True,
+            **kwargs,
         )
+        model_for_context = params.get("model", self.model)
 
-        start = time.perf_counter()
-        translated = await self._translator.arun_embed(
-            raw_texts=text,
-            op_ctx=core_ctx,
-            framework_ctx=framework_ctx,
-        )
-        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        if run_manager is not None:
+            await run_manager.on_llm_start(
+                self,
+                messages,
+                invocation_params=params,
+                run_id=ctx.request_id,
+            )
 
-        vec = self._coerce_embedding_vector(translated)
-        self._update_dim_hint(len(vec))
+        stream_canceled = False
+        agen: Optional[AsyncIterator[Any]] = None
 
-        logger.debug(
-            "LangChain aembed_query completed: dim=%d latency_ms=%.2f",
-            len(vec),
-            elapsed_ms,
-        )
-        return vec
+        try:
+            agen = await self._translator.arun_stream(
+                raw_messages=messages,
+                model=model_for_context,
+                max_tokens=params.get("max_tokens"),
+                temperature=params.get("temperature"),
+                top_p=params.get("top_p"),
+                frequency_penalty=params.get("frequency_penalty"),
+                presence_penalty=params.get("presence_penalty"),
+                stop_sequences=params.get("stop_sequences"),
+                tools=kwargs.get("tools"),
+                tool_choice=kwargs.get("tool_choice"),
+                system_message=kwargs.get("system_message"),
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+
+            async for chunk in agen:
+                gen_chunk = CorpusLangChainLLM._ensure_generation_chunk(chunk)
+                text = gen_chunk.message.content or ""
+
+                if run_manager is not None and text:
+                    try:
+                        await run_manager.on_llm_new_token(text, chunk=gen_chunk)
+                    except Exception as callback_error:  # noqa: BLE001
+                        logger.warning(
+                            "LLM new token callback failed: %s",
+                            callback_error,
+                        )
+                        stream_canceled = True
+                        break
+
+                yield gen_chunk
+        except Exception as exc:  # noqa: BLE001
+            if run_manager is not None:
+                await run_manager.on_llm_error(exc)
+            raise
+        finally:
+            if agen is not None and hasattr(agen, "aclose"):
+                try:
+                    await agen.aclose()  # type: ignore[func-returns-value]
+                except Exception as cleanup_error:  # noqa: BLE001
+                    logger.warning(
+                        "Async stream cleanup failed in LangChain adapter: %s",
+                        cleanup_error,
+                    )
+
+            if run_manager is not None and not stream_canceled:
+                completion_result = ChatResult(
+                    generations=[
+                        ChatGeneration(
+                            message=AIMessage(content=""),
+                            generation_info={
+                                "streaming": True,
+                                "completed": True,
+                                "model": model_for_context,
+                            },
+                        )
+                    ]
+                )
+                await run_manager.on_llm_end(completion_result)
 
     # ------------------------------------------------------------------ #
-    # Sync API
+    # LangChain sync API (via LLMTranslator)
     # ------------------------------------------------------------------ #
 
-    @with_embedding_error_context("documents")
-    def embed_documents(
+    @with_llm_error_context("generate")
+    def _generate(
         self,
-        texts: Sequence[str],
-        *,
-        config: Optional[LangChainConfig] = None,
-        model: Optional[str] = None,
+        messages: List[BaseMessage],
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
         **kwargs: Any,
-    ) -> List[List[float]]:
+    ) -> ChatResult:
         """
-        Sync embedding for multiple documents.
+        Sync chat generation entrypoint used by LangChain.
 
-        Uses the synchronous `EmbeddingTranslator.embed` API, which internally
-        bridges async protocol calls and respects any `deadline_ms` timeout
-        encoded in the OperationContext.
+        This method enforces event-loop safety: it must not be called from
+        inside an active asyncio event loop. Use `_agenerate` instead in that
+        case.
         """
-        _ensure_not_in_event_loop("embed_documents")
+        _ensure_not_in_event_loop("_generate")
 
-        texts_list = list(texts)
-        _validate_texts_are_strings(texts_list, op_name="embed_documents")
-        self._warn_if_extreme_batch(texts_list, op_name="embed_documents")
+        self._validate_messages(messages)
 
-        core_ctx, framework_ctx = self._build_contexts(config=config, model=model, **kwargs)
-
-        logger.debug(
-            "Sync embedding %d documents for LangChain run: %s",
-            len(texts_list),
-            config.get("run_name", "unknown") if isinstance(config, Mapping) else "unknown",
+        ctx, params, framework_ctx = self._build_context_and_params(
+            stop=stop,
+            operation="generate",
+            stream=False,
+            **kwargs,
         )
+        model_for_context = params.get("model", self.model)
 
-        start = time.perf_counter()
-        translated = self._translator.embed(
-            raw_texts=texts_list,
-            op_ctx=core_ctx,
-            framework_ctx=framework_ctx,
-        )
-        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        if run_manager is not None:
+            run_manager.on_llm_start(
+                self,
+                messages,
+                invocation_params=params,
+                run_id=ctx.request_id,
+            )
 
-        mat = self._coerce_embedding_matrix(translated)
-        dim = _infer_dim_from_matrix(mat)
-        self._update_dim_hint(dim)
+        try:
+            result = self._translator.complete(
+                raw_messages=messages,
+                model=model_for_context,
+                max_tokens=params.get("max_tokens"),
+                temperature=params.get("temperature"),
+                top_p=params.get("top_p"),
+                frequency_penalty=params.get("frequency_penalty"),
+                presence_penalty=params.get("presence_penalty"),
+                stop_sequences=params.get("stop_sequences"),
+                tools=kwargs.get("tools"),
+                tool_choice=kwargs.get("tool_choice"),
+                system_message=kwargs.get("system_message"),
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
 
-        logger.debug(
-            "LangChain embed_documents completed: docs=%d dim=%s latency_ms=%.2f",
-            len(mat),
-            dim,
-            elapsed_ms,
-        )
-        return mat
+            chat_result = CorpusLangChainLLM._ensure_chat_result(result)
 
-    @with_embedding_error_context("query")
-    def embed_query(
+            if run_manager is not None:
+                run_manager.on_llm_end(chat_result)
+
+            return chat_result
+        except Exception as exc:  # noqa: BLE001
+            if run_manager is not None:
+                run_manager.on_llm_error(exc)
+            raise
+
+    @with_llm_error_context("stream")
+    def _stream(
         self,
-        text: str,
-        *,
-        config: Optional[LangChainConfig] = None,
-        model: Optional[str] = None,
+        messages: List[BaseMessage],
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
         **kwargs: Any,
-    ) -> List[float]:
+    ) -> Iterator[ChatGenerationChunk]:
         """
-        Sync embedding for a single query.
+        Sync streaming entrypoint used by LangChain.
 
-        Uses the synchronous `EmbeddingTranslator.embed` API, which internally
-        bridges async protocol calls and respects any `deadline_ms` timeout
-        encoded in the OperationContext.
+        This method enforces event-loop safety: it must not be called from
+        inside an active asyncio event loop. Use `_astream` instead in that
+        case.
         """
-        _ensure_not_in_event_loop("embed_query")
+        _ensure_not_in_event_loop("_stream")
 
-        if not isinstance(text, str):
-            raise TypeError(f"embed_query expects str; got {type(text).__name__}")
+        self._validate_messages(messages)
 
-        core_ctx, framework_ctx = self._build_contexts(config=config, model=model, **kwargs)
-
-        logger.debug(
-            "Sync embedding query for LangChain run: %s",
-            config.get("run_name", "unknown") if isinstance(config, Mapping) else "unknown",
+        ctx, params, framework_ctx = self._build_context_and_params(
+            stop=stop,
+            operation="stream",
+            stream=True,
+            **kwargs,
         )
+        model_for_context = params.get("model", self.model)
 
-        start = time.perf_counter()
-        translated = self._translator.embed(
-            raw_texts=text,
-            op_ctx=core_ctx,
-            framework_ctx=framework_ctx,
-        )
-        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        if run_manager is not None:
+            run_manager.on_llm_start(
+                self,
+                messages,
+                invocation_params=params,
+                run_id=ctx.request_id,
+            )
 
-        vec = self._coerce_embedding_vector(translated)
-        self._update_dim_hint(len(vec))
+        stream_canceled = False
+        iterator: Optional[Iterator[Any]] = None
 
-        logger.debug(
-            "LangChain embed_query completed: dim=%d latency_ms=%.2f",
-            len(vec),
-            elapsed_ms,
-        )
-        return vec
+        try:
+            iterator = self._translator.stream(
+                raw_messages=messages,
+                model=model_for_context,
+                max_tokens=params.get("max_tokens"),
+                temperature=params.get("temperature"),
+                top_p=params.get("top_p"),
+                frequency_penalty=params.get("frequency_penalty"),
+                presence_penalty=params.get("presence_penalty"),
+                stop_sequences=params.get("stop_sequences"),
+                tools=kwargs.get("tools"),
+                tool_choice=kwargs.get("tool_choice"),
+                system_message=kwargs.get("system_message"),
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
 
-    @with_embedding_error_context("function_call")
-    def __call__(
-        self,
-        texts: Sequence[str],
-        *,
-        config: Optional[LangChainConfig] = None,
-        model: Optional[str] = None,
-        **kwargs: Any,
-    ) -> List[List[float]]:
+            for chunk in iterator:
+                gen_chunk = CorpusLangChainLLM._ensure_generation_chunk(chunk)
+                text = gen_chunk.message.content or ""
+
+                if run_manager is not None and text:
+                    try:
+                        run_manager.on_llm_new_token(text, chunk=gen_chunk)
+                    except Exception as callback_error:  # noqa: BLE001
+                        logger.warning(
+                            "LLM new token callback failed: %s",
+                            callback_error,
+                        )
+                        stream_canceled = True
+                        break
+
+                yield gen_chunk
+        except Exception as exc:  # noqa: BLE001
+            if run_manager is not None:
+                run_manager.on_llm_error(exc)
+            raise
+        finally:
+            if iterator is not None and hasattr(iterator, "close"):
+                try:
+                    iterator.close()  # type: ignore[func-returns-value]
+                except Exception as cleanup_error:  # noqa: BLE001
+                    logger.warning(
+                        "Sync stream cleanup failed in LangChain adapter: %s",
+                        cleanup_error,
+                    )
+
+            if run_manager is not None and not stream_canceled:
+                completion_result = ChatResult(
+                    generations=[
+                        ChatGeneration(
+                            message=AIMessage(content=""),
+                            generation_info={
+                                "streaming": True,
+                                "completed": True,
+                                "model": model_for_context,
+                            },
+                        )
+                    ]
+                )
+                run_manager.on_llm_end(completion_result)
+
+    # ------------------------------------------------------------------ #
+    # Token counting (via LLMTranslator with robust fallbacks)
+    # ------------------------------------------------------------------ #
+
+    def get_num_tokens_from_messages(self, messages: List[BaseMessage]) -> int:
         """
-        Callable interface for vector-store style protocols.
+        Estimate token count for a list of LangChain messages.
 
-        This allows the adapter to be passed directly as an `embedding_function`
-        where a simple callable is expected.
+        Primary path:
+            Use LLMTranslator.count_tokens_for_messages so that token counting
+            respects provider-specific formatting and configuration.
+
+        Fallback:
+            Character-based heuristic estimation.
         """
-        _ensure_not_in_event_loop("__call__")
-        return self.embed_documents(texts, config=config, model=model, **kwargs)
+        if not messages:
+            return 0
 
-
-# ------------------------------------------------------------------ #
-# LangChain "configuration / registration" helpers
-# ------------------------------------------------------------------ #
-
-
-def configure_langchain_embeddings(
-    corpus_adapter: Any,
-    model: Optional[str] = None,
-    framework_version: Optional[str] = None,
-    langchain_config: Optional[LangChainAdapterConfig] = None,
-    **kwargs: Any,
-) -> CorpusLangChainEmbeddings:
-    """
-    Configure and return Corpus embeddings for LangChain usage.
-
-    This mirrors the *shape* of the Semantic Kernel / LlamaIndex helpers:
-
-    - Always constructs and returns a `CorpusLangChainEmbeddings` instance.
-    - If LangChain is not installed, the adapter still constructs, but you
-      obviously won't be able to plug it into real LangChain pipelines.
-
-    Unlike Semantic Kernel or LlamaIndex, LangChain does not expose a single
-    global "Settings" object for embeddings, so this helper does *not* attempt
-    any global registration; you pass the returned instance into vectorstores,
-    retrievers, chains, etc.
-
-    Example
-    -------
-    ```python
-    from corpus_sdk.embedding.framework_adapters.langchain import (
-        configure_langchain_embeddings,
-    )
-    embeddings = configure_langchain_embeddings(
-        corpus_adapter=my_adapter,
-        model="text-embedding-3-large",
-        langchain_config={"fallback_to_simple_context": False},
-    )
-    ```
-    Parameters
-    ----------
-    corpus_adapter:
-        Corpus embedding protocol adapter implementing the EmbeddingProtocolV1 behavior.
-    model:
-        Optional default model identifier.
-    framework_version:
-        Optional framework version string (e.g. LangChain version).
-    langchain_config:
-        Optional adapter-level configuration (separate from per-call `config`).
-    **kwargs:
-        Additional arguments for `CorpusLangChainEmbeddings`
-        (e.g. batch_config, text_normalization_config).
-
-    Returns
-    -------
-    CorpusLangChainEmbeddings
-        Configured embeddings instance ready for LangChain integration.
-    """
-    embeddings = CorpusLangChainEmbeddings(
-        corpus_adapter=corpus_adapter,
-        model=model,
-        framework_version=framework_version,
-        langchain_config=langchain_config,
-        **kwargs,
-    )
-
-    if not LANGCHAIN_AVAILABLE:
-        logger.debug(
-            "LangChain is not installed; returning embeddings without any framework-level integration.",
+        ctx = _build_operation_context_from_config(
+            config=None,
+            framework_version=self._framework_version,
         )
-    else:
-        logger.info(
-            "Corpus LangChain embeddings configured with model=%s, framework_version=%s",
-            model or "default",
-            framework_version or "unknown",
-        )
+        framework_ctx: Dict[str, Any] = {
+            "framework": _FRAMEWORK_NAME,
+            "framework_version": self._framework_version,
+            "operation": "count_tokens",
+            "stream": False,
+            "model": self.model,
+        }
 
-    return embeddings
+        try:
+            result = self._translator.count_tokens_for_messages(
+                raw_messages=messages,
+                model=self.model,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
 
+            if isinstance(result, int):
+                return result
+            if isinstance(result, Mapping):
+                for key in ("tokens", "count", "total_tokens"):
+                    value = result.get(key)
+                    if isinstance(value, int):
+                        return value
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "LLMTranslator.count_tokens_for_messages failed, "
+                "falling back to heuristic: %s",
+                exc,
+            )
 
-def register_with_langchain(
-    corpus_adapter: Any,
-    model: Optional[str] = None,
-    framework_version: Optional[str] = None,
-    langchain_config: Optional[LangChainAdapterConfig] = None,
-    **kwargs: Any,
-) -> CorpusLangChainEmbeddings:
-    """
-    Alias for `configure_langchain_embeddings` to mirror the
-    `register_with_semantic_kernel` / `register_with_llamaindex`
-    naming convention.
+        combined_text = self._combine_messages_for_counting(messages)
+        if not combined_text:
+            return 0
 
-    This helper is primarily for API symmetry across framework adapters,
-    rather than actual global registration.
-    """
-    return configure_langchain_embeddings(
-        corpus_adapter=corpus_adapter,
-        model=model,
-        framework_version=framework_version,
-        langchain_config=langchain_config,
-        **kwargs,
-    )
+        char_count = len(combined_text)
+        message_count = len(messages)
+        char_based = max(1, char_count // 4)
+        message_based = max(1, message_count)
+        return max(char_based, message_based)
 
+    def _combine_messages_for_counting(self, messages: List[BaseMessage]) -> str:
+        """Combine messages into a single string for heuristic token counting."""
+        parts: List[str] = []
+        for msg in messages:
+            role = getattr(msg, "type", "user")
+            content = str(getattr(msg, "content", ""))
+            parts.append(f"{role}: {content}")
+        return "\n".join(parts)
+
+    def get_num_tokens(self, text: str) -> int:
+        """
+        Token counting for a single text string.
+
+        Implemented via get_num_tokens_from_messages for consistency.
+        """
+        return self.get_num_tokens_from_messages([HumanMessage(content=text)])
 
 __all__ = [
-    "CorpusLangChainEmbeddings",
-    "LangChainConfig",
-    "LangChainAdapterConfig",
-    "ErrorCodes",
-    "configure_langchain_embeddings",
-    "register_with_langchain",
-    "with_embedding_error_context",
-    "with_async_embedding_error_context",
+    "LangChainLLMProtocol",
+    "LangChainLLMConfig",
+    "CorpusLangChainLLM",
+    "with_llm_error_context",
+    "with_async_llm_error_context",
+    "ERROR_CODES",
     "LANGCHAIN_AVAILABLE",
+    "LANGCHAIN_LLM_AVAILABLE",
+    "INIT_CONFIG_ERROR",
+    "SYNC_WRAPPER_CALLED_IN_EVENT_LOOP"
 ]

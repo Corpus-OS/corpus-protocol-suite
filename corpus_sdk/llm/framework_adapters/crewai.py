@@ -1169,6 +1169,76 @@ class CorpusCrewAILLM:
                     )
 
     # ---------------------------------------------------------------------
+    # Token counting
+    # ---------------------------------------------------------------------
+
+    def count_tokens(
+        self,
+        task: Optional["Task"] = None,
+        **kwargs: Any,
+    ) -> int:
+        """
+        Token counting helper for CrewAI tasks.
+
+        Preferred path:
+        - Use LLMTranslator.count_tokens_for_messages so token counting
+          can use the same formatting and strategies as actual completions.
+
+        Fallbacks:
+        - If translator/adapter count fails, use char-based estimate.
+        """
+        # Extract messages from task if provided
+        messages = []
+        if task is not None:
+            # CrewAI tasks contain prompt/context that we need to convert to messages
+            try:
+                messages = self._translator.from_crewai(task)
+            except Exception:
+                # If conversion fails, fall back to character-based estimate
+                pass
+
+        if not messages and not task:
+            return 0
+
+        ctx, params, model_for_context, framework_ctx = self._build_request_context(
+            kwargs,
+            operation="count_tokens",
+            stream=False,
+        )
+
+        # Preferred: translator-based token counting
+        try:
+            tokens_any = self._translator.count_tokens_for_messages(
+                raw_messages=messages or task,
+                model=model_for_context,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+            if isinstance(tokens_any, int):
+                return tokens_any
+        except Exception:
+            pass
+
+        # Fallback: improved character-based estimate
+        try:
+            char_count = 0
+            if messages:
+                for msg in messages:
+                    if hasattr(msg, "content"):
+                        char_count += len(str(msg.content))
+                    else:
+                        char_count += len(str(msg))
+            elif task:
+                # Estimate based on task content
+                char_count = len(str(task))
+            
+            # Rough estimate: ~4 characters per token on average
+            return max(1, char_count // 4)
+        except Exception:
+            # Ultimate fallback
+            return 0
+
+    # ---------------------------------------------------------------------
     # Health and capabilities passthroughs (translator-only)
     # ---------------------------------------------------------------------
 

@@ -634,6 +634,67 @@ class CorpusAutoGenChatClient:
             )
         return result
 
+    # ------------------------------------------------------------------ #
+    # Token counting
+    # ------------------------------------------------------------------ #
+
+    def count_tokens(
+        self,
+        messages: Sequence[Dict[str, Any]],
+        **kwargs: Any,
+    ) -> int:
+        """
+        Token counting helper for AutoGen messages.
+
+        Preferred path:
+        - Use LLMTranslator.count_tokens_for_messages so token counting
+          can use the same formatting and strategies as actual completions.
+
+        Fallbacks:
+        - If translator/adapter count fails, use char-based estimate.
+        """
+        if not messages:
+            return 0
+
+        ctx, params, model_for_context, framework_ctx = self._build_request_context(
+            conversation=None,
+            llm_config=kwargs,
+            operation="count_tokens",
+            stream=False,
+        )
+
+        # Preferred: translator-based token counting
+        try:
+            tokens_any = self._translator.count_tokens_for_messages(
+                raw_messages=messages,
+                model=model_for_context,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+            if isinstance(tokens_any, int):
+                return tokens_any
+        except Exception:
+            pass
+
+        # Fallback: character-based estimate
+        try:
+            char_count = 0
+            for msg in messages:
+                if isinstance(msg, dict):
+                    content = msg.get("content", "")
+                    char_count += len(str(content))
+                else:
+                    char_count += len(str(msg))
+            
+            # Rough estimate: ~4 characters per token on average
+            return max(1, char_count // 4)
+        except Exception:
+            return 0
+
+    # ------------------------------------------------------------------ #
+    # Health and capabilities
+    # ------------------------------------------------------------------ #
+
     @with_llm_error_context("health")
     def health(self) -> Mapping[str, Any]:
         """
