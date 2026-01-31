@@ -98,7 +98,7 @@ Canonical JSON envelope:
     Unary Success:
         {
             "ok": true,
-            "code": "STREAMING",
+            "code": "OK",
             "ms": <float>,          # elapsed milliseconds (best-effort)
             "result": { ... }
         }
@@ -175,6 +175,7 @@ and is aligned with the canonical envelope contract.
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import logging
@@ -1053,7 +1054,38 @@ class BaseLLMAdapter(LLMProtocolV1):
         """
         return None
 
-    # --- internal helpers (validation, metrics) ------------------------------
+    # --- internal helpers (validation, metrics, cache safety) ----------------
+
+    @staticmethod
+    def _safe_deepcopy(obj: Any) -> Any:
+        """
+        Best-effort deepcopy helper for cache safety.
+
+        Cache implementations frequently store objects by reference. Deep-copying
+        cached results on both read and write prevents cross-request mutation
+        and accidental state bleed across callers.
+        """
+        try:
+            return copy.deepcopy(obj)
+        except Exception:
+            # Deepcopy failures must never break callers; return best-effort.
+            return obj
+
+    @staticmethod
+    def _bucket_wait_ms(ms: float) -> str:
+        """
+        Low-cardinality wait-time buckets for limiter observability.
+
+        This keeps metrics cardinality bounded while still providing signal
+        when the limiter is actively applying backpressure.
+        """
+        if ms < 1.0:
+            return "<1ms"
+        if ms < 10.0:
+            return "1-10ms"
+        if ms < 100.0:
+            return "10-100ms"
+        return ">=100ms"
 
     @staticmethod
     def _validate_messages(messages: List[Mapping[str, str]]) -> None:
@@ -1239,6 +1271,14 @@ class BaseLLMAdapter(LLMProtocolV1):
                 code=code,
                 extra=x or None,
             )
+            if not ok:
+                # Standard error counter (SIEM-safe, low-cardinality).
+                self._metrics.counter(
+                    component=self._component,
+                    name="errors_total",
+                    value=1,
+                    extra={"op": op, "code": code},
+                )
         except Exception:
             pass
 
@@ -1312,19 +1352,29 @@ class BaseLLMAdapter(LLMProtocolV1):
             - Messages fingerprint
             - Sampling params
             - Tool definitions and choice (stable JSON hash)
+            - Stop sequences hash (to avoid embedding plaintext stops into cache keys)
             - Capabilities fingerprint
             - Tenant hash (when present)
+
+        SECURITY NOTE:
+            This method intentionally avoids embedding raw prompt content,
+            system message text, tool definitions, or stop sequence text in
+            cache keys. Instead it uses SHA-256 digests to reduce the risk of
+            sensitive data exposure in cache backends.
         """
         caps_fingerprint_payload = {
             "server": caps.server,
             "version": caps.version,
             "model_family": caps.model_family,
             "max_context_length": caps.max_context_length,
+            "protocol": caps.protocol,
             "supports_streaming": caps.supports_streaming,
             "supports_roles": caps.supports_roles,
             "supports_json_output": caps.supports_json_output,
             "supports_tools": caps.supports_tools,
             "supports_parallel_tool_calls": caps.supports_parallel_tool_calls,
+            "supports_tool_choice": caps.supports_tool_choice,
+            "max_tool_calls_per_turn": caps.max_tool_calls_per_turn,
             "idempotent_writes": caps.idempotent_writes,
             "supports_multi_tenant": caps.supports_multi_tenant,
             "supports_system_message": caps.supports_system_message,
@@ -1333,14 +1383,15 @@ class BaseLLMAdapter(LLMProtocolV1):
             "supported_models": caps.supported_models,
         }
         caps_hash = hashlib.sha256(
-            json.dumps(caps_fingerprint_payload, sort_keys=True, default=str).encode(
-                "utf-8"
-            )
+            json.dumps(caps_fingerprint_payload, sort_keys=True, default=str).encode("utf-8")
         ).hexdigest()
 
-        # Hash tools/choice stably
-        tools_json = json.dumps(tools, sort_keys=True) if tools else "none"
-        choice_json = json.dumps(tool_choice, sort_keys=True) if tool_choice else "none"
+        # Hash tools/choice stably (do not embed plaintext in cache key)
+        tools_json = json.dumps(tools, sort_keys=True, default=str) if tools else "none"
+        choice_json = json.dumps(tool_choice, sort_keys=True, default=str) if tool_choice else "none"
+
+        # Hash stop sequences (do not embed plaintext in cache key)
+        stops_json = json.dumps(stop_sequences, sort_keys=True, default=str) if stop_sequences else "none"
 
         parts: Dict[str, str] = {
             "model": str(model or "default"),
@@ -1351,7 +1402,7 @@ class BaseLLMAdapter(LLMProtocolV1):
             "top_p": repr(top_p) if top_p is not None else "none",
             "freq_pen": repr(frequency_penalty) if frequency_penalty is not None else "none",
             "pres_pen": repr(presence_penalty) if presence_penalty is not None else "none",
-            "stops": ",".join(stop_sequences) if stop_sequences else "none",
+            "stops": self._hash_str(stops_json),
             "tools": self._hash_str(tools_json),
             "tool_choice": self._hash_str(choice_json),
             "caps": caps_hash,
@@ -1468,13 +1519,38 @@ class BaseLLMAdapter(LLMProtocolV1):
         metric_extra = dict(metric_extra or {})
 
         if not self._breaker.allow():
+            # Match cross-SDK observability patterns: breaker open counter.
+            try:
+                self._metrics.counter(
+                    component=self._component,
+                    name="breaker_open_total",
+                    value=1,
+                    extra={"op": op},
+                )
+            except Exception:
+                pass
+
             e = Unavailable("circuit open")
             code = e.code or type(e).__name__
             t0 = time.monotonic()
             self._record(op, t0, False, code=code, ctx=ctx, **metric_extra)
             raise e
 
+        # Observe limiter backpressure in low-cardinality buckets.
+        wait_t0 = time.monotonic()
         await self._limiter.acquire()
+        waited_ms = (time.monotonic() - wait_t0) * 1000.0
+        if waited_ms > 0:
+            try:
+                self._metrics.counter(
+                    component=self._component,
+                    name="limiter_wait_buckets_total",
+                    value=1,
+                    extra={"op": op, "bucket": self._bucket_wait_ms(waited_ms)},
+                )
+            except Exception:
+                pass
+
         t0 = time.monotonic()
         try:
             result = await call()
@@ -1539,13 +1615,38 @@ class BaseLLMAdapter(LLMProtocolV1):
         metric_extra = dict(metric_extra or {})
 
         if not self._breaker.allow():
+            # Match cross-SDK observability patterns: breaker open counter.
+            try:
+                self._metrics.counter(
+                    component=self._component,
+                    name="breaker_open_total",
+                    value=1,
+                    extra={"op": op},
+                )
+            except Exception:
+                pass
+
             e = Unavailable("circuit open")
             code = e.code or type(e).__name__
             t0 = time.monotonic()
             self._record(op, t0, False, code=code, ctx=ctx, **metric_extra)
             raise e
 
+        # Observe limiter backpressure in low-cardinality buckets.
+        wait_t0 = time.monotonic()
         await self._limiter.acquire()
+        waited_ms = (time.monotonic() - wait_t0) * 1000.0
+        if waited_ms > 0:
+            try:
+                self._metrics.counter(
+                    component=self._component,
+                    name="limiter_wait_buckets_total",
+                    value=1,
+                    extra={"op": op, "bucket": self._bucket_wait_ms(waited_ms)},
+                )
+            except Exception:
+                pass
+
         t0 = time.monotonic()
         check_n = self._stream_deadline_check_every_n_chunks
 
@@ -1670,11 +1771,13 @@ class BaseLLMAdapter(LLMProtocolV1):
                         extra={"op": "capabilities"},
                     )
                     self._record("capabilities", t0, True)
-                    return cached
+                    # Cache safety: return a defensive copy to prevent mutation bleed.
+                    return self._safe_deepcopy(cached)
             caps = await self._do_capabilities()
             if use_cache:
                 try:
-                    await self._cache.set(self._caps_cache_key, caps, ttl_s=self._cache_ttl_s)
+                    # Cache safety: store a defensive copy to prevent mutation bleed.
+                    await self._cache.set(self._caps_cache_key, self._safe_deepcopy(caps), ttl_s=self._cache_ttl_s)
                 except Exception:
                     pass
             self._record("capabilities", t0, True)
@@ -1776,7 +1879,8 @@ class BaseLLMAdapter(LLMProtocolV1):
                         name="cache_hits",
                         value=1,
                     )
-                    return cached  # type: ignore[return-value]
+                    # Cache safety: return a defensive copy to prevent mutation bleed.
+                    return self._safe_deepcopy(cached)  # type: ignore[return-value]
 
             result = await self._maybe_apply_deadline(
                 self._do_complete(
@@ -1799,7 +1903,8 @@ class BaseLLMAdapter(LLMProtocolV1):
 
             if use_cache and cache_key is not None:
                 try:
-                    await self._cache.set(cache_key, result, ttl_s=self._cache_ttl_s)
+                    # Cache safety: store a defensive copy to prevent mutation bleed.
+                    await self._cache.set(cache_key, self._safe_deepcopy(result), ttl_s=self._cache_ttl_s)
                 except Exception:
                     pass
 
@@ -2238,6 +2343,10 @@ def _error_to_wire(e: Exception, ms: float) -> Dict[str, Any]:
 
     Security hardening:
       - For unknown/unhandled exceptions, return a stable, non-leaky message.
+
+    Operational triage:
+      - For unknown/unhandled exceptions, include a SIEM-safe details payload
+        with error_type to support debugging without leaking internals.
     """
     if isinstance(e, LLMAdapterError):
         details = dict(e.details or {})
@@ -2262,7 +2371,8 @@ def _error_to_wire(e: Exception, ms: float) -> Dict[str, Any]:
         # Unknown exception: stable message; do not echo raw exception text (may leak internals).
         "message": "internal error",
         "retry_after_ms": None,
-        "details": None,
+        # SIEM-safe triage context: error type only (no stack traces, no payload echo).
+        "details": {"error_type": type(e).__name__},
         "ms": ms,
     }
 
