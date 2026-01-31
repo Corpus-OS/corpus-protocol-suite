@@ -87,10 +87,26 @@ class LLMFrameworkDescriptor:
         (e.g. "conversation", "task", "config", "callback_manager", "settings").
 
     has_capabilities:
-        True if the adapter exposes a capabilities()/acapabilities() surface.
+        True if the adapter exposes a capabilities surface.
+
+    capabilities_method / async_capabilities_method:
+        Method names for capabilities on the adapter.
+
+        NOTE:
+            These are optional for backwards compatibility; when omitted and
+            has_capabilities=True, conformance tests may still assume a
+            conventional async method name ("capabilities"). Explicitly
+            listing method names here keeps the registry unambiguous.
 
     has_health:
-        True if the adapter exposes a health()/ahealth() surface.
+        True if the adapter exposes a health surface.
+
+    health_method / async_health_method:
+        Method names for health on the adapter.
+
+        NOTE:
+            As with capabilities, these are optional for backwards compatibility.
+            Explicitly listing method names is preferred for clarity.
 
     supports_streaming:
         True if the adapter is expected to support streaming responses.
@@ -130,8 +146,18 @@ class LLMFrameworkDescriptor:
 
     context_kwarg: Optional[str] = None
 
+    # Extra surfaces (capabilities/health) are intentionally represented
+    # explicitly so the conformance suite can decide what to test per framework.
     has_capabilities: bool = False
     has_health: bool = False
+
+    # Explicit method names for capabilities/health (prefer async names).
+    # These are optional to preserve compatibility with existing test logic,
+    # but descriptors SHOULD set them when has_capabilities/has_health is True.
+    capabilities_method: Optional[str] = None
+    async_capabilities_method: Optional[str] = None
+    health_method: Optional[str] = None
+    async_health_method: Optional[str] = None
 
     supports_streaming: bool = False
     supports_token_count: bool = False
@@ -151,11 +177,18 @@ class LLMFrameworkDescriptor:
 
     @property
     def supports_async(self) -> bool:
-        """True if any async method is declared."""
+        """
+        True if any async method is declared.
+
+        This includes async completion/streaming/token-count surfaces as well
+        as async capability/health methods when explicitly declared.
+        """
         return bool(
             self.async_completion_method
             or self.async_streaming_method
             or self.async_token_count_method
+            or self.async_capabilities_method
+            or self.async_health_method
         )
 
     def is_available(self) -> bool:
@@ -264,6 +297,26 @@ class LLMFrameworkDescriptor:
             warnings.warn(
                 f"{self.name}: async_token_count_method is set but "
                 f"token_count_method is None (async should have a sync counterpart)",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+        # Capability/health method presence checks (kept conservative).
+        # If a descriptor claims the surface exists, it SHOULD specify the async method
+        # name explicitly to keep the registry unambiguous.
+        if self.has_capabilities and not (self.capabilities_method or self.async_capabilities_method):
+            warnings.warn(
+                f"{self.name}: has_capabilities is True but no "
+                f"capabilities_method/async_capabilities_method is set "
+                f"(tests may assume a conventional async method name)",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        if self.has_health and not (self.health_method or self.async_health_method):
+            warnings.warn(
+                f"{self.name}: has_health is True but no "
+                f"health_method/async_health_method is set "
+                f"(tests may assume a conventional async method name)",
                 RuntimeWarning,
                 stacklevel=2,
             )
@@ -391,8 +444,13 @@ LLM_FRAMEWORKS: Dict[str, LLMFrameworkDescriptor] = {
         token_count_method=None,
         async_token_count_method=None,
         context_kwarg="conversation",
-        has_capabilities=False,
-        has_health=False,
+        # Conformance expectation: the adapter layer exposes these surfaces even when
+        # the underlying framework does not have a first-class analogue.
+        has_capabilities=True,
+        has_health=True,
+        # Prefer async method names because the conformance suite is async-first.
+        async_capabilities_method="capabilities",
+        async_health_method="health",
         supports_streaming=True,
         supports_token_count=False,
         availability_attr=None,
@@ -418,6 +476,8 @@ LLM_FRAMEWORKS: Dict[str, LLMFrameworkDescriptor] = {
         context_kwarg="task",
         has_capabilities=True,
         has_health=True,
+        async_capabilities_method="capabilities",
+        async_health_method="health",
         supports_streaming=True,
         supports_token_count=True,
         availability_attr=None,
@@ -444,6 +504,8 @@ LLM_FRAMEWORKS: Dict[str, LLMFrameworkDescriptor] = {
         context_kwarg="config",
         has_capabilities=True,
         has_health=True,
+        async_capabilities_method="capabilities",
+        async_health_method="health",
         supports_streaming=True,
         supports_token_count=True,
         availability_attr="LANGCHAIN_LLM_AVAILABLE",
@@ -469,6 +531,8 @@ LLM_FRAMEWORKS: Dict[str, LLMFrameworkDescriptor] = {
         context_kwarg="callback_manager",
         has_capabilities=True,
         has_health=True,
+        async_capabilities_method="capabilities",
+        async_health_method="health",
         supports_streaming=True,
         supports_token_count=True,
         availability_attr=None,
@@ -494,6 +558,8 @@ LLM_FRAMEWORKS: Dict[str, LLMFrameworkDescriptor] = {
         context_kwarg="settings",
         has_capabilities=True,
         has_health=True,
+        async_capabilities_method="capabilities",
+        async_health_method="health",
         supports_streaming=True,
         supports_token_count=True,
         availability_attr=None,
