@@ -277,14 +277,18 @@ def _require_langchain_base_tool() -> Any:
     this adapter remains dependency-light and import-safe in minimal environments.
     """
     try:
-        # This import path is the typical LangChain tools surface.
-        from langchain.tools import BaseTool  # type: ignore[import-not-found]
-    except ImportError as exc:  # noqa: BLE001
-        raise ImportError(
-            "LangChain tools are not installed. Install with:\n"
-            '  pip install -U "langchain"\n'
-            "Then retry using create_langchain_graph_tools(...) / create_corpus_graph_tool(...)."
-        ) from exc
+        # Try langchain_core.tools first (langchain 0.1.x and newer)
+        from langchain_core.tools import BaseTool  # type: ignore[import-not-found]
+    except ImportError:
+        try:
+            # Fallback to langchain.tools for older versions
+            from langchain.tools import BaseTool  # type: ignore[import-not-found]
+        except ImportError as exc:  # noqa: BLE001
+            raise ImportError(
+                "LangChain tools are not installed. Install with:\n"
+                '  pip install -U "langchain" "langchain-core"\n'
+                "Then retry using create_langchain_graph_tools(...) / create_corpus_graph_tool(...)."
+            ) from exc
     return BaseTool
 
 
