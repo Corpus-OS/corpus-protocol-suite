@@ -954,6 +954,15 @@ class BatchEmbedResult:
           to `texts[i]` from the input BatchEmbedSpec (i.e., same length and order).
         - Partial success may also be expressed via `failed_texts`, but any
           deviation from 1:1 alignment MUST be documented by the implementation.
+
+    IMPORTANT (clarification for framework callers):
+        - Some implementations (including the BaseEmbeddingAdapter fallback path)
+          may return **success-only** `embeddings` and record failures in
+          `failed_texts`. In this case, positional alignment does not hold.
+        - For robust correlation, callers SHOULD use:
+            - `EmbeddingVector.index` (when present) for successes, and
+            - `failed_texts[*].index` for failures.
+          This preserves forward compatibility while allowing efficient fallback.
     """
     embeddings: List[EmbeddingVector]
     model: str
@@ -1680,6 +1689,11 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
 
         Assumes that `embeddings[i]` corresponds to the same input item
         as `metadatas[i]`.
+
+        NOTE:
+            This helper is intentionally "fast path" (O(n), no index lookups).
+            When positional alignment is not guaranteed (e.g., success-only
+            embeddings), use _attach_batch_metadata_to_embeddings_safely().
         """
         if not metadatas:
             return embeddings
@@ -1697,6 +1711,55 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
                         model=ev.model,
                         dimensions=ev.dimensions,
                         index=ev.index,  # preserve index
+                        metadata=md,
+                    )
+                )
+        return out
+
+    @staticmethod
+    def _attach_batch_metadata_to_embeddings_safely(
+        embeddings: List[EmbeddingVector],
+        metadatas: Optional[List[Dict[str, Any]]],
+        total_texts: int,
+    ) -> List[EmbeddingVector]:
+        """
+        Attach metadata to embeddings in a way that is safe under both:
+          - 1:1 positional alignment, and
+          - success-only embedding lists (where embeddings length < total_texts).
+
+        Strategy:
+          - If lengths align (common provider-native contract), attach by position.
+          - Otherwise, attempt to attach by EmbeddingVector.index (if present).
+            This preserves correctness without forcing providers to return
+            placeholder vectors for failures.
+
+        This method does NOT mutate original embedding objects.
+        """
+        if not metadatas:
+            return embeddings
+
+        # Fast path: identical lengths implies positional correlation.
+        if len(embeddings) == len(metadatas):
+            return BaseEmbeddingAdapter._attach_batch_metadata_to_embeddings(embeddings, metadatas)
+
+        # Safe path: attach by index when available.
+        out: List[EmbeddingVector] = []
+        for ev in embeddings:
+            md: Optional[Dict[str, Any]] = None
+            if ev.index is not None and isinstance(ev.index, int) and 0 <= ev.index < total_texts:
+                # Only attach metadata when the index is valid; avoids exceptions and keeps SIEM safe.
+                if ev.index < len(metadatas):
+                    md = metadatas[ev.index]
+            if md is None:
+                out.append(ev)
+            else:
+                out.append(
+                    EmbeddingVector(
+                        vector=ev.vector,
+                        text=ev.text,
+                        model=ev.model,
+                        dimensions=ev.dimensions,
+                        index=ev.index,
                         metadata=md,
                     )
                 )
@@ -2092,8 +2155,18 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         batching is not supported. Preserves partial success semantics.
 
         Uses asyncio.gather() to run per-text embeddings concurrently while
-        still returning results in input order and maintaining the same
-        failure structure as the sequential implementation.
+        returning:
+          - `embeddings`: success-only embedding vectors in ascending index order
+          - `failed_texts`: per-item errors with stable indices
+
+        IMPORTANT:
+            This fallback does NOT enforce 1:1 positional alignment between
+            `embeddings` and the input texts. This is intentional:
+              - Avoids introducing placeholder vectors for failures (which can
+                be misleading and complicate downstream handling).
+              - Preserves correctness and efficiency by using indices for correlation.
+            Callers that require correlation MUST use EmbeddingVector.index and/or
+            failed_texts[*].index.
         """
 
         async def _embed_one(idx: int, text: str):
@@ -2118,6 +2191,18 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
                 single = await self._do_embed(single_spec, ctx=ctx)
                 ev = single.embedding
 
+                # Ensure index correlation is always present for fallback success items.
+                # Providers may omit index; the fallback guarantees index=idx for safe joining.
+                if ev.index is None:
+                    ev = EmbeddingVector(
+                        vector=ev.vector,
+                        text=ev.text,
+                        model=ev.model,
+                        dimensions=ev.dimensions,
+                        index=idx,
+                        metadata=ev.metadata,
+                    )
+
                 if eff_spec.normalize:
                     if not caps.supports_normalization:
                         raise NotSupported("normalization not supported for this adapter")
@@ -2128,7 +2213,7 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
                             text=ev.text,
                             model=ev.model,
                             dimensions=len(vec),
-                            index=ev.index,  # preserve index
+                            index=ev.index,  # preserve index (now guaranteed non-None)
                             metadata=ev.metadata,
                         )
 
@@ -2170,14 +2255,20 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         tasks = [_embed_one(idx, text) for idx, text in enumerate(eff_spec.texts)]
         results = await asyncio.gather(*tasks, return_exceptions=False)
 
+        # Sort deterministically by original input index.
+        # This avoids any subtle ordering dependence if implementations change gather usage.
+        results.sort(key=lambda t: int(t[0]))
+
         embeddings: List[EmbeddingVector] = []
         failed: List[Dict[str, Any]] = []
 
         for _idx, ev, error_info in results:
-            if error_info is None:
+            if error_info is None and ev is not None:
                 embeddings.append(ev)
             else:
-                failed.append(error_info)
+                # error_info is always populated when ev is None in our implementation
+                if error_info is not None:
+                    failed.append(error_info)
 
         return BatchEmbedResult(
             embeddings=embeddings,
@@ -2212,10 +2303,14 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
             )
         else:
             # Post-processing of provider-native batch results.
-            # Attach metadata to embeddings/failures if provided.
-            result.embeddings = self._attach_batch_metadata_to_embeddings(
+            #
+            # Metadata attachment:
+            #   - If provider returns 1:1 aligned embeddings, attach by position.
+            #   - If provider returns success-only embeddings, attach by index (when present).
+            result.embeddings = self._attach_batch_metadata_to_embeddings_safely(
                 result.embeddings,
                 eff_spec.metadatas,
+                total_texts=len(eff_spec.texts),
             )
             result.failed_texts = self._attach_batch_metadata_to_failures(
                 result.failed_texts,
@@ -2391,6 +2486,13 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
         Get embedding operation statistics and usage information.
 
         Includes streaming-specific metrics in addition to base statistics.
+
+        NOTE (clarification):
+            - BaseEmbeddingAdapter maintains its own cache hit/miss counters because
+              it owns the cache read/write path for embed() and capabilities().
+            - Backend adapters may also track cache behavior internally; this method
+              intentionally surfaces base-owned cache stats to preserve a consistent
+              top-level definition across providers.
         """
         base_stats = await self._do_get_stats(ctx)
 
@@ -2479,6 +2581,13 @@ class BaseEmbeddingAdapter(EmbeddingProtocolV1):
             - If you return a different structure (e.g., only successes),
               you MUST document this behavior clearly for callers that rely
               on positional alignment (such as metadata propagation).
+
+        NOTE (clarification):
+            The BaseEmbeddingAdapter will attach metadata safely:
+              - by position when lengths align, and
+              - by EmbeddingVector.index when they do not.
+            Providers that return success-only embeddings are encouraged to set
+            EmbeddingVector.index for each success to preserve correlation.
         """
         raise NotImplementedError
 
