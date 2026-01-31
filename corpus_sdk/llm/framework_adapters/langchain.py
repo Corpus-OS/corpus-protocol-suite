@@ -103,6 +103,9 @@ except ImportError:  # pragma: no cover - only used when LangChain isn't install
 
     LANGCHAIN_AVAILABLE = False
 
+# LLM adapter not yet implemented for LangChain
+LANGCHAIN_LLM_AVAILABLE = False
+
 
 class ErrorCodes:
     """

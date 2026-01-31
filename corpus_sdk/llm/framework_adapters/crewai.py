@@ -66,7 +66,9 @@ from typing import (
 )
 
 # Context translation for OperationContext
-from corpus_sdk.core.context_translation import ContextTranslator
+from corpus_sdk.core.context_translation import (
+    from_crewai as core_ctx_from_crewai,
+)
 from corpus_sdk.core.error_context import attach_context
 
 # LLM protocol + translator orchestration
