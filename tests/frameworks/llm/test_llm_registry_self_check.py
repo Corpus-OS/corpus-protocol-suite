@@ -1,6 +1,7 @@
 # tests/frameworks/llm/test_llm_registry_self_check.py
 
 import dataclasses
+import importlib
 import re
 from typing import Optional
 import warnings
@@ -156,8 +157,7 @@ def test_async_method_consistency(all_descriptors) -> None:
 
     NOTE:
         This matches the registry contract and the self-check expectations:
-        supports_async is strictly about async completion/stream surfaces, not
-        about async capability/health surfaces.
+        supports_async is strictly about async completion/stream surfaces.
     """
     for descriptor in all_descriptors:
         if descriptor.supports_async:
@@ -169,11 +169,10 @@ def test_async_method_consistency(all_descriptors) -> None:
 
 def test_supports_streaming_property(all_descriptors) -> None:
     """
-    Test supports_streaming reflects whether ANY streaming capability is declared.
+    Test the supports_streaming property logic.
 
-    A framework may support streaming via:
-      - a dedicated streaming method (sync or async), OR
-      - a streaming boolean kwarg on the completion method.
+    Ensures the property correctly reflects whether ANY streaming capability
+    is declared (sync method, async method, or streaming_kwarg).
     """
     for descriptor in all_descriptors:
         has_streaming = (
@@ -188,11 +187,10 @@ def test_supports_streaming_property(all_descriptors) -> None:
 
 def test_supports_async_property(all_descriptors) -> None:
     """
-    Test supports_async reflects whether ANY async completion/stream method is declared.
+    Test the supports_async property logic.
 
-    NOTE:
-        This test intentionally ignores capability/health surfaces. The registry
-        uses supports_async only to describe async completion/stream ability.
+    Ensures the property correctly reflects whether ANY async method
+    is declared (completion or streaming).
     """
     for descriptor in all_descriptors:
         has_async = (
@@ -206,10 +204,10 @@ def test_supports_async_property(all_descriptors) -> None:
 
 def test_supports_token_count_property(all_descriptors) -> None:
     """
-    Test supports_token_count reflects whether a token-counting method is declared.
+    Test the supports_token_count property logic.
 
-    Token counting may be exposed via a sync or async method; the registry contract
-    treats either one as sufficient to declare support.
+    Ensures the property correctly reflects whether a token-counting
+    method (sync or async) is declared.
     """
     for descriptor in all_descriptors:
         has_token_count = (
@@ -287,16 +285,88 @@ def test_streaming_style_consistency(all_descriptors) -> None:
             )
 
 
+def test_registry_declared_surfaces_exist_when_available(all_descriptors) -> None:
+    """
+    Ensure that registry-declared adapter surfaces exist on the adapter class.
+
+    This is a TEST-ONLY drift detector that catches:
+        - adapter_module refactors (module path changes)
+        - adapter_class renames
+        - method renames (completion/stream/token_count)
+
+    IMPORTANT:
+        This test is intentionally best-effort and environment-safe:
+        - If a framework is not available (descriptor.is_available() is False),
+          we do not require importing or introspecting its adapter class.
+        - If importing the adapter module fails despite is_available() being True,
+          we treat it as a hard failure because it indicates registry drift or
+          a broken adapter module.
+    """
+    for descriptor in all_descriptors:
+        # If the underlying framework is not installed/available, we do not enforce
+        # class/method presence here. Other conformance layers may handle skipping.
+        if not descriptor.is_available():
+            continue
+
+        try:
+            module = importlib.import_module(descriptor.adapter_module)
+        except ImportError as e:
+            pytest.fail(
+                f"{descriptor.name}: adapter_module {descriptor.adapter_module!r} "
+                f"could not be imported even though is_available() is True: {e}"
+            )
+
+        cls = getattr(module, descriptor.adapter_class, None)
+        assert cls is not None, (
+            f"{descriptor.name}: adapter_class {descriptor.adapter_class!r} "
+            f"not found in module {descriptor.adapter_module!r}"
+        )
+
+        # Helper to assert a named attribute exists and is callable.
+        def _assert_callable(method_name: Optional[str], *, label: str) -> None:
+            if not method_name:
+                return
+            attr = getattr(cls, method_name, None)
+            assert attr is not None, (
+                f"{descriptor.name}: declared {label} {method_name!r} is missing on "
+                f"class {descriptor.adapter_class!r}"
+            )
+            assert callable(attr), (
+                f"{descriptor.name}: declared {label} {method_name!r} exists but is not callable "
+                f"on class {descriptor.adapter_class!r}"
+            )
+
+        _assert_callable(descriptor.completion_method, label="completion_method")
+        _assert_callable(descriptor.async_completion_method, label="async_completion_method")
+
+        # Streaming surfaces (method style) are validated by declared method presence.
+        _assert_callable(descriptor.streaming_method, label="streaming_method")
+        _assert_callable(descriptor.async_streaming_method, label="async_streaming_method")
+
+        # Token counting surfaces are validated by declared method presence.
+        _assert_callable(descriptor.token_count_method, label="token_count_method")
+        _assert_callable(descriptor.async_token_count_method, label="async_token_count_method")
+
+        # Streaming kwarg style cannot be validated fully without signature inspection.
+        # Here we simply ensure the completion methods exist when kwarg streaming is selected.
+        if descriptor.streaming_style == "kwarg":
+            assert descriptor.streaming_kwarg is not None, (
+                f"{descriptor.name}: streaming_style='kwarg' requires streaming_kwarg"
+            )
+            assert (
+                descriptor.completion_method is not None
+                or descriptor.async_completion_method is not None
+            ), (
+                f"{descriptor.name}: streaming_style='kwarg' requires a completion method"
+            )
+
+
 def test_register_llm_framework_descriptor() -> None:
     """
     Test dynamic registration functionality for LLM frameworks.
 
     This tests the ability to add new framework descriptors at runtime,
     which is useful for testing experimental or third-party LLM adapters.
-
-    IMPORTANT:
-        This test temporarily mutates the registry; it restores the original
-        registry at the end to avoid cross-test contamination.
     """
     original_registry = dict(LLM_FRAMEWORKS)
     try:
