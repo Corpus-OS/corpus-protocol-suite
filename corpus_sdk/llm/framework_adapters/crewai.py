@@ -399,7 +399,12 @@ def _create_error_context_decorator(
                 @wraps(func)
                 async def async_wrapper(self: Any, *args: Any, **kwargs: Any) -> T:
                     try:
-                        return await func(self, *args, **kwargs)
+                        result = func(self, *args, **kwargs)
+                        # Check if result is an async generator - don't await it
+                        if hasattr(result, '__aiter__'):
+                            return result
+                        # Otherwise await it
+                        return await result
                     except Exception as exc:  # noqa: BLE001
                         dynamic_context = _extract_dynamic_context(
                             self,
@@ -412,6 +417,8 @@ def _create_error_context_decorator(
                             **static_context,
                             **dynamic_context,
                         }
+                        # Remove 'operation' to avoid duplicate kwarg when spreading full_context
+                        full_context.pop("operation", None)
                         attach_context(
                             exc,
                             framework=_FRAMEWORK_NAME,
@@ -439,6 +446,8 @@ def _create_error_context_decorator(
                             **static_context,
                             **dynamic_context,
                         }
+                        # Remove 'operation' to avoid duplicate kwarg when spreading full_context
+                        full_context.pop("operation", None)
                         attach_context(
                             exc,
                             framework=_FRAMEWORK_NAME,
@@ -536,7 +545,7 @@ def _build_operation_context_from_kwargs(
         return None
 
     try:
-        ctx = ContextTranslator.from_crewai(
+        ctx = core_ctx_from_crewai(
             task=task,
             framework_version=framework_version,
             **context_kwargs,
@@ -552,20 +561,8 @@ def _build_operation_context_from_kwargs(
         )
         raise
 
-    if not isinstance(ctx, OperationContext):
-        exc = TypeError(
-            f"{ErrorCodes.BAD_OPERATION_CONTEXT}: "
-            "ContextTranslator.from_crewai produced unsupported context type "
-            f"{type(ctx).__name__}"
-        )
-        attach_context(
-            exc,
-            framework=_FRAMEWORK_NAME,
-            operation="llm_context_translation",
-            framework_version=framework_version,
-            returned_type=type(ctx).__name__,
-        )
-        raise exc
+    # Trust context_translation to return correct type
+    # (isinstance check removed - was comparing different OperationContext classes)
 
     logger.debug(
         "Built OperationContext from CrewAI context with agent_role: %s, crew_id: %s",
@@ -1013,7 +1010,8 @@ class CorpusCrewAILLM:
             kwargs=kwargs,
         )
 
-        agen = await self._translator.arun_stream(
+        # LLMTranslator.arun_stream returns an AsyncIterator directly; do not await.
+        agen = self._translator.arun_stream(
             raw_messages=messages,
             model=params.get("model"),
             max_tokens=params.get("max_tokens"),
@@ -1033,6 +1031,19 @@ class CorpusCrewAILLM:
             async for chunk in agen:
                 # The CrewAI translator defines the chunk shape; usually a text token.
                 yield chunk
+        except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework=_FRAMEWORK_NAME,
+                operation="llm_astream",
+                resource_type="llm",
+                stream=True,
+                model=str(params.get("model") or self.model),
+                request_id=getattr(ctx, "request_id", None),
+                tenant=getattr(ctx, "tenant", None),
+                error_codes=ERROR_CODES,
+            )
+            raise
         finally:
             aclose = getattr(agen, "aclose", None)
             if callable(aclose):
@@ -1157,16 +1168,25 @@ class CorpusCrewAILLM:
         try:
             for chunk in iterator:
                 yield chunk
+        except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework=_FRAMEWORK_NAME,
+                operation="llm_stream",
+                resource_type="llm",
+                stream=True,
+                model=str(params.get("model") or self.model),
+                request_id=getattr(ctx, "request_id", None),
+                tenant=getattr(ctx, "tenant", None),
+                error_codes=ERROR_CODES,
+            )
+            raise
         finally:
-            close = getattr(iterator, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug(
-                        "Failed to close sync stream iterator in CrewAI adapter: %s",
-                        exc,
-                    )
+            # Do not forcibly close the iterator.
+            # SyncStreamBridge-based iterators may defer raising worker exceptions
+            # until the iterator naturally unwinds; calling close() can suppress
+            # those errors.
+            pass
 
     # ---------------------------------------------------------------------
     # Token counting
@@ -1259,7 +1279,9 @@ class CorpusCrewAILLM:
                 "Health reporting must be centralized in the translator."
             )
 
-        result = health_fn(**kwargs)
+        # Conformance suite may pass the framework context kwarg (e.g. task=...).
+        # Translator health/capabilities APIs are intentionally kwarg-free.
+        result = health_fn()
         if not isinstance(result, Mapping):
             raise TypeError(
                 "health() returned unsupported type from LLMTranslator: "
@@ -1279,7 +1301,7 @@ class CorpusCrewAILLM:
         """
         async_health = getattr(self._translator, "ahealth", None)
         if callable(async_health):
-            result = await async_health(**kwargs)
+            result = await async_health()
         else:
             health_fn = getattr(self._translator, "health", None)
             if not callable(health_fn):
@@ -1287,7 +1309,7 @@ class CorpusCrewAILLM:
                     "LLMTranslator does not implement health() or ahealth(). "
                     "Health reporting must be implemented on the translator."
                 )
-            result = await asyncio.to_thread(health_fn, **kwargs)
+            result = await asyncio.to_thread(health_fn)
 
         if not isinstance(result, Mapping):
             raise TypeError(
@@ -1313,7 +1335,7 @@ class CorpusCrewAILLM:
                 "Capability reporting must be centralized in the translator."
             )
 
-        result = caps_fn(**kwargs)
+        result = caps_fn()
         if not isinstance(result, Mapping):
             raise TypeError(
                 "capabilities() returned unsupported type from LLMTranslator: "
@@ -1333,7 +1355,7 @@ class CorpusCrewAILLM:
         """
         async_caps = getattr(self._translator, "acapabilities", None)
         if callable(async_caps):
-            result = await async_caps(**kwargs)
+            result = await async_caps()
         else:
             caps_fn = getattr(self._translator, "capabilities", None)
             if not callable(caps_fn):
@@ -1341,7 +1363,7 @@ class CorpusCrewAILLM:
                     "LLMTranslator does not implement capabilities() or acapabilities(). "
                     "Capability reporting must be implemented on the translator."
                 )
-            result = await asyncio.to_thread(caps_fn, **kwargs)
+            result = await asyncio.to_thread(caps_fn)
 
         if not isinstance(result, Mapping):
             raise TypeError(

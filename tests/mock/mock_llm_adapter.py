@@ -845,7 +845,7 @@ class MockLLMAdapter(BaseLLMAdapter):
             supports_system_message=True,
             supports_deadline=True,
             supports_count_tokens=True,
-            supported_models=("mock-model", "mock-model-pro"),
+            supported_models=("mock-model", "mock-model-pro", "default"),
         )
         # Cache for reuse during _do_complete/_do_stream without re-fetching.
         self._last_caps = caps

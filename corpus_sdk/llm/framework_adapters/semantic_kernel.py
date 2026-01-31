@@ -64,7 +64,10 @@ from typing import (
     TypeVar,
 )
 
+from corpus_sdk.core.async_bridge import AsyncBridge
+
 from corpus_sdk.core.context_translation import (
+    from_dict as context_from_dict,
     from_semantic_kernel as context_from_semantic_kernel,
 )
 from corpus_sdk.core.error_context import attach_context
@@ -101,11 +104,11 @@ T = TypeVar("T")
 if TYPE_CHECKING:
     from semantic_kernel.connectors.ai.chat_completion_client_base import (
         ChatCompletionClientBase,
-        ChatHistory,
-        PromptExecutionSettings,
     )
+    from semantic_kernel.connectors.ai import PromptExecutionSettings
     from semantic_kernel.contents import (
         AuthorRole,
+        ChatHistory,
         ChatMessageContent,
         StreamingChatMessageContent,
     )
@@ -114,11 +117,11 @@ else:  # pragma: no cover - optional dependency path
     try:
         from semantic_kernel.connectors.ai.chat_completion_client_base import (
             ChatCompletionClientBase,
-            ChatHistory,
-            PromptExecutionSettings,
         )
+        from semantic_kernel.connectors.ai import PromptExecutionSettings
         from semantic_kernel.contents import (
             AuthorRole,
+            ChatHistory,
             ChatMessageContent,
             StreamingChatMessageContent,
         )
@@ -358,7 +361,12 @@ def _create_error_context_decorator(
                 @wraps(func)
                 async def async_wrapper(self: Any, *args: Any, **kwargs: Any) -> T:
                     try:
-                        return await func(self, *args, **kwargs)
+                        result = func(self, *args, **kwargs)
+                        # If the function returns an async iterator (async generator),
+                        # do not await it.
+                        if hasattr(result, "__aiter__"):
+                            return result
+                        return await result
                     except Exception as exc:  # noqa: BLE001
                         dynamic_ctx = _extract_dynamic_context(
                             self,
@@ -371,6 +379,7 @@ def _create_error_context_decorator(
                             **static_context,
                             **dynamic_ctx,
                         }
+                        full_ctx.pop("operation", None)
                         attach_context(
                             exc,
                             framework=_FRAMEWORK_NAME,
@@ -398,6 +407,7 @@ def _create_error_context_decorator(
                             **static_context,
                             **dynamic_ctx,
                         }
+                        full_ctx.pop("operation", None)
                         attach_context(
                             exc,
                             framework=_FRAMEWORK_NAME,
@@ -520,39 +530,49 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
     ) -> None:
         _ensure_semantic_kernel_installed()
 
-        # Resolve configuration precedence: config object > legacy kwargs.
+        # Resolve config for model/temperature/max_tokens before calling super().__init__()
         if config is not None:
-            self.model = config.model
-            self.temperature = float(config.temperature)
-            self.max_tokens = config.max_tokens
-            self.framework_version = config.framework_version or framework_version
-
-            effective_post_processing = (
-                post_processing_config or config.post_processing_config
-            )
+            resolved_model = config.model
+            resolved_temperature = float(config.temperature)
+            resolved_max_tokens = config.max_tokens
+            resolved_framework_version = config.framework_version or framework_version
+            effective_post_processing = post_processing_config or config.post_processing_config
             effective_safety_filter = safety_filter or config.safety_filter
             effective_json_repair = json_repair or config.json_repair
-
-            self._enable_metrics_flag = config.enable_metrics
-            self._validate_inputs_flag = config.validate_inputs
+            enable_metrics = config.enable_metrics
+            validate_inputs = config.validate_inputs
         else:
-            self.model = model
-            self.temperature = float(temperature)
-            self.max_tokens = max_tokens
-            self.framework_version = framework_version
-
+            resolved_model = model
+            resolved_temperature = float(temperature)
+            resolved_max_tokens = max_tokens
+            resolved_framework_version = framework_version
             effective_post_processing = post_processing_config
             effective_safety_filter = safety_filter
             effective_json_repair = json_repair
+            enable_metrics = True
+            validate_inputs = True
 
-            # Defaults aligned with other adapters
-            self._enable_metrics_flag = True
-            self._validate_inputs_flag = True
+        # Validate adapter before anything else
+        if not hasattr(llm_adapter, "complete"):
+            raise TypeError("llm_adapter must implement LLMProtocolV1")
 
-        # Validate adapter + sampling defaults in a shared, symbolic way.
+        # Call super().__init__() with required fields and llm_adapter
+        super().__init__(
+            ai_model_id=resolved_model,
+            service_id=service_id or "corpus_semantic_kernel_chat",
+            llm_adapter=llm_adapter,
+        )
+
+        # Set remaining instance attributes
+        self.model = resolved_model
+        self.temperature = resolved_temperature
+        self.max_tokens = resolved_max_tokens
+        self.framework_version = resolved_framework_version
+        self._enable_metrics_flag = enable_metrics
+        self._validate_inputs_flag = validate_inputs
+
+        # Validate sampling defaults in a shared, symbolic way.
         self._validate_init_params(llm_adapter)
-
-        super().__init__(service_id=service_id)
 
         # Build the shared LLMTranslator for the "semantic_kernel" framework.
         self._translator: LLMTranslator = create_llm_translator(
@@ -633,6 +653,19 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
             raise ValueError("Chat history cannot be empty")
 
         for idx, msg in enumerate(chat_history):
+            # Conformance tests may pass list-of-dicts (OpenAI-like) instead of
+            # Semantic Kernel ChatMessageContent objects.
+            if isinstance(msg, Mapping):
+                if not ("role" in msg or "author_role" in msg):
+                    raise TypeError(
+                        f"chat_history[{idx}] is missing 'role' or 'author_role'"
+                    )
+                if not ("content" in msg or "items" in msg):
+                    raise TypeError(
+                        f"chat_history[{idx}] is missing 'content' or 'items'"
+                    )
+                continue
+
             if not (hasattr(msg, "role") or hasattr(msg, "author_role")):
                 raise TypeError(
                     f"chat_history[{idx}] is missing 'role' or 'author_role'"
@@ -648,7 +681,7 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
 
     def _build_operation_context(
         self,
-        settings: "PromptExecutionSettings",
+        settings: Any,
     ) -> OperationContext:
         """
         Build OperationContext from Semantic Kernel prompt settings.
@@ -657,7 +690,18 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
         context attachment.
         """
         try:
+            # The conformance suite may pass a pre-normalized dict via the
+            # registry-declared context kwarg ("settings").
+            if settings is None:
+                return context_from_semantic_kernel(
+                    None,
+                    settings=None,
+                    framework_version=self.framework_version,
+                )
+            if isinstance(settings, Mapping):
+                return context_from_dict(settings)
             return context_from_semantic_kernel(
+                None,
                 settings=settings,
                 framework_version=self.framework_version,
             )
@@ -674,7 +718,7 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
 
     def _build_sampling_params(
         self,
-        settings: "PromptExecutionSettings",
+        settings: Any,
         kwargs: Mapping[str, Any],
     ) -> Dict[str, Any]:
         """
@@ -689,24 +733,46 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
         # 3. Instance default
         model = (
             kwargs.get("model")
-            or getattr(settings, "model_id", None)
-            or getattr(settings, "model", None)
-            or getattr(settings, "deployment_name", None)
+            or (
+                getattr(settings, "model_id", None)
+                if settings is not None and not isinstance(settings, Mapping)
+                else None
+            )
+            or (
+                getattr(settings, "model", None)
+                if settings is not None and not isinstance(settings, Mapping)
+                else None
+            )
+            or (
+                getattr(settings, "deployment_name", None)
+                if settings is not None and not isinstance(settings, Mapping)
+                else None
+            )
             or self.model
         )
 
-        temperature = getattr(settings, "temperature", None)
+        temperature = (
+            getattr(settings, "temperature", None)
+            if settings is not None and not isinstance(settings, Mapping)
+            else None
+        )
         if temperature is None:
             temperature = self.temperature
 
-        max_tokens = getattr(settings, "max_tokens", None)
+        max_tokens = (
+            getattr(settings, "max_tokens", None)
+            if settings is not None and not isinstance(settings, Mapping)
+            else None
+        )
         if max_tokens is None:
             max_tokens = self.max_tokens
 
-        raw_stop = (
-            getattr(settings, "stop_sequences", None)
-            or getattr(settings, "stop", None)
-        )
+        raw_stop = None
+        if settings is not None and not isinstance(settings, Mapping):
+            raw_stop = (
+                getattr(settings, "stop_sequences", None)
+                or getattr(settings, "stop", None)
+            )
 
         stop_sequences: Optional[List[str]]
         if raw_stop is None:
@@ -722,9 +788,21 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
             "model": model,
             "temperature": temperature,
             "max_tokens": max_tokens,
-            "top_p": getattr(settings, "top_p", None),
-            "frequency_penalty": getattr(settings, "frequency_penalty", None),
-            "presence_penalty": getattr(settings, "presence_penalty", None),
+            "top_p": (
+                getattr(settings, "top_p", None)
+                if settings is not None and not isinstance(settings, Mapping)
+                else None
+            ),
+            "frequency_penalty": (
+                getattr(settings, "frequency_penalty", None)
+                if settings is not None and not isinstance(settings, Mapping)
+                else None
+            ),
+            "presence_penalty": (
+                getattr(settings, "presence_penalty", None)
+                if settings is not None and not isinstance(settings, Mapping)
+                else None
+            ),
             "stop_sequences": stop_sequences,
         }
 
@@ -745,7 +823,7 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
 
     def _build_framework_ctx(
         self,
-        settings: "PromptExecutionSettings",
+        settings: Any,
         kwargs: Mapping[str, Any],
         *,
         operation: str,
@@ -776,7 +854,7 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
 
     def _build_request_context(
         self,
-        settings: "PromptExecutionSettings",
+        settings: Any,
         kwargs: Mapping[str, Any],
         *,
         operation: str,
@@ -805,7 +883,7 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
     async def get_chat_message_content(
         self,
         chat_history: "ChatHistory",
-        settings: "PromptExecutionSettings",
+        settings: Any = None,
         **kwargs: Any,
     ) -> "ChatMessageContent":
         """
@@ -841,11 +919,33 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
         )
         return cast("ChatMessageContent", result)
 
+    def get_chat_message_content_sync(
+        self,
+        chat_history: "ChatHistory",
+        settings: Any = None,
+        **kwargs: Any,
+    ) -> "ChatMessageContent":
+        """Synchronous wrapper around `get_chat_message_content`.
+
+        This exists primarily for registry parity so that frameworks declaring
+        async completion also have a sync entrypoint.
+        """
+        return cast(
+            "ChatMessageContent",
+            AsyncBridge.run_async(
+                self.get_chat_message_content(
+                    chat_history,
+                    settings=settings,
+                    **kwargs,
+                )
+            ),
+        )
+
     @with_async_llm_error_context("get_chat_message_contents")
     async def get_chat_message_contents(
         self,
         chat_history: "ChatHistory",
-        settings: "PromptExecutionSettings",
+        settings: Any = None,
         **kwargs: Any,
     ) -> List["ChatMessageContent"]:
         """
@@ -859,7 +959,7 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
     async def get_streaming_chat_message_content(
         self,
         chat_history: "ChatHistory",
-        settings: "PromptExecutionSettings",
+        settings: Any = None,
         **kwargs: Any,
     ) -> AsyncIterator["StreamingChatMessageContent"]:
         """
@@ -881,7 +981,8 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
 
         agen: Optional[AsyncIterator[Any]] = None
         try:
-            agen = await self._translator.arun_stream(
+            # LLMTranslator.arun_stream returns an AsyncIterator directly; do not await.
+            agen = self._translator.arun_stream(
                 raw_messages=chat_history,
                 model=params.get("model"),
                 max_tokens=params.get("max_tokens"),
@@ -901,6 +1002,21 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
                 # The Semantic Kernel translator defines the chunk shape;
                 # expected: StreamingChatMessageContent.
                 yield cast("StreamingChatMessageContent", chunk)
+        except Exception as exc:  # noqa: BLE001
+            # Attach error-context here so failures during iteration are observable
+            # and test patches on this module see the call.
+            attach_context(
+                exc,
+                framework=_FRAMEWORK_NAME,
+                operation="llm_get_streaming_chat_message_content",
+                resource_type="llm",
+                stream=True,
+                model=str(params.get("model", self.model)),
+                request_id=getattr(ctx, "request_id", None),
+                tenant=getattr(ctx, "tenant", None),
+                error_codes=ERROR_CODES,
+            )
+            raise
         finally:
             # Best-effort cleanup of async generator resources.
             if agen is not None:
@@ -918,7 +1034,7 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
     async def get_streaming_chat_message_contents(
         self,
         chat_history: "ChatHistory",
-        settings: "PromptExecutionSettings",
+        settings: Any = None,
         **kwargs: Any,
     ) -> AsyncIterator["StreamingChatMessageContent"]:
         """
@@ -946,6 +1062,12 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
         """
         parts: List[str] = []
         for msg in chat_history or []:
+            if isinstance(msg, Mapping):
+                role = msg.get("role") or msg.get("author_role") or "user"
+                content = msg.get("content") or ""
+                parts.append(f"{role}: {content}")
+                continue
+
             role = getattr(msg, "role", None)
             if role is None and hasattr(msg, "author_role"):
                 role = getattr(msg, "author_role", None)
@@ -968,7 +1090,7 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
     def count_tokens(
         self,
         chat_history: "ChatHistory",
-        settings: "PromptExecutionSettings",
+        settings: Any = None,
         **kwargs: Any,
     ) -> int:
         """
@@ -991,32 +1113,24 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
             stream=False,
         )
 
-        # Preferred: translator-based token counting
-        try:
-            tokens_any = self._translator.count_tokens_for_messages(
-                raw_messages=chat_history,
-                model=model_for_context,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-            if isinstance(tokens_any, int):
-                return tokens_any
-            if isinstance(tokens_any, Mapping):
-                for key in ("tokens", "total_tokens", "count"):
-                    value = tokens_any.get(key)
-                    if isinstance(value, int):
-                        return value
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(
-                "Semantic Kernel translator-based token counting failed: %s",
-                exc,
-            )
-
-        # Fallback: simple character-based heuristic
-        combined = self._combine_chat_history_for_counting(chat_history)
-        if not combined:
-            return 0
-        return max(1, len(combined) // 4)
+        # Translator-based token counting (no silent fallback).
+        tokens_any = self._translator.count_tokens_for_messages(
+            raw_messages=chat_history,
+            model=model_for_context,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+        if isinstance(tokens_any, int):
+            return tokens_any
+        if isinstance(tokens_any, Mapping):
+            for key in ("tokens", "total_tokens", "count"):
+                value = tokens_any.get(key)
+                if isinstance(value, int):
+                    return value
+        raise TypeError(
+            f"{ERROR_CODES.BAD_USAGE_RESULT}: count_tokens returned unsupported type "
+            f"{type(tokens_any).__name__}"
+        )
 
     # ------------------------------------------------------------------ #
     # Health / capabilities via translator only (no adapter fallback)
@@ -1038,7 +1152,7 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
                 "LLMTranslator for framework='semantic_kernel' must implement "
                 "health(); no adapter fallback is allowed."
             )
-        return translator_health(**kwargs)
+        return translator_health()
 
     @with_async_llm_error_context("ahealth")
     async def ahealth(self, **kwargs: Any) -> Mapping[str, Any]:
@@ -1055,13 +1169,13 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
 
         translator_ahealth = getattr(self._translator, "ahealth", None)
         if callable(translator_ahealth):
-            return await translator_ahealth(**kwargs)  # type: ignore[misc]
+            return await translator_ahealth()  # type: ignore[misc]
 
         translator_health = getattr(self._translator, "health", None)
         if callable(translator_health):
             return await loop.run_in_executor(
                 None,
-                lambda: translator_health(**kwargs),
+                lambda: translator_health(),
             )
 
         raise AttributeError(
@@ -1085,7 +1199,7 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
                 "LLMTranslator for framework='semantic_kernel' must implement "
                 "capabilities(); no adapter fallback is allowed."
             )
-        return translator_capabilities(**kwargs)
+        return translator_capabilities()
 
     @with_async_llm_error_context("acapabilities")
     async def acapabilities(self, **kwargs: Any) -> Mapping[str, Any]:
@@ -1102,13 +1216,13 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
 
         translator_acapabilities = getattr(self._translator, "acapabilities", None)
         if callable(translator_acapabilities):
-            return await translator_acapabilities(**kwargs)  # type: ignore[misc]
+            return await translator_acapabilities()  # type: ignore[misc]
 
         translator_capabilities = getattr(self._translator, "capabilities", None)
         if callable(translator_capabilities):
             return await loop.run_in_executor(
                 None,
-                lambda: translator_capabilities(**kwargs),
+                lambda: translator_capabilities(),
             )
 
         raise AttributeError(

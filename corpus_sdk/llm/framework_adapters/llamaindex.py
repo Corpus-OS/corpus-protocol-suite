@@ -114,6 +114,11 @@ try:  # pragma: no cover - optional dependency path
         MessageRole,
         LLMMetadata,
     )
+    from llama_index.core.base.llms.types import (
+        CompletionResponse,
+        CompletionResponseAsyncGen,
+        CompletionResponseGen,
+    )
     from llama_index.core.callbacks import CallbackManager
 except BaseException as exc:  # pragma: no cover
     _LLAMAINDEX_IMPORT_ERROR = exc
@@ -123,6 +128,9 @@ except BaseException as exc:  # pragma: no cover
     ChatResponse = object  # type: ignore[assignment]
     ChatResponseAsyncGen = AsyncIterator[Any]  # type: ignore[assignment]
     ChatResponseGen = Iterator[Any]  # type: ignore[assignment]
+    CompletionResponse = object  # type: ignore[assignment]
+    CompletionResponseAsyncGen = AsyncIterator[Any]  # type: ignore[assignment]
+    CompletionResponseGen = Iterator[Any]  # type: ignore[assignment]
     MessageRole = object  # type: ignore[assignment]
     LLMMetadata = object  # type: ignore[assignment]
     CallbackManager = object  # type: ignore[assignment]
@@ -563,18 +571,9 @@ class CorpusLlamaIndexLLM(LLM):
         if self._config.context_window is not None:
             self.context_window = self._config.context_window
 
-        # Fail fast if there is no registered translator factory for LlamaIndex.
-        # This prevents silently falling back to the default translator, which
-        # may not know how to handle ChatMessage objects.
-        factory = get_llm_translator_factory("llamaindex")
-        if factory is None:
-            raise RuntimeError(
-                "No LLMFrameworkTranslator registered for framework='llamaindex'. "
-                "Call register_llm_translator('llamaindex', factory) before "
-                "constructing CorpusLlamaIndexLLM."
-            )
-
         # LLMTranslator orchestrator for the LlamaIndex framework.
+        # If no factory is registered, the translator layer will use
+        # DefaultLLMFrameworkTranslator.
         self._translator: LLMTranslator = create_llm_translator(
             adapter=self.llm_adapter,
             framework="llamaindex",
@@ -649,7 +648,7 @@ class CorpusLlamaIndexLLM(LLM):
         base_ctx: Dict[str, Any] = {
             "framework": "llamaindex",
             "resource_type": "llm",
-            "operation": operation,
+            "operation": f"llm_{operation}",
             "model": model,
             "temperature": params.get("temperature"),
             "max_tokens": params.get("max_tokens"),
@@ -756,7 +755,9 @@ class CorpusLlamaIndexLLM(LLM):
             )
             raise
 
-        if not isinstance(ctx, OperationContext):
+        # Duck-type check for OperationContext (handle cross-module instances)
+        if not (isinstance(ctx, OperationContext) or 
+                (hasattr(ctx, "request_id") and hasattr(ctx, "attrs"))):
             type_name = type(ctx).__name__
             exc = TypeError(
                 "context_from_llamaindex produced unsupported context type "
@@ -959,16 +960,18 @@ class CorpusLlamaIndexLLM(LLM):
             stream=True,
         )
 
-        async with self._error_context_async(
-            "astream_chat",
-            stream=True,
-            messages=messages,
-            model=model_for_context,
-            ctx=ctx,
-            params=params,
-        ):
-            async def _gen() -> AsyncIterator[ChatResponse]:
-                agen = await self._translator.arun_stream(
+        async def _gen() -> AsyncIterator[ChatResponse]:
+            # Keep error-context active for the full streaming iteration.
+            async with self._error_context_async(
+                "astream_chat",
+                stream=True,
+                messages=messages,
+                model=model_for_context,
+                ctx=ctx,
+                params=params,
+            ):
+                # LLMTranslator.arun_stream returns an AsyncIterator directly; do not await.
+                agen = self._translator.arun_stream(
                     raw_messages=messages,
                     model=params.get("model"),
                     max_tokens=params.get("max_tokens"),
@@ -996,7 +999,7 @@ class CorpusLlamaIndexLLM(LLM):
                                 close_exc,
                             )
 
-            return _gen()
+        return _gen()
 
     # ------------------------------------------------------------------ #
     # Sync API
@@ -1073,15 +1076,16 @@ class CorpusLlamaIndexLLM(LLM):
             stream=True,
         )
 
-        with self._error_context(
-            "stream_chat",
-            stream=True,
-            messages=messages,
-            model=model_for_context,
-            ctx=ctx,
-            params=params,
-        ):
-            def _gen() -> Iterator[ChatResponse]:
+        def _gen() -> Iterator[ChatResponse]:
+            # Keep error-context active for the full streaming iteration.
+            with self._error_context(
+                "stream_chat",
+                stream=True,
+                messages=messages,
+                model=model_for_context,
+                ctx=ctx,
+                params=params,
+            ):
                 stream_iter = self._translator.stream(
                     raw_messages=messages,
                     model=params.get("model"),
@@ -1095,22 +1099,127 @@ class CorpusLlamaIndexLLM(LLM):
                     framework_ctx=framework_ctx,
                 )
 
-                try:
-                    for chunk_obj in stream_iter:
-                        yield _build_chat_response_from_chunk_like(chunk_obj)
-                finally:
-                    # Explicit cleanup of sync iterator if supported
-                    close = getattr(stream_iter, "close", None)
-                    if callable(close):
-                        try:
-                            close()
-                        except Exception as close_exc:  # noqa: BLE001
-                            logger.debug(
-                                "Failed to close sync stream iterator: %s",
-                                close_exc,
-                            )
+                for chunk_obj in stream_iter:
+                    yield _build_chat_response_from_chunk_like(chunk_obj)
 
-            return _gen()
+                # NOTE: Do not forcibly close the iterator.
+                # The SyncStreamBridge-based iterators may defer raising worker
+                # exceptions until the iterator naturally unwinds; calling
+                # close() can suppress those errors.
+
+        return _gen()
+
+    # ------------------------------------------------------------------ #
+    # Completion methods (required by LlamaIndex LLM base class)
+    # ------------------------------------------------------------------ #
+
+    def complete(
+        self,
+        prompt: str,
+        formatted: bool = False,
+        **kwargs: Any,
+    ) -> CompletionResponse:
+        """
+        Sync completion entrypoint required by LlamaIndex.
+
+        Converts the prompt to a user message and delegates to chat().
+        """
+        _ensure_not_in_event_loop("complete", "acomplete")
+
+        # Convert prompt to a ChatMessage
+        user_message = ChatMessage(role=MessageRole.USER, content=prompt)
+        
+        # Delegate to chat()
+        chat_response = self.chat(messages=[user_message], **kwargs)
+        
+        # Convert ChatResponse to CompletionResponse
+        return CompletionResponse(
+            text=chat_response.message.content or "",
+            additional_kwargs=chat_response.additional_kwargs,
+            raw=chat_response.raw,
+        )
+
+    async def acomplete(
+        self,
+        prompt: str,
+        formatted: bool = False,
+        **kwargs: Any,
+    ) -> CompletionResponse:
+        """
+        Async completion entrypoint required by LlamaIndex.
+
+        Converts the prompt to a user message and delegates to achat().
+        """
+        # Convert prompt to a ChatMessage
+        user_message = ChatMessage(role=MessageRole.USER, content=prompt)
+        
+        # Delegate to achat()
+        chat_response = await self.achat(messages=[user_message], **kwargs)
+        
+        # Convert ChatResponse to CompletionResponse
+        return CompletionResponse(
+            text=chat_response.message.content or "",
+            additional_kwargs=chat_response.additional_kwargs,
+            raw=chat_response.raw,
+        )
+
+    def stream_complete(
+        self,
+        prompt: str,
+        formatted: bool = False,
+        **kwargs: Any,
+    ) -> CompletionResponseGen:
+        """
+        Sync streaming completion entrypoint required by LlamaIndex.
+
+        Converts the prompt to a user message and delegates to stream_chat().
+        """
+        _ensure_not_in_event_loop("stream_complete", "astream_complete")
+
+        # Convert prompt to a ChatMessage
+        user_message = ChatMessage(role=MessageRole.USER, content=prompt)
+        
+        # Delegate to stream_chat()
+        chat_stream = self.stream_chat(messages=[user_message], **kwargs)
+        
+        def _gen() -> Iterator[CompletionResponse]:
+            for chat_response in chat_stream:
+                yield CompletionResponse(
+                    text=chat_response.delta or "",
+                    additional_kwargs=chat_response.additional_kwargs,
+                    raw=chat_response.raw,
+                    delta=chat_response.delta,
+                )
+        
+        return _gen()
+
+    async def astream_complete(
+        self,
+        prompt: str,
+        formatted: bool = False,
+        **kwargs: Any,
+    ) -> CompletionResponseAsyncGen:
+        """
+        Async streaming completion entrypoint required by LlamaIndex.
+
+        Converts the prompt to a user message and delegates to astream_chat().
+        """
+        # Convert prompt to a ChatMessage
+        user_message = ChatMessage(role=MessageRole.USER, content=prompt)
+        
+        # Delegate to astream_chat()
+        chat_stream = await self.astream_chat(messages=[user_message], **kwargs)
+        
+        async def _gen() -> AsyncIterator[CompletionResponse]:
+            async for chat_response in chat_stream:
+                yield CompletionResponse(
+                    text=chat_response.delta or "",
+                    additional_kwargs=chat_response.additional_kwargs,
+                    raw=chat_response.raw,
+                    delta=chat_response.delta,
+                )
+        
+        return _gen()
 
     # ------------------------------------------------------------------ #
     # Token counting
@@ -1121,17 +1230,8 @@ class CorpusLlamaIndexLLM(LLM):
         messages: Sequence[ChatMessage],
         **kwargs: Any,
     ) -> int:
-        """
-        Token counting helper.
+        """Token counting helper (no silent fallback)."""
 
-        Preferred path:
-        - Use LLMTranslator.count_tokens_for_messages so token counting
-          can use the same formatting and strategies as actual completions.
-
-        Fallbacks:
-        - If translator/adapter count fails, use improved char-based estimate.
-        - If that fails, use the simple character-based heuristic.
-        """
         if not messages:
             return 0
 
@@ -1141,26 +1241,23 @@ class CorpusLlamaIndexLLM(LLM):
             stream=False,
         )
 
-        # Preferred: translator-based token counting
-        try:
-            tokens_any = self._translator.count_tokens_for_messages(
-                raw_messages=messages,
-                model=model_for_context,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-            return int(tokens_any)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Translator-based token counting failed: %s", exc)
-
-        # Fall back to improved character-based estimate
-        try:
-            return self._estimate_tokens_from_messages(messages)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Token estimation failed: %s", exc)
-
-        # Ultimate fallback to simple character count
-        return self._simple_token_estimate(messages)
+        tokens_any = self._translator.count_tokens_for_messages(
+            raw_messages=messages,
+            model=model_for_context,
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+        if isinstance(tokens_any, int):
+            return tokens_any
+        if isinstance(tokens_any, Mapping):
+            for key in ("tokens", "total_tokens", "count"):
+                value = tokens_any.get(key)
+                if isinstance(value, int):
+                    return value
+        raise TypeError(
+            f"{ERROR_CODES.BAD_USAGE_RESULT}: count_tokens returned unsupported type "
+            f"{type(tokens_any).__name__}"
+        )
 
     def _combine_messages_for_counting(
         self,
@@ -1222,7 +1319,7 @@ class CorpusLlamaIndexLLM(LLM):
             )
 
         try:
-            return translator_health(**kwargs)
+            return translator_health()
         except Exception as exc:  # noqa: BLE001
             if self._config.enable_error_context:
                 attach_context(
@@ -1252,14 +1349,14 @@ class CorpusLlamaIndexLLM(LLM):
         translator_ahealth = getattr(self._translator, "ahealth", None)
         if callable(translator_ahealth):
             try:
-                return await translator_ahealth(**kwargs)  # type: ignore[misc]
+                return await translator_ahealth()  # type: ignore[misc]
             except Exception as exc:  # noqa: BLE001
                 if self._config.enable_error_context:
                     attach_context(
                         exc,
                         framework="llamaindex",
                         resource_type="llm",
-                        operation="ahealth",
+                        operation="health",
                         model=self.model,
                         error_codes=ERROR_CODES,
                         source="translator_async",
@@ -1271,7 +1368,7 @@ class CorpusLlamaIndexLLM(LLM):
             try:
                 return await loop.run_in_executor(
                     None,
-                    lambda: translator_health(**kwargs),
+                    lambda: translator_health(),
                 )
             except Exception as exc:  # noqa: BLE001
                 if self._config.enable_error_context:
@@ -1279,7 +1376,7 @@ class CorpusLlamaIndexLLM(LLM):
                         exc,
                         framework="llamaindex",
                         resource_type="llm",
-                        operation="ahealth",
+                        operation="health",
                         model=self.model,
                         error_codes=ERROR_CODES,
                         source="translator_sync_thread",
@@ -1309,7 +1406,7 @@ class CorpusLlamaIndexLLM(LLM):
             )
 
         try:
-            return translator_capabilities(**kwargs)
+            return translator_capabilities()
         except Exception as exc:  # noqa: BLE001
             if self._config.enable_error_context:
                 attach_context(
@@ -1339,14 +1436,14 @@ class CorpusLlamaIndexLLM(LLM):
         translator_acapabilities = getattr(self._translator, "acapabilities", None)
         if callable(translator_acapabilities):
             try:
-                return await translator_acapabilities(**kwargs)  # type: ignore[misc]
+                return await translator_acapabilities()  # type: ignore[misc]
             except Exception as exc:  # noqa: BLE001
                 if self._config.enable_error_context:
                     attach_context(
                         exc,
                         framework="llamaindex",
                         resource_type="llm",
-                        operation="acapabilities",
+                        operation="capabilities",
                         model=self.model,
                         error_codes=ERROR_CODES,
                         source="translator_async",
@@ -1358,7 +1455,7 @@ class CorpusLlamaIndexLLM(LLM):
             try:
                 return await loop.run_in_executor(
                     None,
-                    lambda: translator_capabilities(**kwargs),
+                    lambda: translator_capabilities(),
                 )
             except Exception as exc:  # noqa: BLE001
                 if self._config.enable_error_context:
@@ -1366,7 +1463,7 @@ class CorpusLlamaIndexLLM(LLM):
                         exc,
                         framework="llamaindex",
                         resource_type="llm",
-                        operation="acapabilities",
+                        operation="capabilities",
                         model=self.model,
                         error_codes=ERROR_CODES,
                         source="translator_sync_thread",

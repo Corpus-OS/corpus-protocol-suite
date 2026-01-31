@@ -400,6 +400,10 @@ class AsyncBridge:
 
             attach_context(
                 exc,
+                # Include minimum conformance keys even for core-layer failures.
+                framework="async_bridge",
+                operation="llm_async_bridge",
+                error_codes=["ASYNC_BRIDGE"],
                 origin="async_bridge",
                 timeout=timeout,
                 threaded_execution=threaded_execution,

@@ -829,6 +829,17 @@ def _ensure_llm_operation_context(
         core_ctx = ctx_from_dict({})
     elif isinstance(ctx, OperationContext):
         return ctx
+    elif hasattr(ctx, "request_id") and hasattr(ctx, "attrs"):
+        # ctx is an OperationContext from another module (e.g. core.operational_context)
+        # Convert it to llm_base.OperationContext
+        return OperationContext(
+            request_id=getattr(ctx, "request_id", None),
+            idempotency_key=getattr(ctx, "idempotency_key", None),
+            deadline_ms=getattr(ctx, "deadline_ms", None),
+            traceparent=getattr(ctx, "traceparent", None),
+            tenant=getattr(ctx, "tenant", None),
+            attrs=getattr(ctx, "attrs", None) or {},
+        )
     elif isinstance(ctx, Mapping):
         core_ctx = ctx_from_dict(ctx)
     else:

@@ -333,7 +333,12 @@ def _create_error_context_decorator(
                     base_context = {**static_context, **basic_context}
 
                     try:
-                        return await func(self, *args, **kwargs)
+                        result = func(self, *args, **kwargs)
+                        # Check if result is an async generator - don't await it
+                        if hasattr(result, '__aiter__'):
+                            return result
+                        # Otherwise await it
+                        return await result
                     except Exception as exc:  # noqa: BLE001
                         detailed = _compute_detailed_context(args, kwargs)
 
@@ -348,6 +353,8 @@ def _create_error_context_decorator(
                             **base_context,
                             **detailed,
                         }
+                        # Remove 'operation' to avoid duplicate kwarg when spreading full_context
+                        full_context.pop("operation", None)
                         attach_context(
                             exc,
                             framework=_FRAMEWORK_NAME,
@@ -379,6 +386,8 @@ def _create_error_context_decorator(
                             **base_context,
                             **detailed,
                         }
+                        # Remove 'operation' to avoid duplicate kwarg when spreading full_context
+                        full_context.pop("operation", None)
                         attach_context(
                             exc,
                             framework=_FRAMEWORK_NAME,
@@ -612,7 +621,11 @@ class CorpusAutoGenChatClient:
         return result
 
     @with_async_llm_error_context("acapabilities")
-    async def acapabilities(self) -> Mapping[str, Any]:
+    async def acapabilities(
+        self,
+        conversation: Optional[Any] = None,
+        **_: Any,
+    ) -> Mapping[str, Any]:
         """
         Async capabilities accessor.
 
@@ -713,7 +726,11 @@ class CorpusAutoGenChatClient:
         return result
 
     @with_async_llm_error_context("ahealth")
-    async def ahealth(self) -> Mapping[str, Any]:
+    async def ahealth(
+        self,
+        conversation: Optional[Any] = None,
+        **_: Any,
+    ) -> Mapping[str, Any]:
         """
         Async health accessor.
 
@@ -834,12 +851,8 @@ class CorpusAutoGenChatClient:
             )
             raise
 
-        if not isinstance(ctx, OperationContext):
-            raise TypeError(
-                f"{ErrorCodes.BAD_OPERATION_CONTEXT}: "
-                f"from_autogen produced unsupported context type: "
-                f"{type(ctx).__name__}"
-            )
+        # Trust context_translation to return correct type
+        # (isinstance check removed - was comparing different OperationContext classes)
 
         # Optional overrides for request_id / tenant.
         if request_id is not None or tenant is not None:
@@ -1320,7 +1333,20 @@ class CorpusAutoGenChatClient:
                         is_first=is_first,
                     )
                     is_first = False
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                # Attach error-context here so test patches on this module observe it,
+                # even when the exception is raised during iteration.
+                attach_context(
+                    exc,
+                    framework=_FRAMEWORK_NAME,
+                    operation="llm_acreate",
+                    resource_type="llm",
+                    stream=True,
+                    model=str(params.get("model", self.model)),
+                    request_id=getattr(ctx, "request_id", None),
+                    tenant=getattr(ctx, "tenant", None),
+                    error_codes=ERROR_CODES,
+                )
                 logger.error("Streaming iteration failed in acreate", exc_info=True)
                 raise
             finally:
@@ -1408,20 +1434,26 @@ class CorpusAutoGenChatClient:
                         is_first=is_first,
                     )
                     is_first = False
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                attach_context(
+                    exc,
+                    framework=_FRAMEWORK_NAME,
+                    operation="llm_create",
+                    resource_type="llm",
+                    stream=True,
+                    model=str(params.get("model", self.model)),
+                    request_id=getattr(ctx, "request_id", None),
+                    tenant=getattr(ctx, "tenant", None),
+                    error_codes=ERROR_CODES,
+                )
                 logger.error("Streaming iteration failed in create", exc_info=True)
                 raise
             finally:
-                if chunk_iter is not None:
-                    close = getattr(chunk_iter, "close", None)
-                    if callable(close):
-                        try:
-                            close()
-                        except Exception as cleanup_error:  # noqa: BLE001
-                            logger.warning(
-                                "Stream cleanup failed in create: %s",
-                                cleanup_error,
-                            )
+                # Do not forcibly close the iterator.
+                # SyncStreamBridge-based iterators may defer raising worker exceptions
+                # until the iterator naturally unwinds; calling close() can suppress
+                # those errors.
+                pass
 
         return _iter()
 
