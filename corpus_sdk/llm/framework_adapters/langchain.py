@@ -341,7 +341,12 @@ def _create_error_context_decorator(
                 @wraps(func)
                 async def async_wrapper(self: Any, *args: Any, **kwargs: Any) -> T:
                     try:
-                        return await func(self, *args, **kwargs)
+                        result = func(self, *args, **kwargs)
+                        # If the function returns an async iterator (async generator),
+                        # do not await it.
+                        if hasattr(result, "__aiter__"):
+                            return result
+                        return await result
                     except Exception as exc:  # noqa: BLE001
                         dynamic_ctx = _extract_dynamic_context(
                             self,
@@ -353,6 +358,7 @@ def _create_error_context_decorator(
                             **static_context,
                             **dynamic_ctx,
                         }
+                        full_ctx.pop("operation", None)
                         attach_context(
                             exc,
                             framework=_FRAMEWORK_NAME,
@@ -379,6 +385,7 @@ def _create_error_context_decorator(
                             **static_context,
                             **dynamic_ctx,
                         }
+                        full_ctx.pop("operation", None)
                         attach_context(
                             exc,
                             framework=_FRAMEWORK_NAME,
@@ -1011,7 +1018,8 @@ class CorpusLangChainLLM(BaseChatModel):
         agen: Optional[AsyncIterator[Any]] = None
 
         try:
-            agen = await self._translator.arun_stream(
+            # LLMTranslator.arun_stream returns an AsyncIterator directly; do not await.
+            agen = self._translator.arun_stream(
                 raw_messages=messages,
                 model=model_for_context,
                 max_tokens=params.get("max_tokens"),
@@ -1044,6 +1052,17 @@ class CorpusLangChainLLM(BaseChatModel):
 
                 yield gen_chunk
         except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework=_FRAMEWORK_NAME,
+                operation="llm_astream",
+                resource_type="llm",
+                stream=True,
+                model=str(model_for_context),
+                request_id=getattr(ctx, "request_id", None),
+                tenant=getattr(ctx, "tenant", None),
+                error_codes=ERROR_CODES,
+            )
             if run_manager is not None:
                 await run_manager.on_llm_error(exc)
             raise
@@ -1211,18 +1230,26 @@ class CorpusLangChainLLM(BaseChatModel):
 
                 yield gen_chunk
         except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework=_FRAMEWORK_NAME,
+                operation="llm_stream",
+                resource_type="llm",
+                stream=True,
+                model=str(model_for_context),
+                request_id=getattr(ctx, "request_id", None),
+                tenant=getattr(ctx, "tenant", None),
+                error_codes=ERROR_CODES,
+            )
             if run_manager is not None:
                 run_manager.on_llm_error(exc)
             raise
         finally:
-            if iterator is not None and hasattr(iterator, "close"):
-                try:
-                    iterator.close()  # type: ignore[func-returns-value]
-                except Exception as cleanup_error:  # noqa: BLE001
-                    logger.warning(
-                        "Sync stream cleanup failed in LangChain adapter: %s",
-                        cleanup_error,
-                    )
+            # Do not forcibly close the iterator.
+            # SyncStreamBridge-based iterators may defer raising worker exceptions
+            # until the iterator naturally unwinds; calling close() can suppress
+            # those errors.
+            pass
 
             if run_manager is not None and not stream_canceled:
                 completion_result = ChatResult(
