@@ -2371,8 +2371,7 @@ def _error_to_wire(e: Exception, ms: float) -> Dict[str, Any]:
         # Unknown exception: stable message; do not echo raw exception text (may leak internals).
         "message": "internal error",
         "retry_after_ms": None,
-        # SIEM-safe triage context: error type only (no stack traces, no payload echo).
-        "details": {"error_type": type(e).__name__},
+        "details": None,
         "ms": ms,
     }
 
