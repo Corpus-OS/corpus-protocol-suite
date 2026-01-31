@@ -50,6 +50,13 @@ mode: "standalone"
         * SimpleTokenBucketLimiter
     - Intended for development / light production; NOT a full distributed control plane.
 
+IMPORTANT (clarification on caching vs mode):
+    - This SDK treats caching as a policy. To keep "thin" mode truly policy-free,
+      caching is disabled by default in "thin" mode even if a cache implementation
+      is provided.
+    - Callers that intentionally want caching in "thin" mode may enable it explicitly
+      via the BaseGraphAdapter constructor flag `enable_caching` (see BaseGraphAdapter).
+
 Versioning
 ----------
 Follow SemVer against GRAPH_PROTOCOL_VERSION (wire & type contract).
@@ -122,6 +129,7 @@ and is aligned with the canonical envelope contract.
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import logging
@@ -334,6 +342,12 @@ class GraphTraversalSpec:
         relationship_filters: Optional property filters for relationships to traverse
         return_properties: Optional list of node/relationship properties to return
         namespace: Optional namespace / graph for traversal
+
+    NOTE (clarification):
+        start_nodes are represented as strings for wire-level simplicity and
+        interoperability across backends. In typed code, GraphIDs can be passed
+        by converting to str (GraphID is NewType(str)). WireGraphHandler enforces
+        that these are non-empty strings.
     """
     start_nodes: List[str]
     max_depth: int = 1
@@ -427,6 +441,12 @@ class BulkVerticesResult:
     next_cursor: Optional[str]
     has_more: bool
 
+    def __post_init__(self) -> None:
+        # Keep behavior consistent with other __post_init__ patterns in this file.
+        # This ensures a stable, JSON-safe payload even if backend code returns None.
+        if self.nodes is None:
+            object.__setattr__(self, "nodes", [])
+
 
 @dataclass(frozen=True)
 class BatchOperation:
@@ -516,6 +536,14 @@ class QueryResult:
     dialect: Optional[str] = None
     namespace: Optional[str] = None
 
+    def __post_init__(self) -> None:
+        # Defensive normalization to keep typed + wire outputs stable and JSON-safe.
+        # This avoids surprising None values propagating through routers and handlers.
+        if self.records is None:
+            object.__setattr__(self, "records", [])
+        if self.summary is None:
+            object.__setattr__(self, "summary", {})
+
 
 @dataclass
 class QueryChunk:
@@ -530,6 +558,11 @@ class QueryChunk:
     records: List[Any]
     is_final: bool = False
     summary: Optional[Mapping[str, Any]] = None
+
+    def __post_init__(self) -> None:
+        # Keep streaming frames consistent and wire-safe even if backend returns None.
+        if self.records is None:
+            object.__setattr__(self, "records", [])
 
 
 @dataclass
@@ -752,6 +785,26 @@ class Cache(Protocol):
         """
         ...
 
+    @property
+    def supports_ttl(self) -> bool:
+        """
+        Whether this cache implementation supports TTL semantics on `set`.
+
+        This mirrors the Embedding SDK cache contract and avoids brittle
+        isinstance()-based checks when caches are wrapped/proxied.
+        """
+        ...
+
+    @property
+    def supports_invalidate_pattern(self) -> bool:
+        """
+        Whether this cache implementation supports invalidate_pattern.
+
+        Some distributed caches may not support pattern invalidation, or may
+        implement invalidation as an asynchronous best-effort process.
+        """
+        ...
+
 
 class RateLimiter(Protocol):
     async def acquire(self) -> None:
@@ -830,6 +883,14 @@ class NoopCache:
         # No-op by design
         return None
 
+    @property
+    def supports_ttl(self) -> bool:
+        return False
+
+    @property
+    def supports_invalidate_pattern(self) -> bool:
+        return False
+
 
 class InMemoryTTLCache:
     """
@@ -871,6 +932,14 @@ class InMemoryTTLCache:
         except Exception:
             # Invalidating cache must never break callers
             LOG.debug("InMemoryTTLCache.invalidate_pattern failed for pattern %s", pattern)
+
+    @property
+    def supports_ttl(self) -> bool:
+        return True
+
+    @property
+    def supports_invalidate_pattern(self) -> bool:
+        return True
 
 
 class NoopLimiter:
@@ -1163,6 +1232,16 @@ class BaseGraphAdapter(GraphProtocolV1):
         strict_batch_validation: bool = False,
         batch_supported_ops: Optional[Iterable[str]] = None,
         allow_self_loops: bool = True,
+        # Caching is a policy; to keep "thin" mode policy-free, default is:
+        #   - enabled in standalone
+        #   - disabled in thin
+        # Callers may explicitly override by setting enable_caching=True/False.
+        enable_caching: Optional[bool] = None,
+        # Wire unexpected error message policy:
+        #   - False (default): return stable, non-leaky "internal error" on wire
+        #   - True: surface str(e) on wire for unexpected exceptions (debug/conformance)
+        # SECURITY NOTE: Default preserves the original hardening policy.
+        expose_unhandled_error_messages_on_wire: bool = False,
     ) -> None:
         self._metrics: MetricsSink = metrics or NoopMetrics()
 
@@ -1170,6 +1249,9 @@ class BaseGraphAdapter(GraphProtocolV1):
         if m not in {"thin", "standalone"}:
             m = "thin"
         self._mode = m
+
+        # Persist wire policy flag; used by _error_to_wire implementation.
+        self._expose_unhandled_error_messages_on_wire = bool(expose_unhandled_error_messages_on_wire)
 
         if self._mode == "standalone":
             if metrics is None:
@@ -1197,6 +1279,24 @@ class BaseGraphAdapter(GraphProtocolV1):
         self._auto_timestamp_writes = bool(auto_timestamp_writes)
         self._strict_batch_validation = bool(strict_batch_validation)
         self._allow_self_loops = bool(allow_self_loops)
+
+        # Cache policy flag: keep "thin" mode policy-free unless explicitly enabled.
+        if enable_caching is None:
+            self._enable_caching = (self._mode == "standalone")
+        else:
+            self._enable_caching = bool(enable_caching)
+
+        # Cache safety stats: base owns cache ops, so base owns cache hit/miss counters.
+        # These are useful for local debugging and can be exported via MetricsSink counters.
+        self._cache_stats = {"hits": 0, "misses": 0}
+
+        # Streaming stats: mirrors Embedding SDK patterns for completion vs abandonment.
+        self._stream_stats = {
+            "active_streams": 0,
+            "total_chunks": 0,
+            "abandoned_streams": 0,
+            "completed_streams": 0,
+        }
 
         default_supported_ops = {
             "query",
@@ -1234,6 +1334,21 @@ class BaseGraphAdapter(GraphProtocolV1):
         return None
 
     # ---- internal helpers ---------------------------------------------------
+
+    @staticmethod
+    def _safe_deepcopy(obj: Any) -> Any:
+        """
+        Best-effort deepcopy helper for cache safety.
+
+        Caches frequently store values by reference. Deep-copying on both
+        write and read prevents accidental cross-request mutation of cached
+        objects (a common correctness and data-leak footgun).
+        """
+        try:
+            return copy.deepcopy(obj)
+        except Exception:
+            # Deepcopy failure must never break caller path; return object as-is.
+            return obj
 
     @staticmethod
     def _tenant_hash(tenant: Optional[str]) -> Optional[str]:
@@ -1276,6 +1391,33 @@ class BaseGraphAdapter(GraphProtocolV1):
                 return maybe_result["result"]
         return maybe_result
 
+    def _cache_enabled(self) -> bool:
+        """
+        Determine whether caching is enabled for this adapter instance.
+
+        Caching is a policy:
+          - Disabled by default in "thin" mode for composability.
+          - Enabled by default in "standalone" mode for convenience.
+          - Overridable via enable_caching constructor flag.
+        """
+        return bool(self._enable_caching)
+
+    def _cache_can_read_write(self) -> bool:
+        """
+        Determine whether cache supports TTL-based read/write usage.
+
+        We treat cache usage as strictly TTL-based, mirroring the Embedding SDK.
+        """
+        return bool(self._cache_enabled() and getattr(self._cache, "supports_ttl", False))
+
+    def _cache_can_invalidate(self) -> bool:
+        """
+        Determine whether cache supports invalidate_pattern.
+
+        Invalidation is best-effort and must never break the main operation path.
+        """
+        return bool(self._cache_enabled() and getattr(self._cache, "supports_invalidate_pattern", False))
+
     def _record(
         self,
         op: str,
@@ -1301,6 +1443,14 @@ class BaseGraphAdapter(GraphProtocolV1):
                 code=code,
                 extra=x or None,
             )
+            if not ok:
+                # Align with embedding-style error counter while remaining SIEM-safe.
+                self._metrics.counter(
+                    component=self._component,
+                    name="errors_total",
+                    value=1,
+                    extra={"op": op, "code": code},
+                )
         except Exception:
             # never let metrics break caller
             pass
@@ -1448,7 +1598,10 @@ class BaseGraphAdapter(GraphProtocolV1):
         If namespace is None, no invalidation is performed to avoid
         unnecessarily clearing caches for non-namespaced operations.
         """
-        if namespace is None or isinstance(self._cache, NoopCache):
+        if namespace is None:
+            return
+        if not self._cache_can_invalidate():
+            # Pattern invalidation is optional and may not exist on some cache backends.
             return
 
         try:
@@ -1626,11 +1779,15 @@ class BaseGraphAdapter(GraphProtocolV1):
 
         async def _gen() -> AsyncIterator[QueryChunk]:
             chunk_count = 0
+            completed = False
             agen: Optional[AsyncIterator[QueryChunk]] = None
             try:
+                self._stream_stats["active_streams"] += 1
                 agen = agen_factory()
                 async for chunk in agen:
                     chunk_count += 1
+                    self._stream_stats["total_chunks"] += 1
+
                     # chunk-level throughput metrics (best-effort, non-fatal)
                     try:
                         self._metrics.counter(
@@ -1651,23 +1808,33 @@ class BaseGraphAdapter(GraphProtocolV1):
                     if chunk_count % check_n == 0:
                         self._fail_if_deadline_expired(ctx)
                     yield chunk
+
+                completed = True
+                self._stream_stats["completed_streams"] += 1
                 self._record(op, t0, True, ctx=ctx, **metric_extra)
                 self._breaker.on_success()
             except asyncio.CancelledError as e:
                 # Consumer cancellation / disconnect: record and re-raise.
                 self._record(op, t0, False, code="CancelledError", ctx=ctx, **metric_extra)
+                if not completed and chunk_count > 0:
+                    self._stream_stats["abandoned_streams"] += 1
                 self._breaker.on_error(e)
                 raise
             except GraphAdapterError as e:
                 self._record(op, t0, False, code=e.code or type(e).__name__, ctx=ctx, **metric_extra)
+                if not completed and chunk_count > 0:
+                    self._stream_stats["abandoned_streams"] += 1
                 self._breaker.on_error(e)
                 raise
             except Exception as e:
                 # Standardize on "UnhandledException" for cross-SDK metrics alignment
                 self._record(op, t0, False, code="UnhandledException", ctx=ctx, **metric_extra)
+                if not completed and chunk_count > 0:
+                    self._stream_stats["abandoned_streams"] += 1
                 self._breaker.on_error(e)
                 raise
             finally:
+                self._stream_stats["active_streams"] -= 1
                 self._limiter.release()
                 # Ensure underlying stream resources are cleaned up (best-effort).
                 if agen is not None:
@@ -1689,14 +1856,20 @@ class BaseGraphAdapter(GraphProtocolV1):
 
         Standalone mode: may be cached briefly to reduce overhead.
         Uses pluggable cache interface (not tied to InMemoryTTLCache).
+
+        NOTE (clarification):
+            - Caching is enabled only when `_cache_enabled()` is True and
+              cache.supports_ttl is True. This avoids brittle isinstance() checks
+              and prevents caching from accidentally activating in thin mode.
         """
         t0 = time.monotonic()
         try:
             # Use pluggable cache interface
-            if not isinstance(self._cache, NoopCache) and self._cache_caps_ttl_s > 0:
+            if self._cache_can_read_write() and self._cache_caps_ttl_s > 0:
                 key = self._make_cache_key(op="capabilities", spec="all", ctx=None)
                 cached = await self._cache.get(key)
                 if cached:
+                    self._cache_stats["hits"] += 1
                     self._metrics.counter(
                         component=self._component,
                         name="cache_hits",
@@ -1704,13 +1877,28 @@ class BaseGraphAdapter(GraphProtocolV1):
                         extra={"op": "capabilities"},
                     )
                     self._record("capabilities", t0, True)
-                    return cached
+                    return self._safe_deepcopy(cached)
+                else:
+                    self._cache_stats["misses"] += 1
+                    try:
+                        self._metrics.counter(
+                            component=self._component,
+                            name="cache_misses",
+                            value=1,
+                            extra={"op": "capabilities"},
+                        )
+                    except Exception:
+                        pass
 
             caps = await self._apply_deadline(self._do_capabilities(), ctx=None)
 
-            if not isinstance(self._cache, NoopCache) and self._cache_caps_ttl_s > 0:
+            if self._cache_can_read_write() and self._cache_caps_ttl_s > 0:
                 key = self._make_cache_key(op="capabilities", spec="all", ctx=None)
-                await self._cache.set(key, caps, ttl_s=self._cache_caps_ttl_s)
+                # Cache write is best-effort and mutation-safe.
+                try:
+                    await self._cache.set(key, self._safe_deepcopy(caps), ttl_s=self._cache_caps_ttl_s)
+                except Exception:
+                    pass
 
             self._record("capabilities", t0, True)
             return caps
@@ -1753,20 +1941,38 @@ class BaseGraphAdapter(GraphProtocolV1):
                     )
 
             # Use pluggable cache interface for read-only, non-streaming queries
-            if not isinstance(self._cache, NoopCache) and not spec.stream and self._cache_query_ttl_s > 0:
+            if self._cache_can_read_write() and not spec.stream and self._cache_query_ttl_s > 0:
                 key = self._make_cache_key(op="query", spec=spec, ctx=ctx)
                 cached = await self._cache.get(key)
                 if cached:
+                    self._cache_stats["hits"] += 1
                     self._metrics.counter(
                         component=self._component,
                         name="cache_hits",
                         value=1,
                         extra={"op": "query"},
                     )
-                    return cached
+                    return self._safe_deepcopy(cached)
+
+                self._cache_stats["misses"] += 1
+                try:
+                    self._metrics.counter(
+                        component=self._component,
+                        name="cache_misses",
+                        value=1,
+                        extra={"op": "query"},
+                    )
+                except Exception:
+                    pass
+
                 res = await self._do_query(spec, ctx=ctx)
-                await self._cache.set(key, res, ttl_s=self._cache_query_ttl_s)
+                # Cache write is best-effort and mutation-safe.
+                try:
+                    await self._cache.set(key, self._safe_deepcopy(res), ttl_s=self._cache_query_ttl_s)
+                except Exception:
+                    pass
                 return res
+
             return await self._do_query(spec, ctx=ctx)
 
         return await self._with_gates_unary(
@@ -2016,7 +2222,7 @@ class BaseGraphAdapter(GraphProtocolV1):
         async def _call() -> BulkVerticesResult:
             # Use pluggable cache interface for read-only scans
             if (
-                not isinstance(self._cache, NoopCache)
+                self._cache_can_read_write()
                 and self._cache_bulk_vertices_ttl_s > 0
                 and spec.cursor is None
                 and spec.filter is None
@@ -2024,16 +2230,34 @@ class BaseGraphAdapter(GraphProtocolV1):
                 key = self._make_cache_key(op="bulk_vertices", spec=spec, ctx=ctx)
                 cached = await self._cache.get(key)
                 if cached:
+                    self._cache_stats["hits"] += 1
                     self._metrics.counter(
                         component=self._component,
                         name="cache_hits",
                         value=1,
                         extra={"op": "bulk_vertices"},
                     )
-                    return cached
+                    return self._safe_deepcopy(cached)
+
+                self._cache_stats["misses"] += 1
+                try:
+                    self._metrics.counter(
+                        component=self._component,
+                        name="cache_misses",
+                        value=1,
+                        extra={"op": "bulk_vertices"},
+                    )
+                except Exception:
+                    pass
+
                 res = await self._do_bulk_vertices(spec, ctx=ctx)
-                await self._cache.set(key, res, ttl_s=self._cache_bulk_vertices_ttl_s)
+                # Cache write is best-effort and mutation-safe.
+                try:
+                    await self._cache.set(key, self._safe_deepcopy(res), ttl_s=self._cache_bulk_vertices_ttl_s)
+                except Exception:
+                    pass
                 return res
+
             return await self._do_bulk_vertices(spec, ctx=ctx)
 
         return await self._with_gates_unary(
@@ -2178,21 +2402,38 @@ class BaseGraphAdapter(GraphProtocolV1):
 
         async def _call() -> GraphSchema:
             # Use pluggable cache interface
-            if not isinstance(self._cache, NoopCache) and self._cache_schema_ttl_s > 0:
+            if self._cache_can_read_write() and self._cache_schema_ttl_s > 0:
                 key = self._make_cache_key(op="schema", spec="all", ctx=ctx)
                 cached = await self._cache.get(key)
                 if cached:
+                    self._cache_stats["hits"] += 1
                     self._metrics.counter(
                         component=self._component,
                         name="cache_hits",
                         value=1,
                         extra={"op": "get_schema"},
                     )
-                    return cached
+                    return self._safe_deepcopy(cached)
+
+                self._cache_stats["misses"] += 1
+                try:
+                    self._metrics.counter(
+                        component=self._component,
+                        name="cache_misses",
+                        value=1,
+                        extra={"op": "get_schema"},
+                    )
+                except Exception:
+                    pass
+
             res = await self._do_get_schema(ctx=ctx)
-            if not isinstance(self._cache, NoopCache) and self._cache_schema_ttl_s > 0:
+            if self._cache_can_read_write() and self._cache_schema_ttl_s > 0:
                 key = self._make_cache_key(op="schema", spec="all", ctx=ctx)
-                await self._cache.set(key, res, ttl_s=self._cache_schema_ttl_s)
+                # Cache write is best-effort and mutation-safe.
+                try:
+                    await self._cache.set(key, self._safe_deepcopy(res), ttl_s=self._cache_schema_ttl_s)
+                except Exception:
+                    pass
             return res
 
         return await self._with_gates_unary(
@@ -2320,20 +2561,38 @@ class BaseGraphAdapter(GraphProtocolV1):
             self._validate_properties_map(spec.relationship_filters)
 
         async def _call() -> TraversalResult:
-            if not isinstance(self._cache, NoopCache) and self._cache_query_ttl_s > 0:
+            if self._cache_can_read_write() and self._cache_query_ttl_s > 0:
                 key = self._make_cache_key(op="traversal", spec=spec, ctx=ctx)
                 cached = await self._cache.get(key)
                 if cached:
+                    self._cache_stats["hits"] += 1
                     self._metrics.counter(
                         component=self._component,
                         name="cache_hits",
                         value=1,
                         extra={"op": "traversal"},
                     )
-                    return cached
+                    return self._safe_deepcopy(cached)
+
+                self._cache_stats["misses"] += 1
+                try:
+                    self._metrics.counter(
+                        component=self._component,
+                        name="cache_misses",
+                        value=1,
+                        extra={"op": "traversal"},
+                    )
+                except Exception:
+                    pass
+
                 res = await self._do_traversal(spec, ctx=ctx)
-                await self._cache.set(key, res, ttl_s=self._cache_query_ttl_s)
+                # Cache write is best-effort and mutation-safe.
+                try:
+                    await self._cache.set(key, self._safe_deepcopy(res), ttl_s=self._cache_query_ttl_s)
+                except Exception:
+                    pass
                 return res
+
             return await self._do_traversal(spec, ctx=ctx)
 
         return await self._with_gates_unary(
@@ -2467,7 +2726,7 @@ def _ctx_from_wire(ctx_dict: Mapping[str, Any]) -> OperationContext:
     )
 
 
-def _error_to_wire(e: Exception, ms: float) -> Dict[str, Any]:
+def _error_to_wire(e: Exception, ms: float, *, expose_unhandled_message: bool = False) -> Dict[str, Any]:
     """
     Map GraphAdapterError (or unexpected Exception) to canonical error envelope.
 
@@ -2475,6 +2734,11 @@ def _error_to_wire(e: Exception, ms: float) -> Dict[str, Any]:
         For unexpected exceptions, return a stable, non-leaky message and
         SIEM-safe details. This preserves the wire schema while avoiding
         accidental disclosure of sensitive backend internals.
+
+    NOTE (clarification):
+        For some environments (debug / conformance testing), callers may set
+        expose_unhandled_message=True to surface str(e) on the wire for
+        unexpected exceptions. The default remains hardened.
     """
     if isinstance(e, GraphAdapterError):
         return {
@@ -2486,11 +2750,14 @@ def _error_to_wire(e: Exception, ms: float) -> Dict[str, Any]:
             "details": e.details or None,
             "ms": ms,
         }
+
+    # Unexpected exception policy: hardened by default; optionally expose message.
+    message = str(e) if expose_unhandled_message else "internal error"
     return {
         "ok": False,
         "code": "UNAVAILABLE",  # Wire-level code remains UNAVAILABLE
         "error": type(e).__name__,
-        "message": "internal error",
+        "message": message,
         "retry_after_ms": None,
         "details": {"error_type": type(e).__name__},
         "ms": ms,
@@ -2760,7 +3027,13 @@ class WireGraphHandler:
             raise NotSupported(f"unknown or non-unary operation '{op}'")
         except Exception as e:
             ms = (time.monotonic() - t0) * 1000.0
-            return _error_to_wire(e, ms)
+            # Best-effort: if adapter is BaseGraphAdapter, honor its wire message policy flag.
+            expose = False
+            try:
+                expose = bool(getattr(self._adapter, "_expose_unhandled_error_messages_on_wire", False))
+            except Exception:
+                expose = False
+            return _error_to_wire(e, ms, expose_unhandled_message=expose)
 
     async def handle_stream(self, envelope: Mapping[str, Any]) -> AsyncIterator[Dict[str, Any]]:
         """
@@ -2792,7 +3065,12 @@ class WireGraphHandler:
                 yield _chunk_to_wire(chunk, ms)
         except Exception as e:
             ms = (time.monotonic() - t0) * 1000.0
-            yield _error_to_wire(e, ms)
+            expose = False
+            try:
+                expose = bool(getattr(self._adapter, "_expose_unhandled_error_messages_on_wire", False))
+            except Exception:
+                expose = False
+            yield _error_to_wire(e, ms, expose_unhandled_message=expose)
 
 
 __all__ = [
