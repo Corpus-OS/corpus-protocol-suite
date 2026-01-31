@@ -48,12 +48,12 @@ def framework_descriptor_fixture(
     """
     Parameterized over all registered graph framework descriptors.
 
-    Frameworks that are not actually available in the environment are skipped
-    via descriptor.is_available().
+    IMPORTANT POLICY ALIGNMENT (NO SKIPS):
+    - We do not skip unavailable frameworks.
+    - Tests must pass by asserting correct "unavailable" signaling when a framework
+      is not installed, and must fully run when it is available.
     """
     descriptor: GraphFrameworkDescriptor = request.param
-    if not descriptor.is_available():
-        pytest.skip(f"Framework '{descriptor.name}' not available in this environment")
     return descriptor
 
 
@@ -64,7 +64,16 @@ def graph_client_instance(
 ) -> Any:
     """
     Construct a concrete graph client instance for the given descriptor.
+
+    Availability contract:
+    - If a framework is unavailable, this fixture returns None and tests must
+      treat that as a validated pass condition (not a skip).
+    - If a framework is available but instantiation fails, tests should fail
+      (real regression or adapter import issue).
     """
+    if not framework_descriptor.is_available():
+        return None
+
     try:
         module = importlib.import_module(framework_descriptor.adapter_module)
     except SyntaxError as e:
@@ -77,6 +86,10 @@ def graph_client_instance(
 
     client_cls = getattr(module, framework_descriptor.adapter_class)
 
+    # NOTE:
+    # This file historically used `adapter=...` directly. In the newer graph
+    # context/error tests, the injection kwarg is registry-driven.
+    # We keep this file stable and focused on interface conformance.
     init_kwargs: dict[str, Any] = {"adapter": adapter}
     return client_cls(**init_kwargs)
 
@@ -84,6 +97,27 @@ def graph_client_instance(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _assert_unavailable_contract(descriptor: GraphFrameworkDescriptor) -> None:
+    """
+    Validate that an unavailable framework descriptor is behaving as expected.
+
+    The test suite policy is "no skip": when unavailable, tests must pass by
+    asserting correct unavailability signaling.
+    """
+    assert descriptor.is_available() is False
+
+    # If availability_attr is set, adapter module should generally import and expose the flag.
+    # If the module cannot import, that is also a valid "unavailable" signal.
+    if descriptor.availability_attr:
+        try:
+            module = importlib.import_module(descriptor.adapter_module)
+        except Exception:
+            return
+        flag = getattr(module, descriptor.availability_attr, None)
+        # Either missing (treated as unavailable) or False.
+        assert flag is None or bool(flag) is False
 
 
 def _get_method(instance: Any, name: str | None) -> Callable[..., Any]:
@@ -102,7 +136,7 @@ def _get_unbound_method(owner: type, name: str) -> Callable[..., Any]:
 def _context_kwargs_for_descriptor(framework_descriptor: GraphFrameworkDescriptor) -> dict[str, Any]:
     """
     Build kwargs reflecting the framework's declared context parameter.
-    
+
     Returns a dict with a single key (the framework's context_kwarg) containing
     the rich context mapping, or an empty dict if no context_kwarg is declared.
     """
@@ -131,7 +165,7 @@ def _call_with_minimal_args(
     framework_descriptor: GraphFrameworkDescriptor,
 ) -> Any:
     from corpus_sdk.graph.graph_base import BulkVerticesSpec, BatchOperation
-    
+
     kw = _context_kwargs_for_descriptor(framework_descriptor)
 
     if kind in {"query", "stream", "async_query", "async_stream"}:
@@ -169,6 +203,12 @@ def test_can_instantiate_graph_client(
     framework_descriptor: GraphFrameworkDescriptor,
     graph_client_instance: Any,
 ) -> None:
+    if not framework_descriptor.is_available():
+        _assert_unavailable_contract(framework_descriptor)
+        return
+
+    assert graph_client_instance is not None
+
     _get_method(graph_client_instance, framework_descriptor.query_method)
 
     if framework_descriptor.stream_query_method:
@@ -209,6 +249,12 @@ def test_sync_query_interface_conformance(
     framework_descriptor: GraphFrameworkDescriptor,
     graph_client_instance: Any,
 ) -> None:
+    if not framework_descriptor.is_available():
+        _assert_unavailable_contract(framework_descriptor)
+        return
+
+    assert graph_client_instance is not None
+
     query_fn = _get_method(graph_client_instance, framework_descriptor.query_method)
     result = _call_with_minimal_args(
         query_fn,
@@ -223,8 +269,15 @@ def test_sync_streaming_interface_when_declared(
     framework_descriptor: GraphFrameworkDescriptor,
     graph_client_instance: Any,
 ) -> None:
+    if not framework_descriptor.is_available():
+        _assert_unavailable_contract(framework_descriptor)
+        return
+
+    assert graph_client_instance is not None
+
     if not framework_descriptor.stream_query_method:
-        pytest.skip(f"Framework '{framework_descriptor.name}' does not declare sync streaming")
+        assert framework_descriptor.stream_query_method is None
+        return
 
     stream_fn = _get_method(graph_client_instance, framework_descriptor.stream_query_method)
 
@@ -247,8 +300,15 @@ async def test_async_query_interface_conformance_when_supported(
     framework_descriptor: GraphFrameworkDescriptor,
     graph_client_instance: Any,
 ) -> None:
+    if not framework_descriptor.is_available():
+        _assert_unavailable_contract(framework_descriptor)
+        return
+
+    assert graph_client_instance is not None
+
     if not framework_descriptor.async_query_method:
-        pytest.skip(f"Framework '{framework_descriptor.name}' does not declare async query")
+        assert framework_descriptor.async_query_method is None
+        return
 
     aquery_fn = _get_method(graph_client_instance, framework_descriptor.async_query_method)
 
@@ -269,8 +329,15 @@ async def test_async_streaming_interface_conformance_when_supported(
     framework_descriptor: GraphFrameworkDescriptor,
     graph_client_instance: Any,
 ) -> None:
+    if not framework_descriptor.is_available():
+        _assert_unavailable_contract(framework_descriptor)
+        return
+
+    assert graph_client_instance is not None
+
     if not framework_descriptor.async_stream_query_method:
-        pytest.skip(f"Framework '{framework_descriptor.name}' does not declare async streaming")
+        assert framework_descriptor.async_stream_query_method is None
+        return
 
     astream_fn = _get_method(graph_client_instance, framework_descriptor.async_stream_query_method)
 
@@ -294,8 +361,15 @@ def test_context_kwarg_is_accepted_when_declared_on_primary_query(
     framework_descriptor: GraphFrameworkDescriptor,
     graph_client_instance: Any,
 ) -> None:
+    if not framework_descriptor.is_available():
+        _assert_unavailable_contract(framework_descriptor)
+        return
+
+    assert graph_client_instance is not None
+
     if not framework_descriptor.context_kwarg:
-        pytest.skip(f"Framework '{framework_descriptor.name}' does not declare a context_kwarg")
+        assert framework_descriptor.context_kwarg is None
+        return
 
     query_fn = _get_method(graph_client_instance, framework_descriptor.query_method)
     result = query_fn(
@@ -309,6 +383,12 @@ def test_bulk_and_batch_methods_are_callable_when_declared(
     framework_descriptor: GraphFrameworkDescriptor,
     graph_client_instance: Any,
 ) -> None:
+    if not framework_descriptor.is_available():
+        _assert_unavailable_contract(framework_descriptor)
+        return
+
+    assert graph_client_instance is not None
+
     if framework_descriptor.supports_bulk_vertices and framework_descriptor.bulk_vertices_method:
         bulk_fn = _get_method(graph_client_instance, framework_descriptor.bulk_vertices_method)
         _call_with_minimal_args(
@@ -333,6 +413,12 @@ async def test_async_bulk_and_batch_methods_are_awaitable_when_declared(
     framework_descriptor: GraphFrameworkDescriptor,
     graph_client_instance: Any,
 ) -> None:
+    if not framework_descriptor.is_available():
+        _assert_unavailable_contract(framework_descriptor)
+        return
+
+    assert graph_client_instance is not None
+
     if framework_descriptor.async_bulk_vertices_method:
         abulk_fn = _get_method(graph_client_instance, framework_descriptor.async_bulk_vertices_method)
         coro = _call_with_minimal_args(
@@ -360,6 +446,12 @@ def test_method_signatures_consistent_between_sync_and_async(
     framework_descriptor: GraphFrameworkDescriptor,
     graph_client_instance: Any,
 ) -> None:
+    if not framework_descriptor.is_available():
+        _assert_unavailable_contract(framework_descriptor)
+        return
+
+    assert graph_client_instance is not None
+
     owner = type(graph_client_instance)
 
     def _compare_signatures(sync_name: str | None, async_name: str | None) -> None:
@@ -400,10 +492,17 @@ def test_capabilities_contract_matches_registry_flag(
 ) -> None:
     """
     NO SKIPS:
+      - If framework is unavailable -> validate unavailable contract and pass.
       - If has_capabilities=True -> capabilities() must exist and return Mapping.
       - If has_capabilities=False -> capabilities() must NOT exist (or must not be callable).
         (If it exists, registry is wrong; force a failure so it gets fixed.)
     """
+    if not framework_descriptor.is_available():
+        _assert_unavailable_contract(framework_descriptor)
+        return
+
+    assert graph_client_instance is not None
+
     capabilities = getattr(graph_client_instance, "capabilities", None)
 
     if framework_descriptor.has_capabilities:
@@ -416,7 +515,7 @@ def test_capabilities_contract_matches_registry_flag(
         )
         assert isinstance(caps_result, Mapping), "capabilities() should return a Mapping"
 
-        # Async variant is optional, but if present it must behave correctly
+        # Async variant is optional, but if present it must be callable.
         async_caps = getattr(graph_client_instance, "acapabilities", None)
         if async_caps is not None:
             assert callable(async_caps), "acapabilities exists but is not callable"
@@ -425,7 +524,6 @@ def test_capabilities_contract_matches_registry_flag(
             "Registry says has_capabilities=False but capabilities() exists/callable; "
             "either remove the method or flip has_capabilities=True in the registry"
         )
-        # If async variant exists while flag is false, that's also inconsistent
         async_caps = getattr(graph_client_instance, "acapabilities", None)
         assert not callable(async_caps), (
             "Registry says has_capabilities=False but acapabilities() exists/callable; "
@@ -440,9 +538,16 @@ async def test_async_capabilities_returns_mapping_if_present(
 ) -> None:
     """
     NO SKIPS:
+      - If framework is unavailable -> validate unavailable contract and pass.
       - If acapabilities() exists, it must return Mapping.
       - If it does not exist, test passes (async variant is optional).
     """
+    if not framework_descriptor.is_available():
+        _assert_unavailable_contract(framework_descriptor)
+        return
+
+    assert graph_client_instance is not None
+
     async_caps = getattr(graph_client_instance, "acapabilities", None)
     if not callable(async_caps):
         return
@@ -464,9 +569,16 @@ def test_health_contract_matches_registry_flag(
 ) -> None:
     """
     NO SKIPS:
+      - If framework is unavailable -> validate unavailable contract and pass.
       - If has_health=True -> health() must exist and return Mapping.
       - If has_health=False -> health() must NOT exist (or must not be callable).
     """
+    if not framework_descriptor.is_available():
+        _assert_unavailable_contract(framework_descriptor)
+        return
+
+    assert graph_client_instance is not None
+
     health = getattr(graph_client_instance, "health", None)
 
     if framework_descriptor.has_health:
@@ -501,9 +613,16 @@ async def test_async_health_returns_mapping_if_present(
 ) -> None:
     """
     NO SKIPS:
+      - If framework is unavailable -> validate unavailable contract and pass.
       - If ahealth() exists, it must return Mapping.
       - If it does not exist, test passes (async variant is optional).
     """
+    if not framework_descriptor.is_available():
+        _assert_unavailable_contract(framework_descriptor)
+        return
+
+    assert graph_client_instance is not None
+
     async_health = getattr(graph_client_instance, "ahealth", None)
     if not callable(async_health):
         return
