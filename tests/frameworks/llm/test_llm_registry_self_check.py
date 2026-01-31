@@ -5,10 +5,15 @@ import re
 from typing import Optional
 import warnings
 
-# Suppress expected warnings before importing registry
+# Suppress expected warnings before importing registry.
+#
+# IMPORTANT:
+# Some frameworks are intentionally async-first (e.g. semantic_kernel) and may
+# not provide sync completion methods. The registry's validation emits a soft
+# warning for that case. We treat this as expected in the conformance suite.
 warnings.filterwarnings(
     "ignore",
-    message="semantic_kernel.*async_completion_method is set but completion_method is None",
+    message=r"semantic_kernel.*async_completion_method is set but completion_method is None",
     category=RuntimeWarning,
 )
 
@@ -25,7 +30,7 @@ from tests.frameworks.registries.llm_registry import (
     iter_available_llm_framework_descriptors,
 )
 
-# Filter expected warnings for async-only frameworks like semantic_kernel
+# Filter expected warnings for async-only frameworks and controlled overwrite warnings.
 pytestmark = [
     pytest.mark.filterwarnings(
         "ignore:semantic_kernel.*async_completion_method is set but completion_method is None:RuntimeWarning"
@@ -76,6 +81,10 @@ def test_llm_registry_descriptors_validate_cleanly(all_descriptors) -> None:
     """
     Run the descriptor-level validation hook to catch obvious inconsistencies
     (e.g. async streaming defined without async completion).
+
+    NOTE:
+        validate() may emit warnings for async-only frameworks; those are filtered
+        above and should not fail this test.
     """
     for descriptor in all_descriptors:
         # validate() may emit warnings but should not raise
@@ -144,6 +153,11 @@ def test_async_method_consistency(all_descriptors) -> None:
 
     Policy: if a framework declares async support, it must at least expose an
     async completion method (async streaming is optional).
+
+    NOTE:
+        This matches the registry contract and the self-check expectations:
+        supports_async is strictly about async completion/stream surfaces, not
+        about async capability/health surfaces.
     """
     for descriptor in all_descriptors:
         if descriptor.supports_async:
@@ -155,10 +169,11 @@ def test_async_method_consistency(all_descriptors) -> None:
 
 def test_supports_streaming_property(all_descriptors) -> None:
     """
-    Test the supports_streaming property logic.
+    Test supports_streaming reflects whether ANY streaming capability is declared.
 
-    Ensures the property correctly reflects whether ANY streaming capability
-    is declared (sync method, async method, or streaming_kwarg).
+    A framework may support streaming via:
+      - a dedicated streaming method (sync or async), OR
+      - a streaming boolean kwarg on the completion method.
     """
     for descriptor in all_descriptors:
         has_streaming = (
@@ -173,10 +188,11 @@ def test_supports_streaming_property(all_descriptors) -> None:
 
 def test_supports_async_property(all_descriptors) -> None:
     """
-    Test the supports_async property logic.
+    Test supports_async reflects whether ANY async completion/stream method is declared.
 
-    Ensures the property correctly reflects whether ANY async method
-    is declared (completion or streaming).
+    NOTE:
+        This test intentionally ignores capability/health surfaces. The registry
+        uses supports_async only to describe async completion/stream ability.
     """
     for descriptor in all_descriptors:
         has_async = (
@@ -190,10 +206,10 @@ def test_supports_async_property(all_descriptors) -> None:
 
 def test_supports_token_count_property(all_descriptors) -> None:
     """
-    Test the supports_token_count property logic.
+    Test supports_token_count reflects whether a token-counting method is declared.
 
-    Ensures the property correctly reflects whether a token-counting
-    method (sync or async) is declared.
+    Token counting may be exposed via a sync or async method; the registry contract
+    treats either one as sufficient to declare support.
     """
     for descriptor in all_descriptors:
         has_token_count = (
@@ -277,6 +293,10 @@ def test_register_llm_framework_descriptor() -> None:
 
     This tests the ability to add new framework descriptors at runtime,
     which is useful for testing experimental or third-party LLM adapters.
+
+    IMPORTANT:
+        This test temporarily mutates the registry; it restores the original
+        registry at the end to avoid cross-test contamination.
     """
     original_registry = dict(LLM_FRAMEWORKS)
     try:
@@ -346,7 +366,7 @@ def test_get_descriptor_variants() -> None:
     # Non-existent framework
     non_existent = "non_existent_llm_framework_xyz123"
 
-    with pytest.raises(KeyError, match=non_existent):
+    with pytest.raises(KeyError, match=re.escape(non_existent)):
         get_llm_framework_descriptor(non_existent)
 
     assert get_llm_framework_descriptor_safe(non_existent) is None
@@ -403,7 +423,7 @@ def test_descriptor_validation_edge_cases() -> None:
     # Missing required completion methods
     with pytest.raises(
         ValueError,
-        match="completion_method or async_completion_method must be set",
+        match=r"completion_method or async_completion_method must be set",
     ):
         LLMFrameworkDescriptor(
             name="bad1",
@@ -415,7 +435,7 @@ def test_descriptor_validation_edge_cases() -> None:
     # Dotted adapter_class (should warn but not fail)
     with pytest.warns(
         RuntimeWarning,
-        match="adapter_class should be a class name only",
+        match=r"adapter_class should be a class name only",
     ):
         LLMFrameworkDescriptor(
             name="warn1",
@@ -428,7 +448,7 @@ def test_descriptor_validation_edge_cases() -> None:
     # Async streaming without async completion (should warn but not fail)
     with pytest.warns(
         RuntimeWarning,
-        match="async_streaming_method is set but async_completion_method is None",
+        match=r"async_streaming_method is set but async_completion_method is None",
     ):
         LLMFrameworkDescriptor(
             name="warn2",
