@@ -639,6 +639,47 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
                     f"{_INIT_ERROR_CODE}: max_tokens must be a positive integer"
                 )
 
+    def _to_translator_messages(self, chat_history: "ChatHistory") -> List[Dict[str, Any]]:
+        """
+        Convert Semantic Kernel chat history to generic dicts for translator.
+
+        Handles:
+        - Plain strings (conformance tests): wrap as user message
+        - SK ChatMessageContent objects
+        - Pre-normalized dicts (OpenAI-style)
+        """
+        # Single string input: wrap as user message
+        if isinstance(chat_history, str):
+            return [{"role": "user", "content": chat_history}]
+
+        result = []
+        for msg in chat_history:
+            # Already a dict: pass through
+            if isinstance(msg, Mapping):
+                result.append(dict(msg))
+                continue
+
+            # SK message object: extract role and content
+            role = getattr(msg, "role", None)
+            if role is None and hasattr(msg, "author_role"):
+                role = getattr(msg, "author_role", "user")
+            if role is None:
+                role = "user"
+
+            # Extract content
+            content = getattr(msg, "content", None)
+            if content is None and hasattr(msg, "items"):
+                try:
+                    content = "".join(str(item) for item in msg.items)  # type: ignore[attr-defined]
+                except Exception:
+                    content = str(getattr(msg, "items", ""))
+
+            if not isinstance(content, str):
+                content = str(content) if content is not None else ""
+
+            result.append({"role": str(role), "content": content})
+        return result
+
     def _validate_chat_history(self, chat_history: "ChatHistory") -> None:
         """
         Validate Semantic Kernel chat history structure before handing it
@@ -651,6 +692,10 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
         """
         if not chat_history:
             raise ValueError("Chat history cannot be empty")
+
+        # String input is valid for conformance tests
+        if isinstance(chat_history, str):
+            return
 
         for idx, msg in enumerate(chat_history):
             # Conformance tests may pass list-of-dicts (OpenAI-like) instead of
@@ -902,8 +947,11 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
             stream=False,
         )
 
+        # Convert SK chat history to generic dicts for translator
+        normalized_messages = self._to_translator_messages(chat_history)
+
         result = await self._translator.arun_complete(
-            raw_messages=chat_history,
+            raw_messages=normalized_messages,
             model=params.get("model"),
             max_tokens=params.get("max_tokens"),
             temperature=params.get("temperature"),
@@ -981,9 +1029,12 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
 
         agen: Optional[AsyncIterator[Any]] = None
         try:
+            # Convert SK chat history to generic dicts for translator
+            normalized_messages = self._to_translator_messages(chat_history)
+
             # LLMTranslator.arun_stream returns an AsyncIterator directly; do not await.
             agen = self._translator.arun_stream(
-                raw_messages=chat_history,
+                raw_messages=normalized_messages,
                 model=params.get("model"),
                 max_tokens=params.get("max_tokens"),
                 temperature=params.get("temperature"),
@@ -1113,9 +1164,12 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
             stream=False,
         )
 
+        # Convert SK chat history to generic dicts for translator
+        normalized_messages = self._to_translator_messages(chat_history)
+
         # Translator-based token counting (no silent fallback).
         tokens_any = self._translator.count_tokens_for_messages(
-            raw_messages=chat_history,
+            raw_messages=normalized_messages,
             model=model_for_context,
             op_ctx=ctx,
             framework_ctx=framework_ctx,

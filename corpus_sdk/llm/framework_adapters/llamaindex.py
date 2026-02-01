@@ -452,6 +452,38 @@ def _build_chat_response_from_chunk_like(chunk_obj: Any) -> ChatResponse:
 # ---------------------------------------------------------------------------
 
 
+def _to_translator_messages(messages: Sequence[ChatMessage]) -> List[Dict[str, Any]]:
+    """
+    Convert LlamaIndex ChatMessage objects to generic dicts for translator.
+
+    The translator expects mappings (dicts) with role/content, not
+    framework-specific message objects.
+    """
+    result = []
+    for msg in messages:
+        # Extract role (may be enum or string)
+        role_raw = getattr(msg, "role", "user")
+        if hasattr(role_raw, "value"):
+            role = str(role_raw.value)
+        else:
+            role = str(role_raw)
+
+        # Extract content from blocks or direct attribute
+        content = ""
+        if hasattr(msg, "blocks"):
+            blocks = getattr(msg, "blocks", [])
+            for block in blocks:
+                if hasattr(block, "text"):
+                    content += str(block.text)
+                else:
+                    content += str(block)
+        else:
+            content = str(getattr(msg, "content", ""))
+
+        result.append({"role": role, "content": content})
+    return result
+
+
 def _analyze_messages_for_context(messages: Sequence[ChatMessage]) -> Dict[str, Any]:
     """
     Derive role distribution and content metrics for error context.
@@ -922,8 +954,11 @@ class CorpusLlamaIndexLLM(LLM):
             ctx=ctx,
             params=params,
         ):
+            # Convert LlamaIndex ChatMessages to dicts for translator
+            normalized_messages = _to_translator_messages(messages)
+
             result = await self._translator.arun_complete(
-                raw_messages=messages,
+                raw_messages=normalized_messages,
                 model=params.get("model"),
                 max_tokens=params.get("max_tokens"),
                 temperature=params.get("temperature"),
@@ -970,9 +1005,12 @@ class CorpusLlamaIndexLLM(LLM):
                 ctx=ctx,
                 params=params,
             ):
+                # Convert LlamaIndex ChatMessages to dicts for translator
+                normalized_messages = _to_translator_messages(messages)
+
                 # LLMTranslator.arun_stream returns an AsyncIterator directly; do not await.
                 agen = self._translator.arun_stream(
-                    raw_messages=messages,
+                    raw_messages=normalized_messages,
                     model=params.get("model"),
                     max_tokens=params.get("max_tokens"),
                     temperature=params.get("temperature"),
@@ -1037,8 +1075,11 @@ class CorpusLlamaIndexLLM(LLM):
             ctx=ctx,
             params=params,
         ):
+            # Convert LlamaIndex ChatMessages to dicts for translator
+            normalized_messages = _to_translator_messages(messages)
+
             result = self._translator.complete(
-                raw_messages=messages,
+                raw_messages=normalized_messages,
                 model=params.get("model"),
                 max_tokens=params.get("max_tokens"),
                 temperature=params.get("temperature"),
@@ -1086,8 +1127,11 @@ class CorpusLlamaIndexLLM(LLM):
                 ctx=ctx,
                 params=params,
             ):
+                # Convert LlamaIndex ChatMessages to dicts for translator
+                normalized_messages = _to_translator_messages(messages)
+
                 stream_iter = self._translator.stream(
-                    raw_messages=messages,
+                    raw_messages=normalized_messages,
                     model=params.get("model"),
                     max_tokens=params.get("max_tokens"),
                     temperature=params.get("temperature"),
@@ -1241,8 +1285,11 @@ class CorpusLlamaIndexLLM(LLM):
             stream=False,
         )
 
+        # Convert LlamaIndex ChatMessages to dicts for translator
+        normalized_messages = _to_translator_messages(messages)
+
         tokens_any = self._translator.count_tokens_for_messages(
-            raw_messages=messages,
+            raw_messages=normalized_messages,
             model=model_for_context,
             op_ctx=ctx,
             framework_ctx=framework_ctx,

@@ -401,7 +401,37 @@ def _create_error_context_decorator(
                     try:
                         result = func(self, *args, **kwargs)
                         # Check if result is an async generator - don't await it
-                        if hasattr(result, '__aiter__'):
+                        if hasattr(result, "__aiter__"):
+                            # If this is a streaming operation, wrap iteration so
+                            # errors raised during async iteration still attach context.
+                            if operation in {"astream"}:
+                                async def _agen() -> AsyncIterator[Any]:
+                                    try:
+                                        async for item in result:  # type: ignore[union-attr]
+                                            yield item
+                                    except Exception as exc:  # noqa: BLE001
+                                        dynamic_context = _extract_dynamic_context(
+                                            self,
+                                            args,
+                                            kwargs,
+                                            operation,
+                                        )
+                                        full_context = {
+                                            "error_codes": ERROR_CODES,
+                                            **static_context,
+                                            **dynamic_context,
+                                        }
+                                        full_context.pop("operation", None)
+                                        attach_context(
+                                            exc,
+                                            framework=_FRAMEWORK_NAME,
+                                            operation=f"llm_{operation}",
+                                            **full_context,
+                                        )
+                                        raise
+
+                                return _agen()  # type: ignore[return-value]
+
                             return result
                         # Otherwise await it
                         return await result
@@ -433,7 +463,39 @@ def _create_error_context_decorator(
                 @wraps(func)
                 def sync_wrapper(self: Any, *args: Any, **kwargs: Any) -> T:
                     try:
-                        return func(self, *args, **kwargs)
+                        result = func(self, *args, **kwargs)
+
+                        # If this is a streaming generator/iterator, wrap iteration so
+                        # errors raised during iteration still attach context.
+                        if operation in {"stream"} and hasattr(result, "__iter__"):
+                            def _gen() -> Iterator[Any]:
+                                try:
+                                    for item in result:  # type: ignore[union-attr]
+                                        yield item
+                                except Exception as exc:  # noqa: BLE001
+                                    dynamic_context = _extract_dynamic_context(
+                                        self,
+                                        args,
+                                        kwargs,
+                                        operation,
+                                    )
+                                    full_context = {
+                                        "error_codes": ERROR_CODES,
+                                        **static_context,
+                                        **dynamic_context,
+                                    }
+                                    full_context.pop("operation", None)
+                                    attach_context(
+                                        exc,
+                                        framework=_FRAMEWORK_NAME,
+                                        operation=f"llm_{operation}",
+                                        **full_context,
+                                    )
+                                    raise
+
+                            return _gen()  # type: ignore[return-value]
+
+                        return result
                     except Exception as exc:  # noqa: BLE001
                         dynamic_context = _extract_dynamic_context(
                             self,
@@ -881,6 +943,53 @@ class CorpusCrewAILLM:
 
         # Mapping or CrewAIMessage-like objects are accepted as-is.
 
+    def _to_translator_messages(
+        self,
+        messages: Union[CrewAIMessageInput, CrewAIMessageSequence],
+    ) -> Any:
+        """
+        Convert CrewAI message inputs to a form the translator can handle.
+
+        CrewAI can accept:
+        - Plain strings (prompt-like)
+        - Dicts with role/content
+        - CrewAI message objects
+
+        The translator expects either:
+        - Mappings (dicts) with role/content
+        - NormalizedMessage objects
+
+        For strings, we wrap them as user messages.
+        """
+        # Single string input: wrap as user message
+        if isinstance(messages, str):
+            return [{"role": "user", "content": messages}]
+
+        # Single dict or message object: wrap in list
+        if isinstance(messages, Mapping):
+            return [dict(messages)]
+
+        # Check if it's a CrewAI message object (not string, not mapping)
+        if not isinstance(messages, (str, Sequence)):
+            # Assume it's a CrewAI message object with role/content attributes
+            role = getattr(messages, "role", "user")
+            content = getattr(messages, "content", str(messages))
+            return [{"role": role, "content": content}]
+
+        # Sequence of messages: normalize each
+        normalized = []
+        for msg in messages:
+            if isinstance(msg, str):
+                normalized.append({"role": "user", "content": msg})
+            elif isinstance(msg, Mapping):
+                normalized.append(dict(msg))
+            else:
+                # CrewAI message object
+                role = getattr(msg, "role", "user")
+                content = getattr(msg, "content", str(msg))
+                normalized.append({"role": role, "content": content})
+        return normalized
+
     def _build_request_context(
         self,
         *,
@@ -956,8 +1065,11 @@ class CorpusCrewAILLM:
             kwargs=kwargs,
         )
 
+        # Normalize messages to dicts for translator
+        normalized_messages = self._to_translator_messages(messages)
+
         result = await self._translator.arun_complete(
-            raw_messages=messages,
+            raw_messages=normalized_messages,
             model=params.get("model"),
             max_tokens=params.get("max_tokens"),
             temperature=params.get("temperature"),
@@ -1010,9 +1122,12 @@ class CorpusCrewAILLM:
             kwargs=kwargs,
         )
 
+        # Normalize messages to dicts for translator
+        normalized_messages = self._to_translator_messages(messages)
+
         # LLMTranslator.arun_stream returns an AsyncIterator directly; do not await.
         agen = self._translator.arun_stream(
-            raw_messages=messages,
+            raw_messages=normalized_messages,
             model=params.get("model"),
             max_tokens=params.get("max_tokens"),
             temperature=params.get("temperature"),
@@ -1091,8 +1206,11 @@ class CorpusCrewAILLM:
             kwargs=kwargs,
         )
 
+        # Normalize messages to dicts for translator
+        normalized_messages = self._to_translator_messages(messages)
+
         result = self._translator.complete(
-            raw_messages=messages,
+            raw_messages=normalized_messages,
             model=params.get("model"),
             max_tokens=params.get("max_tokens"),
             temperature=params.get("temperature"),
@@ -1149,8 +1267,11 @@ class CorpusCrewAILLM:
             kwargs=kwargs,
         )
 
+        # Normalize messages to dicts for translator
+        normalized_messages = self._to_translator_messages(messages)
+
         iterator = self._translator.stream(
-            raw_messages=messages,
+            raw_messages=normalized_messages,
             model=params.get("model"),
             max_tokens=params.get("max_tokens"),
             temperature=params.get("temperature"),
@@ -1165,28 +1286,10 @@ class CorpusCrewAILLM:
             framework_ctx=framework_ctx,
         )
 
-        try:
-            for chunk in iterator:
-                yield chunk
-        except Exception as exc:  # noqa: BLE001
-            attach_context(
-                exc,
-                framework=_FRAMEWORK_NAME,
-                operation="llm_stream",
-                resource_type="llm",
-                stream=True,
-                model=str(params.get("model") or self.model),
-                request_id=getattr(ctx, "request_id", None),
-                tenant=getattr(ctx, "tenant", None),
-                error_codes=ERROR_CODES,
-            )
-            raise
-        finally:
-            # Do not forcibly close the iterator.
-            # SyncStreamBridge-based iterators may defer raising worker exceptions
-            # until the iterator naturally unwinds; calling close() can suppress
-            # those errors.
-            pass
+        # NOTE: Error context for iteration-time failures is handled by the
+        # decorator wrapper for streaming operations.
+        for chunk in iterator:
+            yield chunk
 
     # ---------------------------------------------------------------------
     # Token counting
@@ -1207,50 +1310,48 @@ class CorpusCrewAILLM:
         Fallbacks:
         - If translator/adapter count fails, use char-based estimate.
         """
-        # Extract messages from task if provided
-        messages = []
-        if task is not None:
-            # CrewAI tasks contain prompt/context that we need to convert to messages
-            try:
-                messages = self._translator.from_crewai(task)
-            except Exception:
-                # If conversion fails, fall back to character-based estimate
-                pass
-
-        if not messages and not task:
+        if task is None:
             return 0
 
-        ctx, params, model_for_context, framework_ctx = self._build_request_context(
-            kwargs,
+        # Best-effort conversion of a Task into a portable message list.
+        # We intentionally avoid relying on translator-specific helpers here.
+        content = (
+            getattr(task, "description", None)
+            or getattr(task, "prompt", None)
+            or str(task)
+        )
+        messages: list[dict[str, Any]] = [{"role": "user", "content": str(content)}]
+
+        ctx, params, framework_ctx, _resolved_kwargs = self._build_request_context(
             operation="count_tokens",
             stream=False,
+            kwargs=kwargs,
         )
+        model_for_context = params.get("model") or self.model
 
         # Preferred: translator-based token counting
         try:
             tokens_any = self._translator.count_tokens_for_messages(
-                raw_messages=messages or task,
+                raw_messages=messages,
                 model=model_for_context,
                 op_ctx=ctx,
                 framework_ctx=framework_ctx,
             )
             if isinstance(tokens_any, int):
                 return tokens_any
+            if isinstance(tokens_any, Mapping):
+                for key in ("tokens", "total_tokens", "count"):
+                    value = tokens_any.get(key)
+                    if isinstance(value, int):
+                        return value
         except Exception:
             pass
 
         # Fallback: improved character-based estimate
         try:
             char_count = 0
-            if messages:
-                for msg in messages:
-                    if hasattr(msg, "content"):
-                        char_count += len(str(msg.content))
-                    else:
-                        char_count += len(str(msg))
-            elif task:
-                # Estimate based on task content
-                char_count = len(str(task))
+            for msg in messages:
+                char_count += len(str(msg.get("content", "")))
             
             # Rough estimate: ~4 characters per token on average
             return max(1, char_count // 4)
