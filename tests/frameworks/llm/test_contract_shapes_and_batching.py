@@ -347,10 +347,22 @@ def _build_primary_call_args(
 
     # Messages-like: first parameter name suggests a list of messages/history.
     if params and params[0].name in {"messages", "chat_history", "history"}:
-        return [_build_message_like_input(descriptor, text)], kwargs
+        args: list[Any] = [_build_message_like_input(descriptor, text)]
+    else:
+        # Default: raw text prompt.
+        args = [text]
 
-    # Default: raw text prompt.
-    return [text], kwargs
+    # If we provided positional args, ensure we don't also pass the same param
+    # name via kwargs (common for context_kwarg overlaps like CrewAI `task`).
+    for i in range(min(len(args), len(params))):
+        p = params[i]
+        if p.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            kwargs.pop(p.name, None)
+
+    return args, kwargs
 
 
 def _sync_first_chunk(stream_obj: Any) -> Any:
