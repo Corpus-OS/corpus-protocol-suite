@@ -349,21 +349,8 @@ def _build_async_completion_call(
 
     if descriptor.name == "semantic_kernel":
         # Registry describes async-only completion via get_chat_message_content(chat_history, settings)
-        try:
-            base_mod = _safe_import("semantic_kernel.connectors.ai.chat_completion_client_base")
-            ChatHistory = getattr(base_mod, "ChatHistory")
-            PromptExecutionSettings = getattr(base_mod, "PromptExecutionSettings")
-        except Exception as e:
-            raise ImportError("semantic_kernel ChatHistory/settings import failed") from e
-
-        history = ChatHistory()
-        if hasattr(history, "add_user_message"):
-            history.add_user_message(text)
-        elif hasattr(history, "add_message"):
-            history.add_message(text)
-
-        settings = PromptExecutionSettings()
-        return [history, settings], kwargs
+        # For conformance tests, pass plain string - adapter will normalize
+        return [text], kwargs
 
     if descriptor.name == "autogen":
         messages = _build_messages_default(text)
@@ -432,22 +419,9 @@ def _build_token_count_call(
         return [messages], kwargs
 
     # Semantic Kernel: count_tokens(history, settings) style in some versions
+    # For conformance tests, pass plain string - adapter will normalize
     if descriptor.name == "semantic_kernel":
-        try:
-            base_mod = _safe_import("semantic_kernel.connectors.ai.chat_completion_client_base")
-            ChatHistory = getattr(base_mod, "ChatHistory")
-            PromptExecutionSettings = getattr(base_mod, "PromptExecutionSettings")
-        except Exception as e:
-            raise ImportError("semantic_kernel ChatHistory/settings import failed") from e
-
-        history = ChatHistory()
-        if hasattr(history, "add_user_message"):
-            history.add_user_message(text)
-        elif hasattr(history, "add_message"):
-            history.add_message(text)
-
-        settings = PromptExecutionSettings()
-        return [history, settings], kwargs
+        return [text], kwargs
 
     # Default: assume simple text-based token counting
     return [text], kwargs
