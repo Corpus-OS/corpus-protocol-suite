@@ -1377,6 +1377,16 @@ class CorpusLangChainLLM(BaseChatModel):
             f"Unexpected token count result type: {type(result).__name__}"
         )
 
+    async def aget_num_tokens_from_messages(
+        self,
+        messages: List[BaseMessage],
+        *,
+        config: Optional[Mapping[str, Any]] = None,
+        **_: Any,
+    ) -> int:
+        """Async token counting wrapper for conformance parity."""
+        return self.get_num_tokens_from_messages(messages, config=config)
+
     def _combine_messages_for_counting(self, messages: List[BaseMessage]) -> str:
         """Combine messages into a single string for heuristic token counting."""
         parts: List[str] = []

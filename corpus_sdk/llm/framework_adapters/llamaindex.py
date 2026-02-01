@@ -1306,6 +1306,14 @@ class CorpusLlamaIndexLLM(LLM):
             f"{type(tokens_any).__name__}"
         )
 
+    async def acount_tokens(
+        self,
+        messages: Sequence[ChatMessage],
+        **kwargs: Any,
+    ) -> int:
+        """Async token counting wrapper for conformance parity."""
+        return self.count_tokens(messages, **kwargs)
+
     def _combine_messages_for_counting(
         self,
         messages: Sequence[ChatMessage],
