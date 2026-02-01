@@ -65,6 +65,7 @@ from typing import (
 )
 
 from corpus_sdk.core.async_bridge import AsyncBridge
+from corpus_sdk.core.sync_bridge import SyncStreamBridge
 
 from corpus_sdk.core.context_translation import (
     from_dict as context_from_dict,
@@ -1081,6 +1082,32 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
                             exc_info=True,
                         )
 
+    def get_streaming_chat_message_content_sync(
+        self,
+        chat_history: "ChatHistory",
+        settings: Any = None,
+        **kwargs: Any,
+    ) -> "Any":
+        """Synchronous streaming wrapper around `get_streaming_chat_message_content`.
+
+        Uses `SyncStreamBridge` to avoid nested event loops and to provide a
+        deterministic sync iterator surface for the conformance registry.
+        """
+        bridge = SyncStreamBridge(
+            coro_factory=lambda: self.get_streaming_chat_message_content(
+                chat_history,
+                settings=settings,
+                **kwargs,
+            ),
+            framework=_FRAMEWORK_NAME,
+            error_context={
+                "operation": "get_streaming_chat_message_content_sync",
+                "model": getattr(self, "model", "default"),
+                "stream": True,
+            },
+        )
+        return bridge.run()
+
     @with_async_llm_error_context("get_streaming_chat_message_contents")
     async def get_streaming_chat_message_contents(
         self,
@@ -1185,6 +1212,15 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
             f"{ERROR_CODES.BAD_USAGE_RESULT}: count_tokens returned unsupported type "
             f"{type(tokens_any).__name__}"
         )
+
+    async def acount_tokens(
+        self,
+        chat_history: "ChatHistory",
+        settings: Any = None,
+        **kwargs: Any,
+    ) -> int:
+        """Async token counting wrapper for conformance parity."""
+        return self.count_tokens(chat_history, settings=settings, **kwargs)
 
     # ------------------------------------------------------------------ #
     # Health / capabilities via translator only (no adapter fallback)

@@ -654,6 +654,7 @@ class CorpusAutoGenChatClient:
     def count_tokens(
         self,
         messages: Sequence[Dict[str, Any]],
+        conversation: Optional[Any] = None,
         **kwargs: Any,
     ) -> int:
         """
@@ -669,12 +670,14 @@ class CorpusAutoGenChatClient:
         if not messages:
             return 0
 
-        ctx, params, model_for_context, framework_ctx = self._build_request_context(
-            conversation=None,
-            llm_config=kwargs,
-            operation="count_tokens",
+        ctx, params, framework_ctx = self._build_ctx_and_params(
+            conversation=conversation,
+            extra_context=None,
             stream=False,
+            operation="count_tokens",
+            **kwargs,
         )
+        model_for_context = params.get("model") or self.model
 
         # Preferred: translator-based token counting
         try:
@@ -703,6 +706,15 @@ class CorpusAutoGenChatClient:
             return max(1, char_count // 4)
         except Exception:
             return 0
+
+    async def acount_tokens(
+        self,
+        messages: Sequence[Dict[str, Any]],
+        conversation: Optional[Any] = None,
+        **kwargs: Any,
+    ) -> int:
+        """Async token counting wrapper for conformance parity."""
+        return self.count_tokens(messages, conversation=conversation, **kwargs)
 
     # ------------------------------------------------------------------ #
     # Health and capabilities

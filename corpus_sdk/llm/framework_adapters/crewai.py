@@ -1359,6 +1359,14 @@ class CorpusCrewAILLM:
             # Ultimate fallback
             return 0
 
+    async def acount_tokens(
+        self,
+        task: Optional["Task"] = None,
+        **kwargs: Any,
+    ) -> int:
+        """Async token counting wrapper for conformance parity."""
+        return self.count_tokens(task=task, **kwargs)
+
     # ---------------------------------------------------------------------
     # Health and capabilities passthroughs (translator-only)
     # ---------------------------------------------------------------------

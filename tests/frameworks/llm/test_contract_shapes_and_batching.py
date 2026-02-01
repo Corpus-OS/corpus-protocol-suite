@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import asyncio
 import inspect
 from typing import Any, Callable, Optional
 
@@ -258,24 +259,29 @@ def _build_semantic_kernel_inputs(text: str) -> tuple[Any, Any]:
     Build Semantic Kernel (chat_history, settings) inputs.
 
     Note:
-    - SK APIs drift across versions. If imports fail, the fixture should already
-      have marked the framework unavailable.
+    - Semantic Kernel APIs drift across versions (ChatHistory moved/renamed).
+      This contract suite uses a portable call shape and relies on the
+      Corpus SK adapter to normalize message inputs.
     """
-    from semantic_kernel.connectors.ai.chat_completion_client_base import (  # type: ignore
-        ChatHistory,
-        PromptExecutionSettings,
-    )
+    # Portable: pass a plain string as chat_history and omit settings.
+    # The adapter normalizes this into the translator-friendly format.
+    return text, None
 
-    history = ChatHistory()
-    # Most SK versions expose add_user_message; fall back to other known names.
-    if hasattr(history, "add_user_message"):
-        history.add_user_message(text)
-    elif hasattr(history, "add_message"):
-        history.add_message(text)
-    elif hasattr(history, "append"):
-        history.append(text)  # pragma: no cover - rare fallback
-    settings = PromptExecutionSettings()
-    return history, settings
+
+def _sync_first_chunk_for_descriptor(
+    descriptor: LLMFrameworkDescriptor,
+    instance: Any,
+    text: str,
+) -> Any:
+    """Safely invoke sync streaming + read first chunk.
+
+    This is intended to run in a worker thread when called from async tests,
+    because many adapters intentionally guard against calling sync APIs from
+    inside an active asyncio event loop.
+    """
+    sync_stream = _invoke_sync_stream(descriptor, instance, text)
+    _assert_iterable(sync_stream)
+    return _sync_first_chunk(sync_stream)
 
 
 def _build_primary_call_args(
@@ -326,15 +332,37 @@ def _build_primary_call_args(
         ("history" in param_names and "settings" in param_names)
         or ("chat_history" in param_names and "settings" in param_names)
     ):
-        history, settings = _build_semantic_kernel_inputs(text)
+        history, default_settings = _build_semantic_kernel_inputs(text)
+
+        # Some registries model Semantic Kernel's settings as a "context" kwarg.
+        # If so, avoid passing it twice (positional + kwarg).
+        settings_from_context = kwargs.pop("settings", None)
+        settings = (
+            settings_from_context
+            if settings_from_context is not None
+            else default_settings
+        )
+
         return [history, settings], kwargs
 
     # Messages-like: first parameter name suggests a list of messages/history.
     if params and params[0].name in {"messages", "chat_history", "history"}:
-        return [_build_message_like_input(descriptor, text)], kwargs
+        args: list[Any] = [_build_message_like_input(descriptor, text)]
+    else:
+        # Default: raw text prompt.
+        args = [text]
 
-    # Default: raw text prompt.
-    return [text], kwargs
+    # If we provided positional args, ensure we don't also pass the same param
+    # name via kwargs (common for context_kwarg overlaps like CrewAI `task`).
+    for i in range(min(len(args), len(params))):
+        p = params[i]
+        if p.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            kwargs.pop(p.name, None)
+
+    return args, kwargs
 
 
 def _sync_first_chunk(stream_obj: Any) -> Any:
@@ -834,9 +862,13 @@ async def test_stream_first_chunk_type_matches_between_sync_and_async_when_both_
         pytest.skip(f"{framework_descriptor.name}: streaming not declared")
 
     # Sync stream
-    sync_stream = _invoke_sync_stream(framework_descriptor, llm_client_instance, SYNC_STREAM_TEXT + "-parity")
-    _assert_iterable(sync_stream)
-    first_sync = _sync_first_chunk(sync_stream)
+    # Run in a worker thread to avoid calling sync adapters from an event loop.
+    first_sync = await asyncio.to_thread(
+        _sync_first_chunk_for_descriptor,
+        framework_descriptor,
+        llm_client_instance,
+        SYNC_STREAM_TEXT + "-parity",
+    )
 
     # Async stream
     async_stream = await _invoke_async_stream(framework_descriptor, llm_client_instance, ASYNC_STREAM_TEXT + "-parity")
