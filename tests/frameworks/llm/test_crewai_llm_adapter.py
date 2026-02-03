@@ -51,9 +51,15 @@ def _make_client(
     validate_inputs: bool = True,
     translator: Any = None,
     config: Optional[CrewAILLMConfig] = None,
+    require_crewai: bool = False,
 ) -> CorpusCrewAILLM:
     if config is not None:
-        return CorpusCrewAILLM(llm_adapter=adapter, config=config, translator=translator)
+        return CorpusCrewAILLM(
+            llm_adapter=adapter,
+            config=config,
+            translator=translator,
+            require_crewai=require_crewai,
+        )
     
     return CorpusCrewAILLM(
         llm_adapter=adapter,
@@ -62,6 +68,7 @@ def _make_client(
         max_tokens=max_tokens,
         framework_version=framework_version,
         translator=translator,
+        require_crewai=require_crewai,
     )
 
 
@@ -201,16 +208,20 @@ def test_create_llm_translator_called_with_framework_crewai(monkeypatch: pytest.
 
 
 def test_translator_override_is_used_and_factory_not_called(monkeypatch: pytest.MonkeyPatch, adapter: Any) -> None:
-    """When translator is provided, factory should not be called."""
-    monkeypatch.setattr(
-        crewai_adapter_module,
-        "create_llm_translator",
-        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("should not be called")),
-    )
+    """When translator is provided, it should be passed into the factory wiring."""
+    captured: Dict[str, Any] = {}
+    provided = object()
 
-    client = _make_client(adapter, translator=_make_dummy_translator())
+    def fake_create_llm_translator(*_: Any, **kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return _make_dummy_translator()
+
+    monkeypatch.setattr(crewai_adapter_module, "create_llm_translator", fake_create_llm_translator)
+
+    client = _make_client(adapter, translator=provided)
     out = client.complete(PROMPT)
     assert out is not None
+    assert captured.get("translator") is provided
 
 
 def test_client_stores_config_attributes() -> None:
@@ -399,10 +410,10 @@ def test_complete_passes_framework_ctx_with_metadata(monkeypatch: pytest.MonkeyP
 
 def test_complete_context_translation_error_attaches_context(monkeypatch: pytest.MonkeyPatch, adapter: Any) -> None:
     """Errors during context translation should attach error context."""
-    captured_ctx: Dict[str, Any] = {}
+    captured_calls: list[Dict[str, Any]] = []
 
-    def fake_attach_context(exc: BaseException, **ctx: Any) -> None:
-        captured_ctx.update(ctx)
+    def fake_attach_context(exc: BaseException, **ctx: Any) -> None:  # noqa: ARG001
+        captured_calls.append(dict(ctx))
 
     def fake_core_ctx_from_crewai(*args: Any, **kwargs: Any) -> Any:
         raise RuntimeError("ctx translation failed")
@@ -415,8 +426,13 @@ def test_complete_context_translation_error_attaches_context(monkeypatch: pytest
     with pytest.raises(RuntimeError, match="ctx translation failed"):
         client.complete(PROMPT, agent_role="test")
 
-    assert captured_ctx.get("framework") == "crewai"
-    assert captured_ctx.get("operation") == "llm_context_translation"
+    # Context translation failure is enriched twice:
+    # 1) inside _build_operation_context_from_kwargs(): llm_context_translation
+    # 2) via the complete() error-context decorator: llm_complete
+    ops = [c.get("operation") for c in captured_calls]
+    assert "llm_context_translation" in ops
+    assert "llm_complete" in ops
+    assert any(c.get("framework") == "crewai" for c in captured_calls)
 
 
 def test_complete_with_none_task_works(monkeypatch: pytest.MonkeyPatch, adapter: Any) -> None:
@@ -1509,7 +1525,8 @@ async def test_stream_raises_when_called_in_event_loop() -> None:
     client = CorpusCrewAILLM(llm_adapter=MinimalAdapter())
     
     with pytest.raises(RuntimeError, match="event loop"):
-        _ = client.stream(PROMPT)
+        it = client.stream(PROMPT)
+        next(it)
 
 
 # ---------------------------------------------------------------------------
