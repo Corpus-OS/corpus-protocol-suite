@@ -1297,7 +1297,9 @@ class CorpusCrewAILLM:
 
     def count_tokens(
         self,
-        task: Optional["Task"] = None,
+        messages: Any = None,
+        *,
+        task: Optional[Any] = None,
         **kwargs: Any,
     ) -> int:
         """
@@ -1307,65 +1309,89 @@ class CorpusCrewAILLM:
         - Use LLMTranslator.count_tokens_for_messages so token counting
           can use the same formatting and strategies as actual completions.
 
-        Fallbacks:
-        - If translator/adapter count fails, use char-based estimate.
+        No fallback:
+        - If translator/adapter token counting fails, raise so callers/tests can
+          observe the failure and error context.
         """
-        if task is None:
+        # The registry uses a single context kwarg for the framework. For CrewAI
+        # that kwarg is historically named `task`. The conformance suite passes
+        # rich Mapping context under that kwarg, so treat Mapping values as
+        # context (not an actual Task instance).
+        context_mapping: Optional[Mapping[str, Any]] = None
+        if isinstance(task, Mapping):
+            context_mapping = task
+            task = None
+
+        # Accept token counting over message-like inputs (conformance uses this).
+        normalized_messages = self._to_translator_messages(messages)
+
+        # If a real Task object is provided, use it as the source of text.
+        if task is not None:
+            content = (
+                getattr(task, "description", None)
+                or getattr(task, "prompt", None)
+                or str(task)
+            )
+            normalized_messages = [{"role": "user", "content": str(content)}]
+
+        if not normalized_messages:
             return 0
 
-        # Best-effort conversion of a Task into a portable message list.
-        # We intentionally avoid relying on translator-specific helpers here.
-        content = (
-            getattr(task, "description", None)
-            or getattr(task, "prompt", None)
-            or str(task)
-        )
-        messages: list[dict[str, Any]] = [{"role": "user", "content": str(content)}]
+        merged_kwargs: dict[str, Any] = dict(kwargs)
+        if context_mapping:
+            # Best-effort: merge rich context keys for OperationContext and framework ctx.
+            merged_kwargs.update(dict(context_mapping))
 
         ctx, params, framework_ctx, _resolved_kwargs = self._build_request_context(
             operation="count_tokens",
             stream=False,
-            kwargs=kwargs,
+            kwargs=merged_kwargs,
         )
         model_for_context = params.get("model") or self.model
 
-        # Preferred: translator-based token counting
         try:
             tokens_any = self._translator.count_tokens_for_messages(
-                raw_messages=messages,
+                raw_messages=normalized_messages,
                 model=model_for_context,
                 op_ctx=ctx,
                 framework_ctx=framework_ctx,
             )
-            if isinstance(tokens_any, int):
-                return tokens_any
-            if isinstance(tokens_any, Mapping):
-                for key in ("tokens", "total_tokens", "count"):
-                    value = tokens_any.get(key)
-                    if isinstance(value, int):
-                        return value
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework=_FRAMEWORK_NAME,
+                operation="llm_count_tokens",
+                resource_type="llm",
+                stream=False,
+                model=str(model_for_context),
+                request_id=getattr(ctx, "request_id", None),
+                tenant=getattr(ctx, "tenant", None),
+                error_codes=ERROR_CODES,
+            )
+            raise
 
-        # Fallback: improved character-based estimate
-        try:
-            char_count = 0
-            for msg in messages:
-                char_count += len(str(msg.get("content", "")))
-            
-            # Rough estimate: ~4 characters per token on average
-            return max(1, char_count // 4)
-        except Exception:
-            # Ultimate fallback
-            return 0
+        if isinstance(tokens_any, int):
+            return tokens_any
+        if isinstance(tokens_any, Mapping):
+            for key in ("tokens", "total_tokens", "count"):
+                value = tokens_any.get(key)
+                if isinstance(value, int):
+                    return value
+
+        raise TypeError(
+            f"{ERROR_CODES.BAD_USAGE_RESULT}: count_tokens returned unsupported type "
+            f"{type(tokens_any).__name__}"
+        )
 
     async def acount_tokens(
         self,
-        task: Optional["Task"] = None,
+        messages: Any = None,
+        *,
+        task: Optional[Any] = None,
         **kwargs: Any,
     ) -> int:
         """Async token counting wrapper for conformance parity."""
-        return self.count_tokens(task=task, **kwargs)
+        return self.count_tokens(messages, task=task, **kwargs)
 
     # ---------------------------------------------------------------------
     # Health and capabilities passthroughs (translator-only)
