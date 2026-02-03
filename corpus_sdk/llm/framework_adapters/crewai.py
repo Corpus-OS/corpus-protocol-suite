@@ -608,7 +608,7 @@ def _build_operation_context_from_kwargs(
         return None
 
     try:
-        ctx = core_ctx_from_crewai(
+        core_ctx = core_ctx_from_crewai(
             task=task,
             framework_version=framework_version,
             **context_kwargs,
@@ -624,8 +624,17 @@ def _build_operation_context_from_kwargs(
         )
         raise
 
-    # Trust context_translation to return correct type
-    # (isinstance check removed - was comparing different OperationContext classes)
+    # `core_ctx_from_crewai` returns the core `corpus_sdk.core.operational_context.OperationContext`,
+    # while this adapter uses `corpus_sdk.llm.llm_base.OperationContext`.
+    # Coerce defensively so downstream components consistently see the LLM context type.
+    ctx = OperationContext(
+        request_id=getattr(core_ctx, "request_id", None),
+        idempotency_key=getattr(core_ctx, "idempotency_key", None),
+        deadline_ms=getattr(core_ctx, "deadline_ms", None),
+        traceparent=getattr(core_ctx, "traceparent", None),
+        tenant=getattr(core_ctx, "tenant", None),
+        attrs=getattr(core_ctx, "attrs", None) or {},
+    )
 
     # Optional overrides for request_id / tenant.
     # Even if context_translation chooses different defaults, explicit call-site
