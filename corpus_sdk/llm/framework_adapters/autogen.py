@@ -664,8 +664,9 @@ class CorpusAutoGenChatClient:
         - Use LLMTranslator.count_tokens_for_messages so token counting
           can use the same formatting and strategies as actual completions.
 
-        Fallbacks:
-        - If translator/adapter count fails, use char-based estimate.
+                No fallback:
+                - If translator/adapter token counting fails, raise so callers/tests can
+                    observe the failure and error context.
         """
         if not messages:
             return 0
@@ -679,7 +680,6 @@ class CorpusAutoGenChatClient:
         )
         model_for_context = params.get("model") or self.model
 
-        # Preferred: translator-based token counting
         try:
             tokens_any = self._translator.count_tokens_for_messages(
                 raw_messages=messages,
@@ -687,25 +687,26 @@ class CorpusAutoGenChatClient:
                 op_ctx=ctx,
                 framework_ctx=framework_ctx,
             )
-            if isinstance(tokens_any, int):
-                return tokens_any
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework=_FRAMEWORK_NAME,
+                operation="llm_count_tokens",
+                resource_type="llm",
+                stream=False,
+                model=str(model_for_context),
+                request_id=getattr(ctx, "request_id", None),
+                tenant=getattr(ctx, "tenant", None),
+                error_codes=ERROR_CODES,
+            )
+            raise
 
-        # Fallback: character-based estimate
-        try:
-            char_count = 0
-            for msg in messages:
-                if isinstance(msg, dict):
-                    content = msg.get("content", "")
-                    char_count += len(str(content))
-                else:
-                    char_count += len(str(msg))
-            
-            # Rough estimate: ~4 characters per token on average
-            return max(1, char_count // 4)
-        except Exception:
-            return 0
+        if isinstance(tokens_any, int):
+            return tokens_any
+        raise TypeError(
+            f"{ErrorCodes.BAD_USAGE_RESULT}: count_tokens returned unsupported type: "
+            f"{type(tokens_any).__name__}"
+        )
 
     async def acount_tokens(
         self,
