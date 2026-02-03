@@ -50,6 +50,7 @@ Optional dependency handling
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import time
@@ -61,6 +62,7 @@ from typing import (
     Callable,
     Dict,
     Iterator,
+    List,
     Mapping,
     Optional,
     Protocol,
@@ -545,14 +547,50 @@ class CorpusAutoGenChatClient:
         translator_close = getattr(self._translator, "close", None)
         if callable(translator_close):
             try:
-                translator_close()
+                res = translator_close()
+                if inspect.isawaitable(res):
+                    try:
+                        loop = asyncio.get_running_loop()
+                    except RuntimeError:
+                        asyncio.run(res)
+                    else:
+                        task = loop.create_task(res)
+
+                        def _done(t: asyncio.Task[Any]) -> None:  # noqa: ANN401
+                            try:
+                                _ = t.exception()
+                            except Exception as e:  # noqa: BLE001
+                                logger.warning(
+                                    "Async translator close failed in __exit__: %s",
+                                    e,
+                                )
+
+                        task.add_done_callback(_done)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Error while closing LLM translator in __exit__: %s", exc)
 
         adapter_close = getattr(self._adapter, "close", None)
         if callable(adapter_close):
             try:
-                adapter_close()
+                res = adapter_close()
+                if inspect.isawaitable(res):
+                    try:
+                        loop = asyncio.get_running_loop()
+                    except RuntimeError:
+                        asyncio.run(res)
+                    else:
+                        task = loop.create_task(res)
+
+                        def _done(t: asyncio.Task[Any]) -> None:  # noqa: ANN401
+                            try:
+                                _ = t.exception()
+                            except Exception as e:  # noqa: BLE001
+                                logger.warning(
+                                    "Async adapter close failed in __exit__: %s",
+                                    e,
+                                )
+
+                        task.add_done_callback(_done)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Error while closing LLM adapter in __exit__: %s", exc)
 
@@ -1959,15 +1997,34 @@ def create_autogen_chat_completion_client(
                     self._actual_completion += ct
                     self._total_completion += ct
 
-            # Extract text for CreateResult in a stable way.
+            # Extract text + finish reason for CreateResult in a stable way.
             text = ""
+            finish_reason: str = "stop"
             choices = resp.get("choices") or []
             if isinstance(choices, list) and choices:
                 c0 = choices[0] if isinstance(choices[0], Mapping) else {}
                 msg = c0.get("message") if isinstance(c0, Mapping) else None
                 if isinstance(msg, Mapping):
                     text = str(msg.get("content") or "")
-            return CreateResult(content=text)
+                fr = c0.get("finish_reason") if isinstance(c0, Mapping) else None
+                if isinstance(fr, str) and fr:
+                    finish_reason = fr
+
+            # AutoGen-Core CreateResult (0.7+) requires finish_reason, usage, cached.
+            # Map any unknown finish_reason to "unknown" to satisfy Literal typing.
+            if finish_reason not in {"stop", "length", "function_calls", "content_filter", "unknown"}:
+                finish_reason = "unknown"
+
+            usage_obj = RequestUsage(
+                prompt_tokens=int(self._actual_prompt) if isinstance(self._actual_prompt, int) else 0,
+                completion_tokens=int(self._actual_completion) if isinstance(self._actual_completion, int) else 0,
+            )
+            return CreateResult(
+                finish_reason=finish_reason,  # type: ignore[arg-type]
+                content=text,
+                usage=usage_obj,
+                cached=False,
+            )
 
         async def stream(
             self,
@@ -2011,6 +2068,7 @@ def create_autogen_chat_completion_client(
             # Track aggregated text for the terminal CreateResult.
             # This is bounded only by the streamed content; we do not store tool call payloads.
             parts: list[str] = []
+            finish_reason: str = "stop"
 
             async for ch in iterator:  # type: ignore[assignment]
                 if not isinstance(ch, Mapping):
@@ -2043,13 +2101,38 @@ def create_autogen_chat_completion_client(
 
                 finish_reason = c0.get("finish_reason") if isinstance(c0, Mapping) else None
                 if finish_reason:
+                    if isinstance(finish_reason, str) and finish_reason:
+                        fr = finish_reason
+                        if fr not in {"stop", "length", "function_calls", "content_filter", "unknown"}:
+                            fr = "unknown"
+                        finish_reason = fr
                     # Terminal marker: provide final assembled content.
-                    yield CreateResult(content="".join(parts))
+                    usage_obj = RequestUsage(
+                        prompt_tokens=int(self._actual_prompt) if isinstance(self._actual_prompt, int) else 0,
+                        completion_tokens=int(self._actual_completion) if isinstance(self._actual_completion, int) else 0,
+                    )
+                    yield CreateResult(
+                        finish_reason=finish_reason,  # type: ignore[arg-type]
+                        content="".join(parts),
+                        usage=usage_obj,
+                        cached=False,
+                    )
                     return
 
             # If the iterator ends without an explicit finish_reason, still yield a terminal marker
             # so downstream AutoGen code has a deterministic completion boundary.
-            yield CreateResult(content="".join(parts))
+            if finish_reason not in {"stop", "length", "function_calls", "content_filter", "unknown"}:
+                finish_reason = "unknown"
+            usage_obj = RequestUsage(
+                prompt_tokens=int(self._actual_prompt) if isinstance(self._actual_prompt, int) else 0,
+                completion_tokens=int(self._actual_completion) if isinstance(self._actual_completion, int) else 0,
+            )
+            yield CreateResult(
+                finish_reason=finish_reason,  # type: ignore[arg-type]
+                content="".join(parts),
+                usage=usage_obj,
+                cached=False,
+            )
 
     return _CorpusChatCompletionClient(
         inner_client=inner,
