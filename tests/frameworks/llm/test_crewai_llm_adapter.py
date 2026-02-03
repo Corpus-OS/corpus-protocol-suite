@@ -1573,6 +1573,35 @@ def test_e2e_crewai_handles_agent_context(adapter: Any) -> None:
     assert result is not None
 
 
+def test_e2e_crewai_accepts_real_task_object(adapter: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """If CrewAI is installed, accept a real CrewAI Task object (no network)."""
+    _require_crewai_available_for_e2e()
+
+    # Some CrewAI versions validate key presence even if no network calls happen.
+    monkeypatch.setenv("OPENAI_API_KEY", "fake-key-for-testing")
+
+    import crewai  # type: ignore
+    from crewai import Task  # type: ignore
+
+    agent = crewai.Agent(
+        role="researcher",
+        goal="Test context translation",
+        backstory="A test agent",
+        allow_delegation=False,
+        verbose=False,
+    )
+
+    task = Task(
+        description="Test task for CrewAI LLM adapter",
+        agent=agent,
+        expected_output="A short answer",
+    )
+
+    client = _make_client(adapter, require_crewai=True)
+    result = client.complete("Hello", task=task)
+    assert result is not None
+
+
 @pytest.mark.asyncio
 async def test_e2e_crewai_async_methods_work(adapter: Any) -> None:
     """CrewAI adapter async methods should work end-to-end."""
@@ -1589,6 +1618,34 @@ async def test_e2e_crewai_async_methods_work(adapter: Any) -> None:
     async for chunk in await client.astream("Stream test"):
         chunks.append(chunk)
     assert len(chunks) > 0
+
+
+@pytest.mark.asyncio
+async def test_e2e_crewai_async_accepts_real_task_object(adapter: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """If CrewAI is installed, async methods accept a real CrewAI Task object."""
+    _require_crewai_available_for_e2e()
+    monkeypatch.setenv("OPENAI_API_KEY", "fake-key-for-testing")
+
+    import crewai  # type: ignore
+    from crewai import Task  # type: ignore
+
+    agent = crewai.Agent(
+        role="researcher",
+        goal="Test context translation",
+        backstory="A test agent",
+        allow_delegation=False,
+        verbose=False,
+    )
+
+    task = Task(
+        description="Async test task for CrewAI LLM adapter",
+        agent=agent,
+        expected_output="A short answer",
+    )
+
+    client = _make_client(adapter, require_crewai=True)
+    out = await client.acomplete("Hello async", task=task)
+    assert out is not None
 
 
 if __name__ == "__main__":
