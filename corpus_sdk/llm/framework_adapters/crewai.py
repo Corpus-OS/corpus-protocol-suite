@@ -45,6 +45,7 @@ Design goals
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from dataclasses import dataclass
 from functools import wraps
@@ -626,6 +627,21 @@ def _build_operation_context_from_kwargs(
     # Trust context_translation to return correct type
     # (isinstance check removed - was comparing different OperationContext classes)
 
+    # Optional overrides for request_id / tenant.
+    # Even if context_translation chooses different defaults, explicit call-site
+    # overrides should win (aligned with other framework adapters).
+    request_id = context_kwargs.get("request_id")
+    tenant = context_kwargs.get("tenant")
+    if request_id is not None or tenant is not None:
+        ctx = OperationContext(
+            request_id=request_id or ctx.request_id,
+            idempotency_key=ctx.idempotency_key,
+            deadline_ms=ctx.deadline_ms,
+            traceparent=ctx.traceparent,
+            tenant=tenant or ctx.tenant,
+            attrs=ctx.attrs,
+        )
+
     logger.debug(
         "Built OperationContext from CrewAI context with agent_role: %s, crew_id: %s",
         context_kwargs.get("agent_role", "unknown"),
@@ -841,7 +857,25 @@ class CorpusCrewAILLM:
         close = getattr(self._llm_adapter, "close", None)
         if callable(close):
             try:
-                close()
+                res = close()
+                if inspect.isawaitable(res):
+                    try:
+                        loop = asyncio.get_running_loop()
+                    except RuntimeError:
+                        asyncio.run(res)
+                    else:
+                        task = loop.create_task(res)
+
+                        def _done(t: asyncio.Task[Any]) -> None:  # noqa: ANN401
+                            try:
+                                _ = t.exception()
+                            except Exception as e:  # noqa: BLE001
+                                logger.warning(
+                                    "Async adapter close failed in __exit__: %s",
+                                    e,
+                                )
+
+                        task.add_done_callback(_done)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Error while closing LLM adapter in __exit__: %s", exc)
 
