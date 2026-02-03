@@ -9,12 +9,14 @@ from typing import Any, Callable, Optional, Type
 
 import pytest
 
+from corpus_sdk.llm.llm_base import LLMChunk, LLMCompletion, TokenUsage
+
 from tests.frameworks.registries.llm_registry import (
     LLMFrameworkDescriptor,
     iter_llm_framework_descriptors,
 )
 
-LLM_OPERATION_PREFIX = "llm_"
+LLM_OPERATION_PREFIX = "llm"
 FAILURE_MESSAGE_SYNC = "intentional llm backend failure (sync)"
 FAILURE_MESSAGE_ASYNC = "intentional llm backend failure (async)"
 
@@ -86,23 +88,22 @@ class InvalidResultLLMBackend:
     silently treating these as valid LLM results.
     """
 
-    # Core completion surfaces expected by the translator
-    def complete(self, *args: Any, **kwargs: Any) -> Any:
+    # Core async surfaces expected by the translator (LLMProtocolV1 is async-first)
+    async def complete(self, *args: Any, **kwargs: Any) -> Any:
         return 123456  # clearly not a ChatResult / text-like
-
-    async def acomplete(self, *args: Any, **kwargs: Any) -> Any:
-        return 123456
 
     def stream(self, *args: Any, **kwargs: Any) -> Any:
         # Return something non-iterable
         return 3.14159
 
-    async def astream(self, *args: Any, **kwargs: Any) -> Any:
-        # Awaitable resolving to something non-async-iterable
-        return 3.14159
-
-    def count_tokens(self, *args: Any, **kwargs: Any) -> Any:
+    async def count_tokens(self, *args: Any, **kwargs: Any) -> Any:
         return "not-an-int"
+
+    async def health(self, *args: Any, **kwargs: Any) -> Any:
+        return {"ok": True}
+
+    async def capabilities(self, *args: Any, **kwargs: Any) -> Any:
+        return {"supports_streaming": True, "supports_count_tokens": True}
 
 
 class EmptyResultLLMBackend:
@@ -116,25 +117,21 @@ class EmptyResultLLMBackend:
     focus assertions on the main completion path.
     """
 
-    def complete(self, *args: Any, **kwargs: Any) -> Any:
+    async def complete(self, *args: Any, **kwargs: Any) -> Any:
         return None
 
-    async def acomplete(self, *args: Any, **kwargs: Any) -> Any:
-        return None
+    async def stream(self, *args: Any, **kwargs: Any) -> AsyncIterable[Any]:
+        if False:  # pragma: no cover - structure only
+            yield None
 
-    def stream(self, *args: Any, **kwargs: Any) -> Any:
-        # Empty iterator
-        return iter(())
-
-    async def astream(self, *args: Any, **kwargs: Any) -> Any:
-        async def _aiter():
-            if False:  # pragma: no cover - structure only
-                yield None
-
-        return _aiter()
-
-    def count_tokens(self, *args: Any, **kwargs: Any) -> Any:
+    async def count_tokens(self, *args: Any, **kwargs: Any) -> Any:
         return 0
+
+    async def health(self, *args: Any, **kwargs: Any) -> Any:
+        return {"ok": True}
+
+    async def capabilities(self, *args: Any, **kwargs: Any) -> Any:
+        return {"supports_streaming": True, "supports_count_tokens": True}
 
 
 class RaisingLLMBackend:
@@ -145,19 +142,21 @@ class RaisingLLMBackend:
     failures originate in the LLM backend rather than higher-level code.
     """
 
-    def complete(self, *args: Any, **kwargs: Any) -> Any:
+    async def complete(self, *args: Any, **kwargs: Any) -> Any:
         raise RuntimeError(FAILURE_MESSAGE_SYNC)
 
-    async def acomplete(self, *args: Any, **kwargs: Any) -> Any:
-        raise RuntimeError(FAILURE_MESSAGE_ASYNC)
+    async def health(self, *args: Any, **kwargs: Any) -> Any:
+        return {"ok": True}
 
-    def stream(self, *args: Any, **kwargs: Any) -> Any:
+    async def capabilities(self, *args: Any, **kwargs: Any) -> Any:
+        return {"supports_streaming": True, "supports_count_tokens": True}
+
+    async def stream(self, *args: Any, **kwargs: Any) -> AsyncIterable[Any]:
         raise RuntimeError(FAILURE_MESSAGE_SYNC)
+        if False:  # pragma: no cover - structure only
+            yield None
 
-    async def astream(self, *args: Any, **kwargs: Any) -> Any:
-        raise RuntimeError(FAILURE_MESSAGE_ASYNC)
-
-    def count_tokens(self, *args: Any, **kwargs: Any) -> Any:
+    async def count_tokens(self, *args: Any, **kwargs: Any) -> Any:
         raise RuntimeError(FAILURE_MESSAGE_SYNC)
 
 
@@ -173,25 +172,81 @@ class IterationRaisingLLMBackend:
     decorators and attach context.
     """
 
-    def complete(self, *args: Any, **kwargs: Any) -> Any:
-        # Not used in iteration-time streaming tests; keep deterministic.
-        return "ok"
+    async def complete(self, *args: Any, **kwargs: Any) -> Any:
+        return LLMCompletion(
+            text="ok",
+            model="mock",
+            model_family="mock",
+            usage=TokenUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+            finish_reason="stop",
+        )
 
-    async def acomplete(self, *args: Any, **kwargs: Any) -> Any:
-        return "ok"
-
-    def stream(self, *args: Any, **kwargs: Any) -> Iterable[Any]:
-        # Yield one chunk/token to prove the stream started, then fail deterministically.
-        yield "chunk-1"
+    async def stream(self, *args: Any, **kwargs: Any) -> AsyncIterable[Any]:
+        # Yield one valid chunk to prove the stream started, then fail deterministically.
+        yield LLMChunk(text="chunk-1", is_final=False)
         raise RuntimeError(FAILURE_MESSAGE_SYNC)
 
-    async def astream(self, *args: Any, **kwargs: Any) -> AsyncIterable[Any]:
-        # Yield one chunk/token to prove the stream started, then fail deterministically.
-        yield "chunk-1"
-        raise RuntimeError(FAILURE_MESSAGE_ASYNC)
-
-    def count_tokens(self, *args: Any, **kwargs: Any) -> Any:
+    async def count_tokens(self, *args: Any, **kwargs: Any) -> Any:
         return 1
+
+    async def health(self, *args: Any, **kwargs: Any) -> Any:
+        return {"ok": True}
+
+    async def capabilities(self, *args: Any, **kwargs: Any) -> Any:
+        return {"supports_streaming": True, "supports_count_tokens": True}
+
+
+def _prompt_as_messages(prompt: str) -> list[dict[str, str]]:
+    return [{"role": "user", "content": prompt}]
+
+
+def _build_prompt_args_kwargs(
+    fn: Callable[..., Any],
+    prompt: str,
+    *,
+    token_count: bool = False,
+) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    """Best-effort adapt prompt inputs to framework-specific call signatures."""
+    try:
+        params = inspect.signature(fn).parameters
+    except Exception:
+        # If introspection fails, fall back to positional prompt.
+        return (prompt,), {}
+
+    if token_count:
+        if "messages" in params:
+            return (), {"messages": _prompt_as_messages(prompt)}
+        if "text" in params:
+            return (), {"text": prompt}
+        return (prompt,), {}
+
+    if "messages" in params:
+        return (), {"messages": _prompt_as_messages(prompt)}
+
+    for name in ("prompt", "input", "text"):
+        if name in params:
+            return (), {name: prompt}
+
+    return (prompt,), {}
+
+
+def _find_attached_context(
+    calls: list[tuple[BaseException, dict[str, Any]]],
+    *,
+    framework: str,
+) -> tuple[BaseException, dict[str, Any]]:
+    """Prefer adapter-level attach_context calls; tolerate extra core-layer calls."""
+    for exc, ctx in reversed(calls):
+        if ctx.get("framework") == framework and str(ctx.get("operation", "")).startswith(
+            LLM_OPERATION_PREFIX
+        ):
+            return exc, ctx
+    # Fallback: any call with matching framework.
+    for exc, ctx in reversed(calls):
+        if ctx.get("framework") == framework:
+            return exc, ctx
+    # Last resort: return the last call so assertions are still informative.
+    return calls[-1]
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +313,7 @@ def _call_with_context(
     fn: Callable[..., Any],
     *args: Any,
     context: Mapping[str, Any],
+    **extra_kwargs: Any,
 ) -> Any:
     """
     Call an LLM adapter method with context in a robust, framework-agnostic way.
@@ -273,10 +329,10 @@ def _call_with_context(
     """
     context_kwarg = getattr(descriptor, "context_kwarg", None)
     if not context_kwarg:
-        return fn(*args)
+        return fn(*args, **extra_kwargs)
 
     try:
-        return fn(*args, **{context_kwarg: dict(context)})
+        return fn(*args, **{context_kwarg: dict(context)}, **extra_kwargs)
     except TypeError as e:
         msg = str(e)
         unexpected_kw = f"unexpected keyword argument '{context_kwarg}'" in msg or (
@@ -284,7 +340,7 @@ def _call_with_context(
         )
         if unexpected_kw:
             # Spread as kwargs for BaseEmbedding-style / **kwargs LLM surfaces.
-            return fn(*args, **dict(context))
+            return fn(*args, **dict(context), **extra_kwargs)
         raise
 
 
@@ -378,20 +434,44 @@ def _require_core_surfaces_declared(descriptor: LLMFrameworkDescriptor) -> None:
       token counting surfaces. We enforce a smaller "core" contract here.
 
     Core contract:
-    - invoke_method must be declared (sync completion surface)
+    - completion_method must be declared (sync completion surface)
     - async surfaces must be internally consistent with supports_async, when present
     """
-    assert descriptor.invoke_method, f"{descriptor.name}: invoke_method must be declared"
+    assert descriptor.completion_method, (
+        f"{descriptor.name}: completion_method must be declared"
+    )
 
     supports_async = getattr(descriptor, "supports_async", None)
     if supports_async is False:
-        assert getattr(descriptor, "async_invoke_method", None) is None
-        assert getattr(descriptor, "async_stream_method", None) is None
+        assert descriptor.async_completion_method is None
+        assert descriptor.async_streaming_method is None
     elif supports_async is True:
         # If a framework advertises async, it must declare async invoke.
-        assert getattr(descriptor, "async_invoke_method", None), (
-            f"{descriptor.name}: supports_async is True but async_invoke_method is not declared"
+        assert descriptor.async_completion_method, (
+            f"{descriptor.name}: supports_async is True but async_completion_method is not declared"
         )
+
+
+def _has_sync_stream_surface(descriptor: LLMFrameworkDescriptor) -> bool:
+    style = getattr(descriptor, "streaming_style", "method")
+    if style == "none":
+        return False
+    if style == "method":
+        return bool(descriptor.streaming_method)
+    if style == "kwarg":
+        return bool(descriptor.streaming_kwarg and descriptor.completion_method)
+    return False
+
+
+def _has_async_stream_surface(descriptor: LLMFrameworkDescriptor) -> bool:
+    style = getattr(descriptor, "streaming_style", "method")
+    if style == "none":
+        return False
+    if style == "method":
+        return bool(descriptor.async_streaming_method)
+    if style == "kwarg":
+        return bool(descriptor.streaming_kwarg and descriptor.async_completion_method)
+    return False
 
 
 def _call_invoke(
@@ -405,9 +485,10 @@ def _call_invoke(
     This abstracts over frameworks that use different method names and may
     accept context via a single kwarg or via **kwargs.
     """
-    invoke_fn = _get_method(instance, descriptor.invoke_method)
+    invoke_fn = _get_method(instance, descriptor.completion_method)
     ctx = _context_payload(descriptor)
-    return _call_with_context(descriptor, invoke_fn, prompt, context=ctx)
+    args, kwargs = _build_prompt_args_kwargs(invoke_fn, prompt)
+    return _call_with_context(descriptor, invoke_fn, *args, context=ctx, **kwargs)
 
 
 def _call_stream(
@@ -418,13 +499,33 @@ def _call_stream(
     """
     Call the sync streaming surface (if declared).
 
-    NOTE: Streaming is optional for some LLM frameworks; tests guard on the
-    descriptor's declared stream_method to avoid forcing optional surfaces.
+    NOTE: Streaming is optional for some LLM frameworks; tests guard using the
+    descriptor's streaming metadata to avoid forcing optional surfaces.
     """
-    assert descriptor.stream_method is not None
-    stream_fn = _get_method(instance, descriptor.stream_method)
+    style = getattr(descriptor, "streaming_style", "method")
     ctx = _context_payload(descriptor)
-    return _call_with_context(descriptor, stream_fn, prompt, context=ctx)
+
+    if style == "method":
+        assert descriptor.streaming_method is not None
+        stream_fn = _get_method(instance, descriptor.streaming_method)
+        args, kwargs = _build_prompt_args_kwargs(stream_fn, prompt)
+        return _call_with_context(descriptor, stream_fn, *args, context=ctx, **kwargs)
+
+    if style == "kwarg":
+        assert descriptor.streaming_kwarg is not None
+        assert descriptor.completion_method is not None
+        invoke_fn = _get_method(instance, descriptor.completion_method)
+        args, kwargs = _build_prompt_args_kwargs(invoke_fn, prompt)
+        kwargs[descriptor.streaming_kwarg] = True
+        return _call_with_context(
+            descriptor,
+            invoke_fn,
+            *args,
+            context=ctx,
+            **kwargs,
+        )
+
+    raise AssertionError(f"{descriptor.name}: unsupported streaming_style={style!r}")
 
 
 def _call_count_tokens(
@@ -439,11 +540,12 @@ def _call_count_tokens(
     - Not all frameworks expose token counting in their adapter interface.
     - When declared, it must return an int (>= 0) or raise.
     """
-    count_tokens_method = getattr(descriptor, "count_tokens_method", None)
-    assert count_tokens_method is not None
-    fn = _get_method(instance, count_tokens_method)
+    token_count_method = getattr(descriptor, "token_count_method", None)
+    assert token_count_method is not None
+    fn = _get_method(instance, token_count_method)
     ctx = _context_payload(descriptor)
-    return _call_with_context(descriptor, fn, prompt, context=ctx)
+    args, kwargs = _build_prompt_args_kwargs(fn, prompt, token_count=True)
+    return _call_with_context(descriptor, fn, *args, context=ctx, **kwargs)
 
 
 def _patch_attach_context(
@@ -473,6 +575,20 @@ def _patch_attach_context(
             monkeypatch.setattr(core_mod, "attach_context", fake_attach_context)
     except Exception:
         # Minimal environments may not import core module; module-local patch is still valuable.
+        pass
+
+    # Patch shared LLM translation layer reference (it imports attach_context at module scope).
+    try:
+        llm_translation_mod = importlib.import_module(
+            "corpus_sdk.llm.framework_adapters.common.llm_translation"
+        )
+        if hasattr(llm_translation_mod, "attach_context"):
+            monkeypatch.setattr(
+                llm_translation_mod,
+                "attach_context",
+                fake_attach_context,
+            )
+    except Exception:
         pass
 
 
@@ -576,10 +692,8 @@ def test_invalid_backend_result_causes_errors_for_sync_stream_when_declared(
         return
 
     _require_core_surfaces_declared(framework_descriptor)
-    _assert_optional_surface_consistency(framework_descriptor, "supports_streaming", "stream_method")
 
-    if not framework_descriptor.stream_method:
-        # Streaming is optional; if not declared, we return after consistency checks above.
+    if not _has_sync_stream_surface(framework_descriptor):
         return
 
     instance = _make_llm_with_evil_backend(
@@ -616,11 +730,11 @@ async def test_async_invalid_backend_result_causes_errors_for_invoke_when_suppor
 
     supports_async = getattr(framework_descriptor, "supports_async", False)
     if not supports_async:
-        assert framework_descriptor.async_invoke_method is None
-        assert framework_descriptor.async_stream_method is None
+        assert framework_descriptor.async_completion_method is None
+        assert framework_descriptor.async_streaming_method is None
         return
 
-    assert framework_descriptor.async_invoke_method is not None
+    assert framework_descriptor.async_completion_method is not None
 
     instance = _make_llm_with_evil_backend(
         framework_descriptor,
@@ -629,7 +743,7 @@ async def test_async_invalid_backend_result_causes_errors_for_invoke_when_suppor
 
     ainvoke_fn = _get_method(
         instance,
-        framework_descriptor.async_invoke_method,
+        framework_descriptor.async_completion_method,
     )
 
     with pytest.raises(Exception):  # noqa: BLE001
@@ -660,15 +774,13 @@ async def test_async_invalid_backend_result_causes_errors_for_stream_when_suppor
         return
 
     _require_core_surfaces_declared(framework_descriptor)
-    _assert_optional_surface_consistency(framework_descriptor, "supports_async_streaming", "async_stream_method")
 
     supports_async = getattr(framework_descriptor, "supports_async", False)
     if not supports_async:
-        assert framework_descriptor.async_stream_method is None
+        assert framework_descriptor.async_streaming_method is None
         return
 
-    if not framework_descriptor.async_stream_method:
-        # Async streaming is optional; if not declared, return after consistency checks above.
+    if not _has_async_stream_surface(framework_descriptor):
         return
 
     instance = _make_llm_with_evil_backend(
@@ -678,16 +790,29 @@ async def test_async_invalid_backend_result_causes_errors_for_stream_when_suppor
 
     astream_fn = _get_method(
         instance,
-        framework_descriptor.async_stream_method,
+        (
+            framework_descriptor.async_streaming_method
+            if framework_descriptor.streaming_style == "method"
+            else framework_descriptor.async_completion_method
+        ),
     )
 
     with pytest.raises(Exception):  # noqa: BLE001
-        aiter = _call_with_context(
-            framework_descriptor,
-            astream_fn,
-            "invalid-llm-async-stream",
-            context=_context_payload(framework_descriptor),
-        )
+        if framework_descriptor.streaming_style == "kwarg":
+            aiter = _call_with_context(
+                framework_descriptor,
+                astream_fn,
+                "invalid-llm-async-stream",
+                context=_context_payload(framework_descriptor),
+                **{framework_descriptor.streaming_kwarg: True},
+            )
+        else:
+            aiter = _call_with_context(
+                framework_descriptor,
+                astream_fn,
+                "invalid-llm-async-stream",
+                context=_context_payload(framework_descriptor),
+            )
 
         # Allow awaitable -> async iterator or async iterator directly
         if inspect.isawaitable(aiter):
@@ -762,9 +887,7 @@ def test_backend_exception_is_wrapped_with_error_context_on_stream_calltime_when
         return
 
     _require_core_surfaces_declared(framework_descriptor)
-    _assert_optional_surface_consistency(framework_descriptor, "supports_streaming", "stream_method")
-
-    if not framework_descriptor.stream_method:
+    if not _has_sync_stream_surface(framework_descriptor):
         return
 
     module = importlib.import_module(framework_descriptor.adapter_module)
@@ -776,12 +899,23 @@ def test_backend_exception_is_wrapped_with_error_context_on_stream_calltime_when
         RaisingLLMBackend,
     )
 
-    with pytest.raises(RuntimeError, match="backend failure"):
-        _call_stream(framework_descriptor, instance, "err-llm-sync-stream-calltime")
+    # Some adapters return lazy generators/iterators; call-time may not execute backend work.
+    # Accept either call-time or first-iteration failure.
+    try:
+        iterator = _call_stream(
+            framework_descriptor,
+            instance,
+            "err-llm-sync-stream-calltime",
+        )
+    except RuntimeError as exc:
+        assert "backend failure" in str(exc)
+    else:
+        with pytest.raises(RuntimeError, match="backend failure"):
+            _consume_sync_stream_best_effort(iterator)
 
     assert calls, "attach_context was not called for backend stream call-time failure"
 
-    exc, ctx = calls[-1]
+    exc, ctx = _find_attached_context(calls, framework=framework_descriptor.name)
     assert isinstance(exc, RuntimeError)
     assert ctx.get("framework") == framework_descriptor.name
     assert str(ctx.get("operation", "")).startswith(LLM_OPERATION_PREFIX)
@@ -802,9 +936,7 @@ def test_backend_exception_is_wrapped_with_error_context_on_stream_iteration_whe
         return
 
     _require_core_surfaces_declared(framework_descriptor)
-    _assert_optional_surface_consistency(framework_descriptor, "supports_streaming", "stream_method")
-
-    if not framework_descriptor.stream_method:
+    if not _has_sync_stream_surface(framework_descriptor):
         return
 
     module = importlib.import_module(framework_descriptor.adapter_module)
@@ -825,7 +957,7 @@ def test_backend_exception_is_wrapped_with_error_context_on_stream_iteration_whe
 
     assert calls, "attach_context was not called for backend stream iteration failure"
 
-    exc, ctx = calls[-1]
+    exc, ctx = _find_attached_context(calls, framework=framework_descriptor.name)
     assert isinstance(exc, RuntimeError)
     assert ctx.get("framework") == framework_descriptor.name
     assert str(ctx.get("operation", "")).startswith(LLM_OPERATION_PREFIX)
@@ -849,14 +981,12 @@ async def test_async_backend_exception_is_wrapped_with_error_context_on_stream_c
         return
 
     _require_core_surfaces_declared(framework_descriptor)
-    _assert_optional_surface_consistency(framework_descriptor, "supports_async_streaming", "async_stream_method")
-
     supports_async = getattr(framework_descriptor, "supports_async", False)
     if not supports_async:
-        assert framework_descriptor.async_stream_method is None
+        assert framework_descriptor.async_streaming_method is None
         return
 
-    if not framework_descriptor.async_stream_method:
+    if not _has_async_stream_surface(framework_descriptor):
         return
 
     module = importlib.import_module(framework_descriptor.adapter_module)
@@ -868,22 +998,42 @@ async def test_async_backend_exception_is_wrapped_with_error_context_on_stream_c
         RaisingLLMBackend,
     )
 
-    astream_fn = _get_method(instance, framework_descriptor.async_stream_method)
+    astream_fn = _get_method(
+        instance,
+        (
+            framework_descriptor.async_streaming_method
+            if framework_descriptor.streaming_style == "method"
+            else framework_descriptor.async_completion_method
+        ),
+    )
 
-    with pytest.raises(RuntimeError, match="backend failure"):
+    # As with sync streaming, allow lazy async iterators where errors surface on first iteration.
+    ctx_payload = _context_payload(framework_descriptor)
+    prompt = "err-llm-async-stream-calltime"
+    args, kwargs = _build_prompt_args_kwargs(astream_fn, prompt)
+    if framework_descriptor.streaming_style == "kwarg":
+        kwargs[framework_descriptor.streaming_kwarg] = True
+
+    try:
         aiter = _call_with_context(
             framework_descriptor,
             astream_fn,
-            "err-llm-async-stream-calltime",
-            context=_context_payload(framework_descriptor),
+            *args,
+            context=ctx_payload,
+            **kwargs,
         )
         if inspect.isawaitable(aiter):
             aiter = await aiter  # type: ignore[assignment]
+    except RuntimeError as exc:
+        assert "backend failure" in str(exc)
+    else:
+        with pytest.raises(RuntimeError, match="backend failure"):
+            await _consume_async_stream_best_effort(aiter)
         await _consume_async_stream_best_effort(aiter)
 
     assert calls, "attach_context was not called for async backend stream call-time failures"
 
-    exc, ctx = calls[-1]
+    exc, ctx = _find_attached_context(calls, framework=framework_descriptor.name)
     assert isinstance(exc, RuntimeError)
     assert ctx.get("framework") == framework_descriptor.name
     assert str(ctx.get("operation", "")).startswith(LLM_OPERATION_PREFIX)
@@ -906,14 +1056,12 @@ async def test_async_backend_exception_is_wrapped_with_error_context_on_stream_i
         return
 
     _require_core_surfaces_declared(framework_descriptor)
-    _assert_optional_surface_consistency(framework_descriptor, "supports_async_streaming", "async_stream_method")
-
     supports_async = getattr(framework_descriptor, "supports_async", False)
     if not supports_async:
-        assert framework_descriptor.async_stream_method is None
+        assert framework_descriptor.async_streaming_method is None
         return
 
-    if not framework_descriptor.async_stream_method:
+    if not _has_async_stream_surface(framework_descriptor):
         return
 
     module = importlib.import_module(framework_descriptor.adapter_module)
@@ -925,14 +1073,28 @@ async def test_async_backend_exception_is_wrapped_with_error_context_on_stream_i
         IterationRaisingLLMBackend,
     )
 
-    astream_fn = _get_method(instance, framework_descriptor.async_stream_method)
+    astream_fn = _get_method(
+        instance,
+        (
+            framework_descriptor.async_streaming_method
+            if framework_descriptor.streaming_style == "method"
+            else framework_descriptor.async_completion_method
+        ),
+    )
+
+    ctx_payload = _context_payload(framework_descriptor)
+    prompt = "err-llm-async-stream-iteration"
+    args, kwargs = _build_prompt_args_kwargs(astream_fn, prompt)
+    if framework_descriptor.streaming_style == "kwarg":
+        kwargs[framework_descriptor.streaming_kwarg] = True
 
     with pytest.raises(RuntimeError, match="backend failure"):
         aiter = _call_with_context(
             framework_descriptor,
             astream_fn,
-            "err-llm-async-stream-iteration",
-            context=_context_payload(framework_descriptor),
+            *args,
+            context=ctx_payload,
+            **kwargs,
         )
         if inspect.isawaitable(aiter):
             aiter = await aiter  # type: ignore[assignment]
@@ -942,7 +1104,7 @@ async def test_async_backend_exception_is_wrapped_with_error_context_on_stream_i
 
     assert calls, "attach_context was not called for async backend stream iteration failures"
 
-    exc, ctx = calls[-1]
+    exc, ctx = _find_attached_context(calls, framework=framework_descriptor.name)
     assert isinstance(exc, RuntimeError)
     assert ctx.get("framework") == framework_descriptor.name
     assert str(ctx.get("operation", "")).startswith(LLM_OPERATION_PREFIX)
@@ -973,10 +1135,10 @@ def test_invalid_backend_result_causes_errors_for_count_tokens_when_declared(
         return
 
     _require_core_surfaces_declared(framework_descriptor)
-    _assert_optional_surface_consistency(framework_descriptor, "supports_token_counting", "count_tokens_method")
+    _assert_optional_surface_consistency(framework_descriptor, "supports_token_count", "token_count_method")
 
-    count_tokens_method = getattr(framework_descriptor, "count_tokens_method", None)
-    if not count_tokens_method:
+    token_count_method = getattr(framework_descriptor, "token_count_method", None)
+    if not token_count_method:
         return
 
     instance = _make_llm_with_evil_backend(
@@ -1011,10 +1173,10 @@ def test_backend_exception_is_wrapped_with_error_context_on_count_tokens_when_de
         return
 
     _require_core_surfaces_declared(framework_descriptor)
-    _assert_optional_surface_consistency(framework_descriptor, "supports_token_counting", "count_tokens_method")
+    _assert_optional_surface_consistency(framework_descriptor, "supports_token_count", "token_count_method")
 
-    count_tokens_method = getattr(framework_descriptor, "count_tokens_method", None)
-    if not count_tokens_method:
+    token_count_method = getattr(framework_descriptor, "token_count_method", None)
+    if not token_count_method:
         return
 
     module = importlib.import_module(framework_descriptor.adapter_module)
@@ -1031,7 +1193,7 @@ def test_backend_exception_is_wrapped_with_error_context_on_count_tokens_when_de
 
     assert calls, "attach_context was not called for backend token counting failure"
 
-    exc, ctx = calls[-1]
+    exc, ctx = _find_attached_context(calls, framework=framework_descriptor.name)
     assert isinstance(exc, RuntimeError)
     assert ctx.get("framework") == framework_descriptor.name
     assert str(ctx.get("operation", "")).startswith(LLM_OPERATION_PREFIX)
@@ -1076,7 +1238,7 @@ def test_backend_exception_is_wrapped_with_error_context_on_invoke(
 
     assert calls, "attach_context was not called for backend invoke failure"
 
-    exc, ctx = calls[-1]
+    exc, ctx = _find_attached_context(calls, framework=framework_descriptor.name)
     assert isinstance(exc, RuntimeError)
     assert "framework" in ctx
     assert "operation" in ctx
@@ -1105,11 +1267,11 @@ async def test_async_backend_exception_is_wrapped_with_error_context_when_suppor
 
     supports_async = getattr(framework_descriptor, "supports_async", False)
     if not supports_async:
-        assert framework_descriptor.async_invoke_method is None
-        assert framework_descriptor.async_stream_method is None
+        assert framework_descriptor.async_completion_method is None
+        assert framework_descriptor.async_streaming_method is None
         return
 
-    assert framework_descriptor.async_invoke_method is not None
+    assert framework_descriptor.async_completion_method is not None
 
     module = importlib.import_module(framework_descriptor.adapter_module)
     calls: list[tuple[BaseException, dict[str, Any]]] = []
@@ -1122,22 +1284,27 @@ async def test_async_backend_exception_is_wrapped_with_error_context_when_suppor
 
     ainvoke_fn = _get_method(
         instance,
-        framework_descriptor.async_invoke_method,
+        framework_descriptor.async_completion_method,
     )
+
+    ctx_payload = _context_payload(framework_descriptor)
+    prompt = "err-llm-async-invoke"
+    args, kwargs = _build_prompt_args_kwargs(ainvoke_fn, prompt)
 
     with pytest.raises(RuntimeError, match="backend failure"):
         coro = _call_with_context(
             framework_descriptor,
             ainvoke_fn,
-            "err-llm-async-invoke",
-            context=_context_payload(framework_descriptor),
+            *args,
+            context=ctx_payload,
+            **kwargs,
         )
         assert inspect.isawaitable(coro), "Async invoke method must return an awaitable"
         await coro  # noqa: PT018
 
     assert calls, "attach_context was not called for async backend failures"
 
-    exc, ctx = calls[-1]
+    exc, ctx = _find_attached_context(calls, framework=framework_descriptor.name)
     assert isinstance(exc, RuntimeError)
     assert "framework" in ctx
     assert "operation" in ctx
