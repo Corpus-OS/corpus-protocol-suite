@@ -653,7 +653,7 @@ class CorpusAutoGenChatClient:
 
     def count_tokens(
         self,
-        messages: Sequence[Dict[str, Any]],
+        messages: Any,
         conversation: Optional[Any] = None,
         **kwargs: Any,
     ) -> int:
@@ -670,6 +670,13 @@ class CorpusAutoGenChatClient:
         """
         if not messages:
             return 0
+
+        # - some callers pass a plain prompt string
+        # - some pass a single mapping
+        if isinstance(messages, str):
+            messages = [{"role": "user", "content": messages}]
+        elif isinstance(messages, Mapping):
+            messages = [dict(messages)]
 
         ctx, params, framework_ctx = self._build_ctx_and_params(
             conversation=conversation,
