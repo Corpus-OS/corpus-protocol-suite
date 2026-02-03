@@ -1404,46 +1404,6 @@ class CorpusLangChainLLM(BaseChatModel):
         """
         return self.get_num_tokens_from_messages([HumanMessage(content=text)])
 
-    # ------------------------------------------------------------------ #
-    # Health / capabilities (for conformance + tolerance)
-    # ------------------------------------------------------------------ #
-
-    @with_async_llm_error_context("capabilities")
-    async def acapabilities(
-        self,
-        *,
-        config: Optional[Mapping[str, Any]] = None,
-        **_: Any,
-    ) -> Any:
-        ctx = _build_operation_context_from_config(
-            config=config,
-            framework_version=self._framework_version,
-        )
-        framework_ctx: Dict[str, Any] = {
-            "framework": _FRAMEWORK_NAME,
-            "framework_version": self._framework_version,
-            "operation": "capabilities",
-        }
-        return await self._translator.arun_capabilities(op_ctx=ctx, framework_ctx=framework_ctx)
-
-    @with_async_llm_error_context("health")
-    async def ahealth(
-        self,
-        *,
-        config: Optional[Mapping[str, Any]] = None,
-        **_: Any,
-    ) -> Any:
-        ctx = _build_operation_context_from_config(
-            config=config,
-            framework_version=self._framework_version,
-        )
-        framework_ctx: Dict[str, Any] = {
-            "framework": _FRAMEWORK_NAME,
-            "framework_version": self._framework_version,
-            "operation": "health",
-        }
-        return await self._translator.arun_health(op_ctx=ctx, framework_ctx=framework_ctx)
-
 __all__ = [
     "LangChainLLMProtocol",
     "LangChainLLMConfig",
