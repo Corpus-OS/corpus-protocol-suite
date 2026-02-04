@@ -16,6 +16,7 @@ from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 from unittest.mock import Mock, patch
 
 import pytest
+from pydantic import ValidationError
 
 import corpus_sdk.vector.framework_adapters.crewai as crewai_adapter_module
 from corpus_sdk.vector.framework_adapters.crewai import (
@@ -30,8 +31,12 @@ from corpus_sdk.vector.vector_base import (
     NotSupported,
     OperationContext,
     QueryResult,
+    Vector,
     VectorCapabilities,
     VectorMatch,
+    UpsertResult,
+    DeleteResult,
+    NamespaceResult,
 )
 
 
@@ -48,53 +53,90 @@ SAMPLE_EMBEDDING = [0.1, 0.2, 0.3, 0.4]
 # ---------------------------------------------------------------------------
 
 
+def _make_caps(**overrides: Any) -> VectorCapabilities:
+    """Construct protocol-valid VectorCapabilities for tests."""
+    base: Dict[str, Any] = {
+        "server": "test",
+        "version": "0",
+        "supports_metadata_filtering": True,
+        "max_top_k": 100,
+    }
+    base.update(overrides)
+    return VectorCapabilities(**base)
+
+
+def _make_match(
+    *,
+    id: str,
+    score: float,
+    text: str = "test",
+    embedding: Optional[List[float]] = None,
+) -> VectorMatch:
+    vec = embedding if embedding is not None else [0.1, 0.2]
+    return VectorMatch(
+        vector=Vector(
+            id=id,
+            vector=list(vec),
+            metadata={"page_content": text, "id": id},
+        ),
+        score=float(score),
+        distance=1.0 - float(score),
+    )
+
+
+def _empty_result(*, namespace: str = "default", query_vector: Optional[List[float]] = None) -> QueryResult:
+    return QueryResult(
+        matches=[],
+        query_vector=list(query_vector) if query_vector is not None else [0.0],
+        namespace=namespace,
+        total_matches=0,
+    )
+
+
 def _make_dummy_translator() -> Any:
     """Factory for creating a standard dummy translator for tests."""
+
+    def _caps(**overrides: Any) -> VectorCapabilities:
+        return VectorCapabilities(
+            server="test",
+            version="0",
+            supports_metadata_filtering=True,
+            max_top_k=100,
+            **overrides,
+        )
+
+    def _match(*, id: str, score: float, text: str = "test") -> VectorMatch:
+        return VectorMatch(
+            vector=Vector(
+                id=id,
+                vector=[0.1, 0.2],
+                metadata={"page_content": text, "id": id},
+            ),
+            score=float(score),
+            distance=1.0 - float(score),
+        )
 
     class DummyTranslator:
         def query(self, *a: Any, **k: Any) -> Any:
             return QueryResult(
-                matches=[
-                    VectorMatch(
-                        id="doc-0",
-                        score=0.95,
-                        vector=Mock(
-                            id="doc-0",
-                            vector=[0.1, 0.2],
-                            metadata={"page_content": "test", "id": "doc-0"},
-                        ),
-                    )
-                ],
+                matches=[_match(id="doc-0", score=0.95)],
+                query_vector=[0.1, 0.2],
                 namespace="default",
+                total_matches=1,
             )
 
         async def arun_query(self, *a: Any, **k: Any) -> Any:
             return QueryResult(
-                matches=[
-                    VectorMatch(
-                        id="doc-0",
-                        score=0.95,
-                        vector=Mock(
-                            id="doc-0",
-                            vector=[0.1, 0.2],
-                            metadata={"page_content": "test", "id": "doc-0"},
-                        ),
-                    )
-                ],
+                matches=[_match(id="doc-0", score=0.95)],
+                query_vector=[0.1, 0.2],
                 namespace="default",
+                total_matches=1,
             )
 
         def query_stream(self, *a: Any, **k: Any) -> Iterator[Any]:
             class Chunk:
                 matches = [
-                    VectorMatch(
-                        id="doc-0",
-                        score=0.95,
-                        vector=Mock(
-                            id="doc-0",
-                            metadata={"page_content": "test", "id": "doc-0"},
-                        ),
-                    )
+                    _match(id="doc-0", score=0.95)
                 ]
                 is_final = True
 
@@ -103,14 +145,7 @@ def _make_dummy_translator() -> Any:
         async def arun_query_stream(self, *a: Any, **k: Any) -> Any:
             class Chunk:
                 matches = [
-                    VectorMatch(
-                        id="doc-0",
-                        score=0.95,
-                        vector=Mock(
-                            id="doc-0",
-                            metadata={"page_content": "test", "id": "doc-0"},
-                        ),
-                    )
+                    _match(id="doc-0", score=0.95)
                 ]
                 is_final = True
 
@@ -120,16 +155,10 @@ def _make_dummy_translator() -> Any:
             return _gen()
 
         def capabilities(self) -> VectorCapabilities:
-            return VectorCapabilities(
-                supports_metadata_filtering=True,
-                max_top_k=100,
-            )
+            return _caps()
 
         async def acapabilities(self) -> VectorCapabilities:
-            return VectorCapabilities(
-                supports_metadata_filtering=True,
-                max_top_k=100,
-            )
+            return _caps()
 
         def health(self) -> Mapping[str, Any]:
             return {"status": "ok"}
@@ -145,7 +174,14 @@ def _make_mock_embedding_function(vectors: Optional[List[List[float]]] = None):
     vectors = vectors or [[0.1, 0.2, 0.3, 0.4]]
 
     def embedding_fn(texts: List[str]) -> List[List[float]]:
-        return vectors[: len(texts)]
+        if not texts:
+            return []
+        if not vectors:
+            return [[0.0] for _ in texts]
+        if len(vectors) >= len(texts):
+            return vectors[: len(texts)]
+        # Repeat last vector if the caller asks for more.
+        return list(vectors) + [list(vectors[-1]) for _ in range(len(texts) - len(vectors))]
 
     return embedding_fn
 
@@ -165,14 +201,32 @@ def adapter() -> Any:
     """Create a minimal test adapter."""
 
     class TestAdapter:
-        def query(self, *args: Any, **kwargs: Any) -> Any:
-            return QueryResult(matches=[], namespace="default")
-
-        def capabilities(self) -> VectorCapabilities:
+        async def capabilities(self) -> VectorCapabilities:
             return VectorCapabilities(
+                server="test",
+                version="0",
                 supports_metadata_filtering=True,
                 max_top_k=100,
+                supports_batch_queries=True,
             )
+
+        async def query(self, *args: Any, **kwargs: Any) -> QueryResult:
+            return QueryResult(matches=[], query_vector=[0.0], namespace="default", total_matches=0)
+
+        async def batch_query(self, *args: Any, **kwargs: Any) -> List[QueryResult]:
+            return [QueryResult(matches=[], query_vector=[0.0], namespace="default", total_matches=0)]
+
+        async def upsert(self, *args: Any, **kwargs: Any) -> UpsertResult:
+            return UpsertResult(upserted_count=0, failed_count=0, failures=[])
+
+        async def delete(self, *args: Any, **kwargs: Any) -> DeleteResult:
+            return DeleteResult(deleted_count=0, failed_count=0, failures=[])
+
+        async def create_namespace(self, *args: Any, **kwargs: Any) -> NamespaceResult:
+            return NamespaceResult(success=True, namespace="default", details={})
+
+        async def delete_namespace(self, *args: Any, **kwargs: Any) -> NamespaceResult:
+            return NamespaceResult(success=True, namespace="default", details={})
 
         def health(self) -> Dict[str, Any]:
             return {"status": "ok"}
@@ -194,7 +248,7 @@ def test_init_requires_crewai_installed() -> None:
 
 def test_init_requires_corpus_adapter(adapter: Any) -> None:
     """Adapter must be provided."""
-    with pytest.raises((TypeError, AttributeError)):
+    with pytest.raises((TypeError, AttributeError, ValidationError)):
         CorpusCrewAIVectorSearchTool(corpus_adapter=None)  # type: ignore
 
 
@@ -296,10 +350,10 @@ def test_translator_created_with_framework_crewai(
             captured.update(kwargs)
 
         def query(self, *a, **k):
-            return QueryResult(matches=[], namespace="default")
+            return _empty_result(namespace="default")
 
         def capabilities(self):
-            return VectorCapabilities()
+            return _make_caps()
 
     def fake_create(*_a, **kwargs):
         captured.update(kwargs)
@@ -342,7 +396,7 @@ def test_translator_uses_custom_framework_translator(
             self.translator = kwargs.get("translator")
 
         def query(self, *a, **k):
-            return QueryResult(matches=[], namespace="default")
+            return _empty_result(namespace="default")
 
     with patch.object(crewai_adapter_module, "VectorTranslator", FakeTranslator):
         tool = CorpusCrewAIVectorSearchTool(corpus_adapter=adapter)
@@ -491,9 +545,7 @@ def test_build_framework_context_includes_namespace(adapter: Any) -> None:
     tool = CorpusCrewAIVectorSearchTool(corpus_adapter=adapter, namespace="test-ns")
     fw_ctx = tool._build_framework_context(namespace="override-ns")
 
-    # Should be in vector_context after normalization
-    assert "vector_context" in fw_ctx
-    assert fw_ctx["vector_context"]["namespace"] == "override-ns"
+    assert fw_ctx["namespace"] == "override-ns"
 
 
 def test_build_contexts_orchestrates_both(adapter: Any) -> None:
@@ -506,7 +558,7 @@ def test_build_contexts_orchestrates_both(adapter: Any) -> None:
 
     assert core_ctx is None  # No call_context provided
     assert isinstance(fw_ctx, Mapping)
-    assert "vector_context" in fw_ctx
+    assert fw_ctx["namespace"] == "test-ns"
 
 
 # ---------------------------------------------------------------------------
@@ -1190,12 +1242,13 @@ def test_match_to_payload_converts_to_json(adapter: Any) -> None:
     """Should convert match to JSON-serializable dict."""
     tool = CorpusCrewAIVectorSearchTool(corpus_adapter=adapter)
     match = VectorMatch(
-        id="test-id",
-        score=0.95,
-        vector=Mock(
+        vector=Vector(
             id="test-id",
+            vector=[0.1, 0.2],
             metadata={"page_content": "test content", "custom": "data"},
         ),
+        score=0.95,
+        distance=0.05,
     )
 
     payload = tool._match_to_payload(match, return_scores=True)
@@ -1334,10 +1387,10 @@ def test_search_simple_sync_calls_translator_query(
     class DummyTranslator:
         def query(self, *a: Any, **k: Any) -> Any:
             called["query"] = True
-            return QueryResult(matches=[], namespace="default")
+            return _empty_result(namespace="default")
 
         def capabilities(self):
-            return VectorCapabilities()
+            return _make_caps()
 
     with patch.object(crewai_adapter_module, "VectorTranslator", return_value=DummyTranslator()):
         fn = _make_mock_embedding_function()
@@ -1360,10 +1413,10 @@ def test_search_simple_sync_uses_default_top_k(
     class DummyTranslator:
         def query(self, raw_query: Any, **k: Any) -> Any:
             captured["raw_query"] = raw_query
-            return QueryResult(matches=[], namespace="default")
+            return _empty_result(namespace="default")
 
         def capabilities(self):
-            return VectorCapabilities()
+            return _make_caps()
 
     with patch.object(crewai_adapter_module, "VectorTranslator", return_value=DummyTranslator()):
         fn = _make_mock_embedding_function()
@@ -1386,26 +1439,16 @@ def test_search_simple_sync_applies_score_threshold(
         def query(self, *a: Any, **k: Any) -> Any:
             return QueryResult(
                 matches=[
-                    VectorMatch(
-                        id="1",
-                        score=0.9,
-                        vector=Mock(
-                            id="1", metadata={"page_content": "high", "id": "1"}
-                        ),
-                    ),
-                    VectorMatch(
-                        id="2",
-                        score=0.3,
-                        vector=Mock(
-                            id="2", metadata={"page_content": "low", "id": "2"}
-                        ),
-                    ),
+                    _make_match(id="1", score=0.9, text="high"),
+                    _make_match(id="2", score=0.3, text="low"),
                 ],
+                query_vector=[0.0],
                 namespace="default",
+                total_matches=2,
             )
 
         def capabilities(self):
-            return VectorCapabilities()
+            return _make_caps()
 
     with patch.object(crewai_adapter_module, "VectorTranslator", return_value=DummyTranslator()):
         fn = _make_mock_embedding_function()
@@ -1475,7 +1518,7 @@ async def test_asearch_simple_returns_payloads(
         )
 
         args = CorpusVectorSearchInput(query="test")
-        caps = VectorCapabilities()
+        caps = _make_caps()
         results = await tool._asearch_simple(args, caps=caps)
 
         assert isinstance(results, list)
@@ -1491,10 +1534,10 @@ async def test_asearch_simple_calls_translator_arun_query(
     class DummyTranslator:
         async def arun_query(self, *a: Any, **k: Any) -> Any:
             called["arun_query"] = True
-            return QueryResult(matches=[], namespace="default")
+            return _empty_result(namespace="default")
 
         async def acapabilities(self):
-            return VectorCapabilities()
+            return _make_caps()
 
     with patch.object(crewai_adapter_module, "VectorTranslator", return_value=DummyTranslator()):
         fn = _make_mock_embedding_function()
@@ -1503,7 +1546,7 @@ async def test_asearch_simple_calls_translator_arun_query(
         )
 
         args = CorpusVectorSearchInput(query="test")
-        caps = VectorCapabilities()
+        caps = _make_caps()
         await tool._asearch_simple(args, caps=caps)
 
         assert called["arun_query"] is True
@@ -1523,7 +1566,7 @@ async def test_asearch_simple_validates_max_top_k(
         )
 
         args = CorpusVectorSearchInput(query="test", k=200)
-        caps = VectorCapabilities(max_top_k=100)
+        caps = _make_caps(max_top_k=100)
 
         with pytest.raises(BadRequest, match="exceeds maximum"):
             await tool._asearch_simple(args, caps=caps)
@@ -1543,7 +1586,7 @@ async def test_asearch_simple_validates_filter_support(
         )
 
         args = CorpusVectorSearchInput(query="test", filter={"key": "value"})
-        caps = VectorCapabilities(supports_metadata_filtering=False)
+        caps = _make_caps(supports_metadata_filtering=False)
 
         with pytest.raises(NotSupported, match="metadata filtering"):
             await tool._asearch_simple(args, caps=caps)
@@ -1559,26 +1602,16 @@ async def test_asearch_simple_applies_score_threshold(
         async def arun_query(self, *a: Any, **k: Any) -> Any:
             return QueryResult(
                 matches=[
-                    VectorMatch(
-                        id="1",
-                        score=0.9,
-                        vector=Mock(
-                            id="1", metadata={"page_content": "high", "id": "1"}
-                        ),
-                    ),
-                    VectorMatch(
-                        id="2",
-                        score=0.3,
-                        vector=Mock(
-                            id="2", metadata={"page_content": "low", "id": "2"}
-                        ),
-                    ),
+                    _make_match(id="1", score=0.9, text="high"),
+                    _make_match(id="2", score=0.3, text="low"),
                 ],
+                query_vector=[0.0],
                 namespace="default",
+                total_matches=2,
             )
 
         async def acapabilities(self):
-            return VectorCapabilities()
+            return _make_caps()
 
     with patch.object(crewai_adapter_module, "VectorTranslator", return_value=DummyTranslator()):
         fn = _make_mock_embedding_function()
@@ -1587,7 +1620,7 @@ async def test_asearch_simple_applies_score_threshold(
         )
 
         args = CorpusVectorSearchInput(query="test")
-        caps = VectorCapabilities()
+        caps = _make_caps()
         results = await tool._asearch_simple(args, caps=caps)
 
         assert len(results) == 1
@@ -1608,7 +1641,7 @@ async def test_asearch_simple_includes_scores_when_requested(
         )
 
         args = CorpusVectorSearchInput(query="test", return_scores=True)
-        caps = VectorCapabilities()
+        caps = _make_caps()
         results = await tool._asearch_simple(args, caps=caps)
 
         assert all("score" in r for r in results)
@@ -1630,22 +1663,21 @@ def test_search_with_mmr_sync_fetches_candidates(
             captured["raw_query"] = raw_query
             return QueryResult(
                 matches=[
-                    VectorMatch(
+                    _make_match(
                         id=str(i),
                         score=0.9 - i * 0.1,
-                        vector=Mock(
-                            id=str(i),
-                            vector=[float(i), 0.0],
-                            metadata={"page_content": f"doc-{i}", "id": str(i)},
-                        ),
+                        text=f"doc-{i}",
+                        embedding=[float(i), 0.0],
                     )
                     for i in range(10)
                 ],
+                query_vector=[0.0],
                 namespace="default",
+                total_matches=10,
             )
 
         def capabilities(self):
-            return VectorCapabilities()
+            return _make_caps()
 
     with patch.object(crewai_adapter_module, "VectorTranslator", return_value=DummyTranslator()):
         fn = _make_mock_embedding_function()
@@ -1670,22 +1702,21 @@ def test_search_with_mmr_sync_returns_k_results(
         def query(self, *a: Any, **k: Any) -> Any:
             return QueryResult(
                 matches=[
-                    VectorMatch(
+                    _make_match(
                         id=str(i),
                         score=0.9,
-                        vector=Mock(
-                            id=str(i),
-                            vector=[float(i), 0.0],
-                            metadata={"page_content": f"doc-{i}", "id": str(i)},
-                        ),
+                        text=f"doc-{i}",
+                        embedding=[float(i), 0.0],
                     )
                     for i in range(10)
                 ],
+                query_vector=[0.0],
                 namespace="default",
+                total_matches=10,
             )
 
         def capabilities(self):
-            return VectorCapabilities()
+            return _make_caps()
 
     with patch.object(crewai_adapter_module, "VectorTranslator", return_value=DummyTranslator()):
         fn = _make_mock_embedding_function()
@@ -1755,22 +1786,21 @@ async def test_asearch_with_mmr_fetches_candidates(
             captured["raw_query"] = raw_query
             return QueryResult(
                 matches=[
-                    VectorMatch(
+                    _make_match(
                         id=str(i),
                         score=0.9 - i * 0.1,
-                        vector=Mock(
-                            id=str(i),
-                            vector=[float(i), 0.0],
-                            metadata={"page_content": f"doc-{i}", "id": str(i)},
-                        ),
+                        text=f"doc-{i}",
+                        embedding=[float(i), 0.0],
                     )
                     for i in range(10)
                 ],
+                query_vector=[0.0],
                 namespace="default",
+                total_matches=10,
             )
 
         async def acapabilities(self):
-            return VectorCapabilities()
+            return _make_caps()
 
     with patch.object(crewai_adapter_module, "VectorTranslator", return_value=DummyTranslator()):
         fn = _make_mock_embedding_function()
@@ -1779,7 +1809,7 @@ async def test_asearch_with_mmr_fetches_candidates(
         )
 
         args = CorpusVectorSearchInput(query="test", k=3, fetch_k=10)
-        caps = VectorCapabilities()
+        caps = _make_caps()
         await tool._asearch_with_mmr(args, caps=caps)
 
         # Should request fetch_k with vectors
@@ -1797,22 +1827,21 @@ async def test_asearch_with_mmr_returns_k_results(
         async def arun_query(self, *a: Any, **k: Any) -> Any:
             return QueryResult(
                 matches=[
-                    VectorMatch(
+                    _make_match(
                         id=str(i),
                         score=0.9,
-                        vector=Mock(
-                            id=str(i),
-                            vector=[float(i), 0.0],
-                            metadata={"page_content": f"doc-{i}", "id": str(i)},
-                        ),
+                        text=f"doc-{i}",
+                        embedding=[float(i), 0.0],
                     )
                     for i in range(10)
                 ],
+                query_vector=[0.0],
                 namespace="default",
+                total_matches=10,
             )
 
         async def acapabilities(self):
-            return VectorCapabilities()
+            return _make_caps()
 
     with patch.object(crewai_adapter_module, "VectorTranslator", return_value=DummyTranslator()):
         fn = _make_mock_embedding_function()
@@ -1821,7 +1850,7 @@ async def test_asearch_with_mmr_returns_k_results(
         )
 
         args = CorpusVectorSearchInput(query="test", k=3)
-        caps = VectorCapabilities()
+        caps = _make_caps()
         results = await tool._asearch_with_mmr(args, caps=caps)
 
         assert len(results) == 3
@@ -1841,7 +1870,7 @@ async def test_asearch_with_mmr_validates_fetch_k(
         )
 
         args = CorpusVectorSearchInput(query="test", k=10, fetch_k=200)
-        caps = VectorCapabilities(max_top_k=100)
+        caps = _make_caps(max_top_k=100)
 
         with pytest.raises(BadRequest, match="exceeds maximum"):
             await tool._asearch_with_mmr(args, caps=caps)
@@ -1861,7 +1890,7 @@ async def test_asearch_with_mmr_uses_lambda_mult(
         )
 
         args = CorpusVectorSearchInput(query="test", mmr_lambda=0.3)
-        caps = VectorCapabilities()
+        caps = _make_caps()
         results = await tool._asearch_with_mmr(args, caps=caps)
 
         assert isinstance(results, list)
@@ -2174,13 +2203,7 @@ def test_stream_search_respects_top_k(
         def query_stream(self, *a: Any, **k: Any) -> Iterator[Any]:
             class Chunk:
                 matches = [
-                    VectorMatch(
-                        id=str(i),
-                        score=0.9,
-                        vector=Mock(
-                            id=str(i), metadata={"page_content": f"doc-{i}", "id": str(i)}
-                        ),
-                    )
+                    _make_match(id=str(i), score=0.9, text=f"doc-{i}")
                     for i in range(10)
                 ]
                 is_final = True
@@ -2188,7 +2211,7 @@ def test_stream_search_respects_top_k(
             yield Chunk()
 
         def capabilities(self):
-            return VectorCapabilities()
+            return _make_caps()
 
     with patch.object(crewai_adapter_module, "VectorTranslator", return_value=DummyTranslator()):
         fn = _make_mock_embedding_function()
@@ -2232,7 +2255,7 @@ async def test_get_caps_async_delegates_to_translator(
     class DummyTranslator:
         async def acapabilities(self):
             called["acapabilities"] = True
-            return VectorCapabilities()
+            return _make_caps()
 
     with patch.object(crewai_adapter_module, "VectorTranslator", return_value=DummyTranslator()):
         tool = CorpusCrewAIVectorSearchTool(corpus_adapter=adapter)
@@ -2252,7 +2275,7 @@ async def test_get_caps_async_falls_back_to_sync(
     class DummyTranslator:
         def capabilities(self):
             called["capabilities"] = True
-            return VectorCapabilities()
+            return _make_caps()
 
     with patch.object(crewai_adapter_module, "VectorTranslator", return_value=DummyTranslator()):
         tool = CorpusCrewAIVectorSearchTool(corpus_adapter=adapter)
@@ -2338,7 +2361,7 @@ def test_close_closes_translator(
             called["close"] = True
 
         def capabilities(self):
-            return VectorCapabilities()
+            return _make_caps()
 
     with patch.object(crewai_adapter_module, "VectorTranslator", return_value=DummyTranslator()):
         tool = CorpusCrewAIVectorSearchTool(corpus_adapter=adapter)
@@ -2356,14 +2379,12 @@ def test_close_closes_adapter_when_owned(
     ):
         called = {"close": False}
 
-        class OwnedAdapter:
-            def close(self) -> None:
-                called["close"] = True
+        def close() -> None:
+            called["close"] = True
 
-            def capabilities(self):
-                return VectorCapabilities()
-
-        owned_adapter = OwnedAdapter()
+        # Use the protocol-valid adapter fixture, but add a close hook.
+        owned_adapter = adapter
+        setattr(owned_adapter, "close", close)
         tool = CorpusCrewAIVectorSearchTool(
             corpus_adapter=owned_adapter, own_adapter=True
         )
@@ -2411,7 +2432,7 @@ def test_error_context_includes_framework_crewai(
             raise RuntimeError("test error")
 
         def capabilities(self):
-            return VectorCapabilities()
+            return _make_caps()
 
     with patch.object(crewai_adapter_module, "VectorTranslator", return_value=FailingTranslator()):
         fn = _make_mock_embedding_function()
@@ -2443,7 +2464,7 @@ def test_error_context_includes_operation_name(
             raise RuntimeError("test error")
 
         def capabilities(self):
-            return VectorCapabilities()
+            return _make_caps()
 
     with patch.object(crewai_adapter_module, "VectorTranslator", return_value=FailingTranslator()):
         fn = _make_mock_embedding_function()
@@ -2475,7 +2496,7 @@ def test_error_context_includes_query_params(
             raise RuntimeError("test error")
 
         def capabilities(self):
-            return VectorCapabilities()
+            return _make_caps()
 
     with patch.object(crewai_adapter_module, "VectorTranslator", return_value=FailingTranslator()):
         fn = _make_mock_embedding_function()
@@ -2508,7 +2529,7 @@ def test_error_context_includes_vector_dimension_hint(
             raise RuntimeError("test error")
 
         def capabilities(self):
-            return VectorCapabilities()
+            return _make_caps()
 
     with patch.object(crewai_adapter_module, "VectorTranslator", return_value=FailingTranslator()):
         fn = _make_mock_embedding_function()
@@ -2542,7 +2563,7 @@ def test_error_context_includes_mmr_params(
             raise RuntimeError("test error")
 
         def capabilities(self):
-            return VectorCapabilities()
+            return _make_caps()
 
     with patch.object(crewai_adapter_module, "VectorTranslator", return_value=FailingTranslator()):
         fn = _make_mock_embedding_function()
@@ -2573,7 +2594,7 @@ def test_error_context_extraction_never_raises(
             raise RuntimeError("main error")
 
         def capabilities(self):
-            return VectorCapabilities()
+            return _make_caps()
 
     with patch.object(crewai_adapter_module, "VectorTranslator", return_value=FailingTranslator()):
         fn = _make_mock_embedding_function()
@@ -2657,10 +2678,10 @@ def test_client_passes_task_as_framework_ctx(
     class CapturingTranslator:
         def query(self, raw_query: Any, *, framework_ctx: Any = None, **k: Any) -> Any:
             captured["framework_ctx"] = framework_ctx
-            return QueryResult(matches=[], namespace="default")
+            return _empty_result(namespace="default")
 
         def capabilities(self):
-            return VectorCapabilities()
+            return _make_caps()
 
         def health(self):
             return {"status": "ok"}
@@ -2682,10 +2703,10 @@ def test_client_query_delegates_to_translator(
     class DummyTranslator:
         def query(self, *a: Any, **k: Any) -> Any:
             called["query"] = True
-            return QueryResult(matches=[], namespace="default")
+            return _empty_result(namespace="default")
 
         def capabilities(self):
-            return VectorCapabilities()
+            return _make_caps()
 
         def health(self):
             return {"status": "ok"}
@@ -2826,7 +2847,7 @@ def test_build_raw_query_includes_namespace(adapter: Any) -> None:
 def test_validate_query_result_accepts_query_result(adapter: Any) -> None:
     """Should accept QueryResult instances."""
     tool = CorpusCrewAIVectorSearchTool(corpus_adapter=adapter)
-    result = QueryResult(matches=[], namespace="default")
+    result = _empty_result(namespace="default")
 
     validated = tool._validate_query_result(result, operation="test")
 
@@ -2928,23 +2949,26 @@ def test_crewai_metadata_field_envelope(
             return QueryResult(
                 matches=[
                     VectorMatch(
-                        id="1",
-                        score=0.9,
-                        vector=Mock(
+                        vector=Vector(
                             id="1",
+                            vector=[0.1, 0.2],
                             metadata={
                                 "page_content": "test",
                                 "id": "1",
                                 "user_meta": {"custom": "data"},
                             },
                         ),
+                        score=0.9,
+                        distance=0.1,
                     )
                 ],
+                query_vector=[0.0],
                 namespace="default",
+                total_matches=1,
             )
 
         def capabilities(self):
-            return VectorCapabilities()
+            return _make_caps()
 
     with patch.object(crewai_adapter_module, "VectorTranslator", return_value=DummyTranslator()):
         fn = _make_mock_embedding_function()
@@ -2962,6 +2986,11 @@ def test_crewai_streaming_with_real_task(
     monkeypatch: pytest.MonkeyPatch, adapter: Any
 ) -> None:
     """Streaming should work with task context."""
+    monkeypatch.setattr(
+        crewai_adapter_module,
+        "ctx_from_crewai",
+        lambda _task: OperationContext(request_id="test", tenant="test", attrs={}),
+    )
     with patch.object(
         crewai_adapter_module, "VectorTranslator", return_value=_make_dummy_translator()
     ):
@@ -3037,16 +3066,22 @@ def test_all_matches_filtered_returns_empty(
             return QueryResult(
                 matches=[
                     VectorMatch(
-                        id="1",
+                        vector=Vector(
+                            id="1",
+                            vector=[0.1, 0.2],
+                            metadata={"page_content": "low", "id": "1"},
+                        ),
                         score=0.3,
-                        vector=Mock(id="1", metadata={"page_content": "low"}),
+                        distance=0.7,
                     )
                 ],
+                query_vector=[0.0],
                 namespace="default",
+                total_matches=1,
             )
 
         def capabilities(self):
-            return VectorCapabilities()
+            return _make_caps()
 
     with patch.object(crewai_adapter_module, "VectorTranslator", return_value=DummyTranslator()):
         fn = _make_mock_embedding_function()
