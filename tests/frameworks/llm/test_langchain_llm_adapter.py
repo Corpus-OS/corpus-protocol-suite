@@ -27,7 +27,6 @@ Structure
 - Integration tests: real LLMTranslator + fake protocol adapter
 - E2E tests: call BaseChatModel public methods (invoke/ainvoke/stream/astream)
 
-This file intentionally contains 60+ distinct tests (target: 57–65).
 """
 
 from __future__ import annotations
