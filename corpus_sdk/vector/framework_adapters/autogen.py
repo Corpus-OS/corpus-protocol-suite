@@ -53,7 +53,7 @@ from typing import (
 
 from corpus_sdk.vector.vector_base import (
     VectorProtocolV1,
-    OperationContext,
+    OperationContext as VectorOperationContext,
     BadRequest,
     NotSupported,
     VectorCapabilities,
@@ -71,6 +71,7 @@ from corpus_sdk.vector.framework_adapters.common.framework_utils import (
     VectorCoercionErrorCodes,
     VectorResourceLimits,
     VectorValidationFlags,
+    TopKWarningConfig,
     coerce_hits,
     warn_if_extreme_k,
 )
@@ -155,6 +156,7 @@ def _warn_if_extreme_k(k: int, op_name: str) -> None:
         k,
         framework="autogen",
         op_name=op_name,
+        warning_config=TopKWarningConfig(warn_threshold=100, framework_label="autogen"),
         logger=logger,
     )
 
@@ -531,28 +533,68 @@ class CorpusAutoGenVectorClient:
         )
 
     def capabilities(self, *, conversation: Optional[Any] = None) -> Any:
-        return self._translator.capabilities(framework_ctx=conversation)
+        if conversation is None:
+            return self._translator.capabilities()
+        try:
+            return self._translator.capabilities(framework_ctx=conversation)
+        except TypeError:
+            return self._translator.capabilities()
 
     def health(self, *, conversation: Optional[Any] = None) -> Any:
-        return self._translator.health(framework_ctx=conversation)
+        if conversation is None:
+            return self._translator.health()
+        try:
+            return self._translator.health(framework_ctx=conversation)
+        except TypeError:
+            return self._translator.health()
 
     def query(self, raw_query: Any, *, conversation: Optional[Any] = None) -> Any:
-        return self._translator.query(raw_query, framework_ctx=conversation)
+        if conversation is None:
+            return self._translator.query(raw_query)
+        try:
+            return self._translator.query(raw_query, framework_ctx=conversation)
+        except TypeError:
+            return self._translator.query(raw_query)
 
     def batch_query(self, raw_queries: Any, *, conversation: Optional[Any] = None) -> Any:
-        return self._translator.batch_query(raw_queries, framework_ctx=conversation)
+        if conversation is None:
+            return self._translator.batch_query(raw_queries)
+        try:
+            return self._translator.batch_query(raw_queries, framework_ctx=conversation)
+        except TypeError:
+            return self._translator.batch_query(raw_queries)
 
     def upsert(self, raw_documents: Any, *, conversation: Optional[Any] = None) -> Any:
-        return self._translator.upsert(raw_documents, framework_ctx=conversation)
+        if conversation is None:
+            return self._translator.upsert(raw_documents)
+        try:
+            return self._translator.upsert(raw_documents, framework_ctx=conversation)
+        except TypeError:
+            return self._translator.upsert(raw_documents)
 
     def delete(self, raw_filter_or_ids: Any, *, conversation: Optional[Any] = None) -> Any:
-        return self._translator.delete(raw_filter_or_ids, framework_ctx=conversation)
+        if conversation is None:
+            return self._translator.delete(raw_filter_or_ids)
+        try:
+            return self._translator.delete(raw_filter_or_ids, framework_ctx=conversation)
+        except TypeError:
+            return self._translator.delete(raw_filter_or_ids)
 
     def create_namespace(self, name: str, *, conversation: Optional[Any] = None) -> Any:
-        return self._translator.create_namespace(name, framework_ctx=conversation)
+        if conversation is None:
+            return self._translator.create_namespace(name)
+        try:
+            return self._translator.create_namespace(name, framework_ctx=conversation)
+        except TypeError:
+            return self._translator.create_namespace(name)
 
     def delete_namespace(self, name: str, *, conversation: Optional[Any] = None) -> Any:
-        return self._translator.delete_namespace(name, framework_ctx=conversation)
+        if conversation is None:
+            return self._translator.delete_namespace(name)
+        try:
+            return self._translator.delete_namespace(name, framework_ctx=conversation)
+        except TypeError:
+            return self._translator.delete_namespace(name)
 
 
 class CorpusAutoGenVectorStore:
@@ -633,6 +675,8 @@ class CorpusAutoGenVectorStore:
         framework_version: Optional[str] = None,
         own_adapter: bool = False,
     ) -> None:
+        if corpus_adapter is None:
+            raise TypeError("corpus_adapter is required")
         self.corpus_adapter: VectorProtocolV1 = corpus_adapter
         self.namespace = namespace
 
@@ -749,12 +793,71 @@ class CorpusAutoGenVectorStore:
     # Standardized context building (core + framework + orchestrator)
     # ------------------------------------------------------------------ #
 
+    def _coerce_context_to_mapping(self, ctx_obj: Any) -> Optional[Mapping[str, Any]]:
+        """Best-effort conversion of a core OperationContext-like object into a dict.
+
+        `context_translation.from_autogen` returns the protocol-agnostic core OperationContext.
+        VectorTranslator accepts either the vector OperationContext or a mapping that can be
+        normalized into one. We avoid importing core types here to keep the adapter
+        protocol-scoped and dependency-light.
+        """
+        if ctx_obj is None:
+            return None
+
+        to_dict = getattr(ctx_obj, "to_dict", None)
+        if callable(to_dict):
+            try:
+                as_dict = to_dict()
+                if isinstance(as_dict, Mapping):
+                    out = dict(as_dict)
+                    attrs = out.get("attrs") or {}
+                    if not isinstance(attrs, dict):
+                        try:
+                            attrs = dict(attrs)
+                        except Exception:  # noqa: BLE001
+                            attrs = {}
+                    attrs.setdefault("framework", "autogen")
+                    if self._framework_version is not None:
+                        attrs.setdefault("framework_version", self._framework_version)
+                    out["attrs"] = attrs
+                    return out
+            except Exception:  # noqa: BLE001
+                pass
+
+        # Duck-typed extraction of common fields.
+        looks_like_ctx = any(
+            hasattr(ctx_obj, k)
+            for k in ("request_id", "tenant", "deadline_ms", "traceparent", "attrs")
+        )
+        if not looks_like_ctx:
+            return None
+
+        attrs = getattr(ctx_obj, "attrs", None) or {}
+        if not isinstance(attrs, dict):
+            try:
+                attrs = dict(attrs)
+            except Exception:  # noqa: BLE001
+                attrs = {}
+
+        attrs.setdefault("framework", "autogen")
+        if self._framework_version is not None:
+            attrs.setdefault("framework_version", self._framework_version)
+
+        return {
+            "request_id": getattr(ctx_obj, "request_id", None),
+            "tenant": getattr(ctx_obj, "tenant", None),
+            "deadline_ms": getattr(ctx_obj, "deadline_ms", None),
+            "traceparent": getattr(ctx_obj, "traceparent", None),
+            "attrs": attrs,
+        }
+
+
     def _build_core_context(
         self,
         *,
         conversation: Optional[Any],
         extra_context: Optional[Mapping[str, Any]],
-    ) -> Optional[OperationContext]:
+    ) -> Optional[Any]:
         """
         Build an OperationContext from an AutoGen-style conversation plus
         optional extra context.
@@ -767,7 +870,7 @@ class CorpusAutoGenVectorStore:
             return None
 
         try:
-            ctx = core_ctx_from_autogen(
+            ctx_candidate = core_ctx_from_autogen(
                 conversation,
                 framework_version=self._framework_version,
                 **extra,
@@ -782,26 +885,32 @@ class CorpusAutoGenVectorStore:
             )
             raise
 
-        if not isinstance(ctx, OperationContext):
-            err = BadRequest(
-                f"from_autogen produced unsupported context type: {type(ctx).__name__}",
-                code=ErrorCodes.BAD_OPERATION_CONTEXT,
-            )
-            attach_context(
-                err,
-                framework="autogen",
-                operation="vector_context_translation",
-                framework_version=self._framework_version,
-                error_codes=VECTOR_COERCION_ERROR_CODES,
-                produced_type=type(ctx).__name__,
-            )
-            raise err
+        # VectorTranslator can accept the vector OperationContext or a mapping.
+        # Prefer passing through vector ctx when available; otherwise coerce to mapping.
+        if isinstance(ctx_candidate, VectorOperationContext):
+            return ctx_candidate
 
-        return ctx
+        coerced = self._coerce_context_to_mapping(ctx_candidate)
+        if coerced is not None:
+            return coerced
+
+        err = BadRequest(
+            f"from_autogen produced unsupported context type: {type(ctx_candidate).__name__}",
+            code=ErrorCodes.BAD_OPERATION_CONTEXT,
+        )
+        attach_context(
+            err,
+            framework="autogen",
+            operation="vector_context_translation",
+            framework_version=self._framework_version,
+            error_codes=VECTOR_COERCION_ERROR_CODES,
+            produced_type=type(ctx_candidate).__name__,
+        )
+        raise err
 
     def _build_framework_context(
         self,
-        core_ctx: Optional[OperationContext],
+        core_ctx: Optional[VectorOperationContext],
         *,
         operation: str,
         namespace: Optional[str],
@@ -829,7 +938,7 @@ class CorpusAutoGenVectorStore:
         conversation: Optional[Any],
         extra_context: Optional[Mapping[str, Any]],
         namespace: Optional[str],
-    ) -> Tuple[Optional[OperationContext], Mapping[str, Any]]:
+    ) -> Tuple[Optional[VectorOperationContext], Mapping[str, Any]]:
         """
         Orchestrate both core OperationContext and framework_ctx building.
 
@@ -1986,7 +2095,7 @@ class CorpusAutoGenVectorStore:
     def similarity_search(
         self,
         query: str,
-        k: int = 4,
+        k: Optional[int] = None,
         filter: Optional[Mapping[str, Any]] = None,
         *,
         conversation: Optional[Any] = None,
@@ -2007,7 +2116,7 @@ class CorpusAutoGenVectorStore:
         )
         query_emb = self._embed_query(query, embedding=embedding)
 
-        top_k = k or self.default_top_k
+        top_k = self.default_top_k if k is None else int(k)
         _warn_if_extreme_k(top_k, op_name="similarity_search")
 
         # Capability-aware validation (fail fast before hitting the backend).
@@ -2046,7 +2155,7 @@ class CorpusAutoGenVectorStore:
     def similarity_search_with_score(
         self,
         query: str,
-        k: int = 4,
+        k: Optional[int] = None,
         filter: Optional[Mapping[str, Any]] = None,
         *,
         conversation: Optional[Any] = None,
@@ -2067,7 +2176,7 @@ class CorpusAutoGenVectorStore:
         )
         query_emb = self._embed_query(query, embedding=embedding)
 
-        top_k = k or self.default_top_k
+        top_k = self.default_top_k if k is None else int(k)
         _warn_if_extreme_k(top_k, op_name="similarity_search_with_score")
 
         caps = self._get_caps_sync()
@@ -2104,7 +2213,7 @@ class CorpusAutoGenVectorStore:
     async def asimilarity_search(
         self,
         query: str,
-        k: int = 4,
+        k: Optional[int] = None,
         filter: Optional[Mapping[str, Any]] = None,
         *,
         conversation: Optional[Any] = None,
@@ -2123,7 +2232,7 @@ class CorpusAutoGenVectorStore:
         )
         query_emb = await self._embed_query_async(query, embedding=embedding)
 
-        top_k = k or self.default_top_k
+        top_k = self.default_top_k if k is None else int(k)
         _warn_if_extreme_k(top_k, op_name="asimilarity_search")
 
         caps = await self._get_caps_async()
@@ -2161,7 +2270,7 @@ class CorpusAutoGenVectorStore:
     async def asimilarity_search_with_score(
         self,
         query: str,
-        k: int = 4,
+        k: Optional[int] = None,
         filter: Optional[Mapping[str, Any]] = None,
         *,
         conversation: Optional[Any] = None,
@@ -2180,7 +2289,7 @@ class CorpusAutoGenVectorStore:
         )
         query_emb = await self._embed_query_async(query, embedding=embedding)
 
-        top_k = k or self.default_top_k
+        top_k = self.default_top_k if k is None else int(k)
         _warn_if_extreme_k(top_k, op_name="asimilarity_search_with_score")
 
         caps = await self._get_caps_async()
@@ -2221,7 +2330,7 @@ class CorpusAutoGenVectorStore:
     def similarity_search_stream(
         self,
         query: str,
-        k: int = 4,
+        k: Optional[int] = None,
         filter: Optional[Mapping[str, Any]] = None,
         *,
         conversation: Optional[Any] = None,
@@ -2246,7 +2355,7 @@ class CorpusAutoGenVectorStore:
         )
         query_emb = self._embed_query(query, embedding=embedding)
 
-        top_k = k or self.default_top_k
+        top_k = self.default_top_k if k is None else int(k)
         _warn_if_extreme_k(top_k, op_name="similarity_search_stream")
 
         caps = self._get_caps_sync()
@@ -2283,7 +2392,7 @@ class CorpusAutoGenVectorStore:
     async def asimilarity_search_stream(
         self,
         query: str,
-        k: int = 4,
+        k: Optional[int] = None,
         filter: Optional[Mapping[str, Any]] = None,
         *,
         conversation: Optional[Any] = None,
@@ -2304,7 +2413,7 @@ class CorpusAutoGenVectorStore:
         )
         query_emb = await self._embed_query_async(query, embedding=embedding)
 
-        top_k = k or self.default_top_k
+        top_k = self.default_top_k if k is None else int(k)
         _warn_if_extreme_k(top_k, op_name="asimilarity_search_stream")
 
         caps = await self._get_caps_async()
@@ -2328,14 +2437,28 @@ class CorpusAutoGenVectorStore:
             include_vectors=False,
         )
 
-        async for chunk in self._translator.arun_query_stream(
-            raw_query,
-            op_ctx=op_ctx,
-            framework_ctx=fw_ctx,
-        ):
-            matches = self._extract_matches_from_chunk(chunk)
-            for doc, _ in self._from_matches(matches):
-                yield doc
+        async def _gen() -> AsyncIterator[AutoGenDocument]:
+            stream = self._translator.arun_query_stream(
+                raw_query,
+                op_ctx=op_ctx,
+                framework_ctx=fw_ctx,
+            )
+
+            if asyncio.iscoroutine(stream):
+                stream = await stream
+
+            if hasattr(stream, "__aiter__"):
+                async for chunk in stream:  # type: ignore[assignment]
+                    matches = self._extract_matches_from_chunk(chunk)
+                    for doc, _ in self._from_matches(matches):
+                        yield doc
+            else:
+                for chunk in stream:  # type: ignore[not-an-iterable]
+                    matches = self._extract_matches_from_chunk(chunk)
+                    for doc, _ in self._from_matches(matches):
+                        yield doc
+
+        return _gen()
 
     # ------------------------------------------------------------------ #
     # Low-level raw query API (precomputed embeddings)
@@ -2345,7 +2468,7 @@ class CorpusAutoGenVectorStore:
     def query(
         self,
         embedding: Sequence[float],
-        k: int = 4,
+        k: Optional[int] = None,
         *,
         filter: Optional[Mapping[str, Any]] = None,
         conversation: Optional[Any] = None,
@@ -2367,7 +2490,7 @@ class CorpusAutoGenVectorStore:
             extra_context=extra_context,
             namespace=namespace,
         )
-        top_k = k or self.default_top_k
+        top_k = self.default_top_k if k is None else int(k)
         _warn_if_extreme_k(top_k, op_name="query")
 
         caps = self._get_caps_sync()
@@ -2403,7 +2526,7 @@ class CorpusAutoGenVectorStore:
     async def aquery(
         self,
         embedding: Sequence[float],
-        k: int = 4,
+        k: Optional[int] = None,
         *,
         filter: Optional[Mapping[str, Any]] = None,
         conversation: Optional[Any] = None,
@@ -2423,7 +2546,7 @@ class CorpusAutoGenVectorStore:
             extra_context=extra_context,
             namespace=namespace,
         )
-        top_k = k or self.default_top_k
+        top_k = self.default_top_k if k is None else int(k)
         _warn_if_extreme_k(top_k, op_name="aquery")
 
         caps = await self._get_caps_async()
@@ -2463,7 +2586,7 @@ class CorpusAutoGenVectorStore:
     def max_marginal_relevance_search(
         self,
         query: str,
-        k: int = 4,
+        k: Optional[int] = None,
         lambda_mult: float = 0.5,
         filter: Optional[Mapping[str, Any]] = None,
         *,
@@ -2489,7 +2612,7 @@ class CorpusAutoGenVectorStore:
         )
         query_emb = self._embed_query(query, embedding=embedding)
 
-        base_k = k or self.default_top_k
+        base_k = self.default_top_k if k is None else int(k)
         actual_fetch_k = fetch_k or max(base_k * 4, base_k + 5)
 
         _warn_if_extreme_k(base_k, op_name="max_marginal_relevance_search_k")
@@ -2546,7 +2669,7 @@ class CorpusAutoGenVectorStore:
     async def amax_marginal_relevance_search(
         self,
         query: str,
-        k: int = 4,
+        k: Optional[int] = None,
         lambda_mult: float = 0.5,
         filter: Optional[Mapping[str, Any]] = None,
         *,
@@ -2567,7 +2690,7 @@ class CorpusAutoGenVectorStore:
         )
         query_emb = await self._embed_query_async(query, embedding=embedding)
 
-        base_k = k or self.default_top_k
+        base_k = self.default_top_k if k is None else int(k)
         actual_fetch_k = fetch_k or max(base_k * 4, base_k + 5)
 
         _warn_if_extreme_k(base_k, op_name="amax_marginal_relevance_search_k")
@@ -3080,10 +3203,68 @@ class CorpusAutoGenRetrieverTool:
         ]
 
 
+# --------------------------------------------------------------------------- #
+# Optional AutoGen-native integration helpers (soft import)
+# --------------------------------------------------------------------------- #
+
+
+def create_autogen_retriever_function_tool(
+    vector_store: "CorpusAutoGenVectorStore",
+    *,
+    name: str = "corpus_vector_search",
+    description: str = "Retrieve relevant documents from a Corpus-backed vector index.",
+    default_k: int = 4,
+) -> Any:
+    """Create an AutoGen-Core FunctionTool for retrieval (lazy import).
+
+    This keeps the adapter itself dependency-free, but enables true end-to-end
+    AutoGen tool registration when `autogen-core` is installed.
+    """
+    try:
+        from autogen_core.tools import FunctionTool  # type: ignore[import-not-found]
+    except ImportError as exc:  # noqa: BLE001
+        raise RuntimeError(
+            "AutoGen tool dependencies are not installed. Install with:\n"
+            '  pip install -U "autogen-core" "autogen-agentchat"\n'
+            "Then retry create_autogen_retriever_function_tool(...)."
+        ) from exc
+
+    async def _retrieve(
+        query: str,
+        *,
+        k: Optional[int] = None,
+        conversation: Optional[Any] = None,
+        extra_context: Optional[Mapping[str, Any]] = None,
+        filter: Optional[Mapping[str, Any]] = None,
+    ) -> List[Mapping[str, Any]]:
+        kk = int(k) if k is not None else int(default_k)
+        docs = await vector_store.asimilarity_search(
+            query,
+            k=kk,
+            filter=filter,
+            conversation=conversation,
+            extra_context=extra_context,
+        )
+        return [
+            {
+                "page_content": d.page_content,
+                "metadata": dict(d.metadata or {}),
+            }
+            for d in docs
+        ]
+
+    return FunctionTool(
+        _retrieve,
+        name=name,
+        description=description,
+    )
+
+
 __all__ = [
     "AutoGenDocument",
     "CorpusAutoGenVectorStore",
     "CorpusAutoGenRetrieverTool",
+    "create_autogen_retriever_function_tool",
     "ErrorCodes",
     "with_error_context",
     "with_async_error_context",
