@@ -123,29 +123,39 @@ class CorpusCrewAIVectorClient:
             translator=DefaultVectorFrameworkTranslator(),
         )
 
+    def _call_with_optional_framework_ctx(self, method_name: str, *args: Any, task: Optional[Any] = None) -> Any:
+        method = getattr(self._translator, method_name)
+        if task is None:
+            return method(*args)
+        try:
+            return method(*args, framework_ctx=task)
+        except TypeError:
+            # Some translator implementations / test doubles don't accept framework_ctx.
+            return method(*args)
+
     def capabilities(self, *, task: Optional[Any] = None) -> Any:
-        return self._translator.capabilities(framework_ctx=task)
+        return self._call_with_optional_framework_ctx("capabilities", task=task)
 
     def health(self, *, task: Optional[Any] = None) -> Any:
-        return self._translator.health(framework_ctx=task)
+        return self._call_with_optional_framework_ctx("health", task=task)
 
     def query(self, raw_query: Any, *, task: Optional[Any] = None) -> Any:
-        return self._translator.query(raw_query, framework_ctx=task)
+        return self._call_with_optional_framework_ctx("query", raw_query, task=task)
 
     def batch_query(self, raw_queries: Any, *, task: Optional[Any] = None) -> Any:
-        return self._translator.batch_query(raw_queries, framework_ctx=task)
+        return self._call_with_optional_framework_ctx("batch_query", raw_queries, task=task)
 
     def upsert(self, raw_documents: Any, *, task: Optional[Any] = None) -> Any:
-        return self._translator.upsert(raw_documents, framework_ctx=task)
+        return self._call_with_optional_framework_ctx("upsert", raw_documents, task=task)
 
     def delete(self, raw_filter_or_ids: Any, *, task: Optional[Any] = None) -> Any:
-        return self._translator.delete(raw_filter_or_ids, framework_ctx=task)
+        return self._call_with_optional_framework_ctx("delete", raw_filter_or_ids, task=task)
 
     def create_namespace(self, name: str, *, task: Optional[Any] = None) -> Any:
-        return self._translator.create_namespace(name, framework_ctx=task)
+        return self._call_with_optional_framework_ctx("create_namespace", name, task=task)
 
     def delete_namespace(self, name: str, *, task: Optional[Any] = None) -> Any:
-        return self._translator.delete_namespace(name, framework_ctx=task)
+        return self._call_with_optional_framework_ctx("delete_namespace", name, task=task)
 
 
 # --------------------------------------------------------------------------- #
@@ -229,6 +239,33 @@ def _build_dynamic_error_context(
     try:
         extra.setdefault("operation", operation)
 
+        # Many internal helpers receive the input schema as a positional arg
+        # (e.g., _search_simple_sync(self, args)). Extract common fields from it.
+        input_payload: Dict[str, Any] = {}
+        if len(args) >= 2:
+            candidate = args[1]
+            try:
+                if isinstance(candidate, Mapping):
+                    input_payload.update(candidate)
+                else:
+                    for key in (
+                        "query",
+                        "k",
+                        "fetch_k",
+                        "namespace",
+                        "filter",
+                        "use_mmr",
+                        "mmr_lambda",
+                        "return_scores",
+                        "embedding",
+                        "texts",
+                    ):
+                        if hasattr(candidate, key):
+                            input_payload[key] = getattr(candidate, key)
+            except Exception:
+                # Best-effort only.
+                pass
+
         # Self-introspection: defaults & basic metadata
         if args:
             self_obj = args[0]
@@ -245,36 +282,38 @@ def _build_dynamic_error_context(
             if dim_hint is not None:
                 extra.setdefault("vector_dim_hint", dim_hint)
 
-        # Common query parameters
-        query = kwargs.get("query")
+        # Common query parameters (kwargs win over schema payload)
+        query = kwargs.get("query") if "query" in kwargs else input_payload.get("query")
         if isinstance(query, str):
             extra.setdefault("query_chars", len(query))
 
-        k = kwargs.get("k")
+        k = kwargs.get("k") if "k" in kwargs else input_payload.get("k")
         if isinstance(k, int):
             extra.setdefault("k", k)
 
-        fetch_k = kwargs.get("fetch_k")
+        fetch_k = kwargs.get("fetch_k") if "fetch_k" in kwargs else input_payload.get("fetch_k")
         if isinstance(fetch_k, int):
             extra.setdefault("fetch_k", fetch_k)
 
-        namespace = kwargs.get("namespace")
+        namespace = kwargs.get("namespace") if "namespace" in kwargs else input_payload.get("namespace")
         if namespace is not None:
             extra.setdefault("namespace", namespace)
 
-        if "filter" in kwargs:
-            extra.setdefault("has_filter", kwargs.get("filter") is not None)
+        if "filter" in kwargs or "filter" in input_payload:
+            fval = kwargs.get("filter") if "filter" in kwargs else input_payload.get("filter")
+            extra.setdefault("has_filter", fval is not None)
 
-        if "return_scores" in kwargs:
-            extra.setdefault("return_scores", bool(kwargs.get("return_scores")))
+        if "return_scores" in kwargs or "return_scores" in input_payload:
+            rval = kwargs.get("return_scores") if "return_scores" in kwargs else input_payload.get("return_scores")
+            extra.setdefault("return_scores", bool(rval))
 
         # Embedding / vectorization inputs
-        if "embedding" in kwargs and kwargs.get("embedding") is not None:
-            emb = kwargs.get("embedding")
+        emb = kwargs.get("embedding") if "embedding" in kwargs else input_payload.get("embedding")
+        if emb is not None:
             if isinstance(emb, Sequence):
                 extra.setdefault("embedding_dim", len(emb))
 
-        texts = kwargs.get("texts")
+        texts = kwargs.get("texts") if "texts" in kwargs else input_payload.get("texts")
         if texts is not None:
             try:
                 texts_list = list(texts)  # may raise for non-iterables
@@ -292,10 +331,13 @@ def _build_dynamic_error_context(
         # If this wrapper was invoked via CrewAI tool `_run/_arun`,
         # the kwargs often represent the input schema fields.
         # Attach the most common ones.
-        if "use_mmr" in kwargs:
-            extra.setdefault("use_mmr", kwargs.get("use_mmr"))
-        if "mmr_lambda" in kwargs:
-            extra.setdefault("mmr_lambda", kwargs.get("mmr_lambda"))
+        if "use_mmr" in kwargs or "use_mmr" in input_payload:
+            extra.setdefault("use_mmr", kwargs.get("use_mmr") if "use_mmr" in kwargs else input_payload.get("use_mmr"))
+        if "mmr_lambda" in kwargs or "mmr_lambda" in input_payload:
+            extra.setdefault(
+                "mmr_lambda",
+                kwargs.get("mmr_lambda") if "mmr_lambda" in kwargs else input_payload.get("mmr_lambda"),
+            )
     except Exception:
         # Error-context enrichment must never be fatal.
         pass
@@ -325,7 +367,6 @@ def with_error_context(
                 attach_context(
                     exc,
                     framework="crewai",
-                    operation=operation,
                     error_codes=VECTOR_ERROR_CODES,
                     **enhanced_context,
                 )
@@ -359,7 +400,6 @@ def with_async_error_context(
                 attach_context(
                     exc,
                     framework="crewai",
-                    operation=operation,
                     error_codes=VECTOR_ERROR_CODES,
                     **enhanced_context,
                 )
@@ -927,6 +967,13 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
         if not texts_list:
             return []
 
+        # Pre-handle empties for deterministic output.
+        # If all texts are empty, we can return zero vectors without calling any embedding provider.
+        empty_mask: List[bool] = [not str(t).strip() for t in texts_list]
+        if all(empty_mask):
+            z = self._zero_vector()
+            return [list(z) for _ in texts_list]
+
         # If embeddings are supplied, validate and coerce.
         if embeddings is not None:
             if len(embeddings) != len(texts_list):
@@ -951,14 +998,6 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
                 code=ErrorCodes.NO_EMBEDDING_FUNCTION,
                 details={"texts": len(texts_list)},
             )
-
-        # Pre-handle empties for deterministic output.
-        # We embed only non-empty texts to avoid inconsistent provider behavior on "".
-        empty_mask: List[bool] = [not str(t).strip() for t in texts_list]
-        if all(empty_mask):
-            # All empty -> require known dim for stable shape.
-            z = self._zero_vector()
-            return [list(z) for _ in texts_list]
 
         non_empty_texts: List[str] = [t for t, is_empty in zip(texts_list, empty_mask) if not is_empty]
         try:
@@ -1665,7 +1704,7 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
         """
         Simple top-k search without MMR (async).
         """
-        top_k = int(args.k or self.default_top_k)
+        top_k = int(self.default_top_k if args.k is None else args.k)
         if top_k <= 0:
             return []
 
@@ -1729,7 +1768,7 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
         """
         MMR-based search that first fetches candidates and then re-ranks them (async).
         """
-        top_k = int(args.k or self.default_top_k)
+        top_k = int(self.default_top_k if args.k is None else args.k)
         if top_k <= 0:
             return []
 
@@ -1826,7 +1865,7 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
         """
         _ensure_not_in_event_loop("CorpusCrewAIVectorSearchTool._search_simple_sync")
 
-        top_k = int(args.k or self.default_top_k)
+        top_k = int(self.default_top_k if args.k is None else args.k)
         if top_k <= 0:
             return []
 
@@ -1874,7 +1913,7 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
         """
         _ensure_not_in_event_loop("CorpusCrewAIVectorSearchTool._search_with_mmr_sync")
 
-        top_k = int(args.k or self.default_top_k)
+        top_k = int(self.default_top_k if args.k is None else args.k)
         if top_k <= 0:
             return []
 
@@ -2029,7 +2068,7 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
 
         args = self.args_schema(**kwargs)  # type: ignore[arg-type]
 
-        top_k = int(args.k or self.default_top_k)
+        top_k = int(self.default_top_k if args.k is None else args.k)
         if top_k <= 0:
             return iter(())
 
